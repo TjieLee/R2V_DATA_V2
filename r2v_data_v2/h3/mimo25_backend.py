@@ -26,11 +26,11 @@ from r2v_data_v2.structured_output import (
 
 MIMO25_MODEL = "mimo-v2.5"
 MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
-MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v19"
-MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v13"
-MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.12"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.17"
-MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v13"
+MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v20"
+MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v14"
+MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.13"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.18"
+MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v14"
 DEFAULT_BASE64_LIMIT_BYTES = 50 * 1024 * 1024
 MimoTransport = Literal["xiaomi", "sglang"]
 
@@ -64,6 +64,18 @@ _VOICE_IDENTITY_PROFILE = re.compile(
     r"|\b(?:mother|father|sister|brother|husband|wife|manager|employee)\b"
     r"|\b(?:personality|character|temperament)\b"
     r"|\b(?:voice|speaker)\s+(?:of|named|identified\s+as)\b",
+    flags=re.IGNORECASE,
+)
+_SOUNDSCAPE_CONTAMINATION = re.compile(
+    r"\b(?:BGM|background music|score|soundtrack|music|song|melody|"
+    r"instrumental music|dialogue|spoken dialogue|narration|voice-over|lyrics|singing)\b",
+    flags=re.IGNORECASE,
+)
+_INTERNAL_ANNOTATION_SYNTAX = re.compile(
+    r"(?<![A-Za-z0-9_])(?:ae|v|g|e)[1-9]\d*(?![A-Za-z0-9_])"
+    r"|\bsegment[_-][A-Za-z0-9_-]+\b"
+    r"|\b(?:visual_observation|audio_observation|av_grounding|h3_projection|"
+    r"CO_ANALYSIS|VISUAL_DESCRIPTION|AUDIO_DESCRIPTION)\b",
     flags=re.IGNORECASE,
 )
 _TRUNCATED_FINISH_REASONS = {
@@ -108,6 +120,13 @@ EvidenceCode = Literal[
     "voice_over_context",
     "device_playback_context",
 ]
+AudioEvidenceCode = Literal[
+    "voice_continuity",
+    "speaker_turn_change",
+    "source_cluster_support",
+    "source_cluster_conflict",
+    "insufficient_evidence",
+]
 
 
 def _has_onscreen_speaker_evidence(evidence_codes: list[EvidenceCode]) -> bool:
@@ -118,6 +137,40 @@ def _has_onscreen_speaker_evidence(evidence_codes: list[EvidenceCode]) -> bool:
         and bool(evidence & {"av_temporal_alignment", "voice_continuity"})
     )
     return direct or occluded
+
+
+def _has_grounded_onscreen_evidence(
+    decision: MimoAVSegmentGrounding,
+    view: MimoVisualSegmentView | None,
+) -> bool:
+    if decision.entity_id is None or view is None:
+        return False
+    observation = next(
+        (
+            item
+            for item in view.entity_observations
+            if item.entity_id == decision.entity_id
+        ),
+        None,
+    )
+    if observation is None:
+        return False
+    evidence = set(decision.evidence_codes)
+    if (
+        observation.speech_correlated_articulation == "observed"
+        and "visible_lip_motion" in evidence
+    ):
+        return True
+    non_assessable = (
+        observation.orientation in {"profile", "back", "mixed"}
+        or observation.face_visibility in {"occluded", "out_of_frame", "not_assessable"}
+        or observation.mouth_visibility in {"occluded", "out_of_frame", "not_assessable"}
+    )
+    return (
+        non_assessable
+        and "speaker_visible_mouth_occluded" in evidence
+        and bool(evidence & {"av_temporal_alignment", "voice_continuity"})
+    )
 
 
 def _compact_json(value: object) -> str:
@@ -181,37 +234,22 @@ MimoSecondaryVocalActivity = Annotated[
 ]
 
 
-class _MimoSegmentDecisionBase(SchemaModel):
+class _MimoAudioSegmentDecisionBase(SchemaModel):
     segment_id: str = Field(min_length=1)
     vocal_composition: VocalComposition
     resolution: Resolution
     primary_speaker_group: str | None = Field(pattern=r"^g[1-9]\d*$")
-    binding_status: BindingStatus
-    speech_presentation: SpeechPresentation
-    entity_id: str | None
     delivery_style: StrictStr | None
     secondary_vocal_activity: MimoSecondaryVocalActivity
     confidence: Literal["high", "medium", "low"]
-    evidence_codes: list[EvidenceCode] = Field(min_length=1, max_length=8)
+    audio_evidence_codes: list[AudioEvidenceCode] = Field(min_length=1, max_length=8)
 
     @model_validator(mode="after")
-    def validate_decision(self) -> _MimoSegmentDecisionBase:
+    def validate_decision(self) -> _MimoAudioSegmentDecisionBase:
         if self.delivery_style is not None and not self.delivery_style.strip():
             raise ValueError("MiMo segment delivery must be non-empty or null")
         if self.resolution == "resolved" and self.primary_speaker_group is None:
             raise ValueError("resolved segment requires one primary speaker group")
-        if self.binding_status == "visible_entity":
-            if self.entity_id is None:
-                raise ValueError("visible_entity requires supplied entity_id")
-            if self.speech_presentation != "onscreen_spoken":
-                raise ValueError("visible_entity requires onscreen_spoken presentation")
-        elif self.entity_id is not None:
-            raise ValueError("only visible_entity may publish entity_id")
-        if self.speech_presentation == "onscreen_spoken":
-            if self.binding_status == "offscreen":
-                raise ValueError("onscreen_spoken cannot use offscreen binding status")
-        elif self.binding_status == "visible_entity" or self.entity_id is not None:
-            raise ValueError("non-onscreen speech cannot claim a visible entity")
         secondary = self.secondary_vocal_activity
         if self.vocal_composition == "single_speaker":
             if secondary.present:
@@ -241,32 +279,63 @@ class _MimoSegmentDecisionBase(SchemaModel):
             )
         ):
             raise ValueError("multi-speaker speech requires acoustic refinement")
-        if len(self.evidence_codes) != len(set(self.evidence_codes)):
-            raise ValueError("segment evidence codes must be unique")
+        if len(self.audio_evidence_codes) != len(set(self.audio_evidence_codes)):
+            raise ValueError("Audio segment evidence codes must be unique")
         return self
 
 
-class MimoResolvedSegmentDecision(_MimoSegmentDecisionBase):
+class MimoResolvedAudioSegmentDecision(_MimoAudioSegmentDecisionBase):
     resolution: Literal["resolved"]
     primary_speaker_group: str = Field(pattern=r"^g[1-9]\d*$")
 
 
-class MimoAcousticRefinementSegmentDecision(_MimoSegmentDecisionBase):
+class MimoAcousticRefinementAudioSegmentDecision(_MimoAudioSegmentDecisionBase):
     resolution: Literal["needs_acoustic_refinement"]
     primary_speaker_group: str | None = Field(pattern=r"^g[1-9]\d*$")
 
 
-class MimoUncertainSegmentDecision(_MimoSegmentDecisionBase):
+class MimoUncertainAudioSegmentDecision(_MimoAudioSegmentDecisionBase):
     resolution: Literal["uncertain"]
     primary_speaker_group: str | None = Field(pattern=r"^g[1-9]\d*$")
 
 
-MimoSegmentDecision = Annotated[
-    MimoResolvedSegmentDecision
-    | MimoAcousticRefinementSegmentDecision
-    | MimoUncertainSegmentDecision,
+MimoAudioSegmentDecision = Annotated[
+    MimoResolvedAudioSegmentDecision
+    | MimoAcousticRefinementAudioSegmentDecision
+    | MimoUncertainAudioSegmentDecision,
     Field(discriminator="resolution"),
 ]
+
+
+class MimoAVSegmentGrounding(SchemaModel):
+    segment_id: str = Field(min_length=1)
+    primary_speaker_group: str | None = Field(pattern=r"^g[1-9]\d*$")
+    binding_status: BindingStatus
+    speech_presentation: SpeechPresentation
+    entity_id: str | None
+    confidence: Literal["high", "medium", "low"]
+    evidence_codes: list[EvidenceCode] = Field(min_length=1, max_length=8)
+
+    @model_validator(mode="after")
+    def validate_grounding(self) -> MimoAVSegmentGrounding:
+        if self.binding_status == "visible_entity":
+            if self.entity_id is None:
+                raise ValueError("visible_entity requires supplied entity_id")
+            if self.speech_presentation != "onscreen_spoken":
+                raise ValueError("visible_entity requires onscreen_spoken presentation")
+        elif self.entity_id is not None:
+            raise ValueError("only visible_entity may publish entity_id")
+        if self.speech_presentation == "onscreen_spoken":
+            if self.binding_status == "offscreen":
+                raise ValueError("onscreen_spoken cannot use offscreen binding status")
+        elif self.binding_status == "visible_entity" or self.entity_id is not None:
+            raise ValueError("non-onscreen speech cannot claim a visible entity")
+        if len(self.evidence_codes) != len(set(self.evidence_codes)):
+            raise ValueError("AV grounding evidence codes must be unique")
+        return self
+
+
+MimoSegmentDecision = MimoAVSegmentGrounding
 
 
 class MimoAudioEvent(SchemaModel):
@@ -335,7 +404,15 @@ class MimoAudioSemantics(SchemaModel):
                 "non-diegetic music event requires present global music semantics"
             )
         has_audible_soundscape_event = any(
-            event.category != "non_diegetic_music"
+            event.category
+            in {
+                "physical",
+                "environmental",
+                "mechanical",
+                "electronic",
+                "human_non_speech",
+                "other",
+            }
             for event in self.temporal_non_speech_events
         )
         if has_audible_soundscape_event and self.overall_soundscape_status != "present":
@@ -359,23 +436,93 @@ class MimoAudioSemantics(SchemaModel):
         return self
 
 
-class MimoH3ProsePart(SchemaModel):
-    type: Literal["prose"]
+class MimoVisualBlock(SchemaModel):
+    block_id: str = Field(pattern=r"^v[1-9]\d*$")
     text: StrictStr
 
     @model_validator(mode="after")
-    def validate_prose(self) -> MimoH3ProsePart:
-        text_without_allowed_references = _PICTURE_OR_SUBJECT.sub("", self.text)
+    def validate_visual_text(self) -> MimoVisualBlock:
         if (
             not self.text.strip()
             or "[[" in self.text
             or "]]" in self.text
             or _PIPELINE_OWNED.search(self.text)
-            or "<" in text_without_allowed_references
-            or ">" in text_without_allowed_references
+            or _PICTURE_OR_SUBJECT.search(self.text)
+            or "<" in self.text
+            or ">" in self.text
         ):
-            raise ValueError("MiMo H3 prose contains empty or pipeline-owned syntax")
+            raise ValueError("MiMo visual block contains non-visual or pipeline syntax")
         return self
+
+
+class MimoVisualShotObservation(SchemaModel):
+    shot_index: int = Field(gt=0)
+    start_time: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    visual_blocks: list[MimoVisualBlock] = Field(min_length=1)
+
+
+class MimoVisibleEntityObservation(SchemaModel):
+    entity_id: str = Field(min_length=1)
+    visibility: Literal["visible", "partially_visible"]
+    orientation: Literal[
+        "front", "three_quarter", "profile", "back", "mixed", "uncertain"
+    ]
+    face_visibility: Literal[
+        "clear", "partial", "occluded", "out_of_frame", "not_assessable", "uncertain"
+    ]
+    mouth_visibility: Literal[
+        "clear", "partial", "occluded", "out_of_frame", "not_assessable", "uncertain"
+    ]
+    speech_correlated_articulation: Literal[
+        "observed", "not_observed", "not_assessable", "uncertain"
+    ]
+
+
+class MimoVisualSegmentView(SchemaModel):
+    segment_id: str = Field(min_length=1)
+    visible_entity_ids: list[str]
+    entity_observations: list[MimoVisibleEntityObservation]
+
+    @model_validator(mode="after")
+    def validate_entities(self) -> MimoVisualSegmentView:
+        observed = [item.entity_id for item in self.entity_observations]
+        if (
+            len(self.visible_entity_ids) != len(set(self.visible_entity_ids))
+            or len(observed) != len(set(observed))
+            or self.visible_entity_ids != observed
+        ):
+            raise ValueError("visual segment entity inventory must agree exactly")
+        return self
+
+
+class MimoVisualObservation(SchemaModel):
+    shots: list[MimoVisualShotObservation] = Field(min_length=1)
+    segment_views: list[MimoVisualSegmentView]
+
+    @model_validator(mode="after")
+    def validate_observation(self) -> MimoVisualObservation:
+        indexes = [shot.shot_index for shot in self.shots]
+        if indexes != list(range(1, len(indexes) + 1)):
+            raise ValueError("MiMo visual shots must use contiguous indexes")
+        if self.shots[0].start_time not in {None, 0}:
+            raise ValueError("MiMo visual Shot 1 must start implicitly or at zero")
+        later = [shot.start_time for shot in self.shots[1:]]
+        if any(value is None or value <= 0 for value in later):
+            raise ValueError("later MiMo visual shots require positive hard-cut times")
+        numeric = [value for value in later if value is not None]
+        if numeric != sorted(numeric) or len(numeric) != len(set(numeric)):
+            raise ValueError("MiMo visual hard-cut times must strictly increase")
+        block_ids = [
+            block.block_id for shot in self.shots for block in shot.visual_blocks
+        ]
+        if block_ids != [f"v{index}" for index in range(1, len(block_ids) + 1)]:
+            raise ValueError("MiMo visual block IDs must be contiguous")
+        return self
+
+
+class MimoH3VisualPart(SchemaModel):
+    type: Literal["visual"]
+    block_id: str = Field(pattern=r"^v[1-9]\d*$")
 
 
 class MimoH3SpeechPart(SchemaModel):
@@ -389,7 +536,7 @@ class MimoH3AudioEventPart(SchemaModel):
 
 
 MimoH3TimelinePart = Annotated[
-    MimoH3ProsePart | MimoH3SpeechPart | MimoH3AudioEventPart,
+    MimoH3VisualPart | MimoH3SpeechPart | MimoH3AudioEventPart,
     Field(discriminator="type"),
 ]
 
@@ -398,6 +545,12 @@ class MimoH3Shot(SchemaModel):
     shot_index: int = Field(gt=0)
     start_time: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     timeline_parts: list[MimoH3TimelinePart] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def require_visual_part(self) -> MimoH3Shot:
+        if not any(isinstance(part, MimoH3VisualPart) for part in self.timeline_parts):
+            raise ValueError("every MiMo H3 projection shot requires a visual block")
+        return self
 
 
 class MimoSubjectDefinitionDraft(SchemaModel):
@@ -450,27 +603,28 @@ class MimoVisualRetentionDraft(SchemaModel):
         return f"{self.subject_label}: {self.marker} - {self.description.strip()}"
 
 
-class MimoH3Draft(SchemaModel):
+class MimoH3Semantics(SchemaModel):
     subject_definitions: list[MimoSubjectDefinitionDraft] = Field(min_length=1)
     summary: StrictStr
     visual_retention_analysis: list[MimoVisualRetentionDraft] = Field(min_length=1)
-    shots: list[MimoH3Shot] = Field(min_length=1)
 
     @model_validator(mode="after")
-    def validate_draft(self) -> MimoH3Draft:
+    def validate_semantics(self) -> MimoH3Semantics:
         values = (
             *(item.description for item in self.subject_definitions),
             self.summary,
             *(item.description for item in self.visual_retention_analysis),
-            *(
-                part.text
-                for shot in self.shots
-                for part in shot.timeline_parts
-                if isinstance(part, MimoH3ProsePart)
-            ),
         )
         if any(not value.strip() for value in values):
-            raise ValueError("MiMo H3 draft text must not be empty")
+            raise ValueError("MiMo H3 semantics text must not be empty")
+        return self
+
+
+class MimoH3Projection(SchemaModel):
+    shots: list[MimoH3Shot] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_projection(self) -> MimoH3Projection:
         indexes = [shot.shot_index for shot in self.shots]
         if indexes != list(range(1, len(indexes) + 1)):
             raise ValueError("MiMo H3 shots must use contiguous indexes")
@@ -509,13 +663,39 @@ class MimoSpeakerVoiceProfile(SchemaModel):
         return self
 
 
-class MimoAVAnnotationDraft(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_av_annotation.12"] = MIMO25_SCHEMA_VERSION
-    segment_decisions: list[MimoSegmentDecision]
+class MimoAudioObservation(SchemaModel):
+    segment_decisions: list[MimoAudioSegmentDecision]
     speaker_voice_profiles: list[MimoSpeakerVoiceProfile]
     audio_semantics: MimoAudioSemantics
-    h3_draft: MimoH3Draft
+
+
+class MimoAVGrounding(SchemaModel):
+    segment_groundings: list[MimoAVSegmentGrounding]
+
+
+MimoH3Draft = MimoH3Semantics
+
+
+class MimoAVAnnotationDraft(SchemaModel):
+    schema_version: Literal["r2v.h3.mimo25_av_annotation.13"] = MIMO25_SCHEMA_VERSION
+    visual_observation: MimoVisualObservation
+    audio_observation: MimoAudioObservation
+    av_grounding: MimoAVGrounding
+    h3_semantics: MimoH3Semantics
+    h3_projection: MimoH3Projection
     warnings: list[MimoAnnotationWarning] = Field(default_factory=list)
+
+    @property
+    def segment_decisions(self) -> list[MimoAVSegmentGrounding]:
+        return self.av_grounding.segment_groundings
+
+    @property
+    def speaker_voice_profiles(self) -> list[MimoSpeakerVoiceProfile]:
+        return self.audio_observation.speaker_voice_profiles
+
+    @property
+    def audio_semantics(self) -> MimoAudioSemantics:
+        return self.audio_observation.audio_semantics
 
 
 class MimoThinkingContract(SchemaModel):
@@ -523,7 +703,7 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.17"] = MIMO25_BACKEND_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.18"] = MIMO25_BACKEND_VERSION
     backend: Literal[
         "xiaomi_openai_compatible", "sglang_openai_compatible"
     ]
@@ -540,13 +720,13 @@ class MimoBackendProvenance(SchemaModel):
     media_mode: Literal["base64", "http"]
     media_root: str
     media_base_url: str | None = None
-    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v19"] = (
+    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v20"] = (
         MIMO25_PROMPT_VERSION
     )
-    policy_version: Literal["h3_mimo25_av_authority_contract_v13"] = (
+    policy_version: Literal["h3_mimo25_av_authority_contract_v14"] = (
         MIMO25_POLICY_VERSION
     )
-    annotation_schema_version: Literal["r2v.h3.mimo25_av_annotation.12"] = (
+    annotation_schema_version: Literal["r2v.h3.mimo25_av_annotation.13"] = (
         MIMO25_SCHEMA_VERSION
     )
     materializer_version: Literal[
@@ -558,6 +738,7 @@ class MimoBackendProvenance(SchemaModel):
         "h3_mimo25_materializer_v11",
         "h3_mimo25_materializer_v12",
         "h3_mimo25_materializer_v13",
+        "h3_mimo25_materializer_v14",
     ] = (
         MIMO25_MATERIALIZER_VERSION
     )
@@ -774,42 +955,40 @@ class MimoBackendConfig:
         )
 
 
-SYSTEM_PROMPT = """You are the unified audiovisual reconciliation model for an H3 shadow pipeline.
+SYSTEM_PROMPT = """You are the unified audiovisual reconciliation model for an H3 shadow pipeline. Return one compact JSON object in the supplied schema. Populate its five internal stages in order inside this ONE response; do not emit hidden reasoning.
 
 AUTHORITY
-- Preserve every supplied DiariZen segment, exact timing, and sample range. Every segment receives one decision even with LR-ASD=0, no binding, or zero direct-anchor support; never split, merge, delete, filter, or invent timing.
+- Preserve every supplied DiariZen segment, exact timing, and sample range. Every segment appears once in every required segment inventory even with LR-ASD=0, no binding, or zero direct-anchor support. Never split, merge, delete, filter, or invent timing.
 - Qwen3-ASR text and language are immutable. Never transcribe, quote, correct, paraphrase, translate, repunctuate, or move dialogue; the schema has no transcript field.
-- Frozen Visual entities, Pictures, Subjects, order, and ownership are immutable. LR-ASD, source clusters, and current bindings are fallible proposals. The target video is observation, never <Video N>.
-- Sound requires audible evidence. Visual evidence may disambiguate a genuinely audible source but cannot invent sound. Return one compact JSON object matching the supplied contract.
+- Frozen Visual entities, Pictures, Subjects, order, and ownership are immutable. LR-ASD, source clusters, and current bindings are fallible proposals. The target video is observation-only, never <Video N>.
 
-SPEAKER / ENTITY / PRESENTATION
-- segment_decisions follow every allowed_segment_id exactly once and in order. Clip-local g1, g2, ... identify speakers by first appearance, not turns. A pause, language, sentence, ASR, or segment boundary must not by itself create a new group. The same resolved visible entity reuses one group; one resolved group never maps to multiple visible entities. Source clusters may split or merge only with AV support.
-- Decide clip-local speaker identity independently from per-segment visual presentation. primary_speaker_group may remain unchanged when that speaker goes off-screen, the camera cuts to a listener, or another person is visible. Previous visible binding, voice continuity, source-cluster continuity, LR-ASD proposals, and group continuity may preserve speaker identity, but must never carry entity_id into a later segment.
-- Every decision includes entity_id. visible_entity requires one supplied entity and onscreen_spoken, supported during that exact segment. visible_lip_motion means clearly observed speech-correlated mouth, lip, or jaw articulation during that segment; articulation in an adjacent segment does not count. A face, head motion, gaze change, expression, breathing, or general body motion does not count. A visible person with a closed or static mouth must not be bound merely because the same voice continues, and a visible listener must never inherit the audible speaker identity.
-- Reliable onscreen evidence is visible_lip_motion, or genuine mouth occlusion/back view marked speaker_visible_mouth_occluded together with av_temporal_alignment or voice_continuity. Voice continuity may preserve speaker-group identity but cannot alone bind a visible entity. LR-ASD/direct anchors are neither sufficient nor required, so a true visible speaker missed by ASD may still be recovered from reliable exact-segment AV evidence.
-- When the same known speaker continues outside the frame, preserve primary_speaker_group but use offscreen, entity_id=null, and offscreen_spoken. If the current visible source is not reliable, preserve the group when acoustically justified but use no_reliable_entity, entity_id=null, and uncertain rather than attaching a nearby visible person.
-- Use offscreen_spoken, voice_over, message_voice_over, or device_playback when observed. Silent phone reading/typing must not become visible speech. Uncertain evidence stays uncertain and unbound. Never delete a segment for non-onscreen presentation.
-- Multiple vocal sounds inside one segment never make that segment invalid. Same-speaker particles/nonlexical sounds preserve the group; secondary non-speech vocalization preserves primary dialogue ownership. Overlapping or sequential secondary speech preserves the segment but requires acoustic refinement without invented internal timing.
-- Before final JSON, self-audit every visible_entity decision without emitting extra fields or hidden reasoning: confirm the entity is visible in that exact segment; confirm exact-segment articulation or the strict mouth-occluded/back-facing evidence path; consider whether the camera instead shows a listener while the established speaker continues off-screen; and reject entity_id carried only from an earlier visible segment. If reliable current-segment onscreen evidence fails, do not publish visible_entity.
+STAGE A visual_observation: PURE VISUAL EVIDENCE
+- Observe real shots and exact segment windows without deciding who speaks. Every shot has at least one contiguous vN visual block. Visual text is English, visual-only, generation-useful prose covering supported style, framing, camera angle, composition, subject appearance and spatial relations, pose and body/hand/head motion, gaze/expression, interactions, object state, environment/material/readable text, lighting/color, camera motion or stability, and early-to-late progression.
+- Target roughly 300-450 English visual/detail words when evidence supports it, but never pad. Anti-collapse minimum visual-only prose is 40 words below 3 seconds, 80 words from 3 through 8 seconds, and 120 words above 8 seconds.
+- Never put transcript, delivery, voice, soundscape, music, speaker presentation, pipeline syntax, Subject/Picture labels, or inferred psychology, intent, causality, relationships, identity, sound, invisible events, or invented details in visual blocks.
+- segment_views exactly follow allowed_segment_ids. visible_entity_ids and entity_observations agree exactly and contain only supplied entities actually visible in that exact interval. A back/profile view, occluded face, or hidden/out-of-frame mouth is still visible presence. speech_correlated_articulation records exact-window observation only and does not assign a speaker.
 
-AUDIO SEMANTICS
-- Perform a full-timeline pass for meaningful audible non-speech sound, covering persistent ambience and discrete events. Check door opening, closing, and latch sounds; knocks; footsteps; impacts; object placement or handling; scraping or sliding; salient fabric or paper movement; mechanical clicks; bells; electronic beeps; abrupt environmental sounds; and non-verbal human sounds. These examples are not an exhaustive whitelist, and a clearly audible event must not be omitted merely because it is brief.
-- Classify localized physical actions or object interactions as physical: door opening, closing, or latch sounds; knocks; footsteps; impacts; object placement or handling; scraping or sliding; physical clicks; and salient paper or fabric handling. Classify background or environmental sources such as wind, rain, flowing water, traffic ambience, crowd ambience, and outdoor layers as environmental. Use mechanical for machinery or device mechanisms operating as an audible source rather than one ordinary object action; electronic for beeps, alarms, tones, and device signals; and human_non_speech for laughter, coughing, sighs, breaths, gasps, crying, and similar non-verbal vocal sound. These examples guide semantic judgment and are not an exhaustive whitelist.
-- pattern=single means one localized transient occurrence, such as one door close, knock, impact, or beep. pattern=repeated means several distinct repetitions of substantially the same sound. pattern=continuous means a sustained audible layer or operation, such as rain, ventilation hum, or ongoing engine or mechanism noise. A short sound is not continuous merely because its approximate event window spans multiple video frames.
-- Emit an event only when genuinely audible. Visible motion alone never creates sound; visual evidence may only identify or disambiguate an audible source. Give localized events tight approximate internal start/end times for chronological placement. Coalesce micro-events from one continuous physical action, split genuinely distinct sounds, preserve contiguous chronological aeN IDs, and use concise literal acoustic generation-useful descriptions without transcript or H3 syntax.
-- Music requires audible musical structure. In-scene music characters can hear is diegetic_music; audience-only score/BGM is non_diegetic_music. Do not infer source from scene plausibility: uncertain source keeps global non-diegetic status unknown. A typed non_diegetic_music event requires present global non-diegetic music and a description.
-- overall_soundscape is a required core H3 semantic. Use present with 1-4 natural English sentences whenever ambience, room tone, an environmental layer, a physical action sound, a non-verbal human sound, or another meaningful non-speech sound is audible, including low-level background sound in ordinary dialogue scenes. Summarize important physical action sounds across the full video instead of collapsing salient events into generic room-tone wording, while avoiding verbatim or mechanical duplication with timeline event prose. It must not summarize or repeat spoken dialogue or speech, narration or voice-over content, singing, diegetic music, or non-diegetic music/BGM/score. Dialogue is represented elsewhere; diegetic music belongs in detailed_description, and non-diegetic music belongs in non_diegetic_music. Do not default a normal audiovisual clip to absent or unknown merely because no salient event was detected. Use absent only for verified complete silence of the soundscape; use unknown only when Audio evidence is genuinely unavailable or uncertain.
-- overall_soundscape and non_diegetic_music descriptions exist only when status=present. Video may ground or disambiguate a genuinely audible source but never create room tone or another sound from visual context.
-- Each transcribed segment requires concise audible delivery_style; non-transcribed segments use null. speaker_voice_profiles contains one row for every resolved speaker group owning transcribed speech, in first-appearance order. Use acoustic-first wording: stable audible pitch register, timbre, texture, baseline cadence, articulation, and clearly supported accent/dialect in one concise English sentence, or null. Supported audible descriptors such as male, female, youthful, or mature may supplement those acoustic properties but never establish visible identity. Never copy dialogue or infer nationality, ethnicity, occupation, role, named identity, family/social relationship, or personality.
-- audiovisual_summary is concise observed AV context without dialogue, plot, relationship, intention, causality, or psychology.
+STAGE B audio_observation: PURE AUDIO EVIDENCE
+- segment_decisions exactly follow allowed_segment_ids. Clip-local gN identify speakers by first appearance, not turns. Decide only acoustic vocal composition, identity, delivery, secondary vocal activity, and Audio evidence. A pause, language, sentence, ASR, or segment boundary must not by itself create a new group. Never emit entity identity or onscreen/offscreen presentation here. The same resolved visible entity reuses one group after AV grounding; source clusters may split or merge only with AV support.
+- Multiple vocal sounds inside one segment never make that segment invalid; represent them with vocal_composition and secondary_vocal_activity, and use needs_acoustic_refinement when the primary speaker cannot be resolved safely.
+- Each transcribed segment has concise nonempty delivery_style; every non-transcribed segment uses null. speaker_voice_profiles exactly cover resolved transcribed groups in first-appearance order and contain only supported acoustic characteristics, never transcript or identity claims.
+- Emit genuinely audible non-speech events with contiguous chronological aeN IDs and tight approximate times. Visual evidence may identify a genuinely audible source but never invent sound.
+- Soundscape event categories are physical, environmental, mechanical, electronic, human_non_speech, and other. Music categories are diegetic_music and non_diegetic_music. Neither music category contributes to overall_soundscape. Diegetic music may enter the detailed timeline; non-diegetic music belongs only in non_diegetic_music.
+- overall_soundscape is present for audible ambience, room tone, environmental/physical/mechanical/electronic/non-verbal human sound; absent only for verified complete soundscape silence; unknown only when Audio evidence is unavailable or genuinely uncertain. It must never contain dialogue, narration, voice-over, lyrics, singing, music, BGM, score, soundtrack, song, melody, or instrumental music. non_diegetic_music describes audience-only score/BGM. Do not substitute either field for the other.
 
-H3 DRAFT
-- Write dense generation-quality observed video prose, not a caption. For each real shot cover applicable visual style; shot scale and framing; camera angle; foreground, midground, and background composition; salient subject appearance and spatial relationships; pose; body, arm, hand, and head motion; gaze; facial expression changes; interactions; object states; environment/materials/readable text; lighting/color; camera motion or explicit stability; and temporal progression through early, middle, and late portions. Target roughly 300-450 English words only when evidence supports it; never pad.
-- Use observed evidence, not plausible filler. Do not infer unsupported emotion/psychology, intent, causality, relationships, identity, sound, offscreen events, or object detail. Non-onscreen speech must not create visible speaking/lip motion. Add later shots only for real hard cuts.
-- Subject definitions use typed subject_label plus natural official MiniMax H3 Ref2VA visual description. Set subject_label to the exact supplied Subject. Keep description visual-only and do not repeat any Subject or Picture label there. Frozen Subject-to-Picture provenance is pipeline-owned and will be appended deterministically after generation; never reproduce, reinterpret, omit, add, or reassign that provenance in description. Never put voice, vocal, pitch, timbre, cadence, articulation, accent, dialect, or speaking-rate concepts in a visual Subject description. Pictures are content references, not first frames, last frames, or keyframes.
-- Visual retention uses typed subject_label, marker, and description. Set subject_label to the exact supplied Subject; choose exactly one marker from fully_preserved, partially_preserved, weak_reference; and write visual explanation only in description without repeating a Subject label or marker. attribute_transfer is forbidden. Do not emit <Video N>, <Audio N>, (Sx), <d>, shot headers, donor provenance, or invented labels.
-- The frozen R2V instruction uses original source <Image N> identities. reference_selection maps each surviving source Image to one task-local contiguous <Picture N>; dropped source Images were intentionally omitted only to comply with the official H3 reference-file limit. Create no Picture or Subject for a dropped source Image, never reinterpret one surviving source Image as another after task-local renumbering, and use the target video as authoritative observation evidence.
-- timeline_parts alone place typed prose, speech, and audio events in target-video playback order. Speech parts exactly equal transcribed_segment_ids once each in order and contain no dialogue; prose must not prefix a complete speech clause. Audio-event parts exactly match emitted aeN events once each in chronological order and at the appropriate observed position; their descriptions are not repeated in prose. Internal event IDs and approximate event times never appear as final prose or invented sound timestamps. The deterministic materializer owns final official H3 syntax, and ordinary observed target-video sounds never create <Audio N> or a conditioning asset."""
+STAGE C av_grounding: AUDIOVISUAL CO-ANALYSIS
+- segment_groundings exactly follow allowed_segment_ids and preserve each matching Stage B primary_speaker_group. Decide binding_status, speech_presentation, entity_id, confidence, and evidence from the exact visual segment view plus Audio/AV evidence.
+- visible_entity must name an entity present in that exact Stage A view. Reliable onscreen evidence is observed speech-correlated articulation with visible_lip_motion, OR visible presence whose face/mouth is genuinely non-assessable because of back/profile view, occlusion, or crop, marked speaker_visible_mouth_occluded together with av_temporal_alignment or voice_continuity.
+- OFFSCREEN IS A SPATIAL CLAIM. Hidden lips, a hidden face, back/profile orientation, an embrace, partial occlusion, or an out-of-frame mouth while the body/head remains visible does not mean offscreen. A visible listener without reliable speaker evidence must not inherit the audible speaker.
+- offscreen_spoken requires offscreen, entity_id=null, and offscreen_audio. voice_over requires null entity and voice_over_context. device_playback requires null entity and device_playback_context. message_voice_over requires null entity plus message_text_alignment and voice_over_context. Inadequate evidence becomes no_reliable_entity/uncertain, not guessed offscreen.
+- A direct_anchor_present current entity without explicit LR-ASD conflict is a strong prior, though not absolute truth. Override only for explicit current-segment AV contradiction. LR-ASD support is not required for a true visible speaker.
+
+STAGE D h3_semantics
+- Produce only official visual Subject definitions, concise summary, and visual retention rows. Definitions are natural MiniMax H3 visual prose; pipeline code appends exact Picture provenance. Retention markers are only fully_preserved, partially_preserved, weak_reference; attribute_transfer is forbidden. Audio soundscape/music comes only from Stage B.
+
+STAGE E h3_projection
+- Project typed visual{block_id}, speech{segment_id}, and audio_event{event_id} parts in playback order. Every Stage A visual block appears exactly once in its own shot. Every transcribed segment appears exactly once in chronological order. Every non-speech event except non_diegetic_music appears exactly once in chronological order. Never project non-diegetic music into detailed description.
+- Do not write final H3 syntax. The deterministic materializer alone owns <Picture N>, <Subject N>, <Audio N>, Sx, exact <d>[Language] dialogue</d>, shot headers/cuts, and the official six-section final Ref2VA output. Internal vN/gN/eN/aeN/segment IDs and stage names must not leak into prose."""
 
 
 def _value(value: object, name: str) -> object | None:
@@ -954,21 +1133,84 @@ def validate_annotation(
     target_duration_seconds: float,
 ) -> list[ValidationIssue]:
     issues: list[ValidationIssue] = []
-    decisions = annotation.segment_decisions
-    actual_ids = [item.segment_id for item in decisions]
-    if actual_ids != segment_ids:
+    audio_decisions = annotation.audio_observation.segment_decisions
+    groundings = annotation.av_grounding.segment_groundings
+    visual_views = annotation.visual_observation.segment_views
+    if [item.segment_id for item in audio_decisions] != segment_ids:
         issues.append(
             ValidationIssue(
                 "segment_inventory_mismatch",
-                "segment_decisions",
-                "segment decisions must exactly follow supplied chronological IDs",
+                "audio_observation.segment_decisions",
+                "Audio decisions must exactly follow supplied chronological IDs",
             )
         )
-    for decision in decisions:
+    if [item.segment_id for item in groundings] != segment_ids:
+        issues.append(
+            ValidationIssue(
+                "segment_inventory_mismatch",
+                "av_grounding.segment_groundings",
+                "AV groundings must exactly follow supplied chronological IDs",
+            )
+        )
+    if [item.segment_id for item in visual_views] != segment_ids:
+        issues.append(
+            ValidationIssue(
+                "visual_segment_inventory_mismatch",
+                "visual_observation.segment_views",
+                "visual segment views must exactly follow supplied chronological IDs",
+            )
+        )
+    audio_by_id = {item.segment_id: item for item in audio_decisions}
+    view_by_id = {item.segment_id: item for item in visual_views}
+    for view in visual_views:
+        unknown_visual_entities = sorted(
+            set(view.visible_entity_ids) - allowed_entity_ids
+        )
+        if unknown_visual_entities:
+            issues.append(
+                ValidationIssue(
+                    "unknown_visual_entity",
+                    view.segment_id,
+                    f"unknown supplied visual entities: {unknown_visual_entities}",
+                )
+            )
+    for decision in groundings:
+        audio = audio_by_id.get(decision.segment_id)
+        if audio is None or decision.primary_speaker_group != audio.primary_speaker_group:
+            issues.append(
+                ValidationIssue(
+                    "av_audio_speaker_group_mismatch",
+                    decision.segment_id,
+                    "AV grounding must preserve the Stage B primary speaker group",
+                )
+            )
+        if decision.binding_status == "visible_entity" and (
+            audio is None or audio.resolution != "resolved"
+        ):
+            issues.append(
+                ValidationIssue(
+                    "visible_entity_requires_resolved_audio",
+                    decision.segment_id,
+                    "visible entity grounding requires one resolved Stage B speaker",
+                )
+            )
+        view = view_by_id.get(decision.segment_id)
+        if (
+            decision.binding_status == "visible_entity"
+            and decision.entity_id is not None
+            and (view is None or decision.entity_id not in view.visible_entity_ids)
+        ):
+            issues.append(
+                ValidationIssue(
+                    "visible_entity_absent_from_visual_segment",
+                    decision.segment_id,
+                    "visible_entity must be present in the exact Stage A segment view",
+                )
+            )
         if decision.binding_status == "visible_entity" and (
             decision.speech_presentation != "onscreen_spoken"
             or decision.entity_id is None
-            or not _has_onscreen_speaker_evidence(decision.evidence_codes)
+            or not _has_grounded_onscreen_evidence(decision, view)
         ):
             issues.append(
                 ValidationIssue(
@@ -978,7 +1220,7 @@ def validate_annotation(
                 )
             )
         if decision.speech_presentation == "onscreen_spoken" and not (
-            _has_onscreen_speaker_evidence(decision.evidence_codes)
+            _has_grounded_onscreen_evidence(decision, view)
         ):
             issues.append(
                 ValidationIssue(
@@ -1023,6 +1265,52 @@ def validate_annotation(
                     "non-onscreen speech cannot publish a visible entity",
                 )
             )
+        if decision.speech_presentation == "offscreen_spoken" and not (
+            decision.binding_status == "offscreen"
+            and decision.entity_id is None
+            and "offscreen_audio" in decision.evidence_codes
+        ):
+            issues.append(
+                ValidationIssue(
+                    "offscreen_presentation_evidence_mismatch",
+                    decision.segment_id,
+                    "offscreen_spoken requires offscreen, null entity, and offscreen_audio",
+                )
+            )
+        if decision.speech_presentation == "voice_over" and not (
+            decision.entity_id is None
+            and "voice_over_context" in decision.evidence_codes
+        ):
+            issues.append(
+                ValidationIssue(
+                    "voice_over_evidence_mismatch",
+                    decision.segment_id,
+                    "voice_over requires null entity and voice_over_context",
+                )
+            )
+        if decision.speech_presentation == "device_playback" and not (
+            decision.entity_id is None
+            and "device_playback_context" in decision.evidence_codes
+        ):
+            issues.append(
+                ValidationIssue(
+                    "device_playback_evidence_mismatch",
+                    decision.segment_id,
+                    "device_playback requires null entity and device_playback_context",
+                )
+            )
+        if decision.speech_presentation == "message_voice_over" and not (
+            decision.entity_id is None
+            and "message_text_alignment" in decision.evidence_codes
+            and "voice_over_context" in decision.evidence_codes
+        ):
+            issues.append(
+                ValidationIssue(
+                    "message_voice_over_evidence_mismatch",
+                    decision.segment_id,
+                    "message_voice_over requires explicit message and voice-over evidence",
+                )
+            )
         if decision.entity_id is not None and decision.entity_id not in allowed_entity_ids:
             issues.append(
                 ValidationIssue(
@@ -1042,7 +1330,7 @@ def validate_annotation(
                 )
             )
     first_groups: list[str] = []
-    for decision in decisions:
+    for decision in audio_decisions:
         group = decision.primary_speaker_group
         if group is not None and group not in first_groups:
             first_groups.append(group)
@@ -1051,16 +1339,15 @@ def validate_annotation(
         issues.append(
             ValidationIssue(
                 "non_contiguous_speaker_groups",
-                "segment_decisions",
+                "audio_observation.segment_decisions",
                 "speaker groups must be contiguous by first chronological appearance",
             )
         )
     entities_by_group: dict[str, set[str]] = {}
     groups_by_entity: dict[str, set[str]] = {}
-    for decision in decisions:
+    for decision in groundings:
         if (
-            decision.resolution == "resolved"
-            and decision.binding_status == "visible_entity"
+            decision.binding_status == "visible_entity"
             and decision.primary_speaker_group is not None
             and decision.entity_id is not None
         ):
@@ -1075,7 +1362,7 @@ def validate_annotation(
             issues.append(
                 ValidationIssue(
                     "speaker_group_entity_contradiction",
-                    "segment_decisions",
+                    "av_grounding.segment_groundings",
                     f"{group} maps to multiple visible entities: {sorted(entity_ids)}",
                 )
             )
@@ -1084,12 +1371,12 @@ def validate_annotation(
             issues.append(
                 ValidationIssue(
                     "visible_entity_speaker_group_contradiction",
-                    "segment_decisions",
+                    "av_grounding.segment_groundings",
                     f"{entity_id} maps to multiple resolved groups: {sorted(groups)}",
                 )
             )
     transcribed_segment_set = set(transcribed_segment_ids)
-    for decision in decisions:
+    for decision in audio_decisions:
         if decision.segment_id in transcribed_segment_set:
             if decision.delivery_style is None:
                 issues.append(
@@ -1108,7 +1395,7 @@ def validate_annotation(
                 )
             )
     required_profile_groups = _required_voice_profile_groups(
-        decisions,
+        audio_decisions,
         transcribed_segment_ids=transcribed_segment_set,
     )
     actual_profile_groups = [
@@ -1145,16 +1432,16 @@ def validate_annotation(
                     str(event.approximate_end_time),
                 )
             )
-    draft = annotation.h3_draft
+    semantics_draft = annotation.h3_semantics
+    projection = annotation.h3_projection
     prose_parts = [
-        part.text
-        for shot in draft.shots
-        for part in shot.timeline_parts
-        if isinstance(part, MimoH3ProsePart)
+        block.text
+        for shot in annotation.visual_observation.shots
+        for block in shot.visual_blocks
     ]
     speech_parts = [
         part.segment_id
-        for shot in draft.shots
+        for shot in projection.shots
         for part in shot.timeline_parts
         if isinstance(part, MimoH3SpeechPart)
     ]
@@ -1166,19 +1453,20 @@ def validate_annotation(
         issues.append(
             ValidationIssue(
                 "speech_placeholder_inventory_mismatch",
-                "h3_draft.shots",
+                "h3_projection.shots",
                 "typed transcribed speech parts must appear exactly once in order",
             )
         )
     event_parts = [
         part.event_id
-        for shot in draft.shots
+        for shot in projection.shots
         for part in shot.timeline_parts
         if isinstance(part, MimoH3AudioEventPart)
     ]
     expected_event_ids = [
         event.event_id
         for event in annotation.audio_semantics.temporal_non_speech_events
+        if event.category != "non_diegetic_music"
     ]
     event_counts = {
         item: event_parts.count(item) for item in set(event_parts)
@@ -1192,7 +1480,7 @@ def validate_annotation(
         issues.append(
             ValidationIssue(
                 "unknown_audio_event_placeholder",
-                "h3_draft.shots",
+                "h3_projection.shots",
                 str(unknown_events),
             )
         )
@@ -1200,7 +1488,7 @@ def validate_annotation(
         issues.append(
             ValidationIssue(
                 "missing_audio_event_placeholder",
-                "h3_draft.shots",
+                "h3_projection.shots",
                 str(missing_events),
             )
         )
@@ -1208,7 +1496,7 @@ def validate_annotation(
         issues.append(
             ValidationIssue(
                 "duplicate_audio_event_placeholder",
-                "h3_draft.shots",
+                "h3_projection.shots",
                 str(duplicate_events),
             )
         )
@@ -1218,26 +1506,26 @@ def validate_annotation(
         issues.append(
             ValidationIssue(
                 "audio_event_placeholder_order_mismatch",
-                "h3_draft.shots",
+                "h3_projection.shots",
                 "typed Audio-event parts must follow chronological event order",
             )
         )
     non_shot_text = "\n".join(
         (
-            *(item.render() for item in draft.subject_definitions),
-            draft.summary,
-            *(item.render() for item in draft.visual_retention_analysis),
+            *(item.render() for item in semantics_draft.subject_definitions),
+            semantics_draft.summary,
+            *(item.render() for item in semantics_draft.visual_retention_analysis),
         )
     )
     if "[[" in non_shot_text or "]]" in non_shot_text:
         issues.append(
             ValidationIssue(
                 "speech_placeholder_outside_shot",
-                "h3_draft",
+                "h3_semantics",
                 "free-form internal timeline syntax is forbidden",
             )
         )
-    for shot in draft.shots:
+    for shot in projection.shots:
         if shot.shot_index > 1 and (
             shot.start_time is None
             or shot.start_time <= 0
@@ -1246,41 +1534,96 @@ def validate_annotation(
             issues.append(
                 ValidationIssue(
                     "shot_start_outside_target",
-                    "h3_draft.shots",
+                    "h3_projection.shots",
                     f"shot {shot.shot_index} start must be inside target duration",
                 )
             )
-        for index, part in enumerate(shot.timeline_parts):
-            if (
-                isinstance(part, MimoH3SpeechPart)
-                and index > 0
-                and isinstance(shot.timeline_parts[index - 1], MimoH3ProsePart)
-                and _SPEECH_LEAD_IN.search(shot.timeline_parts[index - 1].text)
-            ):
+    visual_shots = annotation.visual_observation.shots
+    def canonical_shot_start(shot: MimoH3Shot | MimoVisualShotObservation) -> float | None:
+        return None if shot.shot_index == 1 and shot.start_time == 0 else shot.start_time
+
+    if [shot.shot_index for shot in projection.shots] != [
+        shot.shot_index for shot in visual_shots
+    ] or [canonical_shot_start(shot) for shot in projection.shots] != [
+        canonical_shot_start(shot) for shot in visual_shots
+    ]:
+        issues.append(
+            ValidationIssue(
+                "visual_projection_shot_mismatch",
+                "h3_projection.shots",
+                "projection shots must exactly preserve Stage A shot indexes and cuts",
+            )
+        )
+    visual_block_ids = [
+        block.block_id for shot in visual_shots for block in shot.visual_blocks
+    ]
+    projected_visual_ids = [
+        part.block_id
+        for shot in projection.shots
+        for part in shot.timeline_parts
+        if isinstance(part, MimoH3VisualPart)
+    ]
+    if projected_visual_ids != visual_block_ids or len(projected_visual_ids) != len(
+        set(projected_visual_ids)
+    ):
+        issues.append(
+            ValidationIssue(
+                "visual_block_projection_inventory_mismatch",
+                "h3_projection.shots",
+                "every Stage A visual block must be projected exactly once in order",
+            )
+        )
+    if len(projection.shots) == len(visual_shots):
+        for visual_shot, projected_shot in zip(
+            visual_shots, projection.shots, strict=True
+        ):
+            expected = [item.block_id for item in visual_shot.visual_blocks]
+            actual = [
+                item.block_id
+                for item in projected_shot.timeline_parts
+                if isinstance(item, MimoH3VisualPart)
+            ]
+            if actual != expected:
                 issues.append(
                     ValidationIssue(
-                        "draft_prefixes_complete_speech_placeholder",
-                        "h3_draft.shots",
-                        f"shot {shot.shot_index} prefixes a complete speech clause",
+                        "visual_block_wrong_shot",
+                        "h3_projection.shots",
+                        f"shot {projected_shot.shot_index} must keep its Stage A visual blocks",
                     )
                 )
+    visual_word_count = sum(
+        len(re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?", text)) for text in prose_parts
+    )
+    visual_floor = (
+        40
+        if target_duration_seconds < 3
+        else (80 if target_duration_seconds <= 8 else 120)
+    )
+    if visual_word_count < visual_floor:
+        issues.append(
+            ValidationIssue(
+                "severe_visual_underdescription",
+                "visual_observation.shots",
+                f"visual-only prose has {visual_word_count} words; requires {visual_floor}",
+            )
+        )
     shot_intervals = [
         (
             0.0 if index == 0 else float(shot.start_time),
             (
                 target_duration_seconds
-                if index + 1 == len(draft.shots)
-                else float(draft.shots[index + 1].start_time)
+                if index + 1 == len(projection.shots)
+                else float(projection.shots[index + 1].start_time)
             ),
         )
-        for index, shot in enumerate(draft.shots)
+        for index, shot in enumerate(projection.shots)
         if (index == 0 or shot.start_time is not None)
         and (
-            index + 1 == len(draft.shots)
-            or draft.shots[index + 1].start_time is not None
+            index + 1 == len(projection.shots)
+            or projection.shots[index + 1].start_time is not None
         )
     ]
-    if len(shot_intervals) == len(draft.shots):
+    if len(shot_intervals) == len(projection.shots):
         event_by_id = {
             event.event_id: (
                 event.approximate_start_time,
@@ -1288,7 +1631,7 @@ def validate_annotation(
             )
             for event in annotation.audio_semantics.temporal_non_speech_events
         }
-        for index, shot in enumerate(draft.shots):
+        for index, shot in enumerate(projection.shots):
             shot_start, shot_end = shot_intervals[index]
             for part in shot.timeline_parts:
                 if not isinstance(part, MimoH3SpeechPart):
@@ -1300,7 +1643,7 @@ def validate_annotation(
                     issues.append(
                         ValidationIssue(
                             "speech_placeholder_wrong_shot",
-                            "h3_draft.shots",
+                            "h3_projection.shots",
                             f"{part.segment_id} does not overlap shot {shot.shot_index}",
                         )
                     )
@@ -1314,16 +1657,24 @@ def validate_annotation(
                     issues.append(
                         ValidationIssue(
                             "audio_event_placeholder_wrong_shot",
-                            "h3_draft.shots",
+                            "h3_projection.shots",
                             f"{part.event_id} does not overlap shot {shot.shot_index}",
                         )
                     )
     draft_text = "\n".join((*prose_parts, non_shot_text))
+    if _INTERNAL_ANNOTATION_SYNTAX.search(draft_text):
+        issues.append(
+            ValidationIssue(
+                "draft_contains_internal_annotation_syntax",
+                "h3_semantics_or_visual_observation",
+                "internal staged field names or IDs cannot enter final H3 prose",
+            )
+        )
     if _PIPELINE_OWNED.search(draft_text):
         issues.append(
             ValidationIssue(
                 "draft_contains_pipeline_owned_syntax",
-                "h3_draft",
+                "h3_semantics_or_visual_observation",
                 "MiMo draft contains pipeline-owned H3 syntax",
             )
         )
@@ -1331,7 +1682,7 @@ def validate_annotation(
         issues.append(
             ValidationIssue(
                 "unassigned_picture_keyframe_role",
-                "h3_draft",
+                "h3_semantics_or_visual_observation",
                 "Pictures are content references, not frame anchors",
             )
         )
@@ -1344,13 +1695,13 @@ def validate_annotation(
         issues.append(
             ValidationIssue(
                 "draft_contains_unknown_reference",
-                "h3_draft",
+                "h3_semantics_or_visual_observation",
                 str(sorted(unknown_labels)),
             )
         )
     supplied_subject_labels = {str(item.subject_label) for item in reference_subjects}
     retention_subject_labels = [
-        item.subject_label for item in draft.visual_retention_analysis
+        item.subject_label for item in semantics_draft.visual_retention_analysis
     ]
     unknown_retention_subjects = sorted(
         set(retention_subject_labels) - supplied_subject_labels
@@ -1359,37 +1710,39 @@ def validate_annotation(
         issues.append(
             ValidationIssue(
                 "unknown_subject_retention",
-                "h3_draft.visual_retention_analysis",
+                "h3_semantics.visual_retention_analysis",
                 str(unknown_retention_subjects),
             )
         )
     if (
-        len(draft.visual_retention_analysis) != len(reference_subjects)
+        len(semantics_draft.visual_retention_analysis) != len(reference_subjects)
         or len(retention_subject_labels) != len(set(retention_subject_labels))
         or set(retention_subject_labels) != supplied_subject_labels
     ):
         issues.append(
             ValidationIssue(
                 "subject_retention_contract_mismatch",
-                "h3_draft.visual_retention_analysis",
+                "h3_semantics.visual_retention_analysis",
                 "retention rows must exactly cover supplied Subjects",
             )
         )
-    if len(draft.subject_definitions) != len(reference_subjects):
+    if len(semantics_draft.subject_definitions) != len(reference_subjects):
         issues.append(
             ValidationIssue(
                 "subject_definition_contract_mismatch",
-                "h3_draft.subject_definitions",
+                "h3_semantics.subject_definitions",
                 "definition rows must exactly cover supplied Subjects",
             )
         )
     expected_subject_labels = [str(item.subject_label) for item in reference_subjects]
-    actual_subject_labels = [item.subject_label for item in draft.subject_definitions]
+    actual_subject_labels = [
+        item.subject_label for item in semantics_draft.subject_definitions
+    ]
     if actual_subject_labels != expected_subject_labels:
         issues.append(
             ValidationIssue(
                 "subject_definition_contract_mismatch",
-                "h3_draft.subject_definitions",
+                "h3_semantics.subject_definitions",
                 "definition rows must follow the exact supplied Subject order",
             )
         )
@@ -1397,14 +1750,14 @@ def validate_annotation(
         subject_label = str(subject.subject_label)
         definitions = [
             item
-            for item in draft.subject_definitions
+            for item in semantics_draft.subject_definitions
             if item.subject_label == subject_label
         ]
         if len(definitions) != 1:
             issues.append(
                 ValidationIssue(
                     "subject_definition_contract_mismatch",
-                    "h3_draft.subject_definitions",
+                    "h3_semantics.subject_definitions",
                     f"{subject_label} requires exactly one visual description row",
                 )
             )
@@ -1414,16 +1767,16 @@ def validate_annotation(
             issues.append(
                 ValidationIssue(
                     "subject_definition_contains_audio_profile",
-                    "h3_draft.subject_definitions",
+                    "h3_semantics.subject_definitions",
                     f"{subject_label} definition must remain visual-only",
                 )
             )
     model_owned_text = _normalized_text(
         "\n".join(
             (
-                *(item.render() for item in draft.subject_definitions),
-                draft.summary,
-                *(item.render() for item in draft.visual_retention_analysis),
+                *(item.render() for item in semantics_draft.subject_definitions),
+                semantics_draft.summary,
+                *(item.render() for item in semantics_draft.visual_retention_analysis),
                 *prose_parts,
             )
         )
@@ -1438,7 +1791,7 @@ def validate_annotation(
             issues.append(
                 ValidationIssue(
                     "draft_contains_authoritative_transcript",
-                    "h3_draft",
+                    "h3_semantics_or_visual_observation",
                     "model-authored draft copies exact authoritative ASR text",
                 )
             )
@@ -1448,7 +1801,7 @@ def validate_annotation(
         *(event.description for event in audio_semantics.temporal_non_speech_events),
         *(
             item.delivery_style
-            for item in decisions
+            for item in audio_decisions
             if item.delivery_style is not None
         ),
         *(
@@ -1468,6 +1821,17 @@ def validate_annotation(
             if item.voice_characteristics is not None
         ),
     ]
+    if (
+        audio_semantics.overall_soundscape is not None
+        and _SOUNDSCAPE_CONTAMINATION.search(audio_semantics.overall_soundscape)
+    ):
+        issues.append(
+            ValidationIssue(
+                "overall_soundscape_contains_music_or_speech",
+                "audio_observation.audio_semantics.overall_soundscape",
+                "overall_soundscape must exclude dialogue, singing, and music",
+            )
+        )
     normalized_audio_fields = [
         _normalized_text(value) for value in model_owned_audio_fields
     ]
@@ -1498,7 +1862,7 @@ _CONSERVATIVE_VISIBLE_SPEAKER_ISSUES = {
 
 
 def _required_voice_profile_groups(
-    decisions: list[MimoSegmentDecision],
+    decisions: list[MimoAudioSegmentDecision],
     *,
     transcribed_segment_ids: set[str],
 ) -> list[str]:
@@ -1522,7 +1886,7 @@ def _normalize_speaker_voice_profiles(
     source_groups_by_final_group: dict[str, list[str]] | None = None,
 ) -> tuple[MimoAVAnnotationDraft, int]:
     required_groups = _required_voice_profile_groups(
-        annotation.segment_decisions,
+        annotation.audio_observation.segment_decisions,
         transcribed_segment_ids=transcribed_segment_ids,
     )
     profiles_by_group: dict[str, MimoSpeakerVoiceProfile] = {}
@@ -1559,7 +1923,7 @@ def _normalize_speaker_voice_profiles(
     if normalized_profiles == annotation.speaker_voice_profiles:
         return annotation, 0
     payload = annotation.model_dump(mode="python")
-    payload["speaker_voice_profiles"] = [
+    payload["audio_observation"]["speaker_voice_profiles"] = [
         profile.model_dump(mode="python") for profile in normalized_profiles
     ]
     return MimoAVAnnotationDraft.model_validate(payload), 1
@@ -1579,7 +1943,7 @@ def _conservative_visible_speaker_downgrade(
         return annotation, 0
     payload = annotation.model_dump(mode="python")
     correction_count = 0
-    for decision in payload["segment_decisions"]:
+    for decision in payload["av_grounding"]["segment_groundings"]:
         if decision["segment_id"] not in affected_segments or _has_onscreen_speaker_evidence(
             decision["evidence_codes"]
         ):
@@ -1610,9 +1974,12 @@ def _canonicalize_same_visible_entity_speaker_groups(
     segment_ids: list[str],
     allowed_entity_ids: set[str],
 ) -> tuple[MimoAVAnnotationDraft, dict[str, int], dict[str, list[str]] | None]:
-    decisions = annotation.segment_decisions
+    decisions = annotation.av_grounding.segment_groundings
     if [decision.segment_id for decision in decisions] != segment_ids:
         return annotation, {}, None
+    audio_by_id = {
+        item.segment_id: item for item in annotation.audio_observation.segment_decisions
+    }
 
     groups_by_entity: dict[str, list[str]] = {}
     visible_entities_by_group: dict[str, set[str]] = {}
@@ -1627,11 +1994,15 @@ def _canonicalize_same_visible_entity_speaker_groups(
             and decision.entity_id is not None
         ):
             visible_entities_by_group.setdefault(group, set()).add(decision.entity_id)
-            if decision.resolution != "resolved":
+            if (
+                decision.segment_id not in audio_by_id
+                or audio_by_id[decision.segment_id].resolution != "resolved"
+            ):
                 groups_with_uncertain_visible_binding.add(group)
                 entities_with_uncertain_visible_binding.add(decision.entity_id)
         if (
-            decision.resolution != "resolved"
+            decision.segment_id not in audio_by_id
+            or audio_by_id[decision.segment_id].resolution != "resolved"
             or decision.binding_status != "visible_entity"
             or decision.entity_id is None
             or group is None
@@ -1687,7 +2058,11 @@ def _canonicalize_same_visible_entity_speaker_groups(
         source_groups_by_final_group.setdefault(final_group, []).append(group)
 
     payload = annotation.model_dump(mode="python")
-    for decision in payload["segment_decisions"]:
+    for decision in payload["av_grounding"]["segment_groundings"]:
+        group = decision["primary_speaker_group"]
+        if group is not None:
+            decision["primary_speaker_group"] = final_group_by_original_group[group]
+    for decision in payload["audio_observation"]["segment_decisions"]:
         group = decision["primary_speaker_group"]
         if group is not None:
             decision["primary_speaker_group"] = final_group_by_original_group[group]
@@ -2310,7 +2685,11 @@ __all__ = [
     "MIMO25_SCHEMA_VERSION",
     "SYSTEM_PROMPT",
     "MimoAVAnnotationDraft",
+    "MimoAVGrounding",
+    "MimoAVSegmentGrounding",
     "MimoAudioEvent",
+    "MimoAudioObservation",
+    "MimoAudioSegmentDecision",
     "MimoAudioSemantics",
     "MimoBackendConfig",
     "MimoBackendFailure",
@@ -2319,16 +2698,23 @@ __all__ = [
     "MimoCompletionDiagnostic",
     "MimoH3AudioEventPart",
     "MimoH3Draft",
-    "MimoH3ProsePart",
+    "MimoH3Projection",
+    "MimoH3Semantics",
     "MimoH3Shot",
     "MimoH3SpeechPart",
     "MimoH3TimelinePart",
+    "MimoH3VisualPart",
     "MimoMediaResolver",
     "MimoSegmentDecision",
     "MimoSpeakerVoiceProfile",
     "MimoSubjectDefinitionDraft",
     "MimoTransport",
+    "MimoVisibleEntityObservation",
+    "MimoVisualBlock",
+    "MimoVisualObservation",
     "MimoVisualRetentionDraft",
+    "MimoVisualSegmentView",
+    "MimoVisualShotObservation",
     "OpenAIMimo25Backend",
     "SpeechPresentation",
     "sha256_file",

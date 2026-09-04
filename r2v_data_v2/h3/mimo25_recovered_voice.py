@@ -25,7 +25,10 @@ from r2v_data_v2.h3.jea_audio_production import (
 )
 from r2v_data_v2.h3.jea_final_renderer import FinalSubjectVoice
 from r2v_data_v2.h3.mimo25_av_reconcile import MimoClipJob, MimoRecord
-from r2v_data_v2.h3.mimo25_backend import MimoSegmentDecision
+from r2v_data_v2.h3.mimo25_backend import (
+    MimoAudioSegmentDecision,
+    MimoAVSegmentGrounding,
+)
 from r2v_data_v2.h3.schemas import SchemaModel
 from r2v_data_v2.h3.voice_quality import _audio_metrics
 
@@ -321,17 +324,23 @@ def _quality_metrics(
     )
 
 
-def _semantic_reasons(decision: MimoSegmentDecision) -> list[RecoveredVoiceReasonCode]:
+def _semantic_reasons(
+    audio_decision: MimoAudioSegmentDecision,
+    grounding: MimoAVSegmentGrounding,
+) -> list[RecoveredVoiceReasonCode]:
     reasons: list[RecoveredVoiceReasonCode] = []
-    if decision.resolution != "resolved" or decision.primary_speaker_group is None:
+    if (
+        audio_decision.resolution != "resolved"
+        or audio_decision.primary_speaker_group is None
+    ):
         reasons.append("unresolved")
-    if decision.binding_status != "visible_entity" or decision.entity_id is None:
+    if grounding.binding_status != "visible_entity" or grounding.entity_id is None:
         reasons.append("not_visible_entity")
-    if decision.speech_presentation != "onscreen_spoken":
+    if grounding.speech_presentation != "onscreen_spoken":
         reasons.append("not_onscreen_spoken")
-    if decision.vocal_composition != "single_speaker":
+    if audio_decision.vocal_composition != "single_speaker":
         reasons.append("non_single_speaker")
-    if decision.secondary_vocal_activity.present:
+    if audio_decision.secondary_vocal_activity.present:
         reasons.append("secondary_vocal_activity")
     return [code for code in _REASON_ORDER if code in reasons]
 
@@ -404,12 +413,18 @@ def recover_mimo_target_voices(
         return [], [], []
     active_policy = policy or MimoRecoveredVoiceQualityPolicy()
     source = Path(job.target_full_audio_path).expanduser().resolve(strict=True)
-    decisions = {item.segment_id: item for item in record.annotation.segment_decisions}
+    audio_decisions = {
+        item.segment_id: item
+        for item in record.annotation.audio_observation.segment_decisions
+    }
+    groundings = {
+        item.segment_id: item for item in record.annotation.av_grounding.segment_groundings
+    }
     candidate_segments = [
         segment
         for segment in job.segments
-        if decisions[segment.segment_id].entity_id is not None
-        and decisions[segment.segment_id].entity_id not in existing_entity_ids
+        if groundings[segment.segment_id].entity_id is not None
+        and groundings[segment.segment_id].entity_id not in existing_entity_ids
     ]
     if not candidate_segments:
         return [], [], []
@@ -432,9 +447,10 @@ def recover_mimo_target_voices(
     )
     provisional: list[MimoRecoveredVoiceReference] = []
     for segment in candidate_segments:
-        decision = decisions[segment.segment_id]
-        assert decision.entity_id is not None
-        reasons = _semantic_reasons(decision)
+        audio_decision = audio_decisions[segment.segment_id]
+        grounding = groundings[segment.segment_id]
+        assert grounding.entity_id is not None
+        reasons = _semantic_reasons(audio_decision, grounding)
         sample_valid = (
             segment.source_sample_rate_hz == CANONICAL_AUDIO_SAMPLE_RATE_HZ
             and segment.source_start_sample
@@ -458,17 +474,17 @@ def recover_mimo_target_voices(
         provisional.append(
             MimoRecoveredVoiceReference(
                 clip_uid=job.clip_uid,
-                entity_id=decision.entity_id,
-                subject_index=subject_index_by_entity[decision.entity_id],
-                speaker_group=decision.primary_speaker_group,
+                entity_id=grounding.entity_id,
+                subject_index=subject_index_by_entity[grounding.entity_id],
+                speaker_group=audio_decision.primary_speaker_group,
                 source_segment_id=segment.segment_id,
                 source_start=segment.start_time,
                 source_end=segment.end_time,
                 source_start_sample=segment.source_start_sample,
                 source_end_sample=segment.source_end_sample,
                 mimo_record_fingerprint=record.record_fingerprint,
-                evidence_codes=list(decision.evidence_codes),
-                confidence=decision.confidence,
+                evidence_codes=list(grounding.evidence_codes),
+                confidence=grounding.confidence,
                 quality_metrics=metrics,
                 quality_policy_fingerprint=active_policy.fingerprint(),
                 status="rejected",

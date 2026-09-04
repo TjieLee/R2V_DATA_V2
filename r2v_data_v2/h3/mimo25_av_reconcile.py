@@ -40,8 +40,8 @@ from r2v_data_v2.h3.schemas import SchemaModel
 from r2v_data_v2.h3.visual_production_source import load_visual_production_inventory
 
 MIMO25_INVENTORY_VERSION = "r2v.h3.mimo25_inventory.4"
-MIMO25_RECORD_VERSION = "r2v.h3.mimo25_record.9"
-MIMO25_SUMMARY_VERSION = "r2v.h3.mimo25_summary.9"
+MIMO25_RECORD_VERSION = "r2v.h3.mimo25_record.10"
+MIMO25_SUMMARY_VERSION = "r2v.h3.mimo25_summary.10"
 MIMO25_FAILURE_VERSION = "r2v.h3.mimo25_failure.5"
 MIMO25_RAW_VERSION = "r2v.h3.mimo25_raw_response.5"
 MIMO25_CASE_MANIFEST_VERSION = "r2v.h3.mimo25_case_manifest.1"
@@ -536,7 +536,7 @@ class MimoFailure(SchemaModel):
 
 
 class MimoRecord(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_record.9"] = MIMO25_RECORD_VERSION
+    schema_version: Literal["r2v.h3.mimo25_record.10"] = MIMO25_RECORD_VERSION
     clip_uid: str
     request_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -580,7 +580,7 @@ class MimoRawResponse(SchemaModel):
 
 
 class MimoSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_summary.9"] = MIMO25_SUMMARY_VERSION
+    schema_version: Literal["r2v.h3.mimo25_summary.10"] = MIMO25_SUMMARY_VERSION
     inventory_scope: Literal[
         "current_diarization_asr_target_inventory",
         "canonical_visual_target_inventory",
@@ -607,6 +607,14 @@ class MimoSummary(SchemaModel):
     correction_counts: dict[str, int]
     audio_event_count: int = Field(ge=0)
     music_status_counts: dict[str, int]
+    original_picture_count_histogram: dict[str, int]
+    selected_picture_count_histogram: dict[str, int]
+    original_reference_kind_counts: dict[str, int]
+    selected_reference_kind_counts: dict[str, int]
+    selected_attribute_type_counts: dict[str, int]
+    dropped_attribute_type_counts: dict[str, int]
+    reference_drop_reason_counts: dict[str, int]
+    over_limit_clip_count: int = Field(ge=0)
     production_binding_modified: Literal[False] = False
     production_diarization_modified: Literal[False] = False
     production_asr_modified: Literal[False] = False
@@ -980,11 +988,21 @@ def _correction_counts(job: MimoClipJob, annotation: MimoAVAnnotationDraft) -> C
     counts: Counter[str] = Counter()
     groups_by_source: dict[str, set[str]] = defaultdict(set)
     sources_by_group: dict[str, set[str]] = defaultdict(set)
-    for source, decision in zip(job.segments, annotation.segment_decisions, strict=True):
-        if decision.primary_speaker_group is not None:
-            groups_by_source[source.source_speaker_cluster_id].add(decision.primary_speaker_group)
-            sources_by_group[decision.primary_speaker_group].add(source.source_speaker_cluster_id)
-        old, new = source.current_entity_id, decision.entity_id
+    rows = zip(
+        job.segments,
+        annotation.audio_observation.segment_decisions,
+        annotation.av_grounding.segment_groundings,
+        strict=True,
+    )
+    for source, audio_decision, grounding in rows:
+        if audio_decision.primary_speaker_group is not None:
+            groups_by_source[source.source_speaker_cluster_id].add(
+                audio_decision.primary_speaker_group
+            )
+            sources_by_group[audio_decision.primary_speaker_group].add(
+                source.source_speaker_cluster_id
+            )
+        old, new = source.current_entity_id, grounding.entity_id
         key = (
             "entity_binding_preserved"
             if old == new
@@ -995,8 +1013,8 @@ def _correction_counts(job: MimoClipJob, annotation: MimoAVAnnotationDraft) -> C
             else "entity_binding_changed"
         )
         counts[key] += 1
-        counts[f"{decision.binding_status}_segments"] += 1
-        counts[f"{decision.resolution}_segments"] += 1
+        counts[f"{grounding.binding_status}_segments"] += 1
+        counts[f"{audio_decision.resolution}_segments"] += 1
     counts["source_cluster_split"] = sum(len(groups) > 1 for groups in groups_by_source.values())
     counts["source_clusters_merged"] = sum(len(sources) > 1 for sources in sources_by_group.values())
     counts["source_cluster_preserved"] = sum(len(groups) == 1 for groups in groups_by_source.values())
@@ -1026,6 +1044,29 @@ def run_mimo25_av_reconcile(
     music_counts: Counter[str] = Counter()
     audio_event_count = 0
     nonzero_reasoning_count = 0
+    original_picture_histogram: Counter[str] = Counter()
+    selected_picture_histogram: Counter[str] = Counter()
+    original_reference_kinds: Counter[str] = Counter()
+    selected_reference_kinds: Counter[str] = Counter()
+    selected_attribute_types: Counter[str] = Counter()
+    dropped_attribute_types: Counter[str] = Counter()
+    drop_reasons: Counter[str] = Counter()
+    for job in inventory.jobs:
+        selection = job.reference_selection
+        original_picture_histogram[str(selection.original_picture_count)] += 1
+        selected_picture_histogram[str(selection.selected_picture_count)] += 1
+        selected_reference_kinds.update(item.kind for item in job.reference_images)
+        original_reference_kinds.update(item.kind for item in job.reference_images)
+        original_reference_kinds.update(item.kind for item in selection.dropped_references)
+        selected_attribute_types.update(
+            item.attribute_type
+            for item in job.reference_images
+            if item.kind == "attribute" and item.attribute_type is not None
+        )
+        dropped_attribute_types.update(
+            item.attribute_type for item in selection.dropped_references
+        )
+        drop_reasons.update(item.drop_reason for item in selection.dropped_references)
     try:
         _write_json(temporary / "inventory.json", inventory.model_dump(mode="json"))
         for job in inventory.jobs:
@@ -1164,6 +1205,22 @@ def run_mimo25_av_reconcile(
             correction_counts=dict(sorted(corrections.items())),
             audio_event_count=audio_event_count,
             music_status_counts=dict(sorted(music_counts.items())),
+            original_picture_count_histogram=dict(
+                sorted(original_picture_histogram.items())
+            ),
+            selected_picture_count_histogram=dict(
+                sorted(selected_picture_histogram.items())
+            ),
+            original_reference_kind_counts=dict(sorted(original_reference_kinds.items())),
+            selected_reference_kind_counts=dict(sorted(selected_reference_kinds.items())),
+            selected_attribute_type_counts=dict(sorted(selected_attribute_types.items())),
+            dropped_attribute_type_counts=dict(sorted(dropped_attribute_types.items())),
+            reference_drop_reason_counts=dict(sorted(drop_reasons.items())),
+            over_limit_clip_count=sum(
+                job.reference_selection.original_picture_count
+                > MIMO25_MAXIMUM_PICTURE_COUNT
+                for job in inventory.jobs
+            ),
         )
         _write_json(temporary / "summary.json", summary.model_dump(mode="json"))
         destination.parent.mkdir(parents=True, exist_ok=True)

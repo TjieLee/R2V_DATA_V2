@@ -20,6 +20,7 @@ from urllib.parse import urlsplit
 from pydantic import Field, ValidationError, model_validator
 
 from r2v_data_v2.h3.mimo25_av_reconcile import (
+    MimoClipJob,
     MimoInventory,
     MimoRawResponse,
     MimoRecord,
@@ -167,6 +168,46 @@ def _review_case_fingerprint(
     )
 
 
+def _reference_selection_audit(job: MimoClipJob) -> list[dict[str, object]]:
+    selected_by_source_index = {
+        item.source_image_index: item for item in job.reference_images
+    }
+    dropped_by_source_index = {
+        item.source_image_index: item
+        for item in job.reference_selection.dropped_references
+    }
+    rows: list[dict[str, object]] = []
+    for source_index in range(1, job.reference_selection.original_picture_count + 1):
+        selected = selected_by_source_index.get(source_index)
+        dropped = dropped_by_source_index.get(source_index)
+        if selected is not None:
+            rows.append(
+                {
+                    "source_image_index": selected.source_image_index,
+                    "source_image_label": selected.source_image_label,
+                    "source_image_id": selected.source_image_id,
+                    "picture_label": selected.picture_label,
+                    "kind": selected.kind,
+                    "entity_id": selected.entity_id,
+                    "owner_entity_id": selected.owner_entity_id,
+                    "attribute_type": selected.attribute_type,
+                    "selected": True,
+                    "drop_reason": None,
+                }
+            )
+        elif dropped is not None:
+            rows.append(
+                {
+                    **dropped.model_dump(mode="json"),
+                    "picture_label": None,
+                    "selected": False,
+                }
+            )
+        else:  # pragma: no cover - MimoReferenceSelection validates coverage
+            raise ValueError("MiMo review reference selection inventory differs")
+    return rows
+
+
 def build_review_cases(
     *,
     mimo_root: Path,
@@ -300,13 +341,108 @@ def build_review_cases(
             variant["audio_references"] = audio_references
             shadow_variants.append(variant)
         review_fingerprint = _review_case_fingerprint(record, variants)
+        annotation = record.annotation
+        audio_by_segment = (
+            {}
+            if annotation is None
+            else {
+                item.segment_id: item
+                for item in annotation.audio_observation.segment_decisions
+            }
+        )
+        grounding_by_segment = (
+            {}
+            if annotation is None
+            else {
+                item.segment_id: item
+                for item in annotation.av_grounding.segment_groundings
+            }
+        )
+        view_by_segment = (
+            {}
+            if annotation is None
+            else {
+                item.segment_id: item
+                for item in annotation.visual_observation.segment_views
+            }
+        )
+        presentation_counts: Counter[str] = Counter()
+        binding_change_counts: Counter[str] = Counter()
+        segment_rows: list[dict[str, object]] = []
+        for source in job.segments:
+            audio = audio_by_segment.get(source.segment_id)
+            grounding = grounding_by_segment.get(source.segment_id)
+            view = view_by_segment.get(source.segment_id)
+            selected_entity = None if grounding is None else grounding.entity_id
+            if grounding is not None:
+                presentation_counts[grounding.speech_presentation] += 1
+            if source.current_entity_id is None and selected_entity is not None:
+                binding_change = "entity_binding_added"
+            elif source.current_entity_id is not None and selected_entity is None:
+                binding_change = "entity_binding_removed"
+            elif source.current_entity_id == selected_entity:
+                binding_change = "entity_binding_preserved"
+            else:
+                binding_change = "entity_binding_changed"
+            binding_change_counts[binding_change] += 1
+            direct_anchor_override = (
+                source.identity_scope == "direct_anchor_present"
+                and source.current_entity_id != selected_entity
+            )
+            if direct_anchor_override:
+                binding_change_counts["direct_anchor_override"] += 1
+            segment_rows.append(
+                {
+                    **source.model_dump(mode="json"),
+                    "stage_a_visible_entity_ids": (
+                        [] if view is None else view.visible_entity_ids
+                    ),
+                    "stage_a_entity_observations": (
+                        []
+                        if view is None
+                        else [
+                            item.model_dump(mode="json")
+                            for item in view.entity_observations
+                        ]
+                    ),
+                    "stage_b_audio_decision": (
+                        None if audio is None else audio.model_dump(mode="json")
+                    ),
+                    "stage_c_av_grounding": (
+                        None
+                        if grounding is None
+                        else grounding.model_dump(mode="json")
+                    ),
+                    "binding_change": binding_change,
+                    "direct_anchor_override": direct_anchor_override,
+                }
+            )
         payload = {
             "clip_uid": job.clip_uid,
             "review_case_fingerprint": review_fingerprint,
             "target_video_url": f"/media/{_token(target)}",
             "references": references,
-            "source_segments": [item.model_dump(mode="json") for item in job.segments],
+            "reference_selection": job.reference_selection.model_dump(mode="json"),
+            "reference_selection_audit": _reference_selection_audit(job),
+            "source_segments": segment_rows,
             "mimo_record": record.model_dump(mode="json"),
+            "visual_observation": (
+                None
+                if annotation is None
+                else annotation.visual_observation.model_dump(mode="json")
+            ),
+            "audio_observation": (
+                None
+                if annotation is None
+                else annotation.audio_observation.model_dump(mode="json")
+            ),
+            "av_grounding": (
+                None
+                if annotation is None
+                else annotation.av_grounding.model_dump(mode="json")
+            ),
+            "presentation_counts": dict(sorted(presentation_counts.items())),
+            "binding_change_counts": dict(sorted(binding_change_counts.items())),
             "mimo_runtime_diagnostics": raw.diagnostics,
             "shadow_variants": shadow_variants,
             "legacy_qwen38": {
@@ -443,14 +579,24 @@ def render_review_html(
         for tag in ISSUE_TAGS
     )
     return f"""<!doctype html><html><head><meta charset="utf-8"><title>MiMo AV Review</title>
-<style>body{{font:14px system-ui;margin:0;background:#f4f5f7;color:#18202a}}header{{position:sticky;top:0;background:#fff;padding:12px 20px;border-bottom:1px solid #ccd2da;z-index:2}}main{{display:grid;grid-template-columns:minmax(420px,1fr) minmax(520px,1.3fr);gap:16px;padding:16px}}video{{width:100%;max-height:48vh;background:#000}}.panel{{background:#fff;border:1px solid #ccd2da;padding:12px;border-radius:6px;overflow:auto}}.refs{{display:flex;gap:8px;overflow:auto}}.refs img{{height:130px}}table{{border-collapse:collapse;width:100%;font-size:12px}}td,th{{border:1px solid #d8dde4;padding:5px;vertical-align:top}}pre{{white-space:pre-wrap}}button{{padding:10px 18px;margin:4px;font-weight:700}}.pass{{background:#d7f5df}}.issue{{background:#ffe1dc}}.skip{{background:#eee}}#tags label{{display:inline-block;margin:4px 10px 4px 0}}</style></head>
-<body><header><button onclick="move(-1)">Previous</button><button onclick="move(1)">Next</button><b id="progress"></b></header><main><section class="panel"><h2 id="title"></h2><video id="video" controls></video><h3>Frozen references</h3><div id="refs" class="refs"></div><h3>Segments</h3><div id="segments"></div><h3>Audio semantics</h3><pre id="audio"></pre><h3>MiMo runtime diagnostics</h3><pre id="diagnostics"></pre></section><section class="panel"><h3>MiMo H3 shadow</h3><div id="shadow"></div><h3>Legacy Qwen3.8</h3><div id="legacy"></div><hr><button class="pass" onclick="save('PASS')">PASS</button><button class="issue" onclick="save('ISSUE')">ISSUE</button><button class="skip" onclick="save('SKIP')">SKIP</button><div id="tags">{tags}</div><textarea id="notes" rows="4" style="width:100%" placeholder="notes"></textarea></section></main>
-<script>const cases={json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")};const initial={json.dumps(annotation_payload, ensure_ascii=False).replace("</", "<\\/")};let index=0;
+<style>body{{font:14px system-ui;margin:0;background:#f4f5f7;color:#18202a}}header{{position:sticky;top:0;background:#fff;padding:12px 20px;border-bottom:1px solid #ccd2da;z-index:2}}main{{display:grid;grid-template-columns:minmax(440px,1fr) minmax(560px,1.35fr);gap:16px;padding:16px}}video{{width:100%;max-height:46vh;background:#000}}.panel{{background:#fff;border:1px solid #ccd2da;padding:12px;border-radius:6px;overflow:auto}}.refs{{display:flex;gap:8px;overflow:auto}}.refs img{{height:130px}}table{{border-collapse:collapse;width:100%;font-size:12px}}td,th{{border:1px solid #d8dde4;padding:5px;vertical-align:top}}pre{{white-space:pre-wrap}}button{{padding:10px 18px;margin:4px;font-weight:700}}.pass{{background:#d7f5df}}.issue,.offscreen{{background:#ffe1dc}}.skip{{background:#eee}}.counts span{{display:inline-block;margin:2px 8px 2px 0;padding:3px 6px;border:1px solid #ccd2da}}#tags label{{display:inline-block;margin:4px 10px 4px 0}}</style></head>
+<body><header><button onclick="move(-1)">Previous</button><button onclick="move(1)">Next</button><b id="progress"></b> <label>Presentation <select id="presentation-filter" onchange="drawSegments()"><option value="all">all</option><option>onscreen_spoken</option><option>offscreen_spoken</option><option>voice_over</option><option>message_voice_over</option><option>device_playback</option><option>uncertain</option></select></label></header>
+<main><section class="panel"><h2 id="title"></h2><video id="video" controls></video><h3>Frozen references</h3><div id="refs" class="refs"></div><h3>Reference-selection provenance</h3><div id="reference-audit"></div><h3>Stage A visual observation</h3><pre id="visual-observation"></pre><h3>Stage B audio observation</h3><pre id="audio-observation"></pre><h3>Stage C AV grounding</h3><pre id="av-grounding"></pre><h3>MiMo runtime diagnostics</h3><pre id="diagnostics"></pre></section>
+<section class="panel"><h3>Presentation and binding counts</h3><div id="case-counts" class="counts"></div><h3>Segments</h3><div id="segments"></div><h3>Final materialized H3 shadow</h3><div id="shadow"></div><h3>Legacy Qwen3.8</h3><div id="legacy"></div><hr><button class="pass" onclick="save('PASS')">PASS</button><button class="issue" onclick="save('ISSUE')">ISSUE</button><button class="skip" onclick="save('SKIP')">SKIP</button><div id="tags">{tags}</div><textarea id="notes" rows="4" style="width:100%" placeholder="notes"></textarea></section></main>
+<script>
+const cases={json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")};
+const initial={json.dumps(annotation_payload, ensure_ascii=False).replace("</", "<\\/")};
+let index=0;
 function esc(v){{return String(v??'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));}}
 function audioMeta(a){{if(a.role==='voice_reference')return `Subject ${{a.subject_index}} / ${{esc(a.entity_id)}} / ${{esc(a.speaker_id||'no Sx')}}`;if(a.role==='music_reference')return `music: ${{esc(a.music_description)}}<br>interval: ${{a.source_start_time}}-${{a.source_end_time}} / ${{esc(a.interval_provenance)}}`;return `complete canonical Audio / ${{esc(a.interval_provenance)}}`;}}
-function draw(){{const c=cases[index],r=c.mimo_record.annotation;document.getElementById('progress').textContent=` ${{index+1}} / ${{cases.length}}`;document.getElementById('title').textContent=c.clip_uid;document.getElementById('video').src=c.target_video_url;document.getElementById('refs').innerHTML=c.references.map(x=>`<figure><img src="${{x.media_url}}"><figcaption>${{esc(x.picture_label)}} ${{esc(x.entity_id||x.kind)}}</figcaption></figure>`).join('');const decisions=Object.fromEntries((r?.segment_decisions||[]).map(x=>[x.segment_id,x]));document.getElementById('segments').innerHTML='<table><tr><th>ID/time</th><th>ASR exact</th><th>source proposal</th><th>MiMo correction</th></tr>'+c.source_segments.map(x=>`<tr><td>${{esc(x.segment_id)}}<br>${{x.start_time}}-${{x.end_time}}</td><td>[${{esc(x.asr_language)}}] ${{esc(x.asr_text)}}</td><td>${{esc(x.source_speaker_cluster_id)}} / ${{esc(x.current_entity_id)}}<br>${{esc(x.identity_scope)}}</td><td><pre>${{esc(JSON.stringify(decisions[x.segment_id]||null,null,2))}}</pre></td></tr>`).join('')+'</table>';document.getElementById('audio').textContent=JSON.stringify(r?.audio_semantics||null,null,2);document.getElementById('diagnostics').textContent=JSON.stringify(c.mimo_runtime_diagnostics||[],null,2);document.getElementById('shadow').innerHTML=c.shadow_variants.map(x=>`<h4>${{esc(x.sample_id)}} (${{esc(x.conditioning_variant)}})</h4>${{(x.audio_references||[]).map(a=>`<div><b>&lt;Audio ${{a.audio_index}}&gt; / ${{esc(a.role)}}</b><br>${{audioMeta(a)}}<br>source: ${{esc(a.source_type)}}${{a.source_segment_id?' / '+esc(a.source_segment_id):''}}<br><audio controls preload="none" src="${{a.media_url}}"></audio></div>`).join('')}}<pre>${{esc(x.rendered_h3_prompt||x.failure_reason)}}</pre>`).join('');document.getElementById('legacy').innerHTML=Object.entries(c.legacy_qwen38).map(([k,v])=>`<h4>${{esc(k)}}</h4><pre>${{esc(v)}}</pre>`).join('')||'[not supplied]';const a=initial[c.clip_uid];document.getElementById('notes').value=a?.notes||'';document.querySelectorAll('#tags input').forEach(el=>el.checked=!!a?.issue_tags?.includes(el.value));}}
+function countBadges(values){{return Object.entries(values||{{}}).map(([key,value])=>`<span><b>${{esc(key)}}</b>: ${{value}}</span>`).join('');}}
+function referenceAudit(c){{const rows=c.reference_selection_audit.map(x=>`<tr><td>${{esc(x.source_image_label)}}<br>${{esc(x.source_image_id)}}</td><td>${{esc(x.picture_label||'[dropped]')}}</td><td>${{esc(x.kind)}}</td><td>${{esc(x.entity_id||x.owner_entity_id||'')}}</td><td>${{esc(x.attribute_type||'')}}</td><td>${{x.selected?'selected':`dropped: ${{esc(x.drop_reason)}}`}}</td></tr>`).join('');return `<div class="counts">original ${{c.reference_selection.original_picture_count}} / selected ${{c.reference_selection.selected_picture_count}}</div><table><tr><th>source</th><th>task-local</th><th>kind</th><th>entity/owner</th><th>attribute</th><th>result</th></tr>${{rows}}</table>`;}}
+function drawSegments(){{const c=cases[index],filter=document.getElementById('presentation-filter').value;const rows=c.source_segments.filter(x=>filter==='all'||x.stage_c_av_grounding?.speech_presentation===filter).map(x=>{{const grounding=x.stage_c_av_grounding||{{}};const cls=grounding.speech_presentation==='offscreen_spoken'?' class="offscreen"':'';return `<tr${{cls}}><td>${{esc(x.segment_id)}}<br>${{x.start_time}}-${{x.end_time}}</td><td>[${{esc(x.asr_language)}}] ${{esc(x.asr_text)}}</td><td>${{esc(x.source_speaker_cluster_id)}} / ${{esc(x.current_entity_id)}}<br>${{esc(x.identity_scope)}} / direct=${{x.direct_anchor_seconds}}</td><td>${{esc((x.stage_a_visible_entity_ids||[]).join(', '))}}<pre>${{esc(JSON.stringify(x.stage_a_entity_observations||[],null,2))}}</pre></td><td>${{esc(x.stage_b_audio_decision?.primary_speaker_group)}}<pre>${{esc(JSON.stringify(x.stage_b_audio_decision||null,null,2))}}</pre></td><td>${{esc(grounding.entity_id)}} / ${{esc(grounding.binding_status)}} / ${{esc(grounding.speech_presentation)}}<br>${{esc((grounding.evidence_codes||[]).join(', '))}}<br><b>${{esc(x.binding_change)}}</b>${{x.direct_anchor_override?' / direct-anchor override':''}}</td></tr>`;}}).join('');document.getElementById('segments').innerHTML='<table><tr><th>ID/time</th><th>ASR exact</th><th>source evidence</th><th>Stage A visible</th><th>Stage B gN/audio</th><th>Stage C selected grounding</th></tr>'+rows+'</table>';}}
+function draw(){{const c=cases[index];document.getElementById('progress').textContent=` ${{index+1}} / ${{cases.length}}`;document.getElementById('title').textContent=c.clip_uid;document.getElementById('video').src=c.target_video_url;document.getElementById('refs').innerHTML=c.references.map(x=>`<figure><img src="${{x.media_url}}"><figcaption>${{esc(x.source_image_label)}} → ${{esc(x.picture_label)}}<br>${{esc(x.kind)}} / ${{esc(x.entity_id||x.owner_entity_id||'')}}</figcaption></figure>`).join('');document.getElementById('reference-audit').innerHTML=referenceAudit(c);document.getElementById('visual-observation').textContent=JSON.stringify(c.visual_observation||null,null,2);document.getElementById('audio-observation').textContent=JSON.stringify(c.audio_observation||null,null,2);document.getElementById('av-grounding').textContent=JSON.stringify(c.av_grounding||null,null,2);document.getElementById('diagnostics').textContent=JSON.stringify(c.mimo_runtime_diagnostics||[],null,2);document.getElementById('case-counts').innerHTML='<b>presentations</b> '+countBadges(c.presentation_counts)+'<br><b>binding</b> '+countBadges(c.binding_change_counts);drawSegments();document.getElementById('shadow').innerHTML=c.shadow_variants.map(x=>`<h4>${{esc(x.sample_id)}} (${{esc(x.conditioning_variant)}})</h4>${{(x.audio_references||[]).map(a=>`<div><b>&lt;Audio ${{a.audio_index}}&gt; / ${{esc(a.role)}}</b><br>${{audioMeta(a)}}<br>source: ${{esc(a.source_type)}}${{a.source_segment_id?' / '+esc(a.source_segment_id):''}}<br><audio controls preload="none" src="${{a.media_url}}"></audio></div>`).join('')}}<pre>${{esc(x.rendered_h3_prompt||x.failure_reason)}}</pre>`).join('');document.getElementById('legacy').innerHTML=Object.entries(c.legacy_qwen38).map(([key,value])=>`<h4>${{esc(key)}}</h4><pre>${{esc(value)}}</pre>`).join('')||'[not supplied]';const annotation=initial[c.clip_uid];document.getElementById('notes').value=annotation?.notes||'';document.querySelectorAll('#tags input').forEach(element=>element.checked=!!annotation?.issue_tags?.includes(element.value));}}
 function move(delta){{index=Math.max(0,Math.min(cases.length-1,index+delta));draw();}}
-async function save(decision){{const c=cases[index],tags=[...document.querySelectorAll('#tags input:checked')].map(x=>x.value);if(decision==='ISSUE'&&!tags.length){{alert('Select an issue tag');return;}}const body={{schema_version:'{MIMO25_REVIEW_ANNOTATION_VERSION}',clip_uid:c.clip_uid,record_fingerprint:c.review_case_fingerprint,decision,issue_tags:decision==='ISSUE'?tags:[],notes:document.getElementById('notes').value,reviewed_at:new Date().toISOString()}};const response=await fetch('/api/annotation',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(body)}});if(!response.ok){{alert(await response.text());return;}}initial[c.clip_uid]=body;move(1);}}draw();</script></body></html>"""
+async function save(decision){{const c=cases[index],selectedTags=[...document.querySelectorAll('#tags input:checked')].map(x=>x.value);if(decision==='ISSUE'&&!selectedTags.length){{alert('Select an issue tag');return;}}const body={{schema_version:'{MIMO25_REVIEW_ANNOTATION_VERSION}',clip_uid:c.clip_uid,record_fingerprint:c.review_case_fingerprint,decision,issue_tags:decision==='ISSUE'?selectedTags:[],notes:document.getElementById('notes').value,reviewed_at:new Date().toISOString()}};const response=await fetch('/api/annotation',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(body)}});if(!response.ok){{alert(await response.text());return;}}initial[c.clip_uid]=body;move(1);}}
+draw();
+</script></body></html>"""
 
 
 def make_review_server(

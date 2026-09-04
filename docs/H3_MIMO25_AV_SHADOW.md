@@ -14,9 +14,11 @@ speaker reconciliation; MiMo is the final AV authority for this shadow path.
 - Qwen3-ASR owns exact transcript text and language.
 - frozen Visual V3 references own entity inventory, order, and image content.
 - LR-ASD, source clusters, and current entity bindings are proposals.
-- MiMo-V2.5 reconciles clip-local speaker groups and visible entities, classifies
-  speech audiovisual presentation, describes AV-grounded non-speech audio, and
-  writes an H3 visual/temporal draft.
+- one MiMo-V2.5 joint-AV request returns five ordered internal stages:
+  `visual_observation`, `audio_observation`, `av_grounding`, `h3_semantics`, and
+  `h3_projection`. These separate visual presence, acoustic identity, speaker
+  grounding, official H3 semantics, and typed playback order without adding
+  model calls.
 - the deterministic materializer owns `Sx`, Subject and Audio references, exact
   dialogue, and final H3 formatting.
 - post-MiMo voice recovery may create a real target voice asset only from a
@@ -25,23 +27,36 @@ speaker reconciliation; MiMo is the final AV authority for this shadow path.
   DiariZen 32 kHz sample interval in canonical stereo FLAC; LR-ASD, association,
   current binding, and direct-anchor support are not recovery gates.
 
-Every DiariZen segment receives one `segment_decisions` row, including empty or
-otherwise non-transcribed segments. Only Qwen3-ASR segments with
-`asr_status="transcribed"` receive typed `speech` entries in the internal shot
-timeline. MiMo chooses prose and temporal ordering, while the pipeline owns the
-exact speech and Audio-event inventories, dialogue text, and final H3 syntax.
-Free-form MiMo prose cannot contain internal placeholders or final `(Sx)`,
-`<d>`, or shot-header syntax.
+Every DiariZen segment receives one Stage A `segment_views` row, one Stage B
+audio `segment_decisions` row, and one Stage C `segment_groundings` row,
+including empty or otherwise non-transcribed segments. Stage A records only
+visible entities and exact-window visibility/orientation/face/mouth/articulation
+observations. Stage B owns clip-local `gN`, vocal composition, acoustic
+resolution, segment delivery, secondary vocal activity, voice profiles, and
+non-speech Audio. Stage C may map that exact Stage B group to one frozen `eN` or
+null and classify presentation. Only Qwen3-ASR segments with
+`asr_status="transcribed"` receive typed `speech` entries in Stage E.
+
+Every Stage A shot contains at least one non-empty visual-only `vN` block. Every
+Stage E shot contains a typed reference to at least one of its own visual blocks,
+and all visual blocks, transcribed speech segments, and timeline-eligible Audio
+events must appear exactly once in authoritative order. A duration-aware hard
+floor of 40 visual words below 3 seconds, 80 words from 3 through 8 seconds, and
+120 words above 8 seconds catches catastrophic collapse; it is not a target
+length and must not induce invented filler. The pipeline expands typed
+visual/speech/event parts, exact dialogue, and final syntax. Internal stage
+names, `vN`, `gN`, `eN`, `aeN`, segment IDs, evidence codes, and model-authored
+H3 placeholders cannot enter final prose.
 
 The compact per-request contract supplies the exact complete segment inventory
 and the exact ordered transcribed-segment inventory once. MiMo chooses the
-observed shot and temporal position, but it does not derive
-speech eligibility. Every segment decision explicitly publishes `entity_id`:
-an exact supplied ID for `visible_entity`, otherwise JSON `null`. Each
-transcribed decision also carries its own audible `delivery_style`; every
-non-transcribed decision uses `null`.
+observed shot and temporal position, but it does not derive speech eligibility.
+Every Stage C grounding explicitly publishes `entity_id`: an exact supplied ID
+for `visible_entity`, otherwise JSON `null`. Each transcribed Stage B decision
+also carries its own audible `delivery_style`; every non-transcribed decision
+uses `null`.
 
-Each draft Subject definition is constrained by a machine-readable, per-request
+Each Stage D Subject definition is constrained by a machine-readable, per-request
 mapping from its exact frozen `<Subject N>` label to all and only its owning
 `<Picture N>` labels. The annotation stores each definition as typed
 `subject_label` plus model-authored visual `description`; it stores retention as
@@ -55,7 +70,7 @@ while nationality, role, named identity, relationship, or personality claims
 remain invalid. The full-AV recheck receives the same mapping and exact
 transcribed segment inventory.
 
-The annotation also carries one nullable `speaker_voice_profiles` row for each
+Stage B also carries one nullable `speaker_voice_profiles` row for each
 resolved speaker group that owns authoritative transcribed speech. A non-null
 profile is limited to stable audible pitch register, timbre, texture, cadence,
 articulation, and genuinely supported accent or dialect; it cannot copy
@@ -77,13 +92,14 @@ canonical-wide coverage false.
 Speaker identity, visible-entity binding, and speech presentation are separate
 facts. A visible person alone does not establish visible speech. An
 `onscreen_spoken` segment may materialize as `<Subject N> (Sx) says, ...` when
-MiMo observes either `visible_lip_motion`, or a visible speaker whose mouth is
-genuinely occluded/back-facing together with AV alignment or voice-continuity
-evidence. `visible_lip_motion` means speech-correlated mouth, lip, or jaw
-articulation in that exact segment; adjacent motion, gaze, expression, breathing,
-or general body movement does not qualify. AV alignment and voice continuity may
-preserve clip-local speaker identity, but they cannot alone establish that a
-visible entity is speaking or transfer the audible speaker to a visible listener.
+Stage A observes speech-correlated articulation and Stage C records
+`visible_lip_motion`, or when Stage A confirms visible presence but the
+face/mouth is genuinely non-assessable because of a back/profile view,
+occlusion, or crop and Stage C records `speaker_visible_mouth_occluded` with AV
+alignment or voice continuity. A hidden mouth does not make a visible person
+offscreen. Adjacent motion, gaze, expression, breathing, and general body motion
+do not establish speech. A visible listener without reliable evidence never
+inherits an offscreen speaker.
 The same clip-local group may therefore remain `g1` while a later segment becomes
 `offscreen` / `entity_id=null` / `offscreen_spoken`.
 LR-ASD support, source-cluster support, current bindings, and direct anchors are
@@ -116,16 +132,16 @@ they do not create additional MiMo model jobs.
 
 Prompt, policy, annotation schema, and materializer versions are:
 
-- `h3_mimo25_unified_av_reconcile_v19`
-- `h3_mimo25_av_authority_contract_v13`
-- `r2v.h3.mimo25_av_annotation.12`
-- `r2v.h3.mimo25_backend.17`
-- `h3_mimo25_materializer_v13`
+- `h3_mimo25_unified_av_reconcile_v20`
+- `h3_mimo25_av_authority_contract_v14`
+- `r2v.h3.mimo25_av_annotation.13`
+- `r2v.h3.mimo25_backend.18`
+- `h3_mimo25_materializer_v14`
 - `h3_mimo25_reference_selection_v1`
 - `h3_mimo25_recovered_voice_quality_v1`
 - `r2v.h3.mimo25_inventory.4`
-- `r2v.h3.mimo25_record.9`
-- `r2v.h3.mimo25_summary.9`
+- `r2v.h3.mimo25_record.10`
+- `r2v.h3.mimo25_summary.10`
 - `r2v.h3.mimo25_failure.5`
 - `r2v.h3.mimo25_raw_response.5`
 - `r2v.h3.mimo25_h3_shadow.11`
@@ -142,7 +158,8 @@ transport and actual response-format mode are recorded in backend provenance
 and its configuration fingerprint.
 For SGLang, the full schema is carried only by strict `response_format`; it is
 not duplicated in user text. Xiaomi retains the textual schema required by its
-JSON-object transport. The `.9` annotation uses a `resolution`-discriminated segment-decision schema:
+JSON-object transport. The Stage B Audio decision uses a
+`resolution`-discriminated schema:
 `resolved` requires a non-null `gN` `primary_speaker_group`, while acoustic
 refinement and uncertain decisions still require the field explicitly and may
 publish `null`. This invariant is enforced by SGLang constrained decoding and
@@ -176,6 +193,10 @@ unchanged. The limits and label semantics follow the official MiniMax H3
 [repository](https://github.com/MiniMax-AI/MiniMax-H3),
 [prompt-writing skill](https://github.com/MiniMax-AI/MiniMax-H3/blob/main/skills/h3-prompt-writing/SKILL.md),
 and [Ref2VA guide](https://github.com/MiniMax-AI/MiniMax-H3/blob/main/skills/h3-prompt-writing/references/ref-en.txt).
+The final six-section prose also remains aligned with the official
+[base prompt guide](https://github.com/MiniMax-AI/MiniMax-H3/blob/main/skills/h3-prompt-writing/references/base-en.txt);
+the five staged fields are serialized annotation only and never become final
+headings.
 
 The exact request contract keeps `fps` and `media_resolution` beside the
 `video_url` object, not inside it:
@@ -217,13 +238,15 @@ or own that external source patch.
 After the authoritative primary or canonical-audio-fallback response is
 selected, parse or semantic validation failure may trigger at most one full AV
 recheck with the same references, target video, and selected audio modality.
-There is no text-only semantic repair. The `.9` annotation assigns chronological
-`ae1`, `ae2`, ... IDs to non-speech Audio events and requires exact ordered
-coverage by typed `audio_event` timeline parts. Typed `speech` parts likewise
-must exactly cover authoritative transcribed segments. The deterministic MiMo
-materializer renders those typed references into the existing internal Qwen3.8
-draft interface, then uses the unchanged validated final renderer. It does not
-repair missing, extra, duplicated, reordered, or misplaced model parts.
+There is no text-only semantic repair. The staged annotation assigns
+chronological `ae1`, `ae2`, ... IDs to non-speech Audio events and requires
+exact ordered Stage E coverage for every event except audience-only
+non-diegetic music. Typed `speech` parts exactly cover authoritative transcribed
+segments, and typed `visual` parts exactly cover Stage A blocks in their owning
+shots. The deterministic MiMo materializer expands those typed references into
+the existing internal Qwen3.8 draft interface, then uses the unchanged
+validated final renderer. It does not repair missing, extra, duplicated,
+reordered, or misplaced model parts.
 
 Music events distinguish audible in-scene `diegetic_music` from audience-only
 `non_diegetic_music`. A typed non-diegetic event requires global music status
@@ -268,6 +291,17 @@ typed timeline is internal annotation structure only and never appears in the
 final Ref2VA text. Approximate event times are internal placement evidence, and
 ordinary observed target-video sounds never create an `<Audio N>` reference;
 that label remains reserved for an actual copied or referenced Audio asset.
+
+MiMo summary diagnostics expose original and selected Picture-count
+histograms, original/selected reference-kind counts, selected/dropped attribute
+types, drop-reason counts, and over-limit clip count. The review page shows the
+source `<Image N>` and task-local `<Picture M>` mapping for selected references,
+dropped attributes and reasons, Stage A/B/C records, per-segment source and
+direct-anchor evidence, presentation/binding-change counts, and final
+materialized H3. These diagnostics do not change
+`h3_mimo25_reference_selection_v1`: clips at or below nine Pictures remain an
+exact no-op, and over-capacity clips retain the existing deterministic
+attribute-only trimming policy.
 
 Shadow materialization isolates only final Ref2VA response-contract failures at
 the individual sample level. Such a record remains `status="failed"`, carries a

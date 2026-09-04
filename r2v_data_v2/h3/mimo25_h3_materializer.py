@@ -33,9 +33,9 @@ from r2v_data_v2.h3.mimo25_backend import (
     MIMO25_MATERIALIZER_VERSION,
     MimoAudioEvent,
     MimoH3AudioEventPart,
-    MimoH3ProsePart,
     MimoH3Shot,
     MimoH3SpeechPart,
+    MimoH3VisualPart,
     MimoSegmentDecision,
     MimoSubjectDefinitionDraft,
 )
@@ -235,6 +235,7 @@ class MimoH3ShadowRecord(SchemaModel):
         "h3_mimo25_materializer_v11",
         "h3_mimo25_materializer_v12",
         "h3_mimo25_materializer_v13",
+        "h3_mimo25_materializer_v14",
     ] = (
         MIMO25_MATERIALIZER_VERSION
     )
@@ -413,7 +414,14 @@ def _corrected_segments(
     record: MimoRecord,
 ) -> tuple[list[FinalQwen3SpeechSegment], list[str]]:
     assert record.annotation is not None
-    decisions = {item.segment_id: item for item in record.annotation.segment_decisions}
+    audio_decisions = {
+        item.segment_id: item
+        for item in record.annotation.audio_observation.segment_decisions
+    }
+    groundings = {
+        item.segment_id: item
+        for item in record.annotation.av_grounding.segment_groundings
+    }
     source_by_id = {item.segment_id: item for item in job.segments}
     sample_by_id = {item.segment_id: item for item in sample.speech_segments}
     transcribed_ids = [
@@ -426,7 +434,8 @@ def _corrected_segments(
     for segment_id in transcribed_ids:
         source = source_by_id[segment_id]
         original = sample_by_id[segment_id]
-        decision = decisions[segment_id]
+        audio_decision = audio_decisions[segment_id]
+        grounding = groundings[segment_id]
         if (
             original.text != source.asr_text
             or original.language != source.asr_language
@@ -439,19 +448,19 @@ def _corrected_segments(
         ):
             raise ValueError("source H3 speech differs from authoritative Qwen3-ASR")
         resolved = (
-            decision.resolution == "resolved"
-            and decision.primary_speaker_group is not None
+            audio_decision.resolution == "resolved"
+            and audio_decision.primary_speaker_group is not None
         )
         group = (
-            decision.primary_speaker_group
+            audio_decision.primary_speaker_group
             if resolved
             else f"fallback__{source.source_speaker_cluster_id}"
         )
         entity_id = (
-            decision.entity_id
+            grounding.entity_id
             if resolved
-            and decision.binding_status == "visible_entity"
-            and decision.speech_presentation == "onscreen_spoken"
+            and grounding.binding_status == "visible_entity"
+            and grounding.speech_presentation == "onscreen_spoken"
             else None
         )
         if not resolved:
@@ -501,7 +510,7 @@ def _audio_facts(
     speaker_ids = _speaker_ids(corrected)
     delivery_by_segment = {
         item.segment_id: item.delivery_style
-        for item in record.annotation.segment_decisions
+        for item in record.annotation.audio_observation.segment_decisions
     }
     speech = []
     for segment in corrected:
@@ -597,12 +606,13 @@ def _contract_with_voice_profiles(
 def _render_timeline_parts(
     shot: MimoH3Shot,
     *,
+    visual_block_by_id: dict[str, str],
     audio_event_by_id: dict[str, str],
 ) -> str:
     rendered: list[str] = []
     for part in shot.timeline_parts:
-        if isinstance(part, MimoH3ProsePart):
-            rendered.append(part.text.strip())
+        if isinstance(part, MimoH3VisualPart):
+            rendered.append(visual_block_by_id[part.block_id].strip())
         elif isinstance(part, MimoH3SpeechPart):
             rendered.append(f"[[{part.segment_id}]]")
         elif isinstance(part, MimoH3AudioEventPart):
@@ -693,7 +703,7 @@ def _materialize_sample(
         audio_facts=facts,
         request_fingerprint=record.request_fingerprint,
     )
-    semantics = record.annotation.audio_semantics
+    semantics = record.annotation.audio_observation.audio_semantics
     audio_event_by_id = {
         item.event_id: item.description for item in semantics.temporal_non_speech_events
     }
@@ -717,19 +727,24 @@ def _materialize_sample(
         raise ValueError(
             "unknown MiMo soundscape cannot be materialized as confirmed silence"
         )
+    visual_block_by_id = {
+        block.block_id: block.text
+        for shot in record.annotation.visual_observation.shots
+        for block in shot.visual_blocks
+    }
     draft = Qwen38H3DraftResponse(
         subject_definitions=[
             _render_subject_definition(item, subject)
             for item, subject in zip(
-                record.annotation.h3_draft.subject_definitions,
+                record.annotation.h3_semantics.subject_definitions,
                 job.reference_subjects,
                 strict=True,
             )
         ],
-        summary=f"{prefix} {record.annotation.h3_draft.summary}",
+        summary=f"{prefix} {record.annotation.h3_semantics.summary}",
         retention_analysis=[
             item.render()
-            for item in record.annotation.h3_draft.visual_retention_analysis
+            for item in record.annotation.h3_semantics.visual_retention_analysis
         ],
         shots=[
             Qwen38DraftShot(
@@ -741,10 +756,11 @@ def _materialize_sample(
                 ),
                 description_template=_render_timeline_parts(
                     item,
+                    visual_block_by_id=visual_block_by_id,
                     audio_event_by_id=audio_event_by_id,
                 ),
             )
-            for item in record.annotation.h3_draft.shots
+            for item in record.annotation.h3_projection.shots
         ],
         overall_soundscape=soundscape,
         non_diegetic_music=music,
@@ -753,10 +769,13 @@ def _materialize_sample(
             for item in facts.non_speech_events
         ],
     )
-    decisions = {item.segment_id: item for item in record.annotation.segment_decisions}
+    decisions = {
+        item.segment_id: item
+        for item in record.annotation.av_grounding.segment_groundings
+    }
     shot_by_segment = {
         part.segment_id: shot.shot_index
-        for shot in record.annotation.h3_draft.shots
+        for shot in record.annotation.h3_projection.shots
         for part in shot.timeline_parts
         if isinstance(part, MimoH3SpeechPart)
     }
