@@ -23,7 +23,7 @@ def render_speech_presentation_clause(
     base_clause: str,
     presentation: SpeechPresentation,
 ) -> str:
-    if presentation == "onscreen_spoken":
+    if presentation in {"onscreen_spoken", "uncertain"}:
         return base_clause
     prefix = {
         "offscreen_spoken": f"({speech.speaker_id}), speaking offscreen",
@@ -37,7 +37,6 @@ def render_speech_presentation_clause(
             f"({speech.speaker_id}), heard through an in-scene device rather than "
             "visible speech"
         ),
-        "uncertain": f"({speech.speaker_id}), with speech presentation uncertain",
     }[presentation]
     return f"{prefix}: {speech.locked_dialogue_block}"
 

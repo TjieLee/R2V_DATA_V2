@@ -125,12 +125,22 @@ preserved, `insufficient_evidence` is recorded when capacity permits, and the
 complete validator runs after normalization. A clean primary response therefore
 publishes without recheck; remaining semantic failures receive the existing one
 full-AV recheck, followed by the same normalization and full validation.
+Stage A/Stage C articulation contradictions are explicitly excluded from this
+conservative downgrade: observed articulation versus `no_visible_lip_motion`,
+unsupported `visible_lip_motion`, or incomplete onscreen grounding with plausible
+Stage A speaker evidence receives the one full-AV recheck and then fails closed if
+still contradictory. Stage C may resolve Stage B `needs_acoustic_refinement` only
+when Stage B supplies a non-null group with `single_speaker` or
+`same_speaker_nonlexical` composition and the existing grounded onscreen evidence
+passes. Overlapping or sequential multi-speaker uncertainty cannot use that path.
 Model-authored Subject visual prose containing Audio-profile content is not
 rewritten by these normalizers and remains a recheck or fail-closed condition.
 `offscreen_spoken`, `voice_over`,
 `message_voice_over`, and `device_playback` preserve the authoritative speech
 and speaker group but never create a visible mouth-speaking action. An uncertain
-presentation similarly removes visible-entity binding rather than guessing.
+presentation similarly removes visible-entity binding rather than guessing; final
+H3 renders its dialogue with the neutral base `(Sx) says` clause and does not leak
+internal uncertainty metadata.
 The clip-local `primary_speaker_group` represents speaker identity rather than
 a speech turn. Segment boundaries, pauses, language changes, or ASR changes do
 not create a new group by themselves. Resolved segments bound to the same
@@ -147,11 +157,11 @@ they do not create additional MiMo model jobs.
 
 Prompt, policy, annotation schema, and materializer versions are:
 
-- `h3_mimo25_unified_av_reconcile_v20`
-- `h3_mimo25_av_authority_contract_v14`
+- `h3_mimo25_unified_av_reconcile_v21`
+- `h3_mimo25_av_authority_contract_v15`
 - `r2v.h3.mimo25_av_annotation.13`
-- `r2v.h3.mimo25_backend.21`
-- `h3_mimo25_materializer_v14`
+- `r2v.h3.mimo25_backend.22`
+- `h3_mimo25_materializer_v15`
 - `h3_mimo25_reference_selection_v1`
 - `h3_mimo25_recovered_voice_quality_v1`
 - `r2v.h3.mimo25_inventory.4`
@@ -268,6 +278,19 @@ Music events distinguish audible in-scene `diegetic_music` from audience-only
 `present` and a non-null grounded description; `absent` cannot coexist with such
 an event. Diegetic music alone does not imply an audience-only score, while a
 continuous global score may be present without a localized event.
+A pitched or harmonically structured soundtrack drone/pad remains
+`non_diegetic_music` even when beatless, minimal, or atmospheric and no plausible
+in-scene source exists. HVAC/electrical hum, room tone, wind, traffic, and
+machinery remain soundscape when audible evidence supports those environmental or
+mechanical sources. No deterministic lexical reassignment is applied.
+
+Entity Subjects describe reusable entities. Attribute Subjects describe only the
+referenced attribute and retain explicit `attribute_type` and `owner_entity_id`
+in the mandatory machine contract. Human-oriented hair, face, glasses,
+upper-clothing, and accessory definitions that instead begin by defining a new
+woman, man, person, girl, boy, or child are rechecked and then fail closed.
+Attribute retention is judged on the owning entity, not by searching for another
+independent Subject.
 
 `overall_soundscape` remains a core section. Any audible ambience, room tone,
 environmental layer, physical sound, or non-verbal human sound requires

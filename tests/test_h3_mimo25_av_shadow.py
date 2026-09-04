@@ -816,12 +816,12 @@ def test_current_backend_schema_keeps_existing_materializer_v6_provenance_readab
     ).hexdigest()
     historical = type(current).model_validate(values)
     assert historical.materializer_version == "h3_mimo25_materializer_v6"
-    assert current.materializer_version == "h3_mimo25_materializer_v14"
+    assert current.materializer_version == "h3_mimo25_materializer_v15"
 
 
-def test_mimo_v20_prompt_preserves_staged_visual_audio_authority_contract() -> None:
-    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v20"
-    assert MIMO25_POLICY_VERSION == "h3_mimo25_av_authority_contract_v14"
+def test_mimo_v21_prompt_preserves_staged_visual_audio_authority_contract() -> None:
+    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v21"
+    assert MIMO25_POLICY_VERSION == "h3_mimo25_av_authority_contract_v15"
     assert MIMO25_SCHEMA_VERSION == "r2v.h3.mimo25_av_annotation.13"
     for phrase in (
         "STAGE A visual_observation: PURE VISUAL EVIDENCE",
@@ -842,6 +842,12 @@ def test_mimo_v20_prompt_preserves_staged_visual_audio_authority_contract() -> N
         "Neither music category contributes to overall_soundscape",
         "Diegetic music may enter the detailed timeline",
         "non-diegetic music belongs only in non_diegetic_music",
+        "sustained musical drone or pad",
+        "HVAC/electrical hum",
+        "Stage C may resolve it to visible_entity",
+        "Stage A articulation observations and Stage C lip-motion evidence must agree",
+        "An attribute Subject describes only the referenced attribute itself",
+        "Attribute retention is owner-aware",
         "Visual evidence may identify a genuinely audible source but never invent sound",
         "Every Stage A visual block appears exactly once in its own shot",
         "The deterministic materializer alone owns",
@@ -850,10 +856,10 @@ def test_mimo_v20_prompt_preserves_staged_visual_audio_authority_contract() -> N
         assert phrase in SYSTEM_PROMPT
 
 
-def test_backend_v21_records_negation_aware_soundscape_policy(tmp_path: Path) -> None:
+def test_backend_v22_records_av_resolution_policy(tmp_path: Path) -> None:
     backend, _ = _backend(tmp_path, [])
 
-    assert backend.provenance.schema_version == "r2v.h3.mimo25_backend.21"
+    assert backend.provenance.schema_version == "r2v.h3.mimo25_backend.22"
 
 
 def test_primary_prompt_includes_exact_subject_picture_contract(
@@ -868,6 +874,11 @@ def test_primary_prompt_includes_exact_subject_picture_contract(
     assert contract["subject_definition_requirements"] == [
         {
             "subject_label": "<Subject 1>",
+            "kind": "entity",
+            "entity_id": "e1",
+            "attribute_id": None,
+            "owner_entity_id": None,
+            "attribute_type": None,
             "required_source_picture_labels": ["<Picture 1>", "<Picture 2>"],
         }
     ]
@@ -2503,6 +2514,7 @@ def test_random10_mechanical_defects_normalize_in_one_model_call(
         binding_status="no_reliable_entity",
         speech_presentation="uncertain",
         entity_id="e1",
+        evidence_codes=["insufficient_evidence"],
     )
     semantics = payload["audio_observation"]["audio_semantics"]
     semantics["temporal_non_speech_events"][0].update(
@@ -2602,7 +2614,9 @@ def test_unknown_stage_c_entity_is_downgraded_without_remap(tmp_path: Path) -> N
     view = payload["visual_observation"]["segment_views"][0]
     view["visible_entity_ids"] = ["e9"]
     view["entity_observations"][0]["entity_id"] = "e9"
-    payload["av_grounding"]["segment_groundings"][0]["entity_id"] = "e9"
+    grounding = payload["av_grounding"]["segment_groundings"][0]
+    grounding["entity_id"] = "e9"
+    grounding["evidence_codes"] = ["voice_continuity"]
     backend, _ = _backend(tmp_path, [(json.dumps(payload), 8)])
 
     result = backend.reconcile(
@@ -3009,7 +3023,46 @@ def test_repeated_unreliable_onscreen_evidence_is_conservatively_downgraded(
     }
 
 
-def test_onscreen_code_without_grounded_stage_a_evidence_is_downgraded(
+def test_stage_a_c_articulation_contradiction_triggers_full_av_recheck(
+    tmp_path: Path,
+) -> None:
+    invalid_payload = _annotation().model_dump(mode="json")
+    observation = invalid_payload["visual_observation"]["segment_views"][0][
+        "entity_observations"
+    ][0]
+    observation["speech_correlated_articulation"] = "not_observed"
+    invalid_payload["av_grounding"]["segment_groundings"][0]["evidence_codes"] = [
+        "visible_lip_motion",
+        "av_temporal_alignment",
+    ]
+    corrected = _annotation(entity_id=None)
+    backend, completions = _backend(
+        tmp_path,
+        [(json.dumps(invalid_payload), 8), (corrected.model_dump_json(), 8)],
+    )
+
+    result = backend.reconcile(
+        _job_fixture(tmp_path),
+        segment_ids=["segment_1"],
+        transcribed_segment_ids=["segment_1"],
+        allowed_entity_ids={"e1"},
+        allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+    )
+
+    grounding = result.annotation.segment_decisions[0]
+    assert grounding.binding_status == "offscreen"
+    assert grounding.speech_presentation == "offscreen_spoken"
+    assert grounding.entity_id is None
+    assert result.recheck_count == 1
+    assert result.model_call_count == 2
+    assert len(completions.requests) == 2
+    assert result.deterministic_correction_counts == {}
+    recheck_prompt = completions.requests[1]["messages"][1]["content"][-1]["text"]
+    assert "Stage A/Stage C contradiction" in recheck_prompt
+    assert "reinspect the exact segment audiovisually" in recheck_prompt
+
+
+def test_stage_a_c_articulation_contradiction_after_recheck_fails_closed(
     tmp_path: Path,
 ) -> None:
     payload = _annotation().model_dump(mode="json")
@@ -3021,8 +3074,49 @@ def test_onscreen_code_without_grounded_stage_a_evidence_is_downgraded(
         "visible_lip_motion",
         "av_temporal_alignment",
     ]
-    backend, completions = _backend(tmp_path, [(json.dumps(payload), 8)])
+    raw = json.dumps(payload)
+    backend, completions = _backend(tmp_path, [(raw, 8), (raw, 8)])
 
+    with pytest.raises(MimoBackendFailure) as exc_info:
+        backend.reconcile(
+            _job_fixture(tmp_path),
+            segment_ids=["segment_1"],
+            transcribed_segment_ids=["segment_1"],
+            allowed_entity_ids={"e1"},
+            allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+        )
+
+    assert exc_info.value.recheck_count == 1
+    assert exc_info.value.model_call_count == 2
+    assert "stage_a_av_articulation_contradiction" in {
+        issue.code for issue in exc_info.value.issues
+    }
+    assert len(completions.requests) == 2
+
+
+def test_observed_stage_a_with_incomplete_onscreen_stage_c_requires_recheck(
+    tmp_path: Path,
+) -> None:
+    payload = _annotation(resolution="needs_acoustic_refinement").model_dump(
+        mode="json"
+    )
+    grounding = payload["av_grounding"]["segment_groundings"][0]
+    grounding.update(
+        binding_status="uncertain",
+        speech_presentation="onscreen_spoken",
+        entity_id=None,
+        evidence_codes=["no_visible_lip_motion", "insufficient_evidence"],
+    )
+    annotation = MimoAVAnnotationDraft.model_validate(payload)
+    issue_codes = {issue.code for issue in _validate(annotation)}
+    assert "stage_a_av_articulation_contradiction" in issue_codes
+    assert "onscreen_grounding_incomplete" in issue_codes
+
+    corrected = _annotation(entity_id=None)
+    backend, completions = _backend(
+        tmp_path,
+        [(annotation.model_dump_json(), 8), (corrected.model_dump_json(), 8)],
+    )
     result = backend.reconcile(
         _job_fixture(tmp_path),
         segment_ids=["segment_1"],
@@ -3031,14 +3125,49 @@ def test_onscreen_code_without_grounded_stage_a_evidence_is_downgraded(
         allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
     )
 
-    grounding = result.annotation.segment_decisions[0]
-    assert grounding.binding_status == "no_reliable_entity"
-    assert grounding.speech_presentation == "uncertain"
-    assert grounding.entity_id is None
-    assert result.recheck_count == 0
-    assert len(completions.requests) == 1
-    assert result.deterministic_correction_counts == {
-        "conservative_visible_speaker_downgrade": 1
+    assert result.recheck_count == 1
+    assert result.model_call_count == 2
+    assert result.annotation.segment_decisions[0].binding_status == "offscreen"
+    assert "conservative_visible_speaker_downgrade" not in (
+        result.deterministic_correction_counts
+    )
+    assert len(completions.requests) == 2
+
+
+def test_stage_c_resolves_single_speaker_audio_refinement_for_materializer(
+    tmp_path: Path,
+) -> None:
+    annotation = _annotation(resolution="needs_acoustic_refinement")
+
+    assert not _validate(annotation)
+    corrected, rendered, warnings = _materialize_sample(
+        _sample(tmp_path),
+        _job_fixture(tmp_path),
+        _record_fixture(tmp_path, annotation),
+    )
+
+    assert corrected[0].speaker_cluster_id == "g1"
+    assert corrected[0].entity_id == "e1"
+    assert corrected[0].entity_occurrence_id == "clip-1/e1"
+    assert "<Subject 1> (S1)" in rendered
+    assert "says, <d>[English] Exact, text!</d>" in rendered
+    assert not any("acoustic_refinement_unresolved" in item for item in warnings)
+
+
+@pytest.mark.parametrize(
+    "composition",
+    ["overlapping_secondary_speech", "sequential_multi_speaker_speech"],
+)
+def test_stage_c_cannot_resolve_multi_speaker_audio_refinement(
+    composition: str,
+) -> None:
+    annotation = _annotation(
+        resolution="needs_acoustic_refinement",
+        composition=composition,
+    )
+
+    assert "visible_entity_requires_resolved_audio" in {
+        issue.code for issue in _validate(annotation)
     }
 
 
@@ -4796,6 +4925,136 @@ def _job_for_reference_inventory(
     return _job(values)
 
 
+def _attribute_subject_annotation(description: str) -> MimoAVAnnotationDraft:
+    payload = _annotation().model_dump(mode="json")
+    payload["h3_semantics"]["subject_definitions"] = [
+        _subject_definition(
+            "<Subject 1>",
+            "A clearly visible person with a stable appearance.",
+        ),
+        _subject_definition("<Subject 2>", description),
+    ]
+    payload["h3_semantics"]["visual_retention_analysis"] = [
+        _retention(
+            "<Subject 1>",
+            "fully_preserved",
+            "The owning person remains clearly visible.",
+        ),
+        _retention(
+            "<Subject 2>",
+            "fully_preserved",
+            "The referenced hairstyle remains visible on its owner.",
+        ),
+    ]
+    return MimoAVAnnotationDraft.model_validate(payload)
+
+
+def test_attribute_subject_contract_is_attribute_only_and_owner_aware(
+    tmp_path: Path,
+) -> None:
+    references = _visual_reference_inventory(
+        tmp_path,
+        ["subject", "hair"],
+        same_entity=True,
+    )
+    sample = _sample_with_reference_inventory(tmp_path, references)
+    job = _job_for_reference_inventory(tmp_path, sample)
+    backend, _ = _backend(tmp_path, [])
+
+    requirements = backend.build_mandatory_h3_draft_contract(job)[
+        "subject_definition_requirements"
+    ]
+    attribute = requirements[1]
+    assert attribute == {
+        "subject_label": "<Subject 2>",
+        "kind": "attribute",
+        "entity_id": None,
+        "attribute_id": "a2",
+        "owner_entity_id": "e1",
+        "attribute_type": "hair",
+        "required_source_picture_labels": ["<Picture 2>"],
+    }
+    prompt = backend._prompt(job)
+    assert "Attribute Subjects describe only their attribute" in prompt
+    assert "retention is judged on that owner, not as an independent entity" in prompt
+
+
+def test_attribute_subject_rejects_standalone_owner_and_accepts_attribute_prose(
+    tmp_path: Path,
+) -> None:
+    references = _visual_reference_inventory(
+        tmp_path,
+        ["subject", "hair"],
+        same_entity=True,
+    )
+    sample = _sample_with_reference_inventory(tmp_path, references)
+    job = _job_for_reference_inventory(tmp_path, sample)
+    allowed_labels = {
+        *(item.picture_label for item in job.reference_images),
+        *(item.subject_label for item in job.reference_subjects),
+    }
+
+    bad = _attribute_subject_annotation(
+        "A woman with short dark-brown hair and straight bangs."
+    )
+    good = _attribute_subject_annotation(
+        "Short dark-brown layered hair with straight bangs framing the face."
+    )
+
+    assert "attribute_subject_redefines_owner_entity" in {
+        issue.code
+        for issue in _validate(
+            bad,
+            allowed_reference_labels=allowed_labels,
+            reference_subjects=job.reference_subjects,
+        )
+    }
+    assert "attribute_subject_redefines_owner_entity" not in {
+        issue.code
+        for issue in _validate(
+            good,
+            allowed_reference_labels=allowed_labels,
+            reference_subjects=job.reference_subjects,
+        )
+    }
+
+
+def test_attribute_subject_failure_uses_existing_full_av_recheck(
+    tmp_path: Path,
+) -> None:
+    references = _visual_reference_inventory(
+        tmp_path,
+        ["subject", "hair"],
+        same_entity=True,
+    )
+    sample = _sample_with_reference_inventory(tmp_path, references)
+    job = _job_for_reference_inventory(tmp_path, sample)
+    bad = _attribute_subject_annotation("A woman with short dark-brown hair.")
+    good = _attribute_subject_annotation("Short dark-brown layered hair with straight bangs.")
+    backend, completions = _backend(
+        tmp_path,
+        [(bad.model_dump_json(), 8), (good.model_dump_json(), 8)],
+    )
+
+    result = backend.reconcile(
+        job,
+        segment_ids=["segment_1"],
+        transcribed_segment_ids=["segment_1"],
+        allowed_entity_ids={"e1"},
+        allowed_reference_labels={
+            *(item.picture_label for item in job.reference_images),
+            *(item.subject_label for item in job.reference_subjects),
+        },
+    )
+
+    assert result.recheck_count == 1
+    assert result.annotation.h3_semantics.subject_definitions[1].description.startswith(
+        "Short dark-brown layered hair"
+    )
+    recheck_prompt = completions.requests[1]["messages"][1]["content"][-1]["text"]
+    assert "attribute-only visual prose" in recheck_prompt
+
+
 @pytest.mark.parametrize("picture_count", [8, 9])
 def test_mimo_reference_selection_is_exact_noop_at_or_below_limit(
     tmp_path: Path,
@@ -5960,7 +6219,8 @@ def test_visible_listener_prose_does_not_reattach_continuing_speaker_entity(
 
     assert corrected[0].speaker_cluster_id == corrected[1].speaker_cluster_id == "g1"
     assert corrected[1].entity_id is None
-    assert "(S1), with speech presentation uncertain" in rendered
+    assert "(S1) says," in rendered
+    assert "presentation uncertain" not in rendered
     assert "<Subject 1> (S1) says, <d>[English] Exact line 2.</d>" not in rendered
 
 
@@ -6200,6 +6460,62 @@ def test_non_diegetic_music_does_not_substitute_for_soundscape() -> None:
     assert annotation.audio_semantics.non_diegetic_music_status == "present"
 
 
+def test_scenic_synthesized_drone_is_representable_as_non_diegetic_music() -> None:
+    payload = _annotation().model_dump(mode="json")
+    semantics = payload["audio_observation"]["audio_semantics"]
+    semantics["temporal_non_speech_events"] = [
+        {
+            "event_id": "ae1",
+            "approximate_start_time": 0.0,
+            "approximate_end_time": 1.0,
+            "category": "non_diegetic_music",
+            "pattern": "continuous",
+            "description": "A sustained synthesized musical drone underlies the scene.",
+            "source_grounding": "audible_only",
+        }
+    ]
+    semantics["overall_soundscape_status"] = "absent"
+    semantics["overall_soundscape"] = None
+    semantics["non_diegetic_music_status"] = "present"
+    semantics["non_diegetic_music"] = (
+        "A beatless, slowly evolving synthesized drone forms the audience-only score."
+    )
+    payload["h3_projection"]["shots"][0]["timeline_parts"] = [
+        _prose("visual"),
+        _speech("segment_1"),
+    ]
+
+    annotation = MimoAVAnnotationDraft.model_validate(payload)
+
+    assert not _validate(annotation)
+    assert annotation.audio_semantics.overall_soundscape_status == "absent"
+    assert annotation.audio_semantics.non_diegetic_music_status == "present"
+
+
+def test_mechanical_hum_remains_soundscape_not_music() -> None:
+    payload = _annotation().model_dump(mode="json")
+    event = payload["audio_observation"]["audio_semantics"][
+        "temporal_non_speech_events"
+    ][0]
+    event.update(
+        category="mechanical",
+        pattern="continuous",
+        description="A steady HVAC hum is audible in the room.",
+        source_grounding="audiovisually_grounded",
+    )
+    semantics = payload["audio_observation"]["audio_semantics"]
+    semantics["overall_soundscape"] = "A steady HVAC hum fills the room."
+    semantics["non_diegetic_music_status"] = "absent"
+    semantics["non_diegetic_music"] = None
+    annotation = MimoAVAnnotationDraft.model_validate(payload)
+
+    assert not _validate(annotation)
+    assert annotation.audio_semantics.temporal_non_speech_events[0].category == (
+        "mechanical"
+    )
+    assert annotation.audio_semantics.non_diegetic_music_status == "absent"
+
+
 @pytest.mark.parametrize(
     ("status", "description", "expected"),
     [
@@ -6338,7 +6654,7 @@ def test_materialized_h3_keeps_official_sections_and_hides_internal_stages(
             "device_playback",
             "heard through an in-scene device rather than visible speech",
         ),
-        ("uncertain", "with speech presentation uncertain"),
+        ("uncertain", "(S1) says"),
     ],
 )
 def test_materializer_renders_non_onscreen_speech_without_visible_subject(
@@ -6357,7 +6673,10 @@ def test_materializer_renders_non_onscreen_speech_without_visible_subject(
     assert segment.entity_occurrence_id is None
     assert expected_phrase in rendered
     assert "<Subject 1> (S1)" not in rendered
-    assert " says," not in rendered
+    if presentation != "uncertain":
+        assert " says," not in rendered
+    else:
+        assert "presentation uncertain" not in rendered
     assert "<d>[English] Exact, text!</d>" in rendered
     assert (
         segment.start_time,
@@ -6674,7 +6993,7 @@ def test_materializer_isolates_one_final_contract_failure_and_continues(
         "r2v.h3.mimo25_h3_shadow.11"
     }
     assert {item.materializer_version for item in records} == {
-        "h3_mimo25_materializer_v14"
+        "h3_mimo25_materializer_v15"
     }
 
 

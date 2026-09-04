@@ -28,11 +28,11 @@ from r2v_data_v2.structured_output import (
 
 MIMO25_MODEL = "mimo-v2.5"
 MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
-MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v20"
-MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v14"
+MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v21"
+MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v15"
 MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.13"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.21"
-MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v14"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.22"
+MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v15"
 DEFAULT_BASE64_LIMIT_BYTES = 50 * 1024 * 1024
 MimoTransport = Literal["xiaomi", "sglang"]
 
@@ -62,6 +62,14 @@ _VOICE_IDENTITY_PROFILE = re.compile(
     r"|\b(?:mother|father|sister|brother|husband|wife|manager|employee)\b"
     r"|\b(?:personality|character|temperament)\b"
     r"|\b(?:voice|speaker)\s+(?:of|named|identified\s+as)\b",
+    flags=re.IGNORECASE,
+)
+_HUMAN_ATTRIBUTE_TYPES = frozenset(
+    {"hair", "face", "glasses", "upper_clothing", "accessory"}
+)
+_STANDALONE_HUMAN_SUBJECT_LEAD = re.compile(
+    r"^\s*(?:is\s+)?(?:an?\s+|the\s+)?(?:woman|man|person|girl|boy|child)"
+    r"(?:\s+(?:with|wearing|who|standing|shown|depicted)\b|\s*[,.;:]|\s*$)",
     flags=re.IGNORECASE,
 )
 _SOUNDSCAPE_CONTAMINATION = re.compile(
@@ -188,6 +196,78 @@ def _has_grounded_onscreen_evidence(
         non_assessable
         and "speaker_visible_mouth_occluded" in evidence
         and bool(evidence & {"av_temporal_alignment", "voice_continuity"})
+    )
+
+
+def _observed_articulation_entity_ids(
+    view: MimoVisualSegmentView | None,
+    *,
+    allowed_entity_ids: set[str],
+) -> set[str]:
+    if view is None:
+        return set()
+    return {
+        item.entity_id
+        for item in view.entity_observations
+        if item.entity_id in allowed_entity_ids
+        and item.speech_correlated_articulation == "observed"
+    }
+
+
+def _has_stage_a_c_articulation_contradiction(
+    decision: MimoAVSegmentGrounding,
+    view: MimoVisualSegmentView | None,
+    *,
+    allowed_entity_ids: set[str],
+) -> bool:
+    observed_entity_ids = _observed_articulation_entity_ids(
+        view,
+        allowed_entity_ids=allowed_entity_ids,
+    )
+    evidence = set(decision.evidence_codes)
+    if "no_visible_lip_motion" in evidence and observed_entity_ids:
+        return True
+    if "visible_lip_motion" not in evidence:
+        return False
+    if decision.entity_id is None:
+        return not observed_entity_ids
+    if decision.entity_id not in allowed_entity_ids:
+        return False
+    return decision.entity_id not in observed_entity_ids
+
+
+def _has_incomplete_onscreen_grounding_contradiction(
+    decision: MimoAVSegmentGrounding,
+    view: MimoVisualSegmentView | None,
+    *,
+    allowed_entity_ids: set[str],
+) -> bool:
+    return (
+        decision.speech_presentation == "onscreen_spoken"
+        and (
+            decision.binding_status != "visible_entity"
+            or decision.entity_id is None
+        )
+        and bool(
+            _observed_articulation_entity_ids(
+                view,
+                allowed_entity_ids=allowed_entity_ids,
+            )
+        )
+    )
+
+
+def _audio_allows_visible_entity_resolution(
+    decision: MimoAudioSegmentDecision | None,
+) -> bool:
+    if decision is None or decision.primary_speaker_group is None:
+        return False
+    if decision.resolution == "resolved":
+        return True
+    return (
+        decision.resolution == "needs_acoustic_refinement"
+        and decision.vocal_composition
+        in {"single_speaker", "same_speaker_nonlexical"}
     )
 
 
@@ -853,7 +933,7 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.21"] = MIMO25_BACKEND_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.22"] = MIMO25_BACKEND_VERSION
     backend: Literal[
         "xiaomi_openai_compatible", "sglang_openai_compatible"
     ]
@@ -870,10 +950,10 @@ class MimoBackendProvenance(SchemaModel):
     media_mode: Literal["base64", "http"]
     media_root: str
     media_base_url: str | None = None
-    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v20"] = (
+    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v21"] = (
         MIMO25_PROMPT_VERSION
     )
-    policy_version: Literal["h3_mimo25_av_authority_contract_v14"] = (
+    policy_version: Literal["h3_mimo25_av_authority_contract_v15"] = (
         MIMO25_POLICY_VERSION
     )
     annotation_schema_version: Literal["r2v.h3.mimo25_av_annotation.13"] = (
@@ -889,6 +969,7 @@ class MimoBackendProvenance(SchemaModel):
         "h3_mimo25_materializer_v12",
         "h3_mimo25_materializer_v13",
         "h3_mimo25_materializer_v14",
+        "h3_mimo25_materializer_v15",
     ] = (
         MIMO25_MATERIALIZER_VERSION
     )
@@ -1124,17 +1205,21 @@ STAGE B audio_observation: PURE AUDIO EVIDENCE
 - Each transcribed segment has concise nonempty delivery_style; every non-transcribed segment uses null. speaker_voice_profiles exactly cover resolved transcribed groups in first-appearance order and contain only supported acoustic characteristics, never transcript or identity claims.
 - Emit genuinely audible non-speech events with contiguous chronological aeN IDs and tight approximate times. Visual evidence may identify a genuinely audible source but never invent sound.
 - Soundscape event categories are physical, environmental, mechanical, electronic, human_non_speech, and other. Music categories are diegetic_music and non_diegetic_music. Neither music category contributes to overall_soundscape. Diegetic music may enter the detailed timeline; non-diegetic music belongs only in non_diegetic_music.
+- A sustained layer is not automatically ambience because it lacks beats or melody. A pitched or harmonically structured synthesized/processed soundtrack bed, sustained musical drone or pad, instrumental layer, or score-like layer with no plausible visible in-scene source is non_diegetic_music even when beatless, minimal, atmospheric, eerie, or slowly evolving. Do not relabel a soundtrack as room ambience merely because it can be called a drone, hum, or ambient bed. HVAC/electrical hum, wind, traffic, room tone, and machinery remain non-musical soundscape only when the audible and audiovisual evidence supports that source distinction.
 - overall_soundscape is present for audible ambience, room tone, environmental/physical/mechanical/electronic/non-verbal human sound; absent only for verified complete soundscape silence; unknown only when Audio evidence is unavailable or genuinely uncertain. It must never contain dialogue, narration, voice-over, lyrics, singing, music, BGM, score, soundtrack, song, melody, or instrumental music. non_diegetic_music describes audience-only score/BGM. Do not substitute either field for the other.
 
 STAGE C av_grounding: AUDIOVISUAL CO-ANALYSIS
 - segment_groundings exactly follow allowed_segment_ids and preserve each matching Stage B primary_speaker_group. Decide binding_status, speech_presentation, entity_id, confidence, and evidence from the exact visual segment view plus Audio/AV evidence.
 - visible_entity must name an entity present in that exact Stage A view. Reliable onscreen evidence is observed speech-correlated articulation with visible_lip_motion, OR visible presence whose face/mouth is genuinely non-assessable because of back/profile view, occlusion, or crop, marked speaker_visible_mouth_occluded together with av_temporal_alignment or voice_continuity.
+- Stage B is Audio-only and may use needs_acoustic_refinement. Stage C may resolve it to visible_entity only when Stage B already supplies one primary gN, vocal_composition is single_speaker or same_speaker_nonlexical, and the exact Stage A/C evidence reliably grounds that visible speaker. Never use this path for overlapping or sequential multi-speaker speech, uncertain composition, or a missing speaker group.
+- Stage A articulation observations and Stage C lip-motion evidence must agree for each exact segment. If they conflict, reinspect the audiovisual interval instead of copying either stage or changing fields merely for consistency.
 - OFFSCREEN IS A SPATIAL CLAIM. Hidden lips, a hidden face, back/profile orientation, an embrace, partial occlusion, or an out-of-frame mouth while the body/head remains visible does not mean offscreen. A visible listener without reliable speaker evidence must not inherit the audible speaker.
 - offscreen_spoken requires offscreen, entity_id=null, and offscreen_audio. voice_over requires null entity and voice_over_context. device_playback requires null entity and device_playback_context. message_voice_over requires null entity plus message_text_alignment and voice_over_context. Inadequate evidence becomes no_reliable_entity/uncertain, not guessed offscreen.
 - A direct_anchor_present current entity without explicit LR-ASD conflict is a strong prior, though not absolute truth. Override only for explicit current-segment AV contradiction. LR-ASD support is not required for a true visible speaker.
 
 STAGE D h3_semantics
-- Produce only official visual Subject definitions, concise summary, and visual retention rows. Definitions are natural MiniMax H3 visual prose; pipeline code appends exact Picture provenance. Retention markers are only fully_preserved, partially_preserved, weak_reference; attribute_transfer is forbidden. Audio soundscape/music comes only from Stage B.
+- Produce only official visual Subject definitions, concise summary, and visual retention rows. Definitions are natural MiniMax H3 visual prose; pipeline code appends exact Picture provenance. An entity Subject describes the reusable entity. An attribute Subject describes only the referenced attribute itself, never another person/object or a redefinition of its owner_entity_id. For hair describe only hairstyle, shape, color, and texture; for face only facial appearance/features; for glasses only eyewear; for upper_clothing only the garment; for accessory only the accessory.
+- Attribute retention is owner-aware: judge whether the referenced attribute remains visibly retained on its owning entity in the target, never whether a second independent person/object exists. Do not mark an attribute weak_reference merely because it is not an independent entity. Retention markers are only fully_preserved, partially_preserved, weak_reference; attribute_transfer is forbidden. Audio soundscape/music comes only from Stage B.
 
 STAGE E h3_projection
 - Project typed visual{block_id}, speech{segment_id}, and audio_event{event_id} parts in playback order. Every Stage A visual block appears exactly once in its own shot. Every transcribed segment appears exactly once in chronological order. Every non-speech event except non_diegetic_music appears exactly once in chronological order. Never project non-diegetic music into detailed description.
@@ -1326,6 +1411,7 @@ def validate_annotation(
             )
     for decision in groundings:
         audio = audio_by_id.get(decision.segment_id)
+        view = view_by_id.get(decision.segment_id)
         if audio is None or decision.primary_speaker_group != audio.primary_speaker_group:
             issues.append(
                 ValidationIssue(
@@ -1334,17 +1420,43 @@ def validate_annotation(
                     "AV grounding must preserve the Stage B primary speaker group",
                 )
             )
-        if decision.binding_status == "visible_entity" and (
-            audio is None or audio.resolution != "resolved"
+        if (
+            decision.binding_status == "visible_entity"
+            and not _audio_allows_visible_entity_resolution(audio)
         ):
             issues.append(
                 ValidationIssue(
                     "visible_entity_requires_resolved_audio",
                     decision.segment_id,
-                    "visible entity grounding requires one resolved Stage B speaker",
+                    "visible entity grounding requires a resolved Stage B speaker or "
+                    "one AV-resolvable single-speaker refinement group",
                 )
             )
-        view = view_by_id.get(decision.segment_id)
+        if _has_stage_a_c_articulation_contradiction(
+            decision,
+            view,
+            allowed_entity_ids=allowed_entity_ids,
+        ):
+            issues.append(
+                ValidationIssue(
+                    "stage_a_av_articulation_contradiction",
+                    decision.segment_id,
+                    "Stage A articulation and Stage C lip-motion evidence disagree",
+                )
+            )
+        if _has_incomplete_onscreen_grounding_contradiction(
+            decision,
+            view,
+            allowed_entity_ids=allowed_entity_ids,
+        ):
+            issues.append(
+                ValidationIssue(
+                    "onscreen_grounding_incomplete",
+                    decision.segment_id,
+                    "onscreen speech with plausible Stage A evidence requires a "
+                    "complete visible entity grounding",
+                )
+            )
         if (
             decision.binding_status == "visible_entity"
             and decision.entity_id is not None
@@ -1921,6 +2033,20 @@ def validate_annotation(
                     f"{subject_label} definition must remain visual-only",
                 )
             )
+        if (
+            len(definitions) == 1
+            and subject.kind == "attribute"
+            and subject.attribute_type in _HUMAN_ATTRIBUTE_TYPES
+            and _STANDALONE_HUMAN_SUBJECT_LEAD.search(definitions[0].description)
+        ):
+            issues.append(
+                ValidationIssue(
+                    "attribute_subject_redefines_owner_entity",
+                    subject_label,
+                    "attribute Subject must describe only the referenced attribute, "
+                    "not a standalone person",
+                )
+            )
     model_owned_text = _normalized_text(
         "\n".join(
             (
@@ -2220,6 +2346,8 @@ def _rebuild_contaminated_overall_soundscape_from_events(
 
 def _conservative_visible_speaker_downgrade(
     annotation: MimoAVAnnotationDraft,
+    *,
+    allowed_entity_ids: set[str],
 ) -> tuple[MimoAVAnnotationDraft, int]:
     view_by_segment = {
         view.segment_id: view for view in annotation.visual_observation.segment_views
@@ -2231,13 +2359,24 @@ def _conservative_visible_speaker_downgrade(
         payload["av_grounding"]["segment_groundings"],
         strict=True,
     ):
+        view = view_by_segment.get(grounding.segment_id)
+        if _has_stage_a_c_articulation_contradiction(
+            grounding,
+            view,
+            allowed_entity_ids=allowed_entity_ids,
+        ) or _has_incomplete_onscreen_grounding_contradiction(
+            grounding,
+            view,
+            allowed_entity_ids=allowed_entity_ids,
+        ):
+            continue
         claims_visible_speech = (
             grounding.binding_status == "visible_entity"
             or grounding.speech_presentation == "onscreen_spoken"
         )
         if not claims_visible_speech or _has_grounded_onscreen_evidence(
             grounding,
-            view_by_segment.get(grounding.segment_id),
+            view,
         ):
             continue
         evidence_codes = list(decision["evidence_codes"])
@@ -2430,7 +2569,10 @@ def _normalize_annotation_before_recheck(
     )
     corrections["unknown_grounding_entity_downgrade"] += count
 
-    annotation, count = _conservative_visible_speaker_downgrade(annotation)
+    annotation, count = _conservative_visible_speaker_downgrade(
+        annotation,
+        allowed_entity_ids=allowed_entity_ids,
+    )
     corrections["conservative_visible_speaker_downgrade"] += count
 
     annotation, count = _conservative_offscreen_presentation_downgrade(annotation)
@@ -2596,6 +2738,11 @@ class OpenAIMimo25Backend:
             "subject_definition_requirements": [
                 {
                     "subject_label": subject.subject_label,
+                    "kind": subject.kind,
+                    "entity_id": subject.entity_id,
+                    "attribute_id": subject.attribute_id,
+                    "owner_entity_id": subject.owner_entity_id,
+                    "attribute_type": subject.attribute_type,
                     "required_source_picture_labels": list(
                         subject.source_picture_labels
                     ),
@@ -2643,7 +2790,9 @@ class OpenAIMimo25Backend:
             + "\nUse allowed_segment_ids for all decisions and transcribed_segment_ids "
             "for typed speech parts. Author only each Subject's visual description; "
             "do not put Picture labels in description because the pipeline owns and "
-            "materializes exact Subject-to-Picture provenance."
+            "materializes exact Subject-to-Picture provenance. Attribute Subjects "
+            "describe only their attribute and remain owned by owner_entity_id; their "
+            "retention is judged on that owner, not as an independent entity."
         )
 
     def _prompt(self, job: MimoBackendJob) -> str:
@@ -2767,6 +2916,13 @@ class OpenAIMimo25Backend:
                 "dialect, and other Audio-profile concepts from Subject definitions; "
                 "describe only visible appearance there."
             )
+        if "attribute_subject_redefines_owner_entity" in issue_codes:
+            issue_actions.append(
+                "Regenerate each affected attribute Subject as attribute-only visual "
+                "prose using its supplied kind, attribute_type, and owner_entity_id. "
+                "Do not define a standalone woman, man, person, girl, boy, child, "
+                "object, or second owner; judge retention on the supplied owner."
+            )
         if "speaker_voice_profile_contains_identity_claim" in issue_codes:
             issue_actions.append(
                 "Remove demographic, identity, nationality, and role claims from "
@@ -2816,6 +2972,19 @@ class OpenAIMimo25Backend:
                 "speaker to a visible listener, and never preserve "
                 "visible_entity merely because source_cluster_support or the current "
                 "binding proposes it."
+            )
+        if issue_codes & {
+            "stage_a_av_articulation_contradiction",
+            "onscreen_grounding_incomplete",
+        }:
+            issue_actions.append(
+                "For each Stage A/Stage C contradiction, reinspect the exact segment "
+                "audiovisually. Make the visual articulation observation and Stage C "
+                "lip-motion evidence agree with what is actually visible, then decide "
+                "whether the audible speech belongs to a supplied visible entity, is "
+                "genuinely offscreen, or is voice-over/device/message Audio. Do not "
+                "merely change fields to satisfy validation, and never transfer an "
+                "offscreen speaker to a visible listener."
             )
         if "visible_speaker_evidence_presentation_contradiction" in issue_codes:
             issue_actions.append(

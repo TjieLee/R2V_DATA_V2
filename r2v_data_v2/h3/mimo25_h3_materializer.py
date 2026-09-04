@@ -236,6 +236,7 @@ class MimoH3ShadowRecord(SchemaModel):
         "h3_mimo25_materializer_v12",
         "h3_mimo25_materializer_v13",
         "h3_mimo25_materializer_v14",
+        "h3_mimo25_materializer_v15",
     ] = (
         MIMO25_MATERIALIZER_VERSION
     )
@@ -447,22 +448,22 @@ def _corrected_segments(
             or original.speaker_cluster_id != source.source_speaker_cluster_id
         ):
             raise ValueError("source H3 speech differs from authoritative Qwen3-ASR")
-        resolved = (
+        audio_resolved = (
             audio_decision.resolution == "resolved"
             and audio_decision.primary_speaker_group is not None
         )
+        visible_entity_resolved = (
+            grounding.binding_status == "visible_entity"
+            and grounding.speech_presentation == "onscreen_spoken"
+            and grounding.entity_id is not None
+        )
+        resolved = audio_resolved or visible_entity_resolved
         group = (
             audio_decision.primary_speaker_group
             if resolved
             else f"fallback__{source.source_speaker_cluster_id}"
         )
-        entity_id = (
-            grounding.entity_id
-            if resolved
-            and grounding.binding_status == "visible_entity"
-            and grounding.speech_presentation == "onscreen_spoken"
-            else None
-        )
+        entity_id = grounding.entity_id if visible_entity_resolved else None
         if not resolved:
             warnings.append(f"{segment_id}:acoustic_refinement_unresolved")
         corrected.append(

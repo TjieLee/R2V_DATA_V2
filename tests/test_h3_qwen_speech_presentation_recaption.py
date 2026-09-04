@@ -289,7 +289,7 @@ def test_visible_entity_must_be_supplied(tmp_path: Path) -> None:
         ("voice_over", "(S1), as a voice-over rather than visible speech: <d>[English] Keep the exact words.</d>"),
         ("message_voice_over", "(S1), as a message voice-over rather than visible speech: <d>[English] Keep the exact words.</d>"),
         ("device_playback", "(S1), heard through an in-scene device rather than visible speech: <d>[English] Keep the exact words.</d>"),
-        ("uncertain", "(S1), with speech presentation uncertain: <d>[English] Keep the exact words.</d>"),
+        ("uncertain", "(S1) says, <d>[English] Keep the exact words.</d>"),
     ],
 )
 def test_corrected_facts_and_materializer_preserve_authority(
@@ -335,6 +335,8 @@ def test_corrected_facts_and_materializer_preserve_authority(
         updated.locked_dialogue_block,
     )
     assert expected in structured.detailed_description
+    if presentation == "uncertain":
+        assert "presentation uncertain" not in structured.detailed_description
     if presentation != "onscreen_spoken":
         assert updated.entity_id is None
         assert "<Subject 1> (S1) says" not in structured.detailed_description
