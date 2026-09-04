@@ -54,11 +54,17 @@ ConditioningVariant = Literal[
     "visual_only",
     "target_voice_reference",
     "cross_voice_reference",
+    "music_reference",
     "full_audio_reuse",
 ]
 RecaptionStatus = Literal["ready", "failed", "unsupported"]
 SubjectKind = Literal["entity", "attribute", "background"]
-AudioKind = Literal["target_voice", "cross_voice", "full_audio_reuse"]
+AudioKind = Literal[
+    "target_voice",
+    "cross_voice",
+    "music_reference",
+    "full_audio_reuse",
+]
 
 _REFERENCE_LABEL = re.compile(r"<(Picture|Subject|Video|Audio)\s+([1-9]\d*)>")
 _SPEAKER_LABEL = re.compile(r"\(S([1-9]\d*)\)")
@@ -195,6 +201,7 @@ class RecaptionAudioContract(SchemaModel):
     entity_id: str | None = None
     speaker_id: str | None = Field(default=None, pattern=r"^S[1-9]\d*$")
     voice_characteristics: str | None = None
+    music_characteristics: str | None = None
     retention_marker: Literal["fully_copy", "reference"]
 
     @model_validator(mode="after")
@@ -208,16 +215,30 @@ class RecaptionAudioContract(SchemaModel):
                 or self.entity_id is not None
                 or self.speaker_id is not None
                 or self.voice_characteristics is not None
+                or self.music_characteristics is not None
             ):
                 raise ValueError("full-audio reuse must be an unbound full copy")
+        elif self.kind == "music_reference":
+            if (
+                self.retention_marker != "reference"
+                or self.subject_label is not None
+                or self.entity_id is not None
+                or self.speaker_id is not None
+                or self.voice_characteristics is not None
+                or self.music_characteristics is None
+            ):
+                raise ValueError("music reference must be an unbound described reference")
         elif (
             self.retention_marker != "reference"
             or self.subject_label is None
             or self.entity_id is None
+            or self.music_characteristics is not None
         ):
             raise ValueError("voice reference requires a bound Subject and entity")
         if self.voice_characteristics is not None and not self.voice_characteristics.strip():
             raise ValueError("voice characteristics must be non-empty or null")
+        if self.music_characteristics is not None and not self.music_characteristics.strip():
+            raise ValueError("music characteristics must be non-empty or null")
         return self
 
 
@@ -783,6 +804,8 @@ def build_reference_contract(
                 retention_marker="fully_copy",
             )
         )
+    elif variant == "music_reference":
+        raise ValueError("music reference requires one explicit extracted Audio asset")
     return RecaptionReferenceContract(pictures=pictures, subjects=subjects, audios=audios)
 
 
@@ -903,7 +926,11 @@ def build_audio_facts(
 def _summary_prefix(variant: ConditioningVariant) -> str:
     if variant == "visual_only":
         return "[reference generation]"
-    if variant in {"target_voice_reference", "cross_voice_reference"}:
+    if variant in {
+        "target_voice_reference",
+        "cross_voice_reference",
+        "music_reference",
+    }:
         return "[reference generation + audio reference]"
     return "[reference generation + audio reuse]"
 
@@ -1286,6 +1313,13 @@ def validate_h3_draft(
 def _canonical_audio_definition(audio: RecaptionAudioContract) -> str:
     if audio.kind == "full_audio_reuse":
         return f"{audio.audio_label} is the supplied full-audio reference for the target."
+    if audio.kind == "music_reference":
+        assert audio.music_characteristics is not None
+        return (
+            f"{audio.audio_label} is a music-style reference for the target video's "
+            f"audience-only score, providing {audio.music_characteristics} without "
+            "copying the source signal."
+        )
     assert audio.subject_label is not None
     speaker = "" if audio.speaker_id is None else f" ({audio.speaker_id})"
     definition = (
@@ -1302,6 +1336,12 @@ def _canonical_audio_retention(audio: RecaptionAudioContract) -> str:
         return (
             f"{audio.audio_label}: fully_copy - the supplied full audio is reused "
             "in full."
+        )
+    if audio.kind == "music_reference":
+        assert audio.music_characteristics is not None
+        return (
+            f"{audio.audio_label}: reference - its {audio.music_characteristics} guide "
+            "the target score without copying the source waveform."
         )
     assert audio.subject_label is not None
     characteristics = (

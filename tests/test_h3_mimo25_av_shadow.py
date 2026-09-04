@@ -85,6 +85,7 @@ from r2v_data_v2.h3.mimo25_recovered_voice import (
 )
 from r2v_data_v2.h3.qwen38_h3_recaption import RecaptionSubjectContract
 from r2v_data_v2.structured_output import ValidationIssue
+from tools.materialize_h3_mimo25_shadow import _parser as _materializer_parser
 
 
 def _annotation(
@@ -3402,6 +3403,99 @@ class _RecoveredVoiceMediaBackend:
         return destination
 
 
+class _ConditioningAudioBackend(_RecoveredVoiceMediaBackend):
+    def __init__(self, *, source_duration_seconds: float) -> None:
+        super().__init__()
+        self.source_duration_seconds = source_duration_seconds
+
+    def probe_audio_file(self, path: Path) -> AudioFileProbe:
+        for extraction in self.extractions:
+            if Path(extraction["destination"]) == path:
+                start = int(extraction["source_start_sample"])
+                end = int(extraction["source_end_sample"])
+                return AudioFileProbe(
+                    sample_rate_hz=32000,
+                    channels=2,
+                    frame_count=end - start,
+                    duration_seconds=(end - start) / 32000,
+                    format_name="flac",
+                )
+        return AudioFileProbe(
+            sample_rate_hz=32000,
+            channels=2,
+            frame_count=round(self.source_duration_seconds * 32000),
+            duration_seconds=self.source_duration_seconds,
+            format_name="flac",
+        )
+
+
+def _constant_conditioning_analyzer(amplitude: int) -> _RecoveredVoiceAnalyzer:
+    analyzer = _RecoveredVoiceAnalyzer(seconds=3.0)
+    analyzer.analysis = CanonicalAudioAnalysis(
+        probe=analyzer.analysis.probe,
+        mono_pcm16=np.full(3 * 32000, amplitude, dtype=np.int16),
+    )
+    return analyzer
+
+
+def _configure_music_materializer_fixture(
+    fixture: SimpleNamespace,
+    *,
+    event_start: float = 1.2,
+    event_end: float = 2.4,
+    category: str = "non_diegetic_music",
+    music_status: str = "present",
+) -> SimpleNamespace:
+    job_values = fixture.job.model_dump(mode="json", exclude={"request_fingerprint"})
+    job_values["target_duration_seconds"] = 3.0
+    job = _job(job_values)
+    annotation_values = _presentation_annotation("offscreen_spoken").model_dump(
+        mode="json"
+    )
+    event = annotation_values["audio_semantics"]["temporal_non_speech_events"][0]
+    event.update(
+        approximate_start_time=event_start,
+        approximate_end_time=event_end,
+        category=category,
+        pattern="continuous",
+        description="A sparse acoustic-guitar texture moves at a restrained pace.",
+        source_grounding="audible_only",
+    )
+    annotation_values["audio_semantics"]["non_diegetic_music_status"] = music_status
+    annotation_values["audio_semantics"]["non_diegetic_music"] = (
+        "Sparse acoustic guitar continues softly."
+        if music_status == "present"
+        else None
+    )
+    annotation_values["h3_draft"]["shots"][0]["timeline_parts"] = [
+        {"type": "prose", "text": "<Subject 1> remains in view."},
+        {"type": "speech", "segment_id": "segment_1"},
+        {"type": "audio_event", "event_id": "ae1"},
+    ]
+    annotation = MimoAVAnnotationDraft.model_validate(annotation_values)
+    inventory_values = fixture.inventory.model_dump(
+        mode="json", exclude={"inventory_fingerprint"}
+    )
+    inventory_values["jobs"] = [job.model_dump(mode="json")]
+    if inventory_values["source_diarization_inventory_sha256"] is None:
+        inventory_values.pop("source_diarization_inventory_sha256")
+    inventory = _inventory(inventory_values)
+    record = _record_fixture(
+        Path(job.target_video_path).parent,
+        annotation,
+        job=job,
+        inventory_fingerprint=inventory.inventory_fingerprint,
+    )
+    (fixture.mimo_root / "inventory.json").write_text(
+        inventory.model_dump_json(), encoding="utf-8"
+    )
+    _write_models_jsonl(fixture.mimo_root / "records.jsonl", [record])
+    fixture.job = job
+    fixture.inventory = inventory
+    fixture.record = record
+    return fixture
+
+
 def _as_asd_miss(job: MimoClipJob) -> MimoClipJob:
     values = job.model_dump(mode="json", exclude={"request_fingerprint"})
     values["target_duration_seconds"] = 3.0
@@ -4044,6 +4138,182 @@ def test_materializer_provenance_preflight_accepts_unchanged_inputs(
     )
     assert summary.ready_count == 1
     assert summary.failed_count == 0
+    assert summary.full_audio_reuse_count == 0
+    assert summary.music_reference_count == 0
+
+
+def test_materializer_audio_variant_flags_default_false_and_are_explicit() -> None:
+    defaults = _materializer_parser().parse_args(
+        ["--audio-production-root", "/tmp/production"]
+    )
+    enabled = _materializer_parser().parse_args(
+        [
+            "--audio-production-root",
+            "/tmp/production",
+            "--enable-full-audio-reuse",
+            "--enable-music-reference",
+        ]
+    )
+    assert defaults.enable_full_audio_reuse is False
+    assert defaults.enable_music_reference is False
+    assert enabled.enable_full_audio_reuse is True
+    assert enabled.enable_music_reference is True
+
+
+def test_full_audio_reuse_is_opt_in_and_uses_canonical_flac(tmp_path: Path) -> None:
+    fixture = _materializer_fixture(tmp_path)
+    source_paths = [
+        fixture.samples_path,
+        fixture.mimo_root / "records.jsonl",
+        Path(fixture.job.target_full_audio_path),
+    ]
+    before = {path: path.read_bytes() for path in source_paths}
+    summary = materialize_mimo25_h3_shadow(
+        mimo_root=fixture.mimo_root,
+        source_h3_root=fixture.source_h3,
+        output_root=fixture.output_root,
+        enable_full_audio_reuse=True,
+        audio_backend=_ConditioningAudioBackend(source_duration_seconds=1.0),
+    )
+    records = _shadow_records(fixture)
+    reuse = next(item for item in records if item.conditioning_variant == "full_audio_reuse")
+    assert len(records) == 2
+    assert reuse.sample_id == "clip-1/audio_reuse"
+    assert reuse.pair_type == "canonical"
+    assert reuse.effective_subject_voices == []
+    assert len(reuse.audio_references) == 1
+    audio = reuse.audio_references[0]
+    assert audio.role == "full_audio_reuse"
+    assert audio.audio_path == fixture.job.target_full_audio_path
+    assert audio.audio_sha256 == fixture.job.target_full_audio_sha256
+    assert audio.speaker_id is None
+    assert "<Audio 1>: fully_copy" in (reuse.rendered_h3_prompt or "")
+    assert "[reference generation + audio reuse]" in (reuse.rendered_h3_prompt or "")
+    assert summary.full_audio_reuse_count == 1
+    assert summary.music_reference_count == 0
+    assert all(path.read_bytes() == before[path] for path in source_paths)
+
+
+def test_clean_non_diegetic_music_derives_one_real_reference(tmp_path: Path) -> None:
+    fixture = _configure_music_materializer_fixture(_materializer_fixture(tmp_path))
+    source_paths = [
+        fixture.samples_path,
+        fixture.mimo_root / "records.jsonl",
+        Path(fixture.job.target_full_audio_path),
+    ]
+    before = {path: path.read_bytes() for path in source_paths}
+    media = _ConditioningAudioBackend(source_duration_seconds=3.0)
+    summary = materialize_mimo25_h3_shadow(
+        mimo_root=fixture.mimo_root,
+        source_h3_root=fixture.source_h3,
+        output_root=fixture.output_root,
+        enable_music_reference=True,
+        audio_backend=media,
+        recovered_voice_analyzer=_RecoveredVoiceAnalyzer(seconds=3.0),
+    )
+    music = next(
+        item
+        for item in _shadow_records(fixture)
+        if item.conditioning_variant == "music_reference"
+    )
+    audio = music.audio_references[0]
+    assert music.sample_id == "clip-1/music_reference"
+    assert audio.role == "music_reference"
+    assert audio.source_event_id == "ae1"
+    assert audio.source_start_sample == round(1.2 * 32000)
+    assert audio.source_end_sample == round(2.4 * 32000)
+    assert audio.interval_provenance == (
+        "mimo_approximate_event_times_rounded_to_32000_v1"
+    )
+    assert audio.subject_index is None
+    assert audio.speaker_id is None
+    assert Path(audio.audio_path).is_file()
+    assert media.probe_audio_file(Path(audio.audio_path)).sample_rate_hz == 32000
+    assert media.probe_audio_file(Path(audio.audio_path)).channels == 2
+    rendered = music.rendered_h3_prompt or ""
+    assert "<Audio 1> is a music-style reference" in rendered
+    assert "<Audio 1>: reference" in rendered
+    assert "without directly reusing the source signal" in rendered
+    assert "[[" not in rendered
+    assert summary.music_reference_count == 1
+    assert summary.full_audio_reuse_count == 0
+    assert len(media.extractions) == 1
+    assert all(path.read_bytes() == before[path] for path in source_paths)
+
+
+@pytest.mark.parametrize(
+    ("event_start", "event_end", "category", "music_status", "reason"),
+    [
+        (0.5, 1.8, "non_diegetic_music", "present", "music_reference_overlaps_speech"),
+        (1.2, 2.4, "diegetic_music", "absent", None),
+        (1.2, 2.4, "physical", "unknown", None),
+        (1.2, 1.8, "non_diegetic_music", "present", "music_reference_too_short"),
+        (
+            1.2,
+            3.1,
+            "non_diegetic_music",
+            "present",
+            "music_reference_invalid_sample_range",
+        ),
+    ],
+)
+def test_music_reference_rejects_ineligible_events_without_publishing(
+    tmp_path: Path,
+    event_start: float,
+    event_end: float,
+    category: str,
+    music_status: str,
+    reason: str | None,
+) -> None:
+    fixture = _configure_music_materializer_fixture(
+        _materializer_fixture(tmp_path),
+        event_start=event_start,
+        event_end=event_end,
+        category=category,
+        music_status=music_status,
+    )
+    summary = materialize_mimo25_h3_shadow(
+        mimo_root=fixture.mimo_root,
+        source_h3_root=fixture.source_h3,
+        output_root=fixture.output_root,
+        enable_music_reference=True,
+        audio_backend=_ConditioningAudioBackend(source_duration_seconds=3.0),
+        recovered_voice_analyzer=_RecoveredVoiceAnalyzer(seconds=3.0),
+    )
+    assert summary.music_reference_count == 0
+    assert all(
+        item.conditioning_variant != "music_reference"
+        for item in _shadow_records(fixture)
+    )
+    if reason is not None:
+        assert summary.music_reference_rejection_reason_counts[reason] == 1
+    else:
+        assert summary.music_reference_rejection_reason_counts == {}
+
+
+@pytest.mark.parametrize(
+    ("amplitude", "reason"),
+    [
+        (0, "music_reference_rms_unusable"),
+        (32767, "music_reference_clipping_excessive"),
+    ],
+)
+def test_music_reference_rejects_unusable_audio_quality(
+    tmp_path: Path,
+    amplitude: int,
+    reason: str,
+) -> None:
+    fixture = _configure_music_materializer_fixture(_materializer_fixture(tmp_path))
+    summary = materialize_mimo25_h3_shadow(
+        mimo_root=fixture.mimo_root,
+        source_h3_root=fixture.source_h3,
+        output_root=fixture.output_root,
+        enable_music_reference=True,
+        audio_backend=_ConditioningAudioBackend(source_duration_seconds=3.0),
+        recovered_voice_analyzer=_constant_conditioning_analyzer(amplitude),
+    )
+    assert summary.music_reference_count == 0
+    assert summary.music_reference_rejection_reason_counts[reason] == 1
 
 
 def test_materializer_rejects_stale_source_h3_samples_sha(tmp_path: Path) -> None:
@@ -4512,6 +4782,52 @@ def test_review_exposes_recovered_audio_asset_and_provenance(tmp_path: Path) -> 
     page = render_review_html(cases, {})
     assert '<audio controls preload="none"' in page
     assert "mimo_recovered_target_voice" in page
+
+
+def test_review_exposes_music_and_full_audio_roles_without_subject_binding(
+    tmp_path: Path,
+) -> None:
+    fixture = _configure_music_materializer_fixture(_materializer_fixture(tmp_path))
+    materialize_mimo25_h3_shadow(
+        mimo_root=fixture.mimo_root,
+        source_h3_root=fixture.source_h3,
+        output_root=fixture.output_root,
+        enable_full_audio_reuse=True,
+        enable_music_reference=True,
+        audio_backend=_ConditioningAudioBackend(source_duration_seconds=3.0),
+        recovered_voice_analyzer=_RecoveredVoiceAnalyzer(seconds=3.0),
+    )
+    raw_path = fixture.mimo_root / "raw_responses" / f"{fixture.job.clip_uid}.json"
+    raw_path.parent.mkdir()
+    raw_path.write_text(
+        MimoRawResponse(
+            clip_uid=fixture.job.clip_uid,
+            request_fingerprint=fixture.job.request_fingerprint,
+            raw_responses=[],
+            diagnostics=[],
+        ).model_dump_json(),
+        encoding="utf-8",
+    )
+    cases, media = build_review_cases(
+        mimo_root=fixture.mimo_root,
+        shadow_root=fixture.output_root,
+    )
+    audio_rows = [
+        audio
+        for variant in cases[0].payload["shadow_variants"]
+        for audio in variant["audio_references"]
+    ]
+    assert {item["role"] for item in audio_rows} == {
+        "music_reference",
+        "full_audio_reuse",
+    }
+    assert all(item["subject_index"] is None for item in audio_rows)
+    assert all(item["media_url"].removeprefix("/media/") in media for item in audio_rows)
+    page = render_review_html(cases, {})
+    assert "music_reference" in page
+    assert "full_audio_reuse" in page
+    assert "music_description" in page
+    assert "interval_provenance" in page
 
 
 class _FakeBackend:

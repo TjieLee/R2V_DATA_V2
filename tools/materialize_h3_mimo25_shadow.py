@@ -18,6 +18,8 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Materialize MiMo H3 shadow prompts")
     parser.add_argument("--audio-production-root", type=Path, required=True)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--enable-full-audio-reuse", action="store_true")
+    parser.add_argument("--enable-music-reference", action="store_true")
     return parser
 
 
@@ -30,6 +32,8 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         source_h3_root=paths.h3,
         output_root=output,
         overwrite=arguments.overwrite,
+        enable_full_audio_reuse=arguments.enable_full_audio_reuse,
+        enable_music_reference=arguments.enable_music_reference,
     )
     result = {"output_root": str(output), "summary": summary.model_dump(mode="json")}
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))

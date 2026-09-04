@@ -41,8 +41,10 @@ from r2v_data_v2.h3.qwen38_h3_recaption import (
     Qwen38RecaptionManifestCase,
     Qwen38RecaptionRecord,
     Qwen38RecaptionRequest,
+    RecaptionAudioContract,
     RecaptionCompletionDiagnostic,
     RecaptionNonSpeechFact,
+    RecaptionReferenceContract,
     build_audio_facts,
     build_qwen38_full_manifest,
     build_qwen38_pilot_manifest,
@@ -533,6 +535,68 @@ def test_full_audio_reuse_materializes_canonical_definition_and_retention(
     )
     assert "referenced from <Audio 1>" not in response.detailed_description
     assert _codes(response, request) == set()
+
+
+def test_music_audio_contract_materializes_reference_without_subject_or_speaker(
+    tmp_path: Path,
+) -> None:
+    request = _request(tmp_path)
+    music = tmp_path / "music.flac"
+    music.write_bytes(b"music")
+    audio = RecaptionAudioContract(
+        audio_index=1,
+        audio_label="<Audio 1>",
+        kind="music_reference",
+        path=str(music),
+        sha256=hashlib.sha256(music.read_bytes()).hexdigest(),
+        music_characteristics="sparse acoustic-guitar texture and restrained pacing",
+        retention_marker="reference",
+    )
+    contract = request.reference_contract.model_copy(update={"audios": [audio]})
+    adjusted = Qwen38RecaptionRequest(
+        sample=request.sample,
+        case=request.case.model_copy(
+            update={"conditioning_variant": "music_reference"}
+        ),
+        reference_contract=contract,
+        audio_facts=request.audio_facts,
+        request_fingerprint=request.request_fingerprint,
+    )
+    draft = _draft(request).model_copy(
+        update={"summary": "[reference generation + audio reference] A scene."}
+    )
+    response = materialize_h3_draft(draft, adjusted)
+    assert (
+        "<Audio 1> is a music-style reference for the target video's audience-only "
+        "score, providing sparse acoustic-guitar texture and restrained pacing "
+        "without copying the source signal."
+    ) in response.subject_definitions
+    assert any(
+        item.startswith("<Audio 1>: reference - its sparse acoustic-guitar")
+        for item in response.retention_analysis
+    )
+    assert "(S1)" not in next(
+        item for item in response.subject_definitions if item.startswith("<Audio 1>")
+    )
+
+    audio_rows = [
+        audio.model_copy(
+            update={"audio_index": index, "audio_label": f"<Audio {index}>"}
+        )
+        for index in range(1, 5)
+    ]
+    with pytest.raises(ValidationError, match="per-modality reference limit"):
+        RecaptionReferenceContract.model_validate(
+            {
+                **request.reference_contract.model_dump(mode="json"),
+                "audios": [item.model_dump(mode="json") for item in audio_rows],
+            }
+        )
+
+
+def test_music_reference_requires_explicit_extracted_asset(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="explicit extracted Audio asset"):
+        build_reference_contract(_sample(tmp_path), "music_reference")
 
 
 def test_draft_cannot_emit_pipeline_owned_audio_lines(tmp_path: Path) -> None:

@@ -108,8 +108,8 @@ Prompt, policy, annotation schema, and materializer versions are:
 - `r2v.h3.mimo25_summary.6`
 - `r2v.h3.mimo25_failure.5`
 - `r2v.h3.mimo25_raw_response.5`
-- `r2v.h3.mimo25_h3_shadow.7`
-- `r2v.h3.mimo25_h3_shadow_summary.7`
+- `r2v.h3.mimo25_h3_shadow.8`
+- `r2v.h3.mimo25_h3_shadow_summary.8`
 
 The OpenAI-compatible client defaults to the `xiaomi` transport, model
 `mimo-v2.5`, video FPS 4, `media_resolution=default`, disabled thinking,
@@ -226,6 +226,34 @@ provenance is unchanged, and the final six-section order remains unchanged.
 The review page exposes each real Audio asset, Subject/entity, `(Sx)`, source
 type, source segment, and browser audio player.
 
+## Optional Audio conditioning variants
+
+The model-free materializer can add two independent shadow variants while
+reusing the same clip-level MiMo annotation. Both are opt-in, so default
+materialization preserves the existing sample inventory.
+
+- `--enable-full-audio-reuse` derives `<clip_uid>/audio_reuse` from the canonical
+  sample. Its sole `<Audio 1>` is the existing canonical 32 kHz stereo lossless
+  FLAC, marked `fully_copy`; no file is copied and no production sample is
+  modified.
+- `--enable-music-reference` derives `<clip_uid>/music_reference` only when a
+  structured `non_diegetic_music` event accompanies global music status
+  `present`. The event must last at least 1.0 seconds, overlap no authoritative
+  DiariZen speech interval, map to a valid rounded 32 kHz range, and pass the
+  conservative RMS and clipping checks. At most one event is selected by longer
+  duration, lower clipping, stronger usable RMS, earlier time, and event ID.
+
+Music boundaries remain explicitly MiMo-approximate and are recorded as rounded
+canonical 32 kHz sample coordinates. The extracted asset is a real stereo FLAC;
+it guides qualitative audience-only music style without copying the waveform.
+V1 does not publish partial music reuse or treat a dialogue-contaminated mix as
+an isolated score. Full-audio reuse, clean music reference, and voice reference
+are distinct roles, and Audio numbering remains independent of `(Sx)` numbering.
+Every variant keeps all Pictures and is omitted rather than dropping Visual
+references if the official Audio <= 3 or Picture + Audio <= 12 limits would be
+exceeded. Review UI exposes each role, playable asset, interval provenance, and
+music description; Subject/entity/`Sx` metadata appears only for voice assets.
+
 MiMo records retain explicit `present`, `absent`, or `unknown` status for the
 overall soundscape and non-diegetic music. The H3 training prompt renders a
 description only for `present`; both `absent` and `unknown` render as `N/A`.
@@ -301,6 +329,13 @@ Materialize and review without another model call:
 ```bash
 "$R2V_PYTHON" tools/materialize_h3_mimo25_shadow.py \
   --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
+  --overwrite
+
+# Optional inspection variants; both flags default to false.
+"$R2V_PYTHON" tools/materialize_h3_mimo25_shadow.py \
+  --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
+  --enable-full-audio-reuse \
+  --enable-music-reference \
   --overwrite
 
 "$R2V_PYTHON" tools/serve_h3_mimo25_review.py \

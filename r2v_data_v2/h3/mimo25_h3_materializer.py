@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import re
 import shutil
 import uuid
 from collections import Counter
@@ -9,9 +11,13 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Literal
 
+import numpy as np
 from pydantic import Field, model_validator
 
 from r2v_data_v2.h3.audio_backends import AudioMediaBackend, FFmpegAudioMediaBackend
+from r2v_data_v2.h3.jea_audio_production import (
+    CANONICAL_AUDIO_TIMELINE_TOLERANCE_SECONDS,
+)
 from r2v_data_v2.h3.jea_final_renderer import (
     FinalH3SampleV2,
     FinalQwen3SpeechSegment,
@@ -24,6 +30,7 @@ from r2v_data_v2.h3.mimo25_av_reconcile import (
 )
 from r2v_data_v2.h3.mimo25_backend import (
     MIMO25_MATERIALIZER_VERSION,
+    MimoAudioEvent,
     MimoH3AudioEventPart,
     MimoH3ProsePart,
     MimoH3Shot,
@@ -44,6 +51,7 @@ from r2v_data_v2.h3.qwen38_h3_recaption import (
     Qwen38H3DraftResponse,
     Qwen38RecaptionManifestCase,
     Qwen38RecaptionRequest,
+    RecaptionAudioContract,
     RecaptionAudioFacts,
     RecaptionNonSpeechFact,
     RecaptionReferenceContract,
@@ -59,23 +67,98 @@ from r2v_data_v2.h3.speech_presentation import (
     render_speech_presentation_clause,
 )
 
-MIMO25_SHADOW_RECORD_VERSION = "r2v.h3.mimo25_h3_shadow.7"
-MIMO25_SHADOW_SUMMARY_VERSION = "r2v.h3.mimo25_h3_shadow_summary.7"
+MIMO25_SHADOW_RECORD_VERSION = "r2v.h3.mimo25_h3_shadow.8"
+MIMO25_SHADOW_SUMMARY_VERSION = "r2v.h3.mimo25_h3_shadow_summary.8"
+MUSIC_REFERENCE_POLICY_VERSION = "h3_mimo25_clean_music_reference_v1"
+MUSIC_REFERENCE_SAMPLE_RATE_HZ = 32000
+MUSIC_REFERENCE_CHANNELS = 2
+MUSIC_REFERENCE_MINIMUM_DURATION_SECONDS = 1.0
+MUSIC_REFERENCE_MINIMUM_RMS_DBFS = -60.0
+MUSIC_REFERENCE_MAXIMUM_CLIPPING_RATIO = 0.001
 
 
 class MimoShadowAudioReference(SchemaModel):
     audio_index: int = Field(gt=0)
-    subject_index: int = Field(gt=0)
-    entity_id: str
+    role: Literal["voice_reference", "music_reference", "full_audio_reuse"]
+    subject_index: int | None = Field(default=None, gt=0)
+    entity_id: str | None = None
     speaker_id: str | None = Field(default=None, pattern=r"^S[1-9]\d*$")
     source_type: Literal[
         "existing_target_voice",
         "mimo_recovered_target_voice",
         "cross_donor",
+        "mimo_non_diegetic_music_event",
+        "canonical_full_audio",
     ]
-    voice_reference_path: str
-    voice_reference_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    audio_path: str
+    audio_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_segment_id: str | None = None
+    source_event_id: str | None = None
+    source_start_time: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    source_end_time: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    source_start_sample: int | None = Field(default=None, ge=0)
+    source_end_sample: int | None = Field(default=None, gt=0)
+    sample_rate_hz: Literal[32000] = MUSIC_REFERENCE_SAMPLE_RATE_HZ
+    channels: Literal[2] = MUSIC_REFERENCE_CHANNELS
+    interval_provenance: str | None = None
+    music_description: str | None = None
+    rms_dbfs: float | None = Field(default=None, allow_inf_nan=False)
+    clipping_ratio: float | None = Field(default=None, ge=0, le=1)
+
+    @model_validator(mode="after")
+    def validate_reference(self) -> MimoShadowAudioReference:
+        interval = (
+            self.source_start_time,
+            self.source_end_time,
+            self.source_start_sample,
+            self.source_end_sample,
+        )
+        if self.role == "voice_reference":
+            if (
+                self.subject_index is None
+                or self.entity_id is None
+                or self.source_type
+                not in {
+                    "existing_target_voice",
+                    "mimo_recovered_target_voice",
+                    "cross_donor",
+                }
+                or self.source_event_id is not None
+                or self.music_description is not None
+                or any(value is not None for value in interval)
+            ):
+                raise ValueError("voice Audio reference provenance is invalid")
+        elif self.role == "music_reference":
+            if (
+                self.subject_index is not None
+                or self.entity_id is not None
+                or self.speaker_id is not None
+                or self.source_type != "mimo_non_diegetic_music_event"
+                or self.source_segment_id is not None
+                or self.source_event_id is None
+                or any(value is None for value in interval)
+                or self.interval_provenance
+                != "mimo_approximate_event_times_rounded_to_32000_v1"
+                or not self.music_description
+                or self.rms_dbfs is None
+                or self.clipping_ratio is None
+            ):
+                raise ValueError("music Audio reference provenance is invalid")
+        elif (
+            self.subject_index is not None
+            or self.entity_id is not None
+            or self.speaker_id is not None
+            or self.source_type != "canonical_full_audio"
+            or self.source_segment_id is not None
+            or self.source_event_id is not None
+            or any(value is not None for value in interval)
+            or self.interval_provenance != "canonical_full_audio_exact_v1"
+            or self.music_description is not None
+            or self.rms_dbfs is not None
+            or self.clipping_ratio is not None
+        ):
+            raise ValueError("full-audio reuse provenance is invalid")
+        return self
 
 
 def _compact_json(value: object) -> str:
@@ -117,12 +200,13 @@ def _write_jsonl(path: Path, values: Sequence[SchemaModel]) -> None:
 
 
 class MimoH3ShadowRecord(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_h3_shadow.7"] = MIMO25_SHADOW_RECORD_VERSION
+    schema_version: Literal["r2v.h3.mimo25_h3_shadow.8"] = MIMO25_SHADOW_RECORD_VERSION
     sample_id: str
     source_h3_sample_id: str
     clip_uid: str
     pair_type: Literal["canonical", "in_pair", "cross_pair"]
     derived_from_pair_type: Literal["canonical"] | None = None
+    conditioning_variant: ConditioningVariant
     status: Literal["ready", "failed"]
     source_mimo_record_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_h3_sample_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -157,11 +241,10 @@ class MimoH3ShadowRecord(SchemaModel):
             raise ValueError("derived MiMo H3 shadow provenance is inconsistent")
         if self.pair_type != "in_pair" and self.recovered_voice_references:
             raise ValueError("only target in-pair shadow may publish recovered voices")
-        if self.pair_type == "canonical" and (
-            self.effective_subject_voices or self.audio_references
-        ):
-            raise ValueError("canonical MiMo shadow must remain voice-free")
-        if len(self.audio_references) != len(self.effective_subject_voices):
+        voice_references = [
+            item for item in self.audio_references if item.role == "voice_reference"
+        ]
+        if len(voice_references) != len(self.effective_subject_voices):
             raise ValueError("MiMo shadow Audio provenance count is inconsistent")
         if [item.audio_index for item in self.audio_references] != list(
             range(1, len(self.audio_references) + 1)
@@ -172,7 +255,7 @@ class MimoH3ShadowRecord(SchemaModel):
             for item in self.recovered_voice_references
             if item.status == "selected"
         }
-        for voice, audio in zip(self.effective_subject_voices, self.audio_references):
+        for voice, audio in zip(self.effective_subject_voices, voice_references):
             recovered = recovered_by_entity.get(voice.entity_id)
             expected_source = (
                 "cross_donor"
@@ -187,12 +270,49 @@ class MimoH3ShadowRecord(SchemaModel):
                 audio.subject_index != voice.subject_index
                 or audio.entity_id != voice.entity_id
                 or audio.source_type != expected_source
-                or audio.voice_reference_path != voice.voice_reference_path
-                or audio.voice_reference_sha256 != voice.voice_reference_sha256
+                or audio.audio_path != voice.voice_reference_path
+                or audio.audio_sha256 != voice.voice_reference_sha256
                 or audio.source_segment_id
                 != (None if recovered is None else recovered.source_segment_id)
             ):
                 raise ValueError("MiMo shadow Audio provenance differs from voice asset")
+        expected_variant: ConditioningVariant
+        if self.sample_id == self.source_h3_sample_id:
+            expected_variant = {
+                "canonical": "visual_only",
+                "in_pair": "target_voice_reference",
+                "cross_pair": "cross_voice_reference",
+            }[self.pair_type]
+        elif self.pair_type == "in_pair":
+            expected_variant = "target_voice_reference"
+        elif self.sample_id.endswith("/audio_reuse"):
+            expected_variant = "full_audio_reuse"
+        elif self.sample_id.endswith("/music_reference"):
+            expected_variant = "music_reference"
+        else:
+            raise ValueError("derived MiMo H3 shadow variant is unknown")
+        if self.conditioning_variant != expected_variant:
+            raise ValueError("MiMo shadow conditioning variant is inconsistent")
+        if self.conditioning_variant == "visual_only":
+            if self.effective_subject_voices or self.audio_references:
+                raise ValueError("visual-only MiMo shadow must remain Audio-free")
+        elif self.conditioning_variant in {
+            "target_voice_reference",
+            "cross_voice_reference",
+        }:
+            if len(voice_references) != len(self.audio_references):
+                raise ValueError("voice MiMo shadow cannot publish non-voice Audio")
+        else:
+            expected_role = {
+                "music_reference": "music_reference",
+                "full_audio_reuse": "full_audio_reuse",
+            }[self.conditioning_variant]
+            if (
+                self.effective_subject_voices
+                or len(self.audio_references) != 1
+                or self.audio_references[0].role != expected_role
+            ):
+                raise ValueError("derived Audio-only MiMo shadow is inconsistent")
         values = self.model_dump(mode="json", exclude={"record_fingerprint"})
         if self.record_fingerprint != _sha256_text(_compact_json(values)):
             raise ValueError("MiMo H3 shadow record fingerprint is invalid")
@@ -200,7 +320,7 @@ class MimoH3ShadowRecord(SchemaModel):
 
 
 class MimoH3ShadowSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_h3_shadow_summary.7"] = (
+    schema_version: Literal["r2v.h3.mimo25_h3_shadow_summary.8"] = (
         MIMO25_SHADOW_SUMMARY_VERSION
     )
     source_mimo_inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -222,6 +342,12 @@ class MimoH3ShadowSummary(SchemaModel):
     derived_in_pair_count: int = Field(ge=0)
     enriched_existing_in_pair_count: int = Field(ge=0)
     recovery_rejection_reason_counts: dict[str, int]
+    full_audio_reuse_count: int = Field(ge=0)
+    music_reference_count: int = Field(ge=0)
+    music_reference_rejection_reason_counts: dict[str, int]
+    music_reference_policy_version: Literal[
+        "h3_mimo25_clean_music_reference_v1"
+    ] = MUSIC_REFERENCE_POLICY_VERSION
     asr_text_modified: Literal[False] = False
     asr_language_modified: Literal[False] = False
     source_segments_deleted: Literal[False] = False
@@ -455,6 +581,9 @@ def _materialize_sample(
     sample: FinalH3SampleV2,
     job: MimoClipJob,
     record: MimoRecord,
+    *,
+    conditioning_variant: ConditioningVariant | None = None,
+    extra_audio_contract: RecaptionAudioContract | None = None,
 ) -> tuple[list[FinalQwen3SpeechSegment], str, list[str]]:
     assert record.annotation is not None
     corrected, warnings = _corrected_segments(sample, job, record)
@@ -463,12 +592,22 @@ def _materialize_sample(
         item.model_dump(mode="python") for item in corrected
     ]
     corrected_sample = FinalH3SampleV2.model_validate(corrected_payload)
-    variant = _variant(corrected_sample)
+    variant = conditioning_variant or _variant(corrected_sample)
     contract = _contract_with_voice_profiles(
-        build_reference_contract(corrected_sample, variant),
+        build_reference_contract(
+            corrected_sample,
+            "visual_only" if extra_audio_contract is not None else variant,
+        ),
         corrected=corrected,
         record=record,
     )
+    if extra_audio_contract is not None:
+        contract = RecaptionReferenceContract.model_validate(
+            {
+                **contract.model_dump(mode="json"),
+                "audios": [extra_audio_contract.model_dump(mode="json")],
+            }
+        )
     facts = _audio_facts(
         sample=corrected_sample,
         corrected=corrected,
@@ -491,11 +630,13 @@ def _materialize_sample(
     audio_event_by_id = {
         item.event_id: item.description for item in semantics.temporal_non_speech_events
     }
-    prefix = (
-        "[reference generation]"
-        if variant == "visual_only"
-        else "[reference generation + audio reference]"
-    )
+    prefix = {
+        "visual_only": "[reference generation]",
+        "target_voice_reference": "[reference generation + audio reference]",
+        "cross_voice_reference": "[reference generation + audio reference]",
+        "music_reference": "[reference generation + audio reference]",
+        "full_audio_reuse": "[reference generation + audio reuse]",
+    }[variant]
     music = (
         semantics.non_diegetic_music
         if semantics.non_diegetic_music_status == "present"
@@ -557,6 +698,18 @@ def _materialize_sample(
         request,
         speech_clause_transform=render_speech,
     )
+    if variant == "music_reference":
+        assert extra_audio_contract is not None
+        assert extra_audio_contract.music_characteristics is not None
+        structured = structured.model_copy(
+            update={
+                "non_diegetic_music": (
+                    "A newly generated audience-only score follows <Audio 1>'s "
+                    f"{extra_audio_contract.music_characteristics} without directly "
+                    "reusing the source signal."
+                )
+            }
+        )
     if "[[audio_event:" in structured.detailed_description:
         raise ValueError("MiMo Audio-event placeholder survived materialization")
     issues, validation_warnings = validate_h3_response(structured, request)
@@ -630,6 +783,7 @@ def _audio_references(
         result.append(
             MimoShadowAudioReference(
                 audio_index=index,
+                role="voice_reference",
                 subject_index=voice.subject_index,
                 entity_id=voice.entity_id,
                 speaker_id=speaker_by_entity.get(voice.entity_id),
@@ -642,8 +796,8 @@ def _audio_references(
                         else "existing_target_voice"
                     )
                 ),
-                voice_reference_path=voice.voice_reference_path,
-                voice_reference_sha256=voice.voice_reference_sha256,
+                audio_path=voice.voice_reference_path,
+                audio_sha256=voice.voice_reference_sha256,
                 source_segment_id=(
                     None
                     if recovered_voice is None
@@ -652,6 +806,212 @@ def _audio_references(
             )
         )
     return result
+
+
+def _full_audio_reuse_reference(job: MimoClipJob) -> MimoShadowAudioReference:
+    source = Path(job.target_full_audio_path).expanduser().resolve(strict=True)
+    return MimoShadowAudioReference(
+        audio_index=1,
+        role="full_audio_reuse",
+        source_type="canonical_full_audio",
+        audio_path=str(source),
+        audio_sha256=job.target_full_audio_sha256,
+        interval_provenance="canonical_full_audio_exact_v1",
+    )
+
+
+def _extra_audio_contract(
+    reference: MimoShadowAudioReference,
+    *,
+    render_path: Path,
+) -> RecaptionAudioContract:
+    if reference.role == "full_audio_reuse":
+        return RecaptionAudioContract(
+            audio_index=1,
+            audio_label="<Audio 1>",
+            kind="full_audio_reuse",
+            path=str(render_path),
+            sha256=reference.audio_sha256,
+            retention_marker="fully_copy",
+        )
+    if reference.role != "music_reference":  # pragma: no cover - internal contract
+        raise ValueError("extra shadow Audio must be music or full reuse")
+    return RecaptionAudioContract(
+        audio_index=1,
+        audio_label="<Audio 1>",
+        kind="music_reference",
+        path=str(render_path),
+        sha256=reference.audio_sha256,
+        music_characteristics=reference.music_description,
+        retention_marker="reference",
+    )
+
+
+def _probe_canonical_audio(
+    *,
+    job: MimoClipJob,
+    audio_backend: AudioMediaBackend,
+) -> None:
+    path = Path(job.target_full_audio_path).expanduser().resolve(strict=True)
+    probe = audio_backend.probe_audio_file(path)
+    if (
+        probe.sample_rate_hz != MUSIC_REFERENCE_SAMPLE_RATE_HZ
+        or probe.channels != MUSIC_REFERENCE_CHANNELS
+        or "flac" not in probe.format_name.lower()
+        or abs(probe.duration_seconds - job.target_duration_seconds)
+        > CANONICAL_AUDIO_TIMELINE_TOLERANCE_SECONDS
+    ):
+        raise ValueError("MiMo Audio conditioning source must be canonical 32 kHz stereo FLAC")
+
+
+def _interval_overlaps_speech(
+    start_time: float,
+    end_time: float,
+    job: MimoClipJob,
+) -> bool:
+    return any(
+        start_time < segment.end_time and end_time > segment.start_time
+        for segment in job.segments
+    )
+
+
+def _music_candidate_rank(
+    item: tuple[MimoAudioEvent, int, int, float, float],
+) -> tuple[float, float, float, float, str]:
+    event, _start_sample, _end_sample, rms_dbfs, clipping_ratio = item
+    duration = event.approximate_end_time - event.approximate_start_time
+    return (
+        -duration,
+        clipping_ratio,
+        -rms_dbfs,
+        event.approximate_start_time,
+        event.event_id,
+    )
+
+
+def _select_music_reference(
+    *,
+    job: MimoClipJob,
+    record: MimoRecord,
+    temporary_root: Path,
+    final_root: Path,
+    audio_backend: AudioMediaBackend,
+    analyzer: RecoveredVoiceAudioAnalyzer,
+) -> tuple[MimoShadowAudioReference | None, Path | None, list[str]]:
+    assert record.annotation is not None
+    semantics = record.annotation.audio_semantics
+    if semantics.non_diegetic_music_status != "present":
+        return None, None, []
+    events = [
+        item
+        for item in semantics.temporal_non_speech_events
+        if item.category == "non_diegetic_music"
+    ]
+    if not events:
+        return None, None, []
+    source = Path(job.target_full_audio_path).expanduser().resolve(strict=True)
+    analysis = analyzer.load(source)
+    if (
+        analysis.probe.sample_rate_hz != MUSIC_REFERENCE_SAMPLE_RATE_HZ
+        or analysis.probe.channels != MUSIC_REFERENCE_CHANNELS
+        or "flac" not in analysis.probe.format_name.lower()
+        or analysis.mono_pcm16.ndim != 1
+        or analysis.mono_pcm16.dtype != np.dtype("int16")
+        or analysis.mono_pcm16.size != analysis.probe.frame_count
+    ):
+        raise ValueError("MiMo music source must be canonical 32 kHz stereo FLAC")
+    rejection_reasons: list[str] = []
+    eligible: list[tuple[MimoAudioEvent, int, int, float, float]] = []
+    for event in events:
+        duration = event.approximate_end_time - event.approximate_start_time
+        start_sample = round(event.approximate_start_time * MUSIC_REFERENCE_SAMPLE_RATE_HZ)
+        end_sample = round(event.approximate_end_time * MUSIC_REFERENCE_SAMPLE_RATE_HZ)
+        reasons: list[str] = []
+        if duration < MUSIC_REFERENCE_MINIMUM_DURATION_SECONDS:
+            reasons.append("music_reference_too_short")
+        if _interval_overlaps_speech(
+            event.approximate_start_time,
+            event.approximate_end_time,
+            job,
+        ):
+            reasons.append("music_reference_overlaps_speech")
+        if re.search(
+            r"\b\d+(?:\.\d+)?\s*(?:bpm|beats?\s+per\s+minute)\b",
+            event.description,
+            flags=re.IGNORECASE,
+        ):
+            reasons.append("music_reference_unmeasured_exact_tempo")
+        if not 0 <= start_sample < end_sample <= analysis.probe.frame_count:
+            reasons.append("music_reference_invalid_sample_range")
+        if reasons:
+            rejection_reasons.extend(reasons)
+            continue
+        samples = analysis.mono_pcm16[start_sample:end_sample]
+        rms = float(np.sqrt(np.mean(np.square(samples.astype(np.float64)))))
+        rms_dbfs = 20.0 * math.log10(rms / 32768.0) if rms > 0 else -math.inf
+        clipping_ratio = float(
+            np.mean(np.abs(samples.astype(np.int32)) >= np.iinfo(np.int16).max)
+        )
+        if not math.isfinite(rms_dbfs) or rms_dbfs < MUSIC_REFERENCE_MINIMUM_RMS_DBFS:
+            rejection_reasons.append("music_reference_rms_unusable")
+            continue
+        if clipping_ratio > MUSIC_REFERENCE_MAXIMUM_CLIPPING_RATIO:
+            rejection_reasons.append("music_reference_clipping_excessive")
+            continue
+        eligible.append((event, start_sample, end_sample, rms_dbfs, clipping_ratio))
+    if not eligible:
+        return None, None, rejection_reasons
+    event, start_sample, end_sample, rms_dbfs, clipping_ratio = min(
+        eligible,
+        key=_music_candidate_rank,
+    )
+    relative = Path("music_references") / job.clip_uid / "music_reference.flac"
+    temporary_path = temporary_root / relative
+    published_path = final_root / relative
+    audio_backend.extract_voice_reference(
+        clip_uid=job.clip_uid,
+        entity_id="music_reference",
+        full_audio_path=source,
+        start_time=event.approximate_start_time,
+        end_time=event.approximate_end_time,
+        destination=temporary_path,
+        sample_rate_hz=MUSIC_REFERENCE_SAMPLE_RATE_HZ,
+        channels=MUSIC_REFERENCE_CHANNELS,
+        output_format="flac",
+        source_audio_path=source,
+        source_start_sample=start_sample,
+        source_end_sample=end_sample,
+    )
+    if not temporary_path.is_file():
+        raise ValueError("MiMo music reference extraction produced no file")
+    output_probe = audio_backend.probe_audio_file(temporary_path)
+    if (
+        output_probe.sample_rate_hz != MUSIC_REFERENCE_SAMPLE_RATE_HZ
+        or output_probe.channels != MUSIC_REFERENCE_CHANNELS
+        or "flac" not in output_probe.format_name.lower()
+        or output_probe.frame_count != end_sample - start_sample
+    ):
+        raise ValueError("MiMo music reference output is not exact 32 kHz stereo FLAC")
+    return (
+        MimoShadowAudioReference(
+            audio_index=1,
+            role="music_reference",
+            source_type="mimo_non_diegetic_music_event",
+            audio_path=str(published_path.resolve(strict=False)),
+            audio_sha256=_sha256_file(temporary_path),
+            source_event_id=event.event_id,
+            source_start_time=event.approximate_start_time,
+            source_end_time=event.approximate_end_time,
+            source_start_sample=start_sample,
+            source_end_sample=end_sample,
+            interval_provenance="mimo_approximate_event_times_rounded_to_32000_v1",
+            music_description=event.description,
+            rms_dbfs=rms_dbfs,
+            clipping_ratio=clipping_ratio,
+        ),
+        temporary_path,
+        rejection_reasons,
+    )
 
 
 def _validate_job_media_integrity(job: MimoClipJob) -> None:
@@ -711,6 +1071,8 @@ def materialize_mimo25_h3_shadow(
     source_h3_root: Path,
     output_root: Path,
     overwrite: bool = False,
+    enable_full_audio_reuse: bool = False,
+    enable_music_reference: bool = False,
     audio_backend: AudioMediaBackend | None = None,
     recovered_voice_analyzer: RecoveredVoiceAudioAnalyzer | None = None,
 ) -> MimoH3ShadowSummary:
@@ -754,6 +1116,7 @@ def materialize_mimo25_h3_shadow(
     recovery_records: list[MimoRecoveredVoiceReference] = []
     temporary_recovered_by_clip: dict[str, list[FinalSubjectVoice]] = {}
     published_recovered_by_clip: dict[str, list[FinalSubjectVoice]] = {}
+    music_rejection_counts: Counter[str] = Counter()
     active_audio_backend = audio_backend or FFmpegAudioMediaBackend()
     active_analyzer = recovered_voice_analyzer or FFmpegRecoveredVoiceAudioAnalyzer()
     existing_target_by_clip: dict[str, list[FinalSubjectVoice]] = {}
@@ -817,6 +1180,7 @@ def materialize_mimo25_h3_shadow(
                 "clip_uid": sample.clip_uid,
                 "pair_type": sample.pair_type,
                 "derived_from_pair_type": None,
+                "conditioning_variant": _variant(sample),
                 "source_mimo_record_fingerprint": (
                     "0" * 64 if mimo_record is None else mimo_record.record_fingerprint
                 ),
@@ -940,6 +1304,7 @@ def materialize_mimo25_h3_shadow(
                         "clip_uid": clip_uid,
                         "pair_type": "in_pair",
                         "derived_from_pair_type": "canonical",
+                        "conditioning_variant": "target_voice_reference",
                         "status": "ready",
                         "source_mimo_record_fingerprint": mimo_record.record_fingerprint,
                         "source_h3_sample_sha256": _sha256_text(
@@ -969,6 +1334,113 @@ def materialize_mimo25_h3_shadow(
                     }
                 )
             )
+
+        for clip_uid in sorted(canonical_by_clip):
+            canonical = canonical_by_clip[clip_uid]
+            job = job_by_clip[clip_uid]
+            mimo_record = record_by_clip[clip_uid]
+            if mimo_record.status != "ready":
+                continue
+            source_hash = _sha256_text(
+                _compact_json(canonical.model_dump(mode="json"))
+            )
+            if enable_full_audio_reuse:
+                if len(canonical.visual_references) + 1 > 12:
+                    warning_counts["full_audio_reuse_reference_limit"] += 1
+                else:
+                    _probe_canonical_audio(job=job, audio_backend=active_audio_backend)
+                    audio_reference = _full_audio_reuse_reference(job)
+                    corrected, rendered, warnings = _materialize_sample(
+                        canonical,
+                        job,
+                        mimo_record,
+                        conditioning_variant="full_audio_reuse",
+                    )
+                    warning_counts.update(warnings)
+                    records.append(
+                        _record(
+                            {
+                                "schema_version": MIMO25_SHADOW_RECORD_VERSION,
+                                "sample_id": f"{clip_uid}/audio_reuse",
+                                "source_h3_sample_id": canonical.sample_id,
+                                "clip_uid": clip_uid,
+                                "pair_type": "canonical",
+                                "derived_from_pair_type": "canonical",
+                                "conditioning_variant": "full_audio_reuse",
+                                "status": "ready",
+                                "source_mimo_record_fingerprint": (
+                                    mimo_record.record_fingerprint
+                                ),
+                                "source_h3_sample_sha256": source_hash,
+                                "materializer_version": MIMO25_MATERIALIZER_VERSION,
+                                "corrected_speech_segments": [
+                                    item.model_dump(mode="json") for item in corrected
+                                ],
+                                "effective_subject_voices": [],
+                                "audio_references": [
+                                    audio_reference.model_dump(mode="json")
+                                ],
+                                "recovered_voice_references": [],
+                                "rendered_h3_prompt": rendered,
+                                "warnings": warnings,
+                                "failure_reason": None,
+                            }
+                        )
+                    )
+            if enable_music_reference:
+                if len(canonical.visual_references) + 1 > 12:
+                    music_rejection_counts["music_reference_limit"] += 1
+                    continue
+                reference, temporary_path, rejections = _select_music_reference(
+                    job=job,
+                    record=mimo_record,
+                    temporary_root=temporary,
+                    final_root=destination,
+                    audio_backend=active_audio_backend,
+                    analyzer=active_analyzer,
+                )
+                music_rejection_counts.update(rejections)
+                if reference is None or temporary_path is None:
+                    continue
+                corrected, rendered, warnings = _materialize_sample(
+                    canonical,
+                    job,
+                    mimo_record,
+                    conditioning_variant="music_reference",
+                    extra_audio_contract=_extra_audio_contract(
+                        reference,
+                        render_path=temporary_path,
+                    ),
+                )
+                warning_counts.update(warnings)
+                records.append(
+                    _record(
+                        {
+                            "schema_version": MIMO25_SHADOW_RECORD_VERSION,
+                            "sample_id": f"{clip_uid}/music_reference",
+                            "source_h3_sample_id": canonical.sample_id,
+                            "clip_uid": clip_uid,
+                            "pair_type": "canonical",
+                            "derived_from_pair_type": "canonical",
+                            "conditioning_variant": "music_reference",
+                            "status": "ready",
+                            "source_mimo_record_fingerprint": (
+                                mimo_record.record_fingerprint
+                            ),
+                            "source_h3_sample_sha256": source_hash,
+                            "materializer_version": MIMO25_MATERIALIZER_VERSION,
+                            "corrected_speech_segments": [
+                                item.model_dump(mode="json") for item in corrected
+                            ],
+                            "effective_subject_voices": [],
+                            "audio_references": [reference.model_dump(mode="json")],
+                            "recovered_voice_references": [],
+                            "rendered_h3_prompt": rendered,
+                            "warnings": warnings,
+                            "failure_reason": None,
+                        }
+                    )
+                )
         records.sort(key=lambda item: (item.clip_uid, item.sample_id))
         _write_jsonl(temporary / "records.jsonl", records)
         _write_jsonl(temporary / "recovered_voice_references.jsonl", recovery_records)
@@ -1005,7 +1477,9 @@ def materialize_mimo25_h3_shadow(
                 {(item.clip_uid, item.entity_id) for item in selected_recovery}
             ),
             derived_in_pair_count=sum(
-                item.derived_from_pair_type == "canonical" for item in records
+                item.derived_from_pair_type == "canonical"
+                and item.pair_type == "in_pair"
+                for item in records
             ),
             enriched_existing_in_pair_count=sum(
                 item.pair_type == "in_pair"
@@ -1014,6 +1488,15 @@ def materialize_mimo25_h3_shadow(
                 for item in records
             ),
             recovery_rejection_reason_counts=dict(sorted(rejection_counts.items())),
+            full_audio_reuse_count=sum(
+                item.conditioning_variant == "full_audio_reuse" for item in records
+            ),
+            music_reference_count=sum(
+                item.conditioning_variant == "music_reference" for item in records
+            ),
+            music_reference_rejection_reason_counts=dict(
+                sorted(music_rejection_counts.items())
+            ),
         )
         _write_json(temporary / "summary.json", summary.model_dump(mode="json"))
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -1037,5 +1520,6 @@ def materialize_mimo25_h3_shadow(
 __all__ = [
     "MimoH3ShadowRecord",
     "MimoH3ShadowSummary",
+    "MimoShadowAudioReference",
     "materialize_mimo25_h3_shadow",
 ]
