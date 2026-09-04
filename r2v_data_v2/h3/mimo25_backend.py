@@ -30,7 +30,7 @@ MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v19"
 MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v13"
 MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.12"
 MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.17"
-MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v12"
+MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v13"
 DEFAULT_BASE64_LIMIT_BYTES = 50 * 1024 * 1024
 MimoTransport = Literal["xiaomi", "sglang"]
 
@@ -557,6 +557,7 @@ class MimoBackendProvenance(SchemaModel):
         "h3_mimo25_materializer_v10",
         "h3_mimo25_materializer_v11",
         "h3_mimo25_materializer_v12",
+        "h3_mimo25_materializer_v13",
     ] = (
         MIMO25_MATERIALIZER_VERSION
     )

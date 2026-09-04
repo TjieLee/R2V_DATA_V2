@@ -69,15 +69,33 @@ from r2v_data_v2.h3.schemas import SchemaModel
 from r2v_data_v2.h3.speech_presentation import (
     render_speech_presentation_clause,
 )
+from r2v_data_v2.structured_output import ValidationIssue
 
 MIMO25_SHADOW_RECORD_VERSION = "r2v.h3.mimo25_h3_shadow.11"
-MIMO25_SHADOW_SUMMARY_VERSION = "r2v.h3.mimo25_h3_shadow_summary.11"
+MIMO25_SHADOW_SUMMARY_VERSION = "r2v.h3.mimo25_h3_shadow_summary.12"
 MUSIC_REFERENCE_POLICY_VERSION = "h3_mimo25_clean_music_reference_v1"
 MUSIC_REFERENCE_SAMPLE_RATE_HZ = 32000
 MUSIC_REFERENCE_CHANNELS = 2
 MUSIC_REFERENCE_MINIMUM_DURATION_SECONDS = 1.0
 MUSIC_REFERENCE_MINIMUM_RMS_DBFS = -60.0
 MUSIC_REFERENCE_MAXIMUM_CLIPPING_RATIO = 0.001
+
+
+class MimoH3MaterializationContractError(ValueError):
+    def __init__(self, issues: Sequence[ValidationIssue]) -> None:
+        self.issues = tuple(issues)
+        super().__init__(
+            "MiMo H3 materialization violates reference contract: "
+            + _compact_json([item.to_dict() for item in self.issues])
+        )
+
+    def failure_reason(self) -> str:
+        return _compact_json(
+            {
+                "category": "materialization_contract_failed",
+                "issues": [item.to_dict() for item in self.issues],
+            }
+        )
 
 
 class MimoShadowAudioReference(SchemaModel):
@@ -216,6 +234,7 @@ class MimoH3ShadowRecord(SchemaModel):
     materializer_version: Literal[
         "h3_mimo25_materializer_v11",
         "h3_mimo25_materializer_v12",
+        "h3_mimo25_materializer_v13",
     ] = (
         MIMO25_MATERIALIZER_VERSION
     )
@@ -326,7 +345,7 @@ class MimoH3ShadowRecord(SchemaModel):
 
 
 class MimoH3ShadowSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_h3_shadow_summary.11"] = (
+    schema_version: Literal["r2v.h3.mimo25_h3_shadow_summary.12"] = (
         MIMO25_SHADOW_SUMMARY_VERSION
     )
     source_mimo_inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -335,6 +354,8 @@ class MimoH3ShadowSummary(SchemaModel):
     sample_count: int = Field(ge=0)
     ready_count: int = Field(ge=0)
     failed_count: int = Field(ge=0)
+    materialization_failure_count: int = Field(ge=0)
+    materialization_failure_code_counts: dict[str, int]
     warning_counts: dict[str, int]
     target_clip_annotation_reuse_count: int = Field(ge=0)
     recovered_voice_quality_policy_version: Literal[
@@ -363,6 +384,14 @@ class MimoH3ShadowSummary(SchemaModel):
     def validate_counts(self) -> MimoH3ShadowSummary:
         if self.sample_count != self.ready_count + self.failed_count:
             raise ValueError("MiMo H3 shadow summary counts must reconcile")
+        if self.materialization_failure_count > self.failed_count:
+            raise ValueError("MiMo materialization failure count exceeds failed records")
+        if bool(self.materialization_failure_count) != bool(
+            self.materialization_failure_code_counts
+        ):
+            raise ValueError("MiMo materialization failure summary is incomplete")
+        if any(count <= 0 for count in self.materialization_failure_code_counts.values()):
+            raise ValueError("MiMo materialization failure code counts must be positive")
         if self.recovered_voice_candidate_count != (
             self.recovered_voice_accepted_count + self.recovered_voice_rejected_count
         ):
@@ -765,10 +794,7 @@ def _materialize_sample(
         raise ValueError("MiMo Audio-event placeholder survived materialization")
     issues, validation_warnings = validate_h3_response(structured, request)
     if issues:
-        raise ValueError(
-            "MiMo H3 materialization violates reference contract: "
-            + _compact_json([item.to_dict() for item in issues])
-        )
+        raise MimoH3MaterializationContractError(issues)
     warnings.extend(validation_warnings)
     if record.annotation.warnings:
         warnings.extend(
@@ -782,6 +808,23 @@ def _record(values: dict[str, object]) -> MimoH3ShadowRecord:
         **values,
         record_fingerprint=_sha256_text(_compact_json(values)),
     )
+
+
+def _materialization_failure_values(
+    base: dict[str, object],
+    error: MimoH3MaterializationContractError,
+) -> dict[str, object]:
+    return {
+        **base,
+        "status": "failed",
+        "corrected_speech_segments": [],
+        "effective_subject_voices": [],
+        "audio_references": [],
+        "recovered_voice_references": [],
+        "rendered_h3_prompt": None,
+        "warnings": [],
+        "failure_reason": error.failure_reason(),
+    }
 
 
 def _sample_with_voices(
@@ -1166,6 +1209,8 @@ def materialize_mimo25_h3_shadow(
     temporary.mkdir(parents=True)
     records: list[MimoH3ShadowRecord] = []
     warning_counts: Counter[str] = Counter()
+    materialization_failure_count = 0
+    materialization_failure_code_counts: Counter[str] = Counter()
     recovery_records: list[MimoRecoveredVoiceReference] = []
     temporary_recovered_by_clip: dict[str, list[FinalSubjectVoice]] = {}
     published_recovered_by_clip: dict[str, list[FinalSubjectVoice]] = {}
@@ -1304,18 +1349,12 @@ def materialize_mimo25_h3_shadow(
                         "warnings": warnings,
                         "failure_reason": None,
                     }
-                except (OSError, ValueError) as exc:
-                    values = {
-                        **base,
-                        "status": "failed",
-                        "corrected_speech_segments": [],
-                        "effective_subject_voices": [],
-                        "audio_references": [],
-                        "recovered_voice_references": [],
-                        "rendered_h3_prompt": None,
-                        "warnings": [],
-                        "failure_reason": f"{type(exc).__name__}: {exc}",
-                    }
+                except MimoH3MaterializationContractError as exc:
+                    materialization_failure_count += 1
+                    materialization_failure_code_counts.update(
+                        item.code for item in exc.issues
+                    )
+                    values = _materialization_failure_values(base, exc)
             records.append(_record(values))
 
         for clip_uid, recovered_voices in sorted(published_recovered_by_clip.items()):
@@ -1344,26 +1383,37 @@ def materialize_mimo25_h3_shadow(
                 for item in recovery_records
                 if item.clip_uid == clip_uid and item.status == "selected"
             ]
-            corrected, rendered, warnings = _materialize_sample(
-                render_sample, job, mimo_record
-            )
+            base = {
+                "schema_version": MIMO25_SHADOW_RECORD_VERSION,
+                "sample_id": published_sample.sample_id,
+                "source_h3_sample_id": canonical.sample_id,
+                "clip_uid": clip_uid,
+                "pair_type": "in_pair",
+                "derived_from_pair_type": "canonical",
+                "conditioning_variant": "target_voice_reference",
+                "source_mimo_record_fingerprint": mimo_record.record_fingerprint,
+                "source_h3_sample_sha256": _sha256_text(
+                    _compact_json(canonical.model_dump(mode="json"))
+                ),
+                "materializer_version": MIMO25_MATERIALIZER_VERSION,
+            }
+            try:
+                corrected, rendered, warnings = _materialize_sample(
+                    render_sample, job, mimo_record
+                )
+            except MimoH3MaterializationContractError as exc:
+                materialization_failure_count += 1
+                materialization_failure_code_counts.update(
+                    item.code for item in exc.issues
+                )
+                records.append(_record(_materialization_failure_values(base, exc)))
+                continue
             warning_counts.update(warnings)
             records.append(
                 _record(
                     {
-                        "schema_version": MIMO25_SHADOW_RECORD_VERSION,
-                        "sample_id": published_sample.sample_id,
-                        "source_h3_sample_id": canonical.sample_id,
-                        "clip_uid": clip_uid,
-                        "pair_type": "in_pair",
-                        "derived_from_pair_type": "canonical",
-                        "conditioning_variant": "target_voice_reference",
+                        **base,
                         "status": "ready",
-                        "source_mimo_record_fingerprint": mimo_record.record_fingerprint,
-                        "source_h3_sample_sha256": _sha256_text(
-                            _compact_json(canonical.model_dump(mode="json"))
-                        ),
-                        "materializer_version": MIMO25_MATERIALIZER_VERSION,
                         "corrected_speech_segments": [
                             item.model_dump(mode="json") for item in corrected
                         ],
@@ -1403,43 +1453,57 @@ def materialize_mimo25_h3_shadow(
                 else:
                     _probe_canonical_audio(job=job, audio_backend=active_audio_backend)
                     audio_reference = _full_audio_reuse_reference(job)
-                    corrected, rendered, warnings = _materialize_sample(
-                        canonical,
-                        job,
-                        mimo_record,
-                        conditioning_variant="full_audio_reuse",
-                    )
-                    warning_counts.update(warnings)
-                    records.append(
-                        _record(
-                            {
-                                "schema_version": MIMO25_SHADOW_RECORD_VERSION,
-                                "sample_id": f"{clip_uid}/audio_reuse",
-                                "source_h3_sample_id": canonical.sample_id,
-                                "clip_uid": clip_uid,
-                                "pair_type": "canonical",
-                                "derived_from_pair_type": "canonical",
-                                "conditioning_variant": "full_audio_reuse",
-                                "status": "ready",
-                                "source_mimo_record_fingerprint": (
-                                    mimo_record.record_fingerprint
-                                ),
-                                "source_h3_sample_sha256": source_hash,
-                                "materializer_version": MIMO25_MATERIALIZER_VERSION,
-                                "corrected_speech_segments": [
-                                    item.model_dump(mode="json") for item in corrected
-                                ],
-                                "effective_subject_voices": [],
-                                "audio_references": [
-                                    audio_reference.model_dump(mode="json")
-                                ],
-                                "recovered_voice_references": [],
-                                "rendered_h3_prompt": rendered,
-                                "warnings": warnings,
-                                "failure_reason": None,
-                            }
+                    base = {
+                        "schema_version": MIMO25_SHADOW_RECORD_VERSION,
+                        "sample_id": f"{clip_uid}/audio_reuse",
+                        "source_h3_sample_id": canonical.sample_id,
+                        "clip_uid": clip_uid,
+                        "pair_type": "canonical",
+                        "derived_from_pair_type": "canonical",
+                        "conditioning_variant": "full_audio_reuse",
+                        "source_mimo_record_fingerprint": (
+                            mimo_record.record_fingerprint
+                        ),
+                        "source_h3_sample_sha256": source_hash,
+                        "materializer_version": MIMO25_MATERIALIZER_VERSION,
+                    }
+                    try:
+                        corrected, rendered, warnings = _materialize_sample(
+                            canonical,
+                            job,
+                            mimo_record,
+                            conditioning_variant="full_audio_reuse",
                         )
-                    )
+                    except MimoH3MaterializationContractError as exc:
+                        materialization_failure_count += 1
+                        materialization_failure_code_counts.update(
+                            item.code for item in exc.issues
+                        )
+                        records.append(
+                            _record(_materialization_failure_values(base, exc))
+                        )
+                    else:
+                        warning_counts.update(warnings)
+                        records.append(
+                            _record(
+                                {
+                                    **base,
+                                    "status": "ready",
+                                    "corrected_speech_segments": [
+                                        item.model_dump(mode="json")
+                                        for item in corrected
+                                    ],
+                                    "effective_subject_voices": [],
+                                    "audio_references": [
+                                        audio_reference.model_dump(mode="json")
+                                    ],
+                                    "recovered_voice_references": [],
+                                    "rendered_h3_prompt": rendered,
+                                    "warnings": warnings,
+                                    "failure_reason": None,
+                                }
+                            )
+                        )
             if enable_music_reference:
                 if len(job.reference_images) + 1 > 12:
                     music_rejection_counts["music_reference_limit"] += 1
@@ -1455,33 +1519,42 @@ def materialize_mimo25_h3_shadow(
                 music_rejection_counts.update(rejections)
                 if reference is None or temporary_path is None:
                     continue
-                corrected, rendered, warnings = _materialize_sample(
-                    canonical,
-                    job,
-                    mimo_record,
-                    conditioning_variant="music_reference",
-                    extra_audio_contract=_extra_audio_contract(
-                        reference,
-                        render_path=temporary_path,
-                    ),
-                )
+                base = {
+                    "schema_version": MIMO25_SHADOW_RECORD_VERSION,
+                    "sample_id": f"{clip_uid}/music_reference",
+                    "source_h3_sample_id": canonical.sample_id,
+                    "clip_uid": clip_uid,
+                    "pair_type": "canonical",
+                    "derived_from_pair_type": "canonical",
+                    "conditioning_variant": "music_reference",
+                    "source_mimo_record_fingerprint": mimo_record.record_fingerprint,
+                    "source_h3_sample_sha256": source_hash,
+                    "materializer_version": MIMO25_MATERIALIZER_VERSION,
+                }
+                try:
+                    corrected, rendered, warnings = _materialize_sample(
+                        canonical,
+                        job,
+                        mimo_record,
+                        conditioning_variant="music_reference",
+                        extra_audio_contract=_extra_audio_contract(
+                            reference,
+                            render_path=temporary_path,
+                        ),
+                    )
+                except MimoH3MaterializationContractError as exc:
+                    materialization_failure_count += 1
+                    materialization_failure_code_counts.update(
+                        item.code for item in exc.issues
+                    )
+                    records.append(_record(_materialization_failure_values(base, exc)))
+                    continue
                 warning_counts.update(warnings)
                 records.append(
                     _record(
                         {
-                            "schema_version": MIMO25_SHADOW_RECORD_VERSION,
-                            "sample_id": f"{clip_uid}/music_reference",
-                            "source_h3_sample_id": canonical.sample_id,
-                            "clip_uid": clip_uid,
-                            "pair_type": "canonical",
-                            "derived_from_pair_type": "canonical",
-                            "conditioning_variant": "music_reference",
+                            **base,
                             "status": "ready",
-                            "source_mimo_record_fingerprint": (
-                                mimo_record.record_fingerprint
-                            ),
-                            "source_h3_sample_sha256": source_hash,
-                            "materializer_version": MIMO25_MATERIALIZER_VERSION,
                             "corrected_speech_segments": [
                                 item.model_dump(mode="json") for item in corrected
                             ],
@@ -1513,6 +1586,10 @@ def materialize_mimo25_h3_shadow(
             sample_count=len(records),
             ready_count=sum(item.status == "ready" for item in records),
             failed_count=sum(item.status == "failed" for item in records),
+            materialization_failure_count=materialization_failure_count,
+            materialization_failure_code_counts=dict(
+                sorted(materialization_failure_code_counts.items())
+            ),
             warning_counts=dict(sorted(warning_counts.items())),
             target_clip_annotation_reuse_count=sum(
                 max(0, count - 1)

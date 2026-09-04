@@ -120,7 +120,7 @@ Prompt, policy, annotation schema, and materializer versions are:
 - `h3_mimo25_av_authority_contract_v13`
 - `r2v.h3.mimo25_av_annotation.12`
 - `r2v.h3.mimo25_backend.17`
-- `h3_mimo25_materializer_v12`
+- `h3_mimo25_materializer_v13`
 - `h3_mimo25_reference_selection_v1`
 - `h3_mimo25_recovered_voice_quality_v1`
 - `r2v.h3.mimo25_inventory.4`
@@ -129,7 +129,7 @@ Prompt, policy, annotation schema, and materializer versions are:
 - `r2v.h3.mimo25_failure.5`
 - `r2v.h3.mimo25_raw_response.5`
 - `r2v.h3.mimo25_h3_shadow.11`
-- `r2v.h3.mimo25_h3_shadow_summary.11`
+- `r2v.h3.mimo25_h3_shadow_summary.12`
 
 The OpenAI-compatible client defaults to the `xiaomi` transport, model
 `mimo-v2.5`, video FPS 4, `media_resolution=default`, disabled thinking,
@@ -268,6 +268,18 @@ typed timeline is internal annotation structure only and never appears in the
 final Ref2VA text. Approximate event times are internal placement evidence, and
 ordinary observed target-video sounds never create an `<Audio N>` reference;
 that label remains reserved for an actual copied or referenced Audio asset.
+
+Shadow materialization isolates only final Ref2VA response-contract failures at
+the individual sample level. Such a record remains `status="failed"`, carries a
+compact `materialization_contract_failed` issue list, and publishes no rendered
+prompt, corrected speech, or Audio references; later samples continue normally.
+The summary reports both the failed-sample count and validation issue-code
+counts. Inventory fingerprints, source H3/ASR provenance, canonical media hashes,
+task-local Picture projection, duplicate identities, and schema/programming
+errors remain batch-level fail-fast checks. Speaker-source validation uses the
+last explicit `<Subject N> (Sx)` or `(Sx)` source attached to each exact dialogue
+clause, without a fixed character lookback that could truncate a valid long
+voice-reference description.
 
 ## Post-MiMo target voice recovery
 

@@ -68,6 +68,7 @@ AudioKind = Literal[
 
 _REFERENCE_LABEL = re.compile(r"<(Picture|Subject|Video|Audio)\s+([1-9]\d*)>")
 _SPEAKER_LABEL = re.compile(r"\(S([1-9]\d*)\)")
+_SPEECH_SOURCE = re.compile(r"(?:<Subject [1-9]\d*>\s+)?\(S[1-9]\d*\)")
 _DIALOGUE_BLOCK = re.compile(r"<d>\[[^\]\r\n]+\][\s\S]*?</d>")
 _SPEECH_PLACEHOLDER = re.compile(r"\[\[([^\[\]\r\n]+)\]\]")
 _SPEECH_LEAD_IN = re.compile(
@@ -1614,11 +1615,14 @@ def validate_h3_response(
             (end for end in all_dialogue_ends if end <= block_index),
             default=0,
         )
-        prefix = response.detailed_description[
-            max(previous_dialogue_end, block_index - 180) : block_index
-        ]
+        prefix = response.detailed_description[previous_dialogue_end:block_index]
         expected_source = _speech_exact_source(speech)
-        if expected_source not in prefix:
+        source_matches = list(_SPEECH_SOURCE.finditer(prefix))
+        actual_source = None if not source_matches else source_matches[-1].group(0)
+        source_suffix = (
+            "" if not source_matches else prefix[source_matches[-1].end() :].rstrip()
+        )
+        if actual_source != expected_source or not source_suffix.endswith(("says,", ":")):
             issues.append(
                 ValidationIssue(
                     "locked_dialogue_source_mismatch",

@@ -737,7 +737,7 @@ def test_current_backend_schema_keeps_existing_materializer_v6_provenance_readab
     ).hexdigest()
     historical = type(current).model_validate(values)
     assert historical.materializer_version == "h3_mimo25_materializer_v6"
-    assert current.materializer_version == "h3_mimo25_materializer_v12"
+    assert current.materializer_version == "h3_mimo25_materializer_v13"
 
 
 def test_mimo_v19_prompt_preserves_dense_visual_and_audio_authority_contract() -> None:
@@ -5442,6 +5442,32 @@ def test_materializer_retains_refinement_segment_without_entity(tmp_path: Path) 
     assert "segment_1:acoustic_refinement_unresolved" in warnings
 
 
+def test_materializer_validates_bound_speech_with_long_voice_profile(
+    tmp_path: Path,
+) -> None:
+    sample = _sample(tmp_path)
+    job = _job_fixture(tmp_path)
+    payload = _annotation().model_dump(mode="json")
+    payload["speaker_voice_profiles"][0]["voice_characteristics"] = (
+        "a controlled mid-register delivery with softly rounded consonants, "
+        "measured pauses, restrained energy, and a steady unhurried cadence "
+        "that remains consistent through the utterance "
+    )
+    annotation = MimoAVAnnotationDraft.model_validate(payload)
+
+    corrected, rendered, _ = _materialize_sample(
+        sample,
+        job,
+        _record_fixture(tmp_path, annotation, job=job),
+    )
+
+    assert corrected[0].entity_id == "e1"
+    dialogue = "<d>[English] Exact, text!</d>"
+    dialogue_index = rendered.index(dialogue)
+    source_index = rendered.rindex("<Subject 1> (S1)", 0, dialogue_index)
+    assert dialogue_index - source_index > 180
+
+
 def test_materializer_rejects_source_speaker_cluster_drift(tmp_path: Path) -> None:
     sample = _sample(tmp_path)
     payload = sample.model_dump(mode="python")
@@ -5479,6 +5505,115 @@ def test_materializer_provenance_preflight_accepts_unchanged_inputs(
     assert summary.failed_count == 0
     assert summary.full_audio_reuse_count == 0
     assert summary.music_reference_count == 0
+
+
+def test_materializer_isolates_one_final_contract_failure_and_continues(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _materializer_fixture(tmp_path, source_sample_count=2)
+    original_validate = mimo25_materializer.validate_h3_response
+
+    def validate_with_one_bad_sample(response: object, request: object) -> object:
+        if request.sample.sample_id == "clip-1/in_pair":  # type: ignore[attr-defined]
+            return (
+                [
+                    ValidationIssue(
+                        "locked_dialogue_source_mismatch",
+                        "detailed_description",
+                        "segment_0001 requires <Subject 1> (S1)",
+                    )
+                ],
+                [],
+            )
+        return original_validate(response, request)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        mimo25_materializer,
+        "validate_h3_response",
+        validate_with_one_bad_sample,
+    )
+    summary = materialize_mimo25_h3_shadow(
+        mimo_root=fixture.mimo_root,
+        source_h3_root=fixture.source_h3,
+        output_root=fixture.output_root,
+        enable_full_audio_reuse=True,
+        audio_backend=_ConditioningAudioBackend(source_duration_seconds=1.0),
+    )
+    records = _shadow_records(fixture)
+
+    assert {item.sample_id: item.status for item in records} == {
+        "clip-1/audio_reuse": "ready",
+        "clip-1/canonical": "ready",
+        "clip-1/in_pair": "failed",
+    }
+    failed = next(item for item in records if item.status == "failed")
+    assert failed.rendered_h3_prompt is None
+    assert failed.corrected_speech_segments == []
+    assert failed.effective_subject_voices == []
+    assert failed.audio_references == []
+    assert failed.recovered_voice_references == []
+    assert failed.warnings == []
+    failure = json.loads(failed.failure_reason)
+    assert failure == {
+        "category": "materialization_contract_failed",
+        "issues": [
+            {
+                "code": "locked_dialogue_source_mismatch",
+                "field": "detailed_description",
+                "message": "segment_0001 requires <Subject 1> (S1)",
+            }
+        ],
+    }
+    assert summary.sample_count == 3
+    assert summary.ready_count == 2
+    assert summary.failed_count == 1
+    assert summary.schema_version == "r2v.h3.mimo25_h3_shadow_summary.12"
+    assert summary.materialization_failure_count == 1
+    assert summary.materialization_failure_code_counts == {
+        "locked_dialogue_source_mismatch": 1
+    }
+    assert {item.schema_version for item in records} == {
+        "r2v.h3.mimo25_h3_shadow.11"
+    }
+    assert {item.materializer_version for item in records} == {
+        "h3_mimo25_materializer_v13"
+    }
+
+
+def test_materializer_does_not_isolate_authoritative_asr_drift(tmp_path: Path) -> None:
+    fixture = _materializer_fixture(tmp_path)
+    sample_values = fixture.samples[0].model_dump(mode="python")
+    sample_values["speech_segments"][0]["text"] = "Mutated source text."
+    changed_sample = FinalH3SampleV2.model_validate(sample_values)
+    _write_models_jsonl(fixture.samples_path, [changed_sample])
+
+    inventory_values = fixture.inventory.model_dump(
+        mode="json", exclude={"inventory_fingerprint"}
+    )
+    inventory_values["source_h3_samples_sha256"] = _file_sha256(fixture.samples_path)
+    if inventory_values["source_diarization_inventory_sha256"] is None:
+        inventory_values.pop("source_diarization_inventory_sha256")
+    inventory = _inventory(inventory_values)
+    changed_record = _replace_record(
+        fixture.record,
+        inventory_fingerprint=inventory.inventory_fingerprint,
+    )
+    (fixture.mimo_root / "inventory.json").write_text(
+        inventory.model_dump_json(), encoding="utf-8"
+    )
+    _write_models_jsonl(fixture.mimo_root / "records.jsonl", [changed_record])
+
+    with pytest.raises(
+        ValueError,
+        match="source H3 speech differs from authoritative Qwen3-ASR",
+    ):
+        materialize_mimo25_h3_shadow(
+            mimo_root=fixture.mimo_root,
+            source_h3_root=fixture.source_h3,
+            output_root=fixture.output_root,
+        )
+    assert not fixture.output_root.exists()
 
 
 def test_materializer_audio_variant_flags_default_false_and_are_explicit() -> None:
