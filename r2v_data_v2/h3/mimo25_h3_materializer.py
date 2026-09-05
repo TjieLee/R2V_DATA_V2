@@ -30,6 +30,7 @@ from r2v_data_v2.h3.mimo25_av_reconcile import (
     project_mimo_h3_sample_references,
 )
 from r2v_data_v2.h3.mimo25_backend import (
+    MIMO25_CANONICAL_ABSENT_SOUNDSCAPE,
     MIMO25_MATERIALIZER_VERSION,
     MimoAudioEvent,
     MimoH3AudioEventPart,
@@ -237,6 +238,7 @@ class MimoH3ShadowRecord(SchemaModel):
         "h3_mimo25_materializer_v13",
         "h3_mimo25_materializer_v14",
         "h3_mimo25_materializer_v15",
+        "h3_mimo25_materializer_v16",
     ] = (
         MIMO25_MATERIALIZER_VERSION
     )
@@ -723,7 +725,11 @@ def _materialize_sample(
     if semantics.overall_soundscape_status == "present":
         soundscape = semantics.overall_soundscape
     elif semantics.overall_soundscape_status == "absent":
-        soundscape = "N/A"
+        soundscape = (
+            semantics.overall_soundscape
+            if semantics.overall_soundscape is not None
+            else MIMO25_CANONICAL_ABSENT_SOUNDSCAPE
+        )
     else:
         raise ValueError(
             "unknown MiMo soundscape cannot be materialized as confirmed silence"

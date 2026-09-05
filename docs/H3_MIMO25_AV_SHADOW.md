@@ -160,8 +160,8 @@ Prompt, policy, annotation schema, and materializer versions are:
 - `h3_mimo25_unified_av_reconcile_v22`
 - `h3_mimo25_av_authority_contract_v16`
 - `r2v.h3.mimo25_av_annotation.13`
-- `r2v.h3.mimo25_backend.23`
-- `h3_mimo25_materializer_v15`
+- `r2v.h3.mimo25_backend.24`
+- `h3_mimo25_materializer_v16`
 - `h3_mimo25_reference_selection_v1`
 - `h3_mimo25_recovered_voice_quality_v1`
 - `r2v.h3.mimo25_inventory.4`
@@ -310,16 +310,19 @@ environmental layer, physical sound, or non-verbal human sound requires
 not repeat dialogue/speech, narration/voice-over content, singing, diegetic
 music, or non-diegetic music/BGM/score. Diegetic music stays in
 `detailed_description`, while audience-only music stays in
-`non_diegetic_music`. The
-model may use `absent` only for verified silence of this soundscape layer, which
-materializes as `N/A`. `unknown` is reserved for genuinely unavailable or
-uncertain Audio evidence and fails closed during shadow materialization instead
-of silently masquerading as confirmed silence. Visual context may disambiguate
-an audible source but can never invent room tone or another sound. MiMo performs
-a full-timeline audible-event pass that includes brief physical sounds such as
-door actions, knocks, footsteps, impacts, object handling, scraping, clicks,
-bells, and beeps. Each grounded event appears once at its typed chronological
-timeline position, while `overall_soundscape` may summarize salient events in
+`non_diegetic_music`. The model uses `absent` when no distinct positive
+non-musical soundscape layer is
+established, independently of speech and music. It may publish null or concise
+explicit negative-only prose; materialization preserves validated negative prose
+or emits the canonical negative statement. `unknown` is reserved for genuinely
+unavailable or uncertain Audio evidence and fails closed during shadow
+materialization instead of silently masquerading as confirmed absence. Visual
+context may disambiguate an audible source but can never invent room tone or
+another sound. MiMo performs a full-timeline audible-event pass that includes
+brief physical sounds such as door actions, knocks, footsteps, impacts, object
+handling, scraping, clicks, bells, and beeps. Each grounded event appears once
+at its typed chronological timeline position, while `overall_soundscape` may
+summarize salient events in
 natural wording rather than repeating the event sentence mechanically.
 Localized object interactions such as one door close, knock, footstep, impact,
 placement, scrape, or physical click are `physical`; background sources such as

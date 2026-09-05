@@ -31,8 +31,12 @@ MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
 MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v22"
 MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v16"
 MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.13"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.23"
-MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v15"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.24"
+MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v16"
+MIMO25_CANONICAL_ABSENT_SOUNDSCAPE = (
+    "No distinct environmental, mechanical, physical, or non-verbal human "
+    "sounds are clearly discernible."
+)
 DEFAULT_BASE64_LIMIT_BYTES = 50 * 1024 * 1024
 MimoTransport = Literal["xiaomi", "sglang"]
 
@@ -123,6 +127,20 @@ _SOUNDSCAPE_NEGATION_SCOPE_BREAK = re.compile(
 _SOUNDSCAPE_POST_NEGATION = re.compile(
     r"^\s*(?:(?:is|are|was|were|seems?|remains?)\s+)?(?:not\s+"
     r"(?:audible|present|detectable|discernible)|absent|undetectable|indiscernible)\b",
+    flags=re.IGNORECASE,
+)
+_SOUNDSCAPE_ABSENCE_CLAUSE_BOUNDARY = re.compile(
+    r"[;.!?\n]+|\b(?:but|however|while|whereas|yet)\b",
+    flags=re.IGNORECASE,
+)
+_EXPLICIT_SOUNDSCAPE_ABSENCE = re.compile(
+    r"^\s*no\b(?P<body>.+)\b(?:is|are|was|were)\s+"
+    r"(?:(?:clearly|currently|readily)\s+)?"
+    r"(?:audible|heard|present|detectable|discernible|established)\s*$",
+    flags=re.IGNORECASE,
+)
+_SOUNDSCAPE_POSITIVE_VERB = re.compile(
+    r"\b(?:is|are|was|were|remains?|continues?|persists?|plays?)\b",
     flags=re.IGNORECASE,
 )
 _INTERNAL_ANNOTATION_SYNTAX = re.compile(
@@ -365,6 +383,21 @@ def _contains_positive_soundscape_contamination(text: str) -> bool:
             if not _soundscape_contamination_match_is_negated(clause, match):
                 return True
     return False
+
+
+def _is_explicit_negative_soundscape_description(text: str) -> bool:
+    clauses = [
+        clause.strip()
+        for clause in _SOUNDSCAPE_ABSENCE_CLAUSE_BOUNDARY.split(text)
+        if clause.strip()
+    ]
+    if not clauses:
+        return False
+    for clause in clauses:
+        match = _EXPLICIT_SOUNDSCAPE_ABSENCE.fullmatch(clause)
+        if match is None or _SOUNDSCAPE_POSITIVE_VERB.search(match.group("body")):
+            return False
+    return True
 
 
 def _deduplicate_exact_strings(values: object) -> tuple[object, int]:
@@ -674,8 +707,17 @@ class MimoAudioSemantics(SchemaModel):
         if self.overall_soundscape_status == "present":
             if self.overall_soundscape is None or not self.overall_soundscape.strip():
                 raise ValueError("present soundscape requires a concise description")
+        elif self.overall_soundscape_status == "absent":
+            if self.overall_soundscape is not None and not (
+                _is_explicit_negative_soundscape_description(
+                    self.overall_soundscape
+                )
+            ):
+                raise ValueError(
+                    "absent soundscape description must be explicit negative-only prose"
+                )
         elif self.overall_soundscape is not None:
-            raise ValueError("absent or unknown soundscape cannot publish a description")
+            raise ValueError("unknown soundscape cannot publish a description")
         if self.non_diegetic_music_status == "present":
             if self.non_diegetic_music is None or not self.non_diegetic_music.strip():
                 raise ValueError("present music requires a concise description")
@@ -987,7 +1029,7 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.23"] = MIMO25_BACKEND_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.24"] = MIMO25_BACKEND_VERSION
     backend: Literal[
         "xiaomi_openai_compatible", "sglang_openai_compatible"
     ]
@@ -1024,6 +1066,7 @@ class MimoBackendProvenance(SchemaModel):
         "h3_mimo25_materializer_v13",
         "h3_mimo25_materializer_v14",
         "h3_mimo25_materializer_v15",
+        "h3_mimo25_materializer_v16",
     ] = (
         MIMO25_MATERIALIZER_VERSION
     )
@@ -1260,7 +1303,7 @@ STAGE B audio_observation: PURE AUDIO EVIDENCE
 - Emit genuinely audible non-speech events with contiguous chronological aeN IDs and tight approximate times. Visual evidence may identify a genuinely audible source but never invent sound.
 - Soundscape event categories are physical, environmental, mechanical, electronic, human_non_speech, and other. Music categories are diegetic_music and non_diegetic_music. Neither music category contributes to overall_soundscape. Diegetic music may enter the detailed timeline; non-diegetic music belongs only in non_diegetic_music.
 - A sustained layer is not automatically ambience because it lacks beats or melody. A pitched or harmonically structured synthesized/processed soundtrack bed, sustained musical drone or pad, instrumental layer, or score-like layer with no plausible visible in-scene source is non_diegetic_music even when beatless, minimal, atmospheric, eerie, or slowly evolving. Do not relabel a soundtrack as room ambience merely because it can be called a drone, hum, or ambient bed. HVAC/electrical hum, wind, traffic, room tone, and machinery remain non-musical soundscape only when the audible and audiovisual evidence supports that source distinction.
-- overall_soundscape is present for audible ambience, room tone, environmental/physical/mechanical/electronic/non-verbal human sound; absent only for verified complete soundscape silence; unknown only when Audio evidence is unavailable or genuinely uncertain. It must never contain dialogue, narration, voice-over, lyrics, singing, music, BGM, score, soundtrack, song, melody, or instrumental music. non_diegetic_music describes audience-only score/BGM. Do not substitute either field for the other. When BGM is audible but no distinct non-musical soundscape is established, do not repeat the music as soundscape or invent room tone, HVAC, wind, traffic, or another layer; a conservative statement that no distinct environmental, mechanical, physical, or non-verbal human sounds are clearly discernible is valid.
+- overall_soundscape is present when one or more positive non-musical ambience, room-tone, environmental, physical, mechanical, electronic, or non-verbal human layers are established. It is absent when no distinct positive non-musical soundscape layer is established, independently of speech, diegetic music, or non-diegetic music; absent may use null or concise explicit negative-only prose. It is unknown only when Audio evidence is unavailable or genuinely uncertain, and unknown must use null. overall_soundscape must never contain dialogue, narration, voice-over, lyrics, singing, music, BGM, score, soundtrack, song, melody, or instrumental music. non_diegetic_music describes audience-only score/BGM. Do not substitute either field for the other. When BGM is audible but no distinct non-musical soundscape is established, do not repeat the music as soundscape or invent room tone, HVAC, wind, traffic, or another layer; a conservative statement that no distinct environmental, mechanical, physical, or non-verbal human sounds are clearly discernible is valid.
 
 STAGE C av_grounding: AUDIOVISUAL CO-ANALYSIS
 - segment_groundings exactly follow allowed_segment_ids and preserve each matching Stage B primary_speaker_group. Decide binding_status, speech_presentation, entity_id, confidence, and evidence from the exact visual segment view plus Audio/AV evidence.
