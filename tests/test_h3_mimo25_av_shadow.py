@@ -819,9 +819,9 @@ def test_current_backend_schema_keeps_existing_materializer_v6_provenance_readab
     assert current.materializer_version == "h3_mimo25_materializer_v15"
 
 
-def test_mimo_v21_prompt_preserves_staged_visual_audio_authority_contract() -> None:
-    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v21"
-    assert MIMO25_POLICY_VERSION == "h3_mimo25_av_authority_contract_v15"
+def test_mimo_v22_prompt_preserves_staged_visual_audio_authority_contract() -> None:
+    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v22"
+    assert MIMO25_POLICY_VERSION == "h3_mimo25_av_authority_contract_v16"
     assert MIMO25_SCHEMA_VERSION == "r2v.h3.mimo25_av_annotation.13"
     for phrase in (
         "STAGE A visual_observation: PURE VISUAL EVIDENCE",
@@ -844,6 +844,7 @@ def test_mimo_v21_prompt_preserves_staged_visual_audio_authority_contract() -> N
         "non-diegetic music belongs only in non_diegetic_music",
         "sustained musical drone or pad",
         "HVAC/electrical hum",
+        "do not repeat the music as soundscape",
         "Stage C may resolve it to visible_entity",
         "Stage A articulation observations and Stage C lip-motion evidence must agree",
         "An attribute Subject describes only the referenced attribute itself",
@@ -856,10 +857,10 @@ def test_mimo_v21_prompt_preserves_staged_visual_audio_authority_contract() -> N
         assert phrase in SYSTEM_PROMPT
 
 
-def test_backend_v22_records_av_resolution_policy(tmp_path: Path) -> None:
+def test_backend_v23_records_cross_field_audio_authority(tmp_path: Path) -> None:
     backend, _ = _backend(tmp_path, [])
 
-    assert backend.provenance.schema_version == "r2v.h3.mimo25_backend.22"
+    assert backend.provenance.schema_version == "r2v.h3.mimo25_backend.23"
 
 
 def test_primary_prompt_includes_exact_subject_picture_contract(
@@ -2240,6 +2241,7 @@ def test_natural_retention_restatement_does_not_trigger_recheck(
         "Music is absent.",
         "Speech is absent.",
         "A low ambient drone remains; there is no human speech or music.",
+        "A faint non-musical ventilation layer remains audible.",
     ],
 )
 def test_negated_soundscape_exclusions_are_clean(soundscape: str) -> None:
@@ -2258,6 +2260,7 @@ def test_negated_soundscape_exclusions_are_clean(soundscape: str) -> None:
         "Room tone is mixed with background music.",
         "No traffic is audible, but soft background music plays.",
         "Music is absent, while a narrator speaks.",
+        "An ambient musical pad continues softly.",
     ],
 )
 def test_positive_soundscape_contamination_remains_detectable(
@@ -6458,6 +6461,209 @@ def test_non_diegetic_music_does_not_substitute_for_soundscape() -> None:
 
     assert annotation.audio_semantics.overall_soundscape_status == "absent"
     assert annotation.audio_semantics.non_diegetic_music_status == "present"
+
+
+def test_near_duplicate_music_in_other_event_requires_full_av_recheck(
+    tmp_path: Path,
+) -> None:
+    payload = _annotation().model_dump(mode="json")
+    semantics = payload["audio_observation"]["audio_semantics"]
+    event = semantics["temporal_non_speech_events"][0]
+    event.update(
+        category="other",
+        pattern="continuous",
+        description=(
+            "A sustained low-pitched resonant ambient musical pad plays continuously."
+        ),
+        source_grounding="audible_only",
+    )
+    semantics["overall_soundscape"] = "A quiet indoor room tone remains audible."
+    semantics["non_diegetic_music_status"] = "present"
+    semantics["non_diegetic_music"] = (
+        "A sustained low-pitched resonant synthesized drone or ambient musical pad "
+        "plays continuously."
+    )
+    annotation = MimoAVAnnotationDraft.model_validate(payload)
+    issue_codes = {issue.code for issue in _validate(annotation)}
+    assert "non_diegetic_music_misclassified_as_soundscape_event" in issue_codes
+
+    raw = annotation.model_dump_json()
+    backend, completions = _backend(tmp_path, [(raw, 8), (raw, 8)])
+    with pytest.raises(MimoBackendFailure) as exc_info:
+        backend.reconcile(
+            _job_fixture(tmp_path),
+            segment_ids=["segment_1"],
+            transcribed_segment_ids=["segment_1"],
+            allowed_entity_ids={"e1"},
+            allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+        )
+
+    assert exc_info.value.recheck_count == 1
+    assert exc_info.value.model_call_count == 2
+    assert "non_diegetic_music_misclassified_as_soundscape_event" in {
+        issue.code for issue in exc_info.value.issues
+    }
+    assert len(completions.requests) == 2
+    recheck_prompt = completions.requests[1]["messages"][1]["content"][-1]["text"]
+    assert "Do not repeat that music in overall_soundscape" in recheck_prompt
+    assert "Do not invent ambience" in recheck_prompt
+
+
+def test_music_duplicated_in_overall_soundscape_is_rejected() -> None:
+    payload = _annotation().model_dump(mode="json")
+    semantics = payload["audio_observation"]["audio_semantics"]
+    semantics["overall_soundscape"] = (
+        "Sparse piano notes and sustained low strings remain audible."
+    )
+    semantics["non_diegetic_music_status"] = "present"
+    semantics["non_diegetic_music"] = "Sparse piano notes with sustained low strings."
+    annotation = MimoAVAnnotationDraft.model_validate(payload)
+
+    assert "non_diegetic_music_leaked_into_soundscape" in {
+        issue.code for issue in _validate(annotation)
+    }
+
+
+def test_distinct_ambience_and_music_do_not_conflict() -> None:
+    payload = _annotation().model_dump(mode="json")
+    semantics = payload["audio_observation"]["audio_semantics"]
+    event = semantics["temporal_non_speech_events"][0]
+    event.update(
+        category="mechanical",
+        pattern="continuous",
+        description="A quiet ventilation hum remains audible indoors.",
+        source_grounding="audible_only",
+    )
+    semantics["overall_soundscape"] = "Quiet indoor room tone and ventilation hum."
+    semantics["non_diegetic_music_status"] = "present"
+    semantics["non_diegetic_music"] = "Sparse piano notes with sustained low strings."
+    annotation = MimoAVAnnotationDraft.model_validate(payload)
+
+    issue_codes = {issue.code for issue in _validate(annotation)}
+    assert "non_diegetic_music_leaked_into_soundscape" not in issue_codes
+    assert "non_diegetic_music_misclassified_as_soundscape_event" not in issue_codes
+
+
+def test_global_music_without_temporal_event_is_valid() -> None:
+    payload = _annotation().model_dump(mode="json")
+    semantics = payload["audio_observation"]["audio_semantics"]
+    semantics["temporal_non_speech_events"] = []
+    semantics["overall_soundscape"] = "A quiet indoor room tone remains audible."
+    semantics["non_diegetic_music_status"] = "present"
+    semantics["non_diegetic_music"] = "Sparse piano notes with sustained low strings."
+    payload["h3_projection"]["shots"][0]["timeline_parts"] = [
+        _prose("visual"),
+        _speech("segment_1"),
+    ]
+    annotation = MimoAVAnnotationDraft.model_validate(payload)
+
+    assert not _validate(annotation)
+
+
+def test_global_music_with_non_diegetic_event_is_valid_and_not_projected() -> None:
+    payload = _annotation().model_dump(mode="json")
+    semantics = payload["audio_observation"]["audio_semantics"]
+    event = semantics["temporal_non_speech_events"][0]
+    event.update(
+        category="non_diegetic_music",
+        pattern="continuous",
+        description="Sparse piano notes with sustained low strings.",
+        source_grounding="audible_only",
+    )
+    semantics["overall_soundscape"] = "A quiet indoor room tone remains audible."
+    semantics["non_diegetic_music_status"] = "present"
+    semantics["non_diegetic_music"] = "Sparse piano notes with sustained low strings."
+    payload["h3_projection"]["shots"][0]["timeline_parts"] = [
+        _prose("visual"),
+        _speech("segment_1"),
+    ]
+    annotation = MimoAVAnnotationDraft.model_validate(payload)
+
+    assert not _validate(annotation)
+    assert all(
+        part.type != "audio_event"
+        for part in annotation.h3_projection.shots[0].timeline_parts
+    )
+
+
+def test_bgm_only_negative_non_musical_soundscape_statement_is_valid() -> None:
+    payload = _annotation().model_dump(mode="json")
+    payload["visual_observation"]["segment_views"] = []
+    payload["audio_observation"]["segment_decisions"] = []
+    payload["audio_observation"]["speaker_voice_profiles"] = []
+    payload["av_grounding"]["segment_groundings"] = []
+    payload["visual_observation"]["shots"][0]["visual_blocks"][0]["text"] = (
+        "A wide static landscape view frames a wooded ridge beneath a pale sky. "
+        "Layered slopes recede from the textured foreground into soft distant haze, "
+        "while muted green and gray tones remain stable across the composition. "
+        "No person enters the view, and the camera holds the scenery without motion."
+    )
+    payload["h3_semantics"]["subject_definitions"] = [
+        _subject_definition("<Subject 1>", "A wooded ridge with layered green slopes.")
+    ]
+    payload["h3_semantics"]["visual_retention_analysis"] = [
+        _retention(
+            "<Subject 1>",
+            "fully_preserved",
+            "The layered wooded ridge remains clearly visible.",
+        )
+    ]
+    payload["h3_semantics"]["summary"] = "A quiet landscape remains in view."
+    semantics = payload["audio_observation"]["audio_semantics"]
+    semantics["temporal_non_speech_events"] = []
+    semantics["overall_soundscape"] = (
+        "No distinct environmental, mechanical, physical, or non-verbal human "
+        "sounds are clearly discernible."
+    )
+    semantics["non_diegetic_music_status"] = "present"
+    semantics["non_diegetic_music"] = (
+        "A sustained synthesized musical pad forms the audience-only score."
+    )
+    semantics["audiovisual_summary"] = (
+        "A scenic view is accompanied by a sustained musical score."
+    )
+    payload["h3_projection"]["shots"][0]["timeline_parts"] = [
+        _prose("v1"),
+    ]
+    annotation = MimoAVAnnotationDraft.model_validate(payload)
+
+    assert not validate_annotation(
+        annotation,
+        segment_ids=[],
+        segment_intervals={},
+        transcribed_segment_ids=[],
+        authoritative_transcripts=[],
+        allowed_entity_ids={"e1"},
+        allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+        reference_subjects=[
+            RecaptionSubjectContract(
+                subject_index=1,
+                subject_label="<Subject 1>",
+                kind="entity",
+                entity_id="e1",
+                source_picture_labels=["<Picture 1>"],
+            )
+        ],
+        target_duration_seconds=1.0,
+    )
+
+
+def test_other_event_with_ambient_musical_pad_is_category_contamination() -> None:
+    payload = _annotation().model_dump(mode="json")
+    event = payload["audio_observation"]["audio_semantics"][
+        "temporal_non_speech_events"
+    ][0]
+    event.update(
+        category="other",
+        pattern="continuous",
+        description="An ambient musical pad continues under the scene.",
+        source_grounding="audible_only",
+    )
+    annotation = MimoAVAnnotationDraft.model_validate(payload)
+
+    assert "soundscape_event_category_contamination" in {
+        issue.code for issue in _validate(annotation)
+    }
 
 
 def test_scenic_synthesized_drone_is_representable_as_non_diegetic_music() -> None:

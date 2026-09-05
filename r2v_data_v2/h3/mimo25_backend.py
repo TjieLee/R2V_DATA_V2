@@ -28,10 +28,10 @@ from r2v_data_v2.structured_output import (
 
 MIMO25_MODEL = "mimo-v2.5"
 MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
-MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v21"
-MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v15"
+MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v22"
+MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v16"
 MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.13"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.22"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.23"
 MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v15"
 DEFAULT_BASE64_LIMIT_BYTES = 50 * 1024 * 1024
 MimoTransport = Literal["xiaomi", "sglang"]
@@ -74,10 +74,38 @@ _STANDALONE_HUMAN_SUBJECT_LEAD = re.compile(
 )
 _SOUNDSCAPE_CONTAMINATION = re.compile(
     r"\b(?:BGM|background music|instrumental music|score|soundtrack|music|song|"
-    r"melody|spoken dialogue|human speech|dialogue|narration|narrator(?:\s+speaks?)?|"
+    r"melody|(?<!non-)(?<!non )musical|spoken dialogue|human speech|dialogue|"
+    r"narration|narrator(?:\s+speaks?)?|"
     r"voice-over|lyrics|singing)\b",
     flags=re.IGNORECASE,
 )
+_AUDIO_LAYER_CONTENT_TOKEN = re.compile(r"[a-z0-9]+")
+_AUDIO_LAYER_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "been",
+        "being",
+        "by",
+        "for",
+        "from",
+        "in",
+        "is",
+        "of",
+        "on",
+        "or",
+        "the",
+        "to",
+        "with",
+    }
+)
+_AUDIO_LAYER_MIN_CONTENT_TOKEN_COUNT = 5
+_AUDIO_LAYER_MIN_CONTAINMENT_RATIO = 0.85
 _SOUNDSCAPE_CLAUSE_BOUNDARY = re.compile(
     r"[,;:.!?\n]+|\b(?:but|however|while|whereas|yet)\b",
     flags=re.IGNORECASE,
@@ -281,6 +309,32 @@ def _sha256_text(value: str) -> str:
 
 def _normalized_text(value: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", value).split()).casefold()
+
+
+def _audio_layer_content_tokens(value: str) -> list[str]:
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    return [
+        token
+        for token in _AUDIO_LAYER_CONTENT_TOKEN.findall(normalized)
+        if token not in _AUDIO_LAYER_STOPWORDS
+    ]
+
+
+def _substantially_same_audio_layer(first: str, second: str) -> bool:
+    first_tokens = _audio_layer_content_tokens(first)
+    second_tokens = _audio_layer_content_tokens(second)
+    first_set = set(first_tokens)
+    second_set = set(second_tokens)
+    if min(len(first_set), len(second_set)) < _AUDIO_LAYER_MIN_CONTENT_TOKEN_COUNT:
+        return False
+    first_text = " ".join(first_tokens)
+    second_text = " ".join(second_tokens)
+    if first_text in second_text or second_text in first_text:
+        return True
+    overlap = len(first_set & second_set)
+    return overlap / min(len(first_set), len(second_set)) >= (
+        _AUDIO_LAYER_MIN_CONTAINMENT_RATIO
+    )
 
 
 def _soundscape_contamination_match_is_negated(
@@ -933,7 +987,7 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.22"] = MIMO25_BACKEND_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.23"] = MIMO25_BACKEND_VERSION
     backend: Literal[
         "xiaomi_openai_compatible", "sglang_openai_compatible"
     ]
@@ -950,10 +1004,10 @@ class MimoBackendProvenance(SchemaModel):
     media_mode: Literal["base64", "http"]
     media_root: str
     media_base_url: str | None = None
-    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v21"] = (
+    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v22"] = (
         MIMO25_PROMPT_VERSION
     )
-    policy_version: Literal["h3_mimo25_av_authority_contract_v15"] = (
+    policy_version: Literal["h3_mimo25_av_authority_contract_v16"] = (
         MIMO25_POLICY_VERSION
     )
     annotation_schema_version: Literal["r2v.h3.mimo25_av_annotation.13"] = (
@@ -1206,7 +1260,7 @@ STAGE B audio_observation: PURE AUDIO EVIDENCE
 - Emit genuinely audible non-speech events with contiguous chronological aeN IDs and tight approximate times. Visual evidence may identify a genuinely audible source but never invent sound.
 - Soundscape event categories are physical, environmental, mechanical, electronic, human_non_speech, and other. Music categories are diegetic_music and non_diegetic_music. Neither music category contributes to overall_soundscape. Diegetic music may enter the detailed timeline; non-diegetic music belongs only in non_diegetic_music.
 - A sustained layer is not automatically ambience because it lacks beats or melody. A pitched or harmonically structured synthesized/processed soundtrack bed, sustained musical drone or pad, instrumental layer, or score-like layer with no plausible visible in-scene source is non_diegetic_music even when beatless, minimal, atmospheric, eerie, or slowly evolving. Do not relabel a soundtrack as room ambience merely because it can be called a drone, hum, or ambient bed. HVAC/electrical hum, wind, traffic, room tone, and machinery remain non-musical soundscape only when the audible and audiovisual evidence supports that source distinction.
-- overall_soundscape is present for audible ambience, room tone, environmental/physical/mechanical/electronic/non-verbal human sound; absent only for verified complete soundscape silence; unknown only when Audio evidence is unavailable or genuinely uncertain. It must never contain dialogue, narration, voice-over, lyrics, singing, music, BGM, score, soundtrack, song, melody, or instrumental music. non_diegetic_music describes audience-only score/BGM. Do not substitute either field for the other.
+- overall_soundscape is present for audible ambience, room tone, environmental/physical/mechanical/electronic/non-verbal human sound; absent only for verified complete soundscape silence; unknown only when Audio evidence is unavailable or genuinely uncertain. It must never contain dialogue, narration, voice-over, lyrics, singing, music, BGM, score, soundtrack, song, melody, or instrumental music. non_diegetic_music describes audience-only score/BGM. Do not substitute either field for the other. When BGM is audible but no distinct non-musical soundscape is established, do not repeat the music as soundscape or invent room tone, HVAC, wind, traffic, or another layer; a conservative statement that no distinct environmental, mechanical, physical, or non-verbal human sounds are clearly discernible is valid.
 
 STAGE C av_grounding: AUDIOVISUAL CO-ANALYSIS
 - segment_groundings exactly follow allowed_segment_ids and preserve each matching Stage B primary_speaker_group. Decide binding_status, speech_presentation, entity_id, confidence, and evidence from the exact visual segment view plus Audio/AV evidence.
@@ -2097,6 +2151,39 @@ def validate_annotation(
             if item.voice_characteristics is not None
         ),
     ]
+    canonical_music = (
+        audio_semantics.non_diegetic_music
+        if audio_semantics.non_diegetic_music_status == "present"
+        else None
+    )
+    if canonical_music is not None:
+        if (
+            audio_semantics.overall_soundscape is not None
+            and _substantially_same_audio_layer(
+                canonical_music,
+                audio_semantics.overall_soundscape,
+            )
+        ):
+            issues.append(
+                ValidationIssue(
+                    "non_diegetic_music_leaked_into_soundscape",
+                    "audio_observation.audio_semantics.overall_soundscape",
+                    "overall_soundscape substantially duplicates the canonical "
+                    "non-diegetic music layer",
+                )
+            )
+        for event in audio_semantics.temporal_non_speech_events:
+            if event.category in _SOUNDSCAPE_EVENT_CATEGORIES and (
+                _substantially_same_audio_layer(canonical_music, event.description)
+            ):
+                issues.append(
+                    ValidationIssue(
+                        "non_diegetic_music_misclassified_as_soundscape_event",
+                        event.event_id,
+                        "soundscape-category event substantially duplicates the "
+                        "canonical non-diegetic music layer",
+                    )
+                )
     if (
         audio_semantics.overall_soundscape is not None
         and _contains_positive_soundscape_contamination(
@@ -2994,6 +3081,19 @@ class OpenAIMimo25Backend:
                 "voice_over_context, or device_playback_context. Speaker-group identity "
                 "may continue while current entity_id becomes null; never transfer the "
                 "audible speaker to a visible listener."
+            )
+        if issue_codes & {
+            "non_diegetic_music_leaked_into_soundscape",
+            "non_diegetic_music_misclassified_as_soundscape_event",
+        }:
+            issue_actions.append(
+                "Reinspect Stage B Audio semantics and separate the canonical "
+                "audience-only non-diegetic music layer from non-musical soundscape. "
+                "Do not repeat that music in overall_soundscape or publish it as a "
+                "physical, environmental, mechanical, electronic, human_non_speech, "
+                "or other event. A global BGM needs no temporal event; if a tight "
+                "event is useful, categorize that same layer as non_diegetic_music. "
+                "Do not invent ambience merely to populate overall_soundscape."
             )
         actions = (
             "\nISSUE-SPECIFIC CONTRACT ACTIONS:\n" + "\n".join(issue_actions)

@@ -157,10 +157,10 @@ they do not create additional MiMo model jobs.
 
 Prompt, policy, annotation schema, and materializer versions are:
 
-- `h3_mimo25_unified_av_reconcile_v21`
-- `h3_mimo25_av_authority_contract_v15`
+- `h3_mimo25_unified_av_reconcile_v22`
+- `h3_mimo25_av_authority_contract_v16`
 - `r2v.h3.mimo25_av_annotation.13`
-- `r2v.h3.mimo25_backend.22`
+- `r2v.h3.mimo25_backend.23`
 - `h3_mimo25_materializer_v15`
 - `h3_mimo25_reference_selection_v1`
 - `h3_mimo25_recovered_voice_quality_v1`
@@ -283,6 +283,18 @@ A pitched or harmonically structured soundtrack drone/pad remains
 in-scene source exists. HVAC/electrical hum, room tone, wind, traffic, and
 machinery remain soundscape when audible evidence supports those environmental or
 mechanical sources. No deterministic lexical reassignment is applied.
+When canonical non-diegetic music is present, a conservative normalized
+content-token comparison rejects a soundscape description or ordinary
+soundscape-category event that substantially duplicates that same music layer.
+The check requires at least five content tokens and high containment, does not
+compare the multimodal summary, and never recategorizes an event. A duplicate is
+sent through the existing one full-AV recheck and remains fail closed if the
+model does not separate it. Global BGM may omit a temporal event; if localized,
+its event category is `non_diegetic_music`, which remains excluded from the
+detailed timeline. In a BGM-only clip with no established non-musical layer,
+soundscape may conservatively state that no distinct environmental, mechanical,
+physical, or non-verbal human sounds are discernible rather than repeating music
+or inventing ambience.
 
 Entity Subjects describe reusable entities. Attribute Subjects describe only the
 referenced attribute and retain explicit `attribute_type` and `owner_entity_id`
