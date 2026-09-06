@@ -16,7 +16,12 @@ production stages. All generated artifacts live under:
 
 Each directory is an independently owned atomic stage. In particular,
 `separation --overwrite` replaces only `separation/`; it cannot remove a
-previously published downstream stage.
+previously published downstream stage. Every downstream consumer verifies the
+current upstream byte lineage before a model call: DiariZen binds the separation
+records hash, ASR binds the DiariZen provenance hash, and facts/reconcile verify
+the complete separation -> DiariZen -> ASR -> facts chain. An overwritten
+separation therefore makes older downstream stages explicitly stale; they are
+never deleted or silently reused.
 
 ## Authority
 
@@ -55,8 +60,10 @@ constructs `SAMAudioProcessor` with only the local model path, while
 `SAMAudio.from_pretrained` is explicitly local-only. Batch-one target and
 residual outputs are read from the first item of their official per-item lists.
 The initial text-only pilot passes `visual_ranker=None`, `text_ranker=None`, and
-`span_predictor=None`, with `predict_spans=False` and one reranking candidate,
-so optional ImageBind, CLAP, Judge, and PE-A-Frame components are not loaded.
+`span_predictor=None`, with `predict_spans=False` and exactly one reranking
+candidate, so optional ImageBind, CLAP, Judge, and PE-A-Frame components are not
+loaded. Values greater than one are rejected before model construction because
+candidate reranking is unavailable under this local-only runtime contract.
 
 Runtime configuration requires local implementation, SAM checkpoint/config,
 and T5-base paths. The SAM text-encoder configuration is copied in memory and
@@ -64,8 +71,12 @@ only its `name` is redirected to the local T5 path; checkpoint configuration is
 never edited. Required files and SHA-256 fingerprints are validated before
 model construction and recorded in inventory provenance. The backend forces
 `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`; there is no network fallback.
-An explicitly supplied model identifier must exactly match the identifier in
-the local SAM configuration.
+An explicitly supplied model identifier must exactly match a non-empty
+`_name_or_path` in the local SAM configuration. When that field is absent, a
+full identifier such as `facebook/sam-audio-small-tv` or
+`facebook/sam-audio-large-tv` is accepted only when its basename exactly matches
+the local checkpoint directory; the full supplied identifier remains in
+provenance. With no supplied identifier, the directory basename is recorded.
 
 Each call records input, target, and residual hashes, prompts, route, model
 fingerprint, timing, and any stable candidate/Judge/CLAP metadata exposed by the
@@ -96,7 +107,9 @@ allowed, and every stem retains zero timeline offset.
    entity-binding field. The views stream-copy original video and use AAC only
    as an annotation proxy; canonical WAV remains Audio authority. Proxy views
    live inside the facts stage and publish atomically with their records, so a
-   failed rerun cannot replace media referenced by the prior stage.
+   failed rerun cannot replace media referenced by the prior stage. Calls store
+   raw response text and request diagnostics per stem. A failed clip publishes
+   an explicit failed facts record while later clips continue.
 5. `run_h3_mimo25_stem_reconcile_shadow.py` sends the original full target AV as
    the model media and supplies stem facts as lower-priority structured
    evidence. Existing speaker fail-closed checks remain active.
@@ -112,9 +125,12 @@ allowed, and every stem retains zero timeline offset.
 Every command accepts or inherits an explicit case manifest. When a manifest is
 provided, its ordered clip inventory must match the stem inventory exactly.
 The ordered `clip_uids` provenance is carried through every stage rather than
-reconstructed from sorted mapping keys. A per-clip separation failure is
-published as an explicit skip while remaining clips continue in that order;
-reconcile does not require facts for skipped clips.
+reconstructed from sorted mapping keys. The same explicit `--sam-route` is
+validated across separation, DiariZen, ASR, facts, and reconcile. A per-clip
+separation failure is published as an explicit skip while remaining clips
+continue in that order. A per-clip facts failure is likewise published and
+becomes an explicit reconcile upstream failure; neither failure aborts usable
+clips or disappears from summary provenance.
 Every optional `--output-root` is constrained to the versioned shadow tree; it
 cannot target current `audio/`, `diarization/`, `asr/`, `h3/`, or MiMo output
 directories.
@@ -128,7 +144,7 @@ python tools/run_h3_sam_audio_stem_shadow.py \
   --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
   --sam-audio-code-root "$SAM_AUDIO_CODE_ROOT" \
   --sam-audio-model-path "$SAM_AUDIO_MODEL_PATH" \
-  --sam-audio-model-name facebook/sam-audio-large \
+  --sam-audio-model-name facebook/sam-audio-small-tv \
   --sam-audio-t5-base-path "$SAM_AUDIO_T5_BASE_PATH" \
   --sam-route music_first \
   --sam-reranking-candidates 1 \
@@ -143,6 +159,7 @@ python tools/run_h3_stem_diarization_shadow.py \
 python tools/run_h3_stem_qwen3_asr_shadow.py \
   --visual-production-root "$VISUAL_PRODUCTION_ROOT" \
   --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
+  --sam-route music_first \
   --case-manifest "$CASE_MANIFEST" \
   --allow-unverified
 
@@ -158,6 +175,7 @@ python tools/run_h3_mimo25_stem_reconcile_shadow.py \
   --visual-runs-root "$VISUAL_RUNS_ROOT" \
   --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
   --case-manifest "$CASE_MANIFEST" \
+  --sam-route music_first \
   --max-completion-tokens 32768 \
   --allow-unverified
 

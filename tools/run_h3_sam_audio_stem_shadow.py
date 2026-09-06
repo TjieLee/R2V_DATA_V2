@@ -37,7 +37,12 @@ def _parser() -> argparse.ArgumentParser:
         choices=("music_first", "voice_first"),
         default="music_first",
     )
-    parser.add_argument("--sam-reranking-candidates", type=int, default=1)
+    parser.add_argument(
+        "--sam-reranking-candidates",
+        type=int,
+        choices=(1,),
+        default=1,
+    )
     parser.add_argument("--run-both-routes", action="store_true")
     parser.add_argument("--case-manifest", type=Path)
     parser.add_argument("--output-root", type=Path)

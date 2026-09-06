@@ -7,6 +7,7 @@ import subprocess
 import uuid
 from collections import Counter
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
@@ -37,24 +38,28 @@ from r2v_data_v2.h3.sam_audio_stem_shadow import (
     SAMAudioStemInventory,
     SAMAudioStemRecord,
     SAMRoute,
-    StemASRShadowProvenance,
-    StemDiarizationShadowProvenance,
     StemShadowClipSkip,
     StemType,
     load_stem_shadow,
     selected_stem_records,
     separation_skips,
     sha256_file,
+    validate_stem_asr_lineage,
+    validate_stem_diarization_lineage,
 )
 from r2v_data_v2.h3.schemas import SchemaModel
 
-MIMO25_STEM_FACTS_VERSION = "r2v.h3.mimo25_stem_facts.2"
-MIMO25_STEM_FACTS_SUMMARY_VERSION = "r2v.h3.mimo25_stem_facts_summary.2"
+MIMO25_STEM_FACTS_VERSION = "r2v.h3.mimo25_stem_facts.3"
+MIMO25_STEM_FACTS_SUMMARY_VERSION = "r2v.h3.mimo25_stem_facts_summary.3"
+MIMO25_STEM_FACT_RAW_VERSION = "r2v.h3.mimo25_stem_fact_raw.1"
 MIMO25_STEM_FACT_PROMPT_VERSION = "h3_mimo25_stem_fact_prompt_v1"
 MIMO25_STEM_RECONCILE_VERSION = "r2v.h3.mimo25_stem_reconcile.1"
-MIMO25_STEM_RECONCILE_SUMMARY_VERSION = "r2v.h3.mimo25_stem_reconcile_summary.2"
+MIMO25_STEM_RECONCILE_SUMMARY_VERSION = "r2v.h3.mimo25_stem_reconcile_summary.3"
 MIMO25_STEM_RECONCILE_POLICY_VERSION = "h3_mimo25_stem_reconcile_v1"
 STEM_VIEW_VERSION = "r2v.h3.sam_audio_stem_view.1"
+STEM_RECONCILE_UPSTREAM_FAILURE_VERSION = (
+    "r2v.h3.mimo25_stem_reconcile_upstream_failure.1"
+)
 
 Confidence = Literal["high", "medium", "low", "unknown"]
 MusicStatus = Literal["present", "absent", "unknown"]
@@ -86,9 +91,13 @@ def _read_jsonl(path: Path) -> list[dict[str, object]]:
         return [json.loads(line) for line in handle if line.strip()]
 
 
-def _write_json(path: Path, value: SchemaModel) -> None:
+def _write_json(path: Path, value: SchemaModel | dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(value.model_dump_json(indent=2) + "\n", encoding="utf-8")
+    payload = value.model_dump(mode="json") if isinstance(value, SchemaModel) else value
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _write_jsonl(path: Path, rows: Sequence[SchemaModel]) -> None:
@@ -369,7 +378,62 @@ class StemFactsBackend(Protocol):
         job: StemFactJob,
         stem_type: StemType,
         view: StemView,
-    ) -> SpeechStemFacts | MusicStemFacts | SFXStemFacts: ...
+    ) -> StemFactsBackendResult: ...
+
+
+@dataclass(frozen=True)
+class StemFactsBackendResult:
+    facts: SpeechStemFacts | MusicStemFacts | SFXStemFacts
+    raw_response: str
+    diagnostics: dict[str, object]
+
+
+class StemFactsBackendFailure(RuntimeError):
+    def __init__(
+        self,
+        *,
+        code: str,
+        reason: str,
+        raw_response: str | None,
+        diagnostics: dict[str, object],
+    ) -> None:
+        super().__init__(reason)
+        self.code = code
+        self.reason = reason
+        self.raw_response = raw_response
+        self.diagnostics = diagnostics
+
+
+class StemFactCallAudit(SchemaModel):
+    schema_version: Literal["r2v.h3.mimo25_stem_fact_raw.1"] = (
+        MIMO25_STEM_FACT_RAW_VERSION
+    )
+    clip_uid: str
+    route: SAMRoute
+    stem_type: StemType
+    job_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    backend_configuration_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    call_index: int = Field(ge=1, le=3)
+    status: Literal["ready", "failed"]
+    raw_response: str | None = None
+    request_diagnostics: dict[str, object]
+    failure_code: str | None = None
+    failure_type: str | None = None
+    failure_reason: str | None = None
+
+    @model_validator(mode="after")
+    def validate_audit(self) -> StemFactCallAudit:
+        if self.status == "ready":
+            if (
+                self.raw_response is None
+                or self.failure_code is not None
+                or self.failure_type is not None
+                or self.failure_reason is not None
+            ):
+                raise ValueError("ready stem fact call requires raw response only")
+        elif not self.failure_code or not self.failure_type or not self.failure_reason:
+            raise ValueError("failed stem fact call requires failure provenance")
+        return self
 
 
 class OpenAIStemFactsBackend:
@@ -456,7 +520,7 @@ class OpenAIStemFactsBackend:
         job: StemFactJob,
         stem_type: StemType,
         view: StemView,
-    ) -> SpeechStemFacts | MusicStemFacts | SFXStemFacts:
+    ) -> StemFactsBackendResult:
         schema = self._schema(stem_type)
         completion = self.client.chat.completions.create(
             model=self.model,
@@ -501,37 +565,113 @@ class OpenAIStemFactsBackend:
             },
         )
         raw = completion.choices[0].message.content
+        usage = getattr(completion, "usage", None)
+        diagnostics = {
+            "finish_reason": getattr(completion.choices[0], "finish_reason", None),
+            "usage": (
+                usage.model_dump(mode="json")
+                if hasattr(usage, "model_dump")
+                else None
+            ),
+            "view_sha256": view.view_sha256,
+            "input_modality": "derived_video_with_embedded_stem_audio",
+        }
         if not isinstance(raw, str):
-            raise TypeError("stem fact response content must be text JSON")
-        return schema.model_validate_json(raw)
+            raise StemFactsBackendFailure(
+                code="stem_fact_response_not_text",
+                reason="stem fact response content must be text JSON",
+                raw_response=None,
+                diagnostics=diagnostics,
+            )
+        try:
+            facts = schema.model_validate_json(raw)
+        except Exception as exc:
+            raise StemFactsBackendFailure(
+                code="stem_fact_structured_output_failed",
+                reason=str(exc),
+                raw_response=raw,
+                diagnostics=diagnostics,
+            ) from exc
+        return StemFactsBackendResult(
+            facts=facts,
+            raw_response=raw,
+            diagnostics=diagnostics,
+        )
 
 
 class MimoStemFactsRecord(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_stem_facts.2"] = (
+    schema_version: Literal["r2v.h3.mimo25_stem_facts.3"] = (
         MIMO25_STEM_FACTS_VERSION
     )
     clip_uid: str
     route: SAMRoute
-    job_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    status: Literal["ready", "failed"]
+    job_fingerprint: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     source_stem_record_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_verification_state: Literal["success", "uncertain", "unverified"]
     unverified_consumption_authorized: bool
     backend_provenance: StemFactsBackendProvenance
     stem_views: list[StemView]
-    speech: SpeechStemFacts
-    music: MusicStemFacts
-    sfx: SFXStemFacts
+    speech: SpeechStemFacts | None = None
+    music: MusicStemFacts | None = None
+    sfx: SFXStemFacts | None = None
+    failing_stem_type: StemType | None = None
+    failure_code: str | None = None
+    failure_type: str | None = None
+    failure_reason: str | None = None
+    model_call_count: int = Field(ge=0, le=3)
+    raw_responses: list[StemFactCallAudit]
     record_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
 
     @model_validator(mode="after")
     def validate_record(self) -> MimoStemFactsRecord:
-        if [item.stem_type for item in self.stem_views] != ["speech", "music", "sfx"]:
-            raise ValueError("stem fact record requires three ordered AV views")
+        view_types = [item.stem_type for item in self.stem_views]
+        if view_types != ["speech", "music", "sfx"][: len(view_types)]:
+            raise ValueError("stem fact record views must preserve stem order")
         if (
             self.source_verification_state == "unverified"
             and not self.unverified_consumption_authorized
         ):
             raise ValueError("unverified stem facts lack explicit authorization")
+        if self.model_call_count != len(self.raw_responses):
+            raise ValueError("stem fact model-call count differs from raw audit")
+        if [item.call_index for item in self.raw_responses] != list(
+            range(1, self.model_call_count + 1)
+        ):
+            raise ValueError("stem fact raw audit call order is invalid")
+        if any(
+            item.clip_uid != self.clip_uid
+            or item.route != self.route
+            or item.job_fingerprint != self.job_fingerprint
+            or item.backend_configuration_fingerprint
+            != self.backend_provenance.configuration_fingerprint
+            for item in self.raw_responses
+        ):
+            raise ValueError("stem fact raw audit provenance differs")
+        if self.status == "ready":
+            if (
+                self.job_fingerprint is None
+                or view_types != ["speech", "music", "sfx"]
+                or self.speech is None
+                or self.music is None
+                or self.sfx is None
+                or self.failing_stem_type is not None
+                or self.failure_code is not None
+                or self.failure_type is not None
+                or self.failure_reason is not None
+                or self.model_call_count != 3
+                or any(item.status != "ready" for item in self.raw_responses)
+            ):
+                raise ValueError("ready stem facts require three successful stem calls")
+        elif (
+            self.speech is not None
+            or self.music is not None
+            or self.sfx is not None
+            or not self.failure_code
+            or not self.failure_type
+            or not self.failure_reason
+        ):
+            raise ValueError("failed stem facts require only failure provenance")
         values = self.model_dump(mode="json", exclude={"record_fingerprint"})
         if self.record_fingerprint != _sha256_text(_compact_json(values)):
             raise ValueError("stem fact record fingerprint is invalid")
@@ -539,17 +679,25 @@ class MimoStemFactsRecord(SchemaModel):
 
 
 class MimoStemFactsSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_stem_facts_summary.2"] = (
+    schema_version: Literal["r2v.h3.mimo25_stem_facts_summary.3"] = (
         MIMO25_STEM_FACTS_SUMMARY_VERSION
     )
-    record_count: int = Field(ge=1)
+    record_count: int = Field(ge=0)
     source_stem_inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_stem_records_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_stem_diarization_provenance_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_stem_asr_provenance_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    records_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     route: SAMRoute
     source_clip_uids: list[str] = Field(min_length=1)
-    clip_uids: list[str] = Field(min_length=1)
+    clip_uids: list[str]
+    ready_clip_uids: list[str]
+    failed_clip_uids: list[str]
     skipped_clips: list[StemShadowClipSkip]
     unverified_clip_uids: list[str]
     unverified_consumption_authorized: bool
+    ready_count: int = Field(ge=0)
+    failed_count: int = Field(ge=0)
     model_call_count: int = Field(ge=0)
     production_artifacts_modified: Literal[False] = False
 
@@ -557,6 +705,20 @@ class MimoStemFactsSummary(SchemaModel):
     def validate_counts(self) -> MimoStemFactsSummary:
         if (
             self.record_count != len(self.clip_uids)
+            or self.record_count != self.ready_count + self.failed_count
+            or self.ready_count != len(self.ready_clip_uids)
+            or self.failed_count != len(self.failed_clip_uids)
+            or [
+                item for item in self.clip_uids if item in set(self.ready_clip_uids)
+            ]
+            != self.ready_clip_uids
+            or [
+                item for item in self.clip_uids if item in set(self.failed_clip_uids)
+            ]
+            != self.failed_clip_uids
+            or set(self.ready_clip_uids).intersection(self.failed_clip_uids)
+            or set(self.ready_clip_uids).union(self.failed_clip_uids)
+            != set(self.clip_uids)
             or len(self.source_clip_uids) != len(set(self.source_clip_uids))
             or [
                 item
@@ -703,6 +865,21 @@ def run_mimo25_stem_facts_shadow(
     )
     diarization_root = shadow_root / "diarization"
     asr_root = shadow_root / "asr"
+    diarization_provenance, _, _ = validate_stem_diarization_lineage(
+        diarization_root
+    )
+    asr_provenance, asr_source_provenance = validate_stem_asr_lineage(asr_root)
+    selected_ids = [item.clip_uid for item in selected]
+    if (
+        Path(diarization_provenance.source_stem_root).resolve(strict=True)
+        != separation_root
+        or asr_source_provenance != diarization_provenance
+        or diarization_provenance.route != route
+        or asr_provenance.route != route
+        or diarization_provenance.usable_clip_uids != selected_ids
+        or asr_provenance.clip_uids != selected_ids
+    ):
+        raise ValueError("stem facts upstream route or ordered inventory differs")
     raw = [
         RawDiarizationSegment.model_validate(item)
         for item in _read_jsonl(diarization_root / "raw_segments.jsonl")
@@ -718,97 +895,247 @@ def run_mimo25_stem_facts_shadow(
         temporary.mkdir(parents=True)
         views_root = temporary / "stem_views"
         for record in selected:
-            job = _stem_fact_job(
-                stem_inventory=stem_inventory,
-                record=record,
-                segments=raw,
-                asr=asr,
-            )
-            source = next(
-                item for item in stem_inventory.jobs if item.clip_uid == record.clip_uid
-            )
-            views = [
-                view_backend.create(
-                    clip_uid=record.clip_uid,
-                    route=route,
-                    stem_type=stem_type,
-                    original_video_path=Path(source.target_video_path),
-                    source_stem_path=Path(record.stem(stem_type).canonical_stem_path),
-                    destination=(
-                        views_root / record.clip_uid / route / f"{stem_type}.mp4"
-                    ),
+            job: StemFactJob | None = None
+            views: list[StemView] = []
+            audits: list[StemFactCallAudit] = []
+            failing_stem_type: StemType | None = None
+            failure_code: str | None = None
+            failure_type: str | None = None
+            failure_reason: str | None = None
+            facts: dict[StemType, SpeechStemFacts | MusicStemFacts | SFXStemFacts] = {}
+            try:
+                job = _stem_fact_job(
+                    stem_inventory=stem_inventory,
+                    record=record,
+                    segments=raw,
+                    asr=asr,
                 )
-                for stem_type in ("speech", "music", "sfx")
-            ]
-            for view in views:
-                stem = record.stem(view.stem_type)
-                if (
-                    view.clip_uid != record.clip_uid
-                    or view.route != route
-                    or view.original_video_path != job.target_video_path
-                    or view.original_video_sha256 != job.target_video_sha256
-                    or view.source_stem_path != stem.canonical_stem_path
-                    or view.source_stem_sha256 != stem.canonical_stem_sha256
-                ):
-                    raise ValueError("stem annotation view provenance differs")
-            facts = {
-                view.stem_type: backend.extract(
-                    job=job,
-                    stem_type=view.stem_type,
-                    view=view,
+                source = next(
+                    item
+                    for item in stem_inventory.jobs
+                    if item.clip_uid == record.clip_uid
                 )
-                for view in views
-            }
-            speech = facts["speech"]
-            music = facts["music"]
-            sfx = facts["sfx"]
-            if not isinstance(speech, SpeechStemFacts):
-                raise TypeError("speech stem backend returned the wrong schema")
-            if not isinstance(music, MusicStemFacts):
-                raise TypeError("music stem backend returned the wrong schema")
-            if not isinstance(sfx, SFXStemFacts):
-                raise TypeError("SFX stem backend returned the wrong schema")
-            _validate_speech_fact_inventory(speech, job)
-            if (
-                music.clip_duration_seconds != job.clip_duration_seconds
-                or sfx.clip_duration_seconds != job.clip_duration_seconds
-            ):
-                raise ValueError("stem fact duration differs from source clip")
-            values = {
-                "schema_version": MIMO25_STEM_FACTS_VERSION,
-                "clip_uid": record.clip_uid,
-                "route": route,
-                "job_fingerprint": job.job_fingerprint,
-                "source_stem_record_fingerprint": record.record_fingerprint,
-                "source_verification_state": record.separation_state,
-                "unverified_consumption_authorized": (
-                    record.separation_state != "unverified" or allow_unverified
-                ),
-                "backend_provenance": backend.provenance.model_dump(mode="json"),
-                "stem_views": [
-                    item.model_dump(mode="json")
-                    for item in _published_stem_views(
-                        views,
-                        temporary_root=temporary,
-                        destination_root=destination,
+                for stem_type in ("speech", "music", "sfx"):
+                    failing_stem_type = stem_type
+                    view = view_backend.create(
+                        clip_uid=record.clip_uid,
+                        route=route,
+                        stem_type=stem_type,
+                        original_video_path=Path(source.target_video_path),
+                        source_stem_path=Path(
+                            record.stem(stem_type).canonical_stem_path
+                        ),
+                        destination=(
+                            views_root / record.clip_uid / route / f"{stem_type}.mp4"
+                        ),
                     )
-                ],
-                "speech": speech.model_dump(mode="json"),
-                "music": music.model_dump(mode="json"),
-                "sfx": sfx.model_dump(mode="json"),
-            }
+                    stem = record.stem(view.stem_type)
+                    if (
+                        view.clip_uid != record.clip_uid
+                        or view.route != route
+                        or view.original_video_path != job.target_video_path
+                        or view.original_video_sha256 != job.target_video_sha256
+                        or view.source_stem_path != stem.canonical_stem_path
+                        or view.source_stem_sha256 != stem.canonical_stem_sha256
+                    ):
+                        raise ValueError("stem annotation view provenance differs")
+                    views.append(view)
+                for view in views:
+                    failing_stem_type = view.stem_type
+                    call_index = len(audits) + 1
+                    try:
+                        result = backend.extract(
+                            job=job,
+                            stem_type=view.stem_type,
+                            view=view,
+                        )
+                    except StemFactsBackendFailure as exc:
+                        audits.append(
+                            StemFactCallAudit(
+                                clip_uid=record.clip_uid,
+                                route=route,
+                                stem_type=view.stem_type,
+                                job_fingerprint=job.job_fingerprint,
+                                backend_configuration_fingerprint=(
+                                    backend.provenance.configuration_fingerprint
+                                ),
+                                call_index=call_index,
+                                status="failed",
+                                raw_response=exc.raw_response,
+                                request_diagnostics=exc.diagnostics,
+                                failure_code=exc.code,
+                                failure_type=type(exc).__name__,
+                                failure_reason=exc.reason,
+                            )
+                        )
+                        failure_code = exc.code
+                        failure_type = type(exc).__name__
+                        failure_reason = exc.reason
+                        raise
+                    except Exception as exc:
+                        audits.append(
+                            StemFactCallAudit(
+                                clip_uid=record.clip_uid,
+                                route=route,
+                                stem_type=view.stem_type,
+                                job_fingerprint=job.job_fingerprint,
+                                backend_configuration_fingerprint=(
+                                    backend.provenance.configuration_fingerprint
+                                ),
+                                call_index=call_index,
+                                status="failed",
+                                raw_response=None,
+                                request_diagnostics={
+                                    "view_sha256": view.view_sha256,
+                                    "input_modality": (
+                                        "derived_video_with_embedded_stem_audio"
+                                    ),
+                                },
+                                failure_code="stem_fact_backend_failed",
+                                failure_type=type(exc).__name__,
+                                failure_reason=str(exc),
+                            )
+                        )
+                        failure_code = "stem_fact_backend_failed"
+                        failure_type = type(exc).__name__
+                        failure_reason = str(exc)
+                        raise
+                    audits.append(
+                        StemFactCallAudit(
+                            clip_uid=record.clip_uid,
+                            route=route,
+                            stem_type=view.stem_type,
+                            job_fingerprint=job.job_fingerprint,
+                            backend_configuration_fingerprint=(
+                                backend.provenance.configuration_fingerprint
+                            ),
+                            call_index=call_index,
+                            status="ready",
+                            raw_response=result.raw_response,
+                            request_diagnostics=result.diagnostics,
+                        )
+                    )
+                    facts[view.stem_type] = result.facts
+                speech = facts["speech"]
+                music = facts["music"]
+                sfx = facts["sfx"]
+                if not isinstance(speech, SpeechStemFacts):
+                    raise TypeError("speech stem backend returned the wrong schema")
+                if not isinstance(music, MusicStemFacts):
+                    raise TypeError("music stem backend returned the wrong schema")
+                if not isinstance(sfx, SFXStemFacts):
+                    raise TypeError("SFX stem backend returned the wrong schema")
+                failing_stem_type = "speech"
+                _validate_speech_fact_inventory(speech, job)
+                failing_stem_type = "music"
+                if music.clip_duration_seconds != job.clip_duration_seconds:
+                    raise ValueError("stem fact duration differs from source clip")
+                failing_stem_type = "sfx"
+                if sfx.clip_duration_seconds != job.clip_duration_seconds:
+                    raise ValueError("stem fact duration differs from source clip")
+                failing_stem_type = None
+                values = {
+                    "schema_version": MIMO25_STEM_FACTS_VERSION,
+                    "clip_uid": record.clip_uid,
+                    "route": route,
+                    "status": "ready",
+                    "job_fingerprint": job.job_fingerprint,
+                    "source_stem_record_fingerprint": record.record_fingerprint,
+                    "source_verification_state": record.separation_state,
+                    "unverified_consumption_authorized": (
+                        record.separation_state != "unverified" or allow_unverified
+                    ),
+                    "backend_provenance": backend.provenance.model_dump(mode="json"),
+                    "stem_views": [
+                        item.model_dump(mode="json")
+                        for item in _published_stem_views(
+                            views,
+                            temporary_root=temporary,
+                            destination_root=destination,
+                        )
+                    ],
+                    "speech": speech.model_dump(mode="json"),
+                    "music": music.model_dump(mode="json"),
+                    "sfx": sfx.model_dump(mode="json"),
+                    "failing_stem_type": None,
+                    "failure_code": None,
+                    "failure_type": None,
+                    "failure_reason": None,
+                    "model_call_count": len(audits),
+                    "raw_responses": [item.model_dump(mode="json") for item in audits],
+                }
+            except Exception as exc:  # noqa: BLE001 - isolate one clip
+                failure_code = failure_code or "stem_fact_clip_failed"
+                failure_type = failure_type or type(exc).__name__
+                failure_reason = failure_reason or str(exc)
+                previous_views = destination / "stem_views" / record.clip_uid / route
+                failed_views = views_root / record.clip_uid / route
+                if previous_views.is_dir():
+                    if failed_views.exists():
+                        shutil.rmtree(failed_views)
+                    failed_views.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copytree(previous_views, failed_views)
+                elif failed_views.exists():
+                    shutil.rmtree(failed_views)
+                values = {
+                    "schema_version": MIMO25_STEM_FACTS_VERSION,
+                    "clip_uid": record.clip_uid,
+                    "route": route,
+                    "status": "failed",
+                    "job_fingerprint": job.job_fingerprint if job is not None else None,
+                    "source_stem_record_fingerprint": record.record_fingerprint,
+                    "source_verification_state": record.separation_state,
+                    "unverified_consumption_authorized": (
+                        record.separation_state != "unverified" or allow_unverified
+                    ),
+                    "backend_provenance": backend.provenance.model_dump(mode="json"),
+                    "stem_views": [],
+                    "speech": None,
+                    "music": None,
+                    "sfx": None,
+                    "failing_stem_type": failing_stem_type,
+                    "failure_code": failure_code,
+                    "failure_type": failure_type,
+                    "failure_reason": failure_reason,
+                    "model_call_count": len(audits),
+                    "raw_responses": [item.model_dump(mode="json") for item in audits],
+                }
             records.append(
                 MimoStemFactsRecord(
                     **values,
                     record_fingerprint=_sha256_text(_compact_json(values)),
                 )
             )
+            _write_json(
+                temporary / "raw_responses" / f"{record.clip_uid}.json",
+                {
+                    "clip_uid": record.clip_uid,
+                    "route": route,
+                    "record_status": values["status"],
+                    "calls": [item.model_dump(mode="json") for item in audits],
+                },
+            )
+        counts = Counter(item.status for item in records)
+        records_path = temporary / "records.jsonl"
+        _write_jsonl(records_path, records)
         summary = MimoStemFactsSummary(
             record_count=len(records),
             source_stem_inventory_fingerprint=stem_inventory.inventory_fingerprint,
+            source_stem_records_sha256=sha256_file(separation_root / "records.jsonl"),
+            source_stem_diarization_provenance_sha256=sha256_file(
+                diarization_root / "stem_provenance.json"
+            ),
+            source_stem_asr_provenance_sha256=sha256_file(
+                asr_root / "stem_provenance.json"
+            ),
+            records_sha256=sha256_file(records_path),
             route=route,
             source_clip_uids=stem_inventory.clip_uids,
             clip_uids=[item.clip_uid for item in records],
+            ready_clip_uids=[item.clip_uid for item in records if item.status == "ready"],
+            failed_clip_uids=[
+                item.clip_uid for item in records if item.status == "failed"
+            ],
             skipped_clips=skips,
             unverified_clip_uids=[
                 item.clip_uid
@@ -816,9 +1143,10 @@ def run_mimo25_stem_facts_shadow(
                 if item.separation_state == "unverified"
             ],
             unverified_consumption_authorized=allow_unverified,
-            model_call_count=len(records) * 3,
+            ready_count=counts["ready"],
+            failed_count=counts["failed"],
+            model_call_count=sum(item.model_call_count for item in records),
         )
-        _write_jsonl(temporary / "records.jsonl", records)
         _write_jsonl(temporary / "skipped_clips.jsonl", skips)
         _write_json(temporary / "summary.json", summary)
         _publish_directory(temporary, destination, overwrite=overwrite)
@@ -836,7 +1164,127 @@ def load_stem_fact_records(path: Path) -> list[MimoStemFactsRecord]:
     ]
 
 
+def validate_stem_facts_lineage(
+    *,
+    facts_root: Path,
+    stem_diarization_root: Path,
+    stem_asr_root: Path,
+    route: SAMRoute,
+) -> tuple[MimoStemFactsSummary, list[MimoStemFactsRecord]]:
+    facts_path = facts_root.expanduser().resolve(strict=True)
+    diarization = stem_diarization_root.expanduser().resolve(strict=True)
+    asr_root = stem_asr_root.expanduser().resolve(strict=True)
+    diarization_provenance, stem_inventory, stem_records = (
+        validate_stem_diarization_lineage(diarization)
+    )
+    asr_provenance, asr_source = validate_stem_asr_lineage(asr_root)
+    if asr_source != diarization_provenance:
+        raise ValueError("stem facts ASR does not consume current DiariZen provenance")
+    summary = MimoStemFactsSummary.model_validate_json(
+        (facts_path / "summary.json").read_text(encoding="utf-8")
+    )
+    records = load_stem_fact_records(facts_path)
+    if (
+        summary.route != route
+        or diarization_provenance.route != route
+        or asr_provenance.route != route
+    ):
+        raise ValueError("stem facts route differs across shadow stages")
+    if (
+        summary.source_stem_inventory_fingerprint
+        != stem_inventory.inventory_fingerprint
+        or summary.source_stem_records_sha256
+        != sha256_file(Path(diarization_provenance.source_stem_root) / "records.jsonl")
+        or summary.source_stem_diarization_provenance_sha256
+        != sha256_file(diarization / "stem_provenance.json")
+        or summary.source_stem_asr_provenance_sha256
+        != sha256_file(asr_root / "stem_provenance.json")
+        or summary.records_sha256 != sha256_file(facts_path / "records.jsonl")
+    ):
+        raise ValueError("stem facts source lineage changed")
+    if summary.source_clip_uids != stem_inventory.clip_uids:
+        raise ValueError("stem facts source clip order changed")
+    selected = selected_stem_records(stem_records, route=route, allow_unverified=True)
+    selected_by_clip = {item.clip_uid: item for item in selected}
+    expected_ids = [
+        clip_uid
+        for clip_uid in stem_inventory.clip_uids
+        if clip_uid in selected_by_clip
+    ]
+    if (
+        expected_ids != asr_provenance.clip_uids
+        or expected_ids != summary.clip_uids
+        or [item.clip_uid for item in records] != expected_ids
+        or summary.ready_clip_uids
+        != [item.clip_uid for item in records if item.status == "ready"]
+        or summary.failed_clip_uids
+        != [item.clip_uid for item in records if item.status == "failed"]
+        or summary.model_call_count
+        != sum(item.model_call_count for item in records)
+        or summary.skipped_clips
+        != separation_skips(
+            inventory=stem_inventory,
+            records=stem_records,
+            route=route,
+        )
+    ):
+        raise ValueError("stem facts ordered inventory differs from upstream")
+    raw_segments = [
+        RawDiarizationSegment.model_validate(item)
+        for item in _read_jsonl(diarization / "raw_segments.jsonl")
+    ]
+    asr_segments = [
+        Qwen3ASRSegment.model_validate(item)
+        for item in _read_jsonl(asr_root / "segments.jsonl")
+    ]
+    for record in records:
+        source_record = selected_by_clip[record.clip_uid]
+        if (
+            record.route != route
+            or record.source_stem_record_fingerprint
+            != source_record.record_fingerprint
+        ):
+            raise ValueError("stem fact record differs from current separation")
+        expected_job = _stem_fact_job(
+            stem_inventory=stem_inventory,
+            record=source_record,
+            segments=raw_segments,
+            asr=asr_segments,
+        )
+        if record.job_fingerprint is not None and (
+            record.job_fingerprint != expected_job.job_fingerprint
+        ):
+            raise ValueError("stem fact job fingerprint changed")
+        raw_payload = json.loads(
+            (facts_path / "raw_responses" / f"{record.clip_uid}.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        if not isinstance(raw_payload, dict) or raw_payload != {
+            "clip_uid": record.clip_uid,
+            "route": record.route,
+            "record_status": record.status,
+            "calls": [item.model_dump(mode="json") for item in record.raw_responses],
+        }:
+            raise ValueError("stem fact raw response audit differs from record")
+    return summary, records
+
+
 def stem_reconcile_auxiliary_contract(facts: MimoStemFactsRecord) -> dict[str, object]:
+    if facts.status != "ready":
+        raise ValueError("stem reconcile requires ready stem facts")
+    published_facts = facts.model_dump(
+        mode="json",
+        exclude={
+            "status",
+            "failing_stem_type",
+            "failure_code",
+            "failure_type",
+            "failure_reason",
+            "model_call_count",
+            "raw_responses",
+        },
+    )
     return {
         "policy_version": MIMO25_STEM_RECONCILE_POLICY_VERSION,
         "authority_order": [
@@ -852,7 +1300,7 @@ def stem_reconcile_auxiliary_contract(facts: MimoStemFactsRecord) -> dict[str, o
             "Preserve verified music onset and offset naturally in the existing H3 section.",
             "Do not duplicate music across detailed description, soundscape, and music.",
         ],
-        "stem_facts": facts.model_dump(mode="json"),
+        "stem_facts": published_facts,
     }
 
 
@@ -904,20 +1352,19 @@ def build_stem_reconcile_jobs(
     base_inventory: MimoInventory,
     stem_diarization_root: Path,
     stem_asr_root: Path,
+    route: SAMRoute | None = None,
 ) -> list[MimoClipJob]:
     diarization = stem_diarization_root.expanduser().resolve(strict=True)
     asr_root = stem_asr_root.expanduser().resolve(strict=True)
-    diarization_provenance = StemDiarizationShadowProvenance.model_validate_json(
-        (diarization / "stem_provenance.json").read_text(encoding="utf-8")
-    )
-    asr_provenance = StemASRShadowProvenance.model_validate_json(
-        (asr_root / "stem_provenance.json").read_text(encoding="utf-8")
-    )
+    diarization_provenance, _, _ = validate_stem_diarization_lineage(diarization)
+    asr_provenance, asr_source = validate_stem_asr_lineage(asr_root)
     if (
-        asr_provenance.source_clip_uids != diarization_provenance.clip_uids
+        asr_source != diarization_provenance
+        or asr_provenance.source_clip_uids != diarization_provenance.clip_uids
         or asr_provenance.clip_uids != diarization_provenance.usable_clip_uids
         or asr_provenance.source_stem_inventory_fingerprint
         != diarization_provenance.source_stem_inventory_fingerprint
+        or (route is not None and diarization_provenance.route != route)
     ):
         raise ValueError("stem reconcile stage provenance differs")
     raw = [
@@ -1036,16 +1483,31 @@ class MimoStemReconcileRecord(SchemaModel):
         return self
 
 
+class StemReconcileUpstreamFailure(SchemaModel):
+    schema_version: Literal[
+        "r2v.h3.mimo25_stem_reconcile_upstream_failure.1"
+    ] = STEM_RECONCILE_UPSTREAM_FAILURE_VERSION
+    clip_uid: str
+    route: SAMRoute
+    source_stage: Literal["mimo_stem_facts"] = "mimo_stem_facts"
+    source_record_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    reason_code: str
+    reason_type: str
+    reason: str
+
+
 class MimoStemReconcileSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_stem_reconcile_summary.2"] = (
+    schema_version: Literal["r2v.h3.mimo25_stem_reconcile_summary.3"] = (
         MIMO25_STEM_RECONCILE_SUMMARY_VERSION
     )
+    route: SAMRoute
     clip_count: int = Field(ge=1)
     processed_clip_count: int = Field(ge=0)
     skipped_clip_count: int = Field(ge=0)
     clip_uids: list[str] = Field(min_length=1)
     processed_clip_uids: list[str]
     skipped_clips: list[StemShadowClipSkip]
+    facts_failed_clips: list[StemReconcileUpstreamFailure]
     ready_count: int = Field(ge=0)
     failed_count: int = Field(ge=0)
     model_call_count: int = Field(ge=0)
@@ -1060,9 +1522,22 @@ class MimoStemReconcileSummary(SchemaModel):
             or self.clip_count != self.processed_clip_count + self.skipped_clip_count
             or self.clip_count != len(self.clip_uids)
             or self.processed_clip_count != len(self.processed_clip_uids)
-            or self.skipped_clip_count != len(self.skipped_clips)
+            or self.skipped_clip_count
+            != len(self.skipped_clips) + len(self.facts_failed_clips)
             or [item for item in self.clip_uids if item in set(self.processed_clip_uids)]
             != self.processed_clip_uids
+            or [
+                item
+                for item in self.clip_uids
+                if item in {failure.clip_uid for failure in self.facts_failed_clips}
+            ]
+            != [item.clip_uid for item in self.facts_failed_clips]
+            or set(self.processed_clip_uids)
+            .union(item.clip_uid for item in self.skipped_clips)
+            .union(item.clip_uid for item in self.facts_failed_clips)
+            != set(self.clip_uids)
+            or any(item.route != self.route for item in self.skipped_clips)
+            or any(item.route != self.route for item in self.facts_failed_clips)
         ):
             raise ValueError("stem reconcile summary counts do not reconcile")
         return self
@@ -1091,6 +1566,7 @@ def run_mimo25_stem_reconcile_shadow(
     output_root: Path,
     source_clip_uids: Sequence[str] | None = None,
     skipped_clips: Sequence[StemShadowClipSkip] = (),
+    route: SAMRoute,
     allow_unverified: bool = False,
     overwrite: bool = False,
 ) -> MimoStemReconcileSummary:
@@ -1108,13 +1584,33 @@ def run_mimo25_stem_reconcile_shadow(
     ordered_source = list(source_clip_uids or [item.clip_uid for item in jobs])
     if len(ordered_source) != len(set(ordered_source)):
         raise ValueError("stem reconcile source clip order contains duplicates")
-    processed_ids = [item.clip_uid for item in jobs]
-    if [item for item in ordered_source if item in set(processed_ids)] != processed_ids:
+    job_ids = [item.clip_uid for item in jobs]
+    if [item for item in ordered_source if item in set(job_ids)] != job_ids:
         raise ValueError("stem reconcile jobs differ from source clip order")
     if {item.clip_uid for item in skipped_clips} != set(ordered_source) - set(
-        processed_ids
+        job_ids
     ):
         raise ValueError("stem reconcile skipped clips differ from source inventory")
+    if any(item.route != route for item in stem_facts) or any(
+        item.route != route for item in skipped_clips
+    ):
+        raise ValueError("stem reconcile route differs from source records")
+    ready_fact_ids = [item.clip_uid for item in stem_facts if item.status == "ready"]
+    failed_facts = [item for item in stem_facts if item.status == "failed"]
+    processed_ids = [clip_uid for clip_uid in job_ids if clip_uid in set(ready_fact_ids)]
+    if ready_fact_ids != processed_ids:
+        raise ValueError("ready stem facts differ from job order")
+    facts_failed_clips = [
+        StemReconcileUpstreamFailure(
+            clip_uid=item.clip_uid,
+            route=route,
+            source_record_fingerprint=item.record_fingerprint,
+            reason_code=item.failure_code or "stem_fact_failed",
+            reason_type=item.failure_type or "UnknownStemFactFailure",
+            reason=item.failure_reason or "stem fact extraction failed",
+        )
+        for item in failed_facts
+    ]
     destination = output_root.expanduser().resolve(strict=False)
     temporary = destination.with_name(f".{destination.name}.tmp-{uuid.uuid4().hex}")
     records: list[MimoStemReconcileRecord] = []
@@ -1122,6 +1618,8 @@ def run_mimo25_stem_reconcile_shadow(
         temporary.mkdir(parents=True)
         for job in jobs:
             facts = facts_by_clip[job.clip_uid]
+            if facts.status != "ready":
+                continue
             segments = [item.segment_id for item in job.segments]
             transcribed = [
                 item.segment_id for item in job.segments if item.asr_status == "transcribed"
@@ -1179,18 +1677,21 @@ def run_mimo25_stem_reconcile_shadow(
             )
         counts = Counter(item.status for item in records)
         summary = MimoStemReconcileSummary(
+            route=route,
             clip_count=len(ordered_source),
             processed_clip_count=len(records),
-            skipped_clip_count=len(skipped_clips),
+            skipped_clip_count=len(skipped_clips) + len(facts_failed_clips),
             clip_uids=ordered_source,
             processed_clip_uids=processed_ids,
             skipped_clips=list(skipped_clips),
+            facts_failed_clips=facts_failed_clips,
             ready_count=counts["ready"],
             failed_count=counts["failed"],
             model_call_count=sum(item.model_call_count for item in records),
         )
         _write_jsonl(temporary / "records.jsonl", records)
         _write_jsonl(temporary / "skipped_clips.jsonl", list(skipped_clips))
+        _write_jsonl(temporary / "facts_failed_clips.jsonl", facts_failed_clips)
         _write_json(temporary / "summary.json", summary)
         _publish_directory(temporary, destination, overwrite=overwrite)
         return summary
@@ -1217,10 +1718,14 @@ __all__ = [
     "SpeechStemFacts",
     "SpeechStemSegmentFact",
     "StemAwareOpenAIMimo25Backend",
+    "StemFactCallAudit",
     "StemFactJob",
     "StemFactSegment",
     "StemFactsBackend",
+    "StemFactsBackendFailure",
     "StemFactsBackendProvenance",
+    "StemFactsBackendResult",
+    "StemReconcileUpstreamFailure",
     "StemView",
     "StemViewBackend",
     "build_stem_reconcile_jobs",
@@ -1228,4 +1733,5 @@ __all__ = [
     "run_mimo25_stem_facts_shadow",
     "run_mimo25_stem_reconcile_shadow",
     "stem_reconcile_auxiliary_contract",
+    "validate_stem_facts_lineage",
 ]

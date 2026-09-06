@@ -43,6 +43,7 @@ from r2v_data_v2.h3.primary_voice import (
 )
 from r2v_data_v2.h3.qwen3_asr import (
     Qwen3ASRBackend,
+    Qwen3ASRSegment,
     Qwen3ASRSummary,
     SegmentAudioLoader,
     run_qwen3_asr,
@@ -54,8 +55,8 @@ SAM_AUDIO_SEPARATION_STAGE_NAME = "separation"
 SAM_AUDIO_STEM_INVENTORY_VERSION = "r2v.h3.sam_audio_stem_inventory.2"
 SAM_AUDIO_STEM_RECORD_VERSION = "r2v.h3.sam_audio_stem_record.2"
 SAM_AUDIO_STEM_SUMMARY_VERSION = "r2v.h3.sam_audio_stem_summary.2"
-STEM_DIARIZATION_SHADOW_VERSION = "r2v.h3.stem_diarization_shadow.2"
-STEM_ASR_SHADOW_VERSION = "r2v.h3.stem_asr_shadow.2"
+STEM_DIARIZATION_SHADOW_VERSION = "r2v.h3.stem_diarization_shadow.3"
+STEM_ASR_SHADOW_VERSION = "r2v.h3.stem_asr_shadow.3"
 STEM_REFERENCE_VERSION = "r2v.h3.sam_audio_stem_reference.2"
 STEM_CLIP_SKIP_VERSION = "r2v.h3.sam_audio_stem_clip_skip.1"
 STEM_CANONICALIZATION_VERSION = "sam_audio_raw_to_32k_stereo_pcm16_v1"
@@ -162,7 +163,7 @@ class SAMAudioModelConfiguration(SchemaModel):
     t5_base_path: str
     t5_dependency_files: dict[str, str]
     device: str
-    reranking_candidates: int = Field(ge=1)
+    reranking_candidates: Literal[1] = 1
     predict_spans: Literal[False] = False
     local_files_only: Literal[True] = True
     visual_ranker_disabled: Literal[True] = True
@@ -274,17 +275,24 @@ def sam_audio_configuration(
     ):
         raise TypeError("local SAM Audio text-encoder configuration is invalid")
     configured_name = raw_config.get("_name_or_path")
-    derived_name = (
+    configured_identifier = (
         configured_name.strip()
         if isinstance(configured_name, str) and configured_name.strip()
-        else checkpoint.name
+        else None
     )
+    derived_name = configured_identifier or checkpoint.name
     if model_name is not None:
         supplied_name = model_name.strip()
-        if not supplied_name or supplied_name != derived_name:
+        if not supplied_name or (
+            configured_identifier is not None
+            and supplied_name != configured_identifier
+        ) or (
+            configured_identifier is None
+            and Path(supplied_name).name != checkpoint.name
+        ):
             raise ValueError("SAM Audio model identifier differs from local model path")
         derived_name = supplied_name
-    if not device.strip() or reranking_candidates < 1:
+    if not device.strip() or reranking_candidates != 1:
         raise ValueError("SAM Audio runtime configuration is incomplete")
     values = {
         "implementation_root": str(code),
@@ -354,6 +362,19 @@ class OfficialSAMAudioBackend:
         self._processor: object | None = None
         self._torch: object | None = None
         self._torchaudio: object | None = None
+
+    @staticmethod
+    def _normalized_waveform(waveform: object, *, torch: object, label: str) -> object:
+        tensor = waveform.float()  # type: ignore[attr-defined]
+        if tensor.ndim == 1:
+            tensor = tensor.unsqueeze(0)
+        if tensor.ndim != 2 or tensor.shape[0] != 1:
+            raise ValueError(f"SAM Audio {label} waveform must have shape [1,T]")
+        if tensor.shape[1] == 0:
+            raise ValueError(f"SAM Audio {label} waveform must not be empty")
+        if not bool(torch.isfinite(tensor).all().item()):  # type: ignore[attr-defined]
+            raise ValueError(f"SAM Audio {label} waveform must contain finite samples")
+        return tensor.cpu()
 
     def _load(self) -> tuple[object, object, object, object]:
         if self._model is not None:
@@ -435,8 +456,18 @@ class OfficialSAMAudioBackend:
         sample_rate = int(processor.audio_sampling_rate)
         if len(result.target) != 1 or len(result.residual) != 1:
             raise ValueError("SAM Audio batch-one result must contain one target/residual")
-        torchaudio.save(str(target_path), result.target[0].cpu(), sample_rate)
-        torchaudio.save(str(residual_path), result.residual[0].cpu(), sample_rate)
+        target = self._normalized_waveform(
+            result.target[0],
+            torch=torch,
+            label="target",
+        )
+        residual = self._normalized_waveform(
+            result.residual[0],
+            torch=torch,
+            label="residual",
+        )
+        torchaudio.save(str(target_path), target, sample_rate)
+        torchaudio.save(str(residual_path), residual, sample_rate)
         return SAMAudioSeparationResult(
             target_path=str(target_path),
             residual_path=str(residual_path),
@@ -1485,14 +1516,18 @@ def export_stem_native_references(
 
 
 class StemDiarizationShadowProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.stem_diarization_shadow.2"] = (
+    schema_version: Literal["r2v.h3.stem_diarization_shadow.3"] = (
         STEM_DIARIZATION_SHADOW_VERSION
     )
     diarization_source_kind: Literal["sam_audio_speech_stem"] = (
         "sam_audio_speech_stem"
     )
+    source_stem_root: str
     source_stem_inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_stem_records_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    raw_segments_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    bound_segments_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    cluster_bindings_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     route: SAMRoute
     target_count: int = Field(ge=1)
     clip_uids: list[str] = Field(min_length=1)
@@ -1533,6 +1568,91 @@ class StemDiarizationShadowProvenance(SchemaModel):
         ):
             raise ValueError("stem DiariZen unverified provenance is inconsistent")
         return self
+
+
+def validate_stem_diarization_lineage(
+    root: Path,
+) -> tuple[
+    StemDiarizationShadowProvenance,
+    SAMAudioStemInventory,
+    list[SAMAudioStemRecord],
+]:
+    diarization = root.expanduser().resolve(strict=True)
+    provenance = StemDiarizationShadowProvenance.model_validate_json(
+        (diarization / "stem_provenance.json").read_text(encoding="utf-8")
+    )
+    separation = Path(provenance.source_stem_root).expanduser().resolve(strict=True)
+    inventory, records, _ = load_stem_shadow(separation)
+    if sha256_file(separation / "records.jsonl") != provenance.source_stem_records_sha256:
+        raise ValueError("stem DiariZen source separation records changed")
+    if (
+        inventory.inventory_fingerprint
+        != provenance.source_stem_inventory_fingerprint
+        or inventory.clip_uids != provenance.clip_uids
+    ):
+        raise ValueError("stem DiariZen source inventory changed")
+
+    selected = selected_stem_records(
+        records,
+        route=provenance.route,
+        allow_unverified=True,
+    )
+    selected_by_clip = {item.clip_uid: item for item in selected}
+    usable = [
+        clip_uid for clip_uid in inventory.clip_uids if clip_uid in selected_by_clip
+    ]
+    skips = separation_skips(
+        inventory=inventory,
+        records=records,
+        route=provenance.route,
+    )
+    unverified = [
+        clip_uid
+        for clip_uid in usable
+        if selected_by_clip[clip_uid].separation_state == "unverified"
+    ]
+    if (
+        usable != provenance.usable_clip_uids
+        or skips != provenance.skipped_clips
+        or unverified != provenance.unverified_clip_uids
+    ):
+        raise ValueError("stem DiariZen selection differs from current separation")
+
+    expected_paths = {
+        key: selected_by_clip[key].stem("speech").canonical_stem_path
+        for key in sorted(selected_by_clip)
+    }
+    expected_hashes = {
+        key: selected_by_clip[key].stem("speech").canonical_stem_sha256
+        for key in sorted(selected_by_clip)
+    }
+    expected_original_paths = {
+        key: selected_by_clip[key].stem("speech").source_audio_path
+        for key in sorted(selected_by_clip)
+    }
+    expected_original_hashes = {
+        key: selected_by_clip[key].stem("speech").source_audio_sha256
+        for key in sorted(selected_by_clip)
+    }
+    if (
+        provenance.speech_stem_paths_by_clip != expected_paths
+        or provenance.speech_stem_hashes_by_clip != expected_hashes
+        or provenance.original_audio_paths_by_clip != expected_original_paths
+        or provenance.original_audio_hashes_by_clip != expected_original_hashes
+    ):
+        raise ValueError("stem DiariZen Audio provenance differs from separation")
+    for clip_uid in usable:
+        speech = selected_by_clip[clip_uid].stem("speech")
+        if sha256_file(Path(speech.canonical_stem_path)) != speech.canonical_stem_sha256:
+            raise ValueError("stem DiariZen speech stem hash changed")
+    for filename, expected_hash in (
+        ("raw_segments.jsonl", provenance.raw_segments_sha256),
+        ("bound_segments.jsonl", provenance.bound_segments_sha256),
+        ("cluster_bindings.jsonl", provenance.cluster_bindings_sha256),
+    ):
+        if sha256_file(diarization / filename) != expected_hash:
+            raise ValueError(f"stem DiariZen {filename} changed")
+    return provenance, inventory, records
 
 
 def _canonical_by_clip(inventory: SAMAudioStemInventory) -> dict[str, CanonicalAudioClip]:
@@ -1754,29 +1874,6 @@ def run_stem_diarization_shadow(
         if by_clip[clip_uid].separation_state == "unverified"
     ]
     records_path = stem_root.expanduser().resolve(strict=True) / "records.jsonl"
-    provenance = StemDiarizationShadowProvenance(
-        source_stem_inventory_fingerprint=stem_inventory.inventory_fingerprint,
-        source_stem_records_sha256=sha256_file(records_path),
-        route=route,
-        target_count=len(inventory.targets),
-        clip_uids=stem_inventory.clip_uids,
-        usable_clip_uids=usable_clip_uids,
-        skipped_clips=skips,
-        unverified_clip_uids=unverified_clip_uids,
-        unverified_consumption_authorized=allow_unverified,
-        speech_stem_paths_by_clip={
-            key: by_clip[key].stem("speech").canonical_stem_path for key in sorted(by_clip)
-        },
-        speech_stem_hashes_by_clip={
-            key: by_clip[key].stem("speech").canonical_stem_sha256 for key in sorted(by_clip)
-        },
-        original_audio_paths_by_clip={
-            key: by_clip[key].stem("speech").source_audio_path for key in sorted(by_clip)
-        },
-        original_audio_hashes_by_clip={
-            key: by_clip[key].stem("speech").source_audio_sha256 for key in sorted(by_clip)
-        },
-    )
     try:
         outer.mkdir(parents=True)
         stage = outer / "stage"
@@ -1789,6 +1886,37 @@ def run_stem_diarization_shadow(
             diarization_root=stage,
             canonical_by_clip=_canonical_by_clip(stem_inventory),
             inventory=inventory,
+        )
+        provenance = StemDiarizationShadowProvenance(
+            source_stem_root=str(stem_root.expanduser().resolve(strict=True)),
+            source_stem_inventory_fingerprint=stem_inventory.inventory_fingerprint,
+            source_stem_records_sha256=sha256_file(records_path),
+            raw_segments_sha256=sha256_file(stage / "raw_segments.jsonl"),
+            bound_segments_sha256=sha256_file(stage / "bound_segments.jsonl"),
+            cluster_bindings_sha256=sha256_file(stage / "cluster_bindings.jsonl"),
+            route=route,
+            target_count=len(inventory.targets),
+            clip_uids=stem_inventory.clip_uids,
+            usable_clip_uids=usable_clip_uids,
+            skipped_clips=skips,
+            unverified_clip_uids=unverified_clip_uids,
+            unverified_consumption_authorized=allow_unverified,
+            speech_stem_paths_by_clip={
+                key: by_clip[key].stem("speech").canonical_stem_path
+                for key in sorted(by_clip)
+            },
+            speech_stem_hashes_by_clip={
+                key: by_clip[key].stem("speech").canonical_stem_sha256
+                for key in sorted(by_clip)
+            },
+            original_audio_paths_by_clip={
+                key: by_clip[key].stem("speech").source_audio_path
+                for key in sorted(by_clip)
+            },
+            original_audio_hashes_by_clip={
+                key: by_clip[key].stem("speech").source_audio_sha256
+                for key in sorted(by_clip)
+            },
         )
         _write_json(stage / "stem_provenance.json", provenance)
         _write_jsonl(stage / "skipped_clips.jsonl", skips)
@@ -1804,7 +1932,7 @@ def run_stem_diarization_shadow(
 
 
 class StemASRShadowProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.stem_asr_shadow.2"] = STEM_ASR_SHADOW_VERSION
+    schema_version: Literal["r2v.h3.stem_asr_shadow.3"] = STEM_ASR_SHADOW_VERSION
     asr_source_kind: Literal["sam_audio_speech_stem_segments"] = (
         "sam_audio_speech_stem_segments"
     )
@@ -1818,6 +1946,7 @@ class StemASRShadowProvenance(SchemaModel):
     unverified_clip_uids: list[str]
     unverified_consumption_authorized: bool
     segment_count: int = Field(ge=0)
+    segments_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     production_asr_modified: Literal[False] = False
 
     @model_validator(mode="after")
@@ -1842,6 +1971,43 @@ class StemASRShadowProvenance(SchemaModel):
         return self
 
 
+def validate_stem_asr_lineage(
+    root: Path,
+) -> tuple[StemASRShadowProvenance, StemDiarizationShadowProvenance]:
+    asr_root = root.expanduser().resolve(strict=True)
+    provenance = StemASRShadowProvenance.model_validate_json(
+        (asr_root / "stem_provenance.json").read_text(encoding="utf-8")
+    )
+    diarization = Path(provenance.source_stem_diarization_root).expanduser().resolve(
+        strict=True
+    )
+    source_path = diarization / "stem_provenance.json"
+    if sha256_file(source_path) != provenance.source_stem_diarization_provenance_sha256:
+        raise ValueError("stem ASR source DiariZen provenance changed")
+    source, _, _ = validate_stem_diarization_lineage(diarization)
+    if (
+        provenance.source_stem_inventory_fingerprint
+        != source.source_stem_inventory_fingerprint
+        or provenance.route != source.route
+        or provenance.source_clip_uids != source.clip_uids
+        or provenance.clip_uids != source.usable_clip_uids
+        or provenance.skipped_clips != source.skipped_clips
+        or provenance.unverified_clip_uids != source.unverified_clip_uids
+    ):
+        raise ValueError("stem ASR provenance differs from current DiariZen stage")
+    segments = [
+        Qwen3ASRSegment.model_validate(row)
+        for row in _read_jsonl(asr_root / "segments.jsonl")
+    ]
+    if len(segments) != provenance.segment_count or (
+        {item.clip_uid for item in segments} - set(provenance.clip_uids)
+    ):
+        raise ValueError("stem ASR segment inventory differs from provenance")
+    if sha256_file(asr_root / "segments.jsonl") != provenance.segments_sha256:
+        raise ValueError("stem ASR segments changed")
+    return provenance, source
+
+
 def run_stem_qwen3_asr_shadow(
     *,
     stem_diarization_root: Path,
@@ -1851,14 +2017,15 @@ def run_stem_qwen3_asr_shadow(
     case_manifest: MimoCaseManifest | None = None,
     segment_audio_loader: SegmentAudioLoader | None = None,
     ffmpeg: str = "ffmpeg",
+    route: SAMRoute | None = None,
     allow_unverified: bool = False,
     overwrite: bool = False,
 ) -> tuple[Qwen3ASRSummary, StemASRShadowProvenance]:
     diarization = stem_diarization_root.expanduser().resolve(strict=True)
     source_provenance_path = diarization / "stem_provenance.json"
-    source_provenance = StemDiarizationShadowProvenance.model_validate_json(
-        source_provenance_path.read_text(encoding="utf-8")
-    )
+    source_provenance, _, _ = validate_stem_diarization_lineage(diarization)
+    if route is not None and source_provenance.route != route:
+        raise ValueError("stem ASR route differs from stem diarization")
     target_ids = source_provenance.usable_clip_uids
     if case_manifest is not None and case_manifest.clip_uids != source_provenance.clip_uids:
         raise ValueError("stem ASR case manifest differs from stem diarization order")
@@ -1894,6 +2061,7 @@ def run_stem_qwen3_asr_shadow(
             unverified_clip_uids=source_provenance.unverified_clip_uids,
             unverified_consumption_authorized=allow_unverified,
             segment_count=summary.segment_count,
+            segments_sha256=sha256_file(stage / "segments.jsonl"),
         )
         _write_json(stage / "stem_provenance.json", provenance)
         _write_jsonl(stage / "skipped_clips.jsonl", provenance.skipped_clips)
@@ -1939,4 +2107,6 @@ __all__ = [
     "separation_skips",
     "stem_separation_root",
     "stem_shadow_root",
+    "validate_stem_asr_lineage",
+    "validate_stem_diarization_lineage",
 ]

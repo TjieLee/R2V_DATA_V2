@@ -62,7 +62,9 @@ from r2v_data_v2.h3.mimo25_stem_shadow import (
     SpeechStemSegmentFact,
     StemAwareOpenAIMimo25Backend,
     StemFactJob,
+    StemFactsBackendFailure,
     StemFactsBackendProvenance,
+    StemFactsBackendResult,
     StemFactSegment,
     StemView,
     build_stem_reconcile_jobs,
@@ -70,6 +72,7 @@ from r2v_data_v2.h3.mimo25_stem_shadow import (
     run_mimo25_stem_facts_shadow,
     run_mimo25_stem_reconcile_shadow,
     stem_reconcile_auxiliary_contract,
+    validate_stem_facts_lineage,
 )
 from r2v_data_v2.h3.primary_voice import (
     PrimaryVoiceReferenceExportSummary,
@@ -98,10 +101,13 @@ from r2v_data_v2.h3.sam_audio_stem_shadow import (
     sha256_file,
     stem_separation_root,
     stem_shadow_root,
+    validate_stem_asr_lineage,
+    validate_stem_diarization_lineage,
 )
 from tools.run_h3_mimo25_stem_reconcile_shadow import (
     _parser as _stem_reconcile_parser,
 )
+from tools.run_h3_sam_audio_stem_shadow import _parser as _sam_stem_parser
 
 
 def _write_wav(
@@ -269,6 +275,12 @@ class _OneClipFailSAM(_SAM):
             target_path=target_path,
             residual_path=residual_path,
         )
+
+
+class _VariantSAM(_SAM):
+    def separate(self, **kwargs: object) -> SAMAudioSeparationResult:
+        result = super().separate(**kwargs)
+        return result.model_copy(update={"backend_metadata": {"fake": "variant-b"}})
 
 
 def _canonical_fixture(tmp_path: Path) -> tuple[Path, CanonicalAudioClip, Path]:
@@ -591,11 +603,28 @@ def test_official_backend_matches_current_local_api_and_list_outputs(
     calls: dict[str, object] = {}
 
     class Tensor:
-        def __init__(self, label: str) -> None:
+        def __init__(self, label: str, shape: tuple[int, ...] = (4,)) -> None:
             self.label = label
+            self.shape = shape
+            self.ndim = len(shape)
+
+        def float(self) -> Tensor:
+            calls.setdefault("float", []).append(self.label)
+            return self
+
+        def unsqueeze(self, dimension: int) -> Tensor:
+            assert dimension == 0
+            return Tensor(self.label, (1, *self.shape))
 
         def cpu(self) -> Tensor:
             return self
+
+    class FiniteResult:
+        def all(self) -> FiniteResult:
+            return self
+
+        def item(self) -> bool:
+            return True
 
     class Batch:
         def to(self, device: str) -> Batch:
@@ -655,6 +684,7 @@ def test_official_backend_matches_current_local_api_and_list_outputs(
     sam_audio.SAMAudioProcessor = Processor
     torch = ModuleType("torch")
     torch.inference_mode = nullcontext
+    torch.isfinite = lambda tensor: FiniteResult()
     torchaudio = ModuleType("torchaudio")
 
     def save(path: str, tensor: Tensor, sample_rate: int) -> None:
@@ -714,6 +744,132 @@ def test_local_model_identifier_cannot_disagree_with_checkpoint_config(
             device="cuda:0",
             reranking_candidates=1,
         )
+
+
+def test_local_model_identifier_without_config_name_uses_matching_path_basename(
+    tmp_path: Path,
+) -> None:
+    existing = _configuration(tmp_path)
+    original_model = Path(existing.model_path)
+    model = original_model.with_name("sam-audio-small-tv")
+    original_model.rename(model)
+    raw = json.loads((model / "config.json").read_text(encoding="utf-8"))
+    raw.pop("_name_or_path")
+    (model / "config.json").write_text(json.dumps(raw), encoding="utf-8")
+
+    supplied = sam_audio_configuration(
+        implementation_root=Path(existing.implementation_root),
+        model_path=model,
+        model_name="facebook/sam-audio-small-tv",
+        t5_base_path=Path(existing.t5_base_path),
+        device="cuda:0",
+        reranking_candidates=1,
+    )
+    derived = sam_audio_configuration(
+        implementation_root=Path(existing.implementation_root),
+        model_path=model,
+        model_name=None,
+        t5_base_path=Path(existing.t5_base_path),
+        device="cuda:0",
+        reranking_candidates=1,
+    )
+    assert supplied.model_name == "facebook/sam-audio-small-tv"
+    assert derived.model_name == "sam-audio-small-tv"
+    with pytest.raises(ValueError, match="model identifier differs"):
+        sam_audio_configuration(
+            implementation_root=Path(existing.implementation_root),
+            model_path=model,
+            model_name="facebook/sam-audio-large-tv",
+            t5_base_path=Path(existing.t5_base_path),
+            device="cuda:0",
+            reranking_candidates=1,
+        )
+
+
+def test_disabled_rankers_require_exactly_one_reranking_candidate(
+    tmp_path: Path,
+) -> None:
+    existing = _configuration(tmp_path)
+    with pytest.raises(ValueError, match="runtime configuration is incomplete"):
+        sam_audio_configuration(
+            implementation_root=Path(existing.implementation_root),
+            model_path=Path(existing.model_path),
+            model_name=existing.model_name,
+            t5_base_path=Path(existing.t5_base_path),
+            device="cuda:0",
+            reranking_candidates=2,
+        )
+    with pytest.raises(SystemExit):
+        _sam_stem_parser().parse_args(
+            [
+                "--audio-production-root",
+                str(tmp_path),
+                "--sam-audio-code-root",
+                existing.implementation_root,
+                "--sam-audio-model-path",
+                existing.model_path,
+                "--sam-audio-t5-base-path",
+                existing.t5_base_path,
+                "--sam-reranking-candidates",
+                "2",
+            ]
+        )
+
+
+@pytest.mark.parametrize(
+    ("values", "expected_shape", "error"),
+    [
+        ([0.0, 0.5], (1, 2), None),
+        ([[0.0, 0.5]], (1, 2), None),
+        ([[0.0, 0.5], [0.5, 0.0]], None, "shape"),
+        ([], None, "empty"),
+        ([0.0, float("nan")], None, "finite"),
+        ([0.0, float("inf")], None, "finite"),
+    ],
+)
+def test_official_sam_waveform_normalization_is_strict_mono_float(
+    values: list[object],
+    expected_shape: tuple[int, int] | None,
+    error: str | None,
+) -> None:
+    class Tensor:
+        def __init__(self, payload: object) -> None:
+            self.values = np.asarray(payload)
+
+        @property
+        def ndim(self) -> int:
+            return self.values.ndim
+
+        @property
+        def shape(self) -> tuple[int, ...]:
+            return self.values.shape
+
+        def float(self) -> Tensor:
+            result = Tensor(self.values.astype(np.float32))
+            return result
+
+        def unsqueeze(self, dimension: int) -> Tensor:
+            return Tensor(np.expand_dims(self.values, dimension))
+
+        def cpu(self) -> Tensor:
+            return self
+
+    torch = SimpleNamespace(isfinite=lambda value: np.isfinite(value.values))
+    if error is not None:
+        with pytest.raises(ValueError, match=error):
+            OfficialSAMAudioBackend._normalized_waveform(
+                Tensor(values),
+                torch=torch,
+                label="target",
+            )
+        return
+    output = OfficialSAMAudioBackend._normalized_waveform(
+        Tensor(values),
+        torch=torch,
+        label="target",
+    )
+    assert output.shape == expected_shape
+    assert output.values.dtype == np.float32
 
 
 def test_unverified_stems_require_explicit_downstream_opt_in(tmp_path: Path) -> None:
@@ -1171,10 +1327,9 @@ class _FactsBackend:
         self.calls: list[str] = []
 
     def extract(self, *, job: StemFactJob, stem_type: str, view: StemView):
-        del view
         self.calls.append(stem_type)
         if stem_type == "speech":
-            return SpeechStemFacts(
+            facts = SpeechStemFacts(
                 clip_duration_seconds=job.clip_duration_seconds,
                 segment_facts=[
                     SpeechStemSegmentFact(
@@ -1186,8 +1341,8 @@ class _FactsBackend:
                     for item in job.segments
                 ],
             )
-        if stem_type == "music":
-            return MusicStemFacts(
+        elif stem_type == "music":
+            facts = MusicStemFacts(
                 clip_duration_seconds=job.clip_duration_seconds,
                 music_status="present",
                 intervals=[
@@ -1199,11 +1354,34 @@ class _FactsBackend:
                     )
                 ],
             )
-        return SFXStemFacts(
-            clip_duration_seconds=job.clip_duration_seconds,
-            continuous_layers=[],
-            events=[],
+        else:
+            facts = SFXStemFacts(
+                clip_duration_seconds=job.clip_duration_seconds,
+                continuous_layers=[],
+                events=[],
+            )
+        return StemFactsBackendResult(
+            facts=facts,
+            raw_response=facts.model_dump_json(),
+            diagnostics={"view_sha256": view.view_sha256},
         )
+
+
+class _OneClipFailFactsBackend(_FactsBackend):
+    def __init__(self, failed_clip_uid: str) -> None:
+        super().__init__()
+        self.failed_clip_uid = failed_clip_uid
+
+    def extract(self, *, job: StemFactJob, stem_type: str, view: StemView):
+        if job.clip_uid == self.failed_clip_uid and stem_type == "music":
+            self.calls.append(stem_type)
+            raise StemFactsBackendFailure(
+                code="stem_fact_structured_output_failed",
+                reason="synthetic malformed music facts",
+                raw_response="{not-json",
+                diagnostics={"view_sha256": view.view_sha256},
+            )
+        return super().extract(job=job, stem_type=stem_type, view=view)
 
 
 class _FailingViewBackend(_ViewBackend):
@@ -1258,18 +1436,23 @@ def test_failed_facts_rerun_preserves_published_records_and_views(
         for item in record.stem_views
     }
 
-    with pytest.raises(RuntimeError, match="view creation failed"):
-        run_mimo25_stem_facts_shadow(
-            stem_root=stem_root,
-            route="music_first",
-            backend=_FactsBackend(),
-            view_backend=_FailingViewBackend(),
-            output_root=facts_root,
-            allow_unverified=True,
-            overwrite=True,
-        )
+    summary = run_mimo25_stem_facts_shadow(
+        stem_root=stem_root,
+        route="music_first",
+        backend=_FactsBackend(),
+        view_backend=_FailingViewBackend(),
+        output_root=facts_root,
+        allow_unverified=True,
+        overwrite=True,
+    )
 
-    assert (facts_root / "records.jsonl").read_bytes() == records_before
+    assert (facts_root / "records.jsonl").read_bytes() != records_before
+    assert summary.ready_count == 0
+    assert summary.failed_count == 1
+    failed = load_stem_fact_records(facts_root)[0]
+    assert failed.status == "failed"
+    assert failed.failure_reason == "view creation failed"
+    assert failed.model_call_count == 0
     assert {path: path.read_bytes() for path in views_before} == views_before
 
 
@@ -1680,12 +1863,230 @@ def test_failed_clip_is_skipped_while_manifest_order_reaches_reconcile(
         output_root=shadow_root / "mimo_reconcile",
         source_clip_uids=clip_order,
         skipped_clips=diarization_provenance.skipped_clips,
+        route="music_first",
         allow_unverified=True,
     )
     assert backend.calls == ["clip-z", "clip-m"]
     assert reconcile_summary.clip_uids == clip_order
     assert reconcile_summary.processed_clip_uids == ["clip-z", "clip-m"]
     assert reconcile_summary.skipped_clip_count == 1
+
+
+def _run_three_clip_shadow_to_asr(
+    tmp_path: Path,
+) -> tuple[Path, Path, Path, object, list[str]]:
+    clip_order = ["clip-z", "clip-a", "clip-m"]
+    manifest, canonical_records, case = _multi_canonical_fixture(
+        tmp_path,
+        clip_uids=clip_order,
+    )
+    configuration = _configuration(tmp_path)
+    inventory = build_sam_audio_stem_inventory(
+        canonical_audio_manifest_path=manifest,
+        model_configuration=configuration,
+        case_manifest_path=case,
+    )
+    separation = stem_separation_root(tmp_path)
+    run_sam_audio_stem_shadow(
+        inventory=inventory,
+        output_root=separation,
+        backend=_SAM(configuration),
+        canonicalizer=_Canonicalizer(),
+        raw_probe_backend=_Media(),
+    )
+    production_root = tmp_path / "production-diarization"
+    production_root.mkdir()
+    production_inventory = _production_diarization_inventory_for_records(
+        tmp_path,
+        canonical_records,
+    )
+    (production_root / "inventory.json").write_text(
+        production_inventory.model_dump_json(indent=2) + "\n",
+        encoding="utf-8",
+    )
+    shadow = separation.parent
+    diarization = shadow / "diarization"
+    run_stem_diarization_shadow(
+        stem_root=separation,
+        production_diarization_root=production_root,
+        backend=_Diarization(),
+        route="music_first",
+        output_root=diarization,
+        allow_unverified=True,
+    )
+    asr = shadow / "asr"
+    run_stem_qwen3_asr_shadow(
+        stem_diarization_root=diarization,
+        source_visual_production_root="/visual/source",
+        backend=_Qwen(),
+        output_root=asr,
+        segment_audio_loader=lambda path, start, end: (
+            np.zeros(round((end - start) * 16000), dtype=np.float32),
+            16000,
+        ),
+        route="music_first",
+        allow_unverified=True,
+    )
+    return separation, diarization, asr, inventory, clip_order
+
+
+def test_one_facts_failure_is_audited_and_reconcile_processes_other_clips(
+    tmp_path: Path,
+) -> None:
+    separation, diarization, asr, _, clip_order = _run_three_clip_shadow_to_asr(
+        tmp_path
+    )
+    shadow = separation.parent
+    facts_root = shadow / "mimo_stem_facts"
+    backend = _OneClipFailFactsBackend("clip-a")
+    facts_summary = run_mimo25_stem_facts_shadow(
+        stem_root=separation,
+        route="music_first",
+        backend=backend,
+        view_backend=_ViewBackend(),
+        output_root=facts_root,
+        allow_unverified=True,
+    )
+    _, facts = validate_stem_facts_lineage(
+        facts_root=facts_root,
+        stem_diarization_root=diarization,
+        stem_asr_root=asr,
+        route="music_first",
+    )
+    assert facts_summary.ready_clip_uids == ["clip-z", "clip-m"]
+    assert facts_summary.failed_clip_uids == ["clip-a"]
+    assert facts_summary.ready_count == 2
+    assert facts_summary.failed_count == 1
+    assert facts_summary.model_call_count == 8
+    failed = next(item for item in facts if item.clip_uid == "clip-a")
+    assert failed.status == "failed"
+    assert failed.failing_stem_type == "music"
+    assert failed.failure_code == "stem_fact_structured_output_failed"
+    assert [item.status for item in failed.raw_responses] == ["ready", "failed"]
+    assert failed.raw_responses[-1].raw_response == "{not-json"
+    raw = json.loads(
+        (facts_root / "raw_responses/clip-a.json").read_text(encoding="utf-8")
+    )
+    assert raw["calls"][-1]["raw_response"] == "{not-json"
+
+    jobs = build_stem_reconcile_jobs(
+        base_inventory=_mimo_inventory_for_clip_order(tmp_path / "base", clip_order),
+        stem_diarization_root=diarization,
+        stem_asr_root=asr,
+        route="music_first",
+    )
+    reconcile_backend = _FailingReconcileBackend(tmp_path)
+    summary = run_mimo25_stem_reconcile_shadow(
+        jobs=jobs,
+        stem_facts=facts,
+        backend=reconcile_backend,
+        output_root=shadow / "mimo_reconcile",
+        source_clip_uids=clip_order,
+        route="music_first",
+        allow_unverified=True,
+    )
+    assert reconcile_backend.calls == ["clip-z", "clip-m"]
+    assert summary.route == "music_first"
+    assert summary.processed_clip_uids == ["clip-z", "clip-m"]
+    assert summary.skipped_clip_count == 1
+    assert [item.clip_uid for item in summary.facts_failed_clips] == ["clip-a"]
+
+
+def test_separation_overwrite_invalidates_complete_downstream_lineage_before_model(
+    tmp_path: Path,
+) -> None:
+    separation, diarization, asr, inventory, clip_order = (
+        _run_three_clip_shadow_to_asr(tmp_path)
+    )
+    shadow = separation.parent
+    facts_root = shadow / "mimo_stem_facts"
+    facts_backend = _FactsBackend()
+    run_mimo25_stem_facts_shadow(
+        stem_root=separation,
+        route="music_first",
+        backend=facts_backend,
+        view_backend=_ViewBackend(),
+        output_root=facts_root,
+        allow_unverified=True,
+    )
+    old_records_hash = sha256_file(separation / "records.jsonl")
+    run_sam_audio_stem_shadow(
+        inventory=inventory,
+        output_root=separation,
+        backend=_VariantSAM(inventory.model_configuration),
+        canonicalizer=_Canonicalizer(),
+        raw_probe_backend=_Media(),
+        overwrite=True,
+    )
+    assert sha256_file(separation / "records.jsonl") != old_records_hash
+
+    with pytest.raises(ValueError, match="source separation records changed"):
+        validate_stem_diarization_lineage(diarization)
+    model = _FailingReconcileBackend(tmp_path)
+    with pytest.raises(ValueError, match="source separation records changed"):
+        build_stem_reconcile_jobs(
+            base_inventory=_mimo_inventory_for_clip_order(
+                tmp_path / "stale-base",
+                clip_order,
+            ),
+            stem_diarization_root=diarization,
+            stem_asr_root=asr,
+            route="music_first",
+        )
+    assert model.calls == []
+
+
+def test_changed_diarization_provenance_invalidates_existing_asr(tmp_path: Path) -> None:
+    _, diarization, asr, _, _ = _run_three_clip_shadow_to_asr(tmp_path)
+    provenance_path = diarization / "stem_provenance.json"
+    provenance_path.write_text(
+        provenance_path.read_text(encoding="utf-8") + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="source DiariZen provenance changed"):
+        validate_stem_asr_lineage(asr)
+
+
+def test_changed_asr_provenance_invalidates_existing_facts(tmp_path: Path) -> None:
+    separation, diarization, asr, _, _ = _run_three_clip_shadow_to_asr(tmp_path)
+    facts_root = separation.parent / "mimo_stem_facts"
+    run_mimo25_stem_facts_shadow(
+        stem_root=separation,
+        route="music_first",
+        backend=_FactsBackend(),
+        view_backend=_ViewBackend(),
+        output_root=facts_root,
+        allow_unverified=True,
+    )
+    provenance_path = asr / "stem_provenance.json"
+    provenance_path.write_text(
+        provenance_path.read_text(encoding="utf-8") + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="stem facts source lineage changed"):
+        validate_stem_facts_lineage(
+            facts_root=facts_root,
+            stem_diarization_root=diarization,
+            stem_asr_root=asr,
+            route="music_first",
+        )
+
+
+def test_route_mismatch_fails_before_stem_facts_model_calls(tmp_path: Path) -> None:
+    separation, _, _, _, _ = _run_three_clip_shadow_to_asr(tmp_path)
+    backend = _FactsBackend()
+    with pytest.raises(ValueError, match="route records differ"):
+        run_mimo25_stem_facts_shadow(
+            stem_root=separation,
+            route="voice_first",
+            backend=backend,
+            view_backend=_ViewBackend(),
+            output_root=separation.parent / "wrong-route-facts",
+            allow_unverified=True,
+        )
+    assert backend.calls == []
 
 
 def test_stem_aware_mimo_request_keeps_original_video_as_model_media(tmp_path: Path) -> None:

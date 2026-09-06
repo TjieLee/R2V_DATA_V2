@@ -17,8 +17,8 @@ from r2v_data_v2.h3.mimo25_backend import MimoBackendConfig, MimoMediaResolver
 from r2v_data_v2.h3.mimo25_stem_shadow import (
     StemAwareOpenAIMimo25Backend,
     build_stem_reconcile_jobs,
-    load_stem_fact_records,
     run_mimo25_stem_reconcile_shadow,
+    validate_stem_facts_lineage,
 )
 from r2v_data_v2.h3.sam_audio_stem_shadow import (
     load_stem_shadow,
@@ -74,8 +74,14 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         base_inventory=base,
         stem_diarization_root=shadow / "diarization",
         stem_asr_root=shadow / "asr",
+        route=arguments.sam_route,
     )
-    facts = load_stem_fact_records(shadow / "mimo_stem_facts")
+    _, facts = validate_stem_facts_lineage(
+        facts_root=shadow / "mimo_stem_facts",
+        stem_diarization_root=shadow / "diarization",
+        stem_asr_root=shadow / "asr",
+        route=arguments.sam_route,
+    )
     stem_inventory, stem_records, _ = load_stem_shadow(separation)
     skipped = separation_skips(
         inventory=stem_inventory,
@@ -91,7 +97,9 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         "original_target_av_is_highest_authority": True,
     }
     if not arguments.dry_run:
-        facts_by_clip = {item.clip_uid: item for item in facts}
+        facts_by_clip = {
+            item.clip_uid: item for item in facts if item.status == "ready"
+        }
         backend = StemAwareOpenAIMimo25Backend(
             MimoBackendConfig(
                 media_resolver=MimoMediaResolver(
@@ -114,6 +122,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
             output_root=output,
             source_clip_uids=stem_inventory.clip_uids,
             skipped_clips=skipped,
+            route=arguments.sam_route,
             allow_unverified=arguments.allow_unverified,
             overwrite=arguments.overwrite,
         )
