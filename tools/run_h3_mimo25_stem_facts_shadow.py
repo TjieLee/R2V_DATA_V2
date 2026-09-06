@@ -14,9 +14,11 @@ if str(REPOSITORY_ROOT) not in sys.path:
 from r2v_data_v2.h3.jea_audio_production import jea_production_paths
 from r2v_data_v2.h3.mimo25_av_reconcile import MimoCaseManifest
 from r2v_data_v2.h3.mimo25_backend import MimoMediaResolver
+from r2v_data_v2.h3.mimo25_stem_facts_runtime import (
+    AuthoritativeOpenAIStemFactsBackend,
+)
 from r2v_data_v2.h3.mimo25_stem_shadow import (
     FFmpegStemViewBackend,
-    OpenAIStemFactsBackend,
     run_mimo25_stem_facts_shadow,
 )
 from r2v_data_v2.h3.sam_audio_stem_shadow import (
@@ -81,7 +83,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         "inventory_fingerprint": inventory.inventory_fingerprint,
     }
     if not arguments.dry_run:
-        backend = OpenAIStemFactsBackend(
+        backend = AuthoritativeOpenAIStemFactsBackend(
             model=arguments.model,
             base_url=arguments.base_url,
             api_key=os.environ.get("MIMO_API_KEY", ""),
