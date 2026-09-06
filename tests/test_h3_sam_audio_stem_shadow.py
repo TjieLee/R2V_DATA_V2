@@ -20,6 +20,7 @@ from r2v_data_v2.h3.diarization_binding import (
     DiarizationBackendSegment,
     DiarizationInventory,
     DiarizationTargetClip,
+    RawDiarizationSegment,
 )
 from r2v_data_v2.h3.diarization_binding import (
     _inventory_fingerprint as _diarization_inventory_fingerprint,
@@ -27,6 +28,7 @@ from r2v_data_v2.h3.diarization_binding import (
 from r2v_data_v2.h3.jea_audio_production import CanonicalAudioClip
 from r2v_data_v2.h3.mimo25_av_reconcile import (
     MIMO25_INVENTORY_VERSION,
+    MimoCaseManifest,
     MimoClipJob,
     MimoInventory,
     MimoReferenceImage,
@@ -82,6 +84,9 @@ from r2v_data_v2.h3.qwen3_asr import Qwen3ASRConfiguration
 from r2v_data_v2.h3.qwen38_h3_recaption import RecaptionSubjectContract
 from r2v_data_v2.h3.sam_audio_stem_shadow import (
     SAM_AUDIO_SHADOW_ROOT_NAME,
+    STEM_ALIGNMENT_TOLERANCE_SECONDS,
+    STEM_CANONICAL_CHANNEL_POLICY,
+    STEM_TIMELINE_POLICY,
     OfficialSAMAudioBackend,
     SAMAudioSeparationResult,
     SAMAudioStemRecord,
@@ -107,6 +112,7 @@ from r2v_data_v2.h3.sam_audio_stem_shadow import (
 from tools.run_h3_mimo25_stem_reconcile_shadow import (
     _parser as _stem_reconcile_parser,
 )
+from tools.run_h3_mimo25_stem_reconcile_shadow import _validate_stage_closure
 from tools.run_h3_sam_audio_stem_shadow import _parser as _sam_stem_parser
 
 
@@ -212,13 +218,13 @@ class _SAM:
             target_path,
             frame_count=probe.frame_count,
             sample_rate_hz=probe.sample_rate_hz,
-            channels=probe.channels,
+            channels=1,
         )
         _write_wav(
             residual_path,
             frame_count=probe.frame_count,
             sample_rate_hz=probe.sample_rate_hz,
-            channels=probe.channels,
+            channels=1,
         )
         return SAMAudioSeparationResult(
             target_path=str(target_path),
@@ -226,6 +232,48 @@ class _SAM:
             verification_state="unverified",
             runtime_seconds=0.1,
             backend_metadata={"fake": True},
+        )
+
+
+class _DurationDriftSAM(_SAM):
+    def __init__(self, configuration: object, duration_delta: float) -> None:
+        super().__init__(configuration)
+        self.duration_delta = duration_delta
+
+    def separate(
+        self,
+        *,
+        clip_uid: str,
+        source_audio_path: Path,
+        prompt: str,
+        target_path: Path,
+        residual_path: Path,
+    ) -> SAMAudioSeparationResult:
+        del clip_uid
+        first_call = not self.calls
+        self.calls.append((source_audio_path, prompt, target_path, residual_path))
+        probe = _probe(source_audio_path)
+        frame_count = probe.frame_count + (
+            round(self.duration_delta * probe.sample_rate_hz) if first_call else 0
+        )
+        _write_wav(
+            target_path,
+            frame_count=frame_count,
+            sample_rate_hz=probe.sample_rate_hz,
+            channels=1,
+        )
+        _write_wav(
+            residual_path,
+            frame_count=frame_count,
+            sample_rate_hz=probe.sample_rate_hz,
+            channels=1,
+        )
+        return SAMAudioSeparationResult(
+            target_path=str(target_path),
+            residual_path=str(residual_path),
+            verification_state="unverified",
+            runtime_seconds=0.1,
+            backend_metadata={"fake": True, "duration_delta": self.duration_delta},
         )
 
 
@@ -389,6 +437,7 @@ def _run_stems(
     route: str = "music_first",
     both: bool = False,
     canonicalizer: _Canonicalizer | None = None,
+    raw_duration_delta: float | None = None,
 ) -> tuple[Path, object, _SAM, _Canonicalizer]:
     manifest, _, _ = _canonical_fixture(tmp_path)
     configuration = _configuration(tmp_path)
@@ -398,7 +447,11 @@ def _run_stems(
         route=route,
         run_both_routes=both,
     )
-    backend = _SAM(configuration)
+    backend = (
+        _SAM(configuration)
+        if raw_duration_delta is None
+        else _DurationDriftSAM(configuration, raw_duration_delta)
+    )
     active_canonicalizer = canonicalizer or _Canonicalizer()
     output = stem_separation_root(tmp_path)
     run_sam_audio_stem_shadow(
@@ -485,6 +538,55 @@ def test_canonical_stems_derive_only_from_raw_stems(tmp_path: Path) -> None:
     assert len(canonicalizer.sources) == 3
     assert source not in canonicalizer.sources
     assert all("/stems/clip-1/music_first/" in item.as_posix() for item in canonicalizer.sources)
+
+
+@pytest.mark.parametrize("duration_delta", [0.032, -0.025])
+def test_bounded_sam_duration_drift_preserves_actual_stem_extent(
+    tmp_path: Path,
+    duration_delta: float,
+) -> None:
+    output, _, _, _ = _run_stems(
+        tmp_path,
+        raw_duration_delta=duration_delta,
+    )
+    _, records, _ = load_stem_shadow(output)
+    assert records[0].separation_state == "unverified"
+    for stem in records[0].stems:
+        assert stem.raw_duration_delta_seconds == pytest.approx(duration_delta)
+        assert stem.canonical_duration_delta_seconds == pytest.approx(duration_delta)
+        assert stem.canonical_frame_count == stem.raw_frame_count
+        assert stem.canonical_frame_count != stem.source_end_sample
+        assert stem.alignment_tolerance_seconds == STEM_ALIGNMENT_TOLERANCE_SECONDS
+        assert stem.alignment_offset_seconds == 0
+        assert stem.timeline_policy == STEM_TIMELINE_POLICY
+        assert stem.canonical_channel_policy == STEM_CANONICAL_CHANNEL_POLICY
+        assert stem.raw_channels == 1
+        assert stem.canonical_channels == 2
+        assert stem.alignment_state == "normal_bounded_drift"
+        assert stem.canonical_uncovered_tail_seconds == pytest.approx(
+            max(0.0, -duration_delta)
+        )
+        assert stem.conversion_settings == ["fake-raw-stem-only-conversion"]
+
+
+def test_eighty_millisecond_sam_drift_is_accepted_with_warning(
+    tmp_path: Path,
+) -> None:
+    output, _, _, _ = _run_stems(tmp_path, raw_duration_delta=0.080)
+    _, records, _ = load_stem_shadow(output)
+    assert records[0].separation_state == "unverified"
+    assert {
+        item.alignment_state for item in records[0].stems
+    } == {"accepted_with_alignment_warning"}
+
+
+def test_one_hundred_twenty_millisecond_sam_drift_fails_closed(
+    tmp_path: Path,
+) -> None:
+    output, _, _, _ = _run_stems(tmp_path, raw_duration_delta=0.120)
+    _, records, _ = load_stem_shadow(output)
+    assert records[0].separation_state == "failure"
+    assert "duration differs" in (records[0].failure_reason or "")
 
 
 def test_duration_mismatch_fails_closed_per_route(tmp_path: Path) -> None:
@@ -1095,8 +1197,45 @@ class _Diarization:
         return [DiarizationBackendSegment(start_time=0.0, end_time=0.5, speaker_label="A")]
 
 
-def _run_diarization(tmp_path: Path) -> tuple[Path, Path, SAMAudioStemRecord]:
-    stem_root, inventory, _, _ = _run_stems(tmp_path)
+class _TailDiarization(_Diarization):
+    def diarize(self, *, clip_uid: str, audio_path: Path):
+        del clip_uid
+        self.paths.append(audio_path)
+        return [
+            DiarizationBackendSegment(
+                start_time=0.8,
+                end_time=1.02,
+                speaker_label="A",
+            )
+        ]
+
+
+class _MixedDiarization(_Diarization):
+    def diarize(self, *, clip_uid: str, audio_path: Path):
+        self.paths.append(audio_path)
+        if clip_uid == "clip-a":
+            raise RuntimeError("synthetic per-clip DiariZen failure")
+        if clip_uid == "clip-m":
+            return []
+        return [
+            DiarizationBackendSegment(
+                start_time=0.0,
+                end_time=0.5,
+                speaker_label="A",
+            )
+        ]
+
+
+def _run_diarization(
+    tmp_path: Path,
+    *,
+    raw_duration_delta: float | None = None,
+    backend: _Diarization | None = None,
+) -> tuple[Path, Path, SAMAudioStemRecord]:
+    stem_root, inventory, _, _ = _run_stems(
+        tmp_path,
+        raw_duration_delta=raw_duration_delta,
+    )
     _, stem_records, _ = load_stem_shadow(stem_root)
     canonical = CanonicalAudioClip.model_validate_json(
         Path(inventory.source_canonical_audio_manifest_path)
@@ -1110,17 +1249,19 @@ def _run_diarization(tmp_path: Path) -> tuple[Path, Path, SAMAudioStemRecord]:
         production_inventory.model_dump_json(indent=2) + "\n",
         encoding="utf-8",
     )
-    backend = _Diarization()
+    active_backend = backend or _Diarization()
     output = stem_root.parent / "diarization"
     run_stem_diarization_shadow(
         stem_root=stem_root,
         production_diarization_root=production_root,
-        backend=backend,
+        backend=active_backend,
         route="music_first",
         output_root=output,
         allow_unverified=True,
     )
-    assert backend.paths == [Path(stem_records[0].stem("speech").canonical_stem_path)]
+    assert active_backend.paths == [
+        Path(stem_records[0].stem("speech").canonical_stem_path)
+    ]
     return stem_root, output, stem_records[0]
 
 
@@ -1143,6 +1284,42 @@ def test_stem_diarization_uses_speech_stem_and_preserves_production_inventory(
     assert shadow.targets[0].source_audio_path == records[0].stem("speech").canonical_stem_path
     assert production.targets[0].source_audio_path == canonical.target_full_audio_path
     assert production.model_dump_json().encode() == production_bytes
+
+
+@pytest.mark.parametrize(
+    ("duration_delta", "expected_frames"),
+    [(0.032, 32000), (-0.025, 31200)],
+)
+def test_stem_diarization_uses_original_and_available_stem_intersection(
+    tmp_path: Path,
+    duration_delta: float,
+    expected_frames: int,
+) -> None:
+    stem_root, inventory, _, _ = _run_stems(
+        tmp_path,
+        raw_duration_delta=duration_delta,
+    )
+    _, records, _ = load_stem_shadow(stem_root)
+    canonical = CanonicalAudioClip.model_validate_json(
+        Path(inventory.source_canonical_audio_manifest_path)
+        .read_text(encoding="utf-8")
+        .strip()
+    )
+    shadow = build_stem_diarization_inventory(
+        stem_inventory=inventory,
+        stem_records=records,
+        production_diarization_inventory=_production_diarization_inventory(
+            tmp_path,
+            canonical,
+        ),
+        route="music_first",
+        allow_unverified=True,
+    )
+
+    assert shadow.targets[0].source_frame_count == expected_frames
+    assert records[0].stem("speech").canonical_frame_count == round(
+        (1.0 + duration_delta) * 32000
+    )
 
 
 class _Qwen:
@@ -1182,6 +1359,23 @@ def test_stem_diarization_and_asr_use_speech_stem_without_touching_production(
         (stem_root.parent / "asr/segments.jsonl").read_text(encoding="utf-8")
     )
     assert row["source_audio_path"] == stem_record.stem("speech").canonical_stem_path
+
+
+def test_stem_diarization_clamps_codec_tail_to_original_target_eof(
+    tmp_path: Path,
+) -> None:
+    _, diarization, _ = _run_diarization(
+        tmp_path,
+        raw_duration_delta=0.032,
+        backend=_TailDiarization(),
+    )
+    row = RawDiarizationSegment.model_validate_json(
+        (diarization / "raw_segments.jsonl").read_text(encoding="utf-8")
+    )
+    assert row.backend_reported_end_time == 1.02
+    assert row.end_time == 1.0
+    assert row.source_end_sample == 32000
+    assert row.boundary_reconciliation.end_clamped is True
 
 
 @pytest.mark.parametrize(
@@ -1384,13 +1578,45 @@ class _OneClipFailFactsBackend(_FactsBackend):
         return super().extract(job=job, stem_type=stem_type, view=view)
 
 
+class _OutOfExtentMusicFactsBackend(_FactsBackend):
+    def extract(self, *, job: StemFactJob, stem_type: str, view: StemView):
+        result = super().extract(job=job, stem_type=stem_type, view=view)
+        if stem_type != "music":
+            return result
+        facts = MusicStemFacts(
+            clip_duration_seconds=job.clip_duration_seconds,
+            music_status="present",
+            intervals=[
+                MusicInterval(
+                    start_time=0.9,
+                    end_time=0.99,
+                    description="tail outside the available shorter stem",
+                    confidence="high",
+                )
+            ],
+        )
+        return StemFactsBackendResult(
+            facts=facts,
+            raw_response=facts.model_dump_json(),
+            diagnostics=result.diagnostics,
+        )
+
+
 class _FailingViewBackend(_ViewBackend):
     def create(self, **kwargs: object) -> StemView:
         raise RuntimeError("view creation failed")
 
 
-def _run_facts(tmp_path: Path) -> tuple[Path, MimoStemFactsRecord]:
-    stem_root, _, _ = _run_diarization(tmp_path)
+def _run_facts(
+    tmp_path: Path,
+    *,
+    raw_duration_delta: float | None = None,
+    facts_backend: _FactsBackend | None = None,
+) -> tuple[Path, MimoStemFactsRecord]:
+    stem_root, _, _ = _run_diarization(
+        tmp_path,
+        raw_duration_delta=raw_duration_delta,
+    )
     run_stem_qwen3_asr_shadow(
         stem_diarization_root=stem_root.parent / "diarization",
         source_visual_production_root="/visual/source",
@@ -1402,7 +1628,7 @@ def _run_facts(tmp_path: Path) -> tuple[Path, MimoStemFactsRecord]:
         ),
         allow_unverified=True,
     )
-    backend = _FactsBackend()
+    backend = facts_backend or _FactsBackend()
     summary = run_mimo25_stem_facts_shadow(
         stem_root=stem_root,
         route="music_first",
@@ -1423,6 +1649,19 @@ def test_stem_facts_use_full_timeline_and_keep_music_timing(tmp_path: Path) -> N
     assert record.music.intervals[0].end_time == 0.4
     assert all(Path(item.view_path).is_file() for item in record.stem_views)
     assert (stem_root.parent / "mimo_stem_facts/records.jsonl").is_file()
+
+
+def test_stem_fact_interval_beyond_shorter_available_media_fails_closed(
+    tmp_path: Path,
+) -> None:
+    _, record = _run_facts(
+        tmp_path,
+        raw_duration_delta=-0.025,
+        facts_backend=_OutOfExtentMusicFactsBackend(),
+    )
+    assert record.status == "failed"
+    assert record.failing_stem_type == "music"
+    assert record.failure_reason == "music stem fact exceeds available source media"
 
 
 def test_failed_facts_rerun_preserves_published_records_and_views(
@@ -1508,6 +1747,9 @@ def test_stem_fact_openai_transport_uses_derived_video_with_embedded_stem_only(
         "music_stem_sha256": sha256_file(stem),
         "sfx_stem_path": str(stem),
         "sfx_stem_sha256": sha256_file(stem),
+        "speech_stem_available_duration_seconds": 1.0,
+        "music_stem_available_duration_seconds": 1.0,
+        "sfx_stem_available_duration_seconds": 1.0,
         "segments": [],
     }
     job = StemFactJob(
@@ -1584,6 +1826,9 @@ def test_speech_stem_fact_prompt_includes_authoritative_shadow_asr_without_outpu
         "music_stem_sha256": sha256_file(stem),
         "sfx_stem_path": str(stem),
         "sfx_stem_sha256": sha256_file(stem),
+        "speech_stem_available_duration_seconds": 1.0,
+        "music_stem_available_duration_seconds": 1.0,
+        "sfx_stem_available_duration_seconds": 1.0,
         "segments": [segment.model_dump(mode="json")],
     }
     job = StemFactJob(
@@ -1874,6 +2119,8 @@ def test_failed_clip_is_skipped_while_manifest_order_reaches_reconcile(
 
 def _run_three_clip_shadow_to_asr(
     tmp_path: Path,
+    *,
+    diarization_backend: _Diarization | None = None,
 ) -> tuple[Path, Path, Path, object, list[str]]:
     clip_order = ["clip-z", "clip-a", "clip-m"]
     manifest, canonical_records, case = _multi_canonical_fixture(
@@ -1909,7 +2156,7 @@ def _run_three_clip_shadow_to_asr(
     run_stem_diarization_shadow(
         stem_root=separation,
         production_diarization_root=production_root,
-        backend=_Diarization(),
+        backend=diarization_backend or _Diarization(),
         route="music_first",
         output_root=diarization,
         allow_unverified=True,
@@ -1928,6 +2175,154 @@ def _run_three_clip_shadow_to_asr(
         allow_unverified=True,
     )
     return separation, diarization, asr, inventory, clip_order
+
+
+def test_diarization_clip_failure_propagates_without_hiding_usable_clips(
+    tmp_path: Path,
+) -> None:
+    separation, diarization, asr, _, clip_order = _run_three_clip_shadow_to_asr(
+        tmp_path,
+        diarization_backend=_MixedDiarization(),
+    )
+    shadow = separation.parent
+    diarization_provenance, _, _ = validate_stem_diarization_lineage(diarization)
+    assert diarization_provenance.ready_clip_uids == ["clip-z"]
+    assert diarization_provenance.empty_clip_uids == ["clip-m"]
+    assert diarization_provenance.failed_clip_uids == ["clip-a"]
+    assert diarization_provenance.usable_clip_uids == ["clip-z", "clip-m"]
+    assert diarization_provenance.clip_results_sha256 == sha256_file(
+        diarization / "clip_results.jsonl"
+    )
+    readable_targets = [
+        json.loads(line)
+        for line in (diarization / "readable_targets.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    assert [item["clip_uid"] for item in readable_targets] == ["clip-z", "clip-m"]
+    assert [
+        item.clip_uid for item in diarization_provenance.diarization_failed_clips
+    ] == ["clip-a"]
+
+    asr_provenance, _ = validate_stem_asr_lineage(asr)
+    assert asr_provenance.clip_uids == ["clip-z", "clip-m"]
+    assert [item.clip_uid for item in asr_provenance.diarization_failed_clips] == [
+        "clip-a"
+    ]
+    asr_rows = [
+        json.loads(line)
+        for line in (asr / "segments.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert [item["clip_uid"] for item in asr_rows] == ["clip-z"]
+
+    facts_root = shadow / "mimo_stem_facts"
+    facts_backend = _FactsBackend()
+    facts_summary = run_mimo25_stem_facts_shadow(
+        stem_root=separation,
+        route="music_first",
+        backend=facts_backend,
+        view_backend=_ViewBackend(),
+        output_root=facts_root,
+        allow_unverified=True,
+    )
+    facts = load_stem_fact_records(facts_root)
+    assert facts_summary.clip_uids == ["clip-z", "clip-m"]
+    assert facts_summary.model_call_count == 6
+    assert [item.clip_uid for item in facts_summary.diarization_failed_clips] == [
+        "clip-a"
+    ]
+
+    jobs = build_stem_reconcile_jobs(
+        base_inventory=_mimo_inventory_for_clip_order(tmp_path / "base", clip_order),
+        stem_diarization_root=diarization,
+        stem_asr_root=asr,
+    )
+    assert [item.clip_uid for item in jobs] == ["clip-z", "clip-m"]
+    backend = _FailingReconcileBackend(tmp_path)
+    summary = run_mimo25_stem_reconcile_shadow(
+        jobs=jobs,
+        stem_facts=facts,
+        backend=backend,
+        output_root=shadow / "mimo_reconcile",
+        source_clip_uids=clip_order,
+        diarization_failed_clips=facts_summary.diarization_failed_clips,
+        route="music_first",
+        allow_unverified=True,
+    )
+    assert backend.calls == ["clip-z", "clip-m"]
+    assert summary.processed_clip_uids == ["clip-z", "clip-m"]
+    assert summary.skipped_clip_count == 1
+    assert [item.clip_uid for item in summary.diarization_failed_clips] == [
+        "clip-a"
+    ]
+
+
+def test_reconcile_preflight_closes_case_and_current_separation_roots(
+    tmp_path: Path,
+) -> None:
+    separation, diarization, asr, inventory, clip_order = (
+        _run_three_clip_shadow_to_asr(tmp_path)
+    )
+    facts_root = separation.parent / "mimo_stem_facts"
+    run_mimo25_stem_facts_shadow(
+        stem_root=separation,
+        route="music_first",
+        backend=_FactsBackend(),
+        view_backend=_ViewBackend(),
+        output_root=facts_root,
+        allow_unverified=True,
+    )
+    diarization_provenance, _, _ = validate_stem_diarization_lineage(
+        diarization
+    )
+    facts_summary, _ = validate_stem_facts_lineage(
+        facts_root=facts_root,
+        stem_diarization_root=diarization,
+        stem_asr_root=asr,
+        route="music_first",
+    )
+    case_manifest = MimoCaseManifest(clip_uids=clip_order)
+    _validate_stage_closure(
+        case_manifest=case_manifest,
+        stem_inventory=inventory,
+        separation_root=separation,
+        diarization_provenance=diarization_provenance,
+        facts_summary=facts_summary,
+    )
+
+    with pytest.raises(ValueError, match="case manifest differs"):
+        _validate_stage_closure(
+            case_manifest=MimoCaseManifest(clip_uids=list(reversed(clip_order))),
+            stem_inventory=inventory,
+            separation_root=separation,
+            diarization_provenance=diarization_provenance,
+            facts_summary=facts_summary,
+        )
+
+    other_separation = tmp_path / "other-separation"
+    other_separation.mkdir()
+    with pytest.raises(ValueError, match="DiariZen source root differs"):
+        _validate_stage_closure(
+            case_manifest=case_manifest,
+            stem_inventory=inventory,
+            separation_root=separation,
+            diarization_provenance=diarization_provenance.model_copy(
+                update={"source_stem_root": str(other_separation)}
+            ),
+            facts_summary=facts_summary,
+        )
+    with pytest.raises(ValueError, match="facts source root differs"):
+        _validate_stage_closure(
+            case_manifest=case_manifest,
+            stem_inventory=inventory,
+            separation_root=separation,
+            diarization_provenance=diarization_provenance,
+            facts_summary=facts_summary.model_copy(
+                update={"source_stem_root": str(other_separation)}
+            ),
+        )
 
 
 def test_one_facts_failure_is_audited_and_reconcile_processes_other_clips(

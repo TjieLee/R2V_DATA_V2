@@ -15,9 +15,12 @@ An opt-in `sam_audio_stem_shadow_v1` experiment now supports bounded full-clip
 music-first or voice-first SAM Audio separation, speech-stem DiariZen/Qwen3-ASR,
 timed stem facts, stem-aware MiMo reconciliation, and exact stem-native
 references. Separation owns only its `separation/` stage; ordered per-clip
-separation and facts failures propagate as explicit skips, while byte-level
-lineage validation rejects stale DiariZen, ASR, facts, or reconcile reuse before
-model calls. Every use of unverified stems requires an explicit pilot opt-in.
+separation, DiariZen, and facts failures propagate as explicit skips, while
+byte-level lineage validation rejects stale DiariZen, ASR, facts, or reconcile
+reuse before model calls. Raw and canonical stem duration drift is bounded to
+0.10 seconds at zero offset, with no stretching or padding; original target EOF
+and actual stem extent jointly bound downstream facts. Every use of unverified
+stems requires an explicit pilot opt-in.
 Local SAM/T5 dependencies are fingerprinted and loaded offline with optional
 rankers disabled and exactly one candidate. The original target AV remains final
 authority, and no current production consumer or frozen MiMo/materializer

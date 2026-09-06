@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import shutil
 import sys
@@ -22,6 +23,7 @@ from r2v_data_v2.h3.audio_backends import (
 from r2v_data_v2.h3.diarization_binding import (
     BoundDiarizationSegment,
     DiarizationBackend,
+    DiarizationClipResult,
     DiarizationInventory,
     DiarizationTargetClip,
     RawDiarizationSegment,
@@ -53,15 +55,19 @@ from r2v_data_v2.h3.schemas import SchemaModel
 SAM_AUDIO_SHADOW_ROOT_NAME = "sam_audio_stem_shadow_v1"
 SAM_AUDIO_SEPARATION_STAGE_NAME = "separation"
 SAM_AUDIO_STEM_INVENTORY_VERSION = "r2v.h3.sam_audio_stem_inventory.2"
-SAM_AUDIO_STEM_RECORD_VERSION = "r2v.h3.sam_audio_stem_record.2"
+SAM_AUDIO_STEM_RECORD_VERSION = "r2v.h3.sam_audio_stem_record.3"
 SAM_AUDIO_STEM_SUMMARY_VERSION = "r2v.h3.sam_audio_stem_summary.2"
-STEM_DIARIZATION_SHADOW_VERSION = "r2v.h3.stem_diarization_shadow.3"
-STEM_ASR_SHADOW_VERSION = "r2v.h3.stem_asr_shadow.3"
+STEM_DIARIZATION_SHADOW_VERSION = "r2v.h3.stem_diarization_shadow.4"
+STEM_ASR_SHADOW_VERSION = "r2v.h3.stem_asr_shadow.4"
 STEM_REFERENCE_VERSION = "r2v.h3.sam_audio_stem_reference.2"
 STEM_CLIP_SKIP_VERSION = "r2v.h3.sam_audio_stem_clip_skip.1"
+STEM_DIARIZATION_FAILURE_VERSION = "r2v.h3.stem_diarization_clip_failure.1"
 STEM_CANONICALIZATION_VERSION = "sam_audio_raw_to_32k_stereo_pcm16_v1"
 STEM_REFERENCE_EXTRACTION_VERSION = "sam_audio_stem_exact_sample_crop_v1"
 STEM_ALIGNMENT_TOLERANCE_SECONDS = 0.10
+STEM_ALIGNMENT_WARNING_SECONDS = 0.05
+STEM_TIMELINE_POLICY = "zero_offset_bounded_duration_drift_v1"
+STEM_CANONICAL_CHANNEL_POLICY = "dual_mono_from_sam_mono_v1"
 STEM_SAMPLE_RATE_HZ = 32000
 STEM_CHANNELS = 2
 
@@ -510,7 +516,7 @@ class StemArtifact(SchemaModel):
     raw_stem_path: str
     raw_stem_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     raw_sample_rate_hz: int = Field(gt=0)
-    raw_channels: int = Field(gt=0)
+    raw_channels: Literal[1] = 1
     raw_frame_count: int = Field(gt=0)
     raw_duration_seconds: float = Field(gt=0, allow_inf_nan=False)
     canonical_stem_path: str
@@ -519,6 +525,20 @@ class StemArtifact(SchemaModel):
     canonical_channels: Literal[2] = STEM_CHANNELS
     canonical_frame_count: int = Field(gt=0)
     canonical_duration_seconds: float = Field(gt=0, allow_inf_nan=False)
+    raw_duration_delta_seconds: float = Field(allow_inf_nan=False)
+    canonical_duration_delta_seconds: float = Field(allow_inf_nan=False)
+    canonical_uncovered_tail_seconds: float = Field(ge=0, allow_inf_nan=False)
+    alignment_tolerance_seconds: Literal[0.1] = STEM_ALIGNMENT_TOLERANCE_SECONDS
+    alignment_state: Literal[
+        "normal_bounded_drift",
+        "accepted_with_alignment_warning",
+    ]
+    timeline_policy: Literal["zero_offset_bounded_duration_drift_v1"] = (
+        STEM_TIMELINE_POLICY
+    )
+    canonical_channel_policy: Literal["dual_mono_from_sam_mono_v1"] = (
+        STEM_CANONICAL_CHANNEL_POLICY
+    )
     conversion_policy_version: Literal[
         "sam_audio_raw_to_32k_stereo_pcm16_v1"
     ] = STEM_CANONICALIZATION_VERSION
@@ -531,9 +551,41 @@ class StemArtifact(SchemaModel):
             self.source_duration_seconds * STEM_SAMPLE_RATE_HZ
         ):
             raise ValueError("stem source sample extent differs from source duration")
-        for duration in (self.raw_duration_seconds, self.canonical_duration_seconds):
-            if abs(duration - self.source_duration_seconds) > STEM_ALIGNMENT_TOLERANCE_SECONDS:
+        expected_raw_delta = self.raw_duration_seconds - self.source_duration_seconds
+        expected_canonical_delta = (
+            self.canonical_duration_seconds - self.source_duration_seconds
+        )
+        if not math.isclose(
+            self.raw_duration_delta_seconds,
+            expected_raw_delta,
+            rel_tol=0,
+            abs_tol=1e-9,
+        ) or not math.isclose(
+            self.canonical_duration_delta_seconds,
+            expected_canonical_delta,
+            rel_tol=0,
+            abs_tol=1e-9,
+        ):
+            raise ValueError("SAM Audio stem duration diagnostics are inconsistent")
+        for delta in (expected_raw_delta, expected_canonical_delta):
+            if abs(delta) > STEM_ALIGNMENT_TOLERANCE_SECONDS:
                 raise ValueError("SAM Audio stem duration differs from source timeline")
+        expected_uncovered = max(0.0, -expected_canonical_delta)
+        if not math.isclose(
+            self.canonical_uncovered_tail_seconds,
+            expected_uncovered,
+            rel_tol=0,
+            abs_tol=1e-9,
+        ):
+            raise ValueError("canonical SAM Audio uncovered tail is inconsistent")
+        expected_state = (
+            "accepted_with_alignment_warning"
+            if max(abs(expected_raw_delta), abs(expected_canonical_delta))
+            > STEM_ALIGNMENT_WARNING_SECONDS
+            else "normal_bounded_drift"
+        )
+        if self.alignment_state != expected_state:
+            raise ValueError("SAM Audio stem alignment state is inconsistent")
         if self.raw_duration_seconds != self.raw_frame_count / self.raw_sample_rate_hz:
             raise ValueError("raw SAM Audio duration differs from sample extent")
         if self.canonical_duration_seconds != (
@@ -595,7 +647,7 @@ class SAMAudioStemInventory(SchemaModel):
 
 
 class SAMAudioStemRecord(SchemaModel):
-    schema_version: Literal["r2v.h3.sam_audio_stem_record.2"] = (
+    schema_version: Literal["r2v.h3.sam_audio_stem_record.3"] = (
         SAM_AUDIO_STEM_RECORD_VERSION
     )
     clip_uid: str
@@ -840,6 +892,25 @@ def _stem_artifact(
         canonical_stem_sha256=sha256_file(canonical_path),
         canonical_frame_count=canonical_probe.frame_count,
         canonical_duration_seconds=canonical_probe.duration_seconds,
+        raw_duration_delta_seconds=(
+            raw_probe.duration_seconds - job.source_duration_seconds
+        ),
+        canonical_duration_delta_seconds=(
+            canonical_probe.duration_seconds - job.source_duration_seconds
+        ),
+        canonical_uncovered_tail_seconds=max(
+            0.0,
+            job.source_duration_seconds - canonical_probe.duration_seconds,
+        ),
+        alignment_state=(
+            "accepted_with_alignment_warning"
+            if max(
+                abs(raw_probe.duration_seconds - job.source_duration_seconds),
+                abs(canonical_probe.duration_seconds - job.source_duration_seconds),
+            )
+            > STEM_ALIGNMENT_WARNING_SECONDS
+            else "normal_bounded_drift"
+        ),
         conversion_settings=settings,
     )
 
@@ -1183,6 +1254,35 @@ class StemShadowClipSkip(SchemaModel):
     reason: str
 
 
+class StemDiarizationClipFailure(SchemaModel):
+    schema_version: Literal["r2v.h3.stem_diarization_clip_failure.1"] = (
+        STEM_DIARIZATION_FAILURE_VERSION
+    )
+    clip_uid: str
+    route: SAMRoute
+    source_stage: Literal["diarization"] = "diarization"
+    reason_code: Literal["stem_diarization_failed"] = "stem_diarization_failed"
+    reason: str
+    source_clip_result_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+def _diarization_failure(
+    result: DiarizationClipResult,
+    *,
+    route: SAMRoute,
+) -> StemDiarizationClipFailure:
+    if result.status != "failed" or not result.reason:
+        raise ValueError("stem DiariZen failure requires a failed clip result")
+    return StemDiarizationClipFailure(
+        clip_uid=result.target_clip_uid,
+        route=route,
+        reason=result.reason,
+        source_clip_result_sha256=_sha256_text(
+            _compact_json(result.model_dump(mode="json"))
+        ),
+    )
+
+
 def separation_skips(
     *,
     inventory: SAMAudioStemInventory,
@@ -1460,7 +1560,8 @@ def export_stem_native_references(
             raise ValueError("stem reference source hash changed")
         start = round(request.start_time * STEM_SAMPLE_RATE_HZ)
         end = round(request.end_time * STEM_SAMPLE_RATE_HZ)
-        if start < 0 or end <= start or end > stem.canonical_frame_count:
+        available_end = min(stem.source_end_sample, stem.canonical_frame_count)
+        if start < 0 or end <= start or end > available_end:
             raise ValueError("stem reference interval exceeds canonical stem")
         destination = (
             output_root.expanduser().resolve(strict=False)
@@ -1516,7 +1617,7 @@ def export_stem_native_references(
 
 
 class StemDiarizationShadowProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.stem_diarization_shadow.3"] = (
+    schema_version: Literal["r2v.h3.stem_diarization_shadow.4"] = (
         STEM_DIARIZATION_SHADOW_VERSION
     )
     diarization_source_kind: Literal["sam_audio_speech_stem"] = (
@@ -1528,11 +1629,16 @@ class StemDiarizationShadowProvenance(SchemaModel):
     raw_segments_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     bound_segments_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     cluster_bindings_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    clip_results_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     route: SAMRoute
     target_count: int = Field(ge=1)
     clip_uids: list[str] = Field(min_length=1)
-    usable_clip_uids: list[str] = Field(min_length=1)
+    ready_clip_uids: list[str]
+    empty_clip_uids: list[str]
+    failed_clip_uids: list[str]
+    usable_clip_uids: list[str]
     skipped_clips: list[StemShadowClipSkip]
+    diarization_failed_clips: list[StemDiarizationClipFailure]
     unverified_clip_uids: list[str]
     unverified_consumption_authorized: bool
     speech_stem_paths_by_clip: dict[str, str]
@@ -1543,13 +1649,34 @@ class StemDiarizationShadowProvenance(SchemaModel):
 
     @model_validator(mode="after")
     def validate_clip_provenance(self) -> StemDiarizationShadowProvenance:
+        skipped = {item.clip_uid for item in self.skipped_clips}
+        attempted = [item for item in self.clip_uids if item not in skipped]
+        ready = set(self.ready_clip_uids)
+        empty = set(self.empty_clip_uids)
+        failed = set(self.failed_clip_uids)
         if (
             len(self.clip_uids) != len(set(self.clip_uids))
-            or self.target_count != len(self.usable_clip_uids)
-            or [item for item in self.clip_uids if item in set(self.usable_clip_uids)]
-            != self.usable_clip_uids
-            or {item.clip_uid for item in self.skipped_clips}
-            != set(self.clip_uids) - set(self.usable_clip_uids)
+            or self.target_count != len(attempted)
+            or skipped != set(self.clip_uids) - set(attempted)
+            or any(
+                [item for item in attempted if item in values] != ordered
+                for values, ordered in (
+                    (ready, self.ready_clip_uids),
+                    (empty, self.empty_clip_uids),
+                    (failed, self.failed_clip_uids),
+                )
+            )
+            or ready.intersection(empty)
+            or ready.intersection(failed)
+            or empty.intersection(failed)
+            or ready.union(empty).union(failed) != set(attempted)
+            or self.usable_clip_uids
+            != [item for item in attempted if item in ready.union(empty)]
+            or [item.clip_uid for item in self.diarization_failed_clips]
+            != self.failed_clip_uids
+            or any(
+                item.route != self.route for item in self.diarization_failed_clips
+            )
         ):
             raise ValueError("stem DiariZen ordered clip provenance is inconsistent")
         usable = set(self.usable_clip_uids)
@@ -1568,6 +1695,29 @@ class StemDiarizationShadowProvenance(SchemaModel):
         ):
             raise ValueError("stem DiariZen unverified provenance is inconsistent")
         return self
+
+
+def _load_stem_diarization_clip_results(
+    root: Path,
+    *,
+    expected_clip_uids: Sequence[str],
+) -> list[DiarizationClipResult]:
+    results = [
+        DiarizationClipResult.model_validate(item)
+        for item in _read_jsonl(root / "clip_results.jsonl")
+    ]
+    by_clip = {item.target_clip_uid: item for item in results}
+    if len(by_clip) != len(results) or set(by_clip) != set(expected_clip_uids):
+        raise ValueError("stem DiariZen clip results differ from attempted clips")
+    ordered = [by_clip[item] for item in expected_clip_uids]
+    if any(
+        item.source_sample_rate_hz != STEM_SAMPLE_RATE_HZ
+        or item.source_channels != STEM_CHANNELS
+        or (item.status == "ready") != (item.raw_segment_count > 0)
+        for item in ordered
+    ):
+        raise ValueError("stem DiariZen clip result status is inconsistent")
+    return ordered
 
 
 def validate_stem_diarization_lineage(
@@ -1598,8 +1748,21 @@ def validate_stem_diarization_lineage(
         allow_unverified=True,
     )
     selected_by_clip = {item.clip_uid: item for item in selected}
-    usable = [
+    attempted = [
         clip_uid for clip_uid in inventory.clip_uids if clip_uid in selected_by_clip
+    ]
+    clip_results = _load_stem_diarization_clip_results(
+        diarization,
+        expected_clip_uids=attempted,
+    )
+    ready = [item.target_clip_uid for item in clip_results if item.status == "ready"]
+    empty = [item.target_clip_uid for item in clip_results if item.status == "empty"]
+    failed = [item.target_clip_uid for item in clip_results if item.status == "failed"]
+    usable = [item for item in attempted if item not in set(failed)]
+    failures = [
+        _diarization_failure(item, route=provenance.route)
+        for item in clip_results
+        if item.status == "failed"
     ]
     skips = separation_skips(
         inventory=inventory,
@@ -1612,27 +1775,32 @@ def validate_stem_diarization_lineage(
         if selected_by_clip[clip_uid].separation_state == "unverified"
     ]
     if (
-        usable != provenance.usable_clip_uids
+        provenance.target_count != len(attempted)
+        or ready != provenance.ready_clip_uids
+        or empty != provenance.empty_clip_uids
+        or failed != provenance.failed_clip_uids
+        or usable != provenance.usable_clip_uids
         or skips != provenance.skipped_clips
+        or failures != provenance.diarization_failed_clips
         or unverified != provenance.unverified_clip_uids
     ):
         raise ValueError("stem DiariZen selection differs from current separation")
 
     expected_paths = {
         key: selected_by_clip[key].stem("speech").canonical_stem_path
-        for key in sorted(selected_by_clip)
+        for key in sorted(usable)
     }
     expected_hashes = {
         key: selected_by_clip[key].stem("speech").canonical_stem_sha256
-        for key in sorted(selected_by_clip)
+        for key in sorted(usable)
     }
     expected_original_paths = {
         key: selected_by_clip[key].stem("speech").source_audio_path
-        for key in sorted(selected_by_clip)
+        for key in sorted(usable)
     }
     expected_original_hashes = {
         key: selected_by_clip[key].stem("speech").source_audio_sha256
-        for key in sorted(selected_by_clip)
+        for key in sorted(usable)
     }
     if (
         provenance.speech_stem_paths_by_clip != expected_paths
@@ -1645,10 +1813,30 @@ def validate_stem_diarization_lineage(
         speech = selected_by_clip[clip_uid].stem("speech")
         if sha256_file(Path(speech.canonical_stem_path)) != speech.canonical_stem_sha256:
             raise ValueError("stem DiariZen speech stem hash changed")
+    raw_segments = [
+        RawDiarizationSegment.model_validate(item)
+        for item in _read_jsonl(diarization / "raw_segments.jsonl")
+    ]
+    bound_segments = [
+        BoundDiarizationSegment.model_validate(item)
+        for item in _read_jsonl(diarization / "bound_segments.jsonl")
+    ]
+    if (
+        {item.target_clip_uid for item in raw_segments} - set(usable)
+        or {item.target_clip_uid for item in bound_segments} - set(usable)
+    ):
+        raise ValueError("failed stem DiariZen clips published segment evidence")
+    failure_rows = [
+        StemDiarizationClipFailure.model_validate(item)
+        for item in _read_jsonl(diarization / "diarization_failed_clips.jsonl")
+    ]
+    if failure_rows != provenance.diarization_failed_clips:
+        raise ValueError("stem DiariZen failure sidecar differs from provenance")
     for filename, expected_hash in (
         ("raw_segments.jsonl", provenance.raw_segments_sha256),
         ("bound_segments.jsonl", provenance.bound_segments_sha256),
         ("cluster_bindings.jsonl", provenance.cluster_bindings_sha256),
+        ("clip_results.jsonl", provenance.clip_results_sha256),
     ):
         if sha256_file(diarization / filename) != expected_hash:
             raise ValueError(f"stem DiariZen {filename} changed")
@@ -1680,6 +1868,7 @@ def build_stem_diarization_inventory(
         allow_unverified=allow_unverified,
     )
     stem_by_clip = {item.clip_uid: item for item in selected}
+    jobs_by_clip = {item.clip_uid: item for item in stem_inventory.jobs}
     source_targets = {
         item.target_clip_uid: item for item in production_diarization_inventory.targets
     }
@@ -1704,7 +1893,10 @@ def build_stem_diarization_inventory(
             source_audio_sha256=speech.canonical_stem_sha256,
             source_sample_rate_hz=speech.canonical_sample_rate_hz,
             source_channels=speech.canonical_channels,
-            source_frame_count=speech.canonical_frame_count,
+            source_frame_count=min(
+                speech.canonical_frame_count,
+                jobs_by_clip[clip_uid].source_frame_count,
+            ),
         )
         targets.append(DiarizationTargetClip.model_validate(values))
     if production_diarization_inventory.source_inventory_kind != "canonical_audio_manifest":
@@ -1751,6 +1943,7 @@ def _publish_shadow_readable(
     diarization_root: Path,
     canonical_by_clip: dict[str, CanonicalAudioClip],
     inventory: DiarizationInventory,
+    usable_clip_uids: Sequence[str],
 ) -> JEAReadableDiarizationSummary:
     raw = [
         RawDiarizationSegment.model_validate(row)
@@ -1765,8 +1958,13 @@ def _publish_shadow_readable(
         (item.target_clip_uid, item.segment_id) for item in raw
     }:
         raise ValueError("stem DiariZen raw and bound inventories differ")
+    usable = set(usable_clip_uids)
+    if not {item.target_clip_uid for item in raw}.issubset(usable):
+        raise ValueError("failed stem DiariZen clip published readable segments")
     targets: list[JEAReadableDiarizationTarget] = []
     for target in inventory.targets:
+        if target.target_clip_uid not in usable:
+            continue
         source = canonical_by_clip[target.target_clip_uid]
         targets.append(
             JEAReadableDiarizationTarget(
@@ -1865,13 +2063,8 @@ def run_stem_diarization_shadow(
         records=stem_records,
         route=route,
     )
-    usable_clip_uids = [
+    attempted_clip_uids = [
         clip_uid for clip_uid in stem_inventory.clip_uids if clip_uid in by_clip
-    ]
-    unverified_clip_uids = [
-        clip_uid
-        for clip_uid in usable_clip_uids
-        if by_clip[clip_uid].separation_state == "unverified"
     ]
     records_path = stem_root.expanduser().resolve(strict=True) / "records.jsonl"
     try:
@@ -1882,10 +2075,38 @@ def run_stem_diarization_shadow(
             output_root=stage,
             backend=backend,
         )
+        clip_results = _load_stem_diarization_clip_results(
+            stage,
+            expected_clip_uids=attempted_clip_uids,
+        )
+        ready_clip_uids = [
+            item.target_clip_uid for item in clip_results if item.status == "ready"
+        ]
+        empty_clip_uids = [
+            item.target_clip_uid for item in clip_results if item.status == "empty"
+        ]
+        failed_clip_uids = [
+            item.target_clip_uid for item in clip_results if item.status == "failed"
+        ]
+        failed = set(failed_clip_uids)
+        usable_clip_uids = [
+            item for item in attempted_clip_uids if item not in failed
+        ]
+        diarization_failures = [
+            _diarization_failure(item, route=route)
+            for item in clip_results
+            if item.status == "failed"
+        ]
+        unverified_clip_uids = [
+            clip_uid
+            for clip_uid in usable_clip_uids
+            if by_clip[clip_uid].separation_state == "unverified"
+        ]
         _publish_shadow_readable(
             diarization_root=stage,
             canonical_by_clip=_canonical_by_clip(stem_inventory),
             inventory=inventory,
+            usable_clip_uids=usable_clip_uids,
         )
         provenance = StemDiarizationShadowProvenance(
             source_stem_root=str(stem_root.expanduser().resolve(strict=True)),
@@ -1894,32 +2115,41 @@ def run_stem_diarization_shadow(
             raw_segments_sha256=sha256_file(stage / "raw_segments.jsonl"),
             bound_segments_sha256=sha256_file(stage / "bound_segments.jsonl"),
             cluster_bindings_sha256=sha256_file(stage / "cluster_bindings.jsonl"),
+            clip_results_sha256=sha256_file(stage / "clip_results.jsonl"),
             route=route,
             target_count=len(inventory.targets),
             clip_uids=stem_inventory.clip_uids,
+            ready_clip_uids=ready_clip_uids,
+            empty_clip_uids=empty_clip_uids,
+            failed_clip_uids=failed_clip_uids,
             usable_clip_uids=usable_clip_uids,
             skipped_clips=skips,
+            diarization_failed_clips=diarization_failures,
             unverified_clip_uids=unverified_clip_uids,
             unverified_consumption_authorized=allow_unverified,
             speech_stem_paths_by_clip={
                 key: by_clip[key].stem("speech").canonical_stem_path
-                for key in sorted(by_clip)
+                for key in sorted(usable_clip_uids)
             },
             speech_stem_hashes_by_clip={
                 key: by_clip[key].stem("speech").canonical_stem_sha256
-                for key in sorted(by_clip)
+                for key in sorted(usable_clip_uids)
             },
             original_audio_paths_by_clip={
                 key: by_clip[key].stem("speech").source_audio_path
-                for key in sorted(by_clip)
+                for key in sorted(usable_clip_uids)
             },
             original_audio_hashes_by_clip={
                 key: by_clip[key].stem("speech").source_audio_sha256
-                for key in sorted(by_clip)
+                for key in sorted(usable_clip_uids)
             },
         )
         _write_json(stage / "stem_provenance.json", provenance)
         _write_jsonl(stage / "skipped_clips.jsonl", skips)
+        _write_jsonl(
+            stage / "diarization_failed_clips.jsonl",
+            diarization_failures,
+        )
         stage.replace(outer / "published")
         published = outer / "published"
         _publish_directory(published, destination, overwrite=overwrite)
@@ -1932,7 +2162,7 @@ def run_stem_diarization_shadow(
 
 
 class StemASRShadowProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.stem_asr_shadow.3"] = STEM_ASR_SHADOW_VERSION
+    schema_version: Literal["r2v.h3.stem_asr_shadow.4"] = STEM_ASR_SHADOW_VERSION
     asr_source_kind: Literal["sam_audio_speech_stem_segments"] = (
         "sam_audio_speech_stem_segments"
     )
@@ -1941,8 +2171,11 @@ class StemASRShadowProvenance(SchemaModel):
     source_stem_inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     route: SAMRoute
     source_clip_uids: list[str] = Field(min_length=1)
-    clip_uids: list[str] = Field(min_length=1)
+    clip_uids: list[str]
+    source_diarization_ready_clip_uids: list[str]
+    source_diarization_empty_clip_uids: list[str]
     skipped_clips: list[StemShadowClipSkip]
+    diarization_failed_clips: list[StemDiarizationClipFailure]
     unverified_clip_uids: list[str]
     unverified_consumption_authorized: bool
     segment_count: int = Field(ge=0)
@@ -1951,6 +2184,9 @@ class StemASRShadowProvenance(SchemaModel):
 
     @model_validator(mode="after")
     def validate_clip_provenance(self) -> StemASRShadowProvenance:
+        excluded = {item.clip_uid for item in self.skipped_clips}.union(
+            item.clip_uid for item in self.diarization_failed_clips
+        )
         if (
             len(self.source_clip_uids) != len(set(self.source_clip_uids))
             or [
@@ -1959,8 +2195,39 @@ class StemASRShadowProvenance(SchemaModel):
                 if item in set(self.clip_uids)
             ]
             != self.clip_uids
-            or {item.clip_uid for item in self.skipped_clips}
-            != set(self.source_clip_uids) - set(self.clip_uids)
+            or excluded != set(self.source_clip_uids) - set(self.clip_uids)
+            or self.clip_uids
+            != [
+                item
+                for item in self.source_clip_uids
+                if item
+                in set(self.source_diarization_ready_clip_uids).union(
+                    self.source_diarization_empty_clip_uids
+                )
+            ]
+            or self.source_diarization_ready_clip_uids
+            != [
+                item
+                for item in self.source_clip_uids
+                if item in set(self.source_diarization_ready_clip_uids)
+            ]
+            or self.source_diarization_empty_clip_uids
+            != [
+                item
+                for item in self.source_clip_uids
+                if item in set(self.source_diarization_empty_clip_uids)
+            ]
+            or set(self.source_diarization_ready_clip_uids).intersection(
+                self.source_diarization_empty_clip_uids
+            )
+            or [item.clip_uid for item in self.diarization_failed_clips]
+            != [
+                item
+                for item in self.source_clip_uids
+                if item
+                in {failure.clip_uid for failure in self.diarization_failed_clips}
+            ]
+            or any(item.route != self.route for item in self.diarization_failed_clips)
             or set(self.unverified_clip_uids) - set(self.clip_uids)
             or (
                 self.unverified_clip_uids
@@ -1991,7 +2258,13 @@ def validate_stem_asr_lineage(
         or provenance.route != source.route
         or provenance.source_clip_uids != source.clip_uids
         or provenance.clip_uids != source.usable_clip_uids
+        or provenance.source_diarization_ready_clip_uids
+        != source.ready_clip_uids
+        or provenance.source_diarization_empty_clip_uids
+        != source.empty_clip_uids
         or provenance.skipped_clips != source.skipped_clips
+        or provenance.diarization_failed_clips
+        != source.diarization_failed_clips
         or provenance.unverified_clip_uids != source.unverified_clip_uids
     ):
         raise ValueError("stem ASR provenance differs from current DiariZen stage")
@@ -2057,7 +2330,16 @@ def run_stem_qwen3_asr_shadow(
             route=source_provenance.route,
             source_clip_uids=source_provenance.clip_uids,
             clip_uids=target_ids,
+            source_diarization_ready_clip_uids=(
+                source_provenance.ready_clip_uids
+            ),
+            source_diarization_empty_clip_uids=(
+                source_provenance.empty_clip_uids
+            ),
             skipped_clips=source_provenance.skipped_clips,
+            diarization_failed_clips=(
+                source_provenance.diarization_failed_clips
+            ),
             unverified_clip_uids=source_provenance.unverified_clip_uids,
             unverified_consumption_authorized=allow_unverified,
             segment_count=summary.segment_count,
@@ -2065,6 +2347,10 @@ def run_stem_qwen3_asr_shadow(
         )
         _write_json(stage / "stem_provenance.json", provenance)
         _write_jsonl(stage / "skipped_clips.jsonl", provenance.skipped_clips)
+        _write_jsonl(
+            stage / "diarization_failed_clips.jsonl",
+            provenance.diarization_failed_clips,
+        )
         stage.replace(outer / "published")
         _publish_directory(outer / "published", destination, overwrite=overwrite)
         outer.rmdir()
@@ -2077,6 +2363,9 @@ def run_stem_qwen3_asr_shadow(
 
 __all__ = [
     "STEM_ALIGNMENT_TOLERANCE_SECONDS",
+    "STEM_ALIGNMENT_WARNING_SECONDS",
+    "STEM_CANONICAL_CHANNEL_POLICY",
+    "STEM_TIMELINE_POLICY",
     "FFmpegStemCanonicalizer",
     "OfficialSAMAudioBackend",
     "SAMAudioBackend",
@@ -2087,6 +2376,7 @@ __all__ = [
     "SAMAudioStemSummary",
     "SAMRoute",
     "StemArtifact",
+    "StemDiarizationClipFailure",
     "StemDiarizationShadowProvenance",
     "StemNativeReference",
     "StemReferenceManifest",

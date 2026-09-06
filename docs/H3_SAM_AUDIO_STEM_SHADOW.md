@@ -86,10 +86,18 @@ stem-native reference export, requires the explicit pilot-only
 `--allow-unverified` flag before consuming such output. Raw model outputs and
 the first-pass residual are retained exactly.
 
-Canonical companions are derived only from each raw stem and are 32 kHz stereo
-PCM16 WAV. Source, raw, and canonical durations must agree within 0.10 seconds,
-which is the existing clip-timeline quantization boundary. No time stretching is
-allowed, and every stem retains zero timeline offset.
+Canonical companions are derived only from each mono raw stem and are 32 kHz
+dual-mono stereo PCM16 WAV. The channel policy is recorded as
+`dual_mono_from_sam_mono_v1`; this shadow does not claim stereo reconstruction.
+Raw and canonical durations are independently allowed to differ from the
+original target by at most 0.10 seconds under
+`zero_offset_bounded_duration_drift_v1`. The actual extents and signed deltas
+are retained, drift above 0.05 seconds is marked with an alignment warning, and
+the offset remains exactly zero. There is no time stretching or synthetic tail
+padding. The original target duration remains semantic timeline authority;
+downstream intervals are also bounded by the actual available stem extent, so a
+codec tail cannot publish facts past target EOF and a shorter stem records its
+uncovered tail.
 
 ## Shadow Stages
 
@@ -128,9 +136,16 @@ The ordered `clip_uids` provenance is carried through every stage rather than
 reconstructed from sorted mapping keys. The same explicit `--sam-route` is
 validated across separation, DiariZen, ASR, facts, and reconcile. A per-clip
 separation failure is published as an explicit skip while remaining clips
-continue in that order. A per-clip facts failure is likewise published and
-becomes an explicit reconcile upstream failure; neither failure aborts usable
-clips or disappears from summary provenance.
+continue in that order. Shadow DiariZen's `clip_results.jsonl` is hashed and its
+`ready`, `empty`, and `failed` states are carried through ASR, facts, and
+reconcile provenance. A failed DiariZen clip is an explicit upstream failure,
+never an inferred empty-speech clip or a reason to fall back to production
+DiariZen. A per-clip facts failure is likewise published and becomes an
+explicit reconcile upstream failure; none of these failures aborts usable
+clips or disappears from summary provenance. Final reconcile preflight requires
+the case-manifest order to equal the current separation inventory and requires
+both DiariZen and facts lineage to name that exact owned `separation/` root
+before constructing the MiMo backend.
 Every optional `--output-root` is constrained to the versioned shadow tree; it
 cannot target current `audio/`, `diarization/`, `asr/`, `h3/`, or MiMo output
 directories.

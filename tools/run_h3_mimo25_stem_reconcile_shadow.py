@@ -12,21 +12,53 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from r2v_data_v2.h3.jea_audio_production import jea_production_paths
-from r2v_data_v2.h3.mimo25_av_reconcile import build_mimo25_inventory
+from r2v_data_v2.h3.mimo25_av_reconcile import (
+    MimoCaseManifest,
+    build_mimo25_inventory,
+)
 from r2v_data_v2.h3.mimo25_backend import MimoBackendConfig, MimoMediaResolver
 from r2v_data_v2.h3.mimo25_stem_shadow import (
+    MimoStemFactsSummary,
     StemAwareOpenAIMimo25Backend,
     build_stem_reconcile_jobs,
     run_mimo25_stem_reconcile_shadow,
     validate_stem_facts_lineage,
 )
 from r2v_data_v2.h3.sam_audio_stem_shadow import (
+    SAMAudioStemInventory,
+    StemDiarizationShadowProvenance,
     load_stem_shadow,
     require_shadow_output_path,
     separation_skips,
     stem_separation_root,
     stem_shadow_root,
+    validate_stem_diarization_lineage,
 )
+
+
+def _validate_stage_closure(
+    *,
+    case_manifest: MimoCaseManifest,
+    stem_inventory: SAMAudioStemInventory,
+    separation_root: Path,
+    diarization_provenance: StemDiarizationShadowProvenance,
+    facts_summary: MimoStemFactsSummary,
+) -> None:
+    separation = separation_root.expanduser().resolve(strict=True)
+    if case_manifest.clip_uids != stem_inventory.clip_uids:
+        raise ValueError("case manifest differs from current SAM Audio inventory")
+    if (
+        Path(diarization_provenance.source_stem_root)
+        .expanduser()
+        .resolve(strict=True)
+        != separation
+    ):
+        raise ValueError("stem DiariZen source root differs from current separation")
+    if (
+        Path(facts_summary.source_stem_root).expanduser().resolve(strict=True)
+        != separation
+    ):
+        raise ValueError("stem facts source root differs from current separation")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -64,6 +96,26 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         shadow_root=shadow,
         output_path=arguments.output_root or shadow / "mimo_reconcile",
     )
+    case_manifest = MimoCaseManifest.model_validate_json(
+        arguments.case_manifest.read_text(encoding="utf-8")
+    )
+    stem_inventory, stem_records, _ = load_stem_shadow(separation)
+    diarization_provenance, _, _ = validate_stem_diarization_lineage(
+        shadow / "diarization"
+    )
+    facts_summary, facts = validate_stem_facts_lineage(
+        facts_root=shadow / "mimo_stem_facts",
+        stem_diarization_root=shadow / "diarization",
+        stem_asr_root=shadow / "asr",
+        route=arguments.sam_route,
+    )
+    _validate_stage_closure(
+        case_manifest=case_manifest,
+        stem_inventory=stem_inventory,
+        separation_root=separation,
+        diarization_provenance=diarization_provenance,
+        facts_summary=facts_summary,
+    )
     base = build_mimo25_inventory(
         visual_production_root=arguments.visual_production_root,
         visual_runs_root=arguments.visual_runs_root,
@@ -76,13 +128,6 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         stem_asr_root=shadow / "asr",
         route=arguments.sam_route,
     )
-    _, facts = validate_stem_facts_lineage(
-        facts_root=shadow / "mimo_stem_facts",
-        stem_diarization_root=shadow / "diarization",
-        stem_asr_root=shadow / "asr",
-        route=arguments.sam_route,
-    )
-    stem_inventory, stem_records, _ = load_stem_shadow(separation)
     skipped = separation_skips(
         inventory=stem_inventory,
         records=stem_records,
@@ -122,6 +167,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
             output_root=output,
             source_clip_uids=stem_inventory.clip_uids,
             skipped_clips=skipped,
+            diarization_failed_clips=facts_summary.diarization_failed_clips,
             route=arguments.sam_route,
             allow_unverified=arguments.allow_unverified,
             overwrite=arguments.overwrite,

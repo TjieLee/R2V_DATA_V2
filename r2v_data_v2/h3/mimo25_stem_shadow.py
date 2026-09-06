@@ -38,6 +38,7 @@ from r2v_data_v2.h3.sam_audio_stem_shadow import (
     SAMAudioStemInventory,
     SAMAudioStemRecord,
     SAMRoute,
+    StemDiarizationClipFailure,
     StemShadowClipSkip,
     StemType,
     load_stem_shadow,
@@ -50,11 +51,11 @@ from r2v_data_v2.h3.sam_audio_stem_shadow import (
 from r2v_data_v2.h3.schemas import SchemaModel
 
 MIMO25_STEM_FACTS_VERSION = "r2v.h3.mimo25_stem_facts.3"
-MIMO25_STEM_FACTS_SUMMARY_VERSION = "r2v.h3.mimo25_stem_facts_summary.3"
+MIMO25_STEM_FACTS_SUMMARY_VERSION = "r2v.h3.mimo25_stem_facts_summary.4"
 MIMO25_STEM_FACT_RAW_VERSION = "r2v.h3.mimo25_stem_fact_raw.1"
 MIMO25_STEM_FACT_PROMPT_VERSION = "h3_mimo25_stem_fact_prompt_v1"
 MIMO25_STEM_RECONCILE_VERSION = "r2v.h3.mimo25_stem_reconcile.1"
-MIMO25_STEM_RECONCILE_SUMMARY_VERSION = "r2v.h3.mimo25_stem_reconcile_summary.3"
+MIMO25_STEM_RECONCILE_SUMMARY_VERSION = "r2v.h3.mimo25_stem_reconcile_summary.4"
 MIMO25_STEM_RECONCILE_POLICY_VERSION = "h3_mimo25_stem_reconcile_v1"
 STEM_VIEW_VERSION = "r2v.h3.sam_audio_stem_view.1"
 STEM_RECONCILE_UPSTREAM_FAILURE_VERSION = (
@@ -343,11 +344,33 @@ class StemFactJob(SchemaModel):
     music_stem_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     sfx_stem_path: str
     sfx_stem_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    speech_stem_available_duration_seconds: float = Field(
+        gt=0,
+        allow_inf_nan=False,
+    )
+    music_stem_available_duration_seconds: float = Field(
+        gt=0,
+        allow_inf_nan=False,
+    )
+    sfx_stem_available_duration_seconds: float = Field(
+        gt=0,
+        allow_inf_nan=False,
+    )
     segments: list[StemFactSegment]
     job_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
 
     @model_validator(mode="after")
     def validate_job(self) -> StemFactJob:
+        available = (
+            self.speech_stem_available_duration_seconds,
+            self.music_stem_available_duration_seconds,
+            self.sfx_stem_available_duration_seconds,
+        )
+        if any(item > self.clip_duration_seconds for item in available) or any(
+            item.end_time > self.speech_stem_available_duration_seconds
+            for item in self.segments
+        ):
+            raise ValueError("stem fact timeline exceeds available source media")
         values = self.model_dump(mode="json", exclude={"job_fingerprint"})
         if self.job_fingerprint != _sha256_text(_compact_json(values)):
             raise ValueError("stem fact job fingerprint is invalid")
@@ -679,10 +702,13 @@ class MimoStemFactsRecord(SchemaModel):
 
 
 class MimoStemFactsSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_stem_facts_summary.3"] = (
+    schema_version: Literal["r2v.h3.mimo25_stem_facts_summary.4"] = (
         MIMO25_STEM_FACTS_SUMMARY_VERSION
     )
     record_count: int = Field(ge=0)
+    source_stem_root: str
+    source_stem_diarization_root: str
+    source_stem_asr_root: str
     source_stem_inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_stem_records_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_stem_diarization_provenance_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -693,7 +719,10 @@ class MimoStemFactsSummary(SchemaModel):
     clip_uids: list[str]
     ready_clip_uids: list[str]
     failed_clip_uids: list[str]
+    diarization_ready_clip_uids: list[str]
+    diarization_empty_clip_uids: list[str]
     skipped_clips: list[StemShadowClipSkip]
+    diarization_failed_clips: list[StemDiarizationClipFailure]
     unverified_clip_uids: list[str]
     unverified_consumption_authorized: bool
     ready_count: int = Field(ge=0)
@@ -703,6 +732,18 @@ class MimoStemFactsSummary(SchemaModel):
 
     @model_validator(mode="after")
     def validate_counts(self) -> MimoStemFactsSummary:
+        if any(
+            not item.strip()
+            for item in (
+                self.source_stem_root,
+                self.source_stem_diarization_root,
+                self.source_stem_asr_root,
+            )
+        ):
+            raise ValueError("stem facts source stage root is empty")
+        excluded = {item.clip_uid for item in self.skipped_clips}.union(
+            item.clip_uid for item in self.diarization_failed_clips
+        )
         if (
             self.record_count != len(self.clip_uids)
             or self.record_count != self.ready_count + self.failed_count
@@ -726,8 +767,39 @@ class MimoStemFactsSummary(SchemaModel):
                 if item in set(self.clip_uids)
             ]
             != self.clip_uids
-            or {item.clip_uid for item in self.skipped_clips}
-            != set(self.source_clip_uids) - set(self.clip_uids)
+            or excluded != set(self.source_clip_uids) - set(self.clip_uids)
+            or self.clip_uids
+            != [
+                item
+                for item in self.source_clip_uids
+                if item
+                in set(self.diarization_ready_clip_uids).union(
+                    self.diarization_empty_clip_uids
+                )
+            ]
+            or self.diarization_ready_clip_uids
+            != [
+                item
+                for item in self.source_clip_uids
+                if item in set(self.diarization_ready_clip_uids)
+            ]
+            or self.diarization_empty_clip_uids
+            != [
+                item
+                for item in self.source_clip_uids
+                if item in set(self.diarization_empty_clip_uids)
+            ]
+            or set(self.diarization_ready_clip_uids).intersection(
+                self.diarization_empty_clip_uids
+            )
+            or [item.clip_uid for item in self.diarization_failed_clips]
+            != [
+                item
+                for item in self.source_clip_uids
+                if item
+                in {failure.clip_uid for failure in self.diarization_failed_clips}
+            ]
+            or any(item.route != self.route for item in self.diarization_failed_clips)
             or set(self.unverified_clip_uids) - set(self.clip_uids)
             or (
                 self.unverified_clip_uids
@@ -793,6 +865,18 @@ def _stem_fact_job(
         "music_stem_sha256": stems["music"].canonical_stem_sha256,
         "sfx_stem_path": stems["sfx"].canonical_stem_path,
         "sfx_stem_sha256": stems["sfx"].canonical_stem_sha256,
+        "speech_stem_available_duration_seconds": min(
+            source.source_duration_seconds,
+            stems["speech"].canonical_duration_seconds,
+        ),
+        "music_stem_available_duration_seconds": min(
+            source.source_duration_seconds,
+            stems["music"].canonical_duration_seconds,
+        ),
+        "sfx_stem_available_duration_seconds": min(
+            source.source_duration_seconds,
+            stems["sfx"].canonical_duration_seconds,
+        ),
         "segments": segment_payload,
     }
     return StemFactJob(
@@ -811,6 +895,28 @@ def _validate_speech_fact_inventory(
         raise ValueError("speech stem facts must preserve exact segment inventory")
     if facts.clip_duration_seconds != job.clip_duration_seconds:
         raise ValueError("speech stem facts clip duration differs")
+
+
+def _validate_music_fact_extent(
+    music: MusicStemFacts,
+    job: StemFactJob,
+) -> None:
+    if any(
+        item.end_time > job.music_stem_available_duration_seconds
+        for item in music.intervals
+    ):
+        raise ValueError("music stem fact exceeds available source media")
+
+
+def _validate_sfx_fact_extent(
+    sfx: SFXStemFacts,
+    job: StemFactJob,
+) -> None:
+    if any(
+        item.end_time > job.sfx_stem_available_duration_seconds
+        for item in (*sfx.continuous_layers, *sfx.events)
+    ):
+        raise ValueError("SFX stem fact exceeds available source media")
 
 
 def _published_stem_views(
@@ -847,13 +953,13 @@ def run_mimo25_stem_facts_shadow(
         raise ValueError("stem facts require the owned SAM Audio separation root")
     shadow_root = separation_root.parent
     stem_inventory, stem_records, _ = load_stem_shadow(separation_root)
-    selected = selected_stem_records(
+    separation_selected = selected_stem_records(
         stem_records,
         route=route,
         allow_unverified=allow_unverified,
     )
-    selected_by_clip = {item.clip_uid: item for item in selected}
-    selected = [
+    selected_by_clip = {item.clip_uid: item for item in separation_selected}
+    separation_selected = [
         selected_by_clip[clip_uid]
         for clip_uid in stem_inventory.clip_uids
         if clip_uid in selected_by_clip
@@ -869,14 +975,22 @@ def run_mimo25_stem_facts_shadow(
         diarization_root
     )
     asr_provenance, asr_source_provenance = validate_stem_asr_lineage(asr_root)
-    selected_ids = [item.clip_uid for item in selected]
+    separation_selected_ids = [item.clip_uid for item in separation_selected]
+    selected_ids = diarization_provenance.usable_clip_uids
+    selected = [selected_by_clip[item] for item in selected_ids]
     if (
         Path(diarization_provenance.source_stem_root).resolve(strict=True)
         != separation_root
         or asr_source_provenance != diarization_provenance
         or diarization_provenance.route != route
         or asr_provenance.route != route
-        or diarization_provenance.usable_clip_uids != selected_ids
+        or diarization_provenance.target_count != len(separation_selected_ids)
+        or [
+            item
+            for item in stem_inventory.clip_uids
+            if item in set(separation_selected_ids)
+        ]
+        != separation_selected_ids
         or asr_provenance.clip_uids != selected_ids
     ):
         raise ValueError("stem facts upstream route or ordered inventory differs")
@@ -1030,9 +1144,11 @@ def run_mimo25_stem_facts_shadow(
                 failing_stem_type = "music"
                 if music.clip_duration_seconds != job.clip_duration_seconds:
                     raise ValueError("stem fact duration differs from source clip")
+                _validate_music_fact_extent(music, job)
                 failing_stem_type = "sfx"
                 if sfx.clip_duration_seconds != job.clip_duration_seconds:
                     raise ValueError("stem fact duration differs from source clip")
+                _validate_sfx_fact_extent(sfx, job)
                 failing_stem_type = None
                 values = {
                     "schema_version": MIMO25_STEM_FACTS_VERSION,
@@ -1120,6 +1236,9 @@ def run_mimo25_stem_facts_shadow(
         _write_jsonl(records_path, records)
         summary = MimoStemFactsSummary(
             record_count=len(records),
+            source_stem_root=str(separation_root),
+            source_stem_diarization_root=str(diarization_root),
+            source_stem_asr_root=str(asr_root),
             source_stem_inventory_fingerprint=stem_inventory.inventory_fingerprint,
             source_stem_records_sha256=sha256_file(separation_root / "records.jsonl"),
             source_stem_diarization_provenance_sha256=sha256_file(
@@ -1136,7 +1255,12 @@ def run_mimo25_stem_facts_shadow(
             failed_clip_uids=[
                 item.clip_uid for item in records if item.status == "failed"
             ],
+            diarization_ready_clip_uids=diarization_provenance.ready_clip_uids,
+            diarization_empty_clip_uids=diarization_provenance.empty_clip_uids,
             skipped_clips=skips,
+            diarization_failed_clips=(
+                diarization_provenance.diarization_failed_clips
+            ),
             unverified_clip_uids=[
                 item.clip_uid
                 for item in selected
@@ -1148,6 +1272,10 @@ def run_mimo25_stem_facts_shadow(
             model_call_count=sum(item.model_call_count for item in records),
         )
         _write_jsonl(temporary / "skipped_clips.jsonl", skips)
+        _write_jsonl(
+            temporary / "diarization_failed_clips.jsonl",
+            diarization_provenance.diarization_failed_clips,
+        )
         _write_json(temporary / "summary.json", summary)
         _publish_directory(temporary, destination, overwrite=overwrite)
         return summary
@@ -1191,7 +1319,13 @@ def validate_stem_facts_lineage(
     ):
         raise ValueError("stem facts route differs across shadow stages")
     if (
-        summary.source_stem_inventory_fingerprint
+        Path(summary.source_stem_root).expanduser().resolve(strict=True)
+        != Path(diarization_provenance.source_stem_root).resolve(strict=True)
+        or Path(summary.source_stem_diarization_root).expanduser().resolve(strict=True)
+        != diarization
+        or Path(summary.source_stem_asr_root).expanduser().resolve(strict=True)
+        != asr_root
+        or summary.source_stem_inventory_fingerprint
         != stem_inventory.inventory_fingerprint
         or summary.source_stem_records_sha256
         != sha256_file(Path(diarization_provenance.source_stem_root) / "records.jsonl")
@@ -1206,11 +1340,7 @@ def validate_stem_facts_lineage(
         raise ValueError("stem facts source clip order changed")
     selected = selected_stem_records(stem_records, route=route, allow_unverified=True)
     selected_by_clip = {item.clip_uid: item for item in selected}
-    expected_ids = [
-        clip_uid
-        for clip_uid in stem_inventory.clip_uids
-        if clip_uid in selected_by_clip
-    ]
+    expected_ids = diarization_provenance.usable_clip_uids
     if (
         expected_ids != asr_provenance.clip_uids
         or expected_ids != summary.clip_uids
@@ -1219,6 +1349,12 @@ def validate_stem_facts_lineage(
         != [item.clip_uid for item in records if item.status == "ready"]
         or summary.failed_clip_uids
         != [item.clip_uid for item in records if item.status == "failed"]
+        or summary.diarization_ready_clip_uids
+        != diarization_provenance.ready_clip_uids
+        or summary.diarization_empty_clip_uids
+        != diarization_provenance.empty_clip_uids
+        or summary.diarization_failed_clips
+        != diarization_provenance.diarization_failed_clips
         or summary.model_call_count
         != sum(item.model_call_count for item in records)
         or summary.skipped_clips
@@ -1497,7 +1633,7 @@ class StemReconcileUpstreamFailure(SchemaModel):
 
 
 class MimoStemReconcileSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_stem_reconcile_summary.3"] = (
+    schema_version: Literal["r2v.h3.mimo25_stem_reconcile_summary.4"] = (
         MIMO25_STEM_RECONCILE_SUMMARY_VERSION
     )
     route: SAMRoute
@@ -1507,6 +1643,7 @@ class MimoStemReconcileSummary(SchemaModel):
     clip_uids: list[str] = Field(min_length=1)
     processed_clip_uids: list[str]
     skipped_clips: list[StemShadowClipSkip]
+    diarization_failed_clips: list[StemDiarizationClipFailure]
     facts_failed_clips: list[StemReconcileUpstreamFailure]
     ready_count: int = Field(ge=0)
     failed_count: int = Field(ge=0)
@@ -1523,9 +1660,18 @@ class MimoStemReconcileSummary(SchemaModel):
             or self.clip_count != len(self.clip_uids)
             or self.processed_clip_count != len(self.processed_clip_uids)
             or self.skipped_clip_count
-            != len(self.skipped_clips) + len(self.facts_failed_clips)
+            != len(self.skipped_clips)
+            + len(self.diarization_failed_clips)
+            + len(self.facts_failed_clips)
             or [item for item in self.clip_uids if item in set(self.processed_clip_uids)]
             != self.processed_clip_uids
+            or [
+                item
+                for item in self.clip_uids
+                if item
+                in {failure.clip_uid for failure in self.diarization_failed_clips}
+            ]
+            != [item.clip_uid for item in self.diarization_failed_clips]
             or [
                 item
                 for item in self.clip_uids
@@ -1534,9 +1680,13 @@ class MimoStemReconcileSummary(SchemaModel):
             != [item.clip_uid for item in self.facts_failed_clips]
             or set(self.processed_clip_uids)
             .union(item.clip_uid for item in self.skipped_clips)
+            .union(item.clip_uid for item in self.diarization_failed_clips)
             .union(item.clip_uid for item in self.facts_failed_clips)
             != set(self.clip_uids)
             or any(item.route != self.route for item in self.skipped_clips)
+            or any(
+                item.route != self.route for item in self.diarization_failed_clips
+            )
             or any(item.route != self.route for item in self.facts_failed_clips)
         ):
             raise ValueError("stem reconcile summary counts do not reconcile")
@@ -1566,6 +1716,7 @@ def run_mimo25_stem_reconcile_shadow(
     output_root: Path,
     source_clip_uids: Sequence[str] | None = None,
     skipped_clips: Sequence[StemShadowClipSkip] = (),
+    diarization_failed_clips: Sequence[StemDiarizationClipFailure] = (),
     route: SAMRoute,
     allow_unverified: bool = False,
     overwrite: bool = False,
@@ -1587,12 +1738,20 @@ def run_mimo25_stem_reconcile_shadow(
     job_ids = [item.clip_uid for item in jobs]
     if [item for item in ordered_source if item in set(job_ids)] != job_ids:
         raise ValueError("stem reconcile jobs differ from source clip order")
-    if {item.clip_uid for item in skipped_clips} != set(ordered_source) - set(
-        job_ids
+    upstream_skipped_ids = {item.clip_uid for item in skipped_clips}
+    diarization_failed_ids = {
+        item.clip_uid for item in diarization_failed_clips
+    }
+    if (
+        upstream_skipped_ids.intersection(diarization_failed_ids)
+        or upstream_skipped_ids.union(diarization_failed_ids)
+        != set(ordered_source) - set(job_ids)
     ):
         raise ValueError("stem reconcile skipped clips differ from source inventory")
     if any(item.route != route for item in stem_facts) or any(
         item.route != route for item in skipped_clips
+    ) or any(
+        item.route != route for item in diarization_failed_clips
     ):
         raise ValueError("stem reconcile route differs from source records")
     ready_fact_ids = [item.clip_uid for item in stem_facts if item.status == "ready"]
@@ -1680,10 +1839,15 @@ def run_mimo25_stem_reconcile_shadow(
             route=route,
             clip_count=len(ordered_source),
             processed_clip_count=len(records),
-            skipped_clip_count=len(skipped_clips) + len(facts_failed_clips),
+            skipped_clip_count=(
+                len(skipped_clips)
+                + len(diarization_failed_clips)
+                + len(facts_failed_clips)
+            ),
             clip_uids=ordered_source,
             processed_clip_uids=processed_ids,
             skipped_clips=list(skipped_clips),
+            diarization_failed_clips=list(diarization_failed_clips),
             facts_failed_clips=facts_failed_clips,
             ready_count=counts["ready"],
             failed_count=counts["failed"],
@@ -1691,6 +1855,10 @@ def run_mimo25_stem_reconcile_shadow(
         )
         _write_jsonl(temporary / "records.jsonl", records)
         _write_jsonl(temporary / "skipped_clips.jsonl", list(skipped_clips))
+        _write_jsonl(
+            temporary / "diarization_failed_clips.jsonl",
+            list(diarization_failed_clips),
+        )
         _write_jsonl(temporary / "facts_failed_clips.jsonl", facts_failed_clips)
         _write_json(temporary / "summary.json", summary)
         _publish_directory(temporary, destination, overwrite=overwrite)
