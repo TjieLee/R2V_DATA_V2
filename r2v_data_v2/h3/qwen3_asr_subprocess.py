@@ -6,7 +6,6 @@ import os
 import select
 import subprocess
 from pathlib import Path
-from typing import TextIO
 
 import numpy as np
 
@@ -183,7 +182,5 @@ class PersistentQwen3ASRBackend:
                     process.wait(timeout=5)
         finally:
             for stream in (process.stdin, process.stdout):
-                if isinstance(stream, TextIO):
-                    stream.close()
-                elif stream is not None:
+                if stream is not None:
                     stream.close()
