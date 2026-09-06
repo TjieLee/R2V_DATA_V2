@@ -26,8 +26,9 @@ class PersistentQwen3ASRBackend:
     ) -> None:
         if timeout_seconds <= 0:
             raise ValueError("Qwen3-ASR worker timeout must be positive")
-        self.configuration = configuration
-        self.python_path = python_path.expanduser().resolve(strict=True)
+        # Preserve the venv's bin/python path exactly. Resolving this symlink can
+        # collapse it to the base interpreter and bypass the venv site-packages.
+        self.python_path = python_path.expanduser().absolute()
         self.worker_path = worker_path.expanduser().resolve(strict=True)
         if not self.python_path.is_file() or not self.worker_path.is_file():
             raise ValueError("Qwen3-ASR worker executable paths must be files")
