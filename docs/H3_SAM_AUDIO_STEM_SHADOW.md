@@ -6,7 +6,17 @@ production stages. All generated artifacts live under:
 
 ```text
 <audio-production-root>/sam_audio_stem_shadow_v1/
+  separation/
+  diarization/
+  asr/
+  mimo_stem_facts/
+  mimo_reconcile/
+  references/
 ```
+
+Each directory is an independently owned atomic stage. In particular,
+`separation --overwrite` replaces only `separation/`; it cannot remove a
+previously published downstream stage.
 
 ## Authority
 
@@ -40,18 +50,30 @@ residual            --"human voices"------> speech + final SFX residual
 ```
 
 The optional `voice_first` route reverses the first two prompts. Both routes are
-exactly two calls; SFX is never recursively separated. The official adapter uses
-the local-only `SAMAudio` / `SAMAudioProcessor.from_pretrained` API and the
-official `model.separate(..., predict_spans=False,
-reranking_candidates=N)` target/residual contract. Runtime configuration must
-name an existing local implementation and model path; the code never downloads
-a checkpoint.
+exactly two calls; SFX is never recursively separated. The official adapter
+constructs `SAMAudioProcessor` with only the local model path, while
+`SAMAudio.from_pretrained` is explicitly local-only. Batch-one target and
+residual outputs are read from the first item of their official per-item lists.
+The initial text-only pilot passes `visual_ranker=None`, `text_ranker=None`, and
+`span_predictor=None`, with `predict_spans=False` and one reranking candidate,
+so optional ImageBind, CLAP, Judge, and PE-A-Frame components are not loaded.
+
+Runtime configuration requires local implementation, SAM checkpoint/config,
+and T5-base paths. The SAM text-encoder configuration is copied in memory and
+only its `name` is redirected to the local T5 path; checkpoint configuration is
+never edited. Required files and SHA-256 fingerprints are validated before
+model construction and recorded in inventory provenance. The backend forces
+`HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`; there is no network fallback.
+An explicitly supplied model identifier must exactly match the identifier in
+the local SAM configuration.
 
 Each call records input, target, and residual hashes, prompts, route, model
 fingerprint, timing, and any stable candidate/Judge/CLAP metadata exposed by the
 runtime. When such quality evidence is unavailable, the state is `unverified`;
-the pipeline does not synthesize a score. Raw model outputs and the first-pass
-residual are retained exactly.
+the pipeline does not synthesize a score. Every downstream consumer, including
+stem-native reference export, requires the explicit pilot-only
+`--allow-unverified` flag before consuming such output. Raw model outputs and
+the first-pass residual are retained exactly.
 
 Canonical companions are derived only from each raw stem and are 32 kHz stereo
 PCM16 WAV. Source, raw, and canonical durations must agree within 0.10 seconds,
@@ -72,7 +94,9 @@ allowed, and every stem retains zero timeline offset.
    shadow DiariZen segment inventory and authoritative shadow Qwen3-ASR
    text/language as read-only facts; the response schema has no transcript or
    entity-binding field. The views stream-copy original video and use AAC only
-   as an annotation proxy; canonical WAV remains Audio authority.
+   as an annotation proxy; canonical WAV remains Audio authority. Proxy views
+   live inside the facts stage and publish atomically with their records, so a
+   failed rerun cannot replace media referenced by the prior stage.
 5. `run_h3_mimo25_stem_reconcile_shadow.py` sends the original full target AV as
    the model media and supplies stem facts as lower-priority structured
    evidence. Existing speaker fail-closed checks remain active.
@@ -87,6 +111,10 @@ allowed, and every stem retains zero timeline offset.
 
 Every command accepts or inherits an explicit case manifest. When a manifest is
 provided, its ordered clip inventory must match the stem inventory exactly.
+The ordered `clip_uids` provenance is carried through every stage rather than
+reconstructed from sorted mapping keys. A per-clip separation failure is
+published as an explicit skip while remaining clips continue in that order;
+reconcile does not require facts for skipped clips.
 Every optional `--output-root` is constrained to the versioned shadow tree; it
 cannot target current `audio/`, `diarization/`, `asr/`, `h3/`, or MiMo output
 directories.
@@ -101,6 +129,7 @@ python tools/run_h3_sam_audio_stem_shadow.py \
   --sam-audio-code-root "$SAM_AUDIO_CODE_ROOT" \
   --sam-audio-model-path "$SAM_AUDIO_MODEL_PATH" \
   --sam-audio-model-name facebook/sam-audio-large \
+  --sam-audio-t5-base-path "$SAM_AUDIO_T5_BASE_PATH" \
   --sam-route music_first \
   --sam-reranking-candidates 1 \
   --case-manifest "$CASE_MANIFEST"
@@ -108,29 +137,36 @@ python tools/run_h3_sam_audio_stem_shadow.py \
 python tools/run_h3_stem_diarization_shadow.py \
   --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
   --sam-route music_first \
-  --case-manifest "$CASE_MANIFEST"
+  --case-manifest "$CASE_MANIFEST" \
+  --allow-unverified
 
 python tools/run_h3_stem_qwen3_asr_shadow.py \
   --visual-production-root "$VISUAL_PRODUCTION_ROOT" \
   --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
-  --case-manifest "$CASE_MANIFEST"
+  --case-manifest "$CASE_MANIFEST" \
+  --allow-unverified
 
 python tools/run_h3_mimo25_stem_facts_shadow.py \
   --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
   --sam-route music_first \
-  --case-manifest "$CASE_MANIFEST"
+  --case-manifest "$CASE_MANIFEST" \
+  --temperature 0.2 \
+  --allow-unverified
 
 python tools/run_h3_mimo25_stem_reconcile_shadow.py \
   --visual-production-root "$VISUAL_PRODUCTION_ROOT" \
   --visual-runs-root "$VISUAL_RUNS_ROOT" \
   --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
-  --case-manifest "$CASE_MANIFEST"
+  --case-manifest "$CASE_MANIFEST" \
+  --max-completion-tokens 32768 \
+  --allow-unverified
 
 python tools/export_h3_sam_audio_stem_references.py \
   --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
   --primary-voice-root "$AUDIO_PRODUCTION_ROOT/primary_voice" \
   --sam-route music_first \
-  --case-manifest "$CASE_MANIFEST"
+  --case-manifest "$CASE_MANIFEST" \
+  --allow-unverified
 ```
 
 Use `--dry-run` to validate inventory selection without constructing a model

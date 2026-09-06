@@ -19,6 +19,7 @@ from r2v_data_v2.h3.sam_audio_stem_shadow import (
     export_stem_native_references,
     load_stem_shadow,
     require_shadow_output_path,
+    stem_separation_root,
     stem_shadow_root,
 )
 
@@ -39,6 +40,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--ffmpeg", default="ffmpeg")
     parser.add_argument("--ffprobe", default="ffprobe")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--allow-unverified", action="store_true")
     return parser
 
 
@@ -46,13 +48,13 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
     arguments = _parser().parse_args(argv)
     paths = jea_production_paths(arguments.audio_production_root)
     shadow = stem_shadow_root(paths.root)
-    inventory, records, _ = load_stem_shadow(shadow)
+    inventory, records, _ = load_stem_shadow(stem_separation_root(paths.root))
     selected_clip_uids: list[str] | None = None
     if arguments.case_manifest is not None:
         cases = MimoCaseManifest.model_validate_json(
             arguments.case_manifest.read_text(encoding="utf-8")
         )
-        if cases.clip_uids != [item.clip_uid for item in inventory.jobs]:
+        if cases.clip_uids != inventory.clip_uids:
             raise ValueError("case manifest differs from SAM Audio stem inventory")
         selected_clip_uids = cases.clip_uids
     if arguments.reference_manifest is not None:
@@ -73,6 +75,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
             records=records,
             route=arguments.sam_route,
             selected_clip_uids=selected_clip_uids,
+            allow_unverified=arguments.allow_unverified,
         )
         selection_source = "accepted_primary_voice_v1"
     output = require_shadow_output_path(
@@ -95,6 +98,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
                 ffmpeg=arguments.ffmpeg,
                 ffprobe=arguments.ffprobe,
             ),
+            allow_unverified=arguments.allow_unverified,
         )
         result["references"] = [item.model_dump(mode="json") for item in references]
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))

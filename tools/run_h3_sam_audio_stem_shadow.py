@@ -19,6 +19,7 @@ from r2v_data_v2.h3.sam_audio_stem_shadow import (
     require_shadow_output_path,
     run_sam_audio_stem_shadow,
     sam_audio_configuration,
+    stem_separation_root,
     stem_shadow_root,
 )
 
@@ -28,7 +29,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--audio-production-root", type=Path, required=True)
     parser.add_argument("--sam-audio-code-root", type=Path, required=True)
     parser.add_argument("--sam-audio-model-path", type=Path, required=True)
-    parser.add_argument("--sam-audio-model-name", default="facebook/sam-audio-large")
+    parser.add_argument("--sam-audio-model-name")
+    parser.add_argument("--sam-audio-t5-base-path", type=Path, required=True)
     parser.add_argument("--sam-device", default="cuda:0")
     parser.add_argument(
         "--sam-route",
@@ -52,12 +54,13 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
     shadow = stem_shadow_root(paths.root)
     output = require_shadow_output_path(
         shadow_root=shadow,
-        output_path=arguments.output_root or shadow,
+        output_path=arguments.output_root or stem_separation_root(paths.root),
     )
     configuration = sam_audio_configuration(
         implementation_root=arguments.sam_audio_code_root,
         model_path=arguments.sam_audio_model_path,
         model_name=arguments.sam_audio_model_name,
+        t5_base_path=arguments.sam_audio_t5_base_path,
         device=arguments.sam_device,
         reranking_candidates=arguments.sam_reranking_candidates,
     )

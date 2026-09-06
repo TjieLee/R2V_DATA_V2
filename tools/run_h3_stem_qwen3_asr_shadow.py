@@ -30,6 +30,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-root", type=Path)
     parser.add_argument("--ffmpeg", default="ffmpeg")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--allow-unverified", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     return parser
 
@@ -60,11 +61,9 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
             encoding="utf-8"
         )
     )
-    if manifest is not None and manifest.clip_uids != list(
-        source_provenance.speech_stem_paths_by_clip
-    ):
+    if manifest is not None and manifest.clip_uids != source_provenance.clip_uids:
         raise ValueError("stem ASR case manifest differs from stem diarization order")
-    result["clip_uids"] = list(source_provenance.speech_stem_paths_by_clip)
+    result["clip_uids"] = source_provenance.usable_clip_uids
     if not arguments.dry_run:
         if not os.environ.get("QWEN3_ASR_ENV"):
             raise ValueError("QWEN3_ASR_ENV must identify the isolated qwen-asr env")
@@ -77,6 +76,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
             output_root=output,
             case_manifest=manifest,
             ffmpeg=arguments.ffmpeg,
+            allow_unverified=arguments.allow_unverified,
             overwrite=arguments.overwrite,
         )
         result.update(

@@ -37,18 +37,22 @@ from r2v_data_v2.h3.sam_audio_stem_shadow import (
     SAMAudioStemInventory,
     SAMAudioStemRecord,
     SAMRoute,
+    StemASRShadowProvenance,
+    StemDiarizationShadowProvenance,
+    StemShadowClipSkip,
     StemType,
     load_stem_shadow,
     selected_stem_records,
+    separation_skips,
     sha256_file,
 )
 from r2v_data_v2.h3.schemas import SchemaModel
 
-MIMO25_STEM_FACTS_VERSION = "r2v.h3.mimo25_stem_facts.1"
-MIMO25_STEM_FACTS_SUMMARY_VERSION = "r2v.h3.mimo25_stem_facts_summary.1"
+MIMO25_STEM_FACTS_VERSION = "r2v.h3.mimo25_stem_facts.2"
+MIMO25_STEM_FACTS_SUMMARY_VERSION = "r2v.h3.mimo25_stem_facts_summary.2"
 MIMO25_STEM_FACT_PROMPT_VERSION = "h3_mimo25_stem_fact_prompt_v1"
 MIMO25_STEM_RECONCILE_VERSION = "r2v.h3.mimo25_stem_reconcile.1"
-MIMO25_STEM_RECONCILE_SUMMARY_VERSION = "r2v.h3.mimo25_stem_reconcile_summary.1"
+MIMO25_STEM_RECONCILE_SUMMARY_VERSION = "r2v.h3.mimo25_stem_reconcile_summary.2"
 MIMO25_STEM_RECONCILE_POLICY_VERSION = "h3_mimo25_stem_reconcile_v1"
 STEM_VIEW_VERSION = "r2v.h3.sam_audio_stem_view.1"
 
@@ -350,6 +354,8 @@ class StemFactsBackendProvenance(SchemaModel):
         MIMO25_STEM_FACT_PROMPT_VERSION
     )
     response_format: Literal["json_schema"] = "json_schema"
+    temperature: float = Field(ge=0, allow_inf_nan=False)
+    max_completion_tokens: int = Field(gt=0)
     original_av_is_final_authority: Literal[True] = True
     configuration_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
 
@@ -374,7 +380,7 @@ class OpenAIStemFactsBackend:
         base_url: str,
         api_key: str,
         media_resolver: MimoMediaResolver,
-        temperature: float = 0.0,
+        temperature: float = 0.2,
         max_completion_tokens: int = 4096,
         client: Any | None = None,
     ) -> None:
@@ -397,6 +403,8 @@ class OpenAIStemFactsBackend:
             "media_mode": media_resolver.mode,
             "prompt_version": MIMO25_STEM_FACT_PROMPT_VERSION,
             "response_format": "json_schema",
+            "temperature": temperature,
+            "max_completion_tokens": max_completion_tokens,
             "original_av_is_final_authority": True,
         }
         self.provenance = StemFactsBackendProvenance(
@@ -499,13 +507,15 @@ class OpenAIStemFactsBackend:
 
 
 class MimoStemFactsRecord(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_stem_facts.1"] = (
+    schema_version: Literal["r2v.h3.mimo25_stem_facts.2"] = (
         MIMO25_STEM_FACTS_VERSION
     )
     clip_uid: str
     route: SAMRoute
     job_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_stem_record_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_verification_state: Literal["success", "uncertain", "unverified"]
+    unverified_consumption_authorized: bool
     backend_provenance: StemFactsBackendProvenance
     stem_views: list[StemView]
     speech: SpeechStemFacts
@@ -517,6 +527,11 @@ class MimoStemFactsRecord(SchemaModel):
     def validate_record(self) -> MimoStemFactsRecord:
         if [item.stem_type for item in self.stem_views] != ["speech", "music", "sfx"]:
             raise ValueError("stem fact record requires three ordered AV views")
+        if (
+            self.source_verification_state == "unverified"
+            and not self.unverified_consumption_authorized
+        ):
+            raise ValueError("unverified stem facts lack explicit authorization")
         values = self.model_dump(mode="json", exclude={"record_fingerprint"})
         if self.record_fingerprint != _sha256_text(_compact_json(values)):
             raise ValueError("stem fact record fingerprint is invalid")
@@ -524,14 +539,41 @@ class MimoStemFactsRecord(SchemaModel):
 
 
 class MimoStemFactsSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_stem_facts_summary.1"] = (
+    schema_version: Literal["r2v.h3.mimo25_stem_facts_summary.2"] = (
         MIMO25_STEM_FACTS_SUMMARY_VERSION
     )
     record_count: int = Field(ge=1)
     source_stem_inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     route: SAMRoute
+    source_clip_uids: list[str] = Field(min_length=1)
+    clip_uids: list[str] = Field(min_length=1)
+    skipped_clips: list[StemShadowClipSkip]
+    unverified_clip_uids: list[str]
+    unverified_consumption_authorized: bool
     model_call_count: int = Field(ge=0)
     production_artifacts_modified: Literal[False] = False
+
+    @model_validator(mode="after")
+    def validate_counts(self) -> MimoStemFactsSummary:
+        if (
+            self.record_count != len(self.clip_uids)
+            or len(self.source_clip_uids) != len(set(self.source_clip_uids))
+            or [
+                item
+                for item in self.source_clip_uids
+                if item in set(self.clip_uids)
+            ]
+            != self.clip_uids
+            or {item.clip_uid for item in self.skipped_clips}
+            != set(self.source_clip_uids) - set(self.clip_uids)
+            or set(self.unverified_clip_uids) - set(self.clip_uids)
+            or (
+                self.unverified_clip_uids
+                and not self.unverified_consumption_authorized
+            )
+        ):
+            raise ValueError("stem facts ordered clip provenance is inconsistent")
+        return self
 
 
 def _stem_fact_job(
@@ -609,6 +651,25 @@ def _validate_speech_fact_inventory(
         raise ValueError("speech stem facts clip duration differs")
 
 
+def _published_stem_views(
+    views: Sequence[StemView],
+    *,
+    temporary_root: Path,
+    destination_root: Path,
+) -> list[StemView]:
+    old = str(temporary_root)
+    new = str(destination_root)
+    output: list[StemView] = []
+    for view in views:
+        values = view.model_dump(mode="json")
+        path = values["view_path"]
+        if not isinstance(path, str) or not (path == old or path.startswith(old + "/")):
+            raise ValueError("stem view is outside the owned facts stage")
+        values["view_path"] = new + path[len(old) :]
+        output.append(StemView.model_validate(values))
+    return output
+
+
 def run_mimo25_stem_facts_shadow(
     *,
     stem_root: Path,
@@ -616,12 +677,32 @@ def run_mimo25_stem_facts_shadow(
     backend: StemFactsBackend,
     view_backend: StemViewBackend,
     output_root: Path,
+    allow_unverified: bool = False,
     overwrite: bool = False,
 ) -> MimoStemFactsSummary:
-    stem_inventory, stem_records, _ = load_stem_shadow(stem_root)
-    selected = selected_stem_records(stem_records, route=route)
-    diarization_root = stem_root.expanduser().resolve(strict=True) / "diarization"
-    asr_root = stem_root.expanduser().resolve(strict=True) / "asr"
+    separation_root = stem_root.expanduser().resolve(strict=True)
+    if separation_root.name != "separation":
+        raise ValueError("stem facts require the owned SAM Audio separation root")
+    shadow_root = separation_root.parent
+    stem_inventory, stem_records, _ = load_stem_shadow(separation_root)
+    selected = selected_stem_records(
+        stem_records,
+        route=route,
+        allow_unverified=allow_unverified,
+    )
+    selected_by_clip = {item.clip_uid: item for item in selected}
+    selected = [
+        selected_by_clip[clip_uid]
+        for clip_uid in stem_inventory.clip_uids
+        if clip_uid in selected_by_clip
+    ]
+    skips = separation_skips(
+        inventory=stem_inventory,
+        records=stem_records,
+        route=route,
+    )
+    diarization_root = shadow_root / "diarization"
+    asr_root = shadow_root / "asr"
     raw = [
         RawDiarizationSegment.model_validate(item)
         for item in _read_jsonl(diarization_root / "raw_segments.jsonl")
@@ -632,10 +713,10 @@ def run_mimo25_stem_facts_shadow(
     ]
     destination = output_root.expanduser().resolve(strict=False)
     temporary = destination.with_name(f".{destination.name}.tmp-{uuid.uuid4().hex}")
-    views_root = stem_root.expanduser().resolve(strict=True) / "stem_views"
     records: list[MimoStemFactsRecord] = []
     try:
         temporary.mkdir(parents=True)
+        views_root = temporary / "stem_views"
         for record in selected:
             job = _stem_fact_job(
                 stem_inventory=stem_inventory,
@@ -699,8 +780,19 @@ def run_mimo25_stem_facts_shadow(
                 "route": route,
                 "job_fingerprint": job.job_fingerprint,
                 "source_stem_record_fingerprint": record.record_fingerprint,
+                "source_verification_state": record.separation_state,
+                "unverified_consumption_authorized": (
+                    record.separation_state != "unverified" or allow_unverified
+                ),
                 "backend_provenance": backend.provenance.model_dump(mode="json"),
-                "stem_views": [item.model_dump(mode="json") for item in views],
+                "stem_views": [
+                    item.model_dump(mode="json")
+                    for item in _published_stem_views(
+                        views,
+                        temporary_root=temporary,
+                        destination_root=destination,
+                    )
+                ],
                 "speech": speech.model_dump(mode="json"),
                 "music": music.model_dump(mode="json"),
                 "sfx": sfx.model_dump(mode="json"),
@@ -715,9 +807,19 @@ def run_mimo25_stem_facts_shadow(
             record_count=len(records),
             source_stem_inventory_fingerprint=stem_inventory.inventory_fingerprint,
             route=route,
+            source_clip_uids=stem_inventory.clip_uids,
+            clip_uids=[item.clip_uid for item in records],
+            skipped_clips=skips,
+            unverified_clip_uids=[
+                item.clip_uid
+                for item in selected
+                if item.separation_state == "unverified"
+            ],
+            unverified_consumption_authorized=allow_unverified,
             model_call_count=len(records) * 3,
         )
         _write_jsonl(temporary / "records.jsonl", records)
+        _write_jsonl(temporary / "skipped_clips.jsonl", skips)
         _write_json(temporary / "summary.json", summary)
         _publish_directory(temporary, destination, overwrite=overwrite)
         return summary
@@ -805,6 +907,19 @@ def build_stem_reconcile_jobs(
 ) -> list[MimoClipJob]:
     diarization = stem_diarization_root.expanduser().resolve(strict=True)
     asr_root = stem_asr_root.expanduser().resolve(strict=True)
+    diarization_provenance = StemDiarizationShadowProvenance.model_validate_json(
+        (diarization / "stem_provenance.json").read_text(encoding="utf-8")
+    )
+    asr_provenance = StemASRShadowProvenance.model_validate_json(
+        (asr_root / "stem_provenance.json").read_text(encoding="utf-8")
+    )
+    if (
+        asr_provenance.source_clip_uids != diarization_provenance.clip_uids
+        or asr_provenance.clip_uids != diarization_provenance.usable_clip_uids
+        or asr_provenance.source_stem_inventory_fingerprint
+        != diarization_provenance.source_stem_inventory_fingerprint
+    ):
+        raise ValueError("stem reconcile stage provenance differs")
     raw = [
         RawDiarizationSegment.model_validate(item)
         for item in _read_jsonl(diarization / "raw_segments.jsonl")
@@ -833,8 +948,17 @@ def build_stem_reconcile_jobs(
     }
     if not (set(raw_by_key) == set(bound_by_key) == set(asr_by_key)):
         raise ValueError("stem reconcile DiariZen/ASR inventories differ")
+    available_ids = set(diarization_provenance.usable_clip_uids)
+    if {key[0] for key in raw_by_key} - available_ids:
+        raise ValueError("stem reconcile segments contain a skipped clip")
+    base_by_clip = {item.clip_uid: item for item in base_inventory.jobs}
+    if len(base_by_clip) != len(base_inventory.jobs) or not available_ids <= set(
+        base_by_clip
+    ):
+        raise ValueError("stem reconcile base inventory lacks usable clips")
     jobs: list[MimoClipJob] = []
-    for base in base_inventory.jobs:
+    for clip_uid in diarization_provenance.usable_clip_uids:
+        base = base_by_clip[clip_uid]
         keys = sorted(
             (key for key in raw_by_key if key[0] == base.clip_uid),
             key=lambda key: (
@@ -913,10 +1037,15 @@ class MimoStemReconcileRecord(SchemaModel):
 
 
 class MimoStemReconcileSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_stem_reconcile_summary.1"] = (
+    schema_version: Literal["r2v.h3.mimo25_stem_reconcile_summary.2"] = (
         MIMO25_STEM_RECONCILE_SUMMARY_VERSION
     )
     clip_count: int = Field(ge=1)
+    processed_clip_count: int = Field(ge=0)
+    skipped_clip_count: int = Field(ge=0)
+    clip_uids: list[str] = Field(min_length=1)
+    processed_clip_uids: list[str]
+    skipped_clips: list[StemShadowClipSkip]
     ready_count: int = Field(ge=0)
     failed_count: int = Field(ge=0)
     model_call_count: int = Field(ge=0)
@@ -926,7 +1055,15 @@ class MimoStemReconcileSummary(SchemaModel):
 
     @model_validator(mode="after")
     def validate_counts(self) -> MimoStemReconcileSummary:
-        if self.clip_count != self.ready_count + self.failed_count:
+        if (
+            self.processed_clip_count != self.ready_count + self.failed_count
+            or self.clip_count != self.processed_clip_count + self.skipped_clip_count
+            or self.clip_count != len(self.clip_uids)
+            or self.processed_clip_count != len(self.processed_clip_uids)
+            or self.skipped_clip_count != len(self.skipped_clips)
+            or [item for item in self.clip_uids if item in set(self.processed_clip_uids)]
+            != self.processed_clip_uids
+        ):
             raise ValueError("stem reconcile summary counts do not reconcile")
         return self
 
@@ -952,6 +1089,9 @@ def run_mimo25_stem_reconcile_shadow(
     stem_facts: Sequence[MimoStemFactsRecord],
     backend: StemReconcileBackend,
     output_root: Path,
+    source_clip_uids: Sequence[str] | None = None,
+    skipped_clips: Sequence[StemShadowClipSkip] = (),
+    allow_unverified: bool = False,
     overwrite: bool = False,
 ) -> MimoStemReconcileSummary:
     facts_by_clip = {item.clip_uid: item for item in stem_facts}
@@ -959,6 +1099,22 @@ def run_mimo25_stem_reconcile_shadow(
         item.clip_uid for item in jobs
     }:
         raise ValueError("stem reconcile jobs and facts differ")
+    if any(
+        item.source_verification_state == "unverified" for item in stem_facts
+    ) and not allow_unverified:
+        raise ValueError(
+            "unverified SAM Audio stems require explicit allow_unverified opt-in"
+        )
+    ordered_source = list(source_clip_uids or [item.clip_uid for item in jobs])
+    if len(ordered_source) != len(set(ordered_source)):
+        raise ValueError("stem reconcile source clip order contains duplicates")
+    processed_ids = [item.clip_uid for item in jobs]
+    if [item for item in ordered_source if item in set(processed_ids)] != processed_ids:
+        raise ValueError("stem reconcile jobs differ from source clip order")
+    if {item.clip_uid for item in skipped_clips} != set(ordered_source) - set(
+        processed_ids
+    ):
+        raise ValueError("stem reconcile skipped clips differ from source inventory")
     destination = output_root.expanduser().resolve(strict=False)
     temporary = destination.with_name(f".{destination.name}.tmp-{uuid.uuid4().hex}")
     records: list[MimoStemReconcileRecord] = []
@@ -1023,12 +1179,18 @@ def run_mimo25_stem_reconcile_shadow(
             )
         counts = Counter(item.status for item in records)
         summary = MimoStemReconcileSummary(
-            clip_count=len(records),
+            clip_count=len(ordered_source),
+            processed_clip_count=len(records),
+            skipped_clip_count=len(skipped_clips),
+            clip_uids=ordered_source,
+            processed_clip_uids=processed_ids,
+            skipped_clips=list(skipped_clips),
             ready_count=counts["ready"],
             failed_count=counts["failed"],
             model_call_count=sum(item.model_call_count for item in records),
         )
         _write_jsonl(temporary / "records.jsonl", records)
+        _write_jsonl(temporary / "skipped_clips.jsonl", list(skipped_clips))
         _write_json(temporary / "summary.json", summary)
         _publish_directory(temporary, destination, overwrite=overwrite)
         return summary

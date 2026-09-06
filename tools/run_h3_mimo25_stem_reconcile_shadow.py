@@ -21,7 +21,10 @@ from r2v_data_v2.h3.mimo25_stem_shadow import (
     run_mimo25_stem_reconcile_shadow,
 )
 from r2v_data_v2.h3.sam_audio_stem_shadow import (
+    load_stem_shadow,
     require_shadow_output_path,
+    separation_skips,
+    stem_separation_root,
     stem_shadow_root,
 )
 
@@ -34,13 +37,20 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--visual-runs-root", type=Path, required=True)
     parser.add_argument("--audio-production-root", type=Path, required=True)
     parser.add_argument("--case-manifest", type=Path, required=True)
+    parser.add_argument(
+        "--sam-route",
+        choices=("music_first", "voice_first"),
+        default="music_first",
+    )
     parser.add_argument("--model", default="mimo-v2.5")
     parser.add_argument("--base-url", default="http://127.0.0.1:8092/v1")
     parser.add_argument("--media-mode", choices=("base64", "http"), default="base64")
     parser.add_argument("--media-root", type=Path, default=Path("/mnt/workspace"))
     parser.add_argument("--media-base-url")
     parser.add_argument("--output-root", type=Path)
+    parser.add_argument("--max-completion-tokens", type=int, default=32768)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--allow-unverified", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     return parser
 
@@ -49,6 +59,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
     arguments = _parser().parse_args(argv)
     paths = jea_production_paths(arguments.audio_production_root)
     shadow = stem_shadow_root(paths.root)
+    separation = stem_separation_root(paths.root)
     output = require_shadow_output_path(
         shadow_root=shadow,
         output_path=arguments.output_root or shadow / "mimo_reconcile",
@@ -65,6 +76,12 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         stem_asr_root=shadow / "asr",
     )
     facts = load_stem_fact_records(shadow / "mimo_stem_facts")
+    stem_inventory, stem_records, _ = load_stem_shadow(separation)
+    skipped = separation_skips(
+        inventory=stem_inventory,
+        records=stem_records,
+        route=arguments.sam_route,
+    )
     result: dict[str, object] = {
         "dry_run": arguments.dry_run,
         "model_called": False,
@@ -86,6 +103,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
                 transport="sglang",
                 base_url=arguments.base_url,
                 model=arguments.model,
+                max_completion_tokens=arguments.max_completion_tokens,
             ),
             stem_facts_by_clip=facts_by_clip,
         )
@@ -94,6 +112,9 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
             stem_facts=facts,
             backend=backend,
             output_root=output,
+            source_clip_uids=stem_inventory.clip_uids,
+            skipped_clips=skipped,
+            allow_unverified=arguments.allow_unverified,
             overwrite=arguments.overwrite,
         )
         result.update(model_called=True, summary=summary.model_dump(mode="json"))

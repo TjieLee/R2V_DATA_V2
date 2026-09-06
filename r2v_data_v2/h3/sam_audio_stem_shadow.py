@@ -50,12 +50,14 @@ from r2v_data_v2.h3.qwen3_asr import (
 from r2v_data_v2.h3.schemas import SchemaModel
 
 SAM_AUDIO_SHADOW_ROOT_NAME = "sam_audio_stem_shadow_v1"
-SAM_AUDIO_STEM_INVENTORY_VERSION = "r2v.h3.sam_audio_stem_inventory.1"
-SAM_AUDIO_STEM_RECORD_VERSION = "r2v.h3.sam_audio_stem_record.1"
-SAM_AUDIO_STEM_SUMMARY_VERSION = "r2v.h3.sam_audio_stem_summary.1"
-STEM_DIARIZATION_SHADOW_VERSION = "r2v.h3.stem_diarization_shadow.1"
-STEM_ASR_SHADOW_VERSION = "r2v.h3.stem_asr_shadow.1"
-STEM_REFERENCE_VERSION = "r2v.h3.sam_audio_stem_reference.1"
+SAM_AUDIO_SEPARATION_STAGE_NAME = "separation"
+SAM_AUDIO_STEM_INVENTORY_VERSION = "r2v.h3.sam_audio_stem_inventory.2"
+SAM_AUDIO_STEM_RECORD_VERSION = "r2v.h3.sam_audio_stem_record.2"
+SAM_AUDIO_STEM_SUMMARY_VERSION = "r2v.h3.sam_audio_stem_summary.2"
+STEM_DIARIZATION_SHADOW_VERSION = "r2v.h3.stem_diarization_shadow.2"
+STEM_ASR_SHADOW_VERSION = "r2v.h3.stem_asr_shadow.2"
+STEM_REFERENCE_VERSION = "r2v.h3.sam_audio_stem_reference.2"
+STEM_CLIP_SKIP_VERSION = "r2v.h3.sam_audio_stem_clip_skip.1"
 STEM_CANONICALIZATION_VERSION = "sam_audio_raw_to_32k_stereo_pcm16_v1"
 STEM_REFERENCE_EXTRACTION_VERSION = "sam_audio_stem_exact_sample_crop_v1"
 STEM_ALIGNMENT_TOLERANCE_SECONDS = 0.10
@@ -136,6 +138,10 @@ def stem_shadow_root(audio_production_root: Path) -> Path:
     )
 
 
+def stem_separation_root(audio_production_root: Path) -> Path:
+    return stem_shadow_root(audio_production_root) / SAM_AUDIO_SEPARATION_STAGE_NAME
+
+
 def require_shadow_output_path(*, shadow_root: Path, output_path: Path) -> Path:
     root = shadow_root.expanduser().resolve(strict=False)
     output = output_path.expanduser().resolve(strict=False)
@@ -146,12 +152,22 @@ def require_shadow_output_path(*, shadow_root: Path, output_path: Path) -> Path:
 
 class SAMAudioModelConfiguration(SchemaModel):
     implementation_root: str
+    implementation_files: dict[str, str]
     model_path: str
     model_name: str
+    model_config_path: str
+    model_config_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    model_checkpoint_path: str
+    model_checkpoint_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    t5_base_path: str
+    t5_dependency_files: dict[str, str]
     device: str
     reranking_candidates: int = Field(ge=1)
     predict_spans: Literal[False] = False
     local_files_only: Literal[True] = True
+    visual_ranker_disabled: Literal[True] = True
+    text_ranker_disabled: Literal[True] = True
+    span_predictor_disabled: Literal[True] = True
     configuration_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
 
     @model_validator(mode="after")
@@ -162,28 +178,132 @@ class SAMAudioModelConfiguration(SchemaModel):
         return self
 
 
+def _t5_dependency_files(root: Path) -> dict[str, str]:
+    required = [root / "config.json"]
+    tokenizer = next(
+        (path for path in (root / "tokenizer.json", root / "spiece.model") if path.is_file()),
+        None,
+    )
+    if tokenizer is None:
+        raise ValueError("local T5-base path lacks tokenizer.json or spiece.model")
+    required.append(tokenizer)
+    tokenizer_config = root / "tokenizer_config.json"
+    if tokenizer_config.is_file():
+        required.append(tokenizer_config)
+
+    direct_weight = next(
+        (
+            path
+            for path in (root / "model.safetensors", root / "pytorch_model.bin")
+            if path.is_file()
+        ),
+        None,
+    )
+    if direct_weight is not None:
+        required.append(direct_weight)
+    else:
+        index = next(
+            (
+                path
+                for path in (
+                    root / "model.safetensors.index.json",
+                    root / "pytorch_model.bin.index.json",
+                )
+                if path.is_file()
+            ),
+            None,
+        )
+        if index is None:
+            raise ValueError("local T5-base path lacks model checkpoint files")
+        payload = json.loads(index.read_text(encoding="utf-8"))
+        weight_map = payload.get("weight_map") if isinstance(payload, dict) else None
+        if not isinstance(weight_map, dict) or not weight_map:
+            raise ValueError("local T5-base checkpoint index is invalid")
+        required.append(index)
+        for relative in sorted(set(weight_map.values())):
+            if not isinstance(relative, str) or Path(relative).is_absolute():
+                raise ValueError("local T5-base checkpoint index contains an invalid path")
+            shard = (root / relative).resolve(strict=True)
+            if root not in shard.parents or not shard.is_file():
+                raise ValueError("local T5-base checkpoint shard is unavailable")
+            required.append(shard)
+    return {
+        str(path.relative_to(root)): sha256_file(path)
+        for path in sorted(set(required))
+    }
+
+
+def _implementation_files(root: Path) -> dict[str, str]:
+    required = [
+        Path("sam_audio/__init__.py"),
+        Path("sam_audio/processor.py"),
+        Path("sam_audio/model/base.py"),
+        Path("sam_audio/model/config.py"),
+        Path("sam_audio/model/model.py"),
+    ]
+    output: dict[str, str] = {}
+    for relative in required:
+        path = root / relative
+        if not path.is_file():
+            raise ValueError(f"local SAM Audio implementation lacks {relative}")
+        output[relative.as_posix()] = sha256_file(path)
+    return output
+
+
 def sam_audio_configuration(
     *,
     implementation_root: Path,
     model_path: Path,
-    model_name: str,
+    model_name: str | None,
+    t5_base_path: Path,
     device: str,
     reranking_candidates: int,
 ) -> SAMAudioModelConfiguration:
     code = implementation_root.expanduser().resolve(strict=True)
     checkpoint = model_path.expanduser().resolve(strict=True)
-    if not code.is_dir() or not checkpoint.exists():
+    t5 = t5_base_path.expanduser().resolve(strict=True)
+    if not code.is_dir() or not checkpoint.is_dir() or not t5.is_dir():
         raise ValueError("SAM Audio implementation/model paths must exist locally")
-    if not model_name.strip() or not device.strip() or reranking_candidates < 1:
+    config_path = checkpoint / "config.json"
+    checkpoint_path = checkpoint / "checkpoint.pt"
+    if not config_path.is_file() or not checkpoint_path.is_file():
+        raise ValueError("local SAM Audio config.json/checkpoint.pt is unavailable")
+    raw_config = json.loads(config_path.read_text(encoding="utf-8"))
+    if not isinstance(raw_config, dict) or not isinstance(
+        raw_config.get("text_encoder"), dict
+    ):
+        raise TypeError("local SAM Audio text-encoder configuration is invalid")
+    configured_name = raw_config.get("_name_or_path")
+    derived_name = (
+        configured_name.strip()
+        if isinstance(configured_name, str) and configured_name.strip()
+        else checkpoint.name
+    )
+    if model_name is not None:
+        supplied_name = model_name.strip()
+        if not supplied_name or supplied_name != derived_name:
+            raise ValueError("SAM Audio model identifier differs from local model path")
+        derived_name = supplied_name
+    if not device.strip() or reranking_candidates < 1:
         raise ValueError("SAM Audio runtime configuration is incomplete")
     values = {
         "implementation_root": str(code),
+        "implementation_files": _implementation_files(code),
         "model_path": str(checkpoint),
-        "model_name": model_name,
+        "model_name": derived_name,
+        "model_config_path": str(config_path),
+        "model_config_sha256": sha256_file(config_path),
+        "model_checkpoint_path": str(checkpoint_path),
+        "model_checkpoint_sha256": sha256_file(checkpoint_path),
+        "t5_base_path": str(t5),
+        "t5_dependency_files": _t5_dependency_files(t5),
         "device": device,
         "reranking_candidates": reranking_candidates,
         "predict_spans": False,
         "local_files_only": True,
+        "visual_ranker_disabled": True,
+        "text_ranker_disabled": True,
+        "span_predictor_disabled": True,
     }
     return SAMAudioModelConfiguration(
         **values,
@@ -241,11 +361,24 @@ class OfficialSAMAudioBackend:
             assert self._torch is not None
             assert self._torchaudio is not None
             return self._model, self._processor, self._torch, self._torchaudio
+        if _implementation_files(
+            Path(self.configuration.implementation_root)
+        ) != self.configuration.implementation_files:
+            raise ValueError("local SAM Audio implementation fingerprint changed")
+        if (
+            sha256_file(Path(self.configuration.model_config_path))
+            != self.configuration.model_config_sha256
+            or sha256_file(Path(self.configuration.model_checkpoint_path))
+            != self.configuration.model_checkpoint_sha256
+            or _t5_dependency_files(Path(self.configuration.t5_base_path))
+            != self.configuration.t5_dependency_files
+        ):
+            raise ValueError("local SAM Audio model dependency fingerprint changed")
         code_root = self.configuration.implementation_root
         if code_root not in sys.path:
             sys.path.insert(0, code_root)
-        os.environ.setdefault("HF_HUB_OFFLINE", "1")
-        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
         try:
             import torch
             import torchaudio
@@ -254,12 +387,20 @@ class OfficialSAMAudioBackend:
             raise RuntimeError(
                 "official SAM Audio runtime dependencies are unavailable"
             ) from exc
-        kwargs = {"local_files_only": True}
-        model = SAMAudio.from_pretrained(self.configuration.model_path, **kwargs)
-        processor = SAMAudioProcessor.from_pretrained(
-            self.configuration.model_path,
-            **kwargs,
+        raw_config = json.loads(
+            Path(self.configuration.model_config_path).read_text(encoding="utf-8")
         )
+        text_encoder = dict(raw_config["text_encoder"])
+        text_encoder["name"] = self.configuration.t5_base_path
+        model = SAMAudio.from_pretrained(
+            self.configuration.model_path,
+            local_files_only=True,
+            text_encoder=text_encoder,
+            visual_ranker=None,
+            text_ranker=None,
+            span_predictor=None,
+        )
+        processor = SAMAudioProcessor.from_pretrained(self.configuration.model_path)
         model = model.eval().to(self.configuration.device)
         self._model, self._processor = model, processor
         self._torch, self._torchaudio = torch, torchaudio
@@ -292,8 +433,10 @@ class OfficialSAMAudioBackend:
                 reranking_candidates=self.configuration.reranking_candidates,
             )
         sample_rate = int(processor.audio_sampling_rate)
-        torchaudio.save(str(target_path), result.target.cpu(), sample_rate)
-        torchaudio.save(str(residual_path), result.residual.cpu(), sample_rate)
+        if len(result.target) != 1 or len(result.residual) != 1:
+            raise ValueError("SAM Audio batch-one result must contain one target/residual")
+        torchaudio.save(str(target_path), result.target[0].cpu(), sample_rate)
+        torchaudio.save(str(residual_path), result.residual[0].cpu(), sample_rate)
         return SAMAudioSeparationResult(
             target_path=str(target_path),
             residual_path=str(residual_path),
@@ -383,7 +526,7 @@ class SAMAudioStemJob(SchemaModel):
 
 
 class SAMAudioStemInventory(SchemaModel):
-    schema_version: Literal["r2v.h3.sam_audio_stem_inventory.1"] = (
+    schema_version: Literal["r2v.h3.sam_audio_stem_inventory.2"] = (
         SAM_AUDIO_STEM_INVENTORY_VERSION
     )
     source_canonical_audio_manifest_path: str
@@ -398,6 +541,7 @@ class SAMAudioStemInventory(SchemaModel):
     run_both_routes: bool = False
     model_configuration: SAMAudioModelConfiguration
     job_count: int = Field(ge=1)
+    clip_uids: list[str] = Field(min_length=1)
     jobs: list[SAMAudioStemJob] = Field(min_length=1)
     inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
 
@@ -406,7 +550,7 @@ class SAMAudioStemInventory(SchemaModel):
         if self.job_count != len(self.jobs):
             raise ValueError("SAM Audio stem inventory job count differs")
         ids = [item.clip_uid for item in self.jobs]
-        if len(ids) != len(set(ids)):
+        if len(ids) != len(set(ids)) or self.clip_uids != ids:
             raise ValueError("SAM Audio stem inventory clip IDs must be unique")
         explicit = self.selection_mode == "explicit_case_manifest"
         if explicit != (self.source_case_manifest_path is not None) or explicit != (
@@ -420,7 +564,7 @@ class SAMAudioStemInventory(SchemaModel):
 
 
 class SAMAudioStemRecord(SchemaModel):
-    schema_version: Literal["r2v.h3.sam_audio_stem_record.1"] = (
+    schema_version: Literal["r2v.h3.sam_audio_stem_record.2"] = (
         SAM_AUDIO_STEM_RECORD_VERSION
     )
     clip_uid: str
@@ -469,7 +613,7 @@ class SAMAudioStemRecord(SchemaModel):
 
 
 class SAMAudioStemSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.sam_audio_stem_summary.1"] = (
+    schema_version: Literal["r2v.h3.sam_audio_stem_summary.2"] = (
         SAM_AUDIO_STEM_SUMMARY_VERSION
     )
     inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -583,6 +727,7 @@ def build_sam_audio_stem_inventory(
         "run_both_routes": run_both_routes,
         "model_configuration": model_configuration.model_dump(mode="json"),
         "job_count": len(jobs),
+        "clip_uids": [item.clip_uid for item in jobs],
         "jobs": [item.model_dump(mode="json") for item in jobs],
     }
     return SAMAudioStemInventory(
@@ -857,6 +1002,8 @@ def run_sam_audio_stem_shadow(
     if backend.configuration != inventory.model_configuration:
         raise ValueError("SAM Audio backend differs from inventory configuration")
     destination = output_root.expanduser().resolve(strict=False)
+    if destination.name != SAM_AUDIO_SEPARATION_STAGE_NAME:
+        raise ValueError("SAM Audio separation must own the separation stage root")
     temporary = destination.with_name(f".{destination.name}.tmp-{uuid.uuid4().hex}")
     temporary.parent.mkdir(parents=True, exist_ok=True)
     routes: list[SAMRoute] = (
@@ -948,6 +1095,8 @@ def load_stem_shadow(
     root: Path,
 ) -> tuple[SAMAudioStemInventory, list[SAMAudioStemRecord], SAMAudioStemSummary]:
     source = root.expanduser().resolve(strict=True)
+    if source.name != SAM_AUDIO_SEPARATION_STAGE_NAME:
+        raise ValueError("SAM Audio records must be loaded from the separation stage")
     inventory = SAMAudioStemInventory.model_validate_json(
         (source / "inventory.json").read_text(encoding="utf-8")
     )
@@ -971,6 +1120,7 @@ def selected_stem_records(
     records: Sequence[SAMAudioStemRecord],
     *,
     route: SAMRoute,
+    allow_unverified: bool = False,
 ) -> list[SAMAudioStemRecord]:
     selected = [
         item
@@ -980,7 +1130,47 @@ def selected_stem_records(
     ids = [item.clip_uid for item in selected]
     if len(ids) != len(set(ids)):
         raise ValueError("selected SAM Audio route contains duplicate clips")
+    if any(item.separation_state == "unverified" for item in selected) and not (
+        allow_unverified
+    ):
+        raise ValueError(
+            "unverified SAM Audio stems require explicit allow_unverified opt-in"
+        )
     return selected
+
+
+class StemShadowClipSkip(SchemaModel):
+    schema_version: Literal["r2v.h3.sam_audio_stem_clip_skip.1"] = (
+        STEM_CLIP_SKIP_VERSION
+    )
+    clip_uid: str
+    route: SAMRoute
+    source_stage: Literal["separation"] = "separation"
+    reason_code: Literal["sam_audio_separation_failed"] = (
+        "sam_audio_separation_failed"
+    )
+    reason: str
+
+
+def separation_skips(
+    *,
+    inventory: SAMAudioStemInventory,
+    records: Sequence[SAMAudioStemRecord],
+    route: SAMRoute,
+) -> list[StemShadowClipSkip]:
+    route_records = [item for item in records if item.route == route]
+    by_clip = {item.clip_uid: item for item in route_records}
+    if len(by_clip) != len(route_records) or set(by_clip) != set(inventory.clip_uids):
+        raise ValueError("SAM Audio route records differ from ordered inventory")
+    return [
+        StemShadowClipSkip(
+            clip_uid=clip_uid,
+            route=route,
+            reason=by_clip[clip_uid].failure_reason or "SAM Audio separation failed",
+        )
+        for clip_uid in inventory.clip_uids
+        if by_clip[clip_uid].separation_state == "failure"
+    ]
 
 
 class StemReferenceRequest(SchemaModel):
@@ -1045,7 +1235,7 @@ class StemReferenceManifest(SchemaModel):
 
 
 class StemNativeReference(SchemaModel):
-    schema_version: Literal["r2v.h3.sam_audio_stem_reference.1"] = (
+    schema_version: Literal["r2v.h3.sam_audio_stem_reference.2"] = (
         STEM_REFERENCE_VERSION
     )
     reference_id: str
@@ -1061,6 +1251,8 @@ class StemNativeReference(SchemaModel):
     end_time: float = Field(gt=0)
     reference_path: str
     reference_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_verification_state: VerificationState
+    unverified_consumption_authorized: bool
     reference_kind: Literal["manual_review", "shadow_primary_voice"]
     entity_occurrence_id: str | None = None
     source_turn_id: str | None = None
@@ -1086,6 +1278,11 @@ class StemNativeReference(SchemaModel):
             or not self.reference_path.strip()
         ):
             raise ValueError("stem-native reference extent is inconsistent")
+        if (
+            self.source_verification_state == "unverified"
+            and not self.unverified_consumption_authorized
+        ):
+            raise ValueError("unverified stem reference lacks explicit authorization")
         voice_provenance = (
             self.entity_occurrence_id,
             self.source_turn_id,
@@ -1121,6 +1318,7 @@ def build_shadow_primary_voice_reference_requests(
     records: Sequence[SAMAudioStemRecord],
     route: SAMRoute,
     selected_clip_uids: Sequence[str] | None = None,
+    allow_unverified: bool = False,
 ) -> list[StemReferenceRequest]:
     """Project already-selected V1 primary turns onto the speech stem timeline."""
 
@@ -1138,7 +1336,11 @@ def build_shadow_primary_voice_reference_requests(
     ):
         raise ValueError("primary voice selection summary does not reconcile")
 
-    selected_records = selected_stem_records(records, route=route)
+    selected_records = selected_stem_records(
+        records,
+        route=route,
+        allow_unverified=allow_unverified,
+    )
     records_by_clip = {item.clip_uid: item for item in selected_records}
     if selected_clip_uids is None:
         clip_order = [item.clip_uid for item in selected_records]
@@ -1207,6 +1409,7 @@ def export_stem_native_references(
     requests: Sequence[StemReferenceRequest],
     output_root: Path,
     media_backend: AudioMediaBackend,
+    allow_unverified: bool = False,
 ) -> list[StemNativeReference]:
     by_key = {(item.clip_uid, item.route): item for item in records}
     if len(by_key) != len(records):
@@ -1216,6 +1419,10 @@ def export_stem_native_references(
         record = by_key.get((request.clip_uid, request.route))
         if record is None or record.separation_state == "failure":
             raise ValueError("stem reference request lacks a usable stem record")
+        if record.separation_state == "unverified" and not allow_unverified:
+            raise ValueError(
+                "unverified SAM Audio stems require explicit allow_unverified opt-in"
+            )
         stem = record.stem(request.stem_type)
         source = Path(stem.canonical_stem_path).resolve(strict=True)
         if sha256_file(source) != stem.canonical_stem_sha256:
@@ -1258,6 +1465,10 @@ def export_stem_native_references(
                 end_time=end / STEM_SAMPLE_RATE_HZ,
                 reference_path=str(destination.resolve(strict=True)),
                 reference_sha256=sha256_file(destination),
+                source_verification_state=record.separation_state,
+                unverified_consumption_authorized=(
+                    record.separation_state != "unverified" or allow_unverified
+                ),
                 reference_kind=request.reference_kind,
                 entity_occurrence_id=request.entity_occurrence_id,
                 source_turn_id=request.source_turn_id,
@@ -1274,7 +1485,7 @@ def export_stem_native_references(
 
 
 class StemDiarizationShadowProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.stem_diarization_shadow.1"] = (
+    schema_version: Literal["r2v.h3.stem_diarization_shadow.2"] = (
         STEM_DIARIZATION_SHADOW_VERSION
     )
     diarization_source_kind: Literal["sam_audio_speech_stem"] = (
@@ -1284,11 +1495,44 @@ class StemDiarizationShadowProvenance(SchemaModel):
     source_stem_records_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     route: SAMRoute
     target_count: int = Field(ge=1)
+    clip_uids: list[str] = Field(min_length=1)
+    usable_clip_uids: list[str] = Field(min_length=1)
+    skipped_clips: list[StemShadowClipSkip]
+    unverified_clip_uids: list[str]
+    unverified_consumption_authorized: bool
     speech_stem_paths_by_clip: dict[str, str]
     speech_stem_hashes_by_clip: dict[str, str]
     original_audio_paths_by_clip: dict[str, str]
     original_audio_hashes_by_clip: dict[str, str]
     production_diarization_modified: Literal[False] = False
+
+    @model_validator(mode="after")
+    def validate_clip_provenance(self) -> StemDiarizationShadowProvenance:
+        if (
+            len(self.clip_uids) != len(set(self.clip_uids))
+            or self.target_count != len(self.usable_clip_uids)
+            or [item for item in self.clip_uids if item in set(self.usable_clip_uids)]
+            != self.usable_clip_uids
+            or {item.clip_uid for item in self.skipped_clips}
+            != set(self.clip_uids) - set(self.usable_clip_uids)
+        ):
+            raise ValueError("stem DiariZen ordered clip provenance is inconsistent")
+        usable = set(self.usable_clip_uids)
+        if any(
+            set(values) != usable
+            for values in (
+                self.speech_stem_paths_by_clip,
+                self.speech_stem_hashes_by_clip,
+                self.original_audio_paths_by_clip,
+                self.original_audio_hashes_by_clip,
+            )
+        ):
+            raise ValueError("stem DiariZen Audio maps differ from usable clips")
+        if set(self.unverified_clip_uids) - usable or (
+            self.unverified_clip_uids and not self.unverified_consumption_authorized
+        ):
+            raise ValueError("stem DiariZen unverified provenance is inconsistent")
+        return self
 
 
 def _canonical_by_clip(inventory: SAMAudioStemInventory) -> dict[str, CanonicalAudioClip]:
@@ -1308,8 +1552,13 @@ def build_stem_diarization_inventory(
     stem_records: Sequence[SAMAudioStemRecord],
     production_diarization_inventory: DiarizationInventory,
     route: SAMRoute,
+    allow_unverified: bool = False,
 ) -> DiarizationInventory:
-    selected = selected_stem_records(stem_records, route=route)
+    selected = selected_stem_records(
+        stem_records,
+        route=route,
+        allow_unverified=allow_unverified,
+    )
     stem_by_clip = {item.clip_uid: item for item in selected}
     source_targets = {
         item.target_clip_uid: item for item in production_diarization_inventory.targets
@@ -1438,8 +1687,16 @@ def _publish_shadow_readable(
                 end_time=source.end_time,
             )
         )
-    targets.sort(key=lambda item: item.clip_display_path)
-    segments.sort(key=lambda item: (item.clip_display_path, item.source_start_sample, item.segment_id))
+    clip_order = {
+        target.target_clip_uid: index for index, target in enumerate(inventory.targets)
+    }
+    segments.sort(
+        key=lambda item: (
+            clip_order[item.clip_uid],
+            item.source_start_sample,
+            item.segment_id,
+        )
+    )
     _write_jsonl(diarization_root / "readable_targets.jsonl", targets)
     _write_jsonl(diarization_root / "readable_segments.jsonl", segments)
     summary = JEAReadableDiarizationSummary(
@@ -1458,6 +1715,7 @@ def run_stem_diarization_shadow(
     backend: DiarizationBackend,
     route: SAMRoute,
     output_root: Path,
+    allow_unverified: bool = False,
     overwrite: bool = False,
 ) -> StemDiarizationShadowProvenance:
     stem_inventory, stem_records, _ = load_stem_shadow(stem_root)
@@ -1472,17 +1730,40 @@ def run_stem_diarization_shadow(
         stem_records=stem_records,
         production_diarization_inventory=production_inventory,
         route=route,
+        allow_unverified=allow_unverified,
     )
     destination = output_root.expanduser().resolve(strict=False)
     outer = destination.with_name(f".{destination.name}.tmp-{uuid.uuid4().hex}")
-    selected = selected_stem_records(stem_records, route=route)
+    selected = selected_stem_records(
+        stem_records,
+        route=route,
+        allow_unverified=allow_unverified,
+    )
     by_clip = {item.clip_uid: item for item in selected}
+    skips = separation_skips(
+        inventory=stem_inventory,
+        records=stem_records,
+        route=route,
+    )
+    usable_clip_uids = [
+        clip_uid for clip_uid in stem_inventory.clip_uids if clip_uid in by_clip
+    ]
+    unverified_clip_uids = [
+        clip_uid
+        for clip_uid in usable_clip_uids
+        if by_clip[clip_uid].separation_state == "unverified"
+    ]
     records_path = stem_root.expanduser().resolve(strict=True) / "records.jsonl"
     provenance = StemDiarizationShadowProvenance(
         source_stem_inventory_fingerprint=stem_inventory.inventory_fingerprint,
         source_stem_records_sha256=sha256_file(records_path),
         route=route,
         target_count=len(inventory.targets),
+        clip_uids=stem_inventory.clip_uids,
+        usable_clip_uids=usable_clip_uids,
+        skipped_clips=skips,
+        unverified_clip_uids=unverified_clip_uids,
+        unverified_consumption_authorized=allow_unverified,
         speech_stem_paths_by_clip={
             key: by_clip[key].stem("speech").canonical_stem_path for key in sorted(by_clip)
         },
@@ -1510,6 +1791,7 @@ def run_stem_diarization_shadow(
             inventory=inventory,
         )
         _write_json(stage / "stem_provenance.json", provenance)
+        _write_jsonl(stage / "skipped_clips.jsonl", skips)
         stage.replace(outer / "published")
         published = outer / "published"
         _publish_directory(published, destination, overwrite=overwrite)
@@ -1522,7 +1804,7 @@ def run_stem_diarization_shadow(
 
 
 class StemASRShadowProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.stem_asr_shadow.1"] = STEM_ASR_SHADOW_VERSION
+    schema_version: Literal["r2v.h3.stem_asr_shadow.2"] = STEM_ASR_SHADOW_VERSION
     asr_source_kind: Literal["sam_audio_speech_stem_segments"] = (
         "sam_audio_speech_stem_segments"
     )
@@ -1530,8 +1812,34 @@ class StemASRShadowProvenance(SchemaModel):
     source_stem_diarization_provenance_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_stem_inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     route: SAMRoute
+    source_clip_uids: list[str] = Field(min_length=1)
+    clip_uids: list[str] = Field(min_length=1)
+    skipped_clips: list[StemShadowClipSkip]
+    unverified_clip_uids: list[str]
+    unverified_consumption_authorized: bool
     segment_count: int = Field(ge=0)
     production_asr_modified: Literal[False] = False
+
+    @model_validator(mode="after")
+    def validate_clip_provenance(self) -> StemASRShadowProvenance:
+        if (
+            len(self.source_clip_uids) != len(set(self.source_clip_uids))
+            or [
+                item
+                for item in self.source_clip_uids
+                if item in set(self.clip_uids)
+            ]
+            != self.clip_uids
+            or {item.clip_uid for item in self.skipped_clips}
+            != set(self.source_clip_uids) - set(self.clip_uids)
+            or set(self.unverified_clip_uids) - set(self.clip_uids)
+            or (
+                self.unverified_clip_uids
+                and not self.unverified_consumption_authorized
+            )
+        ):
+            raise ValueError("stem ASR ordered clip provenance is inconsistent")
+        return self
 
 
 def run_stem_qwen3_asr_shadow(
@@ -1543,6 +1851,7 @@ def run_stem_qwen3_asr_shadow(
     case_manifest: MimoCaseManifest | None = None,
     segment_audio_loader: SegmentAudioLoader | None = None,
     ffmpeg: str = "ffmpeg",
+    allow_unverified: bool = False,
     overwrite: bool = False,
 ) -> tuple[Qwen3ASRSummary, StemASRShadowProvenance]:
     diarization = stem_diarization_root.expanduser().resolve(strict=True)
@@ -1550,9 +1859,13 @@ def run_stem_qwen3_asr_shadow(
     source_provenance = StemDiarizationShadowProvenance.model_validate_json(
         source_provenance_path.read_text(encoding="utf-8")
     )
-    target_ids = list(source_provenance.speech_stem_paths_by_clip)
-    if case_manifest is not None and case_manifest.clip_uids != target_ids:
+    target_ids = source_provenance.usable_clip_uids
+    if case_manifest is not None and case_manifest.clip_uids != source_provenance.clip_uids:
         raise ValueError("stem ASR case manifest differs from stem diarization order")
+    if source_provenance.unverified_clip_uids and not allow_unverified:
+        raise ValueError(
+            "unverified SAM Audio stems require explicit allow_unverified opt-in"
+        )
     destination = output_root.expanduser().resolve(strict=False)
     outer = destination.with_name(f".{destination.name}.tmp-{uuid.uuid4().hex}")
     try:
@@ -1575,9 +1888,15 @@ def run_stem_qwen3_asr_shadow(
                 source_provenance.source_stem_inventory_fingerprint
             ),
             route=source_provenance.route,
+            source_clip_uids=source_provenance.clip_uids,
+            clip_uids=target_ids,
+            skipped_clips=source_provenance.skipped_clips,
+            unverified_clip_uids=source_provenance.unverified_clip_uids,
+            unverified_consumption_authorized=allow_unverified,
             segment_count=summary.segment_count,
         )
         _write_json(stage / "stem_provenance.json", provenance)
+        _write_jsonl(stage / "skipped_clips.jsonl", provenance.skipped_clips)
         stage.replace(outer / "published")
         _publish_directory(outer / "published", destination, overwrite=overwrite)
         outer.rmdir()
@@ -1604,6 +1923,7 @@ __all__ = [
     "StemNativeReference",
     "StemReferenceManifest",
     "StemReferenceRequest",
+    "StemShadowClipSkip",
     "StemType",
     "build_sam_audio_stem_inventory",
     "build_shadow_primary_voice_reference_requests",
@@ -1616,5 +1936,7 @@ __all__ = [
     "run_stem_qwen3_asr_shadow",
     "sam_audio_configuration",
     "selected_stem_records",
+    "separation_skips",
+    "stem_separation_root",
     "stem_shadow_root",
 ]
