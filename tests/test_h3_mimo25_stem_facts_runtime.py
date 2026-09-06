@@ -70,6 +70,13 @@ def test_sfx_asr_leakage_is_suppressed_without_dropping_real_sfx() -> None:
             ],
             events=[
                 SFXEvent(
+                    start_time=1.0,
+                    end_time=1.2,
+                    description="a short door click",
+                    confidence="medium",
+                    category="physical",
+                ),
+                SFXEvent(
                     start_time=2.2925,
                     end_time=4.381406,
                     description=(
@@ -77,13 +84,6 @@ def test_sfx_asr_leakage_is_suppressed_without_dropping_real_sfx() -> None:
                     ),
                     confidence="high",
                     category="human_non_speech",
-                ),
-                SFXEvent(
-                    start_time=1.0,
-                    end_time=1.2,
-                    description="a short door click",
-                    confidence="medium",
-                    category="physical",
                 ),
             ],
         ),
