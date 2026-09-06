@@ -27,6 +27,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run Qwen3-ASR on SAM speech stems")
     parser.add_argument("--visual-production-root", type=Path, required=True)
     parser.add_argument("--audio-production-root", type=Path, required=True)
+    parser.add_argument("--shadow-run-id")
     parser.add_argument("--case-manifest", type=Path)
     parser.add_argument(
         "--sam-route",
@@ -63,7 +64,7 @@ def _isolated_backend() -> PersistentQwen3ASRBackend:
 def main(argv: list[str] | None = None) -> dict[str, object]:
     arguments = _parser().parse_args(argv)
     paths = jea_production_paths(arguments.audio_production_root)
-    shadow = stem_shadow_root(paths.root)
+    shadow = stem_shadow_root(paths.root, arguments.shadow_run_id)
     output = require_shadow_output_path(
         shadow_root=shadow,
         output_path=arguments.output_root or shadow / "asr",
@@ -82,7 +83,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         "output_root": str(output),
     }
     source_provenance, _, _ = validate_stem_diarization_lineage(
-        shadow / "diarization"
+        shadow / "diarization", expected_shadow_root=shadow,
     )
     if source_provenance.route != arguments.sam_route:
         raise ValueError("stem ASR route differs from selected SAM route")

@@ -27,6 +27,7 @@ from r2v_data_v2.h3.sam_audio_stem_shadow import (
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Export exact stem-native references")
     parser.add_argument("--audio-production-root", type=Path, required=True)
+    parser.add_argument("--shadow-run-id")
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--reference-manifest", type=Path)
     source.add_argument("--primary-voice-root", type=Path)
@@ -47,8 +48,10 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> dict[str, object]:
     arguments = _parser().parse_args(argv)
     paths = jea_production_paths(arguments.audio_production_root)
-    shadow = stem_shadow_root(paths.root)
-    inventory, records, _ = load_stem_shadow(stem_separation_root(paths.root))
+    shadow = stem_shadow_root(paths.root, arguments.shadow_run_id)
+    inventory, records, _ = load_stem_shadow(
+        stem_separation_root(paths.root, arguments.shadow_run_id),
+    )
     selected_clip_uids: list[str] | None = None
     if arguments.case_manifest is not None:
         cases = MimoCaseManifest.model_validate_json(

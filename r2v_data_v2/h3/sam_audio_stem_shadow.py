@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import sys
 import time
@@ -138,15 +139,30 @@ def _publish_directory(temporary: Path, destination: Path, *, overwrite: bool) -
         raise
 
 
-def stem_shadow_root(audio_production_root: Path) -> Path:
-    return (
+def stem_shadow_root(
+    audio_production_root: Path, shadow_run_id: str | None = None,
+) -> Path:
+    root = (
         audio_production_root.expanduser().resolve(strict=False)
         / SAM_AUDIO_SHADOW_ROOT_NAME
     )
+    if shadow_run_id is None:
+        return root
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", shadow_run_id) is None:
+        raise ValueError("invalid SAM Audio shadow run ID")
+    selected = root / "runs" / shadow_run_id
+    if selected.resolve(strict=False) != root.resolve(strict=False) / "runs" / shadow_run_id:
+        raise ValueError("SAM Audio shadow run must not redirect to another root")
+    return selected
 
 
-def stem_separation_root(audio_production_root: Path) -> Path:
-    return stem_shadow_root(audio_production_root) / SAM_AUDIO_SEPARATION_STAGE_NAME
+def stem_separation_root(
+    audio_production_root: Path, shadow_run_id: str | None = None,
+) -> Path:
+    root = stem_shadow_root(audio_production_root, shadow_run_id)
+    return require_shadow_output_path(
+        shadow_root=root, output_path=root / SAM_AUDIO_SEPARATION_STAGE_NAME,
+    )
 
 
 def require_shadow_output_path(*, shadow_root: Path, output_path: Path) -> Path:
@@ -1215,6 +1231,10 @@ def load_stem_shadow(
         item.inventory_fingerprint != inventory.inventory_fingerprint for item in records
     ):
         raise ValueError("SAM Audio record inventory is inconsistent")
+    for record in records:
+        for stem in record.stems:
+            for path in (stem.raw_stem_path, stem.canonical_stem_path):
+                require_shadow_output_path(shadow_root=source, output_path=Path(path))
     return inventory, records, summary
 
 
@@ -1722,6 +1742,8 @@ def _load_stem_diarization_clip_results(
 
 def validate_stem_diarization_lineage(
     root: Path,
+    *,
+    expected_shadow_root: Path | None = None,
 ) -> tuple[
     StemDiarizationShadowProvenance,
     SAMAudioStemInventory,
@@ -1732,6 +1754,11 @@ def validate_stem_diarization_lineage(
         (diarization / "stem_provenance.json").read_text(encoding="utf-8")
     )
     separation = Path(provenance.source_stem_root).expanduser().resolve(strict=True)
+    if expected_shadow_root is not None:
+        expected = expected_shadow_root.expanduser().resolve(strict=True)
+        require_shadow_output_path(shadow_root=expected, output_path=diarization)
+        if separation != expected / SAM_AUDIO_SEPARATION_STAGE_NAME:
+            raise ValueError("stem DiariZen source root differs from selected shadow run")
     inventory, records, _ = load_stem_shadow(separation)
     if sha256_file(separation / "records.jsonl") != provenance.source_stem_records_sha256:
         raise ValueError("stem DiariZen source separation records changed")
@@ -2240,6 +2267,8 @@ class StemASRShadowProvenance(SchemaModel):
 
 def validate_stem_asr_lineage(
     root: Path,
+    *,
+    expected_shadow_root: Path | None = None,
 ) -> tuple[StemASRShadowProvenance, StemDiarizationShadowProvenance]:
     asr_root = root.expanduser().resolve(strict=True)
     provenance = StemASRShadowProvenance.model_validate_json(
@@ -2248,10 +2277,17 @@ def validate_stem_asr_lineage(
     diarization = Path(provenance.source_stem_diarization_root).expanduser().resolve(
         strict=True
     )
+    if expected_shadow_root is not None:
+        expected = expected_shadow_root.expanduser().resolve(strict=True)
+        require_shadow_output_path(shadow_root=expected, output_path=asr_root)
+        if diarization != expected / "diarization":
+            raise ValueError("stem ASR source root differs from selected shadow run")
     source_path = diarization / "stem_provenance.json"
     if sha256_file(source_path) != provenance.source_stem_diarization_provenance_sha256:
         raise ValueError("stem ASR source DiariZen provenance changed")
-    source, _, _ = validate_stem_diarization_lineage(diarization)
+    source, _, _ = validate_stem_diarization_lineage(
+        diarization, expected_shadow_root=expected_shadow_root,
+    )
     if (
         provenance.source_stem_inventory_fingerprint
         != source.source_stem_inventory_fingerprint

@@ -150,7 +150,67 @@ Every optional `--output-root` is constrained to the versioned shadow tree; it
 cannot target current `audio/`, `diarization/`, `asr/`, `h3/`, or MiMo output
 directories.
 
-## Example Pilot
+## Named Pilots
+
+Without `--shadow-run-id`, all six tools retain the exact default layout under
+`$AUDIO_PRODUCTION_ROOT/sam_audio_stem_shadow_v1/`. The validated complete
+one-clip smoke remains there; no migration, copy, or overwrite is needed.
+
+For an independent pilot, pass the same `--shadow-run-id random10-v1` to every
+stage. Its root is
+`$AUDIO_PRODUCTION_ROOT/sam_audio_stem_shadow_v1/runs/random10-v1/`, containing
+`separation/`, `diarization/`, `asr/`, `mimo_stem_facts/`, `mimo_reconcile/`,
+and `references/` (plus the existing owned stem views).
+Run IDs must match `[A-Za-z0-9][A-Za-z0-9._-]{0,63}` exactly. Invalid IDs and
+symlink redirects are rejected, not normalized. Custom `--output-root` values
+must stay within the selected run. Downstream readers use that run's standard
+stage paths, so a custom output location is not automatically discovered.
+Stored absolute paths and hashes must close over the same run: copied artifacts
+whose provenance still points to the default run or another run are rejected.
+Case-manifest order is preserved exactly; run naming performs no sampling.
+
+The following Bash commands launch a new pilot using the existing ordered
+10-clip `CASE_MANIFEST` and already configured runtime environments. They are
+operator commands, not evidence of a new model run. Keep the validated SAM
+environment active for separation; keep `R2V_PYTHON` as the main environment
+for the remaining stages. The ASR runner still launches the isolated
+`QWEN3_ASR_ENV/bin/python` worker; install nothing into the main environment.
+
+```bash
+RUN_ARGS=(--audio-production-root "$AUDIO_PRODUCTION_ROOT"
+  --shadow-run-id random10-v1 --case-manifest "$CASE_MANIFEST"
+  --sam-route music_first)
+
+python tools/run_h3_sam_audio_stem_shadow.py "${RUN_ARGS[@]}" \
+  --sam-audio-code-root "$SAM_AUDIO_CODE_ROOT" \
+  --sam-audio-model-path "$SAM_AUDIO_MODEL_PATH" \
+  --sam-audio-t5-base-path "$SAM_AUDIO_T5_BASE_PATH" \
+  --sam-reranking-candidates 1
+
+"$R2V_PYTHON" tools/run_h3_stem_diarization_shadow.py "${RUN_ARGS[@]}" \
+  --allow-unverified
+
+"$R2V_PYTHON" tools/run_h3_stem_qwen3_asr_shadow.py "${RUN_ARGS[@]}" \
+  --visual-production-root "$VISUAL_PRODUCTION_ROOT" --allow-unverified
+
+"$R2V_PYTHON" tools/run_h3_mimo25_stem_facts_shadow.py "${RUN_ARGS[@]}" \
+  --temperature 0.2 --allow-unverified
+
+"$R2V_PYTHON" tools/run_h3_mimo25_stem_reconcile_shadow.py "${RUN_ARGS[@]}" \
+  --visual-production-root "$VISUAL_PRODUCTION_ROOT" \
+  --visual-runs-root "$VISUAL_RUNS_ROOT" \
+  --max-completion-tokens 32768 --allow-unverified
+
+"$R2V_PYTHON" tools/export_h3_sam_audio_stem_references.py "${RUN_ARGS[@]}" \
+  --primary-voice-root "$AUDIO_PRODUCTION_ROOT/primary_voice" --allow-unverified
+```
+
+The model identifier is derived from the local SAM checkpoint path/config;
+an explicit `--sam-audio-model-name` must agree with it. Do not add
+`--overwrite` when launching this independent pilot. Future pilots can use a
+different valid ID, without touching this run or the default smoke.
+
+## Example Default Pilot
 
 ```bash
 SHADOW="$AUDIO_PRODUCTION_ROOT/sam_audio_stem_shadow_v1"

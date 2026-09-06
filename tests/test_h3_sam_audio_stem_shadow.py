@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 import wave
 from contextlib import nullcontext
@@ -438,6 +439,7 @@ def _run_stems(
     both: bool = False,
     canonicalizer: _Canonicalizer | None = None,
     raw_duration_delta: float | None = None,
+    shadow_run_id: str | None = None,
 ) -> tuple[Path, object, _SAM, _Canonicalizer]:
     manifest, _, _ = _canonical_fixture(tmp_path)
     configuration = _configuration(tmp_path)
@@ -453,7 +455,7 @@ def _run_stems(
         else _DurationDriftSAM(configuration, raw_duration_delta)
     )
     active_canonicalizer = canonicalizer or _Canonicalizer()
-    output = stem_separation_root(tmp_path)
+    output = stem_separation_root(tmp_path, shadow_run_id)
     run_sam_audio_stem_shadow(
         inventory=inventory,
         output_root=output,
@@ -473,6 +475,175 @@ def test_current_production_versions_and_shadow_root_are_unchanged(tmp_path: Pat
     assert stem_separation_root(tmp_path) == (
         tmp_path / SAM_AUDIO_SHADOW_ROOT_NAME / "separation"
     )
+
+
+@pytest.mark.parametrize(
+    "run_id",
+    ["", " ", ".", "..", "/tmp/run", "../run", "a/b", "a\\b", " a", "a ",
+     "a\nb", "-run", "a" * 65],
+)
+def test_named_shadow_rejects_invalid_run_ids(tmp_path: Path, run_id: str) -> None:
+    with pytest.raises(ValueError, match="run ID"):
+        stem_shadow_root(tmp_path, run_id)
+    with pytest.raises(ValueError, match="run ID"):
+        stem_separation_root(tmp_path, run_id)
+
+
+def test_named_shadow_roots_and_output_ownership(tmp_path: Path) -> None:
+    default = stem_shadow_root(tmp_path)
+    selected = stem_shadow_root(tmp_path, "random10-v1")
+    other = stem_shadow_root(tmp_path, "random20-v1")
+    assert selected == default / "runs/random10-v1"
+    assert stem_separation_root(tmp_path, "random10-v1") == selected / "separation"
+    assert selected != other
+    assert stem_shadow_root(tmp_path, "a" * 64).name == "a" * 64
+    for stage in ("separation", "diarization", "asr", "mimo_stem_facts",
+                  "mimo_reconcile", "references"):
+        assert require_shadow_output_path(
+            shadow_root=selected, output_path=selected / stage,
+        ) == selected / stage
+        for outside in (default / stage, other / stage, tmp_path / stage):
+            with pytest.raises(ValueError, match="shadow root"):
+                require_shadow_output_path(shadow_root=selected, output_path=outside)
+    other.mkdir(parents=True)
+    selected.symlink_to(other, target_is_directory=True)
+    with pytest.raises(ValueError, match="redirect"):
+        stem_shadow_root(tmp_path, "random10-v1")
+
+
+def test_two_named_separations_preserve_default_and_each_other(tmp_path: Path) -> None:
+    default, _, _, _ = _run_stems(tmp_path)
+    before = {path: path.read_bytes() for path in default.rglob("*") if path.is_file()}
+    first, _, _, _ = _run_stems(tmp_path, shadow_run_id="pilot-a")
+    first_before = {
+        path: path.read_bytes() for path in first.rglob("*") if path.is_file()
+    }
+    second, _, _, _ = _run_stems(tmp_path, shadow_run_id="pilot-b")
+    assert len({default, first, second}) == 3
+    for path, content in (before | first_before).items():
+        assert path.read_bytes() == content
+    for root in (default, first, second):
+        _, records, _ = load_stem_shadow(root)
+        assert all(
+            root in Path(stem.canonical_stem_path).parents
+            for record in records for stem in record.stems
+        )
+
+
+@pytest.mark.parametrize("run_id", [None, "random10-v1"])
+def test_six_shadow_clis_use_selected_run_and_preserve_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, run_id: str | None,
+) -> None:
+    from tools import (
+        export_h3_sam_audio_stem_references as references_cli,
+    )
+    from tools import (
+        run_h3_mimo25_stem_facts_shadow as facts_cli,
+    )
+    from tools import (
+        run_h3_mimo25_stem_reconcile_shadow as reconcile_cli,
+    )
+    from tools import (
+        run_h3_sam_audio_stem_shadow as separation_cli,
+    )
+    from tools import (
+        run_h3_stem_diarization_shadow as diarization_cli,
+    )
+    from tools import (
+        run_h3_stem_qwen3_asr_shadow as asr_cli,
+    )
+
+    separation, diarization, asr, _, order = _run_three_clip_shadow_to_asr(
+        tmp_path, shadow_run_id=run_id,
+    )
+    shadow = stem_shadow_root(tmp_path, run_id)
+    common = ["--audio-production-root", str(tmp_path),
+              "--case-manifest", str(tmp_path / "case.json")]
+    if run_id is not None:
+        common += ["--shadow-run-id", run_id]
+        assert not (stem_shadow_root(tmp_path) / "separation").exists()
+    dry = [*common, "--dry-run"]
+    result = separation_cli.main([
+        *dry, "--sam-audio-code-root", str(tmp_path / "sam-code"),
+        "--sam-audio-model-path", str(tmp_path / "sam-model"),
+        "--sam-audio-t5-base-path", str(tmp_path / "t5-base"),
+    ])
+    assert result["output_root"] == str(separation)
+    assert result["clip_uids"] == order
+    shutil.copytree(tmp_path / "production-diarization", tmp_path / "diarization")
+    result = diarization_cli.main([*dry, "--allow-unverified"])
+    assert result["output_root"] == str(diarization)
+    assert result["target_clip_uids"] == order
+
+    def no_asr_backend(**kwargs):
+        raise AssertionError("dry run must not construct the isolated ASR backend")
+
+    monkeypatch.setattr(asr_cli, "_isolated_backend", no_asr_backend)
+    result = asr_cli.main([
+        *dry, "--visual-production-root", "/visual/source", "--allow-unverified",
+    ])
+    assert result["diarization_root"] == str(diarization)
+    assert result["output_root"] == str(asr)
+    result = facts_cli.main([*dry, "--allow-unverified"])
+    assert result["output_root"] == str(shadow / "mimo_stem_facts")
+    assert result["clip_uids"] == order
+    facts_summary = run_mimo25_stem_facts_shadow(
+        stem_root=separation, route="music_first", backend=_FactsBackend(),
+        view_backend=_ViewBackend(), output_root=shadow / "mimo_stem_facts",
+        allow_unverified=True,
+    )
+    assert facts_summary.source_clip_uids == order
+    assert facts_summary.source_stem_root == str(separation)
+    assert facts_summary.source_stem_diarization_root == str(diarization)
+    assert facts_summary.source_stem_asr_root == str(asr)
+    base = _mimo_inventory_for_clip_order(tmp_path / "base", order)
+    monkeypatch.setattr(reconcile_cli, "build_mimo25_inventory", lambda **kwargs: base)
+    result = reconcile_cli.main([
+        *dry, "--visual-production-root", "/visual/source",
+        "--visual-runs-root", "/visual/runs", "--allow-unverified",
+    ])
+    assert result["output_root"] == str(shadow / "mimo_reconcile")
+    assert result["clip_uids"] == order
+    reference_manifest = tmp_path / "references.json"
+    reference_manifest.write_text(json.dumps({
+        "schema_version": "r2v.h3.sam_audio_stem_reference_manifest.1",
+        "requests": [{
+            "reference_id": clip, "clip_uid": clip, "route": "music_first",
+            "stem_type": "speech", "start_time": 0, "end_time": 0.5,
+        } for clip in order],
+    }), encoding="utf-8")
+    monkeypatch.setattr(references_cli, "FFmpegAudioMediaBackend", lambda **kwargs: _Media())
+    result = references_cli.main([
+        *common, "--reference-manifest", str(reference_manifest), "--allow-unverified",
+    ])
+    assert result["output_root"] == str(shadow / "references")
+    assert result["reference_ids"] == order
+    for reference in result["references"]:
+        assert str(separation) in reference["source_stem_path"]
+
+
+@pytest.mark.parametrize("source_run", [None, "pilot-other"])
+@pytest.mark.parametrize("stage", ["separation", "diarization", "asr"])
+def test_named_run_rejects_copied_cross_run_lineage(
+    tmp_path: Path, source_run: str | None, stage: str,
+) -> None:
+    separation, diarization, asr, _, _ = _run_three_clip_shadow_to_asr(
+        tmp_path, shadow_run_id=source_run,
+    )
+    selected = stem_shadow_root(tmp_path, "pilot-current")
+    selected.mkdir(parents=True)
+    source = {"separation": separation, "diarization": diarization, "asr": asr}[stage]
+    copied = selected / stage
+    shutil.copytree(source, copied)
+    before = {path: path.read_bytes() for path in source.rglob("*") if path.is_file()}
+    with pytest.raises(ValueError, match="shadow (root|run)"):
+        if stage == "separation":
+            load_stem_shadow(copied)
+        elif stage == "diarization":
+            validate_stem_diarization_lineage(copied, expected_shadow_root=selected)
+        else:
+            validate_stem_asr_lineage(copied, expected_shadow_root=selected)
+    assert all(path.read_bytes() == data for path, data in before.items())
 
 
 def test_shadow_output_guard_rejects_current_production_directories(
@@ -2121,6 +2292,7 @@ def _run_three_clip_shadow_to_asr(
     tmp_path: Path,
     *,
     diarization_backend: _Diarization | None = None,
+    shadow_run_id: str | None = None,
 ) -> tuple[Path, Path, Path, object, list[str]]:
     clip_order = ["clip-z", "clip-a", "clip-m"]
     manifest, canonical_records, case = _multi_canonical_fixture(
@@ -2133,7 +2305,7 @@ def _run_three_clip_shadow_to_asr(
         model_configuration=configuration,
         case_manifest_path=case,
     )
-    separation = stem_separation_root(tmp_path)
+    separation = stem_separation_root(tmp_path, shadow_run_id)
     run_sam_audio_stem_shadow(
         inventory=inventory,
         output_root=separation,

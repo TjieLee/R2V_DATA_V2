@@ -42,6 +42,7 @@ from r2v_data_v2.h3.sam_audio_stem_shadow import (
     StemShadowClipSkip,
     StemType,
     load_stem_shadow,
+    require_shadow_output_path,
     selected_stem_records,
     separation_skips,
     sha256_file,
@@ -972,9 +973,11 @@ def run_mimo25_stem_facts_shadow(
     diarization_root = shadow_root / "diarization"
     asr_root = shadow_root / "asr"
     diarization_provenance, _, _ = validate_stem_diarization_lineage(
-        diarization_root
+        diarization_root, expected_shadow_root=shadow_root,
     )
-    asr_provenance, asr_source_provenance = validate_stem_asr_lineage(asr_root)
+    asr_provenance, asr_source_provenance = validate_stem_asr_lineage(
+        asr_root, expected_shadow_root=shadow_root,
+    )
     separation_selected_ids = [item.clip_uid for item in separation_selected]
     selected_ids = diarization_provenance.usable_clip_uids
     selected = [selected_by_clip[item] for item in selected_ids]
@@ -1302,10 +1305,17 @@ def validate_stem_facts_lineage(
     facts_path = facts_root.expanduser().resolve(strict=True)
     diarization = stem_diarization_root.expanduser().resolve(strict=True)
     asr_root = stem_asr_root.expanduser().resolve(strict=True)
-    diarization_provenance, stem_inventory, stem_records = (
-        validate_stem_diarization_lineage(diarization)
+    require_shadow_output_path(
+        shadow_root=diarization.parent, output_path=facts_path,
     )
-    asr_provenance, asr_source = validate_stem_asr_lineage(asr_root)
+    diarization_provenance, stem_inventory, stem_records = (
+        validate_stem_diarization_lineage(
+            diarization, expected_shadow_root=diarization.parent,
+        )
+    )
+    asr_provenance, asr_source = validate_stem_asr_lineage(
+        asr_root, expected_shadow_root=diarization.parent,
+    )
     if asr_source != diarization_provenance:
         raise ValueError("stem facts ASR does not consume current DiariZen provenance")
     summary = MimoStemFactsSummary.model_validate_json(
@@ -1492,8 +1502,12 @@ def build_stem_reconcile_jobs(
 ) -> list[MimoClipJob]:
     diarization = stem_diarization_root.expanduser().resolve(strict=True)
     asr_root = stem_asr_root.expanduser().resolve(strict=True)
-    diarization_provenance, _, _ = validate_stem_diarization_lineage(diarization)
-    asr_provenance, asr_source = validate_stem_asr_lineage(asr_root)
+    diarization_provenance, _, _ = validate_stem_diarization_lineage(
+        diarization, expected_shadow_root=diarization.parent,
+    )
+    asr_provenance, asr_source = validate_stem_asr_lineage(
+        asr_root, expected_shadow_root=diarization.parent,
+    )
     if (
         asr_source != diarization_provenance
         or asr_provenance.source_clip_uids != diarization_provenance.clip_uids

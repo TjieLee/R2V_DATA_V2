@@ -68,6 +68,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--visual-production-root", type=Path, required=True)
     parser.add_argument("--visual-runs-root", type=Path, required=True)
     parser.add_argument("--audio-production-root", type=Path, required=True)
+    parser.add_argument("--shadow-run-id")
     parser.add_argument("--case-manifest", type=Path, required=True)
     parser.add_argument(
         "--sam-route",
@@ -90,8 +91,8 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> dict[str, object]:
     arguments = _parser().parse_args(argv)
     paths = jea_production_paths(arguments.audio_production_root)
-    shadow = stem_shadow_root(paths.root)
-    separation = stem_separation_root(paths.root)
+    shadow = stem_shadow_root(paths.root, arguments.shadow_run_id)
+    separation = stem_separation_root(paths.root, arguments.shadow_run_id)
     output = require_shadow_output_path(
         shadow_root=shadow,
         output_path=arguments.output_root or shadow / "mimo_reconcile",
@@ -101,7 +102,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
     )
     stem_inventory, stem_records, _ = load_stem_shadow(separation)
     diarization_provenance, _, _ = validate_stem_diarization_lineage(
-        shadow / "diarization"
+        shadow / "diarization", expected_shadow_root=shadow,
     )
     facts_summary, facts = validate_stem_facts_lineage(
         facts_root=shadow / "mimo_stem_facts",

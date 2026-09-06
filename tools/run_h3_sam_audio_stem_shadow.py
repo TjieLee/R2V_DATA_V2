@@ -27,6 +27,7 @@ from r2v_data_v2.h3.sam_audio_stem_shadow import (
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run opt-in SAM Audio stem shadow")
     parser.add_argument("--audio-production-root", type=Path, required=True)
+    parser.add_argument("--shadow-run-id")
     parser.add_argument("--sam-audio-code-root", type=Path, required=True)
     parser.add_argument("--sam-audio-model-path", type=Path, required=True)
     parser.add_argument("--sam-audio-model-name")
@@ -56,10 +57,12 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> dict[str, object]:
     arguments = _parser().parse_args(argv)
     paths = jea_production_paths(arguments.audio_production_root)
-    shadow = stem_shadow_root(paths.root)
+    shadow = stem_shadow_root(paths.root, arguments.shadow_run_id)
     output = require_shadow_output_path(
         shadow_root=shadow,
-        output_path=arguments.output_root or stem_separation_root(paths.root),
+        output_path=arguments.output_root or stem_separation_root(
+            paths.root, arguments.shadow_run_id,
+        ),
     )
     configuration = sam_audio_configuration(
         implementation_root=arguments.sam_audio_code_root,
