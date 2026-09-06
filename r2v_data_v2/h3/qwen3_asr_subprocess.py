@@ -6,6 +6,7 @@ import os
 import select
 import subprocess
 from pathlib import Path
+from typing import Self
 
 import numpy as np
 
@@ -34,7 +35,7 @@ class PersistentQwen3ASRBackend:
         self._process: subprocess.Popen[str] | None = None
         self._request_index = 0
 
-    def __enter__(self) -> PersistentQwen3ASRBackend:
+    def __enter__(self) -> Self:
         self._start()
         return self
 
