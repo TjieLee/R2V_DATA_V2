@@ -11,6 +11,13 @@ the full media collection path. See `docs/H3_QWEN3_ASR.md`. Legacy Whisper
 pilots are retained but are not selected by this production path; Dots3 remains
 paused.
 
+An opt-in `sam_audio_stem_shadow_v1` experiment now supports bounded full-clip
+music-first or voice-first SAM Audio separation, speech-stem DiariZen/Qwen3-ASR,
+timed stem facts, stem-aware MiMo reconciliation, and exact stem-native
+references. The original target AV remains final authority, unverified separator
+output is not promoted to fact, and no current production consumer or frozen
+MiMo/materializer version is changed. See `docs/H3_SAM_AUDIO_STEM_SHADOW.md`.
+
 For ordinary single-run exports, Audio consumes a strict stable projection of
 `subject_attributes/enriched_samples.jsonl`. It validates the selected
 reference/attribute provenance needed downstream but does not depend on Visual's
