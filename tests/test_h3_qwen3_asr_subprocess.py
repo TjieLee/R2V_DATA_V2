@@ -61,6 +61,21 @@ def _configuration() -> Qwen3ASRConfiguration:
     )
 
 
+def test_persistent_qwen_backend_preserves_venv_python_symlink(tmp_path: Path) -> None:
+    base_python = tmp_path / "base-python"
+    base_python.write_text("", encoding="utf-8")
+    venv_python = tmp_path / "venv-python"
+    venv_python.symlink_to(base_python)
+    backend = PersistentQwen3ASRBackend(
+        _configuration(),
+        python_path=venv_python,
+        worker_path=_fake_worker(tmp_path),
+        timeout_seconds=5,
+    )
+    assert backend.python_path == venv_python.absolute()
+    assert backend.python_path != venv_python.resolve()
+
+
 def test_persistent_qwen_backend_uses_isolated_worker_environment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
