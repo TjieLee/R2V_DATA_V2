@@ -108,12 +108,10 @@ def _canonicalize_sfx_draft(
     def clean(
         values: list[BoundedSFXContinuousLayerDraft | BoundedSFXEventDraft],
     ) -> list[BoundedSFXContinuousLayerDraft | BoundedSFXEventDraft]:
-        nonlocal (
-            nonpositive_count,
-            duplicate_count,
-            asr_leakage_count,
-            music_leakage_count,
-        )
+        nonlocal nonpositive_count
+        nonlocal duplicate_count
+        nonlocal asr_leakage_count
+        nonlocal music_leakage_count
         output: list[BoundedSFXContinuousLayerDraft | BoundedSFXEventDraft] = []
         seen: set[tuple[object, ...]] = set()
         for item in values:
