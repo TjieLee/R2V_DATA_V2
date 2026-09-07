@@ -2,7 +2,7 @@
 
 This experimental path is additive and read-only with respect to the current JEA
 production stages. The current path is the named SAM shadow entry, publishing
-`mimo_reconcile_av_rawstems_sound_partition/` after existing separation,
+`mimo_reconcile_av_stemtext_sound_partition/` after existing separation,
 DiariZen and ASR. Historical `mimo25_av_reconcile_v5/`, `mimo25_h3_shadow_v5/`,
 stem-facts and older reconcile artifacts are not migrated or overwritten.
 See `H3_AUDIO_SERVER_RUNBOOK.md` Stage 4 for current run and QA commands.
@@ -20,10 +20,13 @@ speaker reconciliation; MiMo is the final AV authority for this shadow path.
 - one MiMo-V2.5 joint-AV request returns visual/audio observation, AV grounding,
   and direct `h3_semantics`. MiMo authors natural `style_opening` / `shot1_caption`,
   and one full `sound_description`; there is no playback projection or compositor.
-  The original video/audio is accompanied by raw music and SFX audio, not stem
-  semantic text or stem-video proxies. No speech stem or duplicate full audio is sent.
-- one separate text-only request partitions only `sound_description` into
-  `overall_soundscape` and `non_diegetic_music`, without media, ICL or history.
+  Only reference images and original video with embedded audio are sent here.
+- two concurrent audio-only requests independently describe music/SFX canonical
+  stems with the same role-blind prompt. No AV, ASR, references, caption or ICL.
+- one text-only request fuses original `sound_description` with available auxiliary
+  prose into `overall_soundscape` and `non_diegetic_music`, without media/ICL/history.
+  Positive auxiliary evidence can recover weak sounds, but auxiliary absence
+  does not prove original-AV absence. Unavailable sources are not silence.
 - the deterministic boundary preserves frozen Subject/Picture ownership and
   checks generated vocal-event formatting without rewriting dialogue. Adjacent
   same-speaker ASR turns may share one natural `<d>` block; ASR artifacts stay
@@ -56,7 +59,7 @@ The final system block prioritizes caption prose. `style_opening` describes only
 global cinematographic style/camera language/lighting, not scene contents or
 actions. Model input has one authoritative segment inventory; old
 `job.r2v_instruction` prose stays stored for provenance but is not model input.
-The new sound schema and two-request contract change versions, not frozen
+The four-request sound contract change versions, not frozen
 reference or speaker authority. This is not a verified quality improvement.
 
 The official Complete Example in `docs/VIDEO_PROMPT_WRITING_GUIDE_ref_en.md`
@@ -172,10 +175,10 @@ they do not create additional MiMo model jobs.
 
 Prompt, policy, annotation schema, and materializer versions are:
 
-- `h3_mimo25_unified_av_reconcile_v29`
+- `h3_mimo25_unified_av_reconcile_v30`
 - `h3_mimo25_av_authority_contract_v17`
 - `r2v.h3.mimo25_av_annotation.19`
-- `r2v.h3.mimo25_backend.32`
+- `r2v.h3.mimo25_backend.33`
 - `h3_mimo25_materializer_v22`
 - `h3_mimo25_reference_selection_v1`
 - `h3_mimo25_recovered_voice_quality_v1`
@@ -204,12 +207,13 @@ JSON-object transport. The Stage B Audio decision uses a
 refinement and uncertain decisions still require the field explicitly and may
 publish `null`. This invariant is enforced by SGLang constrained decoding and
 again by backend semantic validation.
-Payloads and API keys are never persisted. Explicit zero video/audio tokens
-fail closed without resending media. Missing usage details remain warnings.
+Payloads and API keys are never persisted. Explicit zero video/image tokens
+fail closed without resending media. Zero/missing embedded audio tokens remain
+warnings only; no canonical-audio fallback or video resend is performed.
 Both the adapter and OpenAI SDK allow one attempt per stage, no hidden retries.
 First-stage output is caption plus full sound description without global
 soundscape/music statuses, absence codes, event timing or duplicated prose.
-The second stage validates only JSON shape and two string fields: no semantic
+Final text reconciliation validates only JSON shape and two string fields: no semantic
 equivalence, absence, leakage, keywords or scoring gate and no repair call.
 Its `N/A` is an unsupported-field placeholder, not verified silence.
 
@@ -256,13 +260,16 @@ The exact request contract keeps `fps` and `media_resolution` beside the
 The first Xiaomi request retains `thinking={"type":"disabled"}`.
 SGLang uses `use_audio_in_video=true`, `reasoning_effort="none"`,
 and `chat_template_kwargs={"thinking":false,"enable_thinking":false}`.
-The named raw-stem entry adds two explicit audio URLs alongside the one original
-video and existing images, with same-time-zero, original-AV-authority and
-leakage cautions. These are not H3 Audio references.
-The second request uses only a short system and sound-description user text,
-temperature 0, disabled thinking, 1024 completion tokens, and a strict two-string
-JSON schema. It does not send `use_audio_in_video` or any first-stage history.
-There is no canonical-audio fallback or full-AV recheck.
+The first request sends only original video and reference images.
+Two subsequent audio-only requests each send one canonical stem audio URL,
+without video/image/ASR/reference/caption/ICL or role hints. They run concurrently,
+use temperature 0, disabled thinking, 1024 tokens, and a one-string description
+schema. A single text-only request then combines the three descriptions using
+the same limits and the strict two-string sound schema. Neither audio-only nor
+text-only requests send `use_audio_in_video` or AV history.
+Normal counts: AV=1, audio=2, text=1, total=4. Every call has one attempt.
+Auxiliary errors retain raw/error evidence and do not erase AV or another source.
+There is no canonical-audio fallback, full-AV recheck or semantic sound checker.
 
 The local SGLang transport was validated at `http://127.0.0.1:8092/v1` with
 `mimo-v2.5` on 8 H200 GPUs using TP8, DP2, and DP-attention. The observed smoke
@@ -272,15 +279,15 @@ seconds. That SGLang checkout carries an external runtime patch for upstream
 `sglang#37060` (MiMo audio encoder deadlock under TP8+DP2); R2V does not modify
 or own that external source patch.
 
-That historical smoke does not verify the new one-video/two-audio combination.
-Only fake-client tests cover the new payload. Aggregate audio tokens cannot
-establish consumption of all audio inputs; unsupported media requests retain
-their error, never drop an input and resend. No model environment changes or
-performance/quality claims are made by this patch.
+The new four-request flow has fake-client coverage only, not sound-quality
+validation. The server 833 smoke and human QA remain necessary.
+Old `mimo_reconcile_av_rawstems_sound_partition/` and
+`mimo_v29_oneclip_smoke/` outputs are not migrated or overwritten.
+Reconcile record .9, summary .11 and policy v4 distinguish this request history.
 
 An invalid first annotation or caption keeps raw prose and errors; a readable
 sound description can still receive its one text request. A text API/JSON failure
-preserves first-stage evidence and does not trigger a third request. Later clips
+preserves first-stage and auxiliary evidence and does not trigger a repair request. Later clips
 continue. Identity-product exclusions remain independent of raw caption visibility.
 Final sound sections use only the partition; no internal status or stock prose
 overrides them. Optional music references lacking event timing remain unavailable,

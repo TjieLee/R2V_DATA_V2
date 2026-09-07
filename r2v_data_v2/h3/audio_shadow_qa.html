@@ -86,7 +86,8 @@ small{color:#626e73}a{color:#176c9a}#loading{padding:20px}
 <h2>Auxiliary SAM stem evidence</h2><p id="separation-status"></p>
 <div id="stems" class="stem-grid"></div>
 <details><summary>Separation provenance / alignment</summary><pre id="separation"></pre></details>
-<div class="evidence"><section><h2>First AV sound description</h2><pre id="sound-description"></pre></section><section><h2>Text-only sound partition</h2><pre id="sound-partition"></pre></section></div>
+<div class="evidence"><section><h2>Music-stem audio-only description</h2><pre id="music-stem-description"></pre></section><section><h2>SFX-stem audio-only description</h2><pre id="sfx-stem-description"></pre></section></div>
+<div class="evidence"><section><h2>Original AV sound description</h2><pre id="sound-description"></pre></section><section><h2>Text-only sound partition: final overall_soundscape / non_diegetic_music</h2><pre id="sound-partition"></pre></section></div>
 <details id="reconcile"><summary>MiMo structured annotation / diagnostic evidence</summary><div id="reconcile-body"></div></details>
 </main>
 <script>
@@ -231,6 +232,10 @@ function render() {
     if (url) { const audio = document.createElement("audio"); audio.controls = true; audio.preload = "none"; audio.src = url; section.append(audio); }
     $("stems").append(section);
   });
+  for (const role of ["music", "sfx"]) {
+    $(role + "-stem-description").textContent = (clip.reconcile[role + "_stem_description"] ?? "[unavailable]") +
+      (clip.reconcile[role + "_stem_error"] ? "\nError: " + clip.reconcile[role + "_stem_error"] : "");
+  }
   $("sound-description").textContent = clip.reconcile.sound_description ?? "[unavailable]";
   $("sound-partition").textContent = pretty({
     result: clip.reconcile.sound_partition,
@@ -253,7 +258,7 @@ function render() {
     model_call_count: result.model_call_count, diagnostics: result.diagnostics,
     backend_provenance: result.backend_provenance, source_job_fingerprint: result.source_job_fingerprint,
     source_stem_record_fingerprint: result.source_stem_record_fingerprint,
-    av_model_call_count: result.av_model_call_count, text_model_call_count: result.text_model_call_count,
+    av_model_call_count: result.av_model_call_count, audio_model_call_count: result.audio_model_call_count, text_model_call_count: result.text_model_call_count,
     issues: result.failure_issues
   }));
   updateProgress(); $("main").hidden = false; $("loading").hidden = true;

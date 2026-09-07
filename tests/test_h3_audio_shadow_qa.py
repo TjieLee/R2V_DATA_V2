@@ -15,6 +15,7 @@ from r2v_data_v2.h3 import audio_shadow_qa as qa
 from r2v_data_v2.h3.jea_final_renderer import FinalH3SampleV2
 from r2v_data_v2.h3.mimo25_av_reconcile import _inventory, _job
 from r2v_data_v2.h3.mimo25_backend import (
+    MimoAuxAudioDescriptionCall,
     MimoAVAnnotationDraft,
     MimoBackendConfig,
     MimoBackendFailure,
@@ -50,7 +51,15 @@ class _Reconcile:
             api_key="fake", transport="sglang",
         ).provenance()
 
-    def partition_sound_description(self, sound_description):
+    def describe_auxiliary_audio(self, path):
+        return MimoAuxAudioDescriptionCall(
+            description="A quiet sound.", raw_response='{"description":"A quiet sound."}',
+            diagnostic=MimoCompletionDiagnostic(
+                input_modality="auxiliary_audio_only", usage=MimoUsage(), http_attempt_count=1,
+            ),
+        )
+
+    def reconcile_sound_descriptions(self, original_sound_description, music_stem_description, sfx_stem_description):
         return MimoSoundPartitionCall(
             partition=MimoSoundPartition(overall_soundscape="A room tone and a short clink.", non_diegetic_music="N/A"),
             raw_response='{"overall_soundscape":"A room tone and a short clink.","non_diegetic_music":"N/A"}',
@@ -178,13 +187,13 @@ def test_builder_ready_failed_order_media_and_sources_unchanged(tmp_path, monkey
     assert result["output_root"] == str(output)
     data = json.loads((output / "data.json").read_text())
     reconcile_summary = json.loads((shadow / MIMO25_STEM_RECONCILE_STAGE / "summary.json").read_text())
-    assert reconcile_summary["schema_version"] == "r2v.h3.mimo25_stem_reconcile_summary.10"
+    assert reconcile_summary["schema_version"] == "r2v.h3.mimo25_stem_reconcile_summary.11"
     assert reconcile_summary["current_mimo_versions_modified"] is True
     assert data["clip_uids"] == ["clip-z", "clip-a", "clip-m"]
     assert [clip["reconcile"]["status"] for clip in data["clips"]] == ["ready", "failed", "ready"]
     failed = data["clips"][1]["reconcile"]
     assert failed["failure_code"] == "synthetic_failed"
-    assert failed["model_call_count"] == 2
+    assert failed["model_call_count"] == 4
     assert data["clips"][1]["direct_h3"]["style_opening"]
     assert data["clips"][1]["direct_h3"]["shot1_caption"]
     assert data["clips"][0]["reconcile"]["annotation"]["audio_observation"]

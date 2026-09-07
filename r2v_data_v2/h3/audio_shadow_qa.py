@@ -201,6 +201,7 @@ def build_audio_shadow_qa(
         or summary.ready_count != sum(item.status == "ready" for item in reconcile)
         or summary.failed_count != sum(item.status == "failed" for item in reconcile)
         or summary.model_call_count != sum(item.model_call_count for item in reconcile)
+        or summary.audio_model_call_count != sum(item.audio_model_call_count for item in reconcile)
         or summary.av_model_call_count != sum(item.av_model_call_count for item in reconcile)
         or summary.text_model_call_count != sum(item.text_model_call_count for item in reconcile)
     ):

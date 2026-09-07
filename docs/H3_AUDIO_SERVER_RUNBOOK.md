@@ -43,7 +43,7 @@ sam_audio_stem_shadow_v1/runs/<shadow-run-id>/
   separation/
   diarization/
   asr/
-  mimo_reconcile_av_rawstems_sound_partition/
+  mimo_reconcile_av_stemtext_sound_partition/
   references/
 ```
 
@@ -241,7 +241,7 @@ PYTHONPATH="$SAM_AUDIO_RUNTIME_PYTHONPATH" \
   --allow-unverified
 ```
 
-### 4. One original AV plus raw stems, then text-only sound partition
+### 4. One original AV, two audio-only descriptions, then text fusion
 
 After separation, DiariZen and ASR, run this entry directly. Do not run
 `run_h3_mimo25_stem_facts_shadow.py`; neither `mimo_stem_facts/` nor three
@@ -257,58 +257,61 @@ stem-video proxies are inputs.
   --allow-unverified
 ```
 
-The first user content contains exactly one original target video with embedded
-audio, existing reference images, and two `audio_url` items read from the selected
-separation record: proposed music and SFX. They share clip time zero, may contain
-leakage, and are observation evidence rather than H3 conditioning assets. There
-is no speech-stem input, duplicate canonical full audio, stem semantic JSON, or
-media repackaging. Original AV remains authoritative.
+The first request sends exactly one original target video with embedded audio
+and the unchanged reference images, authoritative text facts, and official
+opening + Shot 1 ICL. It sends no independent audio or stem prose. Defaults
+remain `--thinking disabled --icl official_ref2va_v1`, temperature 0.0,
+and `use_audio_in_video=true`. Embedded audio token counts of zero or missing
+are diagnostic warnings only; they never cause a video resend or fallback.
 
-The first annotation keeps speaker/AV grounding and natural
-`style_opening` / `shot1_caption`, and emits one `sound_description` instead of
-global soundscape/music statuses or timed-event inventories. Existing speaker
-normalization and identity-product exclusions remain intact.
+After AV completes, two audio-only requests run concurrently (max two threads).
+Each receives just one canonical SAM audio URL with the same role-blind prompt,
+no video, image, ASR, references, caption or ICL. File hashes are checked against
+separation provenance. Temperature 0, disabled thinking, 1024 completion tokens
+and a one-string `description` schema apply. These requests do not send
+`use_audio_in_video`. Results/errors are stored by music/SFX pipeline role,
+not completion order. A failed auxiliary does not erase the other result or AV.
 
-The second request contains only a short system instruction and the first
-`sound_description` as user text. It has no media, ASR, references, ICL, previous
-messages or caption. Disabled thinking, temperature 0, 1024 completion tokens,
-and a strict two-string JSON schema produce `overall_soundscape` and
-`non_diegetic_music`. The partition is not a semantic audit or a remedy for
-sounds missed in the first observation. Unsupported fields use `N/A` as a
-placeholder, not a claim of confirmed silence. No content-keyword QC is applied.
+A final text-only request receives original AV sound prose plus available
+auxiliary descriptions. Positive auxiliary evidence can recover a weak audible
+sound missed by AV; auxiliary absence cannot establish absence in the original.
+The prompt removes speech/singing/music from `overall_soundscape` and retains
+only supported audience-facing score in `non_diegetic_music`. Missing auxiliary
+evidence is `SOURCE_UNAVAILABLE`, not silence. Only JSON/two-string shape is
+validated; no content checker is added. No original sound description means no
+text fusion call, but auxiliary descriptions remain available for QA.
 
-Both stages make exactly one request attempt: no SDK retry, HTTP retry,
-zero-audio fallback, full-AV recheck or third repair call. Errors preserve raw
-output and diagnostics and later clips continue. A parseable
-`sound_description` may be partitioned even when AV grounding or caption
-format failed; that does not authorize identity-specific products.
+Normal per-clip counts: AV=1, audio=2, text=1, total=4. Each request has one
+attempt, SDK retries disabled; there is no repair, fallback or AV recheck.
+Failures preserve raw/error/usage diagnostics and do not trigger another call.
+Text failure retains AV and all sound descriptions; existing final H3 gates
+remain unchanged. Dialogue, grounding, multiple-speaker exclusion and six-section
+Ref2VA materialization are unchanged.
 
-First-stage defaults remain `--thinking disabled --icl official_ref2va_v1`,
-temperature 0.0. The official opening + Shot 1 ICL
-(`h3_official_ref2va_detailed_shot1_v2`) is unchanged. First-stage SGLang still
-uses `use_audio_in_video=true`; the text stage does not send that flag.
+Versions: prompt v30, annotation .19, backend .33, materializer v22, authority
+v17, ICL v2; reconcile record .9, summary .11, policy v4. New output:
+`mimo_reconcile_av_stemtext_sound_partition/`. The old
+`mimo_reconcile_av_rawstems_sound_partition/` and `mimo_v29_oneclip_smoke/`
+are preserved, not migrated.
 
-Dialogue is model-authored. Consecutive same-speaker ASR segments may share one
-natural `<d>[Language] ...</d>` block. Code checks paired tags, language markers,
-allowed labels and a valid `(Sx)` in each generated vocal-event lead-in; it does
-not count/zip against ASR segments, rewrite text, or infer binding from syntax.
-Upstream ASR files remain immutable and are shown separately for review.
-Detailed description is exactly
-`style_opening + "\n[Shot 1] " + shot1_caption`; final sound sections come only
-from the text partition. Six-section Ref2VA output and frozen reference ownership
-remain unchanged. Raw caption stays visible when final materialization is blocked.
+For a fresh 833 single-clip smoke, set `CASE_833_MANIFEST` to an existing manifest
+containing only `8331da9bfe08e7f67e5e398d`. It must be an ordered subset of the
+existing named separation inventory. This reuses SAM/DiariZen/ASR without reruns:
 
-Current versions: prompt v29, annotation .19, backend .32, materializer v22,
-authority v17 unchanged; raw-stem reconcile records .8, summary .10, policy v3.
-New output is `mimo_reconcile_av_rawstems_sound_partition/`. Old experiments
-are not migrated or rewritten. Normal random10 request counts are 10 AV and
-10 text calls; counts are not quality or latency measurements.
+```bash
+"$R2V_PYTHON" tools/run_h3_mimo25_stem_reconcile_shadow.py \
+  --visual-production-root "$VISUAL_PRODUCTION_ROOT" \
+  --visual-runs-root "$VISUAL_RUNS_ROOT" \
+  --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
+  --shadow-run-id random10-v1 --case-manifest "$CASE_833_MANIFEST" \
+  --sam-route music_first --allow-unverified \
+  --model mimo-v2.5 --base-url http://127.0.0.1:8092/v1 \
+  --media-root /mnt/workspace --max-completion-tokens 32768 \
+  --output-root "$AUDIO_PRODUCTION_ROOT/sam_audio_stem_shadow_v1/runs/random10-v1/mimo_v30_833_oneclip_smoke"
+```
 
-**Deployment boundary:** the original joint-AV runtime was validated earlier.
-The one-video/two-auxiliary-audio combination has only fake-client coverage in
-this patch, not a real server run. Aggregate `audio_tokens > 0` cannot prove
-that all three audio inputs were consumed. Unsupported combinations must retain
-the actual error, never silently drop an audio track and resend the video.
+No `--overwrite` is used. This patch has fake-client coverage only; sound
+quality must be checked in the real 833 smoke and manual QA.
 
 ### 5. Optional stem-native primary voice references
 
@@ -331,7 +334,7 @@ find "$SHADOW_ROOT" -maxdepth 2 -type f | sort
 cat "$SHADOW_ROOT/separation/summary.json"
 cat "$SHADOW_ROOT/diarization/stem_provenance.json"
 cat "$SHADOW_ROOT/asr/summary.json"
-cat "$SHADOW_ROOT/mimo_reconcile_av_rawstems_sound_partition/summary.json"
+cat "$SHADOW_ROOT/mimo_reconcile_av_stemtext_sound_partition/summary.json"
 cat "$SHADOW_ROOT/references/references.jsonl"
 ```
 
@@ -346,7 +349,7 @@ Inspect label quality without running any model or changing any source stage.
 The explicit output below is outside production inputs and preserves old QA pages:
 
 ```bash
-export QA_ROOT="$AUDIO_PRODUCTION_ROOT/../h3-audio-qa/$SHADOW_RUN_ID-av-rawstems-sound-partition"
+export QA_ROOT="$AUDIO_PRODUCTION_ROOT/../h3-audio-qa/$SHADOW_RUN_ID-av-stemtext-sound-partition"
 "$R2V_PYTHON" tools/build_h3_audio_shadow_qa.py \
   --visual-production-root "$VISUAL_PRODUCTION_ROOT" \
   --visual-runs-root "$VISUAL_RUNS_ROOT" \
@@ -365,7 +368,8 @@ The page shows original target AV, frozen references, unchanged production
 comparison text, shadow DiariZen/ASR, and optional stem audio players.
 It reads the new reconcile directory without requiring stem-facts artifacts.
 First raw caption and sound description remain visible for failed records;
-text partition result/raw/error and both call counts are shown separately.
+music/SFX audio-only descriptions and errors, final text result/raw/error, and
+AV/audio/text call counts are shown separately.
 
 The exact final six-section prompt uses the existing materializer v22 path
 when AV validation and partitioning permit it. Each source conditioning variant

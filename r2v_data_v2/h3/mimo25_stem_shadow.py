@@ -7,6 +7,7 @@ import subprocess
 import uuid
 from collections import Counter
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -25,6 +26,7 @@ from r2v_data_v2.h3.mimo25_av_reconcile import (
     _inventory,
 )
 from r2v_data_v2.h3.mimo25_backend import (
+    MimoAuxAudioDescriptionCall,
     MimoAVAnnotationDraft,
     MimoBackendConfig,
     MimoBackendFailure,
@@ -34,6 +36,7 @@ from r2v_data_v2.h3.mimo25_backend import (
     MimoMediaResolver,
     MimoSoundPartition,
     MimoSoundPartitionCall,
+    MimoUsage,
     OpenAIMimo25Backend,
 )
 from r2v_data_v2.h3.qwen3_asr import Qwen3ASRSegment
@@ -63,10 +66,10 @@ MIMO25_STEM_FACTS_VERSION = "r2v.h3.mimo25_stem_facts.3"
 MIMO25_STEM_FACTS_SUMMARY_VERSION = "r2v.h3.mimo25_stem_facts_summary.4"
 MIMO25_STEM_FACT_RAW_VERSION = "r2v.h3.mimo25_stem_fact_raw.1"
 MIMO25_STEM_FACT_PROMPT_VERSION = "h3_mimo25_stem_fact_prompt_v1"
-MIMO25_STEM_RECONCILE_VERSION = "r2v.h3.mimo25_stem_reconcile.8"
-MIMO25_STEM_RECONCILE_SUMMARY_VERSION = "r2v.h3.mimo25_stem_reconcile_summary.10"
-MIMO25_STEM_RECONCILE_POLICY_VERSION = "h3_mimo25_stem_reconcile_v3"
-MIMO25_STEM_RECONCILE_STAGE = "mimo_reconcile_av_rawstems_sound_partition"
+MIMO25_STEM_RECONCILE_VERSION = "r2v.h3.mimo25_stem_reconcile.9"
+MIMO25_STEM_RECONCILE_SUMMARY_VERSION = "r2v.h3.mimo25_stem_reconcile_summary.11"
+MIMO25_STEM_RECONCILE_POLICY_VERSION = "h3_mimo25_stem_reconcile_v4"
+MIMO25_STEM_RECONCILE_STAGE = "mimo_reconcile_av_stemtext_sound_partition"
 STEM_VIEW_VERSION = "r2v.h3.sam_audio_stem_view.1"
 STEM_RECONCILE_UPSTREAM_FAILURE_VERSION = (
     "r2v.h3.mimo25_stem_reconcile_upstream_failure.1"
@@ -1465,10 +1468,6 @@ def stem_reconcile_auxiliary_contract(facts: MimoStemFactsRecord) -> dict[str, o
 
 
 class StemAwareOpenAIMimo25Backend(OpenAIMimo25Backend):
-    @property
-    def _input_modality(self) -> str:
-        return "target_av_with_auxiliary_raw_audio"
-
     def __init__(
         self,
         config: MimoBackendConfig,
@@ -1478,38 +1477,6 @@ class StemAwareOpenAIMimo25Backend(OpenAIMimo25Backend):
     ) -> None:
         super().__init__(config, client=client)
         self.stem_records_by_clip = stem_records_by_clip
-
-    def _media_content(self, job: MimoClipJob) -> list[dict[str, object]]:
-        content = super()._media_content(job)
-        content.insert(
-            0, {"type": "text", "text": "Original target AV; authoritative."}
-        )
-        record = self.stem_records_by_clip[job.clip_uid]
-        for kind in ("music", "sfx"):
-            stem = record.stem(kind)
-            path = Path(stem.canonical_stem_path)
-            if sha256_file(path) != stem.canonical_stem_sha256:
-                raise ValueError(f"{kind} auxiliary stem changed")
-            content.extend(
-                [
-                    {
-                        "type": "text",
-                        "text": (
-                            f"Proposed {kind.upper()} separation. This is an auxiliary separation "
-                            "of the SAME target clip, aligned to t=0 and the same time origin. "
-                            "It is not another scene or a reference asset. Use it to notice weak "
-                            "sounds, then interpret them in the original AV. Separation may contain "
-                            "leakage or artifacts. Do not count the same sound twice or treat the "
-                            "track name as proof."
-                        ),
-                    },
-                    {
-                        "type": "audio_url",
-                        "audio_url": {"url": self.config.media_resolver.resolve(path)},
-                    },
-                ]
-            )
-        return content
 
 
 def _mimo_job(values: dict[str, object]) -> MimoClipJob:
@@ -1649,13 +1616,13 @@ def build_stem_reconcile_jobs(
 
 
 class MimoStemReconcileRecord(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_stem_reconcile.8"] = (
+    schema_version: Literal["r2v.h3.mimo25_stem_reconcile.9"] = (
         MIMO25_STEM_RECONCILE_VERSION
     )
     clip_uid: str
     source_job_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_stem_record_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
-    policy_version: Literal["h3_mimo25_stem_reconcile_v3"] = (
+    policy_version: Literal["h3_mimo25_stem_reconcile_v4"] = (
         MIMO25_STEM_RECONCILE_POLICY_VERSION
     )
     backend_provenance: MimoBackendProvenance
@@ -1667,12 +1634,19 @@ class MimoStemReconcileRecord(SchemaModel):
     raw_responses: list[StrictStr]
     diagnostics: list[MimoCompletionDiagnostic]
     sound_description: StrictStr | None
+    music_stem_description: StrictStr | None
+    music_stem_raw_response: StrictStr | None
+    music_stem_error: str | None
+    sfx_stem_description: StrictStr | None
+    sfx_stem_raw_response: StrictStr | None
+    sfx_stem_error: str | None
     sound_partition: MimoSoundPartition | None
     sound_partition_raw_response: StrictStr | None
     sound_partition_error: str | None
     av_model_call_count: int = Field(ge=0, le=1)
+    audio_model_call_count: int = Field(ge=0, le=2)
     text_model_call_count: int = Field(ge=0, le=1)
-    model_call_count: int = Field(ge=0, le=2)
+    model_call_count: int = Field(ge=0, le=4)
     record_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
 
     @model_validator(mode="after")
@@ -1689,7 +1663,7 @@ class MimoStemReconcileRecord(SchemaModel):
                 raise ValueError("ready stem reconcile requires only annotation")
         elif not self.failure_code or not self.failure_reason:
             raise ValueError("failed stem reconcile requires failure provenance")
-        if self.model_call_count != self.av_model_call_count + self.text_model_call_count:
+        if self.model_call_count != self.av_model_call_count + self.audio_model_call_count + self.text_model_call_count:
             raise ValueError("stem reconcile model call counts differ")
         if self.text_model_call_count == 0 and (
             self.sound_partition is not None or self.sound_partition_raw_response is not None
@@ -1716,7 +1690,7 @@ class StemReconcileUpstreamFailure(SchemaModel):
 
 
 class MimoStemReconcileSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_stem_reconcile_summary.10"] = (
+    schema_version: Literal["r2v.h3.mimo25_stem_reconcile_summary.11"] = (
         MIMO25_STEM_RECONCILE_SUMMARY_VERSION
     )
     route: SAMRoute
@@ -1730,6 +1704,7 @@ class MimoStemReconcileSummary(SchemaModel):
     ready_count: int = Field(ge=0)
     failed_count: int = Field(ge=0)
     av_model_call_count: int = Field(ge=0)
+    audio_model_call_count: int = Field(ge=0)
     text_model_call_count: int = Field(ge=0)
     model_call_count: int = Field(ge=0)
     original_target_av_is_highest_authority: Literal[True] = True
@@ -1739,7 +1714,7 @@ class MimoStemReconcileSummary(SchemaModel):
     @model_validator(mode="after")
     def validate_counts(self) -> MimoStemReconcileSummary:
         if (
-            self.model_call_count != self.av_model_call_count + self.text_model_call_count
+            self.model_call_count != self.av_model_call_count + self.audio_model_call_count + self.text_model_call_count
             or self.processed_clip_count != self.ready_count + self.failed_count
             or self.clip_count != self.processed_clip_count + self.skipped_clip_count
             or self.clip_count != len(self.clip_uids)
@@ -1770,7 +1745,12 @@ class MimoStemReconcileSummary(SchemaModel):
 
 
 class StemReconcileBackend(Protocol):
-    def partition_sound_description(self, sound_description: str) -> MimoSoundPartitionCall: ...
+    def describe_auxiliary_audio(self, path: Path) -> MimoAuxAudioDescriptionCall: ...
+
+    def reconcile_sound_descriptions(
+        self, original_sound_description: str,
+        music_stem_description: str | None, sfx_stem_description: str | None,
+    ) -> MimoSoundPartitionCall: ...
 
     @property
     def provenance(self) -> MimoBackendProvenance: ...
@@ -1784,6 +1764,29 @@ class StemReconcileBackend(Protocol):
         allowed_entity_ids: set[str],
         allowed_reference_labels: set[str],
     ) -> MimoBackendResult: ...
+
+
+def _describe_auxiliary_stem(
+    backend: StemReconcileBackend, record: SAMAudioStemRecord, kind: StemType,
+) -> tuple[MimoAuxAudioDescriptionCall, int]:
+    calls = 0
+    try:
+        stem = record.stem(kind)
+        path = Path(stem.canonical_stem_path)
+        if sha256_file(path) != stem.canonical_stem_sha256:
+            raise ValueError(f"{kind} auxiliary stem changed")
+        calls = 1
+        result = backend.describe_auxiliary_audio(path)
+        return result, result.model_call_count
+    except (OSError, ValueError, TypeError, RuntimeError) as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        return MimoAuxAudioDescriptionCall(
+            diagnostic=MimoCompletionDiagnostic(
+                input_modality="auxiliary_audio_only", usage=MimoUsage(),
+                http_attempt_count=1, request_error=error,
+            ),
+            error=error, model_call_count=calls,
+        ), calls
 
 
 def run_mimo25_stem_reconcile_shadow(
@@ -1878,9 +1881,22 @@ def run_mimo25_stem_reconcile_shadow(
                     annotation = MimoAVAnnotationDraft.model_validate(payload)
                 except (ValueError, TypeError, AttributeError):
                     pass
+            # Only these two audio-only requests run concurrently; role order is fixed.
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = {
+                    kind: executor.submit(_describe_auxiliary_stem, backend, stems_by_clip[job.clip_uid], kind)
+                    for kind in ("music", "sfx")
+                }
+                auxiliary = {kind: future.result() for kind, future in futures.items()}
+            music, music_calls = auxiliary["music"]
+            sfx, sfx_calls = auxiliary["sfx"]
+            audio_calls = music_calls + sfx_calls
+            diagnostics.extend([music.diagnostic, sfx.diagnostic])
             partition = None
             if sound is not None:
-                partition = backend.partition_sound_description(sound)
+                partition = backend.reconcile_sound_descriptions(
+                    sound, music.description, sfx.description,
+                )
                 diagnostics.append(partition.diagnostic)
                 if partition.error is not None and failure_code is None:
                     failure_code, failure_reason = (
@@ -1908,6 +1924,12 @@ def run_mimo25_stem_reconcile_shadow(
                 "raw_responses": raw,
                 "diagnostics": [d.model_dump(mode="json") for d in diagnostics],
                 "sound_description": sound,
+                "music_stem_description": music.description,
+                "music_stem_raw_response": music.raw_response,
+                "music_stem_error": music.error,
+                "sfx_stem_description": sfx.description,
+                "sfx_stem_raw_response": sfx.raw_response,
+                "sfx_stem_error": sfx.error,
                 "sound_partition": partition.partition.model_dump(mode="json")
                 if partition and partition.partition
                 else None,
@@ -1916,8 +1938,9 @@ def run_mimo25_stem_reconcile_shadow(
                 else None,
                 "sound_partition_error": partition.error if partition else None,
                 "av_model_call_count": av_calls,
+                "audio_model_call_count": audio_calls,
                 "text_model_call_count": int(partition is not None),
-                "model_call_count": av_calls + int(partition is not None),
+                "model_call_count": av_calls + audio_calls + int(partition is not None),
             }
             records.append(
                 MimoStemReconcileRecord(
@@ -1938,6 +1961,7 @@ def run_mimo25_stem_reconcile_shadow(
             ready_count=counts["ready"],
             failed_count=counts["failed"],
             av_model_call_count=sum(r.av_model_call_count for r in records),
+            audio_model_call_count=sum(r.audio_model_call_count for r in records),
             text_model_call_count=sum(r.text_model_call_count for r in records),
             model_call_count=sum(r.model_call_count for r in records),
         )
