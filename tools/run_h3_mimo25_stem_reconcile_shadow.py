@@ -81,6 +81,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--media-root", type=Path, default=Path("/mnt/workspace"))
     parser.add_argument("--media-base-url")
     parser.add_argument("--output-root", type=Path)
+    parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-completion-tokens", type=int, default=32768)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--allow-unverified", action="store_true")
@@ -140,6 +141,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         "output_root": str(output),
         "clip_count": len(jobs),
         "clip_uids": [item.clip_uid for item in jobs],
+        "temperature": arguments.temperature,
         "original_target_av_is_highest_authority": True,
     }
     if not arguments.dry_run:
@@ -157,6 +159,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
                 transport="sglang",
                 base_url=arguments.base_url,
                 model=arguments.model,
+                temperature=arguments.temperature,
                 max_completion_tokens=arguments.max_completion_tokens,
             ),
             stem_facts_by_clip=facts_by_clip,
