@@ -2,10 +2,26 @@
 
 This is an opt-in, additive experiment. It never replaces or writes the current
 canonical Audio, DiariZen, Qwen3-ASR, MiMo, H3, primary-voice, or Visual
-production stages. All generated artifacts live under:
+production stages. For the current server paths, dependency boundaries, and
+copy-paste launch commands, use `docs/H3_AUDIO_SERVER_RUNBOOK.md`; this document
+owns the semantic and artifact contracts.
+
+All generated artifacts live under the legacy/default root:
 
 ```text
 <audio-production-root>/sam_audio_stem_shadow_v1/
+  separation/
+  diarization/
+  asr/
+  mimo_stem_facts/
+  mimo_reconcile/
+  references/
+```
+
+or, for an explicit named pilot:
+
+```text
+<audio-production-root>/sam_audio_stem_shadow_v1/runs/<shadow-run-id>/
   separation/
   diarization/
   asr/
@@ -106,8 +122,10 @@ uncovered tail.
    on the canonical speech stem. Production DiariZen continues to read the
    original canonical mix.
 3. `run_h3_stem_qwen3_asr_shadow.py` runs the existing exact-segment Qwen3-ASR
-   implementation on the speech stem. ASR remains authoritative for text and
-   language and is never rewritten by MiMo.
+   implementation on the speech stem. The outer shadow CLI runs with
+   `R2V_PYTHON` and launches the isolated `QWEN3_ASR_ENV/bin/python` persistent
+   worker internally. ASR remains authoritative for text and language and is
+   never rewritten by MiMo.
 4. `run_h3_mimo25_stem_facts_shadow.py` creates aligned speech, music, and SFX
    AV views and emits factual stem evidence. Speech calls receive the exact
    shadow DiariZen segment inventory and authoritative shadow Qwen3-ASR
@@ -117,7 +135,10 @@ uncovered tail.
    live inside the facts stage and publish atomically with their records, so a
    failed rerun cannot replace media referenced by the prior stage. Calls store
    raw response text and request diagnostics per stem. A failed clip publishes
-   an explicit failed facts record while later clips continue.
+   an explicit failed facts record while later clips continue. Model-reported
+   clip duration is canonicalized to the code-owned job duration before
+   publication, and obvious lexical speech leakage matching authoritative ASR
+   is suppressed from SFX facts while the raw MiMo response remains auditable.
 5. `run_h3_mimo25_stem_reconcile_shadow.py` sends the original full target AV as
    the model media and supplies stem facts as lower-priority structured
    evidence. Existing speaker fail-closed checks remain active.
@@ -146,9 +167,10 @@ clips or disappears from summary provenance. Final reconcile preflight requires
 the case-manifest order to equal the current separation inventory and requires
 both DiariZen and facts lineage to name that exact owned `separation/` root
 before constructing the MiMo backend.
-Every optional `--output-root` is constrained to the versioned shadow tree; it
-cannot target current `audio/`, `diarization/`, `asr/`, `h3/`, or MiMo output
-directories.
+Every optional `--output-root` is constrained to the selected versioned shadow
+root; it cannot target current `audio/`, `diarization/`, `asr/`, `h3/`, MiMo
+outputs, the legacy/default shadow while a named run is selected, or another
+named run.
 
 ## Named Pilots
 
@@ -171,19 +193,25 @@ Case-manifest order is preserved exactly; run naming performs no sampling.
 
 The following Bash commands launch a new pilot using the existing ordered
 10-clip `CASE_MANIFEST` and already configured runtime environments. They are
-operator commands, not evidence of a new model run. Keep the validated SAM
-environment active for separation; keep `R2V_PYTHON` as the main environment
-for the remaining stages. The ASR runner still launches the isolated
-`QWEN3_ASR_ENV/bin/python` worker; install nothing into the main environment.
+operator commands, not evidence of a new model run. SAM-only Python dependencies
+are supplied only to the separation invocation; the remaining stage CLIs run
+with `R2V_PYTHON`. The shadow ASR CLI then launches the isolated
+`QWEN3_ASR_ENV/bin/python` worker itself. Do not install one stage's packages
+into another environment to resolve an import error.
 
 ```bash
-RUN_ARGS=(--audio-production-root "$AUDIO_PRODUCTION_ROOT"
-  --shadow-run-id random10-v1 --case-manifest "$CASE_MANIFEST"
-  --sam-route music_first)
+RUN_ARGS=(
+  --audio-production-root "$AUDIO_PRODUCTION_ROOT"
+  --shadow-run-id random10-v1
+  --case-manifest "$CASE_MANIFEST"
+  --sam-route music_first
+)
 
-python tools/run_h3_sam_audio_stem_shadow.py "${RUN_ARGS[@]}" \
+PYTHONPATH="$SAM_AUDIO_RUNTIME_PYTHONPATH" \
+"$R2V_PYTHON" tools/run_h3_sam_audio_stem_shadow.py "${RUN_ARGS[@]}" \
   --sam-audio-code-root "$SAM_AUDIO_CODE_ROOT" \
   --sam-audio-model-path "$SAM_AUDIO_MODEL_PATH" \
+  --sam-audio-model-name "$SAM_AUDIO_MODEL_NAME" \
   --sam-audio-t5-base-path "$SAM_AUDIO_T5_BASE_PATH" \
   --sam-reranking-candidates 1
 
@@ -191,70 +219,89 @@ python tools/run_h3_sam_audio_stem_shadow.py "${RUN_ARGS[@]}" \
   --allow-unverified
 
 "$R2V_PYTHON" tools/run_h3_stem_qwen3_asr_shadow.py "${RUN_ARGS[@]}" \
-  --visual-production-root "$VISUAL_PRODUCTION_ROOT" --allow-unverified
+  --visual-production-root "$VISUAL_PRODUCTION_ROOT" \
+  --allow-unverified
 
 "$R2V_PYTHON" tools/run_h3_mimo25_stem_facts_shadow.py "${RUN_ARGS[@]}" \
-  --temperature 0.2 --allow-unverified
+  --model mimo-v2.5 \
+  --base-url http://127.0.0.1:8092/v1 \
+  --temperature 0.2 \
+  --allow-unverified
 
 "$R2V_PYTHON" tools/run_h3_mimo25_stem_reconcile_shadow.py "${RUN_ARGS[@]}" \
   --visual-production-root "$VISUAL_PRODUCTION_ROOT" \
   --visual-runs-root "$VISUAL_RUNS_ROOT" \
-  --max-completion-tokens 32768 --allow-unverified
+  --model mimo-v2.5 \
+  --base-url http://127.0.0.1:8092/v1 \
+  --max-completion-tokens 32768 \
+  --allow-unverified
 
 "$R2V_PYTHON" tools/export_h3_sam_audio_stem_references.py "${RUN_ARGS[@]}" \
-  --primary-voice-root "$AUDIO_PRODUCTION_ROOT/primary_voice" --allow-unverified
+  --primary-voice-root "$AUDIO_PRODUCTION_ROOT/primary_voice" \
+  --allow-unverified
 ```
 
-The model identifier is derived from the local SAM checkpoint path/config;
-an explicit `--sam-audio-model-name` must agree with it. Do not add
-`--overwrite` when launching this independent pilot. Future pilots can use a
-different valid ID, without touching this run or the default smoke.
+The currently validated server model is `facebook/sam-audio-large-tv`; the exact
+path and dependency overlay are recorded in `docs/H3_AUDIO_SERVER_RUNBOOK.md`.
+The model identifier is derived from the local SAM checkpoint path/config; an
+explicit `--sam-audio-model-name` must agree with it. Do not add `--overwrite`
+when launching an independent named pilot. Future pilots can use a different
+valid ID without touching this run or the default smoke.
 
 ## Example Default Pilot
+
+The legacy/default root remains supported for reproducing or inspecting the
+validated smoke. New case inventories should normally use a named run instead
+of overwriting this root.
 
 ```bash
 SHADOW="$AUDIO_PRODUCTION_ROOT/sam_audio_stem_shadow_v1"
 
-python tools/run_h3_sam_audio_stem_shadow.py \
+PYTHONPATH="$SAM_AUDIO_RUNTIME_PYTHONPATH" \
+"$R2V_PYTHON" tools/run_h3_sam_audio_stem_shadow.py \
   --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
   --sam-audio-code-root "$SAM_AUDIO_CODE_ROOT" \
   --sam-audio-model-path "$SAM_AUDIO_MODEL_PATH" \
-  --sam-audio-model-name facebook/sam-audio-small-tv \
+  --sam-audio-model-name "$SAM_AUDIO_MODEL_NAME" \
   --sam-audio-t5-base-path "$SAM_AUDIO_T5_BASE_PATH" \
   --sam-route music_first \
   --sam-reranking-candidates 1 \
   --case-manifest "$CASE_MANIFEST"
 
-python tools/run_h3_stem_diarization_shadow.py \
+"$R2V_PYTHON" tools/run_h3_stem_diarization_shadow.py \
   --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
   --sam-route music_first \
   --case-manifest "$CASE_MANIFEST" \
   --allow-unverified
 
-python tools/run_h3_stem_qwen3_asr_shadow.py \
+"$R2V_PYTHON" tools/run_h3_stem_qwen3_asr_shadow.py \
   --visual-production-root "$VISUAL_PRODUCTION_ROOT" \
   --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
   --sam-route music_first \
   --case-manifest "$CASE_MANIFEST" \
   --allow-unverified
 
-python tools/run_h3_mimo25_stem_facts_shadow.py \
+"$R2V_PYTHON" tools/run_h3_mimo25_stem_facts_shadow.py \
   --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
   --sam-route music_first \
   --case-manifest "$CASE_MANIFEST" \
+  --model mimo-v2.5 \
+  --base-url http://127.0.0.1:8092/v1 \
   --temperature 0.2 \
   --allow-unverified
 
-python tools/run_h3_mimo25_stem_reconcile_shadow.py \
+"$R2V_PYTHON" tools/run_h3_mimo25_stem_reconcile_shadow.py \
   --visual-production-root "$VISUAL_PRODUCTION_ROOT" \
   --visual-runs-root "$VISUAL_RUNS_ROOT" \
   --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
   --case-manifest "$CASE_MANIFEST" \
   --sam-route music_first \
+  --model mimo-v2.5 \
+  --base-url http://127.0.0.1:8092/v1 \
   --max-completion-tokens 32768 \
   --allow-unverified
 
-python tools/export_h3_sam_audio_stem_references.py \
+"$R2V_PYTHON" tools/export_h3_sam_audio_stem_references.py \
   --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
   --primary-voice-root "$AUDIO_PRODUCTION_ROOT/primary_voice" \
   --sam-route music_first \
