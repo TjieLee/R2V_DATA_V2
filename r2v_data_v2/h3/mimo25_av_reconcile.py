@@ -41,7 +41,7 @@ from r2v_data_v2.h3.visual_production_source import load_visual_production_inven
 
 MIMO25_INVENTORY_VERSION = "r2v.h3.mimo25_inventory.4"
 MIMO25_RECORD_VERSION = "r2v.h3.mimo25_record.11"
-MIMO25_SUMMARY_VERSION = "r2v.h3.mimo25_summary.10"
+MIMO25_SUMMARY_VERSION = "r2v.h3.mimo25_summary.11"
 MIMO25_FAILURE_VERSION = "r2v.h3.mimo25_failure.5"
 MIMO25_RAW_VERSION = "r2v.h3.mimo25_raw_response.5"
 MIMO25_CASE_MANIFEST_VERSION = "r2v.h3.mimo25_case_manifest.1"
@@ -580,7 +580,7 @@ class MimoRawResponse(SchemaModel):
 
 
 class MimoSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_summary.10"] = MIMO25_SUMMARY_VERSION
+    schema_version: Literal["r2v.h3.mimo25_summary.11"] = MIMO25_SUMMARY_VERSION
     inventory_scope: Literal[
         "current_diarization_asr_target_inventory",
         "canonical_visual_target_inventory",
@@ -605,8 +605,9 @@ class MimoSummary(SchemaModel):
     diagnostic_warning_counts: dict[str, int]
     responses_with_nonzero_reasoning_tokens: int = Field(ge=0)
     correction_counts: dict[str, int]
-    audio_event_count: int = Field(ge=0)
-    music_status_counts: dict[str, int]
+    # The current observation does not emit timed events or classified music status.
+    audio_event_count: int | None = Field(default=None, ge=0)
+    music_status_counts: dict[str, int] | None = None
     original_picture_count_histogram: dict[str, int]
     selected_picture_count_histogram: dict[str, int]
     original_reference_kind_counts: dict[str, int]
@@ -1041,8 +1042,6 @@ def run_mimo25_av_reconcile(
     usage_totals: Counter[str] = Counter()
     diagnostic_warning_counts: Counter[str] = Counter()
     corrections: Counter[str] = Counter()
-    music_counts: Counter[str] = Counter()
-    audio_event_count = 0
     nonzero_reasoning_count = 0
     original_picture_histogram: Counter[str] = Counter()
     selected_picture_histogram: Counter[str] = Counter()
@@ -1110,8 +1109,6 @@ def run_mimo25_av_reconcile(
                 modality_counts[result.input_modality] += 1
                 corrections.update(_correction_counts(job, result.annotation))
                 corrections.update(result.deterministic_correction_counts)
-                audio_event_count += len(result.annotation.audio_semantics.temporal_non_speech_events)
-                music_counts[result.annotation.audio_semantics.non_diegetic_music_status] += 1
                 case_diagnostics = result.diagnostics
                 raw = MimoRawResponse(
                     clip_uid=job.clip_uid,
@@ -1203,8 +1200,6 @@ def run_mimo25_av_reconcile(
             ),
             responses_with_nonzero_reasoning_tokens=nonzero_reasoning_count,
             correction_counts=dict(sorted(corrections.items())),
-            audio_event_count=audio_event_count,
-            music_status_counts=dict(sorted(music_counts.items())),
             original_picture_count_histogram=dict(
                 sorted(original_picture_histogram.items())
             ),

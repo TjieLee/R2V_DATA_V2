@@ -32,6 +32,7 @@ from r2v_data_v2.h3.mimo25_av_reconcile import (
 from r2v_data_v2.h3.mimo25_backend import (
     MIMO25_MATERIALIZER_VERSION,
     MimoAudioEvent,
+    MimoSoundPartition,
     MimoSubjectDefinitionDraft,
     protect_direct_dialogue,
 )
@@ -48,7 +49,6 @@ from r2v_data_v2.h3.qwen38_h3_recaption import (
     Qwen38H3StructuredResponse,
     RecaptionAudioContract,
     RecaptionAudioFacts,
-    RecaptionNonSpeechFact,
     RecaptionReferenceContract,
     RecaptionSpeechFact,
     RecaptionSubjectContract,
@@ -228,7 +228,7 @@ class MimoH3ShadowRecord(SchemaModel):
         "h3_mimo25_materializer_v17",
         "h3_mimo25_materializer_v18",
         "h3_mimo25_materializer_v19",
-        "h3_mimo25_materializer_v21",
+        "h3_mimo25_materializer_v22",
     ] = (
         MIMO25_MATERIALIZER_VERSION
     )
@@ -540,24 +540,11 @@ def _audio_facts(
                 locked_dialogue_block=f"<d>[{language}] {segment.text}</d>",
             )
         )
-    events = [
-        RecaptionNonSpeechFact(
-            fact_id=item.event_id,
-            start_time=item.approximate_start_time,
-            end_time=item.approximate_end_time,
-            category=item.category,
-            description=item.description,
-            source_attribution=item.source_grounding,
-            provenance="mimo25.audio_semantics.temporal_non_speech_events",
-        )
-        for item in record.annotation.audio_semantics.temporal_non_speech_events
-    ]
-    semantics = record.annotation.audio_semantics
     return RecaptionAudioFacts(
         speech=speech,
-        non_speech_events=events,
-        overall_soundscape_hint=semantics.overall_soundscape,
-        non_diegetic_music_hint=semantics.non_diegetic_music,
+        non_speech_events=[],
+        overall_soundscape_hint=None,
+        non_diegetic_music_hint=None,
         audio_grounding_complete=True,
         provenance={
             "speech": "qwen3_asr_segments_exact",
@@ -623,6 +610,7 @@ def _materialize_sample(
     *,
     conditioning_variant: ConditioningVariant | None = None,
     extra_audio_contract: RecaptionAudioContract | None = None,
+    sound_partition: MimoSoundPartition | None = None,
 ) -> tuple[list[FinalQwen3SpeechSegment], str, list[str]]:
     assert record.annotation is not None
     transcribed_ids = [item.segment_id for item in job.segments if item.asr_status == "transcribed"]
@@ -635,6 +623,10 @@ def _materialize_sample(
             "multi_speaker_segment_requires_turn_refinement", segment_id,
             "retain exact multi-speaker ASR; authoritative sub-turn refinement is required",
         ) for segment_id in blocked])
+    if sound_partition is None:
+        raise MimoH3MaterializationContractError([ValidationIssue(
+            "sound_partition_unavailable", "sound_partition", "no text partition was published",
+        )])
     projected_sample = project_mimo_h3_sample_references(
         sample,
         reference_images=job.reference_images,
@@ -702,26 +694,14 @@ def _materialize_sample(
             item.render()
             for item in record.annotation.h3_semantics.visual_retention_analysis
         ],
-        detailed_description=f"{direct.style_opening} [Shot 1] {detailed}",
-        overall_soundscape=direct.overall_soundscape,
-        non_diegetic_music=direct.non_diegetic_music,
+        detailed_description=f"{direct.style_opening}\n[Shot 1] {detailed}",
+        overall_soundscape=sound_partition.overall_soundscape,
+        non_diegetic_music=sound_partition.non_diegetic_music,
         audio_fact_audit=[
             AudioFactAuditItem(fact_id=item.fact_id, action="preserved")
             for item in facts.non_speech_events
         ],
     )
-    if variant == "music_reference":
-        assert extra_audio_contract is not None
-        assert extra_audio_contract.music_characteristics is not None
-        structured = structured.model_copy(
-            update={
-                "non_diegetic_music": (
-                    "A newly generated audience-only score follows <Audio 1>'s "
-                    f"{extra_audio_contract.music_characteristics} without directly "
-                    "reusing the source signal."
-                )
-            }
-        )
     if record.annotation.warnings:
         warnings.extend(
             f"{item.segment_id}:{item.code}" for item in record.annotation.warnings
@@ -919,7 +899,9 @@ def _select_music_reference(
     analyzer: RecoveredVoiceAudioAnalyzer,
 ) -> tuple[MimoShadowAudioReference | None, Path | None, list[str]]:
     assert record.annotation is not None
-    semantics = record.annotation.audio_semantics
+    semantics = getattr(record.annotation, "audio_semantics", None)
+    if semantics is None:
+        return None, None, ["music_reference_timing_unavailable"]
     if semantics.non_diegetic_music_status != "present":
         return None, None, []
     # TODO: A future policy may merge contiguous compatible spans from one cue.

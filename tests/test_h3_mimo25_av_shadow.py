@@ -211,24 +211,6 @@ def _annotation(
                     if resolution == "resolved"
                     else []
                 ),
-                "audio_semantics": {
-                    "temporal_non_speech_events": [
-                        {
-                            "event_id": "ae1",
-                            "approximate_start_time": 0.1,
-                            "approximate_end_time": 0.2,
-                            "category": "physical",
-                            "pattern": "repeated",
-                            "description": "A short repeated clink is audible.",
-                            "source_grounding": "audiovisually_grounded",
-                        }
-                    ],
-                    "overall_soundscape_status": "present",
-                    "overall_soundscape": "A quiet room tone accompanies a short clink.",
-                    "non_diegetic_music_status": "absent",
-                    "non_diegetic_music": None,
-                    "audiovisual_summary": "One speaker is audible in a quiet scene.",
-                },
             },
             "av_grounding": {
                 "segment_groundings": [
@@ -263,8 +245,7 @@ def _annotation(
                 "summary": "A person speaks while remaining visible.",
                 "style_opening": "The live-action video shows a seated person.",
                 "shot1_caption": "<Subject 1> (S1) turns and asks gently, <d>[Chinese] 错误文本</d> while lowering a hand. A clink sounds nearby.",
-                "overall_soundscape": "A quiet room tone and a short clink are audible.",
-                "non_diegetic_music": "N/A",
+                "sound_description": "A quiet room tone and a short clink accompany the speaking voice.",
                 "visual_retention_analysis": [
                     _retention(
                         "<Subject 1>",
@@ -8100,6 +8081,8 @@ def test_shadow_runner_is_atomic_and_does_not_modify_inputs(tmp_path: Path) -> N
         "image_tokens_unavailable": 2,
     }
     assert summary.correction_counts["conservative_visible_speaker_downgrade"] == 2
+    assert summary.audio_event_count is None
+    assert summary.music_status_counts is None
     assert summary.original_picture_count_histogram == {"1": 1}
     assert summary.selected_picture_count_histogram == {"1": 1}
     assert summary.original_reference_kind_counts == {"subject": 1}

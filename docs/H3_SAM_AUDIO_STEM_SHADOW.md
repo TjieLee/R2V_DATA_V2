@@ -13,8 +13,7 @@ All generated artifacts live under the legacy/default root:
   separation/
   diarization/
   asr/
-  mimo_stem_facts/
-  mimo_reconcile/
+  mimo_reconcile_av_rawstems_sound_partition/
   references/
 ```
 
@@ -25,8 +24,7 @@ or, for an explicit named pilot:
   separation/
   diarization/
   asr/
-  mimo_stem_facts/
-  mimo_reconcile/
+  mimo_reconcile_av_rawstems_sound_partition/
   references/
 ```
 
@@ -34,8 +32,8 @@ Each directory is an independently owned atomic stage. In particular,
 `separation --overwrite` replaces only `separation/`; it cannot remove a
 previously published downstream stage. Every downstream consumer verifies the
 current upstream byte lineage before a model call: DiariZen binds the separation
-records hash, ASR binds the DiariZen provenance hash, and facts/reconcile verify
-the complete separation -> DiariZen -> ASR -> facts chain. An overwritten
+records hash, ASR binds the DiariZen provenance hash, and reconcile verifies
+the same separation -> DiariZen -> ASR chain. Stem-facts are not a dependency. An overwritten
 separation therefore makes older downstream stages explicitly stale; they are
 never deleted or silently reused.
 
@@ -47,7 +45,7 @@ become sources for explicitly requested stem-native reference assets. A
 separator target label is not semantic ground truth and cannot override a
 contradiction in the original AV.
 
-The shadow keeps the frozen production contracts unchanged:
+Historical production artifacts remain unchanged. Their frozen versions were:
 
 - MiMo prompt `h3_mimo25_unified_av_reconcile_v22`
 - MiMo authority `h3_mimo25_av_authority_contract_v16`
@@ -57,8 +55,8 @@ The shadow keeps the frozen production contracts unchanged:
 
 Final H3 remains exactly six sections: subject definitions, summary, retention
 analysis, detailed description, overall soundscape, and non-diegetic music.
-There is no seventh stem or music-timeline section. Verified music timing is
-rendered naturally in the appropriate existing section.
+There is no seventh stem or music-timeline section. The new first response has no timed music-event inventory; missing timing cannot
+be invented to make an optional reference variant available.
 
 ## Separation
 
@@ -126,23 +124,20 @@ uncovered tail.
    `R2V_PYTHON` and launches the isolated `QWEN3_ASR_ENV/bin/python` persistent
    worker internally. ASR remains authoritative for text and language and is
    never rewritten by MiMo.
-4. `run_h3_mimo25_stem_facts_shadow.py` creates aligned speech, music, and SFX
-   AV views and emits factual stem evidence. Speech calls receive the exact
-   shadow DiariZen segment inventory and authoritative shadow Qwen3-ASR
-   text/language as read-only facts; the response schema has no transcript or
-   entity-binding field. The views stream-copy original video and use AAC only
-   as an annotation proxy; canonical WAV remains Audio authority. Proxy views
-   live inside the facts stage and publish atomically with their records, so a
-   failed rerun cannot replace media referenced by the prior stage. Calls store
-   raw response text and request diagnostics per stem. A failed clip publishes
-   an explicit failed facts record while later clips continue. Model-reported
-   clip duration is canonicalized to the code-owned job duration before
-   publication, and obvious lexical speech leakage matching authoritative ASR
-   is suppressed from SFX facts while the raw MiMo response remains auditable.
-5. `run_h3_mimo25_stem_reconcile_shadow.py` sends the original full target AV as
-   the model media and supplies stem facts as lower-priority structured
-   evidence. Existing speaker fail-closed checks remain active.
-6. `export_h3_sam_audio_stem_references.py` crops an explicitly requested
+4. `run_h3_mimo25_stem_reconcile_shadow.py` reads separation, DiariZen and ASR
+   directly. Its first request contains one original video with embedded audio,
+   existing reference images, and music/SFX raw audio URLs from the selected SAM
+   record. No speech audio, duplicate canonical audio, stem videos, or semantic
+   facts are sent. Same-time-zero separations may leak and never override
+   original AV. They are not H3 Audio conditioning assets.
+   The output retains visual/speaker/grounding fields and natural caption, with
+   one full `sound_description` replacing global audio statuses/events.
+   A second independent request sees only that text and partitions it into
+   `overall_soundscape` and `non_diegetic_music`: temperature 0, 1024 tokens,
+   disabled thinking, strict two-string JSON. It receives no media/history/ICL.
+   There is no content QC, HTTP/SDK retry, fallback, full-AV recheck or repair.
+   All raw evidence and per-stage call counts survive failures.
+5. `export_h3_sam_audio_stem_references.py` crops an explicitly requested
    reference from its canonical stem. It never selects an interval on a stem and
    then cuts bytes from the original mix. With `--primary-voice-root`, it reuses
    the already accepted V1 primary-voice turn and policy provenance, then cuts
@@ -155,18 +150,33 @@ Every command accepts or inherits an explicit case manifest. When a manifest is
 provided, its ordered clip inventory must match the stem inventory exactly.
 The ordered `clip_uids` provenance is carried through every stage rather than
 reconstructed from sorted mapping keys. The same explicit `--sam-route` is
-validated across separation, DiariZen, ASR, facts, and reconcile. A per-clip
+validated across separation, DiariZen, ASR, and reconcile. A per-clip
 separation failure is published as an explicit skip while remaining clips
 continue in that order. Shadow DiariZen's `clip_results.jsonl` is hashed and its
-`ready`, `empty`, and `failed` states are carried through ASR, facts, and
+`ready`, `empty`, and `failed` states are carried through ASR and
 reconcile provenance. A failed DiariZen clip is an explicit upstream failure,
 never an inferred empty-speech clip or a reason to fall back to production
-DiariZen. A per-clip facts failure is likewise published and becomes an
-explicit reconcile upstream failure; none of these failures aborts usable
-clips or disappears from summary provenance. Final reconcile preflight requires
-the case-manifest order to equal the current separation inventory and requires
-both DiariZen and facts lineage to name that exact owned `separation/` root
-before constructing the MiMo backend.
+DiariZen. No missing/failed historical facts record can block this new path.
+Case order and the exact current separation root must match before MiMo calls.
+Existing `run_h3_mimo25_stem_facts_shadow.py`, facts and views remain historical
+inspection tools only; the new path neither calls nor requires them.
+
+First raw caption and sound description remain visible when grounding or format
+fails; readable sound text can still receive its one partition request. That
+does not authorize unsafe identity products. Multi-speaker exclusions remain.
+The materializer leaves dialogue text intact, allows consecutive same-speaker
+ASR turns in one generated vocal event, and only checks H3 syntax/allowed labels.
+Final audio sections come solely from the partition, with no invented timing.
+Prompt v29, annotation .19, backend .32, materializer v22 and reconcile .8/.10
+record/summary versions distinguish the new contract; authority v17 and official
+opening + Shot 1 ICL v2 are unchanged.
+
+No real server multi-audio inference has been performed for this patch.
+Fake clients establish request shape only. Aggregate audio tokens cannot prove
+consumption of embedded audio plus both auxiliaries; an unsupported request
+must fail visibly rather than drop tracks and resend. Performance and sound
+quality require server execution and human review.
+
 Every optional `--output-root` is constrained to the selected versioned shadow
 root; it cannot target current `audio/`, `diarization/`, `asr/`, `h3/`, MiMo
 outputs, the legacy/default shadow while a named run is selected, or another
@@ -174,15 +184,16 @@ named run.
 
 ## Named Pilots
 
-Without `--shadow-run-id`, all six tools retain the exact default layout under
+Without `--shadow-run-id`, the tools use the default root under
 `$AUDIO_PRODUCTION_ROOT/sam_audio_stem_shadow_v1/`. The validated complete
 one-clip smoke remains there; no migration, copy, or overwrite is needed.
 
 For an independent pilot, pass the same `--shadow-run-id random10-v1` to every
 stage. Its root is
 `$AUDIO_PRODUCTION_ROOT/sam_audio_stem_shadow_v1/runs/random10-v1/`, containing
-`separation/`, `diarization/`, `asr/`, `mimo_stem_facts/`, `mimo_reconcile/`,
-and `references/` (plus the existing owned stem views).
+`separation/`, `diarization/`, `asr/`,
+`mimo_reconcile_av_rawstems_sound_partition/`, and optional `references/`.
+Old `mimo_stem_facts/` and `mimo_reconcile/` outputs are left untouched.
 Run IDs must match `[A-Za-z0-9][A-Za-z0-9._-]{0,63}` exactly. Invalid IDs and
 symlink redirects are rejected, not normalized. Custom `--output-root` values
 must stay within the selected run. Downstream readers use that run's standard
@@ -220,12 +231,6 @@ PYTHONPATH="$SAM_AUDIO_RUNTIME_PYTHONPATH" \
 
 "$R2V_PYTHON" tools/run_h3_stem_qwen3_asr_shadow.py "${RUN_ARGS[@]}" \
   --visual-production-root "$VISUAL_PRODUCTION_ROOT" \
-  --allow-unverified
-
-"$R2V_PYTHON" tools/run_h3_mimo25_stem_facts_shadow.py "${RUN_ARGS[@]}" \
-  --model mimo-v2.5 \
-  --base-url http://127.0.0.1:8092/v1 \
-  --temperature 0.2 \
   --allow-unverified
 
 "$R2V_PYTHON" tools/run_h3_mimo25_stem_reconcile_shadow.py "${RUN_ARGS[@]}" \
@@ -281,15 +286,6 @@ PYTHONPATH="$SAM_AUDIO_RUNTIME_PYTHONPATH" \
   --case-manifest "$CASE_MANIFEST" \
   --allow-unverified
 
-"$R2V_PYTHON" tools/run_h3_mimo25_stem_facts_shadow.py \
-  --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
-  --sam-route music_first \
-  --case-manifest "$CASE_MANIFEST" \
-  --model mimo-v2.5 \
-  --base-url http://127.0.0.1:8092/v1 \
-  --temperature 0.2 \
-  --allow-unverified
-
 "$R2V_PYTHON" tools/run_h3_mimo25_stem_reconcile_shadow.py \
   --visual-production-root "$VISUAL_PRODUCTION_ROOT" \
   --visual-runs-root "$VISUAL_RUNS_ROOT" \
@@ -308,6 +304,11 @@ PYTHONPATH="$SAM_AUDIO_RUNTIME_PYTHONPATH" \
   --case-manifest "$CASE_MANIFEST" \
   --allow-unverified
 ```
+
+The static QA builder now reads the new reconcile output directly, without facts.
+Use the exact build/serve commands in `H3_AUDIO_SERVER_RUNBOOK.md`; an independent
+QA output root preserves older review exports. It shows both raw stages, errors,
+original AV, production comparison and final six-section H3 when safe.
 
 Use `--dry-run` to validate inventory selection without constructing a model
 backend. Production migration requires a later explicit decision after shadow

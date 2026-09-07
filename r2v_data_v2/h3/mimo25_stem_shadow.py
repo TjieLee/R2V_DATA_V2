@@ -31,6 +31,8 @@ from r2v_data_v2.h3.mimo25_backend import (
     MimoBackendResult,
     MimoCompletionDiagnostic,
     MimoMediaResolver,
+    MimoSoundPartition,
+    MimoSoundPartitionCall,
     OpenAIMimo25Backend,
 )
 from r2v_data_v2.h3.qwen3_asr import Qwen3ASRSegment
@@ -50,15 +52,19 @@ from r2v_data_v2.h3.sam_audio_stem_shadow import (
     validate_stem_diarization_lineage,
 )
 from r2v_data_v2.h3.schemas import SchemaModel
-from r2v_data_v2.structured_output import ValidationIssue
+from r2v_data_v2.structured_output import (
+    ValidationIssue,
+    normalize_structured_json_envelope,
+)
 
 MIMO25_STEM_FACTS_VERSION = "r2v.h3.mimo25_stem_facts.3"
 MIMO25_STEM_FACTS_SUMMARY_VERSION = "r2v.h3.mimo25_stem_facts_summary.4"
 MIMO25_STEM_FACT_RAW_VERSION = "r2v.h3.mimo25_stem_fact_raw.1"
 MIMO25_STEM_FACT_PROMPT_VERSION = "h3_mimo25_stem_fact_prompt_v1"
-MIMO25_STEM_RECONCILE_VERSION = "r2v.h3.mimo25_stem_reconcile.7"
-MIMO25_STEM_RECONCILE_SUMMARY_VERSION = "r2v.h3.mimo25_stem_reconcile_summary.9"
-MIMO25_STEM_RECONCILE_POLICY_VERSION = "h3_mimo25_stem_reconcile_v2"
+MIMO25_STEM_RECONCILE_VERSION = "r2v.h3.mimo25_stem_reconcile.8"
+MIMO25_STEM_RECONCILE_SUMMARY_VERSION = "r2v.h3.mimo25_stem_reconcile_summary.10"
+MIMO25_STEM_RECONCILE_POLICY_VERSION = "h3_mimo25_stem_reconcile_v3"
+MIMO25_STEM_RECONCILE_STAGE = "mimo_reconcile_av_rawstems_sound_partition"
 STEM_VIEW_VERSION = "r2v.h3.sam_audio_stem_view.1"
 STEM_RECONCILE_UPSTREAM_FAILURE_VERSION = (
     "r2v.h3.mimo25_stem_reconcile_upstream_failure.1"
@@ -1457,39 +1463,51 @@ def stem_reconcile_auxiliary_contract(facts: MimoStemFactsRecord) -> dict[str, o
 
 
 class StemAwareOpenAIMimo25Backend(OpenAIMimo25Backend):
+    @property
+    def _input_modality(self) -> str:
+        return "target_av_with_auxiliary_raw_audio"
+
     def __init__(
         self,
         config: MimoBackendConfig,
         *,
-        stem_facts_by_clip: dict[str, MimoStemFactsRecord],
+        stem_records_by_clip: dict[str, SAMAudioStemRecord],
         client: Any | None = None,
     ) -> None:
         super().__init__(config, client=client)
-        self.stem_facts_by_clip = stem_facts_by_clip
+        self.stem_records_by_clip = stem_records_by_clip
 
-    def _auxiliary_text(self, job: MimoClipJob) -> str:
-        facts = self.stem_facts_by_clip.get(job.clip_uid)
-        if facts is None:
-            raise ValueError("stem-aware MiMo job lacks stem facts")
-        return "\nSTEM AUXILIARY EVIDENCE:\n" + _compact_json(
-            stem_reconcile_auxiliary_contract(facts)
+    def _media_content(self, job: MimoClipJob) -> list[dict[str, object]]:
+        content = super()._media_content(job)
+        content.insert(
+            0, {"type": "text", "text": "Original target AV; authoritative."}
         )
-
-    def _prompt(self, job: MimoClipJob) -> str:
-        return super()._prompt(job) + self._auxiliary_text(job)
-
-    def _full_av_recheck_prompt(
-        self,
-        job: MimoClipJob,
-        *,
-        invalid_response: str,
-        issues: list[Any],
-    ) -> str:
-        return super()._full_av_recheck_prompt(
-            job,
-            invalid_response=invalid_response,
-            issues=issues,
-        ) + self._auxiliary_text(job)
+        record = self.stem_records_by_clip[job.clip_uid]
+        for kind in ("music", "sfx"):
+            stem = record.stem(kind)
+            path = Path(stem.canonical_stem_path)
+            if sha256_file(path) != stem.canonical_stem_sha256:
+                raise ValueError(f"{kind} auxiliary stem changed")
+            content.extend(
+                [
+                    {
+                        "type": "text",
+                        "text": (
+                            f"Proposed {kind.upper()} separation. This is an auxiliary separation "
+                            "of the SAME target clip, aligned to t=0 and the same time origin. "
+                            "It is not another scene or a reference asset. Use it to notice weak "
+                            "sounds, then interpret them in the original AV. Separation may contain "
+                            "leakage or artifacts. Do not count the same sound twice or treat the "
+                            "track name as proof."
+                        ),
+                    },
+                    {
+                        "type": "audio_url",
+                        "audio_url": {"url": self.config.media_resolver.resolve(path)},
+                    },
+                ]
+            )
+        return content
 
 
 def _mimo_job(values: dict[str, object]) -> MimoClipJob:
@@ -1608,13 +1626,13 @@ def build_stem_reconcile_jobs(
 
 
 class MimoStemReconcileRecord(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_stem_reconcile.7"] = (
+    schema_version: Literal["r2v.h3.mimo25_stem_reconcile.8"] = (
         MIMO25_STEM_RECONCILE_VERSION
     )
     clip_uid: str
     source_job_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
-    source_stem_facts_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
-    policy_version: Literal["h3_mimo25_stem_reconcile_v2"] = (
+    source_stem_record_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    policy_version: Literal["h3_mimo25_stem_reconcile_v3"] = (
         MIMO25_STEM_RECONCILE_POLICY_VERSION
     )
     backend_provenance: MimoBackendProvenance
@@ -1625,7 +1643,13 @@ class MimoStemReconcileRecord(SchemaModel):
     failure_issues: list[ValidationIssue]
     raw_responses: list[StrictStr]
     diagnostics: list[MimoCompletionDiagnostic]
-    model_call_count: int = Field(ge=0)
+    sound_description: StrictStr | None
+    sound_partition: MimoSoundPartition | None
+    sound_partition_raw_response: StrictStr | None
+    sound_partition_error: str | None
+    av_model_call_count: int = Field(ge=0, le=1)
+    text_model_call_count: int = Field(ge=0, le=1)
+    model_call_count: int = Field(ge=0, le=2)
     record_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
 
     @model_validator(mode="after")
@@ -1636,10 +1660,19 @@ class MimoStemReconcileRecord(SchemaModel):
                 or self.failure_code is not None
                 or self.failure_reason is not None
                 or self.failure_issues
+                or self.sound_partition is None
+                or self.sound_partition_error is not None
             ):
                 raise ValueError("ready stem reconcile requires only annotation")
-        elif self.annotation is not None or not self.failure_code or not self.failure_reason:
+        elif not self.failure_code or not self.failure_reason:
             raise ValueError("failed stem reconcile requires failure provenance")
+        if self.model_call_count != self.av_model_call_count + self.text_model_call_count:
+            raise ValueError("stem reconcile model call counts differ")
+        if self.text_model_call_count == 0 and (
+            self.sound_partition is not None or self.sound_partition_raw_response is not None
+            or self.sound_partition_error is not None
+        ):
+            raise ValueError("sound partition evidence requires one text call")
         values = self.model_dump(mode="json", exclude={"record_fingerprint"})
         if self.record_fingerprint != _sha256_text(_compact_json(values)):
             raise ValueError("stem reconcile record fingerprint is invalid")
@@ -1660,7 +1693,7 @@ class StemReconcileUpstreamFailure(SchemaModel):
 
 
 class MimoStemReconcileSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_stem_reconcile_summary.9"] = (
+    schema_version: Literal["r2v.h3.mimo25_stem_reconcile_summary.10"] = (
         MIMO25_STEM_RECONCILE_SUMMARY_VERSION
     )
     route: SAMRoute
@@ -1671,9 +1704,10 @@ class MimoStemReconcileSummary(SchemaModel):
     processed_clip_uids: list[str]
     skipped_clips: list[StemShadowClipSkip]
     diarization_failed_clips: list[StemDiarizationClipFailure]
-    facts_failed_clips: list[StemReconcileUpstreamFailure]
     ready_count: int = Field(ge=0)
     failed_count: int = Field(ge=0)
+    av_model_call_count: int = Field(ge=0)
+    text_model_call_count: int = Field(ge=0)
     model_call_count: int = Field(ge=0)
     original_target_av_is_highest_authority: Literal[True] = True
     current_mimo_versions_modified: Literal[True] = True
@@ -1682,14 +1716,14 @@ class MimoStemReconcileSummary(SchemaModel):
     @model_validator(mode="after")
     def validate_counts(self) -> MimoStemReconcileSummary:
         if (
-            self.processed_clip_count != self.ready_count + self.failed_count
+            self.model_call_count != self.av_model_call_count + self.text_model_call_count
+            or self.processed_clip_count != self.ready_count + self.failed_count
             or self.clip_count != self.processed_clip_count + self.skipped_clip_count
             or self.clip_count != len(self.clip_uids)
             or self.processed_clip_count != len(self.processed_clip_uids)
             or self.skipped_clip_count
             != len(self.skipped_clips)
             + len(self.diarization_failed_clips)
-            + len(self.facts_failed_clips)
             or [item for item in self.clip_uids if item in set(self.processed_clip_uids)]
             != self.processed_clip_uids
             or [
@@ -1699,28 +1733,22 @@ class MimoStemReconcileSummary(SchemaModel):
                 in {failure.clip_uid for failure in self.diarization_failed_clips}
             ]
             != [item.clip_uid for item in self.diarization_failed_clips]
-            or [
-                item
-                for item in self.clip_uids
-                if item in {failure.clip_uid for failure in self.facts_failed_clips}
-            ]
-            != [item.clip_uid for item in self.facts_failed_clips]
             or set(self.processed_clip_uids)
             .union(item.clip_uid for item in self.skipped_clips)
             .union(item.clip_uid for item in self.diarization_failed_clips)
-            .union(item.clip_uid for item in self.facts_failed_clips)
             != set(self.clip_uids)
             or any(item.route != self.route for item in self.skipped_clips)
             or any(
                 item.route != self.route for item in self.diarization_failed_clips
             )
-            or any(item.route != self.route for item in self.facts_failed_clips)
         ):
             raise ValueError("stem reconcile summary counts do not reconcile")
         return self
 
 
 class StemReconcileBackend(Protocol):
+    def partition_sound_description(self, sound_description: str) -> MimoSoundPartitionCall: ...
+
     @property
     def provenance(self) -> MimoBackendProvenance: ...
 
@@ -1738,7 +1766,7 @@ class StemReconcileBackend(Protocol):
 def run_mimo25_stem_reconcile_shadow(
     *,
     jobs: Sequence[MimoClipJob],
-    stem_facts: Sequence[MimoStemFactsRecord],
+    stem_records: Sequence[SAMAudioStemRecord],
     backend: StemReconcileBackend,
     output_root: Path,
     source_clip_uids: Sequence[str] | None = None,
@@ -1748,149 +1776,153 @@ def run_mimo25_stem_reconcile_shadow(
     allow_unverified: bool = False,
     overwrite: bool = False,
 ) -> MimoStemReconcileSummary:
-    facts_by_clip = {item.clip_uid: item for item in stem_facts}
-    if len(facts_by_clip) != len(stem_facts) or set(facts_by_clip) != {
-        item.clip_uid for item in jobs
-    }:
-        raise ValueError("stem reconcile jobs and facts differ")
-    if any(
-        item.source_verification_state == "unverified" for item in stem_facts
-    ) and not allow_unverified:
-        raise ValueError(
-            "unverified SAM Audio stems require explicit allow_unverified opt-in"
-        )
-    ordered_source = list(source_clip_uids or [item.clip_uid for item in jobs])
-    if len(ordered_source) != len(set(ordered_source)):
-        raise ValueError("stem reconcile source clip order contains duplicates")
-    job_ids = [item.clip_uid for item in jobs]
-    if [item for item in ordered_source if item in set(job_ids)] != job_ids:
-        raise ValueError("stem reconcile jobs differ from source clip order")
-    upstream_skipped_ids = {item.clip_uid for item in skipped_clips}
-    diarization_failed_ids = {
-        item.clip_uid for item in diarization_failed_clips
-    }
+    job_ids = [job.clip_uid for job in jobs]
+    selected = selected_stem_records(
+        [record for record in stem_records if record.clip_uid in set(job_ids)],
+        route=route,
+        allow_unverified=allow_unverified,
+    )
+    stems_by_clip = {record.clip_uid: record for record in selected}
+    if set(stems_by_clip) != set(job_ids) or len(set(job_ids)) != len(job_ids):
+        raise ValueError("stem reconcile jobs and usable separation records differ")
+    ordered_source = list(source_clip_uids or job_ids)
     if (
-        upstream_skipped_ids.intersection(diarization_failed_ids)
-        or upstream_skipped_ids.union(diarization_failed_ids)
-        != set(ordered_source) - set(job_ids)
+        len(ordered_source) != len(set(ordered_source))
+        or [clip for clip in ordered_source if clip in set(job_ids)] != job_ids
+    ):
+        raise ValueError("stem reconcile jobs differ from source clip order")
+    skipped_ids = [
+        item.clip_uid for item in [*skipped_clips, *diarization_failed_clips]
+    ]
+    if (
+        len(skipped_ids) != len(set(skipped_ids))
+        or set(skipped_ids) != set(ordered_source) - set(job_ids)
+        or any(
+            item.route != route for item in [*skipped_clips, *diarization_failed_clips]
+        )
     ):
         raise ValueError("stem reconcile skipped clips differ from source inventory")
-    if any(item.route != route for item in stem_facts) or any(
-        item.route != route for item in skipped_clips
-    ) or any(
-        item.route != route for item in diarization_failed_clips
-    ):
-        raise ValueError("stem reconcile route differs from source records")
-    ready_fact_ids = [item.clip_uid for item in stem_facts if item.status == "ready"]
-    failed_facts = [item for item in stem_facts if item.status == "failed"]
-    processed_ids = [clip_uid for clip_uid in job_ids if clip_uid in set(ready_fact_ids)]
-    if ready_fact_ids != processed_ids:
-        raise ValueError("ready stem facts differ from job order")
-    facts_failed_clips = [
-        StemReconcileUpstreamFailure(
-            clip_uid=item.clip_uid,
-            route=route,
-            source_record_fingerprint=item.record_fingerprint,
-            reason_code=item.failure_code or "stem_fact_failed",
-            reason_type=item.failure_type or "UnknownStemFactFailure",
-            reason=item.failure_reason or "stem fact extraction failed",
-        )
-        for item in failed_facts
-    ]
     destination = output_root.expanduser().resolve(strict=False)
+    if destination.exists() and not overwrite:
+        raise FileExistsError(destination)
     temporary = destination.with_name(f".{destination.name}.tmp-{uuid.uuid4().hex}")
     records: list[MimoStemReconcileRecord] = []
     try:
         temporary.mkdir(parents=True)
         for job in jobs:
-            facts = facts_by_clip[job.clip_uid]
-            if facts.status != "ready":
-                continue
-            segments = [item.segment_id for item in job.segments]
-            transcribed = [
-                item.segment_id for item in job.segments if item.asr_status == "transcribed"
-            ]
-            entities = {
-                item.entity_id
-                for item in job.reference_images
-                if item.kind == "subject" and item.entity_id is not None
-            }
-            labels = {item.picture_label for item in job.reference_images} | {
-                item.subject_label for item in job.reference_subjects
-            }
+            annotation = None
+            failure_code = failure_reason = None
+            issues: list[ValidationIssue] = []
             try:
                 result = backend.reconcile(
                     job,
-                    segment_ids=segments,
-                    transcribed_segment_ids=transcribed,
-                    allowed_entity_ids=entities,
-                    allowed_reference_labels=labels,
+                    segment_ids=[s.segment_id for s in job.segments],
+                    transcribed_segment_ids=[
+                        s.segment_id
+                        for s in job.segments
+                        if s.asr_status == "transcribed"
+                    ],
+                    allowed_entity_ids={
+                        r.entity_id
+                        for r in job.reference_images
+                        if r.kind == "subject" and r.entity_id is not None
+                    },
+                    allowed_reference_labels={
+                        r.picture_label for r in job.reference_images
+                    }
+                    | {s.subject_label for s in job.reference_subjects},
                 )
-                values = {
-                    "schema_version": MIMO25_STEM_RECONCILE_VERSION,
-                    "clip_uid": job.clip_uid,
-                    "source_job_fingerprint": job.request_fingerprint,
-                    "source_stem_facts_fingerprint": facts.record_fingerprint,
-                    "policy_version": MIMO25_STEM_RECONCILE_POLICY_VERSION,
-                    "backend_provenance": backend.provenance.model_dump(mode="json"),
-                    "status": "ready",
-                    "annotation": result.annotation.model_dump(mode="json"),
-                    "failure_code": None,
-                    "failure_reason": None,
-                    "failure_issues": [],
-                    "raw_responses": list(result.raw_responses),
-                    "diagnostics": [item.model_dump(mode="json") for item in result.diagnostics],
-                    "model_call_count": result.model_call_count,
-                }
+                annotation = result.annotation
+                raw = list(result.raw_responses)
+                diagnostics = list(result.diagnostics)
+                av_calls = result.model_call_count
             except MimoBackendFailure as exc:
-                values = {
-                    "schema_version": MIMO25_STEM_RECONCILE_VERSION,
-                    "clip_uid": job.clip_uid,
-                    "source_job_fingerprint": job.request_fingerprint,
-                    "source_stem_facts_fingerprint": facts.record_fingerprint,
-                    "policy_version": MIMO25_STEM_RECONCILE_POLICY_VERSION,
-                    "backend_provenance": backend.provenance.model_dump(mode="json"),
-                    "status": "failed",
-                    "annotation": None,
-                    "failure_code": exc.code,
-                    "failure_reason": exc.reason,
-                    "failure_issues": [item.to_dict() for item in exc.issues],
-                    "raw_responses": list(exc.raw_responses),
-                    "diagnostics": [item.model_dump(mode="json") for item in exc.diagnostics],
-                    "model_call_count": exc.model_call_count,
-                }
+                failure_code, failure_reason = exc.code, exc.reason
+                issues = list(exc.issues)
+                raw, diagnostics, av_calls = (
+                    list(exc.raw_responses),
+                    list(exc.diagnostics),
+                    exc.model_call_count,
+                )
+            # Preserve parseable first-pass fields even when identity/format validation failed.
+            sound = annotation.h3_semantics.sound_description if annotation else None
+            if raw and annotation is None:
+                try:
+                    payload = json.loads(normalize_structured_json_envelope(raw[-1]))
+                    candidate = payload.get("h3_semantics", {}).get("sound_description")
+                    if isinstance(candidate, str):
+                        sound = candidate
+                    annotation = MimoAVAnnotationDraft.model_validate(payload)
+                except (ValueError, TypeError, AttributeError):
+                    pass
+            partition = None
+            if sound is not None:
+                partition = backend.partition_sound_description(sound)
+                diagnostics.append(partition.diagnostic)
+                if partition.error is not None and failure_code is None:
+                    failure_code, failure_reason = (
+                        "sound_partition_failed",
+                        partition.error,
+                    )
+            values = {
+                "schema_version": MIMO25_STEM_RECONCILE_VERSION,
+                "clip_uid": job.clip_uid,
+                "source_job_fingerprint": job.request_fingerprint,
+                "source_stem_record_fingerprint": stems_by_clip[
+                    job.clip_uid
+                ].record_fingerprint,
+                "policy_version": MIMO25_STEM_RECONCILE_POLICY_VERSION,
+                "backend_provenance": backend.provenance.model_dump(mode="json"),
+                "status": "ready"
+                if failure_code is None and partition is not None
+                else "failed",
+                "annotation": annotation.model_dump(mode="json")
+                if annotation
+                else None,
+                "failure_code": failure_code,
+                "failure_reason": failure_reason,
+                "failure_issues": [issue.to_dict() for issue in issues],
+                "raw_responses": raw,
+                "diagnostics": [d.model_dump(mode="json") for d in diagnostics],
+                "sound_description": sound,
+                "sound_partition": partition.partition.model_dump(mode="json")
+                if partition and partition.partition
+                else None,
+                "sound_partition_raw_response": partition.raw_response
+                if partition
+                else None,
+                "sound_partition_error": partition.error if partition else None,
+                "av_model_call_count": av_calls,
+                "text_model_call_count": int(partition is not None),
+                "model_call_count": av_calls + int(partition is not None),
+            }
             records.append(
                 MimoStemReconcileRecord(
                     **values,
                     record_fingerprint=_sha256_text(_compact_json(values)),
                 )
             )
-        counts = Counter(item.status for item in records)
+        counts = Counter(record.status for record in records)
         summary = MimoStemReconcileSummary(
             route=route,
             clip_count=len(ordered_source),
             processed_clip_count=len(records),
-            skipped_clip_count=(
-                len(skipped_clips)
-                + len(diarization_failed_clips)
-                + len(facts_failed_clips)
-            ),
+            skipped_clip_count=len(skipped_ids),
             clip_uids=ordered_source,
-            processed_clip_uids=processed_ids,
+            processed_clip_uids=job_ids,
             skipped_clips=list(skipped_clips),
             diarization_failed_clips=list(diarization_failed_clips),
-            facts_failed_clips=facts_failed_clips,
             ready_count=counts["ready"],
             failed_count=counts["failed"],
-            model_call_count=sum(item.model_call_count for item in records),
+            av_model_call_count=sum(r.av_model_call_count for r in records),
+            text_model_call_count=sum(r.text_model_call_count for r in records),
+            model_call_count=sum(r.model_call_count for r in records),
         )
         _write_jsonl(temporary / "records.jsonl", records)
         _write_jsonl(temporary / "skipped_clips.jsonl", list(skipped_clips))
         _write_jsonl(
-            temporary / "diarization_failed_clips.jsonl",
-            list(diarization_failed_clips),
+            temporary / "diarization_failed_clips.jsonl", list(diarization_failed_clips)
         )
-        _write_jsonl(temporary / "facts_failed_clips.jsonl", facts_failed_clips)
         _write_json(temporary / "summary.json", summary)
         _publish_directory(temporary, destination, overwrite=overwrite)
         return summary
@@ -1903,6 +1935,7 @@ def run_mimo25_stem_reconcile_shadow(
 __all__ = [
     "MIMO25_STEM_FACT_PROMPT_VERSION",
     "MIMO25_STEM_RECONCILE_POLICY_VERSION",
+    "MIMO25_STEM_RECONCILE_STAGE",
     "FFmpegStemViewBackend",
     "MimoStemFactsRecord",
     "MimoStemFactsSummary",

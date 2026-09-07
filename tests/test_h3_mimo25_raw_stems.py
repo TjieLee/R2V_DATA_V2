@@ -1,0 +1,463 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from r2v_data_v2.h3 import audio_shadow_qa as qa
+from r2v_data_v2.h3.mimo25_backend import (
+    MimoBackendConfig,
+    MimoBackendFailure,
+    MimoMediaResolver,
+    MimoSoundPartition,
+    OpenAIMimo25Backend,
+    protect_direct_dialogue,
+)
+from r2v_data_v2.h3.mimo25_stem_shadow import (
+    MIMO25_STEM_RECONCILE_STAGE,
+    StemAwareOpenAIMimo25Backend,
+    build_stem_reconcile_jobs,
+    run_mimo25_stem_reconcile_shadow,
+)
+from r2v_data_v2.h3.sam_audio_stem_shadow import load_stem_shadow
+from tests.test_h3_audio_shadow_qa import _fixture, _snapshot
+from tests.test_h3_mimo25_av_shadow import _annotation, _Completions
+from tools import run_h3_mimo25_stem_reconcile_shadow as cli
+
+PARTITION = (
+    '{"overall_soundscape":"A quiet room tone and a clink.","non_diegetic_music":"N/A"}'
+)
+
+
+def _raw():
+    return _annotation().model_dump_json().replace("segment_1", "segment_0001")
+
+
+def _backend(tmp_path, shadow, responses):
+    stems = load_stem_shadow(shadow / "separation")[1]
+    completions = _Completions(responses)
+    backend = StemAwareOpenAIMimo25Backend(
+        MimoBackendConfig(
+            api_key="fake",
+            transport="sglang",
+            icl="official_ref2va_v1",
+            media_resolver=MimoMediaResolver(
+                mode="http",
+                media_root=tmp_path,
+                media_base_url="http://media.invalid",
+            ),
+        ),
+        stem_records_by_clip={r.clip_uid: r for r in stems},
+        client=SimpleNamespace(chat=SimpleNamespace(completions=completions)),
+    )
+    base = qa.build_mimo25_inventory()
+    jobs = build_stem_reconcile_jobs(
+        base_inventory=base,
+        stem_diarization_root=shadow / "diarization",
+        stem_asr_root=shadow / "asr",
+        route="music_first",
+    )
+    return backend, completions, stems, jobs
+
+
+def _run(shadow, backend, stems, jobs):
+    return run_mimo25_stem_reconcile_shadow(
+        jobs=jobs,
+        stem_records=stems,
+        backend=backend,
+        output_root=shadow / MIMO25_STEM_RECONCILE_STAGE,
+        route="music_first",
+        allow_unverified=True,
+        overwrite=True,
+    )
+
+
+def _records(shadow):
+    path = shadow / MIMO25_STEM_RECONCILE_STAGE / "records.jsonl"
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+def _reconcile(backend, job):
+    return backend.reconcile(
+        job,
+        segment_ids=[s.segment_id for s in job.segments],
+        transcribed_segment_ids=[
+            s.segment_id for s in job.segments if s.asr_status == "transcribed"
+        ],
+        allowed_entity_ids={"e1"},
+        allowed_reference_labels={"<Subject 1>", "<Picture 1>"},
+    )
+
+
+def test_real_entry_without_facts_sends_one_av_and_one_text(tmp_path, monkeypatch):
+    kwargs, shadow = _fixture(tmp_path, monkeypatch)
+    backend, completions, stems, jobs = _backend(
+        tmp_path,
+        shadow,
+        [(_raw(), 8), (PARTITION, None)] * 3,
+    )
+    source_before = {
+        path: data
+        for path, data in _snapshot(tmp_path).items()
+        if MIMO25_STEM_RECONCILE_STAGE not in path.parts
+    }
+    monkeypatch.setattr(cli, "build_mimo25_inventory", qa.build_mimo25_inventory)
+    monkeypatch.setattr(cli, "StemAwareOpenAIMimo25Backend", lambda *a, **k: backend)
+    argv = [
+        part
+        for key, value in kwargs.items()
+        for part in ("--" + key.replace("_", "-"), str(value))
+    ]
+    with pytest.raises(ValueError, match="unverified"):
+        cli.main([*argv, "--dry-run"])
+    monkeypatch.setenv("MIMO_API_KEY", "fake")
+    result = cli.main(
+        [*argv, "--media-root", str(tmp_path), "--allow-unverified", "--overwrite"]
+    )
+    assert result["output_root"] == str(shadow / MIMO25_STEM_RECONCILE_STAGE)
+    assert not (shadow / "mimo_stem_facts").exists()
+    assert not (shadow / "stem_views").exists()
+    assert result["summary"]["ready_count"] == 3
+    assert result["summary"]["av_model_call_count"] == 3
+    assert result["summary"]["text_model_call_count"] == 3
+    assert result["summary"]["model_call_count"] == len(completions.requests) == 6
+    assert result["summary"]["processed_clip_uids"] == ["clip-z", "clip-a", "clip-m"]
+
+    first, second = completions.requests[:2]
+    assert [m["role"] for m in first["messages"]] == [
+        "system",
+        "user",
+        "assistant",
+        "user",
+    ]
+    media = first["messages"][-1]["content"]
+    assert sum(p["type"] == "video_url" for p in media) == 1
+    assert sum(p["type"] == "image_url" for p in media) == 1
+    audio_urls = [p["audio_url"]["url"] for p in media if p["type"] == "audio_url"]
+    selected = next(
+        r for r in stems if r.clip_uid == jobs[0].clip_uid and r.route == "music_first"
+    )
+    assert audio_urls == [
+        backend.config.media_resolver.resolve(
+            Path(selected.stem(kind).canonical_stem_path)
+        )
+        for kind in ("music", "sfx")
+    ]
+    full = json.dumps(media)
+    assert "stem_facts" not in full and "STEM AUXILIARY EVIDENCE" not in full
+    assert "input_audio" not in full and "<Audio " not in full
+    assert (
+        backend.config.media_resolver.resolve(Path(jobs[0].target_full_audio_path))
+        not in full
+    )
+    assert (
+        backend.config.media_resolver.resolve(
+            Path(selected.stem("speech").canonical_stem_path)
+        )
+        not in full
+    )
+    assert "same time origin" in full and "leakage" in full
+    assert first["extra_body"]["use_audio_in_video"] is True
+    assert first["extra_body"]["chat_template_kwargs"] == {
+        "thinking": False,
+        "enable_thinking": False,
+    }
+    assert first["reasoning_effort"] == "none"
+
+    schema = first["response_format"]["json_schema"]["schema"]
+    assert "sound_description" in schema["$defs"]["MimoH3Semantics"]["required"]
+    for forbidden in (
+        "overall_soundscape_status",
+        "complete_silence_verified",
+        "temporal_non_speech_events",
+    ):
+        assert forbidden not in json.dumps(schema)
+    assert (
+        "audio_semantics" not in schema["$defs"]["MimoAudioObservation"]["properties"]
+    )
+    assert set(second["messages"][1]) == {"role", "content"}
+    assert [m["role"] for m in second["messages"]] == ["system", "user"]
+    assert (
+        second["messages"][1]["content"] == _annotation().h3_semantics.sound_description
+    )
+    assert second["temperature"] == 0.0 and second["max_completion_tokens"] == 1024
+    assert second["reasoning_effort"] == "none"
+    assert second["extra_body"] == {
+        "chat_template_kwargs": {"thinking": False, "enable_thinking": False}
+    }
+    assert (
+        second["response_format"]["json_schema"]["schema"]
+        == MimoSoundPartition.model_json_schema()
+    )
+    for marker in (
+        "video_url",
+        "audio_url",
+        "image_url",
+        "AUTHORITATIVE INPUT",
+        "Shot 1",
+        "segment_0001",
+    ):
+        assert marker not in json.dumps(second)
+    assert all(path.read_bytes() == data for path, data in source_before.items())
+
+    qa.build_audio_shadow_qa(**kwargs)
+    data = json.loads((shadow / "qa/data.json").read_text())
+    assert all(row["final_h3"]["status"] == "ready" for row in data["clips"])
+    assert (
+        data["clips"][0]["reconcile"]["diagnostics"][0]["input_modality"]
+        == "target_av_with_auxiliary_raw_audio"
+    )
+    final = data["clips"][0]["final_h3"]["text"]
+    assert final.count("[Shot 1]") == 1 and "[[" not in final
+    assert _annotation().h3_semantics.shot1_caption in final
+    assert "overall_soundscape:\nA quiet room tone and a clink." in final
+    assert "non_diegetic_music:\nN/A" in final
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "semantic",
+        "format",
+        "schema",
+        "articulation",
+        "zero_audio",
+        "text_json",
+        "text_api",
+    ],
+)
+def test_failures_keep_raw_and_continue_without_retries(tmp_path, monkeypatch, failure):
+    kwargs, shadow = _fixture(tmp_path, monkeypatch)
+    payload = json.loads(_raw())
+    if failure == "semantic":
+        payload["h3_semantics"]["subject_definitions"][0]["subject_label"] = (
+            "<Subject 9>"
+        )
+    elif failure == "format":
+        payload["h3_semantics"]["shot1_caption"] = "<d>[Chinese] unchanged</d>"
+    elif failure == "articulation":
+        payload["visual_observation"]["segment_views"][0]["entity_observations"][0][
+            "speech_correlated_articulation"
+        ] = "not_observed"
+    elif failure == "schema":
+        del payload["h3_semantics"]["subject_definitions"]
+    first_raw = json.dumps(payload)
+    backend, completions, stems, jobs = _backend(
+        tmp_path,
+        shadow,
+        [
+            (first_raw, 0 if failure == "zero_audio" else 8),
+            ("not JSON" if failure == "text_json" else PARTITION, None),
+            (_raw(), 8),
+            (PARTITION, None),
+            (_raw(), 8),
+            (PARTITION, None),
+        ],
+    )
+    if failure == "text_api":
+        original = completions.create
+
+        def create(**request):
+            if len(completions.requests) == 1:
+                completions.requests.append(request)
+                completions.responses.pop(0)
+                raise OSError("synthetic text timeout")
+            return original(**request)
+
+        monkeypatch.setattr(completions, "create", create)
+    summary = _run(shadow, backend, stems, jobs)
+    assert summary.failed_count == 1 and summary.ready_count == 2
+    assert summary.av_model_call_count == summary.text_model_call_count == 3
+    assert summary.model_call_count == len(completions.requests) == 6
+    records = _records(shadow)
+    assert records[0]["status"] == "failed"
+    assert records[0]["raw_responses"] == [first_raw]
+    assert (
+        records[0]["sound_description"] == payload["h3_semantics"]["sound_description"]
+    )
+    if failure.startswith("text"):
+        assert (
+            records[0]["sound_partition"] is None
+            and records[0]["sound_partition_error"]
+        )
+    else:
+        assert records[0]["sound_partition"] == json.loads(PARTITION)
+    qa.build_audio_shadow_qa(**kwargs)
+    clip = json.loads((shadow / "qa/data.json").read_text())["clips"][0]
+    assert (
+        clip["direct_h3"]["shot1_caption"] == payload["h3_semantics"]["shot1_caption"]
+    )
+    assert clip["reconcile"]["sound_description"]
+    assert clip["final_h3"]["status"] == "unavailable"
+    page = (shadow / "qa/review.html").read_text()
+    assert "First AV raw response" in page and "Text-only sound partition" in page
+
+
+def test_av_http_failure_is_single_attempt_and_next_clip_runs(tmp_path, monkeypatch):
+    _, shadow = _fixture(tmp_path, monkeypatch)
+    backend, completions, stems, jobs = _backend(
+        tmp_path,
+        shadow,
+        [(_raw(), 8), (PARTITION, None)] * 2,
+    )
+    original = completions.create
+
+    def create(**request):
+        if not completions.requests:
+            completions.requests.append(request)
+            raise OSError("synthetic AV timeout")
+        return original(**request)
+
+    monkeypatch.setattr(completions, "create", create)
+    summary = _run(shadow, backend, stems, jobs)
+    assert summary.ready_count == 2 and summary.failed_count == 1
+    assert summary.av_model_call_count == 3 and summary.text_model_call_count == 2
+    assert len(completions.requests) == 5
+    assert _records(shadow)[0]["raw_responses"] == []
+
+
+def test_sdk_retries_disabled_even_for_injected_openai_client(tmp_path):
+    from openai import OpenAI
+
+    client = OpenAI(api_key="fake", base_url="http://unused.invalid/v1", max_retries=4)
+    config = MimoBackendConfig(
+        api_key="fake",
+        media_resolver=MimoMediaResolver(mode="base64", media_root=tmp_path),
+    )
+    backend = OpenAIMimo25Backend(config, client=client)
+    assert backend.client.max_retries == 0
+    backend.client.close()
+    client.close()
+    owned = OpenAIMimo25Backend(config)
+    assert owned.client.max_retries == 0
+    owned.client.close()
+
+
+def test_multiple_same_speaker_segments_may_share_one_unchanged_dialogue(
+    tmp_path, monkeypatch
+):
+    _, shadow = _fixture(tmp_path, monkeypatch)
+    backend, _, _, jobs = _backend(tmp_path, shadow, [])
+    job = jobs[0]
+    values = job.model_dump(mode="json")
+    segment = values["segments"][0]
+    values["segments"] = []
+    for i in range(1, 5):
+        start, end = (i - 1) * 0.25, (i - 1) * 0.25 + 0.2
+        values["segments"].append(
+            {
+                **segment,
+                "segment_id": f"segment_{i:04d}",
+                "start_time": start,
+                "end_time": end,
+                "source_start_sample": round(start * segment["source_sample_rate_hz"]),
+                "source_end_sample": round(end * segment["source_sample_rate_hz"]),
+            }
+        )
+    payload = json.loads(_raw())
+    for section, key in (
+        ("visual_observation", "segment_views"),
+        ("audio_observation", "segment_decisions"),
+        ("av_grounding", "segment_groundings"),
+    ):
+        template = payload[section][key][0]
+        payload[section][key] = [
+            {**template, "segment_id": s["segment_id"]} for s in values["segments"]
+        ]
+    caption = "(S1) <Subject 1> gestures. <d>[Chinese] Original model wording stays intact.</d>"
+    payload["h3_semantics"]["shot1_caption"] = caption
+    from r2v_data_v2.h3.mimo25_av_reconcile import _job
+
+    values.pop("request_fingerprint")
+    job = _job(values)
+    backend.client.chat.completions.responses = [(json.dumps(payload), 8)]
+    result = _reconcile(backend, job)
+    assert result.model_call_count == 1
+    assert result.annotation.h3_semantics.shot1_caption == caption
+    assert len(result.annotation.segment_decisions) == 4
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "(S1) <d>[English] a <d>[English] b</d></d>",
+        "(S1) <d>[English] a",
+        "(S1) <d>no language</d>",
+        "<d>[English] no source</d>",
+        "(S9) <d>[English] unknown</d>",
+        "(S1) <d>[English] a</d> <d>[English] b</d>",
+        "[Shot 1] body",
+        "[[segment:x]]",
+    ],
+)
+def test_dialogue_format_failures_are_not_rewritten(text):
+    unchanged, issues, warnings = protect_direct_dialogue(
+        text,
+        [{"speaker_id": "S1", "text": "not used"}],
+        allowed_labels=set(),
+    )
+    assert unchanged == text and issues and warnings == []
+
+
+def test_media_preflight_failure_has_zero_model_calls(tmp_path, monkeypatch):
+    _, shadow = _fixture(tmp_path, monkeypatch)
+    backend, completions, _, jobs = _backend(tmp_path, shadow, [])
+    monkeypatch.setattr(
+        backend,
+        "_media_content",
+        lambda job: (_ for _ in ()).throw(ValueError("missing stem")),
+    )
+    with pytest.raises(MimoBackendFailure) as failure:
+        _reconcile(backend, jobs[0])
+    assert failure.value.model_call_count == 0 and not failure.value.diagnostics
+    assert not completions.requests
+
+
+@pytest.mark.parametrize(
+    "payload, accepted",
+    [
+        ({"overall_soundscape": "", "non_diegetic_music": ""}, True),
+        (
+            {
+                "overall_soundscape": "Music and speech, uncertain.",
+                "non_diegetic_music": "N/A",
+            },
+            True,
+        ),
+        ({"overall_soundscape": 7, "non_diegetic_music": "N/A"}, False),
+    ],
+)
+def test_partition_checks_only_two_string_json_shape(tmp_path, payload, accepted):
+    completions = _Completions([(json.dumps(payload), None)])
+    backend = OpenAIMimo25Backend(
+        MimoBackendConfig(
+            api_key="fake",
+            transport="sglang",
+            media_resolver=MimoMediaResolver(mode="base64", media_root=tmp_path),
+        ),
+        client=SimpleNamespace(chat=SimpleNamespace(completions=completions)),
+    )
+    result = backend.partition_sound_description("Only the source sound description.")
+    assert (result.partition is not None) == accepted
+    assert result.raw_response == json.dumps(payload)
+    assert len(completions.requests) == 1
+    if accepted:
+        assert result.partition.model_dump() == payload
+    else:
+        assert result.error
+
+
+def test_optional_music_reference_does_not_invent_timing(tmp_path):
+    from r2v_data_v2.h3.mimo25_h3_materializer import _select_music_reference
+
+    result = _select_music_reference(
+        job=None,
+        record=SimpleNamespace(annotation=_annotation()),
+        final_root=tmp_path,
+        audio_backend=None,
+        temporary_root=tmp_path,
+        analyzer=None,
+    )
+    assert result == (None, None, ["music_reference_timing_unavailable"])

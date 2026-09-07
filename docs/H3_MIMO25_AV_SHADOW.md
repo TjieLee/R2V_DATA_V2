@@ -1,8 +1,11 @@
 # H3 MiMo-V2.5 AV Shadow
 
 This experimental path is additive and read-only with respect to the current JEA
-production stages. It writes only `mimo25_av_reconcile_v5/` and
-`mimo25_h3_shadow_v5/` under the Audio production root.
+production stages. The current path is the named SAM shadow entry, publishing
+`mimo_reconcile_av_rawstems_sound_partition/` after existing separation,
+DiariZen and ASR. Historical `mimo25_av_reconcile_v5/`, `mimo25_h3_shadow_v5/`,
+stem-facts and older reconcile artifacts are not migrated or overwritten.
+See `H3_AUDIO_SERVER_RUNBOOK.md` Stage 4 for current run and QA commands.
 
 The independent `H3_QWEN_SPEECH_PRESENTATION_AB.md` shadow is frozen as a
 visual-only contract check. It is not a replacement for MiMo's full audiovisual
@@ -16,10 +19,15 @@ speaker reconciliation; MiMo is the final AV authority for this shadow path.
 - LR-ASD, source clusters, and current entity bindings are proposals.
 - one MiMo-V2.5 joint-AV request returns visual/audio observation, AV grounding,
   and direct `h3_semantics`. MiMo authors natural `style_opening` / `shot1_caption`,
-  soundscape, and music prose; there is no playback projection or compositor.
+  and one full `sound_description`; there is no playback projection or compositor.
+  The original video/audio is accompanied by raw music and SFX audio, not stem
+  semantic text or stem-video proxies. No speech stem or duplicate full audio is sent.
+- one separate text-only request partitions only `sound_description` into
+  `overall_soundscape` and `non_diegetic_music`, without media, ICL or history.
 - the deterministic boundary preserves frozen Subject/Picture ownership and
-  corrects only safely matched `<d>` payloads to exact Qwen3-ASR text/language.
-  It does not replace MiMo speaker/action lead-ins or connective prose.
+  checks generated vocal-event formatting without rewriting dialogue. Adjacent
+  same-speaker ASR turns may share one natural `<d>` block; ASR artifacts stay
+  unchanged and remain visible in QA. There is no segment-count/order zip.
 - post-MiMo voice recovery may create a real target voice asset only from a
   validated clean single-speaker, resolved `visible_entity` / `onscreen_spoken`
   segment for an entity that has no existing target voice. It uses the exact
@@ -31,33 +39,32 @@ audio `segment_decisions` row, and one Stage C `segment_groundings` row,
 including empty or otherwise non-transcribed segments. Stage A records only
 visible entities and exact-window visibility/orientation/face/mouth/articulation
 observations. Stage B owns clip-local `gN`, vocal composition, acoustic
-resolution, segment delivery, secondary vocal activity, voice profiles, and
-non-speech Audio. Stage C may map that exact Stage B group to one frozen `eN` or
-null and classify presentation. Only Qwen3-ASR segments with
-`asr_status="transcribed"` receive a `<d>` dialogue block in the direct caption.
-Every authoritative `<d>` event needs its expected `(Sx)` in the lead-in after
-the previous `</d>` (or caption start). The marker may occur anywhere in that
-span; no nearest-marker, fixed says clause, or pronoun resolution is used.
-Counts and recognizable dialogue order must map safely; recognized out-of-order
-dialogue is rejected, not silently moved. The current pilot is exactly one shot. Visual observation contains only
-`visual_blocks` and `segment_views`, with no model-owned shot boundaries or
-timestamps. The pipeline inserts the single `[Shot 1]` between `style_opening`
-and `shot1_caption`; any model-authored shot marker is rejected/rechecked.
+resolution, segment delivery, secondary vocal activity and voice profiles. Stage C may map that exact Stage B group to one frozen `eN` or
+null and classify presentation. Supplied transcribed speech belongs in the
+caption, preserving dialogue and language. Generated vocal events need a valid
+`(Sx)` in the span after the previous `</d>` and before the current `<d>`.
+This is format validation, not proof of speaker identity or segment alignment.
+Paired, non-nested dialogue tags with language labels and allowed reference/source
+labels are checked; text is never replaced, moved or split by code.
+The current pilot remains exactly one shot. Visual observation contains only
+`visual_blocks` and `segment_views`, not generated shot boundaries.
+The pipeline inserts `"\\n[Shot 1] "` between opening and caption.
+Model-authored shot markers or internal placeholders produce issues without retries.
 Coarse visual evidence never controls final sentence order or length. There is no visual word-count floor.
 
 The final system block prioritizes caption prose. `style_opening` describes only
 global cinematographic style/camera language/lighting, not scene contents or
 actions. Model input has one authoritative segment inventory; old
 `job.r2v_instruction` prose stays stored for provenance but is not model input.
-The response shape, authority v17, and materializer v21 are unchanged. This is
-a prompt-quality experiment, not a verified random10 quality improvement.
+The new sound schema and two-request contract change versions, not frozen
+reference or speaker authority. This is not a verified quality improvement.
 
 The official Complete Example in `docs/VIDEO_PROMPT_WRITING_GUIDE_ref_en.md`
 is unchanged. ICL extracts only its global detailed-description line and complete
 Shot 1 body before Shot 2, removes the Shot 1 marker, and wraps the exact prose
 as `style_opening` / `shot1_caption` JSON. This is a style subset, not the real
 response schema; provenance is `h3_official_ref2va_detailed_shot1_v2`.
-See `H3_AUDIO_SERVER_RUNBOOK.md` Stage 5 for current defaults and versions.
+See `H3_AUDIO_SERVER_RUNBOOK.md` Stage 4 for current defaults and versions.
 Human random10 QA, not automated style checks, determines caption quality.
 
 The compact per-request contract supplies the exact complete segment inventory
@@ -79,8 +86,7 @@ model-authored Picture label is rejected rather than treated as authority.
 Subject descriptions reject narrow speaker-profile vocabulary. Voice profiles
 remain acoustic-first; supported audible age/gender descriptors are allowed,
 while nationality, role, named identity, relationship, or personality claims
-remain invalid. The full-AV recheck receives the same mapping and exact
-transcribed segment inventory.
+remain invalid. No full-AV recheck is sent.
 
 Stage B also carries one nullable `speaker_voice_profiles` row for each
 resolved speaker group that owns authoritative transcribed speech. A non-null
@@ -116,7 +122,7 @@ LR-ASD support, source-cluster support, current bindings, and direct anchors are
 proposals rather than visible-speaking proof: MiMo may
 restore a supplied entity for an unbound or zero-anchor segment. Every DiariZen
 segment enters MiMo regardless of its current LR-ASD/binding evidence.
-Before deciding whether a full-AV recheck is necessary, the adapter applies only
+Before final validation, the adapter retains existing
 semantics-preserving raw canonicalization and fail-closed typed normalization.
 Exact duplicate Stage B or Stage C evidence codes are removed in first-occurrence
 order, and an exact redundant leading copy of a row's own retention marker is
@@ -133,30 +139,29 @@ predicate as validation: explicit `offscreen_audio` becomes `offscreen` /
 fabricated `offscreen_audio`. The speaker group and other valid evidence are
 preserved, `insufficient_evidence` is recorded when capacity permits, and the
 complete validator runs after normalization. A clean primary response therefore
-publishes without recheck; remaining semantic failures receive the existing one
-full-AV recheck, followed by the same normalization and full validation.
+publishes without recheck. Remaining semantic failures are recorded on the
+single response; raw caption and sound description remain available to QA.
 Stage A/Stage C articulation contradictions are explicitly excluded from this
 conservative downgrade: observed articulation versus `no_visible_lip_motion`,
 unsupported `visible_lip_motion`, or incomplete onscreen grounding with plausible
-Stage A speaker evidence receives the one full-AV recheck and then fails closed if
-still contradictory. Stage C may resolve Stage B `needs_acoustic_refinement` only
+Stage A speaker evidence still fails closed for binding without another AV call. Stage C may resolve Stage B `needs_acoustic_refinement` only
 when Stage B supplies a non-null group with `single_speaker` or
 `same_speaker_nonlexical` composition and the existing grounded onscreen evidence
 passes. Overlapping or sequential multi-speaker uncertainty cannot use that path.
 Model-authored Subject visual prose containing Audio-profile content is not
-rewritten by these normalizers and remains a recheck or fail-closed condition.
+rewritten by these normalizers and retains its existing validation diagnostics.
 `offscreen_spoken`, `voice_over`,
 `message_voice_over`, and `device_playback` preserve the authoritative speech
 and speaker group but never create a visible mouth-speaking action. An uncertain
 presentation similarly removes visible-entity binding rather than guessing; final
-H3 retains the model-authored neutral speaker prose and exact dialogue without
+H3 retains model-authored speaker prose and dialogue without
 leaking internal uncertainty metadata.
 The clip-local `primary_speaker_group` represents speaker identity rather than
 a speech turn. Segment boundaries, pauses, language changes, or ASR changes do
 not create a new group by themselves. Resolved segments bound to the same
 visible entity reuse one group, while one resolved group cannot map to multiple
-visible entities; full-AV recheck must revisit the AV evidence rather than
-blindly merging a conflicting assignment.
+visible entities. Existing safe same-entity canonicalization remains; unrelated
+identity contradictions fail closed rather than receiving a recheck.
 
 Each clip must have exactly one `pair_type="canonical"` Final H3 sample. That
 sample is the target-observation representative and uses the `visual_only`
@@ -167,16 +172,16 @@ they do not create additional MiMo model jobs.
 
 Prompt, policy, annotation schema, and materializer versions are:
 
-- `h3_mimo25_unified_av_reconcile_v28`
+- `h3_mimo25_unified_av_reconcile_v29`
 - `h3_mimo25_av_authority_contract_v17`
-- `r2v.h3.mimo25_av_annotation.18`
-- `r2v.h3.mimo25_backend.31`
-- `h3_mimo25_materializer_v21`
+- `r2v.h3.mimo25_av_annotation.19`
+- `r2v.h3.mimo25_backend.32`
+- `h3_mimo25_materializer_v22`
 - `h3_mimo25_reference_selection_v1`
 - `h3_mimo25_recovered_voice_quality_v1`
 - `r2v.h3.mimo25_inventory.4`
-- `r2v.h3.mimo25_record.10`
-- `r2v.h3.mimo25_summary.10`
+- `r2v.h3.mimo25_record.11`
+- `r2v.h3.mimo25_summary.11`
 - `r2v.h3.mimo25_failure.5`
 - `r2v.h3.mimo25_raw_response.5`
 - `r2v.h3.mimo25_h3_shadow.16`
@@ -199,11 +204,14 @@ JSON-object transport. The Stage B Audio decision uses a
 refinement and uncertain decisions still require the field explicitly and may
 publish `null`. This invariant is enforced by SGLang constrained decoding and
 again by backend semantic validation.
-Payloads and API keys are never persisted. Explicitly reported zero video
-tokens fail closed. If primary embedded-audio tokens are exactly zero, one
-request retries with canonical full audio; explicitly reported zero audio
-tokens on that request also fail closed. Unavailable usage details produce
-warnings and do not trigger a blind retry.
+Payloads and API keys are never persisted. Explicit zero video/audio tokens
+fail closed without resending media. Missing usage details remain warnings.
+Both the adapter and OpenAI SDK allow one attempt per stage, no hidden retries.
+First-stage output is caption plus full sound description without global
+soundscape/music statuses, absence codes, event timing or duplicated prose.
+The second stage validates only JSON shape and two string fields: no semantic
+equivalence, absence, leakage, keywords or scoring gate and no repair call.
+Its `N/A` is an unsupported-field placeholder, not verified silence.
 
 MiniMax H3 Ref2VA retains its official hard reference limits: at most 9 Images,
 3 Audio files, and 12 mixed reference files total. MiMo reference-selection V1
@@ -245,22 +253,16 @@ The exact request contract keeps `fps` and `media_resolution` beside the
 }
 ```
 
-On `xiaomi`, the one canonical-audio fallback uses
-`{"type":"input_audio","input_audio":{"data":"..."}}`, and every request
-sends `extra_body={"thinking":{"type":"disabled"}}`. On `sglang`, every
-primary, fallback, and full-AV-recheck request sends HTTP-top-level
-`use_audio_in_video=true`, `reasoning_effort="none"`, and
-`chat_template_kwargs={"thinking":false,"enable_thinking":false}`. The primary
-request remains one complete target MP4 with embedded audio and no separate
-Audio item. Only an explicit primary `audio_tokens==0` adds canonical full audio
-as `{"type":"audio_url","audio_url":{"url":"..."}}`, while retaining the
-target video. MiMo reasoning is intentionally disabled because this dataset
-path needs deterministic structured annotation rather than agentic
-chain-of-thought, while avoiding unnecessary tokens and latency. Nonzero
-reported reasoning tokens are retained as runtime diagnostics. Only `stop` is
-an explicitly successful finish reason; unavailable finish reason is retained
-as a warning, while token limits and every other explicit non-stop reason fail
-closed without a semantic recheck.
+The first Xiaomi request retains `thinking={"type":"disabled"}`.
+SGLang uses `use_audio_in_video=true`, `reasoning_effort="none"`,
+and `chat_template_kwargs={"thinking":false,"enable_thinking":false}`.
+The named raw-stem entry adds two explicit audio URLs alongside the one original
+video and existing images, with same-time-zero, original-AV-authority and
+leakage cautions. These are not H3 Audio references.
+The second request uses only a short system and sound-description user text,
+temperature 0, disabled thinking, 1024 completion tokens, and a strict two-string
+JSON schema. It does not send `use_audio_in_video` or any first-stage history.
+There is no canonical-audio fallback or full-AV recheck.
 
 The local SGLang transport was validated at `http://127.0.0.1:8092/v1` with
 `mimo-v2.5` on 8 H200 GPUs using TP8, DP2, and DP-attention. The observed smoke
@@ -270,21 +272,19 @@ seconds. That SGLang checkout carries an external runtime patch for upstream
 `sglang#37060` (MiMo audio encoder deadlock under TP8+DP2); R2V does not modify
 or own that external source patch.
 
-After the authoritative primary or canonical-audio-fallback response is
-selected, parse or semantic validation failure may trigger at most one full AV
-recheck with the same references, target video, and selected audio modality.
-There is no text-only semantic repair. MiMo writes direct H3 prose in the same AV
-response. The materializer does not expand visual blocks, speech placeholders,
-or timed event references. It preserves model prose, changing only safely
-matched dialogue payloads to authoritative Qwen3-ASR text and language.
+That historical smoke does not verify the new one-video/two-audio combination.
+Only fake-client tests cover the new payload. Aggregate audio tokens cannot
+establish consumption of all audio inputs; unsupported media requests retain
+their error, never drop an input and resend. No model environment changes or
+performance/quality claims are made by this patch.
 
-Internal noncritical audio and style validation issues become diagnostic
-warnings; they cannot alone cause recheck or suppress a usable direct caption.
-Final soundscape excludes dialogue/singing and non-diegetic music; the latter
-has its own section. Suspected contamination is visible to human QA rather than
-silently replaced with stock prose. Unusable structured output, unknown labels,
-unmappable dialogue, source-provenance failures, and unsafe multi-speaker
-attribution remain fail closed.
+An invalid first annotation or caption keeps raw prose and errors; a readable
+sound description can still receive its one text request. A text API/JSON failure
+preserves first-stage evidence and does not trigger a third request. Later clips
+continue. Identity-product exclusions remain independent of raw caption visibility.
+Final sound sections use only the partition; no internal status or stock prose
+overrides them. Optional music references lacking event timing remain unavailable,
+rather than fabricating events or suppressing the base caption.
 
 The materialized output remains official MiniMax H3 Ref2VA: the six sections
 are emitted in `subject_definitions`, `summary`, `retention_analysis`,

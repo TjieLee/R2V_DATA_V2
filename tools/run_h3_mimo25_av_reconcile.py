@@ -45,7 +45,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--max-completion-tokens", type=int, default=16384)
     parser.add_argument("--timeout-seconds", type=float, default=900.0)
-    parser.add_argument("--http-max-attempts", type=int, default=3)
+    parser.add_argument("--http-max-attempts", type=int, choices=(1,), default=1)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     return parser

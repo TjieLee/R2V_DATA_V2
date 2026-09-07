@@ -36,19 +36,18 @@ The validated one-clip smoke under the legacy/default root is retained as a
 regression baseline. New pilots should use `--shadow-run-id`; do not overwrite
 the default smoke merely to change the case inventory.
 
-The named run contains the same six owned stages:
+The current named run uses these owned stages:
 
 ```text
 sam_audio_stem_shadow_v1/runs/<shadow-run-id>/
   separation/
   diarization/
   asr/
-  mimo_stem_facts/
-  mimo_reconcile/
+  mimo_reconcile_av_rawstems_sound_partition/
   references/
 ```
 
-All six commands must receive the same run ID and ordered case manifest. Hash
+All commands must receive the same run ID and ordered case manifest. Hash
 and absolute-path lineage is run-local; copied artifacts from another named run
 or from the legacy/default root fail closed.
 
@@ -242,17 +241,11 @@ PYTHONPATH="$SAM_AUDIO_RUNTIME_PYTHONPATH" \
   --allow-unverified
 ```
 
-### 4. Three-stem MiMo facts
+### 4. One original AV plus raw stems, then text-only sound partition
 
-```bash
-"$R2V_PYTHON" tools/run_h3_mimo25_stem_facts_shadow.py "${RUN_ARGS[@]}" \
-  --model mimo-v2.5 \
-  --base-url http://127.0.0.1:8092/v1 \
-  --temperature 0.2 \
-  --allow-unverified
-```
-
-### 5. Single-shot AV reconciliation and direct H3
+After separation, DiariZen and ASR, run this entry directly. Do not run
+`run_h3_mimo25_stem_facts_shadow.py`; neither `mimo_stem_facts/` nor three
+stem-video proxies are inputs.
 
 ```bash
 "$R2V_PYTHON" tools/run_h3_mimo25_stem_reconcile_shadow.py "${RUN_ARGS[@]}" \
@@ -264,68 +257,60 @@ PYTHONPATH="$SAM_AUDIO_RUNTIME_PYTHONPATH" \
   --allow-unverified
 ```
 
-Stage 5 uses one joint-AV MiMo call to write the complete natural
-`h3_semantics.style_opening`, `shot1_caption`, `overall_soundscape`, and
-`non_diegetic_music`. Original target video, embedded audio, frozen references,
-and exact ASR facts are observed together. Coarse Stage-A evidence is diagnostic;
-it is not expanded into final prose. The current pilot is exactly one shot:
-visual observation has only `visual_blocks` and `segment_views`, not generated
-shot indexes or cut times. Code renders detailed description as
-`style_opening + " [Shot 1] " + ASR-protected shot1_caption`. Model-authored
-`[Shot N]` markers are rejected, not repaired. No placeholders, sentence atoms, template
-substitution, or second compositor remain.
+The first user content contains exactly one original target video with embedded
+audio, existing reference images, and two `audio_url` items read from the selected
+separation record: proposed music and SFX. They share clip time zero, may contain
+leakage, and are observation evidence rather than H3 conditioning assets. There
+is no speech-stem input, duplicate canonical full audio, stem semantic JSON, or
+media repackaging. Original AV remains authoritative.
 
-Defaults are `--thinking disabled --icl official_ref2va_v1`, temperature 0.0.
-The actual message order is system -> official-example user -> official-example
-assistant -> real AV user. The assistant is a two-field JSON style subset from
-the unchanged Complete Example in `docs/VIDEO_PROMPT_WRITING_GUIDE_ref_en.md`:
-the global line after `detailed_description:` and the complete Shot 1 body,
-stopping before Shot 2 and stripping only the Shot 1 marker. No other H3 section
-is included. ICL provenance is `h3_official_ref2va_detailed_shot1_v2`; this is
-prose organization guidance, not a response-schema example.
-Only final assistant content is parsed; reasoning text is never persisted.
-The request sends one chronological segment inventory and one reference mapping.
-Stored `r2v_instruction` remains provenance/QA only; its old caption is not sent
-as a recaption draft. Recheck sends hard issues, the same contract, and the prior
-response, without duplicating the system policy.
+The first annotation keeps speaker/AV grounding and natural
+`style_opening` / `shot1_caption`, and emits one `sound_description` instead of
+global soundscape/music statuses or timed-event inventories. Existing speaker
+normalization and identity-product exclusions remain intact.
 
-MiMo writes natural speaker/action/delivery lead-ins and chronological
-`<d>[Language] dialogue</d>` blocks. When counts, resolved source order, and any
-recognizable exact dialogue agree, code corrects only the inner `<d>` payload to
-Qwen3-ASR text/language. All surrounding prose stays byte-for-byte unchanged.
-Each dialogue event must contain its expected `(Sx)` in the span after the
-previous `</d>` (or caption start) and before its own `<d>`. This is membership,
-not nearest-marker matching; no fixed says clause, character lookback, immediate
-adjacency, or pronoun interpretation is used.
-Unmappable dialogue or unknown reference/source labels fails closed; no dialogue
-is moved, dropped, or invented. Frozen Subject/Picture ownership remains the
-existing small deterministic definition/retention path. Final H3 keeps the six
-official sections and stable `(Sx)` IDs.
+The second request contains only a short system instruction and the first
+`sound_description` as user text. It has no media, ASR, references, ICL, previous
+messages or caption. Disabled thinking, temperature 0, 1024 completion tokens,
+and a strict two-string JSON schema produce `overall_soundscape` and
+`non_diegetic_music`. The partition is not a semantic audit or a remedy for
+sounds missed in the first observation. Unsupported fields use `N/A` as a
+placeholder, not a claim of confirmed silence. No content-keyword QC is applied.
 
-Internal soundscape absence/unknown bookkeeping is not a publication gate.
-Noncritical audio/style diagnostics become warnings, not another AV call.
-The model writes final soundscape/music prose directly, with music kept separate.
-Multi-speaker attribution still blocks final H3 pending authoritative refinement;
-QA retains the raw direct caption even when publication is blocked.
-Normal success is one AV call, genuine failure gets at most one full-AV recheck.
-The existing explicit zero-audio fallback remains separately counted.
+Both stages make exactly one request attempt: no SDK retry, HTTP retry,
+zero-audio fallback, full-AV recheck or third repair call. Errors preserve raw
+output and diagnostics and later clips continue. A parseable
+`sound_description` may be partitioned even when AV grounding or caption
+format failed; that does not authorize identity-specific products.
 
-Current versions: prompt v28, annotation .18, backend .31, materializer v21,
-authority policy v17; Stage-5 records .7 and summary .9. Materialized shadow
-record .16 and summary .17 distinguish the new direct-caption implementation.
-Prior template/composition artifacts cannot be silently reused.
+First-stage defaults remain `--thinking disabled --icl official_ref2va_v1`,
+temperature 0.0. The official opening + Shot 1 ICL
+(`h3_official_ref2va_detailed_shot1_v2`) is unchanged. First-stage SGLang still
+uses `use_audio_in_video=true`; the text stage does not send that flag.
 
-Stage-5 persists annotation, raw responses, failure issues, diagnostics, and call
-counts under the same additive shadow ownership. Rebuild the existing static QA
-page after a fresh random10 pilot. Review target AV, MiMo direct H3, ASR-protected
-H3, and the published production instruction side by side. Use `better`,
-`same`, `worse`, `speaker_wrong`, `dialogue_wrong`, `audio_wrong`, and
-`visual_hallucination`, then export fingerprint-bound QA JSON. A production
-instruction is labeled as such, not claimed to be a prior generated H3 caption.
-Do not infer quality improvement from CPU fixtures or tune production behavior
-before human review.
+Dialogue is model-authored. Consecutive same-speaker ASR segments may share one
+natural `<d>[Language] ...</d>` block. Code checks paired tags, language markers,
+allowed labels and a valid `(Sx)` in each generated vocal-event lead-in; it does
+not count/zip against ASR segments, rewrite text, or infer binding from syntax.
+Upstream ASR files remain immutable and are shown separately for review.
+Detailed description is exactly
+`style_opening + "\n[Shot 1] " + shot1_caption`; final sound sections come only
+from the text partition. Six-section Ref2VA output and frozen reference ownership
+remain unchanged. Raw caption stays visible when final materialization is blocked.
 
-### 6. Stem-native primary voice references
+Current versions: prompt v29, annotation .19, backend .32, materializer v22,
+authority v17 unchanged; raw-stem reconcile records .8, summary .10, policy v3.
+New output is `mimo_reconcile_av_rawstems_sound_partition/`. Old experiments
+are not migrated or rewritten. Normal random10 request counts are 10 AV and
+10 text calls; counts are not quality or latency measurements.
+
+**Deployment boundary:** the original joint-AV runtime was validated earlier.
+The one-video/two-auxiliary-audio combination has only fake-client coverage in
+this patch, not a real server run. Aggregate `audio_tokens > 0` cannot prove
+that all three audio inputs were consumed. Unsupported combinations must retain
+the actual error, never silently drop an audio track and resend the video.
+
+### 5. Optional stem-native primary voice references
 
 ```bash
 "$R2V_PYTHON" tools/export_h3_sam_audio_stem_references.py "${RUN_ARGS[@]}" \
@@ -346,8 +331,7 @@ find "$SHADOW_ROOT" -maxdepth 2 -type f | sort
 cat "$SHADOW_ROOT/separation/summary.json"
 cat "$SHADOW_ROOT/diarization/stem_provenance.json"
 cat "$SHADOW_ROOT/asr/summary.json"
-cat "$SHADOW_ROOT/mimo_stem_facts/summary.json"
-cat "$SHADOW_ROOT/mimo_reconcile/summary.json"
+cat "$SHADOW_ROOT/mimo_reconcile_av_rawstems_sound_partition/summary.json"
 cat "$SHADOW_ROOT/references/references.jsonl"
 ```
 
@@ -358,58 +342,39 @@ ID for a new case inventory or algorithm experiment.
 
 ## Static manual QA sidecar
 
-Inspect label quality without running any model or changing any source stage:
+Inspect label quality without running any model or changing any source stage.
+The explicit output below is outside production inputs and preserves old QA pages:
 
 ```bash
+export QA_ROOT="$AUDIO_PRODUCTION_ROOT/../h3-audio-qa/$SHADOW_RUN_ID-av-rawstems-sound-partition"
 "$R2V_PYTHON" tools/build_h3_audio_shadow_qa.py \
   --visual-production-root "$VISUAL_PRODUCTION_ROOT" \
   --visual-runs-root "$VISUAL_RUNS_ROOT" \
   --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
-  --shadow-run-id random10-v1 \
-  --case-manifest "$CASE_MANIFEST"
-
-QA_ROOT="$AUDIO_PRODUCTION_ROOT/sam_audio_stem_shadow_v1/runs/random10-v1/qa"
+  --shadow-run-id "$SHADOW_RUN_ID" \
+  --case-manifest "$CASE_MANIFEST" \
+  --output-root "$QA_ROOT"
 "$R2V_PYTHON" -m http.server 8774 --bind 127.0.0.1 --directory "$QA_ROOT"
+
 ```
 
 Forward port 8774 through the existing SSH connection and open
 `http://127.0.0.1:8774/review.html` locally. Serve only the QA directory, not the
 whole production tree. No POST endpoint or model environment is involved.
-The page shows original target AV, frozen Visual references, distinct production
-and shadow binding evidence, stem DiariZen/ASR, three auxiliary stem-fact panels,
-and ready/failed/upstream-failed reconcile results. Original AV remains factual
-authority; separator names and manual labels are not production truth.
+The page shows original target AV, frozen references, unchanged production
+comparison text, shadow DiariZen/ASR, and optional stem audio players.
+It reads the new reconcile directory without requiring stem-facts artifacts.
+First raw caption and sound description remain visible for failed records;
+text partition result/raw/error and both call counts are shown separately.
 
-The primary review surface is the exact final six-section H3 prompt beside the
-target AV, rendered by the existing MiMo `_materialize_sample()` v21 path. Each
-source H3 conditioning variant is shown separately, using current shadow ASR
-speech in memory while retaining frozen references. No recovery, media generation,
-or H3 publication runs. Structured MiMo annotation is secondary diagnostic evidence.
-Failed/upstream-failed reconcile has no final prompt. Rendered text participates
-in QA fingerprints, so regenerated text invalidates stale annotations.
-
-### Current one-shot review contract
-
-The official Ref2VA source remains unchanged; the ICL now contains only its
-global opening and Shot 1 prose. The final system writing block owns the
-one-shot/no-model-marker instruction. A complete natural
-caption remains model-authored; only the single shot marker and safe ASR payload
-correction are deterministic.
-
-Soundscape/music wording and possible contamination remain review warnings.
-No internal absent/null or verified-silence bookkeeping gates final prose.
-The explicit multi-speaker refinement gate remains unchanged, and failed
-records retain raw `style_opening` / `shot1_caption` for QA. No ASR splitting,
-new model call, production artifact modification, or automated prose score is
-introduced. These are pilot assumptions, not a claim that arbitrary future
-production clips contain one shot.
-
-The QA surface remains Target AV beside Final H3 Prompt. A ready annotation can
-have an unavailable final prompt; each blocked variant displays its issue codes
-and disables Copy. No best-effort renderer is used. Existing production inputs
-remain read-only. Shadow reconcile temperature stays 0.0 with at most the
-existing one full-AV recheck; transport and model runtime are unchanged.
-Local synthetic validation is not real random10/model validation.
+The exact final six-section prompt uses the existing materializer v22 path
+when AV validation and partitioning permit it. Each source conditioning variant
+remains separate. Multi-speaker attribution still blocks identity-specific
+materialization, and blocked variants expose issues instead of best-effort text.
+No voice recovery, media generation, H3 publication, or model call runs in QA.
+Model prose is not overwritten by ASR. Rendered text and current records remain
+fingerprint-bound, so changed output invalidates stale annotations.
+The `better/same/worse` and issue-label review workflow is unchanged.
 
 The builder validates existing complete stage metadata and lineage, including
 per-clip failure records. Output is `review.html`, `data.json`, and `media/`

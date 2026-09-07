@@ -18,17 +18,17 @@ from r2v_data_v2.h3.mimo25_av_reconcile import (
 )
 from r2v_data_v2.h3.mimo25_backend import MimoBackendConfig, MimoMediaResolver
 from r2v_data_v2.h3.mimo25_stem_shadow import (
-    MimoStemFactsSummary,
+    MIMO25_STEM_RECONCILE_STAGE,
     StemAwareOpenAIMimo25Backend,
     build_stem_reconcile_jobs,
     run_mimo25_stem_reconcile_shadow,
-    validate_stem_facts_lineage,
 )
 from r2v_data_v2.h3.sam_audio_stem_shadow import (
     SAMAudioStemInventory,
     StemDiarizationShadowProvenance,
     load_stem_shadow,
     require_shadow_output_path,
+    selected_stem_records,
     separation_skips,
     stem_separation_root,
     stem_shadow_root,
@@ -42,7 +42,6 @@ def _validate_stage_closure(
     stem_inventory: SAMAudioStemInventory,
     separation_root: Path,
     diarization_provenance: StemDiarizationShadowProvenance,
-    facts_summary: MimoStemFactsSummary,
 ) -> None:
     separation = separation_root.expanduser().resolve(strict=True)
     if case_manifest.clip_uids != stem_inventory.clip_uids:
@@ -54,16 +53,11 @@ def _validate_stage_closure(
         != separation
     ):
         raise ValueError("stem DiariZen source root differs from current separation")
-    if (
-        Path(facts_summary.source_stem_root).expanduser().resolve(strict=True)
-        != separation
-    ):
-        raise ValueError("stem facts source root differs from current separation")
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Reconcile original AV with SAM Audio stem facts",
+        description="One original AV request with raw music/SFX stems, then text-only sound partition",
     )
     parser.add_argument("--visual-production-root", type=Path, required=True)
     parser.add_argument("--visual-runs-root", type=Path, required=True)
@@ -98,7 +92,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
     separation = stem_separation_root(paths.root, arguments.shadow_run_id)
     output = require_shadow_output_path(
         shadow_root=shadow,
-        output_path=arguments.output_root or shadow / "mimo_reconcile",
+        output_path=arguments.output_root or shadow / MIMO25_STEM_RECONCILE_STAGE,
     )
     case_manifest = MimoCaseManifest.model_validate_json(
         arguments.case_manifest.read_text(encoding="utf-8")
@@ -107,18 +101,11 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
     diarization_provenance, _, _ = validate_stem_diarization_lineage(
         shadow / "diarization", expected_shadow_root=shadow,
     )
-    facts_summary, facts = validate_stem_facts_lineage(
-        facts_root=shadow / "mimo_stem_facts",
-        stem_diarization_root=shadow / "diarization",
-        stem_asr_root=shadow / "asr",
-        route=arguments.sam_route,
-    )
     _validate_stage_closure(
         case_manifest=case_manifest,
         stem_inventory=stem_inventory,
         separation_root=separation,
         diarization_provenance=diarization_provenance,
-        facts_summary=facts_summary,
     )
     base = build_mimo25_inventory(
         visual_production_root=arguments.visual_production_root,
@@ -137,6 +124,10 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         records=stem_records,
         route=arguments.sam_route,
     )
+    selected = selected_stem_records(
+        [record for record in stem_records if record.clip_uid in {job.clip_uid for job in jobs}],
+        route=arguments.sam_route, allow_unverified=arguments.allow_unverified,
+    )
     result: dict[str, object] = {
         "dry_run": arguments.dry_run,
         "model_called": False,
@@ -149,9 +140,6 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         "original_target_av_is_highest_authority": True,
     }
     if not arguments.dry_run:
-        facts_by_clip = {
-            item.clip_uid: item for item in facts if item.status == "ready"
-        }
         backend = StemAwareOpenAIMimo25Backend(
             MimoBackendConfig(
                 media_resolver=MimoMediaResolver(
@@ -168,16 +156,16 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
                 icl=arguments.icl,
                 max_completion_tokens=arguments.max_completion_tokens,
             ),
-            stem_facts_by_clip=facts_by_clip,
+            stem_records_by_clip={record.clip_uid: record for record in selected},
         )
         summary = run_mimo25_stem_reconcile_shadow(
             jobs=jobs,
-            stem_facts=facts,
+            stem_records=stem_records,
             backend=backend,
             output_root=output,
             source_clip_uids=stem_inventory.clip_uids,
             skipped_clips=skipped,
-            diarization_failed_clips=facts_summary.diarization_failed_clips,
+            diarization_failed_clips=diarization_provenance.diarization_failed_clips,
             route=arguments.sam_route,
             allow_unverified=arguments.allow_unverified,
             overwrite=arguments.overwrite,

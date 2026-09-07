@@ -61,7 +61,7 @@ small{color:#626e73}a{color:#176c9a}#loading{padding:20px}
 <details id="target-details"><summary>Target provenance</summary><pre></pre></details>
 </section>
 <section id="final-h3">
-<div class="final-heading"><h2>MiMo H3 (ASR-protected)</h2><button id="copy-final">Copy</button></div>
+<div class="final-heading"><h2>MiMo H3</h2><button id="copy-final">Copy</button></div>
 <p><small id="materializer-version"></small></p>
 <select id="final-variant" aria-label="H3 sample variant"></select>
 <p id="final-unavailable" class="failed" style="white-space:pre-line" hidden></p>
@@ -86,7 +86,7 @@ small{color:#626e73}a{color:#176c9a}#loading{padding:20px}
 <h2>Auxiliary SAM stem evidence</h2><p id="separation-status"></p>
 <div id="stems" class="stem-grid"></div>
 <details><summary>Separation provenance / alignment</summary><pre id="separation"></pre></details>
-<details><summary>Stem-facts runtime diagnostics</summary><pre id="fact-diagnostics"></pre></details>
+<div class="evidence"><section><h2>First AV sound description</h2><pre id="sound-description"></pre></section><section><h2>Text-only sound partition</h2><pre id="sound-partition"></pre></section></div>
 <details id="reconcile"><summary>MiMo structured annotation / diagnostic evidence</summary><div id="reconcile-body"></div></details>
 </main>
 <script>
@@ -164,7 +164,7 @@ function render() {
     el.append(input, document.createTextNode(label)); $("labels").append(el);
   });
   $("notes").value = state.notes;
-  $("direct-text").textContent = clip.direct_h3 ? ["summary", "style_opening", "shot1_caption", "overall_soundscape", "non_diegetic_music"].map(name => name + ":\n" + (clip.direct_h3[name] || "[unavailable]")).join("\n\n") : "[unavailable]";
+  $("direct-text").textContent = clip.direct_h3 ? ["summary", "style_opening", "shot1_caption", "sound_description"].map(name => name + ":\n" + (clip.direct_h3[name] || "[unavailable]")).join("\n\n") : "[unavailable]";
   $("production-text").textContent = (clip.production_h3 || []).map(row => row.sample_id + "\n" + row.text).join("\n\n") || "[unavailable]";
   const final = clip.final_h3;
   $("materializer-version").textContent = final.materializer_version;
@@ -221,7 +221,7 @@ function render() {
   });
   $("speech-provenance").textContent = pretty({diarization: clip.diarization, asr: clip.asr});
   $("binding").textContent = pretty(clip.speaker_binding);
-  $("separation-status").textContent = "Separation: " + clip.separation.separation_state + " | Facts: " + (clip.stem_facts ? clip.stem_facts.status : "[upstream unavailable]");
+  $("separation-status").textContent = "Separation: " + clip.separation.separation_state;
   $("separation").textContent = pretty(clip.separation);
   $("stems").replaceChildren();
   ["speech", "music", "sfx"].forEach(kind => {
@@ -229,14 +229,14 @@ function render() {
     section.className = "stem"; heading.textContent = kind.toUpperCase(); section.append(heading);
     const url = clip.separation.media[kind];
     if (url) { const audio = document.createElement("audio"); audio.controls = true; audio.preload = "none"; audio.src = url; section.append(audio); }
-    section.append(pre(clip.stem_facts && clip.stem_facts[kind] ? clip.stem_facts[kind] : "[unavailable]"));
     $("stems").append(section);
   });
-  $("fact-diagnostics").textContent = pretty(clip.stem_facts ? {
-    status: clip.stem_facts.status, failure_code: clip.stem_facts.failure_code,
-    failure_reason: clip.stem_facts.failure_reason, backend_provenance: clip.stem_facts.backend_provenance,
-    diagnostics: clip.stem_facts.diagnostics
-  } : "[unavailable]");
+  $("sound-description").textContent = clip.reconcile.sound_description ?? "[unavailable]";
+  $("sound-partition").textContent = pretty({
+    result: clip.reconcile.sound_partition,
+    error: clip.reconcile.sound_partition_error,
+    raw_response: clip.reconcile.sound_partition_raw_response
+  });
   $("reconcile-body").replaceChildren();
   const result = clip.reconcile;
   if (result.status !== "ready") {
@@ -248,10 +248,13 @@ function render() {
     Object.entries(result.annotation).filter(([name]) => name !== "schema_version").forEach(([name, value]) =>
       $("reconcile-body").append(details(name, value, name === "av_grounding" || name === "audio_observation")));
   }
+  $("reconcile-body").append(details("First AV raw response", result.raw_responses || []));
   $("reconcile-body").append(details("Request diagnostics / provenance", {
     model_call_count: result.model_call_count, diagnostics: result.diagnostics,
     backend_provenance: result.backend_provenance, source_job_fingerprint: result.source_job_fingerprint,
-    source_stem_facts_fingerprint: result.source_stem_facts_fingerprint
+    source_stem_record_fingerprint: result.source_stem_record_fingerprint,
+    av_model_call_count: result.av_model_call_count, text_model_call_count: result.text_model_call_count,
+    issues: result.failure_issues
   }));
   updateProgress(); $("main").hidden = false; $("loading").hidden = true;
 }
@@ -314,7 +317,7 @@ fetch("data.json", {cache: "no-store"}).then(response => {
   if (!response.ok) throw new Error("Cannot load data.json: " + response.status);
   return response.json();
 }).then(payload => {
-  if (payload.schema_version !== "r2v.h3.audio_shadow_qa.2" || !payload.clips.length) throw new Error("Invalid QA dataset.");
+  if (payload.schema_version !== "r2v.h3.audio_shadow_qa.5" || !payload.clips.length) throw new Error("Invalid QA dataset.");
   data = payload;
   data.clips.forEach((clip, i) => {
     const option = document.createElement("option"); option.value = String(i);

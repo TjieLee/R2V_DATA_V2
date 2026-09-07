@@ -27,10 +27,10 @@ from r2v_data_v2.h3.mimo25_h3_materializer import (
     _materialize_sample,
 )
 from r2v_data_v2.h3.mimo25_stem_shadow import (
+    MIMO25_STEM_RECONCILE_STAGE,
     MimoStemReconcileRecord,
     MimoStemReconcileSummary,
     build_stem_reconcile_jobs,
-    validate_stem_facts_lineage,
 )
 from r2v_data_v2.h3.qwen3_asr import Qwen3ASRSegment
 from r2v_data_v2.h3.sam_audio_stem_shadow import (
@@ -41,8 +41,9 @@ from r2v_data_v2.h3.sam_audio_stem_shadow import (
     stem_shadow_root,
     validate_stem_diarization_lineage,
 )
+from r2v_data_v2.structured_output import normalize_structured_json_envelope
 
-QA_DATA_VERSION = "r2v.h3.audio_shadow_qa.4"
+QA_DATA_VERSION = "r2v.h3.audio_shadow_qa.5"
 QA_REVIEW_VERSION = "r2v.h3.audio_shadow_human_qa.2"
 QA_LABELS = (
     "better", "same", "worse", "speaker_wrong",
@@ -68,7 +69,7 @@ def _direct_h3(record: object) -> dict[str, object] | None:
     # Failed final publication must not hide parseable model-authored prose.
     for raw in reversed(record.raw_responses):
         try:
-            payload = json.loads(raw)
+            payload = json.loads(normalize_structured_json_envelope(raw))
         except (ValueError, TypeError):
             continue
         if isinstance(payload, dict) and isinstance(payload.get("h3_semantics"), dict):
@@ -146,11 +147,11 @@ def build_audio_shadow_qa(
     cases = MimoCaseManifest.model_validate_json(case_path.read_text(encoding="utf-8"))
     separation = stem_separation_root(audio, shadow_run_id)
     diarization, asr = shadow / "diarization", shadow / "asr"
-    facts_root, reconcile_root = shadow / "mimo_stem_facts", shadow / "mimo_reconcile"
+    reconcile_root = shadow / MIMO25_STEM_RECONCILE_STAGE
     # Hash the source JSON sidecars before loading, then verify the same snapshot at publication.
     samples_path = audio / "h3/samples.jsonl"
     sources = {case_path, samples_path}
-    for stage in (separation, diarization, asr, facts_root, reconcile_root):
+    for stage in (separation, diarization, asr, reconcile_root):
         for pattern in ("*.json", "*.jsonl", "raw_responses/*.json"):
             sources.update(stage.glob(pattern))
     source_hashes = {str(path): sha256_file(path) for path in sorted(sources)}
@@ -159,10 +160,6 @@ def build_audio_shadow_qa(
         raise ValueError("QA case manifest differs from selected separation order")
     diar_provenance, _, _ = validate_stem_diarization_lineage(
         diarization, expected_shadow_root=shadow,
-    )
-    facts_summary, facts = validate_stem_facts_lineage(
-        facts_root=facts_root, stem_diarization_root=diarization,
-        stem_asr_root=asr, route=diar_provenance.route,
     )
     base = build_mimo25_inventory(
         visual_production_root=visual, visual_runs_root=runs,
@@ -186,7 +183,7 @@ def build_audio_shadow_qa(
         stem_asr_root=asr, route=diar_provenance.route,
     )
     jobs_by_clip = {job.clip_uid: job for job in jobs}
-    facts_by_clip = {record.clip_uid: record for record in facts}
+    stems_by_clip = {record.clip_uid: record for record in stems if record.route == diar_provenance.route}
     reconcile = _rows(reconcile_root / "records.jsonl", MimoStemReconcileRecord)
     summary = MimoStemReconcileSummary.model_validate_json(
         (reconcile_root / "summary.json").read_text(encoding="utf-8")
@@ -194,33 +191,29 @@ def build_audio_shadow_qa(
     if (
         summary.clip_uids != cases.clip_uids
         or summary.route != diar_provenance.route
-        or summary.skipped_clips != facts_summary.skipped_clips
-        or summary.diarization_failed_clips != facts_summary.diarization_failed_clips
+        or summary.skipped_clips != diar_provenance.skipped_clips
+        or summary.diarization_failed_clips != diar_provenance.diarization_failed_clips
         or summary.processed_clip_uids != [item.clip_uid for item in reconcile]
-        or summary.processed_clip_uids != [item.clip_uid for item in facts if item.status == "ready"]
+        or summary.processed_clip_uids != [item.clip_uid for item in jobs]
         or len({item.clip_uid for item in reconcile}) != len(reconcile)
         or summary.ready_count != sum(item.status == "ready" for item in reconcile)
         or summary.failed_count != sum(item.status == "failed" for item in reconcile)
         or summary.model_call_count != sum(item.model_call_count for item in reconcile)
-        or [item.clip_uid for item in summary.facts_failed_clips]
-        != [item.clip_uid for item in facts if item.status == "failed"]
+        or summary.av_model_call_count != sum(item.av_model_call_count for item in reconcile)
+        or summary.text_model_call_count != sum(item.text_model_call_count for item in reconcile)
     ):
         raise ValueError("QA reconcile summary differs from current run inventory")
     for record in reconcile:
         if (
             record.source_job_fingerprint != jobs_by_clip[record.clip_uid].request_fingerprint
-            or record.source_stem_facts_fingerprint
-            != facts_by_clip[record.clip_uid].record_fingerprint
+            or record.source_stem_record_fingerprint
+            != stems_by_clip[record.clip_uid].record_fingerprint
         ):
             raise ValueError("QA reconcile record has stale source provenance")
-    for failure in summary.facts_failed_clips:
-        if failure.source_record_fingerprint != facts_by_clip[failure.clip_uid].record_fingerprint:
-            raise ValueError("QA reconcile skip has stale facts provenance")
     reconcile_by_clip = {item.clip_uid: item for item in reconcile}
     upstream_failures = {
         item.clip_uid: item.model_dump(mode="json")
-        for item in [*summary.skipped_clips, *summary.diarization_failed_clips,
-                     *summary.facts_failed_clips]
+        for item in [*summary.skipped_clips, *summary.diarization_failed_clips]
     }
     raw = sorted(
         _rows(diarization / "raw_segments.jsonl", RawDiarizationSegment),
@@ -267,13 +260,6 @@ def build_audio_shadow_qa(
              "url": media_link(image.image_artifact_path, image.image_sha256)}
             for image in base_job.reference_images
         ]
-        fact = facts_by_clip.get(clip)
-        fact_payload = fact.model_dump(mode="json", exclude={"raw_responses"}) if fact else None
-        if fact_payload is not None:
-            fact_payload["diagnostics"] = [
-                audit.model_dump(mode="json", exclude={"raw_response"})
-                for audit in fact.raw_responses
-            ]
         record = reconcile_by_clip.get(clip)
         current = jobs_by_clip.get(clip)
         final_h3 = {
@@ -307,6 +293,7 @@ def build_audio_shadow_qa(
                     _, text, warnings = _materialize_sample(
                         sample, current,
                         _MaterializerInput(record.annotation, record.source_job_fingerprint),
+                        sound_partition=record.sound_partition,
                     )
                     variant = {"status": "ready", "text": text, "warnings": warnings, "reason": None}
                 except MimoH3MaterializationContractError as error:
@@ -349,7 +336,6 @@ def build_audio_shadow_qa(
                 "stem_cluster_bindings": [item.model_dump(mode="json") for item in clusters if item.target_clip_uid == clip],
             },
             "separation": {**stem_record.model_dump(mode="json"), "media": stem_media},
-            "stem_facts": fact_payload,
             "final_h3": final_h3,
             "direct_h3": _direct_h3(record),
             "production_h3": [

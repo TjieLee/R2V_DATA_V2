@@ -14,32 +14,56 @@ from PIL import Image
 from r2v_data_v2.h3 import audio_shadow_qa as qa
 from r2v_data_v2.h3.jea_final_renderer import FinalH3SampleV2
 from r2v_data_v2.h3.mimo25_av_reconcile import _inventory, _job
-from r2v_data_v2.h3.mimo25_backend import MimoAVAnnotationDraft, MimoBackendFailure
+from r2v_data_v2.h3.mimo25_backend import (
+    MimoAVAnnotationDraft,
+    MimoBackendConfig,
+    MimoBackendFailure,
+    MimoCompletionDiagnostic,
+    MimoMediaResolver,
+    MimoSoundPartition,
+    MimoSoundPartitionCall,
+    MimoUsage,
+)
 from r2v_data_v2.h3.mimo25_stem_shadow import (
+    MIMO25_STEM_RECONCILE_STAGE,
     build_stem_reconcile_jobs,
-    load_stem_fact_records,
-    run_mimo25_stem_facts_shadow,
     run_mimo25_stem_reconcile_shadow,
 )
-from r2v_data_v2.h3.sam_audio_stem_shadow import sha256_file
+from r2v_data_v2.h3.sam_audio_stem_shadow import (
+    load_stem_shadow,
+    sha256_file,
+    validate_stem_diarization_lineage,
+)
 from tests.test_h3_mimo25_av_shadow import _annotation, _sample
 from tests.test_h3_sam_audio_stem_shadow import (
-    _FactsBackend,
-    _FailingReconcileBackend,
     _mimo_inventory_for_clip_order,
     _MixedDiarization,
     _run_three_clip_shadow_to_asr,
-    _ViewBackend,
 )
 from tools.build_h3_audio_shadow_qa import main
 
 
-class _Reconcile(_FailingReconcileBackend):
+class _Reconcile:
+    def __init__(self, tmp_path):
+        self.provenance = MimoBackendConfig(
+            media_resolver=MimoMediaResolver(mode="base64", media_root=tmp_path),
+            api_key="fake", transport="sglang",
+        ).provenance()
+
+    def partition_sound_description(self, sound_description):
+        return MimoSoundPartitionCall(
+            partition=MimoSoundPartition(overall_soundscape="A room tone and a short clink.", non_diegetic_music="N/A"),
+            raw_response='{"overall_soundscape":"A room tone and a short clink.","non_diegetic_music":"N/A"}',
+            diagnostic=MimoCompletionDiagnostic(
+                input_modality="sound_description_text_only", usage=MimoUsage(), http_attempt_count=1,
+            ),
+        )
+
     def reconcile(self, job, **kwargs):
         if job.clip_uid == "clip-a":
             raise MimoBackendFailure(
                 code="synthetic_failed", reason="failed <script>not markup</script>",
-                model_call_count=2,
+                model_call_count=1,
                 raw_responses=(_annotation().model_dump_json(),),
             )
         # Pure fixture output; no client or model is called.
@@ -53,7 +77,6 @@ class _Reconcile(_FailingReconcileBackend):
             values["audio_observation"]["speaker_voice_profiles"] = []
             values["av_grounding"]["segment_groundings"] = []
             values["h3_semantics"]["shot1_caption"] = "The seated person remains still."
-            values["audio_observation"]["audio_semantics"]["temporal_non_speech_events"] = []
         annotation = MimoAVAnnotationDraft.model_validate(values)
         return SimpleNamespace(annotation=annotation, raw_responses=(), diagnostics=(), model_call_count=1)
 
@@ -108,20 +131,17 @@ def _fixture(tmp_path, monkeypatch, *, mixed=False, variants=False):
     values["source_h3_samples_sha256"] = sha256_file(samples_path)
     base = _inventory(values)
     monkeypatch.setattr(qa, "build_mimo25_inventory", lambda **kwargs: base)
-    facts_summary = run_mimo25_stem_facts_shadow(
-        stem_root=separation, route="music_first", backend=_FactsBackend(),
-        view_backend=_ViewBackend(), output_root=shadow / "mimo_stem_facts",
-        allow_unverified=True,
-    )
+    assert not (shadow / "mimo_stem_facts").exists()
+    provenance, _, _ = validate_stem_diarization_lineage(diarization)
     jobs = build_stem_reconcile_jobs(
         base_inventory=base, stem_diarization_root=diarization,
         stem_asr_root=asr, route="music_first",
     )
     run_mimo25_stem_reconcile_shadow(
-        jobs=jobs, stem_facts=load_stem_fact_records(shadow / "mimo_stem_facts"),
-        backend=_Reconcile(tmp_path), output_root=shadow / "mimo_reconcile",
+        jobs=jobs, stem_records=load_stem_shadow(separation)[1],
+        backend=_Reconcile(tmp_path), output_root=shadow / MIMO25_STEM_RECONCILE_STAGE,
         source_clip_uids=order, route="music_first",
-        diarization_failed_clips=facts_summary.diarization_failed_clips,
+        diarization_failed_clips=provenance.diarization_failed_clips,
         allow_unverified=True,
     )
     visual, runs = tmp_path / "visual", tmp_path / "runs"
@@ -144,8 +164,8 @@ def test_builder_ready_failed_order_media_and_sources_unchanged(tmp_path, monkey
     materialized = []
     original = qa._materialize_sample
 
-    def capture(sample, job, record):
-        result = original(sample, job, record)
+    def capture(sample, job, record, **kwargs):
+        result = original(sample, job, record, **kwargs)
         materialized.append((sample, job, record, result[1]))
         return result
 
@@ -156,8 +176,8 @@ def test_builder_ready_failed_order_media_and_sources_unchanged(tmp_path, monkey
     output = shadow / "qa"
     assert result["output_root"] == str(output)
     data = json.loads((output / "data.json").read_text())
-    reconcile_summary = json.loads((shadow / "mimo_reconcile/summary.json").read_text())
-    assert reconcile_summary["schema_version"] == "r2v.h3.mimo25_stem_reconcile_summary.9"
+    reconcile_summary = json.loads((shadow / MIMO25_STEM_RECONCILE_STAGE / "summary.json").read_text())
+    assert reconcile_summary["schema_version"] == "r2v.h3.mimo25_stem_reconcile_summary.10"
     assert reconcile_summary["current_mimo_versions_modified"] is True
     assert data["clip_uids"] == ["clip-z", "clip-a", "clip-m"]
     assert [clip["reconcile"]["status"] for clip in data["clips"]] == ["ready", "failed", "ready"]
@@ -171,8 +191,8 @@ def test_builder_ready_failed_order_media_and_sources_unchanged(tmp_path, monkey
     for clip, call in zip((data["clips"][0], data["clips"][2]), materialized, strict=True):
         final = clip["final_h3"]
         assert final["status"] == "ready"
-        assert final["materializer_version"] == "h3_mimo25_materializer_v21"
-        assert final["text"] == call[3] == original(*call[:3])[1]
+        assert final["materializer_version"] == "h3_mimo25_materializer_v22"
+        assert final["text"] == call[3] == original(*call[:3], sound_partition=MimoSoundPartition(**clip["reconcile"]["sound_partition"]))[1]
         assert final["variants"][0]["text"] == final["text"]
         assert "[[" not in final["text"]
         assert clip["direct_h3"]["shot1_caption"]
@@ -183,8 +203,8 @@ def test_builder_ready_failed_order_media_and_sources_unchanged(tmp_path, monkey
                     "detailed_description", "overall_soundscape", "non_diegetic_music"]
         positions = [final["text"].index(section + ":\n") for section in sections]
         assert positions == sorted(positions)
-        for segment in call[1].segments:
-            assert f"<d>[{segment.asr_language}] {segment.asr_text}</d>" in final["text"]
+        assert clip["direct_h3"]["shot1_caption"] in final["text"]
+        assert final["text"].count("[Shot 1]") == 1
     assert data["clips"][1]["final_h3"]["status"] == "unavailable"
     assert data["clips"][1]["final_h3"]["text"] is None
     assert data["clips"][1]["final_h3"]["reason"] == "AV reconcile failed: failed <script>not markup</script>"
@@ -202,7 +222,10 @@ def test_builder_ready_failed_order_media_and_sources_unchanged(tmp_path, monkey
     assert "innerHTML" not in html
     assert "frozen_production_evidence" in data["clips"][0]["speaker_binding"]
     assert "stem_segment_evidence" in data["clips"][0]["speaker_binding"]
-    assert "raw_response" not in data["clips"][0]["stem_facts"]["diagnostics"][0]
+    assert "stem_facts" not in data["clips"][0]
+    assert data["clips"][1]["reconcile"]["sound_description"]
+    assert data["clips"][1]["reconcile"]["sound_partition"]
+    assert not (shadow / "mimo_stem_facts").exists()
     first_data = (output / "data.json").read_bytes()
     qa.build_audio_shadow_qa(**kwargs, overwrite=True)
     assert (output / "data.json").read_bytes() == first_data
@@ -215,7 +238,7 @@ def test_upstream_failed_and_empty_clips_remain_visible(tmp_path, monkeypatch):
     assert [clip["diarization"]["clip_result"]["status"] for clip in clips] == ["ready", "failed", "empty"]
     assert clips[1]["reconcile"]["status"] == "upstream_failed"
     assert clips[1]["reconcile"]["model_call_count"] == 0
-    assert clips[1]["stem_facts"] is None
+    assert "stem_facts" not in clips[1]
     assert clips[1]["asr"]["segments"] == []
     assert clips[1]["final_h3"]["status"] == "unavailable"
     assert clips[1]["final_h3"]["text"] is None
@@ -229,8 +252,8 @@ def test_final_text_changes_review_fingerprints(tmp_path, monkeypatch):
     before = json.loads((shadow / "qa/data.json").read_text())
     original = qa._materialize_sample
 
-    def changed_text(*args):
-        corrected, text, warnings = original(*args)
+    def changed_text(*args, **kwargs):
+        corrected, text, warnings = original(*args, **kwargs)
         return corrected, text + "\nsynthetic materializer change", warnings
 
     monkeypatch.setattr(qa, "_materialize_sample", changed_text)
@@ -293,7 +316,7 @@ def test_output_safety_and_atomic_failure_preserve_existing_qa(tmp_path, monkeyp
 
 def test_stale_reconcile_fingerprint_rejected_before_publication(tmp_path, monkeypatch):
     kwargs, shadow = _fixture(tmp_path, monkeypatch)
-    path = shadow / "mimo_reconcile/records.jsonl"
+    path = shadow / MIMO25_STEM_RECONCILE_STAGE / "records.jsonl"
     records = [json.loads(line) for line in path.read_text().splitlines()]
     records[0]["source_job_fingerprint"] = "f" * 64
     values = {k: v for k, v in records[0].items() if k != "record_fingerprint"}
@@ -340,10 +363,6 @@ def test_ready_annotation_with_blocked_materialization_is_unavailable(tmp_path, 
                 grounding.update(binding_status="no_reliable_entity", entity_id=None,
                                  speech_presentation="uncertain", confidence="low",
                                  evidence_codes=["insufficient_evidence"])
-        elif blocked == "unknown":
-            values["audio_observation"]["audio_semantics"].update(
-                non_diegetic_music_status="unknown", non_diegetic_music=None,
-            )
         else:
             values["h3_semantics"]["shot1_caption"] += " [[unknown]]"
         return SimpleNamespace(annotation=MimoAVAnnotationDraft.model_validate(values),
@@ -354,7 +373,7 @@ def test_ready_annotation_with_blocked_materialization_is_unavailable(tmp_path, 
     before = _snapshot(tmp_path)
     qa.build_audio_shadow_qa(**kwargs)
     data = json.loads((shadow / "qa/data.json").read_text())
-    assert data["schema_version"] == "r2v.h3.audio_shadow_qa.4"
+    assert data["schema_version"] == "r2v.h3.audio_shadow_qa.5"
     for clip in (data["clips"][0], data["clips"][2]):
         assert clip["reconcile"]["status"] == "ready"
         final = clip["final_h3"]
@@ -515,7 +534,7 @@ const {chromium} = require(process.argv[2]);
     assert.strictEqual(await page.locator("#final-text").textContent(), expectedFinal);
     assert(await page.locator("#final-text").isVisible());
     assert.strictEqual(await page.locator("#final-h3").evaluate(el => el.closest("details")), null);
-    assert.strictEqual(await page.locator("#materializer-version").textContent(), "h3_mimo25_materializer_v21");
+    assert.strictEqual(await page.locator("#materializer-version").textContent(), "h3_mimo25_materializer_v22");
     await page.locator("#final-variant").selectOption("1");
     assert.strictEqual(await page.locator("#final-text").textContent(), dataset.clips[0].final_h3.variants[1].text);
     await page.locator("#final-variant").selectOption("0");

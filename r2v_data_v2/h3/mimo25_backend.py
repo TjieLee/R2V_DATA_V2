@@ -28,12 +28,12 @@ from r2v_data_v2.structured_output import (
 
 MIMO25_MODEL = "mimo-v2.5"
 MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
-MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v28"
+MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v29"
 MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v17"
-MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.18"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.31"
+MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.19"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.32"
 MIMO25_ICL_VERSION = "h3_official_ref2va_detailed_shot1_v2"
-MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v21"
+MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v22"
 MIMO25_CANONICAL_ABSENT_SOUNDSCAPE = (
     "No distinct environmental, mechanical, physical, or non-verbal human "
     "sounds are clearly discernible."
@@ -812,8 +812,7 @@ class MimoH3Semantics(SchemaModel):
     summary: StrictStr
     style_opening: StrictStr = Field(min_length=1)
     shot1_caption: StrictStr = Field(min_length=1)
-    overall_soundscape: StrictStr = Field(min_length=1)
-    non_diegetic_music: StrictStr = Field(min_length=1)
+    sound_description: StrictStr = Field(min_length=1)
     visual_retention_analysis: list[MimoVisualRetentionDraft] = Field(min_length=1)
 
     @model_validator(mode="after")
@@ -823,8 +822,7 @@ class MimoH3Semantics(SchemaModel):
             self.summary,
             self.style_opening,
             self.shot1_caption,
-            self.overall_soundscape,
-            self.non_diegetic_music,
+            self.sound_description,
             *(item.description for item in self.visual_retention_analysis),
         )
         if any(not value.strip() for value in values):
@@ -861,7 +859,6 @@ class MimoSpeakerVoiceProfile(SchemaModel):
 class MimoAudioObservation(SchemaModel):
     segment_decisions: list[MimoAudioSegmentDecision]
     speaker_voice_profiles: list[MimoSpeakerVoiceProfile]
-    audio_semantics: MimoAudioSemantics
 
 
 class MimoAVGrounding(SchemaModel):
@@ -872,7 +869,7 @@ MimoH3Draft = MimoH3Semantics
 
 
 class MimoAVAnnotationDraft(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_av_annotation.18"] = MIMO25_SCHEMA_VERSION
+    schema_version: Literal["r2v.h3.mimo25_av_annotation.19"] = MIMO25_SCHEMA_VERSION
     visual_observation: MimoVisualObservation
     audio_observation: MimoAudioObservation
     av_grounding: MimoAVGrounding
@@ -887,17 +884,13 @@ class MimoAVAnnotationDraft(SchemaModel):
     def speaker_voice_profiles(self) -> list[MimoSpeakerVoiceProfile]:
         return self.audio_observation.speaker_voice_profiles
 
-    @property
-    def audio_semantics(self) -> MimoAudioSemantics:
-        return self.audio_observation.audio_semantics
-
 
 class MimoThinkingContract(SchemaModel):
     type: Literal["disabled", "enabled"] = "disabled"
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.31"] = MIMO25_BACKEND_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.32"] = MIMO25_BACKEND_VERSION
     backend: Literal[
         "xiaomi_openai_compatible", "sglang_openai_compatible"
     ]
@@ -915,13 +908,13 @@ class MimoBackendProvenance(SchemaModel):
     media_mode: Literal["base64", "http"]
     media_root: str
     media_base_url: str | None = None
-    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v28"] = (
+    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v29"] = (
         MIMO25_PROMPT_VERSION
     )
     policy_version: Literal["h3_mimo25_av_authority_contract_v17"] = (
         MIMO25_POLICY_VERSION
     )
-    annotation_schema_version: Literal["r2v.h3.mimo25_av_annotation.18"] = (
+    annotation_schema_version: Literal["r2v.h3.mimo25_av_annotation.19"] = (
         MIMO25_SCHEMA_VERSION
     )
     materializer_version: Literal[
@@ -937,12 +930,12 @@ class MimoBackendProvenance(SchemaModel):
         "h3_mimo25_materializer_v15",
         "h3_mimo25_materializer_v16",
         "h3_mimo25_materializer_v17",
-        "h3_mimo25_materializer_v21",
+        "h3_mimo25_materializer_v22",
     ] = (
         MIMO25_MATERIALIZER_VERSION
     )
-    http_max_attempts: int = Field(ge=1, le=5)
-    full_av_recheck_limit: Literal[1] = 1
+    http_max_attempts: Literal[1] = 1
+    full_av_recheck_limit: Literal[0] = 0
     configuration_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
 
     @model_validator(mode="after")
@@ -982,6 +975,8 @@ class MimoCompletionDiagnostic(SchemaModel):
         "target_video_plus_canonical_full_audio_fallback",
         "full_av_recheck_embedded_audio",
         "full_av_recheck_with_canonical_audio",
+        "target_av_with_auxiliary_raw_audio",
+        "sound_description_text_only",
     ]
     finish_reason: str | None = None
     usage: MimoUsage
@@ -1002,8 +997,30 @@ class MimoBackendResult:
     input_modality: Literal[
         "target_video_with_embedded_audio",
         "target_video_plus_canonical_full_audio_fallback",
+        "target_av_with_auxiliary_raw_audio",
     ]
     deterministic_correction_counts: dict[str, int] = field(default_factory=dict)
+
+
+class MimoSoundPartition(SchemaModel):
+    overall_soundscape: StrictStr
+    non_diegetic_music: StrictStr
+
+
+@dataclass(frozen=True)
+class MimoSoundPartitionCall:
+    diagnostic: MimoCompletionDiagnostic
+    partition: MimoSoundPartition | None = None
+    raw_response: str | None = None
+    error: str | None = None
+
+
+SOUND_PARTITION_PROMPT = """Partition SOURCE_SOUND_DESCRIPTION into two fields using only information already stated in the source.
+overall_soundscape: Non-musical ambience, environmental/physical/mechanical/electronic sounds, and non-speech human sounds. Exclude spoken dialogue and music.
+non_diegetic_music: Audience-facing background music or score described in the source. Do not turn in-scene music into background score.
+You may shorten and reorganize existing descriptions. Do not add an event, source, instrument, mood, setting, timing, or acoustic property. Preserve explicit uncertainty and negation. Omit dialogue content.
+If a field has no supported content, use "N/A" as an empty-field placeholder; do not invent a statement of confirmed silence.
+Return only: {"overall_soundscape": "...", "non_diegetic_music": "..."}"""
 
 
 class MimoBackendFailure(ValueError):
@@ -1104,7 +1121,7 @@ class MimoBackendConfig:
     temperature: float = 0.0
     max_completion_tokens: int = 16384
     timeout_seconds: float = 900.0
-    http_max_attempts: int = 3
+    http_max_attempts: int = 1
     thinking: Literal["disabled", "enabled"] = "disabled"
     icl: Literal["none", "official_ref2va_v1"] = "official_ref2va_v1"
 
@@ -1122,9 +1139,9 @@ class MimoBackendConfig:
             or self.temperature < 0
             or self.max_completion_tokens <= 0
             or self.timeout_seconds <= 0
-            or not 1 <= self.http_max_attempts <= 5
+            or self.http_max_attempts != 1
         ):
-            raise ValueError("MiMo backend configuration violates the v7 contract")
+            raise ValueError("MiMo backend configuration violates the single-attempt contract")
 
     def provenance(self) -> MimoBackendProvenance:
         values = {
@@ -1151,7 +1168,7 @@ class MimoBackendConfig:
             "annotation_schema_version": MIMO25_SCHEMA_VERSION,
             "materializer_version": MIMO25_MATERIALIZER_VERSION,
             "http_max_attempts": self.http_max_attempts,
-            "full_av_recheck_limit": 1,
+            "full_av_recheck_limit": 0,
         }
         return MimoBackendProvenance(
             **values,
@@ -1164,7 +1181,7 @@ Return one compact JSON object in the supplied schema for this H3 shadow pipelin
 
 AUTHORITY
 - DiariZen owns exact segment/sample boundaries. All decision inventories follow allowed_segment_ids, including LR-ASD=0, unbound, and zero-anchor segments. Never split, merge, filter, or invent segments.
-- Qwen3-ASR language/text are immutable. Only transcribed_segment_ids receive <d> dialogue, once in chronological order; never retranscribe, paraphrase, translate, or invent dialogue.
+- Preserve supplied Qwen3-ASR dialogue content and language without additions or omissions. Consecutive speech by the same speaker may share one natural <d> block; never alter upstream segment boundaries.
 - Frozen entities, Subjects, Pictures, order, and ownership are immutable; use only supplied IDs/labels and enabled Audio references. Target video is observation-only, never <Video N>. Current LR-ASD bindings and source clusters are proposals, not truth.
 
 VISUAL OBSERVATION
@@ -1174,7 +1191,7 @@ VISUAL OBSERVATION
 AUDIO + AV GROUNDING
 - Stage B identifies acoustic speakers as contiguous gN by first appearance, not turns. Pauses, language, sentences, ASR, or segment boundaries alone never create groups. Record vocal_composition, delivery, secondary_vocal_activity, and non-speech evidence, without entity identity or spatial presentation.
 - Multiple vocal sounds are valid observations; use needs_acoustic_refinement if primary identity is unsafe. Each transcribed segment needs nonempty delivery_style; non-transcribed segments use null. Voice profiles cover resolved transcribed groups in first-appearance order with supported acoustic traits, not transcript or identity claims.
-- Non-speech events use chronological contiguous aeN and tight approximate intervals. Classify music versus non-musical sound from original AV, including beatless pitched/harmonic score versus genuine environmental hum. Visuals may identify an audible source, never invent sound. Stems are auxiliary: negative evidence is non-confirmatory and separator labels are not truth. Internal statuses remain QA observations, not final prose gates; absent/null means verified absence, unknown/null means uncertainty.
+- Original AV is the sound authority. Auxiliary separations may contain leakage/artifacts and are the same events aligned at t=0, not extra scenes or conditioning references; track names are not proof.
 - Stage C preserves each Stage B primary group. visible_entity requires presence in the exact Stage A view plus visible_lip_motion with observed speech-correlated articulation, OR a genuinely non-assessable mouth/back/profile/occluded/cropped view with speaker_visible_mouth_occluded and av_temporal_alignment or voice_continuity. Reinspect conflicting Stage A articulation and Stage C lip-motion evidence.
 - Stage C may resolve Stage B needs_acoustic_refinement only with an existing primary gN, single_speaker or same_speaker_nonlexical composition, and reliable exact-window visible-speaker evidence; never for overlapping/sequential multi-speaker speech, uncertain composition, or missing groups.
 - Offscreen is spatial: hidden lips/face or partial occlusion of a visible person is not offscreen. A visible listener must not inherit the audible speaker. offscreen_spoken requires offscreen/null entity/offscreen_audio; voice_over requires null/voice_over_context; device_playback requires null/device_playback_context; message_voice_over requires null/message_text_alignment/voice_over_context. Inadequate evidence is no_reliable_entity/uncertain, not guessed offscreen.
@@ -1189,9 +1206,8 @@ PRIMARY H3 WRITING TASK
 - This pilot is exactly one shot. Write style_opening and shot1_caption; the pipeline inserts [Shot 1]. Never output [Shot N], shot timing, or placeholders.
 - style_opening: one concise sentence about global visual/cinematographic style, camera language, and lighting only. Do not summarize people, clothing, scene contents, Subjects, actions, chronology, dialogue, or audio.
 - shot1_caption: complete natural English audiovisual prose in playback order. Integrate visible setup, actions, dialogue, and reactions where they occur; do not append all dialogue at the end.
-- Number stable (Sx) by final groups' first transcribed appearance. EVERY authoritative vocal event needs its expected (Sx) in that event's natural lead-in before <d>, using the supplied authoritative dialogue facts. Referenced visible speakers use <Subject N> (Sx); unbound sources use a natural semantic source plus (Sx). No fixed says clause or immediate adjacency is required.
-- overall_soundscape: audible non-musical, non-dialogue ambience/SFX only; exclude speech, singing, and music. Do not infer room tone from visuals or synthesize stock absence prose.
-- non_diegetic_music: audience-only score/BGM heard in original AV, or N/A when none is audible.
+- Number stable (Sx) by final groups' first transcribed appearance. Every generated vocal event needs a valid (Sx) in its natural lead-in before <d>. Referenced visible speakers use <Subject N> (Sx); unbound sources use a natural semantic source plus (Sx). No fixed says clause or immediate adjacency is required.
+- sound_description: describe the complete audible content of original target AV in natural English, including foreground vocal activity, background sounds, music, and meaningful changes when audible. Auxiliary separations only help notice sounds; interpret them in original AV, never infer sounds from visible objects or scene type. Preserve uncertainty about unidentified sources. Do not organize into H3 soundscape/music categories or describe each stem separately. Do not repeat transcripts here; dialogue belongs in the caption.
 - The official ICL is a detailed-description prose-style subset, not a response-schema demonstration. Follow the actual supplied schema and official six-section Ref2VA semantics."""
 
 
@@ -1239,6 +1255,8 @@ def _completion_diagnostic(
         "target_video_plus_canonical_full_audio_fallback",
         "full_av_recheck_embedded_audio",
         "full_av_recheck_with_canonical_audio",
+        "target_av_with_auxiliary_raw_audio",
+        "sound_description_text_only",
     ],
     http_attempt_count: int,
     thinking: Literal["disabled", "enabled"] = "disabled",
@@ -1353,43 +1371,76 @@ _SPEAKER_LABEL = re.compile(r"\(S(\d+)\)")
 
 
 def protect_direct_dialogue(
-    text: str, speech: list[dict[str, Any]], *, allowed_labels: set[str],
+    text: str,
+    speech: list[dict[str, Any]],
+    *,
+    allowed_labels: set[str],
 ) -> tuple[str, list[ValidationIssue], list[str]]:
-    """Change only d-tag payloads after count, event speaker and order checks."""
+    """Check generated vocal-event syntax only; never align or rewrite ASR text."""
     issues = []
-    warnings = []
     unknown = set(_REFERENCE_LABEL.findall(text)) - allowed_labels
     if unknown:
-        issues.append(ValidationIssue("direct_unknown_reference", "shot1_caption", str(sorted(unknown))))
-    known_speakers = {item["speaker_id"] for item in speech}
-    actual_speakers = {"S" + number for number in _SPEAKER_LABEL.findall(text)}
-    if actual_speakers - known_speakers:
-        issues.append(ValidationIssue("direct_unknown_speaker", "shot1_caption", str(sorted(actual_speakers - known_speakers))))
+        issues.append(
+            ValidationIssue(
+                "direct_unknown_reference", "shot1_caption", str(sorted(unknown))
+            )
+        )
+    known = {item["speaker_id"] for item in speech}
+    actual = {"S" + number for number in _SPEAKER_LABEL.findall(text)}
+    if actual - known:
+        issues.append(
+            ValidationIssue(
+                "direct_unknown_speaker", "shot1_caption", str(sorted(actual - known))
+            )
+        )
     blocks = list(_DIALOGUE.finditer(text))
-    if len(blocks) != len(speech) or text.count("<d>") != len(blocks) or text.count("</d>") != len(blocks):
-        issues.append(ValidationIssue("direct_dialogue_inventory_mismatch", "shot1_caption", "dialogue blocks must map one-to-one to ordered transcribed segments"))
-        return text, issues, warnings
-    expected = [f"[{item['language'] or 'Unknown'}] {item['text']}" for item in speech]
+    if (
+        text.count("<d>") != len(blocks)
+        or text.count("</d>") != len(blocks)
+        or any("<d>" in block.group(1) for block in blocks)
+    ):
+        issues.append(
+            ValidationIssue(
+                "direct_dialogue_format",
+                "shot1_caption",
+                "dialogue tags must be paired and non-nested",
+            )
+        )
     previous_end = 0
-    for index, (block, fact) in enumerate(zip(blocks, speech, strict=True)):
-        speaker = fact["speaker_id"]
-        if f"({speaker})" not in text[previous_end:block.start()]:
-            issues.append(ValidationIssue(
-                "direct_dialogue_speaker_marker_missing", fact["segment_id"],
-                f"({speaker}) must occur in this dialogue event's lead-in",
-            ))
+    for index, block in enumerate(blocks):
+        lead_in = text[previous_end : block.start()]
+        if not any(f"({speaker})" in lead_in for speaker in known):
+            issues.append(
+                ValidationIssue(
+                    "direct_dialogue_speaker_marker_missing",
+                    f"dialogue_{index + 1}",
+                    "generated vocal event needs a valid speaker lead-in",
+                )
+            )
+        if re.match(r"^\[[^\]\r\n]+\]", block.group(1)) is None:
+            issues.append(
+                ValidationIssue(
+                    "direct_dialogue_language_missing",
+                    f"dialogue_{index + 1}",
+                    "dialogue requires a language marker",
+                )
+            )
         previous_end = block.end()
-        recognized_positions = [i for i, payload in enumerate(expected) if payload == block.group(1)]
-        if recognized_positions and index not in recognized_positions:
-            issues.append(ValidationIssue("direct_dialogue_order_mismatch", fact["segment_id"], "recognized dialogue belongs to a different segment"))
     if "[[" in text or "]]" in text:
-        issues.append(ValidationIssue("direct_internal_syntax", "shot1_caption", "internal placeholders are not H3"))
-    if issues:
-        return text, issues, warnings
-    replacements = iter(expected)
-    if any(block.group(1) != payload for block, payload in zip(blocks, expected, strict=True)):
-        warnings.append("asr_dialogue_payload_corrected")
-    return _DIALOGUE.sub(lambda _: "<d>" + next(replacements) + "</d>", text), [], warnings
+        issues.append(
+            ValidationIssue(
+                "direct_internal_syntax",
+                "shot1_caption",
+                "internal placeholders are not H3",
+            )
+        )
+    if re.search(r"\[Shot\s+\d+\]", text):
+        issues.append(
+            ValidationIssue(
+                "direct_shot_marker", "shot1_caption", "shot markers are pipeline-owned"
+            )
+        )
+    return text, issues, []
 
 
 def direct_speech_facts(annotation: MimoAVAnnotationDraft, segments: list[Any]) -> list[dict[str, Any]]:
@@ -1756,15 +1807,6 @@ def validate_annotation(
                     f"{profile.speaker_group} voice profile contains identity wording",
                 )
             )
-    for event in annotation.audio_semantics.temporal_non_speech_events:
-        if event.approximate_end_time > target_duration_seconds + 1e-6:
-            issues.append(
-                ValidationIssue(
-                    "audio_event_exceeds_target",
-                    "audio_semantics.temporal_non_speech_events",
-                    str(event.approximate_end_time),
-                )
-            )
     semantics_draft = annotation.h3_semantics
     prose_parts = [
         block.text
@@ -1934,89 +1976,11 @@ def validate_annotation(
                 )
             )
             break
-    audio_semantics = annotation.audio_semantics
     model_owned_audio_fields = [
-        *(event.description for event in audio_semantics.temporal_non_speech_events),
-        *(
-            item.delivery_style
-            for item in audio_decisions
-            if item.delivery_style is not None
-        ),
-        *(
-            [audio_semantics.overall_soundscape]
-            if audio_semantics.overall_soundscape is not None
-            else []
-        ),
-        *(
-            [audio_semantics.non_diegetic_music]
-            if audio_semantics.non_diegetic_music is not None
-            else []
-        ),
-        audio_semantics.audiovisual_summary,
-        *(
-            item.voice_characteristics
-            for item in annotation.speaker_voice_profiles
-            if item.voice_characteristics is not None
-        ),
+        *(item.delivery_style for item in audio_decisions if item.delivery_style is not None),
+        *(item.voice_characteristics for item in annotation.speaker_voice_profiles
+          if item.voice_characteristics is not None),
     ]
-    canonical_music = (
-        audio_semantics.non_diegetic_music
-        if audio_semantics.non_diegetic_music_status == "present"
-        else None
-    )
-    if canonical_music is not None:
-        if (
-            audio_semantics.overall_soundscape is not None
-            and _substantially_same_audio_layer(
-                canonical_music,
-                audio_semantics.overall_soundscape,
-            )
-        ):
-            issues.append(
-                ValidationIssue(
-                    "non_diegetic_music_leaked_into_soundscape",
-                    "audio_observation.audio_semantics.overall_soundscape",
-                    "overall_soundscape substantially duplicates the canonical "
-                    "non-diegetic music layer",
-                )
-            )
-        for event in audio_semantics.temporal_non_speech_events:
-            if event.category in _SOUNDSCAPE_EVENT_CATEGORIES and (
-                _substantially_same_audio_layer(canonical_music, event.description)
-            ):
-                issues.append(
-                    ValidationIssue(
-                        "non_diegetic_music_misclassified_as_soundscape_event",
-                        event.event_id,
-                        "soundscape-category event substantially duplicates the "
-                        "canonical non-diegetic music layer",
-                    )
-                )
-    if (
-        audio_semantics.overall_soundscape is not None
-        and _contains_positive_soundscape_contamination(
-            audio_semantics.overall_soundscape
-        )
-    ):
-        issues.append(
-            ValidationIssue(
-                "overall_soundscape_contains_music_or_speech",
-                "audio_observation.audio_semantics.overall_soundscape",
-                "overall_soundscape must exclude dialogue, singing, and music",
-            )
-        )
-    for event in audio_semantics.temporal_non_speech_events:
-        if (
-            event.category in _SOUNDSCAPE_EVENT_CATEGORIES
-            and _SOUNDSCAPE_CONTAMINATION.search(event.description)
-        ):
-            issues.append(
-                ValidationIssue(
-                    "soundscape_event_category_contamination",
-                    event.event_id,
-                    "soundscape-category event contains music or dialogue semantics",
-                )
-            )
     normalized_audio_fields = [
         _normalized_text(value) for value in model_owned_audio_fields
     ]
@@ -2205,38 +2169,6 @@ def _drop_voice_profile_identity_claims(
     if correction_count == 0:
         return annotation, 0
     return MimoAVAnnotationDraft.model_validate(payload), correction_count
-
-
-def _rebuild_contaminated_overall_soundscape_from_events(
-    annotation: MimoAVAnnotationDraft,
-) -> tuple[MimoAVAnnotationDraft, int]:
-    semantics = annotation.audio_semantics
-    soundscape = semantics.overall_soundscape
-    if (
-        semantics.overall_soundscape_status != "present"
-        or soundscape is None
-        or not _contains_positive_soundscape_contamination(soundscape)
-    ):
-        return annotation, 0
-
-    descriptions: list[str] = []
-    seen: set[str] = set()
-    for event in semantics.temporal_non_speech_events:
-        if event.category not in _SOUNDSCAPE_EVENT_CATEGORIES:
-            continue
-        if _SOUNDSCAPE_CONTAMINATION.search(event.description):
-            return annotation, 0
-        if event.description not in seen:
-            descriptions.append(event.description.strip())
-            seen.add(event.description)
-    if not descriptions:
-        return annotation, 0
-
-    payload = annotation.model_dump(mode="python")
-    payload["audio_observation"]["audio_semantics"]["overall_soundscape"] = " ".join(
-        descriptions
-    )
-    return MimoAVAnnotationDraft.model_validate(payload), 1
 
 
 def _conservative_visible_speaker_downgrade(
@@ -2443,7 +2375,7 @@ def _canonicalize_same_visible_entity_speaker_groups(
     )
 
 
-def _normalize_annotation_before_recheck(
+def _normalize_speaker_annotation(
     annotation: MimoAVAnnotationDraft,
     *,
     segment_ids: list[str],
@@ -2476,11 +2408,6 @@ def _normalize_annotation_before_recheck(
     annotation, count = _drop_voice_profile_identity_claims(annotation)
     corrections["speaker_voice_profile_identity_claim_dropped"] += count
 
-    annotation, count = _rebuild_contaminated_overall_soundscape_from_events(
-        annotation
-    )
-    corrections["overall_soundscape_rebuilt_from_typed_events"] += count
-
     annotation, group_corrections, source_groups = (
         _canonicalize_same_visible_entity_speaker_groups(
             annotation,
@@ -2512,45 +2439,34 @@ class OpenAIMimo25Backend:
         jitter: Any = random.random,
     ) -> None:
         self.config = config
-        self.client = client or OpenAI(
+        self.client = (client.with_options(max_retries=0) if isinstance(client, OpenAI) else client) or OpenAI(
             api_key=config.api_key,
             base_url=config.base_url,
             timeout=config.timeout_seconds,
+            max_retries=0,
         )
         self._sleep = sleep
         self._jitter = jitter
+        self._av_request_started = False
+        self._av_raw_response = None
 
     @property
     def provenance(self) -> MimoBackendProvenance:
         return self.config.provenance()
 
     def _call(self, payload: dict[str, object]) -> tuple[object, int, int]:
-        retries = 0
-        for attempt in range(1, self.config.http_max_attempts + 1):
-            try:
-                return self.client.chat.completions.create(**payload), attempt, retries
-            except Exception as exc:
-                status = getattr(exc, "status_code", None)
-                retryable = status == 429 or (
-                    isinstance(status, int) and 500 <= status <= 599
-                ) or isinstance(exc, (TimeoutError, ConnectionError, OSError)) or type(
-                    exc
-                ).__name__ in {"APITimeoutError", "APIConnectionError"}
-                if not retryable or attempt == self.config.http_max_attempts:
-                    raise _MimoHTTPAttemptsExhausted(
-                        exc,
-                        attempts=attempt,
-                        retries=retries,
-                    ) from exc
-                retries += 1
-                self._sleep((2 ** (attempt - 1)) + self._jitter())
-        raise AssertionError("bounded MiMo retry loop did not terminate")
+        try:
+            return self.client.chat.completions.create(**payload), 1, 0
+        except Exception as exc:
+            raise _MimoHTTPAttemptsExhausted(exc, attempts=1, retries=0) from exc
+
+    @property
+    def _input_modality(self) -> str:
+        return "target_video_with_embedded_audio"
 
     def _media_content(
         self,
         job: MimoBackendJob,
-        *,
-        include_audio_fallback: bool,
     ) -> list[dict[str, object]]:
         job_payload = job.model_dump(mode="json")
         references = job_payload.get("reference_images")
@@ -2583,24 +2499,6 @@ class OpenAIMimo25Backend:
                 "media_resolution": self.config.media_resolution,
             }
         )
-        if include_audio_fallback:
-            audio_url = self.config.media_resolver.resolve(
-                Path(job.target_full_audio_path)
-            )
-            if self.config.transport == "sglang":
-                content.append(
-                    {
-                        "type": "audio_url",
-                        "audio_url": {"url": audio_url},
-                    }
-                )
-            else:
-                content.append(
-                    {
-                        "type": "input_audio",
-                        "input_audio": {"data": audio_url},
-                    }
-                )
         return content
 
     @staticmethod
@@ -2685,28 +2583,11 @@ class OpenAIMimo25Backend:
         )
 
     def _request(
-        self,
-        job: MimoBackendJob,
-        *,
-        include_audio_fallback: bool,
-        recheck_prompt: str | None = None,
+        self, job: MimoBackendJob,
     ) -> tuple[str, MimoCompletionDiagnostic, int]:
-        if recheck_prompt is not None:
-            modality = (
-                "full_av_recheck_with_canonical_audio"
-                if include_audio_fallback
-                else "full_av_recheck_embedded_audio"
-            )
-        else:
-            modality = (
-                "target_video_plus_canonical_full_audio_fallback"
-                if include_audio_fallback
-                else "target_video_with_embedded_audio"
-            )
-        content = self._media_content(job, include_audio_fallback=include_audio_fallback)
-        content.append(
-            {"type": "text", "text": recheck_prompt or self._prompt(job)}
-        )
+        content = self._media_content(job)
+        content.append({"type": "text", "text": self._prompt(job)})
+        modality = self._input_modality
         payload: dict[str, object] = {
             "model": self.config.model,
             "messages": [
@@ -2739,6 +2620,7 @@ class OpenAIMimo25Backend:
         else:
             payload["response_format"] = {"type": "json_object"}
             payload["extra_body"] = {"thinking": {"type": self.config.thinking}}
+        self._av_request_started = True
         completion, attempts, retries = self._call(payload)
         try:
             choices = _value(completion, "choices")
@@ -2749,6 +2631,7 @@ class OpenAIMimo25Backend:
             raw = _value(message, "content")
             if not isinstance(raw, str):
                 raise TypeError("MiMo response content must be text")
+            self._av_raw_response = raw
         except Exception as exc:
             raise _MimoResponseContractError(
                 exc,
@@ -2763,27 +2646,70 @@ class OpenAIMimo25Backend:
             thinking=self.config.thinking,
         ), retries
 
-    def _full_av_recheck_prompt(
-        self,
-        job: MimoBackendJob,
-        *,
-        invalid_response: str,
-        issues: list[ValidationIssue],
-    ) -> str:
-        schema = (
-            "\nSCHEMA: " + _compact_json(MimoAVAnnotationDraft.model_json_schema())
-            if self.config.transport == "xiaomi"
-            else ""
+    def partition_sound_description(
+        self, sound_description: str
+    ) -> MimoSoundPartitionCall:
+        payload: dict[str, object] = {
+            "model": self.config.model,
+            "messages": [
+                {"role": "system", "content": SOUND_PARTITION_PROMPT},
+                {"role": "user", "content": sound_description},
+            ],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "MimoSoundPartition",
+                    "schema": MimoSoundPartition.model_json_schema(),
+                    "strict": True,
+                },
+            },
+            "temperature": 0.0,
+            "max_completion_tokens": 1024,
+            "stream": False,
+        }
+        if self.config.transport == "sglang":
+            payload["reasoning_effort"] = "none"
+            payload["extra_body"] = {
+                "chat_template_kwargs": {"thinking": False, "enable_thinking": False}
+            }
+        else:
+            payload["extra_body"] = {"thinking": {"type": "disabled"}}
+        raw = None
+        diagnostic = MimoCompletionDiagnostic(
+            input_modality="sound_description_text_only",
+            usage=MimoUsage(),
+            http_attempt_count=1,
         )
-        return (
-            "Reinspect the same AV and fix ONLY these hard issues:\n"
-            + _compact_json([item.to_dict() for item in issues if item.code not in _REVIEW_ONLY_ISSUES])
-            + "\nPreserve the authoritative contract below:\n"
-            + _compact_json(self.build_compact_task_contract(job))
-            + schema
-            + "\nPrevious response:\n"
-            + invalid_response
-        )
+        try:
+            completion, _, _ = self._call(payload)
+            choice = _value(completion, "choices")[0]
+            raw = _value(_value(choice, "message"), "content")
+            diagnostic = _completion_diagnostic(
+                completion,
+                choice,
+                modality="sound_description_text_only",
+                http_attempt_count=1,
+                thinking="disabled",
+            )
+            partition, issues = parse_structured_json_issues(raw, MimoSoundPartition)
+            if issues:
+                raise ValueError("; ".join(item.message for item in issues))
+            return MimoSoundPartitionCall(
+                partition=partition, raw_response=raw, diagnostic=diagnostic
+            )
+        except (
+            ValueError,
+            TypeError,
+            IndexError,
+            KeyError,
+            _MimoHTTPAttemptsExhausted,
+        ) as exc:
+            diagnostic.request_error = f"{type(exc).__name__}: {exc}"
+            return MimoSoundPartitionCall(
+                raw_response=raw if isinstance(raw, str) else None,
+                diagnostic=diagnostic,
+                error=diagnostic.request_error,
+            )
 
     def reconcile(
         self,
@@ -2794,193 +2720,127 @@ class OpenAIMimo25Backend:
         allowed_entity_ids: set[str],
         allowed_reference_labels: set[str],
     ) -> MimoBackendResult:
-        raw_responses: list[str] = []
-        diagnostics: list[MimoCompletionDiagnostic] = []
-        modality: Literal[
-            "target_video_with_embedded_audio",
-            "target_video_plus_canonical_full_audio_fallback",
-        ] = "target_video_with_embedded_audio"
-        recheck_count = 0
-
-        def contextual_failure(
-            failure: MimoBackendFailure,
-            *,
-            validation_issues: list[ValidationIssue] | None = None,
-        ) -> MimoBackendFailure:
-            return MimoBackendFailure(
-                code=failure.code,
-                reason=failure.reason,
-                raw_responses=tuple(raw_responses),
-                diagnostics=tuple(diagnostics),
-                issues=tuple(validation_issues or failure.issues),
-                model_call_count=len(diagnostics),
-                http_attempt_count=sum(item.http_attempt_count for item in diagnostics),
-                http_retry_count=sum(
-                    item.http_attempt_count - 1 for item in diagnostics
-                ),
-                recheck_count=recheck_count,
-            )
-
-        def perform_request(
-            *,
-            include_audio: bool,
-            recheck_prompt: str | None = None,
-        ) -> tuple[str, MimoCompletionDiagnostic]:
-            attempted_modality = (
-                "full_av_recheck_with_canonical_audio"
-                if recheck_prompt is not None and include_audio
-                else "full_av_recheck_embedded_audio"
-                if recheck_prompt is not None
-                else "target_video_plus_canonical_full_audio_fallback"
-                if include_audio
-                else "target_video_with_embedded_audio"
-            )
-            try:
-                raw, diagnostic, _ = self._request(
-                    job,
-                    include_audio_fallback=include_audio,
-                    recheck_prompt=recheck_prompt,
-                )
-            except MimoBackendFailure as failure:
-                raise contextual_failure(failure) from failure
-            except (_MimoHTTPAttemptsExhausted, _MimoResponseContractError) as exc:
-                diagnostics.append(
+        self._av_request_started = False
+        try:
+            raw, diagnostic, _ = self._request(job)
+        except Exception as exc:
+            reason = f"{type(exc).__name__}: {exc}"
+            diagnostics = (
+                (
                     MimoCompletionDiagnostic(
-                        input_modality=attempted_modality,
+                        input_modality=self._input_modality,
                         usage=MimoUsage(),
-                        http_attempt_count=exc.attempts,
-                        warnings=["http_request_failed"],
-                        request_error=str(exc),
-                    )
+                        http_attempt_count=1,
+                        request_error=reason,
+                    ),
                 )
-                raise contextual_failure(
-                    MimoBackendFailure(code="mimo_request_failed", reason=str(exc))
-                ) from exc.original
-            except Exception as exc:
-                raise contextual_failure(
-                    MimoBackendFailure(
-                        code="mimo_request_failed",
-                        reason=f"{type(exc).__name__}: {exc}",
-                    )
-                ) from exc
-            raw_responses.append(raw)
-            diagnostics.append(diagnostic)
-            try:
-                _validate_finish_reason(diagnostic)
-                _validate_av_observation_usage(
-                    diagnostic,
-                    require_explicit_audio=include_audio,
-                )
-                if recheck_prompt is not None and diagnostic.usage.audio_tokens == 0:
-                    raise MimoBackendFailure(
-                        code="mimo_target_audio_not_observed",
-                        reason="MiMo full AV recheck reported zero target-audio tokens",
-                    )
-            except MimoBackendFailure as failure:
-                raise contextual_failure(failure) from failure
-            return raw, diagnostic
-
-        raw, diagnostic = perform_request(include_audio=False)
-        include_audio = diagnostic.usage.audio_tokens == 0
-        if include_audio:
-            raw, _ = perform_request(include_audio=True)
-            modality = "target_video_plus_canonical_full_audio_fallback"
-
-        deterministic_correction_counts: Counter[str] = Counter()
-
-        def parse_normalize_and_validate(
-            value: str,
-        ) -> tuple[MimoAVAnnotationDraft | None, list[ValidationIssue]]:
-            canonical_value, raw_corrections = _canonicalize_raw_annotation_payload(
-                value
+                if self._av_request_started
+                else ()
             )
-            deterministic_correction_counts.update(raw_corrections)
-            annotation, validation_issues = parse_structured_json_issues(
-                canonical_value, MimoAVAnnotationDraft
+            raise MimoBackendFailure(
+                code="mimo_request_failed",
+                reason=reason,
+                diagnostics=diagnostics,
+                raw_responses=(self._av_raw_response,)
+                if self._av_raw_response is not None
+                else (),
+                model_call_count=int(self._av_request_started),
+                http_attempt_count=int(self._av_request_started),
+            ) from exc
+        try:
+            _validate_finish_reason(diagnostic)
+            _validate_av_observation_usage(diagnostic, require_explicit_audio=False)
+            if diagnostic.usage.audio_tokens == 0:
+                raise MimoBackendFailure(
+                    code="mimo_target_audio_not_observed",
+                    reason="MiMo reported zero audio tokens; media is not resent",
+                )
+        except MimoBackendFailure as exc:
+            raise MimoBackendFailure(
+                code=exc.code,
+                reason=exc.reason,
+                raw_responses=(raw,),
+                diagnostics=(diagnostic,),
+                model_call_count=1,
+                http_attempt_count=1,
+            ) from exc
+        canonical_raw, raw_corrections = _canonicalize_raw_annotation_payload(raw)
+        corrections = Counter(raw_corrections)
+        annotation, issues = parse_structured_json_issues(
+            canonical_raw, MimoAVAnnotationDraft
+        )
+        if annotation is not None:
+            annotation, grounding_corrections = _normalize_speaker_annotation(
+                annotation,
+                segment_ids=segment_ids,
+                transcribed_segment_ids=set(transcribed_segment_ids),
+                allowed_entity_ids=allowed_entity_ids,
             )
-            if annotation is not None:
-                annotation, typed_corrections = _normalize_annotation_before_recheck(
-                    annotation,
-                    segment_ids=segment_ids,
-                    transcribed_segment_ids=set(transcribed_segment_ids),
-                    allowed_entity_ids=allowed_entity_ids,
+            corrections.update(grounding_corrections)
+            diagnostic.warnings.extend(
+                f"deterministic_correction:{key}" for key in sorted(corrections)
+            )
+            issues = validate_annotation(
+                annotation,
+                segment_ids=segment_ids,
+                segment_intervals={
+                    item.segment_id: (item.start_time, item.end_time)
+                    for item in job.segments
+                },
+                transcribed_segment_ids=transcribed_segment_ids,
+                authoritative_transcripts=[
+                    item.asr_text
+                    for item in job.segments
+                    if item.asr_status == "transcribed" and item.asr_text is not None
+                ],
+                allowed_entity_ids=allowed_entity_ids,
+                allowed_reference_labels=allowed_reference_labels,
+                reference_subjects=job.reference_subjects,
+                target_duration_seconds=job.target_duration_seconds,
+            )
+            diagnostic.warnings.extend(
+                item.code for item in issues if item.code in _REVIEW_ONLY_ISSUES
+            )
+            issues = [item for item in issues if item.code not in _REVIEW_ONLY_ISSUES]
+            _, direct_issues, _ = protect_direct_dialogue(
+                annotation.h3_semantics.shot1_caption,
+                direct_speech_facts(annotation, list(job.segments)),
+                allowed_labels=allowed_reference_labels,
+            )
+            issues.extend(direct_issues)
+            for name in ("summary", "style_opening"):
+                unknown = (
+                    set(
+                        _REFERENCE_LABEL.findall(getattr(annotation.h3_semantics, name))
+                    )
+                    - allowed_reference_labels
                 )
-                deterministic_correction_counts.update(typed_corrections)
-                validation_issues = validate_annotation(
-                    annotation,
-                    segment_ids=segment_ids,
-                    segment_intervals={
-                        item.segment_id: (item.start_time, item.end_time)
-                        for item in job.segments
-                    },
-                    transcribed_segment_ids=transcribed_segment_ids,
-                    authoritative_transcripts=[
-                        item.asr_text
-                        for item in job.segments
-                        if item.asr_status == "transcribed" and item.asr_text is not None
-                    ],
-                    allowed_entity_ids=allowed_entity_ids,
-                    allowed_reference_labels=allowed_reference_labels,
-                    reference_subjects=job.reference_subjects,
-                    target_duration_seconds=job.target_duration_seconds,
-                )
-                review_issues = [issue for issue in validation_issues if issue.code in _REVIEW_ONLY_ISSUES]
-                validation_issues = [issue for issue in validation_issues if issue.code not in _REVIEW_ONLY_ISSUES]
-                direct = annotation.h3_semantics
-                _, direct_issues, direct_warnings = protect_direct_dialogue(
-                    direct.shot1_caption, direct_speech_facts(annotation, list(job.segments)),
-                    allowed_labels=allowed_reference_labels,
-                )
-                validation_issues.extend(direct_issues)
-                for name in ("summary", "style_opening", "overall_soundscape", "non_diegetic_music"):
-                    unknown = set(_REFERENCE_LABEL.findall(getattr(direct, name))) - allowed_reference_labels
-                    if unknown:
-                        validation_issues.append(ValidationIssue("direct_unknown_reference", name, str(sorted(unknown))))
-                if _contains_positive_soundscape_contamination(direct.overall_soundscape):
-                    direct_warnings.append("direct_soundscape_contains_music_or_speech")
-                if direct.non_diegetic_music != "N/A" and _substantially_same_audio_layer(
-                    direct.non_diegetic_music, direct.overall_soundscape,
-                ):
-                    direct_warnings.append("direct_music_duplicated_in_soundscape")
-                diagnostics[-1].warnings.extend(sorted(set(
-                    [issue.code for issue in review_issues] + direct_warnings
-                )))
-            return annotation, validation_issues
-
-        annotation, issues = parse_normalize_and_validate(raw)
+                if unknown:
+                    issues.append(
+                        ValidationIssue(
+                            "direct_unknown_reference", name, str(sorted(unknown))
+                        )
+                    )
         if annotation is None or issues:
-            recheck_count = 1
-            raw, _ = perform_request(
-                include_audio=include_audio,
-                recheck_prompt=self._full_av_recheck_prompt(
-                    job,
-                    invalid_response=raw,
-                    issues=issues,
-                ),
-            )
-            annotation, issues = parse_normalize_and_validate(raw)
-        if annotation is None or issues:
-            raise contextual_failure(
-                MimoBackendFailure(
-                    code="mimo_structured_output_failed",
-                    reason="MiMo AV annotation failed after one full AV recheck",
-                ),
-                validation_issues=issues,
+            raise MimoBackendFailure(
+                code="mimo_structured_output_failed",
+                reason="MiMo single AV observation failed validation",
+                raw_responses=(raw,),
+                diagnostics=(diagnostic,),
+                issues=tuple(issues),
+                model_call_count=1,
+                http_attempt_count=1,
             )
         return MimoBackendResult(
             annotation=annotation,
-            raw_responses=tuple(raw_responses),
-            diagnostics=tuple(diagnostics),
-            model_call_count=len(diagnostics),
-            http_attempt_count=sum(item.http_attempt_count for item in diagnostics),
-            http_retry_count=sum(
-                item.http_attempt_count - 1 for item in diagnostics
-            ),
-            recheck_count=recheck_count,
-            input_modality=modality,
-            deterministic_correction_counts=dict(
-                sorted(deterministic_correction_counts.items())
-            ),
+            raw_responses=(raw,),
+            diagnostics=(diagnostic,),
+            model_call_count=1,
+            http_attempt_count=1,
+            http_retry_count=0,
+            recheck_count=0,
+            input_modality=self._input_modality,
+            deterministic_correction_counts=dict(sorted(corrections.items())),
         )
 
 
@@ -3008,6 +2868,8 @@ __all__ = [
     "MimoH3Semantics",
     "MimoMediaResolver",
     "MimoSegmentDecision",
+    "MimoSoundPartition",
+    "MimoSoundPartitionCall",
     "MimoSpeakerVoiceProfile",
     "MimoSubjectDefinitionDraft",
     "MimoTransport",
