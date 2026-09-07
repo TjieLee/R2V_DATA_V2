@@ -576,7 +576,7 @@ def test_failures_keep_raw_and_continue_without_retries(tmp_path, monkeypatch, f
             "<Subject 9>"
         )
     elif failure == "format":
-        payload["h3_semantics"]["shot1_caption"] = "<d>[Chinese] unchanged</d>"
+        payload["h3_semantics"]["shot1_caption"] = "(S1)<d>missing language</d>"
     elif failure == "articulation":
         payload["visual_observation"]["segment_views"][0]["entity_observations"][0][
             "speech_correlated_articulation"
@@ -598,19 +598,20 @@ def test_failures_keep_raw_and_continue_without_retries(tmp_path, monkeypatch, f
         ],
     )
     summary = _run(shadow, backend, stems, jobs)
-    assert summary.failed_count == 1 and summary.ready_count == 2
+    expected_failed = 0 if failure == "articulation" else 1
+    assert summary.failed_count == expected_failed and summary.ready_count == 3 - expected_failed
     assert summary.av_model_call_count == 3
     assert summary.model_call_count == len(completions.requests) == 9
     records = _records(shadow)
-    assert records[0]["status"] == "failed"
+    assert records[0]["status"] == ("ready" if failure == "articulation" else "failed")
     assert records[0]["raw_responses"] == [first_raw]
     assert records[0]["music_stem_description"] and records[0]["sfx_stem_description"]
     if failure == "articulation":
-        assert "stage_a_av_articulation_contradiction" in {
-            issue["code"] for issue in records[0]["failure_issues"]
-        }
+        assert records[0]["failure_issues"] == []
+        assert "stage_a_av_articulation_contradiction" in records[0]["diagnostics"][-1]["warnings"]
         annotation = records[0]["annotation"]
         assert annotation is not None
+        assert annotation["av_grounding"] == payload["av_grounding"]
         assert annotation["audio_observation"]["segment_decisions"][0]["audio_evidence_codes"] == ["voice_continuity"]
         assert annotation["h3_semantics"]["visual_retention_analysis"][0]["description"] == "the person remains visible."
     qa.build_audio_shadow_qa(**kwargs)
@@ -621,7 +622,7 @@ def test_failures_keep_raw_and_continue_without_retries(tmp_path, monkeypatch, f
     assert clip["direct_h3"]["overall_soundscape"]
     if failure == "articulation":
         assert clip["direct_h3"] == records[0]["annotation"]["h3_semantics"]
-    assert clip["final_h3"]["status"] == "unavailable"
+    assert clip["final_h3"]["status"] == ("ready" if failure == "articulation" else "unavailable")
     page = (shadow / "qa/review.html").read_text()
     assert "Final AV raw response" in page and "Final overall_soundscape" in page
     assert "Text-only sound partition" not in page
@@ -663,7 +664,6 @@ def test_reference_prose_still_requires_nonempty_description(field):
 
 @pytest.mark.parametrize("caption,issue", [
     ("<Subject 1> (S1) speaks using <Audio 1>, <d>[Chinese] text</d>", "direct_unknown_reference"),
-    ("A man says, <d>[Chinese] text</d>", "direct_dialogue_speaker_marker_missing"),
     ("A man (S2) says, <d>[Chinese] text</d>", "direct_unknown_speaker"),
     ("A man (S1) says, <d>text</d>", "direct_dialogue_language_missing"),
     ("A man (S1) says, <d>[Chinese] text", "direct_dialogue_format"),
@@ -842,10 +842,12 @@ def test_direct_dialogue_authoritative_continuity(speakers, caption, missing, un
         [{"speaker_id": speaker} for speaker in speakers],
         allowed_labels={"<Subject 1>"},
     )
-    assert unchanged == caption and warnings == []
+    single_speaker = len(set(speakers)) == 1
+    assert unchanged == caption
+    assert warnings == (["direct_single_speaker_marker_missing"] * len(missing) if single_speaker else [])
     assert [(issue.code, issue.field) for issue in issues] == (
         ([("direct_unknown_speaker", "shot1_caption")] if unknown else [])
-        + [("direct_dialogue_speaker_marker_missing", field) for field in missing]
+        + ([("direct_dialogue_speaker_marker_missing", field) for field in missing] if not single_speaker else [])
     )
 
 
@@ -964,7 +966,6 @@ def test_incomplete_onscreen_grounding_is_review_only_without_rebinding(tmp_path
     ("offscreen_audio", "visible_speaker_evidence_presentation_contradiction"),
     ("voice_over_context", "visible_speaker_evidence_presentation_contradiction"),
     ("device_playback_context", "visible_speaker_evidence_presentation_contradiction"),
-    ("articulation", "stage_a_av_articulation_contradiction"),
 ])
 def test_concrete_visible_speaker_contradictions_remain_hard(tmp_path, monkeypatch, contradiction, issue):
     _, shadow = _fixture(tmp_path, monkeypatch)
@@ -974,8 +975,6 @@ def test_concrete_visible_speaker_contradictions_remain_hard(tmp_path, monkeypat
     if contradiction == "absent":
         view.update(visible_entity_ids=[], entity_observations=[])
         grounding["evidence_codes"] = ["insufficient_evidence"]
-    elif contradiction == "articulation":
-        view["entity_observations"][0]["speech_correlated_articulation"] = "not_observed"
     else:
         grounding["evidence_codes"] = [contradiction]
     backend, completions, stems, jobs = _backend(tmp_path, shadow, [(json.dumps(payload), 8)])
@@ -1023,6 +1022,51 @@ def test_confirmed_multi_speaker_cannot_publish_h3_identity(tmp_path, monkeypatc
     assert {issue.code for issue in error.value.issues} == {"multi_speaker_segment_requires_turn_refinement"}
 
 
+@pytest.mark.parametrize("speakers,caption,hard_code", [
+    (["S1"], "She says, <d>[Chinese] a</d>", None),
+    (["S1"] * 3, "He says, <d>[Chinese] a</d> He continues, <d>[Chinese] b</d> He adds, <d>[Chinese] c</d>", None),
+    (["S1"], "<d>[Chinese] a</d> <d>[Chinese] b</d>", None),
+    (["S1", "S2"], "(S1)<d>[Chinese] a</d> Another voice <d>[Chinese] b</d>", "direct_dialogue_speaker_marker_missing"),
+    (["S1"], "Another voice (S2)<d>[Chinese] a</d>", "direct_unknown_speaker"),
+    (["S1", "S2"], "(S1)<d>[Chinese] a</d> (S1)<d>[Chinese] b</d>", "direct_dialogue_speaker_marker_mismatch"),
+    ([], "<d>[Chinese] a</d>", "direct_dialogue_speaker_marker_missing"),
+])
+def test_marker_severity_uses_distinct_authoritative_speakers(
+    tmp_path, monkeypatch, speakers, caption, hard_code,
+):
+    from r2v_data_v2.h3 import mimo25_backend
+
+    kwargs, shadow = _fixture(tmp_path, monkeypatch)
+    payload = json.loads(_raw())
+    payload["h3_semantics"]["shot1_caption"] = caption
+    backend, completions, stems, jobs = _backend(tmp_path, shadow, [(json.dumps(payload), 8)] * 3)
+    monkeypatch.setattr(
+        mimo25_backend, "direct_speech_facts",
+        lambda annotation, segments: [{"speaker_id": speaker} for speaker in speakers],
+    )
+    summary = _run(shadow, backend, stems, jobs)
+    row = _records(shadow)[0]
+    assert row["annotation"]["h3_semantics"]["shot1_caption"] == caption
+    assert row["raw_responses"] == [json.dumps(payload)]
+    assert row["annotation"]["av_grounding"] == payload["av_grounding"]
+    assert summary.model_call_count == len(completions.requests) == 3 * len(jobs)
+    assert row["model_call_count"] == 3
+    assert row["audio_model_call_count"] == 2 and row["av_model_call_count"] == 1
+    if hard_code:
+        assert summary.failed_count == len(jobs) and row["status"] == "failed"
+        assert hard_code in {issue["code"] for issue in row["failure_issues"]}
+        assert hard_code not in row["diagnostics"][-1]["warnings"]
+    else:
+        assert summary.ready_count == len(jobs) and row["status"] == "ready"
+        assert row["failure_issues"] == []
+        assert "direct_single_speaker_marker_missing" in row["diagnostics"][-1]["warnings"]
+        qa.build_audio_shadow_qa(**kwargs)
+        final = json.loads((shadow / "qa/data.json").read_text())["clips"][0]["final_h3"]
+        assert final["status"] == "ready"
+        assert caption in final["text"]
+        assert "direct_single_speaker_marker_missing" in final["variants"][0]["warnings"]
+
+
 def test_explicit_marker_mismatch_remains_hard_in_backend(tmp_path, monkeypatch):
     from r2v_data_v2.h3 import mimo25_backend
 
@@ -1043,7 +1087,7 @@ def test_explicit_marker_mismatch_remains_hard_in_backend(tmp_path, monkeypatch)
     ]
     assert "direct_dialogue_speaker_marker_mismatch" not in row["diagnostics"][-1]["warnings"]
     assert summary.model_call_count == len(completions.requests) == 3
-    assert backend.provenance.schema_version == MIMO25_BACKEND_VERSION == "r2v.h3.mimo25_backend.38"
+    assert backend.provenance.schema_version == MIMO25_BACKEND_VERSION == "r2v.h3.mimo25_backend.39"
     assert backend.provenance.prompt_version == "h3_mimo25_unified_av_reconcile_v35"
 
 
@@ -1053,9 +1097,7 @@ def test_explicit_marker_mismatch_remains_hard_in_backend(tmp_path, monkeypatch)
         "(S1) <d>[English] a <d>[English] b</d></d>",
         "(S1) <d>[English] a",
         "(S1) <d>no language</d>",
-        "<d>[English] no source</d>",
         "(S9) <d>[English] unknown</d>",
-        "(S1) <d>[English] a</d> <d>[English] b</d>",
         "[Shot 1] body",
         "[[segment:x]]",
     ],
@@ -1066,7 +1108,8 @@ def test_dialogue_format_failures_are_not_rewritten(text):
         [{"speaker_id": "S1", "text": "not used"}],
         allowed_labels=set(),
     )
-    assert unchanged == text and issues and warnings == []
+    assert unchanged == text and issues
+    assert set(warnings) <= {"direct_single_speaker_marker_missing"}
 
 
 def test_media_preflight_failure_has_zero_model_calls(tmp_path, monkeypatch):

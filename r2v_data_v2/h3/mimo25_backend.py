@@ -31,7 +31,7 @@ MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
 MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v35"
 MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v17"
 MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.20"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.38"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.39"
 MIMO25_ICL_VERSION = "h3_official_ref2va_detailed_shot1_v2"
 MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v23"
 MIMO25_CANONICAL_ABSENT_SOUNDSCAPE = (
@@ -877,7 +877,7 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.38"] = MIMO25_BACKEND_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.39"] = MIMO25_BACKEND_VERSION
     backend: Literal[
         "xiaomi_openai_compatible", "sglang_openai_compatible"
     ]
@@ -1451,7 +1451,10 @@ def protect_direct_dialogue(
         elif not same_speaker_continuation:
             issues.append(
                 ValidationIssue(
-                    "direct_dialogue_speaker_marker_missing",
+                    (
+                        "direct_single_speaker_marker_missing" if len(known) == 1
+                        else "direct_dialogue_speaker_marker_missing"
+                    ),
                     f"dialogue_{index + 1}",
                     "generated vocal event needs a valid speaker lead-in",
                 )
@@ -1479,7 +1482,11 @@ def protect_direct_dialogue(
                 "direct_shot_marker", "shot1_caption", "shot markers are pipeline-owned"
             )
         )
-    return text, issues, []
+    return (
+        text,
+        [issue for issue in issues if issue.code not in _REVIEW_ONLY_ISSUES],
+        [issue.code for issue in issues if issue.code in _REVIEW_ONLY_ISSUES],
+    )
 
 
 def direct_speech_facts(annotation: MimoAVAnnotationDraft, segments: list[Any]) -> list[dict[str, Any]]:
@@ -1505,6 +1512,7 @@ def direct_speech_facts(annotation: MimoAVAnnotationDraft, segments: list[Any]) 
 
 
 _REVIEW_ONLY_ISSUES = frozenset({
+    "direct_single_speaker_marker_missing", "stage_a_av_articulation_contradiction",
     "visible_entity_requires_resolved_audio", "onscreen_grounding_incomplete",
     "visible_entity_requires_confirmed_onscreen_speech",
     "onscreen_speech_requires_reliable_visible_speaker_evidence",
@@ -2854,12 +2862,13 @@ class OpenAIMimo25Backend:
                 item.code for item in issues if item.code in review_only
             )
             issues = [item for item in issues if item.code not in review_only]
-            _, direct_issues, _ = protect_direct_dialogue(
+            _, direct_issues, direct_warnings = protect_direct_dialogue(
                 annotation.h3_semantics.shot1_caption,
                 direct_speech_facts(annotation, list(job.segments)),
                 allowed_labels=allowed_reference_labels,
             )
             issues.extend(direct_issues)
+            diagnostic.warnings.extend(direct_warnings)
             for name in ("summary", "style_opening"):
                 unknown = (
                     set(

@@ -172,7 +172,7 @@ responses. Both auxiliary candidates/errors remain available regardless of AV
 success. Failed AV cannot authorize unsafe identity products. Multi-speaker
 exclusions remain. The materializer leaves dialogue intact and reads final
 sound fields directly from annotation; no timing is invented.
-Prompt v35, annotation .20, backend .38, materializer v23, reconcile .10/.12,
+Prompt v35, annotation .20, backend .39, materializer v23, reconcile .10/.12,
 and policy v5 distinguish the new contract. Authority v17 and official opening
 + Shot 1 ICL v2 are unchanged.
 

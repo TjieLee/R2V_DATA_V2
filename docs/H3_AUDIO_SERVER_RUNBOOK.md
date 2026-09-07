@@ -294,15 +294,15 @@ embedded audio tokens remain warnings only. AV defaults still include
 `--thinking disabled --icl official_ref2va_v1`, `use_audio_in_video=true`,
 temperature 0.0 and 32768 completion tokens.
 
-Versions: prompt v35, annotation .20, backend .38, materializer v23, authority
+Versions: prompt v35, annotation .20, backend .39, materializer v23, authority
 v17, ICL v2; reconcile record .10, summary .12, policy v5. New output:
 `mimo_reconcile_stemtext_final_av_v35/`. Old
 `mimo_reconcile_av_stemtext_sound_partition/`, `mimo_v29_oneclip_smoke/`,
 and `mimo_v30_833_oneclip_smoke/` are preserved, not migrated.
 
-For a fresh v35 random10 run, keep `CASE_MANIFEST` as the existing ordered
+For a fresh v35/backend .39 random10 run, keep `CASE_MANIFEST` as the existing ordered
 random10 manifest. This reuses SAM/DiariZen/ASR without reruns and leaves the
-previous `mimo_reconcile_stemtext_final_av_v34/` and earlier outputs untouched:
+previous `mimo_reconcile_stemtext_final_av_v35/` and earlier outputs untouched:
 
 ```bash
 "$R2V_PYTHON" tools/run_h3_mimo25_stem_reconcile_shadow.py \
@@ -313,7 +313,7 @@ previous `mimo_reconcile_stemtext_final_av_v34/` and earlier outputs untouched:
   --sam-route music_first --allow-unverified \
   --model mimo-v2.5 --base-url http://127.0.0.1:8092/v1 \
   --media-root /mnt/workspace --max-completion-tokens 32768 \
-  --output-root "$AUDIO_PRODUCTION_ROOT/sam_audio_stem_shadow_v1/runs/random10-v1/mimo_reconcile_stemtext_final_av_v35"
+  --output-root "$AUDIO_PRODUCTION_ROOT/sam_audio_stem_shadow_v1/runs/random10-v1/mimo_reconcile_stemtext_final_av_v35_backend39"
 ```
 
 No `--overwrite` is used. This patch has fake-client coverage only; readiness

@@ -151,10 +151,15 @@ Malformed offscreen representations retain their existing conservative
 normalization and never gain fabricated `offscreen_audio`; absence of supporting
 evidence is not converted into offscreen.
 Concrete contradictions remain hard: a known entity absent from the segment,
-Stage A/Stage C articulation disagreement, explicit offscreen/voice-over/device
+explicit offscreen/voice-over/device
 evidence conflicting with an onscreen claim, invalid presentation/entity
 combinations, unknown references/speakers, and malformed or wrongly attributed
 dialogue. No additional call, retry, recheck, or evidence threshold is introduced.
+Backend .39 treats Stage A/C articulation disagreement as a review-only warning
+without clearing bindings. Missing Sx is also warning-only when authoritative
+speech facts contain exactly one distinct speaker (`direct_single_speaker_marker_missing`).
+Caption text is preserved, with no marker insertion. Multi-speaker missing
+markers, explicit known-marker mismatch, and unknown speakers remain hard.
 Model-authored Subject visual prose containing Audio-profile content is not
 rewritten by these normalizers and retains its existing validation diagnostics.
 `offscreen_spoken`, `voice_over`,
@@ -182,7 +187,7 @@ Prompt, policy, annotation schema, and materializer versions are:
 - `h3_mimo25_unified_av_reconcile_v35`
 - `h3_mimo25_av_authority_contract_v17`
 - `r2v.h3.mimo25_av_annotation.20`
-- `r2v.h3.mimo25_backend.38`
+- `r2v.h3.mimo25_backend.39`
 - `h3_mimo25_materializer_v23`
 - `h3_mimo25_reference_selection_v1`
 - `h3_mimo25_recovered_voice_quality_v1`
