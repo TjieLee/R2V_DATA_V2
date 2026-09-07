@@ -50,7 +50,6 @@ from r2v_data_v2.h3.mimo25_backend import (
     MimoBackendConfig,
     MimoBackendFailure,
     MimoMediaResolver,
-    _synthetic_icl_messages,
 )
 from r2v_data_v2.h3.mimo25_stem_shadow import (
     MIMO25_STEM_FACT_PROMPT_VERSION,
@@ -2206,6 +2205,7 @@ def test_stem_reconcile_failure_audit_roundtrip_and_fingerprint(
     tmp_path: Path, ready: bool,
 ) -> None:
     from r2v_data_v2.h3.mimo25_backend import MimoAVAnnotationDraft
+    from tests.test_h3_mimo25_av_shadow import _annotation
 
     stem_root, facts = _run_facts(tmp_path)
     jobs = build_stem_reconcile_jobs(
@@ -2229,9 +2229,9 @@ def test_stem_reconcile_failure_audit_roundtrip_and_fingerprint(
             if ready:
                 return SimpleNamespace(
                     annotation=MimoAVAnnotationDraft.model_validate_json(
-                        _synthetic_icl_messages()[1]["content"]
+                        _annotation().model_dump_json()
                     ),
-                    raw_responses=(_synthetic_icl_messages()[1]["content"],),
+                    raw_responses=(_annotation().model_dump_json(),),
                     diagnostics=(), model_call_count=1,
                 )
             raise MimoBackendFailure(
@@ -2249,12 +2249,12 @@ def test_stem_reconcile_failure_audit_roundtrip_and_fingerprint(
     serialized = (output / "records.jsonl").read_text()
     record = MimoStemReconcileRecord.model_validate_json(serialized)
     assert backend.calls == ["clip-1"]
-    assert record.schema_version == "r2v.h3.mimo25_stem_reconcile.5"
-    assert summary.schema_version == "r2v.h3.mimo25_stem_reconcile_summary.7"
+    assert record.schema_version == "r2v.h3.mimo25_stem_reconcile.6"
+    assert summary.schema_version == "r2v.h3.mimo25_stem_reconcile_summary.8"
     assert summary.model_call_count == (1 if ready else 2)
     assert summary.ready_count == int(ready)
     assert summary.failed_count == int(not ready)
-    assert record.raw_responses == ([_synthetic_icl_messages()[1]["content"]] if ready else list(raw))
+    assert record.raw_responses == ([_annotation().model_dump_json()] if ready else list(raw))
     assert record.failure_issues == ([] if ready else list(issues))
     assert MimoStemReconcileRecord.model_validate_json(
         record.model_dump_json()

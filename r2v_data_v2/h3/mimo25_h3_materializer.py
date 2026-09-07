@@ -30,15 +30,10 @@ from r2v_data_v2.h3.mimo25_av_reconcile import (
     project_mimo_h3_sample_references,
 )
 from r2v_data_v2.h3.mimo25_backend import (
-    _EVENT_PLACEHOLDER,
     MIMO25_MATERIALIZER_VERSION,
     MimoAudioEvent,
-    MimoSegmentDecision,
     MimoSubjectDefinitionDraft,
-    speech_placeholder_ids,
-    validate_audio_materialization_semantics,
-    validate_template_inventory,
-    validate_timeline_projection,
+    protect_direct_dialogue,
 )
 from r2v_data_v2.h3.mimo25_recovered_voice import (
     RECOVERED_VOICE_POLICY_VERSION,
@@ -50,27 +45,21 @@ from r2v_data_v2.h3.mimo25_recovered_voice import (
 from r2v_data_v2.h3.qwen38_h3_recaption import (
     AudioFactAuditItem,
     ConditioningVariant,
-    Qwen38DraftShot,
-    Qwen38H3DraftResponse,
-    Qwen38RecaptionManifestCase,
-    Qwen38RecaptionRequest,
+    Qwen38H3StructuredResponse,
     RecaptionAudioContract,
     RecaptionAudioFacts,
     RecaptionNonSpeechFact,
     RecaptionReferenceContract,
     RecaptionSpeechFact,
     RecaptionSubjectContract,
-    _render_locked_speech,
     build_reference_contract,
-    materialize_h3_draft,
     render_h3_prompt,
-    validate_h3_response,
 )
 from r2v_data_v2.h3.schemas import SchemaModel
 from r2v_data_v2.structured_output import ValidationIssue
 
-MIMO25_SHADOW_RECORD_VERSION = "r2v.h3.mimo25_h3_shadow.14"
-MIMO25_SHADOW_SUMMARY_VERSION = "r2v.h3.mimo25_h3_shadow_summary.15"
+MIMO25_SHADOW_RECORD_VERSION = "r2v.h3.mimo25_h3_shadow.15"
+MIMO25_SHADOW_SUMMARY_VERSION = "r2v.h3.mimo25_h3_shadow_summary.16"
 MUSIC_REFERENCE_POLICY_VERSION = "h3_mimo25_clean_music_reference_v1"
 MUSIC_REFERENCE_SAMPLE_RATE_HZ = 32000
 MUSIC_REFERENCE_CHANNELS = 2
@@ -219,7 +208,7 @@ def _write_jsonl(path: Path, values: Sequence[SchemaModel]) -> None:
 
 
 class MimoH3ShadowRecord(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_h3_shadow.14"] = MIMO25_SHADOW_RECORD_VERSION
+    schema_version: Literal["r2v.h3.mimo25_h3_shadow.15"] = MIMO25_SHADOW_RECORD_VERSION
     sample_id: str
     source_h3_sample_id: str
     clip_uid: str
@@ -239,6 +228,7 @@ class MimoH3ShadowRecord(SchemaModel):
         "h3_mimo25_materializer_v17",
         "h3_mimo25_materializer_v18",
         "h3_mimo25_materializer_v19",
+        "h3_mimo25_materializer_v20",
     ] = (
         MIMO25_MATERIALIZER_VERSION
     )
@@ -349,7 +339,7 @@ class MimoH3ShadowRecord(SchemaModel):
 
 
 class MimoH3ShadowSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_h3_shadow_summary.15"] = (
+    schema_version: Literal["r2v.h3.mimo25_h3_shadow_summary.16"] = (
         MIMO25_SHADOW_SUMMARY_VERSION
     )
     source_mimo_inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -578,20 +568,6 @@ def _audio_facts(
     )
 
 
-def _render_mimo_speech_clause(
-    speech: RecaptionSpeechFact,
-    decisions: dict[str, MimoSegmentDecision],
-    contract: RecaptionReferenceContract,
-    *,
-    include_audio_reference: bool,
-) -> str:
-    presentation = decisions[speech.segment_id].speech_presentation
-    return _render_locked_speech(
-        speech, contract, include_audio_reference=include_audio_reference,
-        presentation=presentation,
-    )
-
-
 def _contract_with_voice_profiles(
     contract: RecaptionReferenceContract,
     *,
@@ -659,15 +635,6 @@ def _materialize_sample(
             "multi_speaker_segment_requires_turn_refinement", segment_id,
             "retain exact multi-speaker ASR; authoritative sub-turn refinement is required",
         ) for segment_id in blocked])
-    temporal_issues = validate_timeline_projection(
-        record.annotation,
-        segment_intervals={item.segment_id: (item.start_time, item.end_time) for item in job.segments},
-        transcribed_segment_ids=transcribed_ids,
-        target_duration_seconds=job.target_duration_seconds,
-    )
-    temporal_issues.extend(validate_template_inventory(record.annotation, transcribed_ids))
-    if temporal_issues:
-        raise MimoH3MaterializationContractError(temporal_issues)
     projected_sample = project_mimo_h3_sample_references(
         sample,
         reference_images=job.reference_images,
@@ -701,24 +668,6 @@ def _materialize_sample(
         record=record,
         contract=contract,
     )
-    case = Qwen38RecaptionManifestCase(
-        sample_id=sample.sample_id,
-        conditioning_variant=variant,
-        note="MiMo-V2.5 target-level AV shadow annotation",
-    )
-    request = Qwen38RecaptionRequest(
-        sample=corrected_sample,
-        case=case,
-        reference_contract=contract,
-        audio_facts=facts,
-        request_fingerprint=record.request_fingerprint,
-    )
-    semantics = record.annotation.audio_observation.audio_semantics
-    audio_issues = validate_audio_materialization_semantics(
-        record.annotation, has_segments=bool(job.segments),
-    )
-    if audio_issues:
-        raise MimoH3MaterializationContractError(audio_issues)
     prefix = {
         "visual_only": "[reference generation]",
         "target_voice_reference": "[reference generation + audio reference]",
@@ -726,17 +675,20 @@ def _materialize_sample(
         "music_reference": "[reference generation + audio reference]",
         "full_audio_reuse": "[reference generation + audio reuse]",
     }[variant]
-    music = (
-        semantics.non_diegetic_music
-        if semantics.non_diegetic_music_status == "present"
-        else "N/A"
+    direct = record.annotation.h3_semantics
+    allowed_labels = {s.subject_label for s in contract.subjects}
+    allowed_labels.update(label for s in contract.subjects for label in s.source_picture_labels)
+    allowed_labels.update(a.audio_label for a in contract.audios)
+    detailed, direct_issues, correction_warnings = protect_direct_dialogue(
+        direct.detailed_description,
+        [{"segment_id": s.segment_id, "speaker_id": s.speaker_id, "language": s.language,
+          "text": s.text} for s in facts.speech],
+        allowed_labels=allowed_labels,
     )
-    soundscape = semantics.overall_soundscape or "N/A"
-    audio_event_by_id = {
-        item.event_id: item.description for item in semantics.temporal_non_speech_events
-        if item.category != "non_diegetic_music"
-    }
-    draft = Qwen38H3DraftResponse(
+    if direct_issues:
+        raise MimoH3MaterializationContractError(direct_issues)
+    warnings.extend(correction_warnings)
+    structured = Qwen38H3StructuredResponse(
         subject_definitions=[
             _render_subject_definition(item, subject)
             for item, subject in zip(
@@ -750,53 +702,13 @@ def _materialize_sample(
             item.render()
             for item in record.annotation.h3_semantics.visual_retention_analysis
         ],
-        shots=[
-            Qwen38DraftShot(
-                shot_index=item.shot_index,
-                start_time=(
-                    None
-                    if item.shot_index == 1 and item.start_time == 0
-                    else item.start_time
-                ),
-                description_template=_EVENT_PLACEHOLDER.sub(
-                    lambda match: audio_event_by_id[match.group(1)], item.description_template,
-                ),
-            )
-            for item in record.annotation.h3_projection.shots
-        ],
-        overall_soundscape=soundscape,
-        non_diegetic_music=music,
+        detailed_description=detailed,
+        overall_soundscape=direct.overall_soundscape,
+        non_diegetic_music=direct.non_diegetic_music,
         audio_fact_audit=[
             AudioFactAuditItem(fact_id=item.fact_id, action="preserved")
             for item in facts.non_speech_events
         ],
-    )
-    decisions = {
-        item.segment_id: item
-        for item in record.annotation.av_grounding.segment_groundings
-    }
-    shot_by_segment = {
-        segment_id: shot.shot_index
-        for shot in record.annotation.h3_projection.shots
-        for segment_id in speech_placeholder_ids(shot.description_template)
-    }
-    cited_speakers: set[tuple[int, str]] = set()
-
-    def render_speech(speech: RecaptionSpeechFact, _base_clause: str) -> str:
-        key = (shot_by_segment[speech.segment_id], speech.speaker_id)
-        include_audio_reference = key not in cited_speakers
-        cited_speakers.add(key)
-        return _render_mimo_speech_clause(
-            speech,
-            decisions,
-            contract,
-            include_audio_reference=include_audio_reference,
-        )
-
-    structured = materialize_h3_draft(
-        draft,
-        request,
-        speech_clause_transform=render_speech,
     )
     if variant == "music_reference":
         assert extra_audio_contract is not None
@@ -810,12 +722,6 @@ def _materialize_sample(
                 )
             }
         )
-    if "[[audio_event:" in structured.detailed_description:
-        raise ValueError("MiMo Audio-event placeholder survived materialization")
-    issues, validation_warnings = validate_h3_response(structured, request)
-    if issues:
-        raise MimoH3MaterializationContractError(issues)
-    warnings.extend(validation_warnings)
     if record.annotation.warnings:
         warnings.extend(
             f"{item.segment_id}:{item.code}" for item in record.annotation.warnings

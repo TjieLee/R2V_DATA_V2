@@ -264,54 +264,53 @@ PYTHONPATH="$SAM_AUDIO_RUNTIME_PYTHONPATH" \
   --allow-unverified
 ```
 
-Stage 5 uses one multimodal MiMo AV reconciliation call to directly write
-chronological shot-level `description_template` prose. Original target video,
-embedded audio and frozen references are observed together. There is no second
-composition call, sentence atomization, or generated visual-block timestamps.
-Stage-A blocks remain coarse internal visual evidence, not final ordering units.
+Stage 5 uses one joint-AV MiMo call to write the complete natural
+`h3_semantics.detailed_description`, `overall_soundscape`, and
+`non_diegetic_music`. Original target video, embedded audio, frozen references,
+and exact ASR facts are observed together. Coarse Stage-A evidence is diagnostic;
+it is not expanded into final prose. No placeholders, sentence atoms, template
+substitution, or second compositor remain.
 
-Speech `[[segment_id]]` and local event `[[audio_event:aeN]]` placeholders occur
-exactly once in chronological order and within plausibly overlapping shots.
-Their timing is factual context, not frame-accurate prose alignment; slight
-within-shot placement mismatch is intentionally tolerated. Code substitutes
-locked ASR/source/delivery clauses and validated event descriptions, then uses
-the existing official six-section H3 renderer. No model writes final H3 syntax.
+Defaults are `--thinking disabled --icl official_ref2va_v1`, temperature 0.0.
+The actual message order is system -> official-example user -> official-example
+assistant -> real AV user. The assistant is the unchanged Complete Example from
+`docs/VIDEO_PROMPT_WRITING_GUIDE_ref_en.md` (coffee shop, Samoyed, blonde woman,
+young man, canned audience laughter), sourced from the official MiniMaxAI guide.
+The base guide is also retained under `docs/`. ICL provenance is
+`h3_official_ref2va_complete_example_v1`; there is no synthetic ICL variant.
+Only final assistant content is parsed; reasoning text is never persisted.
 
-Normal success uses one AV call; validation failure allows the existing single
-full-AV recheck (two AV calls). The existing explicit zero-audio fallback is
-unchanged and counted when used. There is no text-only model request.
-Soundscape/music materialization prerequisites are checked during AV validation,
-so they can trigger the same recheck rather than fail in a later stage.
-Multi-speaker segments still block final H3 pending authoritative turn refinement.
-QA is model-free and renders the persisted annotation directly.
+MiMo writes natural speaker/action/delivery lead-ins and chronological
+`<d>[Language] dialogue</d>` blocks. When counts, resolved source order, and any
+recognizable exact dialogue agree, code corrects only the inner `<d>` payload to
+Qwen3-ASR text/language. All surrounding prose stays byte-for-byte unchanged.
+Unmappable dialogue or unknown reference/source labels fails closed; no dialogue
+is moved, dropped, or invented. Frozen Subject/Picture ownership remains the
+existing small deterministic definition/retention path. Final H3 keeps the six
+official sections and stable `(Sx)` IDs.
 
-Stage 5 offers experimental A/B controls `--thinking disabled|enabled` and
-`--icl none|v1`. Defaults remain `disabled / none`, temperature 0.0, and one
-full-AV recheck. For a separately named experimental run, append
-`--thinking enabled --icl v1` to the command above. Both choices appear in the
-CLI result and backend provenance; all four combinations have distinct
-configuration fingerprints. These controls are not production-approved and
-have no demonstrated quality benefit without a server A/B review.
+Internal soundscape absence/unknown bookkeeping is not a publication gate.
+Noncritical audio/style diagnostics become warnings, not another AV call.
+The model writes final soundscape/music prose directly, with music kept separate.
+Multi-speaker attribution still blocks final H3 pending authoritative refinement;
+QA retains the raw direct caption even when publication is blocked.
+Normal success is one AV call, genuine failure gets at most one full-AV recheck.
+The existing explicit zero-audio fallback remains separately counted.
 
-For SGLang, enabled mode omits `reasoning_effort="none"` and sets both
-`chat_template_kwargs.thinking` and `enable_thinking` to true. Embedded
-target-video audio and strict JSON schema remain unchanged. ICL v1
-(`h3_mimo25_av_reconcile_icl_v3`, updated for annotation .16) inserts one synthetic user/assistant
-pair between the unchanged system message and the real user request.
-Only final assistant content is parsed; separate reasoning text is never stored.
-Reasoning token usage remains diagnostic, with the nonzero-under-disabled
-warning limited to disabled mode.
+Current versions: prompt v26, annotation .17, backend .29, materializer v20,
+authority policy v17; Stage-5 records .6 and summary .8. Materialized shadow
+record .15 and summary .16 distinguish the new direct-caption implementation.
+Prior template/composition artifacts cannot be silently reused.
 
-Current versions: AV prompt v25, annotation .16, backend .28, materializer v19;
-authority policy remains v17. Stage-5 records are .5, summary .7;
-materialized shadow record .14 and summary .15 identify the direct-template path.
-Old typed timelines and composition artifacts cannot masquerade as current.
-
-Stage-5 persists `annotation`, `failure_code`, `failure_reason`,
-`failure_issues`, final `raw_responses`, diagnostics, and `model_call_count`.
-Failed AV records have null annotation; ready records have no failure.
-All audit fields participate in record fingerprinting. Separate reasoning text
-is never persisted. There is no composition or compositor failure stage.
+Stage-5 persists annotation, raw responses, failure issues, diagnostics, and call
+counts under the same additive shadow ownership. Rebuild the existing static QA
+page after a fresh random10 pilot. Review target AV, MiMo direct H3, ASR-protected
+H3, and the published production instruction side by side. Use `better`,
+`same`, `worse`, `speaker_wrong`, `dialogue_wrong`, `audio_wrong`, and
+`visual_hallucination`, then export fingerprint-bound QA JSON. A production
+instruction is labeled as such, not claimed to be a prior generated H3 caption.
+Do not infer quality improvement from CPU fixtures or tune production behavior
+before human review.
 
 ### 6. Stem-native primary voice references
 

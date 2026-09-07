@@ -14,13 +14,12 @@ speaker reconciliation; MiMo is the final AV authority for this shadow path.
 - Qwen3-ASR owns exact transcript text and language.
 - frozen Visual V3 references own entity inventory, order, and image content.
 - LR-ASD, source clusters, and current entity bindings are proposals.
-- one MiMo-V2.5 joint-AV request returns five ordered internal stages:
-  `visual_observation`, `audio_observation`, `av_grounding`, `h3_semantics`, and
-  `h3_projection`. These separate visual presence, acoustic identity, speaker
-  grounding, official H3 semantics, and typed playback order without adding
-  model calls.
-- the deterministic materializer owns `Sx`, Subject and Audio references, exact
-  dialogue, and final H3 formatting.
+- one MiMo-V2.5 joint-AV request returns visual/audio observation, AV grounding,
+  and direct `h3_semantics`. MiMo authors complete natural detailed-description,
+  soundscape, and music prose; there is no playback projection or compositor.
+- the deterministic boundary preserves frozen Subject/Picture ownership and
+  corrects only safely matched `<d>` payloads to exact Qwen3-ASR text/language.
+  It does not replace MiMo speaker/action lead-ins or connective prose.
 - post-MiMo voice recovery may create a real target voice asset only from a
   validated clean single-speaker, resolved `visible_entity` / `onscreen_spoken`
   segment for an entity that has no existing target voice. It uses the exact
@@ -35,18 +34,15 @@ observations. Stage B owns clip-local `gN`, vocal composition, acoustic
 resolution, segment delivery, secondary vocal activity, voice profiles, and
 non-speech Audio. Stage C may map that exact Stage B group to one frozen `eN` or
 null and classify presentation. Only Qwen3-ASR segments with
-`asr_status="transcribed"` receive typed `speech` entries in Stage E.
+`asr_status="transcribed"` receive a `<d>` dialogue block in the direct caption.
+Counts and resolved speaker order must map safely; recognized out-of-order
+dialogue is rejected, not silently moved. Coarse visual evidence never controls
+final sentence order or length. There is no visual word-count floor.
 
-Every Stage A shot contains at least one non-empty visual-only `vN` block. Every
-Stage E shot contains a typed reference to at least one of its own visual blocks,
-and all visual blocks, transcribed speech segments, and timeline-eligible Audio
-events must appear exactly once in authoritative order. A duration-aware hard
-floor of 40 visual words below 3 seconds, 80 words from 3 through 8 seconds, and
-120 words above 8 seconds catches catastrophic collapse; it is not a target
-length and must not induce invented filler. The pipeline expands typed
-visual/speech/event parts, exact dialogue, and final syntax. Internal stage
-names, `vN`, `gN`, `eN`, `aeN`, segment IDs, evidence codes, and model-authored
-H3 placeholders cannot enter final prose.
+The official Complete Example in `docs/VIDEO_PROMPT_WRITING_GUIDE_ref_en.md`
+is the few-shot assistant message, unchanged and without placeholders.
+See `H3_AUDIO_SERVER_RUNBOOK.md` Stage 5 for current defaults and versions.
+Human random10 QA, not automated style checks, determines caption quality.
 
 The compact per-request contract supplies the exact complete segment inventory
 and the exact ordered transcribed-segment inventory once. MiMo chooses the
@@ -75,11 +71,9 @@ resolved speaker group that owns authoritative transcribed speech. A non-null
 profile is limited to stable audible pitch register, timbre, texture, cadence,
 articulation, and genuinely supported accent or dialect; it cannot copy
 dialogue or infer nationality, identity, role, relationship, or personality.
-The deterministic
-materializer uses this profile in the definition and retention prose for a real
-voice Audio asset. Within each real shot it cites that Audio relationship only
-on the speaker's first speech event; every authoritative segment and `(Sx)` / `<d>`
-block remains present, and a later real shot may cite the asset once again.
+Profiles remain available for real voice-asset provenance. MiMo authors natural
+speaker/delivery lead-ins in the direct caption; code never splices fixed speech
+clauses into that prose.
 
 MiMo never splits or deletes a DiariZen segment. Multiple vocal events can mark
 a segment as requiring acoustic refinement, but the authoritative segment and
@@ -139,8 +133,8 @@ rewritten by these normalizers and remains a recheck or fail-closed condition.
 `message_voice_over`, and `device_playback` preserve the authoritative speech
 and speaker group but never create a visible mouth-speaking action. An uncertain
 presentation similarly removes visible-entity binding rather than guessing; final
-H3 renders its dialogue with the neutral base `(Sx) says` clause and does not leak
-internal uncertainty metadata.
+H3 retains the model-authored neutral speaker prose and exact dialogue without
+leaking internal uncertainty metadata.
 The clip-local `primary_speaker_group` represents speaker identity rather than
 a speech turn. Segment boundaries, pauses, language changes, or ASR changes do
 not create a new group by themselves. Resolved segments bound to the same
@@ -157,11 +151,11 @@ they do not create additional MiMo model jobs.
 
 Prompt, policy, annotation schema, and materializer versions are:
 
-- `h3_mimo25_unified_av_reconcile_v22`
-- `h3_mimo25_av_authority_contract_v16`
-- `r2v.h3.mimo25_av_annotation.13`
-- `r2v.h3.mimo25_backend.24`
-- `h3_mimo25_materializer_v16`
+- `h3_mimo25_unified_av_reconcile_v26`
+- `h3_mimo25_av_authority_contract_v17`
+- `r2v.h3.mimo25_av_annotation.17`
+- `r2v.h3.mimo25_backend.29`
+- `h3_mimo25_materializer_v20`
 - `h3_mimo25_reference_selection_v1`
 - `h3_mimo25_recovered_voice_quality_v1`
 - `r2v.h3.mimo25_inventory.4`
@@ -169,12 +163,12 @@ Prompt, policy, annotation schema, and materializer versions are:
 - `r2v.h3.mimo25_summary.10`
 - `r2v.h3.mimo25_failure.5`
 - `r2v.h3.mimo25_raw_response.5`
-- `r2v.h3.mimo25_h3_shadow.11`
-- `r2v.h3.mimo25_h3_shadow_summary.12`
+- `r2v.h3.mimo25_h3_shadow.15`
+- `r2v.h3.mimo25_h3_shadow_summary.16`
 
 The OpenAI-compatible client defaults to the `xiaomi` transport, model
 `mimo-v2.5`, video FPS 4, `media_resolution=default`, disabled thinking,
-JSON-object output, temperature 0.2, and 16384 completion tokens. Base64 is the
+JSON-object output, official Ref2VA ICL, temperature 0.0, and 16384 completion tokens. Base64 is the
 pilot default. `--transport sglang` is the explicit local-provider alternative
 and uses strict `json_schema` constrained decoding with the complete current
 `MimoAVAnnotationDraft` schema. Xiaomi remains on its separately validated
@@ -220,7 +214,7 @@ unchanged. The limits and label semantics follow the official MiniMax H3
 and [Ref2VA guide](https://github.com/MiniMax-AI/MiniMax-H3/blob/main/skills/h3-prompt-writing/references/ref-en.txt).
 The final six-section prose also remains aligned with the official
 [base prompt guide](https://github.com/MiniMax-AI/MiniMax-H3/blob/main/skills/h3-prompt-writing/references/base-en.txt);
-the five staged fields are serialized annotation only and never become final
+the internal observation/grounding fields are serialized annotation only and never become final
 headings.
 
 The exact request contract keeps `fps` and `media_resolution` beside the
@@ -263,101 +257,25 @@ or own that external source patch.
 After the authoritative primary or canonical-audio-fallback response is
 selected, parse or semantic validation failure may trigger at most one full AV
 recheck with the same references, target video, and selected audio modality.
-There is no text-only semantic repair. The staged annotation assigns
-chronological `ae1`, `ae2`, ... IDs to non-speech Audio events and requires
-exact ordered Stage E coverage for every event except audience-only
-non-diegetic music. Typed `speech` parts exactly cover authoritative transcribed
-segments, and typed `visual` parts exactly cover Stage A blocks in their owning
-shots. The deterministic MiMo materializer expands those typed references into
-the existing internal Qwen3.8 draft interface, then uses the unchanged
-validated final renderer. It does not repair missing, extra, duplicated,
-reordered, or misplaced model parts.
+There is no text-only semantic repair. MiMo writes direct H3 prose in the same AV
+response. The materializer does not expand visual blocks, speech placeholders,
+or timed event references. It preserves model prose, changing only safely
+matched dialogue payloads to authoritative Qwen3-ASR text and language.
 
-Music events distinguish audible in-scene `diegetic_music` from audience-only
-`non_diegetic_music`. A typed non-diegetic event requires global music status
-`present` and a non-null grounded description; `absent` cannot coexist with such
-an event. Diegetic music alone does not imply an audience-only score, while a
-continuous global score may be present without a localized event.
-A pitched or harmonically structured soundtrack drone/pad remains
-`non_diegetic_music` even when beatless, minimal, or atmospheric and no plausible
-in-scene source exists. HVAC/electrical hum, room tone, wind, traffic, and
-machinery remain soundscape when audible evidence supports those environmental or
-mechanical sources. No deterministic lexical reassignment is applied.
-When canonical non-diegetic music is present, a conservative normalized
-content-token comparison rejects a soundscape description or ordinary
-soundscape-category event that substantially duplicates that same music layer.
-The check requires at least five content tokens and high containment, does not
-compare the multimodal summary, and never recategorizes an event. A duplicate is
-sent through the existing one full-AV recheck and remains fail closed if the
-model does not separate it. Global BGM may omit a temporal event; if localized,
-its event category is `non_diegetic_music`, which remains excluded from the
-detailed timeline. In a BGM-only clip with no established non-musical layer,
-soundscape may conservatively state that no distinct environmental, mechanical,
-physical, or non-verbal human sounds are discernible rather than repeating music
-or inventing ambience.
-
-Entity Subjects describe reusable entities. Attribute Subjects describe only the
-referenced attribute and retain explicit `attribute_type` and `owner_entity_id`
-in the mandatory machine contract. Human-oriented hair, face, glasses,
-upper-clothing, and accessory definitions that instead begin by defining a new
-woman, man, person, girl, boy, or child are rechecked and then fail closed.
-Attribute retention is judged on the owning entity, not by searching for another
-independent Subject.
-
-`overall_soundscape` remains a core section. Any audible ambience, room tone,
-environmental layer, physical sound, or non-verbal human sound requires
-`overall_soundscape_status=present` and a concise grounded description. It does
-not repeat dialogue/speech, narration/voice-over content, singing, diegetic
-music, or non-diegetic music/BGM/score. Diegetic music stays in
-`detailed_description`, while audience-only music stays in
-`non_diegetic_music`. The model uses `absent` when no distinct positive
-non-musical soundscape layer is
-established, independently of speech and music. It may publish null or concise
-explicit negative-only prose; materialization preserves validated negative prose
-or emits the canonical negative statement. `unknown` is reserved for genuinely
-unavailable or uncertain Audio evidence and fails closed during shadow
-materialization instead of silently masquerading as confirmed absence. Visual
-context may disambiguate an audible source but can never invent room tone or
-another sound. MiMo performs a full-timeline audible-event pass that includes
-brief physical sounds such as door actions, knocks, footsteps, impacts, object
-handling, scraping, clicks, bells, and beeps. Each grounded event appears once
-at its typed chronological timeline position, while `overall_soundscape` may
-summarize salient events in
-natural wording rather than repeating the event sentence mechanically.
-Localized object interactions such as one door close, knock, footstep, impact,
-placement, scrape, or physical click are `physical`; background sources such as
-wind, rain, water, traffic, crowds, and outdoor layers are `environmental`.
-Operating machinery/device mechanisms are `mechanical`, device signals are
-`electronic`, and non-verbal vocal sounds are `human_non_speech`. The examples
-are illustrative rather than exhaustive. `single` denotes one transient,
-`repeated` several distinct repetitions, and `continuous` a sustained layer or
-operation; a multi-frame event window does not by itself make a brief sound
-continuous.
-
-Before recheck, a `present` soundscape that accidentally contains dialogue or
-music wording may be rebuilt only from its already published, chronological typed
-events in `physical`, `environmental`, `mechanical`, `electronic`,
-`human_non_speech`, or `other`. Exact duplicate descriptions are removed;
-diegetic and non-diegetic music are excluded. If an eligible event itself contains
-dialogue/music semantics, or no clean eligible event exists, the adapter does not
-fabricate a replacement and retains the normal recheck/fail-closed path.
-Global soundscape validation treats local, explicit exclusions such as `no music`,
-`without music`, or `neither dialogue nor music is audible` as clean prose. The
-same clause-local check still rejects any positive music/dialogue mention, including
-one that follows an unrelated negation after `but`, `while`, or another clause
-boundary. Typed event descriptions retain the stricter lexical category guard
-because every event represents positively observed Audio evidence. Quiet ambience
-may therefore remain `present` with zero typed events; no event is invented merely
-to justify the global description.
+Internal noncritical audio and style validation issues become diagnostic
+warnings; they cannot alone cause recheck or suppress a usable direct caption.
+Final soundscape excludes dialogue/singing and non-diegetic music; the latter
+has its own section. Suspected contamination is visible to human QA rather than
+silently replaced with stock prose. Unusable structured output, unknown labels,
+unmappable dialogue, source-provenance failures, and unsafe multi-speaker
+attribution remain fail closed.
 
 The materialized output remains official MiniMax H3 Ref2VA: the six sections
 are emitted in `subject_definitions`, `summary`, `retention_analysis`,
 `detailed_description`, `overall_soundscape`, `non_diegetic_music` order;
 reference labels keep one meaning across sections; and dialogue uses stable
 `(Sx)` source IDs with `<d>[Language] ...</d>`. The mandatory draft contract
-does not redefine official reference-label or retention-marker semantics. The
-typed timeline is internal annotation structure only and never appears in the
-final Ref2VA text. Approximate event times are internal placement evidence, and
+does not redefine official reference-label or retention-marker semantics. The direct caption contains no internal timeline syntax. Approximate event times are internal placement evidence, and
 ordinary observed target-video sounds never create an `<Audio N>` reference;
 that label remains reserved for an actual copied or referenced Audio asset.
 
@@ -445,13 +363,11 @@ references if the official Audio <= 3 or Picture + Audio <= 12 limits would be
 exceeded. Review UI exposes each role, playable asset, interval provenance, and
 music description; Subject/entity/`Sx` metadata appears only for voice assets.
 
-MiMo records retain explicit `present`, `absent`, or `unknown` status for the
-overall soundscape and non-diegetic music. The H3 training prompt renders a
-soundscape description only for `present`, and renders verified `absent` as
-`N/A`. An `unknown` soundscape remains explicit in the annotation but fails
-closed during shadow materialization rather than being rendered as silence.
-Music retains its independent three-state rendering contract. Neither section
-emits prose such as "not established" into training prompts.
+Internal audio statuses remain diagnostic observations. Final H3 uses the
+model-authored `h3_semantics.overall_soundscape` and `non_diegetic_music` prose,
+not a status-to-stock-sentence mapping. Noncritical soundscape wording issues
+are review warnings; an absent/null/false bookkeeping combination cannot alone
+invalidate a usable caption.
 
 ## Server commands
 

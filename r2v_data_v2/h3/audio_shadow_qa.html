@@ -61,12 +61,16 @@ small{color:#626e73}a{color:#176c9a}#loading{padding:20px}
 <details id="target-details"><summary>Target provenance</summary><pre></pre></details>
 </section>
 <section id="final-h3">
-<div class="final-heading"><h2>Final H3 Prompt</h2><button id="copy-final">Copy</button></div>
+<div class="final-heading"><h2>MiMo H3 (ASR-protected)</h2><button id="copy-final">Copy</button></div>
 <p><small id="materializer-version"></small></p>
 <select id="final-variant" aria-label="H3 sample variant"></select>
 <p id="final-unavailable" class="failed" style="white-space:pre-line" hidden></p>
 <pre id="final-text"></pre>
 </section>
+</div>
+<div class="evidence">
+<section><h2>MiMo DIRECT H3 (raw)</h2><pre id="direct-text"></pre></section>
+<section><h2>Production instruction (as published)</h2><pre id="production-text"></pre></section>
 </div>
 <details open><summary>Frozen Visual evidence</summary>
 <div id="references" class="references"></div>
@@ -95,7 +99,7 @@ function validState(state) {
   return state && Array.isArray(state.labels) && typeof state.notes === "string" &&
     state.labels.every(label => data.qa_labels.includes(label)) &&
     new Set(state.labels).size === state.labels.length &&
-    (!state.labels.includes("good") || state.labels.length === 1);
+    state.labels.filter(label => ["better", "same", "worse"].includes(label)).length <= 1;
 }
 function stateFor(clip) {
   const raw = localStorage.getItem(key(clip));
@@ -119,7 +123,7 @@ function saveCurrent() {
 function labelChanged(input) {
   if (input.checked) {
     document.querySelectorAll("input[data-qa-label]").forEach(other => {
-      if (other !== input && (input.dataset.qaLabel === "good" || other.dataset.qaLabel === "good"))
+      if (other !== input && (["better", "same", "worse"].includes(input.dataset.qaLabel) && ["better", "same", "worse"].includes(other.dataset.qaLabel)))
         other.checked = false;
     });
   }
@@ -160,6 +164,8 @@ function render() {
     el.append(input, document.createTextNode(label)); $("labels").append(el);
   });
   $("notes").value = state.notes;
+  $("direct-text").textContent = clip.direct_h3 ? ["summary", "detailed_description", "overall_soundscape", "non_diegetic_music"].map(name => name + ":\\n" + (clip.direct_h3[name] || "[unavailable]")).join("\\n\\n") : "[unavailable]";
+  $("production-text").textContent = (clip.production_h3 || []).map(row => row.sample_id + "\\n" + row.text).join("\\n\\n") || "[unavailable]";
   const final = clip.final_h3;
   $("materializer-version").textContent = final.materializer_version;
   $("final-variant").replaceChildren();

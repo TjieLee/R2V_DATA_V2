@@ -42,11 +42,11 @@ from r2v_data_v2.h3.sam_audio_stem_shadow import (
     validate_stem_diarization_lineage,
 )
 
-QA_DATA_VERSION = "r2v.h3.audio_shadow_qa.2"
-QA_REVIEW_VERSION = "r2v.h3.audio_shadow_human_qa.1"
+QA_DATA_VERSION = "r2v.h3.audio_shadow_qa.3"
+QA_REVIEW_VERSION = "r2v.h3.audio_shadow_human_qa.2"
 QA_LABELS = (
-    "good", "upstream_label_wrong", "speaker_ambiguous",
-    "asr_issue", "stem_issue", "mimo_semantic_issue",
+    "better", "same", "worse", "speaker_wrong",
+    "dialogue_wrong", "audio_wrong", "visual_hallucination",
 )
 _Model = TypeVar("_Model", bound=BaseModel)
 
@@ -57,6 +57,23 @@ class _MaterializerInput:
 
     annotation: MimoAVAnnotationDraft
     request_fingerprint: str
+
+
+def _direct_h3(record: object) -> dict[str, object] | None:
+    if record is None:
+        return None
+    annotation = record.annotation
+    if annotation is not None:
+        return annotation.h3_semantics.model_dump(mode="json")
+    # Failed final publication must not hide parseable model-authored prose.
+    for raw in reversed(record.raw_responses):
+        try:
+            payload = json.loads(raw)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(payload, dict) and isinstance(payload.get("h3_semantics"), dict):
+            return payload["h3_semantics"]
+    return None
 
 
 def _json(value: object) -> str:
@@ -334,6 +351,11 @@ def build_audio_shadow_qa(
             "separation": {**stem_record.model_dump(mode="json"), "media": stem_media},
             "stem_facts": fact_payload,
             "final_h3": final_h3,
+            "direct_h3": _direct_h3(record),
+            "production_h3": [
+                {"sample_id": sample_id, "text": samples_by_id[sample_id].r2v_instruction}
+                for sample_id in sorted(base_job.source_h3_sample_ids)
+            ],
             "reconcile": record.model_dump(mode="json") if record else {
                 "status": "upstream_failed", "upstream_failure": upstream_failures[clip],
                 "model_call_count": 0,

@@ -83,7 +83,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-root", type=Path)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--thinking", choices=("disabled", "enabled"), default="disabled")
-    parser.add_argument("--icl", choices=("none", "v1"), default="none")
+    parser.add_argument("--icl", choices=("none", "official_ref2va_v1"), default="official_ref2va_v1")
     parser.add_argument("--max-completion-tokens", type=int, default=32768)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--allow-unverified", action="store_true")

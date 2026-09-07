@@ -56,8 +56,8 @@ MIMO25_STEM_FACTS_VERSION = "r2v.h3.mimo25_stem_facts.3"
 MIMO25_STEM_FACTS_SUMMARY_VERSION = "r2v.h3.mimo25_stem_facts_summary.4"
 MIMO25_STEM_FACT_RAW_VERSION = "r2v.h3.mimo25_stem_fact_raw.1"
 MIMO25_STEM_FACT_PROMPT_VERSION = "h3_mimo25_stem_fact_prompt_v1"
-MIMO25_STEM_RECONCILE_VERSION = "r2v.h3.mimo25_stem_reconcile.5"
-MIMO25_STEM_RECONCILE_SUMMARY_VERSION = "r2v.h3.mimo25_stem_reconcile_summary.7"
+MIMO25_STEM_RECONCILE_VERSION = "r2v.h3.mimo25_stem_reconcile.6"
+MIMO25_STEM_RECONCILE_SUMMARY_VERSION = "r2v.h3.mimo25_stem_reconcile_summary.8"
 MIMO25_STEM_RECONCILE_POLICY_VERSION = "h3_mimo25_stem_reconcile_v2"
 STEM_VIEW_VERSION = "r2v.h3.sam_audio_stem_view.1"
 STEM_RECONCILE_UPSTREAM_FAILURE_VERSION = (
@@ -1608,7 +1608,7 @@ def build_stem_reconcile_jobs(
 
 
 class MimoStemReconcileRecord(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_stem_reconcile.5"] = (
+    schema_version: Literal["r2v.h3.mimo25_stem_reconcile.6"] = (
         MIMO25_STEM_RECONCILE_VERSION
     )
     clip_uid: str
@@ -1660,7 +1660,7 @@ class StemReconcileUpstreamFailure(SchemaModel):
 
 
 class MimoStemReconcileSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_stem_reconcile_summary.7"] = (
+    schema_version: Literal["r2v.h3.mimo25_stem_reconcile_summary.8"] = (
         MIMO25_STEM_RECONCILE_SUMMARY_VERSION
     )
     route: SAMRoute

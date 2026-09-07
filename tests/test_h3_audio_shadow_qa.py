@@ -51,7 +51,7 @@ class _Reconcile(_FailingReconcileBackend):
             values["audio_observation"]["segment_decisions"] = []
             values["audio_observation"]["speaker_voice_profiles"] = []
             values["av_grounding"]["segment_groundings"] = []
-            values["h3_projection"]["shots"][0]["description_template"] = "The seated person remains still."
+            values["h3_semantics"]["detailed_description"] = "The seated person remains still."
             values["audio_observation"]["audio_semantics"]["temporal_non_speech_events"] = []
         annotation = MimoAVAnnotationDraft.model_validate(values)
         return SimpleNamespace(annotation=annotation, raw_responses=(), diagnostics=(), model_call_count=1)
@@ -156,7 +156,7 @@ def test_builder_ready_failed_order_media_and_sources_unchanged(tmp_path, monkey
     assert result["output_root"] == str(output)
     data = json.loads((output / "data.json").read_text())
     reconcile_summary = json.loads((shadow / "mimo_reconcile/summary.json").read_text())
-    assert reconcile_summary["schema_version"] == "r2v.h3.mimo25_stem_reconcile_summary.7"
+    assert reconcile_summary["schema_version"] == "r2v.h3.mimo25_stem_reconcile_summary.8"
     assert reconcile_summary["current_mimo_versions_modified"] is True
     assert data["clip_uids"] == ["clip-z", "clip-a", "clip-m"]
     assert [clip["reconcile"]["status"] for clip in data["clips"]] == ["ready", "failed", "ready"]
@@ -168,11 +168,13 @@ def test_builder_ready_failed_order_media_and_sources_unchanged(tmp_path, monkey
     for clip, call in zip((data["clips"][0], data["clips"][2]), materialized, strict=True):
         final = clip["final_h3"]
         assert final["status"] == "ready"
-        assert final["materializer_version"] == "h3_mimo25_materializer_v19"
+        assert final["materializer_version"] == "h3_mimo25_materializer_v20"
         assert final["text"] == call[3] == original(*call[:3])[1]
         assert final["variants"][0]["text"] == final["text"]
         assert "[[" not in final["text"]
-        assert "<Audio 1>" in final["text"]
+        assert clip["direct_h3"]["detailed_description"]
+        assert clip["production_h3"]
+        assert "MiMo DIRECT H3" in (output / "review.html").read_text()
         assert "<Picture 1>" in final["text"]
         sections = ["subject_definitions", "summary", "retention_analysis",
                     "detailed_description", "overall_soundscape", "non_diegetic_music"]
@@ -250,7 +252,7 @@ def test_final_h3_keeps_conditioning_variants_separate(tmp_path, monkeypatch):
     assert "[reference generation]" in canonical["text"]
     assert "<Audio 1>" not in canonical["text"]
     assert "[reference generation + audio reference]" in voice["text"]
-    assert "<Audio 1>" in voice["text"]
+    assert voice["text"].split("detailed_description:", 1)[1] == canonical["text"].split("detailed_description:", 1)[1]
 
 
 def test_output_safety_and_atomic_failure_preserve_existing_qa(tmp_path, monkeypatch):
@@ -315,8 +317,7 @@ def test_cli_and_manifest_order_fail_closed(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("blocked, expected", [
     ("multi", "multi_speaker_segment_requires_turn_refinement"),
-    ("unknown", "unknown_audio_semantics"),
-    ("placeholder", "unknown_pipeline_placeholder"),
+    ("placeholder", "direct_internal_syntax"),
 ])
 def test_ready_annotation_with_blocked_materialization_is_unavailable(tmp_path, monkeypatch, blocked, expected):
     original = _Reconcile.reconcile
@@ -341,7 +342,7 @@ def test_ready_annotation_with_blocked_materialization_is_unavailable(tmp_path, 
                 non_diegetic_music_status="unknown", non_diegetic_music=None,
             )
         else:
-            values["h3_projection"]["shots"][0]["description_template"] += " [[unknown]]"
+            values["h3_semantics"]["detailed_description"] += " [[unknown]]"
         return SimpleNamespace(annotation=MimoAVAnnotationDraft.model_validate(values),
                                raw_responses=(), diagnostics=(), model_call_count=1)
 
@@ -350,10 +351,11 @@ def test_ready_annotation_with_blocked_materialization_is_unavailable(tmp_path, 
     before = _snapshot(tmp_path)
     qa.build_audio_shadow_qa(**kwargs)
     data = json.loads((shadow / "qa/data.json").read_text())
-    assert data["schema_version"] == "r2v.h3.audio_shadow_qa.2"
+    assert data["schema_version"] == "r2v.h3.audio_shadow_qa.3"
     for clip in (data["clips"][0], data["clips"][2]):
         assert clip["reconcile"]["status"] == "ready"
         final = clip["final_h3"]
+        assert clip["direct_h3"]["detailed_description"]
         assert final["status"] == "unavailable" and final["text"] is None
         assert final["reason"] == "materialization_contract_failed"
         for variant in final["variants"]:
@@ -409,16 +411,17 @@ function expectLabels(labels) {
   if (JSON.stringify(exportPayload().annotations[0].labels) !== JSON.stringify(labels))
     throw Error("export selection differs");
 }
-change("good", true); expectLabels(["good"]);
-change("asr_issue", true); expectLabels(["asr_issue"]);
-change("stem_issue", true); expectLabels(["asr_issue", "stem_issue"]);
-change("good", true); expectLabels(["good"]);
-change("good", false); expectLabels([]);
-change("asr_issue", true); change("stem_issue", true);
-change("asr_issue", false); expectLabels(["stem_issue"]);
+change("better", true); expectLabels(["better"]);
+change("same", true); expectLabels(["same"]);
+change("same", false); expectLabels([]);
+change("dialogue_wrong", true); expectLabels(["dialogue_wrong"]);
+change("audio_wrong", true); expectLabels(["dialogue_wrong", "audio_wrong"]);
+change("dialogue_wrong", false); change("audio_wrong", false); expectLabels([]);
+change("dialogue_wrong", true); change("audio_wrong", true);
+change("dialogue_wrong", false); expectLabels(["audio_wrong"]);
 const first = exportPayload();
 if (first.annotations[0].clip_uid !== data.clips[1].clip_uid) throw Error("wrong clip");
-if (first.annotations[0].labels.join(",") !== "stem_issue") throw Error("DOM state was not exported");
+if (first.annotations[0].labels.join(",") !== "audio_wrong") throw Error("DOM state was not exported");
 if (stateFor(data.clips[1]).notes !== $("notes").value) throw Error("notes not restored");
 if ($("progress").textContent !== "Labeled 1 / 3") throw Error("progress wrong");
 importPayload(first);
@@ -430,23 +433,25 @@ if (!rejected) throw Error("stale import accepted");
 const invalid = JSON.parse(old); invalid.annotations[0].labels = ["invented"];
 rejected = false; try { importPayload(invalid); } catch (e) { rejected = true; }
 if (!rejected) throw Error("unknown label accepted");
-const contradictory = JSON.parse(old); contradictory.annotations[0].labels = ["good", "asr_issue"];
+const contradictory = JSON.parse(old); contradictory.annotations[0].labels = ["better", "same"];
 const beforeImport = JSON.stringify([...saved]);
 rejected = false; try { importPayload(contradictory); } catch (e) {
   rejected = e.message === "Invalid, duplicate, or stale QA annotation.";
 }
 if (!rejected || JSON.stringify([...saved]) !== beforeImport) throw Error("contradictory import accepted or rewritten");
 const storageKey = key(data.clips[index]), previousState = saved.get(storageKey);
-saved.set(storageKey, JSON.stringify({labels:["good", "asr_issue"], notes:"stale"}));
+saved.set(storageKey, JSON.stringify({labels:["better", "same"], notes:"stale"}));
 rejected = false; try { stateFor(data.clips[index]); } catch (e) {
   rejected = e.message.startsWith("Invalid saved QA state");
 }
 if (!rejected) throw Error("contradictory saved state accepted");
 saved.set(storageKey, previousState);
-inputs.find(input => input.dataset.qaLabel === "good").checked = true;
+inputs.find(input => input.dataset.qaLabel === "better").checked = true;
+inputs.find(input => input.dataset.qaLabel === "same").checked = true;
 rejected = false; try { exportPayload(); } catch (e) { rejected = true; }
 if (!rejected || saved.get(storageKey) !== previousState) throw Error("contradictory DOM exported or persisted");
-inputs.find(input => input.dataset.qaLabel === "good").checked = false;
+inputs.find(input => input.dataset.qaLabel === "better").checked = false;
+inputs.find(input => input.dataset.qaLabel === "same").checked = false;
 const duplicate = JSON.parse(old); duplicate.annotations.push(duplicate.annotations[0]);
 rejected = false; try { importPayload(duplicate); } catch (e) { rejected = true; }
 if (!rejected) throw Error("duplicate accepted");
@@ -507,7 +512,7 @@ const {chromium} = require(process.argv[2]);
     assert.strictEqual(await page.locator("#final-text").textContent(), expectedFinal);
     assert(await page.locator("#final-text").isVisible());
     assert.strictEqual(await page.locator("#final-h3").evaluate(el => el.closest("details")), null);
-    assert.strictEqual(await page.locator("#materializer-version").textContent(), "h3_mimo25_materializer_v19");
+    assert.strictEqual(await page.locator("#materializer-version").textContent(), "h3_mimo25_materializer_v20");
     await page.locator("#final-variant").selectOption("1");
     assert.strictEqual(await page.locator("#final-text").textContent(), dataset.clips[0].final_h3.variants[1].text);
     await page.locator("#final-variant").selectOption("0");
@@ -517,12 +522,13 @@ const {chromium} = require(process.argv[2]);
         inputs => inputs.map(input => input.dataset.qaLabel)), expected);
       assert.deepStrictEqual(await page.evaluate(() => stateFor(data.clips[index]).labels), expected);
     }
-    await label("good").check();
-    await label("asr_issue").check(); await assertSelection(["asr_issue"]);
-    await label("stem_issue").check(); await assertSelection(["asr_issue", "stem_issue"]);
-    await label("good").check(); await assertSelection(["good"]);
-    await label("good").uncheck(); await assertSelection([]);
-    await page.locator('input[data-qa-label="stem_issue"]').check();
+    await label("better").check();
+    await label("same").check(); await assertSelection(["same"]);
+    await label("same").uncheck(); await assertSelection([]);
+    await label("dialogue_wrong").check(); await assertSelection(["dialogue_wrong"]);
+    await label("audio_wrong").check(); await assertSelection(["dialogue_wrong", "audio_wrong"]);
+    await label("dialogue_wrong").uncheck(); await label("audio_wrong").uncheck(); await assertSelection([]);
+    await page.locator('input[data-qa-label="audio_wrong"]').check();
     await page.locator("#notes").fill("synthetic human note");
     await page.locator("#next").click();
     assert.strictEqual(await page.locator("#status").textContent(), "failed");
@@ -540,22 +546,22 @@ const {chromium} = require(process.argv[2]);
     await page.locator("#export").click();
     const download = await downloaded;
     const payload = JSON.parse(fs.readFileSync(await download.path(), "utf8"));
-    assert.deepStrictEqual(payload.annotations[0].labels, ["stem_issue"]);
+    assert.deepStrictEqual(payload.annotations[0].labels, ["audio_wrong"]);
     await page.evaluate(() => localStorage.removeItem(key(data.clips[0])));
     await page.reload(); await page.locator("#main").waitFor({state:"visible"});
     await page.locator("#import-file").setInputFiles({name:"qa.json", mimeType:"application/json", buffer:Buffer.from(JSON.stringify(payload))});
     await page.waitForFunction(() => document.getElementById("notes").value === "synthetic human note");
     const contradictory = JSON.parse(JSON.stringify(payload));
-    contradictory.annotations[0].labels = ["good", "asr_issue"];
+    contradictory.annotations[0].labels = ["better", "same"];
     await page.locator("#import-file").setInputFiles({name:"invalid.json", mimeType:"application/json", buffer:Buffer.from(JSON.stringify(contradictory))});
     await page.waitForFunction(() => document.getElementById("message").textContent === "Invalid, duplicate, or stale QA annotation.");
-    await assertSelection(["stem_issue"]);
+    await assertSelection(["audio_wrong"]);
     await page.screenshot({path:path.join(process.argv[4], "qa-desktop.png"), fullPage:true});
     await page.setViewportSize({width:390,height:844});
     await page.screenshot({path:path.join(process.argv[4], "qa-mobile.png"), fullPage:true});
     assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
     await page.evaluate(() => localStorage.setItem(key(data.clips[0]),
-      JSON.stringify({labels:["good", "asr_issue"], notes:"injected"})));
+      JSON.stringify({labels:["better", "same"], notes:"injected"})));
     await page.reload();
     await page.waitForFunction(() => document.getElementById("message").textContent.startsWith("Invalid saved QA state"));
     assert.strictEqual(await page.locator("#main").isVisible(), false);
