@@ -12,6 +12,7 @@ from r2v_data_v2.h3 import audio_shadow_qa as qa
 from r2v_data_v2.h3.mimo25_av_reconcile import _inventory, _job
 from r2v_data_v2.h3.mimo25_backend import (
     AUXILIARY_AUDIO_PROMPT,
+    MIMO25_BACKEND_VERSION,
     MIMO25_PROMPT_VERSION,
     SYSTEM_PROMPT,
     MimoAuxAudioDescription,
@@ -839,6 +840,54 @@ def test_direct_dialogue_authoritative_continuity(speakers, caption, missing, un
         ([("direct_unknown_speaker", "shot1_caption")] if unknown else [])
         + [("direct_dialogue_speaker_marker_missing", field) for field in missing]
     )
+
+
+@pytest.mark.parametrize("speakers,caption,mismatched", [
+    (["S1", "S2"], "(S1)<d>[English] a</d> (S1)<d>[English] b</d>", ["dialogue_2"]),
+    (["S1", "S2"], "(S1)<d>[English] a</d> (S2)<d>[English] b</d>", []),
+    (["S1", "S1", "S2"], "(S1)<d>[English] a</d> He continues <d>[English] b</d> (S1)<d>[English] c</d>", ["dialogue_3"]),
+    (["S1", "S1"], "(S1)<d>[English] a</d> <d>[English] b</d>", []),
+    (["S1", "S2"], "(S2)<d>[English] merged</d>", []),
+    (["S1", "S2"], "(S1)<d>[English] a</d> (S1)<d>[English] b</d> (S1)<d>[English] c</d>", []),
+    (["S1", "S2"], "(S2)<d>[English] a</d> (S2)<d>[English] b</d>", ["dialogue_1"]),
+    (["S1", "S2"], "(S1)<d>[English] a</d> (S1) listens while (S2)<d>[English] b</d>", []),
+])
+def test_explicit_known_marker_must_match_only_with_equal_counts(speakers, caption, mismatched):
+    unchanged, issues, warnings = protect_direct_dialogue(
+        caption, [{"speaker_id": speaker} for speaker in speakers], allowed_labels=set(),
+    )
+    assert unchanged == caption and warnings == []
+    assert [(issue.code, issue.field) for issue in issues] == [
+        ("direct_dialogue_speaker_marker_mismatch", field) for field in mismatched
+    ]
+    assert all(
+        issue.message == "explicit speaker marker disagrees with authoritative chronological speaker"
+        for issue in issues
+    )
+
+
+def test_explicit_marker_mismatch_remains_hard_in_backend(tmp_path, monkeypatch):
+    from r2v_data_v2.h3 import mimo25_backend
+
+    _, shadow = _fixture(tmp_path, monkeypatch)
+    payload = json.loads(_raw())
+    payload["h3_semantics"]["shot1_caption"] = "(S1)<d>[English] a</d> (S1)<d>[English] b</d>"
+    backend, completions, stems, jobs = _backend(tmp_path, shadow, [(json.dumps(payload), 8)])
+    monkeypatch.setattr(
+        mimo25_backend, "direct_speech_facts",
+        lambda annotation, segments: [{"speaker_id": "S1"}, {"speaker_id": "S2"}],
+    )
+    summary = _run(shadow, backend, stems, jobs[:1])
+    row = _records(shadow)[0]
+    assert summary.failed_count == 1 and summary.ready_count == 0
+    assert row["status"] == "failed" and row["annotation"] is not None
+    assert [(issue["code"], issue["field"]) for issue in row["failure_issues"]] == [
+        ("direct_dialogue_speaker_marker_mismatch", "dialogue_2"),
+    ]
+    assert "direct_dialogue_speaker_marker_mismatch" not in row["diagnostics"][-1]["warnings"]
+    assert summary.model_call_count == len(completions.requests) == 3
+    assert backend.provenance.schema_version == MIMO25_BACKEND_VERSION == "r2v.h3.mimo25_backend.37"
+    assert backend.provenance.prompt_version == "h3_mimo25_unified_av_reconcile_v34"
 
 
 @pytest.mark.parametrize(

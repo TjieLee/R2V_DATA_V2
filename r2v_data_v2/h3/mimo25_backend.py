@@ -31,7 +31,7 @@ MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
 MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v34"
 MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v17"
 MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.20"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.36"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.37"
 MIMO25_ICL_VERSION = "h3_official_ref2va_detailed_shot1_v2"
 MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v23"
 MIMO25_CANONICAL_ABSENT_SOUNDSCAPE = (
@@ -877,7 +877,7 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.36"] = MIMO25_BACKEND_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.37"] = MIMO25_BACKEND_VERSION
     backend: Literal[
         "xiaomi_openai_compatible", "sglang_openai_compatible"
     ]
@@ -1423,15 +1423,26 @@ def protect_direct_dialogue(
         )
     previous_end = 0
     speech_sequence = [item["speaker_id"] for item in speech]
+    aligned_counts = len(blocks) == len(speech_sequence)
     for index, block in enumerate(blocks):
         lead_in = text[previous_end : block.start()]
-        # Equal counts permit continuity only; they are never an inventory gate.
+        lead_markers = {speaker for speaker in known if f"({speaker})" in lead_in}
+        # Equal counts permit speaker checks; they are never an inventory gate.
         same_speaker_continuation = (
-            len(blocks) == len(speech_sequence)
+            aligned_counts
             and index > 0
             and speech_sequence[index] == speech_sequence[index - 1]
         )
-        if not any(f"({speaker})" in lead_in for speaker in known) and not same_speaker_continuation:
+        if lead_markers:
+            if aligned_counts and speech_sequence[index] not in lead_markers:
+                issues.append(
+                    ValidationIssue(
+                        "direct_dialogue_speaker_marker_mismatch",
+                        f"dialogue_{index + 1}",
+                        "explicit speaker marker disagrees with authoritative chronological speaker",
+                    )
+                )
+        elif not same_speaker_continuation:
             issues.append(
                 ValidationIssue(
                     "direct_dialogue_speaker_marker_missing",
