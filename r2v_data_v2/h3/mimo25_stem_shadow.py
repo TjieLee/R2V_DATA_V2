@@ -55,9 +55,9 @@ MIMO25_STEM_FACTS_VERSION = "r2v.h3.mimo25_stem_facts.3"
 MIMO25_STEM_FACTS_SUMMARY_VERSION = "r2v.h3.mimo25_stem_facts_summary.4"
 MIMO25_STEM_FACT_RAW_VERSION = "r2v.h3.mimo25_stem_fact_raw.1"
 MIMO25_STEM_FACT_PROMPT_VERSION = "h3_mimo25_stem_fact_prompt_v1"
-MIMO25_STEM_RECONCILE_VERSION = "r2v.h3.mimo25_stem_reconcile.1"
-MIMO25_STEM_RECONCILE_SUMMARY_VERSION = "r2v.h3.mimo25_stem_reconcile_summary.4"
-MIMO25_STEM_RECONCILE_POLICY_VERSION = "h3_mimo25_stem_reconcile_v1"
+MIMO25_STEM_RECONCILE_VERSION = "r2v.h3.mimo25_stem_reconcile.2"
+MIMO25_STEM_RECONCILE_SUMMARY_VERSION = "r2v.h3.mimo25_stem_reconcile_summary.5"
+MIMO25_STEM_RECONCILE_POLICY_VERSION = "h3_mimo25_stem_reconcile_v2"
 STEM_VIEW_VERSION = "r2v.h3.sam_audio_stem_view.1"
 STEM_RECONCILE_UPSTREAM_FAILURE_VERSION = (
     "r2v.h3.mimo25_stem_reconcile_upstream_failure.1"
@@ -1442,6 +1442,11 @@ def stem_reconcile_auxiliary_contract(facts: MimoStemFactsRecord) -> dict[str, o
         "rules": [
             "Original target AV is final factual authority.",
             "Stem facts may increase recall but cannot override contradictory original AV.",
+            "Negative stem evidence is non-confirmatory; positive evidence may increase recall.",
+            "Music stem absent does NOT establish that original target has no music.",
+            "Empty SFX items do NOT establish absent original ambience or physical sounds.",
+            "Separator labels are never semantic truth.",
+            "Independently decide soundscape/music from original target AV; uncertainty is unknown, not absent.",
             "Music-stem labels do not decide diegetic versus non-diegetic music.",
             "Preserve verified music onset and offset naturally in the existing H3 section.",
             "Do not duplicate music across detailed description, soundscape, and music.",
@@ -1602,13 +1607,13 @@ def build_stem_reconcile_jobs(
 
 
 class MimoStemReconcileRecord(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_stem_reconcile.1"] = (
+    schema_version: Literal["r2v.h3.mimo25_stem_reconcile.2"] = (
         MIMO25_STEM_RECONCILE_VERSION
     )
     clip_uid: str
     source_job_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_stem_facts_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
-    policy_version: Literal["h3_mimo25_stem_reconcile_v1"] = (
+    policy_version: Literal["h3_mimo25_stem_reconcile_v2"] = (
         MIMO25_STEM_RECONCILE_POLICY_VERSION
     )
     backend_provenance: MimoBackendProvenance
@@ -1647,7 +1652,7 @@ class StemReconcileUpstreamFailure(SchemaModel):
 
 
 class MimoStemReconcileSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_stem_reconcile_summary.4"] = (
+    schema_version: Literal["r2v.h3.mimo25_stem_reconcile_summary.5"] = (
         MIMO25_STEM_RECONCILE_SUMMARY_VERSION
     )
     route: SAMRoute
@@ -1663,7 +1668,7 @@ class MimoStemReconcileSummary(SchemaModel):
     failed_count: int = Field(ge=0)
     model_call_count: int = Field(ge=0)
     original_target_av_is_highest_authority: Literal[True] = True
-    current_mimo_versions_modified: Literal[False] = False
+    current_mimo_versions_modified: Literal[True] = True
     production_artifacts_modified: Literal[False] = False
 
     @model_validator(mode="after")

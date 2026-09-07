@@ -16,7 +16,7 @@ from typing import Annotated, Any, Literal, Protocol
 from urllib.parse import quote, urlsplit
 
 from openai import OpenAI
-from pydantic import Field, StrictStr, model_validator
+from pydantic import Field, StrictBool, StrictStr, model_validator
 
 from r2v_data_v2.h3.schemas import SchemaModel
 from r2v_data_v2.h3.speech_presentation import SpeechPresentation
@@ -28,11 +28,11 @@ from r2v_data_v2.structured_output import (
 
 MIMO25_MODEL = "mimo-v2.5"
 MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
-MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v22"
-MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v16"
-MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.13"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.24"
-MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v16"
+MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v23"
+MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v17"
+MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.14"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.25"
+MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v17"
 MIMO25_CANONICAL_ABSENT_SOUNDSCAPE = (
     "No distinct environmental, mechanical, physical, or non-verbal human "
     "sounds are clearly discernible."
@@ -698,12 +698,20 @@ class MimoAudioSemantics(SchemaModel):
     temporal_non_speech_events: list[MimoAudioEvent]
     overall_soundscape_status: Literal["present", "absent", "unknown"]
     overall_soundscape: StrictStr | None = None
+    complete_silence_verified: StrictBool = False
     non_diegetic_music_status: Literal["present", "absent", "unknown"]
     non_diegetic_music: StrictStr | None = None
     audiovisual_summary: StrictStr
 
     @model_validator(mode="after")
     def validate_semantics(self) -> MimoAudioSemantics:
+        if self.complete_silence_verified and (
+            self.overall_soundscape_status != "absent"
+            or self.overall_soundscape is not None
+            or self.non_diegetic_music_status != "absent"
+            or self.temporal_non_speech_events
+        ):
+            raise ValueError("verified complete silence cannot contain audible layers")
         if self.overall_soundscape_status == "present":
             if self.overall_soundscape is None or not self.overall_soundscape.strip():
                 raise ValueError("present soundscape requires a concise description")
@@ -766,10 +774,14 @@ class MimoAudioSemantics(SchemaModel):
 
 class MimoVisualBlock(SchemaModel):
     block_id: str = Field(pattern=r"^v[1-9]\d*$")
+    start_time: float = Field(ge=0, allow_inf_nan=False)
+    end_time: float = Field(gt=0, allow_inf_nan=False)
     text: StrictStr
 
     @model_validator(mode="after")
     def validate_visual_text(self) -> MimoVisualBlock:
+        if self.end_time <= self.start_time:
+            raise ValueError("visual_phase_interval_invalid: phase must have positive duration")
         if (
             not self.text.strip()
             or "[[" in self.text
@@ -1003,7 +1015,7 @@ MimoH3Draft = MimoH3Semantics
 
 
 class MimoAVAnnotationDraft(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_av_annotation.13"] = MIMO25_SCHEMA_VERSION
+    schema_version: Literal["r2v.h3.mimo25_av_annotation.14"] = MIMO25_SCHEMA_VERSION
     visual_observation: MimoVisualObservation
     audio_observation: MimoAudioObservation
     av_grounding: MimoAVGrounding
@@ -1029,7 +1041,7 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.24"] = MIMO25_BACKEND_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.25"] = MIMO25_BACKEND_VERSION
     backend: Literal[
         "xiaomi_openai_compatible", "sglang_openai_compatible"
     ]
@@ -1046,13 +1058,13 @@ class MimoBackendProvenance(SchemaModel):
     media_mode: Literal["base64", "http"]
     media_root: str
     media_base_url: str | None = None
-    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v22"] = (
+    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v23"] = (
         MIMO25_PROMPT_VERSION
     )
-    policy_version: Literal["h3_mimo25_av_authority_contract_v16"] = (
+    policy_version: Literal["h3_mimo25_av_authority_contract_v17"] = (
         MIMO25_POLICY_VERSION
     )
-    annotation_schema_version: Literal["r2v.h3.mimo25_av_annotation.13"] = (
+    annotation_schema_version: Literal["r2v.h3.mimo25_av_annotation.14"] = (
         MIMO25_SCHEMA_VERSION
     )
     materializer_version: Literal[
@@ -1067,6 +1079,7 @@ class MimoBackendProvenance(SchemaModel):
         "h3_mimo25_materializer_v14",
         "h3_mimo25_materializer_v15",
         "h3_mimo25_materializer_v16",
+        "h3_mimo25_materializer_v17",
     ] = (
         MIMO25_MATERIALIZER_VERSION
     )
@@ -1292,6 +1305,7 @@ AUTHORITY
 
 STAGE A visual_observation: PURE VISUAL EVIDENCE
 - Observe real shots and exact segment windows without deciding who speaks. Every shot has at least one contiguous vN visual block. Visual text is English, visual-only, generation-useful prose covering supported style, framing, camera angle, composition, subject appearance and spatial relations, pose and body/hand/head motion, gaze/expression, interactions, object state, environment/material/readable text, lighting/color, camera motion or stability, and early-to-late progression.
+- Each visual block is a time-local phase with absolute start_time/end_time, positive duration, inside its shot. Keep phases chronological and non-overlapping. Describe only that phase, not a paragraph narrating the entire shot before early dialogue. Expose phase boundaries at every transcribed speech start/end inside the shot; never span across a speech boundary. Visual phases together with projected speech/events must cover the shot timeline without gaps. Do not invent details to fill time; describe an observed stable state when appropriate.
 - Target roughly 300-450 English visual/detail words when evidence supports it, but never pad. Anti-collapse minimum visual-only prose is 40 words below 3 seconds, 80 words from 3 through 8 seconds, and 120 words above 8 seconds.
 - Never put transcript, delivery, voice, soundscape, music, speaker presentation, pipeline syntax, Subject/Picture labels, or inferred psychology, intent, causality, relationships, identity, sound, invisible events, or invented details in visual blocks.
 - segment_views exactly follow allowed_segment_ids. visible_entity_ids and entity_observations agree exactly and contain only supplied entities actually visible in that exact interval. A back/profile view, occluded face, or hidden/out-of-frame mouth is still visible presence. speech_correlated_articulation records exact-window observation only and does not assign a speaker.
@@ -1303,7 +1317,9 @@ STAGE B audio_observation: PURE AUDIO EVIDENCE
 - Emit genuinely audible non-speech events with contiguous chronological aeN IDs and tight approximate times. Visual evidence may identify a genuinely audible source but never invent sound.
 - Soundscape event categories are physical, environmental, mechanical, electronic, human_non_speech, and other. Music categories are diegetic_music and non_diegetic_music. Neither music category contributes to overall_soundscape. Diegetic music may enter the detailed timeline; non-diegetic music belongs only in non_diegetic_music.
 - A sustained layer is not automatically ambience because it lacks beats or melody. A pitched or harmonically structured synthesized/processed soundtrack bed, sustained musical drone or pad, instrumental layer, or score-like layer with no plausible visible in-scene source is non_diegetic_music even when beatless, minimal, atmospheric, eerie, or slowly evolving. Do not relabel a soundtrack as room ambience merely because it can be called a drone, hum, or ambient bed. HVAC/electrical hum, wind, traffic, room tone, and machinery remain non-musical soundscape only when the audible and audiovisual evidence supports that source distinction.
-- overall_soundscape is present when one or more positive non-musical ambience, room-tone, environmental, physical, mechanical, electronic, or non-verbal human layers are established. It is absent when no distinct positive non-musical soundscape layer is established, independently of speech, diegetic music, or non-diegetic music; absent may use null or concise explicit negative-only prose. It is unknown only when Audio evidence is unavailable or genuinely uncertain, and unknown must use null. overall_soundscape must never contain dialogue, narration, voice-over, lyrics, singing, music, BGM, score, soundtrack, song, melody, or instrumental music. non_diegetic_music describes audience-only score/BGM. Do not substitute either field for the other. When BGM is audible but no distinct non-musical soundscape is established, do not repeat the music as soundscape or invent room tone, HVAC, wind, traffic, or another layer; a conservative statement that no distinct environmental, mechanical, physical, or non-verbal human sounds are clearly discernible is valid.
+- Independently judge overall_soundscape_status and non_diegetic_music_status from ORIGINAL TARGET AV. Positive stem evidence may increase recall; negative stem evidence is non-confirmatory. An absent music stem does not establish absent original music; empty SFX items do not establish absent original ambience/SFX; separator labels are never semantic truth.
+- overall_soundscape is present when original AV audibly supports non-musical ambience, room tone, environmental, physical, mechanical, electronic, or non-verbal human sound. Describe the positive layer concisely. Do not infer room tone from visuals. Absent requires an explicit original-AV absence judgment, not lack of salient events or stem evidence. For verified complete silence throughout the original clip use absent, overall_soundscape=null, complete_silence_verified=true. Otherwise keep complete_silence_verified=false; if original AV verifies no non-speech layer, supply concise explicit negative-only prose yourself. The materializer never synthesizes a negative sentence. If genuinely uncertain use unknown/null; unknown cannot become confirmed absence.
+- Keep dialogue/singing out of overall_soundscape and both music categories out of it. non_diegetic_music describes only audience-only score/BGM, independently from original AV; use absent/null only when original AV establishes no such music, unknown/null when uncertain. Do not substitute music for soundscape or invent ambience. Timed physical sounds belong in the detailed timeline as well as a concise global soundscape summary where appropriate.
 
 STAGE C av_grounding: AUDIOVISUAL CO-ANALYSIS
 - segment_groundings exactly follow allowed_segment_ids and preserve each matching Stage B primary_speaker_group. Decide binding_status, speech_presentation, entity_id, confidence, and evidence from the exact visual segment view plus Audio/AV evidence.
@@ -1320,6 +1336,8 @@ STAGE D h3_semantics
 
 STAGE E h3_projection
 - Project typed visual{block_id}, speech{segment_id}, and audio_event{event_id} parts in playback order. Every Stage A visual block appears exactly once in its own shot. Every transcribed segment appears exactly once in chronological order. Every non-speech event except non_diegetic_music appears exactly once in chronological order. Never project non-diegetic music into detailed description.
+- Project visual phase intervals from Stage A without duplicating their times. Speech uses supplied exact segment times; events use Stage B validated times. Effective starts must be nondecreasing. A visual phase before speech or an event must finish no later than that speech/event starts. Do not append early speech after a full-shot visual narrative. Keep genuine simultaneous evidence at its shared time, not after later phases.
+- Transcribed overlapping_secondary_speech or sequential_multi_speaker_speech is retained as acoustic evidence but blocks final H3 with multi_speaker_segment_requires_turn_refinement. Do not hide the classification or split/rewrite ASR to obtain a final prompt; authoritative sub-turn refinement is future work.
 - Do not write final H3 syntax. The deterministic materializer alone owns <Picture N>, <Subject N>, <Audio N>, Sx, exact <d>[Language] dialogue</d>, shot headers/cuts, and the official six-section final Ref2VA output. Internal vN/gN/eN/aeN/segment IDs and stage names must not leak into prose."""
 
 
@@ -1452,6 +1470,95 @@ class _MimoResponseContractError(RuntimeError):
         self.retries = retries
 
 
+def validate_timeline_projection(
+    annotation: MimoAVAnnotationDraft,
+    *,
+    segment_intervals: dict[str, tuple[float, float]],
+    transcribed_segment_ids: list[str],
+    target_duration_seconds: float,
+) -> list[ValidationIssue]:
+    """Validate temporal projection without changing any prose or source intervals."""
+    issues: list[ValidationIssue] = []
+    epsilon = 1e-6
+    shots = annotation.visual_observation.shots
+    projected = {shot.shot_index: shot for shot in annotation.h3_projection.shots}
+    events = {item.event_id: (item.approximate_start_time, item.approximate_end_time)
+              for item in annotation.audio_semantics.temporal_non_speech_events
+              if item.category != "non_diegetic_music"}
+
+    def issue(code: str, shot_index: int, message: str) -> None:
+        issues.append(ValidationIssue(code, f"h3_projection.shots[{shot_index - 1}]", message))
+
+    for index, shot in enumerate(shots):
+        start = shot.start_time or 0.0
+        end = (shots[index + 1].start_time if index + 1 < len(shots)
+               else target_duration_seconds)
+        assert end is not None
+        phases = {block.block_id: (block.start_time, block.end_time)
+                  for block in shot.visual_blocks}
+        previous_end = start
+        for block in shot.visual_blocks:
+            if (block.start_time < previous_end - epsilon
+                    or block.end_time > end + epsilon):
+                issue("visual_phase_interval_invalid", shot.shot_index,
+                      f"{block.block_id} must be chronological, non-overlapping and shot-bounded")
+            previous_end = block.end_time
+            for segment_id in transcribed_segment_ids:
+                interval = segment_intervals.get(segment_id)
+                if interval is not None and any(
+                    block.start_time + epsilon < boundary < block.end_time - epsilon
+                    for boundary in interval if start < boundary < end
+                ):
+                    issue("speech_visual_phase_boundary_mismatch", shot.shot_index,
+                          f"{block.block_id} spans a boundary of {segment_id}; supply time-local phases")
+        projection = projected.get(shot.shot_index)
+        if projection is None:
+            issue("visual_phase_inventory_mismatch", shot.shot_index, "missing projected shot")
+            continue
+        if [part.block_id for part in projection.timeline_parts
+            if isinstance(part, MimoH3VisualPart)] != list(phases):
+            issue("visual_phase_inventory_mismatch", shot.shot_index,
+                  "project all Stage A phases exactly once in Stage A order")
+        previous_start = start
+        latest_visual_end = start
+        coverage = []
+        for part in projection.timeline_parts:
+            if isinstance(part, MimoH3VisualPart):
+                interval = phases.get(part.block_id)
+            elif isinstance(part, MimoH3SpeechPart):
+                interval = segment_intervals.get(part.segment_id)
+            else:
+                interval = events.get(part.event_id)
+            if interval is None:
+                continue  # Exact inventories are checked by validate_annotation.
+            effective_start, effective_end = max(start, interval[0]), min(end, interval[1])
+            if effective_end <= effective_start:
+                issue("timeline_part_temporal_order_mismatch", shot.shot_index,
+                      "part has no positive extent inside this shot")
+                continue
+            if (effective_start < previous_start - epsilon or (
+                not isinstance(part, MimoH3VisualPart)
+                and effective_start < latest_visual_end - epsilon
+            )):
+                code = ("audio_event_temporal_order_mismatch"
+                        if isinstance(part, MimoH3AudioEventPart)
+                        else "timeline_part_temporal_order_mismatch")
+                issue(code, shot.shot_index, "part is serialized after later visual/time evidence")
+            previous_start = effective_start
+            if isinstance(part, MimoH3VisualPart):
+                latest_visual_end = effective_end
+            coverage.append((effective_start, effective_end))
+        covered_end = start
+        for interval_start, interval_end in sorted(coverage):
+            if interval_start > covered_end + epsilon:
+                issue("visual_phase_timeline_gap", shot.shot_index,
+                      "visual phases and projected speech/events leave an uncovered interval")
+            covered_end = max(covered_end, interval_end)
+        if covered_end < end - epsilon:
+            issue("visual_phase_timeline_gap", shot.shot_index, "shot tail lacks temporal evidence")
+    return issues
+
+
 def validate_annotation(
     annotation: MimoAVAnnotationDraft,
     *,
@@ -1464,7 +1571,16 @@ def validate_annotation(
     reference_subjects: list[Any],
     target_duration_seconds: float,
 ) -> list[ValidationIssue]:
-    issues: list[ValidationIssue] = []
+    issues = validate_timeline_projection(
+        annotation, segment_intervals=segment_intervals,
+        transcribed_segment_ids=transcribed_segment_ids,
+        target_duration_seconds=target_duration_seconds,
+    )
+    if annotation.audio_semantics.complete_silence_verified and segment_ids:
+        issues.append(ValidationIssue(
+            "complete_silence_conflicts_with_speech_inventory", "audio_observation.audio_semantics",
+            "a clip containing authoritative speech segments cannot claim complete silence",
+        ))
     audio_decisions = annotation.audio_observation.segment_decisions
     groundings = annotation.av_grounding.segment_groundings
     visual_views = annotation.visual_observation.segment_views
@@ -3030,6 +3146,19 @@ class OpenAIMimo25Backend:
     ) -> str:
         issue_codes = {item.code for item in issues}
         issue_actions: list[str] = []
+        if issue_codes & {
+            "visual_phase_interval_invalid", "visual_phase_inventory_mismatch",
+            "timeline_part_temporal_order_mismatch", "speech_visual_phase_boundary_mismatch",
+            "audio_event_temporal_order_mismatch", "visual_phase_timeline_gap",
+        }:
+            issue_actions.append(
+                "Reinspect original AV and regenerate time-local Stage A visual phases "
+                "and Stage E projection together. Use positive, shot-bounded, non-overlapping "
+                "phase intervals with boundaries at authoritative speech start/end times. "
+                "Preserve exact speech/event inventories and interleave by actual time; "
+                "never append early speech/events after later visual phases. Cover the "
+                "shot with phases plus speech/events, without inventing details or editing ASR."
+            )
         if issue_codes & {
             "subject_definition_contract_mismatch",
             "subject_retention_contract_mismatch",

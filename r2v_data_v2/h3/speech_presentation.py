@@ -17,6 +17,29 @@ class SpeechPresentationFact(Protocol):
     locked_dialogue_block: str
 
 
+def semantic_speech_source(
+    *, speaker_id: str, subject_label: str | None, presentation: SpeechPresentation,
+) -> tuple[str, str]:
+    """Official Ref2VA source phrase and action; never invent speaker attributes."""
+    if subject_label is not None:
+        source = f"{subject_label} ({speaker_id})"
+        if presentation == "offscreen_spoken":
+            source += ", speaking off-screen,"
+    else:
+        description = {
+            "onscreen_spoken": "An unidentified visible speaker",
+            "offscreen_spoken": "An off-screen voice",
+            "voice_over": "A voice-over",
+            "message_voice_over": "A message voice-over",
+            "device_playback": "A voice from an in-scene device",
+            "uncertain": "An unidentified voice",
+        }[presentation]
+        source = f"{description} ({speaker_id})"
+    action = ("says in an off-screen voiceover:"
+              if presentation in {"voice_over", "message_voice_over"} else "says,")
+    return source, action
+
+
 def render_speech_presentation_clause(
     *,
     speech: SpeechPresentationFact,

@@ -320,12 +320,65 @@ and ready/failed/upstream-failed reconcile results. Original AV remains factual
 authority; separator names and manual labels are not production truth.
 
 The primary review surface is the exact final six-section H3 prompt beside the
-target AV, rendered by the existing MiMo `_materialize_sample()` v16 path. Each
+target AV, rendered by the existing MiMo `_materialize_sample()` v17 path. Each
 source H3 conditioning variant is shown separately, using current shadow ASR
 speech in memory while retaining frozen references. No recovery, media generation,
 or H3 publication runs. Structured MiMo annotation is secondary diagnostic evidence.
 Failed/upstream-failed reconcile has no final prompt. Rendered text participates
 in QA fingerprints, so regenerated text invalidates stale annotations.
+
+### Time-aware shadow contract (v17 materializer)
+
+This is an intentional new shadow contract, not a rewrite of existing artifacts.
+The checked official sources are MiniMax-H3
+[Ref2VA](https://github.com/MiniMax-AI/MiniMax-H3/blob/main/skills/h3-prompt-writing/references/ref-en.txt)
+(speaker notation and playback order) and
+[Base](https://github.com/MiniMax-AI/MiniMax-H3/blob/main/skills/h3-prompt-writing/references/base-en.txt)
+(soundscape/music sections and absence). Final output retains the six Ref2VA
+sections, natural Subject/Picture definitions, stable `(Sx)`, and exact
+`<d>[Language] ...</d>` dialogue.
+
+- Every unbound speaker has a semantic source phrase (off-screen voice,
+  voice-over, in-scene device, or unidentified voice), never just bare `(Sx)`.
+  A resolved voice group with one bound Subject retains that Subject when it
+  speaks off-screen. This is rendering identity continuity, not mutation of
+  DiariZen/ASR or published entity bindings.
+- Negative stem evidence is non-confirmatory. Empty SFX or absent stem music
+  cannot establish absence in the original AV; positive stems only help recall.
+  Original AV independently owns soundscape and music judgments.
+- Soundscape `N/A` is reserved for explicitly verified complete silence
+  (`complete_silence_verified=true`, with no speech or audible layers).
+  For a non-silent clip with a verified absent non-musical layer, retain only
+  model-supplied negative prose. The materializer never inserts a stock negative
+  sentence. Absent non-diegetic music renders `N/A`; unknown audio semantics
+  makes final H3 unavailable, not confirmed absence.
+- Stage A visual blocks own absolute positive shot-bounded phase intervals.
+  Stage E preserves their order and interleaves exact speech/event intervals by
+  playback time. Phases cannot cross interior transcribed speech boundaries;
+  projected evidence must cover the shot. Invalid order/gaps require the
+  existing single full-AV recheck, never heuristic prose splitting.
+- Transcribed overlapping or sequential multi-speaker speech blocks final H3
+  with `multi_speaker_segment_requires_turn_refinement`. Acoustic facts, exact
+  transcript/language, and sample/time boundaries remain intact. Authoritative
+  sub-turn refinement is future work; no punctuation-based splitting is added.
+
+Versions: MiMo prompt v22 -> v23 and authority policy v16 -> v17 encode these
+rules; annotation .13 -> .14 adds phase times and explicit silence evidence;
+backend .24 -> .25 and record .10 -> .11 bind that output contract.
+Materializer v16 -> v17 changes source/absence rendering and fail-closed gates;
+H3 shadow record .11 -> .12 and summary .12 -> .13 identify the resulting output.
+Stem reconcile policy v1 -> v2, record .1 -> .2, and summary .4 -> .5 bind the
+revised authority/provenance; `current_mimo_versions_modified=true` is explicit.
+QA data .1 -> .2 exposes per-variant materialization availability/issues;
+human-label schema stays .1. Intentional historical materializer unions retain
+their old entries, but old annotation/backend lineage is not accepted as current.
+
+The QA surface remains Target AV beside Final H3 Prompt. A ready annotation can
+have an unavailable final prompt; each blocked variant displays its issue codes
+and disables Copy. No best-effort renderer is used. Existing production inputs
+remain read-only. Shadow reconcile temperature stays 0.0 with at most the
+existing one full-AV recheck; transport and model runtime are unchanged.
+Local synthetic validation is not real random10/model validation.
 
 The builder validates existing complete stage metadata and lineage, including
 per-clip failure records. Output is `review.html`, `data.json`, and `media/`

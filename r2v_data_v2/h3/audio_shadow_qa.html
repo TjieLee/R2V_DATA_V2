@@ -64,7 +64,7 @@ small{color:#626e73}a{color:#176c9a}#loading{padding:20px}
 <div class="final-heading"><h2>Final H3 Prompt</h2><button id="copy-final">Copy</button></div>
 <p><small id="materializer-version"></small></p>
 <select id="final-variant" aria-label="H3 sample variant"></select>
-<p id="final-unavailable" class="failed" hidden></p>
+<p id="final-unavailable" class="failed" style="white-space:pre-line" hidden></p>
 <pre id="final-text"></pre>
 </section>
 </div>
@@ -135,7 +135,12 @@ function details(title, value, open = false) {
 function cell(row, value) { const el = document.createElement("td"); el.textContent = value == null ? "[unavailable]" : String(value); row.append(el); return el; }
 function renderFinalVariant() {
   const final = data.clips[index].final_h3;
-  $("final-text").textContent = final.status === "ready" ? final.variants[Number($("final-variant").value)].text : "";
+  const variant = final.variants[Number($("final-variant").value)] || final;
+  $("final-text").textContent = variant.status === "ready" ? variant.text : "";
+  $("copy-final").disabled = variant.status !== "ready";
+  $("final-unavailable").hidden = variant.status === "ready";
+  if (variant.issues) $("final-unavailable").textContent = "Final H3 Prompt unavailable\n" +
+    variant.issues.map(issue => issue.code + ": " + issue.message).join("\n");
 }
 function render() {
   const clip = data.clips[index], state = stateFor(clip);
@@ -302,7 +307,7 @@ fetch("data.json", {cache: "no-store"}).then(response => {
   if (!response.ok) throw new Error("Cannot load data.json: " + response.status);
   return response.json();
 }).then(payload => {
-  if (payload.schema_version !== "r2v.h3.audio_shadow_qa.1" || !payload.clips.length) throw new Error("Invalid QA dataset.");
+  if (payload.schema_version !== "r2v.h3.audio_shadow_qa.2" || !payload.clips.length) throw new Error("Invalid QA dataset.");
   data = payload;
   data.clips.forEach((clip, i) => {
     const option = document.createElement("option"); option.value = String(i);

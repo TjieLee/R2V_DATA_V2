@@ -30,7 +30,6 @@ from r2v_data_v2.h3.mimo25_av_reconcile import (
     project_mimo_h3_sample_references,
 )
 from r2v_data_v2.h3.mimo25_backend import (
-    MIMO25_CANONICAL_ABSENT_SOUNDSCAPE,
     MIMO25_MATERIALIZER_VERSION,
     MimoAudioEvent,
     MimoH3AudioEventPart,
@@ -39,6 +38,7 @@ from r2v_data_v2.h3.mimo25_backend import (
     MimoH3VisualPart,
     MimoSegmentDecision,
     MimoSubjectDefinitionDraft,
+    validate_timeline_projection,
 )
 from r2v_data_v2.h3.mimo25_recovered_voice import (
     RECOVERED_VOICE_POLICY_VERSION,
@@ -67,13 +67,10 @@ from r2v_data_v2.h3.qwen38_h3_recaption import (
     validate_h3_response,
 )
 from r2v_data_v2.h3.schemas import SchemaModel
-from r2v_data_v2.h3.speech_presentation import (
-    render_speech_presentation_clause,
-)
 from r2v_data_v2.structured_output import ValidationIssue
 
-MIMO25_SHADOW_RECORD_VERSION = "r2v.h3.mimo25_h3_shadow.11"
-MIMO25_SHADOW_SUMMARY_VERSION = "r2v.h3.mimo25_h3_shadow_summary.12"
+MIMO25_SHADOW_RECORD_VERSION = "r2v.h3.mimo25_h3_shadow.12"
+MIMO25_SHADOW_SUMMARY_VERSION = "r2v.h3.mimo25_h3_shadow_summary.13"
 MUSIC_REFERENCE_POLICY_VERSION = "h3_mimo25_clean_music_reference_v1"
 MUSIC_REFERENCE_SAMPLE_RATE_HZ = 32000
 MUSIC_REFERENCE_CHANNELS = 2
@@ -222,7 +219,7 @@ def _write_jsonl(path: Path, values: Sequence[SchemaModel]) -> None:
 
 
 class MimoH3ShadowRecord(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_h3_shadow.11"] = MIMO25_SHADOW_RECORD_VERSION
+    schema_version: Literal["r2v.h3.mimo25_h3_shadow.12"] = MIMO25_SHADOW_RECORD_VERSION
     sample_id: str
     source_h3_sample_id: str
     clip_uid: str
@@ -239,6 +236,7 @@ class MimoH3ShadowRecord(SchemaModel):
         "h3_mimo25_materializer_v14",
         "h3_mimo25_materializer_v15",
         "h3_mimo25_materializer_v16",
+        "h3_mimo25_materializer_v17",
     ] = (
         MIMO25_MATERIALIZER_VERSION
     )
@@ -349,7 +347,7 @@ class MimoH3ShadowRecord(SchemaModel):
 
 
 class MimoH3ShadowSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_h3_shadow_summary.12"] = (
+    schema_version: Literal["r2v.h3.mimo25_h3_shadow_summary.13"] = (
         MIMO25_SHADOW_SUMMARY_VERSION
     )
     source_mimo_inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -515,19 +513,31 @@ def _audio_facts(
         item.segment_id: item.delivery_style
         for item in record.annotation.audio_observation.segment_decisions
     }
+    groundings = {item.segment_id: item for item in record.annotation.av_grounding.segment_groundings}
+    entities_by_group: dict[str, set[str]] = {}
+    for segment in corrected:
+        if segment.entity_id is not None:
+            entities_by_group.setdefault(segment.speaker_cluster_id, set()).add(segment.entity_id)
     speech = []
     for segment in corrected:
         language = segment.language or "Unknown"
+        entity_id = segment.entity_id
+        # A known Subject keeps its identity when the same resolved voice goes off-screen.
+        # This changes only rendering facts, never raw/bound segments or AV decisions.
+        if entity_id is None and groundings[segment.segment_id].speech_presentation == "offscreen_spoken":
+            identities = entities_by_group.get(segment.speaker_cluster_id, set())
+            if len(identities) == 1:
+                entity_id = next(iter(identities))
         speech.append(
             RecaptionSpeechFact(
                 fact_id=segment.segment_id,
                 segment_id=segment.segment_id,
                 speaker_cluster_id=segment.speaker_cluster_id,
-                entity_id=segment.entity_id,
+                entity_id=entity_id,
                 entity_subject_label=(
                     None
-                    if segment.entity_id is None
-                    else entity_subject.get(segment.entity_id)
+                    if entity_id is None
+                    else entity_subject.get(entity_id)
                 ),
                 speaker_id=speaker_ids[segment.speaker_cluster_id],
                 start_time=segment.start_time,
@@ -574,13 +584,8 @@ def _render_mimo_speech_clause(
     include_audio_reference: bool,
 ) -> str:
     presentation = decisions[speech.segment_id].speech_presentation
-    return render_speech_presentation_clause(
-        speech=speech,
-        base_clause=_render_locked_speech(
-            speech,
-            contract,
-            include_audio_reference=include_audio_reference,
-        ),
+    return _render_locked_speech(
+        speech, contract, include_audio_reference=include_audio_reference,
         presentation=presentation,
     )
 
@@ -661,6 +666,24 @@ def _materialize_sample(
     extra_audio_contract: RecaptionAudioContract | None = None,
 ) -> tuple[list[FinalQwen3SpeechSegment], str, list[str]]:
     assert record.annotation is not None
+    transcribed_ids = [item.segment_id for item in job.segments if item.asr_status == "transcribed"]
+    blocked = [item.segment_id for item in record.annotation.audio_observation.segment_decisions
+               if item.segment_id in transcribed_ids and item.vocal_composition in {
+                   "overlapping_secondary_speech", "sequential_multi_speaker_speech",
+               }]
+    if blocked:
+        raise MimoH3MaterializationContractError([ValidationIssue(
+            "multi_speaker_segment_requires_turn_refinement", segment_id,
+            "retain exact multi-speaker ASR; authoritative sub-turn refinement is required",
+        ) for segment_id in blocked])
+    temporal_issues = validate_timeline_projection(
+        record.annotation,
+        segment_intervals={item.segment_id: (item.start_time, item.end_time) for item in job.segments},
+        transcribed_segment_ids=transcribed_ids,
+        target_duration_seconds=job.target_duration_seconds,
+    )
+    if temporal_issues:
+        raise MimoH3MaterializationContractError(temporal_issues)
     projected_sample = project_mimo_h3_sample_references(
         sample,
         reference_images=job.reference_images,
@@ -707,6 +730,15 @@ def _materialize_sample(
         request_fingerprint=record.request_fingerprint,
     )
     semantics = record.annotation.audio_observation.audio_semantics
+    if semantics.complete_silence_verified and job.segments:
+        raise MimoH3MaterializationContractError([ValidationIssue(
+            "complete_silence_conflicts_with_speech_inventory", "audio_semantics",
+            "authoritative speech exists in a claimed silent clip",
+        )])
+    if semantics.non_diegetic_music_status == "unknown":
+        raise MimoH3MaterializationContractError([ValidationIssue(
+            "unknown_audio_semantics", "non_diegetic_music", "unknown music is not absence",
+        )])
     audio_event_by_id = {
         item.event_id: item.description for item in semantics.temporal_non_speech_events
     }
@@ -725,15 +757,20 @@ def _materialize_sample(
     if semantics.overall_soundscape_status == "present":
         soundscape = semantics.overall_soundscape
     elif semantics.overall_soundscape_status == "absent":
-        soundscape = (
-            semantics.overall_soundscape
-            if semantics.overall_soundscape is not None
-            else MIMO25_CANONICAL_ABSENT_SOUNDSCAPE
-        )
+        if semantics.complete_silence_verified:
+            soundscape = "N/A"
+        elif semantics.overall_soundscape is not None:
+            soundscape = semantics.overall_soundscape
+        else:
+            raise MimoH3MaterializationContractError([ValidationIssue(
+                "soundscape_absence_requires_explicit_original_av_judgment", "overall_soundscape",
+                "absence without model-provided negative prose or verified silence is unavailable",
+            )])
     else:
-        raise ValueError(
-            "unknown MiMo soundscape cannot be materialized as confirmed silence"
-        )
+        raise MimoH3MaterializationContractError([ValidationIssue(
+            "unknown_audio_semantics", "overall_soundscape",
+            "unknown MiMo soundscape cannot be materialized as confirmed silence",
+        )])
     visual_block_by_id = {
         block.block_id: block.text
         for shot in record.annotation.visual_observation.shots

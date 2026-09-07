@@ -45,17 +45,21 @@ class _Reconcile(_FailingReconcileBackend):
         annotation = MimoAVAnnotationDraft.model_validate_json(
             _annotation().model_dump_json().replace("segment_1", "segment_0001")
         )
+        values = annotation.model_dump(mode="json")
+        values["visual_observation"]["shots"][0]["visual_blocks"][0]["start_time"] = (
+            job.segments[-1].end_time if job.segments else 0.0
+        )
         if not job.segments:
-            values = annotation.model_dump(mode="json")
             values["visual_observation"]["segment_views"] = []
             values["audio_observation"]["segment_decisions"] = []
             values["audio_observation"]["speaker_voice_profiles"] = []
             values["av_grounding"]["segment_groundings"] = []
             values["h3_projection"]["shots"][0]["timeline_parts"] = [
                 part for part in values["h3_projection"]["shots"][0]["timeline_parts"]
-                if part["type"] != "speech"
+                if part["type"] == "visual"
             ]
-            annotation = MimoAVAnnotationDraft.model_validate(values)
+            values["audio_observation"]["audio_semantics"]["temporal_non_speech_events"] = []
+        annotation = MimoAVAnnotationDraft.model_validate(values)
         return SimpleNamespace(annotation=annotation, diagnostics=(), model_call_count=1)
 
 
@@ -157,6 +161,9 @@ def test_builder_ready_failed_order_media_and_sources_unchanged(tmp_path, monkey
     output = shadow / "qa"
     assert result["output_root"] == str(output)
     data = json.loads((output / "data.json").read_text())
+    reconcile_summary = json.loads((shadow / "mimo_reconcile/summary.json").read_text())
+    assert reconcile_summary["schema_version"] == "r2v.h3.mimo25_stem_reconcile_summary.5"
+    assert reconcile_summary["current_mimo_versions_modified"] is True
     assert data["clip_uids"] == ["clip-z", "clip-a", "clip-m"]
     assert [clip["reconcile"]["status"] for clip in data["clips"]] == ["ready", "failed", "ready"]
     failed = data["clips"][1]["reconcile"]
@@ -167,7 +174,7 @@ def test_builder_ready_failed_order_media_and_sources_unchanged(tmp_path, monkey
     for clip, call in zip((data["clips"][0], data["clips"][2]), materialized, strict=True):
         final = clip["final_h3"]
         assert final["status"] == "ready"
-        assert final["materializer_version"] == "h3_mimo25_materializer_v16"
+        assert final["materializer_version"] == "h3_mimo25_materializer_v17"
         assert final["text"] == call[3] == original(*call[:3])[1]
         assert final["variants"][0]["text"] == final["text"]
         assert "[[" not in final["text"]
@@ -312,6 +319,56 @@ def test_cli_and_manifest_order_fail_closed(tmp_path, monkeypatch):
     assert (shadow / "qa/review.html").is_file()
 
 
+@pytest.mark.parametrize("blocked, expected", [
+    ("multi", "multi_speaker_segment_requires_turn_refinement"),
+    ("unknown", "unknown_audio_semantics"),
+    ("temporal", "timeline_part_temporal_order_mismatch"),
+])
+def test_ready_annotation_with_blocked_materialization_is_unavailable(tmp_path, monkeypatch, blocked, expected):
+    original = _Reconcile.reconcile
+
+    def reconcile(self, job, **kwargs):
+        result = original(self, job, **kwargs)
+        values = result.annotation.model_dump(mode="json")
+        if blocked == "multi":
+            for decision in values["audio_observation"]["segment_decisions"]:
+                decision.update(
+                    vocal_composition="sequential_multi_speaker_speech",
+                    resolution="needs_acoustic_refinement",
+                    secondary_vocal_activity={"present": True, "speaker_relation": "different_speaker", "kind": "speech"},
+                )
+            values["audio_observation"]["speaker_voice_profiles"] = []
+            for grounding in values["av_grounding"]["segment_groundings"]:
+                grounding.update(binding_status="no_reliable_entity", entity_id=None,
+                                 speech_presentation="uncertain", confidence="low",
+                                 evidence_codes=["insufficient_evidence"])
+        elif blocked == "unknown":
+            values["audio_observation"]["audio_semantics"].update(
+                non_diegetic_music_status="unknown", non_diegetic_music=None,
+            )
+        else:
+            parts = values["h3_projection"]["shots"][0]["timeline_parts"]
+            parts.append(parts.pop(0))
+        return SimpleNamespace(annotation=MimoAVAnnotationDraft.model_validate(values),
+                               diagnostics=(), model_call_count=1)
+
+    monkeypatch.setattr(_Reconcile, "reconcile", reconcile)
+    kwargs, shadow = _fixture(tmp_path, monkeypatch, variants=True)
+    before = _snapshot(tmp_path)
+    qa.build_audio_shadow_qa(**kwargs)
+    data = json.loads((shadow / "qa/data.json").read_text())
+    assert data["schema_version"] == "r2v.h3.audio_shadow_qa.2"
+    for clip in (data["clips"][0], data["clips"][2]):
+        assert clip["reconcile"]["status"] == "ready"
+        final = clip["final_h3"]
+        assert final["status"] == "unavailable" and final["text"] is None
+        assert final["reason"] == "materialization_contract_failed"
+        for variant in final["variants"]:
+            assert variant["text"] is None
+            assert expected in {issue["code"] for issue in variant["issues"]}
+    assert all(path.read_bytes() == content for path, content in before.items())
+
+
 def test_generated_javascript_and_qa_roundtrip(tmp_path, monkeypatch):
     node = os.environ.get("NODE_BINARY") or shutil.which("node")
     if not node:
@@ -406,6 +463,14 @@ if (!rejected) throw Error("stale record accepted");
 index = 0; $("notes").value = ""; saveCurrent();
 if (exportPayload().annotations.map(x => x.clip_uid).join(",") !== "clip-z,clip-a")
   throw Error("export did not retain authoritative order");
+index = 0; $("final-variant").value = "0";
+data.clips[0].final_h3.variants[0] = {status:"unavailable", text:null,
+  issues:[{code:"multi_speaker_segment_requires_turn_refinement", message:"retain ASR"}]};
+renderFinalVariant();
+if ($("final-unavailable").hidden || !$("copy-final").disabled ||
+    $("final-text").textContent !== "" ||
+    !$("final-unavailable").textContent.includes("multi_speaker_segment_requires_turn_refinement"))
+  throw Error("blocked materialization was not displayed");
 '''
     harness = tmp_path / "test.cjs"
     harness.write_text(prelude + "\n" + script + "\n" + checks)
@@ -449,7 +514,7 @@ const {chromium} = require(process.argv[2]);
     assert.strictEqual(await page.locator("#final-text").textContent(), expectedFinal);
     assert(await page.locator("#final-text").isVisible());
     assert.strictEqual(await page.locator("#final-h3").evaluate(el => el.closest("details")), null);
-    assert.strictEqual(await page.locator("#materializer-version").textContent(), "h3_mimo25_materializer_v16");
+    assert.strictEqual(await page.locator("#materializer-version").textContent(), "h3_mimo25_materializer_v17");
     await page.locator("#final-variant").selectOption("1");
     assert.strictEqual(await page.locator("#final-text").textContent(), dataset.clips[0].final_h3.variants[1].text);
     await page.locator("#final-variant").selectOption("0");

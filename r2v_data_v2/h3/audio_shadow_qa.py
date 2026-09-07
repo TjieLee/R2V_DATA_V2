@@ -22,7 +22,10 @@ from r2v_data_v2.h3.mimo25_backend import (
     MIMO25_MATERIALIZER_VERSION,
     MimoAVAnnotationDraft,
 )
-from r2v_data_v2.h3.mimo25_h3_materializer import _materialize_sample
+from r2v_data_v2.h3.mimo25_h3_materializer import (
+    MimoH3MaterializationContractError,
+    _materialize_sample,
+)
 from r2v_data_v2.h3.mimo25_stem_shadow import (
     MimoStemReconcileRecord,
     MimoStemReconcileSummary,
@@ -39,7 +42,7 @@ from r2v_data_v2.h3.sam_audio_stem_shadow import (
     validate_stem_diarization_lineage,
 )
 
-QA_DATA_VERSION = "r2v.h3.audio_shadow_qa.1"
+QA_DATA_VERSION = "r2v.h3.audio_shadow_qa.2"
 QA_REVIEW_VERSION = "r2v.h3.audio_shadow_human_qa.1"
 QA_LABELS = (
     "good", "upstream_label_wrong", "speaker_ambiguous",
@@ -283,14 +286,18 @@ def build_audio_shadow_qa(
                 sample = FinalH3SampleV2.model_validate({
                     **source.model_dump(mode="python"), "speech_segments": speech,
                 })
-                _, text, warnings = _materialize_sample(
-                    sample, current,
-                    _MaterializerInput(record.annotation, record.source_job_fingerprint),
-                )
-                variants.append({"sample_id": sample_id, "pair_type": source.pair_type,
-                                 "text": text, "warnings": warnings})
-            final_h3.update(status="ready", text=variants[0]["text"], reason=None,
-                            variants=variants)
+                try:
+                    _, text, warnings = _materialize_sample(
+                        sample, current,
+                        _MaterializerInput(record.annotation, record.source_job_fingerprint),
+                    )
+                    variant = {"status": "ready", "text": text, "warnings": warnings, "reason": None}
+                except MimoH3MaterializationContractError as error:
+                    variant = {"status": "unavailable", "text": None,
+                               "reason": "materialization_contract_failed",
+                               "issues": [item.to_dict() for item in error.issues]}
+                variants.append({"sample_id": sample_id, "pair_type": source.pair_type, **variant})
+            final_h3.update(variants[0], variants=variants)
         row = {
             "clip_uid": clip,
             "target": {

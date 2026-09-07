@@ -466,11 +466,11 @@ def _run_stems(
     return output, inventory, backend, active_canonicalizer
 
 
-def test_current_production_versions_and_shadow_root_are_unchanged(tmp_path: Path) -> None:
-    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v22"
-    assert MIMO25_POLICY_VERSION == "h3_mimo25_av_authority_contract_v16"
-    assert MIMO25_SCHEMA_VERSION == "r2v.h3.mimo25_av_annotation.13"
-    assert MIMO25_MATERIALIZER_VERSION == "h3_mimo25_materializer_v16"
+def test_current_shadow_contract_versions_and_root(tmp_path: Path) -> None:
+    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v23"
+    assert MIMO25_POLICY_VERSION == "h3_mimo25_av_authority_contract_v17"
+    assert MIMO25_SCHEMA_VERSION == "r2v.h3.mimo25_av_annotation.14"
+    assert MIMO25_MATERIALIZER_VERSION == "h3_mimo25_materializer_v17"
     assert stem_shadow_root(tmp_path) == tmp_path / SAM_AUDIO_SHADOW_ROOT_NAME
     assert stem_separation_root(tmp_path) == (
         tmp_path / SAM_AUDIO_SHADOW_ROOT_NAME / "separation"
@@ -1872,6 +1872,48 @@ def test_stem_reconcile_contract_keeps_original_av_above_stem_facts(tmp_path: Pa
     assert contract["authority_order"][0] == "original_target_full_av"
     assert "cannot override contradictory original AV" in " ".join(contract["rules"])
     assert contract["stem_facts"]["music"]["intervals"][0]["start_time"] == 0.1
+    assert contract["policy_version"] == "h3_mimo25_stem_reconcile_v2"
+    rules = " ".join(contract["rules"])
+    assert "Negative stem evidence is non-confirmatory" in rules
+    assert "Music stem absent does NOT establish" in rules
+    assert "Empty SFX items do NOT establish" in rules
+    assert "Separator labels are never semantic truth" in rules
+
+
+def test_negative_stem_facts_do_not_override_positive_original_av(tmp_path: Path) -> None:
+    from r2v_data_v2.h3.mimo25_backend import MimoAVAnnotationDraft
+    from tests.test_h3_mimo25_av_shadow import (
+        _materialize_sample,
+        _playback_inputs,
+        _record_fixture,
+    )
+
+    class NegativeFacts(_FactsBackend):
+        def extract(self, *, job, stem_type, view):
+            result = super().extract(job=job, stem_type=stem_type, view=view)
+            if stem_type != "music":
+                return result
+            facts = MusicStemFacts(clip_duration_seconds=job.clip_duration_seconds,
+                                   music_status="absent", intervals=[])
+            return StemFactsBackendResult(facts=facts, raw_response=facts.model_dump_json(),
+                                          diagnostics=result.diagnostics)
+
+    _, facts = _run_facts(tmp_path / "stems", facts_backend=NegativeFacts())
+    contract = stem_reconcile_auxiliary_contract(facts)
+    assert contract["stem_facts"]["music"]["music_status"] == "absent"
+    assert contract["stem_facts"]["sfx"]["events"] == []
+    assert contract["stem_facts"]["sfx"]["continuous_layers"] == []
+    target = tmp_path / "original"
+    target.mkdir()
+    sample, job, record = _playback_inputs(target)
+    values = record.annotation.model_dump(mode="json")
+    values["audio_observation"]["audio_semantics"].update(
+        non_diegetic_music_status="present", non_diegetic_music="A faint musical score continues.",
+    )
+    annotation = MimoAVAnnotationDraft.model_validate(values)
+    _, text, _ = _materialize_sample(sample, job, _record_fixture(target, annotation, job=job))
+    assert "overall_soundscape:\nA quiet room tone accompanies a short clink." in text
+    assert "non_diegetic_music:\nA faint musical score continues." in text
 
 
 class _Completions:
@@ -1967,6 +2009,7 @@ def test_stem_reconcile_cli_keeps_current_completion_budget() -> None:
         ]
     )
     assert arguments.max_completion_tokens == 32768
+    assert arguments.temperature == 0.0
 
 
 def test_speech_stem_fact_prompt_includes_authoritative_shadow_asr_without_output_field(

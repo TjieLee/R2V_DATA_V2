@@ -25,6 +25,10 @@ from r2v_data_v2.h3.semantic_augmentation import MediaURLResolver
 from r2v_data_v2.h3.specialized_audio_semantics import (
     SpecializedAudioSemanticsRecord,
 )
+from r2v_data_v2.h3.speech_presentation import (
+    SpeechPresentation,
+    semantic_speech_source,
+)
 from r2v_data_v2.structured_output import (
     ValidationIssue,
     parse_structured_json_issues,
@@ -1380,19 +1384,26 @@ def _render_locked_speech(
     contract: RecaptionReferenceContract,
     *,
     include_audio_reference: bool = True,
+    presentation: SpeechPresentation | None = None,
 ) -> str:
     source = _speech_exact_source(speech)
+    action = "says,"
+    if presentation is not None:
+        source, action = semantic_speech_source(
+            speaker_id=speech.speaker_id, subject_label=speech.entity_subject_label,
+            presentation=presentation,
+        )
     audio = _matching_voice_audio(speech, contract)
     if audio is None or not include_audio_reference:
-        return f"{source} says, {speech.locked_dialogue_block}"
+        return f"{source} {action} {speech.locked_dialogue_block}"
     characteristics = (
         "voice timbre"
         if audio.voice_characteristics is None
         else f"{audio.voice_characteristics} voice"
     )
     return (
-        f"{source}, using the {characteristics} referenced from {audio.audio_label}, "
-        f"says, {speech.locked_dialogue_block}"
+        f"{source.rstrip(',')}, using the {characteristics} referenced from {audio.audio_label}, "
+        f"{action} {speech.locked_dialogue_block}"
     )
 
 
