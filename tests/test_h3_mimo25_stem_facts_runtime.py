@@ -23,9 +23,9 @@ from r2v_data_v2.h3.mimo25_stem_shadow import (
 )
 
 
-def _job() -> SimpleNamespace:
+def _job(*, clip_duration_seconds: float = 4.38140625) -> SimpleNamespace:
     return SimpleNamespace(
-        clip_duration_seconds=4.38140625,
+        clip_duration_seconds=clip_duration_seconds,
         segments=[
             SimpleNamespace(
                 asr_status="transcribed",
@@ -181,6 +181,7 @@ def test_sfx_draft_drops_nonpositive_duplicates_and_asr_leakage() -> None:
 
 
 def test_sfx_draft_drops_music_cross_stem_leakage_and_speculative_notes() -> None:
+    job = _job(clip_duration_seconds=5.16175)
     draft = BoundedSFXStemFactsDraft(
         clip_duration_seconds=5.16175,
         continuous_layers=[
@@ -207,8 +208,9 @@ def test_sfx_draft_drops_music_cross_stem_leakage_and_speculative_notes() -> Non
         ),
     )
 
-    facts, counts = _canonicalize_sfx_draft(draft, _job())
+    facts, counts = _canonicalize_sfx_draft(draft, job)
 
+    assert facts.clip_duration_seconds == job.clip_duration_seconds
     assert [item.description for item in facts.continuous_layers] == [
         "steady room ambience and glass clinks"
     ]
