@@ -2,7 +2,7 @@
 
 This experimental path is additive and read-only with respect to the current JEA
 production stages. The current path is the named SAM shadow entry, publishing
-`mimo_reconcile_stemtext_final_av_v33/` after existing separation,
+`mimo_reconcile_stemtext_final_av_v34/` after existing separation,
 DiariZen and ASR. Historical `mimo25_av_reconcile_v5/`, `mimo25_h3_shadow_v5/`,
 stem-facts and older reconcile artifacts are not migrated or overwritten.
 See `H3_AUDIO_SERVER_RUNBOOK.md` Stage 4 for current run and QA commands.
@@ -47,8 +47,11 @@ visible entities and exact-window visibility/orientation/face/mouth/articulation
 observations. Stage B owns clip-local `gN`, vocal composition, acoustic
 resolution, segment delivery, secondary vocal activity and voice profiles. Stage C may map that exact Stage B group to one frozen `eN` or
 null and classify presentation. Supplied transcribed speech belongs in the
-caption, preserving dialogue and language. Generated vocal events need a valid
-`(Sx)` in the span after the previous `</d>` and before the current `<d>`.
+caption, preserving dialogue and language. The first dialogue block and speaker
+transitions need an explicit known `(Sx)`. Consecutive blocks may omit a repeated
+marker only when block count equals chronological speech-fact count and the
+adjacent speaker IDs match. Count mismatch is not an inventory failure; it
+simply disables continuity inference, so every block then needs a marker.
 This is format validation, not proof of speaker identity or segment alignment.
 Paired, non-nested dialogue tags with language labels and allowed reference/source
 labels are checked; text is never replaced, moved or split by code.
@@ -178,10 +181,10 @@ they do not create additional MiMo model jobs.
 
 Prompt, policy, annotation schema, and materializer versions are:
 
-- `h3_mimo25_unified_av_reconcile_v33`
+- `h3_mimo25_unified_av_reconcile_v34`
 - `h3_mimo25_av_authority_contract_v17`
 - `r2v.h3.mimo25_av_annotation.20`
-- `r2v.h3.mimo25_backend.35`
+- `r2v.h3.mimo25_backend.36`
 - `h3_mimo25_materializer_v23`
 - `h3_mimo25_reference_selection_v1`
 - `h3_mimo25_recovered_voice_quality_v1`

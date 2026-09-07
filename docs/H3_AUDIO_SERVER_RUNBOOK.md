@@ -43,7 +43,7 @@ sam_audio_stem_shadow_v1/runs/<shadow-run-id>/
   separation/
   diarization/
   asr/
-  mimo_reconcile_stemtext_final_av_v33/
+  mimo_reconcile_stemtext_final_av_v34/
   references/
 ```
 
@@ -294,15 +294,15 @@ embedded audio tokens remain warnings only. AV defaults still include
 `--thinking disabled --icl official_ref2va_v1`, `use_audio_in_video=true`,
 temperature 0.0 and 32768 completion tokens.
 
-Versions: prompt v33, annotation .20, backend .35, materializer v23, authority
+Versions: prompt v34, annotation .20, backend .36, materializer v23, authority
 v17, ICL v2; reconcile record .10, summary .12, policy v5. New output:
-`mimo_reconcile_stemtext_final_av_v33/`. Old
+`mimo_reconcile_stemtext_final_av_v34/`. Old
 `mimo_reconcile_av_stemtext_sound_partition/`, `mimo_v29_oneclip_smoke/`,
 and `mimo_v30_833_oneclip_smoke/` are preserved, not migrated.
 
-For a fresh v33 random10 run, keep `CASE_MANIFEST` as the existing ordered
+For a fresh v34 random10 run, keep `CASE_MANIFEST` as the existing ordered
 random10 manifest. This reuses SAM/DiariZen/ASR without reruns and leaves the
-previous `mimo_reconcile_stemtext_final_av/` output untouched:
+previous `mimo_reconcile_stemtext_final_av_v33/` and earlier outputs untouched:
 
 ```bash
 "$R2V_PYTHON" tools/run_h3_mimo25_stem_reconcile_shadow.py \
@@ -313,7 +313,7 @@ previous `mimo_reconcile_stemtext_final_av/` output untouched:
   --sam-route music_first --allow-unverified \
   --model mimo-v2.5 --base-url http://127.0.0.1:8092/v1 \
   --media-root /mnt/workspace --max-completion-tokens 32768 \
-  --output-root "$AUDIO_PRODUCTION_ROOT/sam_audio_stem_shadow_v1/runs/random10-v1/mimo_reconcile_stemtext_final_av_v33"
+  --output-root "$AUDIO_PRODUCTION_ROOT/sam_audio_stem_shadow_v1/runs/random10-v1/mimo_reconcile_stemtext_final_av_v34"
 ```
 
 No `--overwrite` is used. This patch has fake-client coverage only; readiness
@@ -321,8 +321,14 @@ and quality require a fresh server run and manual QA.
 
 V33 sends the validator's exact, stably sorted `allowed_h3_reference_labels`
 to final AV; absent Audio labels are forbidden. Sx denotes actual vocal sources,
-not Subject indexes: silent Subjects consume no speaker ID, and every separate
-dialogue block needs its speaker lead-in.
+not Subject indexes: silent Subjects consume no speaker ID.
+
+V34 allows a missing repeated marker only when dialogue-block count equals the
+chronological speech-fact count and the adjacent speaker IDs are identical.
+The first block and speaker transitions still require an explicit known Sx.
+Unequal counts do not fail by themselves: already marked merged dialogue stays
+valid, but unmarked blocks receive no inferred mapping. No pronoun parsing,
+transcript matching, text rewrite or model call is added.
 
 Only repeated Subject labels in definition/retention prose and internal
 segment/visual inventory mismatches with zero transcribed segments are relaxed.
@@ -359,7 +365,7 @@ find "$SHADOW_ROOT" -maxdepth 2 -type f | sort
 cat "$SHADOW_ROOT/separation/summary.json"
 cat "$SHADOW_ROOT/diarization/stem_provenance.json"
 cat "$SHADOW_ROOT/asr/summary.json"
-cat "$SHADOW_ROOT/mimo_reconcile_stemtext_final_av_v33/summary.json"
+cat "$SHADOW_ROOT/mimo_reconcile_stemtext_final_av_v34/summary.json"
 cat "$SHADOW_ROOT/references/references.jsonl"
 ```
 

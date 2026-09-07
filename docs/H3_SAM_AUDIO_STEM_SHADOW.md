@@ -13,7 +13,7 @@ All generated artifacts live under the legacy/default root:
   separation/
   diarization/
   asr/
-  mimo_reconcile_stemtext_final_av_v33/
+  mimo_reconcile_stemtext_final_av_v34/
   references/
 ```
 
@@ -24,7 +24,7 @@ or, for an explicit named pilot:
   separation/
   diarization/
   asr/
-  mimo_reconcile_stemtext_final_av_v33/
+  mimo_reconcile_stemtext_final_av_v34/
   references/
 ```
 
@@ -172,7 +172,7 @@ responses. Both auxiliary candidates/errors remain available regardless of AV
 success. Failed AV cannot authorize unsafe identity products. Multi-speaker
 exclusions remain. The materializer leaves dialogue intact and reads final
 sound fields directly from annotation; no timing is invented.
-Prompt v33, annotation .20, backend .35, materializer v23, reconcile .10/.12,
+Prompt v34, annotation .20, backend .36, materializer v23, reconcile .10/.12,
 and policy v5 distinguish the new contract. Authority v17 and official opening
 + Shot 1 ICL v2 are unchanged.
 
@@ -196,7 +196,7 @@ For an independent pilot, pass the same `--shadow-run-id random10-v1` to every
 stage. Its root is
 `$AUDIO_PRODUCTION_ROOT/sam_audio_stem_shadow_v1/runs/random10-v1/`, containing
 `separation/`, `diarization/`, `asr/`,
-`mimo_reconcile_stemtext_final_av_v33/`, and optional `references/`.
+`mimo_reconcile_stemtext_final_av_v34/`, and optional `references/`.
 Old `mimo_stem_facts/` and `mimo_reconcile/` outputs are left untouched.
 Run IDs must match `[A-Za-z0-9][A-Za-z0-9._-]{0,63}` exactly. Invalid IDs and
 symlink redirects are rejected, not normalized. Custom `--output-root` values

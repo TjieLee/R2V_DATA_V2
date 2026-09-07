@@ -46,7 +46,7 @@ def _subset_inventory(base, clip_ids):
 
 
 def test_final_av_prompt_preserves_positive_auxiliary_observations():
-    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v33"
+    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v34"
     assert "FACTUAL CONTRADICTION FILTER" in SYSTEM_PROMPT
     assert "NOT A REQUIREMENT TO RE-PROVE EVERY AUXILIARY DETAIL" in SYSTEM_PROMPT
     assert "Preserve positive observations by default" in SYSTEM_PROMPT
@@ -60,14 +60,18 @@ def test_final_av_prompt_preserves_positive_auxiliary_observations():
     assert "unless the original AV supports them" not in SYSTEM_PROMPT
 
 
-def test_v33_prompt_reference_vocal_and_positive_audio_contracts():
+def test_v34_prompt_reference_vocal_and_positive_audio_contracts():
     assert "Use H3 reference labels ONLY from allowed_h3_reference_labels" in SYSTEM_PROMPT
     assert "NEVER emit <Audio N>" in SYSTEM_PROMPT
     assert "They are NOT Subject numbers" in SYSTEM_PROMPT
     assert "A silent Subject must not consume a speaker ID" in SYSTEM_PROMPT
     assert "first actual vocal source -> S1" in SYSTEM_PROMPT
-    assert "before each <d> MUST contain the corresponding (Sx)" in SYSTEM_PROMPT
-    assert "Repeat the same (Sx) for separate dialogue blocks" in SYSTEM_PROMPT
+    assert "SAME continuing speaker may inherit" in SYSTEM_PROMPT
+    assert "When the speaker changes, the new vocal source MUST be explicitly introduced" in SYSTEM_PROMPT
+    assert "The first dialogue event from a vocal source must establish its (Sx)" in SYSTEM_PROMPT
+    assert "If speaker continuity is uncertain, repeat the explicit (Sx)" in SYSTEM_PROMPT
+    assert "before each <d> MUST contain" not in SYSTEM_PROMPT
+    assert "Repeat the same (Sx) for separate dialogue blocks" not in SYSTEM_PROMPT
     assert "If allowed_segment_ids is empty, output empty" in SYSTEM_PROMPT
     assert "description should not repeat <Subject N>" in SYSTEM_PROMPT
     assert "TRACK-LOCAL and MUST NOT be copied into final H3" in SYSTEM_PROMPT
@@ -413,7 +417,7 @@ def test_real_entry_without_facts_sends_two_audio_then_one_final_av(tmp_path, mo
     )
     for name in ("mimo_reconcile_av_rawstems_sound_partition", "mimo_reconcile_av_stemtext_sound_partition",
                  "mimo_v29_oneclip_smoke", "mimo_v30_833_oneclip_smoke",
-                 "mimo_reconcile_stemtext_final_av"):
+                 "mimo_reconcile_stemtext_final_av", "mimo_reconcile_stemtext_final_av_v33"):
         legacy_output = shadow / name
         legacy_output.mkdir()
         (legacy_output / "sentinel.json").write_text('{"preserved": true}')
@@ -761,8 +765,9 @@ def test_sdk_retries_disabled_even_for_injected_openai_client(tmp_path):
     owned.client.close()
 
 
-def test_multiple_same_speaker_segments_may_share_one_unchanged_dialogue(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize("split_blocks", [False, True])
+def test_multiple_same_speaker_segments_keep_merged_or_continuing_dialogue(
+    tmp_path, monkeypatch, split_blocks,
 ):
     _, shadow = _fixture(tmp_path, monkeypatch)
     backend, _, _, jobs = _backend(tmp_path, shadow, [])
@@ -793,6 +798,10 @@ def test_multiple_same_speaker_segments_may_share_one_unchanged_dialogue(
             {**template, "segment_id": s["segment_id"]} for s in values["segments"]
         ]
     caption = "(S1) <Subject 1> gestures. <d>[Chinese] Original model wording stays intact.</d>"
+    if split_blocks:
+        caption += " ".join(
+            f" <d>[Chinese] Model-owned continuation {i}.</d>" for i in range(2, 5)
+        )
     payload["h3_semantics"]["shot1_caption"] = caption
     from r2v_data_v2.h3.mimo25_av_reconcile import _job
 
@@ -803,6 +812,33 @@ def test_multiple_same_speaker_segments_may_share_one_unchanged_dialogue(
     assert result.model_call_count == 1
     assert result.annotation.h3_semantics.shot1_caption == caption
     assert len(result.annotation.segment_decisions) == 4
+
+
+@pytest.mark.parametrize("speakers,caption,missing,unknown", [
+    (["S1"], "A man says, <d>[Chinese] hello</d>", ["dialogue_1"], False),
+    (["S1", "S1"], "A man (S1) says, <d>[Chinese] a</d> He continues, <d>[Chinese] b</d>", [], False),
+    (["S1"] * 4, "<Subject 1> (S1) says, <d>[Chinese] a</d> He continues, <d>[Chinese] b</d> After a pause, he adds, <d>[Chinese] c</d> Finally, he concludes, <d>[Chinese] d</d>", [], False),
+    (["S1", "S1"], "(S1) <d>[Chinese] a</d> <d>[Chinese] b</d>", [], False),
+    (["S1", "S2"], "A man (S1) says, <d>[Chinese] a</d> A woman replies, <d>[Chinese] b</d>", ["dialogue_2"], False),
+    (["S1", "S2"], "(S1) <d>[Chinese] a</d> <d>[Chinese] b</d>", ["dialogue_2"], False),
+    (["S1", "S2"], "A man (S1) says, <d>[Chinese] a</d> A woman (S2) replies, <d>[Chinese] b</d>", [], False),
+    (["S1"] * 4, "A man (S1) says, <d>[Chinese] merged same-speaker dialogue</d>", [], False),
+    (["S1"], "A man (S1) says, <d>[Chinese] a</d> <d>[Chinese] b</d> <d>[Chinese] c</d>", ["dialogue_2", "dialogue_3"], False),
+    (["S1"], "A man (S2) says, <d>[Chinese] a</d>", ["dialogue_1"], True),
+    (["S1", "S1"], "<d>[Chinese] a</d> <d>[Chinese] b</d>", ["dialogue_1"], False),
+    (["S1"], "(S1) <d>[Chinese] a</d> (S1) <d>[Chinese] b</d>", [], False),
+])
+def test_direct_dialogue_authoritative_continuity(speakers, caption, missing, unknown):
+    unchanged, issues, warnings = protect_direct_dialogue(
+        caption,
+        [{"speaker_id": speaker} for speaker in speakers],
+        allowed_labels={"<Subject 1>"},
+    )
+    assert unchanged == caption and warnings == []
+    assert [(issue.code, issue.field) for issue in issues] == (
+        ([("direct_unknown_speaker", "shot1_caption")] if unknown else [])
+        + [("direct_dialogue_speaker_marker_missing", field) for field in missing]
+    )
 
 
 @pytest.mark.parametrize(

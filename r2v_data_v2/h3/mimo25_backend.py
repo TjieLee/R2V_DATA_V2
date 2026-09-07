@@ -28,10 +28,10 @@ from r2v_data_v2.structured_output import (
 
 MIMO25_MODEL = "mimo-v2.5"
 MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
-MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v33"
+MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v34"
 MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v17"
 MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.20"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.35"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.36"
 MIMO25_ICL_VERSION = "h3_official_ref2va_detailed_shot1_v2"
 MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v23"
 MIMO25_CANONICAL_ABSENT_SOUNDSCAPE = (
@@ -877,7 +877,7 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.35"] = MIMO25_BACKEND_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.36"] = MIMO25_BACKEND_VERSION
     backend: Literal[
         "xiaomi_openai_compatible", "sglang_openai_compatible"
     ]
@@ -895,7 +895,7 @@ class MimoBackendProvenance(SchemaModel):
     media_mode: Literal["base64", "http"]
     media_root: str
     media_base_url: str | None = None
-    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v33"] = (
+    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v34"] = (
         MIMO25_PROMPT_VERSION
     )
     policy_version: Literal["h3_mimo25_av_authority_contract_v17"] = (
@@ -1212,10 +1212,15 @@ PRIMARY H3 WRITING TASK
 - This pilot is exactly one shot. Write style_opening and shot1_caption; the pipeline inserts [Shot 1]. Never output [Shot N], shot timing, or placeholders.
 - style_opening: one concise sentence about global visual/cinematographic style, camera language, and lighting only. Do not summarize people, clothing, scene contents, Subjects, actions, chronology, dialogue, or audio.
 - shot1_caption: complete natural English audiovisual prose in playback order. Integrate visible setup, actions, dialogue, and reactions where they occur; do not append all dialogue at the end.
-- Number stable (Sx) by final groups' first transcribed appearance. Every generated vocal event needs a valid (Sx) in its natural lead-in before <d>. Referenced visible speakers use <Subject N> (Sx); unbound sources use a natural semantic source plus (Sx). No fixed says clause or immediate adjacency is required.
+
+SPEAKER MARKERS
+- Number stable (Sx) by final groups' first transcribed appearance. Referenced visible speakers use <Subject N> (Sx); unbound sources use a natural semantic source plus (Sx). No fixed says clause or immediate adjacency is required.
 - (Sx) IDs identify actual vocal sources/events. They are NOT Subject numbers. Do NOT attach (Sx) merely because a person is visible, introduced, listening or present. A silent Subject must not consume a speaker ID. Number by first ACTUAL vocal appearance: first actual vocal source -> S1; second distinct vocal source -> S2.
 - Example: <Subject 1> is visible but silent; <Subject 2> speaks first. Correct: "<Subject 1> watches quietly. <Subject 2> (S1) says, <d>...</d>". Wrong: "<Subject 1> (S1) ... <Subject 2> (S2) says ...".
-- The span after the previous </d> (or caption start) and before each <d> MUST contain the corresponding (Sx). Repeat the same (Sx) for separate dialogue blocks from the same speaker, e.g. "A voice (S1) says, <d>...</d> After a pause, the same voice (S1) adds, <d>...</d>". No fixed verb such as "says" is required.
+- The first dialogue event from a vocal source must establish its (Sx). When the speaker changes, the new vocal source MUST be explicitly introduced with its own valid (Sx) before that <d>.
+- Consecutive dialogue blocks from the SAME continuing speaker may inherit the already established (Sx); mechanical repetition of the same marker is not required. If speaker continuity is uncertain, repeat the explicit (Sx).
+- Allowed same-speaker continuity: "A man (S1) says, <d>[English] First.</d> He continues, <d>[English] Second.</d>".
+- Required transition: "A man (S1) says, <d>[English] First.</d> A woman (S2) replies, <d>[English] Second.</d>".
 - overall_soundscape: Write only non-musical, non-dialogue audible ambience/SFX. Preserve positive auxiliary observations and useful acoustic detail unless original AV provides a concrete factual contradiction; correct a mistaken source without deleting the sound. Exclude spoken dialogue, singing, and all music. Use "N/A" only when no eligible content remains, not merely because a positive candidate is weak or masked.
 - non_diegetic_music: Write audience-facing background music/score, preserving clearly reported auxiliary music and harmless acoustic wording by default. Use original AV to correct factual errors and determine placement, not to re-prove every detail. If music is diegetic/in-scene, describe it naturally at its observed chronological position in shot1_caption instead and output "N/A" here. Discard music only for concrete factual falsehood or clear leakage/artifact, not merely weak original-mix audibility.
 - The official ICL is a detailed-description prose-style subset, not a response-schema demonstration. Follow the actual supplied schema and official six-section Ref2VA semantics."""
@@ -1417,9 +1422,16 @@ def protect_direct_dialogue(
             )
         )
     previous_end = 0
+    speech_sequence = [item["speaker_id"] for item in speech]
     for index, block in enumerate(blocks):
         lead_in = text[previous_end : block.start()]
-        if not any(f"({speaker})" in lead_in for speaker in known):
+        # Equal counts permit continuity only; they are never an inventory gate.
+        same_speaker_continuation = (
+            len(blocks) == len(speech_sequence)
+            and index > 0
+            and speech_sequence[index] == speech_sequence[index - 1]
+        )
+        if not any(f"({speaker})" in lead_in for speaker in known) and not same_speaker_continuation:
             issues.append(
                 ValidationIssue(
                     "direct_dialogue_speaker_marker_missing",
