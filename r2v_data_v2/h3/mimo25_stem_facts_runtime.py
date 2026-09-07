@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 
 from pydantic import Field
 
@@ -19,9 +20,14 @@ from r2v_data_v2.h3.mimo25_stem_shadow import (
 )
 from r2v_data_v2.h3.schemas import SchemaModel
 
-SFX_STRUCTURED_OUTPUT_POLICY = "stem_fact_sfx_bounded_normalization_v1"
+SFX_STRUCTURED_OUTPUT_POLICY = "stem_fact_sfx_bounded_normalization_v2"
 SFX_MAX_CONTINUOUS_LAYERS = 8
 SFX_MAX_EVENTS = 16
+_SFX_MUSIC_SEMANTICS = re.compile(
+    r"\b(?:bgm|music|song|soundtrack|score|melody|instrumental)\b"
+    r"|背景音乐|音乐|歌曲|配乐",
+    flags=re.IGNORECASE,
+)
 
 
 class BoundedSFXContinuousLayerDraft(SchemaModel):
@@ -74,6 +80,10 @@ def _matches_authoritative_asr(description: str, job: StemFactJob) -> bool:
     return False
 
 
+def _contains_music_semantics(description: str) -> bool:
+    return _SFX_MUSIC_SEMANTICS.search(description) is not None
+
+
 def _item_key(
     item: BoundedSFXContinuousLayerDraft | BoundedSFXEventDraft,
 ) -> tuple[object, ...]:
@@ -92,11 +102,18 @@ def _canonicalize_sfx_draft(
     nonpositive_count = 0
     duplicate_count = 0
     asr_leakage_count = 0
+    music_leakage_count = 0
+    model_note_discarded_count = int(bool(facts.residual_artifact_notes))
 
     def clean(
         values: list[BoundedSFXContinuousLayerDraft | BoundedSFXEventDraft],
     ) -> list[BoundedSFXContinuousLayerDraft | BoundedSFXEventDraft]:
-        nonlocal nonpositive_count, duplicate_count, asr_leakage_count
+        nonlocal (
+            nonpositive_count,
+            duplicate_count,
+            asr_leakage_count,
+            music_leakage_count,
+        )
         output: list[BoundedSFXContinuousLayerDraft | BoundedSFXEventDraft] = []
         seen: set[tuple[object, ...]] = set()
         for item in values:
@@ -111,25 +128,14 @@ def _canonicalize_sfx_draft(
             if _matches_authoritative_asr(str(item.description), job):
                 asr_leakage_count += 1
                 continue
+            if _contains_music_semantics(str(item.description)):
+                music_leakage_count += 1
+                continue
             output.append(item)
         return output
 
     kept_layers = clean(list(facts.continuous_layers))
     kept_events = clean(list(facts.events))
-    notes: list[str] = []
-    if facts.residual_artifact_notes:
-        notes.append(facts.residual_artifact_notes.rstrip())
-    if nonpositive_count:
-        notes.append(
-            f"Suppressed {nonpositive_count} non-positive-duration residual item(s)."
-        )
-    if duplicate_count:
-        notes.append(f"Suppressed {duplicate_count} duplicate residual item(s).")
-    if asr_leakage_count:
-        notes.append(
-            f"Suppressed {asr_leakage_count} residual item(s) whose lexical content "
-            "matched authoritative ASR; treated as separator speech leakage."
-        )
     return (
         SFXStemFacts(
             clip_duration_seconds=job.clip_duration_seconds,
@@ -153,12 +159,14 @@ def _canonicalize_sfx_draft(
                 for item in kept_events
                 if isinstance(item, BoundedSFXEventDraft)
             ],
-            residual_artifact_notes=" ".join(notes) or None,
+            residual_artifact_notes=None,
         ),
         {
             "nonpositive": nonpositive_count,
             "duplicate": duplicate_count,
             "asr_leakage": asr_leakage_count,
+            "music_leakage": music_leakage_count,
+            "model_note_discarded": model_note_discarded_count,
         },
     )
 
@@ -167,7 +175,7 @@ def canonicalize_stem_facts(
     facts: SpeechStemFacts | MusicStemFacts | SFXStemFacts,
     job: StemFactJob,
 ) -> tuple[SpeechStemFacts | MusicStemFacts | SFXStemFacts, int]:
-    """Apply code-owned timeline authority and remove obvious ASR leakage from SFX."""
+    """Apply code-owned timeline authority and remove cross-stem leakage from SFX."""
 
     if isinstance(facts, SpeechStemFacts):
         values = facts.model_dump(mode="python")
@@ -183,9 +191,13 @@ def canonicalize_stem_facts(
         item
         for item in facts.continuous_layers
         if not _matches_authoritative_asr(item.description, job)
+        and not _contains_music_semantics(item.description)
     ]
     kept_events = [
-        item for item in facts.events if not _matches_authoritative_asr(item.description, job)
+        item
+        for item in facts.events
+        if not _matches_authoritative_asr(item.description, job)
+        and not _contains_music_semantics(item.description)
     ]
     suppressed_count = (
         len(facts.continuous_layers)
@@ -193,23 +205,12 @@ def canonicalize_stem_facts(
         + len(facts.events)
         - len(kept_events)
     )
-    residual_note = facts.residual_artifact_notes
-    if suppressed_count:
-        suppression_note = (
-            f"Suppressed {suppressed_count} residual item(s) whose lexical content "
-            "matched authoritative ASR; treated as separator speech leakage."
-        )
-        residual_note = (
-            suppression_note
-            if not residual_note
-            else f"{residual_note.rstrip()} {suppression_note}"
-        )
     values = facts.model_dump(mode="python")
     values.update(
         clip_duration_seconds=job.clip_duration_seconds,
         continuous_layers=[item.model_dump(mode="python") for item in kept_layers],
         events=[item.model_dump(mode="python") for item in kept_events],
-        residual_artifact_notes=residual_note,
+        residual_artifact_notes=None,
     )
     return SFXStemFacts.model_validate(values), suppressed_count
 
@@ -237,6 +238,21 @@ class AuthoritativeOpenAIStemFactsBackend(OpenAIStemFactsBackend):
             return BoundedSFXStemFactsDraft
         return OpenAIStemFactsBackend._schema(stem_type)
 
+    @staticmethod
+    def _prompt(job: StemFactJob, stem_type: StemType) -> str:
+        prompt = OpenAIStemFactsBackend._prompt(job, stem_type)
+        if stem_type != "sfx":
+            return prompt
+        return prompt + (
+            " Report only non-musical, non-lexical sounds directly audible in this "
+            "SFX stem audio. Never infer sounds from the visual setting, ASR text, "
+            "the presence or name of another stem, or general scene expectations. "
+            "Do not report music, songs, soundtrack, score, BGM, or lexical speech "
+            "as SFX layers/events. If no qualifying SFX is directly audible, return "
+            "empty continuous_layers and events. residual_artifact_notes may describe "
+            "separator artifacts only and must not contain scene-based sound guesses."
+        )
+
     def extract(
         self,
         *,
@@ -256,6 +272,10 @@ class AuthoritativeOpenAIStemFactsBackend(OpenAIStemFactsBackend):
                 {
                     "sfx_nonpositive_items_suppressed_count": counts["nonpositive"],
                     "sfx_duplicate_items_suppressed_count": counts["duplicate"],
+                    "sfx_music_leakage_suppressed_count": counts["music_leakage"],
+                    "sfx_model_residual_note_discarded_count": counts[
+                        "model_note_discarded"
+                    ],
                 }
             )
         else:
@@ -264,6 +284,8 @@ class AuthoritativeOpenAIStemFactsBackend(OpenAIStemFactsBackend):
                 {
                     "sfx_nonpositive_items_suppressed_count": 0,
                     "sfx_duplicate_items_suppressed_count": 0,
+                    "sfx_music_leakage_suppressed_count": 0,
+                    "sfx_model_residual_note_discarded_count": 0,
                 }
             )
 
