@@ -74,12 +74,14 @@ def _matches_authoritative_asr(description: str, job: StemFactJob) -> bool:
     return False
 
 
-def _item_key(item: object) -> tuple[object, ...]:
+def _item_key(
+    item: BoundedSFXContinuousLayerDraft | BoundedSFXEventDraft,
+) -> tuple[object, ...]:
     return (
-        getattr(item, "start_time"),
-        getattr(item, "end_time"),
-        " ".join(str(getattr(item, "description")).split()).casefold(),
-        getattr(item, "category", None),
+        item.start_time,
+        item.end_time,
+        " ".join(str(item.description).split()).casefold(),
+        item.category if isinstance(item, BoundedSFXEventDraft) else None,
     )
 
 
@@ -91,12 +93,14 @@ def _canonicalize_sfx_draft(
     duplicate_count = 0
     asr_leakage_count = 0
 
-    def clean(values: list[object]) -> list[object]:
+    def clean(
+        values: list[BoundedSFXContinuousLayerDraft | BoundedSFXEventDraft],
+    ) -> list[BoundedSFXContinuousLayerDraft | BoundedSFXEventDraft]:
         nonlocal nonpositive_count, duplicate_count, asr_leakage_count
-        output: list[object] = []
+        output: list[BoundedSFXContinuousLayerDraft | BoundedSFXEventDraft] = []
         seen: set[tuple[object, ...]] = set()
         for item in values:
-            if getattr(item, "end_time") <= getattr(item, "start_time"):
+            if item.end_time <= item.start_time:
                 nonpositive_count += 1
                 continue
             key = _item_key(item)
@@ -104,7 +108,7 @@ def _canonicalize_sfx_draft(
                 duplicate_count += 1
                 continue
             seen.add(key)
-            if _matches_authoritative_asr(str(getattr(item, "description")), job):
+            if _matches_authoritative_asr(str(item.description), job):
                 asr_leakage_count += 1
                 continue
             output.append(item)
@@ -147,6 +151,7 @@ def _canonicalize_sfx_draft(
                     "category": item.category,
                 }
                 for item in kept_events
+                if isinstance(item, BoundedSFXEventDraft)
             ],
             residual_artifact_notes=" ".join(notes) or None,
         ),
@@ -278,10 +283,10 @@ class AuthoritativeOpenAIStemFactsBackend(OpenAIStemFactsBackend):
 
 
 __all__ = [
-    "AuthoritativeOpenAIStemFactsBackend",
-    "BoundedSFXStemFactsDraft",
     "SFX_MAX_CONTINUOUS_LAYERS",
     "SFX_MAX_EVENTS",
     "SFX_STRUCTURED_OUTPUT_POLICY",
+    "AuthoritativeOpenAIStemFactsBackend",
+    "BoundedSFXStemFactsDraft",
     "canonicalize_stem_facts",
 ]
