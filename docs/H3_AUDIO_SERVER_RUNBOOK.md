@@ -264,6 +264,29 @@ PYTHONPATH="$SAM_AUDIO_RUNTIME_PYTHONPATH" \
   --allow-unverified
 ```
 
+Stage 5 offers experimental A/B controls `--thinking disabled|enabled` and
+`--icl none|v1`. Defaults remain `disabled / none`, temperature 0.0, and one
+full-AV recheck. For a separately named experimental run, append
+`--thinking enabled --icl v1` to the command above. Both choices appear in the
+CLI result and backend provenance; all four combinations have distinct
+configuration fingerprints. These controls are not production-approved and
+have no demonstrated quality benefit without a server A/B review.
+
+For SGLang, enabled mode omits `reasoning_effort="none"` and sets both
+`chat_template_kwargs.thinking` and `enable_thinking` to true. Embedded
+target-video audio and strict JSON schema remain unchanged. ICL v1
+(`h3_mimo25_av_reconcile_icl_v1`) inserts exactly one synthetic user/assistant
+pair between the unchanged system message and the real user request.
+Only final assistant content is parsed; separate reasoning text is never stored.
+Reasoning token usage remains diagnostic, with the nonzero-under-disabled
+warning limited to disabled mode.
+
+Backend provenance is now .26; Stage-5 reconcile records are .3. Failed records
+retain `failure_issues` (code/field/message) and `raw_responses` (final assistant
+content only), covered by the record fingerprint. Ready records leave both
+lists empty. The summary remains .5; prompt v23, annotation .14, authority policy
+v17, and materializer v17 are unchanged.
+
 ### 6. Stem-native primary voice references
 
 ```bash

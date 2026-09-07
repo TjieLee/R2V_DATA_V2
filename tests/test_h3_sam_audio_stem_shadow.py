@@ -50,11 +50,13 @@ from r2v_data_v2.h3.mimo25_backend import (
     MimoBackendConfig,
     MimoBackendFailure,
     MimoMediaResolver,
+    _synthetic_icl_messages,
 )
 from r2v_data_v2.h3.mimo25_stem_shadow import (
     MIMO25_STEM_FACT_PROMPT_VERSION,
     FFmpegStemViewBackend,
     MimoStemFactsRecord,
+    MimoStemReconcileRecord,
     MusicInterval,
     MusicStemFacts,
     OpenAIStemFactsBackend,
@@ -110,6 +112,7 @@ from r2v_data_v2.h3.sam_audio_stem_shadow import (
     validate_stem_asr_lineage,
     validate_stem_diarization_lineage,
 )
+from r2v_data_v2.structured_output import ValidationIssue
 from tools.run_h3_mimo25_stem_reconcile_shadow import (
     _parser as _stem_reconcile_parser,
 )
@@ -2010,6 +2013,8 @@ def test_stem_reconcile_cli_keeps_current_completion_budget() -> None:
     )
     assert arguments.max_completion_tokens == 32768
     assert arguments.temperature == 0.0
+    assert arguments.thinking == "disabled"
+    assert arguments.icl == "none"
 
 
 def test_speech_stem_fact_prompt_includes_authoritative_shadow_asr_without_output_field(
@@ -2194,6 +2199,123 @@ class _FailingReconcileBackend:
             code="synthetic_failure",
             reason="synthetic reconcile failure",
         )
+
+
+@pytest.mark.parametrize("ready", [False, True])
+def test_stem_reconcile_failure_audit_roundtrip_and_fingerprint(
+    tmp_path: Path, ready: bool,
+) -> None:
+    from r2v_data_v2.h3.mimo25_backend import MimoAVAnnotationDraft
+
+    stem_root, facts = _run_facts(tmp_path)
+    jobs = build_stem_reconcile_jobs(
+        base_inventory=_mimo_inventory_fixture(tmp_path / "base"),
+        stem_diarization_root=stem_root.parent / "diarization",
+        stem_asr_root=stem_root.parent / "asr",
+    )
+    raw = ('{"invalid": "primary"}', '{"invalid": "recheck"}')
+    issues = tuple(
+        ValidationIssue(
+            code="schema_validation",
+            field=f"visual_observation.shots.0.visual_blocks.{index}.end_time",
+            message="Input should be greater than 0",
+        )
+        for index in range(2)
+    )
+
+    class Backend(_FailingReconcileBackend):
+        def reconcile(self, job: MimoClipJob, **_: object) -> object:
+            self.calls.append(job.clip_uid)
+            if ready:
+                return SimpleNamespace(
+                    annotation=MimoAVAnnotationDraft.model_validate_json(
+                        _synthetic_icl_messages()[1]["content"]
+                    ),
+                    diagnostics=(), model_call_count=1,
+                )
+            raise MimoBackendFailure(
+                code="structured_output_failed",
+                reason="Both final contents failed validation",
+                raw_responses=raw, issues=issues, model_call_count=2,
+            )
+
+    backend = Backend(tmp_path)
+    output = stem_root.parent / "mimo_reconcile"
+    summary = run_mimo25_stem_reconcile_shadow(
+        jobs=jobs, stem_facts=[facts], backend=backend,
+        output_root=output, route="music_first", allow_unverified=True,
+    )
+    serialized = (output / "records.jsonl").read_text()
+    record = MimoStemReconcileRecord.model_validate_json(serialized)
+    assert backend.calls == ["clip-1"]
+    assert record.schema_version == "r2v.h3.mimo25_stem_reconcile.3"
+    assert summary.schema_version == "r2v.h3.mimo25_stem_reconcile_summary.5"
+    assert summary.model_call_count == (1 if ready else 2)
+    assert summary.ready_count == int(ready)
+    assert summary.failed_count == int(not ready)
+    assert record.raw_responses == ([] if ready else list(raw))
+    assert record.failure_issues == ([] if ready else list(issues))
+    assert MimoStemReconcileRecord.model_validate_json(
+        record.model_dump_json()
+    ) == record
+    if ready:
+        assert record.failure_code is record.failure_reason is None
+        for field, value in (("failure_issues", [issues[0].to_dict()]),
+                             ("raw_responses", [raw[0]])):
+            with pytest.raises(ValueError, match="ready stem reconcile"):
+                MimoStemReconcileRecord.model_validate(
+                    {**record.model_dump(mode="json"), field: value}
+                )
+    else:
+        for field in ("raw_responses", "failure_issues"):
+            changed = record.model_dump(mode="json")
+            changed[field] = []
+            with pytest.raises(ValueError, match="fingerprint is invalid"):
+                MimoStemReconcileRecord.model_validate(changed)
+
+
+def test_stem_reconcile_cli_forwards_experimental_controls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture,
+) -> None:
+    from tools import run_h3_mimo25_stem_reconcile_shadow as cli
+
+    _run_facts(tmp_path)
+    (tmp_path / "case.json").write_text(
+        MimoCaseManifest(clip_uids=["clip-1"]).model_dump_json(), encoding="utf-8",
+    )
+    base = _mimo_inventory_fixture(tmp_path / "base")
+    monkeypatch.setattr(cli, "build_mimo25_inventory", lambda **kwargs: base)
+    captured = []
+
+    def backend_factory(config: MimoBackendConfig, **_: object) -> object:
+        captured.append(config)
+        backend = _FailingReconcileBackend(tmp_path)
+        backend.provenance = config.provenance()
+        return backend
+
+    monkeypatch.setattr(cli, "StemAwareOpenAIMimo25Backend", backend_factory)
+    monkeypatch.setenv("MIMO_API_KEY", "synthetic-test")
+    args = [
+        "--audio-production-root", str(tmp_path),
+        "--visual-production-root", str(tmp_path / "visual"),
+        "--visual-runs-root", str(tmp_path / "runs"),
+        "--case-manifest", str(tmp_path / "case.json"),
+        "--media-root", str(tmp_path),
+        "--thinking", "enabled", "--icl", "v1", "--allow-unverified",
+    ]
+    dry = cli.main([*args, "--dry-run"])
+    assert captured == []
+    assert dry["thinking"] == "enabled"
+    assert dry["icl"] == "v1"
+    result = cli.main(args)
+    assert len(captured) == 1
+    assert captured[0].thinking == "enabled"
+    assert captured[0].icl == "v1"
+    assert captured[0].temperature == 0.0
+    assert result["thinking"] == "enabled"
+    assert result["icl"] == "v1"
+    assert result["temperature"] == 0.0
+    assert json.loads(capsys.readouterr().out.splitlines()[-1]) == result
 
 
 def test_stem_reconcile_jobs_keep_original_av_and_use_shadow_speech_timeline(

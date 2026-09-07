@@ -54,6 +54,7 @@ from r2v_data_v2.h3.mimo25_av_reconcile import (
 from r2v_data_v2.h3.mimo25_backend import (
     _CONSERVATIVE_VISIBLE_SPEAKER_ISSUES,
     MIMO25_CANONICAL_ABSENT_SOUNDSCAPE,
+    MIMO25_ICL_VERSION,
     MIMO25_MODEL,
     MIMO25_POLICY_VERSION,
     MIMO25_PROMPT_VERSION,
@@ -74,6 +75,7 @@ from r2v_data_v2.h3.mimo25_backend import (
     _canonicalize_same_visible_entity_speaker_groups,
     _contains_positive_soundscape_contamination,
     _normalize_speaker_voice_profiles,
+    _synthetic_icl_messages,
     validate_annotation,
 )
 from r2v_data_v2.h3.mimo25_h3_materializer import (
@@ -638,6 +640,176 @@ def test_v17_absence_is_not_synthesized_and_verified_silence_is_na(tmp_path):
     assert "non_diegetic_music:\nN/A" in text
 
 
+def test_experimental_icl_is_synthetic_and_semantically_valid():
+    user, assistant = _synthetic_icl_messages()
+    inputs = json.loads(user["content"].split("\n", 1)[1])
+    annotation = MimoAVAnnotationDraft.model_validate_json(assistant["content"])
+    assert inputs["example_kind"] == "fully_synthetic_text_described_av"
+    assert inputs["segments"][0]["current_entity_id"] is None
+    assert inputs["segments"][0]["lr_asd_support"] == 0
+    assert inputs["auxiliary_stem_evidence"]["sfx_events"] == []
+    assert annotation.audio_semantics.overall_soundscape_status == "present"
+    assert annotation.segment_decisions[0].entity_id == "e7"
+    assert annotation.segment_decisions[0].binding_status == "visible_entity"
+    assert annotation.segment_decisions[0].speech_presentation == "onscreen_spoken"
+    assert all(block.end_time > block.start_time >= 0
+               for shot in annotation.visual_observation.shots for block in shot.visual_blocks)
+    assert [part.type for part in annotation.h3_projection.shots[0].timeline_parts] == [
+        "visual", "speech", "visual", "audio_event", "visual",
+    ]
+    assert not _validate(
+        annotation, segment_ids=inputs["allowed_segment_ids"],
+        transcribed_segment_ids=inputs["transcribed_segment_ids"],
+        segment_intervals={"segment_0001": (1.0, 2.0)},
+        authoritative_transcripts=["The latch is secure."],
+        allowed_entity_ids={"e7"}, target_duration_seconds=4.5,
+        reference_subjects=[RecaptionSubjectContract(
+            subject_index=1, subject_label="<Subject 1>", kind="entity", entity_id="e7",
+            source_picture_labels=["<Picture 1>"],
+        )],
+    )
+    assert "The latch is secure." not in assistant["content"]
+    assert MIMO25_CANONICAL_ABSENT_SOUNDSCAPE not in assistant["content"]
+    assert _synthetic_icl_messages() == [user, assistant]
+
+
+@pytest.mark.parametrize("thinking", ["disabled", "enabled"])
+@pytest.mark.parametrize("icl", ["none", "v1"])
+def test_experimental_thinking_icl_payload_and_reasoning_isolation(tmp_path, monkeypatch, thinking, icl):
+    raw = _annotation().model_dump_json()
+    backend, completions = _backend(
+        tmp_path, [(raw, 8, "stop", 13)], transport="sglang", thinking=thinking, icl=icl,
+    )
+    create = completions.create
+
+    def with_reasoning(**kwargs):
+        completion = create(**kwargs)
+        completion.choices[0].message.reasoning_content = "PRIVATE_THINKING_NOT_ANNOTATION"
+        return completion
+
+    monkeypatch.setattr(completions, "create", with_reasoning)
+    job = _job_fixture(tmp_path)
+    result = backend.reconcile(
+        job, segment_ids=["segment_1"], transcribed_segment_ids=["segment_1"],
+        allowed_entity_ids={"e1"}, allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+    )
+    assert result.annotation == _annotation()
+    assert result.model_call_count == len(completions.requests) == 1
+    assert result.recheck_count == 0
+    request = completions.requests[0]
+    if thinking == "disabled":
+        assert request["reasoning_effort"] == "none"
+    else:
+        assert "reasoning_effort" not in request
+    assert request["extra_body"] == {
+        "use_audio_in_video": True,
+        "chat_template_kwargs": {"thinking": thinking == "enabled", "enable_thinking": thinking == "enabled"},
+    }
+    assert request["response_format"] == {
+        "type": "json_schema", "json_schema": {
+            "name": "MimoAVAnnotationDraft", "schema": MimoAVAnnotationDraft.model_json_schema(), "strict": True,
+        },
+    }
+    assert [message["role"] for message in request["messages"]] == (
+        ["system", "user"] if icl == "none" else ["system", "user", "assistant", "user"]
+    )
+    assert request["messages"][0] == {"role": "system", "content": SYSTEM_PROMPT}
+    assert request["messages"][-1]["content"] == [
+        *backend._media_content(job, include_audio_fallback=False),
+        {"type": "text", "text": backend._prompt(job)},
+    ]
+    if icl == "v1":
+        assert request["messages"][1:3] == _synthetic_icl_messages()
+    assert result.raw_responses == (raw,)
+    assert result.diagnostics[0].usage.reasoning_tokens == 13
+    assert ("reasoning_tokens_nonzero_under_disabled_thinking" in result.diagnostics[0].warnings) == (
+        thinking == "disabled"
+    )
+    assert "PRIVATE_THINKING" not in json.dumps([item.model_dump() for item in result.diagnostics])
+    assert backend.provenance.full_av_recheck_limit == 1
+
+
+def test_experimental_configuration_fingerprints_distinguish_matrix(tmp_path):
+    fingerprints = set()
+    for thinking in ("disabled", "enabled"):
+        for icl in ("none", "v1"):
+            backend, _ = _backend(tmp_path, [], transport="sglang", thinking=thinking, icl=icl)
+            provenance = backend.provenance
+            assert provenance.thinking.type == thinking
+            assert provenance.icl_version == (MIMO25_ICL_VERSION if icl == "v1" else None)
+            fingerprints.add(provenance.configuration_fingerprint)
+    assert len(fingerprints) == 4
+    assert MIMO25_ICL_VERSION == "h3_mimo25_av_reconcile_icl_v1"
+
+
+def test_experimental_enabled_recheck_keeps_example_and_call_limit(tmp_path):
+    backend, completions = _backend(
+        tmp_path, [("not JSON", 8), (_annotation().model_dump_json(), 8)],
+        transport="sglang", thinking="enabled", icl="v1",
+    )
+    result = backend.reconcile(
+        _job_fixture(tmp_path), segment_ids=["segment_1"], transcribed_segment_ids=["segment_1"],
+        allowed_entity_ids={"e1"}, allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+    )
+    assert result.model_call_count == 2 and result.recheck_count == 1
+    for request in completions.requests:
+        assert request["messages"][1:3] == _synthetic_icl_messages()
+        assert "reasoning_effort" not in request
+
+
+def test_experimental_enabled_fallback_allows_missing_reasoning_accounting(tmp_path):
+    raw = _annotation().model_dump_json()
+    backend, completions = _backend(
+        tmp_path, [(raw, 0, "stop", None), (raw, 4, "stop", None)],
+        transport="sglang", thinking="enabled", icl="v1",
+    )
+    result = backend.reconcile(
+        _job_fixture(tmp_path), segment_ids=["segment_1"], transcribed_segment_ids=["segment_1"],
+        allowed_entity_ids={"e1"}, allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+    )
+    assert result.model_call_count == 2
+    assert result.recheck_count == 0
+    for diagnostic in result.diagnostics:
+        assert diagnostic.usage.reasoning_tokens is None
+        assert "reasoning_tokens_nonzero_under_disabled_thinking" not in diagnostic.warnings
+    for request in completions.requests:
+        assert request["messages"][1:3] == _synthetic_icl_messages()
+        assert "reasoning_effort" not in request
+        assert request["extra_body"]["use_audio_in_video"] is True
+    content = completions.requests[-1]["messages"][-1]["content"]
+    assert any(item["type"] == "video_url" for item in content)
+    assert sum(item["type"] == "audio_url" for item in content) == 1
+    assert not any(item["type"] == "input_audio" for item in content)
+
+
+def test_experimental_failed_final_content_never_retains_separate_reasoning(tmp_path, monkeypatch):
+    backend, completions = _backend(
+        tmp_path, [("bad primary", 8), ("bad recheck", 8)],
+        transport="sglang", thinking="enabled", icl="v1",
+    )
+    create = completions.create
+
+    def with_reasoning(**kwargs):
+        completion = create(**kwargs)
+        completion.choices[0].message.reasoning_content = "PRIVATE_THINKING_NOT_ANNOTATION"
+        return completion
+
+    monkeypatch.setattr(completions, "create", with_reasoning)
+    with pytest.raises(MimoBackendFailure) as raised:
+        backend.reconcile(
+            _job_fixture(tmp_path), segment_ids=["segment_1"], transcribed_segment_ids=["segment_1"],
+            allowed_entity_ids={"e1"}, allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+        )
+    failure = raised.value
+    assert failure.model_call_count == len(completions.requests) == 2
+    assert failure.raw_responses == ("bad primary", "bad recheck")
+    assert "PRIVATE_THINKING" not in json.dumps({
+        "issues": [item.to_dict() for item in failure.issues],
+        "diagnostics": [item.model_dump(mode="json") for item in failure.diagnostics],
+        "reason": failure.reason,
+    })
+
+
 def _job_fixture(tmp_path: Path) -> MimoClipJob:
     video = tmp_path / "target.mp4"
     audio = tmp_path / "full.flac"
@@ -963,6 +1135,8 @@ def _backend(
     ],
     *,
     transport: Literal["xiaomi", "sglang"] = "xiaomi",
+    thinking: Literal["disabled", "enabled"] = "disabled",
+    icl: Literal["none", "v1"] = "none",
 ) -> tuple[OpenAIMimo25Backend, _Completions]:
     completions = _Completions(responses)
     client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
@@ -972,6 +1146,8 @@ def _backend(
             media_resolver=resolver,
             api_key="secret",
             transport=transport,
+            thinking=thinking,
+            icl=icl,
         ),
         client=client,
         sleep=lambda _: None,
@@ -1185,12 +1361,14 @@ def test_mimo_v23_prompt_preserves_staged_visual_audio_authority_contract() -> N
         assert phrase in SYSTEM_PROMPT
 
 
-def test_backend_v25_records_time_aware_materialization_contract(
+def test_backend_v26_records_experiment_provenance(
     tmp_path: Path,
 ) -> None:
     backend, _ = _backend(tmp_path, [])
 
-    assert backend.provenance.schema_version == "r2v.h3.mimo25_backend.25"
+    assert backend.provenance.schema_version == "r2v.h3.mimo25_backend.26"
+    assert backend.provenance.thinking.type == "disabled"
+    assert backend.provenance.icl_version is None
 
 
 def test_primary_prompt_includes_exact_subject_picture_contract(

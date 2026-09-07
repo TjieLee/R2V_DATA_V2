@@ -31,7 +31,8 @@ MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
 MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v23"
 MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v17"
 MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.14"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.25"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.26"
+MIMO25_ICL_VERSION = "h3_mimo25_av_reconcile_icl_v1"
 MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v17"
 MIMO25_CANONICAL_ABSENT_SOUNDSCAPE = (
     "No distinct environmental, mechanical, physical, or non-verbal human "
@@ -1037,11 +1038,11 @@ class MimoAVAnnotationDraft(SchemaModel):
 
 
 class MimoThinkingContract(SchemaModel):
-    type: Literal["disabled"] = "disabled"
+    type: Literal["disabled", "enabled"] = "disabled"
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.25"] = MIMO25_BACKEND_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.26"] = MIMO25_BACKEND_VERSION
     backend: Literal[
         "xiaomi_openai_compatible", "sglang_openai_compatible"
     ]
@@ -1051,6 +1052,7 @@ class MimoBackendProvenance(SchemaModel):
     video_fps: Literal[4.0] = 4.0
     media_resolution: Literal["default"] = "default"
     thinking: MimoThinkingContract
+    icl_version: Literal["h3_mimo25_av_reconcile_icl_v1"] | None
     temperature: float = Field(ge=0, allow_inf_nan=False)
     max_completion_tokens: int = Field(gt=0)
     response_format: Literal["json_object", "json_schema"]
@@ -1247,11 +1249,15 @@ class MimoBackendConfig:
     max_completion_tokens: int = 16384
     timeout_seconds: float = 900.0
     http_max_attempts: int = 3
+    thinking: Literal["disabled", "enabled"] = "disabled"
+    icl: Literal["none", "v1"] = "none"
 
     def __post_init__(self) -> None:
         if (
             not self.api_key.strip()
             or self.transport not in {"xiaomi", "sglang"}
+            or self.thinking not in {"disabled", "enabled"}
+            or self.icl not in {"none", "v1"}
             or not self.base_url.strip()
             or self.model != MIMO25_MODEL
             or self.video_fps != 4.0
@@ -1273,7 +1279,8 @@ class MimoBackendConfig:
             "base_url": self.base_url,
             "video_fps": self.video_fps,
             "media_resolution": self.media_resolution,
-            "thinking": {"type": "disabled"},
+            "thinking": {"type": self.thinking},
+            "icl_version": MIMO25_ICL_VERSION if self.icl == "v1" else None,
             "temperature": self.temperature,
             "max_completion_tokens": self.max_completion_tokens,
             "response_format": (
@@ -1341,6 +1348,135 @@ STAGE E h3_projection
 - Do not write final H3 syntax. The deterministic materializer alone owns <Picture N>, <Subject N>, <Audio N>, Sx, exact <d>[Language] dialogue</d>, shot headers/cuts, and the official six-section final Ref2VA output. Internal vN/gN/eN/aeN/segment IDs and stage names must not leak into prose."""
 
 
+def _synthetic_icl_messages() -> list[dict[str, str]]:
+    """One fictional worked example; no production media, identities or dialogue."""
+    inputs = {
+        "example_kind": "fully_synthetic_text_described_av",
+        "target_duration_seconds": 4.5,
+        "allowed_segment_ids": ["segment_0001"],
+        "transcribed_segment_ids": ["segment_0001"],
+        "allowed_speaker_bindable_entity_ids": ["e7"],
+        "reference_subjects": [{
+            "subject_label": "<Subject 1>", "entity_id": "e7",
+            "source_picture_labels": ["<Picture 1>"],
+            "description": "a person in a plain green jacket beside a small cabinet",
+        }],
+        "segments": [{
+            "segment_id": "segment_0001", "start_time": 1.0, "end_time": 2.0,
+            "source_start_sample": 16000, "source_end_sample": 32000,
+            "source_sample_rate_hz": 16000, "asr_status": "transcribed",
+            "asr_text": "The latch is secure.", "asr_language": "English",
+            "current_entity_id": None, "direct_anchor_seconds": 0.0,
+            "lr_asd_support": 0, "current_binding_status": "unbound",
+        }],
+        "original_av_evidence": (
+            "One static eye-level medium shot. The supplied person faces forward "
+            "beside a cabinet, speaks alone from 1.0 to 2.0 with clearly synchronized "
+            "lip motion, then lowers one hand onto its latch. A short latch click "
+            "is audible from 3.0 to 3.2. The hand rests afterward. Low room ambience "
+            "is audible throughout. No music is audible in the original clip."
+        ),
+        "auxiliary_stem_evidence": {
+            "music_status": "absent", "sfx_events": [], "sfx_continuous_layers": [],
+        },
+    }
+    example = {
+        "schema_version": MIMO25_SCHEMA_VERSION,
+        "visual_observation": {
+            "shots": [{
+                "shot_index": 1, "start_time": None,
+                "visual_blocks": [
+                    {"block_id": "v1", "start_time": 0.0, "end_time": 1.0, "text": (
+                        "An eye-level medium shot shows a person in a plain green jacket "
+                        "standing beside a small gray cabinet. The figure faces forward "
+                        "with relaxed shoulders. Soft light defines the jacket folds "
+                        "against an undecorated wall."
+                    )},
+                    {"block_id": "v2", "start_time": 2.0, "end_time": 3.0, "text": (
+                        "The person lowers the right forearm toward the cabinet and places "
+                        "the fingers on its metal latch. The head angles slightly downward "
+                        "as the gaze follows the hand. The fixed framing keeps both the "
+                        "upper body and cabinet visible."
+                    )},
+                    {"block_id": "v3", "start_time": 3.2, "end_time": 4.5, "text": (
+                        "The hand rests beside the closed latch while the person returns "
+                        "to an upright pose. The cabinet stays at frame right and the "
+                        "plain wall remains behind the figure. Lighting and camera position "
+                        "remain steady."
+                    )},
+                ],
+            }],
+            "segment_views": [{
+                "segment_id": "segment_0001", "visible_entity_ids": ["e7"],
+                "entity_observations": [{
+                    "entity_id": "e7", "visibility": "visible", "orientation": "front",
+                    "face_visibility": "clear", "mouth_visibility": "clear",
+                    "speech_correlated_articulation": "observed",
+                }],
+            }],
+        },
+        "audio_observation": {
+            "segment_decisions": [{
+                "segment_id": "segment_0001", "vocal_composition": "single_speaker",
+                "resolution": "resolved", "primary_speaker_group": "g1",
+                "delivery_style": "measured pace with a level, clear delivery",
+                "secondary_vocal_activity": {"present": False, "speaker_relation": "none", "kind": None},
+                "confidence": "high", "audio_evidence_codes": ["voice_continuity"],
+            }],
+            "speaker_voice_profiles": [{"speaker_group": "g1", "voice_characteristics": None}],
+            "audio_semantics": {
+                "temporal_non_speech_events": [{
+                    "event_id": "ae1", "approximate_start_time": 3.0, "approximate_end_time": 3.2,
+                    "category": "physical", "pattern": "single",
+                    "description": "A short latch click is audible.",
+                    "source_grounding": "audiovisually_grounded",
+                }],
+                "overall_soundscape_status": "present",
+                "overall_soundscape": "Low room ambience underlies a brief latch click.",
+                "complete_silence_verified": False,
+                "non_diegetic_music_status": "absent", "non_diegetic_music": None,
+                "audiovisual_summary": "A person speaks beside a cabinet before a short latch click.",
+            },
+        },
+        "av_grounding": {"segment_groundings": [{
+            "segment_id": "segment_0001", "primary_speaker_group": "g1",
+            "binding_status": "visible_entity", "speech_presentation": "onscreen_spoken",
+            "entity_id": "e7", "confidence": "high",
+            "evidence_codes": ["visible_lip_motion", "av_temporal_alignment"],
+        }]},
+        "h3_semantics": {
+            "subject_definitions": [{
+                "subject_label": "<Subject 1>", "description": "a person wearing a plain green jacket.",
+            }],
+            "summary": "A person speaks beside a cabinet and then lowers a hand onto its latch.",
+            "visual_retention_analysis": [{
+                "subject_label": "<Subject 1>", "marker": "fully_preserved",
+                "description": "the referenced person remains clearly visible.",
+            }],
+        },
+        "h3_projection": {"shots": [{
+            "shot_index": 1, "start_time": None,
+            "timeline_parts": [
+                {"type": "visual", "block_id": "v1"},
+                {"type": "speech", "segment_id": "segment_0001"},
+                {"type": "visual", "block_id": "v2"},
+                {"type": "audio_event", "event_id": "ae1"},
+                {"type": "visual", "block_id": "v3"},
+            ],
+        }]},
+        "warnings": [],
+    }
+    return [
+        {"role": "user", "content": (
+            "Synthetic worked example only. The fictional original AV is described "
+            "as text below to demonstrate the contract. Do not reuse this scene or "
+            "its identifiers in the real case. Return the complete staged annotation.\n"
+            + _compact_json(inputs)
+        )},
+        {"role": "assistant", "content": MimoAVAnnotationDraft.model_validate(example).model_dump_json()},
+    ]
+
+
 def _value(value: object, name: str) -> object | None:
     return value.get(name) if isinstance(value, dict) else getattr(value, name, None)
 
@@ -1365,6 +1501,7 @@ def _completion_diagnostic(
         "full_av_recheck_with_canonical_audio",
     ],
     http_attempt_count: int,
+    thinking: Literal["disabled", "enabled"] = "disabled",
 ) -> MimoCompletionDiagnostic:
     usage = _value(completion, "usage")
     prompt_details = _value(usage, "prompt_tokens_details")
@@ -1382,7 +1519,7 @@ def _completion_diagnostic(
         reasoning_tokens = _token(
             usage, "completion_tokens_details", "reasoning_tokens"
         )
-    if reasoning_tokens is not None and reasoning_tokens > 0:
+    if thinking == "disabled" and reasoning_tokens is not None and reasoning_tokens > 0:
         warnings.append("reasoning_tokens_nonzero_under_disabled_thinking")
     return MimoCompletionDiagnostic(
         input_modality=modality,
@@ -3086,6 +3223,7 @@ class OpenAIMimo25Backend:
             "model": self.config.model,
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
+                *(_synthetic_icl_messages() if self.config.icl == "v1" else []),
                 {"role": "user", "content": content},
             ],
             "temperature": self.config.temperature,
@@ -3101,19 +3239,18 @@ class OpenAIMimo25Backend:
                     "strict": True,
                 },
             }
-            payload.update(
-                reasoning_effort="none",
-                extra_body={
-                    "use_audio_in_video": True,
-                    "chat_template_kwargs": {
-                        "thinking": False,
-                        "enable_thinking": False,
-                    },
+            if self.config.thinking == "disabled":
+                payload["reasoning_effort"] = "none"
+            payload["extra_body"] = {
+                "use_audio_in_video": True,
+                "chat_template_kwargs": {
+                    "thinking": self.config.thinking == "enabled",
+                    "enable_thinking": self.config.thinking == "enabled",
                 },
-            )
+            }
         else:
             payload["response_format"] = {"type": "json_object"}
-            payload["extra_body"] = {"thinking": {"type": "disabled"}}
+            payload["extra_body"] = {"thinking": {"type": self.config.thinking}}
         completion, attempts, retries = self._call(payload)
         try:
             choices = _value(completion, "choices")
@@ -3135,6 +3272,7 @@ class OpenAIMimo25Backend:
             choice,
             modality=modality,
             http_attempt_count=attempts,
+            thinking=self.config.thinking,
         ), retries
 
     def _full_av_recheck_prompt(

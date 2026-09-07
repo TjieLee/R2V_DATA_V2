@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
-from pydantic import Field, model_validator
+from pydantic import Field, StrictStr, model_validator
 
 from r2v_data_v2.h3.diarization_binding import (
     BoundDiarizationSegment,
@@ -50,12 +50,13 @@ from r2v_data_v2.h3.sam_audio_stem_shadow import (
     validate_stem_diarization_lineage,
 )
 from r2v_data_v2.h3.schemas import SchemaModel
+from r2v_data_v2.structured_output import ValidationIssue
 
 MIMO25_STEM_FACTS_VERSION = "r2v.h3.mimo25_stem_facts.3"
 MIMO25_STEM_FACTS_SUMMARY_VERSION = "r2v.h3.mimo25_stem_facts_summary.4"
 MIMO25_STEM_FACT_RAW_VERSION = "r2v.h3.mimo25_stem_fact_raw.1"
 MIMO25_STEM_FACT_PROMPT_VERSION = "h3_mimo25_stem_fact_prompt_v1"
-MIMO25_STEM_RECONCILE_VERSION = "r2v.h3.mimo25_stem_reconcile.2"
+MIMO25_STEM_RECONCILE_VERSION = "r2v.h3.mimo25_stem_reconcile.3"
 MIMO25_STEM_RECONCILE_SUMMARY_VERSION = "r2v.h3.mimo25_stem_reconcile_summary.5"
 MIMO25_STEM_RECONCILE_POLICY_VERSION = "h3_mimo25_stem_reconcile_v2"
 STEM_VIEW_VERSION = "r2v.h3.sam_audio_stem_view.1"
@@ -1607,7 +1608,7 @@ def build_stem_reconcile_jobs(
 
 
 class MimoStemReconcileRecord(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_stem_reconcile.2"] = (
+    schema_version: Literal["r2v.h3.mimo25_stem_reconcile.3"] = (
         MIMO25_STEM_RECONCILE_VERSION
     )
     clip_uid: str
@@ -1621,6 +1622,8 @@ class MimoStemReconcileRecord(SchemaModel):
     annotation: MimoAVAnnotationDraft | None = None
     failure_code: str | None = None
     failure_reason: str | None = None
+    failure_issues: list[ValidationIssue]
+    raw_responses: list[StrictStr]
     diagnostics: list[MimoCompletionDiagnostic]
     model_call_count: int = Field(ge=0)
     record_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -1628,7 +1631,13 @@ class MimoStemReconcileRecord(SchemaModel):
     @model_validator(mode="after")
     def validate_record(self) -> MimoStemReconcileRecord:
         if self.status == "ready":
-            if self.annotation is None or self.failure_code is not None or self.failure_reason is not None:
+            if (
+                self.annotation is None
+                or self.failure_code is not None
+                or self.failure_reason is not None
+                or self.failure_issues
+                or self.raw_responses
+            ):
                 raise ValueError("ready stem reconcile requires only annotation")
         elif self.annotation is not None or not self.failure_code or not self.failure_reason:
             raise ValueError("failed stem reconcile requires failure provenance")
@@ -1829,6 +1838,8 @@ def run_mimo25_stem_reconcile_shadow(
                     "annotation": result.annotation.model_dump(mode="json"),
                     "failure_code": None,
                     "failure_reason": None,
+                    "failure_issues": [],
+                    "raw_responses": [],
                     "diagnostics": [item.model_dump(mode="json") for item in result.diagnostics],
                     "model_call_count": result.model_call_count,
                 }
@@ -1844,6 +1855,8 @@ def run_mimo25_stem_reconcile_shadow(
                     "annotation": None,
                     "failure_code": exc.code,
                     "failure_reason": exc.reason,
+                    "failure_issues": [item.to_dict() for item in exc.issues],
+                    "raw_responses": list(exc.raw_responses),
                     "diagnostics": [item.model_dump(mode="json") for item in exc.diagnostics],
                     "model_call_count": exc.model_call_count,
                 }
