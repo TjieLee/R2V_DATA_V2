@@ -19,7 +19,9 @@ main{padding:0 20px 24px;max-width:1800px;margin:auto}#clip-heading{display:flex
 .qa{border-block:1px solid #cbd2d6;padding:12px 0;margin-bottom:16px;display:grid;grid-template-columns:1fr 1fr;gap:14px}
 #labels{display:flex;gap:12px;flex-wrap:wrap;align-content:start}#labels label{display:flex;align-items:center;gap:5px}
 textarea{display:block;width:100%;resize:vertical;min-height:64px;border:1px solid #aab2b9;border-radius:4px;padding:6px}
-.evidence{display:grid;grid-template-columns:minmax(0,1.3fr) minmax(0,1fr);gap:20px;align-items:start}
+.evidence{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.3fr);gap:20px;align-items:start}
+#final-h3{min-width:0}#final-h3 pre{max-height:none;font:14px/1.6 ui-monospace,monospace}
+.final-heading{display:flex;align-items:center;gap:10px;flex-wrap:wrap}#final-variant{max-width:100%}
 video{width:100%;aspect-ratio:16/9;max-height:540px;background:#151817}audio{width:100%;height:34px}
 .references{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:10px}
 figure{margin:0;min-width:0}figure img{width:100%;height:150px;object-fit:contain;background:white;border:1px solid #d7dde0}
@@ -58,13 +60,19 @@ small{color:#626e73}a{color:#176c9a}#loading{padding:20px}
 <p><small id="duration"></small></p>
 <details id="target-details"><summary>Target provenance</summary><pre></pre></details>
 </section>
-<section>
-<h2>Frozen Visual evidence</h2>
+<section id="final-h3">
+<div class="final-heading"><h2>Final H3 Prompt</h2><button id="copy-final">Copy</button></div>
+<p><small id="materializer-version"></small></p>
+<select id="final-variant" aria-label="H3 sample variant"></select>
+<p id="final-unavailable" class="failed" hidden></p>
+<pre id="final-text"></pre>
+</section>
+</div>
+<details open><summary>Frozen Visual evidence</summary>
 <div id="references" class="references"></div>
 <details open><summary>Subjects / Pictures</summary><pre id="subjects"></pre></details>
 <details><summary>Visual selection / provenance</summary><pre id="visual-provenance"></pre></details>
-</section>
-</div>
+</details>
 <details open><summary>DiariZen speech timeline + Qwen3-ASR</summary>
 <p id="diar-status"></p>
 <div class="table-scroll"><table><thead><tr><th>Segment / seconds</th><th>Cluster / binding</th><th>ASR status</th><th>Language / transcript</th></tr></thead><tbody id="timeline"></tbody></table></div>
@@ -75,7 +83,7 @@ small{color:#626e73}a{color:#176c9a}#loading{padding:20px}
 <div id="stems" class="stem-grid"></div>
 <details><summary>Separation provenance / alignment</summary><pre id="separation"></pre></details>
 <details><summary>Stem-facts runtime diagnostics</summary><pre id="fact-diagnostics"></pre></details>
-<section id="reconcile"><h2>MiMo original-AV reconcile</h2><div id="reconcile-body"></div></section>
+<details id="reconcile"><summary>MiMo structured annotation / diagnostic evidence</summary><div id="reconcile-body"></div></details>
 </main>
 <script>
 "use strict";
@@ -125,6 +133,10 @@ function details(title, value, open = false) {
   heading.textContent = title; element.append(heading, pre(value)); element.open = open; return element;
 }
 function cell(row, value) { const el = document.createElement("td"); el.textContent = value == null ? "[unavailable]" : String(value); row.append(el); return el; }
+function renderFinalVariant() {
+  const final = data.clips[index].final_h3;
+  $("final-text").textContent = final.status === "ready" ? final.variants[Number($("final-variant").value)].text : "";
+}
 function render() {
   const clip = data.clips[index], state = stateFor(clip);
   document.querySelectorAll("video,audio").forEach(media => media.pause());
@@ -143,6 +155,23 @@ function render() {
     el.append(input, document.createTextNode(label)); $("labels").append(el);
   });
   $("notes").value = state.notes;
+  const final = clip.final_h3;
+  $("materializer-version").textContent = final.materializer_version;
+  $("final-variant").replaceChildren();
+  final.variants.forEach((variant, i) => {
+    const option = document.createElement("option"); option.value = String(i);
+    option.textContent = variant.sample_id + " / " + variant.pair_type;
+    $("final-variant").append(option);
+  });
+  $("final-variant").value = "0";
+  $("final-variant").hidden = final.variants.length < 2;
+  $("copy-final").disabled = final.status !== "ready";
+  $("final-unavailable").hidden = final.status === "ready";
+  const failure = clip.reconcile.upstream_failure || clip.reconcile;
+  $("final-unavailable").textContent = final.status === "ready" ? "" :
+    "Final H3 Prompt unavailable\n" + (final.reason === "upstream_failed" ? "Upstream failed: " : "Reconcile failed: ") +
+    [failure.failure_code || failure.reason_code, failure.failure_reason || failure.reason].filter(Boolean).join(" / ");
+  renderFinalVariant();
   $("target-video").src = clip.target.video_url;
   $("duration").textContent = clip.target.duration_seconds.toFixed(3) + " s";
   $("target-details").querySelector("pre").textContent = pretty(clip.target);
@@ -245,6 +274,11 @@ $("previous").onclick = () => safely(() => navigate(index - 1));
 $("next").onclick = () => safely(() => navigate(index + 1));
 $("clip-select").onchange = event => safely(() => navigate(Number(event.target.value)));
 $("notes").oninput = () => safely(saveCurrent);
+$("final-variant").onchange = () => safely(renderFinalVariant);
+$("copy-final").onclick = async () => {
+  try { await navigator.clipboard.writeText($("final-text").textContent); message("Final H3 prompt copied."); }
+  catch (error) { message(error.message, true); }
+};
 $("export").onclick = () => safely(() => {
   const url = URL.createObjectURL(new Blob([JSON.stringify(exportPayload(), null, 2) + "\n"], {type: "application/json"}));
   const link = document.createElement("a"); link.href = url; link.download = "h3_audio_shadow_qa.json";

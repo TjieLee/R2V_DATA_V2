@@ -319,6 +319,14 @@ and shadow binding evidence, stem DiariZen/ASR, three auxiliary stem-fact panels
 and ready/failed/upstream-failed reconcile results. Original AV remains factual
 authority; separator names and manual labels are not production truth.
 
+The primary review surface is the exact final six-section H3 prompt beside the
+target AV, rendered by the existing MiMo `_materialize_sample()` v16 path. Each
+source H3 conditioning variant is shown separately, using current shadow ASR
+speech in memory while retaining frozen references. No recovery, media generation,
+or H3 publication runs. Structured MiMo annotation is secondary diagnostic evidence.
+Failed/upstream-failed reconcile has no final prompt. Rendered text participates
+in QA fingerprints, so regenerated text invalidates stale annotations.
+
 The builder validates existing complete stage metadata and lineage, including
 per-clip failure records. Output is `review.html`, `data.json`, and `media/`
 containing only single-file symlinks to provenance-checked video/image/stem
@@ -333,8 +341,9 @@ An existing output requires `--overwrite` and must be owned by the same QA run;
 replacement is atomic and never replaces separation or downstream source stages.
 Export browser annotations before clearing browser storage or changing origin.
 
-Manual categories (multi-select) are `good`, `upstream_label_wrong`,
+Manual categories are `good`, `upstream_label_wrong`,
 `speaker_ambiguous`, `asr_issue`, `stem_issue`, and `mimo_semantic_issue`.
+Issue labels may be co-selected; `good` is exclusive with every issue label.
 Notes and labels persist in localStorage. **Export QA JSON** downloads
 `h3_audio_shadow_qa.json`; **Import QA JSON** restores a matching export.
 The sidecar shape is:

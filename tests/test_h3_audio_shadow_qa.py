@@ -12,6 +12,7 @@ import pytest
 from PIL import Image
 
 from r2v_data_v2.h3 import audio_shadow_qa as qa
+from r2v_data_v2.h3.jea_final_renderer import FinalH3SampleV2
 from r2v_data_v2.h3.mimo25_av_reconcile import _inventory, _job
 from r2v_data_v2.h3.mimo25_backend import MimoAVAnnotationDraft, MimoBackendFailure
 from r2v_data_v2.h3.mimo25_stem_shadow import (
@@ -21,7 +22,7 @@ from r2v_data_v2.h3.mimo25_stem_shadow import (
     run_mimo25_stem_reconcile_shadow,
 )
 from r2v_data_v2.h3.sam_audio_stem_shadow import sha256_file
-from tests.test_h3_mimo25_av_shadow import _annotation
+from tests.test_h3_mimo25_av_shadow import _annotation, _sample
 from tests.test_h3_sam_audio_stem_shadow import (
     _FactsBackend,
     _FailingReconcileBackend,
@@ -44,10 +45,21 @@ class _Reconcile(_FailingReconcileBackend):
         annotation = MimoAVAnnotationDraft.model_validate_json(
             _annotation().model_dump_json().replace("segment_1", "segment_0001")
         )
+        if not job.segments:
+            values = annotation.model_dump(mode="json")
+            values["visual_observation"]["segment_views"] = []
+            values["audio_observation"]["segment_decisions"] = []
+            values["audio_observation"]["speaker_voice_profiles"] = []
+            values["av_grounding"]["segment_groundings"] = []
+            values["h3_projection"]["shots"][0]["timeline_parts"] = [
+                part for part in values["h3_projection"]["shots"][0]["timeline_parts"]
+                if part["type"] != "speech"
+            ]
+            annotation = MimoAVAnnotationDraft.model_validate(values)
         return SimpleNamespace(annotation=annotation, diagnostics=(), model_call_count=1)
 
 
-def _fixture(tmp_path, monkeypatch, *, mixed=False):
+def _fixture(tmp_path, monkeypatch, *, mixed=False, variants=False):
     root = tmp_path / "production"
     root.mkdir()
     separation, diarization, asr, inventory, order = _run_three_clip_shadow_to_asr(
@@ -65,12 +77,36 @@ def _fixture(tmp_path, monkeypatch, *, mixed=False):
             target_full_audio_path=stem.source_audio_path,
             target_full_audio_sha256=stem.source_audio_sha256,
         )
+        if variants:
+            values["source_h3_sample_ids"].append(f"{old.clip_uid}/canonical")
         for ref in values["reference_images"]:
             Image.new("RGB", (160, 200), (98, 150, 140)).save(ref["image_artifact_path"])
             ref["image_sha256"] = sha256_file(Path(ref["image_artifact_path"]))
         jobs.append(_job(values))
     values = base.model_dump(mode="json", exclude={"inventory_fingerprint"})
     values["jobs"] = [job.model_dump(mode="json") for job in jobs]
+    sample_root = tmp_path / "sample-template"
+    sample_root.mkdir()
+    template = _sample(sample_root)
+    samples_path = root / "h3/samples.jsonl"
+    samples_path.parent.mkdir()
+    samples = []
+    for job in jobs:
+        sample_values = template.model_dump(mode="json")
+        sample_values.update(sample_id=job.source_h3_sample_ids[0], clip_uid=job.clip_uid,
+                             target_video=job.target_video_path,
+                             target_full_audio_path=job.target_full_audio_path,
+                             target_full_audio_sha256=job.target_full_audio_sha256)
+        sample_values["visual_references"][0]["image_artifact_path"] = job.reference_images[0].image_artifact_path
+        sample_values["subject_voices"][0]["target_occurrence_id"] = f"{job.clip_uid}/e1"
+        samples.append(FinalH3SampleV2.model_validate(sample_values))
+        if variants:
+            samples.append(FinalH3SampleV2.model_validate({
+                **sample_values, "sample_id": f"{job.clip_uid}/canonical",
+                "pair_type": "canonical", "subject_voices": [],
+            }))
+    samples_path.write_text("".join(sample.model_dump_json() + "\n" for sample in samples))
+    values["source_h3_samples_sha256"] = sha256_file(samples_path)
     base = _inventory(values)
     monkeypatch.setattr(qa, "build_mimo25_inventory", lambda **kwargs: base)
     facts_summary = run_mimo25_stem_facts_shadow(
@@ -106,6 +142,15 @@ def _snapshot(root):
 
 def test_builder_ready_failed_order_media_and_sources_unchanged(tmp_path, monkeypatch):
     kwargs, shadow = _fixture(tmp_path, monkeypatch)
+    materialized = []
+    original = qa._materialize_sample
+
+    def capture(sample, job, record):
+        result = original(sample, job, record)
+        materialized.append((sample, job, record, result[1]))
+        return result
+
+    monkeypatch.setattr(qa, "_materialize_sample", capture)
     before = _snapshot(tmp_path)
     result = qa.build_audio_shadow_qa(**kwargs)
     assert result["model_called"] is False
@@ -118,6 +163,25 @@ def test_builder_ready_failed_order_media_and_sources_unchanged(tmp_path, monkey
     assert failed["failure_code"] == "synthetic_failed"
     assert failed["model_call_count"] == 2
     assert data["clips"][0]["reconcile"]["annotation"]["audio_observation"]
+    assert [item[1].clip_uid for item in materialized] == ["clip-z", "clip-m"]
+    for clip, call in zip((data["clips"][0], data["clips"][2]), materialized, strict=True):
+        final = clip["final_h3"]
+        assert final["status"] == "ready"
+        assert final["materializer_version"] == "h3_mimo25_materializer_v16"
+        assert final["text"] == call[3] == original(*call[:3])[1]
+        assert final["variants"][0]["text"] == final["text"]
+        assert "[[" not in final["text"]
+        assert "<Audio 1>" in final["text"]
+        assert "<Picture 1>" in final["text"]
+        sections = ["subject_definitions", "summary", "retention_analysis",
+                    "detailed_description", "overall_soundscape", "non_diegetic_music"]
+        positions = [final["text"].index(section + ":\n") for section in sections]
+        assert positions == sorted(positions)
+        for segment in call[1].segments:
+            assert f"<d>[{segment.asr_language}] {segment.asr_text}</d>" in final["text"]
+    assert data["clips"][1]["final_h3"]["status"] == "unavailable"
+    assert data["clips"][1]["final_h3"]["text"] is None
+    assert data["clips"][1]["final_h3"]["reason"] == "reconcile_failed"
     assert data["qa_labels"] == list(qa.QA_LABELS)
     assert all(path.read_bytes() == content for path, content in before.items())
     for url, source in data["media"].items():
@@ -147,7 +211,45 @@ def test_upstream_failed_and_empty_clips_remain_visible(tmp_path, monkeypatch):
     assert clips[1]["reconcile"]["model_call_count"] == 0
     assert clips[1]["stem_facts"] is None
     assert clips[1]["asr"]["segments"] == []
+    assert clips[1]["final_h3"]["status"] == "unavailable"
+    assert clips[1]["final_h3"]["text"] is None
+    assert clips[1]["final_h3"]["reason"] == "upstream_failed"
     assert clips[2]["asr"]["segments"] == []
+
+
+def test_final_text_changes_review_fingerprints(tmp_path, monkeypatch):
+    kwargs, shadow = _fixture(tmp_path, monkeypatch)
+    qa.build_audio_shadow_qa(**kwargs)
+    before = json.loads((shadow / "qa/data.json").read_text())
+    original = qa._materialize_sample
+
+    def changed_text(*args):
+        corrected, text, warnings = original(*args)
+        return corrected, text + "\nsynthetic materializer change", warnings
+
+    monkeypatch.setattr(qa, "_materialize_sample", changed_text)
+    qa.build_audio_shadow_qa(**kwargs, overwrite=True)
+    after = json.loads((shadow / "qa/data.json").read_text())
+    assert before["dataset_fingerprint"] != after["dataset_fingerprint"]
+    for old, new in zip(before["clips"], after["clips"], strict=True):
+        assert (old["record_fingerprint"] == new["record_fingerprint"]) == (
+            old["reconcile"]["status"] == "failed"
+        )
+
+
+def test_final_h3_keeps_conditioning_variants_separate(tmp_path, monkeypatch):
+    kwargs, shadow = _fixture(tmp_path, monkeypatch, variants=True)
+    qa.build_audio_shadow_qa(**kwargs)
+    final = json.loads((shadow / "qa/data.json").read_text())["clips"][0]["final_h3"]
+    assert [row["sample_id"] for row in final["variants"]] == [
+        "clip-z/canonical", "clip-z/in_pair",
+    ]
+    canonical, voice = final["variants"]
+    assert final["text"] == canonical["text"]
+    assert "[reference generation]" in canonical["text"]
+    assert "<Audio 1>" not in canonical["text"]
+    assert "[reference generation + audio reference]" in voice["text"]
+    assert "<Audio 1>" in voice["text"]
 
 
 def test_output_safety_and_atomic_failure_preserve_existing_qa(tmp_path, monkeypatch):
@@ -318,7 +420,7 @@ def test_synthetic_browser_review_desktop_mobile(tmp_path, monkeypatch):
     playwright = os.environ.get("QA_PLAYWRIGHT_MODULE")
     if not node or not playwright:
         pytest.skip("optional preinstalled Playwright not configured")
-    kwargs, shadow = _fixture(tmp_path, monkeypatch)
+    kwargs, shadow = _fixture(tmp_path, monkeypatch, variants=True)
     qa.build_audio_shadow_qa(**kwargs)
     script = tmp_path / "browser.cjs"
     script.write_text(r'''
@@ -342,6 +444,15 @@ const {chromium} = require(process.argv[2]);
     await page.locator("#main").waitFor({state:"visible"});
     await page.waitForFunction(() => [...document.querySelectorAll("#references img")].every(image => image.naturalWidth > 0));
     assert.strictEqual(await page.locator("#clip-id").textContent(), "clip-z");
+    const dataset = JSON.parse(fs.readFileSync(path.join(root, "data.json"), "utf8"));
+    const expectedFinal = dataset.clips[0].final_h3.text;
+    assert.strictEqual(await page.locator("#final-text").textContent(), expectedFinal);
+    assert(await page.locator("#final-text").isVisible());
+    assert.strictEqual(await page.locator("#final-h3").evaluate(el => el.closest("details")), null);
+    assert.strictEqual(await page.locator("#materializer-version").textContent(), "h3_mimo25_materializer_v16");
+    await page.locator("#final-variant").selectOption("1");
+    assert.strictEqual(await page.locator("#final-text").textContent(), dataset.clips[0].final_h3.variants[1].text);
+    await page.locator("#final-variant").selectOption("0");
     const label = name => page.locator('input[data-qa-label="' + name + '"]');
     async function assertSelection(expected) {
       assert.deepStrictEqual(await page.locator("input[data-qa-label]:checked").evaluateAll(
@@ -357,8 +468,15 @@ const {chromium} = require(process.argv[2]);
     await page.locator("#notes").fill("synthetic human note");
     await page.locator("#next").click();
     assert.strictEqual(await page.locator("#status").textContent(), "failed");
+    assert(await page.locator("#final-unavailable").isVisible());
+    assert.match(await page.locator("#final-unavailable").textContent(), /Final H3 Prompt unavailable.*Reconcile failed: synthetic_failed/s);
+    assert.strictEqual(await page.locator("#final-text").textContent(), "");
+    assert(await page.locator("#copy-final").isDisabled());
     assert.match(await page.locator("#reconcile-body").textContent(), /synthetic_failed/);
     await page.locator("#previous").click();
+    assert.strictEqual(await page.locator("#final-text").textContent(), expectedFinal);
+    assert(await page.locator("#final-text").isVisible());
+    assert(!await page.locator("#final-unavailable").isVisible());
     assert.strictEqual(await page.locator("#notes").inputValue(), "synthetic human note");
     const downloaded = page.waitForEvent("download");
     await page.locator("#export").click();

@@ -4,6 +4,7 @@ import hashlib
 import json
 import shutil
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TypeVar
 
@@ -15,7 +16,13 @@ from r2v_data_v2.h3.diarization_binding import (
     DiarizationClusterBinding,
     RawDiarizationSegment,
 )
+from r2v_data_v2.h3.jea_final_renderer import FinalH3SampleV2, FinalQwen3SpeechSegment
 from r2v_data_v2.h3.mimo25_av_reconcile import MimoCaseManifest, build_mimo25_inventory
+from r2v_data_v2.h3.mimo25_backend import (
+    MIMO25_MATERIALIZER_VERSION,
+    MimoAVAnnotationDraft,
+)
+from r2v_data_v2.h3.mimo25_h3_materializer import _materialize_sample
 from r2v_data_v2.h3.mimo25_stem_shadow import (
     MimoStemReconcileRecord,
     MimoStemReconcileSummary,
@@ -39,6 +46,14 @@ QA_LABELS = (
     "asr_issue", "stem_issue", "mimo_semantic_issue",
 )
 _Model = TypeVar("_Model", bound=BaseModel)
+
+
+@dataclass(frozen=True)
+class _MaterializerInput:
+    """Read-only projection of the stem record fields consumed by the materializer."""
+
+    annotation: MimoAVAnnotationDraft
+    request_fingerprint: str
 
 
 def _json(value: object) -> str:
@@ -113,7 +128,8 @@ def build_audio_shadow_qa(
     diarization, asr = shadow / "diarization", shadow / "asr"
     facts_root, reconcile_root = shadow / "mimo_stem_facts", shadow / "mimo_reconcile"
     # Hash the source JSON sidecars before loading, then verify the same snapshot at publication.
-    sources = {case_path}
+    samples_path = audio / "h3/samples.jsonl"
+    sources = {case_path, samples_path}
     for stage in (separation, diarization, asr, facts_root, reconcile_root):
         for pattern in ("*.json", "*.jsonl", "raw_responses/*.json"):
             sources.update(stage.glob(pattern))
@@ -134,6 +150,17 @@ def build_audio_shadow_qa(
     )
     if [job.clip_uid for job in base.jobs] != cases.clip_uids:
         raise ValueError("QA Visual/MiMo inventory differs from case order")
+    if source_hashes[str(samples_path)] != base.source_h3_samples_sha256:
+        raise ValueError("QA source H3 samples differ from MiMo inventory")
+    samples = _rows(samples_path, FinalH3SampleV2)
+    samples_by_id = {sample.sample_id: sample for sample in samples}
+    if len(samples_by_id) != len(samples):
+        raise ValueError("QA source H3 samples contain duplicate sample IDs")
+    for job in base.jobs:
+        if sorted(job.source_h3_sample_ids) != sorted(
+            sample.sample_id for sample in samples if sample.clip_uid == job.clip_uid
+        ):
+            raise ValueError("QA source H3 variants differ from MiMo inventory")
     jobs = build_stem_reconcile_jobs(
         base_inventory=base, stem_diarization_root=diarization,
         stem_asr_root=asr, route=diar_provenance.route,
@@ -229,6 +256,41 @@ def build_audio_shadow_qa(
             ]
         record = reconcile_by_clip.get(clip)
         current = jobs_by_clip.get(clip)
+        final_h3 = {
+            "status": "unavailable", "materializer_version": MIMO25_MATERIALIZER_VERSION,
+            "text": None, "reason": "reconcile_failed" if record else "upstream_failed",
+            "variants": [],
+        }
+        if record is not None and record.status == "ready":
+            assert current is not None and record.annotation is not None
+            # Only the in-memory speech input changes: exact current shadow ASR,
+            # not the unrelated frozen production speech inventory. No media is generated.
+            speech = [FinalQwen3SpeechSegment(
+                segment_id=item.segment_id,
+                speaker_cluster_id=item.source_speaker_cluster_id,
+                entity_id=item.current_entity_id,
+                entity_occurrence_id=item.entity_occurrence_id,
+                source_start_sample=item.source_start_sample,
+                source_end_sample=item.source_end_sample,
+                source_sample_rate_hz=item.source_sample_rate_hz,
+                start_time=item.start_time, end_time=item.end_time,
+                text=item.asr_text, language=item.asr_language,
+            ).model_dump(mode="python") for item in current.segments
+                if item.asr_status == "transcribed"]
+            variants = []
+            for sample_id in sorted(current.source_h3_sample_ids):
+                source = samples_by_id[sample_id]
+                sample = FinalH3SampleV2.model_validate({
+                    **source.model_dump(mode="python"), "speech_segments": speech,
+                })
+                _, text, warnings = _materialize_sample(
+                    sample, current,
+                    _MaterializerInput(record.annotation, record.source_job_fingerprint),
+                )
+                variants.append({"sample_id": sample_id, "pair_type": source.pair_type,
+                                 "text": text, "warnings": warnings})
+            final_h3.update(status="ready", text=variants[0]["text"], reason=None,
+                            variants=variants)
         row = {
             "clip_uid": clip,
             "target": {
@@ -259,6 +321,7 @@ def build_audio_shadow_qa(
             },
             "separation": {**stem_record.model_dump(mode="json"), "media": stem_media},
             "stem_facts": fact_payload,
+            "final_h3": final_h3,
             "reconcile": record.model_dump(mode="json") if record else {
                 "status": "upstream_failed", "upstream_failure": upstream_failures[clip],
                 "model_call_count": 0,
