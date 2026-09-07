@@ -75,7 +75,7 @@ from r2v_data_v2.h3.mimo25_backend import (
     _canonicalize_same_visible_entity_speaker_groups,
     _contains_positive_soundscape_contamination,
     _normalize_speaker_voice_profiles,
-    _official_icl_messages,
+    _official_detailed_description_icl_messages,
     validate_annotation,
 )
 from r2v_data_v2.h3.mimo25_h3_materializer import (
@@ -347,7 +347,7 @@ def test_experimental_thinking_icl_payload_and_reasoning_isolation(tmp_path, mon
         {"type": "text", "text": backend._prompt(job)},
     ]
     if icl == "official_ref2va_v1":
-        assert request["messages"][1:3] == _official_icl_messages()
+        assert request["messages"][1:3] == _official_detailed_description_icl_messages()
     assert result.raw_responses == (raw,)
     assert result.diagnostics[0].usage.reasoning_tokens == 13
     assert ("reasoning_tokens_nonzero_under_disabled_thinking" in result.diagnostics[0].warnings) == (
@@ -381,7 +381,7 @@ def test_experimental_enabled_recheck_keeps_example_and_call_limit(tmp_path):
     )
     assert result.model_call_count == 2 and result.recheck_count == 1
     for request in completions.requests:
-        assert request["messages"][1:3] == _official_icl_messages()
+        assert request["messages"][1:3] == _official_detailed_description_icl_messages()
         assert "reasoning_effort" not in request
 
 
@@ -401,7 +401,7 @@ def test_experimental_enabled_fallback_allows_missing_reasoning_accounting(tmp_p
         assert diagnostic.usage.reasoning_tokens is None
         assert "reasoning_tokens_nonzero_under_disabled_thinking" not in diagnostic.warnings
     for request in completions.requests:
-        assert request["messages"][1:3] == _official_icl_messages()
+        assert request["messages"][1:3] == _official_detailed_description_icl_messages()
         assert "reasoning_effort" not in request
         assert request["extra_body"]["use_audio_in_video"] is True
     content = completions.requests[-1]["messages"][-1]["content"]
@@ -816,7 +816,7 @@ def test_mimo_request_contract_and_embedded_audio(tmp_path: Path) -> None:
     assert MIMO25_POLICY_VERSION in backend.provenance.model_dump_json()
     assert backend.provenance.transport == "xiaomi"
     assert backend.provenance.backend == "xiaomi_openai_compatible"
-    assert job.r2v_instruction in content[-1]["text"]  # type: ignore[index]
+    assert job.r2v_instruction not in content[-1]["text"]  # type: ignore[index]
 
 
 
@@ -2244,10 +2244,10 @@ def test_true_malformed_output_uses_exactly_one_full_av_recheck(tmp_path: Path) 
     content = completions.requests[1]["messages"][1]["content"]  # type: ignore[index]
     assert any(item["type"] == "video_url" for item in content)
     assert any(item["type"] == "image_url" for item in content)
-    assert "Reinspect the same full audiovisual evidence" in content[-1]["text"]
+    assert "Reinspect the same AV and fix ONLY these hard issues:" in content[-1]["text"]
     assert completions.requests[1]["extra_body"] == {"thinking": {"type": "disabled"}}
     recheck = content[-1]["text"]
-    assert job.r2v_instruction in recheck
+    assert job.r2v_instruction not in recheck
     assert job.target_video_path not in recheck
 
 

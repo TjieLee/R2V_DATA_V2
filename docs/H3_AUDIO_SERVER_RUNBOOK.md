@@ -277,20 +277,26 @@ substitution, or second compositor remain.
 
 Defaults are `--thinking disabled --icl official_ref2va_v1`, temperature 0.0.
 The actual message order is system -> official-example user -> official-example
-assistant -> real AV user. The assistant is the unchanged Complete Example from
-`docs/VIDEO_PROMPT_WRITING_GUIDE_ref_en.md` (coffee shop, Samoyed, blonde woman,
-young man, canned audience laughter), sourced from the official MiniMaxAI guide.
-The base guide is also retained under `docs/`. ICL provenance is
-`h3_official_ref2va_complete_example_v1`; there is no synthetic ICL variant.
+assistant -> real AV user. The assistant is a two-field JSON style subset from
+the unchanged Complete Example in `docs/VIDEO_PROMPT_WRITING_GUIDE_ref_en.md`:
+the global line after `detailed_description:` and the complete Shot 1 body,
+stopping before Shot 2 and stripping only the Shot 1 marker. No other H3 section
+is included. ICL provenance is `h3_official_ref2va_detailed_shot1_v2`; this is
+prose organization guidance, not a response-schema example.
 Only final assistant content is parsed; reasoning text is never persisted.
+The request sends one chronological segment inventory and one reference mapping.
+Stored `r2v_instruction` remains provenance/QA only; its old caption is not sent
+as a recaption draft. Recheck sends hard issues, the same contract, and the prior
+response, without duplicating the system policy.
 
 MiMo writes natural speaker/action/delivery lead-ins and chronological
 `<d>[Language] dialogue</d>` blocks. When counts, resolved source order, and any
 recognizable exact dialogue agree, code corrects only the inner `<d>` payload to
 Qwen3-ASR text/language. All surrounding prose stays byte-for-byte unchanged.
-Each expected `(Sx)` must appear somewhere in `shot1_caption` before its first
-authoritative dialogue. No nearest-speaker or repeated-marker requirement exists;
-pronouns and connective prose are not interpreted by code.
+Each dialogue event must contain its expected `(Sx)` in the span after the
+previous `</d>` (or caption start) and before its own `<d>`. This is membership,
+not nearest-marker matching; no fixed says clause, character lookback, immediate
+adjacency, or pronoun interpretation is used.
 Unmappable dialogue or unknown reference/source labels fails closed; no dialogue
 is moved, dropped, or invented. Frozen Subject/Picture ownership remains the
 existing small deterministic definition/retention path. Final H3 keeps the six
@@ -304,7 +310,7 @@ QA retains the raw direct caption even when publication is blocked.
 Normal success is one AV call, genuine failure gets at most one full-AV recheck.
 The existing explicit zero-audio fallback remains separately counted.
 
-Current versions: prompt v27, annotation .18, backend .30, materializer v21,
+Current versions: prompt v28, annotation .18, backend .31, materializer v21,
 authority policy v17; Stage-5 records .7 and summary .9. Materialized shadow
 record .16 and summary .17 distinguish the new direct-caption implementation.
 Prior template/composition artifacts cannot be silently reused.
@@ -384,9 +390,9 @@ in QA fingerprints, so regenerated text invalidates stale annotations.
 
 ### Current one-shot review contract
 
-The official Ref2VA ICL remains unchanged; it teaches prose style, not shot count.
-The real user prompt explicitly states that this target contains exactly one
-shot and that model output must have no `[Shot N]` markers. A complete natural
+The official Ref2VA source remains unchanged; the ICL now contains only its
+global opening and Shot 1 prose. The final system writing block owns the
+one-shot/no-model-marker instruction. A complete natural
 caption remains model-authored; only the single shot marker and safe ASR payload
 correction are deterministic.
 

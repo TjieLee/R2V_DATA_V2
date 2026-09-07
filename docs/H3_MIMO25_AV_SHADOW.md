@@ -35,8 +35,9 @@ resolution, segment delivery, secondary vocal activity, voice profiles, and
 non-speech Audio. Stage C may map that exact Stage B group to one frozen `eN` or
 null and classify presentation. Only Qwen3-ASR segments with
 `asr_status="transcribed"` receive a `<d>` dialogue block in the direct caption.
-Every speaking `(Sx)` must be introduced before its first authoritative
-`<d>` in `shot1_caption`; it need not be repeated or immediately adjacent.
+Every authoritative `<d>` event needs its expected `(Sx)` in the lead-in after
+the previous `</d>` (or caption start). The marker may occur anywhere in that
+span; no nearest-marker, fixed says clause, or pronoun resolution is used.
 Counts and recognizable dialogue order must map safely; recognized out-of-order
 dialogue is rejected, not silently moved. The current pilot is exactly one shot. Visual observation contains only
 `visual_blocks` and `segment_views`, with no model-owned shot boundaries or
@@ -44,8 +45,18 @@ timestamps. The pipeline inserts the single `[Shot 1]` between `style_opening`
 and `shot1_caption`; any model-authored shot marker is rejected/rechecked.
 Coarse visual evidence never controls final sentence order or length. There is no visual word-count floor.
 
+The final system block prioritizes caption prose. `style_opening` describes only
+global cinematographic style/camera language/lighting, not scene contents or
+actions. Model input has one authoritative segment inventory; old
+`job.r2v_instruction` prose stays stored for provenance but is not model input.
+The response shape, authority v17, and materializer v21 are unchanged. This is
+a prompt-quality experiment, not a verified random10 quality improvement.
+
 The official Complete Example in `docs/VIDEO_PROMPT_WRITING_GUIDE_ref_en.md`
-is the few-shot assistant message, unchanged and without placeholders.
+is unchanged. ICL extracts only its global detailed-description line and complete
+Shot 1 body before Shot 2, removes the Shot 1 marker, and wraps the exact prose
+as `style_opening` / `shot1_caption` JSON. This is a style subset, not the real
+response schema; provenance is `h3_official_ref2va_detailed_shot1_v2`.
 See `H3_AUDIO_SERVER_RUNBOOK.md` Stage 5 for current defaults and versions.
 Human random10 QA, not automated style checks, determines caption quality.
 
@@ -156,10 +167,10 @@ they do not create additional MiMo model jobs.
 
 Prompt, policy, annotation schema, and materializer versions are:
 
-- `h3_mimo25_unified_av_reconcile_v27`
+- `h3_mimo25_unified_av_reconcile_v28`
 - `h3_mimo25_av_authority_contract_v17`
 - `r2v.h3.mimo25_av_annotation.18`
-- `r2v.h3.mimo25_backend.30`
+- `r2v.h3.mimo25_backend.31`
 - `h3_mimo25_materializer_v21`
 - `h3_mimo25_reference_selection_v1`
 - `h3_mimo25_recovered_voice_quality_v1`
@@ -302,8 +313,8 @@ prompt, corrected speech, or Audio references; later samples continue normally.
 The summary reports both the failed-sample count and validation issue-code
 counts. Inventory fingerprints, source H3/ASR provenance, canonical media hashes,
 task-local Picture projection, duplicate identities, and schema/programming
-errors remain batch-level fail-fast checks. Speaker-source validation requires each expected `(Sx)` somewhere before its
-first dialogue, not the closest marker before every block. No pronoun resolution
+errors remain batch-level fail-fast checks. Speaker-source validation requires each expected `(Sx)` in its own dialogue
+event's lead-in, not necessarily the closest marker. No pronoun resolution
 or fixed speech clause is used.
 
 ## Post-MiMo target voice recovery

@@ -9,10 +9,11 @@ from pydantic import ValidationError
 
 from r2v_data_v2.h3.mimo25_backend import (
     MIMO25_ICL_VERSION,
+    SYSTEM_PROMPT,
     MimoAVAnnotationDraft,
     MimoBackendConfig,
     MimoBackendFailure,
-    _official_icl_messages,
+    _official_detailed_description_icl_messages,
     protect_direct_dialogue,
 )
 from r2v_data_v2.h3.mimo25_h3_materializer import _materialize_sample
@@ -47,16 +48,26 @@ def test_official_example_and_single_av_message_order(tmp_path):
     assert result.model_call_count == len(calls.requests) == 1
     messages = calls.requests[0]["messages"]
     assert [m["role"] for m in messages] == ["system", "user", "assistant", "user"]
-    assert messages[1:3] == _official_icl_messages()
+    assert messages[1:3] == _official_detailed_description_icl_messages()
     guide = (Path(__file__).parents[1] / "docs/VIDEO_PROMPT_WRITING_GUIDE_ref_en.md").read_text()
     example = guide.split("## 7. Complete Example", 1)[1].split("```text", 1)[1].split("```", 1)[0].strip()
-    assert messages[2]["content"] == example
-    assert "Samoyed" in example and "canned" in example.lower()
-    assert "[[" not in example
-    assert backend.provenance.icl_version == MIMO25_ICL_VERSION
-    prompt = messages[-1]["content"][-1]["text"]
-    assert "This target video contains exactly one shot." in prompt
-    assert "prose style only, not shot count" in prompt
+    detailed = example.split("detailed_description:\n", 1)[1]
+    opening, body = detailed.split("\n[Shot 1] ", 1)
+    body = body.split("\n[Shot 2]", 1)[0]
+    assert json.loads(messages[2]["content"]) == {
+        "style_opening": opening, "shot1_caption": body,
+    }
+    for excluded in ("subject_definitions:", "summary:", "retention_analysis:",
+                     "overall_soundscape:", "non_diegetic_music:", "[Shot 1]", "[Shot 2]", "[Shot 3]"):
+        assert excluded not in messages[2]["content"]
+    assert backend.provenance.icl_version == MIMO25_ICL_VERSION == "h3_official_ref2va_detailed_shot1_v2"
+    assert backend.provenance.prompt_version == "h3_mimo25_unified_av_reconcile_v28"
+    assert backend.provenance.schema_version == "r2v.h3.mimo25_backend.31"
+    assert backend.provenance.annotation_schema_version == "r2v.h3.mimo25_av_annotation.18"
+    assert backend.provenance.materializer_version == "h3_mimo25_materializer_v21"
+    assert "This pilot is exactly one shot." in SYSTEM_PROMPT
+    assert "Do not repeat the marker before every utterance" not in SYSTEM_PROMPT
+    assert "style_opening: one concise sentence about global visual/cinematographic style" in SYSTEM_PROMPT
 
 
 def test_direct_caption_materializes_without_reconstructing_prose(tmp_path):
@@ -159,14 +170,15 @@ def test_model_shot_markers_fail_and_use_only_existing_recheck(tmp_path, field, 
 
 
 @pytest.mark.parametrize("speakers,introductions,valid", [
-    (["S1"] * 4, ["<Subject 1> (S1) speaks softly,", "He continues,", "He then adds,", "Finally, he concludes,"], True),
+    (["S1"] * 4, ["<Subject 1> (S1) speaks softly,", "He (S1) continues,", "He (S1) then adds,", "Finally, he (S1) concludes,"], True),
     (["S1"] * 4, ["The woman speaks,"] * 4, False),
-    (["S1", "S1", "S2", "S2"], ["(S1) speaks,", "He adds,", "An off-screen voice (S2) replies,", "It continues,"], True),
-    (["S1", "S2", "S1"], ["(S1) listens to (S2), then speaks,", "The reply follows,", "He resumes,"], True),
+    (["S1", "S1"], ["(S1) speaks,", "He continues,"], False),
+    (["S1", "S1", "S2", "S2"], ["(S1) speaks,", "He (S1) adds,", "An off-screen voice (S2) replies,", "It (S2) continues,"], True),
+    (["S1", "S2"], ["(S1) listens to (S2), then speaks,", "(S2) answers (S1) with a pause,"], True),
     (["S1", "S2"], ["(S1) speaks,", "A voice replies,"], False),
     (["S1", "S1"], ["He speaks,", "(S1) continues,"], False),
 ])
-def test_speakers_need_only_first_dialogue_introduction(speakers, introductions, valid):
+def test_each_dialogue_needs_its_speaker_in_event_lead_in(speakers, introductions, valid):
     speech = [
         {"segment_id": f"segment_{i}", "speaker_id": speaker,
          "language": "Chinese", "text": f"原文{i}"}
@@ -178,4 +190,42 @@ def test_speakers_need_only_first_dialogue_introduction(speakers, introductions,
     assert corrected == text
     assert (not issues) == valid
     if not valid:
-        assert {issue.code for issue in issues} == {"direct_speaker_not_established"}
+        assert {issue.code for issue in issues} == {"direct_dialogue_speaker_marker_missing"}
+
+
+def test_long_natural_lead_in_preserved_with_exact_asr_payload():
+    lead = ("After watching the other person for a moment, <Subject 1> (S1) "
+            "turns away and answers quietly, ")
+    tail = " while lowering his gaze."
+    text = lead + "<d>[Chinese] wrong text</d>" + tail
+    speech = [{**SPEECH[0], "language": "Chinese", "text": "EXACT ASR"}]
+    corrected, issues, warnings = protect_direct_dialogue(text, speech, allowed_labels=LABELS)
+    assert not issues
+    assert corrected == lead + "<d>[Chinese] EXACT ASR</d>" + tail
+    assert warnings == ["asr_dialogue_payload_corrected"]
+
+
+def test_old_caption_excluded_and_single_authoritative_payload(tmp_path):
+    job = _job_fixture(tmp_path)
+    sentinel = "OLD_CAPTION_MUST_NOT_ANCHOR_RECAPTION"
+    old_instruction = f"summary:\nOld scene\ndetailed_description:\n{sentinel}\noverall_soundscape:\nOld audio"
+    job = job.model_copy(update={"r2v_instruction": old_instruction})
+    backend, calls = _backend(tmp_path, [("bad JSON", 8), (_annotation().model_dump_json(), 8)],
+                              transport="sglang", icl="official_ref2va_v1")
+    result = _run(backend, job)
+    assert result.model_call_count == len(calls.requests) == 2
+    assert job.r2v_instruction == old_instruction
+    for request in calls.requests:
+        assert sentinel not in json.dumps(request["messages"])
+        text = request["messages"][-1]["content"][-1]["text"]
+        assert text.count('"subject_definition_requirements"') == 1
+        assert text.count('"reference_image_mapping"') == 1
+        assert text.count('"segments"') == 1
+        assert "authoritative_speech_facts" not in text
+        assert "MANDATORY MACHINE CONTRACT" not in text
+        assert "r2v_instruction" not in text
+    contract = backend.build_compact_task_contract(job)
+    assert contract["segments"] == [segment.model_dump(mode="json") for segment in job.segments]
+    assert calls.requests[1]["messages"][-1]["content"][-1]["text"].startswith(
+        "Reinspect the same AV and fix ONLY these hard issues:"
+    )
