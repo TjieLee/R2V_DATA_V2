@@ -96,6 +96,7 @@ def test_sfx_asr_leakage_is_suppressed_without_dropping_real_sfx() -> None:
                     category="human_non_speech",
                 ),
             ],
+            residual_artifact_notes="model guessed from the scene",
         ),
         job,
     )
@@ -104,8 +105,7 @@ def test_sfx_asr_leakage_is_suppressed_without_dropping_real_sfx() -> None:
     assert facts.clip_duration_seconds == job.clip_duration_seconds
     assert suppressed == 1
     assert [item.description for item in facts.events] == ["a short door click"]
-    assert facts.residual_artifact_notes is not None
-    assert "separator speech leakage" in facts.residual_artifact_notes
+    assert facts.residual_artifact_notes is None
 
 
 def test_bounded_sfx_schema_publishes_hard_array_limits() -> None:
@@ -170,8 +170,53 @@ def test_sfx_draft_drops_nonpositive_duplicates_and_asr_leakage() -> None:
 
     assert facts.clip_duration_seconds == _job().clip_duration_seconds
     assert [item.description for item in facts.events] == ["door click"]
-    assert counts == {"nonpositive": 1, "duplicate": 1, "asr_leakage": 1}
-    assert facts.residual_artifact_notes is not None
-    assert "non-positive-duration" in facts.residual_artifact_notes
-    assert "duplicate residual" in facts.residual_artifact_notes
-    assert "separator speech leakage" in facts.residual_artifact_notes
+    assert counts == {
+        "nonpositive": 1,
+        "duplicate": 1,
+        "asr_leakage": 1,
+        "music_leakage": 0,
+        "model_note_discarded": 0,
+    }
+    assert facts.residual_artifact_notes is None
+
+
+def test_sfx_draft_drops_music_cross_stem_leakage_and_speculative_notes() -> None:
+    draft = BoundedSFXStemFactsDraft(
+        clip_duration_seconds=5.16175,
+        continuous_layers=[
+            {
+                "start_time": 0.0,
+                "end_time": 5.16175,
+                "description": (
+                    "Background music and ambient noise (club/bar atmosphere) "
+                    "playing continuously."
+                ),
+                "confidence": "high",
+            },
+            {
+                "start_time": 0.0,
+                "end_time": 5.16175,
+                "description": "steady room ambience and glass clinks",
+                "confidence": "medium",
+            },
+        ],
+        events=[],
+        residual_artifact_notes=(
+            "The audio likely contains background music typical of a bar, as suggested "
+            "by the visual context."
+        ),
+    )
+
+    facts, counts = _canonicalize_sfx_draft(draft, _job())
+
+    assert [item.description for item in facts.continuous_layers] == [
+        "steady room ambience and glass clinks"
+    ]
+    assert facts.residual_artifact_notes is None
+    assert counts == {
+        "nonpositive": 0,
+        "duplicate": 0,
+        "asr_leakage": 0,
+        "music_leakage": 1,
+        "model_note_discarded": 1,
+    }
