@@ -60,13 +60,13 @@ def _case(tmp_path, monkeypatch, original, response, speakers=("S1",), transport
     return row, completions.requests, summary, responses, facts
 
 
-@pytest.mark.parametrize("original,candidate,speakers", [
-    (SINGLE, SINGLE_FIXED, ("S1",)),
-    (MULTI, MULTI_FIXED, ("S1", "S2")),
-    (MULTI.replace("A woman says", "A woman (S1) says"), MULTI_FIXED, ("S1", "S2")),
+@pytest.mark.parametrize("original,candidate,speakers,projection_issue", [
+    (SINGLE, SINGLE_FIXED, ("S1",), "direct_single_speaker_marker_missing"),
+    (MULTI, MULTI_FIXED, ("S1", "S2"), "direct_dialogue_speaker_marker_missing"),
+    (MULTI.replace("A woman says", "A woman (S1) says"), MULTI_FIXED, ("S1", "S2"), "direct_dialogue_speaker_marker_mismatch"),
 ])
 def test_polish_applies_only_sx_and_rescues_marker_projection(
-    tmp_path, monkeypatch, original, candidate, speakers,
+    tmp_path, monkeypatch, original, candidate, speakers, projection_issue,
 ):
     raw_polish = json.dumps({"shot1_caption": candidate, "needs_review": False})
     row, requests, summary, pending, facts = _case(
@@ -94,12 +94,29 @@ def test_polish_applies_only_sx_and_rescues_marker_projection(
     user = json.loads(request["messages"][-1]["content"])
     assert user["authoritative_speaker_facts"] == facts
     assert user["existing_shot_caption"] == original
+    assert user["speaker_marker_projection_issues"] == [projection_issue]
     assert user["allowed_h3_reference_labels"] == ["<Picture 1>", "<Subject 1>"]
     assert request["response_format"]["json_schema"]["name"] == "MimoSpeakerMarkerPolish"
     diagnostic = row["diagnostics"][-1]
     assert diagnostic["input_modality"] == "speaker_marker_text_only"
     assert all(diagnostic["usage"][f"{kind}_tokens"] is None for kind in ("image", "video", "audio"))
     assert row["backend_provenance"]["speaker_marker_polish_prompt_version"] == mb.MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION
+
+
+def test_polish_v2_prompt_makes_single_speaker_projection_unambiguous():
+    assert mb.MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v35"
+    assert mb.MIMO25_BACKEND_VERSION == "r2v.h3.mimo25_backend.41"
+    assert mb.MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION == "h3_mimo25_speaker_marker_polish_v2"
+    prompt = mb.SPEAKER_MARKER_POLISH_PROMPT
+    assert "exactly one distinct speaker_id" in prompt
+    assert "missing its speaker marker is NOT ambiguous" in prompt
+    assert "smallest natural location and set needs_review=false" in prompt
+    assert "Subject identity, visual binding, pronouns, or on/offscreen presentation" in prompt
+    assert "needs_review=true is only for cases where the supplied authoritative speaker sequence itself" in prompt
+    assert 'AUTHORITATIVE: [{"speaker_id":"S1","text":"..."}]' in prompt
+    assert "EXISTING: He says, <d>[Chinese] ...</d>" in prompt
+    assert "CORRECT: He (S1) says, <d>[Chinese] ...</d>" in prompt
+    assert 'Keep "He says" and all other prose unchanged' in prompt
 
 
 @pytest.mark.parametrize("original,code", [

@@ -31,8 +31,8 @@ MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
 MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v35"
 MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v17"
 MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.20"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.40"
-MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION = "h3_mimo25_speaker_marker_polish_v1"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.41"
+MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION = "h3_mimo25_speaker_marker_polish_v2"
 MIMO25_ICL_VERSION = "h3_official_ref2va_detailed_shot1_v2"
 MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v23"
 MIMO25_CANONICAL_ABSENT_SOUNDSCAPE = (
@@ -878,8 +878,8 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.40"] = MIMO25_BACKEND_VERSION
-    speaker_marker_polish_prompt_version: Literal["h3_mimo25_speaker_marker_polish_v1"] = (
+    schema_version: Literal["r2v.h3.mimo25_backend.41"] = MIMO25_BACKEND_VERSION
+    speaker_marker_polish_prompt_version: Literal["h3_mimo25_speaker_marker_polish_v2"] = (
         MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION
     )
     backend: Literal[
@@ -1427,7 +1427,15 @@ The first dialogue event for a speaker should establish its correct (Sx).
 Consecutive dialogue from the same continuing speaker may inherit the established marker naturally; mechanical repetition is not required.
 A speaker transition must use the correct new (Sx). Make the smallest possible edit.
 Treat all existing prose as immutable except for (Sx) markers.
-If the authoritative facts do not uniquely support a correction, return the caption unchanged and set needs_review=true.
+If AUTHORITATIVE SPEAKER FACTS contain exactly one distinct speaker_id, then any dialogue event missing its speaker marker is NOT ambiguous. Add that authoritative (Sx) marker at the smallest natural location and set needs_review=false.
+Do not treat uncertainty about Subject identity, visual binding, pronouns, or on/offscreen presentation as uncertainty about Sx projection. Speaker identity and Sx mapping are already fixed by AUTHORITATIVE SPEAKER FACTS.
+needs_review=true is only for cases where the supplied authoritative speaker sequence itself does not uniquely determine which existing dialogue block should receive which Sx. In that case return the caption unchanged.
+speaker_marker_projection_issues only explains why this check was requested; it supplies no new speaker facts.
+AUTHORITATIVE: [{"speaker_id":"S1","text":"..."}]
+EXISTING: He says, <d>[Chinese] ...</d>
+CORRECT: He (S1) says, <d>[Chinese] ...</d>
+needs_review=false
+Keep "He says" and all other prose unchanged; only the marker is added.
 Return JSON only with exactly shot1_caption (string) and needs_review (boolean)."""
 
 _SPEAKER_MARKER_POLISH_ISSUES = frozenset({
@@ -2847,6 +2855,9 @@ class OpenAIMimo25Backend:
                     "authoritative_speaker_facts": speech,
                     "allowed_h3_reference_labels": sorted(allowed_labels),
                     "existing_shot_caption": original,
+                    "speaker_marker_projection_issues": sorted(
+                        (codes | set(warnings)) & _SPEAKER_MARKER_POLISH_ISSUES
+                    ),
                 })},
             ],
             "temperature": 0.0, "max_completion_tokens": 2048, "stream": False,
