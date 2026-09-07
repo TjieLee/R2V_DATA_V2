@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>H3 Audio Shadow QA</title>
+<style>
+:root{font-family:system-ui,sans-serif;color:#202824;background:#f7f8fa;font-size:14px}
+*{box-sizing:border-box;letter-spacing:0}body{margin:0}button,select,textarea{font:inherit}
+button,select{padding:7px 10px;border:1px solid #aab2b9;border-radius:4px;background:white;color:inherit;cursor:pointer}
+button:disabled{opacity:.45;cursor:default}button:hover:not(:disabled){background:#edf3f0}button:focus-visible,select:focus-visible{outline:2px solid #167c66}
+header{padding:12px 20px;border-bottom:1px solid #cbd2d6;background:white;display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+h1{font-size:18px;margin:0}h2{font-size:16px;margin:0 0 10px}h3{font-size:14px;margin:8px 0}
+#clip-select{max-width:100%;min-width:260px}#progress{margin-left:auto}#message{padding:8px 20px;margin:0;min-height:34px;color:#4e5960}
+#message.error{color:#a32632;background:#fff0f1}
+main{padding:0 20px 24px;max-width:1800px;margin:auto}#clip-heading{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:8px 0}
+#clip-id{font-size:17px;overflow-wrap:anywhere}.badge{font-weight:700;color:#14654c}
+.failed{color:#a32632!important;background:#fff0f1!important}.empty{color:#825616;background:#fff8e7}
+.qa{border-block:1px solid #cbd2d6;padding:12px 0;margin-bottom:16px;display:grid;grid-template-columns:1fr 1fr;gap:14px}
+#labels{display:flex;gap:12px;flex-wrap:wrap;align-content:start}#labels label{display:flex;align-items:center;gap:5px}
+textarea{display:block;width:100%;resize:vertical;min-height:64px;border:1px solid #aab2b9;border-radius:4px;padding:6px}
+.evidence{display:grid;grid-template-columns:minmax(0,1.3fr) minmax(0,1fr);gap:20px;align-items:start}
+video{width:100%;aspect-ratio:16/9;max-height:540px;background:#151817}audio{width:100%;height:34px}
+.references{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:10px}
+figure{margin:0;min-width:0}figure img{width:100%;height:150px;object-fit:contain;background:white;border:1px solid #d7dde0}
+figcaption{font-size:12px;overflow-wrap:anywhere}details{border-top:1px solid #cbd2d6;padding:12px 0;margin-top:12px}
+summary{font-weight:650;cursor:pointer}pre{white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.5 ui-monospace,monospace;max-height:400px;overflow:auto;margin:8px 0}
+.table-scroll{overflow-x:auto}table{border-collapse:collapse;width:100%;font-size:13px}td,th{text-align:left;border-bottom:1px solid #dbe0e3;padding:8px;vertical-align:top;overflow-wrap:anywhere}
+th{white-space:nowrap}.stem-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.stem{min-width:0;border-top:3px solid #2c947b;padding-top:8px}
+td{white-space:pre-line}
+.stem:nth-child(2){border-color:#b28424}.stem:nth-child(3){border-color:#5f73a7}#reconcile{border-top:1px solid #cbd2d6;padding-top:14px;margin-top:18px}
+small{color:#626e73}a{color:#176c9a}#loading{padding:20px}
+@media(max-width:900px){.evidence,.qa,.stem-grid{grid-template-columns:1fr}header,main{padding-inline:12px}header h1{flex-basis:100%}#progress{margin-left:0}#clip-select{min-width:180px;flex:1}figure img{height:130px}}
+</style>
+</head>
+<body>
+<header>
+<h1>H3 Audio Shadow QA</h1>
+<button id="previous" title="Previous clip" aria-label="Previous clip">&larr;</button>
+<select id="clip-select" aria-label="Clip selector"></select>
+<button id="next" title="Next clip" aria-label="Next clip">&rarr;</button>
+<span id="position"></span><span id="progress"></span>
+<button id="export">Export QA JSON</button>
+<button id="import">Import QA JSON</button>
+<input id="import-file" type="file" accept=".json,application/json" hidden>
+</header>
+<p id="message" role="status"></p>
+<div id="loading">Loading review data...</div>
+<main id="main" hidden>
+<div id="clip-heading"><strong id="clip-id"></strong><span id="status" class="badge"></span><small id="run"></small></div>
+<div class="qa">
+<div id="labels"></div><label>Notes<textarea id="notes" aria-label="QA notes"></textarea></label>
+</div>
+<div class="evidence">
+<section>
+<h2>Original target AV</h2>
+<video id="target-video" controls preload="metadata"></video>
+<p><small id="duration"></small></p>
+<details id="target-details"><summary>Target provenance</summary><pre></pre></details>
+</section>
+<section>
+<h2>Frozen Visual evidence</h2>
+<div id="references" class="references"></div>
+<details open><summary>Subjects / Pictures</summary><pre id="subjects"></pre></details>
+<details><summary>Visual selection / provenance</summary><pre id="visual-provenance"></pre></details>
+</section>
+</div>
+<details open><summary>DiariZen speech timeline + Qwen3-ASR</summary>
+<p id="diar-status"></p>
+<div class="table-scroll"><table><thead><tr><th>Segment / seconds</th><th>Cluster / binding</th><th>ASR status</th><th>Language / transcript</th></tr></thead><tbody id="timeline"></tbody></table></div>
+<details><summary>Exact source sample ranges / ASR provenance</summary><pre id="speech-provenance"></pre></details>
+</details>
+<details><summary>Speaker-binding evidence: frozen production and shadow (separate sources)</summary><pre id="binding"></pre></details>
+<h2>Auxiliary SAM stem evidence</h2><p id="separation-status"></p>
+<div id="stems" class="stem-grid"></div>
+<details><summary>Separation provenance / alignment</summary><pre id="separation"></pre></details>
+<details><summary>Stem-facts runtime diagnostics</summary><pre id="fact-diagnostics"></pre></details>
+<section id="reconcile"><h2>MiMo original-AV reconcile</h2><div id="reconcile-body"></div></section>
+</main>
+<script>
+"use strict";
+let data = null, index = 0;
+const $ = id => document.getElementById(id);
+function message(text, error = false) { $("message").textContent = text; $("message").className = error ? "error" : ""; }
+function key(clip) { return "h3-audio-shadow-qa-v1:" + clip.clip_uid + ":" + clip.record_fingerprint; }
+function validState(state) {
+  return state && Array.isArray(state.labels) && typeof state.notes === "string" &&
+    state.labels.every(label => data.qa_labels.includes(label)) &&
+    new Set(state.labels).size === state.labels.length;
+}
+function stateFor(clip) {
+  const raw = localStorage.getItem(key(clip));
+  if (raw === null) return {labels: [], notes: ""};
+  const state = JSON.parse(raw);
+  if (!validState(state)) throw new Error("Invalid saved QA state; export/inspect browser storage before continuing.");
+  return state;
+}
+function updateProgress() {
+  const reviewed = data.clips.filter(c => stateFor(c).labels.length > 0).length;
+  $("progress").textContent = "Labeled " + reviewed + " / " + data.clips.length;
+}
+function saveCurrent() {
+  if (!data) return;
+  const state = {labels: data.qa_labels.filter(label =>
+    document.querySelector('input[data-qa-label="' + label + '"]').checked), notes: $("notes").value};
+  localStorage.setItem(key(data.clips[index]), JSON.stringify(state));
+  updateProgress();
+}
+function safely(action) { try { return action(); } catch (error) { message(error.message, true); return false; } }
+function pretty(value) { return JSON.stringify(value, null, 2); }
+function pre(value) { const element = document.createElement("pre"); element.textContent = pretty(value); return element; }
+function details(title, value, open = false) {
+  const element = document.createElement("details"), heading = document.createElement("summary");
+  heading.textContent = title; element.append(heading, pre(value)); element.open = open; return element;
+}
+function cell(row, value) { const el = document.createElement("td"); el.textContent = value == null ? "[unavailable]" : String(value); row.append(el); return el; }
+function render() {
+  const clip = data.clips[index], state = stateFor(clip);
+  document.querySelectorAll("video,audio").forEach(media => media.pause());
+  $("clip-select").value = String(index);
+  $("clip-id").textContent = clip.clip_uid;
+  $("run").textContent = data.shadow_run_id || "default";
+  $("position").textContent = (index + 1) + " / " + data.clips.length;
+  $("previous").disabled = index === 0; $("next").disabled = index === data.clips.length - 1;
+  $("status").textContent = clip.reconcile.status;
+  $("status").className = "badge" + (clip.reconcile.status === "ready" ? "" : " failed");
+  $("labels").replaceChildren();
+  data.qa_labels.forEach(label => {
+    const el = document.createElement("label"), input = document.createElement("input");
+    input.type = "checkbox"; input.dataset.qaLabel = label; input.checked = state.labels.includes(label);
+    input.addEventListener("change", () => safely(saveCurrent));
+    el.append(input, document.createTextNode(label)); $("labels").append(el);
+  });
+  $("notes").value = state.notes;
+  $("target-video").src = clip.target.video_url;
+  $("duration").textContent = clip.target.duration_seconds.toFixed(3) + " s";
+  $("target-details").querySelector("pre").textContent = pretty(clip.target);
+  $("references").replaceChildren();
+  clip.visual.reference_images.forEach(ref => {
+    const fig = document.createElement("figure"), link = document.createElement("a");
+    const img = document.createElement("img"), caption = document.createElement("figcaption");
+    link.href = ref.url; link.target = "_blank"; link.rel = "noopener";
+    img.src = ref.url; img.alt = ref.picture_label; img.loading = "lazy"; link.append(img);
+    caption.textContent = [ref.picture_label, ref.entity_id || ref.owner_entity_id || "", ref.kind, ref.attribute_type || ""].filter(Boolean).join(" / ");
+    fig.append(link, caption); $("references").append(fig);
+  });
+  $("subjects").textContent = pretty(clip.visual.reference_subjects);
+  $("visual-provenance").textContent = pretty(clip.visual);
+  const diar = clip.diarization.clip_result;
+  $("diar-status").textContent = diar ? ("DiariZen: " + diar.status + (diar.reason ? " / " + diar.reason : "")) : "DiariZen unavailable: upstream failure";
+  $("diar-status").className = !diar || diar.status === "failed" ? "failed" : diar.status === "empty" ? "empty" : "";
+  const asr = new Map(clip.asr.segments.map(s => [s.segment_id, s]));
+  const bound = new Map(clip.speaker_binding.stem_bound_segments.map(s => [s.segment_id, s]));
+  $("timeline").replaceChildren();
+  clip.diarization.raw_segments.forEach(segment => {
+    const row = document.createElement("tr"), transcript = asr.get(segment.segment_id), binding = bound.get(segment.segment_id);
+    const duration = segment.end_time - segment.start_time;
+    const timing = cell(row, segment.segment_id + "\n" + segment.start_time.toFixed(3) + " - " + segment.end_time.toFixed(3) + " (" + duration.toFixed(3) + "s)");
+    const play = document.createElement("button"); play.textContent = "\u25b6"; play.title = "Play target at segment start";
+    play.addEventListener("click", () => { $("target-video").currentTime = segment.start_time; $("target-video").play().catch(e => message(e.message, true)); });
+    timing.append(document.createElement("br"), play);
+    cell(row, segment.speaker_cluster_id + "\n" + (binding ? binding.cluster_binding_status + " / " + (binding.entity_id || "unbound") : "[unavailable]"));
+    const status = cell(row, transcript ? transcript.status : "[missing ASR]");
+    if (!transcript || transcript.status === "failed") status.className = "failed";
+    else if (transcript.status === "empty") status.className = "empty";
+    cell(row, transcript ? [transcript.language, transcript.text, transcript.failure_reason].filter(Boolean).join("\n") || "[empty]" : "[unavailable]");
+    if (duration < 1) timing.className = "empty";
+    $("timeline").append(row);
+  });
+  $("speech-provenance").textContent = pretty({diarization: clip.diarization, asr: clip.asr});
+  $("binding").textContent = pretty(clip.speaker_binding);
+  $("separation-status").textContent = "Separation: " + clip.separation.separation_state + " | Facts: " + (clip.stem_facts ? clip.stem_facts.status : "[upstream unavailable]");
+  $("separation").textContent = pretty(clip.separation);
+  $("stems").replaceChildren();
+  ["speech", "music", "sfx"].forEach(kind => {
+    const section = document.createElement("section"), heading = document.createElement("h3");
+    section.className = "stem"; heading.textContent = kind.toUpperCase(); section.append(heading);
+    const url = clip.separation.media[kind];
+    if (url) { const audio = document.createElement("audio"); audio.controls = true; audio.preload = "none"; audio.src = url; section.append(audio); }
+    section.append(pre(clip.stem_facts && clip.stem_facts[kind] ? clip.stem_facts[kind] : "[unavailable]"));
+    $("stems").append(section);
+  });
+  $("fact-diagnostics").textContent = pretty(clip.stem_facts ? {
+    status: clip.stem_facts.status, failure_code: clip.stem_facts.failure_code,
+    failure_reason: clip.stem_facts.failure_reason, backend_provenance: clip.stem_facts.backend_provenance,
+    diagnostics: clip.stem_facts.diagnostics
+  } : "[unavailable]");
+  $("reconcile-body").replaceChildren();
+  const result = clip.reconcile;
+  if (result.status !== "ready") {
+    const failure = pre({status: result.status, failure_code: result.failure_code,
+      failure_reason: result.failure_reason, upstream_failure: result.upstream_failure,
+      model_call_count: result.model_call_count});
+    failure.className = "failed"; $("reconcile-body").append(failure);
+  } else {
+    Object.entries(result.annotation).filter(([name]) => name !== "schema_version").forEach(([name, value]) =>
+      $("reconcile-body").append(details(name, value, name === "av_grounding" || name === "audio_observation")));
+  }
+  $("reconcile-body").append(details("Request diagnostics / provenance", {
+    model_call_count: result.model_call_count, diagnostics: result.diagnostics,
+    backend_provenance: result.backend_provenance, source_job_fingerprint: result.source_job_fingerprint,
+    source_stem_facts_fingerprint: result.source_stem_facts_fingerprint
+  }));
+  updateProgress(); $("main").hidden = false; $("loading").hidden = true;
+}
+function navigate(next) { saveCurrent(); index = Math.max(0, Math.min(data.clips.length - 1, next)); render(); }
+function exportPayload() {
+  saveCurrent();
+  return {schema_version: data.review_schema_version, dataset_fingerprint: data.dataset_fingerprint,
+    shadow_run_id: data.shadow_run_id, annotations: data.clips.flatMap(clip => {
+      const state = stateFor(clip);
+      return state.labels.length || state.notes ? [{clip_uid: clip.clip_uid,
+        record_fingerprint: clip.record_fingerprint,
+        labels: data.qa_labels.filter(label => state.labels.includes(label)), notes: state.notes}] : [];
+    })};
+}
+function importPayload(payload) {
+  if (!payload || payload.schema_version !== data.review_schema_version ||
+      payload.dataset_fingerprint !== data.dataset_fingerprint ||
+      payload.shadow_run_id !== data.shadow_run_id || !Array.isArray(payload.annotations))
+    throw new Error("QA import belongs to a different or stale dataset.");
+  const clips = new Map(data.clips.map(c => [c.clip_uid, c])), seen = new Set();
+  payload.annotations.forEach(row => {
+    const clip = clips.get(row.clip_uid);
+    if (!clip || seen.has(row.clip_uid) || row.record_fingerprint !== clip.record_fingerprint || !validState(row))
+      throw new Error("Invalid, duplicate, or stale QA annotation.");
+    seen.add(row.clip_uid);
+  });
+  payload.annotations.forEach(row => localStorage.setItem(key(clips.get(row.clip_uid)),
+    JSON.stringify({labels: row.labels, notes: row.notes})));
+  render(); message("Imported " + payload.annotations.length + " annotations.");
+}
+$("previous").onclick = () => safely(() => navigate(index - 1));
+$("next").onclick = () => safely(() => navigate(index + 1));
+$("clip-select").onchange = event => safely(() => navigate(Number(event.target.value)));
+$("notes").oninput = () => safely(saveCurrent);
+$("export").onclick = () => safely(() => {
+  const url = URL.createObjectURL(new Blob([JSON.stringify(exportPayload(), null, 2) + "\n"], {type: "application/json"}));
+  const link = document.createElement("a"); link.href = url; link.download = "h3_audio_shadow_qa.json";
+  link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+});
+$("import").onclick = () => $("import-file").click();
+$("import-file").onchange = async event => {
+  try {
+    const file = event.target.files[0]; if (!file) return;
+    importPayload(JSON.parse(await file.text()));
+  } catch (error) { message(error.message, true); }
+  finally { event.target.value = ""; }
+};
+document.addEventListener("keydown", event => {
+  if (!data || ["INPUT", "TEXTAREA", "SELECT"].includes(event.target.tagName)) return;
+  if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+    event.preventDefault(); safely(() => navigate(index + (event.key === "ArrowRight" ? 1 : -1)));
+  }
+});
+fetch("data.json", {cache: "no-store"}).then(response => {
+  if (!response.ok) throw new Error("Cannot load data.json: " + response.status);
+  return response.json();
+}).then(payload => {
+  if (payload.schema_version !== "r2v.h3.audio_shadow_qa.1" || !payload.clips.length) throw new Error("Invalid QA dataset.");
+  data = payload;
+  data.clips.forEach((clip, i) => {
+    const option = document.createElement("option"); option.value = String(i);
+    option.textContent = clip.clip_uid + " / " + clip.reconcile.status; $("clip-select").append(option);
+  });
+  render();
+}).catch(error => { $("loading").hidden = true; message(error.message, true); });
+</script>
+</body>
+</html>

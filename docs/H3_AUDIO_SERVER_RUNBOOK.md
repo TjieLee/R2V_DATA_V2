@@ -295,6 +295,71 @@ intentionally replaced, all already-published downstream stages become stale by
 lineage and must be inspected before any explicit replacement. Prefer a new run
 ID for a new case inventory or algorithm experiment.
 
+## Static manual QA sidecar
+
+Inspect label quality without running any model or changing any source stage:
+
+```bash
+"$R2V_PYTHON" tools/build_h3_audio_shadow_qa.py \
+  --visual-production-root "$VISUAL_PRODUCTION_ROOT" \
+  --visual-runs-root "$VISUAL_RUNS_ROOT" \
+  --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
+  --shadow-run-id random10-v1 \
+  --case-manifest "$CASE_MANIFEST"
+
+QA_ROOT="$AUDIO_PRODUCTION_ROOT/sam_audio_stem_shadow_v1/runs/random10-v1/qa"
+"$R2V_PYTHON" -m http.server 8774 --bind 127.0.0.1 --directory "$QA_ROOT"
+```
+
+Forward port 8774 through the existing SSH connection and open
+`http://127.0.0.1:8774/review.html` locally. Serve only the QA directory, not the
+whole production tree. No POST endpoint or model environment is involved.
+The page shows original target AV, frozen Visual references, distinct production
+and shadow binding evidence, stem DiariZen/ASR, three auxiliary stem-fact panels,
+and ready/failed/upstream-failed reconcile results. Original AV remains factual
+authority; separator names and manual labels are not production truth.
+
+The builder validates existing complete stage metadata and lineage, including
+per-clip failure records. Output is `review.html`, `data.json`, and `media/`
+containing only single-file symlinks to provenance-checked video/image/stem
+assets. No production media is copied or changed. Relative frontend URLs work
+with a static server that follows these links; moving this directory to another
+machine requires the same source paths. Browser codec support and server access
+to the links still need checking on Linux. No media transcode is performed.
+
+Omit the run ID for the default smoke's independent `qa/` folder. An optional
+`--output-root` may select a separate directory outside all input roots.
+An existing output requires `--overwrite` and must be owned by the same QA run;
+replacement is atomic and never replaces separation or downstream source stages.
+Export browser annotations before clearing browser storage or changing origin.
+
+Manual categories (multi-select) are `good`, `upstream_label_wrong`,
+`speaker_ambiguous`, `asr_issue`, `stem_issue`, and `mimo_semantic_issue`.
+Notes and labels persist in localStorage. **Export QA JSON** downloads
+`h3_audio_shadow_qa.json`; **Import QA JSON** restores a matching export.
+The sidecar shape is:
+
+```json
+{
+  "schema_version": "r2v.h3.audio_shadow_human_qa.1",
+  "dataset_fingerprint": "<sha256>",
+  "shadow_run_id": "random10-v1",
+  "annotations": [
+    {
+      "clip_uid": "<clip>",
+      "record_fingerprint": "<sha256>",
+      "labels": ["stem_issue"],
+      "notes": "Manual observation"
+    }
+  ]
+}
+```
+
+Exports follow case-manifest order and omit untouched clips. Fingerprints bind
+the reviewed source facts; stale/unknown/duplicate imports fail rather than
+attaching labels to changed artifacts. Annotations are independent QA sidecars,
+never binding corrections or updates to DiariZen, ASR, facts, reconcile, or H3.
+
 ## Environment and overwrite rules
 
 - Never install SAM-only, DiariZen, or Qwen3-ASR dependencies into the main
