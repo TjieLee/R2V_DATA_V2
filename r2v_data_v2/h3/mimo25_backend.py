@@ -31,8 +31,8 @@ MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
 MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v35"
 MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v17"
 MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.20"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.41"
-MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION = "h3_mimo25_speaker_marker_polish_v2"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.42"
+MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION = "h3_mimo25_speaker_marker_polish_v3"
 MIMO25_ICL_VERSION = "h3_official_ref2va_detailed_shot1_v2"
 MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v23"
 MIMO25_CANONICAL_ABSENT_SOUNDSCAPE = (
@@ -475,6 +475,19 @@ def _canonicalize_raw_annotation_payload(
                             "av_grounding_evidence_code_deduplication"
                         ] += count
                 if (
+                    grounding.get("binding_status") == "visible_entity"
+                    and grounding.get("speech_presentation") == "offscreen_spoken"
+                ):
+                    evidence = grounding.get("evidence_codes")
+                    offscreen = isinstance(evidence, list) and "offscreen_audio" in evidence
+                    grounding["binding_status"] = "offscreen" if offscreen else "no_reliable_entity"
+                    grounding["speech_presentation"] = "offscreen_spoken" if offscreen else "uncertain"
+                    grounding["entity_id"] = None
+                    grounding["confidence"] = "low"
+                    if not offscreen and isinstance(evidence, list):
+                        _append_insufficient_evidence(grounding)
+                    corrections["raw_visible_offscreen_binding_downgrade"] += 1
+                if (
                     grounding.get("binding_status") != "visible_entity"
                     and grounding.get("entity_id") is not None
                 ):
@@ -878,8 +891,8 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.41"] = MIMO25_BACKEND_VERSION
-    speaker_marker_polish_prompt_version: Literal["h3_mimo25_speaker_marker_polish_v2"] = (
+    schema_version: Literal["r2v.h3.mimo25_backend.42"] = MIMO25_BACKEND_VERSION
+    speaker_marker_polish_prompt_version: Literal["h3_mimo25_speaker_marker_polish_v3"] = (
         MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION
     )
     backend: Literal[
@@ -1436,6 +1449,13 @@ EXISTING: He says, <d>[Chinese] ...</d>
 CORRECT: He (S1) says, <d>[Chinese] ...</d>
 needs_review=false
 Keep "He says" and all other prose unchanged; only the marker is added.
+DIALOGUE_MARKER_TARGETS gives the authoritative marker for each existing <d> block by 1-based chronological dialogue index.
+For every listed target, ensure that dialogue block is introduced by the listed (Sx): if missing, add it; if a different known Sx is present, replace it. Do not question or infer the mapping. Do not modify any non-Sx text.
+If DIALOGUE_MARKER_TARGETS is supplied, it is already uniquely aligned. Set needs_review=false after applying the required marker-only edits.
+DIALOGUE_MARKER_TARGETS: [{"dialogue_index":1,"speaker_id":"S1"},{"dialogue_index":2,"speaker_id":"S2"}]
+EXISTING: An offscreen male voice (S1) says, <d>[Chinese] a</d> <Subject 1> replies, <d>[Chinese] b</d>
+CORRECT: An offscreen male voice (S1) says, <d>[Chinese] a</d> <Subject 1> (S2) replies, <d>[Chinese] b</d>
+needs_review=false
 Return JSON only with exactly shot1_caption (string) and needs_review (boolean)."""
 
 _SPEAKER_MARKER_POLISH_ISSUES = frozenset({
@@ -2844,6 +2864,9 @@ class OpenAIMimo25Backend:
         ):
             return annotation, audit, None
         original = annotation.h3_semantics.shot1_caption
+        dialogue_blocks = _DIALOGUE.findall(original)
+        if not dialogue_blocks or len(dialogue_blocks) != len(speech):
+            return annotation, audit, None
         diagnostic = MimoCompletionDiagnostic(
             input_modality="speaker_marker_text_only", usage=MimoUsage(), http_attempt_count=1,
         )
@@ -2853,6 +2876,10 @@ class OpenAIMimo25Backend:
                 {"role": "system", "content": SPEAKER_MARKER_POLISH_PROMPT},
                 {"role": "user", "content": _compact_json({
                     "authoritative_speaker_facts": speech,
+                    "dialogue_marker_targets": [
+                        {"dialogue_index": index, "speaker_id": fact["speaker_id"]}
+                        for index, fact in enumerate(speech, 1)
+                    ],
                     "allowed_h3_reference_labels": sorted(allowed_labels),
                     "existing_shot_caption": original,
                     "speaker_marker_projection_issues": sorted(

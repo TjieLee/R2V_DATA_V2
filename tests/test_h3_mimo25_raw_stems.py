@@ -1059,7 +1059,10 @@ def test_marker_severity_uses_distinct_authoritative_speakers(
     assert row["annotation"]["h3_semantics"]["shot1_caption"] == caption
     assert row["raw_responses"] == [json.dumps(payload)]
     assert row["annotation"]["av_grounding"] == payload["av_grounding"]
-    text_calls = int(hard_code != "direct_unknown_speaker")
+    text_calls = int(
+        hard_code != "direct_unknown_speaker"
+        and 0 < caption.count("<d>") == len(speakers)
+    )
     assert summary.model_call_count == len(completions.requests) == (3 + text_calls) * len(jobs)
     assert row["model_call_count"] == 3 + text_calls
     assert row["text_model_call_count"] == text_calls
@@ -1100,7 +1103,7 @@ def test_explicit_marker_mismatch_remains_hard_in_backend(tmp_path, monkeypatch)
     assert "direct_dialogue_speaker_marker_mismatch" not in row["diagnostics"][-1]["warnings"]
     assert summary.model_call_count == len(completions.requests) == 4
     assert row["text_model_call_count"] == 1
-    assert backend.provenance.schema_version == MIMO25_BACKEND_VERSION == "r2v.h3.mimo25_backend.41"
+    assert backend.provenance.schema_version == MIMO25_BACKEND_VERSION == "r2v.h3.mimo25_backend.42"
     assert backend.provenance.prompt_version == "h3_mimo25_unified_av_reconcile_v35"
 
 

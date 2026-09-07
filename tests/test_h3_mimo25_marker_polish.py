@@ -63,6 +63,9 @@ def _case(tmp_path, monkeypatch, original, response, speakers=("S1",), transport
 @pytest.mark.parametrize("original,candidate,speakers,projection_issue", [
     (SINGLE, SINGLE_FIXED, ("S1",), "direct_single_speaker_marker_missing"),
     (MULTI, MULTI_FIXED, ("S1", "S2"), "direct_dialogue_speaker_marker_missing"),
+    ("An offscreen male voice (S1) says, <d>[Chinese] a</d> <Subject 1> replies, <d>[Chinese] b</d>",
+     "An offscreen male voice (S1) says, <d>[Chinese] a</d> <Subject 1> (S2) replies, <d>[Chinese] b</d>",
+     ("S1", "S2"), "direct_dialogue_speaker_marker_missing"),
     (MULTI.replace("A woman says", "A woman (S1) says"), MULTI_FIXED, ("S1", "S2"), "direct_dialogue_speaker_marker_mismatch"),
 ])
 def test_polish_applies_only_sx_and_rescues_marker_projection(
@@ -93,6 +96,10 @@ def test_polish_applies_only_sx_and_rescues_marker_projection(
     assert request["extra_body"] == {"chat_template_kwargs": {"thinking": False, "enable_thinking": False}}
     user = json.loads(request["messages"][-1]["content"])
     assert user["authoritative_speaker_facts"] == facts
+    assert user["dialogue_marker_targets"] == [
+        {"dialogue_index": index, "speaker_id": speaker}
+        for index, speaker in enumerate(speakers, 1)
+    ]
     assert user["existing_shot_caption"] == original
     assert user["speaker_marker_projection_issues"] == [projection_issue]
     assert user["allowed_h3_reference_labels"] == ["<Picture 1>", "<Subject 1>"]
@@ -103,10 +110,10 @@ def test_polish_applies_only_sx_and_rescues_marker_projection(
     assert row["backend_provenance"]["speaker_marker_polish_prompt_version"] == mb.MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION
 
 
-def test_polish_v2_prompt_makes_single_speaker_projection_unambiguous():
+def test_polish_v3_prompt_makes_aligned_speaker_projection_unambiguous():
     assert mb.MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v35"
-    assert mb.MIMO25_BACKEND_VERSION == "r2v.h3.mimo25_backend.41"
-    assert mb.MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION == "h3_mimo25_speaker_marker_polish_v2"
+    assert mb.MIMO25_BACKEND_VERSION == "r2v.h3.mimo25_backend.42"
+    assert mb.MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION == "h3_mimo25_speaker_marker_polish_v3"
     prompt = mb.SPEAKER_MARKER_POLISH_PROMPT
     assert "exactly one distinct speaker_id" in prompt
     assert "missing its speaker marker is NOT ambiguous" in prompt
@@ -117,6 +124,94 @@ def test_polish_v2_prompt_makes_single_speaker_projection_unambiguous():
     assert "EXISTING: He says, <d>[Chinese] ...</d>" in prompt
     assert "CORRECT: He (S1) says, <d>[Chinese] ...</d>" in prompt
     assert 'Keep "He says" and all other prose unchanged' in prompt
+    assert "1-based chronological dialogue index" in prompt
+    assert "if a different known Sx is present, replace it" in prompt
+    assert "Do not question or infer the mapping" in prompt
+    assert "already uniquely aligned. Set needs_review=false" in prompt
+    assert '<Subject 1> (S2) replies, <d>[Chinese] b</d>' in prompt
+
+
+@pytest.mark.parametrize("speakers,caption", [
+    (("S1",), "She says <d>[Chinese] a</d> Then <d>[Chinese] b</d> Finally <d>[Chinese] c</d>"),
+    (("S1", "S1"), SINGLE),
+])
+def test_unaligned_dialogue_never_polishes_or_rewrites(tmp_path, monkeypatch, speakers, caption):
+    row, _, summary, pending, _ = _case(
+        tmp_path, monkeypatch, caption, "MUST NOT BE USED", speakers,
+    )
+    assert pending == ["MUST NOT BE USED"]
+    assert summary.ready_count == 1 and summary.model_call_count == 3
+    assert summary.text_model_call_count == 0
+    assert not row["speaker_marker_polish_attempted"]
+    assert row["annotation"]["h3_semantics"]["shot1_caption"] == caption
+    assert row["failure_issues"] == []
+    assert "direct_single_speaker_marker_missing" in row["diagnostics"][-1]["warnings"]
+
+
+@pytest.mark.parametrize("offscreen", [False, True])
+def test_raw_visible_offscreen_downgrade_preserves_audio_and_caption(tmp_path, monkeypatch, offscreen):
+    _, shadow = _fixture(tmp_path, monkeypatch)
+    payload = json.loads(_raw())
+    payload["h3_semantics"]["shot1_caption"] = SINGLE_FIXED
+    grounding = payload["av_grounding"]["segment_groundings"][0]
+    grounding["speech_presentation"] = "offscreen_spoken"
+    grounding["evidence_codes"] = ["offscreen_audio"] if offscreen else ["visible_lip_motion"]
+    with pytest.raises(ValueError, match="visible_entity"):
+        mb.MimoAVAnnotationDraft.model_validate(payload)
+    raw = json.dumps(payload)
+    canonical, counts = mb._canonicalize_raw_annotation_payload(raw)
+    assert counts == {"raw_visible_offscreen_binding_downgrade": 1}
+    parsed = mb.MimoAVAnnotationDraft.model_validate_json(canonical)
+    fixed = parsed.av_grounding.segment_groundings[0]
+    assert fixed.binding_status == ("offscreen" if offscreen else "no_reliable_entity")
+    assert fixed.speech_presentation == ("offscreen_spoken" if offscreen else "uncertain")
+    assert fixed.entity_id is None and fixed.confidence == "low"
+    assert fixed.evidence_codes == (["offscreen_audio"] if offscreen else ["visible_lip_motion", "insufficient_evidence"])
+    assert parsed.audio_observation.model_dump(mode="json") == payload["audio_observation"]
+    assert parsed.h3_semantics.model_dump(mode="json") == payload["h3_semantics"]
+    assert parsed.visual_observation.model_dump(mode="json") == payload["visual_observation"]
+    backend, completions, stems, jobs = _backend(tmp_path, shadow, [(raw, 8)])
+    original_segments = [segment.model_dump() for segment in jobs[0].segments]
+    summary = _run(shadow, backend, stems, jobs[:1])
+    row = _records(shadow)[0]
+    assert summary.ready_count == 1 and row["failure_issues"] == []
+    assert summary.model_call_count == len(completions.requests) == 3
+    assert row["audio_model_call_count"] == 2 and row["av_model_call_count"] == 1
+    assert row["text_model_call_count"] == 0
+    assert row["raw_responses"] == [raw]
+    assert row["annotation"]["audio_observation"] == payload["audio_observation"]
+    assert row["annotation"]["h3_semantics"] == payload["h3_semantics"]
+    assert [segment.model_dump() for segment in jobs[0].segments] == original_segments
+    annotation = mb.MimoAVAnnotationDraft.model_validate(row["annotation"])
+    assert mb.direct_speech_facts(annotation, jobs[0].segments)[0]["speaker_id"] == "S1"
+    assert "deterministic_correction:raw_visible_offscreen_binding_downgrade" in row["diagnostics"][-1]["warnings"]
+
+
+@pytest.mark.parametrize("presentation", ["voice_over", "device_playback", "message_voice_over", "onscreen_spoken"])
+def test_raw_downgrade_does_not_expand_to_other_presentations(presentation):
+    payload = json.loads(_raw())
+    payload["av_grounding"]["segment_groundings"][0]["speech_presentation"] = presentation
+    raw = json.dumps(payload)
+    canonical, corrections = mb._canonicalize_raw_annotation_payload(raw)
+    assert canonical == raw and corrections == {}
+
+
+@pytest.mark.parametrize("evidence", [
+    ["insufficient_evidence"],
+    ["visible_lip_motion", "speaker_visible_mouth_occluded", "av_temporal_alignment",
+     "voice_continuity", "speaker_turn_change", "lr_asd_support", "lr_asd_conflict",
+     "source_cluster_support"],
+])
+def test_raw_downgrade_preserves_evidence_uniqueness_and_capacity(evidence):
+    payload = json.loads(_raw())
+    grounding = payload["av_grounding"]["segment_groundings"][0]
+    grounding["speech_presentation"] = "offscreen_spoken"
+    grounding["evidence_codes"] = evidence
+    canonical, counts = mb._canonicalize_raw_annotation_payload(json.dumps(payload))
+    parsed = mb.MimoAVAnnotationDraft.model_validate_json(canonical)
+    assert parsed.av_grounding.segment_groundings[0].evidence_codes == evidence
+    assert counts == {"raw_visible_offscreen_binding_downgrade": 1}
+    assert mb._canonicalize_raw_annotation_payload(canonical) == (canonical, {})
 
 
 @pytest.mark.parametrize("original,code", [
