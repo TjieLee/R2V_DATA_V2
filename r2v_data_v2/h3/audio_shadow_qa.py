@@ -31,6 +31,7 @@ from r2v_data_v2.h3.mimo25_stem_shadow import (
     MimoStemReconcileRecord,
     MimoStemReconcileSummary,
     build_stem_reconcile_jobs,
+    usable_stem_reconcile_inventory,
 )
 from r2v_data_v2.h3.qwen3_asr import Qwen3ASRSegment
 from r2v_data_v2.h3.sam_audio_stem_shadow import (
@@ -179,7 +180,8 @@ def build_audio_shadow_qa(
         ):
             raise ValueError("QA source H3 variants differ from MiMo inventory")
     jobs = build_stem_reconcile_jobs(
-        base_inventory=base, stem_diarization_root=diarization,
+        base_inventory=usable_stem_reconcile_inventory(base, diar_provenance),
+        stem_diarization_root=diarization,
         stem_asr_root=asr, route=diar_provenance.route,
     )
     jobs_by_clip = {job.clip_uid: job for job in jobs}

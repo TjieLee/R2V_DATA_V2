@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from r2v_data_v2.h3 import audio_shadow_qa as qa
+from r2v_data_v2.h3.mimo25_av_reconcile import _inventory
 from r2v_data_v2.h3.mimo25_backend import (
     MimoBackendConfig,
     MimoBackendFailure,
@@ -29,6 +30,82 @@ from tools import run_h3_mimo25_stem_reconcile_shadow as cli
 PARTITION = (
     '{"overall_soundscape":"A quiet room tone and a clink.","non_diegetic_music":"N/A"}'
 )
+
+
+def _subset_inventory(base, clip_ids):
+    by_id = {job.clip_uid: job for job in base.jobs}
+    values = base.model_dump(mode="json", exclude={"inventory_fingerprint"})
+    if values["source_diarization_inventory_sha256"] is None:
+        values.pop("source_diarization_inventory_sha256")
+    values["jobs"] = [by_id[uid].model_dump(mode="json") for uid in clip_ids]
+    values["clip_count"] = len(clip_ids)
+    return _inventory(values)
+
+
+@pytest.mark.parametrize("clip_ids,mixed", [
+    (["clip-a"], False),
+    (["clip-z", "clip-a", "clip-m"], False),
+    (["clip-z"], True),
+])
+def test_reconcile_ordered_subset_cli(tmp_path, monkeypatch, clip_ids, mixed):
+    kwargs, shadow = _fixture(tmp_path, monkeypatch, mixed=mixed)
+    base = _subset_inventory(qa.build_mimo25_inventory(), clip_ids)
+    monkeypatch.setattr(qa, "build_mimo25_inventory", lambda **kwargs: base)
+    backend, completions, _, _ = _backend(
+        tmp_path, shadow, [(_raw(), 8), (PARTITION, None)] * len(clip_ids),
+    )
+    if mixed:
+        monkeypatch.setattr(
+            cli, "separation_skips",
+            lambda **kwargs: [SimpleNamespace(clip_uid="clip-m")],
+        )
+    case_path = kwargs["case_manifest"]
+    case = json.loads(case_path.read_text())
+    case["clip_uids"] = clip_ids
+    case_path.write_text(json.dumps(case))
+    monkeypatch.setattr(cli, "build_mimo25_inventory", lambda **kwargs: base)
+    monkeypatch.setattr(cli, "StemAwareOpenAIMimo25Backend", lambda *a, **k: backend)
+    monkeypatch.setenv("MIMO_API_KEY", "fake")
+    argv = [
+        part for key, value in kwargs.items()
+        for part in ("--" + key.replace("_", "-"), str(value))
+    ]
+    result = cli.main([
+        *argv, "--media-root", str(tmp_path), "--allow-unverified", "--overwrite",
+    ])
+    summary = result["summary"]
+    assert result["clip_uids"] == clip_ids
+    assert summary["clip_uids"] == clip_ids
+    assert summary["processed_clip_uids"] == clip_ids
+    assert summary["skipped_clips"] == []
+    assert summary["diarization_failed_clips"] == []
+    assert [row["clip_uid"] for row in _records(shadow)] == clip_ids
+    assert len(completions.requests) == 2 * len(clip_ids)
+
+
+@pytest.mark.parametrize("clip_ids", [["clip-m", "clip-z"], ["unknown"], ["clip-a", "clip-a"]])
+def test_reconcile_rejects_invalid_subsets(tmp_path, monkeypatch, clip_ids):
+    _, shadow = _fixture(tmp_path, monkeypatch)
+    inventory = load_stem_shadow(shadow / "separation")[0]
+    with pytest.raises(ValueError, match="ordered subset"):
+        cli._validate_stage_closure(
+            case_manifest=SimpleNamespace(clip_uids=clip_ids),
+            stem_inventory=inventory,
+            separation_root=shadow / "separation",
+            diarization_provenance=SimpleNamespace(source_stem_root=str(shadow / "separation")),
+        )
+    base = qa.build_mimo25_inventory()
+    by_id = {job.clip_uid: job for job in base.jobs}
+    requested = [
+        by_id.get(uid, base.jobs[0].model_copy(update={"clip_uid": uid}))
+        for uid in clip_ids
+    ]
+    with pytest.raises(ValueError, match="unique and usable|ordered usable subset"):
+        build_stem_reconcile_jobs(
+            base_inventory=SimpleNamespace(jobs=requested),
+            stem_diarization_root=shadow / "diarization",
+            stem_asr_root=shadow / "asr", route="music_first",
+        )
 
 
 def _raw():

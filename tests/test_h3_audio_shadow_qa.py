@@ -134,7 +134,8 @@ def _fixture(tmp_path, monkeypatch, *, mixed=False, variants=False):
     assert not (shadow / "mimo_stem_facts").exists()
     provenance, _, _ = validate_stem_diarization_lineage(diarization)
     jobs = build_stem_reconcile_jobs(
-        base_inventory=base, stem_diarization_root=diarization,
+        base_inventory=qa.usable_stem_reconcile_inventory(base, provenance),
+        stem_diarization_root=diarization,
         stem_asr_root=asr, route="music_first",
     )
     run_mimo25_stem_reconcile_shadow(

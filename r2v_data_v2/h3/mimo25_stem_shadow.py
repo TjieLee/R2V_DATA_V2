@@ -22,6 +22,7 @@ from r2v_data_v2.h3.mimo25_av_reconcile import (
     MimoClipJob,
     MimoInventory,
     MimoSegmentEvidence,
+    _inventory,
 )
 from r2v_data_v2.h3.mimo25_backend import (
     MimoAVAnnotationDraft,
@@ -41,6 +42,7 @@ from r2v_data_v2.h3.sam_audio_stem_shadow import (
     SAMAudioStemRecord,
     SAMRoute,
     StemDiarizationClipFailure,
+    StemDiarizationShadowProvenance,
     StemShadowClipSkip,
     StemType,
     load_stem_shadow,
@@ -1517,6 +1519,23 @@ def _mimo_job(values: dict[str, object]) -> MimoClipJob:
     )
 
 
+def usable_stem_reconcile_inventory(
+    inventory: MimoInventory, provenance: StemDiarizationShadowProvenance,
+) -> MimoInventory:
+    """Separate known upstream failures before strict reconcile job selection."""
+    requested = [job.clip_uid for job in inventory.jobs]
+    selected = set(requested)
+    if [uid for uid in provenance.clip_uids if uid in selected] != requested:
+        raise ValueError("stem reconcile inventory is not an ordered upstream subset")
+    usable = set(provenance.usable_clip_uids)
+    values = inventory.model_dump(mode="json", exclude={"inventory_fingerprint"})
+    if values["source_diarization_inventory_sha256"] is None:
+        values.pop("source_diarization_inventory_sha256")
+    values["jobs"] = [job.model_dump(mode="json") for job in inventory.jobs if job.clip_uid in usable]
+    values["clip_count"] = len(values["jobs"])
+    return _inventory(values)
+
+
 def build_stem_reconcile_jobs(
     *,
     base_inventory: MimoInventory,
@@ -1573,12 +1592,16 @@ def build_stem_reconcile_jobs(
     if {key[0] for key in raw_by_key} - available_ids:
         raise ValueError("stem reconcile segments contain a skipped clip")
     base_by_clip = {item.clip_uid: item for item in base_inventory.jobs}
-    if len(base_by_clip) != len(base_inventory.jobs) or not available_ids <= set(
-        base_by_clip
-    ):
-        raise ValueError("stem reconcile base inventory lacks usable clips")
+    requested_ids = [item.clip_uid for item in base_inventory.jobs]
+    if len(base_by_clip) != len(requested_ids) or not set(requested_ids) <= available_ids:
+        raise ValueError("stem reconcile requested clips must be unique and usable")
+    projected = [
+        uid for uid in diarization_provenance.usable_clip_uids if uid in base_by_clip
+    ]
+    if projected != requested_ids:
+        raise ValueError("stem reconcile requested clips are not an ordered usable subset")
     jobs: list[MimoClipJob] = []
-    for clip_uid in diarization_provenance.usable_clip_uids:
+    for clip_uid in requested_ids:
         base = base_by_clip[clip_uid]
         keys = sorted(
             (key for key in raw_by_key if key[0] == base.clip_uid),

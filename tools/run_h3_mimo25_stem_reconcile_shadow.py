@@ -22,6 +22,7 @@ from r2v_data_v2.h3.mimo25_stem_shadow import (
     StemAwareOpenAIMimo25Backend,
     build_stem_reconcile_jobs,
     run_mimo25_stem_reconcile_shadow,
+    usable_stem_reconcile_inventory,
 )
 from r2v_data_v2.h3.sam_audio_stem_shadow import (
     SAMAudioStemInventory,
@@ -44,8 +45,10 @@ def _validate_stage_closure(
     diarization_provenance: StemDiarizationShadowProvenance,
 ) -> None:
     separation = separation_root.expanduser().resolve(strict=True)
-    if case_manifest.clip_uids != stem_inventory.clip_uids:
-        raise ValueError("case manifest differs from current SAM Audio inventory")
+    selected_ids = set(case_manifest.clip_uids)
+    projected = [uid for uid in stem_inventory.clip_uids if uid in selected_ids]
+    if projected != case_manifest.clip_uids:
+        raise ValueError("case manifest is not an ordered subset of current SAM Audio inventory")
     if (
         Path(diarization_provenance.source_stem_root)
         .expanduser()
@@ -114,16 +117,24 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         case_manifest_path=arguments.case_manifest,
     )
     jobs = build_stem_reconcile_jobs(
-        base_inventory=base,
+        base_inventory=usable_stem_reconcile_inventory(base, diarization_provenance),
         stem_diarization_root=shadow / "diarization",
         stem_asr_root=shadow / "asr",
         route=arguments.sam_route,
     )
-    skipped = separation_skips(
-        inventory=stem_inventory,
-        records=stem_records,
-        route=arguments.sam_route,
-    )
+    selected_ids = set(case_manifest.clip_uids)
+    skipped = [
+        item for item in separation_skips(
+            inventory=stem_inventory,
+            records=stem_records,
+            route=arguments.sam_route,
+        )
+        if item.clip_uid in selected_ids
+    ]
+    diarization_failed = [
+        item for item in diarization_provenance.diarization_failed_clips
+        if item.clip_uid in selected_ids
+    ]
     selected = selected_stem_records(
         [record for record in stem_records if record.clip_uid in {job.clip_uid for job in jobs}],
         route=arguments.sam_route, allow_unverified=arguments.allow_unverified,
@@ -163,9 +174,9 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
             stem_records=stem_records,
             backend=backend,
             output_root=output,
-            source_clip_uids=stem_inventory.clip_uids,
+            source_clip_uids=case_manifest.clip_uids,
             skipped_clips=skipped,
-            diarization_failed_clips=diarization_provenance.diarization_failed_clips,
+            diarization_failed_clips=diarization_failed,
             route=arguments.sam_route,
             allow_unverified=arguments.allow_unverified,
             overwrite=arguments.overwrite,
