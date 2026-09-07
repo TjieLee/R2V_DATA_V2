@@ -14,25 +14,14 @@ from PIL import Image
 from r2v_data_v2.h3 import audio_shadow_qa as qa
 from r2v_data_v2.h3.jea_final_renderer import FinalH3SampleV2
 from r2v_data_v2.h3.mimo25_av_reconcile import _inventory, _job
-from r2v_data_v2.h3.mimo25_backend import (
-    MimoAVAnnotationDraft,
-    MimoBackendFailure,
-    MimoCompletionDiagnostic,
-    MimoUsage,
-)
+from r2v_data_v2.h3.mimo25_backend import MimoAVAnnotationDraft, MimoBackendFailure
 from r2v_data_v2.h3.mimo25_stem_shadow import (
     build_stem_reconcile_jobs,
     load_stem_fact_records,
     run_mimo25_stem_facts_shadow,
     run_mimo25_stem_reconcile_shadow,
 )
-from r2v_data_v2.h3.mimo25_text_compositor import (
-    CompositorOrdering,
-    ShotOrdering,
-    make_composition,
-)
 from r2v_data_v2.h3.sam_audio_stem_shadow import sha256_file
-from r2v_data_v2.structured_output import ValidationIssue
 from tests.test_h3_mimo25_av_shadow import _annotation, _sample
 from tests.test_h3_sam_audio_stem_shadow import (
     _FactsBackend,
@@ -62,21 +51,10 @@ class _Reconcile(_FailingReconcileBackend):
             values["audio_observation"]["segment_decisions"] = []
             values["audio_observation"]["speaker_voice_profiles"] = []
             values["av_grounding"]["segment_groundings"] = []
-            values["h3_projection"]["shots"][0]["timeline_parts"] = [
-                part for part in values["h3_projection"]["shots"][0]["timeline_parts"]
-                if part["type"] == "visual"
-            ]
+            values["h3_projection"]["shots"][0]["description_template"] = "The seated person remains still."
             values["audio_observation"]["audio_semantics"]["temporal_non_speech_events"] = []
         annotation = MimoAVAnnotationDraft.model_validate(values)
-        return SimpleNamespace(annotation=annotation, diagnostics=(), raw_responses=(), model_call_count=1)
-
-    def compose(self, source):
-        ordering = CompositorOrdering(shots=[
-            ShotOrdering(shot_index=s.shot_index, atom_ids=s.initial_order) for s in source.shots
-        ])
-        return make_composition(source, ordering), ordering.model_dump_json(), MimoCompletionDiagnostic(
-            input_modality="text_only_compositor", usage=MimoUsage(), http_attempt_count=1,
-        )
+        return SimpleNamespace(annotation=annotation, raw_responses=(), diagnostics=(), model_call_count=1)
 
 
 def _fixture(tmp_path, monkeypatch, *, mixed=False, variants=False):
@@ -140,7 +118,6 @@ def _fixture(tmp_path, monkeypatch, *, mixed=False, variants=False):
     )
     run_mimo25_stem_reconcile_shadow(
         jobs=jobs, stem_facts=load_stem_fact_records(shadow / "mimo_stem_facts"),
-        source_samples=samples,
         backend=_Reconcile(tmp_path), output_root=shadow / "mimo_reconcile",
         source_clip_uids=order, route="music_first",
         diarization_failed_clips=facts_summary.diarization_failed_clips,
@@ -166,9 +143,9 @@ def test_builder_ready_failed_order_media_and_sources_unchanged(tmp_path, monkey
     materialized = []
     original = qa._materialize_sample
 
-    def capture(sample, job, record, **kwargs):
-        result = original(sample, job, record, **kwargs)
-        materialized.append((sample, job, record, result[1], kwargs))
+    def capture(sample, job, record):
+        result = original(sample, job, record)
+        materialized.append((sample, job, record, result[1]))
         return result
 
     monkeypatch.setattr(qa, "_materialize_sample", capture)
@@ -179,7 +156,7 @@ def test_builder_ready_failed_order_media_and_sources_unchanged(tmp_path, monkey
     assert result["output_root"] == str(output)
     data = json.loads((output / "data.json").read_text())
     reconcile_summary = json.loads((shadow / "mimo_reconcile/summary.json").read_text())
-    assert reconcile_summary["schema_version"] == "r2v.h3.mimo25_stem_reconcile_summary.6"
+    assert reconcile_summary["schema_version"] == "r2v.h3.mimo25_stem_reconcile_summary.7"
     assert reconcile_summary["current_mimo_versions_modified"] is True
     assert data["clip_uids"] == ["clip-z", "clip-a", "clip-m"]
     assert [clip["reconcile"]["status"] for clip in data["clips"]] == ["ready", "failed", "ready"]
@@ -191,8 +168,8 @@ def test_builder_ready_failed_order_media_and_sources_unchanged(tmp_path, monkey
     for clip, call in zip((data["clips"][0], data["clips"][2]), materialized, strict=True):
         final = clip["final_h3"]
         assert final["status"] == "ready"
-        assert final["materializer_version"] == "h3_mimo25_materializer_v18"
-        assert final["text"] == call[3] == original(*call[:3], **call[4])[1]
+        assert final["materializer_version"] == "h3_mimo25_materializer_v19"
+        assert final["text"] == call[3] == original(*call[:3])[1]
         assert final["variants"][0]["text"] == final["text"]
         assert "[[" not in final["text"]
         assert "<Audio 1>" in final["text"]
@@ -205,7 +182,7 @@ def test_builder_ready_failed_order_media_and_sources_unchanged(tmp_path, monkey
             assert f"<d>[{segment.asr_language}] {segment.asr_text}</d>" in final["text"]
     assert data["clips"][1]["final_h3"]["status"] == "unavailable"
     assert data["clips"][1]["final_h3"]["text"] is None
-    assert data["clips"][1]["final_h3"]["reason"].startswith("AV reconcile failed:")
+    assert data["clips"][1]["final_h3"]["reason"] == "AV reconcile failed: failed <script>not markup</script>"
     assert data["qa_labels"] == list(qa.QA_LABELS)
     assert all(path.read_bytes() == content for path, content in before.items())
     for url, source in data["media"].items():
@@ -247,8 +224,8 @@ def test_final_text_changes_review_fingerprints(tmp_path, monkeypatch):
     before = json.loads((shadow / "qa/data.json").read_text())
     original = qa._materialize_sample
 
-    def changed_text(*args, **kwargs):
-        corrected, text, warnings = original(*args, **kwargs)
+    def changed_text(*args):
+        corrected, text, warnings = original(*args)
         return corrected, text + "\nsynthetic materializer change", warnings
 
     monkeypatch.setattr(qa, "_materialize_sample", changed_text)
@@ -317,7 +294,7 @@ def test_stale_reconcile_fingerprint_rejected_before_publication(tmp_path, monke
     values = {k: v for k, v in records[0].items() if k != "record_fingerprint"}
     records[0]["record_fingerprint"] = qa._fingerprint(values)
     path.write_text("".join(json.dumps(row) + "\n" for row in records))
-    with pytest.raises(ValueError, match="provenance"):
+    with pytest.raises(ValueError, match="stale source provenance"):
         qa.build_audio_shadow_qa(**kwargs)
     assert not (shadow / "qa").exists()
 
@@ -339,6 +316,7 @@ def test_cli_and_manifest_order_fail_closed(tmp_path, monkeypatch):
 @pytest.mark.parametrize("blocked, expected", [
     ("multi", "multi_speaker_segment_requires_turn_refinement"),
     ("unknown", "unknown_audio_semantics"),
+    ("placeholder", "unknown_pipeline_placeholder"),
 ])
 def test_ready_annotation_with_blocked_materialization_is_unavailable(tmp_path, monkeypatch, blocked, expected):
     original = _Reconcile.reconcile
@@ -362,8 +340,10 @@ def test_ready_annotation_with_blocked_materialization_is_unavailable(tmp_path, 
             values["audio_observation"]["audio_semantics"].update(
                 non_diegetic_music_status="unknown", non_diegetic_music=None,
             )
+        else:
+            values["h3_projection"]["shots"][0]["description_template"] += " [[unknown]]"
         return SimpleNamespace(annotation=MimoAVAnnotationDraft.model_validate(values),
-                               diagnostics=(), raw_responses=(), model_call_count=1)
+                               raw_responses=(), diagnostics=(), model_call_count=1)
 
     monkeypatch.setattr(_Reconcile, "reconcile", reconcile)
     kwargs, shadow = _fixture(tmp_path, monkeypatch, variants=True)
@@ -372,36 +352,13 @@ def test_ready_annotation_with_blocked_materialization_is_unavailable(tmp_path, 
     data = json.loads((shadow / "qa/data.json").read_text())
     assert data["schema_version"] == "r2v.h3.audio_shadow_qa.2"
     for clip in (data["clips"][0], data["clips"][2]):
-        assert clip["reconcile"]["status"] == "failed"
-        assert clip["reconcile"]["annotation"] is not None
+        assert clip["reconcile"]["status"] == "ready"
         final = clip["final_h3"]
         assert final["status"] == "unavailable" and final["text"] is None
-        assert final["reason"].startswith("text compositor failed:")
-        assert expected in {issue["code"] for issue in final["issues"]}
-    assert all(path.read_bytes() == content for path, content in before.items())
-
-
-def test_text_compositor_failure_is_visible_without_qa_inference(tmp_path, monkeypatch):
-    def fail(self, source):
-        raise MimoBackendFailure(
-            code="text_compositor_failed", reason="invalid atom order", model_call_count=1,
-            raw_responses=['{"shots": []}'],
-            issues=[ValidationIssue("compositor_atom_inventory_mismatch", "shots", "missing atoms")],
-        )
-    monkeypatch.setattr(_Reconcile, "compose", fail)
-    kwargs, shadow = _fixture(tmp_path, monkeypatch)
-    before = _snapshot(tmp_path)
-    def forbidden(*args, **kwargs):
-        raise AssertionError("QA must not call either backend")
-    monkeypatch.setattr(_Reconcile, "compose", forbidden)
-    monkeypatch.setattr(_Reconcile, "reconcile", forbidden)
-    qa.build_audio_shadow_qa(**kwargs)
-    data = json.loads((shadow / "qa/data.json").read_text())
-    final = data["clips"][0]["final_h3"]
-    assert final["text"] is None and final["status"] == "unavailable"
-    assert final["reason"].startswith("text compositor failed:")
-    assert final["issues"][0]["code"] == "compositor_atom_inventory_mismatch"
-    assert data["clips"][0]["reconcile"]["annotation"] is not None
+        assert final["reason"] == "materialization_contract_failed"
+        for variant in final["variants"]:
+            assert variant["text"] is None
+            assert expected in {issue["code"] for issue in variant["issues"]}
     assert all(path.read_bytes() == content for path, content in before.items())
 
 
@@ -550,7 +507,7 @@ const {chromium} = require(process.argv[2]);
     assert.strictEqual(await page.locator("#final-text").textContent(), expectedFinal);
     assert(await page.locator("#final-text").isVisible());
     assert.strictEqual(await page.locator("#final-h3").evaluate(el => el.closest("details")), null);
-    assert.strictEqual(await page.locator("#materializer-version").textContent(), "h3_mimo25_materializer_v18");
+    assert.strictEqual(await page.locator("#materializer-version").textContent(), "h3_mimo25_materializer_v19");
     await page.locator("#final-variant").selectOption("1");
     assert.strictEqual(await page.locator("#final-text").textContent(), dataset.clips[0].final_h3.variants[1].text);
     await page.locator("#final-variant").selectOption("0");

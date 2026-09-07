@@ -79,12 +79,9 @@ from r2v_data_v2.h3.mimo25_backend import (
     validate_annotation,
 )
 from r2v_data_v2.h3.mimo25_h3_materializer import (
-    _materialize_sample as _materialize_with_composition,
-)
-from r2v_data_v2.h3.mimo25_h3_materializer import (
+    _materialize_sample,
     _render_subject_definition,
     materialize_mimo25_h3_shadow,
-    prepare_compositor_input,
 )
 from r2v_data_v2.h3.mimo25_human_review import (
     MimoHumanReviewAnnotation,
@@ -101,23 +98,9 @@ from r2v_data_v2.h3.mimo25_recovered_voice import (
     MimoRecoveredVoiceQualityPolicy,
     recover_mimo_target_voices,
 )
-from r2v_data_v2.h3.mimo25_text_compositor import (
-    CompositorOrdering,
-    ShotOrdering,
-    make_composition,
-)
 from r2v_data_v2.h3.qwen38_h3_recaption import RecaptionSubjectContract
 from r2v_data_v2.structured_output import ValidationIssue
 from tools.materialize_h3_mimo25_shadow import _parser as _materializer_parser
-
-
-def _materialize_sample(sample, job, record, **kwargs):
-    # Existing renderer fixtures supply a synthetic validated ordering, not a runtime fallback.
-    source = prepare_compositor_input(sample, job, record)
-    composition = make_composition(source, CompositorOrdering(shots=[
-        ShotOrdering(shot_index=s.shot_index, atom_ids=s.initial_order) for s in source.shots
-    ]))
-    return _materialize_with_composition(sample, job, record, composition=composition, **kwargs)
 
 
 def _subject_definition(subject_label: str, description: str) -> dict[str, str]:
@@ -297,11 +280,7 @@ def _annotation(
                     {
                         "shot_index": 1,
                         "start_time": None,
-                        "timeline_parts": [
-                            {"type": "speech", "segment_id": "segment_1"},
-                            {"type": "audio_event", "event_id": "ae1"},
-                            {"type": "visual", "block_id": "v1"},
-                        ],
+                        "description_template": "A person sits at the table. [[segment_1]] The person lowers a hand. [[audio_event:ae1]] The seated pose remains steady.",
                     }
                 ],
             },
@@ -353,19 +332,18 @@ def _playback_inputs(tmp_path: Path, *, two_shots: bool = False):
     ]
     event = values["audio_observation"]["audio_semantics"]["temporal_non_speech_events"][0]
     event.update(approximate_start_time=3.5, approximate_end_time=3.8)
-    parts = [
-        {"type": "visual", "block_id": "v1"}, _speech("segment_1"),
-        {"type": "visual", "block_id": "v2"}, {"type": "audio_event", "event_id": "ae1"},
-        {"type": "visual", "block_id": "v3"},
-    ]
     values["visual_observation"]["shots"][0]["visual_blocks"] = blocks[:2] if two_shots else blocks
-    values["h3_projection"]["shots"][0]["timeline_parts"] = parts[:3] if two_shots else parts
+    values["h3_projection"]["shots"][0]["description_template"] = (
+        "Opening view. [[segment_1]] The hand lowers beside the table."
+        + ("" if two_shots else " [[audio_event:ae1]] The person settles back into the chair.")
+    )
     if two_shots:
         values["visual_observation"]["shots"].append({
             "shot_index": 2, "start_time": 3.5, "visual_blocks": blocks[2:],
         })
         values["h3_projection"]["shots"].append({
-            "shot_index": 2, "start_time": 3.5, "timeline_parts": parts[3:],
+            "shot_index": 2, "start_time": 3.5,
+            "description_template": "[[audio_event:ae1]] The person settles back into the chair.",
         })
     record = _record_fixture(tmp_path, MimoAVAnnotationDraft.model_validate(values), job=job)
     return sample, job, record
@@ -393,19 +371,20 @@ def test_v17_playback_projection_and_official_sections(tmp_path, two_shots):
 def test_v18_initial_projection_is_only_an_order_hint(tmp_path, mutation):
     _, _, record = _playback_inputs(tmp_path)
     values = record.annotation.model_dump(mode="json")
-    parts = values["h3_projection"]["shots"][0]["timeline_parts"]
-    parts.append(parts.pop(1 if mutation == "speech_last" else 3))
+    key = "[[segment_1]]" if mutation == "speech_last" else "[[audio_event:ae1]]"
+    shot = values["h3_projection"]["shots"][0]
+    shot["description_template"] = shot["description_template"].replace(key, "") + " " + key
     annotation = MimoAVAnnotationDraft.model_validate(values)
     assert not _validate(annotation, segment_intervals={"segment_1": (1, 2)}, target_duration_seconds=5)
 
 
-def test_v18_missing_visual_block_is_still_rejected(tmp_path):
+def test_v19_direct_prose_need_not_project_visual_blocks(tmp_path):
     _, _, record = _playback_inputs(tmp_path)
     values = record.annotation.model_dump(mode="json")
-    values["h3_projection"]["shots"][0]["timeline_parts"].pop(0)
+    values["h3_projection"]["shots"][0]["description_template"] = "A new natural description. [[segment_1]] [[audio_event:ae1]]"
     issues = _validate(MimoAVAnnotationDraft.model_validate(values),
                        segment_intervals={"segment_1": (1, 2)}, target_duration_seconds=5)
-    assert "visual_block_projection_inventory_mismatch" in {i.code for i in issues}
+    assert not issues
 
 
 @pytest.mark.parametrize("composition, allowed", [
@@ -462,7 +441,7 @@ def test_v17_unknown_audio_semantics_block_materialization(tmp_path, field):
     semantics.update({field + "_status": "unknown", field: None})
     if field == "overall_soundscape":
         semantics["temporal_non_speech_events"] = []
-        values["h3_projection"]["shots"][0]["timeline_parts"].pop(3)
+        values["h3_projection"]["shots"][0]["description_template"] = values["h3_projection"]["shots"][0]["description_template"].replace("[[audio_event:ae1]]", "")
     with pytest.raises(mimo25_materializer.MimoH3MaterializationContractError) as caught:
         _materialize_sample(sample, job, _record_fixture(tmp_path, MimoAVAnnotationDraft.model_validate(values), job=job))
     assert "unknown_audio_semantics" in {issue.code for issue in caught.value.issues}
@@ -499,7 +478,7 @@ def test_v17_same_bound_subject_offscreen_keeps_source_without_rebinding(tmp_pat
         "speech_presentation": "offscreen_spoken", "entity_id": None,
         "evidence_codes": ["offscreen_audio"],
     })
-    values["h3_projection"]["shots"][0]["timeline_parts"].insert(2, _speech("segment_2"))
+    values["h3_projection"]["shots"][0]["description_template"] = values["h3_projection"]["shots"][0]["description_template"].replace("[[segment_1]]", "[[segment_1]] [[segment_2]]")
     annotation = MimoAVAnnotationDraft.model_validate(values)
     assert not _validate(
         annotation, segment_ids=["segment_1", "segment_2"],
@@ -549,9 +528,9 @@ def test_v17_visual_phase_numeric_schema_stays_strict(change):
 
 
 def test_v18_prompt_and_strict_lineage(tmp_path):
-    assert "WITHOUT numeric timestamps" in SYSTEM_PROMPT
+    assert "without numeric timestamps" in SYSTEM_PROMPT
     assert "negative stem evidence is non-confirmatory" in SYSTEM_PROMPT
-    assert "initial order hint" in SYSTEM_PROMPT
+    assert "directly as coherent natural English in playback order" in SYSTEM_PROMPT
     assert "never synthesizes a negative sentence" in SYSTEM_PROMPT
     old = _annotation().model_dump(mode="json")
     old["schema_version"] = "r2v.h3.mimo25_av_annotation.14"
@@ -564,8 +543,8 @@ def test_v18_prompt_and_strict_lineage(tmp_path):
 def test_v17_temporal_recheck_retains_one_call_limit(tmp_path):
     _, job, record = _playback_inputs(tmp_path)
     invalid = record.annotation.model_dump(mode="json")
-    parts = invalid["h3_projection"]["shots"][0]["timeline_parts"]
-    parts.pop(1)
+    shot = invalid["h3_projection"]["shots"][0]
+    shot["description_template"] = shot["description_template"].replace("[[segment_1]]", "")
     backend, completions = _backend(tmp_path, [
         (json.dumps(invalid), 5), (record.annotation.model_dump_json(), 5),
     ])
@@ -604,7 +583,7 @@ def test_v17_absence_is_not_synthesized_and_verified_silence_is_na(tmp_path):
     semantics = values["audio_observation"]["audio_semantics"]
     semantics.update(overall_soundscape_status="absent", overall_soundscape=None,
                      temporal_non_speech_events=[])
-    values["h3_projection"]["shots"][0]["timeline_parts"].pop(3)
+    values["h3_projection"]["shots"][0]["description_template"] = values["h3_projection"]["shots"][0]["description_template"].replace("[[audio_event:ae1]]", "")
     with pytest.raises(mimo25_materializer.MimoH3MaterializationContractError) as caught:
         _materialize_sample(sample, job, _record_fixture(tmp_path, MimoAVAnnotationDraft.model_validate(values), job=job))
     assert caught.value.issues[0].code == "soundscape_absence_requires_explicit_original_av_judgment"
@@ -616,7 +595,7 @@ def test_v17_absence_is_not_synthesized_and_verified_silence_is_na(tmp_path):
     values["visual_observation"]["segment_views"] = []
     values["audio_observation"].update(segment_decisions=[], speaker_voice_profiles=[])
     values["av_grounding"]["segment_groundings"] = []
-    values["h3_projection"]["shots"][0]["timeline_parts"].pop(1)
+    values["h3_projection"]["shots"][0]["description_template"] = values["h3_projection"]["shots"][0]["description_template"].replace("[[segment_1]]", "")
     job_values = job.model_dump(mode="json", exclude={"request_fingerprint"})
     job_values["segments"] = []
     job = _job(job_values)
@@ -640,9 +619,8 @@ def test_experimental_icl_is_synthetic_and_semantically_valid():
     assert annotation.segment_decisions[0].speech_presentation == "onscreen_spoken"
     assert all(set(block.model_dump()) == {"block_id", "text"}
                for shot in annotation.visual_observation.shots for block in shot.visual_blocks)
-    assert [part.type for part in annotation.h3_projection.shots[0].timeline_parts] == [
-        "visual", "speech", "visual", "audio_event", "visual",
-    ]
+    template = annotation.h3_projection.shots[0].description_template
+    assert template.index("[[segment_0001]]") < template.index("[[audio_event:ae1]]")
     assert not _validate(
         annotation, segment_ids=inputs["allowed_segment_ids"],
         transcribed_segment_ids=inputs["transcribed_segment_ids"],
@@ -725,7 +703,7 @@ def test_experimental_configuration_fingerprints_distinguish_matrix(tmp_path):
             assert provenance.icl_version == (MIMO25_ICL_VERSION if icl == "v1" else None)
             fingerprints.add(provenance.configuration_fingerprint)
     assert len(fingerprints) == 4
-    assert MIMO25_ICL_VERSION == "h3_mimo25_av_reconcile_icl_v2"
+    assert MIMO25_ICL_VERSION == "h3_mimo25_av_reconcile_icl_v3"
 
 
 def test_experimental_enabled_recheck_keeps_example_and_call_limit(tmp_path):
@@ -1304,13 +1282,13 @@ def test_current_backend_schema_keeps_existing_materializer_v6_provenance_readab
     ).hexdigest()
     historical = type(current).model_validate(values)
     assert historical.materializer_version == "h3_mimo25_materializer_v6"
-    assert current.materializer_version == "h3_mimo25_materializer_v18"
+    assert current.materializer_version == "h3_mimo25_materializer_v19"
 
 
 def test_mimo_v23_prompt_preserves_staged_visual_audio_authority_contract() -> None:
-    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v24"
+    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v25"
     assert MIMO25_POLICY_VERSION == "h3_mimo25_av_authority_contract_v17"
-    assert MIMO25_SCHEMA_VERSION == "r2v.h3.mimo25_av_annotation.15"
+    assert MIMO25_SCHEMA_VERSION == "r2v.h3.mimo25_av_annotation.16"
     for phrase in (
         "STAGE A visual_observation: PURE VISUAL EVIDENCE",
         "STAGE B audio_observation: PURE AUDIO EVIDENCE",
@@ -1352,7 +1330,7 @@ def test_backend_v26_records_experiment_provenance(
 ) -> None:
     backend, _ = _backend(tmp_path, [])
 
-    assert backend.provenance.schema_version == "r2v.h3.mimo25_backend.27"
+    assert backend.provenance.schema_version == "r2v.h3.mimo25_backend.28"
     assert backend.provenance.thinking.type == "disabled"
     assert backend.provenance.icl_version is None
 

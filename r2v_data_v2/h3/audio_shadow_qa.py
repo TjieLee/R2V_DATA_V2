@@ -184,9 +184,7 @@ def build_audio_shadow_qa(
         or len({item.clip_uid for item in reconcile}) != len(reconcile)
         or summary.ready_count != sum(item.status == "ready" for item in reconcile)
         or summary.failed_count != sum(item.status == "failed" for item in reconcile)
-            or summary.model_call_count != sum(item.model_call_count for item in reconcile)
-            or summary.av_model_call_count != sum(item.av_model_call_count for item in reconcile)
-            or summary.compositor_model_call_count != sum(item.compositor_model_call_count for item in reconcile)
+        or summary.model_call_count != sum(item.model_call_count for item in reconcile)
         or [item.clip_uid for item in summary.facts_failed_clips]
         != [item.clip_uid for item in facts if item.status == "failed"]
     ):
@@ -292,7 +290,6 @@ def build_audio_shadow_qa(
                     _, text, warnings = _materialize_sample(
                         sample, current,
                         _MaterializerInput(record.annotation, record.source_job_fingerprint),
-                        composition=record.composition,
                     )
                     variant = {"status": "ready", "text": text, "warnings": warnings, "reason": None}
                 except MimoH3MaterializationContractError as error:
@@ -303,8 +300,7 @@ def build_audio_shadow_qa(
             final_h3.update(variants[0], variants=variants)
         elif record is not None:
             final_h3.update(
-                reason=("text compositor failed: " if record.failure_stage == "text_compositor"
-                        else "AV reconcile failed: ") + (record.failure_reason or "unavailable"),
+                reason="AV reconcile failed: " + (record.failure_reason or "unavailable"),
                 issues=[item.to_dict() for item in record.failure_issues],
             )
         row = {

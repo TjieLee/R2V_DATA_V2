@@ -12,7 +12,6 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from r2v_data_v2.h3.jea_audio_production import jea_production_paths
-from r2v_data_v2.h3.jea_final_renderer import FinalH3SampleV2
 from r2v_data_v2.h3.mimo25_av_reconcile import (
     MimoCaseManifest,
     build_mimo25_inventory,
@@ -31,7 +30,6 @@ from r2v_data_v2.h3.sam_audio_stem_shadow import (
     load_stem_shadow,
     require_shadow_output_path,
     separation_skips,
-    sha256_file,
     stem_separation_root,
     stem_shadow_root,
     validate_stem_diarization_lineage,
@@ -151,13 +149,6 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         "original_target_av_is_highest_authority": True,
     }
     if not arguments.dry_run:
-        samples_path = paths.root / "h3/samples.jsonl"
-        if sha256_file(samples_path) != base.source_h3_samples_sha256:
-            raise ValueError("H3 samples changed after inventory construction")
-        source_samples = [
-            FinalH3SampleV2.model_validate_json(line)
-            for line in samples_path.read_text(encoding="utf-8").splitlines() if line.strip()
-        ]
         facts_by_clip = {
             item.clip_uid: item for item in facts if item.status == "ready"
         }
@@ -181,7 +172,6 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         )
         summary = run_mimo25_stem_reconcile_shadow(
             jobs=jobs,
-            source_samples=source_samples,
             stem_facts=facts,
             backend=backend,
             output_root=output,

@@ -18,15 +18,6 @@ from urllib.parse import quote, urlsplit
 from openai import OpenAI
 from pydantic import Field, StrictBool, StrictStr, model_validator
 
-from r2v_data_v2.h3.mimo25_text_compositor import (
-    COMPOSITOR_PROMPT,
-    COMPOSITOR_VERSION,
-    CompositorInput,
-    CompositorOrdering,
-    TextComposition,
-    make_composition,
-    validate_ordering,
-)
 from r2v_data_v2.h3.schemas import SchemaModel
 from r2v_data_v2.h3.speech_presentation import SpeechPresentation
 from r2v_data_v2.structured_output import (
@@ -37,12 +28,12 @@ from r2v_data_v2.structured_output import (
 
 MIMO25_MODEL = "mimo-v2.5"
 MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
-MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v24"
+MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v25"
 MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v17"
-MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.15"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.27"
-MIMO25_ICL_VERSION = "h3_mimo25_av_reconcile_icl_v2"
-MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v18"
+MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.16"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.28"
+MIMO25_ICL_VERSION = "h3_mimo25_av_reconcile_icl_v3"
+MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v19"
 MIMO25_CANONICAL_ABSENT_SOUNDSCAPE = (
     "No distinct environmental, mechanical, physical, or non-verbal human "
     "sounds are clearly discernible."
@@ -866,37 +857,26 @@ class MimoVisualObservation(SchemaModel):
         return self
 
 
-class MimoH3VisualPart(SchemaModel):
-    type: Literal["visual"]
-    block_id: str = Field(pattern=r"^v[1-9]\d*$")
-
-
-class MimoH3SpeechPart(SchemaModel):
-    type: Literal["speech"]
-    segment_id: str = Field(min_length=1)
-
-
-class MimoH3AudioEventPart(SchemaModel):
-    type: Literal["audio_event"]
-    event_id: str = Field(pattern=r"^ae[1-9]\d*$")
-
-
-MimoH3TimelinePart = Annotated[
-    MimoH3VisualPart | MimoH3SpeechPart | MimoH3AudioEventPart,
-    Field(discriminator="type"),
-]
-
-
 class MimoH3Shot(SchemaModel):
     shot_index: int = Field(gt=0)
     start_time: float | None = Field(default=None, ge=0, allow_inf_nan=False)
-    timeline_parts: list[MimoH3TimelinePart] = Field(min_length=1)
+    description_template: StrictStr = Field(min_length=1)
 
-    @model_validator(mode="after")
-    def require_visual_part(self) -> MimoH3Shot:
-        if not any(isinstance(part, MimoH3VisualPart) for part in self.timeline_parts):
-            raise ValueError("every MiMo H3 projection shot requires a visual block")
-        return self
+
+_SPEECH_PLACEHOLDER = re.compile(r"\[\[(segment_[A-Za-z0-9_]+)\]\]")
+_EVENT_PLACEHOLDER = re.compile(r"\[\[audio_event:(ae[1-9]\d*)\]\]")
+
+
+def speech_placeholder_ids(text: str) -> list[str]:
+    return _SPEECH_PLACEHOLDER.findall(text)
+
+
+def event_placeholder_ids(text: str) -> list[str]:
+    return _EVENT_PLACEHOLDER.findall(text)
+
+
+def template_visual_prose(text: str) -> str:
+    return _EVENT_PLACEHOLDER.sub("", _SPEECH_PLACEHOLDER.sub("", text))
 
 
 class MimoSubjectDefinitionDraft(SchemaModel):
@@ -1021,7 +1001,7 @@ MimoH3Draft = MimoH3Semantics
 
 
 class MimoAVAnnotationDraft(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_av_annotation.15"] = MIMO25_SCHEMA_VERSION
+    schema_version: Literal["r2v.h3.mimo25_av_annotation.16"] = MIMO25_SCHEMA_VERSION
     visual_observation: MimoVisualObservation
     audio_observation: MimoAudioObservation
     av_grounding: MimoAVGrounding
@@ -1047,7 +1027,7 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.27"] = MIMO25_BACKEND_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.28"] = MIMO25_BACKEND_VERSION
     backend: Literal[
         "xiaomi_openai_compatible", "sglang_openai_compatible"
     ]
@@ -1057,10 +1037,7 @@ class MimoBackendProvenance(SchemaModel):
     video_fps: Literal[4.0] = 4.0
     media_resolution: Literal["default"] = "default"
     thinking: MimoThinkingContract
-    icl_version: Literal["h3_mimo25_av_reconcile_icl_v2"] | None
-    compositor_version: Literal["h3_mimo25_text_compositor_v1"] = COMPOSITOR_VERSION
-    compositor_temperature: Literal[0.0] = 0.0
-    compositor_max_completion_tokens: Literal[4096] = 4096
+    icl_version: Literal["h3_mimo25_av_reconcile_icl_v3"] | None
     temperature: float = Field(ge=0, allow_inf_nan=False)
     max_completion_tokens: int = Field(gt=0)
     response_format: Literal["json_object", "json_schema"]
@@ -1068,13 +1045,13 @@ class MimoBackendProvenance(SchemaModel):
     media_mode: Literal["base64", "http"]
     media_root: str
     media_base_url: str | None = None
-    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v24"] = (
+    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v25"] = (
         MIMO25_PROMPT_VERSION
     )
     policy_version: Literal["h3_mimo25_av_authority_contract_v17"] = (
         MIMO25_POLICY_VERSION
     )
-    annotation_schema_version: Literal["r2v.h3.mimo25_av_annotation.15"] = (
+    annotation_schema_version: Literal["r2v.h3.mimo25_av_annotation.16"] = (
         MIMO25_SCHEMA_VERSION
     )
     materializer_version: Literal[
@@ -1090,7 +1067,7 @@ class MimoBackendProvenance(SchemaModel):
         "h3_mimo25_materializer_v15",
         "h3_mimo25_materializer_v16",
         "h3_mimo25_materializer_v17",
-        "h3_mimo25_materializer_v18",
+        "h3_mimo25_materializer_v19",
     ] = (
         MIMO25_MATERIALIZER_VERSION
     )
@@ -1131,7 +1108,6 @@ class MimoUsage(SchemaModel):
 
 class MimoCompletionDiagnostic(SchemaModel):
     input_modality: Literal[
-        "text_only_compositor",
         "target_video_with_embedded_audio",
         "target_video_plus_canonical_full_audio_fallback",
         "full_av_recheck_embedded_audio",
@@ -1291,9 +1267,6 @@ class MimoBackendConfig:
             "media_resolution": self.media_resolution,
             "thinking": {"type": self.thinking},
             "icl_version": MIMO25_ICL_VERSION if self.icl == "v1" else None,
-            "compositor_version": COMPOSITOR_VERSION,
-            "compositor_temperature": 0.0,
-            "compositor_max_completion_tokens": 4096,
             "temperature": self.temperature,
             "max_completion_tokens": self.max_completion_tokens,
             "response_format": (
@@ -1325,7 +1298,7 @@ AUTHORITY
 
 STAGE A visual_observation: PURE VISUAL EVIDENCE
 - Observe real shots and exact segment windows without deciding who speaks. Every shot has at least one contiguous vN visual block. Visual text is English, visual-only, generation-useful prose covering supported style, framing, camera angle, composition, subject appearance and spatial relations, pose and body/hand/head motion, gaze/expression, interactions, object state, environment/material/readable text, lighting/color, camera motion or stability, and early-to-late progression.
-- Visual blocks are chronological, time-local visual phases WITHOUT numeric timestamps. Keep blocks in playback order and describe local visual progression. When dialogue or actions change meaningfully, prefer multiple concise blocks rather than one giant paragraph narrating the whole shot. Never put transcript or audio semantics in these visual blocks.
+- Keep one coherent visual block per shot by default, in playback order, without numeric timestamps. Use only a few additional blocks for genuinely meaningful progression, never one per sentence or minor detail. These blocks are internal evidence, not final description ordering. Never put transcript or audio semantics in them.
 - Target roughly 300-450 English visual/detail words when evidence supports it, but never pad. Anti-collapse minimum visual-only prose is 40 words below 3 seconds, 80 words from 3 through 8 seconds, and 120 words above 8 seconds.
 - Never put transcript, delivery, voice, soundscape, music, speaker presentation, pipeline syntax, Subject/Picture labels, or inferred psychology, intent, causality, relationships, identity, sound, invisible events, or invented details in visual blocks.
 - segment_views exactly follow allowed_segment_ids. visible_entity_ids and entity_observations agree exactly and contain only supplied entities actually visible in that exact interval. A back/profile view, occluded face, or hidden/out-of-frame mouth is still visible presence. speech_correlated_articulation records exact-window observation only and does not assign a speaker.
@@ -1354,9 +1327,10 @@ STAGE D h3_semantics
 - Produce only official visual Subject definitions, concise summary, and visual retention rows. Definitions are natural MiniMax H3 visual prose; pipeline code appends exact Picture provenance. An entity Subject describes the reusable entity. An attribute Subject describes only the referenced attribute itself, never another person/object or a redefinition of its owner_entity_id. For hair describe only hairstyle, shape, color, and texture; for face only facial appearance/features; for glasses only eyewear; for upper_clothing only the garment; for accessory only the accessory.
 - Attribute retention is owner-aware: judge whether the referenced attribute remains visibly retained on its owning entity in the target, never whether a second independent person/object exists. Do not mark an attribute weak_reference merely because it is not an independent entity. Retention markers are only fully_preserved, partially_preserved, weak_reference; attribute_transfer is forbidden. Audio soundscape/music comes only from Stage B.
 
-STAGE E h3_projection
-- Project typed visual{block_id}, speech{segment_id}, and audio_event{event_id} parts in playback order. Every Stage A visual block appears exactly once in its own shot. Every transcribed segment appears exactly once in chronological order. Every non-speech event except non_diegetic_music appears exactly once in chronological order. Never project non-diegetic music into detailed description.
-- This projection is an initial order hint. Preserve visual block order and authoritative speech/event order and shot membership. A later text-only compositor inserts locked speech/events among immutable visual sentences; it cannot rewrite any facts. Do not generate visual timestamps.
+STAGE E h3_projection: DETAILED DESCRIPTION
+- You are watching the original video and hearing its audio now. Write each shot's description_template directly as coherent natural English in playback order. Interleave required [[segment_id]] speech and [[audio_event:aeN]] event placeholders near the actions/reactions they accompany. Exact frame or millisecond alignment is NOT required.
+- Use every transcribed speech placeholder exactly once in chronological order, and every local event except non_diegetic_music exactly once in chronological order, in a plausibly overlapping shot. Never quote or paraphrase dialogue yourself.
+- Do not put all speech placeholders at the end merely because you described the visuals first. For ongoing action, write visual setup, the speech placeholder, then reaction/progression. Keep prose fluid, not sentence IDs or timestamped phases.
 - Transcribed overlapping_secondary_speech or sequential_multi_speaker_speech is retained as acoustic evidence but blocks final H3 with multi_speaker_segment_requires_turn_refinement. Do not hide the classification or split/rewrite ASR to obtain a final prompt; authoritative sub-turn refinement is future work.
 - Do not write final H3 syntax. The deterministic materializer alone owns <Picture N>, <Subject N>, <Audio N>, Sx, exact <d>[Language] dialogue</d>, shot headers/cuts, and the official six-section final Ref2VA output. Internal vN/gN/eN/aeN/segment IDs and stage names must not leak into prose."""
 
@@ -1469,13 +1443,7 @@ def _synthetic_icl_messages() -> list[dict[str, str]]:
         },
         "h3_projection": {"shots": [{
             "shot_index": 1, "start_time": None,
-            "timeline_parts": [
-                {"type": "visual", "block_id": "v1"},
-                {"type": "speech", "segment_id": "segment_0001"},
-                {"type": "visual", "block_id": "v2"},
-                {"type": "audio_event", "event_id": "ae1"},
-                {"type": "visual", "block_id": "v3"},
-            ],
+            "description_template": "A person faces forward beside a gray cabinet. [[segment_0001]] The person lowers a hand onto the metal latch. [[audio_event:ae1]] The hand rests beside the closed latch as the person straightens.",
         }]},
         "warnings": [],
     }
@@ -1508,7 +1476,6 @@ def _completion_diagnostic(
     choice: object,
     *,
     modality: Literal[
-        "text_only_compositor",
         "target_video_with_embedded_audio",
         "target_video_plus_canonical_full_audio_fallback",
         "full_av_recheck_embedded_audio",
@@ -1628,7 +1595,7 @@ def validate_timeline_projection(
     transcribed_segment_ids: list[str],
     target_duration_seconds: float,
 ) -> list[ValidationIssue]:
-    """Keep authoritative timed atoms shot-bounded; visual prose has no timestamps."""
+    """Keep authoritative speech/events shot-bounded, not prose-aligned."""
     issues: list[ValidationIssue] = []
     events = {item.event_id: (item.approximate_start_time, item.approximate_end_time)
               for item in annotation.audio_semantics.temporal_non_speech_events
@@ -1642,17 +1609,136 @@ def validate_timeline_projection(
             issues.append(ValidationIssue("shot_start_outside_target", "h3_projection",
                                           "shot must have positive target-bounded extent"))
             continue
-        for part in shot.timeline_parts:
-            if isinstance(part, MimoH3VisualPart):
-                continue
-            interval = (segment_intervals.get(part.segment_id)
-                        if isinstance(part, MimoH3SpeechPart) else events.get(part.event_id))
+        for interval in (
+            [segment_intervals.get(key) for key in speech_placeholder_ids(shot.description_template)]
+            + [events.get(key) for key in event_placeholder_ids(shot.description_template)]
+        ):
             if interval is not None and (
                 interval[0] < 0 or interval[1] <= interval[0]
                 or min(end, interval[1]) <= max(start, interval[0])
             ):
                 issues.append(ValidationIssue("timed_atom_interval_invalid", "h3_projection",
                                               "authoritative speech/event must overlap its shot"))
+    return issues
+
+
+def validate_audio_materialization_semantics(
+    annotation: MimoAVAnnotationDraft, *, has_segments: bool,
+) -> list[ValidationIssue]:
+    """Audio prerequisites shared by AV validation and defensive materialization."""
+    semantics = annotation.audio_semantics
+    issues = []
+    if semantics.complete_silence_verified and has_segments:
+        issues.append(ValidationIssue(
+            "complete_silence_conflicts_with_speech_inventory", "audio_semantics",
+            "authoritative speech exists in a claimed silent clip",
+        ))
+    if (semantics.overall_soundscape_status == "absent"
+            and not semantics.complete_silence_verified and semantics.overall_soundscape is None):
+        issues.append(ValidationIssue(
+            "soundscape_absence_requires_explicit_original_av_judgment", "overall_soundscape",
+            "absence requires explicit negative prose or verified complete silence",
+        ))
+    for name in ("overall_soundscape", "non_diegetic_music"):
+        if getattr(semantics, name + "_status") == "unknown":
+            issues.append(ValidationIssue(
+                "unknown_audio_semantics", name, "unknown cannot be rendered as confirmed absence",
+            ))
+    return issues
+
+
+def validate_template_inventory(
+    annotation: MimoAVAnnotationDraft, transcribed_segment_ids: list[str],
+) -> list[ValidationIssue]:
+    issues = []
+    projection = annotation.h3_projection
+    speech_parts = [
+        segment_id
+        for shot in projection.shots
+        for segment_id in speech_placeholder_ids(shot.description_template)
+    ]
+    speech_counts = {item: speech_parts.count(item) for item in set(speech_parts)}
+    if (
+        speech_parts != transcribed_segment_ids
+        or any(count != 1 for count in speech_counts.values())
+    ):
+        issues.append(
+            ValidationIssue(
+                "speech_placeholder_inventory_mismatch",
+                "h3_projection.shots",
+                "transcribed speech placeholders must appear exactly once in order",
+            )
+        )
+    event_parts = [
+        event_id
+        for shot in projection.shots
+        for event_id in event_placeholder_ids(shot.description_template)
+    ]
+    expected_event_ids = [
+        event.event_id
+        for event in annotation.audio_semantics.temporal_non_speech_events
+        if event.category != "non_diegetic_music"
+    ]
+    event_counts = {
+        item: event_parts.count(item) for item in set(event_parts)
+    }
+    unknown_events = sorted(set(event_parts) - set(expected_event_ids))
+    missing_events = [item for item in expected_event_ids if event_counts.get(item, 0) == 0]
+    duplicate_events = sorted(
+        item for item, count in event_counts.items() if count > 1
+    )
+    if unknown_events:
+        issues.append(
+            ValidationIssue(
+                "unknown_audio_event_placeholder",
+                "h3_projection.shots",
+                str(unknown_events),
+            )
+        )
+    if missing_events:
+        issues.append(
+            ValidationIssue(
+                "missing_audio_event_placeholder",
+                "h3_projection.shots",
+                str(missing_events),
+            )
+        )
+    if duplicate_events:
+        issues.append(
+            ValidationIssue(
+                "duplicate_audio_event_placeholder",
+                "h3_projection.shots",
+                str(duplicate_events),
+            )
+        )
+    if not unknown_events and not missing_events and not duplicate_events and (
+        event_parts != expected_event_ids
+    ):
+        issues.append(
+            ValidationIssue(
+                "audio_event_placeholder_order_mismatch",
+                "h3_projection.shots",
+                "Audio-event placeholders must follow chronological event order",
+            )
+        )
+    for shot in projection.shots:
+        prose = template_visual_prose(shot.description_template)
+        if "[[" in prose or "]]" in prose:
+            issues.append(ValidationIssue(
+                "unknown_pipeline_placeholder", "h3_projection.shots",
+                "only supplied speech and local audio-event placeholders are allowed",
+            ))
+        if _PIPELINE_OWNED.search(prose) or re.search(r"\bS[1-9]\d*\b", prose):
+            issues.append(ValidationIssue(
+                "draft_contains_pipeline_owned_syntax", "h3_projection.shots",
+                "speaker/reference/dialogue syntax is pipeline-owned",
+            ))
+        for match in _SPEECH_PLACEHOLDER.finditer(shot.description_template):
+            if _SPEECH_LEAD_IN.search(shot.description_template[:match.start()].rstrip()):
+                issues.append(ValidationIssue(
+                    "draft_prefixes_complete_speech_placeholder", "h3_projection.shots",
+                    "speech placeholders already contain the complete locked speaker clause",
+                ))
     return issues
 
 
@@ -1668,16 +1754,12 @@ def validate_annotation(
     reference_subjects: list[Any],
     target_duration_seconds: float,
 ) -> list[ValidationIssue]:
-    issues = validate_timeline_projection(
+    issues = validate_audio_materialization_semantics(annotation, has_segments=bool(segment_ids))
+    issues.extend(validate_timeline_projection(
         annotation, segment_intervals=segment_intervals,
         transcribed_segment_ids=transcribed_segment_ids,
         target_duration_seconds=target_duration_seconds,
-    )
-    if annotation.audio_semantics.complete_silence_verified and segment_ids:
-        issues.append(ValidationIssue(
-            "complete_silence_conflicts_with_speech_inventory", "audio_observation.audio_semantics",
-            "a clip containing authoritative speech segments cannot claim complete silence",
-        ))
+    ))
     audio_decisions = annotation.audio_observation.segment_decisions
     groundings = annotation.av_grounding.segment_groundings
     visual_views = annotation.visual_observation.segment_views
@@ -2011,77 +2093,7 @@ def validate_annotation(
         for shot in annotation.visual_observation.shots
         for block in shot.visual_blocks
     ]
-    speech_parts = [
-        part.segment_id
-        for shot in projection.shots
-        for part in shot.timeline_parts
-        if isinstance(part, MimoH3SpeechPart)
-    ]
-    speech_counts = {item: speech_parts.count(item) for item in set(speech_parts)}
-    if (
-        speech_parts != transcribed_segment_ids
-        or any(count != 1 for count in speech_counts.values())
-    ):
-        issues.append(
-            ValidationIssue(
-                "speech_placeholder_inventory_mismatch",
-                "h3_projection.shots",
-                "typed transcribed speech parts must appear exactly once in order",
-            )
-        )
-    event_parts = [
-        part.event_id
-        for shot in projection.shots
-        for part in shot.timeline_parts
-        if isinstance(part, MimoH3AudioEventPart)
-    ]
-    expected_event_ids = [
-        event.event_id
-        for event in annotation.audio_semantics.temporal_non_speech_events
-        if event.category != "non_diegetic_music"
-    ]
-    event_counts = {
-        item: event_parts.count(item) for item in set(event_parts)
-    }
-    unknown_events = sorted(set(event_parts) - set(expected_event_ids))
-    missing_events = [item for item in expected_event_ids if event_counts.get(item, 0) == 0]
-    duplicate_events = sorted(
-        item for item, count in event_counts.items() if count > 1
-    )
-    if unknown_events:
-        issues.append(
-            ValidationIssue(
-                "unknown_audio_event_placeholder",
-                "h3_projection.shots",
-                str(unknown_events),
-            )
-        )
-    if missing_events:
-        issues.append(
-            ValidationIssue(
-                "missing_audio_event_placeholder",
-                "h3_projection.shots",
-                str(missing_events),
-            )
-        )
-    if duplicate_events:
-        issues.append(
-            ValidationIssue(
-                "duplicate_audio_event_placeholder",
-                "h3_projection.shots",
-                str(duplicate_events),
-            )
-        )
-    if not unknown_events and not missing_events and not duplicate_events and (
-        event_parts != expected_event_ids
-    ):
-        issues.append(
-            ValidationIssue(
-                "audio_event_placeholder_order_mismatch",
-                "h3_projection.shots",
-                "typed Audio-event parts must follow chronological event order",
-            )
-        )
+    issues.extend(validate_template_inventory(annotation, transcribed_segment_ids))
     non_shot_text = "\n".join(
         (
             *(item.render() for item in semantics_draft.subject_definitions),
@@ -2126,43 +2138,6 @@ def validate_annotation(
                 "projection shots must exactly preserve Stage A shot indexes and cuts",
             )
         )
-    visual_block_ids = [
-        block.block_id for shot in visual_shots for block in shot.visual_blocks
-    ]
-    projected_visual_ids = [
-        part.block_id
-        for shot in projection.shots
-        for part in shot.timeline_parts
-        if isinstance(part, MimoH3VisualPart)
-    ]
-    if projected_visual_ids != visual_block_ids or len(projected_visual_ids) != len(
-        set(projected_visual_ids)
-    ):
-        issues.append(
-            ValidationIssue(
-                "visual_block_projection_inventory_mismatch",
-                "h3_projection.shots",
-                "every Stage A visual block must be projected exactly once in order",
-            )
-        )
-    if len(projection.shots) == len(visual_shots):
-        for visual_shot, projected_shot in zip(
-            visual_shots, projection.shots, strict=True
-        ):
-            expected = [item.block_id for item in visual_shot.visual_blocks]
-            actual = [
-                item.block_id
-                for item in projected_shot.timeline_parts
-                if isinstance(item, MimoH3VisualPart)
-            ]
-            if actual != expected:
-                issues.append(
-                    ValidationIssue(
-                        "visual_block_wrong_shot",
-                        "h3_projection.shots",
-                        f"shot {projected_shot.shot_index} must keep its Stage A visual blocks",
-                    )
-                )
     visual_word_count = sum(
         len(re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?", text)) for text in prose_parts
     )
@@ -2205,10 +2180,8 @@ def validate_annotation(
         }
         for index, shot in enumerate(projection.shots):
             shot_start, shot_end = shot_intervals[index]
-            for part in shot.timeline_parts:
-                if not isinstance(part, MimoH3SpeechPart):
-                    continue
-                interval = segment_intervals.get(part.segment_id)
+            for segment_id in speech_placeholder_ids(shot.description_template):
+                interval = segment_intervals.get(segment_id)
                 if interval is not None and not (
                     interval[0] < shot_end and interval[1] > shot_start
                 ):
@@ -2216,13 +2189,11 @@ def validate_annotation(
                         ValidationIssue(
                             "speech_placeholder_wrong_shot",
                             "h3_projection.shots",
-                            f"{part.segment_id} does not overlap shot {shot.shot_index}",
+                            f"{segment_id} does not overlap shot {shot.shot_index}",
                         )
                     )
-            for part in shot.timeline_parts:
-                if not isinstance(part, MimoH3AudioEventPart):
-                    continue
-                interval = event_by_id.get(part.event_id)
+            for event_id in event_placeholder_ids(shot.description_template):
+                interval = event_by_id.get(event_id)
                 if interval is not None and not (
                     interval[0] < shot_end and interval[1] > shot_start
                 ):
@@ -2230,10 +2201,11 @@ def validate_annotation(
                         ValidationIssue(
                             "audio_event_placeholder_wrong_shot",
                             "h3_projection.shots",
-                            f"{part.event_id} does not overlap shot {shot.shot_index}",
+                            f"{event_id} does not overlap shot {shot.shot_index}",
                         )
                     )
-    draft_text = "\n".join((*prose_parts, non_shot_text))
+    template_prose = [template_visual_prose(shot.description_template) for shot in projection.shots]
+    draft_text = "\n".join((*prose_parts, *template_prose, non_shot_text))
     if _INTERNAL_ANNOTATION_SYNTAX.search(draft_text):
         issues.append(
             ValidationIssue(
@@ -2364,6 +2336,7 @@ def validate_annotation(
                 semantics_draft.summary,
                 *(item.render() for item in semantics_draft.visual_retention_analysis),
                 *prose_parts,
+                *template_prose,
             )
         )
     )
@@ -3131,7 +3104,7 @@ class OpenAIMimo25Backend:
             "MANDATORY MACHINE CONTRACT:\n"
             + _compact_json(cls.build_mandatory_h3_draft_contract(job))
             + "\nUse allowed_segment_ids for all decisions and transcribed_segment_ids "
-            "for typed speech parts. Author only each Subject's visual description; "
+            "for exact [[segment_id]] speech placeholders. Author only each Subject's visual description; "
             "do not put Picture labels in description because the pipeline owns and "
             "materializes exact Subject-to-Picture provenance. Attribute Subjects "
             "describe only their attribute and remain owned by owner_entity_id; their "
@@ -3235,73 +3208,6 @@ class OpenAIMimo25Backend:
             thinking=self.config.thinking,
         ), retries
 
-    def compose(
-        self, source: CompositorInput,
-    ) -> tuple[TextComposition, str, MimoCompletionDiagnostic]:
-        """One text-only ordering request. No ICL, media, or semantic repair."""
-        payload = {
-            "model": self.config.model,
-            "messages": [
-                {"role": "system", "content": COMPOSITOR_PROMPT},
-                {"role": "user", "content": source.model_dump_json()},
-            ],
-            "temperature": 0.0,
-            "max_completion_tokens": 4096,
-            "stream": False,
-        }
-        if self.config.transport == "sglang":
-            payload.update(
-                response_format={"type": "json_schema", "json_schema": {
-                    "name": "CompositorOrdering", "schema": CompositorOrdering.model_json_schema(),
-                    "strict": True,
-                }},
-                reasoning_effort="none",
-                extra_body={"chat_template_kwargs": {"thinking": False, "enable_thinking": False}},
-            )
-        else:
-            payload.update(response_format={"type": "json_object"},
-                           extra_body={"thinking": {"type": "disabled"}})
-        raw = None
-        diagnostic = None
-        try:
-            completion, attempts, _ = self._call(payload)
-            choices = _value(completion, "choices")
-            if not isinstance(choices, list) or not choices:
-                raise ValueError("compositor response has no choices")
-            choice = choices[0]
-            raw = _value(_value(choice, "message"), "content")
-            diagnostic = _completion_diagnostic(
-                completion, choice, modality="text_only_compositor",
-                http_attempt_count=attempts, thinking="disabled",
-            )
-            _validate_finish_reason(diagnostic)
-            if not isinstance(raw, str):
-                raise TypeError("compositor final content must be text")
-            ordering, issues = parse_structured_json_issues(raw, CompositorOrdering)
-            if ordering is not None:
-                issues.extend(validate_ordering(source, ordering))
-            if issues:
-                raise MimoBackendFailure(
-                    code="text_compositor_failed", reason="invalid compositor ordering",
-                    issues=issues,
-                )
-            assert ordering is not None
-            return make_composition(source, ordering), raw, diagnostic
-        except Exception as exc:
-            issues = (exc.issues if isinstance(exc, MimoBackendFailure) else
-                      [ValidationIssue("compositor_request_failed", None, str(exc))])
-            if diagnostic is None:
-                diagnostic = MimoCompletionDiagnostic(
-                    input_modality="text_only_compositor", usage=MimoUsage(),
-                    http_attempt_count=getattr(exc, "attempts", 1),
-                    request_error=type(exc).__name__, warnings=[],
-                )
-            raise MimoBackendFailure(
-                code="text_compositor_failed", reason=str(exc), issues=issues,
-                raw_responses=([raw] if isinstance(raw, str) else []),
-                diagnostics=[diagnostic], model_call_count=1,
-            ) from exc
-
     def _full_av_recheck_prompt(
         self,
         job: MimoBackendJob,
@@ -3342,8 +3248,8 @@ class OpenAIMimo25Backend:
             )
         if "speech_placeholder_inventory_mismatch" in issue_codes:
             issue_actions.append(
-                "For speech_placeholder_inventory_mismatch, rebuild all typed speech "
-                "timeline parts so their flattened segment_id sequence exactly equals "
+                "For speech_placeholder_inventory_mismatch, rebuild shot-template speech "
+                "placeholders so their flattened segment_id sequence exactly equals "
                 "transcribed_segment_ids. Do not derive eligibility again or emit any "
                 "other segment ID."
             )
@@ -3642,14 +3548,10 @@ __all__ = [
     "MimoBackendProvenance",
     "MimoBackendResult",
     "MimoCompletionDiagnostic",
-    "MimoH3AudioEventPart",
     "MimoH3Draft",
     "MimoH3Projection",
     "MimoH3Semantics",
     "MimoH3Shot",
-    "MimoH3SpeechPart",
-    "MimoH3TimelinePart",
-    "MimoH3VisualPart",
     "MimoMediaResolver",
     "MimoSegmentDecision",
     "MimoSpeakerVoiceProfile",
