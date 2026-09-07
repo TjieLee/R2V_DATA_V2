@@ -2,6 +2,35 @@
 
 This file is the repository-level handoff and operating contract for Codex, ChatGPT, and other coding agents. Read it before inspecting, editing, testing, or proposing server commands.
 
+> **Branch-specific Audio/H3 override — `feature/h3-audio-jea-qwen3-v1`:** The
+> active Audio/H3 branch is developed independently from the frozen Visual
+> branches. The named SAM Audio shadow-run namespace was implemented at
+> `51d4b3c50ef62870a06f2ac4db4df0da444fd9bc`; later docs-only commits may
+> advance HEAD without changing that code baseline. Before changing or operating
+> Audio/H3, read, in order:
+>
+> 1. `docs/H3_AUDIO_SERVER_RUNBOOK.md`
+> 2. `docs/H3_SAM_AUDIO_STEM_SHADOW.md`
+> 3. `docs/H3_QWEN3_ASR.md`
+> 4. `docs/V3_VISUAL_AUDIO_INTEGRATION.md`
+>
+> The validated complete one-clip SAM Audio shadow smoke remains under the
+> legacy/default `$AUDIO_PRODUCTION_ROOT/sam_audio_stem_shadow_v1/` root and is a
+> regression baseline; new inventories should use
+> `sam_audio_stem_shadow_v1/runs/<shadow-run-id>/` rather than overwrite it.
+> All six shadow stages must use the same run ID and ordered case manifest.
+> Cross-run copied artifacts and output paths fail closed by lineage.
+>
+> Environment boundaries are strict. SAM separation uses the main R2V `.venv`
+> with an invocation-local `SAM_AUDIO_RUNTIME_PYTHONPATH` overlay only. The
+> shadow Qwen3-ASR CLI is launched with `R2V_PYTHON` and starts its isolated
+> `QWEN3_ASR_ENV/bin/python` persistent worker internally. Do not install SAM,
+> DiariZen, or Qwen-only dependencies into the main `.venv`, do not replace the
+> Torch/CUDA/NumPy stack, and do not carry the SAM dependency overlay into later
+> stages. The original target AV remains final factual authority; stem evidence
+> is auxiliary only. Do not mutate frozen production Audio, Visual, MiMo, or H3
+> outputs while operating a shadow run.
+
 > **Branch-specific V3 override — `feature/v3-subject-attributes-v1`:** The
 > repository is `TjieLee/R2V_DATA_V2`; the
 > final Visual/reference code freeze is
