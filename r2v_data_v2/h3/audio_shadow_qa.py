@@ -42,7 +42,7 @@ from r2v_data_v2.h3.sam_audio_stem_shadow import (
     validate_stem_diarization_lineage,
 )
 
-QA_DATA_VERSION = "r2v.h3.audio_shadow_qa.3"
+QA_DATA_VERSION = "r2v.h3.audio_shadow_qa.4"
 QA_REVIEW_VERSION = "r2v.h3.audio_shadow_human_qa.2"
 QA_LABELS = (
     "better", "same", "worse", "speaker_wrong",

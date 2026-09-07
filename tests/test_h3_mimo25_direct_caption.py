@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from r2v_data_v2.h3.mimo25_backend import (
     MIMO25_ICL_VERSION,
@@ -52,6 +54,9 @@ def test_official_example_and_single_av_message_order(tmp_path):
     assert "Samoyed" in example and "canned" in example.lower()
     assert "[[" not in example
     assert backend.provenance.icl_version == MIMO25_ICL_VERSION
+    prompt = messages[-1]["content"][-1]["text"]
+    assert "This target video contains exactly one shot." in prompt
+    assert "prose style only, not shot count" in prompt
 
 
 def test_direct_caption_materializes_without_reconstructing_prose(tmp_path):
@@ -59,13 +64,17 @@ def test_direct_caption_materializes_without_reconstructing_prose(tmp_path):
     sample = _sample(tmp_path)
     annotation = _annotation()
     record = _record_fixture(tmp_path, annotation, job=job)
-    raw = annotation.h3_semantics.detailed_description
+    raw = annotation.h3_semantics.shot1_caption
     _, final, warnings = _materialize_sample(sample, job, record)
     direct = final.split("detailed_description:\n", 1)[1].split("\n\noverall_soundscape:", 1)[0]
+    opening = annotation.h3_semantics.style_opening + " [Shot 1] "
+    assert direct.startswith(opening)
+    assert direct.count("[Shot 1]") == 1 and "[Shot 2]" not in direct
+    direct = direct[len(opening):]
     assert re.sub(r"<d>.*?</d>", "<d></d>", direct) == re.sub(r"<d>.*?</d>", "<d></d>", raw)
     assert "<d>[English] Exact, text!</d>" in direct
     assert "asr_dialogue_payload_corrected" in warnings
-    assert annotation.h3_semantics.detailed_description == raw
+    assert annotation.h3_semantics.shot1_caption == raw
     sections = ["subject_definitions", "summary", "retention_analysis",
                 "detailed_description", "overall_soundscape", "non_diegetic_music"]
     offsets = [final.index(name + ":\n") for name in sections]
@@ -121,3 +130,52 @@ def test_internal_absence_and_audio_wording_do_not_block_caption(tmp_path):
     result = _run(backend, job)
     assert result.model_call_count == len(calls.requests) == 1
     assert "direct_soundscape_contains_music_or_speech" in result.diagnostics[0].warnings
+
+
+def test_one_shot_schema_has_no_model_owned_timing():
+    schema = MimoAVAnnotationDraft.model_json_schema()
+    visual = schema["$defs"]["MimoVisualObservation"]
+    assert set(visual["properties"]) == {"visual_blocks", "segment_views"}
+    assert "MimoVisualShotObservation" not in schema["$defs"]
+    assert "start_time" not in json.dumps(visual)
+    semantics = schema["$defs"]["MimoH3Semantics"]["properties"]
+    assert {"style_opening", "shot1_caption"} <= set(semantics)
+    assert "detailed_description" not in semantics
+
+
+@pytest.mark.parametrize("field,marker", [
+    ("style_opening", "[Shot 1]"), ("shot1_caption", "[Shot 2]"),
+])
+def test_model_shot_markers_fail_and_use_only_existing_recheck(tmp_path, field, marker):
+    job = _job_fixture(tmp_path)
+    values = _annotation().model_dump(mode="json")
+    values["h3_semantics"][field] += " " + marker
+    with pytest.raises(ValidationError, match="pipeline-owned shot markers"):
+        MimoAVAnnotationDraft.model_validate(values)
+    backend, calls = _backend(tmp_path, [
+        (json.dumps(values), 8), (_annotation().model_dump_json(), 8),
+    ])
+    assert _run(backend, job).model_call_count == len(calls.requests) == 2
+
+
+@pytest.mark.parametrize("speakers,introductions,valid", [
+    (["S1"] * 4, ["<Subject 1> (S1) speaks softly,", "He continues,", "He then adds,", "Finally, he concludes,"], True),
+    (["S1"] * 4, ["The woman speaks,"] * 4, False),
+    (["S1", "S1", "S2", "S2"], ["(S1) speaks,", "He adds,", "An off-screen voice (S2) replies,", "It continues,"], True),
+    (["S1", "S2", "S1"], ["(S1) listens to (S2), then speaks,", "The reply follows,", "He resumes,"], True),
+    (["S1", "S2"], ["(S1) speaks,", "A voice replies,"], False),
+    (["S1", "S1"], ["He speaks,", "(S1) continues,"], False),
+])
+def test_speakers_need_only_first_dialogue_introduction(speakers, introductions, valid):
+    speech = [
+        {"segment_id": f"segment_{i}", "speaker_id": speaker,
+         "language": "Chinese", "text": f"原文{i}"}
+        for i, speaker in enumerate(speakers)
+    ]
+    text = " ".join(f"{intro} <d>[Chinese] 原文{i}</d>"
+                    for i, intro in enumerate(introductions))
+    corrected, issues, _ = protect_direct_dialogue(text, speech, allowed_labels=LABELS)
+    assert corrected == text
+    assert (not issues) == valid
+    if not valid:
+        assert {issue.code for issue in issues} == {"direct_speaker_not_established"}

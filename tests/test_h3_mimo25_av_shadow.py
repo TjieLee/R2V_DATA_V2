@@ -130,29 +130,23 @@ def _annotation(
         {
             "schema_version": MIMO25_SCHEMA_VERSION,
             "visual_observation": {
-                "shots": [
+                "visual_blocks": [
                     {
-                        "shot_index": 1,
-                        "start_time": None,
-                        "visual_blocks": [
-                            {
-                                "block_id": "v1",
-                                "text": (
-                                    "A stable medium shot frames one person near the center "
-                                    "against a quiet interior background. Soft neutral light "
-                                    "defines the face and clothing while the camera remains "
-                                    "still. The subject keeps an upright posture, makes small "
-                                    "natural head and hand movements, and remains clearly "
-                                    "separated from the simple surrounding objects throughout "
-                                    "the early, middle, and late portions of the view. A plain "
-                                    "wall and restrained furnishings hold steady behind the "
-                                    "figure, with no camera pan or zoom. Clothing folds shift "
-                                    "slightly as the arms settle, but the balanced composition, "
-                                    "soft shadows, muted palette, and uncluttered depth remain "
-                                    "visually consistent until the shot ends."
-                                ),
-                            }
-                        ],
+                        "block_id": "v1",
+                        "text": (
+                            "A stable medium shot frames one person near the center "
+                            "against a quiet interior background. Soft neutral light "
+                            "defines the face and clothing while the camera remains "
+                            "still. The subject keeps an upright posture, makes small "
+                            "natural head and hand movements, and remains clearly "
+                            "separated from the simple surrounding objects throughout "
+                            "the early, middle, and late portions of the view. A plain "
+                            "wall and restrained furnishings hold steady behind the "
+                            "figure, with no camera pan or zoom. Clothing folds shift "
+                            "slightly as the arms settle, but the balanced composition, "
+                            "soft shadows, muted palette, and uncluttered depth remain "
+                            "visually consistent until the shot ends."
+                        ),
                     }
                 ],
                 "segment_views": [
@@ -267,7 +261,8 @@ def _annotation(
                     )
                 ],
                 "summary": "A person speaks while remaining visible.",
-                "detailed_description": "The live-action video shows a seated person. [Shot 1] <Subject 1> (S1) turns and asks gently, <d>[Chinese] 错误文本</d> while lowering a hand. A clink sounds nearby.",
+                "style_opening": "The live-action video shows a seated person.",
+                "shot1_caption": "<Subject 1> (S1) turns and asks gently, <d>[Chinese] 错误文本</d> while lowering a hand. A clink sounds nearby.",
                 "overall_soundscape": "A quiet room tone and a short clink are audible.",
                 "non_diegetic_music": "N/A",
                 "visual_retention_analysis": [
@@ -824,25 +819,6 @@ def test_mimo_request_contract_and_embedded_audio(tmp_path: Path) -> None:
     assert job.r2v_instruction in content[-1]["text"]  # type: ignore[index]
 
 
-def test_first_shot_zero_does_not_trigger_full_av_recheck(tmp_path: Path) -> None:
-    payload = _annotation().model_dump(mode="json")
-    payload["h3_projection"]["shots"][0]["start_time"] = 0
-    annotation = MimoAVAnnotationDraft.model_validate(payload)
-    backend, completions = _backend(tmp_path, [(annotation.model_dump_json(), 8)])
-
-    result = backend.reconcile(
-        _job_fixture(tmp_path),
-        segment_ids=["segment_1"],
-        transcribed_segment_ids=["segment_1"],
-        allowed_entity_ids={"e1"},
-        allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
-    )
-
-    assert result.annotation.h3_projection.shots[0].start_time == 0
-    assert result.model_call_count == 1
-    assert result.recheck_count == 0
-    assert len(completions.requests) == 1
-
 
 def test_sglang_primary_uses_embedded_video_audio_and_non_thinking_contract(
     tmp_path: Path,
@@ -1207,7 +1183,7 @@ def test_visible_listener_does_not_inherit_offscreen_speaker() -> None:
 
 def test_visual_observation_requires_real_visual_content_per_shot() -> None:
     payload = _annotation().model_dump(mode="json")
-    payload["visual_observation"]["shots"][0]["visual_blocks"] = []
+    payload["visual_observation"]["visual_blocks"] = []
     with pytest.raises(ValidationError):
         MimoAVAnnotationDraft.model_validate(payload)
 
@@ -1222,7 +1198,7 @@ def test_visual_observation_requires_real_visual_content_per_shot() -> None:
 
 def test_visual_underdescription_floor_is_hard_but_not_a_target_length() -> None:
     payload = _annotation().model_dump(mode="json")
-    payload["visual_observation"]["shots"][0]["visual_blocks"][0]["text"] = (
+    payload["visual_observation"]["visual_blocks"][0]["text"] = (
         " ".join(["detail"] * 39)
     )
     short = MimoAVAnnotationDraft.model_validate(payload)
@@ -1230,7 +1206,7 @@ def test_visual_underdescription_floor_is_hard_but_not_a_target_length() -> None
         item.code for item in _validate(short)
     }
 
-    payload["visual_observation"]["shots"][0]["visual_blocks"][0]["text"] = (
+    payload["visual_observation"]["visual_blocks"][0]["text"] = (
         " ".join(["detail"] * 40)
     )
     sufficient = MimoAVAnnotationDraft.model_validate(payload)
@@ -1251,7 +1227,7 @@ def test_visual_stage_rejects_unknown_entities_and_internal_ids() -> None:
     assert "unknown_visual_entity" in {item.code for item in _validate(annotation)}
 
     payload = _annotation().model_dump(mode="json")
-    payload["visual_observation"]["shots"][0]["visual_blocks"][0]["text"] = (
+    payload["visual_observation"]["visual_blocks"][0]["text"] = (
         "The internal e1 token appears inside otherwise concrete visible description "
         + " ".join(["detail"] * 40)
     )
@@ -4271,7 +4247,7 @@ def test_subject_and_retention_fields_are_structured_in_json_schema() -> None:
 )
 def test_timeline_prose_rejects_pipeline_owned_syntax(forbidden_text: str) -> None:
     payload = _annotation().model_dump(mode="json")
-    payload["visual_observation"]["shots"][0]["visual_blocks"][0]["text"] = (
+    payload["visual_observation"]["visual_blocks"][0]["text"] = (
         forbidden_text
     )
     with pytest.raises(ValidationError, match="non-visual or pipeline syntax"):
@@ -4605,172 +4581,6 @@ def test_short_authoritative_text_does_not_trigger_audio_semantics_leakage(
     assert "audio_semantics_contains_authoritative_transcript" not in {
         item.code for item in issues
     }
-
-
-def _two_shot_annotation(
-    *,
-    speech_shot: int = 1,
-    event_shot: int = 1,
-    event_interval: tuple[float, float] = (1.0, 1.5),
-) -> MimoAVAnnotationDraft:
-    payload = _annotation().model_dump(mode="json")
-    event = payload["audio_observation"]["audio_semantics"]["temporal_non_speech_events"][0]
-    event["approximate_start_time"], event["approximate_end_time"] = event_interval
-    shot_parts = {
-        1: [_prose("<Subject 1> remains visible.")],
-        2: [_prose("The scene continues.")],
-    }
-    shot_parts[speech_shot].append(_speech("segment_1"))
-    shot_parts[event_shot].append(_audio_event("ae1"))
-    payload["h3_projection"]["shots"] = [
-        {
-            "shot_index": 1,
-            "start_time": None,
-            "timeline_parts": shot_parts[1],
-        },
-        {
-            "shot_index": 2,
-            "start_time": 5.0,
-            "timeline_parts": shot_parts[2],
-        },
-    ]
-    return MimoAVAnnotationDraft.model_validate(payload)
-
-
-def test_speech_placeholder_must_overlap_its_shot() -> None:
-    issues = _validate(
-        _two_shot_annotation(speech_shot=2),
-        segment_intervals={"segment_1": (1.0, 2.0)},
-        target_duration_seconds=10.0,
-    )
-    assert "speech_placeholder_wrong_shot" in {item.code for item in issues}
-
-
-@pytest.mark.parametrize("speech_shot", [1, 2])
-def test_speech_placeholder_crossing_cut_may_use_either_overlapping_shot(
-    speech_shot: int,
-) -> None:
-    issues = _validate(
-        _two_shot_annotation(speech_shot=speech_shot),
-        segment_intervals={"segment_1": (4.8, 5.2)},
-        target_duration_seconds=10.0,
-    )
-    assert "speech_placeholder_wrong_shot" not in {item.code for item in issues}
-
-
-def test_audio_event_placeholder_must_overlap_its_shot() -> None:
-    issues = _validate(
-        _two_shot_annotation(event_shot=2),
-        segment_intervals={"segment_1": (1.0, 2.0)},
-        target_duration_seconds=10.0,
-    )
-    assert "audio_event_placeholder_wrong_shot" in {item.code for item in issues}
-
-
-@pytest.mark.parametrize("event_shot", [1, 2])
-def test_audio_event_crossing_cut_may_use_either_overlapping_shot(
-    event_shot: int,
-) -> None:
-    issues = _validate(
-        _two_shot_annotation(event_shot=event_shot, event_interval=(4.9, 5.1)),
-        segment_intervals={"segment_1": (1.0, 2.0)},
-        target_duration_seconds=10.0,
-    )
-    assert "audio_event_placeholder_wrong_shot" not in {item.code for item in issues}
-
-
-def test_subject_definition_picture_omission_is_valid_but_shot_bounds_fail_closed() -> None:
-    payload = _annotation().model_dump(mode="json")
-    payload["h3_semantics"]["subject_definitions"] = [
-        _subject_definition("<Subject 1>", "has no supplied source Picture.")
-    ]
-    payload["visual_observation"]["shots"].append(
-        {
-            "shot_index": 2,
-            "start_time": 1.0,
-            "visual_blocks": [
-                {
-                    "block_id": "v2",
-                    "start_time": 1.0,
-                    "end_time": 2.0,
-                    "text": "A hard cut changes the visible composition and establishes a second clear view.",
-                }
-            ],
-        }
-    )
-    payload["h3_projection"]["shots"].append(
-        {
-            "shot_index": 2,
-            "start_time": 1.0,
-            "timeline_parts": [{"type": "visual", "block_id": "v2"}],
-        }
-    )
-    issues = _validate(
-        MimoAVAnnotationDraft.model_validate(payload),
-        target_duration_seconds=1.0,
-    )
-    assert "shot_start_outside_target" in {item.code for item in issues}
-    assert "visual_phase_interval_invalid" in {item.code for item in issues}
-
-
-@pytest.mark.parametrize("start_time", [None, 0])
-def test_first_shot_implicit_or_explicit_zero_is_accepted(
-    start_time: float | None,
-) -> None:
-    payload = _annotation().model_dump(mode="json")
-    payload["h3_projection"]["shots"][0]["start_time"] = start_time
-    draft = MimoAVAnnotationDraft.model_validate(payload)
-    assert draft.h3_projection.shots[0].start_time == start_time
-
-
-def test_first_shot_nonzero_start_time_is_rejected() -> None:
-    payload = _annotation().model_dump(mode="json")
-    payload["h3_projection"]["shots"][0]["start_time"] = 0.1
-    with pytest.raises(ValidationError, match="start implicitly or at zero"):
-        MimoAVAnnotationDraft.model_validate(payload)
-
-
-@pytest.mark.parametrize("start_time", [None, 0])
-def test_later_shot_missing_or_zero_start_time_is_rejected(
-    start_time: float | None,
-) -> None:
-    payload = _annotation().model_dump(mode="json")
-    payload["h3_projection"]["shots"].append(
-        {
-            "shot_index": 2,
-            "start_time": start_time,
-            "timeline_parts": [_prose("A hard cut reveals another angle.")],
-        }
-    )
-    with pytest.raises(ValidationError, match="later MiMo H3"):
-        MimoAVAnnotationDraft.model_validate(payload)
-
-
-def test_later_positive_hard_cuts_remain_strictly_ordered() -> None:
-    payload = _annotation().model_dump(mode="json")
-    payload["h3_projection"]["shots"].extend(
-        [
-            {
-                "shot_index": 2,
-                "start_time": 0.25,
-                "timeline_parts": [_prose("A hard cut reveals another angle.")],
-            },
-            {
-                "shot_index": 3,
-                "start_time": 0.75,
-                "timeline_parts": [_prose("A final hard cut returns to the subject.")],
-            },
-        ]
-    )
-    annotation = MimoAVAnnotationDraft.model_validate(payload)
-    assert [shot.start_time for shot in annotation.h3_projection.shots] == [
-        None,
-        0.25,
-        0.75,
-    ]
-    payload["h3_projection"]["shots"][2]["start_time"] = 0.2
-    with pytest.raises(ValidationError, match="strictly increase"):
-        MimoAVAnnotationDraft.model_validate(payload)
 
 
 def test_subject_definition_rejects_model_authored_picture_provenance() -> None:
@@ -6099,7 +5909,7 @@ def _presentation_annotation(presentation: str) -> MimoAVAnnotationDraft:
     )
     if presentation == "message_voice_over":
         payload["h3_semantics"]["summary"] = "A person silently handles a phone."
-        payload["visual_observation"]["shots"][0]["visual_blocks"][0]["text"] = (
+        payload["visual_observation"]["visual_blocks"][0]["text"] = (
             "The visible person looks at the phone and types without visible speech."
         )
     return MimoAVAnnotationDraft.model_validate(payload)
@@ -6143,41 +5953,6 @@ def test_materializer_preserves_exact_asr_and_segment(tmp_path: Path) -> None:
     assert not warnings or all("words" in item for item in warnings)
 
 
-def test_materializer_canonicalizes_first_shot_zero_to_none(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    payload = _annotation().model_dump(mode="json")
-    payload["h3_projection"]["shots"][0]["start_time"] = 0
-    annotation = MimoAVAnnotationDraft.model_validate(payload)
-    assert annotation.h3_projection.shots[0].start_time == 0
-    _, expected_rendered, _ = _materialize_sample(
-        _sample(tmp_path),
-        _job_fixture(tmp_path),
-        _record_fixture(tmp_path, _annotation()),
-    )
-
-    original = mimo25_materializer.materialize_h3_draft
-    observed: dict[str, float | None] = {}
-
-    def capture_start_time(draft: object, *args: object, **kwargs: object) -> object:
-        observed["start_time"] = draft.shots[0].start_time  # type: ignore[attr-defined]
-        return original(draft, *args, **kwargs)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(
-        mimo25_materializer,
-        "materialize_h3_draft",
-        capture_start_time,
-    )
-    _, rendered, _ = _materialize_sample(
-        _sample(tmp_path),
-        _job_fixture(tmp_path),
-        _record_fixture(tmp_path, annotation),
-    )
-
-    assert observed["start_time"] is None
-    assert rendered == expected_rendered
-
 
 def test_materializer_audio_facts_use_segment_level_delivery(tmp_path: Path) -> None:
     sample = _sample(tmp_path)
@@ -6197,8 +5972,6 @@ def test_materializer_audio_facts_use_segment_level_delivery(tmp_path: Path) -> 
 
 def _repeated_speech_inputs(
     tmp_path: Path,
-    *,
-    second_shot: bool,
 ) -> tuple[FinalH3SampleV2, MimoClipJob, MimoRecord]:
     sample = _sample(tmp_path)
     job = _job_fixture(tmp_path)
@@ -6254,27 +6027,12 @@ def _repeated_speech_inputs(
     annotation_values["audio_observation"]["segment_decisions"] = audio_decisions
     annotation_values["av_grounding"]["segment_groundings"] = groundings
     annotation_values["visual_observation"]["segment_views"] = segment_views
-    long_prose = annotation.visual_observation.shots[0].visual_blocks[0].text
-    visual_shots, projected_shots = [], []
-    for shot_index, indices in enumerate(
-        ([range(2), range(2, 4)] if second_shot else [range(4)]), start=1,
-    ):
-        blocks, parts = [], []
-        for index in indices:
-            block_id = f"v{index + 1}"
-            blocks.append({
-                "block_id": block_id, "start_time": index + 0.75, "end_time": index + 1.0,
-                "text": long_prose if index == 0 else "The person holds a steady upright pose.",
-            })
-            parts.append(_speech(f"segment_{index + 1}"))
-            if index == 0:
-                parts.append(_audio_event("ae1"))
-            parts.append({"type": "visual", "block_id": block_id})
-        start_time = None if shot_index == 1 else 2.0
-        visual_shots.append({"shot_index": shot_index, "start_time": start_time, "visual_blocks": blocks})
-        projected_shots.append({"shot_index": shot_index, "start_time": start_time, "timeline_parts": parts})
-    annotation_values["visual_observation"]["shots"] = visual_shots
-    annotation_values["h3_projection"]["shots"] = projected_shots
+    annotation_values["h3_semantics"]["shot1_caption"] = (
+        "<Subject 1> (S1) speaks, "
+        + " He continues, ".join(
+            f"<d>[English] Exact line {index + 1}.</d>" for index in range(4)
+        )
+    )
     typed_sample = FinalH3SampleV2.model_validate(sample_values)
     typed_job = _job(job_values)
     typed_annotation = MimoAVAnnotationDraft.model_validate(annotation_values)
@@ -6288,7 +6046,7 @@ def _repeated_speech_inputs(
 def test_same_speaker_group_can_move_offscreen_without_entity_propagation(
     tmp_path: Path,
 ) -> None:
-    sample, job, record = _repeated_speech_inputs(tmp_path, second_shot=False)
+    sample, job, record = _repeated_speech_inputs(tmp_path)
     assert record.annotation is not None
     payload = record.annotation.model_dump(mode="json")
     second = payload["av_grounding"]["segment_groundings"][1]
@@ -6328,10 +6086,10 @@ def test_same_speaker_group_can_move_offscreen_without_entity_propagation(
 def test_visible_listener_prose_does_not_reattach_continuing_speaker_entity(
     tmp_path: Path,
 ) -> None:
-    sample, job, record = _repeated_speech_inputs(tmp_path, second_shot=False)
+    sample, job, record = _repeated_speech_inputs(tmp_path)
     assert record.annotation is not None
     payload = record.annotation.model_dump(mode="json")
-    payload["visual_observation"]["shots"][0]["visual_blocks"][0]["text"] = (
+    payload["visual_observation"]["visual_blocks"][0]["text"] = (
         "A visible listener keeps a closed mouth while the established voice continues."
     )
     second = payload["av_grounding"]["segment_groundings"][1]
@@ -6359,16 +6117,9 @@ def test_visible_listener_prose_does_not_reattach_continuing_speaker_entity(
 def test_materializer_cites_voice_audio_once_per_speaker_per_shot(
     tmp_path: Path,
 ) -> None:
-    sample, job, record = _repeated_speech_inputs(tmp_path, second_shot=False)
+    sample, job, record = _repeated_speech_inputs(tmp_path)
     _, rendered, _ = _materialize_sample(sample, job, record)
     assert rendered.count("referenced from <Audio 1>") == 1
-    assert rendered.count("<d>[English] Exact line") == 4
-
-
-def test_materializer_cites_voice_audio_again_in_new_shot(tmp_path: Path) -> None:
-    sample, job, record = _repeated_speech_inputs(tmp_path, second_shot=True)
-    _, rendered, _ = _materialize_sample(sample, job, record)
-    assert rendered.count("referenced from <Audio 1>") == 2
     assert rendered.count("<d>[English] Exact line") == 4
 
 
@@ -6807,7 +6558,7 @@ def test_bgm_only_negative_non_musical_soundscape_statement_is_valid() -> None:
     payload["audio_observation"]["segment_decisions"] = []
     payload["audio_observation"]["speaker_voice_profiles"] = []
     payload["av_grounding"]["segment_groundings"] = []
-    payload["visual_observation"]["shots"][0]["visual_blocks"][0]["text"] = (
+    payload["visual_observation"]["visual_blocks"][0]["text"] = (
         "A wide static landscape view frames a wooded ridge beneath a pale sky. "
         "Layered slopes recede from the textured foreground into soft distant haze, "
         "while muted green and gray tones remain stable across the composition. "
@@ -7197,7 +6948,7 @@ def test_message_voice_over_draft_keeps_phone_action_without_visible_speech(
     annotation = _presentation_annotation("message_voice_over")
     assert (
         "looks at the phone and types"
-        in annotation.visual_observation.shots[0].visual_blocks[0].text
+        in annotation.visual_observation.visual_blocks[0].text
     )
     corrected, rendered, _ = _materialize_sample(
         _sample(tmp_path),

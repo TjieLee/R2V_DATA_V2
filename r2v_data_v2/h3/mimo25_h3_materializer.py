@@ -58,8 +58,8 @@ from r2v_data_v2.h3.qwen38_h3_recaption import (
 from r2v_data_v2.h3.schemas import SchemaModel
 from r2v_data_v2.structured_output import ValidationIssue
 
-MIMO25_SHADOW_RECORD_VERSION = "r2v.h3.mimo25_h3_shadow.15"
-MIMO25_SHADOW_SUMMARY_VERSION = "r2v.h3.mimo25_h3_shadow_summary.16"
+MIMO25_SHADOW_RECORD_VERSION = "r2v.h3.mimo25_h3_shadow.16"
+MIMO25_SHADOW_SUMMARY_VERSION = "r2v.h3.mimo25_h3_shadow_summary.17"
 MUSIC_REFERENCE_POLICY_VERSION = "h3_mimo25_clean_music_reference_v1"
 MUSIC_REFERENCE_SAMPLE_RATE_HZ = 32000
 MUSIC_REFERENCE_CHANNELS = 2
@@ -208,7 +208,7 @@ def _write_jsonl(path: Path, values: Sequence[SchemaModel]) -> None:
 
 
 class MimoH3ShadowRecord(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_h3_shadow.15"] = MIMO25_SHADOW_RECORD_VERSION
+    schema_version: Literal["r2v.h3.mimo25_h3_shadow.16"] = MIMO25_SHADOW_RECORD_VERSION
     sample_id: str
     source_h3_sample_id: str
     clip_uid: str
@@ -228,7 +228,7 @@ class MimoH3ShadowRecord(SchemaModel):
         "h3_mimo25_materializer_v17",
         "h3_mimo25_materializer_v18",
         "h3_mimo25_materializer_v19",
-        "h3_mimo25_materializer_v20",
+        "h3_mimo25_materializer_v21",
     ] = (
         MIMO25_MATERIALIZER_VERSION
     )
@@ -339,7 +339,7 @@ class MimoH3ShadowRecord(SchemaModel):
 
 
 class MimoH3ShadowSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_h3_shadow_summary.16"] = (
+    schema_version: Literal["r2v.h3.mimo25_h3_shadow_summary.17"] = (
         MIMO25_SHADOW_SUMMARY_VERSION
     )
     source_mimo_inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -680,7 +680,7 @@ def _materialize_sample(
     allowed_labels.update(label for s in contract.subjects for label in s.source_picture_labels)
     allowed_labels.update(a.audio_label for a in contract.audios)
     detailed, direct_issues, correction_warnings = protect_direct_dialogue(
-        direct.detailed_description,
+        direct.shot1_caption,
         [{"segment_id": s.segment_id, "speaker_id": s.speaker_id, "language": s.language,
           "text": s.text} for s in facts.speech],
         allowed_labels=allowed_labels,
@@ -702,7 +702,7 @@ def _materialize_sample(
             item.render()
             for item in record.annotation.h3_semantics.visual_retention_analysis
         ],
-        detailed_description=detailed,
+        detailed_description=f"{direct.style_opening} [Shot 1] {detailed}",
         overall_soundscape=direct.overall_soundscape,
         non_diegetic_music=direct.non_diegetic_music,
         audio_fact_audit=[

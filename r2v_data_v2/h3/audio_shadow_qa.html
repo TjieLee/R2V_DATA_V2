@@ -164,8 +164,8 @@ function render() {
     el.append(input, document.createTextNode(label)); $("labels").append(el);
   });
   $("notes").value = state.notes;
-  $("direct-text").textContent = clip.direct_h3 ? ["summary", "detailed_description", "overall_soundscape", "non_diegetic_music"].map(name => name + ":\\n" + (clip.direct_h3[name] || "[unavailable]")).join("\\n\\n") : "[unavailable]";
-  $("production-text").textContent = (clip.production_h3 || []).map(row => row.sample_id + "\\n" + row.text).join("\\n\\n") || "[unavailable]";
+  $("direct-text").textContent = clip.direct_h3 ? ["summary", "style_opening", "shot1_caption", "overall_soundscape", "non_diegetic_music"].map(name => name + ":\n" + (clip.direct_h3[name] || "[unavailable]")).join("\n\n") : "[unavailable]";
+  $("production-text").textContent = (clip.production_h3 || []).map(row => row.sample_id + "\n" + row.text).join("\n\n") || "[unavailable]";
   const final = clip.final_h3;
   $("materializer-version").textContent = final.materializer_version;
   $("final-variant").replaceChildren();

@@ -15,7 +15,7 @@ speaker reconciliation; MiMo is the final AV authority for this shadow path.
 - frozen Visual V3 references own entity inventory, order, and image content.
 - LR-ASD, source clusters, and current entity bindings are proposals.
 - one MiMo-V2.5 joint-AV request returns visual/audio observation, AV grounding,
-  and direct `h3_semantics`. MiMo authors complete natural detailed-description,
+  and direct `h3_semantics`. MiMo authors natural `style_opening` / `shot1_caption`,
   soundscape, and music prose; there is no playback projection or compositor.
 - the deterministic boundary preserves frozen Subject/Picture ownership and
   corrects only safely matched `<d>` payloads to exact Qwen3-ASR text/language.
@@ -35,9 +35,14 @@ resolution, segment delivery, secondary vocal activity, voice profiles, and
 non-speech Audio. Stage C may map that exact Stage B group to one frozen `eN` or
 null and classify presentation. Only Qwen3-ASR segments with
 `asr_status="transcribed"` receive a `<d>` dialogue block in the direct caption.
-Counts and resolved speaker order must map safely; recognized out-of-order
-dialogue is rejected, not silently moved. Coarse visual evidence never controls
-final sentence order or length. There is no visual word-count floor.
+Every speaking `(Sx)` must be introduced before its first authoritative
+`<d>` in `shot1_caption`; it need not be repeated or immediately adjacent.
+Counts and recognizable dialogue order must map safely; recognized out-of-order
+dialogue is rejected, not silently moved. The current pilot is exactly one shot. Visual observation contains only
+`visual_blocks` and `segment_views`, with no model-owned shot boundaries or
+timestamps. The pipeline inserts the single `[Shot 1]` between `style_opening`
+and `shot1_caption`; any model-authored shot marker is rejected/rechecked.
+Coarse visual evidence never controls final sentence order or length. There is no visual word-count floor.
 
 The official Complete Example in `docs/VIDEO_PROMPT_WRITING_GUIDE_ref_en.md`
 is the few-shot assistant message, unchanged and without placeholders.
@@ -151,11 +156,11 @@ they do not create additional MiMo model jobs.
 
 Prompt, policy, annotation schema, and materializer versions are:
 
-- `h3_mimo25_unified_av_reconcile_v26`
+- `h3_mimo25_unified_av_reconcile_v27`
 - `h3_mimo25_av_authority_contract_v17`
-- `r2v.h3.mimo25_av_annotation.17`
-- `r2v.h3.mimo25_backend.29`
-- `h3_mimo25_materializer_v20`
+- `r2v.h3.mimo25_av_annotation.18`
+- `r2v.h3.mimo25_backend.30`
+- `h3_mimo25_materializer_v21`
 - `h3_mimo25_reference_selection_v1`
 - `h3_mimo25_recovered_voice_quality_v1`
 - `r2v.h3.mimo25_inventory.4`
@@ -163,8 +168,8 @@ Prompt, policy, annotation schema, and materializer versions are:
 - `r2v.h3.mimo25_summary.10`
 - `r2v.h3.mimo25_failure.5`
 - `r2v.h3.mimo25_raw_response.5`
-- `r2v.h3.mimo25_h3_shadow.15`
-- `r2v.h3.mimo25_h3_shadow_summary.16`
+- `r2v.h3.mimo25_h3_shadow.16`
+- `r2v.h3.mimo25_h3_shadow_summary.17`
 
 The OpenAI-compatible client defaults to the `xiaomi` transport, model
 `mimo-v2.5`, video FPS 4, `media_resolution=default`, disabled thinking,
@@ -297,10 +302,9 @@ prompt, corrected speech, or Audio references; later samples continue normally.
 The summary reports both the failed-sample count and validation issue-code
 counts. Inventory fingerprints, source H3/ASR provenance, canonical media hashes,
 task-local Picture projection, duplicate identities, and schema/programming
-errors remain batch-level fail-fast checks. Speaker-source validation uses the
-last explicit `<Subject N> (Sx)` or `(Sx)` source attached to each exact dialogue
-clause, without a fixed character lookback that could truncate a valid long
-voice-reference description.
+errors remain batch-level fail-fast checks. Speaker-source validation requires each expected `(Sx)` somewhere before its
+first dialogue, not the closest marker before every block. No pronoun resolution
+or fixed speech clause is used.
 
 ## Post-MiMo target voice recovery
 

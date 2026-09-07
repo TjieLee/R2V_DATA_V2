@@ -40,6 +40,7 @@ class _Reconcile(_FailingReconcileBackend):
             raise MimoBackendFailure(
                 code="synthetic_failed", reason="failed <script>not markup</script>",
                 model_call_count=2,
+                raw_responses=(_annotation().model_dump_json(),),
             )
         # Pure fixture output; no client or model is called.
         annotation = MimoAVAnnotationDraft.model_validate_json(
@@ -51,7 +52,7 @@ class _Reconcile(_FailingReconcileBackend):
             values["audio_observation"]["segment_decisions"] = []
             values["audio_observation"]["speaker_voice_profiles"] = []
             values["av_grounding"]["segment_groundings"] = []
-            values["h3_semantics"]["detailed_description"] = "The seated person remains still."
+            values["h3_semantics"]["shot1_caption"] = "The seated person remains still."
             values["audio_observation"]["audio_semantics"]["temporal_non_speech_events"] = []
         annotation = MimoAVAnnotationDraft.model_validate(values)
         return SimpleNamespace(annotation=annotation, raw_responses=(), diagnostics=(), model_call_count=1)
@@ -156,23 +157,25 @@ def test_builder_ready_failed_order_media_and_sources_unchanged(tmp_path, monkey
     assert result["output_root"] == str(output)
     data = json.loads((output / "data.json").read_text())
     reconcile_summary = json.loads((shadow / "mimo_reconcile/summary.json").read_text())
-    assert reconcile_summary["schema_version"] == "r2v.h3.mimo25_stem_reconcile_summary.8"
+    assert reconcile_summary["schema_version"] == "r2v.h3.mimo25_stem_reconcile_summary.9"
     assert reconcile_summary["current_mimo_versions_modified"] is True
     assert data["clip_uids"] == ["clip-z", "clip-a", "clip-m"]
     assert [clip["reconcile"]["status"] for clip in data["clips"]] == ["ready", "failed", "ready"]
     failed = data["clips"][1]["reconcile"]
     assert failed["failure_code"] == "synthetic_failed"
     assert failed["model_call_count"] == 2
+    assert data["clips"][1]["direct_h3"]["style_opening"]
+    assert data["clips"][1]["direct_h3"]["shot1_caption"]
     assert data["clips"][0]["reconcile"]["annotation"]["audio_observation"]
     assert [item[1].clip_uid for item in materialized] == ["clip-z", "clip-m"]
     for clip, call in zip((data["clips"][0], data["clips"][2]), materialized, strict=True):
         final = clip["final_h3"]
         assert final["status"] == "ready"
-        assert final["materializer_version"] == "h3_mimo25_materializer_v20"
+        assert final["materializer_version"] == "h3_mimo25_materializer_v21"
         assert final["text"] == call[3] == original(*call[:3])[1]
         assert final["variants"][0]["text"] == final["text"]
         assert "[[" not in final["text"]
-        assert clip["direct_h3"]["detailed_description"]
+        assert clip["direct_h3"]["shot1_caption"]
         assert clip["production_h3"]
         assert "MiMo DIRECT H3" in (output / "review.html").read_text()
         assert "<Picture 1>" in final["text"]
@@ -342,7 +345,7 @@ def test_ready_annotation_with_blocked_materialization_is_unavailable(tmp_path, 
                 non_diegetic_music_status="unknown", non_diegetic_music=None,
             )
         else:
-            values["h3_semantics"]["detailed_description"] += " [[unknown]]"
+            values["h3_semantics"]["shot1_caption"] += " [[unknown]]"
         return SimpleNamespace(annotation=MimoAVAnnotationDraft.model_validate(values),
                                raw_responses=(), diagnostics=(), model_call_count=1)
 
@@ -351,11 +354,11 @@ def test_ready_annotation_with_blocked_materialization_is_unavailable(tmp_path, 
     before = _snapshot(tmp_path)
     qa.build_audio_shadow_qa(**kwargs)
     data = json.loads((shadow / "qa/data.json").read_text())
-    assert data["schema_version"] == "r2v.h3.audio_shadow_qa.3"
+    assert data["schema_version"] == "r2v.h3.audio_shadow_qa.4"
     for clip in (data["clips"][0], data["clips"][2]):
         assert clip["reconcile"]["status"] == "ready"
         final = clip["final_h3"]
-        assert clip["direct_h3"]["detailed_description"]
+        assert clip["direct_h3"]["shot1_caption"]
         assert final["status"] == "unavailable" and final["text"] is None
         assert final["reason"] == "materialization_contract_failed"
         for variant in final["variants"]:
@@ -512,7 +515,7 @@ const {chromium} = require(process.argv[2]);
     assert.strictEqual(await page.locator("#final-text").textContent(), expectedFinal);
     assert(await page.locator("#final-text").isVisible());
     assert.strictEqual(await page.locator("#final-h3").evaluate(el => el.closest("details")), null);
-    assert.strictEqual(await page.locator("#materializer-version").textContent(), "h3_mimo25_materializer_v20");
+    assert.strictEqual(await page.locator("#materializer-version").textContent(), "h3_mimo25_materializer_v21");
     await page.locator("#final-variant").selectOption("1");
     assert.strictEqual(await page.locator("#final-text").textContent(), dataset.clips[0].final_h3.variants[1].text);
     await page.locator("#final-variant").selectOption("0");

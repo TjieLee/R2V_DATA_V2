@@ -28,12 +28,12 @@ from r2v_data_v2.structured_output import (
 
 MIMO25_MODEL = "mimo-v2.5"
 MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
-MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v26"
+MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v27"
 MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v17"
-MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.17"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.29"
+MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.18"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.30"
 MIMO25_ICL_VERSION = "h3_official_ref2va_complete_example_v1"
-MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v20"
+MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v21"
 MIMO25_CANONICAL_ABSENT_SOUNDSCAPE = (
     "No distinct environmental, mechanical, physical, or non-verbal human "
     "sounds are clearly discernible."
@@ -720,12 +720,6 @@ class MimoVisualBlock(SchemaModel):
         return self
 
 
-class MimoVisualShotObservation(SchemaModel):
-    shot_index: int = Field(gt=0)
-    start_time: float | None = Field(default=None, ge=0, allow_inf_nan=False)
-    visual_blocks: list[MimoVisualBlock] = Field(min_length=1)
-
-
 class MimoVisibleEntityObservation(SchemaModel):
     entity_id: str = Field(min_length=1)
     visibility: Literal["visible", "partially_visible"]
@@ -761,23 +755,8 @@ class MimoVisualSegmentView(SchemaModel):
 
 
 class MimoVisualObservation(SchemaModel):
-    shots: list[MimoVisualShotObservation] = Field(min_length=1)
+    visual_blocks: list[MimoVisualBlock] = Field(min_length=1)
     segment_views: list[MimoVisualSegmentView]
-
-    @model_validator(mode="after")
-    def validate_observation(self) -> MimoVisualObservation:
-        indexes = [shot.shot_index for shot in self.shots]
-        if indexes != list(range(1, len(indexes) + 1)):
-            raise ValueError("MiMo visual shots must use contiguous indexes")
-        if self.shots[0].start_time not in {None, 0}:
-            raise ValueError("MiMo visual Shot 1 must start implicitly or at zero")
-        later = [shot.start_time for shot in self.shots[1:]]
-        if any(value is None or value <= 0 for value in later):
-            raise ValueError("later MiMo visual shots require positive hard-cut times")
-        numeric = [value for value in later if value is not None]
-        if numeric != sorted(numeric) or len(numeric) != len(set(numeric)):
-            raise ValueError("MiMo visual hard-cut times must strictly increase")
-        return self
 
 
 class MimoSubjectDefinitionDraft(SchemaModel):
@@ -831,7 +810,8 @@ class MimoVisualRetentionDraft(SchemaModel):
 class MimoH3Semantics(SchemaModel):
     subject_definitions: list[MimoSubjectDefinitionDraft] = Field(min_length=1)
     summary: StrictStr
-    detailed_description: StrictStr = Field(min_length=1)
+    style_opening: StrictStr = Field(min_length=1)
+    shot1_caption: StrictStr = Field(min_length=1)
     overall_soundscape: StrictStr = Field(min_length=1)
     non_diegetic_music: StrictStr = Field(min_length=1)
     visual_retention_analysis: list[MimoVisualRetentionDraft] = Field(min_length=1)
@@ -841,13 +821,18 @@ class MimoH3Semantics(SchemaModel):
         values = (
             *(item.description for item in self.subject_definitions),
             self.summary,
-            self.detailed_description,
+            self.style_opening,
+            self.shot1_caption,
             self.overall_soundscape,
             self.non_diegetic_music,
             *(item.description for item in self.visual_retention_analysis),
         )
         if any(not value.strip() for value in values):
             raise ValueError("MiMo H3 semantics text must not be empty")
+        if any(re.search(r"\[Shot\s+\d+\]", value) for value in (self.style_opening, self.shot1_caption)):
+            raise ValueError("MiMo must not emit pipeline-owned shot markers")
+        if "<d>" in self.style_opening or "</d>" in self.style_opening:
+            raise ValueError("dialogue belongs only in shot1_caption")
         return self
 
 
@@ -887,7 +872,7 @@ MimoH3Draft = MimoH3Semantics
 
 
 class MimoAVAnnotationDraft(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_av_annotation.17"] = MIMO25_SCHEMA_VERSION
+    schema_version: Literal["r2v.h3.mimo25_av_annotation.18"] = MIMO25_SCHEMA_VERSION
     visual_observation: MimoVisualObservation
     audio_observation: MimoAudioObservation
     av_grounding: MimoAVGrounding
@@ -912,7 +897,7 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.29"] = MIMO25_BACKEND_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.30"] = MIMO25_BACKEND_VERSION
     backend: Literal[
         "xiaomi_openai_compatible", "sglang_openai_compatible"
     ]
@@ -930,13 +915,13 @@ class MimoBackendProvenance(SchemaModel):
     media_mode: Literal["base64", "http"]
     media_root: str
     media_base_url: str | None = None
-    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v26"] = (
+    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v27"] = (
         MIMO25_PROMPT_VERSION
     )
     policy_version: Literal["h3_mimo25_av_authority_contract_v17"] = (
         MIMO25_POLICY_VERSION
     )
-    annotation_schema_version: Literal["r2v.h3.mimo25_av_annotation.17"] = (
+    annotation_schema_version: Literal["r2v.h3.mimo25_av_annotation.18"] = (
         MIMO25_SCHEMA_VERSION
     )
     materializer_version: Literal[
@@ -952,7 +937,7 @@ class MimoBackendProvenance(SchemaModel):
         "h3_mimo25_materializer_v15",
         "h3_mimo25_materializer_v16",
         "h3_mimo25_materializer_v17",
-        "h3_mimo25_materializer_v20",
+        "h3_mimo25_materializer_v21",
     ] = (
         MIMO25_MATERIALIZER_VERSION
     )
@@ -1178,12 +1163,12 @@ SYSTEM_PROMPT = """You are the unified audiovisual reconciliation model for an H
 
 AUTHORITY
 - Preserve every supplied DiariZen segment, exact timing, and sample range. Every segment appears once in every required segment inventory even with LR-ASD=0, no binding, or zero direct-anchor support. Never split, merge, delete, filter, or invent timing.
-- Qwen3-ASR text and language are immutable. Use them verbatim only inside detailed_description <d> blocks. Never retranscribe, paraphrase, translate, or invent dialogue.
+- Qwen3-ASR text and language are immutable. Use them verbatim only inside shot1_caption <d> blocks. Never retranscribe, paraphrase, translate, or invent dialogue.
 - Frozen Visual entities, Pictures, Subjects, order, and ownership are immutable. LR-ASD, source clusters, and current bindings are fallible proposals. The target video is observation-only, never <Video N>.
 
 STAGE A visual_observation: PURE VISUAL EVIDENCE
-- Observe real shots and exact segment windows without deciding who speaks. Every shot has at least one visual evidence block. Visual text is English, visual-only, generation-useful prose covering supported style, framing, camera angle, composition, subject appearance and spatial relations, pose and body/hand/head motion, gaze/expression, interactions, object state, environment/material/readable text, lighting/color, camera motion or stability, and early-to-late progression.
-- Keep one coherent visual block per shot by default, in playback order, without numeric timestamps. Use only a few additional blocks for genuinely meaningful progression, never one per sentence or minor detail. These blocks are internal evidence, not final description ordering. Never put transcript or audio semantics in them.
+- Observe the single shot and exact segment windows without deciding who speaks. Supply visual evidence blocks without shot indexes or timestamps. Visual text is English, visual-only, generation-useful prose covering supported style, framing, camera angle, composition, subject appearance and spatial relations, pose and body/hand/head motion, gaze/expression, interactions, object state, environment/material/readable text, lighting/color, camera motion or stability, and early-to-late progression.
+- Keep one coherent visual block for this target by default, in playback order, without numeric timestamps. Use only a few additional blocks for genuinely meaningful progression, never one per sentence or minor detail. These blocks are internal evidence, not final description ordering. Never put transcript or audio semantics in them.
 - Never put transcript, delivery, voice, soundscape, music, speaker presentation, pipeline syntax, Subject/Picture labels, or inferred psychology, intent, causality, relationships, identity, sound, invisible events, or invented details in visual blocks.
 - segment_views exactly follow allowed_segment_ids. visible_entity_ids and entity_observations agree exactly and contain only supplied entities actually visible in that exact interval. A back/profile view, occluded face, or hidden/out-of-frame mouth is still visible presence. speech_correlated_articulation records exact-window observation only and does not assign a speaker.
 
@@ -1212,9 +1197,9 @@ STAGE D h3_semantics reference fields
 - Attribute retention is owner-aware: judge whether the referenced attribute remains visibly retained on its owning entity in the target, never whether a second independent person/object exists. Do not mark an attribute weak_reference merely because it is not an independent entity. Retention markers are only fully_preserved, partially_preserved, weak_reference; attribute_transfer is forbidden. Final audio prose must remain grounded in original AV.
 
 DIRECT H3 in h3_semantics
-- Write detailed_description as complete natural English H3, with style opening and [Shot N] syntax. You are observing original AV now: weave visible setup, action, speaker lead-in, exact <d>[Language] dialogue</d>, and reactions in playback order. Small within-shot placement differences are acceptable. Do not append all dialogue after the visual description.
+- Write style_opening as a concise visual-style opening and shot1_caption as complete natural English H3 prose. This target is exactly one shot; do not detect cuts, generate timestamps, split shots, or write any [Shot N] marker. Pipeline code inserts [Shot 1]. You are observing original AV now: weave visible setup, action, speaker lead-in, exact <d>[Language] dialogue</d>, and reactions in playback order. Small within-shot placement differences are acceptable. Do not append all dialogue after the visual description.
 - Use authoritative ASR language/text verbatim inside each <d>, once per transcribed segment in chronological order. Write action, speaker and delivery lead-ins naturally outside <d>; no placeholders, sentence IDs, or generated visual timestamps.
-- Derive stable (Sx) from final speaker groups in first transcribed appearance order. A referenced speaker uses its supplied <Subject N> (Sx); an unbound source uses a stable source description (Sx). Never invent reference labels or speakers. Use only explicitly enabled Audio labels; original target video is observation, not a Video reference.
+- Derive stable (Sx) from final speaker groups in first transcribed appearance order. Introduce each speaking (Sx) naturally somewhere in shot1_caption before its first dialogue. Do not repeat the marker before every utterance: He continues, He then adds, and similar connective prose are valid. Do not force a fixed says clause. A referenced speaker uses its supplied <Subject N> (Sx); an unbound source uses a stable source description (Sx). Never invent reference labels or speakers. Use only explicitly enabled Audio labels; original target video is observation, not a Video reference.
 - Write overall_soundscape and non_diegetic_music directly as natural prose following the official example. Soundscape excludes dialogue/singing and audience-only music. Music may be N/A if inaudible. Low room ambience is valid only when actually heard. Do not synthesize stock absence text.
 - A transcribed overlapping_secondary_speech or sequential_multi_speaker_speech still blocks final publication pending authoritative turn refinement. Retain your direct caption for human review; never split ASR heuristically.
 - Subject/Picture ownership and retention are frozen. Follow official six-section Ref2VA semantics, not mechanical phrase counts."""
@@ -1375,33 +1360,36 @@ _SPEAKER_LABEL = re.compile(r"\(S(\d+)\)")
 def protect_direct_dialogue(
     text: str, speech: list[dict[str, Any]], *, allowed_labels: set[str],
 ) -> tuple[str, list[ValidationIssue], list[str]]:
-    """Change only d-tag payloads after count, source sequence and order checks."""
+    """Change only d-tag payloads after count, first-speaker introduction and order checks."""
     issues = []
     warnings = []
     unknown = set(_REFERENCE_LABEL.findall(text)) - allowed_labels
     if unknown:
-        issues.append(ValidationIssue("direct_unknown_reference", "detailed_description", str(sorted(unknown))))
+        issues.append(ValidationIssue("direct_unknown_reference", "shot1_caption", str(sorted(unknown))))
     known_speakers = {item["speaker_id"] for item in speech}
     actual_speakers = {"S" + number for number in _SPEAKER_LABEL.findall(text)}
     if actual_speakers - known_speakers:
-        issues.append(ValidationIssue("direct_unknown_speaker", "detailed_description", str(sorted(actual_speakers - known_speakers))))
+        issues.append(ValidationIssue("direct_unknown_speaker", "shot1_caption", str(sorted(actual_speakers - known_speakers))))
     blocks = list(_DIALOGUE.finditer(text))
     if len(blocks) != len(speech) or text.count("<d>") != len(blocks) or text.count("</d>") != len(blocks):
-        issues.append(ValidationIssue("direct_dialogue_inventory_mismatch", "detailed_description", "dialogue blocks must map one-to-one to ordered transcribed segments"))
+        issues.append(ValidationIssue("direct_dialogue_inventory_mismatch", "shot1_caption", "dialogue blocks must map one-to-one to ordered transcribed segments"))
         return text, issues, warnings
     expected = [f"[{item['language'] or 'Unknown'}] {item['text']}" for item in speech]
-    previous_end = 0
+    established_speakers: set[str] = set()
     for index, (block, fact) in enumerate(zip(blocks, speech, strict=True)):
-        lead_in = text[previous_end:block.start()]
-        speakers = _SPEAKER_LABEL.findall(lead_in)
-        if not speakers or "S" + speakers[-1] != fact["speaker_id"]:
-            issues.append(ValidationIssue("direct_dialogue_speaker_mismatch", fact["segment_id"], "dialogue order must agree with resolved speaker order"))
+        speaker = fact["speaker_id"]
+        if speaker not in established_speakers:
+            if f"({speaker})" not in text[:block.start()]:
+                issues.append(ValidationIssue(
+                    "direct_speaker_not_established", fact["segment_id"],
+                    f"({speaker}) must be introduced before its first dialogue",
+                ))
+            established_speakers.add(speaker)
         recognized_positions = [i for i, payload in enumerate(expected) if payload == block.group(1)]
         if recognized_positions and index not in recognized_positions:
             issues.append(ValidationIssue("direct_dialogue_order_mismatch", fact["segment_id"], "recognized dialogue belongs to a different segment"))
-        previous_end = block.end()
     if "[[" in text or "]]" in text:
-        issues.append(ValidationIssue("direct_internal_syntax", "detailed_description", "internal placeholders are not H3"))
+        issues.append(ValidationIssue("direct_internal_syntax", "shot1_caption", "internal placeholders are not H3"))
     if issues:
         return text, issues, warnings
     replacements = iter(expected)
@@ -1786,8 +1774,7 @@ def validate_annotation(
     semantics_draft = annotation.h3_semantics
     prose_parts = [
         block.text
-        for shot in annotation.visual_observation.shots
-        for block in shot.visual_blocks
+        for block in annotation.visual_observation.visual_blocks
     ]
     non_shot_text = "\n".join(
         (
@@ -2735,6 +2722,10 @@ class OpenAIMimo25Backend:
             + "R2V INSTRUCTION:\n"
             + job.r2v_instruction
             + "\nThis intent hint never overrides observed target evidence.\n"
+            + "This target video contains exactly one shot. "
+            "The official example demonstrates prose style only, not shot count. "
+            "Do not output any [Shot N] marker. "
+            "Write style_opening and shot1_caption only for detailed description.\n"
             + self._mandatory_h3_draft_contract_text(job)
             + "\nAUTHORITATIVE INPUT:\n"
             + _compact_json(self.build_compact_task_contract(job))
@@ -3097,11 +3088,11 @@ class OpenAIMimo25Backend:
                 validation_issues = [issue for issue in validation_issues if issue.code not in _REVIEW_ONLY_ISSUES]
                 direct = annotation.h3_semantics
                 _, direct_issues, direct_warnings = protect_direct_dialogue(
-                    direct.detailed_description, direct_speech_facts(annotation, list(job.segments)),
+                    direct.shot1_caption, direct_speech_facts(annotation, list(job.segments)),
                     allowed_labels=allowed_reference_labels,
                 )
                 validation_issues.extend(direct_issues)
-                for name in ("summary", "overall_soundscape", "non_diegetic_music"):
+                for name in ("summary", "style_opening", "overall_soundscape", "non_diegetic_music"):
                     unknown = set(_REFERENCE_LABEL.findall(getattr(direct, name))) - allowed_reference_labels
                     if unknown:
                         validation_issues.append(ValidationIssue("direct_unknown_reference", name, str(sorted(unknown))))
@@ -3185,7 +3176,6 @@ __all__ = [
     "MimoVisualObservation",
     "MimoVisualRetentionDraft",
     "MimoVisualSegmentView",
-    "MimoVisualShotObservation",
     "OpenAIMimo25Backend",
     "SpeechPresentation",
     "sha256_file",

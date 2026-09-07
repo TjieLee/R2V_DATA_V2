@@ -252,7 +252,7 @@ PYTHONPATH="$SAM_AUDIO_RUNTIME_PYTHONPATH" \
   --allow-unverified
 ```
 
-### 5. AV reconciliation and text-only composition
+### 5. Single-shot AV reconciliation and direct H3
 
 ```bash
 "$R2V_PYTHON" tools/run_h3_mimo25_stem_reconcile_shadow.py "${RUN_ARGS[@]}" \
@@ -265,10 +265,14 @@ PYTHONPATH="$SAM_AUDIO_RUNTIME_PYTHONPATH" \
 ```
 
 Stage 5 uses one joint-AV MiMo call to write the complete natural
-`h3_semantics.detailed_description`, `overall_soundscape`, and
+`h3_semantics.style_opening`, `shot1_caption`, `overall_soundscape`, and
 `non_diegetic_music`. Original target video, embedded audio, frozen references,
 and exact ASR facts are observed together. Coarse Stage-A evidence is diagnostic;
-it is not expanded into final prose. No placeholders, sentence atoms, template
+it is not expanded into final prose. The current pilot is exactly one shot:
+visual observation has only `visual_blocks` and `segment_views`, not generated
+shot indexes or cut times. Code renders detailed description as
+`style_opening + " [Shot 1] " + ASR-protected shot1_caption`. Model-authored
+`[Shot N]` markers are rejected, not repaired. No placeholders, sentence atoms, template
 substitution, or second compositor remain.
 
 Defaults are `--thinking disabled --icl official_ref2va_v1`, temperature 0.0.
@@ -284,6 +288,9 @@ MiMo writes natural speaker/action/delivery lead-ins and chronological
 `<d>[Language] dialogue</d>` blocks. When counts, resolved source order, and any
 recognizable exact dialogue agree, code corrects only the inner `<d>` payload to
 Qwen3-ASR text/language. All surrounding prose stays byte-for-byte unchanged.
+Each expected `(Sx)` must appear somewhere in `shot1_caption` before its first
+authoritative dialogue. No nearest-speaker or repeated-marker requirement exists;
+pronouns and connective prose are not interpreted by code.
 Unmappable dialogue or unknown reference/source labels fails closed; no dialogue
 is moved, dropped, or invented. Frozen Subject/Picture ownership remains the
 existing small deterministic definition/retention path. Final H3 keeps the six
@@ -297,9 +304,9 @@ QA retains the raw direct caption even when publication is blocked.
 Normal success is one AV call, genuine failure gets at most one full-AV recheck.
 The existing explicit zero-audio fallback remains separately counted.
 
-Current versions: prompt v26, annotation .17, backend .29, materializer v20,
-authority policy v17; Stage-5 records .6 and summary .8. Materialized shadow
-record .15 and summary .16 distinguish the new direct-caption implementation.
+Current versions: prompt v27, annotation .18, backend .30, materializer v21,
+authority policy v17; Stage-5 records .7 and summary .9. Materialized shadow
+record .16 and summary .17 distinguish the new direct-caption implementation.
 Prior template/composition artifacts cannot be silently reused.
 
 Stage-5 persists annotation, raw responses, failure issues, diagnostics, and call
@@ -368,58 +375,28 @@ and ready/failed/upstream-failed reconcile results. Original AV remains factual
 authority; separator names and manual labels are not production truth.
 
 The primary review surface is the exact final six-section H3 prompt beside the
-target AV, rendered by the existing MiMo `_materialize_sample()` v17 path. Each
+target AV, rendered by the existing MiMo `_materialize_sample()` v21 path. Each
 source H3 conditioning variant is shown separately, using current shadow ASR
 speech in memory while retaining frozen references. No recovery, media generation,
 or H3 publication runs. Structured MiMo annotation is secondary diagnostic evidence.
 Failed/upstream-failed reconcile has no final prompt. Rendered text participates
 in QA fingerprints, so regenerated text invalidates stale annotations.
 
-### Time-aware shadow contract (v17 materializer)
+### Current one-shot review contract
 
-This is an intentional new shadow contract, not a rewrite of existing artifacts.
-The checked official sources are MiniMax-H3
-[Ref2VA](https://github.com/MiniMax-AI/MiniMax-H3/blob/main/skills/h3-prompt-writing/references/ref-en.txt)
-(speaker notation and playback order) and
-[Base](https://github.com/MiniMax-AI/MiniMax-H3/blob/main/skills/h3-prompt-writing/references/base-en.txt)
-(soundscape/music sections and absence). Final output retains the six Ref2VA
-sections, natural Subject/Picture definitions, stable `(Sx)`, and exact
-`<d>[Language] ...</d>` dialogue.
+The official Ref2VA ICL remains unchanged; it teaches prose style, not shot count.
+The real user prompt explicitly states that this target contains exactly one
+shot and that model output must have no `[Shot N]` markers. A complete natural
+caption remains model-authored; only the single shot marker and safe ASR payload
+correction are deterministic.
 
-- Every unbound speaker has a semantic source phrase (off-screen voice,
-  voice-over, in-scene device, or unidentified voice), never just bare `(Sx)`.
-  A resolved voice group with one bound Subject retains that Subject when it
-  speaks off-screen. This is rendering identity continuity, not mutation of
-  DiariZen/ASR or published entity bindings.
-- Negative stem evidence is non-confirmatory. Empty SFX or absent stem music
-  cannot establish absence in the original AV; positive stems only help recall.
-  Original AV independently owns soundscape and music judgments.
-- Soundscape `N/A` is reserved for explicitly verified complete silence
-  (`complete_silence_verified=true`, with no speech or audible layers).
-  For a non-silent clip with a verified absent non-musical layer, retain only
-  model-supplied negative prose. The materializer never inserts a stock negative
-  sentence. Absent non-diegetic music renders `N/A`; unknown audio semantics
-  makes final H3 unavailable, not confirmed absence.
-- Stage A visual blocks own absolute positive shot-bounded phase intervals.
-  Stage E preserves their order and interleaves exact speech/event intervals by
-  playback time. Phases cannot cross interior transcribed speech boundaries;
-  projected evidence must cover the shot. Invalid order/gaps require the
-  existing single full-AV recheck, never heuristic prose splitting.
-- Transcribed overlapping or sequential multi-speaker speech blocks final H3
-  with `multi_speaker_segment_requires_turn_refinement`. Acoustic facts, exact
-  transcript/language, and sample/time boundaries remain intact. Authoritative
-  sub-turn refinement is future work; no punctuation-based splitting is added.
-
-Historical v17 rollout (superseded by Stage 5 above): prompt v22 -> v23 and authority policy v16 -> v17 encoded these
-rules; annotation .13 -> .14 adds phase times and explicit silence evidence;
-backend .24 -> .25 and record .10 -> .11 bind that output contract.
-Materializer v16 -> v17 changes source/absence rendering and fail-closed gates;
-H3 shadow record .11 -> .12 and summary .12 -> .13 identify the resulting output.
-Stem reconcile policy v1 -> v2, record .1 -> .2, and summary .4 -> .5 bind the
-revised authority/provenance; `current_mimo_versions_modified=true` is explicit.
-QA data .1 -> .2 exposes per-variant materialization availability/issues;
-human-label schema stays .1. Intentional historical materializer unions retain
-their old entries, but old annotation/backend lineage is not accepted as current.
+Soundscape/music wording and possible contamination remain review warnings.
+No internal absent/null or verified-silence bookkeeping gates final prose.
+The explicit multi-speaker refinement gate remains unchanged, and failed
+records retain raw `style_opening` / `shot1_caption` for QA. No ASR splitting,
+new model call, production artifact modification, or automated prose score is
+introduced. These are pilot assumptions, not a claim that arbitrary future
+production clips contain one shot.
 
 The QA surface remains Target AV beside Final H3 Prompt. A ready annotation can
 have an unavailable final prompt; each blocked variant displays its issue codes
@@ -442,9 +419,9 @@ An existing output requires `--overwrite` and must be owned by the same QA run;
 replacement is atomic and never replaces separation or downstream source stages.
 Export browser annotations before clearing browser storage or changing origin.
 
-Manual categories are `good`, `upstream_label_wrong`,
-`speaker_ambiguous`, `asr_issue`, `stem_issue`, and `mimo_semantic_issue`.
-Issue labels may be co-selected; `good` is exclusive with every issue label.
+Manual categories are `better`, `same`, `worse`, `speaker_wrong`,
+`dialogue_wrong`, `audio_wrong`, and `visual_hallucination`. Comparison labels
+are mutually exclusive; issue labels can be combined.
 Notes and labels persist in localStorage. **Export QA JSON** downloads
 `h3_audio_shadow_qa.json`; **Import QA JSON** restores a matching export.
 The sidecar shape is:

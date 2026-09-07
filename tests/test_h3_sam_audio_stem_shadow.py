@@ -2217,8 +2217,8 @@ def test_stem_reconcile_failure_audit_roundtrip_and_fingerprint(
     issues = tuple(
         ValidationIssue(
             code="schema_validation",
-            field=f"visual_observation.shots.0.visual_blocks.{index}.end_time",
-            message="Input should be greater than 0",
+            field=f"visual_observation.visual_blocks.{index}.text",
+            message="Input should be a valid string",
         )
         for index in range(2)
     )
@@ -2249,8 +2249,8 @@ def test_stem_reconcile_failure_audit_roundtrip_and_fingerprint(
     serialized = (output / "records.jsonl").read_text()
     record = MimoStemReconcileRecord.model_validate_json(serialized)
     assert backend.calls == ["clip-1"]
-    assert record.schema_version == "r2v.h3.mimo25_stem_reconcile.6"
-    assert summary.schema_version == "r2v.h3.mimo25_stem_reconcile_summary.8"
+    assert record.schema_version == "r2v.h3.mimo25_stem_reconcile.7"
+    assert summary.schema_version == "r2v.h3.mimo25_stem_reconcile_summary.9"
     assert summary.model_call_count == (1 if ready else 2)
     assert summary.ready_count == int(ready)
     assert summary.failed_count == int(not ready)
