@@ -67,7 +67,7 @@ MIMO25_STEM_FACT_PROMPT_VERSION = "h3_mimo25_stem_fact_prompt_v1"
 MIMO25_STEM_RECONCILE_VERSION = "r2v.h3.mimo25_stem_reconcile.10"
 MIMO25_STEM_RECONCILE_SUMMARY_VERSION = "r2v.h3.mimo25_stem_reconcile_summary.12"
 MIMO25_STEM_RECONCILE_POLICY_VERSION = "h3_mimo25_stem_reconcile_v5"
-MIMO25_STEM_RECONCILE_STAGE = "mimo_reconcile_stemtext_final_av_v34"
+MIMO25_STEM_RECONCILE_STAGE = "mimo_reconcile_stemtext_final_av_v35"
 STEM_VIEW_VERSION = "r2v.h3.sam_audio_stem_view.1"
 STEM_RECONCILE_UPSTREAM_FAILURE_VERSION = (
     "r2v.h3.mimo25_stem_reconcile_upstream_failure.1"

@@ -22,6 +22,7 @@ from r2v_data_v2.h3.mimo25_backend import (
     MimoH3Semantics,
     MimoMediaResolver,
     OpenAIMimo25Backend,
+    _normalize_speaker_annotation,
     protect_direct_dialogue,
 )
 from r2v_data_v2.h3.mimo25_stem_shadow import (
@@ -47,7 +48,7 @@ def _subset_inventory(base, clip_ids):
 
 
 def test_final_av_prompt_preserves_positive_auxiliary_observations():
-    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v34"
+    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v35"
     assert "FACTUAL CONTRADICTION FILTER" in SYSTEM_PROMPT
     assert "NOT A REQUIREMENT TO RE-PROVE EVERY AUXILIARY DETAIL" in SYSTEM_PROMPT
     assert "Preserve positive observations by default" in SYSTEM_PROMPT
@@ -61,7 +62,13 @@ def test_final_av_prompt_preserves_positive_auxiliary_observations():
     assert "unless the original AV supports them" not in SYSTEM_PROMPT
 
 
-def test_v34_prompt_reference_vocal_and_positive_audio_contracts():
+def test_v35_prompt_reference_vocal_and_positive_audio_contracts():
+    assert "VISIBLE SPEAKER BINDING" in SYSTEM_PROMPT
+    assert "supporting clues, NOT mandatory prerequisites" in SYSTEM_PROMPT
+    assert "Absence of supporting evidence is NOT a contradiction" in SYSTEM_PROMPT
+    assert "resolution == resolved is NOT a prerequisite" in SYSTEM_PROMPT
+    assert "visible_entity requires presence" not in SYSTEM_PROMPT
+    assert "may resolve Stage B needs_acoustic_refinement only" not in SYSTEM_PROMPT
     assert "Use H3 reference labels ONLY from allowed_h3_reference_labels" in SYSTEM_PROMPT
     assert "NEVER emit <Audio N>" in SYSTEM_PROMPT
     assert "They are NOT Subject numbers" in SYSTEM_PROMPT
@@ -866,6 +873,156 @@ def test_explicit_known_marker_must_match_only_with_equal_counts(speakers, capti
     )
 
 
+@pytest.mark.parametrize("resolution,composition", [
+    ("resolved", "single_speaker"),
+    ("needs_acoustic_refinement", "single_speaker"),
+    ("needs_acoustic_refinement", "uncertain"),
+    ("uncertain", "uncertain"),
+])
+def test_visible_binding_without_supporting_evidence_is_retained(
+    tmp_path, monkeypatch, resolution, composition,
+):
+    from r2v_data_v2.h3 import mimo25_backend
+
+    kwargs, shadow = _fixture(tmp_path, monkeypatch)
+    payload = json.loads(_raw())
+    observation = payload["visual_observation"]["segment_views"][0]["entity_observations"][0]
+    observation.update(mouth_visibility="not_assessable", speech_correlated_articulation="not_assessable")
+    audio = payload["audio_observation"]["segment_decisions"][0]
+    audio.update(resolution=resolution, vocal_composition=composition)
+    grounding = payload["av_grounding"]["segment_groundings"][0]
+    grounding["evidence_codes"] = ["insufficient_evidence"]
+    annotation = MimoAVAnnotationDraft.model_validate(payload)
+
+    def forbidden_downgrade(*args, **kwargs):
+        pytest.fail("evidence-sufficiency downgrade must not run")
+
+    monkeypatch.setattr(mimo25_backend, "_conservative_visible_speaker_downgrade", forbidden_downgrade)
+    normalized, corrections = _normalize_speaker_annotation(
+        annotation, segment_ids=["segment_0001"],
+        transcribed_segment_ids={"segment_0001"}, allowed_entity_ids={"e1"},
+    )
+    assert normalized.segment_decisions == annotation.segment_decisions
+    assert "conservative_visible_speaker_downgrade" not in corrections
+    backend, completions, stems, jobs = _backend(tmp_path, shadow, [(json.dumps(payload), 8)])
+    summary = _run(shadow, backend, stems, jobs[:1])
+    row = _records(shadow)[0]
+    assert summary.ready_count == 1 and summary.failed_count == 0
+    assert row["annotation"]["av_grounding"]["segment_groundings"][0] == grounding
+    assert row["failure_issues"] == []
+    warnings = set(row["diagnostics"][-1]["warnings"])
+    assert {
+        "visible_entity_requires_confirmed_onscreen_speech",
+        "onscreen_speech_requires_reliable_visible_speaker_evidence",
+    } <= warnings
+    if composition == "uncertain":
+        assert "visible_entity_requires_resolved_audio" in warnings
+    assert summary.model_call_count == len(completions.requests) == 3
+    assert summary.audio_model_call_count == 2 and summary.av_model_call_count == 1
+
+    sample = qa.FinalH3SampleV2.model_validate_json(
+        (kwargs["audio_production_root"] / "h3/samples.jsonl").read_text().splitlines()[0],
+    )
+    source = jobs[0].segments[0]
+    # Shadow ASR owns the in-memory speech input, as in the QA materializer path.
+    sample = qa.FinalH3SampleV2.model_validate({
+        **sample.model_dump(mode="python"),
+        "speech_segments": [qa.FinalQwen3SpeechSegment(
+            segment_id=source.segment_id, speaker_cluster_id=source.source_speaker_cluster_id,
+            entity_id=source.current_entity_id, entity_occurrence_id=source.entity_occurrence_id,
+            source_start_sample=source.source_start_sample, source_end_sample=source.source_end_sample,
+            source_sample_rate_hz=source.source_sample_rate_hz,
+            start_time=source.start_time, end_time=source.end_time,
+            text=source.asr_text, language=source.asr_language,
+        ).model_dump(mode="python")],
+    })
+    corrected, text, _ = qa._materialize_sample(
+        sample, jobs[0], qa._MaterializerInput(
+            MimoAVAnnotationDraft.model_validate(row["annotation"]), jobs[0].request_fingerprint,
+        ),
+    )
+    assert corrected[0].entity_id == "e1"
+    assert corrected[0].text == jobs[0].segments[0].asr_text
+    assert "detailed_description:" in text
+
+
+def test_incomplete_onscreen_grounding_is_review_only_without_rebinding(tmp_path, monkeypatch):
+    _, shadow = _fixture(tmp_path, monkeypatch)
+    payload = json.loads(_raw())
+    grounding = payload["av_grounding"]["segment_groundings"][0]
+    grounding.update(binding_status="no_reliable_entity", entity_id=None)
+    backend, _, stems, jobs = _backend(tmp_path, shadow, [(json.dumps(payload), 8)])
+    summary = _run(shadow, backend, stems, jobs[:1])
+    row = _records(shadow)[0]
+    assert summary.ready_count == 1 and row["failure_issues"] == []
+    assert "onscreen_grounding_incomplete" in row["diagnostics"][-1]["warnings"]
+    assert row["annotation"]["av_grounding"]["segment_groundings"][0] == grounding
+
+
+@pytest.mark.parametrize("contradiction,issue", [
+    ("absent", "visible_entity_absent_from_visual_segment"),
+    ("offscreen_audio", "visible_speaker_evidence_presentation_contradiction"),
+    ("voice_over_context", "visible_speaker_evidence_presentation_contradiction"),
+    ("device_playback_context", "visible_speaker_evidence_presentation_contradiction"),
+    ("articulation", "stage_a_av_articulation_contradiction"),
+])
+def test_concrete_visible_speaker_contradictions_remain_hard(tmp_path, monkeypatch, contradiction, issue):
+    _, shadow = _fixture(tmp_path, monkeypatch)
+    payload = json.loads(_raw())
+    view = payload["visual_observation"]["segment_views"][0]
+    grounding = payload["av_grounding"]["segment_groundings"][0]
+    if contradiction == "absent":
+        view.update(visible_entity_ids=[], entity_observations=[])
+        grounding["evidence_codes"] = ["insufficient_evidence"]
+    elif contradiction == "articulation":
+        view["entity_observations"][0]["speech_correlated_articulation"] = "not_observed"
+    else:
+        grounding["evidence_codes"] = [contradiction]
+    backend, completions, stems, jobs = _backend(tmp_path, shadow, [(json.dumps(payload), 8)])
+    summary = _run(shadow, backend, stems, jobs[:1])
+    row = _records(shadow)[0]
+    assert summary.failed_count == 1 and row["status"] == "failed"
+    assert issue in {item["code"] for item in row["failure_issues"]}
+    assert issue not in row["diagnostics"][-1]["warnings"]
+    assert summary.model_call_count == len(completions.requests) == 3
+
+
+def test_unknown_grounding_entity_still_cannot_publish(tmp_path, monkeypatch):
+    _, shadow = _fixture(tmp_path, monkeypatch)
+    payload = json.loads(_raw())
+    payload["av_grounding"]["segment_groundings"][0].update(
+        entity_id="e99", evidence_codes=["insufficient_evidence"],
+    )
+    backend, _, stems, jobs = _backend(tmp_path, shadow, [(json.dumps(payload), 8)])
+    _run(shadow, backend, stems, jobs[:1])
+    row = _records(shadow)[0]
+    grounding = row["annotation"]["av_grounding"]["segment_groundings"][0]
+    assert grounding["entity_id"] is None and grounding["binding_status"] != "visible_entity"
+
+
+@pytest.mark.parametrize("composition", ["overlapping_secondary_speech", "sequential_multi_speaker_speech"])
+def test_confirmed_multi_speaker_cannot_publish_h3_identity(tmp_path, monkeypatch, composition):
+    kwargs, shadow = _fixture(tmp_path, monkeypatch)
+    payload = json.loads(_raw())
+    payload["audio_observation"]["segment_decisions"][0].update(
+        resolution="needs_acoustic_refinement", vocal_composition=composition,
+        secondary_vocal_activity={"present": True, "speaker_relation": "different_speaker", "kind": "speech"},
+    )
+    backend, _, stems, jobs = _backend(tmp_path, shadow, [(json.dumps(payload), 8)])
+    _run(shadow, backend, stems, jobs[:1])
+    row = _records(shadow)[0]
+    sample = qa.FinalH3SampleV2.model_validate_json(
+        (kwargs["audio_production_root"] / "h3/samples.jsonl").read_text().splitlines()[0],
+    )
+    with pytest.raises(qa.MimoH3MaterializationContractError) as error:
+        qa._materialize_sample(
+            sample, jobs[0], qa._MaterializerInput(
+                MimoAVAnnotationDraft.model_validate(row["annotation"]), jobs[0].request_fingerprint,
+            ),
+        )
+    assert {issue.code for issue in error.value.issues} == {"multi_speaker_segment_requires_turn_refinement"}
+
+
 def test_explicit_marker_mismatch_remains_hard_in_backend(tmp_path, monkeypatch):
     from r2v_data_v2.h3 import mimo25_backend
 
@@ -886,8 +1043,8 @@ def test_explicit_marker_mismatch_remains_hard_in_backend(tmp_path, monkeypatch)
     ]
     assert "direct_dialogue_speaker_marker_mismatch" not in row["diagnostics"][-1]["warnings"]
     assert summary.model_call_count == len(completions.requests) == 3
-    assert backend.provenance.schema_version == MIMO25_BACKEND_VERSION == "r2v.h3.mimo25_backend.37"
-    assert backend.provenance.prompt_version == "h3_mimo25_unified_av_reconcile_v34"
+    assert backend.provenance.schema_version == MIMO25_BACKEND_VERSION == "r2v.h3.mimo25_backend.38"
+    assert backend.provenance.prompt_version == "h3_mimo25_unified_av_reconcile_v35"
 
 
 @pytest.mark.parametrize(

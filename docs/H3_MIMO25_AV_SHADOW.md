@@ -2,7 +2,7 @@
 
 This experimental path is additive and read-only with respect to the current JEA
 production stages. The current path is the named SAM shadow entry, publishing
-`mimo_reconcile_stemtext_final_av_v34/` after existing separation,
+`mimo_reconcile_stemtext_final_av_v35/` after existing separation,
 DiariZen and ASR. Historical `mimo25_av_reconcile_v5/`, `mimo25_h3_shadow_v5/`,
 stem-facts and older reconcile artifacts are not migrated or overwritten.
 See `H3_AUDIO_SERVER_RUNBOOK.md` Stage 4 for current run and QA commands.
@@ -115,16 +115,13 @@ An explicit case manifest switches the scope to `explicit_case_subset` and sets
 canonical-wide coverage false.
 
 Speaker identity, visible-entity binding, and speech presentation are separate
-facts. A visible person alone does not establish visible speech. An
-`onscreen_spoken` segment may materialize as `<Subject N> (Sx) says, ...` when
-Stage A observes speech-correlated articulation and Stage C records
-`visible_lip_motion`, or when Stage A confirms visible presence but the
-face/mouth is genuinely non-assessable because of a back/profile view,
-occlusion, or crop and Stage C records `speaker_visible_mouth_occluded` with AV
-alignment or voice continuity. A hidden mouth does not make a visible person
-offscreen. Adjacent motion, gaze, expression, breathing, and general body motion
-do not establish speech. A visible listener without reliable evidence never
-inherits an offscreen speaker.
+facts. Final original AV may directly bind a known visible speaker and materialize
+an `onscreen_spoken` segment as `<Subject N> (Sx) says, ...`.
+LR-ASD, source clusters, lip motion, mouth visibility, temporal alignment,
+voice continuity, and Stage B resolved status are supporting clues, not binding
+prerequisites. Missing supporting evidence does not clear a plausible binding.
+A hidden mouth does not make a visible person offscreen. A visible listener
+must not inherit speech when AV explicitly indicates another source.
 The same clip-local group may therefore remain `g1` while a later segment becomes
 `offscreen` / `entity_id=null` / `offscreen_spoken`.
 LR-ASD support, source-cluster support, current bindings, and direct anchors are
@@ -137,26 +134,27 @@ Exact duplicate Stage B or Stage C evidence codes are removed in first-occurrenc
 order, and an exact redundant leading copy of a row's own retention marker is
 stripped. A retention phrase that occurs naturally later in the description is
 valid prose and is not a structural failure. Unknown Stage A entities are removed
-rather than remapped. Unknown or unsupported Stage C bindings are downgraded to
+rather than remapped. Unknown Stage C bindings are downgraded to
 null-entity conservative states, and an explicitly non-visible Stage C binding
 cannot retain an `entity_id`. Identity-bearing voice-profile prose is replaced
 only with `null`.
-Visible-speaker normalization uses the same Stage-A-aware grounded-evidence
-predicate as validation: explicit `offscreen_audio` becomes `offscreen` /
-`offscreen_spoken`; otherwise an unsupported claim becomes
-`no_reliable_entity` / `uncertain`. Malformed offscreen claims never gain
-fabricated `offscreen_audio`. The speaker group and other valid evidence are
-preserved, `insufficient_evidence` is recorded when capacity permits, and the
-complete validator runs after normalization. A clean primary response therefore
-publishes without recheck. Remaining semantic failures are recorded on the
-single response; raw caption and sound description remain available to QA.
-Stage A/Stage C articulation contradictions are explicitly excluded from this
-conservative downgrade: observed articulation versus `no_visible_lip_motion`,
-unsupported `visible_lip_motion`, or incomplete onscreen grounding with plausible
-Stage A speaker evidence still fails closed for binding without another AV call. Stage C may resolve Stage B `needs_acoustic_refinement` only
-when Stage B supplies a non-null group with `single_speaker` or
-`same_speaker_nonlexical` composition and the existing grounded onscreen evidence
-passes. Overlapping or sequential multi-speaker uncertainty cannot use that path.
+The production normalization path no longer calls
+`_conservative_visible_speaker_downgrade`. The four evidence-sufficiency issues
+`visible_entity_requires_resolved_audio`, `onscreen_grounding_incomplete`,
+`visible_entity_requires_confirmed_onscreen_speech`, and
+`onscreen_speech_requires_reliable_visible_speaker_evidence` are review-only
+diagnostic warnings. They neither clear entity IDs nor block H3 publication.
+Stage B single-speaker or ordinary uncertain evidence may receive a final AV
+visible binding. Confirmed transcribed overlapping or sequential multi-speaker
+speech still blocks identity/H3 publication pending turn refinement.
+Malformed offscreen representations retain their existing conservative
+normalization and never gain fabricated `offscreen_audio`; absence of supporting
+evidence is not converted into offscreen.
+Concrete contradictions remain hard: a known entity absent from the segment,
+Stage A/Stage C articulation disagreement, explicit offscreen/voice-over/device
+evidence conflicting with an onscreen claim, invalid presentation/entity
+combinations, unknown references/speakers, and malformed or wrongly attributed
+dialogue. No additional call, retry, recheck, or evidence threshold is introduced.
 Model-authored Subject visual prose containing Audio-profile content is not
 rewritten by these normalizers and retains its existing validation diagnostics.
 `offscreen_spoken`, `voice_over`,
@@ -181,10 +179,10 @@ they do not create additional MiMo model jobs.
 
 Prompt, policy, annotation schema, and materializer versions are:
 
-- `h3_mimo25_unified_av_reconcile_v34`
+- `h3_mimo25_unified_av_reconcile_v35`
 - `h3_mimo25_av_authority_contract_v17`
 - `r2v.h3.mimo25_av_annotation.20`
-- `r2v.h3.mimo25_backend.36`
+- `r2v.h3.mimo25_backend.38`
 - `h3_mimo25_materializer_v23`
 - `h3_mimo25_reference_selection_v1`
 - `h3_mimo25_recovered_voice_quality_v1`

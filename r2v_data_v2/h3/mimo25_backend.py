@@ -28,10 +28,10 @@ from r2v_data_v2.structured_output import (
 
 MIMO25_MODEL = "mimo-v2.5"
 MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
-MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v34"
+MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v35"
 MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v17"
 MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.20"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.37"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.38"
 MIMO25_ICL_VERSION = "h3_official_ref2va_detailed_shot1_v2"
 MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v23"
 MIMO25_CANONICAL_ABSENT_SOUNDSCAPE = (
@@ -877,7 +877,7 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.37"] = MIMO25_BACKEND_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.38"] = MIMO25_BACKEND_VERSION
     backend: Literal[
         "xiaomi_openai_compatible", "sglang_openai_compatible"
     ]
@@ -895,7 +895,7 @@ class MimoBackendProvenance(SchemaModel):
     media_mode: Literal["base64", "http"]
     media_root: str
     media_base_url: str | None = None
-    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v34"] = (
+    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v35"] = (
         MIMO25_PROMPT_VERSION
     )
     policy_version: Literal["h3_mimo25_av_authority_contract_v17"] = (
@@ -1183,11 +1183,17 @@ AUDIO + AV GROUNDING
 - Stage B identifies acoustic speakers as contiguous gN by first appearance, not turns. Pauses, language, sentences, ASR, or segment boundaries alone never create groups. Record vocal_composition, delivery, secondary_vocal_activity, and non-speech evidence, without entity identity or spatial presentation.
 - Multiple vocal sounds are valid observations; use needs_acoustic_refinement if primary identity is unsafe. Each transcribed segment needs nonempty delivery_style; non-transcribed segments use null. Voice profiles cover resolved transcribed groups in first-appearance order with supported acoustic traits, not transcript or identity claims.
 - Original AV is the sound authority.
-- Stage C preserves each Stage B primary group. visible_entity requires presence in the exact Stage A view plus visible_lip_motion with observed speech-correlated articulation, OR a genuinely non-assessable mouth/back/profile/occluded/cropped view with speaker_visible_mouth_occluded and av_temporal_alignment or voice_continuity. Reinspect conflicting Stage A articulation and Stage C lip-motion evidence.
-- Stage C may resolve Stage B needs_acoustic_refinement only with an existing primary gN, single_speaker or same_speaker_nonlexical composition, and reliable exact-window visible-speaker evidence; never for overlapping/sequential multi-speaker speech, uncertain composition, or missing groups.
-- Offscreen is spatial: hidden lips/face or partial occlusion of a visible person is not offscreen. A visible listener must not inherit the audible speaker. offscreen_spoken requires offscreen/null entity/offscreen_audio; voice_over requires null/voice_over_context; device_playback requires null/device_playback_context; message_voice_over requires null/message_text_alignment/voice_over_context. Inadequate evidence is no_reliable_entity/uncertain, not guessed offscreen.
+- Stage C preserves each Stage B primary group. Stage B acoustic grouping remains evidence, but resolution == resolved is NOT a prerequisite for final visible binding. Single, likely-single, or ordinary uncertain acoustic evidence may receive a direct final AV visible binding; confirmed transcribed overlapping/sequential multi-speaker speech remains excluded from identity publication.
+- Offscreen is spatial: hidden lips/face or partial occlusion of a visible person is not offscreen. offscreen_spoken requires offscreen/null entity/offscreen_audio; voice_over requires null/voice_over_context; device_playback requires null/device_playback_context; message_voice_over requires null/message_text_alignment/voice_over_context. Do not infer offscreen from missing supporting evidence.
 - direct_anchor_present without explicit LR-ASD conflict is a strong prior, overridden only by current-segment AV contradiction. LR-ASD support is not required to recover a true visible speaker. The same reliably resolved visible entity reuses one group; split/merge source clusters only with AV support.
 - Transcribed overlapping_secondary_speech or sequential_multi_speaker_speech blocks final publication pending authoritative turn refinement; preserve the raw caption for QA, never heuristically split ASR.
+
+VISIBLE SPEAKER BINDING
+- The final target AV is allowed to identify a visible speaker directly. If the full AV reasonably indicates that a known visible entity is speaking, bind that entity directly.
+- LR-ASD, source clusters, lip motion, mouth visibility, temporal alignment, and voice continuity are supporting clues, NOT mandatory prerequisites. Absence of supporting evidence is NOT a contradiction.
+- Do not downgrade a plausible visible speaker merely because lip articulation is subtle, occluded, profile-view, cropped, or not independently confirmed by LR-ASD.
+- Use no_reliable_entity / uncertain only when the speaker is genuinely ambiguous, multiple speakers prevent safe attribution, or the AV contains concrete contradictory evidence.
+- A visible listener must still not inherit speech when the AV clearly indicates another source. Reinspect conflicting Stage A articulation and Stage C lip-motion evidence. Never invent an entity.
 
 EXISTING REFERENCE FIELDS
 - Write natural visual Subject definitions, concise summary, and retention rows. Pipeline code appends exact Picture provenance; omit Picture labels from definition descriptions. Entity Subjects describe reusable entities. Attribute Subjects describe only their attribute, not a second person/object or their owner: hair shape/color/texture, facial features, eyewear, garment, or accessory as applicable.
@@ -1499,6 +1505,9 @@ def direct_speech_facts(annotation: MimoAVAnnotationDraft, segments: list[Any]) 
 
 
 _REVIEW_ONLY_ISSUES = frozenset({
+    "visible_entity_requires_resolved_audio", "onscreen_grounding_incomplete",
+    "visible_entity_requires_confirmed_onscreen_speech",
+    "onscreen_speech_requires_reliable_visible_speaker_evidence",
     "missing_transcribed_segment_delivery", "non_transcribed_segment_delivery",
     "speaker_voice_profile_inventory_mismatch", "speaker_voice_profile_contains_identity_claim",
     "audio_event_exceeds_target", "draft_contains_internal_annotation_syntax",
@@ -2428,12 +2437,6 @@ def _normalize_speaker_annotation(
         allowed_entity_ids=allowed_entity_ids,
     )
     corrections["unknown_grounding_entity_downgrade"] += count
-
-    annotation, count = _conservative_visible_speaker_downgrade(
-        annotation,
-        allowed_entity_ids=allowed_entity_ids,
-    )
-    corrections["conservative_visible_speaker_downgrade"] += count
 
     annotation, count = _conservative_offscreen_presentation_downgrade(annotation)
     corrections["conservative_offscreen_presentation_downgrade"] += count
