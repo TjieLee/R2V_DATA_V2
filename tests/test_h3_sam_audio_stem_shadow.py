@@ -50,7 +50,6 @@ from r2v_data_v2.h3.mimo25_backend import (
     MimoBackendConfig,
     MimoBackendFailure,
     MimoMediaResolver,
-    _synthetic_icl_messages,
 )
 from r2v_data_v2.h3.mimo25_stem_shadow import (
     MIMO25_STEM_FACT_PROMPT_VERSION,
@@ -470,7 +469,7 @@ def _run_stems(
 
 
 def test_current_shadow_contract_versions_and_root(tmp_path: Path) -> None:
-    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v23"
+    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v24"
     assert MIMO25_POLICY_VERSION == "h3_mimo25_av_authority_contract_v17"
     assert MIMO25_SCHEMA_VERSION == "r2v.h3.mimo25_av_annotation.14"
     assert MIMO25_MATERIALIZER_VERSION == "h3_mimo25_materializer_v17"
@@ -2201,12 +2200,9 @@ class _FailingReconcileBackend:
         )
 
 
-@pytest.mark.parametrize("ready", [False, True])
 def test_stem_reconcile_failure_audit_roundtrip_and_fingerprint(
-    tmp_path: Path, ready: bool,
+    tmp_path: Path,
 ) -> None:
-    from r2v_data_v2.h3.mimo25_backend import MimoAVAnnotationDraft
-
     stem_root, facts = _run_facts(tmp_path)
     jobs = build_stem_reconcile_jobs(
         base_inventory=_mimo_inventory_fixture(tmp_path / "base"),
@@ -2226,13 +2222,6 @@ def test_stem_reconcile_failure_audit_roundtrip_and_fingerprint(
     class Backend(_FailingReconcileBackend):
         def reconcile(self, job: MimoClipJob, **_: object) -> object:
             self.calls.append(job.clip_uid)
-            if ready:
-                return SimpleNamespace(
-                    annotation=MimoAVAnnotationDraft.model_validate_json(
-                        _synthetic_icl_messages()[1]["content"]
-                    ),
-                    diagnostics=(), model_call_count=1,
-                )
             raise MimoBackendFailure(
                 code="structured_output_failed",
                 reason="Both final contents failed validation",
@@ -2248,30 +2237,23 @@ def test_stem_reconcile_failure_audit_roundtrip_and_fingerprint(
     serialized = (output / "records.jsonl").read_text()
     record = MimoStemReconcileRecord.model_validate_json(serialized)
     assert backend.calls == ["clip-1"]
-    assert record.schema_version == "r2v.h3.mimo25_stem_reconcile.3"
-    assert summary.schema_version == "r2v.h3.mimo25_stem_reconcile_summary.5"
-    assert summary.model_call_count == (1 if ready else 2)
-    assert summary.ready_count == int(ready)
-    assert summary.failed_count == int(not ready)
-    assert record.raw_responses == ([] if ready else list(raw))
-    assert record.failure_issues == ([] if ready else list(issues))
+    assert record.schema_version == "r2v.h3.mimo25_stem_reconcile.4"
+    assert summary.schema_version == "r2v.h3.mimo25_stem_reconcile_summary.6"
+    assert summary.model_call_count == 2
+    assert summary.ready_count == 0
+    assert summary.failed_count == 1
+    assert record.raw_responses == list(raw)
+    assert record.failure_issues == list(issues)
     assert MimoStemReconcileRecord.model_validate_json(
         record.model_dump_json()
     ) == record
-    if ready:
-        assert record.failure_code is record.failure_reason is None
-        for field, value in (("failure_issues", [issues[0].to_dict()]),
-                             ("raw_responses", [raw[0]])):
-            with pytest.raises(ValueError, match="ready stem reconcile"):
-                MimoStemReconcileRecord.model_validate(
-                    {**record.model_dump(mode="json"), field: value}
-                )
-    else:
-        for field in ("raw_responses", "failure_issues"):
-            changed = record.model_dump(mode="json")
-            changed[field] = []
-            with pytest.raises(ValueError, match="fingerprint is invalid"):
-                MimoStemReconcileRecord.model_validate(changed)
+    assert record.failure_stage == "av_reconcile"
+    assert record.composition is None and record.annotation is None
+    for field in ("raw_responses", "failure_issues"):
+        changed = record.model_dump(mode="json")
+        changed[field] = []
+        with pytest.raises(ValueError, match="fingerprint is invalid"):
+            MimoStemReconcileRecord.model_validate(changed)
 
 
 def test_stem_reconcile_cli_forwards_experimental_controls(
@@ -2285,6 +2267,12 @@ def test_stem_reconcile_cli_forwards_experimental_controls(
     )
     base = _mimo_inventory_fixture(tmp_path / "base")
     monkeypatch.setattr(cli, "build_mimo25_inventory", lambda **kwargs: base)
+    samples_path = tmp_path / "h3/samples.jsonl"
+    samples_path.parent.mkdir()
+    samples_path.write_text("", encoding="utf-8")
+    base_values = base.model_dump(mode="json", exclude={"inventory_fingerprint"})
+    base_values["source_h3_samples_sha256"] = sha256_file(samples_path)
+    base = _mimo_inventory(base_values)
     captured = []
 
     def backend_factory(config: MimoBackendConfig, **_: object) -> object:

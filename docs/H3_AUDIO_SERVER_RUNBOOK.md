@@ -252,7 +252,7 @@ PYTHONPATH="$SAM_AUDIO_RUNTIME_PYTHONPATH" \
   --allow-unverified
 ```
 
-### 5. Original-AV stem-aware reconcile
+### 5. AV reconciliation and text-only composition
 
 ```bash
 "$R2V_PYTHON" tools/run_h3_mimo25_stem_reconcile_shadow.py "${RUN_ARGS[@]}" \
@@ -264,7 +264,38 @@ PYTHONPATH="$SAM_AUDIO_RUNTIME_PYTHONPATH" \
   --allow-unverified
 ```
 
-Stage 5 offers experimental A/B controls `--thinking disabled|enabled` and
+Stage 5a performs multimodal AV semantic reconciliation. Only 5a receives the
+original target video with embedded audio and frozen reference images. It retains
+the existing optional canonical-audio fallback and at most one full-AV recheck.
+Visual blocks now contain only `block_id` and chronological, time-local English
+prose, not model-generated numeric start/end timestamps. Shot cuts and
+authoritative DiariZen/Qwen speech times and approximate event times remain
+validated; no timestamps are guessed or repaired.
+
+Stage 5b is an ordering-only text compositor. The materializer splits visual
+prose into exact sentence atoms and locks speech/event clauses using the existing
+renderer. The compositor receives only these immutable text atoms, their
+timing/order hints, and initial shot membership. It returns only per-shot
+`atom_ids`; missing/duplicate/unknown atoms, cross-shot movement, prose output,
+or changed relative visual/speech/event order fail closed. It cannot edit
+dialogue, binding, facts, or the other five H3 sections. Clip-level ordering uses
+locked visual-only speech clauses; conditioning-specific Audio citations remain
+deterministic variant-owned formatting. No model rewrites those clauses.
+
+5b uses the same client/endpoint but no media, `use_audio_in_video`, or ICL.
+It always disables thinking, uses temperature 0.0 and a 4096-token completion
+budget, with no semantic repair or multimodal recheck. Correctness never depends
+on a KV cache or cache API. Final H3 remains the deterministic six-section
+renderer, with `detailed_description` ordering coming only from the persisted
+validated composition. QA never calls MiMo and reports compositor failures as
+unavailable final H3 with issue codes.
+
+Normal counts are 1 AV + 1 compositor = 2; an AV recheck gives 2 AV + 1 compositor
+= 3 (the existing explicit zero-audio fallback is counted separately when used).
+Records and summary report `av_model_call_count`, `compositor_model_call_count`,
+and their exact `model_call_count` sum.
+
+Stage 5a offers experimental A/B controls `--thinking disabled|enabled` and
 `--icl none|v1`. Defaults remain `disabled / none`, temperature 0.0, and one
 full-AV recheck. For a separately named experimental run, append
 `--thinking enabled --icl v1` to the command above. Both choices appear in the
@@ -272,20 +303,28 @@ CLI result and backend provenance; all four combinations have distinct
 configuration fingerprints. These controls are not production-approved and
 have no demonstrated quality benefit without a server A/B review.
 
-For SGLang, enabled mode omits `reasoning_effort="none"` and sets both
+For SGLang 5a, enabled mode omits `reasoning_effort="none"` and sets both
 `chat_template_kwargs.thinking` and `enable_thinking` to true. Embedded
 target-video audio and strict JSON schema remain unchanged. ICL v1
-(`h3_mimo25_av_reconcile_icl_v1`) inserts exactly one synthetic user/assistant
+(`h3_mimo25_av_reconcile_icl_v2`, updated for annotation .15) inserts one synthetic user/assistant
 pair between the unchanged system message and the real user request.
 Only final assistant content is parsed; separate reasoning text is never stored.
 Reasoning token usage remains diagnostic, with the nonzero-under-disabled
 warning limited to disabled mode.
 
-Backend provenance is now .26; Stage-5 reconcile records are .3. Failed records
-retain `failure_issues` (code/field/message) and `raw_responses` (final assistant
-content only), covered by the record fingerprint. Ready records leave both
-lists empty. The summary remains .5; prompt v23, annotation .14, authority policy
-v17, and materializer v17 are unchanged.
+Current versions: AV prompt v24, annotation .15, backend .27, materializer v18;
+authority policy remains v17. Compositor prompt/policy is
+`h3_mimo25_text_compositor_v1`. Stage-5 records are .4, summary .6;
+materialized shadow record .13 and summary .14 identify the new materializer.
+Old .14 annotations/v17 results cannot masquerade as current.
+
+Stage-5 persists `composition` (immutable input, validated ordering and fingerprint),
+final `raw_responses`, diagnostics, and typed `failure_issues`. On AV failure,
+`failure_stage=av_reconcile` and annotation/composition are null. On compositor
+failure, `failure_stage=text_compositor`, annotation is retained and composition
+is null. Ready records have empty failure issues and no failure stage/code/reason.
+All audit fields participate in record fingerprinting. Separate reasoning text
+is never persisted.
 
 ### 6. Stem-native primary voice references
 
@@ -385,7 +424,7 @@ sections, natural Subject/Picture definitions, stable `(Sx)`, and exact
   transcript/language, and sample/time boundaries remain intact. Authoritative
   sub-turn refinement is future work; no punctuation-based splitting is added.
 
-Versions: MiMo prompt v22 -> v23 and authority policy v16 -> v17 encode these
+Historical v17 rollout (superseded by Stage 5a/5b above): prompt v22 -> v23 and authority policy v16 -> v17 encoded these
 rules; annotation .13 -> .14 adds phase times and explicit silence evidence;
 backend .24 -> .25 and record .10 -> .11 bind that output contract.
 Materializer v16 -> v17 changes source/absence rendering and fail-closed gates;

@@ -9,6 +9,7 @@ from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Literal, Protocol
 
 from pydantic import Field, StrictStr, model_validator
@@ -18,6 +19,7 @@ from r2v_data_v2.h3.diarization_binding import (
     DiarizationClusterBinding,
     RawDiarizationSegment,
 )
+from r2v_data_v2.h3.jea_final_renderer import FinalH3SampleV2
 from r2v_data_v2.h3.mimo25_av_reconcile import (
     MimoClipJob,
     MimoInventory,
@@ -32,6 +34,16 @@ from r2v_data_v2.h3.mimo25_backend import (
     MimoCompletionDiagnostic,
     MimoMediaResolver,
     OpenAIMimo25Backend,
+)
+from r2v_data_v2.h3.mimo25_h3_materializer import (
+    MimoH3MaterializationContractError,
+    prepare_compositor_input,
+    sample_with_job_speech,
+)
+from r2v_data_v2.h3.mimo25_text_compositor import (
+    CompositorInput,
+    TextComposition,
+    fingerprint,
 )
 from r2v_data_v2.h3.qwen3_asr import Qwen3ASRSegment
 from r2v_data_v2.h3.sam_audio_stem_shadow import (
@@ -56,8 +68,8 @@ MIMO25_STEM_FACTS_VERSION = "r2v.h3.mimo25_stem_facts.3"
 MIMO25_STEM_FACTS_SUMMARY_VERSION = "r2v.h3.mimo25_stem_facts_summary.4"
 MIMO25_STEM_FACT_RAW_VERSION = "r2v.h3.mimo25_stem_fact_raw.1"
 MIMO25_STEM_FACT_PROMPT_VERSION = "h3_mimo25_stem_fact_prompt_v1"
-MIMO25_STEM_RECONCILE_VERSION = "r2v.h3.mimo25_stem_reconcile.3"
-MIMO25_STEM_RECONCILE_SUMMARY_VERSION = "r2v.h3.mimo25_stem_reconcile_summary.5"
+MIMO25_STEM_RECONCILE_VERSION = "r2v.h3.mimo25_stem_reconcile.4"
+MIMO25_STEM_RECONCILE_SUMMARY_VERSION = "r2v.h3.mimo25_stem_reconcile_summary.6"
 MIMO25_STEM_RECONCILE_POLICY_VERSION = "h3_mimo25_stem_reconcile_v2"
 STEM_VIEW_VERSION = "r2v.h3.sam_audio_stem_view.1"
 STEM_RECONCILE_UPSTREAM_FAILURE_VERSION = (
@@ -1608,7 +1620,7 @@ def build_stem_reconcile_jobs(
 
 
 class MimoStemReconcileRecord(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_stem_reconcile.3"] = (
+    schema_version: Literal["r2v.h3.mimo25_stem_reconcile.4"] = (
         MIMO25_STEM_RECONCILE_VERSION
     )
     clip_uid: str
@@ -1620,12 +1632,16 @@ class MimoStemReconcileRecord(SchemaModel):
     backend_provenance: MimoBackendProvenance
     status: Literal["ready", "failed"]
     annotation: MimoAVAnnotationDraft | None = None
+    composition: TextComposition | None
+    failure_stage: Literal["av_reconcile", "text_compositor"] | None
     failure_code: str | None = None
     failure_reason: str | None = None
     failure_issues: list[ValidationIssue]
     raw_responses: list[StrictStr]
     diagnostics: list[MimoCompletionDiagnostic]
     model_call_count: int = Field(ge=0)
+    av_model_call_count: int = Field(ge=0)
+    compositor_model_call_count: int = Field(ge=0, le=1)
     record_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
 
     @model_validator(mode="after")
@@ -1636,11 +1652,27 @@ class MimoStemReconcileRecord(SchemaModel):
                 or self.failure_code is not None
                 or self.failure_reason is not None
                 or self.failure_issues
-                or self.raw_responses
+                or self.composition is None
+                or self.failure_stage is not None
             ):
-                raise ValueError("ready stem reconcile requires only annotation")
-        elif self.annotation is not None or not self.failure_code or not self.failure_reason:
-            raise ValueError("failed stem reconcile requires failure provenance")
+                raise ValueError("ready stem reconcile requires annotation and validated composition")
+        else:
+            if (not self.failure_code or not self.failure_reason or self.failure_stage is None
+                    or self.composition is not None):
+                raise ValueError("failed stem reconcile requires failure provenance")
+            if (self.failure_stage == "av_reconcile") != (self.annotation is None):
+                raise ValueError("failure stage differs from annotation availability")
+        if self.model_call_count != self.av_model_call_count + self.compositor_model_call_count:
+            raise ValueError("stem reconcile model call counts differ")
+        if self.failure_stage == "av_reconcile" and self.compositor_model_call_count:
+            raise ValueError("AV failure cannot have compositor calls")
+        if self.composition is not None and (
+            self.compositor_model_call_count != 1
+            or self.composition.source.source_job_fingerprint != self.source_job_fingerprint
+            or self.composition.source.source_annotation_fingerprint
+            != fingerprint(self.annotation.model_dump(mode="json"))
+        ):
+            raise ValueError("composition provenance differs from annotation")
         values = self.model_dump(mode="json", exclude={"record_fingerprint"})
         if self.record_fingerprint != _sha256_text(_compact_json(values)):
             raise ValueError("stem reconcile record fingerprint is invalid")
@@ -1661,7 +1693,7 @@ class StemReconcileUpstreamFailure(SchemaModel):
 
 
 class MimoStemReconcileSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_stem_reconcile_summary.5"] = (
+    schema_version: Literal["r2v.h3.mimo25_stem_reconcile_summary.6"] = (
         MIMO25_STEM_RECONCILE_SUMMARY_VERSION
     )
     route: SAMRoute
@@ -1676,12 +1708,16 @@ class MimoStemReconcileSummary(SchemaModel):
     ready_count: int = Field(ge=0)
     failed_count: int = Field(ge=0)
     model_call_count: int = Field(ge=0)
+    av_model_call_count: int = Field(ge=0)
+    compositor_model_call_count: int = Field(ge=0)
     original_target_av_is_highest_authority: Literal[True] = True
     current_mimo_versions_modified: Literal[True] = True
     production_artifacts_modified: Literal[False] = False
 
     @model_validator(mode="after")
     def validate_counts(self) -> MimoStemReconcileSummary:
+        if self.model_call_count != self.av_model_call_count + self.compositor_model_call_count:
+            raise ValueError("summary call counts differ")
         if (
             self.processed_clip_count != self.ready_count + self.failed_count
             or self.clip_count != self.processed_clip_count + self.skipped_clip_count
@@ -1725,6 +1761,8 @@ class StemReconcileBackend(Protocol):
     @property
     def provenance(self) -> MimoBackendProvenance: ...
 
+    def compose(self, source: CompositorInput) -> tuple[TextComposition, str, MimoCompletionDiagnostic]: ...
+
     def reconcile(
         self,
         job: MimoClipJob,
@@ -1742,6 +1780,7 @@ def run_mimo25_stem_reconcile_shadow(
     stem_facts: Sequence[MimoStemFactsRecord],
     backend: StemReconcileBackend,
     output_root: Path,
+    source_samples: Sequence[FinalH3SampleV2] = (),
     source_clip_uids: Sequence[str] | None = None,
     skipped_clips: Sequence[StemShadowClipSkip] = (),
     diarization_failed_clips: Sequence[StemDiarizationClipFailure] = (),
@@ -1819,47 +1858,69 @@ def run_mimo25_stem_reconcile_shadow(
             labels = {item.picture_label for item in job.reference_images} | {
                 item.subject_label for item in job.reference_subjects
             }
+            annotation = None
+            composition = None
+            diagnostics = []
+            raw = []
+            av_calls = compositor_calls = 0
+            stage = "av_reconcile"
+            failure = None
             try:
                 result = backend.reconcile(
-                    job,
-                    segment_ids=segments,
-                    transcribed_segment_ids=transcribed,
-                    allowed_entity_ids=entities,
-                    allowed_reference_labels=labels,
+                    job, segment_ids=segments, transcribed_segment_ids=transcribed,
+                    allowed_entity_ids=entities, allowed_reference_labels=labels,
                 )
-                values = {
-                    "schema_version": MIMO25_STEM_RECONCILE_VERSION,
-                    "clip_uid": job.clip_uid,
-                    "source_job_fingerprint": job.request_fingerprint,
-                    "source_stem_facts_fingerprint": facts.record_fingerprint,
-                    "policy_version": MIMO25_STEM_RECONCILE_POLICY_VERSION,
-                    "backend_provenance": backend.provenance.model_dump(mode="json"),
-                    "status": "ready",
-                    "annotation": result.annotation.model_dump(mode="json"),
-                    "failure_code": None,
-                    "failure_reason": None,
-                    "failure_issues": [],
-                    "raw_responses": [],
-                    "diagnostics": [item.model_dump(mode="json") for item in result.diagnostics],
-                    "model_call_count": result.model_call_count,
-                }
+                annotation = result.annotation
+                av_calls = result.model_call_count
+                diagnostics.extend(result.diagnostics)
+                raw.extend(result.raw_responses)
+                stage = "text_compositor"
+                sample = next((s for s in source_samples if s.sample_id in job.source_h3_sample_ids), None)
+                if sample is None or sample.clip_uid != job.clip_uid or sample.target_video != job.target_video_path:
+                    raise MimoBackendFailure(code="compositor_source_sample_unavailable",
+                                             reason="matching frozen H3 source sample required")
+                shadow_sample = sample_with_job_speech(sample, job)
+                source = prepare_compositor_input(
+                    shadow_sample, job, SimpleNamespace(
+                        annotation=annotation, request_fingerprint=job.request_fingerprint,
+                    ),
+                )
+                composition, content, diagnostic = backend.compose(source)
+                compositor_calls = 1
+                raw.append(content)
+                diagnostics.append(diagnostic)
+            except MimoH3MaterializationContractError as exc:
+                failure = MimoBackendFailure(
+                    code="text_compositor_input_failed", reason=str(exc), issues=exc.issues,
+                )
             except MimoBackendFailure as exc:
-                values = {
-                    "schema_version": MIMO25_STEM_RECONCILE_VERSION,
-                    "clip_uid": job.clip_uid,
-                    "source_job_fingerprint": job.request_fingerprint,
-                    "source_stem_facts_fingerprint": facts.record_fingerprint,
-                    "policy_version": MIMO25_STEM_RECONCILE_POLICY_VERSION,
-                    "backend_provenance": backend.provenance.model_dump(mode="json"),
-                    "status": "failed",
-                    "annotation": None,
-                    "failure_code": exc.code,
-                    "failure_reason": exc.reason,
-                    "failure_issues": [item.to_dict() for item in exc.issues],
-                    "raw_responses": list(exc.raw_responses),
-                    "diagnostics": [item.model_dump(mode="json") for item in exc.diagnostics],
-                    "model_call_count": exc.model_call_count,
-                }
+                failure = exc
+                if stage == "av_reconcile":
+                    av_calls = exc.model_call_count
+                else:
+                    compositor_calls = exc.model_call_count
+                diagnostics.extend(exc.diagnostics)
+                raw.extend(exc.raw_responses)
+            values = {
+                "schema_version": MIMO25_STEM_RECONCILE_VERSION,
+                "clip_uid": job.clip_uid,
+                "source_job_fingerprint": job.request_fingerprint,
+                "source_stem_facts_fingerprint": facts.record_fingerprint,
+                "policy_version": MIMO25_STEM_RECONCILE_POLICY_VERSION,
+                "backend_provenance": backend.provenance.model_dump(mode="json"),
+                "status": "failed" if failure else "ready",
+                "annotation": annotation.model_dump(mode="json") if annotation else None,
+                "composition": composition.model_dump(mode="json") if composition else None,
+                "failure_stage": stage if failure else None,
+                "failure_code": failure.code if failure else None,
+                "failure_reason": failure.reason if failure else None,
+                "failure_issues": [i.to_dict() for i in failure.issues] if failure else [],
+                "raw_responses": raw,
+                "diagnostics": [d.model_dump(mode="json") for d in diagnostics],
+                "av_model_call_count": av_calls,
+                "compositor_model_call_count": compositor_calls,
+                "model_call_count": av_calls + compositor_calls,
+            }
             records.append(
                 MimoStemReconcileRecord(
                     **values,
@@ -1884,6 +1945,8 @@ def run_mimo25_stem_reconcile_shadow(
             ready_count=counts["ready"],
             failed_count=counts["failed"],
             model_call_count=sum(item.model_call_count for item in records),
+            av_model_call_count=sum(item.av_model_call_count for item in records),
+            compositor_model_call_count=sum(item.compositor_model_call_count for item in records),
         )
         _write_jsonl(temporary / "records.jsonl", records)
         _write_jsonl(temporary / "skipped_clips.jsonl", list(skipped_clips))

@@ -18,6 +18,15 @@ from urllib.parse import quote, urlsplit
 from openai import OpenAI
 from pydantic import Field, StrictBool, StrictStr, model_validator
 
+from r2v_data_v2.h3.mimo25_text_compositor import (
+    COMPOSITOR_PROMPT,
+    COMPOSITOR_VERSION,
+    CompositorInput,
+    CompositorOrdering,
+    TextComposition,
+    make_composition,
+    validate_ordering,
+)
 from r2v_data_v2.h3.schemas import SchemaModel
 from r2v_data_v2.h3.speech_presentation import SpeechPresentation
 from r2v_data_v2.structured_output import (
@@ -28,12 +37,12 @@ from r2v_data_v2.structured_output import (
 
 MIMO25_MODEL = "mimo-v2.5"
 MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
-MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v23"
+MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v24"
 MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v17"
-MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.14"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.26"
-MIMO25_ICL_VERSION = "h3_mimo25_av_reconcile_icl_v1"
-MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v17"
+MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.15"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.27"
+MIMO25_ICL_VERSION = "h3_mimo25_av_reconcile_icl_v2"
+MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v18"
 MIMO25_CANONICAL_ABSENT_SOUNDSCAPE = (
     "No distinct environmental, mechanical, physical, or non-verbal human "
     "sounds are clearly discernible."
@@ -775,14 +784,10 @@ class MimoAudioSemantics(SchemaModel):
 
 class MimoVisualBlock(SchemaModel):
     block_id: str = Field(pattern=r"^v[1-9]\d*$")
-    start_time: float = Field(ge=0, allow_inf_nan=False)
-    end_time: float = Field(gt=0, allow_inf_nan=False)
     text: StrictStr
 
     @model_validator(mode="after")
     def validate_visual_text(self) -> MimoVisualBlock:
-        if self.end_time <= self.start_time:
-            raise ValueError("visual_phase_interval_invalid: phase must have positive duration")
         if (
             not self.text.strip()
             or "[[" in self.text
@@ -1016,7 +1021,7 @@ MimoH3Draft = MimoH3Semantics
 
 
 class MimoAVAnnotationDraft(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_av_annotation.14"] = MIMO25_SCHEMA_VERSION
+    schema_version: Literal["r2v.h3.mimo25_av_annotation.15"] = MIMO25_SCHEMA_VERSION
     visual_observation: MimoVisualObservation
     audio_observation: MimoAudioObservation
     av_grounding: MimoAVGrounding
@@ -1042,7 +1047,7 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.26"] = MIMO25_BACKEND_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.27"] = MIMO25_BACKEND_VERSION
     backend: Literal[
         "xiaomi_openai_compatible", "sglang_openai_compatible"
     ]
@@ -1052,7 +1057,10 @@ class MimoBackendProvenance(SchemaModel):
     video_fps: Literal[4.0] = 4.0
     media_resolution: Literal["default"] = "default"
     thinking: MimoThinkingContract
-    icl_version: Literal["h3_mimo25_av_reconcile_icl_v1"] | None
+    icl_version: Literal["h3_mimo25_av_reconcile_icl_v2"] | None
+    compositor_version: Literal["h3_mimo25_text_compositor_v1"] = COMPOSITOR_VERSION
+    compositor_temperature: Literal[0.0] = 0.0
+    compositor_max_completion_tokens: Literal[4096] = 4096
     temperature: float = Field(ge=0, allow_inf_nan=False)
     max_completion_tokens: int = Field(gt=0)
     response_format: Literal["json_object", "json_schema"]
@@ -1060,13 +1068,13 @@ class MimoBackendProvenance(SchemaModel):
     media_mode: Literal["base64", "http"]
     media_root: str
     media_base_url: str | None = None
-    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v23"] = (
+    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v24"] = (
         MIMO25_PROMPT_VERSION
     )
     policy_version: Literal["h3_mimo25_av_authority_contract_v17"] = (
         MIMO25_POLICY_VERSION
     )
-    annotation_schema_version: Literal["r2v.h3.mimo25_av_annotation.14"] = (
+    annotation_schema_version: Literal["r2v.h3.mimo25_av_annotation.15"] = (
         MIMO25_SCHEMA_VERSION
     )
     materializer_version: Literal[
@@ -1082,6 +1090,7 @@ class MimoBackendProvenance(SchemaModel):
         "h3_mimo25_materializer_v15",
         "h3_mimo25_materializer_v16",
         "h3_mimo25_materializer_v17",
+        "h3_mimo25_materializer_v18",
     ] = (
         MIMO25_MATERIALIZER_VERSION
     )
@@ -1122,6 +1131,7 @@ class MimoUsage(SchemaModel):
 
 class MimoCompletionDiagnostic(SchemaModel):
     input_modality: Literal[
+        "text_only_compositor",
         "target_video_with_embedded_audio",
         "target_video_plus_canonical_full_audio_fallback",
         "full_av_recheck_embedded_audio",
@@ -1281,6 +1291,9 @@ class MimoBackendConfig:
             "media_resolution": self.media_resolution,
             "thinking": {"type": self.thinking},
             "icl_version": MIMO25_ICL_VERSION if self.icl == "v1" else None,
+            "compositor_version": COMPOSITOR_VERSION,
+            "compositor_temperature": 0.0,
+            "compositor_max_completion_tokens": 4096,
             "temperature": self.temperature,
             "max_completion_tokens": self.max_completion_tokens,
             "response_format": (
@@ -1312,7 +1325,7 @@ AUTHORITY
 
 STAGE A visual_observation: PURE VISUAL EVIDENCE
 - Observe real shots and exact segment windows without deciding who speaks. Every shot has at least one contiguous vN visual block. Visual text is English, visual-only, generation-useful prose covering supported style, framing, camera angle, composition, subject appearance and spatial relations, pose and body/hand/head motion, gaze/expression, interactions, object state, environment/material/readable text, lighting/color, camera motion or stability, and early-to-late progression.
-- Each visual block is a time-local phase with absolute start_time/end_time, positive duration, inside its shot. Keep phases chronological and non-overlapping. Describe only that phase, not a paragraph narrating the entire shot before early dialogue. Expose phase boundaries at every transcribed speech start/end inside the shot; never span across a speech boundary. Visual phases together with projected speech/events must cover the shot timeline without gaps. Do not invent details to fill time; describe an observed stable state when appropriate.
+- Visual blocks are chronological, time-local visual phases WITHOUT numeric timestamps. Keep blocks in playback order and describe local visual progression. When dialogue or actions change meaningfully, prefer multiple concise blocks rather than one giant paragraph narrating the whole shot. Never put transcript or audio semantics in these visual blocks.
 - Target roughly 300-450 English visual/detail words when evidence supports it, but never pad. Anti-collapse minimum visual-only prose is 40 words below 3 seconds, 80 words from 3 through 8 seconds, and 120 words above 8 seconds.
 - Never put transcript, delivery, voice, soundscape, music, speaker presentation, pipeline syntax, Subject/Picture labels, or inferred psychology, intent, causality, relationships, identity, sound, invisible events, or invented details in visual blocks.
 - segment_views exactly follow allowed_segment_ids. visible_entity_ids and entity_observations agree exactly and contain only supplied entities actually visible in that exact interval. A back/profile view, occluded face, or hidden/out-of-frame mouth is still visible presence. speech_correlated_articulation records exact-window observation only and does not assign a speaker.
@@ -1343,7 +1356,7 @@ STAGE D h3_semantics
 
 STAGE E h3_projection
 - Project typed visual{block_id}, speech{segment_id}, and audio_event{event_id} parts in playback order. Every Stage A visual block appears exactly once in its own shot. Every transcribed segment appears exactly once in chronological order. Every non-speech event except non_diegetic_music appears exactly once in chronological order. Never project non-diegetic music into detailed description.
-- Project visual phase intervals from Stage A without duplicating their times. Speech uses supplied exact segment times; events use Stage B validated times. Effective starts must be nondecreasing. A visual phase before speech or an event must finish no later than that speech/event starts. Do not append early speech after a full-shot visual narrative. Keep genuine simultaneous evidence at its shared time, not after later phases.
+- This projection is an initial order hint. Preserve visual block order and authoritative speech/event order and shot membership. A later text-only compositor inserts locked speech/events among immutable visual sentences; it cannot rewrite any facts. Do not generate visual timestamps.
 - Transcribed overlapping_secondary_speech or sequential_multi_speaker_speech is retained as acoustic evidence but blocks final H3 with multi_speaker_segment_requires_turn_refinement. Do not hide the classification or split/rewrite ASR to obtain a final prompt; authoritative sub-turn refinement is future work.
 - Do not write final H3 syntax. The deterministic materializer alone owns <Picture N>, <Subject N>, <Audio N>, Sx, exact <d>[Language] dialogue</d>, shot headers/cuts, and the official six-section final Ref2VA output. Internal vN/gN/eN/aeN/segment IDs and stage names must not leak into prose."""
 
@@ -1386,19 +1399,19 @@ def _synthetic_icl_messages() -> list[dict[str, str]]:
             "shots": [{
                 "shot_index": 1, "start_time": None,
                 "visual_blocks": [
-                    {"block_id": "v1", "start_time": 0.0, "end_time": 1.0, "text": (
+                    {"block_id": "v1", "text": (
                         "An eye-level medium shot shows a person in a plain green jacket "
                         "standing beside a small gray cabinet. The figure faces forward "
                         "with relaxed shoulders. Soft light defines the jacket folds "
                         "against an undecorated wall."
                     )},
-                    {"block_id": "v2", "start_time": 2.0, "end_time": 3.0, "text": (
+                    {"block_id": "v2", "text": (
                         "The person lowers the right forearm toward the cabinet and places "
                         "the fingers on its metal latch. The head angles slightly downward "
                         "as the gaze follows the hand. The fixed framing keeps both the "
                         "upper body and cabinet visible."
                     )},
-                    {"block_id": "v3", "start_time": 3.2, "end_time": 4.5, "text": (
+                    {"block_id": "v3", "text": (
                         "The hand rests beside the closed latch while the person returns "
                         "to an upright pose. The cabinet stays at frame right and the "
                         "plain wall remains behind the figure. Lighting and camera position "
@@ -1495,6 +1508,7 @@ def _completion_diagnostic(
     choice: object,
     *,
     modality: Literal[
+        "text_only_compositor",
         "target_video_with_embedded_audio",
         "target_video_plus_canonical_full_audio_fallback",
         "full_av_recheck_embedded_audio",
@@ -1614,85 +1628,31 @@ def validate_timeline_projection(
     transcribed_segment_ids: list[str],
     target_duration_seconds: float,
 ) -> list[ValidationIssue]:
-    """Validate temporal projection without changing any prose or source intervals."""
+    """Keep authoritative timed atoms shot-bounded; visual prose has no timestamps."""
     issues: list[ValidationIssue] = []
-    epsilon = 1e-6
-    shots = annotation.visual_observation.shots
-    projected = {shot.shot_index: shot for shot in annotation.h3_projection.shots}
     events = {item.event_id: (item.approximate_start_time, item.approximate_end_time)
               for item in annotation.audio_semantics.temporal_non_speech_events
               if item.category != "non_diegetic_music"}
-
-    def issue(code: str, shot_index: int, message: str) -> None:
-        issues.append(ValidationIssue(code, f"h3_projection.shots[{shot_index - 1}]", message))
-
+    shots = annotation.h3_projection.shots
     for index, shot in enumerate(shots):
         start = shot.start_time or 0.0
         end = (shots[index + 1].start_time if index + 1 < len(shots)
                else target_duration_seconds)
-        assert end is not None
-        phases = {block.block_id: (block.start_time, block.end_time)
-                  for block in shot.visual_blocks}
-        previous_end = start
-        for block in shot.visual_blocks:
-            if (block.start_time < previous_end - epsilon
-                    or block.end_time > end + epsilon):
-                issue("visual_phase_interval_invalid", shot.shot_index,
-                      f"{block.block_id} must be chronological, non-overlapping and shot-bounded")
-            previous_end = block.end_time
-            for segment_id in transcribed_segment_ids:
-                interval = segment_intervals.get(segment_id)
-                if interval is not None and any(
-                    block.start_time + epsilon < boundary < block.end_time - epsilon
-                    for boundary in interval if start < boundary < end
-                ):
-                    issue("speech_visual_phase_boundary_mismatch", shot.shot_index,
-                          f"{block.block_id} spans a boundary of {segment_id}; supply time-local phases")
-        projection = projected.get(shot.shot_index)
-        if projection is None:
-            issue("visual_phase_inventory_mismatch", shot.shot_index, "missing projected shot")
+        if end is None or end <= start:
+            issues.append(ValidationIssue("shot_start_outside_target", "h3_projection",
+                                          "shot must have positive target-bounded extent"))
             continue
-        if [part.block_id for part in projection.timeline_parts
-            if isinstance(part, MimoH3VisualPart)] != list(phases):
-            issue("visual_phase_inventory_mismatch", shot.shot_index,
-                  "project all Stage A phases exactly once in Stage A order")
-        previous_start = start
-        latest_visual_end = start
-        coverage = []
-        for part in projection.timeline_parts:
+        for part in shot.timeline_parts:
             if isinstance(part, MimoH3VisualPart):
-                interval = phases.get(part.block_id)
-            elif isinstance(part, MimoH3SpeechPart):
-                interval = segment_intervals.get(part.segment_id)
-            else:
-                interval = events.get(part.event_id)
-            if interval is None:
-                continue  # Exact inventories are checked by validate_annotation.
-            effective_start, effective_end = max(start, interval[0]), min(end, interval[1])
-            if effective_end <= effective_start:
-                issue("timeline_part_temporal_order_mismatch", shot.shot_index,
-                      "part has no positive extent inside this shot")
                 continue
-            if (effective_start < previous_start - epsilon or (
-                not isinstance(part, MimoH3VisualPart)
-                and effective_start < latest_visual_end - epsilon
-            )):
-                code = ("audio_event_temporal_order_mismatch"
-                        if isinstance(part, MimoH3AudioEventPart)
-                        else "timeline_part_temporal_order_mismatch")
-                issue(code, shot.shot_index, "part is serialized after later visual/time evidence")
-            previous_start = effective_start
-            if isinstance(part, MimoH3VisualPart):
-                latest_visual_end = effective_end
-            coverage.append((effective_start, effective_end))
-        covered_end = start
-        for interval_start, interval_end in sorted(coverage):
-            if interval_start > covered_end + epsilon:
-                issue("visual_phase_timeline_gap", shot.shot_index,
-                      "visual phases and projected speech/events leave an uncovered interval")
-            covered_end = max(covered_end, interval_end)
-        if covered_end < end - epsilon:
-            issue("visual_phase_timeline_gap", shot.shot_index, "shot tail lacks temporal evidence")
+            interval = (segment_intervals.get(part.segment_id)
+                        if isinstance(part, MimoH3SpeechPart) else events.get(part.event_id))
+            if interval is not None and (
+                interval[0] < 0 or interval[1] <= interval[0]
+                or min(end, interval[1]) <= max(start, interval[0])
+            ):
+                issues.append(ValidationIssue("timed_atom_interval_invalid", "h3_projection",
+                                              "authoritative speech/event must overlap its shot"))
     return issues
 
 
@@ -3275,6 +3235,73 @@ class OpenAIMimo25Backend:
             thinking=self.config.thinking,
         ), retries
 
+    def compose(
+        self, source: CompositorInput,
+    ) -> tuple[TextComposition, str, MimoCompletionDiagnostic]:
+        """One text-only ordering request. No ICL, media, or semantic repair."""
+        payload = {
+            "model": self.config.model,
+            "messages": [
+                {"role": "system", "content": COMPOSITOR_PROMPT},
+                {"role": "user", "content": source.model_dump_json()},
+            ],
+            "temperature": 0.0,
+            "max_completion_tokens": 4096,
+            "stream": False,
+        }
+        if self.config.transport == "sglang":
+            payload.update(
+                response_format={"type": "json_schema", "json_schema": {
+                    "name": "CompositorOrdering", "schema": CompositorOrdering.model_json_schema(),
+                    "strict": True,
+                }},
+                reasoning_effort="none",
+                extra_body={"chat_template_kwargs": {"thinking": False, "enable_thinking": False}},
+            )
+        else:
+            payload.update(response_format={"type": "json_object"},
+                           extra_body={"thinking": {"type": "disabled"}})
+        raw = None
+        diagnostic = None
+        try:
+            completion, attempts, _ = self._call(payload)
+            choices = _value(completion, "choices")
+            if not isinstance(choices, list) or not choices:
+                raise ValueError("compositor response has no choices")
+            choice = choices[0]
+            raw = _value(_value(choice, "message"), "content")
+            diagnostic = _completion_diagnostic(
+                completion, choice, modality="text_only_compositor",
+                http_attempt_count=attempts, thinking="disabled",
+            )
+            _validate_finish_reason(diagnostic)
+            if not isinstance(raw, str):
+                raise TypeError("compositor final content must be text")
+            ordering, issues = parse_structured_json_issues(raw, CompositorOrdering)
+            if ordering is not None:
+                issues.extend(validate_ordering(source, ordering))
+            if issues:
+                raise MimoBackendFailure(
+                    code="text_compositor_failed", reason="invalid compositor ordering",
+                    issues=issues,
+                )
+            assert ordering is not None
+            return make_composition(source, ordering), raw, diagnostic
+        except Exception as exc:
+            issues = (exc.issues if isinstance(exc, MimoBackendFailure) else
+                      [ValidationIssue("compositor_request_failed", None, str(exc))])
+            if diagnostic is None:
+                diagnostic = MimoCompletionDiagnostic(
+                    input_modality="text_only_compositor", usage=MimoUsage(),
+                    http_attempt_count=getattr(exc, "attempts", 1),
+                    request_error=type(exc).__name__, warnings=[],
+                )
+            raise MimoBackendFailure(
+                code="text_compositor_failed", reason=str(exc), issues=issues,
+                raw_responses=([raw] if isinstance(raw, str) else []),
+                diagnostics=[diagnostic], model_call_count=1,
+            ) from exc
+
     def _full_av_recheck_prompt(
         self,
         job: MimoBackendJob,
@@ -3284,19 +3311,6 @@ class OpenAIMimo25Backend:
     ) -> str:
         issue_codes = {item.code for item in issues}
         issue_actions: list[str] = []
-        if issue_codes & {
-            "visual_phase_interval_invalid", "visual_phase_inventory_mismatch",
-            "timeline_part_temporal_order_mismatch", "speech_visual_phase_boundary_mismatch",
-            "audio_event_temporal_order_mismatch", "visual_phase_timeline_gap",
-        }:
-            issue_actions.append(
-                "Reinspect original AV and regenerate time-local Stage A visual phases "
-                "and Stage E projection together. Use positive, shot-bounded, non-overlapping "
-                "phase intervals with boundaries at authoritative speech start/end times. "
-                "Preserve exact speech/event inventories and interleave by actual time; "
-                "never append early speech/events after later visual phases. Cover the "
-                "shot with phases plus speech/events, without inventing details or editing ASR."
-            )
         if issue_codes & {
             "subject_definition_contract_mismatch",
             "subject_retention_contract_mismatch",

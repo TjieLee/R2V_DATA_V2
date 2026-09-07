@@ -8,6 +8,7 @@ import shutil
 import uuid
 from collections import Counter
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
@@ -47,6 +48,15 @@ from r2v_data_v2.h3.mimo25_recovered_voice import (
     RecoveredVoiceAudioAnalyzer,
     recover_mimo_target_voices,
 )
+from r2v_data_v2.h3.mimo25_text_compositor import (
+    AtomShot,
+    CompositorInput,
+    DescriptionAtom,
+    TextComposition,
+    fingerprint,
+    split_visual_sentences,
+    validate_ordering,
+)
 from r2v_data_v2.h3.qwen38_h3_recaption import (
     AudioFactAuditItem,
     ConditioningVariant,
@@ -69,8 +79,8 @@ from r2v_data_v2.h3.qwen38_h3_recaption import (
 from r2v_data_v2.h3.schemas import SchemaModel
 from r2v_data_v2.structured_output import ValidationIssue
 
-MIMO25_SHADOW_RECORD_VERSION = "r2v.h3.mimo25_h3_shadow.12"
-MIMO25_SHADOW_SUMMARY_VERSION = "r2v.h3.mimo25_h3_shadow_summary.13"
+MIMO25_SHADOW_RECORD_VERSION = "r2v.h3.mimo25_h3_shadow.13"
+MIMO25_SHADOW_SUMMARY_VERSION = "r2v.h3.mimo25_h3_shadow_summary.14"
 MUSIC_REFERENCE_POLICY_VERSION = "h3_mimo25_clean_music_reference_v1"
 MUSIC_REFERENCE_SAMPLE_RATE_HZ = 32000
 MUSIC_REFERENCE_CHANNELS = 2
@@ -219,7 +229,7 @@ def _write_jsonl(path: Path, values: Sequence[SchemaModel]) -> None:
 
 
 class MimoH3ShadowRecord(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_h3_shadow.12"] = MIMO25_SHADOW_RECORD_VERSION
+    schema_version: Literal["r2v.h3.mimo25_h3_shadow.13"] = MIMO25_SHADOW_RECORD_VERSION
     sample_id: str
     source_h3_sample_id: str
     clip_uid: str
@@ -237,6 +247,7 @@ class MimoH3ShadowRecord(SchemaModel):
         "h3_mimo25_materializer_v15",
         "h3_mimo25_materializer_v16",
         "h3_mimo25_materializer_v17",
+        "h3_mimo25_materializer_v18",
     ] = (
         MIMO25_MATERIALIZER_VERSION
     )
@@ -347,7 +358,7 @@ class MimoH3ShadowRecord(SchemaModel):
 
 
 class MimoH3ShadowSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_h3_shadow_summary.13"] = (
+    schema_version: Literal["r2v.h3.mimo25_h3_shadow_summary.14"] = (
         MIMO25_SHADOW_SUMMARY_VERSION
     )
     source_mimo_inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -657,14 +668,25 @@ def _render_subject_definition(
     return f"{contract.subject_label} is {description}, {connector} {pictures}."
 
 
-def _materialize_sample(
+@dataclass
+class _PreparedMaterialization:
+    corrected: list[FinalQwen3SpeechSegment]
+    warnings: list[str]
+    request: Qwen38RecaptionRequest
+    variant: ConditioningVariant
+    prefix: str
+    soundscape: str
+    music: str
+
+
+def _prepare_materialization(
     sample: FinalH3SampleV2,
     job: MimoClipJob,
     record: MimoRecord,
     *,
     conditioning_variant: ConditioningVariant | None = None,
     extra_audio_contract: RecaptionAudioContract | None = None,
-) -> tuple[list[FinalQwen3SpeechSegment], str, list[str]]:
+) -> _PreparedMaterialization:
     assert record.annotation is not None
     transcribed_ids = [item.segment_id for item in job.segments if item.asr_status == "transcribed"]
     blocked = [item.segment_id for item in record.annotation.audio_observation.segment_decisions
@@ -739,9 +761,6 @@ def _materialize_sample(
         raise MimoH3MaterializationContractError([ValidationIssue(
             "unknown_audio_semantics", "non_diegetic_music", "unknown music is not absence",
         )])
-    audio_event_by_id = {
-        item.event_id: item.description for item in semantics.temporal_non_speech_events
-    }
     prefix = {
         "visual_only": "[reference generation]",
         "target_voice_reference": "[reference generation + audio reference]",
@@ -771,10 +790,125 @@ def _materialize_sample(
             "unknown_audio_semantics", "overall_soundscape",
             "unknown MiMo soundscape cannot be materialized as confirmed silence",
         )])
-    visual_block_by_id = {
-        block.block_id: block.text
-        for shot in record.annotation.visual_observation.shots
-        for block in shot.visual_blocks
+    return _PreparedMaterialization(corrected, warnings, request, variant, prefix, soundscape, music)
+
+
+def _atoms_from_prepared(
+    job: MimoClipJob, record: MimoRecord, prepared: _PreparedMaterialization,
+) -> CompositorInput:
+    assert record.annotation is not None
+    annotation = record.annotation
+    facts, contract = prepared.request.audio_facts, prepared.request.reference_contract
+    speech = {s.segment_id: s for s in facts.speech}
+    events = {e.event_id: e for e in annotation.audio_semantics.temporal_non_speech_events
+              if e.category != "non_diegetic_music"}
+    speech_ids = {s.segment_id: f"SPEECH_{i}" for i, s in enumerate(facts.speech, 1)}
+    event_ids = {event_id: f"EVENT_{i}" for i, event_id in enumerate(events, 1)}
+    visual = {}
+    visual_count = 0
+    for shot in annotation.visual_observation.shots:
+        for block in shot.visual_blocks:
+            visual[block.block_id] = []
+            for sentence in split_visual_sentences(block.text):
+                visual_count += 1
+                visual[block.block_id].append(DescriptionAtom(
+                    atom_id=f"V{visual_count}", kind="visual", source_id=block.block_id,
+                    text=sentence, start_time=None, end_time=None,
+                ))
+    decisions = {d.segment_id: d for d in annotation.segment_decisions}
+    shots = []
+    for shot in annotation.h3_projection.shots:
+        atoms = []
+        cited = set()
+        for part in shot.timeline_parts:
+            if isinstance(part, MimoH3VisualPart):
+                atoms.extend(visual[part.block_id])
+            elif isinstance(part, MimoH3SpeechPart):
+                fact = speech[part.segment_id]
+                clause = _render_mimo_speech_clause(
+                    fact, decisions, contract, include_audio_reference=fact.speaker_id not in cited,
+                )
+                cited.add(fact.speaker_id)
+                atoms.append(DescriptionAtom(
+                    atom_id=speech_ids[part.segment_id], kind="speech", source_id=part.segment_id,
+                    text=clause, start_time=fact.start_time, end_time=fact.end_time,
+                ))
+            else:
+                event = events[part.event_id]
+                atoms.append(DescriptionAtom(
+                    atom_id=event_ids[part.event_id], kind="event", source_id=part.event_id,
+                    text=event.description, start_time=event.approximate_start_time,
+                    end_time=event.approximate_end_time,
+                ))
+        shots.append(AtomShot(shot_index=shot.shot_index, atoms=atoms,
+                              initial_order=[a.atom_id for a in atoms]))
+    return CompositorInput(
+        source_job_fingerprint=job.request_fingerprint,
+        source_annotation_fingerprint=fingerprint(annotation.model_dump(mode="json")),
+        shots=shots,
+    )
+
+
+def prepare_compositor_input(
+    sample: FinalH3SampleV2, job: MimoClipJob, record: MimoRecord,
+) -> CompositorInput:
+    # One clip-level ordering is reusable across conditioning variants. Audio reference
+    # citations are deterministic variant-owned formatting, never compositor output.
+    prepared = _prepare_materialization(sample, job, record, conditioning_variant="visual_only")
+    return _atoms_from_prepared(job, record, prepared)
+
+
+def sample_with_job_speech(sample: FinalH3SampleV2, job: MimoClipJob) -> FinalH3SampleV2:
+    """Use the already validated shadow ASR timeline without modifying source samples."""
+    speech = [FinalQwen3SpeechSegment(
+        segment_id=s.segment_id, speaker_cluster_id=s.source_speaker_cluster_id,
+        entity_id=s.current_entity_id, entity_occurrence_id=s.entity_occurrence_id,
+        source_start_sample=s.source_start_sample, source_end_sample=s.source_end_sample,
+        source_sample_rate_hz=s.source_sample_rate_hz,
+        start_time=s.start_time, end_time=s.end_time, text=s.asr_text, language=s.asr_language,
+    ) for s in job.segments if s.asr_status == "transcribed"]
+    return FinalH3SampleV2.model_validate({
+        **sample.model_dump(mode="python"), "speech_segments": speech,
+    })
+
+
+def _materialize_sample(
+    sample: FinalH3SampleV2,
+    job: MimoClipJob,
+    record: MimoRecord,
+    *,
+    conditioning_variant: ConditioningVariant | None = None,
+    extra_audio_contract: RecaptionAudioContract | None = None,
+    composition: TextComposition | None = None,
+) -> tuple[list[FinalQwen3SpeechSegment], str, list[str]]:
+    prepared = _prepare_materialization(
+        sample, job, record, conditioning_variant=conditioning_variant,
+        extra_audio_contract=extra_audio_contract,
+    )
+    if composition is None:
+        raise MimoH3MaterializationContractError([ValidationIssue(
+            "text_composition_required", "composition", "persisted text composition is required",
+        )])
+    expected_source = prepare_compositor_input(sample, job, record)
+    if composition.source != expected_source:
+        raise MimoH3MaterializationContractError([ValidationIssue(
+            "compositor_source_mismatch", "composition", "composition differs from current locked facts",
+        )])
+    issues = validate_ordering(expected_source, composition.ordering)
+    if issues:
+        raise MimoH3MaterializationContractError(issues)
+    corrected, warnings, request = prepared.corrected, prepared.warnings, prepared.request
+    facts = request.audio_facts
+    variant, prefix = prepared.variant, prepared.prefix
+    soundscape, music = prepared.soundscape, prepared.music
+    atoms = _atoms_from_prepared(job, record, prepared)
+    atoms_by_id = {a.atom_id: a for shot in atoms.shots for a in shot.atoms}
+    ordered_templates = {
+        shot.shot_index: " ".join(
+            f"[[{atoms_by_id[atom_id].source_id}]]" if atoms_by_id[atom_id].kind == "speech"
+            else atoms_by_id[atom_id].text
+            for atom_id in shot.atom_ids
+        ) for shot in composition.ordering.shots
     }
     draft = Qwen38H3DraftResponse(
         subject_definitions=[
@@ -798,11 +932,7 @@ def _materialize_sample(
                     if item.shot_index == 1 and item.start_time == 0
                     else item.start_time
                 ),
-                description_template=_render_timeline_parts(
-                    item,
-                    visual_block_by_id=visual_block_by_id,
-                    audio_event_by_id=audio_event_by_id,
-                ),
+                description_template=ordered_templates[item.shot_index],
             )
             for item in record.annotation.h3_projection.shots
         ],
@@ -813,28 +943,10 @@ def _materialize_sample(
             for item in facts.non_speech_events
         ],
     )
-    decisions = {
-        item.segment_id: item
-        for item in record.annotation.av_grounding.segment_groundings
-    }
-    shot_by_segment = {
-        part.segment_id: shot.shot_index
-        for shot in record.annotation.h3_projection.shots
-        for part in shot.timeline_parts
-        if isinstance(part, MimoH3SpeechPart)
-    }
-    cited_speakers: set[tuple[int, str]] = set()
+    locked_speech = {a.source_id: a.text for a in atoms_by_id.values() if a.kind == "speech"}
 
     def render_speech(speech: RecaptionSpeechFact, _base_clause: str) -> str:
-        key = (shot_by_segment[speech.segment_id], speech.speaker_id)
-        include_audio_reference = key not in cited_speakers
-        cited_speakers.add(key)
-        return _render_mimo_speech_clause(
-            speech,
-            decisions,
-            contract,
-            include_audio_reference=include_audio_reference,
-        )
+        return locked_speech[speech.segment_id]
 
     structured = materialize_h3_draft(
         draft,

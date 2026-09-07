@@ -174,8 +174,9 @@ function render() {
   $("final-unavailable").hidden = final.status === "ready";
   const failure = clip.reconcile.upstream_failure || clip.reconcile;
   $("final-unavailable").textContent = final.status === "ready" ? "" :
-    "Final H3 Prompt unavailable\n" + (final.reason === "upstream_failed" ? "Upstream failed: " : "Reconcile failed: ") +
-    [failure.failure_code || failure.reason_code, failure.failure_reason || failure.reason].filter(Boolean).join(" / ");
+    "Final H3 Prompt unavailable\n" + (final.reason || "Reconcile failed") + "\n" +
+    [failure.failure_code || failure.reason_code, failure.failure_reason || failure.reason].filter(Boolean).join(" / ") +
+    (final.issues ? "\n" + final.issues.map(issue => issue.code + ": " + issue.message).join("\n") : "");
   renderFinalVariant();
   $("target-video").src = clip.target.video_url;
   $("duration").textContent = clip.target.duration_seconds.toFixed(3) + " s";
