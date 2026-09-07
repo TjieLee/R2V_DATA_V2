@@ -270,13 +270,15 @@ authoritative text facts and official opening + Shot 1 ICL, plus:
 `SOURCE_UNAVAILABLE`, never silence. Generated candidates are ephemeral request
 text, not fields added to `MimoClipJob`. No independent audio enters final AV.
 
-Original AV is final factual authority. Auxiliary candidates may direct attention
-to weak sounds but cannot establish a source, mood, setting or absence. MiMo
-must correct/discard unsupported interpretations. Supported audience-facing
-music goes to `non_diegetic_music`; in-scene music is authored naturally in
-`shot1_caption`, never soundscape. Unsupported music is discarded. Uncertain
-music context must not be guessed as BGM. Soundscape contains only supported
-non-musical, non-dialogue ambience/SFX, with no programmatic semantic checker.
+Original AV is a factual contradiction filter, not a requirement to independently
+re-prove every auxiliary detail. Preserve positive acoustic observations by
+default, including weak/masked sounds and harmless perceptual wording. Correct
+concrete factual errors or clear leakage/artifacts; an unsupported engine guess
+may become a low rumble without deleting the sound. Auxiliary absence never
+establishes absence. Score goes to `non_diegetic_music`; in-scene music is
+authored naturally in `shot1_caption`, never soundscape. Uncertain music placement
+uses conservative caption prose, not guessed BGM. Soundscape remains non-musical,
+non-dialogue ambience/SFX, with no programmatic semantic checker.
 
 Final AV directly produces `overall_soundscape` and `non_diegetic_music`
 (`N/A` for no eligible content). There is no intermediate `sound_description`
@@ -292,7 +294,7 @@ embedded audio tokens remain warnings only. AV defaults still include
 `--thinking disabled --icl official_ref2va_v1`, `use_audio_in_video=true`,
 temperature 0.0 and 32768 completion tokens.
 
-Versions: prompt v31, annotation .20, backend .34, materializer v23, authority
+Versions: prompt v32, annotation .20, backend .34, materializer v23, authority
 v17, ICL v2; reconcile record .10, summary .12, policy v5. New output:
 `mimo_reconcile_stemtext_final_av/`. Old
 `mimo_reconcile_av_stemtext_sound_partition/`, `mimo_v29_oneclip_smoke/`,
@@ -311,7 +313,7 @@ existing named separation inventory. This reuses SAM/DiariZen/ASR without reruns
   --sam-route music_first --allow-unverified \
   --model mimo-v2.5 --base-url http://127.0.0.1:8092/v1 \
   --media-root /mnt/workspace --max-completion-tokens 32768 \
-  --output-root "$AUDIO_PRODUCTION_ROOT/sam_audio_stem_shadow_v1/runs/random10-v1/mimo_v31_833_oneclip_smoke"
+  --output-root "$AUDIO_PRODUCTION_ROOT/sam_audio_stem_shadow_v1/runs/random10-v1/mimo_v32_833_oneclip_smoke"
 ```
 
 No `--overwrite` is used. This patch has fake-client coverage only; sound

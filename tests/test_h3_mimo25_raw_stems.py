@@ -10,6 +10,8 @@ import pytest
 from r2v_data_v2.h3 import audio_shadow_qa as qa
 from r2v_data_v2.h3.mimo25_av_reconcile import _inventory
 from r2v_data_v2.h3.mimo25_backend import (
+    MIMO25_PROMPT_VERSION,
+    SYSTEM_PROMPT,
     MimoAuxAudioDescription,
     MimoBackendConfig,
     MimoBackendFailure,
@@ -38,6 +40,21 @@ def _subset_inventory(base, clip_ids):
     values["jobs"] = [by_id[uid].model_dump(mode="json") for uid in clip_ids]
     values["clip_count"] = len(clip_ids)
     return _inventory(values)
+
+
+def test_final_av_prompt_preserves_positive_auxiliary_observations():
+    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v32"
+    assert "FACTUAL CONTRADICTION FILTER" in SYSTEM_PROMPT
+    assert "NOT A REQUIREMENT TO RE-PROVE EVERY AUXILIARY DETAIL" in SYSTEM_PROMPT
+    assert "Preserve positive observations by default" in SYSTEM_PROMPT
+    assert "Do NOT require every auxiliary detail to be independently re-proven" in SYSTEM_PROMPT
+    assert "melancholic, reflective, tense, light" in SYSTEM_PROMPT
+    assert "correct a mistaken source without deleting the sound" in SYSTEM_PROMPT
+    assert "Auxiliary negative/absence claims never establish absence" in SYSTEM_PROMPT
+    assert "Music never belongs in overall_soundscape" in SYSTEM_PROMPT
+    assert "not merely because a positive candidate is weak or masked" in SYSTEM_PROMPT
+    assert "Reinspect the ORIGINAL TARGET AV before using any claim" not in SYSTEM_PROMPT
+    assert "unless the original AV supports them" not in SYSTEM_PROMPT
 
 
 @pytest.mark.parametrize("clip_ids,mixed", [
@@ -299,6 +316,10 @@ def test_auxiliary_media_preflight_has_no_model_attempt(tmp_path):
     "candidate,soundscape,music,caption_suffix",
     [
         ("Soft piano music is audible.", "N/A", "Soft piano background music plays.", ""),
+        ("Soft, slow, melancholic piano music is audible.", "N/A",
+         "Soft, slow, melancholic piano background music plays.", ""),
+        ("A low continuous rumble, possibly from machinery or an engine.",
+         "A low continuous rumble or hum is audible.", "N/A", ""),
         ("Piano music is audible.", "N/A", "N/A", " A visible pianist plays the piano in the room."),
         ("A large engine in a moving vehicle fills a large empty space.",
          "A faint low-frequency hum is audible.", "N/A", ""),
@@ -327,6 +348,9 @@ def test_final_av_authors_sound_and_diegetic_caption_without_postprocessing(
     monkeypatch.setattr(completions, "create", create)
     summary = _run(shadow, backend, stems, jobs)
     assert summary.ready_count == 3 and summary.model_call_count == 9
+    assert summary.av_model_call_count == 3 and summary.audio_model_call_count == 6
+    assert len(completions.requests) == 9
+    assert backend.provenance.prompt_version == MIMO25_PROMPT_VERSION
     assert [job.model_dump(mode="json") for job in jobs] == jobs_before
     assert all(row["annotation"]["h3_semantics"] == payload["h3_semantics"] for row in _records(shadow))
     qa.build_audio_shadow_qa(**kwargs)

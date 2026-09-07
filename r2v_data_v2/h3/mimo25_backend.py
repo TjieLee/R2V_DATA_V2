@@ -28,7 +28,7 @@ from r2v_data_v2.structured_output import (
 
 MIMO25_MODEL = "mimo-v2.5"
 MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
-MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v31"
+MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v32"
 MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v17"
 MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.20"
 MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.34"
@@ -908,7 +908,7 @@ class MimoBackendProvenance(SchemaModel):
     media_mode: Literal["base64", "http"]
     media_root: str
     media_base_url: str | None = None
-    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v31"] = (
+    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v32"] = (
         MIMO25_PROMPT_VERSION
     )
     policy_version: Literal["h3_mimo25_av_authority_contract_v17"] = (
@@ -1202,20 +1202,23 @@ EXISTING REFERENCE FIELDS
 - Attribute retention is judged on its owning entity, not independent existence. Allowed markers: fully_preserved, partially_preserved, weak_reference; attribute_transfer is forbidden.
 
 AUXILIARY AUDIO EVIDENCE
-- Auxiliary descriptions are candidate recall evidence from source-separated tracks of the SAME target clip, NOT factual truth. SOURCE_UNAVAILABLE means no candidate evidence, never silence.
-- Reinspect the ORIGINAL TARGET AV before using any claim. Positive auxiliary evidence may direct attention to weak sounds; negative/absence claims never prove absence in the original AV. Separation leakage/artifacts are possible.
-- ORIGINAL TARGET AV is final factual authority. Correct or discard speculative source, setting, mood, cause, spatial environment, instrument, or acoustic interpretations unless the original AV supports them. A hum/rumble alone does not establish an engine, moving vehicle or large empty room.
-- Music has three outcomes: supported audience-facing score -> non_diegetic_music; supported diegetic/in-scene music -> shot1_caption at its observed position, never overall_soundscape; unsupported/leaked/artifact candidate -> discard.
-- An unseen source does not prove non-diegetic music. If the distinction is uncertain, use conservative audible-music prose in shot1_caption and "N/A" for non_diegetic_music. Never move music to overall_soundscape merely because it is not score.
-- Supported non-musical ambience, room tone, footsteps, handling, mechanical/environmental sounds and human non-speech may enter overall_soundscape. Strip unsupported source/context guesses; music/speech leakage cannot enter that field.
+- Auxiliary descriptions are positive acoustic observations from source-separated tracks of the SAME target clip. Treat clearly reported audible events as valid recall evidence: separation exposes sounds that may be weak or masked in the original mixture. SOURCE_UNAVAILABLE means no candidate evidence, never silence.
+- FINAL AV IS A FACTUAL CONTRADICTION FILTER, NOT A REQUIREMENT TO RE-PROVE EVERY AUXILIARY DETAIL. Preserve positive observations by default. Do NOT require every auxiliary detail to be independently re-proven from the original mixture before keeping it.
+- Use the ORIGINAL TARGET AV to correct CONCRETE FACTUAL ERRORS: a clearly wrong source or physical cause, incorrect scene/context claim, speech/music leakage misclassified as another sound, incorrect diegetic versus non-diegetic interpretation, or clear separator artifact. Otherwise preserve useful auxiliary detail.
+- Do not discard a candidate merely because it is faint, masked, not independently clear in the original mix, subjectively worded, or lacks an exact source. Harmless acoustic/perceptual descriptions such as slow, gentle, simple, soft, continuous, melancholic, reflective, tense, light, slight hiss, muffled or reverberant may remain unless they introduce a concrete factual contradiction.
+- Correct only the mistaken source/context interpretation, not the underlying audible event. For "a low rumble, possibly from an engine", if engine is unsupported but the rumble is not contradicted, retain "a low rumble"; do not turn it into "N/A". Remove the entire event only for a concrete factual falsehood or clear leakage/artifact.
+- For music_separator_candidate, preserve clearly reported music and useful acoustic wording by default. Original AV determines H3 placement: audience-facing score -> non_diegetic_music; diegetic/in-scene music -> chronological shot1_caption and "N/A" for non_diegetic_music; concrete separator leakage/artifact -> discard. Never output "N/A" merely because music is weak or masked, or strip harmless adjectives merely because AV cannot independently verify them.
+- An unseen source does not prove non-diegetic music. If the distinction is uncertain, preserve conservative audible-music prose in shot1_caption and use "N/A" for non_diegetic_music. Music never belongs in overall_soundscape.
+- For sfx_separator_candidate, preserve positive non-musical, non-dialogue observations by default, including room tone, footsteps, handling, mechanical/environmental sounds and human non-speech. An unsupported engine guess may become "A low continuous rumble or hum is audible", not "N/A".
+- Auxiliary negative/absence claims never establish absence.
 
 PRIMARY H3 WRITING TASK
 - This pilot is exactly one shot. Write style_opening and shot1_caption; the pipeline inserts [Shot 1]. Never output [Shot N], shot timing, or placeholders.
 - style_opening: one concise sentence about global visual/cinematographic style, camera language, and lighting only. Do not summarize people, clothing, scene contents, Subjects, actions, chronology, dialogue, or audio.
 - shot1_caption: complete natural English audiovisual prose in playback order. Integrate visible setup, actions, dialogue, and reactions where they occur; do not append all dialogue at the end.
 - Number stable (Sx) by final groups' first transcribed appearance. Every generated vocal event needs a valid (Sx) in its natural lead-in before <d>. Referenced visible speakers use <Subject N> (Sx); unbound sources use a natural semantic source plus (Sx). No fixed says clause or immediate adjacency is required.
-- overall_soundscape: Write only non-musical, non-dialogue audible ambience/SFX supported by the ORIGINAL TARGET AV. Auxiliary descriptions may help you notice weak events, but the original AV decides whether they are real and how specifically they can be described. Exclude spoken dialogue, singing, and all music. Use "N/A" if no eligible content remains.
-- non_diegetic_music: Write only audience-facing background music/score supported by the ORIGINAL TARGET AV. Use the music-separation candidate only as a recall aid. If audible music is diegetic/in-scene, describe it naturally at its observed chronological position in shot1_caption instead and output "N/A" here. If a candidate is unsupported or separation leakage, discard it.
+- overall_soundscape: Write only non-musical, non-dialogue audible ambience/SFX. Preserve positive auxiliary observations and useful acoustic detail unless original AV provides a concrete factual contradiction; correct a mistaken source without deleting the sound. Exclude spoken dialogue, singing, and all music. Use "N/A" only when no eligible content remains, not merely because a positive candidate is weak or masked.
+- non_diegetic_music: Write audience-facing background music/score, preserving clearly reported auxiliary music and harmless acoustic wording by default. Use original AV to correct factual errors and determine placement, not to re-prove every detail. If music is diegetic/in-scene, describe it naturally at its observed chronological position in shot1_caption instead and output "N/A" here. Discard music only for concrete factual falsehood or clear leakage/artifact, not merely weak original-mix audibility.
 - The official ICL is a detailed-description prose-style subset, not a response-schema demonstration. Follow the actual supplied schema and official six-section Ref2VA semantics."""
 
 

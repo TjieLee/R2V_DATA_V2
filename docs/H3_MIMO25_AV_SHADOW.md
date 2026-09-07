@@ -21,8 +21,11 @@ speaker reconciliation; MiMo is the final AV authority for this shadow path.
   with the unchanged role-blind prompt, no AV/ASR/references/caption/ICL.
 - one final MiMo-V2.5 joint-AV request receives original video with embedded
   audio, reference images, authoritative text facts, ICL and candidate texts.
-  No independent audio is sent. MiMo reinspects original AV as final authority,
-  discards unsupported source/mood/context guesses and authors all H3 fields.
+  No independent audio is sent. Final AV filters concrete factual contradictions,
+  not weak original-mix audibility. Positive auxiliary acoustic observations and
+  harmless perceptual wording are preserved by default; correct wrong source
+  interpretations without deleting the underlying sound. Clear leakage/artifacts
+  may be discarded. MiMo authors all H3 fields.
   Auxiliary absence cannot establish original absence; unavailable is not silence.
 - final AV writes `overall_soundscape` and `non_diegetic_music` directly.
   Supported in-scene music belongs in chronological `shot1_caption`, not
@@ -175,7 +178,7 @@ they do not create additional MiMo model jobs.
 
 Prompt, policy, annotation schema, and materializer versions are:
 
-- `h3_mimo25_unified_av_reconcile_v31`
+- `h3_mimo25_unified_av_reconcile_v32`
 - `h3_mimo25_av_authority_contract_v17`
 - `r2v.h3.mimo25_av_annotation.20`
 - `r2v.h3.mimo25_backend.34`

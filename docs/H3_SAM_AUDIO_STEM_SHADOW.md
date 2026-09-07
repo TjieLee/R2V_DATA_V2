@@ -131,9 +131,12 @@ uncovered tail.
    After both finish/fail, one final original AV request receives candidate text,
    one original video with embedded audio, reference images and existing
    authoritative text/ICL. It has zero independent audio URLs.
-   Original AV arbitrates all candidate claims and directly writes final sound
-   fields. Score goes to `non_diegetic_music`; in-scene music is model-authored
-   in `shot1_caption`; unsupported candidates are discarded. Soundscape never
+   Original AV corrects concrete factual contradictions and directly writes final
+   sound fields. Positive auxiliary acoustic details are preserved by default,
+   not discarded for weak/masked original-mix audibility or harmless descriptive
+   wording. Correct an unsupported source guess without removing the sound;
+   clear leakage/artifacts may be discarded. Score goes to `non_diegetic_music`;
+   in-scene music is model-authored in `shot1_caption`. Soundscape never
    receives music/dialogue. There is no semantic checker or deterministic music
    insertion. There is no text fusion, repair, retry, fallback or AV recheck.
    Normal counts: audio=2, AV=1, total=3. Raw auxiliary errors are retained;
@@ -169,7 +172,7 @@ responses. Both auxiliary candidates/errors remain available regardless of AV
 success. Failed AV cannot authorize unsafe identity products. Multi-speaker
 exclusions remain. The materializer leaves dialogue intact and reads final
 sound fields directly from annotation; no timing is invented.
-Prompt v31, annotation .20, backend .34, materializer v23, reconcile .10/.12,
+Prompt v32, annotation .20, backend .34, materializer v23, reconcile .10/.12,
 and policy v5 distinguish the new contract. Authority v17 and official opening
 + Shot 1 ICL v2 are unchanged.
 
