@@ -2,7 +2,17 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from r2v_data_v2.h3.mimo25_stem_facts_runtime import canonicalize_stem_facts
+import pytest
+from pydantic import ValidationError
+
+from r2v_data_v2.h3.mimo25_stem_facts_runtime import (
+    BoundedSFXEventDraft,
+    BoundedSFXStemFactsDraft,
+    SFX_MAX_CONTINUOUS_LAYERS,
+    SFX_MAX_EVENTS,
+    _canonicalize_sfx_draft,
+    canonicalize_stem_facts,
+)
 from r2v_data_v2.h3.mimo25_stem_shadow import (
     MusicStemFacts,
     SFXContinuousLayer,
@@ -95,4 +105,73 @@ def test_sfx_asr_leakage_is_suppressed_without_dropping_real_sfx() -> None:
     assert suppressed == 1
     assert [item.description for item in facts.events] == ["a short door click"]
     assert facts.residual_artifact_notes is not None
+    assert "separator speech leakage" in facts.residual_artifact_notes
+
+
+def test_bounded_sfx_schema_publishes_hard_array_limits() -> None:
+    schema = BoundedSFXStemFactsDraft.model_json_schema()
+    assert schema["properties"]["continuous_layers"]["maxItems"] == (
+        SFX_MAX_CONTINUOUS_LAYERS
+    )
+    assert schema["properties"]["events"]["maxItems"] == SFX_MAX_EVENTS
+
+    event = BoundedSFXEventDraft(
+        start_time=0.1,
+        end_time=0.2,
+        description="click",
+        confidence="medium",
+        category="physical",
+    )
+    with pytest.raises(ValidationError):
+        BoundedSFXStemFactsDraft(
+            clip_duration_seconds=1.0,
+            continuous_layers=[],
+            events=[event] * (SFX_MAX_EVENTS + 1),
+        )
+
+
+def test_sfx_draft_drops_nonpositive_duplicates_and_asr_leakage() -> None:
+    draft = BoundedSFXStemFactsDraft(
+        clip_duration_seconds=4.381406,
+        continuous_layers=[],
+        events=[
+            BoundedSFXEventDraft(
+                start_time=0.0,
+                end_time=0.0,
+                description="faint breath",
+                confidence="medium",
+                category="human_non_speech",
+            ),
+            BoundedSFXEventDraft(
+                start_time=1.0,
+                end_time=1.2,
+                description="door click",
+                confidence="medium",
+                category="physical",
+            ),
+            BoundedSFXEventDraft(
+                start_time=1.0,
+                end_time=1.2,
+                description="door click",
+                confidence="medium",
+                category="physical",
+            ),
+            BoundedSFXEventDraft(
+                start_time=2.2925,
+                end_time=4.381406,
+                description="当时我们一起出差的时候，你不是。",
+                confidence="high",
+                category="human_non_speech",
+            ),
+        ],
+    )
+
+    facts, counts = _canonicalize_sfx_draft(draft, _job())
+
+    assert facts.clip_duration_seconds == _job().clip_duration_seconds
+    assert [item.description for item in facts.events] == ["door click"]
+    assert counts == {"nonpositive": 1, "duplicate": 1, "asr_leakage": 1}
+    assert facts.residual_artifact_notes is not None
+    assert "non-positive-duration" in facts.residual_artifact_notes
+    assert "duplicate residual" in facts.residual_artifact_notes
     assert "separator speech leakage" in facts.residual_artifact_notes
