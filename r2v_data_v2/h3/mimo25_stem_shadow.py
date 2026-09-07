@@ -34,6 +34,7 @@ from r2v_data_v2.h3.mimo25_backend import (
     MimoBackendResult,
     MimoCompletionDiagnostic,
     MimoMediaResolver,
+    MimoSpeakerMarkerPolishAudit,
     MimoUsage,
     OpenAIMimo25Backend,
 )
@@ -64,10 +65,10 @@ MIMO25_STEM_FACTS_VERSION = "r2v.h3.mimo25_stem_facts.3"
 MIMO25_STEM_FACTS_SUMMARY_VERSION = "r2v.h3.mimo25_stem_facts_summary.4"
 MIMO25_STEM_FACT_RAW_VERSION = "r2v.h3.mimo25_stem_fact_raw.1"
 MIMO25_STEM_FACT_PROMPT_VERSION = "h3_mimo25_stem_fact_prompt_v1"
-MIMO25_STEM_RECONCILE_VERSION = "r2v.h3.mimo25_stem_reconcile.10"
-MIMO25_STEM_RECONCILE_SUMMARY_VERSION = "r2v.h3.mimo25_stem_reconcile_summary.12"
-MIMO25_STEM_RECONCILE_POLICY_VERSION = "h3_mimo25_stem_reconcile_v5"
-MIMO25_STEM_RECONCILE_STAGE = "mimo_reconcile_stemtext_final_av_v35"
+MIMO25_STEM_RECONCILE_VERSION = "r2v.h3.mimo25_stem_reconcile.11"
+MIMO25_STEM_RECONCILE_SUMMARY_VERSION = "r2v.h3.mimo25_stem_reconcile_summary.13"
+MIMO25_STEM_RECONCILE_POLICY_VERSION = "h3_mimo25_stem_reconcile_v6"
+MIMO25_STEM_RECONCILE_STAGE = "mimo_reconcile_stemtext_final_av_markerpolish_v1"
 STEM_VIEW_VERSION = "r2v.h3.sam_audio_stem_view.1"
 STEM_RECONCILE_UPSTREAM_FAILURE_VERSION = (
     "r2v.h3.mimo25_stem_reconcile_upstream_failure.1"
@@ -1614,13 +1615,13 @@ def build_stem_reconcile_jobs(
 
 
 class MimoStemReconcileRecord(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_stem_reconcile.10"] = (
+    schema_version: Literal["r2v.h3.mimo25_stem_reconcile.11"] = (
         MIMO25_STEM_RECONCILE_VERSION
     )
     clip_uid: str
     source_job_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_stem_record_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
-    policy_version: Literal["h3_mimo25_stem_reconcile_v5"] = (
+    policy_version: Literal["h3_mimo25_stem_reconcile_v6"] = (
         MIMO25_STEM_RECONCILE_POLICY_VERSION
     )
     backend_provenance: MimoBackendProvenance
@@ -1637,9 +1638,15 @@ class MimoStemReconcileRecord(SchemaModel):
     sfx_stem_description: StrictStr | None
     sfx_stem_raw_response: StrictStr | None
     sfx_stem_error: str | None
+    speaker_marker_polish_attempted: bool
+    speaker_marker_polish_applied: bool
+    speaker_marker_polish_needs_review: bool | None
+    speaker_marker_polish_raw_response: str | None
+    speaker_marker_polish_error: str | None
     av_model_call_count: int = Field(ge=0, le=1)
     audio_model_call_count: int = Field(ge=0, le=2)
-    model_call_count: int = Field(ge=0, le=3)
+    text_model_call_count: int = Field(ge=0, le=1)
+    model_call_count: int = Field(ge=0, le=4)
     record_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
 
     @model_validator(mode="after")
@@ -1654,8 +1661,28 @@ class MimoStemReconcileRecord(SchemaModel):
                 raise ValueError("ready stem reconcile requires only annotation")
         elif not self.failure_code or not self.failure_reason:
             raise ValueError("failed stem reconcile requires failure provenance")
-        if self.model_call_count != self.av_model_call_count + self.audio_model_call_count:
+        if self.model_call_count != self.av_model_call_count + self.audio_model_call_count + self.text_model_call_count:
             raise ValueError("stem reconcile model call counts differ")
+        if (
+            self.text_model_call_count != int(self.speaker_marker_polish_attempted)
+            or self.text_model_call_count != sum(
+                diagnostic.input_modality == "speaker_marker_text_only"
+                for diagnostic in self.diagnostics
+            )
+            or (self.speaker_marker_polish_attempted and self.av_model_call_count != 1)
+            or (not self.speaker_marker_polish_attempted and (
+                self.speaker_marker_polish_applied
+                or self.speaker_marker_polish_needs_review is not None
+                or self.speaker_marker_polish_raw_response is not None
+                or self.speaker_marker_polish_error is not None
+            ))
+            or (self.speaker_marker_polish_applied and (
+                self.speaker_marker_polish_needs_review is not False
+                or self.speaker_marker_polish_raw_response is None
+                or self.speaker_marker_polish_error is not None
+            ))
+        ):
+            raise ValueError("stem reconcile speaker marker polish audit differs")
         values = self.model_dump(mode="json", exclude={"record_fingerprint"})
         if self.record_fingerprint != _sha256_text(_compact_json(values)):
             raise ValueError("stem reconcile record fingerprint is invalid")
@@ -1676,7 +1703,7 @@ class StemReconcileUpstreamFailure(SchemaModel):
 
 
 class MimoStemReconcileSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_stem_reconcile_summary.12"] = (
+    schema_version: Literal["r2v.h3.mimo25_stem_reconcile_summary.13"] = (
         MIMO25_STEM_RECONCILE_SUMMARY_VERSION
     )
     route: SAMRoute
@@ -1691,6 +1718,7 @@ class MimoStemReconcileSummary(SchemaModel):
     failed_count: int = Field(ge=0)
     av_model_call_count: int = Field(ge=0)
     audio_model_call_count: int = Field(ge=0)
+    text_model_call_count: int = Field(ge=0)
     model_call_count: int = Field(ge=0)
     original_target_av_is_highest_authority: Literal[True] = True
     current_mimo_versions_modified: Literal[True] = True
@@ -1699,7 +1727,8 @@ class MimoStemReconcileSummary(SchemaModel):
     @model_validator(mode="after")
     def validate_counts(self) -> MimoStemReconcileSummary:
         if (
-            self.model_call_count != self.av_model_call_count + self.audio_model_call_count
+            self.model_call_count != self.av_model_call_count + self.audio_model_call_count + self.text_model_call_count
+            or self.text_model_call_count > self.av_model_call_count
             or self.processed_clip_count != self.ready_count + self.failed_count
             or self.clip_count != self.processed_clip_count + self.skipped_clip_count
             or self.clip_count != len(self.clip_uids)
@@ -1856,7 +1885,9 @@ def run_mimo25_stem_reconcile_shadow(
                 annotation = result.annotation
                 raw = list(result.raw_responses)
                 diagnostics = list(result.diagnostics)
-                av_calls = result.model_call_count
+                text_calls = getattr(result, "text_model_call_count", 0)
+                polish = getattr(result, "speaker_marker_polish", MimoSpeakerMarkerPolishAudit())
+                av_calls = result.model_call_count - text_calls
             except MimoBackendFailure as exc:
                 annotation = exc.annotation
                 failure_code, failure_reason = exc.code, exc.reason
@@ -1864,8 +1895,10 @@ def run_mimo25_stem_reconcile_shadow(
                 raw, diagnostics, av_calls = (
                     list(exc.raw_responses),
                     list(exc.diagnostics),
-                    exc.model_call_count,
+                    exc.model_call_count - exc.text_model_call_count,
                 )
+                text_calls = exc.text_model_call_count
+                polish = exc.speaker_marker_polish
             # Preserve parseable first-pass fields even when identity/format validation failed.
             if raw and annotation is None:
                 try:
@@ -1900,9 +1933,11 @@ def run_mimo25_stem_reconcile_shadow(
                 "sfx_stem_description": sfx.description,
                 "sfx_stem_raw_response": sfx.raw_response,
                 "sfx_stem_error": sfx.error,
+                **{f"speaker_marker_polish_{key}": value for key, value in polish.model_dump(mode="json").items()},
                 "av_model_call_count": av_calls,
                 "audio_model_call_count": audio_calls,
-                "model_call_count": av_calls + audio_calls,
+                "text_model_call_count": text_calls,
+                "model_call_count": av_calls + audio_calls + text_calls,
             }
             records.append(
                 MimoStemReconcileRecord(
@@ -1924,6 +1959,7 @@ def run_mimo25_stem_reconcile_shadow(
             failed_count=counts["failed"],
             av_model_call_count=sum(r.av_model_call_count for r in records),
             audio_model_call_count=sum(r.audio_model_call_count for r in records),
+            text_model_call_count=sum(r.text_model_call_count for r in records),
             model_call_count=sum(r.model_call_count for r in records),
         )
         _write_jsonl(temporary / "records.jsonl", records)

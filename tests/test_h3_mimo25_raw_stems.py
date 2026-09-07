@@ -165,7 +165,7 @@ def _raw():
     return _annotation().model_dump_json().replace("segment_1", "segment_0001")
 
 
-def _backend(tmp_path, shadow, responses):
+def _backend(tmp_path, shadow, responses, *, polish_responses=None):
     stems = load_stem_shadow(shadow / "separation")[1]
     completions = _Completions(responses)
     original = completions.create
@@ -174,6 +174,15 @@ def _backend(tmp_path, shadow, responses):
         if request["response_format"]["json_schema"]["name"] == "MimoAuxAudioDescription":
             completions.requests.append(request)
             return _Completions([('{"description":"An audible auxiliary sound."}', 4)]).create(**request)
+        if request["response_format"]["json_schema"]["name"] == "MimoSpeakerMarkerPolish":
+            completions.requests.append(request)
+            response = polish_responses.pop(0) if polish_responses is not None else json.dumps({
+                "shot1_caption": json.loads(request["messages"][-1]["content"])["existing_shot_caption"],
+                "needs_review": True,
+            })
+            if isinstance(response, Exception):
+                raise response
+            return _Completions([(response, 0)]).create(**request)
         return original(**request)
 
     completions.create = create
@@ -318,7 +327,7 @@ def test_final_av_malformed_retains_stems_without_fourth_call(tmp_path, monkeypa
     result = _records(shadow)[0]
     assert result["status"] == "failed" and result["annotation"] is None
     assert result["music_stem_description"] and result["sfx_stem_description"]
-    assert "sound_partition" not in result and "text_model_call_count" not in result
+    assert "sound_partition" not in result and result["text_model_call_count"] == 0
     assert summary.model_call_count == len(completions.requests) == 3
 
 
@@ -425,7 +434,8 @@ def test_real_entry_without_facts_sends_two_audio_then_one_final_av(tmp_path, mo
     )
     for name in ("mimo_reconcile_av_rawstems_sound_partition", "mimo_reconcile_av_stemtext_sound_partition",
                  "mimo_v29_oneclip_smoke", "mimo_v30_833_oneclip_smoke",
-                 "mimo_reconcile_stemtext_final_av", "mimo_reconcile_stemtext_final_av_v33"):
+                 "mimo_reconcile_stemtext_final_av", "mimo_reconcile_stemtext_final_av_v33",
+                 "mimo_reconcile_stemtext_final_av_v35", "mimo_reconcile_stemtext_final_av_v35_backend39"):
         legacy_output = shadow / name
         legacy_output.mkdir()
         (legacy_output / "sentinel.json").write_text('{"preserved": true}')
@@ -452,7 +462,7 @@ def test_real_entry_without_facts_sends_two_audio_then_one_final_av(tmp_path, mo
     assert not (shadow / "stem_views").exists()
     assert result["summary"]["ready_count"] == 3
     assert result["summary"]["av_model_call_count"] == 3
-    assert "text_model_call_count" not in result["summary"]
+    assert result["summary"]["text_model_call_count"] == 0
     assert result["summary"]["model_call_count"] == len(completions.requests) == 9
     assert result["summary"]["processed_clip_uids"] == ["clip-z", "clip-a", "clip-m"]
 
@@ -1049,8 +1059,10 @@ def test_marker_severity_uses_distinct_authoritative_speakers(
     assert row["annotation"]["h3_semantics"]["shot1_caption"] == caption
     assert row["raw_responses"] == [json.dumps(payload)]
     assert row["annotation"]["av_grounding"] == payload["av_grounding"]
-    assert summary.model_call_count == len(completions.requests) == 3 * len(jobs)
-    assert row["model_call_count"] == 3
+    text_calls = int(hard_code != "direct_unknown_speaker")
+    assert summary.model_call_count == len(completions.requests) == (3 + text_calls) * len(jobs)
+    assert row["model_call_count"] == 3 + text_calls
+    assert row["text_model_call_count"] == text_calls
     assert row["audio_model_call_count"] == 2 and row["av_model_call_count"] == 1
     if hard_code:
         assert summary.failed_count == len(jobs) and row["status"] == "failed"
@@ -1059,7 +1071,7 @@ def test_marker_severity_uses_distinct_authoritative_speakers(
     else:
         assert summary.ready_count == len(jobs) and row["status"] == "ready"
         assert row["failure_issues"] == []
-        assert "direct_single_speaker_marker_missing" in row["diagnostics"][-1]["warnings"]
+        assert "direct_single_speaker_marker_missing" in row["diagnostics"][2]["warnings"]
         qa.build_audio_shadow_qa(**kwargs)
         final = json.loads((shadow / "qa/data.json").read_text())["clips"][0]["final_h3"]
         assert final["status"] == "ready"
@@ -1086,8 +1098,9 @@ def test_explicit_marker_mismatch_remains_hard_in_backend(tmp_path, monkeypatch)
         ("direct_dialogue_speaker_marker_mismatch", "dialogue_2"),
     ]
     assert "direct_dialogue_speaker_marker_mismatch" not in row["diagnostics"][-1]["warnings"]
-    assert summary.model_call_count == len(completions.requests) == 3
-    assert backend.provenance.schema_version == MIMO25_BACKEND_VERSION == "r2v.h3.mimo25_backend.39"
+    assert summary.model_call_count == len(completions.requests) == 4
+    assert row["text_model_call_count"] == 1
+    assert backend.provenance.schema_version == MIMO25_BACKEND_VERSION == "r2v.h3.mimo25_backend.40"
     assert backend.provenance.prompt_version == "h3_mimo25_unified_av_reconcile_v35"
 
 

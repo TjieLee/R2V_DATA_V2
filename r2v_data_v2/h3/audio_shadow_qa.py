@@ -203,6 +203,7 @@ def build_audio_shadow_qa(
         or summary.model_call_count != sum(item.model_call_count for item in reconcile)
         or summary.audio_model_call_count != sum(item.audio_model_call_count for item in reconcile)
         or summary.av_model_call_count != sum(item.av_model_call_count for item in reconcile)
+        or summary.text_model_call_count != sum(item.text_model_call_count for item in reconcile)
     ):
         raise ValueError("QA reconcile summary differs from current run inventory")
     for record in reconcile:

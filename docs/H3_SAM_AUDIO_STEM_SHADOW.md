@@ -13,7 +13,7 @@ All generated artifacts live under the legacy/default root:
   separation/
   diarization/
   asr/
-  mimo_reconcile_stemtext_final_av_v35/
+  mimo_reconcile_stemtext_final_av_markerpolish_v1/
   references/
 ```
 
@@ -24,7 +24,7 @@ or, for an explicit named pilot:
   separation/
   diarization/
   asr/
-  mimo_reconcile_stemtext_final_av_v35/
+  mimo_reconcile_stemtext_final_av_markerpolish_v1/
   references/
 ```
 
@@ -139,7 +139,10 @@ uncovered tail.
    in-scene music is model-authored in `shot1_caption`. Soundscape never
    receives music/dialogue. There is no semantic checker or deterministic music
    insertion. There is no text fusion, repair, retry, fallback or AV recheck.
-   Normal counts: audio=2, AV=1, total=3. Raw auxiliary errors are retained;
+   Normal counts: audio=2, AV=1, text=0, total=3. Only Sx projection issues may
+   trigger one media-free speaker-marker polish (text=1, total=4); it cannot
+   change dialogue/prose or binding. Failure preserves the original result.
+   Raw auxiliary errors are retained;
    unavailable evidence does not mean silence or prevent the final AV attempt.
 5. `export_h3_sam_audio_stem_references.py` crops an explicitly requested
    reference from its canonical stem. It never selects an interval on a stem and
@@ -172,8 +175,8 @@ responses. Both auxiliary candidates/errors remain available regardless of AV
 success. Failed AV cannot authorize unsafe identity products. Multi-speaker
 exclusions remain. The materializer leaves dialogue intact and reads final
 sound fields directly from annotation; no timing is invented.
-Prompt v35, annotation .20, backend .39, materializer v23, reconcile .10/.12,
-and policy v5 distinguish the new contract. Authority v17 and official opening
+Prompt v35, annotation .20, backend .40, materializer v23, reconcile .11/.13,
+and policy v6 distinguish the new contract. Authority v17 and official opening
 + Shot 1 ICL v2 are unchanged.
 
 No real inference was run for this patch. Fake clients establish request shape
@@ -196,7 +199,7 @@ For an independent pilot, pass the same `--shadow-run-id random10-v1` to every
 stage. Its root is
 `$AUDIO_PRODUCTION_ROOT/sam_audio_stem_shadow_v1/runs/random10-v1/`, containing
 `separation/`, `diarization/`, `asr/`,
-`mimo_reconcile_stemtext_final_av_v35/`, and optional `references/`.
+`mimo_reconcile_stemtext_final_av_markerpolish_v1/`, and optional `references/`.
 Old `mimo_stem_facts/` and `mimo_reconcile/` outputs are left untouched.
 Run IDs must match `[A-Za-z0-9][A-Za-z0-9._-]{0,63}` exactly. Invalid IDs and
 symlink redirects are rejected, not normalized. Custom `--output-root` values

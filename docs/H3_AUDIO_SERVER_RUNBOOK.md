@@ -43,7 +43,7 @@ sam_audio_stem_shadow_v1/runs/<shadow-run-id>/
   separation/
   diarization/
   asr/
-  mimo_reconcile_stemtext_final_av_v35/
+  mimo_reconcile_stemtext_final_av_markerpolish_v1/
   references/
 ```
 
@@ -286,23 +286,26 @@ or text fusion. The materializer reads these annotation fields directly.
 Caption, grounding, relaxed dialogue, multi-speaker exclusion and six-section
 Ref2VA formatting remain unchanged.
 
-Normal per-clip counts: audio=2, AV=1, total=3. One attempt per request, no
+Normal per-clip counts: audio=2, AV=1, text=0, total=3. Eligible Sx projection
+issues alone may trigger one text-only polish (text=1, total=4).
+One attempt per request, no
 SDK retry, repair, fallback, AV recheck or resend. Auxiliary errors do not
 automatically fail a clip; final AV still runs. Final AV failures retain raw
-annotation/error and both candidates, without a fourth call. Zero/missing
+annotation/error and both candidates. Polish failure preserves the original
+status and caption. No video/audio/images are sent to polish. Zero/missing
 embedded audio tokens remain warnings only. AV defaults still include
 `--thinking disabled --icl official_ref2va_v1`, `use_audio_in_video=true`,
 temperature 0.0 and 32768 completion tokens.
 
-Versions: prompt v35, annotation .20, backend .39, materializer v23, authority
-v17, ICL v2; reconcile record .10, summary .12, policy v5. New output:
-`mimo_reconcile_stemtext_final_av_v35/`. Old
+Versions: prompt v35, annotation .20, backend .40, materializer v23, authority
+v17, ICL v2; reconcile record .11, summary .13, policy v6. New output:
+`mimo_reconcile_stemtext_final_av_markerpolish_v1/`. Old
 `mimo_reconcile_av_stemtext_sound_partition/`, `mimo_v29_oneclip_smoke/`,
 and `mimo_v30_833_oneclip_smoke/` are preserved, not migrated.
 
-For a fresh v35/backend .39 random10 run, keep `CASE_MANIFEST` as the existing ordered
+For a fresh v35/backend .40 random10 run, keep `CASE_MANIFEST` as the existing ordered
 random10 manifest. This reuses SAM/DiariZen/ASR without reruns and leaves the
-previous `mimo_reconcile_stemtext_final_av_v35/` and earlier outputs untouched:
+previous `mimo_reconcile_stemtext_final_av_v35_backend39/`, v35, and earlier outputs untouched:
 
 ```bash
 "$R2V_PYTHON" tools/run_h3_mimo25_stem_reconcile_shadow.py \
@@ -313,7 +316,7 @@ previous `mimo_reconcile_stemtext_final_av_v35/` and earlier outputs untouched:
   --sam-route music_first --allow-unverified \
   --model mimo-v2.5 --base-url http://127.0.0.1:8092/v1 \
   --media-root /mnt/workspace --max-completion-tokens 32768 \
-  --output-root "$AUDIO_PRODUCTION_ROOT/sam_audio_stem_shadow_v1/runs/random10-v1/mimo_reconcile_stemtext_final_av_v35_backend39"
+  --output-root "$AUDIO_PRODUCTION_ROOT/sam_audio_stem_shadow_v1/runs/random10-v1/mimo_reconcile_stemtext_final_av_markerpolish_v1"
 ```
 
 No `--overwrite` is used. This patch has fake-client coverage only; readiness
@@ -365,7 +368,7 @@ find "$SHADOW_ROOT" -maxdepth 2 -type f | sort
 cat "$SHADOW_ROOT/separation/summary.json"
 cat "$SHADOW_ROOT/diarization/stem_provenance.json"
 cat "$SHADOW_ROOT/asr/summary.json"
-cat "$SHADOW_ROOT/mimo_reconcile_stemtext_final_av_v35/summary.json"
+cat "$SHADOW_ROOT/mimo_reconcile_stemtext_final_av_markerpolish_v1/summary.json"
 cat "$SHADOW_ROOT/references/references.jsonl"
 ```
 

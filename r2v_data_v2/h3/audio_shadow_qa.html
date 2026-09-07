@@ -249,11 +249,19 @@ function render() {
       $("reconcile-body").append(details(name, value, name === "av_grounding" || name === "audio_observation")));
   }
   $("reconcile-body").append(details("Final AV raw response", result.raw_responses || []));
+  $("reconcile-body").append(details("Speaker marker polish", {
+    attempted: result.speaker_marker_polish_attempted,
+    applied: result.speaker_marker_polish_applied,
+    needs_review: result.speaker_marker_polish_needs_review,
+    error: result.speaker_marker_polish_error,
+    ...(result.speaker_marker_polish_attempted ? {raw_response: result.speaker_marker_polish_raw_response} : {})
+  }));
   $("reconcile-body").append(details("Request diagnostics / provenance", {
     model_call_count: result.model_call_count, diagnostics: result.diagnostics,
     backend_provenance: result.backend_provenance, source_job_fingerprint: result.source_job_fingerprint,
     source_stem_record_fingerprint: result.source_stem_record_fingerprint,
     av_model_call_count: result.av_model_call_count, audio_model_call_count: result.audio_model_call_count,
+    text_model_call_count: result.text_model_call_count,
     issues: result.failure_issues
   }));
   updateProgress(); $("main").hidden = false; $("loading").hidden = true;

@@ -31,7 +31,8 @@ MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
 MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v35"
 MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v17"
 MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.20"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.39"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.40"
+MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION = "h3_mimo25_speaker_marker_polish_v1"
 MIMO25_ICL_VERSION = "h3_official_ref2va_detailed_shot1_v2"
 MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v23"
 MIMO25_CANONICAL_ABSENT_SOUNDSCAPE = (
@@ -877,7 +878,10 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.39"] = MIMO25_BACKEND_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.40"] = MIMO25_BACKEND_VERSION
+    speaker_marker_polish_prompt_version: Literal["h3_mimo25_speaker_marker_polish_v1"] = (
+        MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION
+    )
     backend: Literal[
         "xiaomi_openai_compatible", "sglang_openai_compatible"
     ]
@@ -964,12 +968,26 @@ class MimoCompletionDiagnostic(SchemaModel):
         "full_av_recheck_with_canonical_audio",
         "target_av_with_auxiliary_raw_audio",
         "auxiliary_audio_only",
+        "speaker_marker_text_only",
     ]
     finish_reason: str | None = None
     usage: MimoUsage
     http_attempt_count: int = Field(ge=1)
     warnings: list[str] = Field(default_factory=list)
     request_error: str | None = None
+
+
+class MimoSpeakerMarkerPolish(SchemaModel):
+    shot1_caption: StrictStr
+    needs_review: StrictBool = False
+
+
+class MimoSpeakerMarkerPolishAudit(SchemaModel):
+    attempted: bool = False
+    applied: bool = False
+    needs_review: bool | None = None
+    raw_response: str | None = None
+    error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -987,6 +1005,8 @@ class MimoBackendResult:
         "target_av_with_auxiliary_raw_audio",
     ]
     deterministic_correction_counts: dict[str, int] = field(default_factory=dict)
+    text_model_call_count: int = 0
+    speaker_marker_polish: MimoSpeakerMarkerPolishAudit = field(default_factory=MimoSpeakerMarkerPolishAudit)
 
 
 class MimoAuxAudioDescription(SchemaModel):
@@ -1025,6 +1045,8 @@ class MimoBackendFailure(ValueError):
         http_retry_count: int = 0,
         recheck_count: int = 0,
         annotation: MimoAVAnnotationDraft | None = None,
+        text_model_call_count: int = 0,
+        speaker_marker_polish: MimoSpeakerMarkerPolishAudit | None = None,
     ) -> None:
         super().__init__(reason)
         self.code = code
@@ -1037,6 +1059,8 @@ class MimoBackendFailure(ValueError):
         self.http_retry_count = http_retry_count
         self.recheck_count = recheck_count
         self.annotation = annotation
+        self.text_model_call_count = text_model_call_count
+        self.speaker_marker_polish = speaker_marker_polish or MimoSpeakerMarkerPolishAudit()
 
 
 class MimoBackendJob(Protocol):
@@ -1154,6 +1178,7 @@ class MimoBackendConfig:
             "media_root": str(self.media_resolver.media_root),
             "media_base_url": self.media_resolver.media_base_url,
             "prompt_version": MIMO25_PROMPT_VERSION,
+            "speaker_marker_polish_prompt_version": MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION,
             "policy_version": MIMO25_POLICY_VERSION,
             "annotation_schema_version": MIMO25_SCHEMA_VERSION,
             "materializer_version": MIMO25_MATERIALIZER_VERSION,
@@ -1278,6 +1303,7 @@ def _completion_diagnostic(
         "full_av_recheck_with_canonical_audio",
         "target_av_with_auxiliary_raw_audio",
         "auxiliary_audio_only",
+        "speaker_marker_text_only",
     ],
     http_attempt_count: int,
     thinking: Literal["disabled", "enabled"] = "disabled",
@@ -1389,6 +1415,35 @@ class _MimoResponseContractError(RuntimeError):
 _DIALOGUE = re.compile(r"<d>(.*?)</d>", re.DOTALL)
 _REFERENCE_LABEL = re.compile(r"<(?:Subject|Picture|Audio|Video) \d+>")
 _SPEAKER_LABEL = re.compile(r"\(S(\d+)\)")
+
+SPEAKER_MARKER_POLISH_PROMPT = """You are correcting ONLY speaker-marker projection in an existing H3 shot caption.
+AUTHORITATIVE SPEAKER FACTS own speaker identity and Sx mapping. Do NOT re-decide who is speaking, Subject identity, binding, or on/offscreen presentation.
+Do NOT invent a speaker or add any Sx absent from AUTHORITATIVE SPEAKER FACTS.
+Do NOT change, translate, split, merge, reorder, or rewrite any <d> dialogue text, including its language marker.
+Do NOT change Subjects, Pictures, visual description, actions, chronology, sound description, or any other caption content.
+Do NOT invent <Audio N>, <Subject N>, <Picture N>, or other references.
+Only add, remove, or replace (Sx) markers where necessary.
+The first dialogue event for a speaker should establish its correct (Sx).
+Consecutive dialogue from the same continuing speaker may inherit the established marker naturally; mechanical repetition is not required.
+A speaker transition must use the correct new (Sx). Make the smallest possible edit.
+Treat all existing prose as immutable except for (Sx) markers.
+If the authoritative facts do not uniquely support a correction, return the caption unchanged and set needs_review=true.
+Return JSON only with exactly shot1_caption (string) and needs_review (boolean)."""
+
+_SPEAKER_MARKER_POLISH_ISSUES = frozenset({
+    "direct_single_speaker_marker_missing",
+    "direct_dialogue_speaker_marker_missing",
+    "direct_dialogue_speaker_marker_mismatch",
+})
+
+
+def _speaker_marker_only_edit(original: str, candidate: str) -> bool:
+    if _DIALOGUE.findall(original) != _DIALOGUE.findall(candidate):
+        return False
+    return (
+        " ".join(_SPEAKER_LABEL.sub("", original).split())
+        == " ".join(_SPEAKER_LABEL.sub("", candidate).split())
+    )
 
 
 def protect_direct_dialogue(
@@ -2765,6 +2820,95 @@ class OpenAIMimo25Backend:
                 diagnostic=diagnostic, error=diagnostic.request_error, model_call_count=calls,
             )
 
+    def _maybe_polish_speaker_markers(
+        self,
+        annotation: MimoAVAnnotationDraft,
+        *,
+        speech: list[dict[str, Any]],
+        allowed_labels: set[str],
+        issues: list[ValidationIssue],
+        warnings: list[str],
+    ) -> tuple[MimoAVAnnotationDraft, MimoSpeakerMarkerPolishAudit, MimoCompletionDiagnostic | None]:
+        audit = MimoSpeakerMarkerPolishAudit()
+        codes = {issue.code for issue in issues}
+        if codes - _SPEAKER_MARKER_POLISH_ISSUES or not (
+            (codes | set(warnings)) & _SPEAKER_MARKER_POLISH_ISSUES
+        ):
+            return annotation, audit, None
+        original = annotation.h3_semantics.shot1_caption
+        diagnostic = MimoCompletionDiagnostic(
+            input_modality="speaker_marker_text_only", usage=MimoUsage(), http_attempt_count=1,
+        )
+        payload: dict[str, object] = {
+            "model": self.config.model,
+            "messages": [
+                {"role": "system", "content": SPEAKER_MARKER_POLISH_PROMPT},
+                {"role": "user", "content": _compact_json({
+                    "authoritative_speaker_facts": speech,
+                    "allowed_h3_reference_labels": sorted(allowed_labels),
+                    "existing_shot_caption": original,
+                })},
+            ],
+            "temperature": 0.0, "max_completion_tokens": 2048, "stream": False,
+        }
+        if self.config.transport == "sglang":
+            payload["response_format"] = {
+                "type": "json_schema", "json_schema": {
+                    "name": "MimoSpeakerMarkerPolish",
+                    "schema": MimoSpeakerMarkerPolish.model_json_schema(), "strict": True,
+                },
+            }
+            payload["reasoning_effort"] = "none"
+            payload["extra_body"] = {
+                "chat_template_kwargs": {"thinking": False, "enable_thinking": False},
+            }
+        else:
+            payload["response_format"] = {"type": "json_object"}
+            payload["extra_body"] = {"thinking": {"type": "disabled"}}
+        audit.attempted = True
+        try:
+            completion, _, _ = self._call(payload)
+            choice = _value(completion, "choices")[0]
+            raw = _value(_value(choice, "message"), "content")
+            audit.raw_response = raw if isinstance(raw, str) else None
+            diagnostic = _completion_diagnostic(
+                completion, choice, modality="speaker_marker_text_only",
+                http_attempt_count=1, thinking="disabled",
+            )
+            # This request contains no media, regardless of provider usage metadata.
+            diagnostic.usage.image_tokens = None
+            diagnostic.usage.video_tokens = None
+            diagnostic.usage.audio_tokens = None
+            _validate_finish_reason(diagnostic)
+            response, parse_issues = parse_structured_json_issues(raw, MimoSpeakerMarkerPolish)
+            if response is None or parse_issues:
+                raise ValueError("; ".join(issue.message for issue in parse_issues))
+            audit.needs_review = response.needs_review
+            if response.needs_review:
+                diagnostic.warnings.append("speaker_marker_polish_needs_review")
+            elif not _speaker_marker_only_edit(original, response.shot1_caption):
+                audit.error = "speaker_marker_polish_non_marker_edit_rejected"
+                diagnostic.warnings.append(audit.error)
+            else:
+                _, remaining, remaining_warnings = protect_direct_dialogue(
+                    response.shot1_caption, speech, allowed_labels=allowed_labels,
+                )
+                if remaining or set(remaining_warnings) & _SPEAKER_MARKER_POLISH_ISSUES:
+                    audit.error = "speaker_marker_polish_unresolved"
+                    diagnostic.warnings.append(audit.error)
+                else:
+                    audit.applied = response.shot1_caption != original
+                    annotation = annotation.model_copy(update={
+                        "h3_semantics": annotation.h3_semantics.model_copy(
+                            update={"shot1_caption": response.shot1_caption},
+                        ),
+                    })
+        except (ValueError, TypeError, IndexError, KeyError, AttributeError, OSError, _MimoHTTPAttemptsExhausted) as exc:
+            audit.error = f"{type(exc).__name__}: {exc}"
+            diagnostic.request_error = audit.error
+            diagnostic.warnings.append("speaker_marker_polish_failed")
+        return annotation, audit, diagnostic
+
     def reconcile(
         self,
         job: MimoBackendJob,
@@ -2824,6 +2968,8 @@ class OpenAIMimo25Backend:
         annotation, issues = parse_structured_json_issues(
             canonical_raw, MimoAVAnnotationDraft
         )
+        polish = MimoSpeakerMarkerPolishAudit()
+        diagnostics = [diagnostic]
         if annotation is not None:
             annotation, grounding_corrections = _normalize_speaker_annotation(
                 annotation,
@@ -2862,13 +3008,12 @@ class OpenAIMimo25Backend:
                 item.code for item in issues if item.code in review_only
             )
             issues = [item for item in issues if item.code not in review_only]
+            speech = direct_speech_facts(annotation, list(job.segments))
             _, direct_issues, direct_warnings = protect_direct_dialogue(
                 annotation.h3_semantics.shot1_caption,
-                direct_speech_facts(annotation, list(job.segments)),
+                speech,
                 allowed_labels=allowed_reference_labels,
             )
-            issues.extend(direct_issues)
-            diagnostic.warnings.extend(direct_warnings)
             for name in ("summary", "style_opening"):
                 unknown = (
                     set(
@@ -2882,27 +3027,45 @@ class OpenAIMimo25Backend:
                             "direct_unknown_reference", name, str(sorted(unknown))
                         )
                     )
+            annotation, polish, polish_diagnostic = self._maybe_polish_speaker_markers(
+                annotation, speech=speech, allowed_labels=allowed_reference_labels,
+                issues=[*issues, *direct_issues], warnings=direct_warnings,
+            )
+            if polish_diagnostic is not None:
+                diagnostics.append(polish_diagnostic)
+            if polish.applied:
+                _, direct_issues, direct_warnings = protect_direct_dialogue(
+                    annotation.h3_semantics.shot1_caption, speech,
+                    allowed_labels=allowed_reference_labels,
+                )
+            issues.extend(direct_issues)
+            diagnostic.warnings.extend(direct_warnings)
+        text_calls = int(polish.attempted)
         if annotation is None or issues:
             raise MimoBackendFailure(
                 code="mimo_structured_output_failed",
                 reason="MiMo single AV observation failed validation",
                 raw_responses=(raw,),
-                diagnostics=(diagnostic,),
+                diagnostics=tuple(diagnostics),
                 issues=tuple(issues),
-                model_call_count=1,
-                http_attempt_count=1,
+                model_call_count=1 + text_calls,
+                http_attempt_count=1 + text_calls,
                 annotation=annotation,
+                text_model_call_count=text_calls,
+                speaker_marker_polish=polish,
             )
         return MimoBackendResult(
             annotation=annotation,
             raw_responses=(raw,),
-            diagnostics=(diagnostic,),
-            model_call_count=1,
-            http_attempt_count=1,
+            diagnostics=tuple(diagnostics),
+            model_call_count=1 + text_calls,
+            http_attempt_count=1 + text_calls,
             http_retry_count=0,
             recheck_count=0,
             input_modality=self._input_modality,
             deterministic_correction_counts=dict(sorted(corrections.items())),
+            text_model_call_count=text_calls,
+            speaker_marker_polish=polish,
         )
 
 

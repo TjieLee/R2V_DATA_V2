@@ -176,7 +176,7 @@ def test_builder_ready_failed_order_media_and_sources_unchanged(tmp_path, monkey
     assert result["output_root"] == str(output)
     data = json.loads((output / "data.json").read_text())
     reconcile_summary = json.loads((shadow / MIMO25_STEM_RECONCILE_STAGE / "summary.json").read_text())
-    assert reconcile_summary["schema_version"] == "r2v.h3.mimo25_stem_reconcile_summary.12"
+    assert reconcile_summary["schema_version"] == "r2v.h3.mimo25_stem_reconcile_summary.13"
     assert reconcile_summary["current_mimo_versions_modified"] is True
     assert data["clip_uids"] == ["clip-z", "clip-a", "clip-m"]
     assert [clip["reconcile"]["status"] for clip in data["clips"]] == ["ready", "failed", "ready"]

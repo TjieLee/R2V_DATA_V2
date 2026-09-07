@@ -2,7 +2,7 @@
 
 This experimental path is additive and read-only with respect to the current JEA
 production stages. The current path is the named SAM shadow entry, publishing
-`mimo_reconcile_stemtext_final_av_v35/` after existing separation,
+`mimo_reconcile_stemtext_final_av_markerpolish_v1/` after existing separation,
 DiariZen and ASR. Historical `mimo25_av_reconcile_v5/`, `mimo25_h3_shadow_v5/`,
 stem-facts and older reconcile artifacts are not migrated or overwritten.
 See `H3_AUDIO_SERVER_RUNBOOK.md` Stage 4 for current run and QA commands.
@@ -154,7 +154,7 @@ Concrete contradictions remain hard: a known entity absent from the segment,
 explicit offscreen/voice-over/device
 evidence conflicting with an onscreen claim, invalid presentation/entity
 combinations, unknown references/speakers, and malformed or wrongly attributed
-dialogue. No additional call, retry, recheck, or evidence threshold is introduced.
+dialogue. These severity rules do not introduce retries, rechecks, or evidence thresholds.
 Backend .39 treats Stage A/C articulation disagreement as a review-only warning
 without clearing bindings. Missing Sx is also warning-only when authoritative
 speech facts contain exactly one distinct speaker (`direct_single_speaker_marker_missing`).
@@ -187,7 +187,7 @@ Prompt, policy, annotation schema, and materializer versions are:
 - `h3_mimo25_unified_av_reconcile_v35`
 - `h3_mimo25_av_authority_contract_v17`
 - `r2v.h3.mimo25_av_annotation.20`
-- `r2v.h3.mimo25_backend.39`
+- `r2v.h3.mimo25_backend.40`
 - `h3_mimo25_materializer_v23`
 - `h3_mimo25_reference_selection_v1`
 - `h3_mimo25_recovered_voice_quality_v1`
@@ -279,6 +279,33 @@ Normal counts: audio=2, AV=1, total=3; each has one attempt.
 Auxiliary failures retain raw/error independently and final AV still runs.
 There is no text fusion, canonical-audio fallback, AV recheck or sound checker.
 
+### Conditional Speaker-Marker Polish
+
+Backend .40 adds at most one text-only call after parsed/normalized final AV,
+using `h3_mimo25_speaker_marker_polish_v1`. The main AV prompt remains v35.
+Only `direct_single_speaker_marker_missing`,
+`direct_dialogue_speaker_marker_missing`, or
+`direct_dialogue_speaker_marker_mismatch` can trigger it, and only without
+other hard issues. Unknown speakers/references, malformed dialogue, missing
+language, internal syntax, and shot markers are not repaired by polish.
+Inputs are the existing caption, authoritative `direct_speech_facts`, and
+allowed reference labels. There are no media, binding decisions, or AV rechecks.
+Thinking is disabled, temperature is 0, and the text budget is 2048 tokens.
+
+Only Sx additions/removals/replacements are accepted: dialogue contents/order
+must match exactly; stripping Sx and normalizing whitespace must leave identical
+prose. The candidate is then validated against the same speaker facts.
+`needs_review`, request/parse failure, non-marker edits, or unresolved projection
+retain the original annotation, caption, and validation outcome, without retry.
+Only `h3_semantics.shot1_caption` changes on success.
+
+Clean clips cost 2 audio + 1 AV + 0 text = 3 calls; attempted polish costs
+2 audio + 1 AV + 1 text = 4, including failed text attempts.
+`raw_responses` remains AV-only. The record separately saves polish
+attempted/applied/needs_review/raw_response/error and `text_model_call_count`.
+The `speaker_marker_text_only` diagnostic has null image/video/audio token
+counts. QA displays polish audit/raw JSON separately from final AV raw.
+
 The local SGLang transport was validated at `http://127.0.0.1:8092/v1` with
 `mimo-v2.5` on 8 H200 GPUs using TP8, DP2, and DP-attention. The observed smoke
 reported `video_tokens=28800`, `audio_tokens=53`, `reasoning_tokens=0`, and
@@ -287,11 +314,13 @@ seconds. That SGLang checkout carries an external runtime patch for upstream
 `sglang#37060` (MiMo audio encoder deadlock under TP8+DP2); R2V does not modify
 or own that external source patch.
 
-The new three-request flow has fake-client coverage only. The 833 server smoke
+The conditional-polish flow has fake-client coverage only. The 833 server smoke
 and human QA remain necessary. Old v29/v30 output directories are not migrated
-or overwritten. Reconcile record .10, summary .12 and policy v5 distinguish this
+or overwritten. Reconcile record .11, summary .13 and policy v6 distinguish this
 request history. Invalid final annotation/caption retains raw AV and auxiliary
-evidence without a fourth call; later clips continue.
+evidence; only eligible marker projection issues may use the fourth text call.
+Later clips continue. Annotation .20, materializer v23, authority v17, and ICL v2
+are unchanged; no quality improvement is claimed before real server review.
 
 Identity-product exclusions remain independent of raw caption visibility.
 Final sound sections come directly from final AV annotation, without internal
