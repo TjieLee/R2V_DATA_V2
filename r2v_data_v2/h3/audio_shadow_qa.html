@@ -86,7 +86,8 @@ function key(clip) { return "h3-audio-shadow-qa-v1:" + clip.clip_uid + ":" + cli
 function validState(state) {
   return state && Array.isArray(state.labels) && typeof state.notes === "string" &&
     state.labels.every(label => data.qa_labels.includes(label)) &&
-    new Set(state.labels).size === state.labels.length;
+    new Set(state.labels).size === state.labels.length &&
+    (!state.labels.includes("good") || state.labels.length === 1);
 }
 function stateFor(clip) {
   const raw = localStorage.getItem(key(clip));
@@ -103,8 +104,18 @@ function saveCurrent() {
   if (!data) return;
   const state = {labels: data.qa_labels.filter(label =>
     document.querySelector('input[data-qa-label="' + label + '"]').checked), notes: $("notes").value};
+  if (!validState(state)) throw new Error("Invalid QA selection.");
   localStorage.setItem(key(data.clips[index]), JSON.stringify(state));
   updateProgress();
+}
+function labelChanged(input) {
+  if (input.checked) {
+    document.querySelectorAll("input[data-qa-label]").forEach(other => {
+      if (other !== input && (input.dataset.qaLabel === "good" || other.dataset.qaLabel === "good"))
+        other.checked = false;
+    });
+  }
+  saveCurrent();
 }
 function safely(action) { try { return action(); } catch (error) { message(error.message, true); return false; } }
 function pretty(value) { return JSON.stringify(value, null, 2); }
@@ -128,7 +139,7 @@ function render() {
   data.qa_labels.forEach(label => {
     const el = document.createElement("label"), input = document.createElement("input");
     input.type = "checkbox"; input.dataset.qaLabel = label; input.checked = state.labels.includes(label);
-    input.addEventListener("change", () => safely(saveCurrent));
+    input.addEventListener("change", () => safely(() => labelChanged(input)));
     el.append(input, document.createTextNode(label)); $("labels").append(el);
   });
   $("notes").value = state.notes;
