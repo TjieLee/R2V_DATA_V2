@@ -6,10 +6,10 @@ import pytest
 from pydantic import ValidationError
 
 from r2v_data_v2.h3.mimo25_stem_facts_runtime import (
-    BoundedSFXEventDraft,
-    BoundedSFXStemFactsDraft,
     SFX_MAX_CONTINUOUS_LAYERS,
     SFX_MAX_EVENTS,
+    BoundedSFXEventDraft,
+    BoundedSFXStemFactsDraft,
     _canonicalize_sfx_draft,
     canonicalize_stem_facts,
 )
