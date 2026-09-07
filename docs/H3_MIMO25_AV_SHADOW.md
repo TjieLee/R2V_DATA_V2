@@ -2,7 +2,7 @@
 
 This experimental path is additive and read-only with respect to the current JEA
 production stages. The current path is the named SAM shadow entry, publishing
-`mimo_reconcile_stemtext_final_av/` after existing separation,
+`mimo_reconcile_stemtext_final_av_v33/` after existing separation,
 DiariZen and ASR. Historical `mimo25_av_reconcile_v5/`, `mimo25_h3_shadow_v5/`,
 stem-facts and older reconcile artifacts are not migrated or overwritten.
 See `H3_AUDIO_SERVER_RUNBOOK.md` Stage 4 for current run and QA commands.
@@ -18,7 +18,7 @@ speaker reconciliation; MiMo is the final AV authority for this shadow path.
 - frozen Visual V3 references own entity inventory, order, and image content.
 - LR-ASD, source clusters, and current entity bindings are proposals.
 - two concurrent audio-only requests first describe music/SFX canonical stems
-  with the unchanged role-blind prompt, no AV/ASR/references/caption/ICL.
+  with the positive-only role-blind prompt, no AV/ASR/references/caption/ICL.
 - one final MiMo-V2.5 joint-AV request receives original video with embedded
   audio, reference images, authoritative text facts, ICL and candidate texts.
   No independent audio is sent. Final AV filters concrete factual contradictions,
@@ -178,10 +178,10 @@ they do not create additional MiMo model jobs.
 
 Prompt, policy, annotation schema, and materializer versions are:
 
-- `h3_mimo25_unified_av_reconcile_v32`
+- `h3_mimo25_unified_av_reconcile_v33`
 - `h3_mimo25_av_authority_contract_v17`
 - `r2v.h3.mimo25_av_annotation.20`
-- `r2v.h3.mimo25_backend.34`
+- `r2v.h3.mimo25_backend.35`
 - `h3_mimo25_materializer_v23`
 - `h3_mimo25_reference_selection_v1`
 - `h3_mimo25_recovered_voice_quality_v1`

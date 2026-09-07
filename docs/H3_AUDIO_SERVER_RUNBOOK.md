@@ -43,7 +43,7 @@ sam_audio_stem_shadow_v1/runs/<shadow-run-id>/
   separation/
   diarization/
   asr/
-  mimo_reconcile_stemtext_final_av/
+  mimo_reconcile_stemtext_final_av_v33/
   references/
 ```
 
@@ -258,7 +258,7 @@ stem-video proxies are inputs.
 ```
 
 Two audio-only requests first run concurrently (max two threads). Each receives
-one canonical SAM audio URL and the unchanged v30 role-blind prompt, no video,
+one canonical SAM audio URL and the v33 positive-only role-blind prompt, no video,
 image, ASR, references, caption or ICL. Hashes are checked against separation
 provenance. Temperature 0, disabled thinking, 1024 tokens and one-string JSON
 remain unchanged. Results/errors are stored by music/SFX pipeline role.
@@ -294,30 +294,49 @@ embedded audio tokens remain warnings only. AV defaults still include
 `--thinking disabled --icl official_ref2va_v1`, `use_audio_in_video=true`,
 temperature 0.0 and 32768 completion tokens.
 
-Versions: prompt v32, annotation .20, backend .34, materializer v23, authority
+Versions: prompt v33, annotation .20, backend .35, materializer v23, authority
 v17, ICL v2; reconcile record .10, summary .12, policy v5. New output:
-`mimo_reconcile_stemtext_final_av/`. Old
+`mimo_reconcile_stemtext_final_av_v33/`. Old
 `mimo_reconcile_av_stemtext_sound_partition/`, `mimo_v29_oneclip_smoke/`,
 and `mimo_v30_833_oneclip_smoke/` are preserved, not migrated.
 
-For a fresh 833 single-clip smoke, set `CASE_833_MANIFEST` to an existing manifest
-containing only `8331da9bfe08e7f67e5e398d`. It must be an ordered subset of the
-existing named separation inventory. This reuses SAM/DiariZen/ASR without reruns:
+For a fresh v33 random10 run, keep `CASE_MANIFEST` as the existing ordered
+random10 manifest. This reuses SAM/DiariZen/ASR without reruns and leaves the
+previous `mimo_reconcile_stemtext_final_av/` output untouched:
 
 ```bash
 "$R2V_PYTHON" tools/run_h3_mimo25_stem_reconcile_shadow.py \
   --visual-production-root "$VISUAL_PRODUCTION_ROOT" \
   --visual-runs-root "$VISUAL_RUNS_ROOT" \
   --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
-  --shadow-run-id random10-v1 --case-manifest "$CASE_833_MANIFEST" \
+  --shadow-run-id random10-v1 --case-manifest "$CASE_MANIFEST" \
   --sam-route music_first --allow-unverified \
   --model mimo-v2.5 --base-url http://127.0.0.1:8092/v1 \
   --media-root /mnt/workspace --max-completion-tokens 32768 \
-  --output-root "$AUDIO_PRODUCTION_ROOT/sam_audio_stem_shadow_v1/runs/random10-v1/mimo_v32_833_oneclip_smoke"
+  --output-root "$AUDIO_PRODUCTION_ROOT/sam_audio_stem_shadow_v1/runs/random10-v1/mimo_reconcile_stemtext_final_av_v33"
 ```
 
-No `--overwrite` is used. This patch has fake-client coverage only; sound
-quality must be checked in the real 833 smoke and manual QA.
+No `--overwrite` is used. This patch has fake-client coverage only; readiness
+and quality require a fresh server run and manual QA.
+
+V33 sends the validator's exact, stably sorted `allowed_h3_reference_labels`
+to final AV; absent Audio labels are forbidden. Sx denotes actual vocal sources,
+not Subject indexes: silent Subjects consume no speaker ID, and every separate
+dialogue block needs its speaker lead-in.
+
+Only repeated Subject labels in definition/retention prose and internal
+segment/visual inventory mismatches with zero transcribed segments are relaxed.
+The latter are retained as diagnostic warnings; speech inventory, unknown
+references/speakers, dialogue formatting, articulation contradictions and unsafe
+multi-speaker identity publication remain hard gates. A failed AV record keeps
+the backend's already parsed/canonicalized annotation for QA, without becoming
+ready or causing another call.
+
+Both role-blind audio prompts now request only positive acoustic observations,
+not absence summaries or guessed causes, locations or recording history.
+Final AV must not copy track-local absence claims, must remove unsupported
+source interpretations while preserving acoustic content, and must never put
+music in overall_soundscape. These are prompt instructions, not code checkers.
 
 ### 5. Optional stem-native primary voice references
 
@@ -340,7 +359,7 @@ find "$SHADOW_ROOT" -maxdepth 2 -type f | sort
 cat "$SHADOW_ROOT/separation/summary.json"
 cat "$SHADOW_ROOT/diarization/stem_provenance.json"
 cat "$SHADOW_ROOT/asr/summary.json"
-cat "$SHADOW_ROOT/mimo_reconcile_stemtext_final_av/summary.json"
+cat "$SHADOW_ROOT/mimo_reconcile_stemtext_final_av_v33/summary.json"
 cat "$SHADOW_ROOT/references/references.jsonl"
 ```
 

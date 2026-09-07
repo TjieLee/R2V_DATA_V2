@@ -67,7 +67,7 @@ MIMO25_STEM_FACT_PROMPT_VERSION = "h3_mimo25_stem_fact_prompt_v1"
 MIMO25_STEM_RECONCILE_VERSION = "r2v.h3.mimo25_stem_reconcile.10"
 MIMO25_STEM_RECONCILE_SUMMARY_VERSION = "r2v.h3.mimo25_stem_reconcile_summary.12"
 MIMO25_STEM_RECONCILE_POLICY_VERSION = "h3_mimo25_stem_reconcile_v5"
-MIMO25_STEM_RECONCILE_STAGE = "mimo_reconcile_stemtext_final_av"
+MIMO25_STEM_RECONCILE_STAGE = "mimo_reconcile_stemtext_final_av_v33"
 STEM_VIEW_VERSION = "r2v.h3.sam_audio_stem_view.1"
 STEM_RECONCILE_UPSTREAM_FAILURE_VERSION = (
     "r2v.h3.mimo25_stem_reconcile_upstream_failure.1"
@@ -1858,6 +1858,7 @@ def run_mimo25_stem_reconcile_shadow(
                 diagnostics = list(result.diagnostics)
                 av_calls = result.model_call_count
             except MimoBackendFailure as exc:
+                annotation = exc.annotation
                 failure_code, failure_reason = exc.code, exc.reason
                 issues = list(exc.issues)
                 raw, diagnostics, av_calls = (

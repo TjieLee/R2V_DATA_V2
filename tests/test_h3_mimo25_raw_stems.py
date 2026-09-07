@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from threading import Barrier, Event
 from types import SimpleNamespace
@@ -8,11 +9,13 @@ from types import SimpleNamespace
 import pytest
 
 from r2v_data_v2.h3 import audio_shadow_qa as qa
-from r2v_data_v2.h3.mimo25_av_reconcile import _inventory
+from r2v_data_v2.h3.mimo25_av_reconcile import _inventory, _job
 from r2v_data_v2.h3.mimo25_backend import (
+    AUXILIARY_AUDIO_PROMPT,
     MIMO25_PROMPT_VERSION,
     SYSTEM_PROMPT,
     MimoAuxAudioDescription,
+    MimoAVAnnotationDraft,
     MimoBackendConfig,
     MimoBackendFailure,
     MimoH3Semantics,
@@ -43,7 +46,7 @@ def _subset_inventory(base, clip_ids):
 
 
 def test_final_av_prompt_preserves_positive_auxiliary_observations():
-    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v32"
+    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v33"
     assert "FACTUAL CONTRADICTION FILTER" in SYSTEM_PROMPT
     assert "NOT A REQUIREMENT TO RE-PROVE EVERY AUXILIARY DETAIL" in SYSTEM_PROMPT
     assert "Preserve positive observations by default" in SYSTEM_PROMPT
@@ -55,6 +58,28 @@ def test_final_av_prompt_preserves_positive_auxiliary_observations():
     assert "not merely because a positive candidate is weak or masked" in SYSTEM_PROMPT
     assert "Reinspect the ORIGINAL TARGET AV before using any claim" not in SYSTEM_PROMPT
     assert "unless the original AV supports them" not in SYSTEM_PROMPT
+
+
+def test_v33_prompt_reference_vocal_and_positive_audio_contracts():
+    assert "Use H3 reference labels ONLY from allowed_h3_reference_labels" in SYSTEM_PROMPT
+    assert "NEVER emit <Audio N>" in SYSTEM_PROMPT
+    assert "They are NOT Subject numbers" in SYSTEM_PROMPT
+    assert "A silent Subject must not consume a speaker ID" in SYSTEM_PROMPT
+    assert "first actual vocal source -> S1" in SYSTEM_PROMPT
+    assert "before each <d> MUST contain the corresponding (Sx)" in SYSTEM_PROMPT
+    assert "Repeat the same (Sx) for separate dialogue blocks" in SYSTEM_PROMPT
+    assert "If allowed_segment_ids is empty, output empty" in SYSTEM_PROMPT
+    assert "description should not repeat <Subject N>" in SYSTEM_PROMPT
+    assert "TRACK-LOCAL and MUST NOT be copied into final H3" in SYSTEM_PROMPT
+    assert "overall_soundscape contains ZERO music" in SYSTEM_PROMPT
+    assert "remove unsupported causal/source/environment inference" in SYSTEM_PROMPT
+    assert "describe only POSITIVE audible content" in AUXILIARY_AUDIO_PROMPT
+    assert "Do NOT summarize what is absent" in AUXILIARY_AUDIO_PROMPT
+    assert "Do NOT infer a physical source or cause, room/location/environment" in AUXILIARY_AUDIO_PROMPT
+    assert "Do not mention that this is a source-separation output" in AUXILIARY_AUDIO_PROMPT
+    assert not any(role in AUXILIARY_AUDIO_PROMPT.lower() for role in (
+        "music stem", "sfx stem", "music separator", "sfx separator",
+    ))
 
 
 @pytest.mark.parametrize("clip_ids,mixed", [
@@ -312,6 +337,18 @@ def test_auxiliary_media_preflight_has_no_model_attempt(tmp_path):
     assert result.model_call_count == 0 and not completions.requests
 
 
+def test_final_prompt_uses_exact_caller_reference_allowlist(tmp_path, monkeypatch):
+    _, shadow = _fixture(tmp_path, monkeypatch)
+    backend, completions, _, jobs = _backend(tmp_path, shadow, [])
+    allowed = {"<Subject 1>"}
+    prompt = backend._prompt(jobs[0], allowed_reference_labels=allowed)
+    contract = json.loads(prompt.split("AUTHORITATIVE INPUT:\n", 1)[1])
+    assert contract["allowed_h3_reference_labels"] == ["<Subject 1>"]
+    assert allowed == {"<Subject 1>"}
+    assert prompt == backend._prompt(jobs[0], allowed_reference_labels=allowed)
+    assert not completions.requests
+
+
 @pytest.mark.parametrize(
     "candidate,soundscape,music,caption_suffix",
     [
@@ -375,7 +412,8 @@ def test_real_entry_without_facts_sends_two_audio_then_one_final_av(tmp_path, mo
         [(_raw(), 8)] * 3,
     )
     for name in ("mimo_reconcile_av_rawstems_sound_partition", "mimo_reconcile_av_stemtext_sound_partition",
-                 "mimo_v29_oneclip_smoke", "mimo_v30_833_oneclip_smoke"):
+                 "mimo_v29_oneclip_smoke", "mimo_v30_833_oneclip_smoke",
+                 "mimo_reconcile_stemtext_final_av"):
         legacy_output = shadow / name
         legacy_output.mkdir()
         (legacy_output / "sentinel.json").write_text('{"preserved": true}')
@@ -439,12 +477,20 @@ def test_real_entry_without_facts_sends_two_audio_then_one_final_av(tmp_path, mo
         assert [m["role"] for m in request["messages"]] == ["system", "user"]
         assert len(request["messages"][1]["content"]) == 1
         assert request["messages"][1]["content"][0]["type"] == "audio_url"
-        assert not any(word in request["messages"][0]["content"].lower() for word in ("music", "sfx", "asr", "caption", "reference", "icl"))
+        assert request["messages"][0]["content"] == AUXILIARY_AUDIO_PROMPT
+        assert re.search(
+            r"\b(?:sfx|asr|caption|reference|icl)\b",
+            request["messages"][0]["content"], re.IGNORECASE,
+        ) is None
         assert request["response_format"]["json_schema"]["schema"] == MimoAuxAudioDescription.model_json_schema()
         assert request["temperature"] == 0.0 and request["max_completion_tokens"] == 1024
         assert request["stream"] is False and request["reasoning_effort"] == "none"
         assert request["extra_body"] == {"chat_template_kwargs": {"thinking": False, "enable_thinking": False}}
     full = json.dumps(media)
+    contract = json.loads(media[-1]["text"].split("AUTHORITATIVE INPUT:\n", 1)[1].split(
+        "\nAUXILIARY AUDIO CANDIDATES", 1,
+    )[0])
+    assert contract["allowed_h3_reference_labels"] == ["<Picture 1>", "<Subject 1>"]
     assert "stem_facts" not in full and "STEM AUXILIARY EVIDENCE" not in full
     assert "input_audio" not in full and "<Audio " not in full
     assert (
@@ -523,6 +569,10 @@ def test_failures_keep_raw_and_continue_without_retries(tmp_path, monkeypatch, f
         payload["visual_observation"]["segment_views"][0]["entity_observations"][0][
             "speech_correlated_articulation"
         ] = "not_observed"
+        payload["audio_observation"]["segment_decisions"][0]["audio_evidence_codes"] *= 2
+        payload["h3_semantics"]["visual_retention_analysis"][0]["description"] = (
+            "fully_preserved - the person remains visible."
+        )
     elif failure == "schema":
         del payload["h3_semantics"]["subject_definitions"]
     first_raw = json.dumps(payload)
@@ -543,16 +593,131 @@ def test_failures_keep_raw_and_continue_without_retries(tmp_path, monkeypatch, f
     assert records[0]["status"] == "failed"
     assert records[0]["raw_responses"] == [first_raw]
     assert records[0]["music_stem_description"] and records[0]["sfx_stem_description"]
+    if failure == "articulation":
+        assert "stage_a_av_articulation_contradiction" in {
+            issue["code"] for issue in records[0]["failure_issues"]
+        }
+        annotation = records[0]["annotation"]
+        assert annotation is not None
+        assert annotation["audio_observation"]["segment_decisions"][0]["audio_evidence_codes"] == ["voice_continuity"]
+        assert annotation["h3_semantics"]["visual_retention_analysis"][0]["description"] == "the person remains visible."
     qa.build_audio_shadow_qa(**kwargs)
     clip = json.loads((shadow / "qa/data.json").read_text())["clips"][0]
     assert (
         clip["direct_h3"]["shot1_caption"] == payload["h3_semantics"]["shot1_caption"]
     )
     assert clip["direct_h3"]["overall_soundscape"]
+    if failure == "articulation":
+        assert clip["direct_h3"] == records[0]["annotation"]["h3_semantics"]
     assert clip["final_h3"]["status"] == "unavailable"
     page = (shadow / "qa/review.html").read_text()
     assert "Final AV raw response" in page and "Final overall_soundscape" in page
     assert "Text-only sound partition" not in page
+
+
+@pytest.mark.parametrize("field", ["subject_definitions", "visual_retention_analysis"])
+@pytest.mark.parametrize("label", ["<Subject 1>", "Subject 1", "<Subject 99>"])
+def test_repeated_subject_prose_parses_but_unknown_reference_stays_hard(
+    tmp_path, monkeypatch, field, label,
+):
+    _, shadow = _fixture(tmp_path, monkeypatch)
+    payload = json.loads(_raw())
+    prose = f"{label} remains visible; {label} has a clear appearance."
+    payload["h3_semantics"][field][0]["description"] = prose
+    assert MimoAVAnnotationDraft.model_validate(payload).h3_semantics.model_dump()[field][0]["description"] == prose
+    backend, completions, stems, jobs = _backend(tmp_path, shadow, [(json.dumps(payload), 8)])
+    summary = _run(shadow, backend, stems, jobs[:1])
+    row = _records(shadow)[0]
+    assert row["annotation"]["h3_semantics"][field][0]["description"] == prose
+    if label == "<Subject 99>":
+        assert row["status"] == "failed"
+        assert "draft_contains_unknown_reference" in {item["code"] for item in row["failure_issues"]}
+    else:
+        assert row["status"] == "ready"
+    assert summary.model_call_count == len(completions.requests) == 3
+
+
+@pytest.mark.parametrize("field", ["subject_definitions", "visual_retention_analysis"])
+def test_reference_prose_still_requires_nonempty_description(field):
+    payload = json.loads(_raw())
+    payload["h3_semantics"][field][0]["description"] = " "
+    with pytest.raises(ValueError, match="must not be empty"):
+        MimoAVAnnotationDraft.model_validate(payload)
+    payload = json.loads(_raw())
+    payload["h3_semantics"]["subject_definitions"][0]["description"] = "From <Picture 1>."
+    with pytest.raises(ValueError, match="cannot own Picture provenance"):
+        MimoAVAnnotationDraft.model_validate(payload)
+
+
+@pytest.mark.parametrize("caption,issue", [
+    ("<Subject 1> (S1) speaks using <Audio 1>, <d>[Chinese] text</d>", "direct_unknown_reference"),
+    ("A man says, <d>[Chinese] text</d>", "direct_dialogue_speaker_marker_missing"),
+    ("A man (S2) says, <d>[Chinese] text</d>", "direct_unknown_speaker"),
+    ("A man (S1) says, <d>text</d>", "direct_dialogue_language_missing"),
+    ("A man (S1) says, <d>[Chinese] text", "direct_dialogue_format"),
+])
+def test_direct_format_hard_gates_keep_parseable_annotation(tmp_path, monkeypatch, caption, issue):
+    _, shadow = _fixture(tmp_path, monkeypatch)
+    payload = json.loads(_raw())
+    payload["h3_semantics"]["shot1_caption"] = caption
+    backend, completions, stems, jobs = _backend(tmp_path, shadow, [(json.dumps(payload), 8)])
+    summary = _run(shadow, backend, stems, jobs[:1])
+    row = _records(shadow)[0]
+    assert row["status"] == "failed" and row["annotation"] is not None
+    assert issue in {item["code"] for item in row["failure_issues"]}
+    assert row["annotation"]["h3_semantics"]["shot1_caption"] == caption
+    assert summary.model_call_count == len(completions.requests) == 3
+
+
+@pytest.mark.parametrize("has_transcribed,empty_inventory", [(False, True), (False, False), (True, False)])
+def test_segment_inventory_is_review_only_without_transcribed_speech(
+    tmp_path, monkeypatch, has_transcribed, empty_inventory,
+):
+    kwargs, shadow = _fixture(tmp_path, monkeypatch)
+    payload = json.loads(_raw())
+    # Three mutually aligned internal stages, but not the authoritative inventory.
+    for section, field in (
+        ("audio_observation", "segment_decisions"),
+        ("av_grounding", "segment_groundings"),
+        ("visual_observation", "segment_views"),
+    ):
+        payload[section][field][0]["segment_id"] = "extra_segment"
+    payload["audio_observation"]["segment_decisions"][0]["delivery_style"] = None
+    payload["h3_semantics"]["shot1_caption"] = "The person sits by a table."
+    backend, completions, stems, jobs = _backend(tmp_path, shadow, [(json.dumps(payload), 8)])
+    values = jobs[0].model_dump(mode="json", exclude={"request_fingerprint"})
+    if empty_inventory:
+        values["segments"] = []
+    elif not has_transcribed:
+        for segment in values["segments"]:
+            segment.update(asr_status="empty", asr_text=None, asr_language=None)
+    job = _job(values)
+    summary = _run(shadow, backend, stems, [job])
+    row = _records(shadow)[0]
+    inventory_codes = {"segment_inventory_mismatch", "visual_segment_inventory_mismatch"}
+    if has_transcribed:
+        assert row["status"] == "failed"
+        assert inventory_codes <= {item["code"] for item in row["failure_issues"]}
+    else:
+        assert row["status"] == "ready"
+        assert inventory_codes <= set(row["diagnostics"][-1]["warnings"])
+        assert row["failure_issues"] == []
+        source_samples = kwargs["audio_production_root"] / "h3/samples.jsonl"
+        sample_values = json.loads(source_samples.read_text().splitlines()[0])
+        sample_values["speech_segments"] = []
+        sample = qa.FinalH3SampleV2.model_validate(sample_values)
+        corrected, text, _ = qa._materialize_sample(
+            sample, job,
+            qa._MaterializerInput(
+                MimoAVAnnotationDraft.model_validate(row["annotation"]),
+                job.request_fingerprint,
+            ),
+        )
+        assert corrected == []
+        assert payload["h3_semantics"]["shot1_caption"] in text
+        assert "overall_soundscape:\nA quiet room tone and a clink." in text
+    assert row["annotation"]["audio_observation"]["segment_decisions"][0]["segment_id"] == "extra_segment"
+    assert summary.model_call_count == len(completions.requests) == 3
 
 
 def test_av_http_failure_is_single_attempt_and_next_clip_runs(tmp_path, monkeypatch):

@@ -326,7 +326,7 @@ def test_experimental_thinking_icl_payload_and_reasoning_isolation(tmp_path, mon
     assert request["messages"][0] == {"role": "system", "content": SYSTEM_PROMPT}
     assert request["messages"][-1]["content"] == [
         *backend._media_content(job, include_audio_fallback=False),
-        {"type": "text", "text": backend._prompt(job)},
+        {"type": "text", "text": backend._prompt(job, allowed_reference_labels={r.picture_label for r in job.reference_images} | {s.subject_label for s in job.reference_subjects})},
     ]
     if icl == "official_ref2va_v1":
         assert request["messages"][1:3] == _official_detailed_description_icl_messages()
@@ -863,7 +863,7 @@ def test_sglang_primary_uses_embedded_video_audio_and_non_thinking_contract(
 
 def test_xiaomi_prompt_retains_textual_json_schema(tmp_path: Path) -> None:
     backend, _ = _backend(tmp_path, [])
-    prompt = backend._prompt(_job_fixture(tmp_path))
+    prompt = backend._prompt(_job_fixture(tmp_path), allowed_reference_labels={"<Subject 1>", "<Picture 1>"})
     assert json.dumps(
         MimoAVAnnotationDraft.model_json_schema(),
         ensure_ascii=False,
@@ -968,7 +968,7 @@ def test_primary_prompt_includes_exact_subject_picture_contract(
     job = _multi_picture_job_fixture(tmp_path)
     backend, _ = _backend(tmp_path, [])
 
-    prompt = backend._prompt(job)
+    prompt = backend._prompt(job, allowed_reference_labels={r.picture_label for r in job.reference_images} | {s.subject_label for s in job.reference_subjects})
     contract = backend.build_mandatory_h3_draft_contract(job)
 
     assert contract["subject_definition_requirements"] == [
@@ -1004,7 +1004,7 @@ def test_primary_prompt_separates_decision_and_typed_speech_inventories(
     job = _job_with_non_transcribed_segment(tmp_path)
     backend, _ = _backend(tmp_path, [])
 
-    prompt = backend._prompt(job)
+    prompt = backend._prompt(job, allowed_reference_labels={r.picture_label for r in job.reference_images} | {s.subject_label for s in job.reference_subjects})
     contract = backend.build_mandatory_h3_draft_contract(job)
 
     assert contract["allowed_segment_ids"] == ["segment_1", "segment_2"]
@@ -4913,7 +4913,7 @@ def test_attribute_subject_contract_is_attribute_only_and_owner_aware(
         "attribute_type": "hair",
         "required_source_picture_labels": ["<Picture 2>"],
     }
-    prompt = backend._prompt(job)
+    prompt = backend._prompt(job, allowed_reference_labels={r.picture_label for r in job.reference_images} | {s.subject_label for s in job.reference_subjects})
     assert "Attribute Subjects describe only their attribute" in prompt
     assert "retention is judged on that owner, not as an independent entity" in prompt
 
