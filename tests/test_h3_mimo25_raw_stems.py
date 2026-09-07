@@ -13,8 +13,8 @@ from r2v_data_v2.h3.mimo25_backend import (
     MimoAuxAudioDescription,
     MimoBackendConfig,
     MimoBackendFailure,
+    MimoH3Semantics,
     MimoMediaResolver,
-    MimoSoundPartition,
     OpenAIMimo25Backend,
     protect_direct_dialogue,
 )
@@ -28,10 +28,6 @@ from r2v_data_v2.h3.sam_audio_stem_shadow import load_stem_shadow
 from tests.test_h3_audio_shadow_qa import _fixture, _snapshot
 from tests.test_h3_mimo25_av_shadow import _annotation, _Completions
 from tools import run_h3_mimo25_stem_reconcile_shadow as cli
-
-PARTITION = (
-    '{"overall_soundscape":"A quiet room tone and a clink.","non_diegetic_music":"N/A"}'
-)
 
 
 def _subset_inventory(base, clip_ids):
@@ -54,7 +50,7 @@ def test_reconcile_ordered_subset_cli(tmp_path, monkeypatch, clip_ids, mixed):
     base = _subset_inventory(qa.build_mimo25_inventory(), clip_ids)
     monkeypatch.setattr(qa, "build_mimo25_inventory", lambda **kwargs: base)
     backend, completions, _, _ = _backend(
-        tmp_path, shadow, [(_raw(), 8), (PARTITION, None)] * len(clip_ids),
+        tmp_path, shadow, [(_raw(), 8)] * len(clip_ids),
     )
     if mixed:
         monkeypatch.setattr(
@@ -82,7 +78,7 @@ def test_reconcile_ordered_subset_cli(tmp_path, monkeypatch, clip_ids, mixed):
     assert summary["skipped_clips"] == []
     assert summary["diarization_failed_clips"] == []
     assert [row["clip_uid"] for row in _records(shadow)] == clip_ids
-    assert len(completions.requests) == 4 * len(clip_ids)
+    assert len(completions.requests) == 3 * len(clip_ids)
     assert summary["audio_model_call_count"] == 2 * len(clip_ids)
 
 
@@ -201,11 +197,11 @@ def test_parallel_auxiliary_results_keep_roles_and_allow_positive_recovery(
 ):
     _, shadow = _fixture(tmp_path, monkeypatch)
     payload = json.loads(_raw())
-    payload["h3_semantics"]["sound_description"] = "There is no background music."
     positive = "Soft instrumental music is clearly audible."
     final = {"overall_soundscape": "A clink.", "non_diegetic_music": positive}
+    payload["h3_semantics"].update(final)
     backend, completions, stems, jobs = _backend(
-        tmp_path, shadow, [(json.dumps(payload), 0), (json.dumps(final), None)],
+        tmp_path, shadow, [(json.dumps(payload), 0)],
     )
     jobs = jobs[:1]
     record = next(r for r in stems if r.clip_uid == jobs[0].clip_uid and r.route == "music_first")
@@ -220,6 +216,7 @@ def test_parallel_auxiliary_results_keep_roles_and_allow_positive_recovery(
 
     def create(**request):
         if request["response_format"]["json_schema"]["name"] != "MimoAuxAudioDescription":
+            assert completion_order == ["sfx", "music"]
             return original(**request)
         role = role_urls[request["messages"][1]["content"][0]["audio_url"]["url"]]
         completions.requests.append(request)
@@ -247,32 +244,33 @@ def test_parallel_auxiliary_results_keep_roles_and_allow_positive_recovery(
     assert bool(result["music_stem_error"]) == (music_failure is not None)
     if music_failure == "json":
         assert result["music_stem_raw_response"] == "bad JSON"
-    assert result["sound_partition"] == final
-    assert summary.av_model_call_count == summary.text_model_call_count == 1
+    assert {key: result["annotation"]["h3_semantics"][key] for key in final} == final
+    assert summary.av_model_call_count == 1
     assert summary.audio_model_call_count == 2
-    assert summary.model_call_count == len(completions.requests) == 4
-    text = completions.requests[-1]["messages"][1]["content"]
-    assert "There is no background music." in text and "A clink." in text
+    assert summary.model_call_count == len(completions.requests) == 3
+    text = completions.requests[-1]["messages"][-1]["content"][-1]["text"]
+    assert "A clink." in text
+    assert "music_separator_candidate" in text and "sfx_separator_candidate" in text
     assert (positive if music_failure is None else "SOURCE_UNAVAILABLE") in text
     assert result["diagnostics"][1]["input_modality"] == "auxiliary_audio_only"
-    assert result["diagnostics"][2]["input_modality"] == "auxiliary_audio_only"
+    assert result["diagnostics"][0]["input_modality"] == "auxiliary_audio_only"
+    assert result["diagnostics"][2]["input_modality"] == "target_video_with_embedded_audio"
 
 
-def test_missing_original_description_retains_stems_without_text_call(tmp_path, monkeypatch):
+def test_final_av_malformed_retains_stems_without_fourth_call(tmp_path, monkeypatch):
     _, shadow = _fixture(tmp_path, monkeypatch)
     backend, completions, stems, jobs = _backend(tmp_path, shadow, [("bad JSON", 8)])
     summary = _run(shadow, backend, stems, jobs[:1])
     result = _records(shadow)[0]
-    assert result["status"] == "failed" and result["sound_description"] is None
+    assert result["status"] == "failed" and result["annotation"] is None
     assert result["music_stem_description"] and result["sfx_stem_description"]
-    assert result["sound_partition"] is None
-    assert summary.text_model_call_count == 0
+    assert "sound_partition" not in result and "text_model_call_count" not in result
     assert summary.model_call_count == len(completions.requests) == 3
 
 
 def test_changed_auxiliary_file_is_not_sent(tmp_path, monkeypatch):
     _, shadow = _fixture(tmp_path, monkeypatch)
-    backend, completions, stems, jobs = _backend(tmp_path, shadow, [(_raw(), 8), (PARTITION, None)])
+    backend, completions, stems, jobs = _backend(tmp_path, shadow, [(_raw(), 8)])
     record = next(r for r in stems if r.clip_uid == jobs[0].clip_uid and r.route == "music_first")
     Path(record.stem("music").canonical_stem_path).write_bytes(b"changed fixture")
     summary = _run(shadow, backend, stems, jobs[:1])
@@ -280,7 +278,7 @@ def test_changed_auxiliary_file_is_not_sent(tmp_path, monkeypatch):
     assert "auxiliary stem changed" in result["music_stem_error"]
     assert result["music_stem_description"] is None and result["sfx_stem_description"]
     assert summary.audio_model_call_count == 1
-    assert summary.model_call_count == len(completions.requests) == 3
+    assert summary.model_call_count == len(completions.requests) == 2
 
 
 def test_auxiliary_media_preflight_has_no_model_attempt(tmp_path):
@@ -297,16 +295,66 @@ def test_auxiliary_media_preflight_has_no_model_attempt(tmp_path):
     assert result.model_call_count == 0 and not completions.requests
 
 
-def test_real_entry_without_facts_sends_one_av_two_audio_and_one_text(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "candidate,soundscape,music,caption_suffix",
+    [
+        ("Soft piano music is audible.", "N/A", "Soft piano background music plays.", ""),
+        ("Piano music is audible.", "N/A", "N/A", " A visible pianist plays the piano in the room."),
+        ("A large engine in a moving vehicle fills a large empty space.",
+         "A faint low-frequency hum is audible.", "N/A", ""),
+    ],
+)
+def test_final_av_authors_sound_and_diegetic_caption_without_postprocessing(
+    tmp_path, monkeypatch, candidate, soundscape, music, caption_suffix,
+):
+    kwargs, shadow = _fixture(tmp_path, monkeypatch)
+    payload = json.loads(_raw())
+    payload["h3_semantics"].update(overall_soundscape=soundscape, non_diegetic_music=music)
+    payload["h3_semantics"]["shot1_caption"] += caption_suffix
+    backend, completions, stems, jobs = _backend(
+        tmp_path, shadow, [(json.dumps(payload), 8)] * 3,
+    )
+    original = completions.create
+    jobs_before = [job.model_dump(mode="json") for job in jobs]
+
+    def create(**request):
+        if request["response_format"]["json_schema"]["name"] == "MimoAuxAudioDescription":
+            completions.requests.append(request)
+            return _Completions([(json.dumps({"description": candidate}), 8)]).create(**request)
+        assert candidate in request["messages"][-1]["content"][-1]["text"]
+        return original(**request)
+
+    monkeypatch.setattr(completions, "create", create)
+    summary = _run(shadow, backend, stems, jobs)
+    assert summary.ready_count == 3 and summary.model_call_count == 9
+    assert [job.model_dump(mode="json") for job in jobs] == jobs_before
+    assert all(row["annotation"]["h3_semantics"] == payload["h3_semantics"] for row in _records(shadow))
+    qa.build_audio_shadow_qa(**kwargs)
+    clips = json.loads((shadow / "qa/data.json").read_text())["clips"]
+    for clip in clips:
+        assert clip["final_h3"]["status"] == "ready"
+        final = clip["final_h3"]["text"]
+        assert f"overall_soundscape:\n{soundscape}" in final
+        assert f"non_diegetic_music:\n{music}" in final
+        expected_detailed = payload["h3_semantics"]["style_opening"] + "\n[Shot 1] " + payload["h3_semantics"]["shot1_caption"]
+        assert expected_detailed in final
+        headings = ["subject_definitions:", "summary:", "retention_analysis:",
+                    "detailed_description:", "overall_soundscape:", "non_diegetic_music:"]
+        assert [final.index(heading) for heading in headings] == sorted(final.index(h) for h in headings)
+
+
+def test_real_entry_without_facts_sends_two_audio_then_one_final_av(tmp_path, monkeypatch):
     kwargs, shadow = _fixture(tmp_path, monkeypatch)
     backend, completions, stems, jobs = _backend(
         tmp_path,
         shadow,
-        [(_raw(), 8), (PARTITION, None)] * 3,
+        [(_raw(), 8)] * 3,
     )
-    legacy_output = shadow / "mimo_reconcile_av_rawstems_sound_partition"
-    legacy_output.mkdir()
-    (legacy_output / "sentinel.json").write_text('{"preserved": true}')
+    for name in ("mimo_reconcile_av_rawstems_sound_partition", "mimo_reconcile_av_stemtext_sound_partition",
+                 "mimo_v29_oneclip_smoke", "mimo_v30_833_oneclip_smoke"):
+        legacy_output = shadow / name
+        legacy_output.mkdir()
+        (legacy_output / "sentinel.json").write_text('{"preserved": true}')
     source_before = {
         path: data
         for path, data in _snapshot(tmp_path).items()
@@ -330,11 +378,14 @@ def test_real_entry_without_facts_sends_one_av_two_audio_and_one_text(tmp_path, 
     assert not (shadow / "stem_views").exists()
     assert result["summary"]["ready_count"] == 3
     assert result["summary"]["av_model_call_count"] == 3
-    assert result["summary"]["text_model_call_count"] == 3
-    assert result["summary"]["model_call_count"] == len(completions.requests) == 12
+    assert "text_model_call_count" not in result["summary"]
+    assert result["summary"]["model_call_count"] == len(completions.requests) == 9
     assert result["summary"]["processed_clip_uids"] == ["clip-z", "clip-a", "clip-m"]
 
-    first, audio_a, audio_b, second = completions.requests[:4]
+    audio_a, audio_b, first = completions.requests[:3]
+    assert [r["response_format"]["json_schema"]["name"] for r in completions.requests] == [
+        "MimoAuxAudioDescription", "MimoAuxAudioDescription", "MimoAVAnnotationDraft",
+    ] * 3
     assert result["summary"]["audio_model_call_count"] == 6
     assert [m["role"] for m in first["messages"]] == [
         "system",
@@ -382,7 +433,8 @@ def test_real_entry_without_facts_sends_one_av_two_audio_and_one_text(tmp_path, 
         )
         not in full
     )
-    assert "separation" not in full and "leakage" not in full
+    assert "music_separator_candidate" in full and "sfx_separator_candidate" in full
+    assert "An audible auxiliary sound." in full
     assert "Auxiliary separations" not in first["messages"][0]["content"]
     assert first["extra_body"]["use_audio_in_video"] is True
     assert first["extra_body"]["chat_template_kwargs"] == {
@@ -392,7 +444,14 @@ def test_real_entry_without_facts_sends_one_av_two_audio_and_one_text(tmp_path, 
     assert first["reasoning_effort"] == "none"
 
     schema = first["response_format"]["json_schema"]["schema"]
-    assert "sound_description" in schema["$defs"]["MimoH3Semantics"]["required"]
+    assert "sound_description" not in schema["$defs"]["MimoH3Semantics"]["properties"]
+    assert {"overall_soundscape", "non_diegetic_music"} <= set(schema["$defs"]["MimoH3Semantics"]["required"])
+    assert set(schema["$defs"]["MimoH3Semantics"]["properties"]) == {
+        "subject_definitions", "summary", "style_opening", "shot1_caption",
+        "overall_soundscape", "non_diegetic_music", "visual_retention_analysis",
+    }
+    assert not hasattr(backend, "reconcile_sound_descriptions")
+    assert not hasattr(backend, "partition_sound_description")
     for forbidden in (
         "overall_soundscape_status",
         "complete_silence_verified",
@@ -402,37 +461,13 @@ def test_real_entry_without_facts_sends_one_av_two_audio_and_one_text(tmp_path, 
     assert (
         "audio_semantics" not in schema["$defs"]["MimoAudioObservation"]["properties"]
     )
-    assert set(second["messages"][1]) == {"role", "content"}
-    assert [m["role"] for m in second["messages"]] == ["system", "user"]
-    assert (
-        _annotation().h3_semantics.sound_description in second["messages"][1]["content"]
-        and "An audible auxiliary sound." in second["messages"][1]["content"]
-    )
-    assert second["temperature"] == 0.0 and second["max_completion_tokens"] == 1024
-    assert second["reasoning_effort"] == "none"
-    assert second["extra_body"] == {
-        "chat_template_kwargs": {"thinking": False, "enable_thinking": False}
-    }
-    assert (
-        second["response_format"]["json_schema"]["schema"]
-        == MimoSoundPartition.model_json_schema()
-    )
-    for marker in (
-        "video_url",
-        "audio_url",
-        "image_url",
-        "AUTHORITATIVE INPUT",
-        "Shot 1",
-        "segment_0001",
-    ):
-        assert marker not in json.dumps(second)
     assert all(path.read_bytes() == data for path, data in source_before.items())
 
     qa.build_audio_shadow_qa(**kwargs)
     data = json.loads((shadow / "qa/data.json").read_text())
     assert all(row["final_h3"]["status"] == "ready" for row in data["clips"])
     assert (
-        data["clips"][0]["reconcile"]["diagnostics"][0]["input_modality"]
+        data["clips"][0]["reconcile"]["diagnostics"][2]["input_modality"]
         == "target_video_with_embedded_audio"
     )
     final = data["clips"][0]["final_h3"]["text"]
@@ -449,8 +484,6 @@ def test_real_entry_without_facts_sends_one_av_two_audio_and_one_text(tmp_path, 
         "format",
         "schema",
         "articulation",
-        "text_json",
-        "text_api",
     ],
 )
 def test_failures_keep_raw_and_continue_without_retries(tmp_path, monkeypatch, failure):
@@ -474,51 +507,28 @@ def test_failures_keep_raw_and_continue_without_retries(tmp_path, monkeypatch, f
         shadow,
         [
             (first_raw, 8),
-            ("not JSON" if failure == "text_json" else PARTITION, None),
             (_raw(), 8),
-            (PARTITION, None),
             (_raw(), 8),
-            (PARTITION, None),
         ],
     )
-    if failure == "text_api":
-        original = completions.create
-
-        def create(**request):
-            if len(completions.requests) == 3:
-                completions.requests.append(request)
-                completions.responses.pop(0)
-                raise OSError("synthetic text timeout")
-            return original(**request)
-
-        monkeypatch.setattr(completions, "create", create)
     summary = _run(shadow, backend, stems, jobs)
     assert summary.failed_count == 1 and summary.ready_count == 2
-    assert summary.av_model_call_count == summary.text_model_call_count == 3
-    assert summary.model_call_count == len(completions.requests) == 12
+    assert summary.av_model_call_count == 3
+    assert summary.model_call_count == len(completions.requests) == 9
     records = _records(shadow)
     assert records[0]["status"] == "failed"
     assert records[0]["raw_responses"] == [first_raw]
     assert records[0]["music_stem_description"] and records[0]["sfx_stem_description"]
-    assert (
-        records[0]["sound_description"] == payload["h3_semantics"]["sound_description"]
-    )
-    if failure.startswith("text"):
-        assert (
-            records[0]["sound_partition"] is None
-            and records[0]["sound_partition_error"]
-        )
-    else:
-        assert records[0]["sound_partition"] == json.loads(PARTITION)
     qa.build_audio_shadow_qa(**kwargs)
     clip = json.loads((shadow / "qa/data.json").read_text())["clips"][0]
     assert (
         clip["direct_h3"]["shot1_caption"] == payload["h3_semantics"]["shot1_caption"]
     )
-    assert clip["reconcile"]["sound_description"]
+    assert clip["direct_h3"]["overall_soundscape"]
     assert clip["final_h3"]["status"] == "unavailable"
     page = (shadow / "qa/review.html").read_text()
-    assert "First AV raw response" in page and "Text-only sound partition" in page
+    assert "Final AV raw response" in page and "Final overall_soundscape" in page
+    assert "Text-only sound partition" not in page
 
 
 def test_av_http_failure_is_single_attempt_and_next_clip_runs(tmp_path, monkeypatch):
@@ -526,12 +536,12 @@ def test_av_http_failure_is_single_attempt_and_next_clip_runs(tmp_path, monkeypa
     backend, completions, stems, jobs = _backend(
         tmp_path,
         shadow,
-        [(_raw(), 8), (PARTITION, None)] * 2,
+        [(_raw(), 8)] * 2,
     )
     original = completions.create
 
     def create(**request):
-        if not completions.requests:
+        if len(completions.requests) == 2:
             completions.requests.append(request)
             raise OSError("synthetic AV timeout")
         return original(**request)
@@ -539,8 +549,8 @@ def test_av_http_failure_is_single_attempt_and_next_clip_runs(tmp_path, monkeypa
     monkeypatch.setattr(completions, "create", create)
     summary = _run(shadow, backend, stems, jobs)
     assert summary.ready_count == 2 and summary.failed_count == 1
-    assert summary.av_model_call_count == 3 and summary.text_model_call_count == 2
-    assert len(completions.requests) == 11
+    assert summary.av_model_call_count == 3
+    assert len(completions.requests) == 9
     assert summary.audio_model_call_count == 6
     assert _records(shadow)[0]["raw_responses"] == []
 
@@ -656,24 +666,15 @@ def test_media_preflight_failure_has_zero_model_calls(tmp_path, monkeypatch):
         ({"overall_soundscape": 7, "non_diegetic_music": "N/A"}, False),
     ],
 )
-def test_partition_checks_only_two_string_json_shape(tmp_path, payload, accepted):
-    completions = _Completions([(json.dumps(payload), None)])
-    backend = OpenAIMimo25Backend(
-        MimoBackendConfig(
-            api_key="fake",
-            transport="sglang",
-            media_resolver=MimoMediaResolver(mode="base64", media_root=tmp_path),
-        ),
-        client=SimpleNamespace(chat=SimpleNamespace(completions=completions)),
-    )
-    result = backend.reconcile_sound_descriptions("Only the source sound description.", None, None)
-    assert (result.partition is not None) == accepted
-    assert result.raw_response == json.dumps(payload)
-    assert len(completions.requests) == 1
+def test_final_sound_fields_check_only_string_shape(payload, accepted):
+    values = _annotation().h3_semantics.model_dump(mode="json")
+    values.update(payload)
     if accepted:
-        assert result.partition.model_dump() == payload
+        result = MimoH3Semantics.model_validate(values)
+        assert {key: getattr(result, key) for key in payload} == payload
     else:
-        assert result.error
+        with pytest.raises(ValueError):
+            MimoH3Semantics.model_validate(values)
 
 
 def test_optional_music_reference_does_not_invent_timing(tmp_path):

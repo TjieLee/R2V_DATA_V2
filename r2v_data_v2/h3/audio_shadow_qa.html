@@ -86,8 +86,8 @@ small{color:#626e73}a{color:#176c9a}#loading{padding:20px}
 <h2>Auxiliary SAM stem evidence</h2><p id="separation-status"></p>
 <div id="stems" class="stem-grid"></div>
 <details><summary>Separation provenance / alignment</summary><pre id="separation"></pre></details>
-<div class="evidence"><section><h2>Music-stem audio-only description</h2><pre id="music-stem-description"></pre></section><section><h2>SFX-stem audio-only description</h2><pre id="sfx-stem-description"></pre></section></div>
-<div class="evidence"><section><h2>Original AV sound description</h2><pre id="sound-description"></pre></section><section><h2>Text-only sound partition: final overall_soundscape / non_diegetic_music</h2><pre id="sound-partition"></pre></section></div>
+<div class="evidence"><section><h2>Music-stem candidate description</h2><pre id="music-stem-description"></pre></section><section><h2>SFX-stem candidate description</h2><pre id="sfx-stem-description"></pre></section></div>
+<div class="evidence"><section><h2>Final overall_soundscape</h2><pre id="final-soundscape"></pre></section><section><h2>Final non_diegetic_music</h2><pre id="final-music"></pre></section></div>
 <details id="reconcile"><summary>MiMo structured annotation / diagnostic evidence</summary><div id="reconcile-body"></div></details>
 </main>
 <script>
@@ -165,7 +165,7 @@ function render() {
     el.append(input, document.createTextNode(label)); $("labels").append(el);
   });
   $("notes").value = state.notes;
-  $("direct-text").textContent = clip.direct_h3 ? ["summary", "style_opening", "shot1_caption", "sound_description"].map(name => name + ":\n" + (clip.direct_h3[name] || "[unavailable]")).join("\n\n") : "[unavailable]";
+  $("direct-text").textContent = clip.direct_h3 ? ["summary", "style_opening", "shot1_caption", "overall_soundscape", "non_diegetic_music"].map(name => name + ":\n" + (clip.direct_h3[name] || "[unavailable]")).join("\n\n") : "[unavailable]";
   $("production-text").textContent = (clip.production_h3 || []).map(row => row.sample_id + "\n" + row.text).join("\n\n") || "[unavailable]";
   const final = clip.final_h3;
   $("materializer-version").textContent = final.materializer_version;
@@ -236,13 +236,8 @@ function render() {
     $(role + "-stem-description").textContent = (clip.reconcile[role + "_stem_description"] ?? "[unavailable]") +
       (clip.reconcile[role + "_stem_error"] ? "\nError: " + clip.reconcile[role + "_stem_error"] : "");
   }
-  $("sound-description").textContent = clip.reconcile.sound_description ?? "[unavailable]";
-  $("sound-partition").textContent = pretty({
-    result: clip.reconcile.sound_partition,
-    error: clip.reconcile.sound_partition_error,
-    raw_response: clip.reconcile.sound_partition_raw_response
-  });
-  $("reconcile-body").replaceChildren();
+  $("final-soundscape").textContent = clip.direct_h3?.overall_soundscape ?? "[unavailable]";
+  $("final-music").textContent = clip.direct_h3?.non_diegetic_music ?? "[unavailable]";
   const result = clip.reconcile;
   if (result.status !== "ready") {
     const failure = pre({status: result.status, failure_code: result.failure_code,
@@ -253,12 +248,12 @@ function render() {
     Object.entries(result.annotation).filter(([name]) => name !== "schema_version").forEach(([name, value]) =>
       $("reconcile-body").append(details(name, value, name === "av_grounding" || name === "audio_observation")));
   }
-  $("reconcile-body").append(details("First AV raw response", result.raw_responses || []));
+  $("reconcile-body").append(details("Final AV raw response", result.raw_responses || []));
   $("reconcile-body").append(details("Request diagnostics / provenance", {
     model_call_count: result.model_call_count, diagnostics: result.diagnostics,
     backend_provenance: result.backend_provenance, source_job_fingerprint: result.source_job_fingerprint,
     source_stem_record_fingerprint: result.source_stem_record_fingerprint,
-    av_model_call_count: result.av_model_call_count, audio_model_call_count: result.audio_model_call_count, text_model_call_count: result.text_model_call_count,
+    av_model_call_count: result.av_model_call_count, audio_model_call_count: result.audio_model_call_count,
     issues: result.failure_issues
   }));
   updateProgress(); $("main").hidden = false; $("loading").hidden = true;

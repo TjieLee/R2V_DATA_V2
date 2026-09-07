@@ -32,7 +32,6 @@ from r2v_data_v2.h3.mimo25_av_reconcile import (
 from r2v_data_v2.h3.mimo25_backend import (
     MIMO25_MATERIALIZER_VERSION,
     MimoAudioEvent,
-    MimoSoundPartition,
     MimoSubjectDefinitionDraft,
     protect_direct_dialogue,
 )
@@ -228,7 +227,7 @@ class MimoH3ShadowRecord(SchemaModel):
         "h3_mimo25_materializer_v17",
         "h3_mimo25_materializer_v18",
         "h3_mimo25_materializer_v19",
-        "h3_mimo25_materializer_v22",
+        "h3_mimo25_materializer_v23",
     ] = (
         MIMO25_MATERIALIZER_VERSION
     )
@@ -610,7 +609,6 @@ def _materialize_sample(
     *,
     conditioning_variant: ConditioningVariant | None = None,
     extra_audio_contract: RecaptionAudioContract | None = None,
-    sound_partition: MimoSoundPartition | None = None,
 ) -> tuple[list[FinalQwen3SpeechSegment], str, list[str]]:
     assert record.annotation is not None
     transcribed_ids = [item.segment_id for item in job.segments if item.asr_status == "transcribed"]
@@ -623,10 +621,6 @@ def _materialize_sample(
             "multi_speaker_segment_requires_turn_refinement", segment_id,
             "retain exact multi-speaker ASR; authoritative sub-turn refinement is required",
         ) for segment_id in blocked])
-    if sound_partition is None:
-        raise MimoH3MaterializationContractError([ValidationIssue(
-            "sound_partition_unavailable", "sound_partition", "no text partition was published",
-        )])
     projected_sample = project_mimo_h3_sample_references(
         sample,
         reference_images=job.reference_images,
@@ -695,8 +689,8 @@ def _materialize_sample(
             for item in record.annotation.h3_semantics.visual_retention_analysis
         ],
         detailed_description=f"{direct.style_opening}\n[Shot 1] {detailed}",
-        overall_soundscape=sound_partition.overall_soundscape,
-        non_diegetic_music=sound_partition.non_diegetic_music,
+        overall_soundscape=direct.overall_soundscape,
+        non_diegetic_music=direct.non_diegetic_music,
         audio_fact_audit=[
             AudioFactAuditItem(fact_id=item.fact_id, action="preserved")
             for item in facts.non_speech_events

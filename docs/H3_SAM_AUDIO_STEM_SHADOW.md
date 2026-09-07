@@ -13,7 +13,7 @@ All generated artifacts live under the legacy/default root:
   separation/
   diarization/
   asr/
-  mimo_reconcile_av_stemtext_sound_partition/
+  mimo_reconcile_stemtext_final_av/
   references/
 ```
 
@@ -24,7 +24,7 @@ or, for an explicit named pilot:
   separation/
   diarization/
   asr/
-  mimo_reconcile_av_stemtext_sound_partition/
+  mimo_reconcile_stemtext_final_av/
   references/
 ```
 
@@ -125,20 +125,19 @@ uncovered tail.
    worker internally. ASR remains authoritative for text and language and is
    never rewritten by MiMo.
 4. `run_h3_mimo25_stem_reconcile_shadow.py` reads separation, DiariZen and ASR
-   directly. First: one original video with embedded audio, existing reference
-   images and authoritative text facts, without independent audio/stem prose.
-   Second: music/SFX canonical stems each get the same role-blind audio-only
-   description request, concurrently with max two threads. Third: original AV
-   sound prose plus the two available auxiliary descriptions receive one text-only
-   reconciliation into `overall_soundscape` and `non_diegetic_music`.
-   Both auxiliary requests and text fusion use temperature 0, disabled thinking,
-   1024 tokens and strict string-only JSON schemas. No media/history/ICL enters
-   fusion; no ASR/reference/caption/ICL enters the audio-only requests.
-   Positive auxiliary evidence can recover weak sounds; negative auxiliary
-   evidence cannot establish original-AV absence. Unavailable is not silence.
-   There is no semantic QC, HTTP/SDK retry, fallback, AV recheck or repair.
-   Normal counts are AV=1, audio=2, text=1, total=4. Auxiliary failures retain
-   raw/error independently and do not fail an otherwise usable AV/fusion result.
+   directly. First, music/SFX canonical stems each receive the same v30
+   role-blind audio-only description request concurrently (max two threads).
+   Temperature 0, disabled thinking, 1024 tokens, no ASR/reference/ICL/caption.
+   After both finish/fail, one final original AV request receives candidate text,
+   one original video with embedded audio, reference images and existing
+   authoritative text/ICL. It has zero independent audio URLs.
+   Original AV arbitrates all candidate claims and directly writes final sound
+   fields. Score goes to `non_diegetic_music`; in-scene music is model-authored
+   in `shot1_caption`; unsupported candidates are discarded. Soundscape never
+   receives music/dialogue. There is no semantic checker or deterministic music
+   insertion. There is no text fusion, repair, retry, fallback or AV recheck.
+   Normal counts: audio=2, AV=1, total=3. Raw auxiliary errors are retained;
+   unavailable evidence does not mean silence or prevent the final AV attempt.
 5. `export_h3_sam_audio_stem_references.py` crops an explicitly requested
    reference from its canonical stem. It never selects an interval on a stem and
    then cuts bytes from the original mix. With `--primary-voice-root`, it reuses
@@ -165,20 +164,19 @@ Case order and the exact current separation root must match before MiMo calls.
 Existing `run_h3_mimo25_stem_facts_shadow.py`, facts and views remain historical
 inspection tools only; the new path neither calls nor requires them.
 
-First raw caption and sound description remain visible when grounding or format
-fails; readable sound text can still receive its one partition request. That
-does not authorize unsafe identity products. Multi-speaker exclusions remain.
-The materializer leaves dialogue text intact, allows consecutive same-speaker
-ASR turns in one generated vocal event, and only checks H3 syntax/allowed labels.
-Final audio sections come solely from the partition, with no invented timing.
-Prompt v30, annotation .19, backend .33, materializer v22 and reconcile .9/.11
-record/summary and policy v4 distinguish the new contract; authority v17 and official
-opening + Shot 1 ICL v2 are unchanged.
+Final raw caption and sound fields remain visible for parseable failed AV
+responses. Both auxiliary candidates/errors remain available regardless of AV
+success. Failed AV cannot authorize unsafe identity products. Multi-speaker
+exclusions remain. The materializer leaves dialogue intact and reads final
+sound fields directly from annotation; no timing is invented.
+Prompt v31, annotation .20, backend .34, materializer v23, reconcile .10/.12,
+and policy v5 distinguish the new contract. Authority v17 and official opening
++ Shot 1 ICL v2 are unchanged.
 
 No real inference was run for this patch. Fake clients establish request shape
 and bookkeeping only. Embedded audio tokens of zero/missing are warnings, never
-a reason to resend AV. Old raw-stem-combined outputs remain untouched.
-Performance and sound quality require the server 833 smoke and human review.
+a reason to resend AV. Old v29/v30 outputs remain untouched. The 833 server
+smoke and human review are still required; no sound-quality improvement is claimed.
 
 Every optional `--output-root` is constrained to the selected versioned shadow
 root; it cannot target current `audio/`, `diarization/`, `asr/`, `h3/`, MiMo
@@ -195,7 +193,7 @@ For an independent pilot, pass the same `--shadow-run-id random10-v1` to every
 stage. Its root is
 `$AUDIO_PRODUCTION_ROOT/sam_audio_stem_shadow_v1/runs/random10-v1/`, containing
 `separation/`, `diarization/`, `asr/`,
-`mimo_reconcile_av_stemtext_sound_partition/`, and optional `references/`.
+`mimo_reconcile_stemtext_final_av/`, and optional `references/`.
 Old `mimo_stem_facts/` and `mimo_reconcile/` outputs are left untouched.
 Run IDs must match `[A-Za-z0-9][A-Za-z0-9._-]{0,63}` exactly. Invalid IDs and
 symlink redirects are rejected, not normalized. Custom `--output-root` values

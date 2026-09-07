@@ -28,12 +28,12 @@ from r2v_data_v2.structured_output import (
 
 MIMO25_MODEL = "mimo-v2.5"
 MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
-MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v30"
+MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v31"
 MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v17"
-MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.19"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.33"
+MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.20"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.34"
 MIMO25_ICL_VERSION = "h3_official_ref2va_detailed_shot1_v2"
-MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v22"
+MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v23"
 MIMO25_CANONICAL_ABSENT_SOUNDSCAPE = (
     "No distinct environmental, mechanical, physical, or non-verbal human "
     "sounds are clearly discernible."
@@ -812,7 +812,8 @@ class MimoH3Semantics(SchemaModel):
     summary: StrictStr
     style_opening: StrictStr = Field(min_length=1)
     shot1_caption: StrictStr = Field(min_length=1)
-    sound_description: StrictStr = Field(min_length=1)
+    overall_soundscape: StrictStr
+    non_diegetic_music: StrictStr
     visual_retention_analysis: list[MimoVisualRetentionDraft] = Field(min_length=1)
 
     @model_validator(mode="after")
@@ -822,7 +823,6 @@ class MimoH3Semantics(SchemaModel):
             self.summary,
             self.style_opening,
             self.shot1_caption,
-            self.sound_description,
             *(item.description for item in self.visual_retention_analysis),
         )
         if any(not value.strip() for value in values):
@@ -869,7 +869,7 @@ MimoH3Draft = MimoH3Semantics
 
 
 class MimoAVAnnotationDraft(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_av_annotation.19"] = MIMO25_SCHEMA_VERSION
+    schema_version: Literal["r2v.h3.mimo25_av_annotation.20"] = MIMO25_SCHEMA_VERSION
     visual_observation: MimoVisualObservation
     audio_observation: MimoAudioObservation
     av_grounding: MimoAVGrounding
@@ -890,7 +890,7 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.33"] = MIMO25_BACKEND_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.34"] = MIMO25_BACKEND_VERSION
     backend: Literal[
         "xiaomi_openai_compatible", "sglang_openai_compatible"
     ]
@@ -908,13 +908,13 @@ class MimoBackendProvenance(SchemaModel):
     media_mode: Literal["base64", "http"]
     media_root: str
     media_base_url: str | None = None
-    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v30"] = (
+    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v31"] = (
         MIMO25_PROMPT_VERSION
     )
     policy_version: Literal["h3_mimo25_av_authority_contract_v17"] = (
         MIMO25_POLICY_VERSION
     )
-    annotation_schema_version: Literal["r2v.h3.mimo25_av_annotation.19"] = (
+    annotation_schema_version: Literal["r2v.h3.mimo25_av_annotation.20"] = (
         MIMO25_SCHEMA_VERSION
     )
     materializer_version: Literal[
@@ -930,7 +930,7 @@ class MimoBackendProvenance(SchemaModel):
         "h3_mimo25_materializer_v15",
         "h3_mimo25_materializer_v16",
         "h3_mimo25_materializer_v17",
-        "h3_mimo25_materializer_v22",
+        "h3_mimo25_materializer_v23",
     ] = (
         MIMO25_MATERIALIZER_VERSION
     )
@@ -976,7 +976,6 @@ class MimoCompletionDiagnostic(SchemaModel):
         "full_av_recheck_embedded_audio",
         "full_av_recheck_with_canonical_audio",
         "target_av_with_auxiliary_raw_audio",
-        "sound_description_text_only",
         "auxiliary_audio_only",
     ]
     finish_reason: str | None = None
@@ -1021,61 +1020,6 @@ This is a source-separation output and may contain leakage or artifacts.
 Describe what is actually audible. Do not infer content from the file name or expected role.
 Do not classify the track by its expected category. Do not decide diegetic versus non-diegetic.
 Preserve uncertainty. Do not add visual context."""
-
-
-class MimoSoundPartition(SchemaModel):
-    overall_soundscape: StrictStr
-    non_diegetic_music: StrictStr
-
-
-@dataclass(frozen=True)
-class MimoSoundPartitionCall:
-    diagnostic: MimoCompletionDiagnostic
-    partition: MimoSoundPartition | None = None
-    raw_response: str | None = None
-    error: str | None = None
-
-
-SOUND_PARTITION_PROMPT = """You are given text descriptions of the same target clip from:
-- the original audiovisual observation;
-- a source-separated auxiliary track A;
-- a source-separated auxiliary track B.
-
-The original AV description is the primary description.
-Separation outputs may contain leakage or artifacts.
-SOURCE_UNAVAILABLE means evidence was unavailable, not silence.
-
-IMPORTANT EVIDENCE RULE:
-A clearly stated positive audible event in an auxiliary description may recover a weak sound missed by the original-AV description.
-A negative or absence statement from an auxiliary description must NOT prove that the sound is absent from the original AV.
-The source labels are provenance only, not semantic truth.
-
-Produce exactly two MiniMax-H3 fields.
-
-overall_soundscape:
-Keep only non-musical ambience, environmental sounds, physical sounds, mechanical/electronic sounds, and non-speech human sounds.
-REMOVE ALL statements about:
-- spoken speech
-- dialogue
-- narrator or voice speaking
-- vocal pitch/tone/delivery
-- singing
-- music
-- score
-- soundtrack
-
-non_diegetic_music:
-Keep only explicitly supported audience-facing background music/score.
-A positive description of clearly audible music from an auxiliary separation may recover music missed in the original AV.
-Do not create music merely because an auxiliary source came from a pipeline track named "music".
-Do not turn clearly in-scene/diegetic music into background score unless the supplied text supports audience-facing score.
-
-Use only facts present in the supplied descriptions.
-Do not invent an event, instrument, source, mood, scene, timing, or acoustic property.
-If no eligible content remains for a field, output "N/A".
-
-Return JSON only:
-{"overall_soundscape": "...", "non_diegetic_music": "..."}"""
 
 
 class MimoBackendFailure(ValueError):
@@ -1257,12 +1201,21 @@ EXISTING REFERENCE FIELDS
 - Write natural visual Subject definitions, concise summary, and retention rows. Pipeline code appends exact Picture provenance; omit Picture labels from definition descriptions. Entity Subjects describe reusable entities. Attribute Subjects describe only their attribute, not a second person/object or their owner: hair shape/color/texture, facial features, eyewear, garment, or accessory as applicable.
 - Attribute retention is judged on its owning entity, not independent existence. Allowed markers: fully_preserved, partially_preserved, weak_reference; attribute_transfer is forbidden.
 
+AUXILIARY AUDIO EVIDENCE
+- Auxiliary descriptions are candidate recall evidence from source-separated tracks of the SAME target clip, NOT factual truth. SOURCE_UNAVAILABLE means no candidate evidence, never silence.
+- Reinspect the ORIGINAL TARGET AV before using any claim. Positive auxiliary evidence may direct attention to weak sounds; negative/absence claims never prove absence in the original AV. Separation leakage/artifacts are possible.
+- ORIGINAL TARGET AV is final factual authority. Correct or discard speculative source, setting, mood, cause, spatial environment, instrument, or acoustic interpretations unless the original AV supports them. A hum/rumble alone does not establish an engine, moving vehicle or large empty room.
+- Music has three outcomes: supported audience-facing score -> non_diegetic_music; supported diegetic/in-scene music -> shot1_caption at its observed position, never overall_soundscape; unsupported/leaked/artifact candidate -> discard.
+- An unseen source does not prove non-diegetic music. If the distinction is uncertain, use conservative audible-music prose in shot1_caption and "N/A" for non_diegetic_music. Never move music to overall_soundscape merely because it is not score.
+- Supported non-musical ambience, room tone, footsteps, handling, mechanical/environmental sounds and human non-speech may enter overall_soundscape. Strip unsupported source/context guesses; music/speech leakage cannot enter that field.
+
 PRIMARY H3 WRITING TASK
 - This pilot is exactly one shot. Write style_opening and shot1_caption; the pipeline inserts [Shot 1]. Never output [Shot N], shot timing, or placeholders.
 - style_opening: one concise sentence about global visual/cinematographic style, camera language, and lighting only. Do not summarize people, clothing, scene contents, Subjects, actions, chronology, dialogue, or audio.
 - shot1_caption: complete natural English audiovisual prose in playback order. Integrate visible setup, actions, dialogue, and reactions where they occur; do not append all dialogue at the end.
 - Number stable (Sx) by final groups' first transcribed appearance. Every generated vocal event needs a valid (Sx) in its natural lead-in before <d>. Referenced visible speakers use <Subject N> (Sx); unbound sources use a natural semantic source plus (Sx). No fixed says clause or immediate adjacency is required.
-- sound_description: Describe the complete audible content of the original target AV in natural English, including foreground vocal activity, background sounds, music, and meaningful changes when audible. Describe only what is actually supported by the target AV. Do not infer sounds from visible objects or scene type. Preserve uncertainty about unidentified sources. Do not organize the result into H3 soundscape/music categories. Do not repeat dialogue transcripts here.
+- overall_soundscape: Write only non-musical, non-dialogue audible ambience/SFX supported by the ORIGINAL TARGET AV. Auxiliary descriptions may help you notice weak events, but the original AV decides whether they are real and how specifically they can be described. Exclude spoken dialogue, singing, and all music. Use "N/A" if no eligible content remains.
+- non_diegetic_music: Write only audience-facing background music/score supported by the ORIGINAL TARGET AV. Use the music-separation candidate only as a recall aid. If audible music is diegetic/in-scene, describe it naturally at its observed chronological position in shot1_caption instead and output "N/A" here. If a candidate is unsupported or separation leakage, discard it.
 - The official ICL is a detailed-description prose-style subset, not a response-schema demonstration. Follow the actual supplied schema and official six-section Ref2VA semantics."""
 
 
@@ -1311,7 +1264,6 @@ def _completion_diagnostic(
         "full_av_recheck_embedded_audio",
         "full_av_recheck_with_canonical_audio",
         "target_av_with_auxiliary_raw_audio",
-        "sound_description_text_only",
         "auxiliary_audio_only",
     ],
     http_attempt_count: int,
@@ -2626,7 +2578,10 @@ class OpenAIMimo25Backend:
             )
         }
 
-    def _prompt(self, job: MimoBackendJob) -> str:
+    def _prompt(
+        self, job: MimoBackendJob, *,
+        auxiliary_audio_evidence: dict[str, str] | None = None,
+    ) -> str:
         schema = (
             "Return one JSON object matching this schema, with no markdown or extra fields:\n"
             + _compact_json(MimoAVAnnotationDraft.model_json_schema())
@@ -2634,15 +2589,24 @@ class OpenAIMimo25Backend:
             if self.config.transport == "xiaomi"
             else "Return one JSON object constrained by the supplied response_format.\n"
         )
-        return schema + "AUTHORITATIVE INPUT:\n" + _compact_json(
+        prompt = schema + "AUTHORITATIVE INPUT:\n" + _compact_json(
             self.build_compact_task_contract(job)
         )
+        if auxiliary_audio_evidence is not None:
+            prompt += "\nAUXILIARY AUDIO CANDIDATES (NOT FACTUAL TRUTH):\n" + _compact_json(
+                auxiliary_audio_evidence
+            )
+        return prompt
 
     def _request(
-        self, job: MimoBackendJob,
+        self, job: MimoBackendJob, *,
+        auxiliary_audio_evidence: dict[str, str] | None = None,
     ) -> tuple[str, MimoCompletionDiagnostic, int]:
         content = self._media_content(job)
-        content.append({"type": "text", "text": self._prompt(job)})
+        content.append({
+            "type": "text",
+            "text": self._prompt(job, auxiliary_audio_evidence=auxiliary_audio_evidence),
+        })
         modality = self._input_modality
         payload: dict[str, object] = {
             "model": self.config.model,
@@ -2760,83 +2724,6 @@ class OpenAIMimo25Backend:
                 diagnostic=diagnostic, error=diagnostic.request_error, model_call_count=calls,
             )
 
-    def reconcile_sound_descriptions(
-        self,
-        original_sound_description: str,
-        music_stem_description: str | None,
-        sfx_stem_description: str | None,
-    ) -> MimoSoundPartitionCall:
-        sources = {
-            "ORIGINAL_AV_DESCRIPTION": original_sound_description,
-            "AUXILIARY_TRACK_FROM_MUSIC_SEPARATOR": music_stem_description,
-            "AUXILIARY_TRACK_FROM_SFX_SEPARATOR": sfx_stem_description,
-        }
-        source_text = "\n\n".join(
-            f"{label}:\n{text if text is not None else 'SOURCE_UNAVAILABLE'}"
-            for label, text in sources.items()
-        )
-        payload: dict[str, object] = {
-            "model": self.config.model,
-            "messages": [
-                {"role": "system", "content": SOUND_PARTITION_PROMPT},
-                {"role": "user", "content": source_text},
-            ],
-            "response_format": {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "MimoSoundPartition",
-                    "schema": MimoSoundPartition.model_json_schema(),
-                    "strict": True,
-                },
-            },
-            "temperature": 0.0,
-            "max_completion_tokens": 1024,
-            "stream": False,
-        }
-        if self.config.transport == "sglang":
-            payload["reasoning_effort"] = "none"
-            payload["extra_body"] = {
-                "chat_template_kwargs": {"thinking": False, "enable_thinking": False}
-            }
-        else:
-            payload["extra_body"] = {"thinking": {"type": "disabled"}}
-        raw = None
-        diagnostic = MimoCompletionDiagnostic(
-            input_modality="sound_description_text_only",
-            usage=MimoUsage(),
-            http_attempt_count=1,
-        )
-        try:
-            completion, _, _ = self._call(payload)
-            choice = _value(completion, "choices")[0]
-            raw = _value(_value(choice, "message"), "content")
-            diagnostic = _completion_diagnostic(
-                completion,
-                choice,
-                modality="sound_description_text_only",
-                http_attempt_count=1,
-                thinking="disabled",
-            )
-            partition, issues = parse_structured_json_issues(raw, MimoSoundPartition)
-            if issues:
-                raise ValueError("; ".join(item.message for item in issues))
-            return MimoSoundPartitionCall(
-                partition=partition, raw_response=raw, diagnostic=diagnostic
-            )
-        except (
-            ValueError,
-            TypeError,
-            IndexError,
-            KeyError,
-            _MimoHTTPAttemptsExhausted,
-        ) as exc:
-            diagnostic.request_error = f"{type(exc).__name__}: {exc}"
-            return MimoSoundPartitionCall(
-                raw_response=raw if isinstance(raw, str) else None,
-                diagnostic=diagnostic,
-                error=diagnostic.request_error,
-            )
-
     def reconcile(
         self,
         job: MimoBackendJob,
@@ -2845,10 +2732,13 @@ class OpenAIMimo25Backend:
         transcribed_segment_ids: list[str],
         allowed_entity_ids: set[str],
         allowed_reference_labels: set[str],
+        auxiliary_audio_evidence: dict[str, str] | None = None,
     ) -> MimoBackendResult:
         self._av_request_started = False
         try:
-            raw, diagnostic, _ = self._request(job)
+            raw, diagnostic, _ = self._request(
+                job, auxiliary_audio_evidence=auxiliary_audio_evidence,
+            )
         except Exception as exc:
             reason = f"{type(exc).__name__}: {exc}"
             diagnostics = (
@@ -2993,8 +2883,6 @@ __all__ = [
     "MimoH3Semantics",
     "MimoMediaResolver",
     "MimoSegmentDecision",
-    "MimoSoundPartition",
-    "MimoSoundPartitionCall",
     "MimoSpeakerVoiceProfile",
     "MimoSubjectDefinitionDraft",
     "MimoTransport",

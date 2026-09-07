@@ -245,7 +245,8 @@ def _annotation(
                 "summary": "A person speaks while remaining visible.",
                 "style_opening": "The live-action video shows a seated person.",
                 "shot1_caption": "<Subject 1> (S1) turns and asks gently, <d>[Chinese] 错误文本</d> while lowering a hand. A clink sounds nearby.",
-                "sound_description": "A quiet room tone and a short clink accompany the speaking voice.",
+                "overall_soundscape": "A quiet room tone and a clink.",
+                "non_diegetic_music": "N/A",
                 "visual_retention_analysis": [
                     _retention(
                         "<Subject 1>",

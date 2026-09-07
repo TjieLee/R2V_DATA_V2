@@ -21,8 +21,6 @@ from r2v_data_v2.h3.mimo25_backend import (
     MimoBackendFailure,
     MimoCompletionDiagnostic,
     MimoMediaResolver,
-    MimoSoundPartition,
-    MimoSoundPartitionCall,
     MimoUsage,
 )
 from r2v_data_v2.h3.mimo25_stem_shadow import (
@@ -56,15 +54,6 @@ class _Reconcile:
             description="A quiet sound.", raw_response='{"description":"A quiet sound."}',
             diagnostic=MimoCompletionDiagnostic(
                 input_modality="auxiliary_audio_only", usage=MimoUsage(), http_attempt_count=1,
-            ),
-        )
-
-    def reconcile_sound_descriptions(self, original_sound_description, music_stem_description, sfx_stem_description):
-        return MimoSoundPartitionCall(
-            partition=MimoSoundPartition(overall_soundscape="A room tone and a short clink.", non_diegetic_music="N/A"),
-            raw_response='{"overall_soundscape":"A room tone and a short clink.","non_diegetic_music":"N/A"}',
-            diagnostic=MimoCompletionDiagnostic(
-                input_modality="sound_description_text_only", usage=MimoUsage(), http_attempt_count=1,
             ),
         )
 
@@ -187,13 +176,13 @@ def test_builder_ready_failed_order_media_and_sources_unchanged(tmp_path, monkey
     assert result["output_root"] == str(output)
     data = json.loads((output / "data.json").read_text())
     reconcile_summary = json.loads((shadow / MIMO25_STEM_RECONCILE_STAGE / "summary.json").read_text())
-    assert reconcile_summary["schema_version"] == "r2v.h3.mimo25_stem_reconcile_summary.11"
+    assert reconcile_summary["schema_version"] == "r2v.h3.mimo25_stem_reconcile_summary.12"
     assert reconcile_summary["current_mimo_versions_modified"] is True
     assert data["clip_uids"] == ["clip-z", "clip-a", "clip-m"]
     assert [clip["reconcile"]["status"] for clip in data["clips"]] == ["ready", "failed", "ready"]
     failed = data["clips"][1]["reconcile"]
     assert failed["failure_code"] == "synthetic_failed"
-    assert failed["model_call_count"] == 4
+    assert failed["model_call_count"] == 3
     assert data["clips"][1]["direct_h3"]["style_opening"]
     assert data["clips"][1]["direct_h3"]["shot1_caption"]
     assert data["clips"][0]["reconcile"]["annotation"]["audio_observation"]
@@ -201,8 +190,8 @@ def test_builder_ready_failed_order_media_and_sources_unchanged(tmp_path, monkey
     for clip, call in zip((data["clips"][0], data["clips"][2]), materialized, strict=True):
         final = clip["final_h3"]
         assert final["status"] == "ready"
-        assert final["materializer_version"] == "h3_mimo25_materializer_v22"
-        assert final["text"] == call[3] == original(*call[:3], sound_partition=MimoSoundPartition(**clip["reconcile"]["sound_partition"]))[1]
+        assert final["materializer_version"] == "h3_mimo25_materializer_v23"
+        assert final["text"] == call[3] == original(*call[:3])[1]
         assert final["variants"][0]["text"] == final["text"]
         assert "[[" not in final["text"]
         assert clip["direct_h3"]["shot1_caption"]
@@ -233,8 +222,8 @@ def test_builder_ready_failed_order_media_and_sources_unchanged(tmp_path, monkey
     assert "frozen_production_evidence" in data["clips"][0]["speaker_binding"]
     assert "stem_segment_evidence" in data["clips"][0]["speaker_binding"]
     assert "stem_facts" not in data["clips"][0]
-    assert data["clips"][1]["reconcile"]["sound_description"]
-    assert data["clips"][1]["reconcile"]["sound_partition"]
+    assert data["clips"][1]["direct_h3"]["overall_soundscape"]
+    assert data["clips"][1]["direct_h3"]["non_diegetic_music"]
     assert not (shadow / "mimo_stem_facts").exists()
     first_data = (output / "data.json").read_bytes()
     qa.build_audio_shadow_qa(**kwargs, overwrite=True)
@@ -544,7 +533,7 @@ const {chromium} = require(process.argv[2]);
     assert.strictEqual(await page.locator("#final-text").textContent(), expectedFinal);
     assert(await page.locator("#final-text").isVisible());
     assert.strictEqual(await page.locator("#final-h3").evaluate(el => el.closest("details")), null);
-    assert.strictEqual(await page.locator("#materializer-version").textContent(), "h3_mimo25_materializer_v22");
+    assert.strictEqual(await page.locator("#materializer-version").textContent(), "h3_mimo25_materializer_v23");
     await page.locator("#final-variant").selectOption("1");
     assert.strictEqual(await page.locator("#final-text").textContent(), dataset.clips[0].final_h3.variants[1].text);
     await page.locator("#final-variant").selectOption("0");

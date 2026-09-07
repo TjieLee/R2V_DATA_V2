@@ -43,7 +43,7 @@ sam_audio_stem_shadow_v1/runs/<shadow-run-id>/
   separation/
   diarization/
   asr/
-  mimo_reconcile_av_stemtext_sound_partition/
+  mimo_reconcile_stemtext_final_av/
   references/
 ```
 
@@ -241,7 +241,7 @@ PYTHONPATH="$SAM_AUDIO_RUNTIME_PYTHONPATH" \
   --allow-unverified
 ```
 
-### 4. One original AV, two audio-only descriptions, then text fusion
+### 4. Two audio-only candidates, then one final original AV
 
 After separation, DiariZen and ASR, run this entry directly. Do not run
 `run_h3_mimo25_stem_facts_shadow.py`; neither `mimo_stem_facts/` nor three
@@ -257,42 +257,46 @@ stem-video proxies are inputs.
   --allow-unverified
 ```
 
-The first request sends exactly one original target video with embedded audio
-and the unchanged reference images, authoritative text facts, and official
-opening + Shot 1 ICL. It sends no independent audio or stem prose. Defaults
-remain `--thinking disabled --icl official_ref2va_v1`, temperature 0.0,
-and `use_audio_in_video=true`. Embedded audio token counts of zero or missing
-are diagnostic warnings only; they never cause a video resend or fallback.
+Two audio-only requests first run concurrently (max two threads). Each receives
+one canonical SAM audio URL and the unchanged v30 role-blind prompt, no video,
+image, ASR, references, caption or ICL. Hashes are checked against separation
+provenance. Temperature 0, disabled thinking, 1024 tokens and one-string JSON
+remain unchanged. Results/errors are stored by music/SFX pipeline role.
 
-After AV completes, two audio-only requests run concurrently (max two threads).
-Each receives just one canonical SAM audio URL with the same role-blind prompt,
-no video, image, ASR, references, caption or ICL. File hashes are checked against
-separation provenance. Temperature 0, disabled thinking, 1024 completion tokens
-and a one-string `description` schema apply. These requests do not send
-`use_audio_in_video`. Results/errors are stored by music/SFX pipeline role,
-not completion order. A failed auxiliary does not erase the other result or AV.
+Only after both requests finish or fail, one final AV request receives the
+original target video with embedded audio, existing reference images, unchanged
+authoritative text facts and official opening + Shot 1 ICL, plus:
+`music_separator_candidate` and `sfx_separator_candidate`. Missing evidence is
+`SOURCE_UNAVAILABLE`, never silence. Generated candidates are ephemeral request
+text, not fields added to `MimoClipJob`. No independent audio enters final AV.
 
-A final text-only request receives original AV sound prose plus available
-auxiliary descriptions. Positive auxiliary evidence can recover a weak audible
-sound missed by AV; auxiliary absence cannot establish absence in the original.
-The prompt removes speech/singing/music from `overall_soundscape` and retains
-only supported audience-facing score in `non_diegetic_music`. Missing auxiliary
-evidence is `SOURCE_UNAVAILABLE`, not silence. Only JSON/two-string shape is
-validated; no content checker is added. No original sound description means no
-text fusion call, but auxiliary descriptions remain available for QA.
+Original AV is final factual authority. Auxiliary candidates may direct attention
+to weak sounds but cannot establish a source, mood, setting or absence. MiMo
+must correct/discard unsupported interpretations. Supported audience-facing
+music goes to `non_diegetic_music`; in-scene music is authored naturally in
+`shot1_caption`, never soundscape. Unsupported music is discarded. Uncertain
+music context must not be guessed as BGM. Soundscape contains only supported
+non-musical, non-dialogue ambience/SFX, with no programmatic semantic checker.
 
-Normal per-clip counts: AV=1, audio=2, text=1, total=4. Each request has one
-attempt, SDK retries disabled; there is no repair, fallback or AV recheck.
-Failures preserve raw/error/usage diagnostics and do not trigger another call.
-Text failure retains AV and all sound descriptions; existing final H3 gates
-remain unchanged. Dialogue, grounding, multiple-speaker exclusion and six-section
-Ref2VA materialization are unchanged.
+Final AV directly produces `overall_soundscape` and `non_diegetic_music`
+(`N/A` for no eligible content). There is no intermediate `sound_description`
+or text fusion. The materializer reads these annotation fields directly.
+Caption, grounding, relaxed dialogue, multi-speaker exclusion and six-section
+Ref2VA formatting remain unchanged.
 
-Versions: prompt v30, annotation .19, backend .33, materializer v22, authority
-v17, ICL v2; reconcile record .9, summary .11, policy v4. New output:
-`mimo_reconcile_av_stemtext_sound_partition/`. The old
-`mimo_reconcile_av_rawstems_sound_partition/` and `mimo_v29_oneclip_smoke/`
-are preserved, not migrated.
+Normal per-clip counts: audio=2, AV=1, total=3. One attempt per request, no
+SDK retry, repair, fallback, AV recheck or resend. Auxiliary errors do not
+automatically fail a clip; final AV still runs. Final AV failures retain raw
+annotation/error and both candidates, without a fourth call. Zero/missing
+embedded audio tokens remain warnings only. AV defaults still include
+`--thinking disabled --icl official_ref2va_v1`, `use_audio_in_video=true`,
+temperature 0.0 and 32768 completion tokens.
+
+Versions: prompt v31, annotation .20, backend .34, materializer v23, authority
+v17, ICL v2; reconcile record .10, summary .12, policy v5. New output:
+`mimo_reconcile_stemtext_final_av/`. Old
+`mimo_reconcile_av_stemtext_sound_partition/`, `mimo_v29_oneclip_smoke/`,
+and `mimo_v30_833_oneclip_smoke/` are preserved, not migrated.
 
 For a fresh 833 single-clip smoke, set `CASE_833_MANIFEST` to an existing manifest
 containing only `8331da9bfe08e7f67e5e398d`. It must be an ordered subset of the
@@ -307,7 +311,7 @@ existing named separation inventory. This reuses SAM/DiariZen/ASR without reruns
   --sam-route music_first --allow-unverified \
   --model mimo-v2.5 --base-url http://127.0.0.1:8092/v1 \
   --media-root /mnt/workspace --max-completion-tokens 32768 \
-  --output-root "$AUDIO_PRODUCTION_ROOT/sam_audio_stem_shadow_v1/runs/random10-v1/mimo_v30_833_oneclip_smoke"
+  --output-root "$AUDIO_PRODUCTION_ROOT/sam_audio_stem_shadow_v1/runs/random10-v1/mimo_v31_833_oneclip_smoke"
 ```
 
 No `--overwrite` is used. This patch has fake-client coverage only; sound
@@ -334,7 +338,7 @@ find "$SHADOW_ROOT" -maxdepth 2 -type f | sort
 cat "$SHADOW_ROOT/separation/summary.json"
 cat "$SHADOW_ROOT/diarization/stem_provenance.json"
 cat "$SHADOW_ROOT/asr/summary.json"
-cat "$SHADOW_ROOT/mimo_reconcile_av_stemtext_sound_partition/summary.json"
+cat "$SHADOW_ROOT/mimo_reconcile_stemtext_final_av/summary.json"
 cat "$SHADOW_ROOT/references/references.jsonl"
 ```
 
@@ -349,7 +353,7 @@ Inspect label quality without running any model or changing any source stage.
 The explicit output below is outside production inputs and preserves old QA pages:
 
 ```bash
-export QA_ROOT="$AUDIO_PRODUCTION_ROOT/../h3-audio-qa/$SHADOW_RUN_ID-av-stemtext-sound-partition"
+export QA_ROOT="$AUDIO_PRODUCTION_ROOT/../h3-audio-qa/$SHADOW_RUN_ID-stemtext-final-av"
 "$R2V_PYTHON" tools/build_h3_audio_shadow_qa.py \
   --visual-production-root "$VISUAL_PRODUCTION_ROOT" \
   --visual-runs-root "$VISUAL_RUNS_ROOT" \
@@ -367,12 +371,12 @@ whole production tree. No POST endpoint or model environment is involved.
 The page shows original target AV, frozen references, unchanged production
 comparison text, shadow DiariZen/ASR, and optional stem audio players.
 It reads the new reconcile directory without requiring stem-facts artifacts.
-First raw caption and sound description remain visible for failed records;
-music/SFX audio-only descriptions and errors, final text result/raw/error, and
-AV/audio/text call counts are shown separately.
+Final raw caption and AV sound fields remain visible for parseable failed records;
+music/SFX candidates and errors, final AV sound fields/raw/error, and
+AV/audio call counts are shown separately.
 
-The exact final six-section prompt uses the existing materializer v22 path
-when AV validation and partitioning permit it. Each source conditioning variant
+The exact final six-section prompt uses the existing six-section materializer v23 path
+when AV validation permits it. Each source conditioning variant
 remains separate. Multi-speaker attribution still blocks identity-specific
 materialization, and blocked variants expose issues instead of best-effort text.
 No voice recovery, media generation, H3 publication, or model call runs in QA.

@@ -34,8 +34,6 @@ from r2v_data_v2.h3.mimo25_backend import (
     MimoBackendResult,
     MimoCompletionDiagnostic,
     MimoMediaResolver,
-    MimoSoundPartition,
-    MimoSoundPartitionCall,
     MimoUsage,
     OpenAIMimo25Backend,
 )
@@ -66,10 +64,10 @@ MIMO25_STEM_FACTS_VERSION = "r2v.h3.mimo25_stem_facts.3"
 MIMO25_STEM_FACTS_SUMMARY_VERSION = "r2v.h3.mimo25_stem_facts_summary.4"
 MIMO25_STEM_FACT_RAW_VERSION = "r2v.h3.mimo25_stem_fact_raw.1"
 MIMO25_STEM_FACT_PROMPT_VERSION = "h3_mimo25_stem_fact_prompt_v1"
-MIMO25_STEM_RECONCILE_VERSION = "r2v.h3.mimo25_stem_reconcile.9"
-MIMO25_STEM_RECONCILE_SUMMARY_VERSION = "r2v.h3.mimo25_stem_reconcile_summary.11"
-MIMO25_STEM_RECONCILE_POLICY_VERSION = "h3_mimo25_stem_reconcile_v4"
-MIMO25_STEM_RECONCILE_STAGE = "mimo_reconcile_av_stemtext_sound_partition"
+MIMO25_STEM_RECONCILE_VERSION = "r2v.h3.mimo25_stem_reconcile.10"
+MIMO25_STEM_RECONCILE_SUMMARY_VERSION = "r2v.h3.mimo25_stem_reconcile_summary.12"
+MIMO25_STEM_RECONCILE_POLICY_VERSION = "h3_mimo25_stem_reconcile_v5"
+MIMO25_STEM_RECONCILE_STAGE = "mimo_reconcile_stemtext_final_av"
 STEM_VIEW_VERSION = "r2v.h3.sam_audio_stem_view.1"
 STEM_RECONCILE_UPSTREAM_FAILURE_VERSION = (
     "r2v.h3.mimo25_stem_reconcile_upstream_failure.1"
@@ -1616,13 +1614,13 @@ def build_stem_reconcile_jobs(
 
 
 class MimoStemReconcileRecord(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_stem_reconcile.9"] = (
+    schema_version: Literal["r2v.h3.mimo25_stem_reconcile.10"] = (
         MIMO25_STEM_RECONCILE_VERSION
     )
     clip_uid: str
     source_job_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_stem_record_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
-    policy_version: Literal["h3_mimo25_stem_reconcile_v4"] = (
+    policy_version: Literal["h3_mimo25_stem_reconcile_v5"] = (
         MIMO25_STEM_RECONCILE_POLICY_VERSION
     )
     backend_provenance: MimoBackendProvenance
@@ -1633,20 +1631,15 @@ class MimoStemReconcileRecord(SchemaModel):
     failure_issues: list[ValidationIssue]
     raw_responses: list[StrictStr]
     diagnostics: list[MimoCompletionDiagnostic]
-    sound_description: StrictStr | None
     music_stem_description: StrictStr | None
     music_stem_raw_response: StrictStr | None
     music_stem_error: str | None
     sfx_stem_description: StrictStr | None
     sfx_stem_raw_response: StrictStr | None
     sfx_stem_error: str | None
-    sound_partition: MimoSoundPartition | None
-    sound_partition_raw_response: StrictStr | None
-    sound_partition_error: str | None
     av_model_call_count: int = Field(ge=0, le=1)
     audio_model_call_count: int = Field(ge=0, le=2)
-    text_model_call_count: int = Field(ge=0, le=1)
-    model_call_count: int = Field(ge=0, le=4)
+    model_call_count: int = Field(ge=0, le=3)
     record_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
 
     @model_validator(mode="after")
@@ -1657,19 +1650,12 @@ class MimoStemReconcileRecord(SchemaModel):
                 or self.failure_code is not None
                 or self.failure_reason is not None
                 or self.failure_issues
-                or self.sound_partition is None
-                or self.sound_partition_error is not None
             ):
                 raise ValueError("ready stem reconcile requires only annotation")
         elif not self.failure_code or not self.failure_reason:
             raise ValueError("failed stem reconcile requires failure provenance")
-        if self.model_call_count != self.av_model_call_count + self.audio_model_call_count + self.text_model_call_count:
+        if self.model_call_count != self.av_model_call_count + self.audio_model_call_count:
             raise ValueError("stem reconcile model call counts differ")
-        if self.text_model_call_count == 0 and (
-            self.sound_partition is not None or self.sound_partition_raw_response is not None
-            or self.sound_partition_error is not None
-        ):
-            raise ValueError("sound partition evidence requires one text call")
         values = self.model_dump(mode="json", exclude={"record_fingerprint"})
         if self.record_fingerprint != _sha256_text(_compact_json(values)):
             raise ValueError("stem reconcile record fingerprint is invalid")
@@ -1690,7 +1676,7 @@ class StemReconcileUpstreamFailure(SchemaModel):
 
 
 class MimoStemReconcileSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_stem_reconcile_summary.11"] = (
+    schema_version: Literal["r2v.h3.mimo25_stem_reconcile_summary.12"] = (
         MIMO25_STEM_RECONCILE_SUMMARY_VERSION
     )
     route: SAMRoute
@@ -1705,7 +1691,6 @@ class MimoStemReconcileSummary(SchemaModel):
     failed_count: int = Field(ge=0)
     av_model_call_count: int = Field(ge=0)
     audio_model_call_count: int = Field(ge=0)
-    text_model_call_count: int = Field(ge=0)
     model_call_count: int = Field(ge=0)
     original_target_av_is_highest_authority: Literal[True] = True
     current_mimo_versions_modified: Literal[True] = True
@@ -1714,7 +1699,7 @@ class MimoStemReconcileSummary(SchemaModel):
     @model_validator(mode="after")
     def validate_counts(self) -> MimoStemReconcileSummary:
         if (
-            self.model_call_count != self.av_model_call_count + self.audio_model_call_count + self.text_model_call_count
+            self.model_call_count != self.av_model_call_count + self.audio_model_call_count
             or self.processed_clip_count != self.ready_count + self.failed_count
             or self.clip_count != self.processed_clip_count + self.skipped_clip_count
             or self.clip_count != len(self.clip_uids)
@@ -1747,11 +1732,6 @@ class MimoStemReconcileSummary(SchemaModel):
 class StemReconcileBackend(Protocol):
     def describe_auxiliary_audio(self, path: Path) -> MimoAuxAudioDescriptionCall: ...
 
-    def reconcile_sound_descriptions(
-        self, original_sound_description: str,
-        music_stem_description: str | None, sfx_stem_description: str | None,
-    ) -> MimoSoundPartitionCall: ...
-
     @property
     def provenance(self) -> MimoBackendProvenance: ...
 
@@ -1763,6 +1743,7 @@ class StemReconcileBackend(Protocol):
         transcribed_segment_ids: list[str],
         allowed_entity_ids: set[str],
         allowed_reference_labels: set[str],
+        auxiliary_audio_evidence: dict[str, str] | None = None,
     ) -> MimoBackendResult: ...
 
 
@@ -1836,12 +1817,26 @@ def run_mimo25_stem_reconcile_shadow(
     try:
         temporary.mkdir(parents=True)
         for job in jobs:
+            # Only these two audio-only requests run concurrently; role order is fixed.
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = {
+                    kind: executor.submit(_describe_auxiliary_stem, backend, stems_by_clip[job.clip_uid], kind)
+                    for kind in ("music", "sfx")
+                }
+                auxiliary = {kind: future.result() for kind, future in futures.items()}
+            music, music_calls = auxiliary["music"]
+            sfx, sfx_calls = auxiliary["sfx"]
+            audio_calls = music_calls + sfx_calls
             annotation = None
             failure_code = failure_reason = None
             issues: list[ValidationIssue] = []
             try:
                 result = backend.reconcile(
                     job,
+                    auxiliary_audio_evidence={
+                        "music_separator_candidate": music.description if music.description is not None else "SOURCE_UNAVAILABLE",
+                        "sfx_separator_candidate": sfx.description if sfx.description is not None else "SOURCE_UNAVAILABLE",
+                    },
                     segment_ids=[s.segment_id for s in job.segments],
                     transcribed_segment_ids=[
                         s.segment_id
@@ -1871,38 +1866,13 @@ def run_mimo25_stem_reconcile_shadow(
                     exc.model_call_count,
                 )
             # Preserve parseable first-pass fields even when identity/format validation failed.
-            sound = annotation.h3_semantics.sound_description if annotation else None
             if raw and annotation is None:
                 try:
                     payload = json.loads(normalize_structured_json_envelope(raw[-1]))
-                    candidate = payload.get("h3_semantics", {}).get("sound_description")
-                    if isinstance(candidate, str):
-                        sound = candidate
                     annotation = MimoAVAnnotationDraft.model_validate(payload)
                 except (ValueError, TypeError, AttributeError):
                     pass
-            # Only these two audio-only requests run concurrently; role order is fixed.
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                futures = {
-                    kind: executor.submit(_describe_auxiliary_stem, backend, stems_by_clip[job.clip_uid], kind)
-                    for kind in ("music", "sfx")
-                }
-                auxiliary = {kind: future.result() for kind, future in futures.items()}
-            music, music_calls = auxiliary["music"]
-            sfx, sfx_calls = auxiliary["sfx"]
-            audio_calls = music_calls + sfx_calls
-            diagnostics.extend([music.diagnostic, sfx.diagnostic])
-            partition = None
-            if sound is not None:
-                partition = backend.reconcile_sound_descriptions(
-                    sound, music.description, sfx.description,
-                )
-                diagnostics.append(partition.diagnostic)
-                if partition.error is not None and failure_code is None:
-                    failure_code, failure_reason = (
-                        "sound_partition_failed",
-                        partition.error,
-                    )
+            diagnostics = [music.diagnostic, sfx.diagnostic, *diagnostics]
             values = {
                 "schema_version": MIMO25_STEM_RECONCILE_VERSION,
                 "clip_uid": job.clip_uid,
@@ -1913,7 +1883,7 @@ def run_mimo25_stem_reconcile_shadow(
                 "policy_version": MIMO25_STEM_RECONCILE_POLICY_VERSION,
                 "backend_provenance": backend.provenance.model_dump(mode="json"),
                 "status": "ready"
-                if failure_code is None and partition is not None
+                if failure_code is None and annotation is not None
                 else "failed",
                 "annotation": annotation.model_dump(mode="json")
                 if annotation
@@ -1923,24 +1893,15 @@ def run_mimo25_stem_reconcile_shadow(
                 "failure_issues": [issue.to_dict() for issue in issues],
                 "raw_responses": raw,
                 "diagnostics": [d.model_dump(mode="json") for d in diagnostics],
-                "sound_description": sound,
                 "music_stem_description": music.description,
                 "music_stem_raw_response": music.raw_response,
                 "music_stem_error": music.error,
                 "sfx_stem_description": sfx.description,
                 "sfx_stem_raw_response": sfx.raw_response,
                 "sfx_stem_error": sfx.error,
-                "sound_partition": partition.partition.model_dump(mode="json")
-                if partition and partition.partition
-                else None,
-                "sound_partition_raw_response": partition.raw_response
-                if partition
-                else None,
-                "sound_partition_error": partition.error if partition else None,
                 "av_model_call_count": av_calls,
                 "audio_model_call_count": audio_calls,
-                "text_model_call_count": int(partition is not None),
-                "model_call_count": av_calls + audio_calls + int(partition is not None),
+                "model_call_count": av_calls + audio_calls,
             }
             records.append(
                 MimoStemReconcileRecord(
@@ -1962,7 +1923,6 @@ def run_mimo25_stem_reconcile_shadow(
             failed_count=counts["failed"],
             av_model_call_count=sum(r.av_model_call_count for r in records),
             audio_model_call_count=sum(r.audio_model_call_count for r in records),
-            text_model_call_count=sum(r.text_model_call_count for r in records),
             model_call_count=sum(r.model_call_count for r in records),
         )
         _write_jsonl(temporary / "records.jsonl", records)

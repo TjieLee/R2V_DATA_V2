@@ -60,7 +60,7 @@ def _validate_stage_closure(
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="One original AV request, two audio-only stem descriptions, then text-only sound reconciliation",
+        description="Two audio-only stem candidates, then one final original AV request",
     )
     parser.add_argument("--visual-production-root", type=Path, required=True)
     parser.add_argument("--visual-runs-root", type=Path, required=True)

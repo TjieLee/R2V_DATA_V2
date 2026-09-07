@@ -203,7 +203,6 @@ def build_audio_shadow_qa(
         or summary.model_call_count != sum(item.model_call_count for item in reconcile)
         or summary.audio_model_call_count != sum(item.audio_model_call_count for item in reconcile)
         or summary.av_model_call_count != sum(item.av_model_call_count for item in reconcile)
-        or summary.text_model_call_count != sum(item.text_model_call_count for item in reconcile)
     ):
         raise ValueError("QA reconcile summary differs from current run inventory")
     for record in reconcile:
@@ -296,7 +295,6 @@ def build_audio_shadow_qa(
                     _, text, warnings = _materialize_sample(
                         sample, current,
                         _MaterializerInput(record.annotation, record.source_job_fingerprint),
-                        sound_partition=record.sound_partition,
                     )
                     variant = {"status": "ready", "text": text, "warnings": warnings, "reason": None}
                 except MimoH3MaterializationContractError as error:

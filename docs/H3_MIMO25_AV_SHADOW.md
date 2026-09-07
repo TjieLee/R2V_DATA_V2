@@ -2,7 +2,7 @@
 
 This experimental path is additive and read-only with respect to the current JEA
 production stages. The current path is the named SAM shadow entry, publishing
-`mimo_reconcile_av_stemtext_sound_partition/` after existing separation,
+`mimo_reconcile_stemtext_final_av/` after existing separation,
 DiariZen and ASR. Historical `mimo25_av_reconcile_v5/`, `mimo25_h3_shadow_v5/`,
 stem-facts and older reconcile artifacts are not migrated or overwritten.
 See `H3_AUDIO_SERVER_RUNBOOK.md` Stage 4 for current run and QA commands.
@@ -17,16 +17,16 @@ speaker reconciliation; MiMo is the final AV authority for this shadow path.
 - Qwen3-ASR owns exact transcript text and language.
 - frozen Visual V3 references own entity inventory, order, and image content.
 - LR-ASD, source clusters, and current entity bindings are proposals.
-- one MiMo-V2.5 joint-AV request returns visual/audio observation, AV grounding,
-  and direct `h3_semantics`. MiMo authors natural `style_opening` / `shot1_caption`,
-  and one full `sound_description`; there is no playback projection or compositor.
-  Only reference images and original video with embedded audio are sent here.
-- two concurrent audio-only requests independently describe music/SFX canonical
-  stems with the same role-blind prompt. No AV, ASR, references, caption or ICL.
-- one text-only request fuses original `sound_description` with available auxiliary
-  prose into `overall_soundscape` and `non_diegetic_music`, without media/ICL/history.
-  Positive auxiliary evidence can recover weak sounds, but auxiliary absence
-  does not prove original-AV absence. Unavailable sources are not silence.
+- two concurrent audio-only requests first describe music/SFX canonical stems
+  with the unchanged role-blind prompt, no AV/ASR/references/caption/ICL.
+- one final MiMo-V2.5 joint-AV request receives original video with embedded
+  audio, reference images, authoritative text facts, ICL and candidate texts.
+  No independent audio is sent. MiMo reinspects original AV as final authority,
+  discards unsupported source/mood/context guesses and authors all H3 fields.
+  Auxiliary absence cannot establish original absence; unavailable is not silence.
+- final AV writes `overall_soundscape` and `non_diegetic_music` directly.
+  Supported in-scene music belongs in chronological `shot1_caption`, not
+  soundscape or guessed score. There is no text-only fusion or music insertion.
 - the deterministic boundary preserves frozen Subject/Picture ownership and
   checks generated vocal-event formatting without rewriting dialogue. Adjacent
   same-speaker ASR turns may share one natural `<d>` block; ASR artifacts stay
@@ -59,7 +59,7 @@ The final system block prioritizes caption prose. `style_opening` describes only
 global cinematographic style/camera language/lighting, not scene contents or
 actions. Model input has one authoritative segment inventory; old
 `job.r2v_instruction` prose stays stored for provenance but is not model input.
-The four-request sound contract change versions, not frozen
+The three-request sound contract change versions, not frozen
 reference or speaker authority. This is not a verified quality improvement.
 
 The official Complete Example in `docs/VIDEO_PROMPT_WRITING_GUIDE_ref_en.md`
@@ -175,11 +175,11 @@ they do not create additional MiMo model jobs.
 
 Prompt, policy, annotation schema, and materializer versions are:
 
-- `h3_mimo25_unified_av_reconcile_v30`
+- `h3_mimo25_unified_av_reconcile_v31`
 - `h3_mimo25_av_authority_contract_v17`
-- `r2v.h3.mimo25_av_annotation.19`
-- `r2v.h3.mimo25_backend.33`
-- `h3_mimo25_materializer_v22`
+- `r2v.h3.mimo25_av_annotation.20`
+- `r2v.h3.mimo25_backend.34`
+- `h3_mimo25_materializer_v23`
 - `h3_mimo25_reference_selection_v1`
 - `h3_mimo25_recovered_voice_quality_v1`
 - `r2v.h3.mimo25_inventory.4`
@@ -211,11 +211,10 @@ Payloads and API keys are never persisted. Explicit zero video/image tokens
 fail closed without resending media. Zero/missing embedded audio tokens remain
 warnings only; no canonical-audio fallback or video resend is performed.
 Both the adapter and OpenAI SDK allow one attempt per stage, no hidden retries.
-First-stage output is caption plus full sound description without global
-soundscape/music statuses, absence codes, event timing or duplicated prose.
-Final text reconciliation validates only JSON shape and two string fields: no semantic
-equivalence, absence, leakage, keywords or scoring gate and no repair call.
-Its `N/A` is an unsupported-field placeholder, not verified silence.
+Final AV output is caption plus two final sound strings, with no intermediate
+sound description, sound status, absence code or timed-event inventory.
+No semantic equivalence, absence, leakage, keyword or scoring gate is added.
+`N/A` denotes no eligible content. The same AV validators remain; no recheck.
 
 MiniMax H3 Ref2VA retains its official hard reference limits: at most 9 Images,
 3 Audio files, and 12 mixed reference files total. MiMo reference-selection V1
@@ -260,16 +259,16 @@ The exact request contract keeps `fps` and `media_resolution` beside the
 The first Xiaomi request retains `thinking={"type":"disabled"}`.
 SGLang uses `use_audio_in_video=true`, `reasoning_effort="none"`,
 and `chat_template_kwargs={"thinking":false,"enable_thinking":false}`.
-The first request sends only original video and reference images.
-Two subsequent audio-only requests each send one canonical stem audio URL,
-without video/image/ASR/reference/caption/ICL or role hints. They run concurrently,
-use temperature 0, disabled thinking, 1024 tokens, and a one-string description
-schema. A single text-only request then combines the three descriptions using
-the same limits and the strict two-string sound schema. Neither audio-only nor
-text-only requests send `use_audio_in_video` or AV history.
-Normal counts: AV=1, audio=2, text=1, total=4. Every call has one attempt.
-Auxiliary errors retain raw/error evidence and do not erase AV or another source.
-There is no canonical-audio fallback, full-AV recheck or semantic sound checker.
+Two audio-only requests run first, each with one canonical stem URL and identical
+role-blind prompt, temperature 0, disabled thinking, 1024 tokens and one-string
+description schema. No video/image/ASR/reference/caption/ICL or role hints enter
+them. Only after both finish/fail, final AV receives candidate prose under
+`music_separator_candidate` and `sfx_separator_candidate`, plus one original
+video and existing images. Missing candidates are `SOURCE_UNAVAILABLE`.
+Only final AV sends `use_audio_in_video`.
+Normal counts: audio=2, AV=1, total=3; each has one attempt.
+Auxiliary failures retain raw/error independently and final AV still runs.
+There is no text fusion, canonical-audio fallback, AV recheck or sound checker.
 
 The local SGLang transport was validated at `http://127.0.0.1:8092/v1` with
 `mimo-v2.5` on 8 H200 GPUs using TP8, DP2, and DP-attention. The observed smoke
@@ -279,18 +278,15 @@ seconds. That SGLang checkout carries an external runtime patch for upstream
 `sglang#37060` (MiMo audio encoder deadlock under TP8+DP2); R2V does not modify
 or own that external source patch.
 
-The new four-request flow has fake-client coverage only, not sound-quality
-validation. The server 833 smoke and human QA remain necessary.
-Old `mimo_reconcile_av_rawstems_sound_partition/` and
-`mimo_v29_oneclip_smoke/` outputs are not migrated or overwritten.
-Reconcile record .9, summary .11 and policy v4 distinguish this request history.
+The new three-request flow has fake-client coverage only. The 833 server smoke
+and human QA remain necessary. Old v29/v30 output directories are not migrated
+or overwritten. Reconcile record .10, summary .12 and policy v5 distinguish this
+request history. Invalid final annotation/caption retains raw AV and auxiliary
+evidence without a fourth call; later clips continue.
 
-An invalid first annotation or caption keeps raw prose and errors; a readable
-sound description can still receive its one text request. A text API/JSON failure
-preserves first-stage and auxiliary evidence and does not trigger a repair request. Later clips
-continue. Identity-product exclusions remain independent of raw caption visibility.
-Final sound sections use only the partition; no internal status or stock prose
-overrides them. Optional music references lacking event timing remain unavailable,
+Identity-product exclusions remain independent of raw caption visibility.
+Final sound sections come directly from final AV annotation, without internal
+status or stock-prose overrides. Optional music references lacking event timing remain unavailable,
 rather than fabricating events or suppressing the base caption.
 
 The materialized output remains official MiniMax H3 Ref2VA: the six sections
