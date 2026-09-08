@@ -31,8 +31,8 @@ MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
 MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v35"
 MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v17"
 MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.20"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.42"
-MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION = "h3_mimo25_speaker_marker_polish_v3"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.43"
+MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION = "h3_mimo25_speaker_marker_polish_v4"
 MIMO25_ICL_VERSION = "h3_official_ref2va_detailed_shot1_v2"
 MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v23"
 MIMO25_CANONICAL_ABSENT_SOUNDSCAPE = (
@@ -891,8 +891,8 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.42"] = MIMO25_BACKEND_VERSION
-    speaker_marker_polish_prompt_version: Literal["h3_mimo25_speaker_marker_polish_v3"] = (
+    schema_version: Literal["r2v.h3.mimo25_backend.43"] = MIMO25_BACKEND_VERSION
+    speaker_marker_polish_prompt_version: Literal["h3_mimo25_speaker_marker_polish_v4"] = (
         MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION
     )
     backend: Literal[
@@ -1451,6 +1451,14 @@ needs_review=false
 Keep "He says" and all other prose unchanged; only the marker is added.
 DIALOGUE_MARKER_TARGETS gives the authoritative marker for each existing <d> block by 1-based chronological dialogue index.
 For every listed target, ensure that dialogue block is introduced by the listed (Sx): if missing, add it; if a different known Sx is present, replace it. Do not question or infer the mapping. Do not modify any non-Sx text.
+The required (Sx) marker MUST appear in the natural lead-in immediately before its corresponding <d> block.
+Never place an (Sx) marker after the closing </d> tag of the dialogue it labels.
+The marker must be visible to the reader before that dialogue begins.
+When adding a missing marker, insert it into the existing speaker lead-in without changing any other prose.
+WRONG: <Subject 1> responds, <d>[Chinese] b</d> (S2)
+CORRECT: <Subject 1> (S2) responds, <d>[Chinese] b</d>
+WRONG: She responds, <d>[Chinese] b</d> (S2)
+CORRECT: She (S2) responds, <d>[Chinese] b</d>
 If DIALOGUE_MARKER_TARGETS is supplied, it is already uniquely aligned. Set needs_review=false after applying the required marker-only edits.
 DIALOGUE_MARKER_TARGETS: [{"dialogue_index":1,"speaker_id":"S1"},{"dialogue_index":2,"speaker_id":"S2"}]
 EXISTING: An offscreen male voice (S1) says, <d>[Chinese] a</d> <Subject 1> replies, <d>[Chinese] b</d>

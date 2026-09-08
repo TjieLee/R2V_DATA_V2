@@ -110,10 +110,10 @@ def test_polish_applies_only_sx_and_rescues_marker_projection(
     assert row["backend_provenance"]["speaker_marker_polish_prompt_version"] == mb.MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION
 
 
-def test_polish_v3_prompt_makes_aligned_speaker_projection_unambiguous():
+def test_polish_v4_prompt_makes_aligned_speaker_projection_unambiguous():
     assert mb.MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v35"
-    assert mb.MIMO25_BACKEND_VERSION == "r2v.h3.mimo25_backend.42"
-    assert mb.MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION == "h3_mimo25_speaker_marker_polish_v3"
+    assert mb.MIMO25_BACKEND_VERSION == "r2v.h3.mimo25_backend.43"
+    assert mb.MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION == "h3_mimo25_speaker_marker_polish_v4"
     prompt = mb.SPEAKER_MARKER_POLISH_PROMPT
     assert "exactly one distinct speaker_id" in prompt
     assert "missing its speaker marker is NOT ambiguous" in prompt
@@ -129,6 +129,37 @@ def test_polish_v3_prompt_makes_aligned_speaker_projection_unambiguous():
     assert "Do not question or infer the mapping" in prompt
     assert "already uniquely aligned. Set needs_review=false" in prompt
     assert '<Subject 1> (S2) replies, <d>[Chinese] b</d>' in prompt
+    assert "MUST appear in the natural lead-in immediately before its corresponding <d> block" in prompt
+    assert "Never place an (Sx) marker after the closing </d> tag" in prompt
+    assert "visible to the reader before that dialogue begins" in prompt
+    assert "existing speaker lead-in without changing any other prose" in prompt
+    for lead in ("<Subject 1>", "She"):
+        assert f"WRONG: {lead} responds, <d>[Chinese] b</d> (S2)" in prompt
+        assert f"CORRECT: {lead} (S2) responds, <d>[Chinese] b</d>" in prompt
+
+
+@pytest.mark.parametrize("trailing", [False, True])
+def test_polish_marker_must_precede_its_dialogue(tmp_path, monkeypatch, trailing):
+    original = "(S1)<d>[Chinese] a</d> <Subject 1> responds, <d>[Chinese] b</d>"
+    candidate = (
+        original + " (S2)" if trailing
+        else original.replace("<Subject 1> responds", "<Subject 1> (S2) responds")
+    )
+    response = json.dumps({"shot1_caption": candidate, "needs_review": False})
+    row, _, summary, pending, _ = _case(
+        tmp_path, monkeypatch, original, response, ("S1", "S2"),
+    )
+    assert not pending
+    assert summary.model_call_count == 4 and summary.text_model_call_count == 1
+    assert row["speaker_marker_polish_applied"] is (not trailing)
+    assert row["speaker_marker_polish_raw_response"] == response
+    assert row["annotation"]["h3_semantics"]["shot1_caption"] == (original if trailing else candidate)
+    if trailing:
+        assert row["status"] == "failed"
+        assert "speaker_marker_polish_unresolved" in row["diagnostics"][-1]["warnings"]
+        assert {issue["code"] for issue in row["failure_issues"]} == {"direct_dialogue_speaker_marker_missing"}
+    else:
+        assert row["status"] == "ready" and row["failure_issues"] == []
 
 
 @pytest.mark.parametrize("speakers,caption", [
