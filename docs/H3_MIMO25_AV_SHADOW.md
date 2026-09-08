@@ -278,9 +278,18 @@ The exact request contract keeps `fps` and `media_resolution` beside the
 
 Xiaomi retains disabled thinking. SGLang uses strict JSON schema, disabled
 thinking and `use_audio_in_video=false` for Turn 1, `true` for Turns 2/3.
-Turn 3 receives ordered `speech`, `music`, `sfx` canonical stem `audio_url` items
-beside the original target video. Stem hashes are checked before any model
-call; invalid media produces a per-clip failure without mutating upstream data.
+Turn 3 media order is: original target AV, finalized profile-target text, full
+canonical speech stem, labeled per-segment speech snippets, full music stem,
+and full SFX stem. Each real gN/Sx target retains every transcribed interval;
+repeated intervals for a group remain separate, in target/interval order. No
+transcript is copied into snippet labels and no best-sample selection occurs.
+Authoritative source sample indices are mapped to the speech-stem sample rate
+with exact rational arithmetic and round-to-nearest (ties-to-even), then cropped
+using the existing lossless exact-sample extractor. Runtime-owned temporary FLACs
+become data URIs and are cleaned before the same Turn 3 call, including when
+source media uses HTTP URLs. No production media is copied or changed. Stem
+hashes are checked before any model call; invalid media produces a per-clip
+failure without mutating upstream data.
 Missing/unreported reference-image usage is not an error for Turns 2/3.
 
 Normal counts: visual=1, AV=2, audio-only=0, text=0, total=3. Optional marker
@@ -289,7 +298,7 @@ The raw fields remain `visual_raw_response`, `speech_av_raw_response` and
 `audio_finalize_raw_response`. Legacy standalone-stem description fields are
 null in new records; current provenance identifies this request contract.
 
-Current versions: backend .56, visual prompt v4, speech assembly v45, audio
+Current versions: backend .57, visual prompt v4, speech assembly v45, audio
 finalizer v4, materializer v26; annotation .20, authority v17, official ICL v4
 and speaker polish v4 remain unchanged. V26 records the recovery-eligibility
 alignment; the acoustic quality policy remains v1. Materializer v25 resolves each

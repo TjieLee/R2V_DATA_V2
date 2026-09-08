@@ -100,6 +100,7 @@ from r2v_data_v2.h3.mimo25_recovered_voice import (
 )
 from r2v_data_v2.h3.qwen38_h3_recaption import RecaptionSubjectContract
 from r2v_data_v2.structured_output import ValidationIssue
+from tests.h3_mimo_two_turn_helpers import SnippetAudioBackend
 from tools.materialize_h3_mimo25_shadow import _parser as _materializer_parser
 
 
@@ -762,6 +763,7 @@ def _backend(
         client=client,
         sleep=lambda _: None,
         jitter=lambda: 0.0,
+        audio_media_backend=SnippetAudioBackend(),
     )
     return backend, completions
 

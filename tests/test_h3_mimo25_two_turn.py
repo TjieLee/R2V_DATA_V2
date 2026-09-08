@@ -228,7 +228,9 @@ def test_three_turn_prefix_is_literal_and_visual_facts_are_isolated(tmp_path, mo
     assert json.loads(speech_text.split("TURN 1 VISUAL DRAFT:\n")[1]) == json.loads(raws[0])
     final_media = third["messages"][-1]["content"]
     audio = [item["audio_url"]["url"] for item in final_media if item["type"] == "audio_url"]
-    assert audio == [backend.config.media_resolver.resolve(Path(job.target_full_audio_path))] * 3
+    assert [audio[i] for i in (0, 2, 3)] == [backend.config.media_resolver.resolve(Path(job.target_full_audio_path))] * 3
+    assert audio[1].startswith("data:audio/")
+    assert len(audio) == 4
     assert job.segments[0].asr_text not in json.dumps(final_media)
     assert "music stem:" in json.dumps(final_media) and "sfx stem:" in json.dumps(final_media)
     assert "separator_candidate" not in json.dumps(calls.requests)
@@ -401,7 +403,7 @@ def test_cache_is_diagnostic_only_and_three_turn_provenance_is_fingerprinted(tmp
     assert result.model_call_count == 3
     assert [d.usage.cached_tokens for d in result.diagnostics] == [cached_tokens] * 3
     provenance = backend.provenance
-    assert provenance.schema_version == "r2v.h3.mimo25_backend.56"
+    assert provenance.schema_version == "r2v.h3.mimo25_backend.57"
     assert provenance.prompt_version == "h3_mimo25_speech_assembly_v45"
     assert provenance.visual_prompt_version == "h3_mimo25_visual_only_v4"
     assert provenance.materializer_version == "h3_mimo25_materializer_v26"

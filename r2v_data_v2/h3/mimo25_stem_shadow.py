@@ -13,6 +13,7 @@ from typing import Any, Literal, Protocol
 
 from pydantic import Field, StrictStr, model_validator
 
+from r2v_data_v2.h3.audio_backends import AudioMediaBackend
 from r2v_data_v2.h3.diarization_binding import (
     BoundDiarizationSegment,
     DiarizationClusterBinding,
@@ -1467,8 +1468,9 @@ class StemAwareOpenAIMimo25Backend(OpenAIMimo25Backend):
         *,
         stem_records_by_clip: dict[str, SAMAudioStemRecord],
         client: Any | None = None,
+        audio_media_backend: AudioMediaBackend | None = None,
     ) -> None:
-        super().__init__(config, client=client)
+        super().__init__(config, client=client, audio_media_backend=audio_media_backend)
         self.stem_records_by_clip = stem_records_by_clip
 
 

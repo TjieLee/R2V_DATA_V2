@@ -31,7 +31,11 @@ from r2v_data_v2.h3.mimo25_stem_shadow import (
     run_mimo25_stem_reconcile_shadow,
 )
 from r2v_data_v2.h3.sam_audio_stem_shadow import load_stem_shadow
-from tests.h3_mimo_two_turn_helpers import assembly_raw, split_annotation
+from tests.h3_mimo_two_turn_helpers import (
+    SnippetAudioBackend,
+    assembly_raw,
+    split_annotation,
+)
 from tests.test_h3_audio_shadow_qa import _fixture, _snapshot
 from tests.test_h3_mimo25_av_shadow import _annotation, _Completions
 from tools import run_h3_mimo25_stem_reconcile_shadow as cli
@@ -235,6 +239,7 @@ def _backend(tmp_path, shadow, responses, *, polish_responses=None):
                 media_base_url="http://media.invalid",
             ),
         ),
+        audio_media_backend=SnippetAudioBackend(),
         stem_records_by_clip={r.clip_uid: r for r in stems},
         client=SimpleNamespace(chat=SimpleNamespace(completions=completions)),
     )
@@ -323,7 +328,9 @@ def test_raw_stem_assets_replace_standalone_calls(tmp_path, monkeypatch, source_
     assert summary.model_call_count == len(completions.requests) == 3
     assert result["annotation"]["h3_semantics"] == payload["h3_semantics"]
     media = completions.requests[-1]["messages"][-1]["content"]
-    assert [item["audio_url"]["url"] for item in media if item["type"] == "audio_url"] == [
+    audio_urls = [item["audio_url"]["url"] for item in media if item["type"] == "audio_url"]
+    assert len(audio_urls) == 4 and audio_urls[1].startswith("data:audio/")
+    assert [audio_urls[i] for i in (0, 2, 3)] == [
         backend.config.media_resolver.resolve(Path(record.stem(kind).canonical_stem_path))
         for kind in ("speech", "music", "sfx")
     ]
@@ -410,7 +417,7 @@ def test_final_av_authors_sound_and_diegetic_caption_without_postprocessing(
     def create(**request):
         assert request["response_format"]["json_schema"]["name"] != "MimoAuxAudioDescription"
         if request["response_format"]["json_schema"]["name"] == "MimoAudioFinalizeDraft":
-            assert sum(p["type"] == "audio_url" for p in request["messages"][-1]["content"]) == 3
+            assert sum(p["type"] == "audio_url" for p in request["messages"][-1]["content"]) == 4
         assert candidate not in json.dumps(request["messages"])
         return original(**request)
 
@@ -496,7 +503,9 @@ def test_real_entry_without_facts_sends_two_audio_then_visual_and_final_av(tmp_p
     assert visual["extra_body"]["use_audio_in_video"] is False
     expected_urls = [backend.config.media_resolver.resolve(Path(selected.stem(kind).canonical_stem_path))
                      for kind in ("speech", "music", "sfx")]
-    assert [p["audio_url"]["url"] for p in first["messages"][-1]["content"] if p["type"] == "audio_url"] == expected_urls
+    actual_urls = [p["audio_url"]["url"] for p in first["messages"][-1]["content"] if p["type"] == "audio_url"]
+    assert [actual_urls[i] for i in (0, 2, 3)] == expected_urls
+    assert len(actual_urls) == 4 and actual_urls[1].startswith("data:audio/")
     assert not any(p["type"] == "audio_url" for p in speech["messages"][-1]["content"])
     full = speech["messages"][-1]["content"][-1]["text"]
     contract = json.loads(full.split("AUTHORITATIVE INPUT:\n", 1)[1].split("\nTURN 1 VISUAL DRAFT:", 1)[0])
@@ -1106,7 +1115,7 @@ def test_explicit_marker_mismatch_remains_hard_in_backend(tmp_path, monkeypatch)
     assert "direct_dialogue_speaker_marker_mismatch" not in row["diagnostics"][-1]["warnings"]
     assert summary.model_call_count == len(completions.requests) == 4
     assert row["text_model_call_count"] == 1
-    assert backend.provenance.schema_version == MIMO25_BACKEND_VERSION == "r2v.h3.mimo25_backend.56"
+    assert backend.provenance.schema_version == MIMO25_BACKEND_VERSION == "r2v.h3.mimo25_backend.57"
     assert backend.provenance.prompt_version == "h3_mimo25_speech_assembly_v45"
 
 

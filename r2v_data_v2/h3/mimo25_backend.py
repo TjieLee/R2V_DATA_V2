@@ -7,10 +7,12 @@ import math
 import mimetypes
 import random
 import re
+import tempfile
 import time
 import unicodedata
 from collections import Counter
 from dataclasses import dataclass, field
+from fractions import Fraction
 from pathlib import Path
 from typing import Annotated, Any, Literal, Protocol
 from urllib.parse import quote, urlsplit
@@ -18,6 +20,7 @@ from urllib.parse import quote, urlsplit
 from openai import OpenAI
 from pydantic import Field, StrictBool, StrictStr, model_validator
 
+from r2v_data_v2.h3.audio_backends import AudioMediaBackend, FFmpegAudioMediaBackend
 from r2v_data_v2.h3.schemas import SchemaModel
 from r2v_data_v2.h3.speech_presentation import SpeechPresentation
 from r2v_data_v2.structured_output import (
@@ -33,7 +36,7 @@ MIMO25_AUDIO_FINALIZE_PROMPT_VERSION = "h3_mimo25_audio_finalize_v4"
 MIMO25_VISUAL_PROMPT_VERSION = "h3_mimo25_visual_only_v4"
 MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v17"
 MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.20"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.56"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.57"
 MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION = "h3_mimo25_speaker_marker_polish_v4"
 MIMO25_ICL_VERSION = "h3_official_ref2va_detailed_shot1_v4"
 MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v26"
@@ -960,7 +963,7 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.56"] = MIMO25_BACKEND_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.57"] = MIMO25_BACKEND_VERSION
     audio_finalize_prompt_version: Literal["h3_mimo25_audio_finalize_v4"] = (
         MIMO25_AUDIO_FINALIZE_PROMPT_VERSION
     )
@@ -2751,6 +2754,7 @@ class OpenAIMimo25Backend:
         client: Any | None = None,
         sleep: Any = time.sleep,
         jitter: Any = random.random,
+        audio_media_backend: AudioMediaBackend | None = None,
     ) -> None:
         self.config = config
         self.client = (client.with_options(max_retries=0) if isinstance(client, OpenAI) else client) or OpenAI(
@@ -2761,6 +2765,7 @@ class OpenAIMimo25Backend:
         )
         self._sleep = sleep
         self._jitter = jitter
+        self._audio_media_backend = audio_media_backend
 
     @property
     def provenance(self) -> MimoBackendProvenance:
@@ -2905,6 +2910,51 @@ class OpenAIMimo25Backend:
         contract["allowed_h3_reference_labels"] = sorted(allowed_reference_labels)
         return schema + "AUTHORITATIVE INPUT:\n" + _compact_json(contract)
 
+    def _speaker_snippet_content(
+        self, job: MimoBackendJob, targets: list[dict[str, Any]], speech_stem: Path,
+    ) -> list[dict[str, Any]]:
+        if not targets:
+            return []
+        media = self._audio_media_backend or FFmpegAudioMediaBackend()
+        probe = media.probe_audio_file(speech_stem)
+        segments = {segment.segment_id: segment for segment in job.segments}
+        content: list[dict[str, Any]] = []
+        with tempfile.TemporaryDirectory(prefix="h3-mimo-speaker-snippets-") as directory:
+            root = Path(directory)
+            resolver = MimoMediaResolver(
+                mode="base64", media_root=root,
+                maximum_base64_bytes=self.config.media_resolver.maximum_base64_bytes,
+            )
+            for target in targets:
+                for interval in target["segments"]:
+                    segment = segments[interval["segment_id"]]
+                    # Map authoritative source samples, never apply another rate's indices directly.
+                    start = round(Fraction(segment.source_start_sample * probe.sample_rate_hz,
+                                           segment.source_sample_rate_hz))
+                    end = round(Fraction(segment.source_end_sample * probe.sample_rate_hz,
+                                         segment.source_sample_rate_hz))
+                    destination = root / f"snippet-{len(content) // 2 + 1:04d}.flac"
+                    media.extract_voice_reference(
+                        clip_uid=job.clip_uid, entity_id="", full_audio_path=speech_stem,
+                        source_audio_path=speech_stem, source_start_sample=start, source_end_sample=end,
+                        start_time=interval["start_time"], end_time=interval["end_time"],
+                        destination=destination, sample_rate_hz=probe.sample_rate_hz,
+                        channels=probe.channels, output_format="flac",
+                    )
+                    label = {
+                        "speaker_group": target["speaker_group"], "speaker_id": target["speaker_id"],
+                        "segment_id": segment.segment_id,
+                        "start_time": interval["start_time"], "end_time": interval["end_time"],
+                        "speech_stem_start_sample": start, "speech_stem_end_sample": end,
+                        "speech_stem_sample_rate_hz": probe.sample_rate_hz,
+                    }
+                    content.extend([
+                        {"type": "text", "text": "speaker snippet: " + _compact_json(label)},
+                        {"type": "audio_url", "audio_url": {"url": resolver.resolve(destination)}},
+                    ])
+        # Data URIs own their bytes; temporary files are gone before the synchronous request.
+        return content
+
     def _request(
         self, job: MimoBackendJob, *,
         allowed_reference_labels: set[str],
@@ -3037,10 +3087,11 @@ class OpenAIMimo25Backend:
                     code="mimo_structured_output_failed",
                     reason="MiMo speech AV assembly failed structured validation", issues=tuple(issues),
                 )
+            profile_targets = _speaker_profile_targets(assembly, job)
             finalize_instruction = (
                 "Judge the target audio and profile only the finalized speaker targets.\n"
                 "FINALIZED SPEAKER-PROFILE TARGETS:\n"
-                + _compact_json(_speaker_profile_targets(assembly, job))
+                + _compact_json(profile_targets)
             )
             if self.config.transport == "xiaomi":
                 finalize_instruction += "\nRESPONSE SCHEMA:\n" + _compact_json(
@@ -3057,6 +3108,10 @@ class OpenAIMimo25Backend:
                             "url": self.config.media_resolver.resolve(auxiliary_audio_paths[kind]),
                         }},
                     ])
+                    if kind == "speech":
+                        finalize_content.extend(self._speaker_snippet_content(
+                            job, profile_targets, auxiliary_audio_paths["speech"],
+                        ))
             turn3_messages = [
                 {"role": "system", "content": AUDIO_FINALIZE_SYSTEM_PROMPT},
                 {"role": "user", "content": finalize_content},

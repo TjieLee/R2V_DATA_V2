@@ -2,6 +2,27 @@
 
 import json
 
+from r2v_data_v2.h3.audio_backends import AudioFileProbe
+
+
+class SnippetAudioBackend:
+    """Deterministic CPU stub for backend fixtures whose media contain placeholder bytes."""
+
+    def __init__(self):
+        self.extractions = []
+
+    def probe_audio_file(self, path):
+        return AudioFileProbe(sample_rate_hz=32000, channels=2, frame_count=3200000,
+                              duration_seconds=100.0, format_name="flac")
+
+    def extract_voice_reference(self, **kwargs):
+        self.extractions.append(kwargs)
+        data = {
+            key: kwargs[key] for key in ("source_start_sample", "source_end_sample", "sample_rate_hz")
+        }
+        kwargs["destination"].write_bytes(json.dumps(data, sort_keys=True).encode())
+        return kwargs["destination"]
+
 
 def split_annotation(raw):
     payload = json.loads(raw)

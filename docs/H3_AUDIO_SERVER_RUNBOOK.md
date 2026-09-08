@@ -273,7 +273,12 @@ the final caption with exact dialogue/Sx. It receives no ICL or reference images
 
 Turn 3 is another fresh request: original target AV plus actual canonical
 speech/music/SFX `audio_url` assets and compact finalized Turn 2 group/Sx/time
-windows/final-binding targets. It owns `speaker_voice_profiles`,
+windows/final-binding targets. After the full speech stem, the same request
+also carries labeled exact speech-stem snippets for every target interval,
+ordered by target then interval. These runtime-only crops are encoded as data
+URIs and cleaned before the call; they neither replace the full stems nor change
+any production media. Labels preserve gN/Sx/segment IDs without transcripts.
+It owns `speaker_voice_profiles`,
 `overall_soundscape` and `non_diegetic_music`; it cannot rewrite summary, caption,
 dialogue or binding.
 Stems are separated views of the same audio, not factual guarantees. Coherent
@@ -294,7 +299,7 @@ temperature 0.0 and 32768 completion tokens. No new runtime canary has been run
 as part of this CPU-only change.
 
 Versions: speech prompt v45, audio finalizer v4, visual v4, annotation .20,
-backend .56, materializer v26, authority v17, ICL v4, marker polish v4;
+backend .57, materializer v26, authority v17, ICL v4, marker polish v4;
 reconcile record .13, summary .15, policy v6, QA data .7. Fixed output:
 `mimo_reconcile_stemtext_final_av_markerpolish_v1/`. Old
 `mimo_reconcile_av_stemtext_sound_partition/`, `mimo_v29_oneclip_smoke/`,
