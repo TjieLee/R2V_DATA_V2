@@ -28,12 +28,12 @@ from r2v_data_v2.structured_output import (
 
 MIMO25_MODEL = "mimo-v2.5"
 MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
-MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v37"
+MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v38"
 MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v17"
 MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.20"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.45"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.46"
 MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION = "h3_mimo25_speaker_marker_polish_v4"
-MIMO25_ICL_VERSION = "h3_official_ref2va_detailed_shot1_v3"
+MIMO25_ICL_VERSION = "h3_official_ref2va_detailed_shot1_v4"
 MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v23"
 MIMO25_CANONICAL_ABSENT_SOUNDSCAPE = (
     "No distinct environmental, mechanical, physical, or non-verbal human "
@@ -891,7 +891,7 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.45"] = MIMO25_BACKEND_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.46"] = MIMO25_BACKEND_VERSION
     speaker_marker_polish_prompt_version: Literal["h3_mimo25_speaker_marker_polish_v4"] = (
         MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION
     )
@@ -904,7 +904,7 @@ class MimoBackendProvenance(SchemaModel):
     video_fps: Literal[4.0] = 4.0
     media_resolution: Literal["default"] = "default"
     thinking: MimoThinkingContract
-    icl_version: Literal["h3_official_ref2va_detailed_shot1_v3"] | None
+    icl_version: Literal["h3_official_ref2va_detailed_shot1_v4"] | None
     temperature: float = Field(ge=0, allow_inf_nan=False)
     max_completion_tokens: int = Field(gt=0)
     response_format: Literal["json_object", "json_schema"]
@@ -912,7 +912,7 @@ class MimoBackendProvenance(SchemaModel):
     media_mode: Literal["base64", "http"]
     media_root: str
     media_base_url: str | None = None
-    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v37"] = (
+    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v38"] = (
         MIMO25_PROMPT_VERSION
     )
     policy_version: Literal["h3_mimo25_av_authority_contract_v17"] = (
@@ -1286,8 +1286,20 @@ Important:
 - shot1_caption states observable audiovisual events, not AV-grounding reasoning or diagnostic explanation.
 - Never explain speaker/source inference with prose such as "indicating", "suggesting", "therefore", "because this means", "may be offscreen", or "may be a voice-over".
 - Binding/presentation rationale belongs only in av_grounding.
-- If a source is determined as offscreen/voice-over, express the final presentation naturally, e.g. "An offscreen female voice (S1) says..." rather than explaining why it was classified that way.
+- If a source is determined as offscreen/voice-over, express the final presentation naturally rather than explaining why it was classified that way.
 - Observable lip/action facts may be described when visually relevant, but do not turn them into analytical conclusions.
+
+VISIBLE SUBJECT PRESERVATION
+- Every defined ENTITY <Subject N> that is visibly present in the target shot MUST appear with its exact <Subject N> label at its first clear visual appearance in shot1_caption.
+- Do not replace a defined visible entity only with generic prose such as "a woman", "a man", "the doctor", "the church", etc. After first establishment, natural pronouns/descriptions may be used.
+- A visible entity remains visually present even when profile-view, back-facing, partially occluded, face/mouth occluded, or silent. Do not drop a visible Subject merely because it is not the speaker.
+- Attribute-only Subjects do not need mechanical repetition unless that referenced attribute is specifically being cited.
+- Visual presence does NOT by itself assign (Sx).
+- If the AV reasonably establishes that a visible defined Subject is the speaker, write <Subject N> (Sx) at the corresponding vocal event.
+- If a defined Subject is visible but the vocal source is genuinely offscreen/other, preserve the visible <Subject N> in the visual prose and describe the vocal source separately.
+- Back/profile/occluded mouth is still visible presence and is not equivalent to offscreen.
+- Do not downgrade a clearly onscreen speaker merely because mouth motion is subtle/not assessable when the full AV supports that binding. Concrete offscreen evidence can still override.
+- Do NOT create <Audio N> merely because target audio/dialogue/music exists. Only use an allowed <Audio N> when the input/reference contract actually contains that Audio reference asset.
 
 SPEAKER MARKERS
 - Number stable (Sx) by final groups' first transcribed appearance. Referenced visible speakers use <Subject N> (Sx); unbound sources use a natural semantic source plus (Sx). No fixed says clause or immediate adjacency is required.
@@ -1303,7 +1315,7 @@ SPEAKER MARKERS
 
 
 def _official_detailed_description_icl_messages() -> list[dict[str, str]]:
-    """Extract official opening, first shot and audio sections without rewriting prose."""
+    """Extract official single-shot writing examples without rewriting their prose."""
     path = Path(__file__).resolve().parents[2] / "docs/VIDEO_PROMPT_WRITING_GUIDE_ref_en.md"
     guide = path.read_text(encoding="utf-8")
     section = guide.split("## 7. Complete Example", 1)[1]
@@ -1314,7 +1326,7 @@ def _official_detailed_description_icl_messages() -> list[dict[str, str]]:
     soundscape, music = audio_sections.split("\n\nnon_diegetic_music:\n", 1)
     opening, shot_body = detailed.split("[Shot 1] ", 1)
     shot_body = shot_body.split("\n[Shot 2]", 1)[0]
-    return [
+    messages = [
         {"role": "user", "content": (
             "This is an official H3 writing/field-boundary demonstration from the "
             "MiniMax-H3 Ref2VA Complete Example, not the response-schema definition. "
@@ -1328,6 +1340,29 @@ def _official_detailed_description_icl_messages() -> list[dict[str, str]]:
             "non_diegetic_music": music.strip(),
         })},
     ]
+    base_path = path.with_name("VIDEO_PROMPT_WRITING_GUIDE_base_en.md")
+    base_guide = base_path.read_text(encoding="utf-8")
+    for case in ("Case 2: I2VA", "Case 3: FL2VA", "Case 4: L2VA"):
+        section = base_guide.split(f"### {case}\n", 1)[1].split("\n### ", 1)[0]
+        example = section.split("```text\n", 1)[1].split("\n```", 1)[0]
+        body, audio_sections = example.split(
+            "integrated_multimodal_description: [Shot 1] ", 1,
+        )[1].split("\n\noverall_soundscape: ", 1)
+        soundscape, music = audio_sections.split("\n\nnon_diegetic_music: ", 1)
+        messages.extend([
+            {"role": "user", "content": (
+                f"Official MiniMax-H3 {case} writing/field-boundary demonstration, "
+                "not the response-schema definition. Observe the single-shot visual "
+                "progression and separate soundscape/music fields. Use only references "
+                "allowed by the actual task, not these example assets."
+            )},
+            {"role": "assistant", "content": _compact_json({
+                "shot1_caption": body,
+                "overall_soundscape": soundscape,
+                "non_diegetic_music": music,
+            })},
+        ])
+    return messages
 
 
 def _value(value: object, name: str) -> object | None:

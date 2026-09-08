@@ -47,8 +47,8 @@ def test_official_example_and_single_av_message_order(tmp_path):
     )
     assert result.model_call_count == len(calls.requests) == 1
     messages = calls.requests[0]["messages"]
-    assert [m["role"] for m in messages] == ["system", "user", "assistant", "user"]
-    assert messages[1:3] == _official_detailed_description_icl_messages()
+    assert [m["role"] for m in messages] == ["system", *(["user", "assistant"] * 4), "user"]
+    assert messages[1:-1] == _official_detailed_description_icl_messages()
     guide = (Path(__file__).parents[1] / "docs/VIDEO_PROMPT_WRITING_GUIDE_ref_en.md").read_text()
     example = guide.split("## 7. Complete Example", 1)[1].split("```text", 1)[1].split("```", 1)[0].strip()
     detailed = example.split("detailed_description:\n", 1)[1]
@@ -65,9 +65,32 @@ def test_official_example_and_single_av_message_order(tmp_path):
                      "overall_soundscape:", "non_diegetic_music:", "[Shot 1]", "[Shot 2]", "[Shot 3]"):
         assert excluded not in messages[2]["content"]
     assert not re.search(r"\d{2}:\d{2}(?:\.\d+)?", messages[2]["content"])
-    assert backend.provenance.icl_version == MIMO25_ICL_VERSION == "h3_official_ref2va_detailed_shot1_v3"
-    assert backend.provenance.prompt_version == "h3_mimo25_unified_av_reconcile_v37"
-    assert backend.provenance.schema_version == "r2v.h3.mimo25_backend.45"
+    base = (Path(__file__).parents[1] / "docs/VIDEO_PROMPT_WRITING_GUIDE_base_en.md").read_text()
+    for number, assistant in zip((2, 3, 4), messages[4:9:2], strict=True):
+        section = base.split(f"### Case {number}:", 1)[1].split("### Case ", 1)[0]
+        source = section.split("```text\n", 1)[1].split("\n```", 1)[0]
+        lines = source.splitlines()
+        expected = {
+            "shot1_caption": next(line.removeprefix("integrated_multimodal_description: [Shot 1] ") for line in lines if line.startswith("integrated_multimodal_description:")),
+            "overall_soundscape": next(line.removeprefix("overall_soundscape: ") for line in lines if line.startswith("overall_soundscape:")),
+            "non_diegetic_music": next(line.removeprefix("non_diegetic_music: ") for line in lines if line.startswith("non_diegetic_music:")),
+        }
+        assert json.loads(assistant["content"]) == expected
+    examples = [json.loads(message["content"]) for message in messages[2:9:2]]
+    assert any(item["non_diegetic_music"] == "N/A" for item in examples)
+    positive = [item for item in examples if item["non_diegetic_music"] != "N/A"]
+    assert len(positive) == 2
+    assert all(item["non_diegetic_music"] not in item["shot1_caption"] for item in positive)
+    assert "cello" in examples[1]["non_diegetic_music"] and "cello" not in examples[1]["shot1_caption"]
+    assert "electronic pulse" in examples[3]["non_diegetic_music"] and "electronic pulse" not in examples[3]["shot1_caption"]
+    for message in messages[1:-1]:
+        assert not re.search(r"\[Shot \d+\]|\d{2}:\d{2}|\d+\.\d+[- ]second", message["content"])
+        assert "For the target video, at" not in message["content"]
+        assert "How the reference pictures align" not in message["content"]
+        assert "Case 1: T2VA" not in message["content"]
+    assert backend.provenance.icl_version == MIMO25_ICL_VERSION == "h3_official_ref2va_detailed_shot1_v4"
+    assert backend.provenance.prompt_version == "h3_mimo25_unified_av_reconcile_v38"
+    assert backend.provenance.schema_version == "r2v.h3.mimo25_backend.46"
     assert backend.provenance.annotation_schema_version == "r2v.h3.mimo25_av_annotation.20"
     assert backend.provenance.materializer_version == "h3_mimo25_materializer_v23"
     assert "This pilot is exactly one shot." in SYSTEM_PROMPT

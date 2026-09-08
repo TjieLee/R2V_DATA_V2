@@ -48,7 +48,7 @@ def _subset_inventory(base, clip_ids):
 
 
 def test_final_av_prompt_preserves_positive_auxiliary_observations():
-    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v37"
+    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v38"
     assert "FACTUAL CONTRADICTION FILTER" in SYSTEM_PROMPT
     assert "NOT A REQUIREMENT TO RE-PROVE EVERY AUXILIARY DETAIL" in SYSTEM_PROMPT
     assert "Preserve positive observations by default" in SYSTEM_PROMPT
@@ -89,7 +89,7 @@ def test_full_shot_visual_coverage_without_word_count_gate():
     assert MimoH3Semantics.model_json_schema()["properties"]["shot1_caption"]["minLength"] == 1
 
 
-def test_v37_caption_field_boundaries_and_no_grounding_explanation():
+def test_caption_field_boundaries_and_no_grounding_explanation():
     for requirement in (
         "Only localized diegetic or shot-synchronized sound events",
         "specific point in playback order belong in shot1_caption",
@@ -100,12 +100,34 @@ def test_v37_caption_field_boundaries_and_no_grounding_explanation():
         "not AV-grounding reasoning or diagnostic explanation",
         '"indicating", "suggesting", "therefore", "because this means", "may be offscreen", or "may be a voice-over"',
         "Binding/presentation rationale belongs only in av_grounding",
-        '"An offscreen female voice (S1) says..."',
+        "express the final presentation naturally rather than explaining why it was classified",
         "Observable lip/action facts may be described when visually relevant",
         "do not turn them into analytical conclusions",
     ):
         assert requirement in SYSTEM_PROMPT
     assert "relevant diegetic/current audible sound when it naturally belongs" not in SYSTEM_PROMPT
+    assert "An offscreen female voice (S1) says" not in SYSTEM_PROMPT
+
+
+def test_v38_visible_subject_preservation_is_separate_from_speaker_binding():
+    for requirement in (
+        "Every defined ENTITY <Subject N>",
+        "MUST appear with its exact <Subject N> label at its first clear visual appearance",
+        'generic prose such as "a woman", "a man", "the doctor", "the church"',
+        "After first establishment, natural pronouns/descriptions may be used",
+        "profile-view, back-facing, partially occluded, face/mouth occluded, or silent",
+        "Do not drop a visible Subject merely because it is not the speaker",
+        "Attribute-only Subjects do not need mechanical repetition",
+        "Visual presence does NOT by itself assign (Sx)",
+        "write <Subject N> (Sx) at the corresponding vocal event",
+        "preserve the visible <Subject N> in the visual prose and describe the vocal source separately",
+        "Back/profile/occluded mouth is still visible presence and is not equivalent to offscreen",
+        "mouth motion is subtle/not assessable when the full AV supports that binding",
+        "Concrete offscreen evidence can still override",
+        "Do NOT create <Audio N> merely because target audio/dialogue/music exists",
+        "Only use an allowed <Audio N> when the input/reference contract actually contains that Audio reference asset",
+    ):
+        assert requirement in SYSTEM_PROMPT
 
 
 def test_prompt_reference_vocal_and_positive_audio_contracts():
@@ -519,8 +541,7 @@ def test_real_entry_without_facts_sends_two_audio_then_one_final_av(tmp_path, mo
     assert result["summary"]["audio_model_call_count"] == 6
     assert [m["role"] for m in first["messages"]] == [
         "system",
-        "user",
-        "assistant",
+        *(["user", "assistant"] * 4),
         "user",
     ]
     media = first["messages"][-1]["content"]
@@ -1149,8 +1170,8 @@ def test_explicit_marker_mismatch_remains_hard_in_backend(tmp_path, monkeypatch)
     assert "direct_dialogue_speaker_marker_mismatch" not in row["diagnostics"][-1]["warnings"]
     assert summary.model_call_count == len(completions.requests) == 4
     assert row["text_model_call_count"] == 1
-    assert backend.provenance.schema_version == MIMO25_BACKEND_VERSION == "r2v.h3.mimo25_backend.45"
-    assert backend.provenance.prompt_version == "h3_mimo25_unified_av_reconcile_v37"
+    assert backend.provenance.schema_version == MIMO25_BACKEND_VERSION == "r2v.h3.mimo25_backend.46"
+    assert backend.provenance.prompt_version == "h3_mimo25_unified_av_reconcile_v38"
 
 
 @pytest.mark.parametrize(
