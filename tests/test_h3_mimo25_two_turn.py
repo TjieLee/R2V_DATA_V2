@@ -401,10 +401,10 @@ def test_cache_is_diagnostic_only_and_three_turn_provenance_is_fingerprinted(tmp
     assert result.model_call_count == 3
     assert [d.usage.cached_tokens for d in result.diagnostics] == [cached_tokens] * 3
     provenance = backend.provenance
-    assert provenance.schema_version == "r2v.h3.mimo25_backend.55"
+    assert provenance.schema_version == "r2v.h3.mimo25_backend.56"
     assert provenance.prompt_version == "h3_mimo25_speech_assembly_v45"
     assert provenance.visual_prompt_version == "h3_mimo25_visual_only_v4"
-    assert provenance.materializer_version == "h3_mimo25_materializer_v25"
+    assert provenance.materializer_version == "h3_mimo25_materializer_v26"
     assert provenance.policy_version == "h3_mimo25_av_authority_contract_v17"
     values = provenance.model_dump(mode="json", exclude={"configuration_fingerprint"})
     assert provenance.configuration_fingerprint == mb._sha256_text(mb._compact_json(values))
@@ -464,9 +464,10 @@ def test_unsupported_turn3_voice_profile_stays_null(tmp_path):
     assert result.model_call_count == len(calls.requests) == 3
 
 
-def test_profile_targets_ignore_nontranscribed_segments_and_preserve_group_order(tmp_path):
+@pytest.mark.parametrize("resolution", ["resolved", "uncertain", "needs_acoustic_refinement"])
+def test_profile_targets_ignore_nontranscribed_segments_and_preserve_group_order(tmp_path, resolution):
     job = _job_fixture(tmp_path)
-    _, raw, _ = split_annotation(_annotation().model_dump_json())
+    _, raw, _ = split_annotation(_annotation(resolution=resolution).model_dump_json())
     assembly = mb.MimoSpeechAVAssemblyDraft.model_validate_json(raw)
     segment = job.segments[0]
     extra = segment.model_copy(update={"segment_id": "empty", "asr_status": "empty", "asr_text": None})
@@ -481,6 +482,18 @@ def test_profile_targets_ignore_nontranscribed_segments_and_preserve_group_order
     assert [s["segment_id"] for s in targets[0]["segments"]] == ["segment_1", "repeat"]
     assert job.segments[1].asr_text not in json.dumps(targets)
     assert mb._speaker_profile_targets(assembly, job.model_copy(update={"segments": []})) == []
+
+
+def test_profile_targets_never_invent_fallback_group_for_null_primary(tmp_path):
+    job = _job_fixture(tmp_path)
+    _, raw, _ = split_annotation(_annotation(resolution="uncertain").model_dump_json())
+    values = json.loads(raw)
+    values["audio_observation"]["segment_decisions"][0]["primary_speaker_group"] = None
+    assembly = mb.MimoSpeechAVAssemblyDraft.model_validate(values)
+    assert mb._speaker_profile_targets(assembly, job) == []
+    assert mb._required_voice_profile_groups(
+        assembly.audio_observation.segment_decisions, transcribed_segment_ids={"segment_1"},
+    ) == []
 
 
 @pytest.mark.parametrize("schema,foreign_field", [

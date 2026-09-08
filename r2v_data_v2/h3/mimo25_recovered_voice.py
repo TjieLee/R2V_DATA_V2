@@ -329,10 +329,7 @@ def _semantic_reasons(
     grounding: MimoAVSegmentGrounding,
 ) -> list[RecoveredVoiceReasonCode]:
     reasons: list[RecoveredVoiceReasonCode] = []
-    if (
-        audio_decision.resolution != "resolved"
-        or audio_decision.primary_speaker_group is None
-    ):
+    if audio_decision.primary_speaker_group is None:
         reasons.append("unresolved")
     if grounding.binding_status != "visible_entity" or grounding.entity_id is None:
         reasons.append("not_visible_entity")

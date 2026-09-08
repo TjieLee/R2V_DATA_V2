@@ -232,6 +232,7 @@ class MimoH3ShadowRecord(SchemaModel):
         "h3_mimo25_materializer_v23",
         "h3_mimo25_materializer_v24",
         "h3_mimo25_materializer_v25",
+        "h3_mimo25_materializer_v26",
     ] = (
         MIMO25_MATERIALIZER_VERSION
     )

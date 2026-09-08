@@ -7593,6 +7593,7 @@ def test_mimo_recovery_preserves_existing_entity_voice(tmp_path: Path) -> None:
                                     "audio_observation"
                                 ]["segment_decisions"][0],
                                 "resolution": "uncertain",
+                                "primary_speaker_group": None,
                             }
                         ],
                     },
@@ -7605,7 +7606,7 @@ def test_mimo_recovery_preserves_existing_entity_voice(tmp_path: Path) -> None:
                 composition="overlapping_secondary_speech",
                 resolution="needs_acoustic_refinement",
             ),
-            "unresolved",
+            "non_single_speaker",
         ),
     ],
 )

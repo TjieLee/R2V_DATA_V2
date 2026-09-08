@@ -38,7 +38,7 @@ speaker reconciliation; MiMo is the final AV authority for this shadow path.
   same-speaker ASR turns may share one natural `<d>` block; ASR artifacts stay
   unchanged and remain visible in QA. There is no segment-count/order zip.
 - post-MiMo voice recovery may create a real target voice asset only from a
-  validated clean single-speaker, resolved `visible_entity` / `onscreen_spoken`
+  validated clean single-speaker, final `visible_entity` / `onscreen_spoken`
   segment for an entity that has no existing target voice. It uses the exact
   DiariZen 32 kHz sample interval in canonical stereo FLAC; LR-ASD, association,
   current binding, and direct-anchor support are not recovery gates.
@@ -101,10 +101,15 @@ cadence/rate and energy/delivery; the prompt forbids identity, profession,
 personality, nationality, role and demographics. No full-AV recheck is sent.
 
 Turn 2 returns an empty `speaker_voice_profiles` list. Turn 3 supplies one
-nullable profile for each resolved group with transcribed speech, using the
+nullable profile for each non-null primary group with transcribed speech, using the
 actual speech stem and compact group/Sx/time-window/final-binding targets.
 It cannot re-decide grouping, binding, presentation, ASR, summary or caption.
 The final annotation combines Turn 2 segment decisions with Turn 3 profiles.
+Stage-B uncertain/refinement status does not suppress a real acoustic group.
+An unbound/offscreen profile alone never publishes an identity-specific Audio
+reference. Recovery still requires a non-null group, final visible entity with
+onscreen presentation, single-speaker composition, no secondary activity and
+all unchanged duration/RMS/clipping/noise/SNR quality gates.
 Profiles remain available for real voice-asset provenance, including MiMo-only
 recovered visible speakers with no LR-ASD binding. The existing materializer
 maps group to Sx to `RecaptionAudioContract.voice_characteristics`; canonical
@@ -284,9 +289,10 @@ The raw fields remain `visual_raw_response`, `speech_av_raw_response` and
 `audio_finalize_raw_response`. Legacy standalone-stem description fields are
 null in new records; current provenance identifies this request contract.
 
-Current versions: backend .55, visual prompt v4, speech assembly v45, audio
-finalizer v4, materializer v25; annotation .20, authority v17, official ICL v4
-and speaker polish v4 remain unchanged. Materializer v25 resolves each
+Current versions: backend .56, visual prompt v4, speech assembly v45, audio
+finalizer v4, materializer v26; annotation .20, authority v17, official ICL v4
+and speaker polish v4 remain unchanged. V26 records the recovery-eligibility
+alignment; the acoustic quality policy remains v1. Materializer v25 resolves each
 attribute Subject's owner from the frozen reference contract and explicitly
 names that entity Subject in its definition. Background Subjects remain
 independent. Actual Audio assets retain the canonical definitions/retention

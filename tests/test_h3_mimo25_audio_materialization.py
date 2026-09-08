@@ -6,6 +6,7 @@ import pytest
 
 from r2v_data_v2.h3 import mimo25_backend as mb
 from r2v_data_v2.h3 import mimo25_h3_materializer as mm
+from r2v_data_v2.h3 import mimo25_recovered_voice as rv
 from r2v_data_v2.h3.jea_final_renderer import FinalH3SampleV2
 from r2v_data_v2.h3.mimo25_av_reconcile import _job
 from r2v_data_v2.h3.mimo25_recovered_voice import recover_mimo_target_voices
@@ -30,7 +31,9 @@ from tests.test_h3_mimo25_av_shadow import (
 )
 
 
-def test_turn3_profile_reaches_mimo_only_recovered_s2_audio_reference(tmp_path):
+@pytest.mark.parametrize("resolution", ["resolved", "uncertain", "needs_acoustic_refinement"])
+@pytest.mark.parametrize("unbound_status", ["offscreen", "no_reliable_entity"])
+def test_turn3_profile_reaches_mimo_only_recovered_s2_audio_reference(tmp_path, resolution, unbound_status):
     job = _as_asd_miss(_job_fixture(tmp_path))
     values = job.model_dump(mode="json", exclude={"request_fingerprint"})
     values["segments"].append({
@@ -44,12 +47,18 @@ def test_turn3_profile_reaches_mimo_only_recovered_s2_audio_reference(tmp_path):
         **payload["audio_observation"]["segment_decisions"][0],
         "segment_id": "segment_2", "primary_speaker_group": "g2",
     })
+    for decision in payload["audio_observation"]["segment_decisions"]:
+        decision["resolution"] = resolution
     first_bound = payload["av_grounding"]["segment_groundings"][0]
     payload["av_grounding"]["segment_groundings"].append({
         **first_bound, "segment_id": "segment_2", "primary_speaker_group": "g2",
     })
-    first_bound.update(binding_status="offscreen", speech_presentation="offscreen_spoken",
-                       entity_id=None, evidence_codes=["offscreen_audio"])
+    first_bound.update(
+        binding_status=unbound_status,
+        speech_presentation="offscreen_spoken" if unbound_status == "offscreen" else "uncertain",
+        entity_id=None,
+        evidence_codes=["offscreen_audio"] if unbound_status == "offscreen" else ["insufficient_evidence"],
+    )
     payload["visual_observation"]["segment_views"].append({
         **payload["visual_observation"]["segment_views"][0], "segment_id": "segment_2",
     })
@@ -72,15 +81,21 @@ def test_turn3_profile_reaches_mimo_only_recovered_s2_audio_reference(tmp_path):
     )
     assert result.model_call_count == len(calls.requests) == 3
     assert all(s.current_entity_id is None and s.direct_anchor_seconds == 0 for s in job.segments)
-    assert result.annotation.av_grounding.segment_groundings[0].binding_status == "offscreen"
+    assert result.annotation.av_grounding.segment_groundings[0].binding_status == unbound_status
     assert result.annotation.av_grounding.segment_groundings[1].entity_id == "e1"
     text = calls.requests[2]["messages"][1]["content"][1]["text"]
     targets = json.loads(text.split("FINALIZED SPEAKER-PROFILE TARGETS:\n")[1].split("\nRESPONSE SCHEMA:", 1)[0])
     assert [(t["speaker_group"], t["speaker_id"]) for t in targets] == [("g1", "S1"), ("g2", "S2")]
-    assert [t["segments"][0]["final_binding"] for t in targets] == ["offscreen", "<Subject 1>"]
+    assert [t["segments"][0]["final_binding"] for t in targets] == [unbound_status, "<Subject 1>"]
     assert [t["segments"][0]["start_time"] for t in targets] == [0.0, 1.0]
     assert json.loads(raws[1])["audio_observation"]["speaker_voice_profiles"] == []
     assert result.annotation.speaker_voice_profiles[1].voice_characteristics == profile
+    assert [p.speaker_group for p in result.annotation.speaker_voice_profiles] == ["g1", "g2"]
+    assert [d.resolution for d in result.annotation.audio_observation.segment_decisions] == [resolution] * 2
+    assert mb._required_voice_profile_groups(
+        result.annotation.audio_observation.segment_decisions,
+        transcribed_segment_ids={"segment_1", "segment_2"},
+    ) == ["g1", "g2"]
     record = _record_fixture(tmp_path, result.annotation, job=job)
     analyzer = _RecoveredVoiceAnalyzer()
     analyzer.analysis.mono_pcm16[32000:64000] = 3000
@@ -90,6 +105,8 @@ def test_turn3_profile_reaches_mimo_only_recovered_s2_audio_reference(tmp_path):
         audio_backend=_RecoveredVoiceMediaBackend(), analyzer=analyzer,
     )
     assert len(voices) == 1, recovered
+    assert len(recovered) == 1 and recovered[0].speaker_group == "g2"
+    assert voices[0].entity_id == "e1"
     assert recovered[0].status == "selected" and recovered[0].source_segment_id == "segment_2"
     sample = _sample(tmp_path)
     sample_values = sample.model_dump(mode="python")
@@ -106,7 +123,62 @@ def test_turn3_profile_reaches_mimo_only_recovered_s2_audio_reference(tmp_path):
     _, rendered, _ = mm._materialize_sample(sample, job, record)
     assert f"<Audio 1> is the voice-timbre reference for <Subject 1> (S2), featuring {profile}." in rendered
     assert "<Audio 1>: reference -" in rendered
-    assert mb.MIMO25_MATERIALIZER_VERSION == "h3_mimo25_materializer_v25"
+    assert "<Audio 2>" not in rendered
+    assert "featuring high register, soft texture" not in rendered
+    assert mb.MIMO25_MATERIALIZER_VERSION == "h3_mimo25_materializer_v26"
+
+
+@pytest.mark.parametrize("composition,secondary,resolution", [
+    ("overlapping_secondary_speech", {"present": True, "speaker_relation": "different_speaker", "kind": "speech"}, "needs_acoustic_refinement"),
+    ("sequential_multi_speaker_speech", {"present": True, "speaker_relation": "different_speaker", "kind": "speech"}, "needs_acoustic_refinement"),
+    ("secondary_non_speech_vocalization", {"present": True, "speaker_relation": "different_speaker", "kind": "sigh"}, "uncertain"),
+    ("same_speaker_nonlexical", {"present": True, "speaker_relation": "same_speaker", "kind": "sigh"}, "uncertain"),
+])
+def test_profiles_do_not_override_recovered_voice_multi_vocal_protection(tmp_path, composition, secondary, resolution):
+    job = _as_asd_miss(_job_fixture(tmp_path))
+    payload = _annotation().model_dump(mode="json")
+    payload["audio_observation"]["segment_decisions"][0].update(
+        resolution=resolution, vocal_composition=composition, secondary_vocal_activity=secondary,
+    )
+    annotation = mb.MimoAVAnnotationDraft.model_validate(payload)
+    assert mb._required_voice_profile_groups(
+        annotation.audio_observation.segment_decisions, transcribed_segment_ids={"segment_1"},
+    ) == ["g1"]
+    recovered, voices, _ = recover_mimo_target_voices(
+        job=job, record=_record_fixture(tmp_path, annotation, job=job),
+        subject_index_by_entity={"e1": 1}, existing_entity_ids=set(), reference_capacity=3,
+        temporary_root=tmp_path / "temp", final_root=tmp_path / "final",
+        audio_backend=_RecoveredVoiceMediaBackend(), analyzer=_RecoveredVoiceAnalyzer(),
+    )
+    assert voices == []
+    assert recovered[0].reason_codes == ["non_single_speaker", "secondary_vocal_activity"]
+
+
+@pytest.mark.parametrize("metric_overrides,reason", [
+    ({"duration_seconds": 0.99}, "duration_too_short"),
+    ({"rms_dbfs": -40.01}, "rms_too_low"),
+    ({"clipping_ratio": 0.00011}, "clipping_excessive"),
+    ({"local_noise_rms_dbfs": None}, "local_noise_unavailable"),
+    ({"estimated_snr_db": 9.99}, "snr_too_low"),
+])
+def test_uncertain_visible_recovery_still_enforces_quality_gates(tmp_path, monkeypatch, metric_overrides, reason):
+    job = _as_asd_miss(_job_fixture(tmp_path))
+    annotation = _annotation(resolution="uncertain")
+    original = rv._quality_metrics
+
+    def metrics(*args, **kwargs):
+        return original(*args, **kwargs).model_copy(update=metric_overrides)
+
+    monkeypatch.setattr(rv, "_quality_metrics", metrics)
+    recovered, voices, _ = recover_mimo_target_voices(
+        job=job, record=_record_fixture(tmp_path, annotation, job=job),
+        subject_index_by_entity={"e1": 1}, existing_entity_ids=set(), reference_capacity=3,
+        temporary_root=tmp_path / "temp", final_root=tmp_path / "final",
+        audio_backend=_RecoveredVoiceMediaBackend(), analyzer=_RecoveredVoiceAnalyzer(),
+    )
+    assert voices == []
+    assert recovered[0].reason_codes == [reason]
+    assert recovered[0].quality_policy_version == "h3_mimo25_recovered_voice_quality_v1"
 
 
 @pytest.mark.parametrize("variant", [
