@@ -7,7 +7,6 @@ import subprocess
 import uuid
 from collections import Counter
 from collections.abc import Sequence
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -26,7 +25,6 @@ from r2v_data_v2.h3.mimo25_av_reconcile import (
     _inventory,
 )
 from r2v_data_v2.h3.mimo25_backend import (
-    MimoAuxAudioDescriptionCall,
     MimoAVAnnotationDraft,
     MimoBackendConfig,
     MimoBackendFailure,
@@ -35,7 +33,6 @@ from r2v_data_v2.h3.mimo25_backend import (
     MimoCompletionDiagnostic,
     MimoMediaResolver,
     MimoSpeakerMarkerPolishAudit,
-    MimoUsage,
     OpenAIMimo25Backend,
 )
 from r2v_data_v2.h3.qwen3_asr import Qwen3ASRSegment
@@ -1785,8 +1782,6 @@ class MimoStemReconcileSummary(SchemaModel):
 
 
 class StemReconcileBackend(Protocol):
-    def describe_auxiliary_audio(self, path: Path) -> MimoAuxAudioDescriptionCall: ...
-
     @property
     def provenance(self) -> MimoBackendProvenance: ...
 
@@ -1798,31 +1793,24 @@ class StemReconcileBackend(Protocol):
         transcribed_segment_ids: list[str],
         allowed_entity_ids: set[str],
         allowed_reference_labels: set[str],
-        auxiliary_audio_evidence: dict[str, str] | None = None,
+        auxiliary_audio_paths: dict[str, Path] | None = None,
     ) -> MimoBackendResult: ...
 
 
-def _describe_auxiliary_stem(
-    backend: StemReconcileBackend, record: SAMAudioStemRecord, kind: StemType,
-) -> tuple[MimoAuxAudioDescriptionCall, int]:
-    calls = 0
+def _validated_auxiliary_stems(record: SAMAudioStemRecord) -> dict[str, Path]:
+    paths = {}
     try:
-        stem = record.stem(kind)
-        path = Path(stem.canonical_stem_path)
-        if sha256_file(path) != stem.canonical_stem_sha256:
-            raise ValueError(f"{kind} auxiliary stem changed")
-        calls = 1
-        result = backend.describe_auxiliary_audio(path)
-        return result, result.model_call_count
-    except (OSError, ValueError, TypeError, RuntimeError) as exc:
-        error = f"{type(exc).__name__}: {exc}"
-        return MimoAuxAudioDescriptionCall(
-            diagnostic=MimoCompletionDiagnostic(
-                input_modality="auxiliary_audio_only", usage=MimoUsage(),
-                http_attempt_count=1, request_error=error,
-            ),
-            error=error, model_call_count=calls,
-        ), calls
+        for kind in ("music", "sfx"):
+            stem = record.stem(kind)
+            path = Path(stem.canonical_stem_path)
+            if sha256_file(path) != stem.canonical_stem_sha256:
+                raise ValueError(f"{kind} auxiliary stem changed")
+            paths[kind] = path
+    except (OSError, ValueError) as exc:
+        raise MimoBackendFailure(
+            code="mimo_stem_media_invalid", reason=f"{type(exc).__name__}: {exc}",
+        ) from exc
+    return paths
 
 
 def run_mimo25_stem_reconcile_shadow(
@@ -1872,26 +1860,14 @@ def run_mimo25_stem_reconcile_shadow(
     try:
         temporary.mkdir(parents=True)
         for job in jobs:
-            # Only these two audio-only requests run concurrently; role order is fixed.
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                futures = {
-                    kind: executor.submit(_describe_auxiliary_stem, backend, stems_by_clip[job.clip_uid], kind)
-                    for kind in ("music", "sfx")
-                }
-                auxiliary = {kind: future.result() for kind, future in futures.items()}
-            music, music_calls = auxiliary["music"]
-            sfx, sfx_calls = auxiliary["sfx"]
-            audio_calls = music_calls + sfx_calls
+            audio_calls = 0
             annotation = None
             failure_code = failure_reason = None
             issues: list[ValidationIssue] = []
             try:
                 result = backend.reconcile(
                     job,
-                    auxiliary_audio_evidence={
-                        "music_separator_candidate": music.description if music.description is not None else "SOURCE_UNAVAILABLE",
-                        "sfx_separator_candidate": sfx.description if sfx.description is not None else "SOURCE_UNAVAILABLE",
-                    },
+                    auxiliary_audio_paths=_validated_auxiliary_stems(stems_by_clip[job.clip_uid]),
                     segment_ids=[s.segment_id for s in job.segments],
                     transcribed_segment_ids=[
                         s.segment_id
@@ -1933,7 +1909,6 @@ def run_mimo25_stem_reconcile_shadow(
                 speech_av_raw = exc.speech_av_raw_response
                 audio_finalize_raw = exc.audio_finalize_raw_response
                 polish = exc.speaker_marker_polish
-            diagnostics = [music.diagnostic, sfx.diagnostic, *diagnostics]
             values = {
                 "schema_version": MIMO25_STEM_RECONCILE_VERSION,
                 "clip_uid": job.clip_uid,
@@ -1957,12 +1932,12 @@ def run_mimo25_stem_reconcile_shadow(
                 "speech_av_raw_response": speech_av_raw,
                 "audio_finalize_raw_response": audio_finalize_raw,
                 "diagnostics": [d.model_dump(mode="json") for d in diagnostics],
-                "music_stem_description": music.description,
-                "music_stem_raw_response": music.raw_response,
-                "music_stem_error": music.error,
-                "sfx_stem_description": sfx.description,
-                "sfx_stem_raw_response": sfx.raw_response,
-                "sfx_stem_error": sfx.error,
+                "music_stem_description": None,
+                "music_stem_raw_response": None,
+                "music_stem_error": None,
+                "sfx_stem_description": None,
+                "sfx_stem_raw_response": None,
+                "sfx_stem_error": None,
                 **{f"speaker_marker_polish_{key}": value for key, value in polish.model_dump(mode="json").items()},
                 "av_model_call_count": av_calls,
                 "visual_model_call_count": visual_calls,

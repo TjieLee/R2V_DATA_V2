@@ -241,7 +241,7 @@ PYTHONPATH="$SAM_AUDIO_RUNTIME_PYTHONPATH" \
   --allow-unverified
 ```
 
-### 4. Two audio-only candidates, then one final original AV
+### 4. Three fresh visual / speech-AV / audio requests
 
 After separation, DiariZen and ASR, run this entry directly. Do not run
 `run_h3_mimo25_stem_facts_shadow.py`; neither `mimo_stem_facts/` nor three
@@ -257,39 +257,38 @@ stem-video proxies are inputs.
   --allow-unverified
 ```
 
-Two audio-only requests first run concurrently (max two threads). Each receives
-one canonical SAM audio URL and the v33 positive-only role-blind prompt, no video,
-image, ASR, references, caption or ICL. Hashes are checked against separation
-provenance. Temperature 0, disabled thinking, 1024 tokens and one-string JSON
-remain unchanged. Results/errors are stored by music/SFX pipeline role.
+There are no standalone stem-description calls. Canonical music/SFX stem hashes
+are checked against separation provenance before inference.
 
-Only after both auxiliary requests finish or fail, visual-only Turn 1 receives
-the original target video, frozen references, official ICL v4 and visual-only
-provenance/windows (`use_audio_in_video=false`). Turn 2 extends that exact
-prefix with the visual raw response and authoritative ASR/speaker/binding
-facts. It enables embedded audio and returns speech/grounding plus the visual
-caption with exact dialogue/Sx, with no auxiliary candidates or non-dialogue
-sound prose. Turn 3 extends the same conversation with the speech raw response
-and only a short audio-finalization task plus `music_separator_candidate` /
-`sfx_separator_candidate`. Embedded audio remains enabled; no media, ASR or
-reference facts are reattached. No session ID is used and cache hits are optional.
+Turn 1 receives target video, frozen reference images and official ICL v4
+(`use_audio_in_video=false`) and produces the visual draft. It writes factual
+appearance/action progression and naturally cites relevant entity and attribute
+Subjects without speculative plot interpretation.
 
-Original AV is primary audio authority; separator descriptions are useful hints,
-not mandatory truth. The finalizer writes summary/caption/soundscape/music,
-without re-deciding visual facts, speakers, Sx or dialogue. Continuous ambience
-goes to soundscape, audience-only score to music, and localized synchronized
-sounds or in-scene music to the caption. Each event has one destination.
-No new audio validator, evidence gate or deterministic prose rewrite is used.
-The unchanged materializer reads final annotation fields directly.
+Turn 2 is a fresh request: original target AV, canonical Turn 1 result as text,
+compact entity-to-Subject mapping, and authoritative ASR/diarization/speaker
+facts. It owns speaker observations/grounding, a short target-video summary and
+the final caption with exact dialogue/Sx. It receives no ICL or reference images.
 
-Normal per-clip counts: audio=2, visual=1, AV=2, text=0, total=5. Eligible Sx
-projection issues alone may trigger unchanged text-only polish (text=1, total=6).
+Turn 3 is another fresh request: original target AV plus actual canonical music
+and SFX `audio_url` assets. It owns ONLY `overall_soundscape` and
+`non_diegetic_music`; it cannot rewrite summary, caption, dialogue or binding.
+Stems are separated views of the same audio, not factual guarantees. Coherent
+music compatible with the original AV should not be discarded merely because it
+is quiet in the original mix. No text fusion or deterministic music insertion.
+
+Both AV turns enable embedded audio and do not require reference-image tokens.
+The final annotation stays .20. Materializer v25 adds deterministic attribute
+Subject ownership and retains canonical Audio definitions/retention.
+
+Normal per-clip counts: audio=0, visual=1, AV=2, text=0, total=3. Eligible Sx
+projection issues alone may trigger unchanged text-only polish (text=1, total=4).
 One attempt per request; no SDK retry, repair, fallback or AV recheck.
-Any failed turn stops that clip, preserving completed raw and diagnostics.
-Records and QA show visual, speech-assembly and audio-finalizer raw outputs
-separately, plus both auxiliary candidates. Zero/missing embedded audio tokens
-remain warnings only. Runtime defaults remain disabled thinking, official ICL,
-temperature 0.0 and 32768 completion tokens.
+A failed turn stops only that clip and preserves completed raw and diagnostics.
+QA displays the three raw responses separately; standalone candidate fields are
+null for new runs. Runtime defaults remain disabled thinking, official ICL,
+temperature 0.0 and 32768 completion tokens. No new runtime canary has been run
+as part of this CPU-only change.
 
 Versions: speech prompt v41, audio finalizer v1, visual v2, annotation .20,
 backend .50, materializer v23, authority v17, ICL v4, marker polish v4;

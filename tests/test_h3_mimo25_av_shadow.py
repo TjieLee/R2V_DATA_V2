@@ -6190,7 +6190,7 @@ def test_materializer_owns_exact_multi_picture_subject_provenance(
     job = _multi_picture_job_fixture(tmp_path)
     draft = _annotation().h3_semantics.subject_definitions[0]
 
-    rendered = _render_subject_definition(draft, job.reference_subjects[0])
+    rendered = _render_subject_definition(draft, job.reference_subjects[0], subjects=job.reference_subjects)
 
     assert rendered.startswith("<Subject 1> is ")
     assert rendered.count("<Picture 1>") == 1

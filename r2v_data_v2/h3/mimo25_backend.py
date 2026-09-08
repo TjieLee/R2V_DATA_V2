@@ -28,15 +28,15 @@ from r2v_data_v2.structured_output import (
 
 MIMO25_MODEL = "mimo-v2.5"
 MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
-MIMO25_PROMPT_VERSION = "h3_mimo25_speech_assembly_v43"
-MIMO25_AUDIO_FINALIZE_PROMPT_VERSION = "h3_mimo25_audio_finalize_v2"
-MIMO25_VISUAL_PROMPT_VERSION = "h3_mimo25_visual_only_v2"
+MIMO25_PROMPT_VERSION = "h3_mimo25_speech_assembly_v44"
+MIMO25_AUDIO_FINALIZE_PROMPT_VERSION = "h3_mimo25_audio_finalize_v3"
+MIMO25_VISUAL_PROMPT_VERSION = "h3_mimo25_visual_only_v3"
 MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v17"
 MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.20"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.53"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.54"
 MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION = "h3_mimo25_speaker_marker_polish_v4"
 MIMO25_ICL_VERSION = "h3_official_ref2va_detailed_shot1_v4"
-MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v24"
+MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v25"
 MIMO25_CANONICAL_ABSENT_SOUNDSCAPE = (
     "No distinct environmental, mechanical, physical, or non-verbal human "
     "sounds are clearly discernible."
@@ -925,6 +925,7 @@ class MimoVisualDraft(SchemaModel):
 
 
 class MimoSpeechAVAssemblyDraft(SchemaModel):
+    summary: StrictStr
     audio_observation: MimoAudioObservation
     av_grounding: MimoAVGrounding
     shot1_caption: StrictStr
@@ -932,8 +933,6 @@ class MimoSpeechAVAssemblyDraft(SchemaModel):
 
 
 class MimoAudioFinalizeDraft(SchemaModel):
-    summary: StrictStr
-    shot1_caption: StrictStr
     overall_soundscape: StrictStr
     non_diegetic_music: StrictStr
 
@@ -960,11 +959,11 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.53"] = MIMO25_BACKEND_VERSION
-    audio_finalize_prompt_version: Literal["h3_mimo25_audio_finalize_v2"] = (
+    schema_version: Literal["r2v.h3.mimo25_backend.54"] = MIMO25_BACKEND_VERSION
+    audio_finalize_prompt_version: Literal["h3_mimo25_audio_finalize_v3"] = (
         MIMO25_AUDIO_FINALIZE_PROMPT_VERSION
     )
-    visual_prompt_version: Literal["h3_mimo25_visual_only_v2"] = MIMO25_VISUAL_PROMPT_VERSION
+    visual_prompt_version: Literal["h3_mimo25_visual_only_v3"] = MIMO25_VISUAL_PROMPT_VERSION
     speaker_marker_polish_prompt_version: Literal["h3_mimo25_speaker_marker_polish_v4"] = (
         MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION
     )
@@ -985,7 +984,7 @@ class MimoBackendProvenance(SchemaModel):
     media_mode: Literal["base64", "http"]
     media_root: str
     media_base_url: str | None = None
-    prompt_version: Literal["h3_mimo25_speech_assembly_v43"] = (
+    prompt_version: Literal["h3_mimo25_speech_assembly_v44"] = (
         MIMO25_PROMPT_VERSION
     )
     policy_version: Literal["h3_mimo25_av_authority_contract_v17"] = (
@@ -1009,6 +1008,7 @@ class MimoBackendProvenance(SchemaModel):
         "h3_mimo25_materializer_v17",
         "h3_mimo25_materializer_v23",
         "h3_mimo25_materializer_v24",
+        "h3_mimo25_materializer_v25",
     ] = (
         MIMO25_MATERIALIZER_VERSION
     )
@@ -1295,32 +1295,24 @@ class MimoBackendConfig:
         )
 
 
-VISUAL_SYSTEM_PROMPT = """This conversation stages visual observation before audiovisual assembly.
-For the first task, observe the ENTIRE target video from beginning to end, using only visual evidence.
-Return only MimoVisualDraft, constrained by the current response schema. Official ICL examples demonstrate writing and field boundaries, not this task's response schema.
-Produce a generation-quality dense VISUAL description, not a plot summary.
-shot1_visual_description is the ONLY full visual description. Do not generate visual_blocks or duplicate this long prose in any other field.
-shot1_visual_description covers every applicable observed dimension: visual style; shot scale and framing; camera angle/viewpoint; foreground/midground/background composition; every salient visible subject; appearance, spatial positions and relationships; pose; body/hand/arm motion; head motion; gaze; facial expression and visible expression changes; object interactions and state changes; environment and major props; materials and visible text when clear; lighting and color; camera motion or clearly static camera; chronological visual progression from early through middle to late.
-A single shot is NOT a reason to make the description short. Do not stop after the opening composition. Describe meaningful visual evolution through the final frame.
-Prefer concrete observation over interpretation. Do not invent psychology, intention, causality, relationships or unseen details. No hard word-count requirement.
-Do not infer sounds or dialogue. Do not decide speaker identity or use offscreen/voice-over classification. Do not output dialogue, (Sx), <d>, acoustic groups, or audio fields in this first response.
-Visible profile/back/occluded/silent subjects remain visible. Every defined ENTITY <Subject N> visibly present must use its exact label at first clear appearance. Attribute-only Subjects do not need mechanical insertion.
-Observable mouth/lip state is visual and allowed, but never derive voice/source conclusions from it. The existing speech_correlated_articulation field records visible mouth articulation only in the supplied window, without any audio correlation or identity inference.
-segment_views follow the supplied segment windows in order, with matching visible_entity_ids and entity_observations.
-Write natural Subject definitions and retention descriptions. Pipeline code owns exact Picture provenance: omit Picture labels from definition descriptions. subject_label already owns the label; do not repeat it in definition/retention descriptions. Attribute Subjects describe only their attribute; attribute retention is judged on the owning entity. Use only fully_preserved, partially_preserved or weak_reference.
-subject_definitions: exactly one definition for every required Subject, in required order. Each description is ONE concise sentence about stable visual identity / appearance only. Do NOT describe actions, frame position, chronology, camera, or speaker state. Do NOT mention <Picture N>. Never repeat a fact or clause inside a definition. Subject definitions are not mini-captions.
-Do NOT use provenance/analysis boilerplate such as "consistent with the visual evidence", "consistent with the video frames", "primary subject of the shot", "only visible person", or similar phrases.
-visual_retention_analysis: one concise retention statement per required item. Do not repeat appearance descriptions from subject_definitions or shot1_visual_description.
-style_opening is one concise global style/camera/lighting sentence. The pipeline owns [Shot 1]; do not emit shot markers, timestamps or placeholders.
-Only use supplied Subject/Picture labels and visible entity IDs, never example assets.
-A later task may supply audiovisual facts and its own response schema; follow that task while retaining this visual draft."""
+VISUAL_SYSTEM_PROMPT = """Observe the full target video using visual evidence only. Return MimoVisualDraft.
+Official ICL demonstrates H3 writing and field boundaries, not the response schema.
+shot1_visual_description is the single generation-quality visual description: cover composition/framing, foreground/background, visible referenced subjects and attributes, appearance, environment and lighting/color, observable actions/state changes, gaze/expression, camera behavior, and meaningful early-to-middle-to-late progression.
+Prefer observable description over plot interpretation. If object identity, function, material, setting, relationship, intention or psychology is uncertain, describe visible appearance instead of guessing (not "likely alcohol", "possibly candles", "presumably", unsupported "nightclub/KTV" or "celebratory/relaxed gathering"). No hard word-count requirement.
+Naturally name every supplied Subject actually visible and relevant, INCLUDING attribute Subjects, at its first relevant description. Use "<Subject 1>, a middle-aged woman, sits on the left..." or "<Subject 1>'s <Subject 3> short dark hair...", "her <Subject 4> concerned facial expression...", "his <Subject 5> grey shirt...". Never use parenthetical metadata such as "a woman (<Subject 1>)" or "hair (<Subject 3>)".
+Profile/back/occluded/silent subjects remain visible; visual presence alone never assigns a speaker. Do not output internal IDs such as (e1), (e2), g1, v1 or segment_0001 in consumer-facing prose.
+Keep segment_views for supplied windows in order; list visible entities and only the detailed observations actually assessable. speech_correlated_articulation records visible articulation only, without audio correlation or identity inference.
+subject_definitions: exactly one per required Subject in order, each ONE concise sentence of stable visual appearance, not actions, frame position, chronology or a mini-caption. Do not repeat facts or provenance/analysis boilerplate. Omit <Picture N> from definition descriptions: pipeline code owns Picture provenance and attribute ownership. Attribute descriptions concern only that attribute.
+visual_retention_analysis: one concise statement per required item, without repeating appearance prose; attribute retention concerns its owning entity. Use fully_preserved, partially_preserved or weak_reference only.
+style_opening is one concise global style/camera/lighting sentence. Use only supplied Subject/Picture labels in visual prose. Pipeline owns [Shot 1]; no shot markers, timestamps or placeholders.
+Do not infer sounds, dialogue or speaker identity; no (Sx), <d>, acoustic groups or audio fields."""
 
 
 SYSTEM_PROMPT = """ROLE / OUTPUT
 Return one compact MimoSpeechAVAssemblyDraft JSON object. Do not regenerate visual_observation, subject_definitions, visual_retention_analysis or style_opening; they are owned by Turn 1.
 
-SPEECH-ONLY ASSEMBLY
-Return only audio_observation, av_grounding, shot1_caption and warnings.
+SPEECH / AV ASSEMBLY
+Return only audio_observation, av_grounding, summary, shot1_caption and warnings.
 Turn 2 caption is Turn 1 visual prose plus speaker markers and exact <d> ASR dialogue, in playback order. Defer ALL non-dialogue audio to Turn 3. Do NOT add music, hum, rumble, room tone, SFX, or any other non-dialogue audio prose.
 
 VISUAL OWNERSHIP
@@ -1362,6 +1354,10 @@ Do not attach (Sx) to a visible Subject when the final AV judgment says the voic
 Grounding rationale and internal evidence belong only in av_grounding, not in shot1_caption. Do not expose internal grounding fields or evidence codes in consumer-facing prose.
 The pipeline owns [Shot 1]; do not emit shot markers, timestamps or placeholders.
 
+TARGET-VIDEO SUMMARY
+Write one short overall target-video summary: the main visible subject/action and important speech presentation. This is not an audio report. Do not enumerate audio layers, list absent music/SFX, write "The audio consists of...", or add a [reference generation ...] task prefix. The materializer owns that prefix.
+Do not invent visual details beyond the supplied Turn 1 draft.
+
 SPEAKER MARKERS
 - Number stable (Sx) by final groups' first transcribed appearance. Referenced visible speakers use <Subject N> (Sx); unbound sources use a natural semantic source plus (Sx). No fixed says clause or immediate adjacency is required.
 - (Sx) IDs identify actual vocal sources/events. They are NOT Subject numbers. Do NOT attach (Sx) merely because a person is visible, introduced, listening or present. A silent Subject must not consume a speaker ID. Number by first ACTUAL vocal appearance: first actual vocal source -> S1; second distinct vocal source -> S2.
@@ -1373,18 +1369,12 @@ SPEAKER MARKERS
 - The official ICL is an official H3 writing/field-boundary demonstration, not the response-schema definition. Follow the actual supplied schema and official six-section Ref2VA semantics."""
 
 
-AUDIO_FINALIZE_SYSTEM_PROMPT = """Finalize ONLY non-dialogue audio presentation.
-The previous assistant response owns visual content, exact <d> dialogue, Sx and speaker identity. Do not change those facts or re-decide grounding.
-Use the original target AV as the primary audio authority. The two separator descriptions are useful hints, not mandatory truth. Make the best direct factual audiovisual judgment.
-If music is audibly present in the original target AV, preserve it in the appropriate final field: audience-only/background score in non_diegetic_music; in-scene/diegetic music in shot1_caption. Do not output N/A for music that is clearly audible in the original target AV.
-Final placement:
-- Continuous ambience / room tone / hum / rumble / general environmental sound -> overall_soundscape.
-- Audience-only background score/music -> non_diegetic_music.
-- Localized diegetic or synchronized sound at a specific moment -> shot1_caption.
-- Diegetic/in-scene music -> shot1_caption at its chronological position.
-Route each audible event once; do not duplicate it across fields.
-You may add, remove or correct NON-DIALOGUE AUDIO wording only as needed to match the target AV. Preserve visual facts, exact <d> dialogue text, Sx, speaker identity and Subject/Picture labels. Do not turn closed lips into moving lips or rewrite visual prose to justify a sound.
-Return only the final summary, shot1_caption, overall_soundscape and non_diegetic_music."""
+AUDIO_FINALIZE_SYSTEM_PROMPT = """Return ONLY overall_soundscape and non_diegetic_music.
+Judge the target audio using the original target AV and two separated audio views of that SAME target together. Original AV remains primary authority.
+The music stem supplies recall/evidence for musical content; the sfx stem supplies recall/evidence for ambience, physical and environmental sounds. Separator residuals are not automatically true.
+Do not discard a coherent musical layer clearly exposed by the music stem merely because it is quiet in the original mix. Preserve coherent piano/music compatible with the original AV in non_diegetic_music when it is audience-only BGM. Do not output N/A for clearly established music.
+overall_soundscape describes ambience and physical/environmental sound, excluding dialogue and non-diegetic music. non_diegetic_music describes audience-only BGM; N/A only when no such music is established.
+Do not output visual prose, dialogue, Subject labels, Sx, summary or shot1_caption."""
 
 
 def _official_detailed_description_icl_messages() -> list[dict[str, str]]:
@@ -1529,13 +1519,14 @@ def _validate_av_observation_usage(
     diagnostic: MimoCompletionDiagnostic,
     *,
     require_explicit_audio: bool,
+    require_reference_images: bool = True,
 ) -> None:
-    if diagnostic.usage.image_tokens == 0:
+    if require_reference_images and diagnostic.usage.image_tokens == 0:
         raise MimoBackendFailure(
             code="mimo_reference_images_not_observed",
             reason="MiMo reported zero frozen-reference image tokens",
         )
-    if diagnostic.usage.image_tokens is None:
+    if require_reference_images and diagnostic.usage.image_tokens is None:
         diagnostic.warnings.append("image_tokens_unavailable")
     if diagnostic.usage.video_tokens == 0:
         raise MimoBackendFailure(
@@ -2864,16 +2855,21 @@ class OpenAIMimo25Backend:
             else "Return one JSON object constrained by the supplied response_format.\n"
         )
         contract = self.build_compact_task_contract(job)
-        # Visual provenance is already in the unchanged first-turn prefix.
+        # Fresh speech requests need entity/Subject ownership, not image/ICL history.
         for key in ("reference_selection", "reference_image_mapping", "subject_definition_requirements"):
             del contract[key]
+        contract["entity_subject_mapping"] = {
+            subject.entity_id: subject.subject_label
+            for subject in job.reference_subjects
+            if subject.kind == "entity" and subject.entity_id is not None
+        }
         contract["allowed_h3_reference_labels"] = sorted(allowed_reference_labels)
         return schema + "AUTHORITATIVE INPUT:\n" + _compact_json(contract)
 
     def _request(
         self, job: MimoBackendJob, *,
         allowed_reference_labels: set[str],
-        auxiliary_audio_evidence: dict[str, str] | None = None,
+        auxiliary_audio_paths: dict[str, Path] | None = None,
     ) -> tuple[str, tuple[str, str, str], list[MimoCompletionDiagnostic], dict[str, int]]:
         diagnostics: list[MimoCompletionDiagnostic] = []
         raws: list[str | None] = [None, None, None]
@@ -2937,7 +2933,9 @@ class OpenAIMimo25Backend:
                 diagnostic.request_error = f"{type(exc).__name__}: {exc}"
                 raise
             _validate_finish_reason(diagnostic)
-            _validate_av_observation_usage(diagnostic, require_explicit_audio=False)
+            _validate_av_observation_usage(
+                diagnostic, require_explicit_audio=False, require_reference_images=visual_only,
+            )
             if visual_only:
                 diagnostic.warnings = [
                     warning for warning in diagnostic.warnings if warning != "audio_tokens_unavailable"
@@ -2980,12 +2978,16 @@ class OpenAIMimo25Backend:
                     code="mimo_visual_structured_output_failed",
                     reason="MiMo visual draft failed structured validation", issues=tuple(issues),
                 )
+            target_video = next(item for item in content if item["type"] == "video_url")
             turn2_messages = [
-                *turn1_messages,
-                {"role": "assistant", "content": visual_raw},
-                {"role": "user", "content": SYSTEM_PROMPT + "\n" + self._prompt(
-                    job, allowed_reference_labels=allowed_reference_labels,
-                )},
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": [
+                    target_video,
+                    {"type": "text", "text": (
+                        self._prompt(job, allowed_reference_labels=allowed_reference_labels)
+                        + "\nTURN 1 VISUAL DRAFT:\n" + visual.model_dump_json()
+                    )},
+                ]},
             ]
             speech_av_raw = request_turn(turn2_messages, MimoSpeechAVAssemblyDraft, turn_index=1)
             canonical_av, corrections = _canonicalize_raw_annotation_payload(speech_av_raw)
@@ -2996,19 +2998,25 @@ class OpenAIMimo25Backend:
                     code="mimo_structured_output_failed",
                     reason="MiMo speech AV assembly failed structured validation", issues=tuple(issues),
                 )
-            finalize_instruction = (
-                AUDIO_FINALIZE_SYSTEM_PROMPT
-                + "\nAUXILIARY AUDIO CANDIDATES (NOT FACTUAL TRUTH):\n"
-                + _compact_json(auxiliary_audio_evidence or {})
-            )
+            finalize_instruction = "Judge the non-dialogue audio of the supplied target AV."
             if self.config.transport == "xiaomi":
                 finalize_instruction += "\nRESPONSE SCHEMA:\n" + _compact_json(
                     MimoAudioFinalizeDraft.model_json_schema()
                 )
+            finalize_content = [target_video, {"type": "text", "text": finalize_instruction}]
+            if auxiliary_audio_paths is not None:
+                if set(auxiliary_audio_paths) != {"music", "sfx"}:
+                    raise ValueError("audio finalization requires both music and sfx stems")
+                for kind in ("music", "sfx"):
+                    finalize_content.extend([
+                        {"type": "text", "text": f"{kind} stem: separated audio of the SAME target"},
+                        {"type": "audio_url", "audio_url": {
+                            "url": self.config.media_resolver.resolve(auxiliary_audio_paths[kind]),
+                        }},
+                    ])
             turn3_messages = [
-                *turn2_messages,
-                {"role": "assistant", "content": speech_av_raw},
-                {"role": "user", "content": finalize_instruction},
+                {"role": "system", "content": AUDIO_FINALIZE_SYSTEM_PROMPT},
+                {"role": "user", "content": finalize_content},
             ]
             audio_finalize_raw = request_turn(
                 turn3_messages, MimoAudioFinalizeDraft, turn_index=2,
@@ -3034,6 +3042,8 @@ class OpenAIMimo25Backend:
                 "av_grounding": assembly.av_grounding.model_dump(mode="json"),
                 "warnings": [item.model_dump(mode="json") for item in assembly.warnings],
                 "h3_semantics": {
+                    "summary": assembly.summary,
+                    "shot1_caption": assembly.shot1_caption,
                     **finalized.model_dump(mode="json"),
                     **visual.model_dump(
                         mode="json", exclude={"segment_views", "shot1_visual_description"},
@@ -3219,11 +3229,11 @@ class OpenAIMimo25Backend:
         transcribed_segment_ids: list[str],
         allowed_entity_ids: set[str],
         allowed_reference_labels: set[str],
-        auxiliary_audio_evidence: dict[str, str] | None = None,
+        auxiliary_audio_paths: dict[str, Path] | None = None,
     ) -> MimoBackendResult:
         raw, raw_responses, diagnostics, stage_corrections = self._request(
             job, allowed_reference_labels=allowed_reference_labels,
-            auxiliary_audio_evidence=auxiliary_audio_evidence,
+            auxiliary_audio_paths=auxiliary_audio_paths,
         )
         visual_raw, speech_av_raw, audio_finalize_raw = raw_responses
         diagnostic = diagnostics[-1]

@@ -231,6 +231,7 @@ class MimoH3ShadowRecord(SchemaModel):
         "h3_mimo25_materializer_v19",
         "h3_mimo25_materializer_v23",
         "h3_mimo25_materializer_v24",
+        "h3_mimo25_materializer_v25",
     ] = (
         MIMO25_MATERIALIZER_VERSION
     )
@@ -589,6 +590,8 @@ def _join_picture_labels(labels: Sequence[str]) -> str:
 def _render_subject_definition(
     draft: MimoSubjectDefinitionDraft,
     contract: RecaptionSubjectContract,
+    *,
+    subjects: Sequence[RecaptionSubjectContract],
 ) -> str:
     if draft.subject_label != contract.subject_label:
         raise ValueError("MiMo Subject definition differs from frozen Subject contract")
@@ -596,6 +599,16 @@ def _render_subject_definition(
     if description.casefold().startswith("is "):
         description = description[3:].lstrip()
     description = description.rstrip(". ")
+    if contract.kind == "attribute":
+        owner = next(
+            (item for item in subjects if item.kind == "entity"
+             and item.entity_id == contract.owner_entity_id),
+            None,
+        )
+        if owner is None:
+            raise ValueError("MiMo attribute Subject has no owning entity Subject")
+        attribute = contract.attribute_type.replace("_", " ")
+        description = f"the {attribute} of {owner.subject_label}, described as {description}"
     pictures = _join_picture_labels(contract.source_picture_labels)
     connector = {
         "entity": "shown in",
@@ -679,7 +692,7 @@ def _materialize_sample(
     warnings.extend(correction_warnings)
     structured = Qwen38H3StructuredResponse(
         subject_definitions=[
-            _render_subject_definition(item, subject)
+            _render_subject_definition(item, subject, subjects=contract.subjects)
             for item, subject in zip(
                 record.annotation.h3_semantics.subject_definitions,
                 job.reference_subjects,

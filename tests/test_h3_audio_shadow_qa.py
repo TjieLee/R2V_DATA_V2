@@ -197,7 +197,7 @@ def test_builder_ready_failed_order_media_and_sources_unchanged(tmp_path, monkey
     assert [clip["reconcile"]["status"] for clip in data["clips"]] == ["ready", "failed", "ready"]
     failed = data["clips"][1]["reconcile"]
     assert failed["failure_code"] == "synthetic_failed"
-    assert failed["model_call_count"] == 5
+    assert failed["model_call_count"] == 3
     assert failed["visual_raw_response"] and failed["speech_av_raw_response"] and failed["audio_finalize_raw_response"]
     assert failed["visual_model_call_count"] == 1
     assert data["clips"][1]["direct_h3"]["style_opening"]
@@ -207,7 +207,7 @@ def test_builder_ready_failed_order_media_and_sources_unchanged(tmp_path, monkey
     for clip, call in zip((data["clips"][0], data["clips"][2]), materialized, strict=True):
         final = clip["final_h3"]
         assert final["status"] == "ready"
-        assert final["materializer_version"] == "h3_mimo25_materializer_v24"
+        assert final["materializer_version"] == "h3_mimo25_materializer_v25"
         assert final["text"] == call[3] == original(*call[:3])[1]
         assert final["variants"][0]["text"] == final["text"]
         assert "[[" not in final["text"]
@@ -556,7 +556,7 @@ const {chromium} = require(process.argv[2]);
     assert.strictEqual(await page.locator("#final-text").textContent(), expectedFinal);
     assert(await page.locator("#final-text").isVisible());
     assert.strictEqual(await page.locator("#final-h3").evaluate(el => el.closest("details")), null);
-    assert.strictEqual(await page.locator("#materializer-version").textContent(), "h3_mimo25_materializer_v24");
+    assert.strictEqual(await page.locator("#materializer-version").textContent(), "h3_mimo25_materializer_v25");
     await page.locator("#final-variant").selectOption("1");
     assert.strictEqual(await page.locator("#final-text").textContent(), dataset.clips[0].final_h3.variants[1].text);
     await page.locator("#final-variant").selectOption("0");

@@ -50,7 +50,8 @@ def test_official_examples_preserved_in_two_turn_prefix(tmp_path):
     )
     assert result.model_call_count == len(calls.requests) == 3
     messages = calls.requests[0]["messages"]
-    assert calls.requests[1]["messages"][:len(messages)] == messages
+    assert [m["role"] for m in calls.requests[1]["messages"]] == ["system", "user"]
+    assert not any(m in calls.requests[1]["messages"] for m in messages[1:-1])
     assert [m["role"] for m in messages] == ["system", *(["user", "assistant"] * 4), "user"]
     assert messages[1:-1] == _official_detailed_description_icl_messages()
     guide = (Path(__file__).parents[1] / "docs/VIDEO_PROMPT_WRITING_GUIDE_ref_en.md").read_text()
@@ -93,10 +94,10 @@ def test_official_examples_preserved_in_two_turn_prefix(tmp_path):
         assert "How the reference pictures align" not in message["content"]
         assert "Case 1: T2VA" not in message["content"]
     assert backend.provenance.icl_version == MIMO25_ICL_VERSION == "h3_official_ref2va_detailed_shot1_v4"
-    assert backend.provenance.prompt_version == "h3_mimo25_speech_assembly_v43"
-    assert backend.provenance.schema_version == "r2v.h3.mimo25_backend.53"
+    assert backend.provenance.prompt_version == "h3_mimo25_speech_assembly_v44"
+    assert backend.provenance.schema_version == "r2v.h3.mimo25_backend.54"
     assert backend.provenance.annotation_schema_version == "r2v.h3.mimo25_av_annotation.20"
-    assert backend.provenance.materializer_version == "h3_mimo25_materializer_v24"
+    assert backend.provenance.materializer_version == "h3_mimo25_materializer_v25"
     assert "The pipeline owns [Shot 1]" in SYSTEM_PROMPT
     assert "Do not repeat the marker before every utterance" not in SYSTEM_PROMPT
     assert "style_opening is one concise global style/camera/lighting sentence" in VISUAL_SYSTEM_PROMPT

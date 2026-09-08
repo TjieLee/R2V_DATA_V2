@@ -71,8 +71,8 @@ def _direct_h3(record: object) -> dict[str, object] | None:
     fields: dict[str, object] = {}
     for raw, keys in (
         (record.visual_raw_response, ("subject_definitions", "visual_retention_analysis", "style_opening")),
-        (record.speech_av_raw_response, ("shot1_caption",)),
-        (record.audio_finalize_raw_response, ("summary", "shot1_caption", "overall_soundscape", "non_diegetic_music")),
+        (record.speech_av_raw_response, ("summary", "shot1_caption")),
+        (record.audio_finalize_raw_response, ("overall_soundscape", "non_diegetic_music")),
     ):
         if raw is None:
             continue
