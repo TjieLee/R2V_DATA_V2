@@ -32,11 +32,11 @@ from r2v_data_v2.structured_output import (
 MIMO25_MODEL = "mimo-v2.5"
 MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
 MIMO25_PROMPT_VERSION = "h3_mimo25_speech_assembly_v45"
-MIMO25_AUDIO_FINALIZE_PROMPT_VERSION = "h3_mimo25_audio_finalize_v4"
+MIMO25_AUDIO_FINALIZE_PROMPT_VERSION = "h3_mimo25_audio_finalize_v5"
 MIMO25_VISUAL_PROMPT_VERSION = "h3_mimo25_visual_only_v4"
 MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v17"
 MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.20"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.57"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.58"
 MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION = "h3_mimo25_speaker_marker_polish_v4"
 MIMO25_ICL_VERSION = "h3_official_ref2va_detailed_shot1_v4"
 MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v26"
@@ -963,8 +963,8 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.57"] = MIMO25_BACKEND_VERSION
-    audio_finalize_prompt_version: Literal["h3_mimo25_audio_finalize_v4"] = (
+    schema_version: Literal["r2v.h3.mimo25_backend.58"] = MIMO25_BACKEND_VERSION
+    audio_finalize_prompt_version: Literal["h3_mimo25_audio_finalize_v5"] = (
         MIMO25_AUDIO_FINALIZE_PROMPT_VERSION
     )
     visual_prompt_version: Literal["h3_mimo25_visual_only_v4"] = MIMO25_VISUAL_PROMPT_VERSION
@@ -1377,7 +1377,7 @@ SPEAKER MARKERS
 
 AUDIO_FINALIZE_SYSTEM_PROMPT = """Return ONLY speaker_voice_profiles, overall_soundscape and non_diegetic_music.
 Judge the target audio using the original target AV and three separated audio views of that SAME target together. Original AV remains primary authority.
-The speech stem supplies acoustic voice evidence. Use the finalized speaker-profile targets ONLY to locate each already-decided voice in the supplied time intervals. Return exactly one profile per supplied speaker_group in target order; use voice_characteristics=null when unsupported. Describe supported pitch/register, timbre/texture, cadence/speaking rate and energy/delivery only. Never infer identity, profession, personality, nationality, role or demographics. Do not re-decide speaker identity, grouping, Subject binding, on/offscreen presentation or ASR; Turn 2 owns those decisions.
+The full speech stem and labeled exact speaker snippets supply acoustic voice evidence. Each labeled speaker snippet is an exact crop from the speech stem for the immediately named speaker_group/speaker_id and interval. Use the snippet as localized acoustic evidence when profiling that already-supplied speaker group. Use the finalized speaker-profile targets ONLY to locate each already-decided voice in the supplied time intervals. Return exactly one profile per supplied speaker_group in target order; use voice_characteristics=null when unsupported. Describe supported pitch/register, timbre/texture, cadence/speaking rate and energy/delivery only. Never infer identity, profession, personality, nationality, role or demographics. Do not re-decide speaker identity, grouping, Subject binding, on/offscreen presentation or ASR; Turn 2 owns those decisions.
 The music stem supplies recall/evidence for musical content; the sfx stem supplies recall/evidence for ambience, physical and environmental sounds. Separator residuals are not automatically true.
 Do not discard a coherent musical layer clearly exposed by the music stem merely because it is quiet in the original mix. Preserve coherent piano/music compatible with the original AV in non_diegetic_music when it is audience-only BGM. Do not output N/A for clearly established music.
 overall_soundscape describes ambience and physical/environmental sound, excluding dialogue and non-diegetic music. non_diegetic_music describes audience-only BGM; N/A only when no such music is established.

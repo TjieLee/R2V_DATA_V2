@@ -298,8 +298,8 @@ The raw fields remain `visual_raw_response`, `speech_av_raw_response` and
 `audio_finalize_raw_response`. Legacy standalone-stem description fields are
 null in new records; current provenance identifies this request contract.
 
-Current versions: backend .57, visual prompt v4, speech assembly v45, audio
-finalizer v4, materializer v26; annotation .20, authority v17, official ICL v4
+Current versions: backend .58, visual prompt v4, speech assembly v45, audio
+finalizer v5, materializer v26; annotation .20, authority v17, official ICL v4
 and speaker polish v4 remain unchanged. V26 records the recovery-eligibility
 alignment; the acoustic quality policy remains v1. Materializer v25 resolves each
 attribute Subject's owner from the frozen reference contract and explicitly

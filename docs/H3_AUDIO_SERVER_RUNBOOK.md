@@ -298,8 +298,8 @@ null for new runs. Runtime defaults remain disabled thinking, official ICL,
 temperature 0.0 and 32768 completion tokens. No new runtime canary has been run
 as part of this CPU-only change.
 
-Versions: speech prompt v45, audio finalizer v4, visual v4, annotation .20,
-backend .57, materializer v26, authority v17, ICL v4, marker polish v4;
+Versions: speech prompt v45, audio finalizer v5, visual v4, annotation .20,
+backend .58, materializer v26, authority v17, ICL v4, marker polish v4;
 reconcile record .13, summary .15, policy v6, QA data .7. Fixed output:
 `mimo_reconcile_stemtext_final_av_markerpolish_v1/`. Old
 `mimo_reconcile_av_stemtext_sound_partition/`, `mimo_v29_oneclip_smoke/`,

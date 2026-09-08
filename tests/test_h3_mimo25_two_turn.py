@@ -295,6 +295,24 @@ def test_visual_and_assembly_prompt_ownership():
     assert "speaker markers and exact dialogue" in mb.SYSTEM_PROMPT
 
 
+def test_finalizer_snippet_clarification_preserves_all_existing_decision_rules():
+    clarification = (
+        "The full speech stem and labeled exact speaker snippets supply acoustic voice evidence. "
+        "Each labeled speaker snippet is an exact crop from the speech stem for the "
+        "immediately named speaker_group/speaker_id and interval. "
+        "Use the snippet as localized acoustic evidence when profiling that already-supplied speaker group."
+    )
+    prompt = mb.AUDIO_FINALIZE_SYSTEM_PROMPT
+    assert prompt.count(clarification) == 1
+    # Removing only the input clarification recovers the exact v4 prompt, with no new gate.
+    previous = prompt.replace(clarification, "The speech stem supplies acoustic voice evidence.")
+    assert hashlib.sha256(previous.encode()).hexdigest() == (
+        "a96422ff0d32635d3ed46ffa410fb64f377638009f13e70a57624ef3f4677e05"
+    )
+    assert "use voice_characteristics=null when unsupported" in prompt
+    assert mb.MIMO25_AUDIO_FINALIZE_PROMPT_VERSION == "h3_mimo25_audio_finalize_v5"
+
+
 def test_speech_prompt_defers_sound_and_finalizer_is_short():
     assert "Defer ALL non-dialogue audio to Turn 3" in mb.SYSTEM_PROMPT
     assert "TARGET-VIDEO SUMMARY" in mb.SYSTEM_PROMPT
@@ -403,14 +421,14 @@ def test_cache_is_diagnostic_only_and_three_turn_provenance_is_fingerprinted(tmp
     assert result.model_call_count == 3
     assert [d.usage.cached_tokens for d in result.diagnostics] == [cached_tokens] * 3
     provenance = backend.provenance
-    assert provenance.schema_version == "r2v.h3.mimo25_backend.57"
+    assert provenance.schema_version == "r2v.h3.mimo25_backend.58"
     assert provenance.prompt_version == "h3_mimo25_speech_assembly_v45"
     assert provenance.visual_prompt_version == "h3_mimo25_visual_only_v4"
     assert provenance.materializer_version == "h3_mimo25_materializer_v26"
     assert provenance.policy_version == "h3_mimo25_av_authority_contract_v17"
     values = provenance.model_dump(mode="json", exclude={"configuration_fingerprint"})
     assert provenance.configuration_fingerprint == mb._sha256_text(mb._compact_json(values))
-    assert provenance.audio_finalize_prompt_version == "h3_mimo25_audio_finalize_v4"
+    assert provenance.audio_finalize_prompt_version == "h3_mimo25_audio_finalize_v5"
     del values["audio_finalize_prompt_version"]
     assert provenance.configuration_fingerprint != mb._sha256_text(mb._compact_json(values))
 
@@ -535,7 +553,7 @@ def test_spatial_presentation_and_audible_music_prompt_contract():
     assert "keep it offscreen even when LR-ASD has no binding" in speech
     assert "Return audio_observation.speaker_voice_profiles=[]" in speech
     for rule in (
-        "speech stem supplies acoustic voice evidence", "pitch/register", "timbre/texture",
+        "full speech stem and labeled exact speaker snippets supply acoustic voice evidence", "pitch/register", "timbre/texture",
         "cadence/speaking rate", "energy/delivery", "voice_characteristics=null",
         "Never infer identity, profession, personality, nationality, role or demographics",
         "Do not re-decide speaker identity, grouping, Subject binding, on/offscreen presentation or ASR",
