@@ -271,15 +271,14 @@ compact entity-to-Subject mapping, and authoritative ASR/diarization/speaker
 facts. It owns speaker observations/grounding, a short target-video summary and
 the final caption with exact dialogue/Sx. It receives no ICL or reference images.
 
-Turn 3 is another fresh request: original target AV plus actual canonical
-speech/music/SFX `audio_url` assets and compact finalized Turn 2 group/Sx/time
-windows/final-binding targets. After the full speech stem, the same request
-also carries labeled exact speech-stem snippets for every target interval,
-ordered by target then interval. These runtime-only crops are encoded as data
-URIs and cleaned before the call; they neither replace the full stems nor change
-any production media. Labels preserve gN/Sx/segment IDs without transcripts.
-It owns `speaker_voice_profiles`,
-`overall_soundscape` and `non_diegetic_music`; it cannot rewrite summary, caption,
+Turn 3 is pure audio: one request contains all finalized gN/Sx targets with
+segment/time locators and exact speech-stem snippets. It owns only
+`speaker_voice_profiles`. No AV/video/images, full stems, transcripts, entity
+or binding context are sent. It is skipped if no profile targets exist.
+Runtime-only exact crops are encoded as data URIs and cleaned before the call.
+Turn 4 is a fresh AV request containing only original target AV, music stem and
+SFX stem. It owns `overall_soundscape` and `non_diegetic_music`; it receives no
+speech stem, snippets or profile targets and cannot rewrite summary, caption,
 dialogue or binding.
 Stems are separated views of the same audio, not factual guarantees. Coherent
 music compatible with the original AV should not be discarded merely because it
@@ -289,18 +288,20 @@ Both AV turns enable embedded audio and do not require reference-image tokens.
 The final annotation stays .20. Materializer v25 adds deterministic attribute
 Subject ownership and retains canonical Audio definitions/retention.
 
-Normal per-clip counts: audio=0, visual=1, AV=2, text=0, total=3. Eligible Sx
-projection issues alone may trigger unchanged text-only polish (text=1, total=4).
+With profile targets: audio=1, visual=1, AV=2, text=0, total=4. Without targets:
+audio=0, total=3. Eligible Sx projection issues alone may trigger unchanged
+text-only polish, adding one call (total=5 or 4 respectively).
 One attempt per request; no SDK retry, repair, fallback or AV recheck.
 A failed turn stops only that clip and preserves completed raw and diagnostics.
-QA displays the three raw responses separately; standalone candidate fields are
+QA displays visual, speech AV, speaker-profile (or skipped), and finalizer raw
+responses separately; standalone candidate fields are
 null for new runs. Runtime defaults remain disabled thinking, official ICL,
 temperature 0.0 and 32768 completion tokens. No new runtime canary has been run
 as part of this CPU-only change.
 
-Versions: speech prompt v45, audio finalizer v5, visual v4, annotation .20,
-backend .58, materializer v26, authority v17, ICL v4, marker polish v4;
-reconcile record .13, summary .15, policy v6, QA data .7. Fixed output:
+Versions: speech prompt v46, speaker-profile prompt v1, audio finalizer v6, visual v4, annotation .20,
+backend .59, materializer v26, authority v17, ICL v4, marker polish v4;
+reconcile record .14, summary .16, policy v6, QA data .7. Fixed output:
 `mimo_reconcile_stemtext_final_av_markerpolish_v1/`. Old
 `mimo_reconcile_av_stemtext_sound_partition/`, `mimo_v29_oneclip_smoke/`,
 and `mimo_v30_833_oneclip_smoke/` are preserved, not migrated.

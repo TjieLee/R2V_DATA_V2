@@ -15,7 +15,7 @@ from tests.test_h3_mimo25_av_shadow import _annotation, _backend, _job_fixture
 
 def _fixture(tmp_path, source_rate=16000):
     job = _job_fixture(tmp_path)
-    visual, speech, final = split_annotation(_annotation(resolution="uncertain").model_dump_json())
+    visual, speech, profile, final = split_annotation(_annotation(resolution="uncertain").model_dump_json())
     speech = json.loads(speech)
     segments, decisions, groundings = [], [], []
     for index, group in enumerate(("g1", "g2", "g1")):
@@ -35,12 +35,13 @@ def _fixture(tmp_path, source_rate=16000):
     speech["audio_observation"]["segment_decisions"] = decisions
     speech["av_grounding"]["segment_groundings"] = groundings
     final = json.loads(final)
-    final["speaker_voice_profiles"] = [
+    profile = json.loads(profile)
+    profile["speaker_voice_profiles"] = [
         {"speaker_group": group, "voice_characteristics": None} for group in ("g1", "g2")
     ]
     job = job.model_copy(update={"segments": segments})
     assembly = mb.MimoSpeechAVAssemblyDraft.model_validate(speech)
-    return job, assembly, (visual, json.dumps(speech), json.dumps(final))
+    return job, assembly, (visual, json.dumps(speech), json.dumps(profile), json.dumps(final))
 
 
 @pytest.mark.parametrize("source_rate", [16000, 32000, 44100])
@@ -56,22 +57,25 @@ def test_exact_snippets_keep_real_uncertain_groups_all_intervals_and_source_byte
         stems[kind].write_bytes(kind.encode())
     before = {p: hashlib.sha256(p.read_bytes()).hexdigest() for p in tmp_path.rglob("*") if p.is_file()}
     result = backend._request(job, allowed_reference_labels={"<Subject 1>", "<Picture 1>"}, auxiliary_audio_paths=stems)
-    assert len(calls.requests) == 3
+    assert len(calls.requests) == 4
     content = calls.requests[2]["messages"][-1]["content"]
-    assert content[0]["type"] == "video_url"
+    assert content[0]["type"] == "text"
     targets = mb._speaker_profile_targets(assembly, job)
     assert [(t["speaker_group"], t["speaker_id"]) for t in targets] == [("g1", "S1"), ("g2", "S2")]
     assert targets[0]["segments"][0]["final_binding"] == "offscreen"
     assert targets[1]["segments"][0]["final_binding"] == "<Subject 1>"
-    target_text = content[1]["text"].split("FINALIZED SPEAKER-PROFILE TARGETS:\n")[1]
-    assert json.loads(target_text.split("\nRESPONSE SCHEMA:")[0]) == targets
-    assert [item["type"] for item in content] == ["video_url", "text"] + ["text", "audio_url"] * 6
-    labels = [json.loads(content[i]["text"].removeprefix("speaker snippet: ")) for i in (4, 6, 8)]
+    target_text = content[0]["text"].split("SPEAKER-PROFILE TARGETS:\n")[1]
+    acoustic_targets = json.loads(target_text.split("\nRESPONSE SCHEMA:")[0])
+    assert [(t["speaker_group"], t["speaker_id"]) for t in acoustic_targets] == [("g1", "S1"), ("g2", "S2")]
+    for forbidden in ("final_binding", "entity_id", "speech_presentation", "<Subject", "video_url", "image_url"):
+        assert forbidden not in json.dumps(content)
+    assert [item["type"] for item in content] == ["text"] + ["text", "audio_url"] * 3
+    labels = [json.loads(content[i]["text"].removeprefix("speaker snippet: ")) for i in (1, 3, 5)]
     assert [(label["speaker_group"], label["speaker_id"], label["segment_id"]) for label in labels] == [
         ("g1", "S1", "segment_1"), ("g1", "S1", "segment_3"), ("g2", "S2", "segment_2"),
     ]
     assert job.segments[0].asr_text not in json.dumps(content)
-    for label, extraction, position in zip(labels, media.extractions, (5, 7, 9), strict=True):
+    for label, extraction, position in zip(labels, media.extractions, (2, 4, 6), strict=True):
         segment = next(s for s in job.segments if s.segment_id == label["segment_id"])
         expected = (round(segment.source_start_sample * 32000 / source_rate),
                     round(segment.source_end_sample * 32000 / source_rate))
@@ -83,13 +87,16 @@ def test_exact_snippets_keep_real_uncertain_groups_all_intervals_and_source_byte
         payload = json.loads(base64.b64decode(content[position]["audio_url"]["url"].split(",", 1)[1]))
         assert payload == {"source_start_sample": expected[0], "source_end_sample": expected[1], "sample_rate_hz": 32000}
         assert not extraction["destination"].parent.exists()
-    for position, kind in ((3, "speech"), (11, "music"), (13, "sfx")):
-        assert content[position]["audio_url"]["url"] == backend.config.media_resolver.resolve(stems[kind])
+    final_content = calls.requests[3]["messages"][-1]["content"]
+    assert final_content[0]["type"] == "video_url"
+    assert [p["audio_url"]["url"] for p in final_content if p["type"] == "audio_url"] == [
+        backend.config.media_resolver.resolve(stems[kind]) for kind in ("music", "sfx")
+    ]
     assert json.loads(result[0])["audio_observation"]["speaker_voice_profiles"] == [
         {"speaker_group": group, "voice_characteristics": None} for group in ("g1", "g2")
     ]
     repeated = backend._speaker_snippet_content(job, targets, stems["speech"])
-    assert repeated == content[4:10]
+    assert repeated == content[1:]
     assert {p: hashlib.sha256(p.read_bytes()).hexdigest() for p in before} == before
     assert {p for p in tmp_path.rglob("*") if p.is_file()} == set(before)
 
@@ -102,6 +109,55 @@ def test_no_targets_does_not_probe_or_invent_snippets(tmp_path):
     targets = mb._speaker_profile_targets(assembly, job)
     assert targets == []
     assert backend._speaker_snippet_content(job, targets, tmp_path / "missing.flac") == []
+
+
+@pytest.mark.parametrize("reason", ["no_segments", "null_group", "nontranscribed"])
+def test_no_profile_target_skips_audio_call_and_publishes_empty_profiles(tmp_path, reason):
+    job, assembly, raws = _fixture(tmp_path)
+    if reason == "no_segments":
+        job = job.model_copy(update={"segments": []})
+    elif reason == "null_group":
+        for decision in assembly.audio_observation.segment_decisions:
+            decision.primary_speaker_group = None
+    else:
+        job = job.model_copy(update={"segments": [
+            s.model_copy(update={"asr_status": "empty", "asr_text": None}) for s in job.segments
+        ]})
+    speech_raw = assembly.model_dump_json()
+    backend, calls = _backend(tmp_path, [(raws[0], 0), (speech_raw, 8), (raws[3], 8)])
+    raw, slots, diagnostics, _ = backend._request(
+        job, allowed_reference_labels={"<Subject 1>", "<Picture 1>"},
+        auxiliary_audio_paths={kind: Path(job.target_full_audio_path) for kind in ("speech", "music", "sfx")},
+    )
+    assert len(calls.requests) == 3
+    assert slots == (raws[0], speech_raw, None, raws[3])
+    assert json.loads(raw)["audio_observation"]["speaker_voice_profiles"] == []
+    assert [d.input_modality for d in diagnostics] == [
+        "target_video_visual_only", "target_video_speech_assembly", "target_video_audio_finalize",
+    ]
+    assert not backend._audio_media_backend.extractions
+    assert "speaker snippet:" not in json.dumps(calls.requests)
+
+
+@pytest.mark.parametrize("schema,field", [
+    (mb.MimoSpeakerProfileDraft, "overall_soundscape"),
+    (mb.MimoSpeakerProfileDraft, "non_diegetic_music"),
+    (mb.MimoSpeakerProfileDraft, "summary"),
+    (mb.MimoSpeakerProfileDraft, "caption"),
+    (mb.MimoSpeakerProfileDraft, "entity_id"),
+    (mb.MimoSpeakerProfileDraft, "binding"),
+    (mb.MimoSpeakerProfileDraft, "asr_text"),
+    (mb.MimoAudioFinalizeDraft, "speaker_voice_profiles"),
+    (mb.MimoSpeechAudioObservation, "speaker_voice_profiles"),
+])
+def test_intermediate_output_ownership_rejects_foreign_fields(schema, field):
+    values = {
+        mb.MimoSpeakerProfileDraft: {"speaker_voice_profiles": []},
+        mb.MimoAudioFinalizeDraft: {"overall_soundscape": "N/A", "non_diegetic_music": "N/A"},
+        mb.MimoSpeechAudioObservation: {"segment_decisions": []},
+    }[schema]
+    with pytest.raises(ValueError, match="Extra inputs"):
+        schema.model_validate({**values, field: []})
 
 
 @pytest.mark.parametrize("failure", ["extract", "encode"])

@@ -21,7 +21,7 @@ def _run(backend, job):
 
 
 def _visual_structure_fixture():
-    visual_raw, _, _ = split_annotation(_annotation().model_dump_json())
+    visual_raw, _, _, _ = split_annotation(_annotation().model_dump_json())
     visual = json.loads(visual_raw)
     row = visual["segment_views"][0]
     first = row["entity_observations"][0]
@@ -117,11 +117,12 @@ def test_visual_structure_recovery_preserves_raw_prefix_and_call_count(tmp_path,
     if pattern == "picture_5cb":
         visual["shot1_visual_description"] = "<Subject 1> from <Picture 1> stands by the door."
     visual_raw = json.dumps(visual, indent=2)
-    _, speech_raw, finalize_raw = split_annotation(_annotation().model_dump_json())
-    backend, calls = _backend(tmp_path, [(visual_raw, 0), (speech_raw, 8), (finalize_raw, 8)])
+    _, speech_raw, profile_raw, finalize_raw = split_annotation(_annotation().model_dump_json())
+    backend, calls = _backend(tmp_path, [(visual_raw, 0), (speech_raw, 8), (profile_raw, 8), (finalize_raw, 8)])
     result = backend.reconcile(
         _job_fixture(tmp_path), segment_ids=["segment_1"], transcribed_segment_ids=["segment_1"],
         allowed_entity_ids={"e1", "e2"}, allowed_reference_labels={"<Subject 1>", "<Picture 1>"},
+        auxiliary_audio_paths={kind: tmp_path / "full.flac" for kind in ("speech", "music", "sfx")},
     )
     views = result.annotation.visual_observation.segment_views
     assert len(views) == 1 and views[0].visible_entity_ids == ["e1", "e2"]
@@ -129,11 +130,11 @@ def test_visual_structure_recovery_preserves_raw_prefix_and_call_count(tmp_path,
     assert [obs.entity_id for obs in views[0].entity_observations] == expected_ids
     assert result.annotation.visual_observation.visual_blocks[0].text == visual["shot1_visual_description"]
     assert result.visual_raw_response == visual_raw
-    assert result.raw_responses == (visual_raw, speech_raw, finalize_raw)
+    assert result.raw_responses == (visual_raw, speech_raw, profile_raw, finalize_raw)
     assert all(message["role"] != "assistant" for message in calls.requests[1]["messages"])
     supplied = calls.requests[1]["messages"][-1]["content"][-1]["text"].split("TURN 1 VISUAL DRAFT:\n")[1]
     assert json.loads(supplied)["segment_views"] == [view.model_dump() for view in views]
-    assert result.model_call_count == len(calls.requests) == 3
+    assert result.model_call_count == len(calls.requests) == 4
     assert result.recheck_count == result.http_retry_count == 0
     if pattern == "duplicate_0262":
         assert result.deterministic_correction_counts["visual_segment_row_merge"] == 1
@@ -177,7 +178,7 @@ def test_intermediate_schema_field_ownership():
     }
     finalize = mb.MimoAudioFinalizeDraft.model_json_schema()
     assert set(finalize["properties"]) == {
-        "speaker_voice_profiles", "overall_soundscape", "non_diegetic_music",
+        "overall_soundscape", "non_diegetic_music",
     }
     assert finalize["additionalProperties"] is False
     assert set(finalize["required"]) == set(finalize["properties"])
@@ -188,11 +189,11 @@ def test_intermediate_schema_field_ownership():
 
 
 @pytest.mark.parametrize("transport", ["sglang", "xiaomi"])
-def test_three_turn_prefix_is_literal_and_visual_facts_are_isolated(tmp_path, monkeypatch, transport):
+def test_four_stage_prefix_is_literal_and_visual_facts_are_isolated(tmp_path, monkeypatch, transport):
     expected = _annotation()
     raws = split_annotation(expected.model_dump_json())
     job = _job_fixture(tmp_path)
-    backend, calls = _backend(tmp_path, [(raws[0], 0), (raws[1], 8), (raws[2], 8)],
+    backend, calls = _backend(tmp_path, [(raws[0], 0), (raws[1], 8), (raws[2], 8), (raws[3], 8)],
                               transport=transport, icl="official_ref2va_v1")
     original = calls.create
     def no_reference_usage_after_visual(**request):
@@ -204,9 +205,9 @@ def test_three_turn_prefix_is_literal_and_visual_facts_are_isolated(tmp_path, mo
     result = _run(backend, job)
     assert result.annotation == expected
     assert result.raw_responses == raws
-    assert result.model_call_count == len(calls.requests) == 3
+    assert result.model_call_count == len(calls.requests) == 4
     assert result.recheck_count == result.http_retry_count == 0
-    first, second, third = calls.requests
+    first, second, profile_request, third = calls.requests
     assert first["messages"][0]["content"] == mb.VISUAL_SYSTEM_PROMPT
     assert first["messages"][1:-1] == mb._official_detailed_description_icl_messages()
     for request, prompt in ((second, mb.SYSTEM_PROMPT), (third, mb.AUDIO_FINALIZE_SYSTEM_PROMPT)):
@@ -228,23 +229,34 @@ def test_three_turn_prefix_is_literal_and_visual_facts_are_isolated(tmp_path, mo
     assert json.loads(speech_text.split("TURN 1 VISUAL DRAFT:\n")[1]) == json.loads(raws[0])
     final_media = third["messages"][-1]["content"]
     audio = [item["audio_url"]["url"] for item in final_media if item["type"] == "audio_url"]
-    assert [audio[i] for i in (0, 2, 3)] == [backend.config.media_resolver.resolve(Path(job.target_full_audio_path))] * 3
-    assert audio[1].startswith("data:audio/")
-    assert len(audio) == 4
+    assert audio == [backend.config.media_resolver.resolve(Path(job.target_full_audio_path))] * 2
     assert job.segments[0].asr_text not in json.dumps(final_media)
     assert "music stem:" in json.dumps(final_media) and "sfx stem:" in json.dumps(final_media)
-    assert "separator_candidate" not in json.dumps(calls.requests)
-    target_text = final_media[1]["text"].split("FINALIZED SPEAKER-PROFILE TARGETS:\n", 1)[1]
+    for forbidden in ("speech stem:", "speaker snippet:", "SPEAKER-PROFILE TARGETS"):
+        assert forbidden not in json.dumps(final_media)
+    profile_media = profile_request["messages"][-1]["content"]
+    assert profile_request["messages"][0]["content"] == mb.SPEAKER_PROFILE_SYSTEM_PROMPT
+    assert profile_request["extra_body"]["use_audio_in_video"] is False
+    assert [p["type"] for p in profile_media] == ["text", "text", "audio_url"]
+    assert profile_media[2]["audio_url"]["url"].startswith("data:audio/")
+    target_text = profile_media[0]["text"].split("SPEAKER-PROFILE TARGETS:\n", 1)[1]
     targets = json.loads(target_text.split("\nRESPONSE SCHEMA:", 1)[0])
     assert targets == [{
         "speaker_group": "g1", "speaker_id": "S1", "segments": [{
             "segment_id": "segment_1", "start_time": 0.0, "end_time": 1.0,
-            "final_binding": "<Subject 1>", "speech_presentation": "onscreen_spoken",
         }],
     }]
-    assert json.loads(raws[1])["audio_observation"]["speaker_voice_profiles"] == []
+    for forbidden in ("video_url", "image_url", "<Subject", "entity_id", "final_binding",
+                      "speech_presentation", "evidence_codes", job.segments[0].asr_text):
+        assert forbidden not in json.dumps(profile_media)
+    assert "speaker_voice_profiles" not in json.loads(raws[1])["audio_observation"]
+    assert result.audio_model_call_count == 1
+    assert [d.input_modality for d in result.diagnostics] == [
+        "target_video_visual_only", "target_video_speech_assembly",
+        "speaker_profile_audio_only", "target_video_audio_finalize",
+    ]
     assert all("image_tokens_unavailable" not in d.warnings for d in result.diagnostics[1:])
-    for request, schema in zip(calls.requests, (mb.MimoVisualDraft, mb.MimoSpeechAVAssemblyDraft, mb.MimoAudioFinalizeDraft), strict=True):
+    for request, schema in zip(calls.requests, (mb.MimoVisualDraft, mb.MimoSpeechAVAssemblyDraft, mb.MimoSpeakerProfileDraft, mb.MimoAudioFinalizeDraft), strict=True):
         if transport == "sglang":
             assert request["response_format"] == {"type": "json_schema", "json_schema": {
                 "name": schema.__name__, "schema": schema.model_json_schema(), "strict": True,
@@ -253,11 +265,11 @@ def test_three_turn_prefix_is_literal_and_visual_facts_are_isolated(tmp_path, mo
             assert request["response_format"] == {"type": "json_object"}
 
 
-@pytest.mark.parametrize("failure_stage", [1, 2, 3])
+@pytest.mark.parametrize("failure_stage", [1, 2, 3, 4])
 @pytest.mark.parametrize("failure", ["malformed", "truncated", "http"])
-def test_three_turn_failure_stops_and_preserves_completed_evidence(tmp_path, failure_stage, failure):
-    visual_raw, speech_raw, finalize_raw = split_annotation(_annotation().model_dump_json())
-    responses = [(visual_raw, 0), (speech_raw, 8), (finalize_raw, 8)]
+def test_four_stage_failure_stops_and_preserves_completed_evidence(tmp_path, failure_stage, failure):
+    visual_raw, speech_raw, profile_raw, finalize_raw = split_annotation(_annotation().model_dump_json())
+    responses = [(visual_raw, 0), (speech_raw, 8), (profile_raw, 8), (finalize_raw, 8)]
     if failure == "malformed":
         responses[failure_stage - 1] = ("not JSON", 0)
     elif failure == "truncated":
@@ -281,7 +293,8 @@ def test_three_turn_failure_stops_and_preserves_completed_evidence(tmp_path, fai
     if failure_stage >= 2:
         assert result.visual_raw_response == visual_raw
     assert result.raw_responses == tuple(raw for raw in (
-        result.visual_raw_response, result.speech_av_raw_response, result.audio_finalize_raw_response,
+        result.visual_raw_response, result.speech_av_raw_response, result.speaker_profile_raw_response,
+        result.audio_finalize_raw_response,
     ) if raw is not None)
 
 
@@ -295,32 +308,30 @@ def test_visual_and_assembly_prompt_ownership():
     assert "speaker markers and exact dialogue" in mb.SYSTEM_PROMPT
 
 
-def test_finalizer_snippet_clarification_preserves_all_existing_decision_rules():
-    clarification = (
-        "The full speech stem and labeled exact speaker snippets supply acoustic voice evidence. "
-        "Each labeled speaker snippet is an exact crop from the speech stem for the "
-        "immediately named speaker_group/speaker_id and interval. "
-        "Use the snippet as localized acoustic evidence when profiling that already-supplied speaker group."
-    )
-    prompt = mb.AUDIO_FINALIZE_SYSTEM_PROMPT
-    assert prompt.count(clarification) == 1
-    # Removing only the input clarification recovers the exact v4 prompt, with no new gate.
-    previous = prompt.replace(clarification, "The speech stem supplies acoustic voice evidence.")
-    assert hashlib.sha256(previous.encode()).hexdigest() == (
-        "a96422ff0d32635d3ed46ffa410fb64f377638009f13e70a57624ef3f4677e05"
-    )
-    assert "use voice_characteristics=null when unsupported" in prompt
-    assert mb.MIMO25_AUDIO_FINALIZE_PROMPT_VERSION == "h3_mimo25_audio_finalize_v5"
+def test_profile_and_finalizer_prompts_have_separate_ownership():
+    profile = mb.SPEAKER_PROFILE_SYSTEM_PROMPT
+    for text in ("localized speech snippets", "exact speech-stem crop", "speaker_group/speaker_id",
+                 "pitch/register", "timbre/texture", "cadence/speaking rate", "energy/delivery",
+                 "voice_characteristics=null when genuinely unsupported",
+                 "Never infer identity, profession, personality, nationality, role or demographics"):
+        assert text in profile
+    assert len(profile.split()) < 110
+    for forbidden in ("speaker_voice_profiles", "snippet", "speech stem", "speaker-profile targets"):
+        assert forbidden not in mb.AUDIO_FINALIZE_SYSTEM_PROMPT
+    for forbidden in ("threshold", "minimum", "mandatory non-null"):
+        assert forbidden not in profile
+    assert mb.MIMO25_SPEAKER_PROFILE_PROMPT_VERSION == "h3_mimo25_speaker_profile_v1"
+    assert mb.MIMO25_AUDIO_FINALIZE_PROMPT_VERSION == "h3_mimo25_audio_finalize_v6"
 
 
 def test_speech_prompt_defers_sound_and_finalizer_is_short():
-    assert "Defer ALL non-dialogue audio to Turn 3" in mb.SYSTEM_PROMPT
+    assert "Defer ALL non-dialogue audio to Turn 4" in mb.SYSTEM_PROMPT
     assert "TARGET-VIDEO SUMMARY" in mb.SYSTEM_PROMPT
     for rule in ("main visible subject/action", "not an audio report", "materializer owns that prefix"):
         assert rule in mb.SYSTEM_PROMPT
     prompt = mb.AUDIO_FINALIZE_SYSTEM_PROMPT
-    for rule in ("Return ONLY speaker_voice_profiles, overall_soundscape and non_diegetic_music",
-                 "three separated audio views of that SAME target", "Original AV remains primary authority",
+    for rule in ("Return ONLY overall_soundscape and non_diegetic_music",
+                 "separated music and sfx audio views of that SAME target", "Original AV remains primary authority",
                  "residuals are not automatically true", "quiet in the original mix",
                  "coherent piano/music compatible", "excluding dialogue and non-diegetic music"):
         assert rule in prompt
@@ -366,7 +377,12 @@ def test_assembly_schema_field_ownership():
     speech = mb.MimoSpeechAVAssemblyDraft.model_json_schema()
     final = mb.MimoAudioFinalizeDraft.model_json_schema()
     assert "summary" in speech["required"]
-    assert set(final["properties"]) == set(final["required"]) == {"speaker_voice_profiles", "overall_soundscape", "non_diegetic_music"}
+    assert set(final["properties"]) == set(final["required"]) == {"overall_soundscape", "non_diegetic_music"}
+    audio = speech["$defs"]["MimoSpeechAudioObservation"]
+    assert set(audio["properties"]) == set(audio["required"]) == {"segment_decisions"}
+    profile = mb.MimoSpeakerProfileDraft.model_json_schema()
+    assert set(profile["properties"]) == set(profile["required"]) == {"speaker_voice_profiles"}
+    assert profile["additionalProperties"] is False
 
 
 def test_visual_v3_factual_writing_and_attribute_subjects():
@@ -406,9 +422,9 @@ def test_visual_prompt_and_schema_remain_frozen():
 
 
 @pytest.mark.parametrize("cached_tokens", [0, 73])
-def test_cache_is_diagnostic_only_and_three_turn_provenance_is_fingerprinted(tmp_path, cached_tokens):
-    visual, speech, finalized = split_annotation(_annotation().model_dump_json())
-    backend, calls = _backend(tmp_path, [(visual, 0), (speech, 8), (finalized, 8)])
+def test_cache_is_diagnostic_only_and_four_stage_provenance_is_fingerprinted(tmp_path, cached_tokens):
+    visual, speech, profile, finalized = split_annotation(_annotation().model_dump_json())
+    backend, calls = _backend(tmp_path, [(visual, 0), (speech, 8), (profile, 8), (finalized, 8)])
     create = calls.create
 
     def with_cache(**request):
@@ -418,48 +434,47 @@ def test_cache_is_diagnostic_only_and_three_turn_provenance_is_fingerprinted(tmp
 
     calls.create = with_cache
     result = _run(backend, _job_fixture(tmp_path))
-    assert result.model_call_count == 3
-    assert [d.usage.cached_tokens for d in result.diagnostics] == [cached_tokens] * 3
+    assert result.model_call_count == 4
+    assert [d.usage.cached_tokens for d in result.diagnostics] == [cached_tokens] * 4
     provenance = backend.provenance
-    assert provenance.schema_version == "r2v.h3.mimo25_backend.58"
-    assert provenance.prompt_version == "h3_mimo25_speech_assembly_v45"
+    assert provenance.schema_version == "r2v.h3.mimo25_backend.59"
+    assert provenance.prompt_version == "h3_mimo25_speech_assembly_v46"
     assert provenance.visual_prompt_version == "h3_mimo25_visual_only_v4"
     assert provenance.materializer_version == "h3_mimo25_materializer_v26"
     assert provenance.policy_version == "h3_mimo25_av_authority_contract_v17"
     values = provenance.model_dump(mode="json", exclude={"configuration_fingerprint"})
     assert provenance.configuration_fingerprint == mb._sha256_text(mb._compact_json(values))
-    assert provenance.audio_finalize_prompt_version == "h3_mimo25_audio_finalize_v5"
-    del values["audio_finalize_prompt_version"]
+    assert provenance.audio_finalize_prompt_version == "h3_mimo25_audio_finalize_v6"
+    assert provenance.speaker_profile_prompt_version == "h3_mimo25_speaker_profile_v1"
+    del values["speaker_profile_prompt_version"]
     assert provenance.configuration_fingerprint != mb._sha256_text(mb._compact_json(values))
 
 
 def test_final_fields_come_from_their_owning_turns(tmp_path):
     source = _annotation()
-    visual_raw, speech_raw, finalize_raw = split_annotation(source.model_dump_json())
+    visual_raw, speech_raw, profile_raw, finalize_raw = split_annotation(source.model_dump_json())
     visual = json.loads(visual_raw)
     visual["shot1_visual_description"] = "<Subject 1> stands with closed lips and lowers a hand."
     speech = json.loads(speech_raw)
     speech["shot1_caption"] = source.h3_semantics.shot1_caption + " Her lips remain closed."
     finalized = json.loads(finalize_raw)
     speech["summary"] = "A standing person speaks."
-    speech["audio_observation"]["speaker_voice_profiles"] = [
-        {"speaker_group": "g1", "voice_characteristics": "Turn 2 must not own this"}
-    ]
-    finalized["speaker_voice_profiles"] = [
+    profile = json.loads(profile_raw)
+    profile["speaker_voice_profiles"] = [
         {"speaker_group": "g1", "voice_characteristics": "low register, dry texture, measured cadence"}
     ]
     finalized.update(
         overall_soundscape="A low steady hum.",
         non_diegetic_music="A soft instrumental score.",
     )
-    raws = tuple(json.dumps(item) for item in (visual, speech, finalized))
+    raws = tuple(json.dumps(item) for item in (visual, speech, profile, finalized))
     backend, calls = _backend(tmp_path, [(raw, 8) for raw in raws])
     result = _run(backend, _job_fixture(tmp_path))
     annotation = result.annotation
     assert annotation.visual_observation.visual_blocks[0].text == visual["shot1_visual_description"]
     assert annotation.visual_observation.segment_views == source.visual_observation.segment_views
     assert annotation.audio_observation.segment_decisions == source.audio_observation.segment_decisions
-    assert annotation.audio_observation.speaker_voice_profiles == mb.MimoAudioFinalizeDraft.model_validate(finalized).speaker_voice_profiles
+    assert annotation.audio_observation.speaker_voice_profiles == mb.MimoSpeakerProfileDraft.model_validate(profile).speaker_voice_profiles
     assert annotation.av_grounding == source.av_grounding
     assert annotation.warnings == source.warnings
     for key in ("subject_definitions", "visual_retention_analysis", "style_opening"):
@@ -469,7 +484,7 @@ def test_final_fields_come_from_their_owning_turns(tmp_path):
     assert annotation.h3_semantics.shot1_caption == speech["shot1_caption"]
     assert annotation.h3_semantics.summary == speech["summary"]
     assert result.raw_responses == raws
-    assert result.model_call_count == len(calls.requests) == 3
+    assert result.model_call_count == len(calls.requests) == 4
     assert not result.speaker_marker_polish.attempted
 
 
@@ -481,13 +496,13 @@ def test_unsupported_turn3_voice_profile_stays_null(tmp_path):
     backend, calls = _backend(tmp_path, [(raw, 8) for raw in raws])
     result = _run(backend, _job_fixture(tmp_path))
     assert result.annotation.speaker_voice_profiles[0].voice_characteristics is None
-    assert result.model_call_count == len(calls.requests) == 3
+    assert result.model_call_count == len(calls.requests) == 4
 
 
 @pytest.mark.parametrize("resolution", ["resolved", "uncertain", "needs_acoustic_refinement"])
 def test_profile_targets_ignore_nontranscribed_segments_and_preserve_group_order(tmp_path, resolution):
     job = _job_fixture(tmp_path)
-    _, raw, _ = split_annotation(_annotation(resolution=resolution).model_dump_json())
+    _, raw, _, _ = split_annotation(_annotation(resolution=resolution).model_dump_json())
     assembly = mb.MimoSpeechAVAssemblyDraft.model_validate_json(raw)
     segment = job.segments[0]
     extra = segment.model_copy(update={"segment_id": "empty", "asr_status": "empty", "asr_text": None})
@@ -506,7 +521,7 @@ def test_profile_targets_ignore_nontranscribed_segments_and_preserve_group_order
 
 def test_profile_targets_never_invent_fallback_group_for_null_primary(tmp_path):
     job = _job_fixture(tmp_path)
-    _, raw, _ = split_annotation(_annotation(resolution="uncertain").model_dump_json())
+    _, raw, _, _ = split_annotation(_annotation(resolution="uncertain").model_dump_json())
     values = json.loads(raw)
     values["audio_observation"]["segment_decisions"][0]["primary_speaker_group"] = None
     assembly = mb.MimoSpeechAVAssemblyDraft.model_validate(values)
@@ -526,7 +541,7 @@ def test_profile_targets_never_invent_fallback_group_for_null_primary(tmp_path):
     (mb.MimoAudioFinalizeDraft, "visual_observation"),
 ])
 def test_intermediate_schema_rejects_other_turn_fields(schema, foreign_field):
-    _, speech, finalized = split_annotation(_annotation().model_dump_json())
+    _, speech, _, finalized = split_annotation(_annotation().model_dump_json())
     payload = json.loads(speech if schema is mb.MimoSpeechAVAssemblyDraft else finalized)
     payload[foreign_field] = {}
     with pytest.raises(ValidationError, match="Extra inputs"):
@@ -551,21 +566,22 @@ def test_spatial_presentation_and_audible_music_prompt_contract():
     assert "Do not output N/A for clearly established music" in mb.AUDIO_FINALIZE_SYSTEM_PROMPT
     assert "only or most salient visible person" in speech
     assert "keep it offscreen even when LR-ASD has no binding" in speech
-    assert "Return audio_observation.speaker_voice_profiles=[]" in speech
+    assert "speaker_voice_profiles" not in speech
     for rule in (
-        "full speech stem and labeled exact speaker snippets supply acoustic voice evidence", "pitch/register", "timbre/texture",
+        "localized speech snippets", "pitch/register", "timbre/texture",
         "cadence/speaking rate", "energy/delivery", "voice_characteristics=null",
         "Never infer identity, profession, personality, nationality, role or demographics",
-        "Do not re-decide speaker identity, grouping, Subject binding, on/offscreen presentation or ASR",
+        "Do not re-decide speaker grouping or binding",
     ):
-        assert rule in mb.AUDIO_FINALIZE_SYSTEM_PROMPT
+        assert rule in mb.SPEAKER_PROFILE_SYSTEM_PROMPT
 
 
 def test_correction_rules_reach_only_their_owning_request(tmp_path):
     responses = split_annotation(_annotation().model_dump_json())
     backend, calls = _backend(tmp_path, [(raw, 8) for raw in responses])
     result = _run(backend, _job_fixture(tmp_path))
-    first, second, third = calls.requests
+    first, second, profile_request, third = calls.requests
+    assert profile_request["messages"][0]["content"] == mb.SPEAKER_PROFILE_SYSTEM_PROMPT
     consistency = "Keep binding_status, speech_presentation and entity_id semantically consistent"
     music = "Do not output N/A for clearly established music"
     assert consistency not in json.dumps(first["messages"])
@@ -573,5 +589,5 @@ def test_correction_rules_reach_only_their_owning_request(tmp_path):
     assert music not in second["messages"][0]["content"]
     assert music in third["messages"][0]["content"]
     assert consistency not in third["messages"][0]["content"]
-    assert result.model_call_count == len(calls.requests) == 3
+    assert result.model_call_count == len(calls.requests) == 4
     assert result.recheck_count == result.http_retry_count == 0

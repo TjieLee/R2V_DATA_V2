@@ -26,6 +26,7 @@ from r2v_data_v2.h3.mimo25_backend import (
 )
 from r2v_data_v2.h3.mimo25_stem_shadow import (
     MIMO25_STEM_RECONCILE_STAGE,
+    MimoStemReconcileRecord,
     StemAwareOpenAIMimo25Backend,
     build_stem_reconcile_jobs,
     run_mimo25_stem_reconcile_shadow,
@@ -52,8 +53,8 @@ def _subset_inventory(base, clip_ids):
 
 
 def test_finalizer_uses_raw_stems_without_evidence_gates():
-    assert MIMO25_PROMPT_VERSION == "h3_mimo25_speech_assembly_v45"
-    assert "three separated audio views of that SAME target" in AUDIO_FINALIZE_SYSTEM_PROMPT
+    assert MIMO25_PROMPT_VERSION == "h3_mimo25_speech_assembly_v46"
+    assert "separated music and sfx audio views of that SAME target" in AUDIO_FINALIZE_SYSTEM_PROMPT
     assert "Original AV remains primary authority" in AUDIO_FINALIZE_SYSTEM_PROMPT
     assert "quiet in the original mix" in AUDIO_FINALIZE_SYSTEM_PROMPT
     assert "residuals are not automatically true" in AUDIO_FINALIZE_SYSTEM_PROMPT
@@ -158,8 +159,8 @@ def test_reconcile_ordered_subset_cli(tmp_path, monkeypatch, clip_ids, mixed):
     assert summary["skipped_clips"] == []
     assert summary["diarization_failed_clips"] == []
     assert [row["clip_uid"] for row in _records(shadow)] == clip_ids
-    assert len(completions.requests) == 3 * len(clip_ids)
-    assert summary["audio_model_call_count"] == 0
+    assert len(completions.requests) == 4 * len(clip_ids)
+    assert summary["audio_model_call_count"] == len(clip_ids)
 
 
 @pytest.mark.parametrize("clip_ids", [["clip-m", "clip-z"], ["unknown"], ["clip-a", "clip-a"]])
@@ -217,12 +218,13 @@ def _backend(tmp_path, shadow, responses, *, polish_responses=None):
                 raise response
             return _Completions([(response, 0)]).create(**request)
         response = completions.responses[0]
-        if request["response_format"]["json_schema"]["name"] == "MimoSpeechAVAssemblyDraft":
+        if request["response_format"]["json_schema"]["name"] in {"MimoSpeechAVAssemblyDraft", "MimoSpeakerProfileDraft"}:
+            response_index = 2 if request["response_format"]["json_schema"]["name"] == "MimoSpeakerProfileDraft" else 1
             completions.requests.append(request)
             try:
-                speech = split_annotation(response[0])[1]
+                speech = split_annotation(response[0])[response_index]
             except (ValueError, KeyError, TypeError):
-                speech = split_annotation(_raw())[1]
+                speech = split_annotation(_raw())[response_index]
             return _Completions([(speech, response[1])]).create(**request)
         completions.responses[0] = (assembly_raw(response[0]), *response[1:])
         return original(**request)
@@ -271,8 +273,10 @@ def _records(shadow):
 
 
 def _reconcile(backend, job):
+    stems = backend.stem_records_by_clip[job.clip_uid]
     return backend.reconcile(
         job,
+        auxiliary_audio_paths={kind: Path(stems.stem(kind).canonical_stem_path) for kind in ("speech", "music", "sfx")},
         segment_ids=[s.segment_id for s in job.segments],
         transcribed_segment_ids=[
             s.segment_id for s in job.segments if s.asr_status == "transcribed"
@@ -287,7 +291,7 @@ def test_embedded_audio_accounting_is_warning_only(tmp_path, monkeypatch, audio_
     _, shadow = _fixture(tmp_path, monkeypatch)
     backend, completions, _, jobs = _backend(tmp_path, shadow, [(_raw(), audio_tokens)])
     result = _reconcile(backend, jobs[0])
-    assert result.model_call_count == len(completions.requests) == 3
+    assert result.model_call_count == len(completions.requests) == 4
     assert result.recheck_count == result.http_retry_count == 0
     expected = "embedded_audio_tokens_zero" if audio_tokens == 0 else "audio_tokens_unavailable"
     assert expected in result.diagnostics[1].warnings
@@ -318,21 +322,21 @@ def test_raw_stem_assets_replace_standalone_calls(tmp_path, monkeypatch, source_
     monkeypatch.setattr(backend, "describe_auxiliary_audio", forbidden)
     summary = _run(shadow, backend, stems, jobs[:1])
     result = _records(shadow)[0]
-    assert summary.audio_model_call_count == 0
+    assert summary.audio_model_call_count == int(source_state == "valid")
     assert result["music_stem_description"] is result["sfx_stem_description"] is None
     if source_state != "valid":
         assert not completions.requests and summary.model_call_count == 0
         assert result["failure_code"] == "mimo_stem_media_invalid"
         return
     assert summary.ready_count == 1
-    assert summary.model_call_count == len(completions.requests) == 3
+    assert summary.model_call_count == len(completions.requests) == 4
     assert result["annotation"]["h3_semantics"] == payload["h3_semantics"]
     media = completions.requests[-1]["messages"][-1]["content"]
     audio_urls = [item["audio_url"]["url"] for item in media if item["type"] == "audio_url"]
-    assert len(audio_urls) == 4 and audio_urls[1].startswith("data:audio/")
-    assert [audio_urls[i] for i in (0, 2, 3)] == [
+    assert len(audio_urls) == 2
+    assert audio_urls == [
         backend.config.media_resolver.resolve(Path(record.stem(kind).canonical_stem_path))
-        for kind in ("speech", "music", "sfx")
+        for kind in ("music", "sfx")
     ]
     assert not any(d["input_modality"] == "auxiliary_audio_only" for d in result["diagnostics"])
     assert sum(item["type"] == "video_url" for item in media) == 1
@@ -346,7 +350,7 @@ def test_final_av_malformed_retains_stems_without_fourth_call(tmp_path, monkeypa
     assert result["status"] == "failed" and result["annotation"] is None
     assert result["music_stem_description"] is result["sfx_stem_description"] is None
     assert "sound_partition" not in result and result["text_model_call_count"] == 0
-    assert summary.model_call_count == len(completions.requests) == 3
+    assert summary.model_call_count == len(completions.requests) == 4
 
 
 def test_changed_auxiliary_file_is_not_sent(tmp_path, monkeypatch):
@@ -417,15 +421,15 @@ def test_final_av_authors_sound_and_diegetic_caption_without_postprocessing(
     def create(**request):
         assert request["response_format"]["json_schema"]["name"] != "MimoAuxAudioDescription"
         if request["response_format"]["json_schema"]["name"] == "MimoAudioFinalizeDraft":
-            assert sum(p["type"] == "audio_url" for p in request["messages"][-1]["content"]) == 4
+            assert sum(p["type"] == "audio_url" for p in request["messages"][-1]["content"]) == 2
         assert candidate not in json.dumps(request["messages"])
         return original(**request)
 
     monkeypatch.setattr(completions, "create", create)
     summary = _run(shadow, backend, stems, jobs)
-    assert summary.ready_count == 3 and summary.model_call_count == 9
-    assert summary.av_model_call_count == 6 and summary.audio_model_call_count == 0
-    assert len(completions.requests) == 9
+    assert summary.ready_count == 3 and summary.model_call_count == 12
+    assert summary.av_model_call_count == 6 and summary.audio_model_call_count == 3
+    assert len(completions.requests) == 12
     assert backend.provenance.prompt_version == MIMO25_PROMPT_VERSION
     assert [job.model_dump(mode="json") for job in jobs] == jobs_before
     assert all(row["annotation"]["h3_semantics"] == payload["h3_semantics"] for row in _records(shadow))
@@ -481,14 +485,14 @@ def test_real_entry_without_facts_sends_two_audio_then_visual_and_final_av(tmp_p
     assert result["summary"]["ready_count"] == 3
     assert result["summary"]["av_model_call_count"] == 6
     assert result["summary"]["text_model_call_count"] == 0
-    assert result["summary"]["model_call_count"] == len(completions.requests) == 9
+    assert result["summary"]["model_call_count"] == len(completions.requests) == 12
     assert result["summary"]["processed_clip_uids"] == ["clip-z", "clip-a", "clip-m"]
 
-    visual, speech, first = completions.requests[:3]
+    visual, speech, profile, first = completions.requests[:4]
     assert [r["response_format"]["json_schema"]["name"] for r in completions.requests] == [
-        "MimoVisualDraft", "MimoSpeechAVAssemblyDraft", "MimoAudioFinalizeDraft",
+        "MimoVisualDraft", "MimoSpeechAVAssemblyDraft", "MimoSpeakerProfileDraft", "MimoAudioFinalizeDraft",
     ] * 3
-    assert result["summary"]["audio_model_call_count"] == 0
+    assert result["summary"]["audio_model_call_count"] == 3
     assert result["summary"]["visual_model_call_count"] == 3
     assert [m["role"] for m in visual["messages"]] == ["system", *(["user", "assistant"] * 4), "user"]
     assert sum(p["type"] == "image_url" for p in visual["messages"][-1]["content"]) == 1
@@ -502,10 +506,11 @@ def test_real_entry_without_facts_sends_two_audio_then_visual_and_final_av(tmp_p
         assert request["reasoning_effort"] == "none"
     assert visual["extra_body"]["use_audio_in_video"] is False
     expected_urls = [backend.config.media_resolver.resolve(Path(selected.stem(kind).canonical_stem_path))
-                     for kind in ("speech", "music", "sfx")]
+                     for kind in ("music", "sfx")]
     actual_urls = [p["audio_url"]["url"] for p in first["messages"][-1]["content"] if p["type"] == "audio_url"]
-    assert [actual_urls[i] for i in (0, 2, 3)] == expected_urls
-    assert len(actual_urls) == 4 and actual_urls[1].startswith("data:audio/")
+    assert actual_urls == expected_urls
+    assert len(actual_urls) == 2
+    assert all(p["type"] != "video_url" for p in profile["messages"][-1]["content"])
     assert not any(p["type"] == "audio_url" for p in speech["messages"][-1]["content"])
     full = speech["messages"][-1]["content"][-1]["text"]
     contract = json.loads(full.split("AUTHORITATIVE INPUT:\n", 1)[1].split("\nTURN 1 VISUAL DRAFT:", 1)[0])
@@ -514,7 +519,7 @@ def test_real_entry_without_facts_sends_two_audio_then_visual_and_final_av(tmp_p
     assert "stem_facts" not in full and "separator_candidate" not in full
     schema = speech["response_format"]["json_schema"]["schema"]
     assert set(schema["properties"]) == {"summary", "audio_observation", "av_grounding", "shot1_caption", "warnings"}
-    assert set(first["response_format"]["json_schema"]["schema"]["properties"]) == {"speaker_voice_profiles", "overall_soundscape", "non_diegetic_music"}
+    assert set(first["response_format"]["json_schema"]["schema"]["properties"]) == {"overall_soundscape", "non_diegetic_music"}
     assert not hasattr(backend, "reconcile_sound_descriptions")
     assert not hasattr(backend, "partition_sound_description")
     assert all(path.read_bytes() == data for path, data in source_before.items())
@@ -575,7 +580,7 @@ def test_failures_keep_raw_and_continue_without_retries(tmp_path, monkeypatch, f
     expected_failed = 0 if failure == "articulation" else 1
     assert summary.failed_count == expected_failed and summary.ready_count == 3 - expected_failed
     assert summary.av_model_call_count == 6
-    assert summary.model_call_count == len(completions.requests) == 9
+    assert summary.model_call_count == len(completions.requests) == 12
     records = _records(shadow)
     assert records[0]["status"] == ("ready" if failure == "articulation" else "failed")
     assert records[0]["audio_finalize_raw_response"] == assembly_raw(first_raw)
@@ -599,7 +604,7 @@ def test_failures_keep_raw_and_continue_without_retries(tmp_path, monkeypatch, f
     assert clip["final_h3"]["status"] == ("ready" if failure == "articulation" else "unavailable")
     page = (shadow / "qa/review.html").read_text()
     assert "Turn 2 speech AV raw response" in page
-    assert "Turn 3 audio finalizer raw response" in page and "Final overall_soundscape" in page
+    assert "Turn 4 audio finalizer raw response" in page and "Final overall_soundscape" in page
     assert "Text-only sound partition" not in page
 
 
@@ -622,7 +627,7 @@ def test_repeated_subject_prose_parses_but_unknown_reference_stays_hard(
         assert "draft_contains_unknown_reference" in {item["code"] for item in row["failure_issues"]}
     else:
         assert row["status"] == "ready"
-    assert summary.model_call_count == len(completions.requests) == 3
+    assert summary.model_call_count == len(completions.requests) == 4
 
 
 @pytest.mark.parametrize("field", ["subject_definitions", "visual_retention_analysis"])
@@ -653,7 +658,7 @@ def test_direct_format_hard_gates_keep_parseable_annotation(tmp_path, monkeypatc
     assert row["status"] == "failed" and row["annotation"] is not None
     assert issue in {item["code"] for item in row["failure_issues"]}
     assert row["annotation"]["h3_semantics"]["shot1_caption"] == caption
-    assert summary.model_call_count == len(completions.requests) == 3
+    assert summary.model_call_count == len(completions.requests) == 4
 
 
 @pytest.mark.parametrize("has_transcribed,empty_inventory", [(False, True), (False, False), (True, False)])
@@ -705,6 +710,9 @@ def test_segment_inventory_is_review_only_without_transcribed_speech(
         assert "overall_soundscape:\nA quiet room tone and a clink." in text
     assert row["annotation"]["audio_observation"]["segment_decisions"][0]["segment_id"] == "extra_segment"
     assert summary.model_call_count == len(completions.requests) == 3
+    assert summary.audio_model_call_count == row["audio_model_call_count"] == 0
+    assert row["speaker_profile_raw_response"] is None
+    assert row["annotation"]["audio_observation"]["speaker_voice_profiles"] == []
 
 
 def test_av_http_failure_is_single_attempt_and_next_clip_runs(tmp_path, monkeypatch):
@@ -726,14 +734,14 @@ def test_av_http_failure_is_single_attempt_and_next_clip_runs(tmp_path, monkeypa
     summary = _run(shadow, backend, stems, jobs)
     assert summary.ready_count == 2 and summary.failed_count == 1
     assert summary.av_model_call_count == 5
-    assert len(completions.requests) == 8
-    assert summary.audio_model_call_count == 0
+    assert len(completions.requests) == 10
+    assert summary.audio_model_call_count == 2
     failed = _records(shadow)[0]
     assert failed["raw_responses"] == [failed["visual_raw_response"]]
     assert failed["audio_finalize_raw_response"] is None
 
 
-@pytest.mark.parametrize("stage", ["MimoVisualDraft", "MimoSpeechAVAssemblyDraft", "MimoAudioFinalizeDraft"])
+@pytest.mark.parametrize("stage", ["MimoVisualDraft", "MimoSpeechAVAssemblyDraft", "MimoSpeakerProfileDraft", "MimoAudioFinalizeDraft"])
 @pytest.mark.parametrize("failure", ["http", "malformed"])
 def test_failed_turn_remains_in_qa_and_next_clip_runs(tmp_path, monkeypatch, stage, failure):
     kwargs, shadow = _fixture(tmp_path, monkeypatch)
@@ -755,11 +763,12 @@ def test_failed_turn_remains_in_qa_and_next_clip_runs(tmp_path, monkeypatch, sta
     monkeypatch.setattr(completions, "create", create)
     summary = _run(shadow, backend, stems, jobs)
     visual_failed = stage == "MimoVisualDraft"
-    remaining_turns = {"MimoVisualDraft": 2, "MimoSpeechAVAssemblyDraft": 1, "MimoAudioFinalizeDraft": 0}[stage]
+    remaining_turns = {"MimoVisualDraft": 3, "MimoSpeechAVAssemblyDraft": 2, "MimoSpeakerProfileDraft": 1, "MimoAudioFinalizeDraft": 0}[stage]
     assert summary.ready_count == 2 and summary.failed_count == 1
     assert summary.visual_model_call_count == 3
-    assert summary.av_model_call_count == 6 - remaining_turns
-    assert summary.model_call_count == len(completions.requests) == 9 - remaining_turns
+    assert summary.av_model_call_count == 6 - {"MimoVisualDraft": 2, "MimoSpeechAVAssemblyDraft": 1, "MimoSpeakerProfileDraft": 1, "MimoAudioFinalizeDraft": 0}[stage]
+    assert summary.audio_model_call_count == (2 if remaining_turns >= 2 else 3)
+    assert summary.model_call_count == len(completions.requests) == 12 - remaining_turns
     assert summary.text_model_call_count == 0
     qa.build_audio_shadow_qa(**kwargs)
     data = json.loads((shadow / "qa/data.json").read_text())
@@ -774,8 +783,34 @@ def test_failed_turn_remains_in_qa_and_next_clip_runs(tmp_path, monkeypatch, sta
     html = (shadow / "qa/review.html").read_text()
     assert "Turn 1 visual draft raw response" in html
     assert "Turn 2 speech AV raw response" in html
-    assert "Turn 3 audio finalizer raw response" in html
+    assert "Turn 4 audio finalizer raw response" in html
     assert "visual_model_call_count" in html
+
+
+@pytest.mark.parametrize("tamper", ["profile_raw_missing", "profile_modality_missing", "order", "audio_count"])
+def test_stem_record_rejects_inconsistent_four_stage_history(tmp_path, monkeypatch, tamper):
+    _, shadow = _fixture(tmp_path, monkeypatch)
+    backend, completions, stems, jobs = _backend(tmp_path, shadow, [(_raw(), 8)])
+    summary = _run(shadow, backend, stems, jobs[:1])
+    row = _records(shadow)[0]
+    assert summary.model_call_count == len(completions.requests) == 4
+    assert row["schema_version"] == "r2v.h3.mimo25_stem_reconcile.14"
+    assert summary.schema_version == "r2v.h3.mimo25_stem_reconcile_summary.16"
+    assert (row["visual_model_call_count"], row["av_model_call_count"], row["audio_model_call_count"], row["text_model_call_count"]) == (1, 2, 1, 0)
+    assert row["raw_responses"] == [row[key] for key in (
+        "visual_raw_response", "speech_av_raw_response", "speaker_profile_raw_response", "audio_finalize_raw_response",
+    )]
+    MimoStemReconcileRecord.model_validate(row)
+    if tamper == "profile_raw_missing":
+        row["speaker_profile_raw_response"] = None
+    elif tamper == "profile_modality_missing":
+        row["diagnostics"].pop(2)
+    elif tamper == "order":
+        row["raw_responses"][2:] = reversed(row["raw_responses"][2:])
+    else:
+        row["audio_model_call_count"] = 0
+    with pytest.raises(ValueError, match="stem reconcile .*counts differ"):
+        MimoStemReconcileRecord.model_validate(row)
 
 
 def test_sdk_retries_disabled_even_for_injected_openai_client(tmp_path):
@@ -839,7 +874,7 @@ def test_multiple_same_speaker_segments_keep_merged_or_continuing_dialogue(
     job = _job(values)
     backend.client.chat.completions.responses = [(json.dumps(payload), 8)]
     result = _reconcile(backend, job)
-    assert result.model_call_count == 3
+    assert result.model_call_count == 4
     assert result.annotation.h3_semantics.shot1_caption == caption
     assert len(result.annotation.segment_decisions) == 4
 
@@ -941,8 +976,8 @@ def test_visible_binding_without_supporting_evidence_is_retained(
     } <= warnings
     if composition == "uncertain":
         assert "visible_entity_requires_resolved_audio" in warnings
-    assert summary.model_call_count == len(completions.requests) == 3
-    assert summary.audio_model_call_count == 0 and summary.av_model_call_count == 2
+    assert summary.model_call_count == len(completions.requests) == 4
+    assert summary.audio_model_call_count == 1 and summary.av_model_call_count == 2
 
     sample = qa.FinalH3SampleV2.model_validate_json(
         (kwargs["audio_production_root"] / "h3/samples.jsonl").read_text().splitlines()[0],
@@ -1005,7 +1040,7 @@ def test_concrete_visible_speaker_contradictions_remain_hard(tmp_path, monkeypat
     assert summary.failed_count == 1 and row["status"] == "failed"
     assert issue in {item["code"] for item in row["failure_issues"]}
     assert issue not in row["diagnostics"][-1]["warnings"]
-    assert summary.model_call_count == len(completions.requests) == 3
+    assert summary.model_call_count == len(completions.requests) == 4
 
 
 def test_unknown_grounding_entity_still_cannot_publish(tmp_path, monkeypatch):
@@ -1075,10 +1110,10 @@ def test_marker_severity_uses_distinct_authoritative_speakers(
         hard_code != "direct_unknown_speaker"
         and 0 < caption.count("<d>") == len(speakers)
     )
-    assert summary.model_call_count == len(completions.requests) == (3 + text_calls) * len(jobs)
-    assert row["model_call_count"] == 3 + text_calls
+    assert summary.model_call_count == len(completions.requests) == (4 + text_calls) * len(jobs)
+    assert row["model_call_count"] == 4 + text_calls
     assert row["text_model_call_count"] == text_calls
-    assert row["audio_model_call_count"] == 0 and row["av_model_call_count"] == 2
+    assert row["audio_model_call_count"] == 1 and row["av_model_call_count"] == 2
     if hard_code:
         assert summary.failed_count == len(jobs) and row["status"] == "failed"
         assert hard_code in {issue["code"] for issue in row["failure_issues"]}
@@ -1086,7 +1121,7 @@ def test_marker_severity_uses_distinct_authoritative_speakers(
     else:
         assert summary.ready_count == len(jobs) and row["status"] == "ready"
         assert row["failure_issues"] == []
-        assert "direct_single_speaker_marker_missing" in row["diagnostics"][2]["warnings"]
+        assert "direct_single_speaker_marker_missing" in row["diagnostics"][3]["warnings"]
         qa.build_audio_shadow_qa(**kwargs)
         final = json.loads((shadow / "qa/data.json").read_text())["clips"][0]["final_h3"]
         assert final["status"] == "ready"
@@ -1113,10 +1148,10 @@ def test_explicit_marker_mismatch_remains_hard_in_backend(tmp_path, monkeypatch)
         ("direct_dialogue_speaker_marker_mismatch", "dialogue_2"),
     ]
     assert "direct_dialogue_speaker_marker_mismatch" not in row["diagnostics"][-1]["warnings"]
-    assert summary.model_call_count == len(completions.requests) == 4
+    assert summary.model_call_count == len(completions.requests) == 5
     assert row["text_model_call_count"] == 1
-    assert backend.provenance.schema_version == MIMO25_BACKEND_VERSION == "r2v.h3.mimo25_backend.58"
-    assert backend.provenance.prompt_version == "h3_mimo25_speech_assembly_v45"
+    assert backend.provenance.schema_version == MIMO25_BACKEND_VERSION == "r2v.h3.mimo25_backend.59"
+    assert backend.provenance.prompt_version == "h3_mimo25_speech_assembly_v46"
 
 
 @pytest.mark.parametrize(

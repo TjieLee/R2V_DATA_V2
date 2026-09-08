@@ -79,16 +79,16 @@ def test_turn3_profile_reaches_mimo_only_recovered_s2_audio_reference(tmp_path, 
         allowed_reference_labels={"<Subject 1>", "<Picture 1>"},
         auxiliary_audio_paths={kind: tmp_path / "full.flac" for kind in ("speech", "music", "sfx")},
     )
-    assert result.model_call_count == len(calls.requests) == 3
+    assert result.model_call_count == len(calls.requests) == 4
     assert all(s.current_entity_id is None and s.direct_anchor_seconds == 0 for s in job.segments)
     assert result.annotation.av_grounding.segment_groundings[0].binding_status == unbound_status
     assert result.annotation.av_grounding.segment_groundings[1].entity_id == "e1"
-    text = calls.requests[2]["messages"][1]["content"][1]["text"]
-    targets = json.loads(text.split("FINALIZED SPEAKER-PROFILE TARGETS:\n")[1].split("\nRESPONSE SCHEMA:", 1)[0])
+    text = calls.requests[2]["messages"][1]["content"][0]["text"]
+    targets = json.loads(text.split("SPEAKER-PROFILE TARGETS:\n")[1].split("\nRESPONSE SCHEMA:", 1)[0])
     assert [(t["speaker_group"], t["speaker_id"]) for t in targets] == [("g1", "S1"), ("g2", "S2")]
-    assert [t["segments"][0]["final_binding"] for t in targets] == [unbound_status, "<Subject 1>"]
+    assert all("final_binding" not in interval for t in targets for interval in t["segments"])
     assert [t["segments"][0]["start_time"] for t in targets] == [0.0, 1.0]
-    assert json.loads(raws[1])["audio_observation"]["speaker_voice_profiles"] == []
+    assert "speaker_voice_profiles" not in json.loads(raws[1])["audio_observation"]
     assert result.annotation.speaker_voice_profiles[1].voice_characteristics == profile
     assert [p.speaker_group for p in result.annotation.speaker_voice_profiles] == ["g1", "g2"]
     assert [d.resolution for d in result.annotation.audio_observation.segment_decisions] == [resolution] * 2

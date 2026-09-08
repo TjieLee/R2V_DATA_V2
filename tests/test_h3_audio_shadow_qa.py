@@ -59,21 +59,6 @@ class _Reconcile:
         )
 
     def reconcile(self, job, **kwargs):
-        raw = _annotation().model_dump_json()
-        visual_raw, speech_raw, finalized_raw = split_annotation(raw)
-        diagnostics = tuple(
-            MimoCompletionDiagnostic(input_modality=modality, usage=MimoUsage(), http_attempt_count=1)
-            for modality in ("target_video_visual_only", "target_video_speech_assembly", "target_video_audio_finalize")
-        )
-        if job.clip_uid == "clip-a":
-            raise MimoBackendFailure(
-                code="synthetic_failed", reason="failed <script>not markup</script>",
-                model_call_count=3, visual_model_call_count=1,
-                visual_raw_response=visual_raw, speech_av_raw_response=speech_raw,
-                audio_finalize_raw_response=finalized_raw,
-                raw_responses=(visual_raw, speech_raw, finalized_raw), diagnostics=diagnostics,
-            )
-        # Pure fixture output; no client or model is called.
         annotation = MimoAVAnnotationDraft.model_validate_json(
             _annotation().model_dump_json().replace("segment_1", "segment_0001")
         )
@@ -85,13 +70,30 @@ class _Reconcile:
             values["av_grounding"]["segment_groundings"] = []
             values["h3_semantics"]["shot1_caption"] = "The seated person remains still."
         annotation = MimoAVAnnotationDraft.model_validate(values)
-        visual_raw, speech_raw, finalized_raw = split_annotation(annotation.model_dump_json())
-        return SimpleNamespace(
-            annotation=annotation, raw_responses=(visual_raw, speech_raw, finalized_raw), diagnostics=diagnostics,
-            model_call_count=3, visual_model_call_count=1,
-            visual_raw_response=visual_raw, speech_av_raw_response=speech_raw,
-                audio_finalize_raw_response=finalized_raw,
+        visual_raw, speech_raw, profile_raw, finalized_raw = split_annotation(annotation.model_dump_json())
+        if not job.segments:
+            profile_raw = None
+        diagnostics = tuple(
+            MimoCompletionDiagnostic(input_modality=modality, usage=MimoUsage(), http_attempt_count=1)
+            for modality in (
+                "target_video_visual_only", "target_video_speech_assembly",
+                *(("speaker_profile_audio_only",) if profile_raw else ()),
+                "target_video_audio_finalize",
+            )
         )
+        fields = {
+            "model_call_count": len(diagnostics), "visual_model_call_count": 1,
+            "audio_model_call_count": int(profile_raw is not None),
+            "visual_raw_response": visual_raw, "speech_av_raw_response": speech_raw,
+            "speaker_profile_raw_response": profile_raw, "audio_finalize_raw_response": finalized_raw,
+            "raw_responses": tuple(raw for raw in (visual_raw, speech_raw, profile_raw, finalized_raw) if raw is not None),
+            "diagnostics": diagnostics,
+        }
+        if job.clip_uid == "clip-a":
+            raise MimoBackendFailure(
+                code="synthetic_failed", reason="failed <script>not markup</script>", **fields,
+            )
+        return SimpleNamespace(annotation=annotation, **fields)
 
 
 def _fixture(tmp_path, monkeypatch, *, mixed=False, variants=False):
@@ -191,13 +193,13 @@ def test_builder_ready_failed_order_media_and_sources_unchanged(tmp_path, monkey
     assert result["output_root"] == str(output)
     data = json.loads((output / "data.json").read_text())
     reconcile_summary = json.loads((shadow / MIMO25_STEM_RECONCILE_STAGE / "summary.json").read_text())
-    assert reconcile_summary["schema_version"] == "r2v.h3.mimo25_stem_reconcile_summary.15"
+    assert reconcile_summary["schema_version"] == "r2v.h3.mimo25_stem_reconcile_summary.16"
     assert reconcile_summary["current_mimo_versions_modified"] is True
     assert data["clip_uids"] == ["clip-z", "clip-a", "clip-m"]
     assert [clip["reconcile"]["status"] for clip in data["clips"]] == ["ready", "failed", "ready"]
     failed = data["clips"][1]["reconcile"]
     assert failed["failure_code"] == "synthetic_failed"
-    assert failed["model_call_count"] == 3
+    assert failed["model_call_count"] == 4
     assert failed["visual_raw_response"] and failed["speech_av_raw_response"] and failed["audio_finalize_raw_response"]
     assert failed["visual_model_call_count"] == 1
     assert data["clips"][1]["direct_h3"]["style_opening"]

@@ -35,20 +35,21 @@ def _run(backend, job):
     return backend.reconcile(
         job, segment_ids=["segment_1"], transcribed_segment_ids=["segment_1"],
         allowed_entity_ids={"e1"}, allowed_reference_labels=LABELS,
+        auxiliary_audio_paths={kind: Path(job.target_full_audio_path) for kind in ("speech", "music", "sfx")},
     )
 
 
 def test_official_examples_preserved_in_two_turn_prefix(tmp_path):
     job = _job_fixture(tmp_path)
-    visual, speech, finalized = split_annotation(_annotation().model_dump_json())
-    backend, calls = _backend(tmp_path, [(visual, 0), (speech, 8), (finalized, 8)],
+    visual, speech, profile, finalized = split_annotation(_annotation().model_dump_json())
+    backend, calls = _backend(tmp_path, [(visual, 0), (speech, 8), (profile, 8), (finalized, 8)],
                              icl="official_ref2va_v1")
     result = _run(backend, job)
     defaults = MimoBackendConfig(media_resolver=backend.config.media_resolver, api_key="test")
     assert (defaults.thinking, defaults.icl, defaults.temperature) == (
         "disabled", "official_ref2va_v1", 0.0,
     )
-    assert result.model_call_count == len(calls.requests) == 3
+    assert result.model_call_count == len(calls.requests) == 4
     messages = calls.requests[0]["messages"]
     assert [m["role"] for m in calls.requests[1]["messages"]] == ["system", "user"]
     assert not any(m in calls.requests[1]["messages"] for m in messages[1:-1])
@@ -94,8 +95,8 @@ def test_official_examples_preserved_in_two_turn_prefix(tmp_path):
         assert "How the reference pictures align" not in message["content"]
         assert "Case 1: T2VA" not in message["content"]
     assert backend.provenance.icl_version == MIMO25_ICL_VERSION == "h3_official_ref2va_detailed_shot1_v4"
-    assert backend.provenance.prompt_version == "h3_mimo25_speech_assembly_v45"
-    assert backend.provenance.schema_version == "r2v.h3.mimo25_backend.58"
+    assert backend.provenance.prompt_version == "h3_mimo25_speech_assembly_v46"
+    assert backend.provenance.schema_version == "r2v.h3.mimo25_backend.59"
     assert backend.provenance.annotation_schema_version == "r2v.h3.mimo25_av_annotation.20"
     assert backend.provenance.materializer_version == "h3_mimo25_materializer_v26"
     assert "The pipeline owns [Shot 1]" in SYSTEM_PROMPT

@@ -17,18 +17,21 @@ speaker reconciliation; MiMo is the final AV authority for this shadow path.
 - Qwen3-ASR owns exact transcript text and language.
 - frozen Visual V3 references own entity inventory, order, and image content.
 - LR-ASD, source clusters, and current entity bindings are proposals.
-- three fresh MiMo requests run in order, with no standalone stem-description calls:
+- four stages run in order, with no standalone music/SFX description calls:
   1. visual-only target video plus frozen images and official ICL produces the
      visual draft; embedded audio is disabled;
   2. original target AV plus the canonical visual draft as text, compact
      entity/Subject mapping and authoritative speech facts produces speaker
      observations/grounding, target-video summary and the dialogue caption;
-  3. original target AV plus actual canonical speech/music/SFX audio assets and
-     compact finalized Turn 2 speaker-profile targets produces acoustic voice
-     profiles, soundscape and audience-only music. It cannot rewrite dialogue,
-     visuals, speaker labels or the summary.
-  Turns 2/3 are independent system/user requests: no inherited ICL, images or
-  assistant history, and no reference-image-token requirement.
+  3. one pure-audio request profiles all real speaker targets using only compact
+     gN/Sx/segment interval labels and exact speech-stem snippets. No AV, images,
+     full stems, transcripts or entity/binding context are supplied. This stage
+     is skipped when no profile targets exist;
+  4. original target AV plus canonical music/SFX stems produces only soundscape
+     and audience-only music. It receives no speech stem, snippets or profile
+     targets and cannot rewrite dialogue, visuals, speaker labels or summary.
+  Stages 2/3/4 use fresh system/user requests without inherited ICL, images or
+  assistant history; only stages 2/4 enable embedded target-video audio.
 - raw stems are separated views of the same target audio. Coherent music exposed
   by a stem and compatible with the original AV is retained even when quiet in
   the original mix; separator residuals are not automatically factual. There is
@@ -68,7 +71,7 @@ The final system block prioritizes caption prose. `style_opening` describes only
 global cinematographic style/camera language/lighting, not scene contents or
 actions. Model input has one authoritative segment inventory; old
 `job.r2v_instruction` prose stays stored for provenance but is not model input.
-The three-request sound contract change versions, not frozen
+The four-stage change versions the producer contract, not frozen
 reference or speaker authority. This is not a verified quality improvement.
 
 The official Complete Example in `docs/VIDEO_PROMPT_WRITING_GUIDE_ref_en.md`
@@ -100,9 +103,11 @@ profiles are acoustic-only: pitch/register, timbre/texture,
 cadence/rate and energy/delivery; the prompt forbids identity, profession,
 personality, nationality, role and demographics. No full-AV recheck is sent.
 
-Turn 2 returns an empty `speaker_voice_profiles` list. Turn 3 supplies one
-nullable profile for each non-null primary group with transcribed speech, using the
-actual speech stem and compact group/Sx/time-window/final-binding targets.
+Turn 2's intermediate audio schema contains only segment decisions, not voice
+profiles. Turn 3 supplies one nullable profile for each non-null primary group
+with transcribed speech, using exact speech-stem snippets and compact
+group/Sx/segment/time locators only. Entity/Subject/final-binding/presentation
+context is never sent to the pure-audio profiler.
 It cannot re-decide grouping, binding, presentation, ASR, summary or caption.
 The final annotation combines Turn 2 segment decisions with Turn 3 profiles.
 Stage-B uncertain/refinement status does not suppress a real acoustic group.
@@ -277,29 +282,32 @@ The exact request contract keeps `fps` and `media_resolution` beside the
 ```
 
 Xiaomi retains disabled thinking. SGLang uses strict JSON schema, disabled
-thinking and `use_audio_in_video=false` for Turn 1, `true` for Turns 2/3.
-Turn 3 media order is: original target AV, finalized profile-target text, full
-canonical speech stem, labeled per-segment speech snippets, full music stem,
-and full SFX stem. Each real gN/Sx target retains every transcribed interval;
-repeated intervals for a group remain separate, in target/interval order. No
-transcript is copied into snippet labels and no best-sample selection occurs.
+thinking and `use_audio_in_video=false` for Turn 1, `true` for Turns 2/4; pure-audio Turn 3 uses `false`.
+Turn 3 media order is: minimal acoustic target text, then labeled exact
+speech snippets ordered by target and interval. Every transcribed interval for
+each real gN/Sx is preserved separately, without best-sample selection. No
+transcript, visual media, full stem or binding facts enter this request.
 Authoritative source sample indices are mapped to the speech-stem sample rate
 with exact rational arithmetic and round-to-nearest (ties-to-even), then cropped
 using the existing lossless exact-sample extractor. Runtime-owned temporary FLACs
 become data URIs and are cleaned before the same Turn 3 call, including when
-source media uses HTTP URLs. No production media is copied or changed. Stem
-hashes are checked before any model call; invalid media produces a per-clip
-failure without mutating upstream data.
-Missing/unreported reference-image usage is not an error for Turns 2/3.
+source media uses HTTP URLs. No production media is changed.
+Turn 4 media order is original target AV, music stem, SFX stem (with compact
+media labels). Stem hashes are checked before any model call; invalid media
+produces a per-clip failure without mutating upstream data.
+Missing/unreported reference-image usage is not an error for Turns 2/4.
 
-Normal counts: visual=1, AV=2, audio-only=0, text=0, total=3. Optional marker
-polish adds one text call, total=4. There are no retry, recheck or fallback calls.
-The raw fields remain `visual_raw_response`, `speech_av_raw_response` and
-`audio_finalize_raw_response`. Legacy standalone-stem description fields are
+With profile targets: visual=1, AV=2, audio-only=1, text=0, total=4. Without
+targets the profiling call is skipped, profiles=[], total=3. Optional marker
+polish adds exactly one text call (5 or 4 total). No retry/recheck/fallback calls.
+Raw fields, in execution order: `visual_raw_response`, `speech_av_raw_response`,
+`speaker_profile_raw_response`, `audio_finalize_raw_response`. The profile field
+is null when skipped; `raw_responses` excludes that absent slot. Profiling has
+its own `speaker_profile_audio_only` diagnostic modality. Legacy standalone-stem description fields are
 null in new records; current provenance identifies this request contract.
 
-Current versions: backend .58, visual prompt v4, speech assembly v45, audio
-finalizer v5, materializer v26; annotation .20, authority v17, official ICL v4
+Current versions: backend .59, visual prompt v4, speech assembly v46,
+speaker-profile prompt v1, audio finalizer v6, materializer v26; annotation .20, authority v17, official ICL v4
 and speaker polish v4 remain unchanged. V26 records the recovery-eligibility
 alignment; the acoustic quality policy remains v1. Materializer v25 resolves each
 attribute Subject's owner from the frozen reference contract and explicitly
@@ -327,9 +335,9 @@ prose. The candidate is then validated against the same speaker facts.
 retain the original annotation, caption, and validation outcome, without retry.
 Only `h3_semantics.shot1_caption` changes on success.
 
-Clean clips cost 1 visual + 2 AV + 0 text = 3 calls; attempted polish costs
-1 visual + 2 AV + 1 text = 4, including failed text attempts.
-`raw_responses` contains the three main-turn responses. The record separately saves polish
+Clean speech clips cost 1 visual + 2 AV + 1 audio-only = 4 calls; attempted
+polish costs 5, including failed text attempts. Subtract one when no profiling
+targets exist. `raw_responses` contains the executed main-stage responses. The record separately saves polish
 attempted/applied/needs_review/raw_response/error and `text_model_call_count`.
 The `speaker_marker_text_only` diagnostic has null image/video/audio token
 counts. QA displays polish audit/raw JSON separately from final AV raw.
@@ -344,10 +352,10 @@ or own that external source patch.
 
 The conditional-polish flow has fake-client coverage only. The 833 server smoke
 and human QA remain necessary. Old v29/v30 output directories are not migrated
-or overwritten. Reconcile record .13, summary .15 and policy v6 distinguish this
+or overwritten. Reconcile record .14, summary .16 and policy v6 distinguish this
 request history. Invalid final annotation/caption retains raw AV and auxiliary
-evidence; only eligible marker projection issues may use the fourth text call.
-Later clips continue. Annotation .20, materializer v23, authority v17, and ICL v2
+evidence; only eligible marker projection issues may use one additional text call.
+Later clips continue. Annotation .20, materializer v26, authority v17, and ICL v4
 are unchanged; no quality improvement is claimed before real server review.
 
 Identity-product exclusions remain independent of raw caption visibility.
