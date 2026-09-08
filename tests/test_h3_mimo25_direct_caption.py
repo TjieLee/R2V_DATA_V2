@@ -39,15 +39,15 @@ def _run(backend, job):
 
 def test_official_examples_preserved_in_two_turn_prefix(tmp_path):
     job = _job_fixture(tmp_path)
-    visual, assembly = split_annotation(_annotation().model_dump_json())
-    backend, calls = _backend(tmp_path, [(visual, 0), (assembly, 8)],
+    visual, speech, finalized = split_annotation(_annotation().model_dump_json())
+    backend, calls = _backend(tmp_path, [(visual, 0), (speech, 8), (finalized, 8)],
                              icl="official_ref2va_v1")
     result = _run(backend, job)
     defaults = MimoBackendConfig(media_resolver=backend.config.media_resolver, api_key="test")
     assert (defaults.thinking, defaults.icl, defaults.temperature) == (
         "disabled", "official_ref2va_v1", 0.0,
     )
-    assert result.model_call_count == len(calls.requests) == 2
+    assert result.model_call_count == len(calls.requests) == 3
     messages = calls.requests[0]["messages"]
     assert calls.requests[1]["messages"][:len(messages)] == messages
     assert [m["role"] for m in messages] == ["system", *(["user", "assistant"] * 4), "user"]
@@ -92,8 +92,8 @@ def test_official_examples_preserved_in_two_turn_prefix(tmp_path):
         assert "How the reference pictures align" not in message["content"]
         assert "Case 1: T2VA" not in message["content"]
     assert backend.provenance.icl_version == MIMO25_ICL_VERSION == "h3_official_ref2va_detailed_shot1_v4"
-    assert backend.provenance.prompt_version == "h3_mimo25_two_turn_av_reconcile_v40"
-    assert backend.provenance.schema_version == "r2v.h3.mimo25_backend.49"
+    assert backend.provenance.prompt_version == "h3_mimo25_speech_assembly_v41"
+    assert backend.provenance.schema_version == "r2v.h3.mimo25_backend.50"
     assert backend.provenance.annotation_schema_version == "r2v.h3.mimo25_av_annotation.20"
     assert backend.provenance.materializer_version == "h3_mimo25_materializer_v23"
     assert "This pilot is exactly one shot." in SYSTEM_PROMPT

@@ -249,7 +249,8 @@ function render() {
       $("reconcile-body").append(details(name, value, name === "av_grounding" || name === "audio_observation")));
   }
   $("reconcile-body").append(details("Turn 1 visual draft raw response", result.visual_raw_response ?? "[unavailable]"));
-  $("reconcile-body").append(details("Final AV raw response", result.final_av_raw_response ?? "[unavailable]"));
+  $("reconcile-body").append(details("Turn 2 speech AV raw response", result.speech_av_raw_response ?? "[unavailable]"));
+  $("reconcile-body").append(details("Turn 3 audio finalizer raw response", result.audio_finalize_raw_response ?? "[unavailable]"));
   $("reconcile-body").append(details("Speaker marker polish", {
     attempted: result.speaker_marker_polish_attempted,
     applied: result.speaker_marker_polish_applied,

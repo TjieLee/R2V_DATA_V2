@@ -62,8 +62,8 @@ MIMO25_STEM_FACTS_VERSION = "r2v.h3.mimo25_stem_facts.3"
 MIMO25_STEM_FACTS_SUMMARY_VERSION = "r2v.h3.mimo25_stem_facts_summary.4"
 MIMO25_STEM_FACT_RAW_VERSION = "r2v.h3.mimo25_stem_fact_raw.1"
 MIMO25_STEM_FACT_PROMPT_VERSION = "h3_mimo25_stem_fact_prompt_v1"
-MIMO25_STEM_RECONCILE_VERSION = "r2v.h3.mimo25_stem_reconcile.12"
-MIMO25_STEM_RECONCILE_SUMMARY_VERSION = "r2v.h3.mimo25_stem_reconcile_summary.14"
+MIMO25_STEM_RECONCILE_VERSION = "r2v.h3.mimo25_stem_reconcile.13"
+MIMO25_STEM_RECONCILE_SUMMARY_VERSION = "r2v.h3.mimo25_stem_reconcile_summary.15"
 MIMO25_STEM_RECONCILE_POLICY_VERSION = "h3_mimo25_stem_reconcile_v6"
 MIMO25_STEM_RECONCILE_STAGE = "mimo_reconcile_stemtext_final_av_markerpolish_v1"
 STEM_VIEW_VERSION = "r2v.h3.sam_audio_stem_view.1"
@@ -1612,7 +1612,7 @@ def build_stem_reconcile_jobs(
 
 
 class MimoStemReconcileRecord(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_stem_reconcile.12"] = (
+    schema_version: Literal["r2v.h3.mimo25_stem_reconcile.13"] = (
         MIMO25_STEM_RECONCILE_VERSION
     )
     clip_uid: str
@@ -1629,7 +1629,8 @@ class MimoStemReconcileRecord(SchemaModel):
     failure_issues: list[ValidationIssue]
     raw_responses: list[StrictStr]
     visual_raw_response: StrictStr | None
-    final_av_raw_response: StrictStr | None
+    speech_av_raw_response: StrictStr | None
+    audio_finalize_raw_response: StrictStr | None
     diagnostics: list[MimoCompletionDiagnostic]
     music_stem_description: StrictStr | None
     music_stem_raw_response: StrictStr | None
@@ -1642,11 +1643,11 @@ class MimoStemReconcileRecord(SchemaModel):
     speaker_marker_polish_needs_review: bool | None
     speaker_marker_polish_raw_response: str | None
     speaker_marker_polish_error: str | None
-    av_model_call_count: int = Field(ge=0, le=1)
+    av_model_call_count: int = Field(ge=0, le=2)
     visual_model_call_count: int = Field(ge=0, le=1)
     audio_model_call_count: int = Field(ge=0, le=2)
     text_model_call_count: int = Field(ge=0, le=1)
-    model_call_count: int = Field(ge=0, le=5)
+    model_call_count: int = Field(ge=0, le=6)
     record_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
 
     @model_validator(mode="after")
@@ -1666,35 +1667,29 @@ class MimoStemReconcileRecord(SchemaModel):
             + self.audio_model_call_count + self.text_model_call_count
         ):
             raise ValueError("stem reconcile model call counts differ")
+        turn_modalities = (
+            "target_video_visual_only", "target_video_speech_assembly",
+            "target_video_audio_finalize",
+        )
+        turns = [d.input_modality for d in self.diagnostics if d.input_modality in turn_modalities]
+        turn_raws = (self.visual_raw_response, self.speech_av_raw_response, self.audio_finalize_raw_response)
         if (
-            self.visual_model_call_count != sum(
-                d.input_modality == "target_video_visual_only" for d in self.diagnostics
-            )
-            or self.av_model_call_count != sum(
-                d.input_modality == "target_video_av_assembly" for d in self.diagnostics
-            )
-            or self.av_model_call_count > self.visual_model_call_count
-            or (
-                self.status == "ready" and (
-                    self.visual_model_call_count != 1 or self.av_model_call_count != 1
-                    or self.visual_raw_response is None or self.final_av_raw_response is None
-                )
-            )
-            or (self.visual_raw_response is not None and self.visual_model_call_count != 1)
-            or (self.final_av_raw_response is not None and self.av_model_call_count != 1)
-            or self.raw_responses != [
-                raw for raw in (self.visual_raw_response, self.final_av_raw_response)
-                if raw is not None
-            ]
+            turns != list(turn_modalities[:len(turns)])
+            or self.visual_model_call_count != int(bool(turns))
+            or self.av_model_call_count != max(0, len(turns) - 1)
+            or (self.status == "ready" and (len(turns) != 3 or any(raw is None for raw in turn_raws)))
+            or any(raw is not None and index >= len(turns) for index, raw in enumerate(turn_raws))
+            or any(turn_raws[index] is None for index in range(max(0, len(turns) - 1)))
+            or self.raw_responses != [raw for raw in turn_raws if raw is not None]
         ):
-            raise ValueError("stem reconcile two-turn raw/diagnostic counts differ")
+            raise ValueError("stem reconcile three-turn raw/diagnostic counts differ")
         if (
             self.text_model_call_count != int(self.speaker_marker_polish_attempted)
             or self.text_model_call_count != sum(
                 diagnostic.input_modality == "speaker_marker_text_only"
                 for diagnostic in self.diagnostics
             )
-            or (self.speaker_marker_polish_attempted and self.av_model_call_count != 1)
+            or (self.speaker_marker_polish_attempted and self.av_model_call_count != 2)
             or (not self.speaker_marker_polish_attempted and (
                 self.speaker_marker_polish_applied
                 or self.speaker_marker_polish_needs_review is not None
@@ -1728,7 +1723,7 @@ class StemReconcileUpstreamFailure(SchemaModel):
 
 
 class MimoStemReconcileSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_stem_reconcile_summary.14"] = (
+    schema_version: Literal["r2v.h3.mimo25_stem_reconcile_summary.15"] = (
         MIMO25_STEM_RECONCILE_SUMMARY_VERSION
     )
     route: SAMRoute
@@ -1757,9 +1752,9 @@ class MimoStemReconcileSummary(SchemaModel):
                 self.visual_model_call_count + self.av_model_call_count
                 + self.audio_model_call_count + self.text_model_call_count
             )
-            or self.av_model_call_count > self.visual_model_call_count
+            or self.av_model_call_count > 2 * self.visual_model_call_count
             or self.visual_model_call_count > self.processed_clip_count
-            or self.text_model_call_count > self.av_model_call_count
+            or self.text_model_call_count > self.av_model_call_count // 2
             or self.processed_clip_count != self.ready_count + self.failed_count
             or self.clip_count != self.processed_clip_count + self.skipped_clip_count
             or self.clip_count != len(self.clip_uids)
@@ -1918,7 +1913,9 @@ def run_mimo25_stem_reconcile_shadow(
                 diagnostics = list(result.diagnostics)
                 text_calls = getattr(result, "text_model_call_count", 0)
                 visual_calls = result.visual_model_call_count
-                visual_raw, final_av_raw = result.visual_raw_response, result.final_av_raw_response
+                visual_raw = result.visual_raw_response
+                speech_av_raw = result.speech_av_raw_response
+                audio_finalize_raw = result.audio_finalize_raw_response
                 polish = getattr(result, "speaker_marker_polish", MimoSpeakerMarkerPolishAudit())
                 av_calls = result.model_call_count - text_calls - visual_calls
             except MimoBackendFailure as exc:
@@ -1932,7 +1929,9 @@ def run_mimo25_stem_reconcile_shadow(
                 )
                 text_calls = exc.text_model_call_count
                 visual_calls = exc.visual_model_call_count
-                visual_raw, final_av_raw = exc.visual_raw_response, exc.final_av_raw_response
+                visual_raw = exc.visual_raw_response
+                speech_av_raw = exc.speech_av_raw_response
+                audio_finalize_raw = exc.audio_finalize_raw_response
                 polish = exc.speaker_marker_polish
             diagnostics = [music.diagnostic, sfx.diagnostic, *diagnostics]
             values = {
@@ -1955,7 +1954,8 @@ def run_mimo25_stem_reconcile_shadow(
                 "failure_issues": [issue.to_dict() for issue in issues],
                 "raw_responses": raw,
                 "visual_raw_response": visual_raw,
-                "final_av_raw_response": final_av_raw,
+                "speech_av_raw_response": speech_av_raw,
+                "audio_finalize_raw_response": audio_finalize_raw,
                 "diagnostics": [d.model_dump(mode="json") for d in diagnostics],
                 "music_stem_description": music.description,
                 "music_stem_raw_response": music.raw_response,

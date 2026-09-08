@@ -44,7 +44,7 @@ from r2v_data_v2.h3.sam_audio_stem_shadow import (
 )
 from r2v_data_v2.structured_output import normalize_structured_json_envelope
 
-QA_DATA_VERSION = "r2v.h3.audio_shadow_qa.6"
+QA_DATA_VERSION = "r2v.h3.audio_shadow_qa.7"
 QA_REVIEW_VERSION = "r2v.h3.audio_shadow_human_qa.2"
 QA_LABELS = (
     "better", "same", "worse", "speaker_wrong",
@@ -71,7 +71,8 @@ def _direct_h3(record: object) -> dict[str, object] | None:
     fields: dict[str, object] = {}
     for raw, keys in (
         (record.visual_raw_response, ("subject_definitions", "visual_retention_analysis", "style_opening")),
-        (record.final_av_raw_response, ("summary", "shot1_caption", "overall_soundscape", "non_diegetic_music")),
+        (record.speech_av_raw_response, ("shot1_caption",)),
+        (record.audio_finalize_raw_response, ("summary", "shot1_caption", "overall_soundscape", "non_diegetic_music")),
     ):
         if raw is None:
             continue

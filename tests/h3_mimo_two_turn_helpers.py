@@ -1,4 +1,4 @@
-"""Split existing frozen annotation fixtures into the two model response shapes."""
+"""Split existing frozen annotation fixtures into the three model response shapes."""
 
 import json
 
@@ -13,17 +13,20 @@ def split_annotation(raw):
         )},
         "shot1_visual_description": payload["visual_observation"]["visual_blocks"][0]["text"],
     }
-    assembly = {
+    speech = {
         **{key: payload[key] for key in ("audio_observation", "av_grounding", "warnings")},
+        "shot1_caption": semantics.get("shot1_caption", ""),
+    }
+    finalized = {
         **{key: semantics[key] for key in (
             "summary", "shot1_caption", "overall_soundscape", "non_diegetic_music",
         ) if key in semantics},
     }
-    return json.dumps(visual), json.dumps(assembly)
+    return json.dumps(visual), json.dumps(speech), json.dumps(finalized)
 
 
 def assembly_raw(raw):
     try:
-        return split_annotation(raw)[1]
+        return split_annotation(raw)[2]
     except (ValueError, KeyError, TypeError):
         return raw

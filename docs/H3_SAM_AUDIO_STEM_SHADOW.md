@@ -135,28 +135,32 @@ uncovered tail.
    one-sentence Subject definitions, short retention statements, style opening
    and one full `shot1_visual_description`. The latter is reused verbatim as
    final `visual_blocks[0].text` (block ID `v1`), not independently generated.
-   Turn 2 literally extends those same messages with the raw visual assistant
-   response and newly supplied authoritative speech/audio facts plus candidates.
-   SGLang uses `use_audio_in_video=true`. No duplicate media is attached in the
-   new user turn. It returns `MimoFinalAVAssemblyDraft`; explicit field ownership
-   combines both drafts into unchanged annotation .20 before existing validation.
+   Turn 2 literally extends those messages with the raw visual assistant response
+   and authoritative speech/ASR/diarization/binding facts, with no auxiliary
+   candidates. It uses `use_audio_in_video=true` and returns
+   `MimoSpeechAVAssemblyDraft`: acoustic observation, grounding, warnings, and a
+   visual-plus-exact-dialogue caption. All non-dialogue audio is deferred.
+   Turn 3 extends the exact Turn 2 prefix with its raw assistant response and
+   a short text-only finalization task containing the music/SFX candidates.
+   No video, images, ASR or reference facts are reattached; embedded audio stays
+   enabled. `MimoAudioFinalizeDraft` contains only summary, caption, soundscape
+   and music. Original AV is primary authority; separator descriptions are
+   hints, not mandatory truth. Continuous ambience belongs in soundscape,
+   audience-only score in music, and localized synchronized sounds or in-scene
+   music in the caption. Route each sound once, without evidence-count gates
+   or deterministic audio rewriting.
+   Explicit ownership combines the three drafts into unchanged annotation .20:
    Turn 1 owns visual observation, definitions, retention and style opening;
-   Turn 2 owns acoustic observation, grounding, summary, caption and sound fields.
+   Turn 2 owns acoustic observation, grounding and warnings;
+   Turn 3 owns final summary, caption and sound fields.
+   Turn 2 may insert dialogue/Sx with local grammatical changes; Turn 3 may
+   change non-dialogue audio wording only. Neither may fabricate visual support.
    Prefix/KV cache reuse is optional: cached-token counts are diagnostics only.
-   Original AV corrects concrete factual contradictions and directly writes final
-   sound fields. Positive auxiliary acoustic details are preserved by default,
-   not discarded for weak/masked original-mix audibility or harmless descriptive
-   wording. Correct an unsupported source guess without removing the sound;
-   clear leakage/artifacts may be discarded. Score goes to `non_diegetic_music`;
-   in-scene music is model-authored in `shot1_caption`. Soundscape never
-   receives music/dialogue. There is no semantic checker or deterministic music
-   insertion. There is no text fusion, repair, retry, fallback or AV recheck.
-   Normal counts: audio=2, visual=1, AV=1, text=0, total=4. Only Sx projection issues may
-   trigger unchanged media-free speaker-marker polish v4 (text=1, total=5); it cannot
-   change dialogue/prose or binding. Failure preserves the original result.
-   Raw auxiliary errors are retained;
-   unavailable evidence does not mean silence or prevent the two-turn attempt.
-   A failed visual or AV turn stops that clip without retry/recheck/fallback.
+   Normal counts: audio=2, visual=1, AV=2, text=0, total=5. Only Sx projection
+   issues may trigger unchanged media-free marker polish v4 (text=1, total=6).
+   There is no repair, retry, fallback or AV recheck. A failed turn stops that
+   clip and preserves completed raw/diagnostics. Auxiliary errors remain
+   available and do not prevent the three-turn attempt.
 5. `export_h3_sam_audio_stem_references.py` crops an explicitly requested
    reference from its canonical stem. It never selects an interval on a stem and
    then cuts bytes from the original mix. With `--primary-voice-root`, it reuses
@@ -188,13 +192,16 @@ responses. Both auxiliary candidates/errors remain available regardless of AV
 success. Failed AV cannot authorize unsafe identity products. Multi-speaker
 exclusions remain. The materializer leaves dialogue intact and reads final
 sound fields directly from annotation; no timing is invented.
-Prompt `h3_mimo25_two_turn_av_reconcile_v39`, visual prompt
-`h3_mimo25_visual_only_v2`, backend .48, reconcile record .12 / summary .14,
-and QA data .6 identify the two-turn contract. Annotation .20, materializer v23,
-authority v17, stem policy v6, official ICL v4 and marker polish v4 are unchanged.
-Records/QA preserve `visual_raw_response`, `final_av_raw_response` and separate
-`target_video_visual_only` / `target_video_av_assembly` diagnostics, including
-partial failed requests. No deterministic visual prose rewrite or coverage gate
+Prompt `h3_mimo25_speech_assembly_v41`, finalizer
+`h3_mimo25_audio_finalize_v1`, visual `h3_mimo25_visual_only_v2`, backend .50,
+reconcile record .13 / summary .15 and QA data .7 identify this contract.
+The review-only record/summary/QA versions change to identify the new raw fields
+and three-turn counting contract. Annotation .20, materializer v23, authority v17,
+stem policy v6, official ICL v4 and marker polish v4 are unchanged.
+Records/QA preserve `visual_raw_response`, `speech_av_raw_response` and
+`audio_finalize_raw_response` separately, with `target_video_visual_only`,
+`target_video_speech_assembly` and `target_video_audio_finalize` diagnostics,
+including partial failed requests. No new audio validator or prose rewriting
 is added.
 
 No real inference was run for this patch. Fake clients establish request shape

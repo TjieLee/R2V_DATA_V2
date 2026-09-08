@@ -43,21 +43,21 @@ def _case(tmp_path, monkeypatch, original, response, speakers=("S1",), transport
                 return _Completions([(responses.pop(0), 0)]).create(**request)
             if request["response_format"] == {"type": "json_object"}:
                 completions.requests.append(request)
-                return _Completions([(split_annotation(raw)[0] if not request["extra_body"]["use_audio_in_video"] else assembly_raw(raw), 8)]).create(**request)
+                return _Completions([(split_annotation(raw)[0] if not request["extra_body"]["use_audio_in_video"] else split_annotation(raw)[2 if mb.AUDIO_FINALIZE_SYSTEM_PROMPT in request["messages"][-1]["content"] else 1], 8)]).create(**request)
             return original_create(**request)
 
         completions.create = create
     summary = _run(shadow, backend, stems, jobs[:1])
     row = _records(shadow)[0]
-    assert row["final_av_raw_response"] == assembly_raw(raw)
+    assert row["audio_finalize_raw_response"] == assembly_raw(raw)
     if row["annotation"] is not None:
         published = json.loads(json.dumps(row["annotation"]))
         published["h3_semantics"]["shot1_caption"] = original
         assert published == payload
     assert summary.model_call_count == len(completions.requests)
-    assert summary.model_call_count == 4 + summary.text_model_call_count
+    assert summary.model_call_count == 5 + summary.text_model_call_count
     assert row["visual_model_call_count"] == 1
-    assert row["av_model_call_count"] == 1 and row["audio_model_call_count"] == 2
+    assert row["av_model_call_count"] == 2 and row["audio_model_call_count"] == 2
     assert row["model_call_count"] == summary.model_call_count
     return row, completions.requests, summary, responses, facts
 
@@ -113,8 +113,8 @@ def test_polish_applies_only_sx_and_rescues_marker_projection(
 
 
 def test_polish_v4_prompt_makes_aligned_speaker_projection_unambiguous():
-    assert mb.MIMO25_PROMPT_VERSION == "h3_mimo25_two_turn_av_reconcile_v40"
-    assert mb.MIMO25_BACKEND_VERSION == "r2v.h3.mimo25_backend.49"
+    assert mb.MIMO25_PROMPT_VERSION == "h3_mimo25_speech_assembly_v41"
+    assert mb.MIMO25_BACKEND_VERSION == "r2v.h3.mimo25_backend.50"
     assert mb.MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION == "h3_mimo25_speaker_marker_polish_v4"
     prompt = mb.SPEAKER_MARKER_POLISH_PROMPT
     assert "exactly one distinct speaker_id" in prompt
@@ -152,7 +152,7 @@ def test_polish_marker_must_precede_its_dialogue(tmp_path, monkeypatch, trailing
         tmp_path, monkeypatch, original, response, ("S1", "S2"),
     )
     assert not pending
-    assert summary.model_call_count == 5 and summary.text_model_call_count == 1
+    assert summary.model_call_count == 6 and summary.text_model_call_count == 1
     assert row["speaker_marker_polish_applied"] is (not trailing)
     assert row["speaker_marker_polish_raw_response"] == response
     assert row["annotation"]["h3_semantics"]["shot1_caption"] == (original if trailing else candidate)
@@ -173,7 +173,7 @@ def test_unaligned_dialogue_never_polishes_or_rewrites(tmp_path, monkeypatch, sp
         tmp_path, monkeypatch, caption, "MUST NOT BE USED", speakers,
     )
     assert pending == ["MUST NOT BE USED"]
-    assert summary.ready_count == 1 and summary.model_call_count == 4
+    assert summary.ready_count == 1 and summary.model_call_count == 5
     assert summary.text_model_call_count == 0
     assert not row["speaker_marker_polish_attempted"]
     assert row["annotation"]["h3_semantics"]["shot1_caption"] == caption
@@ -208,10 +208,10 @@ def test_raw_visible_offscreen_downgrade_preserves_audio_and_caption(tmp_path, m
     summary = _run(shadow, backend, stems, jobs[:1])
     row = _records(shadow)[0]
     assert summary.ready_count == 1 and row["failure_issues"] == []
-    assert summary.model_call_count == len(completions.requests) == 4
-    assert row["audio_model_call_count"] == 2 and row["av_model_call_count"] == 1
+    assert summary.model_call_count == len(completions.requests) == 5
+    assert row["audio_model_call_count"] == 2 and row["av_model_call_count"] == 2
     assert row["text_model_call_count"] == 0
-    assert row["final_av_raw_response"] == assembly_raw(raw)
+    assert row["audio_finalize_raw_response"] == assembly_raw(raw)
     assert row["annotation"]["audio_observation"] == payload["audio_observation"]
     assert row["annotation"]["h3_semantics"] == payload["h3_semantics"]
     assert [segment.model_dump() for segment in jobs[0].segments] == original_segments
@@ -259,7 +259,7 @@ def test_raw_downgrade_preserves_evidence_uniqueness_and_capacity(evidence):
 def test_clean_and_non_marker_failures_never_polish(tmp_path, monkeypatch, original, code):
     row, _, summary, pending, _ = _case(tmp_path, monkeypatch, original, "MUST NOT BE USED")
     assert pending == ["MUST NOT BE USED"]
-    assert summary.text_model_call_count == 0 and summary.model_call_count == 4
+    assert summary.text_model_call_count == 0 and summary.model_call_count == 5
     assert not row["speaker_marker_polish_attempted"]
     assert row["speaker_marker_polish_raw_response"] is None
     assert row["status"] == ("failed" if code else "ready")
@@ -299,7 +299,7 @@ def test_rejected_polish_preserves_original_status_and_caption(
         expected_warning = "speaker_marker_polish_failed"
     row, _, summary, pending, _ = _case(tmp_path, monkeypatch, original, raw_response, speakers)
     assert not pending
-    assert summary.text_model_call_count == 1 and summary.model_call_count == 5
+    assert summary.text_model_call_count == 1 and summary.model_call_count == 6
     assert not row["speaker_marker_polish_applied"]
     assert row["annotation"]["h3_semantics"]["shot1_caption"] == original
     assert row["status"] == ("ready" if len(set(speakers)) == 1 else "failed")
@@ -349,7 +349,7 @@ def test_token_limited_polish_keeps_single_speaker_ready(tmp_path, monkeypatch):
     completions.create = create
     summary = _run(shadow, backend, stems, jobs[:1])
     row = _records(shadow)[0]
-    assert summary.ready_count == 1 and summary.model_call_count == 5
+    assert summary.ready_count == 1 and summary.model_call_count == 6
     assert not row["speaker_marker_polish_applied"]
     assert row["speaker_marker_polish_raw_response"] == raw_polish
     assert row["annotation"]["h3_semantics"]["shot1_caption"] == SINGLE
@@ -367,17 +367,17 @@ def test_polish_summary_audit_and_qa_keep_av_raw_separate(tmp_path, monkeypatch)
         tmp_path, shadow, [(raw, 8)] * 3, polish_responses=[polish] * 3,
     )
     summary = _run(shadow, backend, stems, jobs)
-    assert (summary.audio_model_call_count, summary.av_model_call_count, summary.text_model_call_count, summary.model_call_count) == (6, 3, 3, 15)
+    assert (summary.audio_model_call_count, summary.av_model_call_count, summary.text_model_call_count, summary.model_call_count) == (6, 6, 3, 18)
     qa.build_audio_shadow_qa(**kwargs)
     data = json.loads((shadow / "qa/data.json").read_text())
     first = data["clips"][0]
-    assert first["reconcile"]["final_av_raw_response"] == assembly_raw(raw)
+    assert first["reconcile"]["audio_finalize_raw_response"] == assembly_raw(raw)
     assert first["reconcile"]["speaker_marker_polish_raw_response"] == polish
     assert first["final_h3"]["status"] == "ready"
     assert SINGLE_FIXED in first["final_h3"]["text"]
     page = (shadow / "qa/review.html").read_text()
     assert 'details("Speaker marker polish"' in page
-    assert 'details("Final AV raw response"' in page
+    assert 'details("Turn 3 audio finalizer raw response"' in page
     for field in ("attempted", "applied", "needs_review", "error", "raw_response"):
         assert f"result.speaker_marker_polish_{field}" in page
     row = _records(shadow)[0]

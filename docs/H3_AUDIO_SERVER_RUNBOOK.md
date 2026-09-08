@@ -263,54 +263,42 @@ image, ASR, references, caption or ICL. Hashes are checked against separation
 provenance. Temperature 0, disabled thinking, 1024 tokens and one-string JSON
 remain unchanged. Results/errors are stored by music/SFX pipeline role.
 
-Only after both requests finish or fail, a visual-only Turn 1 receives the
-original target video, frozen references, official ICL v4 and visual-only
-provenance/windows (`use_audio_in_video=false` in SGLang). Turn 2 extends that
-exact message prefix with the raw visual draft and a new text-only user turn:
-authoritative ASR/speaker/audio facts plus `music_separator_candidate` and
-`sfx_separator_candidate`. It enables `use_audio_in_video=true` and returns the
-final AV assembly. There is no duplicate media attachment in the new user turn,
-no generated muted video and no server session ID. Cache hits are optional.
-Missing evidence is
-`SOURCE_UNAVAILABLE`, never silence. Generated candidates are ephemeral request
-text, not fields added to `MimoClipJob`. No independent audio enters final AV.
+Only after both auxiliary requests finish or fail, visual-only Turn 1 receives
+the original target video, frozen references, official ICL v4 and visual-only
+provenance/windows (`use_audio_in_video=false`). Turn 2 extends that exact
+prefix with the visual raw response and authoritative ASR/speaker/binding
+facts. It enables embedded audio and returns speech/grounding plus the visual
+caption with exact dialogue/Sx, with no auxiliary candidates or non-dialogue
+sound prose. Turn 3 extends the same conversation with the speech raw response
+and only a short audio-finalization task plus `music_separator_candidate` /
+`sfx_separator_candidate`. Embedded audio remains enabled; no media, ASR or
+reference facts are reattached. No session ID is used and cache hits are optional.
 
-Original AV is a factual contradiction filter, not a requirement to independently
-re-prove every auxiliary detail. Preserve positive acoustic observations by
-default, including weak/masked sounds and harmless perceptual wording. Correct
-concrete factual errors or clear leakage/artifacts; an unsupported engine guess
-may become a low rumble without deleting the sound. Auxiliary absence never
-establishes absence. Score goes to `non_diegetic_music`; in-scene music is
-authored naturally in `shot1_caption`, never soundscape. Uncertain music placement
-uses conservative caption prose, not guessed BGM. Soundscape remains non-musical,
-non-dialogue ambience/SFX, with no programmatic semantic checker.
+Original AV is primary audio authority; separator descriptions are useful hints,
+not mandatory truth. The finalizer writes summary/caption/soundscape/music,
+without re-deciding visual facts, speakers, Sx or dialogue. Continuous ambience
+goes to soundscape, audience-only score to music, and localized synchronized
+sounds or in-scene music to the caption. Each event has one destination.
+No new audio validator, evidence gate or deterministic prose rewrite is used.
+The unchanged materializer reads final annotation fields directly.
 
-Final AV directly produces `overall_soundscape` and `non_diegetic_music`
-(`N/A` for no eligible content). There is no intermediate `sound_description`
-or text fusion. The materializer reads these annotation fields directly.
-Caption, grounding, relaxed dialogue, multi-speaker exclusion and six-section
-Ref2VA formatting remain unchanged.
-
-Normal per-clip counts: audio=2, visual=1, AV=1, text=0, total=4. Eligible Sx projection
-issues alone may trigger one unchanged text-only polish (text=1, total=5).
-One attempt per request, no
-SDK retry, repair, fallback, AV recheck or resend. Auxiliary errors do not
-automatically fail a clip; the two-turn path still runs. A failed visual turn
-stops before AV assembly. Records and QA retain separate visual/final-AV raw
-responses and diagnostics, plus both candidates. Polish failure preserves the original
-status and caption. No video/audio/images are sent to polish. Zero/missing
-embedded audio tokens remain warnings only. AV defaults still include
-`--thinking disabled --icl official_ref2va_v1`, `use_audio_in_video=true`,
+Normal per-clip counts: audio=2, visual=1, AV=2, text=0, total=5. Eligible Sx
+projection issues alone may trigger unchanged text-only polish (text=1, total=6).
+One attempt per request; no SDK retry, repair, fallback or AV recheck.
+Any failed turn stops that clip, preserving completed raw and diagnostics.
+Records and QA show visual, speech-assembly and audio-finalizer raw outputs
+separately, plus both auxiliary candidates. Zero/missing embedded audio tokens
+remain warnings only. Runtime defaults remain disabled thinking, official ICL,
 temperature 0.0 and 32768 completion tokens.
 
-Versions: main prompt v39, visual prompt v2, annotation .20, backend .48,
-materializer v23, authority v17, ICL v4, marker polish v4; reconcile record .12,
-summary .14, policy v6, QA data .6. Fixed output:
+Versions: speech prompt v41, audio finalizer v1, visual v2, annotation .20,
+backend .50, materializer v23, authority v17, ICL v4, marker polish v4;
+reconcile record .13, summary .15, policy v6, QA data .7. Fixed output:
 `mimo_reconcile_stemtext_final_av_markerpolish_v1/`. Old
 `mimo_reconcile_av_stemtext_sound_partition/`, `mimo_v29_oneclip_smoke/`,
 and `mimo_v30_833_oneclip_smoke/` are preserved, not migrated.
 
-For a manually requested v39/backend .48 pilot, keep `CASE_MANIFEST` as the selected
+For a manually requested v41/backend .50 pilot, keep `CASE_MANIFEST` as the selected
 ordered manifest. This reuses SAM/DiariZen/ASR without reruns and leaves the
 previous `mimo_reconcile_stemtext_final_av_v35_backend39/`, v35, and earlier outputs untouched:
 

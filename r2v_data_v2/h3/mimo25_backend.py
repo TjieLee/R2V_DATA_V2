@@ -28,11 +28,12 @@ from r2v_data_v2.structured_output import (
 
 MIMO25_MODEL = "mimo-v2.5"
 MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
-MIMO25_PROMPT_VERSION = "h3_mimo25_two_turn_av_reconcile_v40"
+MIMO25_PROMPT_VERSION = "h3_mimo25_speech_assembly_v41"
+MIMO25_AUDIO_FINALIZE_PROMPT_VERSION = "h3_mimo25_audio_finalize_v1"
 MIMO25_VISUAL_PROMPT_VERSION = "h3_mimo25_visual_only_v2"
 MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v17"
 MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.20"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.49"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.50"
 MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION = "h3_mimo25_speaker_marker_polish_v4"
 MIMO25_ICL_VERSION = "h3_official_ref2va_detailed_shot1_v4"
 MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v23"
@@ -880,14 +881,18 @@ class MimoVisualDraft(SchemaModel):
     shot1_visual_description: StrictStr
 
 
-class MimoFinalAVAssemblyDraft(SchemaModel):
+class MimoSpeechAVAssemblyDraft(SchemaModel):
     audio_observation: MimoAudioObservation
     av_grounding: MimoAVGrounding
+    shot1_caption: StrictStr
+    warnings: list[MimoAnnotationWarning]
+
+
+class MimoAudioFinalizeDraft(SchemaModel):
     summary: StrictStr
     shot1_caption: StrictStr
     overall_soundscape: StrictStr
     non_diegetic_music: StrictStr
-    warnings: list[MimoAnnotationWarning]
 
 
 class MimoAVAnnotationDraft(SchemaModel):
@@ -912,7 +917,10 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.49"] = MIMO25_BACKEND_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.50"] = MIMO25_BACKEND_VERSION
+    audio_finalize_prompt_version: Literal["h3_mimo25_audio_finalize_v1"] = (
+        MIMO25_AUDIO_FINALIZE_PROMPT_VERSION
+    )
     visual_prompt_version: Literal["h3_mimo25_visual_only_v2"] = MIMO25_VISUAL_PROMPT_VERSION
     speaker_marker_polish_prompt_version: Literal["h3_mimo25_speaker_marker_polish_v4"] = (
         MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION
@@ -934,7 +942,7 @@ class MimoBackendProvenance(SchemaModel):
     media_mode: Literal["base64", "http"]
     media_root: str
     media_base_url: str | None = None
-    prompt_version: Literal["h3_mimo25_two_turn_av_reconcile_v40"] = (
+    prompt_version: Literal["h3_mimo25_speech_assembly_v41"] = (
         MIMO25_PROMPT_VERSION
     )
     policy_version: Literal["h3_mimo25_av_authority_contract_v17"] = (
@@ -998,7 +1006,8 @@ class MimoUsage(SchemaModel):
 class MimoCompletionDiagnostic(SchemaModel):
     input_modality: Literal[
         "target_video_visual_only",
-        "target_video_av_assembly",
+        "target_video_speech_assembly",
+        "target_video_audio_finalize",
         "target_video_with_embedded_audio",
         "target_video_plus_canonical_full_audio_fallback",
         "full_av_recheck_embedded_audio",
@@ -1045,7 +1054,8 @@ class MimoBackendResult:
     text_model_call_count: int = 0
     visual_model_call_count: int = 0
     visual_raw_response: str | None = None
-    final_av_raw_response: str | None = None
+    speech_av_raw_response: str | None = None
+    audio_finalize_raw_response: str | None = None
     speaker_marker_polish: MimoSpeakerMarkerPolishAudit = field(default_factory=MimoSpeakerMarkerPolishAudit)
 
 
@@ -1088,7 +1098,8 @@ class MimoBackendFailure(ValueError):
         text_model_call_count: int = 0,
         visual_model_call_count: int = 0,
         visual_raw_response: str | None = None,
-        final_av_raw_response: str | None = None,
+        speech_av_raw_response: str | None = None,
+        audio_finalize_raw_response: str | None = None,
         speaker_marker_polish: MimoSpeakerMarkerPolishAudit | None = None,
     ) -> None:
         super().__init__(reason)
@@ -1105,7 +1116,8 @@ class MimoBackendFailure(ValueError):
         self.text_model_call_count = text_model_call_count
         self.visual_model_call_count = visual_model_call_count
         self.visual_raw_response = visual_raw_response
-        self.final_av_raw_response = final_av_raw_response
+        self.speech_av_raw_response = speech_av_raw_response
+        self.audio_finalize_raw_response = audio_finalize_raw_response
         self.speaker_marker_polish = speaker_marker_polish or MimoSpeakerMarkerPolishAudit()
 
 
@@ -1226,6 +1238,7 @@ class MimoBackendConfig:
             "prompt_version": MIMO25_PROMPT_VERSION,
             "speaker_marker_polish_prompt_version": MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION,
             "visual_prompt_version": MIMO25_VISUAL_PROMPT_VERSION,
+            "audio_finalize_prompt_version": MIMO25_AUDIO_FINALIZE_PROMPT_VERSION,
             "policy_version": MIMO25_POLICY_VERSION,
             "annotation_schema_version": MIMO25_SCHEMA_VERSION,
             "materializer_version": MIMO25_MATERIALIZER_VERSION,
@@ -1260,20 +1273,15 @@ A later task may supply audiovisual facts and its own response schema; follow th
 
 
 SYSTEM_PROMPT = """ROLE / OUTPUT
-Return one compact MimoFinalAVAssemblyDraft JSON object. Do not regenerate visual_observation, subject_definitions, visual_retention_analysis or style_opening; they are owned by Turn 1.
+Return one compact MimoSpeechAVAssemblyDraft JSON object. Do not regenerate visual_observation, subject_definitions, visual_retention_analysis or style_opening; they are owned by Turn 1.
 
-FINAL H3 FIELD OWNERSHIP
-- shot1_caption: preserve the Turn 1 visual description and insert dialogue / Sx at the correct chronological position. Only localized diegetic or shot-synchronized audible events whose occurrence belongs at a specific point in playback order may be included. MUST NOT contain continuous ambience / room tone / hum / rumble or audience-only non-diegetic music.
-- overall_soundscape: owns non-musical, non-dialogue ambience and SFX. Continuous ambience / room tone / hum / rumble / environmental noise -> overall_soundscape ONLY. No dialogue, singing, or music.
-- non_diegetic_music: audience-only score/background music -> non_diegetic_music ONLY. No duplication into shot1_caption or overall_soundscape.
-- Diegetic/in-scene music -> shot1_caption ONLY, at its chronological position; non_diegetic_music must be N/A for that music.
-- Every audible fact has ONE narrative home among shot1_caption / overall_soundscape / non_diegetic_music. Do not duplicate an audible event across those three fields; do not append a soundscape/music recap to the caption.
-- This exclusivity applies after deciding what the event is. "Preserve evidence" means preserve the factual event in its CORRECT owning field, not copy it into multiple fields.
-- Use N/A for a sound field only when no eligible content remains for that field. summary is exempt from this exclusivity because it is a summary field.
+SPEECH-ONLY ASSEMBLY
+Return only audio_observation, av_grounding, shot1_caption and warnings.
+Turn 2 caption is Turn 1 visual prose plus speaker markers and exact <d> ASR dialogue, in playback order. Defer ALL non-dialogue audio to Turn 3. Do NOT add music, hum, rumble, room tone, SFX, or any other non-dialogue audio prose.
 
 VISUAL OWNERSHIP
 - The previous assistant Turn 1 visual draft is the authoritative visual draft for observable visual prose. Do NOT replace the visual draft with a new shorter visual summary or discard observations because Audio evidence is now supplied.
-- Minimal connective rephrasing is allowed to insert dialogue/audio; retain all materially useful visual observations. MUST NOT invent or reverse a Turn 1 observable visual fact merely to support speaker grounding.
+- Minimal connective rephrasing is allowed to insert dialogue/Sx; retain all materially useful visual observations. MUST NOT invent or reverse a Turn 1 observable visual fact merely to support speaker grounding.
 - If Turn 1 says "Her lips remain closed.", do NOT change it to "Her lips move subtly" solely because the model decided she is the speaker.
 - Speaker binding and visual articulation are separate decisions. Stage A articulation is an observable visual clue, not speaker authority. speech_correlated_articulation=not_observed means absence of observed articulation, NOT evidence that the person is not speaking; it does not block visible binding.
 - Full AV may still bind a visible entity when articulation is subtle, the mouth is partially visible, articulation is not observed, or LR-ASD support is absent. Do not manufacture visible_lip_motion, mouth movement, or another visual observation to rationalize the binding. not_observed must not be converted into visible_lip_motion without actual positive visual observation.
@@ -1301,20 +1309,6 @@ VISIBLE SPEAKER BINDING
 - Use no_reliable_entity / uncertain only when the speaker is genuinely ambiguous, multiple speakers prevent safe attribution, or the AV contains concrete contradictory evidence.
 - A visible listener must still not inherit speech when the AV clearly indicates another source. Never invent an entity.
 
-EXISTING REFERENCE FIELDS
-- Keep the preceding natural visual Subject definitions and retention rows unchanged; write the final summary. Pipeline code appends exact Picture provenance; omit Picture labels from definition descriptions. Entity Subjects describe reusable entities. Attribute Subjects describe only their attribute, not a second person/object or their owner: hair shape/color/texture, facial features, eyewear, garment, or accessory as applicable.
-- Attribute retention is judged on its owning entity, not independent existence. Allowed markers: fully_preserved, partially_preserved, weak_reference; attribute_transfer is forbidden.
-- In both subject_definitions and visual_retention_analysis, subject_label already owns the label; description should not repeat <Subject N> or bare Subject numbering.
-
-AUXILIARY AUDIO EVIDENCE
-- Auxiliary stem descriptions are positive recall evidence from the SAME target clip, not final field placement. SOURCE_UNAVAILABLE means no candidate evidence, never silence.
-- Keep a positively observed acoustic fact unless original AV provides a concrete factual contradiction or it is clear separator leakage/artifact. Correct an unsupported source/context interpretation without deleting the underlying sound; remove unsupported causal/source/environment inference.
-- After retaining the fact, route it to exactly ONE final H3 field according to FINAL H3 FIELD OWNERSHIP. Preservation is not duplication.
-- Weak/masked audibility is not by itself a reason to delete a positive fact or demand independent re-proof. Harmless acoustic adjectives may remain, but only in the owning field.
-- Negative/absence claims are TRACK-LOCAL and MUST NOT be copied into final H3; they never establish absence.
-- music_separator_candidate: use original AV to classify retained music as diegetic or non-diegetic, then follow its single destination in FINAL H3 FIELD OWNERSHIP. Discard clear artifact. An unseen source alone does not establish non-diegetic music. For uncertain placement, make the best final classification from original AV; if genuinely unresolved, choose ONE conservative presentation, never both. Never duplicate music merely to ensure preservation.
-- sfx_separator_candidate: distinguish continuous ambience from localized synchronized SFX using FINAL H3 FIELD OWNERSHIP. Do not repeat a localized event in another field solely because it appeared in auxiliary evidence.
-
 PRIMARY H3 WRITING TASK
 - This pilot is exactly one shot. Preserve style_opening and assemble shot1_caption; the pipeline inserts [Shot 1]. Never output [Shot N], shot timing, or placeholders.
 - style_opening: one concise sentence about global visual/cinematographic style, camera language, and lighting only. Do not summarize people, clothing, scene contents, Subjects, actions, chronology, dialogue, or audio.
@@ -1332,7 +1326,7 @@ For the shot, cover the observable dimensions that are present:
 6. visible actions, gestures, gaze changes, facial-expression changes, posture changes, object interactions, and other state changes in chronological order;
 7. dialogue and speaker markers at the moment they occur; do not append all dialogue at the end;
 8. where referenced Subjects/Pictures actually appear or affect the shot.
-Follow FINAL H3 FIELD OWNERSHIP for all audible content.
+Preserve the Turn 1 visual facts; add only speech and its speaker markers.
 Important:
 - A single shot is NOT a reason to make the description short.
 - Do not stop after describing the opening composition and dialogue.
@@ -1368,6 +1362,19 @@ SPEAKER MARKERS
 - Allowed same-speaker continuity: "A man (S1) says, <d>[English] First.</d> He continues, <d>[English] Second.</d>".
 - Required transition: "A man (S1) says, <d>[English] First.</d> A woman (S2) replies, <d>[English] Second.</d>".
 - The official ICL is an official H3 writing/field-boundary demonstration, not the response-schema definition. Follow the actual supplied schema and official six-section Ref2VA semantics."""
+
+
+AUDIO_FINALIZE_SYSTEM_PROMPT = """Finalize ONLY non-dialogue audio presentation.
+The previous assistant response owns visual content, exact <d> dialogue, Sx and speaker identity. Do not change those facts or re-decide grounding.
+Use the original target AV as the primary audio authority. The two separator descriptions are useful hints, not mandatory truth. Make the best direct factual audiovisual judgment.
+Final placement:
+- Continuous ambience / room tone / hum / rumble / general environmental sound -> overall_soundscape.
+- Audience-only background score/music -> non_diegetic_music.
+- Localized diegetic or synchronized sound at a specific moment -> shot1_caption.
+- Diegetic/in-scene music -> shot1_caption at its chronological position.
+Route each audible event once; do not duplicate it across fields.
+You may add, remove or correct NON-DIALOGUE AUDIO wording only as needed to match the target AV. Preserve visual facts, exact <d> dialogue text, Sx, speaker identity and Subject/Picture labels. Do not turn closed lips into moving lips or rewrite visual prose to justify a sound.
+Return only the final summary, shot1_caption, overall_soundscape and non_diegetic_music."""
 
 
 def _official_detailed_description_icl_messages() -> list[dict[str, str]]:
@@ -1440,7 +1447,8 @@ def _completion_diagnostic(
     *,
     modality: Literal[
         "target_video_visual_only",
-        "target_video_av_assembly",
+        "target_video_speech_assembly",
+        "target_video_audio_finalize",
         "target_video_with_embedded_audio",
         "target_video_plus_canonical_full_audio_fallback",
         "full_av_recheck_embedded_audio",
@@ -2837,11 +2845,10 @@ class OpenAIMimo25Backend:
     def _prompt(
         self, job: MimoBackendJob, *,
         allowed_reference_labels: set[str],
-        auxiliary_audio_evidence: dict[str, str] | None = None,
     ) -> str:
         schema = (
             "Return one JSON object matching this schema, with no markdown or extra fields:\n"
-            + _compact_json(MimoFinalAVAssemblyDraft.model_json_schema())
+            + _compact_json(MimoSpeechAVAssemblyDraft.model_json_schema())
             + "\n"
             if self.config.transport == "xiaomi"
             else "Return one JSON object constrained by the supplied response_format.\n"
@@ -2851,28 +2858,27 @@ class OpenAIMimo25Backend:
         for key in ("reference_selection", "reference_image_mapping", "subject_definition_requirements"):
             del contract[key]
         contract["allowed_h3_reference_labels"] = sorted(allowed_reference_labels)
-        prompt = schema + "AUTHORITATIVE INPUT:\n" + _compact_json(contract)
-        if auxiliary_audio_evidence is not None:
-            prompt += "\nAUXILIARY AUDIO CANDIDATES (NOT FACTUAL TRUTH):\n" + _compact_json(
-                auxiliary_audio_evidence
-            )
-        return prompt
+        return schema + "AUTHORITATIVE INPUT:\n" + _compact_json(contract)
 
     def _request(
         self, job: MimoBackendJob, *,
         allowed_reference_labels: set[str],
         auxiliary_audio_evidence: dict[str, str] | None = None,
-    ) -> tuple[str, tuple[str, str], list[MimoCompletionDiagnostic], dict[str, int]]:
+    ) -> tuple[str, tuple[str, str, str], list[MimoCompletionDiagnostic], dict[str, int]]:
         diagnostics: list[MimoCompletionDiagnostic] = []
-        raws: list[str | None] = [None, None]
+        raws: list[str | None] = [None, None, None]
 
         def request_turn(
             messages: list[dict[str, object]],
             schema: type[SchemaModel],
             *,
-            visual_only: bool,
+            turn_index: int,
         ) -> str:
-            modality = "target_video_visual_only" if visual_only else "target_video_av_assembly"
+            visual_only = turn_index == 0
+            modality = (
+                "target_video_visual_only", "target_video_speech_assembly",
+                "target_video_audio_finalize",
+            )[turn_index]
             payload: dict[str, object] = {
                 "model": self.config.model, "messages": messages,
                 "temperature": self.config.temperature,
@@ -2911,7 +2917,7 @@ class OpenAIMimo25Backend:
                 raw = _value(_value(choice, "message"), "content")
                 if not isinstance(raw, str):
                     raise TypeError("MiMo response content must be text")
-                raws[0 if visual_only else 1] = raw
+                raws[turn_index] = raw
                 diagnostic = _completion_diagnostic(
                     completion, choice, modality=modality,
                     http_attempt_count=1, thinking=self.config.thinking,
@@ -2956,7 +2962,7 @@ class OpenAIMimo25Backend:
                 *(_official_detailed_description_icl_messages() if self.config.icl == "official_ref2va_v1" else []),
                 {"role": "user", "content": content},
             ]
-            visual_raw = request_turn(turn1_messages, MimoVisualDraft, visual_only=True)
+            visual_raw = request_turn(turn1_messages, MimoVisualDraft, turn_index=0)
             visual, issues = parse_structured_json_issues(visual_raw, MimoVisualDraft)
             if visual is None or issues:
                 raise MimoBackendFailure(
@@ -2968,16 +2974,41 @@ class OpenAIMimo25Backend:
                 {"role": "assistant", "content": visual_raw},
                 {"role": "user", "content": SYSTEM_PROMPT + "\n" + self._prompt(
                     job, allowed_reference_labels=allowed_reference_labels,
-                    auxiliary_audio_evidence=auxiliary_audio_evidence,
                 )},
             ]
-            av_raw = request_turn(turn2_messages, MimoFinalAVAssemblyDraft, visual_only=False)
-            canonical_av, corrections = _canonicalize_raw_annotation_payload(av_raw)
-            assembly, issues = parse_structured_json_issues(canonical_av, MimoFinalAVAssemblyDraft)
+            speech_av_raw = request_turn(turn2_messages, MimoSpeechAVAssemblyDraft, turn_index=1)
+            canonical_av, corrections = _canonicalize_raw_annotation_payload(speech_av_raw)
+            assembly, issues = parse_structured_json_issues(canonical_av, MimoSpeechAVAssemblyDraft)
             if assembly is None or issues:
                 raise MimoBackendFailure(
                     code="mimo_structured_output_failed",
-                    reason="MiMo final AV assembly failed structured validation", issues=tuple(issues),
+                    reason="MiMo speech AV assembly failed structured validation", issues=tuple(issues),
+                )
+            finalize_instruction = (
+                AUDIO_FINALIZE_SYSTEM_PROMPT
+                + "\nAUXILIARY AUDIO CANDIDATES (NOT FACTUAL TRUTH):\n"
+                + _compact_json(auxiliary_audio_evidence or {})
+            )
+            if self.config.transport == "xiaomi":
+                finalize_instruction += "\nRESPONSE SCHEMA:\n" + _compact_json(
+                    MimoAudioFinalizeDraft.model_json_schema()
+                )
+            turn3_messages = [
+                *turn2_messages,
+                {"role": "assistant", "content": speech_av_raw},
+                {"role": "user", "content": finalize_instruction},
+            ]
+            audio_finalize_raw = request_turn(
+                turn3_messages, MimoAudioFinalizeDraft, turn_index=2,
+            )
+            finalized, issues = parse_structured_json_issues(
+                audio_finalize_raw, MimoAudioFinalizeDraft,
+            )
+            if finalized is None or issues:
+                raise MimoBackendFailure(
+                    code="mimo_audio_finalize_structured_output_failed",
+                    reason="MiMo audio finalization failed structured validation",
+                    issues=tuple(issues),
                 )
             final = {
                 "schema_version": MIMO25_SCHEMA_VERSION,
@@ -2991,15 +3022,13 @@ class OpenAIMimo25Backend:
                 "av_grounding": assembly.av_grounding.model_dump(mode="json"),
                 "warnings": [item.model_dump(mode="json") for item in assembly.warnings],
                 "h3_semantics": {
-                    **assembly.model_dump(
-                        mode="json", exclude={"audio_observation", "av_grounding", "warnings"},
-                    ),
+                    **finalized.model_dump(mode="json"),
                     **visual.model_dump(
                         mode="json", exclude={"segment_views", "shot1_visual_description"},
                     ),
                 },
             }
-            return _compact_json(final), (visual_raw, av_raw), diagnostics, corrections
+            return _compact_json(final), (visual_raw, speech_av_raw, audio_finalize_raw), diagnostics, corrections
         except Exception as exc:
             raise MimoBackendFailure(
                 code=exc.code if isinstance(exc, MimoBackendFailure) else "mimo_request_failed",
@@ -3009,7 +3038,8 @@ class OpenAIMimo25Backend:
                 diagnostics=tuple(diagnostics), model_call_count=len(diagnostics),
                 http_attempt_count=len(diagnostics),
                 visual_model_call_count=sum(d.input_modality == "target_video_visual_only" for d in diagnostics),
-                visual_raw_response=raws[0], final_av_raw_response=raws[1],
+                visual_raw_response=raws[0], speech_av_raw_response=raws[1],
+                audio_finalize_raw_response=raws[2],
             ) from exc
 
     def describe_auxiliary_audio(self, path: Path) -> MimoAuxAudioDescriptionCall:
@@ -3183,7 +3213,7 @@ class OpenAIMimo25Backend:
             job, allowed_reference_labels=allowed_reference_labels,
             auxiliary_audio_evidence=auxiliary_audio_evidence,
         )
-        visual_raw, av_raw = raw_responses
+        visual_raw, speech_av_raw, audio_finalize_raw = raw_responses
         diagnostic = diagnostics[-1]
         canonical_raw, raw_corrections = _canonicalize_raw_annotation_payload(raw)
         corrections = Counter(raw_corrections)
@@ -3266,15 +3296,16 @@ class OpenAIMimo25Backend:
         if annotation is None or issues:
             raise MimoBackendFailure(
                 code="mimo_structured_output_failed",
-                reason="MiMo two-turn observation failed validation",
+                reason="MiMo three-turn observation failed validation",
                 raw_responses=raw_responses,
                 diagnostics=tuple(diagnostics),
                 issues=tuple(issues),
-                model_call_count=2 + text_calls,
-                http_attempt_count=2 + text_calls,
+                model_call_count=3 + text_calls,
+                http_attempt_count=3 + text_calls,
                 visual_model_call_count=1,
                 visual_raw_response=visual_raw,
-                final_av_raw_response=av_raw,
+                speech_av_raw_response=speech_av_raw,
+                audio_finalize_raw_response=audio_finalize_raw,
                 annotation=annotation,
                 text_model_call_count=text_calls,
                 speaker_marker_polish=polish,
@@ -3283,11 +3314,12 @@ class OpenAIMimo25Backend:
             annotation=annotation,
             raw_responses=raw_responses,
             diagnostics=tuple(diagnostics),
-            model_call_count=2 + text_calls,
-            http_attempt_count=2 + text_calls,
+            model_call_count=3 + text_calls,
+            http_attempt_count=3 + text_calls,
             visual_model_call_count=1,
             visual_raw_response=visual_raw,
-            final_av_raw_response=av_raw,
+            speech_av_raw_response=speech_av_raw,
+            audio_finalize_raw_response=audio_finalize_raw,
             http_retry_count=0,
             recheck_count=0,
             input_modality=self._input_modality,
