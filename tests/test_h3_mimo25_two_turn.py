@@ -21,6 +21,128 @@ def _run(backend, job):
     )
 
 
+def _visual_structure_fixture():
+    visual_raw, _, _ = split_annotation(_annotation().model_dump_json())
+    visual = json.loads(visual_raw)
+    row = visual["segment_views"][0]
+    first = row["entity_observations"][0]
+    second = {**first, "entity_id": "e2"}
+    row["visible_entity_ids"] = ["e1", "e2"]
+    return visual, first, second
+
+
+def test_duplicate_visual_segment_rows_merge_in_first_seen_order():
+    visual, first, second = _visual_structure_fixture()
+    row = visual["segment_views"][0]
+    row["segment_id"] = "segment_0001"
+    other = {"segment_id": "segment_0002", "visible_entity_ids": [], "entity_observations": []}
+    visual["segment_views"] = [row, other, {
+        "segment_id": "segment_0001", "visible_entity_ids": ["e2"],
+        "entity_observations": [second, first],
+    }]
+    raw = json.dumps(visual)
+    canonical, corrections = mb._canonicalize_visual_draft_payload(raw)
+    draft = mb.MimoVisualDraft.model_validate_json(canonical)
+    assert [view.segment_id for view in draft.segment_views] == ["segment_0001", "segment_0002"]
+    assert draft.segment_views[0].visible_entity_ids == ["e1", "e2"]
+    assert [obs.model_dump() for obs in draft.segment_views[0].entity_observations] == [first, second]
+    assert draft.shot1_visual_description == visual["shot1_visual_description"]
+    assert corrections == {"visual_segment_row_merge": 1}
+    assert mb._canonicalize_visual_draft_payload(canonical) == (canonical, {})
+    assert json.loads(raw) == visual
+
+
+def test_partial_visual_observations_do_not_invent_missing_entity_metadata():
+    visual, first, _ = _visual_structure_fixture()
+    draft = mb.MimoVisualDraft.model_validate(visual)
+    assert draft.segment_views[0].visible_entity_ids == ["e1", "e2"]
+    assert [obs.model_dump() for obs in draft.segment_views[0].entity_observations] == [first]
+
+
+def test_visual_observation_order_is_not_a_presence_requirement():
+    visual, first, second = _visual_structure_fixture()
+    visual["segment_views"][0]["entity_observations"] = [second, first]
+    draft = mb.MimoVisualDraft.model_validate(visual)
+    assert [obs.entity_id for obs in draft.segment_views[0].entity_observations] == ["e2", "e1"]
+
+
+@pytest.mark.parametrize("invalid", ["duplicate_visible", "duplicate_observation", "outside_visible"])
+def test_visual_segment_keeps_structural_sanity(invalid):
+    visual, first, second = _visual_structure_fixture()
+    row = visual["segment_views"][0]
+    if invalid == "duplicate_visible":
+        row["visible_entity_ids"] = ["e1", "e1"]
+    elif invalid == "duplicate_observation":
+        row["entity_observations"] = [first, first]
+    else:
+        row["visible_entity_ids"] = ["e1"]
+        row["entity_observations"] = [second]
+    with pytest.raises(ValidationError, match="visual observations must be unique"):
+        mb.MimoVisualDraft.model_validate(visual)
+
+
+def test_duplicate_visual_rows_do_not_hide_conflicting_observations():
+    visual, first, _ = _visual_structure_fixture()
+    row = visual["segment_views"][0]
+    visual["segment_views"].append({
+        **row, "entity_observations": [{**first, "orientation": "back"}],
+    })
+    canonical, _ = mb._canonicalize_visual_draft_payload(json.dumps(visual))
+    with pytest.raises(ValidationError, match="visual observations must be unique"):
+        mb.MimoVisualDraft.model_validate_json(canonical)
+
+
+@pytest.mark.parametrize("invalid", ["missing", "extra"])
+def test_duplicate_visual_rows_do_not_mask_invalid_fields(invalid):
+    visual, _, _ = _visual_structure_fixture()
+    row = dict(visual["segment_views"][0])
+    if invalid == "missing":
+        del row["entity_observations"]
+    else:
+        row["unexpected"] = True
+    visual["segment_views"].append(row)
+    raw = json.dumps(visual)
+    assert mb._canonicalize_visual_draft_payload(raw) == (raw, {})
+    with pytest.raises(ValidationError):
+        mb.MimoVisualDraft.model_validate_json(raw)
+
+
+@pytest.mark.parametrize("pattern", ["duplicate_0262", "partial_2ec", "picture_5cb"])
+def test_visual_structure_recovery_preserves_raw_prefix_and_call_count(tmp_path, pattern):
+    visual, _, second = _visual_structure_fixture()
+    if pattern == "duplicate_0262":
+        visual["segment_views"].append({
+            "segment_id": "segment_1", "visible_entity_ids": ["e2"],
+            "entity_observations": [second],
+        })
+    if pattern == "picture_5cb":
+        visual["shot1_visual_description"] = "<Subject 1> from <Picture 1> stands by the door."
+    visual_raw = json.dumps(visual, indent=2)
+    _, speech_raw, finalize_raw = split_annotation(_annotation().model_dump_json())
+    backend, calls = _backend(tmp_path, [(visual_raw, 0), (speech_raw, 8), (finalize_raw, 8)])
+    result = backend.reconcile(
+        _job_fixture(tmp_path), segment_ids=["segment_1"], transcribed_segment_ids=["segment_1"],
+        allowed_entity_ids={"e1", "e2"}, allowed_reference_labels={"<Subject 1>", "<Picture 1>"},
+    )
+    views = result.annotation.visual_observation.segment_views
+    assert len(views) == 1 and views[0].visible_entity_ids == ["e1", "e2"]
+    expected_ids = ["e1", "e2"] if pattern == "duplicate_0262" else ["e1"]
+    assert [obs.entity_id for obs in views[0].entity_observations] == expected_ids
+    assert result.annotation.visual_observation.visual_blocks[0].text == visual["shot1_visual_description"]
+    assert result.visual_raw_response == visual_raw
+    assert result.raw_responses == (visual_raw, speech_raw, finalize_raw)
+    assert calls.requests[1]["messages"][-2] == {"role": "assistant", "content": visual_raw}
+    assert result.model_call_count == len(calls.requests) == 3
+    assert result.recheck_count == result.http_retry_count == 0
+    if pattern == "duplicate_0262":
+        assert result.deterministic_correction_counts["visual_segment_row_merge"] == 1
+
+
+def test_visual_block_preserves_valid_subject_and_picture_labels():
+    text = "<Subject 1> wears the coat in <Picture 1>."
+    assert mb.MimoVisualBlock(block_id="v1", text=text).text == text
+
+
 def test_intermediate_schema_field_ownership():
     visual = mb.MimoVisualDraft.model_json_schema()
     assert set(visual["properties"]) == {
@@ -287,7 +409,7 @@ def test_visual_v2_keeps_only_caption_long_and_definitions_concise():
     assert block.text == payload["shot1_visual_description"]
 
 
-@pytest.mark.parametrize("syntax", ["<Picture 1>", "<Audio 1>", "(S1)", "<d>x</d>", "[[segment:x]]", "<Subject 0>"])
+@pytest.mark.parametrize("syntax", ["<Audio 1>", "<Video 1>", "(S1)", "<d>x</d>", "[Shot 1]", "[[segment:x]]", "<Subject 0>", "<Picture 0>", "<Unknown 1>"])
 def test_reused_visual_caption_still_rejects_non_visual_syntax(syntax):
     with pytest.raises(ValidationError, match="non-visual or pipeline syntax"):
         mb.MimoVisualBlock(block_id="v1", text=f"<Subject 1> stands. {syntax}")
@@ -320,7 +442,7 @@ def test_cache_is_diagnostic_only_and_three_turn_provenance_is_fingerprinted(tmp
     assert result.model_call_count == 3
     assert [d.usage.cached_tokens for d in result.diagnostics] == [cached_tokens] * 3
     provenance = backend.provenance
-    assert provenance.schema_version == "r2v.h3.mimo25_backend.52"
+    assert provenance.schema_version == "r2v.h3.mimo25_backend.53"
     assert provenance.prompt_version == "h3_mimo25_speech_assembly_v43"
     assert provenance.visual_prompt_version == "h3_mimo25_visual_only_v2"
     assert provenance.materializer_version == "h3_mimo25_materializer_v23"

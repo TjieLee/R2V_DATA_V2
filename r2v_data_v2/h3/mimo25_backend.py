@@ -33,7 +33,7 @@ MIMO25_AUDIO_FINALIZE_PROMPT_VERSION = "h3_mimo25_audio_finalize_v2"
 MIMO25_VISUAL_PROMPT_VERSION = "h3_mimo25_visual_only_v2"
 MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v17"
 MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.20"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.52"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.53"
 MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION = "h3_mimo25_speaker_marker_polish_v4"
 MIMO25_ICL_VERSION = "h3_official_ref2va_detailed_shot1_v4"
 MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v23"
@@ -435,6 +435,49 @@ def _strip_redundant_retention_marker_prefix(
     return remainder, True
 
 
+def _canonicalize_visual_draft_payload(raw: str) -> tuple[str, dict[str, int]]:
+    try:
+        payload = json.loads(normalize_structured_json_envelope(raw))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return raw, {}
+    if not isinstance(payload, dict) or not isinstance(payload.get("segment_views"), list):
+        return raw, {}
+    rows = payload["segment_views"]
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        # Never hide malformed/missing fields while combining repeated rows.
+        if (
+            not isinstance(row, dict)
+            or set(row) != {"segment_id", "visible_entity_ids", "entity_observations"}
+            or not isinstance(row["segment_id"], str)
+            or not row["segment_id"]
+            or not isinstance(row["visible_entity_ids"], list)
+            or not isinstance(row["entity_observations"], list)
+        ):
+            return raw, {}
+        groups.setdefault(row["segment_id"], []).append(row)
+    merged_count = len(rows) - len(groups)
+    if not merged_count:
+        return raw, {}
+    merged_rows = []
+    for same_segment in groups.values():
+        merged = dict(same_segment[0])
+        if len(same_segment) > 1:
+            for field_name in ("visible_entity_ids", "entity_observations"):
+                values = []
+                seen: set[str] = set()
+                for row in same_segment:
+                    for value in row[field_name]:
+                        key = _compact_json(value)
+                        if key not in seen:
+                            seen.add(key)
+                            values.append(value)
+                merged[field_name] = values
+        merged_rows.append(merged)
+    payload["segment_views"] = merged_rows
+    return _compact_json(payload), {"visual_segment_row_merge": merged_count}
+
+
 def _canonicalize_raw_annotation_payload(
     raw: str,
 ) -> tuple[str, dict[str, int]]:
@@ -722,8 +765,8 @@ class MimoVisualBlock(SchemaModel):
 
     @model_validator(mode="after")
     def validate_visual_text(self) -> MimoVisualBlock:
-        # The reused visual caption may identify a visible reference Subject.
-        syntax = re.sub(r"<Subject [1-9]\d*>", "", self.text)
+        # Allow visual reference labels without changing the stored prose.
+        syntax = re.sub(r"<(?:Subject|Picture) [1-9]\d*>", "", self.text)
         if (
             not self.text.strip()
             or "[[" in self.text
@@ -765,9 +808,9 @@ class MimoVisualSegmentView(SchemaModel):
         if (
             len(self.visible_entity_ids) != len(set(self.visible_entity_ids))
             or len(observed) != len(set(observed))
-            or self.visible_entity_ids != observed
+            or not set(observed) <= set(self.visible_entity_ids)
         ):
-            raise ValueError("visual segment entity inventory must agree exactly")
+            raise ValueError("visual observations must be unique and belong to visible entities")
         return self
 
 
@@ -917,7 +960,7 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.52"] = MIMO25_BACKEND_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.53"] = MIMO25_BACKEND_VERSION
     audio_finalize_prompt_version: Literal["h3_mimo25_audio_finalize_v2"] = (
         MIMO25_AUDIO_FINALIZE_PROMPT_VERSION
     )
@@ -2929,7 +2972,8 @@ class OpenAIMimo25Backend:
                 {"role": "user", "content": content},
             ]
             visual_raw = request_turn(turn1_messages, MimoVisualDraft, turn_index=0)
-            visual, issues = parse_structured_json_issues(visual_raw, MimoVisualDraft)
+            canonical_visual, visual_corrections = _canonicalize_visual_draft_payload(visual_raw)
+            visual, issues = parse_structured_json_issues(canonical_visual, MimoVisualDraft)
             if visual is None or issues:
                 raise MimoBackendFailure(
                     code="mimo_visual_structured_output_failed",
@@ -2944,6 +2988,7 @@ class OpenAIMimo25Backend:
             ]
             speech_av_raw = request_turn(turn2_messages, MimoSpeechAVAssemblyDraft, turn_index=1)
             canonical_av, corrections = _canonicalize_raw_annotation_payload(speech_av_raw)
+            corrections.update(visual_corrections)
             assembly, issues = parse_structured_json_issues(canonical_av, MimoSpeechAVAssemblyDraft)
             if assembly is None or issues:
                 raise MimoBackendFailure(
