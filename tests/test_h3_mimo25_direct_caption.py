@@ -96,7 +96,7 @@ def test_official_examples_preserved_in_two_turn_prefix(tmp_path):
     assert backend.provenance.prompt_version == "h3_mimo25_speech_assembly_v43"
     assert backend.provenance.schema_version == "r2v.h3.mimo25_backend.53"
     assert backend.provenance.annotation_schema_version == "r2v.h3.mimo25_av_annotation.20"
-    assert backend.provenance.materializer_version == "h3_mimo25_materializer_v23"
+    assert backend.provenance.materializer_version == "h3_mimo25_materializer_v24"
     assert "The pipeline owns [Shot 1]" in SYSTEM_PROMPT
     assert "Do not repeat the marker before every utterance" not in SYSTEM_PROMPT
     assert "style_opening is one concise global style/camera/lighting sentence" in VISUAL_SYSTEM_PROMPT

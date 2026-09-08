@@ -445,7 +445,7 @@ def test_cache_is_diagnostic_only_and_three_turn_provenance_is_fingerprinted(tmp
     assert provenance.schema_version == "r2v.h3.mimo25_backend.53"
     assert provenance.prompt_version == "h3_mimo25_speech_assembly_v43"
     assert provenance.visual_prompt_version == "h3_mimo25_visual_only_v2"
-    assert provenance.materializer_version == "h3_mimo25_materializer_v23"
+    assert provenance.materializer_version == "h3_mimo25_materializer_v24"
     assert provenance.policy_version == "h3_mimo25_av_authority_contract_v17"
     values = provenance.model_dump(mode="json", exclude={"configuration_fingerprint"})
     assert provenance.configuration_fingerprint == mb._sha256_text(mb._compact_json(values))

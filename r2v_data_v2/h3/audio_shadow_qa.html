@@ -328,7 +328,7 @@ fetch("data.json", {cache: "no-store"}).then(response => {
   if (!response.ok) throw new Error("Cannot load data.json: " + response.status);
   return response.json();
 }).then(payload => {
-  if (payload.schema_version !== "r2v.h3.audio_shadow_qa.5" || !payload.clips.length) throw new Error("Invalid QA dataset.");
+  if (payload.schema_version !== "r2v.h3.audio_shadow_qa.7" || !payload.clips.length) throw new Error("Invalid QA dataset.");
   data = payload;
   data.clips.forEach((clip, i) => {
     const option = document.createElement("option"); option.value = String(i);

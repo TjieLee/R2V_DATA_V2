@@ -51,6 +51,8 @@ from r2v_data_v2.h3.qwen38_h3_recaption import (
     RecaptionReferenceContract,
     RecaptionSpeechFact,
     RecaptionSubjectContract,
+    _canonical_audio_definition,
+    _canonical_audio_retention,
     build_reference_contract,
     render_h3_prompt,
 )
@@ -228,6 +230,7 @@ class MimoH3ShadowRecord(SchemaModel):
         "h3_mimo25_materializer_v18",
         "h3_mimo25_materializer_v19",
         "h3_mimo25_materializer_v23",
+        "h3_mimo25_materializer_v24",
     ] = (
         MIMO25_MATERIALIZER_VERSION
     )
@@ -682,12 +685,12 @@ def _materialize_sample(
                 job.reference_subjects,
                 strict=True,
             )
-        ],
+        ] + [_canonical_audio_definition(audio) for audio in contract.audios],
         summary=f"{prefix} {record.annotation.h3_semantics.summary}",
         retention_analysis=[
             item.render()
             for item in record.annotation.h3_semantics.visual_retention_analysis
-        ],
+        ] + [_canonical_audio_retention(audio) for audio in contract.audios],
         detailed_description=f"{direct.style_opening}\n[Shot 1] {detailed}",
         overall_soundscape=direct.overall_soundscape,
         non_diegetic_music=direct.non_diegetic_music,

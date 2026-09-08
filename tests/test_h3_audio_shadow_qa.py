@@ -207,7 +207,7 @@ def test_builder_ready_failed_order_media_and_sources_unchanged(tmp_path, monkey
     for clip, call in zip((data["clips"][0], data["clips"][2]), materialized, strict=True):
         final = clip["final_h3"]
         assert final["status"] == "ready"
-        assert final["materializer_version"] == "h3_mimo25_materializer_v23"
+        assert final["materializer_version"] == "h3_mimo25_materializer_v24"
         assert final["text"] == call[3] == original(*call[:3])[1]
         assert final["variants"][0]["text"] == final["text"]
         assert "[[" not in final["text"]
@@ -402,6 +402,12 @@ def test_ready_annotation_with_blocked_materialization_is_unavailable(tmp_path, 
     assert all(path.read_bytes() == content for path, content in before.items())
 
 
+def test_html_expected_schema_matches_qa_data_version():
+    html = Path(qa.__file__).with_suffix(".html").read_text()
+    expected = re.findall(r'payload\.schema_version !== "([^"]+)"', html)
+    assert expected == [qa.QA_DATA_VERSION]
+
+
 def test_generated_javascript_and_qa_roundtrip(tmp_path, monkeypatch):
     node = os.environ.get("NODE_BINARY") or shutil.which("node")
     if not node:
@@ -550,7 +556,7 @@ const {chromium} = require(process.argv[2]);
     assert.strictEqual(await page.locator("#final-text").textContent(), expectedFinal);
     assert(await page.locator("#final-text").isVisible());
     assert.strictEqual(await page.locator("#final-h3").evaluate(el => el.closest("details")), null);
-    assert.strictEqual(await page.locator("#materializer-version").textContent(), "h3_mimo25_materializer_v23");
+    assert.strictEqual(await page.locator("#materializer-version").textContent(), "h3_mimo25_materializer_v24");
     await page.locator("#final-variant").selectOption("1");
     assert.strictEqual(await page.locator("#final-text").textContent(), dataset.clips[0].final_h3.variants[1].text);
     await page.locator("#final-variant").selectOption("0");
