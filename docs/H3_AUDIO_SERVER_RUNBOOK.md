@@ -1,6 +1,6 @@
 # H3 Audio Server Runbook
 
-Last updated: 2026-09-07
+Last updated: 2026-09-08
 
 This is the server operating runbook for Audio/H3 development on
 `feature/h3-audio-jea-qwen3-v1`. It complements the Visual-focused
@@ -169,10 +169,9 @@ Do not launch the shadow runner with the Qwen interpreter and do not install
 The worker clears inherited `PYTHONPATH`, loads Qwen once, and stays
 local-files-only.
 
-## MiMo endpoint
+## MiMo endpoint and SGLang startup
 
-The validated stem-facts and reconcile pilots use the existing OpenAI-compatible
-MiMo service:
+The Audio/H3 reconcile path uses the local OpenAI-compatible MiMo service:
 
 ```text
 model:    mimo-v2.5
@@ -182,12 +181,81 @@ endpoint: http://127.0.0.1:8092/v1
 The main R2V interpreter calls this endpoint. `MIMO_API_KEY` remains a
 server-local environment value and must not be committed.
 
-Optional health check:
+The current server runtime and local checkpoint are:
 
 ```bash
+export SGLANG_ENV=/mnt/workspace/litengjie/data/audio_deps/qwen38-sglang-env
+export MIMO_CHECKPOINT=/mnt/workspace/public/pretrained/MiMo/MiMo-V2.5
+```
+
+For current Audio/H3 profiling reproducibility tests, start MiMo with deterministic
+inference enabled while preserving the validated FA3/DP configuration:
+
+```bash
+"$SGLANG_ENV/bin/sglang" serve \
+  --model-path "$MIMO_CHECKPOINT" \
+  --served-model-name mimo-v2.5 \
+  --host 127.0.0.1 \
+  --port 8092 \
+  --trust-remote-code \
+  --tp 8 \
+  --dp 2 \
+  --enable-dp-attention \
+  --enable-dp-lm-head \
+  --mm-enable-dp-encoder \
+  --dtype bfloat16 \
+  --attention-backend fa3 \
+  --mm-attention-backend fa3 \
+  --context-length 131072 \
+  --mem-fraction-static 0.65 \
+  --chunked-prefill-size 16384 \
+  --max-running-requests 8 \
+  --reasoning-parser mimo \
+  --tool-call-parser mimo \
+  --constrained-json-disable-any-whitespace \
+  --enable-deterministic-inference \
+  2>&1 | tee /tmp/mimo8092_deterministic.log
+```
+
+When running this command directly in an interactive shell, use normal shell
+quoting exactly as above. Do **not** write `\"$MIMO_CHECKPOINT\"`: the backslashes
+make the quote characters part of the argument, so Transformers receives a model
+path such as `"/mnt/.../MiMo-V2.5"` and rejects it as an invalid Hugging Face repo
+ID/path.
+
+No `tmux` dependency is required. For a background process, use the same command
+under the server's preferred process supervisor or `nohup`; keep the full command
+and log path visible for later reproduction.
+
+Useful endpoint/process checks:
+
+```bash
+# Health check once server startup completes.
 curl -s http://127.0.0.1:8092/v1/models | head -c 1000
 echo
+
+# Find the process currently listening on 8092.
+PID=$(fuser 8092/tcp 2>/dev/null | awk '{print $1}')
+echo "PID=$PID"
+
+# Verify the important live flags without printing the whole argv.
+tr '\0' '\n' < "/proc/$PID/cmdline" \
+  | grep -E 'enable-deterministic|attention-backend|mm-attention-backend|max-running'
 ```
+
+To stop the endpoint explicitly:
+
+```bash
+PID=$(fuser 8092/tcp 2>/dev/null | awk '{print $1}')
+test -n "$PID" && kill "$PID"
+```
+
+`POST /flush_cache` is useful only as a manual serving diagnostic. Do not add
+cache flushing to the Audio/H3 business pipeline or use it as a semantic fallback.
+The current profiling investigation observed identical input/config/audio-token
+counts producing null profiles in a warm serving state, while manual cache flushes
+restored non-null profiles; deterministic inference is being validated as the
+serving-layer fix.
 
 ## Named random10 shadow pilot
 
@@ -241,7 +309,7 @@ PYTHONPATH="$SAM_AUDIO_RUNTIME_PYTHONPATH" \
   --allow-unverified
 ```
 
-### 4. Three fresh visual / speech-AV / audio requests
+### 4. Four-stage visual / speech-AV / speaker-profile / audio-finalize requests
 
 After separation, DiariZen and ASR, run this entry directly. Do not run
 `run_h3_mimo25_stem_facts_shadow.py`; neither `mimo_stem_facts/` nor three
@@ -285,8 +353,8 @@ music compatible with the original AV should not be discarded merely because it
 is quiet in the original mix. No text fusion or deterministic music insertion.
 
 Both AV turns enable embedded audio and do not require reference-image tokens.
-The final annotation stays .20. Materializer v25 adds deterministic attribute
-Subject ownership and retains canonical Audio definitions/retention.
+The final annotation stays .20. Materializer v26 retains canonical Audio
+definitions/retention and the current recovered-voice profile mapping.
 
 With profile targets: audio=1, visual=1, AV=2, text=0, total=4. Without targets:
 audio=0, total=3. Eligible Sx projection issues alone may trigger unchanged
