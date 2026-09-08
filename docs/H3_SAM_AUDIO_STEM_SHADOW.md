@@ -128,9 +128,18 @@ uncovered tail.
    directly. First, music/SFX canonical stems each receive the same v33
    positive-only role-blind audio-only description request concurrently (max two threads).
    Temperature 0, disabled thinking, 1024 tokens, no ASR/reference/ICL/caption.
-   After both finish/fail, one final original AV request receives candidate text,
-   one original video with embedded audio, reference images and existing
-   authoritative text/ICL. It has zero independent audio URLs.
+   After both finish/fail, Turn 1 receives the original video and frozen reference
+   images, with official ICL v4 and visual provenance/windows only. SGLang uses
+   `use_audio_in_video=false`; no ASR, clusters, bindings or auxiliary candidates
+   enter this visual-only request. It returns `MimoVisualDraft`.
+   Turn 2 literally extends those same messages with the raw visual assistant
+   response and newly supplied authoritative speech/audio facts plus candidates.
+   SGLang uses `use_audio_in_video=true`. No duplicate media is attached in the
+   new user turn. It returns `MimoFinalAVAssemblyDraft`; explicit field ownership
+   combines both drafts into unchanged annotation .20 before existing validation.
+   Turn 1 owns visual observation, definitions, retention and style opening;
+   Turn 2 owns acoustic observation, grounding, summary, caption and sound fields.
+   Prefix/KV cache reuse is optional: cached-token counts are diagnostics only.
    Original AV corrects concrete factual contradictions and directly writes final
    sound fields. Positive auxiliary acoustic details are preserved by default,
    not discarded for weak/masked original-mix audibility or harmless descriptive
@@ -139,11 +148,12 @@ uncovered tail.
    in-scene music is model-authored in `shot1_caption`. Soundscape never
    receives music/dialogue. There is no semantic checker or deterministic music
    insertion. There is no text fusion, repair, retry, fallback or AV recheck.
-   Normal counts: audio=2, AV=1, text=0, total=3. Only Sx projection issues may
-   trigger one media-free speaker-marker polish (text=1, total=4); it cannot
+   Normal counts: audio=2, visual=1, AV=1, text=0, total=4. Only Sx projection issues may
+   trigger unchanged media-free speaker-marker polish v4 (text=1, total=5); it cannot
    change dialogue/prose or binding. Failure preserves the original result.
    Raw auxiliary errors are retained;
-   unavailable evidence does not mean silence or prevent the final AV attempt.
+   unavailable evidence does not mean silence or prevent the two-turn attempt.
+   A failed visual or AV turn stops that clip without retry/recheck/fallback.
 5. `export_h3_sam_audio_stem_references.py` crops an explicitly requested
    reference from its canonical stem. It never selects an interval on a stem and
    then cuts bytes from the original mix. With `--primary-voice-root`, it reuses
@@ -175,9 +185,14 @@ responses. Both auxiliary candidates/errors remain available regardless of AV
 success. Failed AV cannot authorize unsafe identity products. Multi-speaker
 exclusions remain. The materializer leaves dialogue intact and reads final
 sound fields directly from annotation; no timing is invented.
-Prompt v35, annotation .20, backend .40, materializer v23, reconcile .11/.13,
-and policy v6 distinguish the new contract. Authority v17 and official opening
-+ Shot 1 ICL v2 are unchanged.
+Prompt `h3_mimo25_two_turn_av_reconcile_v39`, visual prompt
+`h3_mimo25_visual_only_v1`, backend .47, reconcile record .12 / summary .14,
+and QA data .6 identify the two-turn contract. Annotation .20, materializer v23,
+authority v17, stem policy v6, official ICL v4 and marker polish v4 are unchanged.
+Records/QA preserve `visual_raw_response`, `final_av_raw_response` and separate
+`target_video_visual_only` / `target_video_av_assembly` diagnostics, including
+partial failed requests. No deterministic visual prose rewrite or coverage gate
+is added.
 
 No real inference was run for this patch. Fake clients establish request shape
 and bookkeeping only. Embedded audio tokens of zero/missing are warnings, never

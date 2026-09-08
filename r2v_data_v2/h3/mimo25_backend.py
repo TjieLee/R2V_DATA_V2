@@ -28,10 +28,11 @@ from r2v_data_v2.structured_output import (
 
 MIMO25_MODEL = "mimo-v2.5"
 MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
-MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v38"
+MIMO25_PROMPT_VERSION = "h3_mimo25_two_turn_av_reconcile_v39"
+MIMO25_VISUAL_PROMPT_VERSION = "h3_mimo25_visual_only_v1"
 MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v17"
 MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.20"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.46"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.47"
 MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION = "h3_mimo25_speaker_marker_polish_v4"
 MIMO25_ICL_VERSION = "h3_official_ref2va_detailed_shot1_v4"
 MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v23"
@@ -869,6 +870,24 @@ class MimoAVGrounding(SchemaModel):
 MimoH3Draft = MimoH3Semantics
 
 
+class MimoVisualDraft(SchemaModel):
+    visual_observation: MimoVisualObservation
+    subject_definitions: list[MimoSubjectDefinitionDraft]
+    visual_retention_analysis: list[MimoVisualRetentionDraft]
+    style_opening: StrictStr
+    shot1_visual_description: StrictStr
+
+
+class MimoFinalAVAssemblyDraft(SchemaModel):
+    audio_observation: MimoAudioObservation
+    av_grounding: MimoAVGrounding
+    summary: StrictStr
+    shot1_caption: StrictStr
+    overall_soundscape: StrictStr
+    non_diegetic_music: StrictStr
+    warnings: list[MimoAnnotationWarning]
+
+
 class MimoAVAnnotationDraft(SchemaModel):
     schema_version: Literal["r2v.h3.mimo25_av_annotation.20"] = MIMO25_SCHEMA_VERSION
     visual_observation: MimoVisualObservation
@@ -891,7 +910,8 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.46"] = MIMO25_BACKEND_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.47"] = MIMO25_BACKEND_VERSION
+    visual_prompt_version: Literal["h3_mimo25_visual_only_v1"] = MIMO25_VISUAL_PROMPT_VERSION
     speaker_marker_polish_prompt_version: Literal["h3_mimo25_speaker_marker_polish_v4"] = (
         MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION
     )
@@ -912,7 +932,7 @@ class MimoBackendProvenance(SchemaModel):
     media_mode: Literal["base64", "http"]
     media_root: str
     media_base_url: str | None = None
-    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v38"] = (
+    prompt_version: Literal["h3_mimo25_two_turn_av_reconcile_v39"] = (
         MIMO25_PROMPT_VERSION
     )
     policy_version: Literal["h3_mimo25_av_authority_contract_v17"] = (
@@ -975,6 +995,8 @@ class MimoUsage(SchemaModel):
 
 class MimoCompletionDiagnostic(SchemaModel):
     input_modality: Literal[
+        "target_video_visual_only",
+        "target_video_av_assembly",
         "target_video_with_embedded_audio",
         "target_video_plus_canonical_full_audio_fallback",
         "full_av_recheck_embedded_audio",
@@ -1019,6 +1041,9 @@ class MimoBackendResult:
     ]
     deterministic_correction_counts: dict[str, int] = field(default_factory=dict)
     text_model_call_count: int = 0
+    visual_model_call_count: int = 0
+    visual_raw_response: str | None = None
+    final_av_raw_response: str | None = None
     speaker_marker_polish: MimoSpeakerMarkerPolishAudit = field(default_factory=MimoSpeakerMarkerPolishAudit)
 
 
@@ -1059,6 +1084,9 @@ class MimoBackendFailure(ValueError):
         recheck_count: int = 0,
         annotation: MimoAVAnnotationDraft | None = None,
         text_model_call_count: int = 0,
+        visual_model_call_count: int = 0,
+        visual_raw_response: str | None = None,
+        final_av_raw_response: str | None = None,
         speaker_marker_polish: MimoSpeakerMarkerPolishAudit | None = None,
     ) -> None:
         super().__init__(reason)
@@ -1073,6 +1101,9 @@ class MimoBackendFailure(ValueError):
         self.recheck_count = recheck_count
         self.annotation = annotation
         self.text_model_call_count = text_model_call_count
+        self.visual_model_call_count = visual_model_call_count
+        self.visual_raw_response = visual_raw_response
+        self.final_av_raw_response = final_av_raw_response
         self.speaker_marker_polish = speaker_marker_polish or MimoSpeakerMarkerPolishAudit()
 
 
@@ -1192,6 +1223,7 @@ class MimoBackendConfig:
             "media_base_url": self.media_resolver.media_base_url,
             "prompt_version": MIMO25_PROMPT_VERSION,
             "speaker_marker_polish_prompt_version": MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION,
+            "visual_prompt_version": MIMO25_VISUAL_PROMPT_VERSION,
             "policy_version": MIMO25_POLICY_VERSION,
             "annotation_schema_version": MIMO25_SCHEMA_VERSION,
             "materializer_version": MIMO25_MATERIALIZER_VERSION,
@@ -1204,18 +1236,39 @@ class MimoBackendConfig:
         )
 
 
+VISUAL_SYSTEM_PROMPT = """This conversation stages visual observation before audiovisual assembly.
+For the first task, observe the ENTIRE target video from beginning to end, using only visual evidence.
+Return only MimoVisualDraft, constrained by the current response schema. Official ICL examples demonstrate writing and field boundaries, not this task's response schema.
+Produce a generation-quality dense VISUAL description, not a plot summary.
+shot1_visual_description covers every applicable observed dimension: visual style; shot scale and framing; camera angle/viewpoint; foreground/midground/background composition; every salient visible subject; appearance, spatial positions and relationships; pose; body/hand/arm motion; head motion; gaze; facial expression and visible expression changes; object interactions and state changes; environment and major props; materials and visible text when clear; lighting and color; camera motion or clearly static camera; chronological visual progression from early through middle to late.
+A single shot is NOT a reason to make the description short. Do not stop after the opening composition. Describe meaningful visual evolution through the final frame.
+Prefer concrete observation over interpretation. Do not invent psychology, intention, causality, relationships or unseen details. No hard word-count requirement.
+Do not infer sounds or dialogue. Do not decide speaker identity or use offscreen/voice-over classification. Do not output dialogue, (Sx), <d>, acoustic groups, or audio fields in this first response.
+Visible profile/back/occluded/silent subjects remain visible. Every defined ENTITY <Subject N> visibly present must use its exact label at first clear appearance. Attribute-only Subjects do not need mechanical insertion.
+Observable mouth/lip state is visual and allowed, but never derive voice/source conclusions from it. The existing speech_correlated_articulation field records visible mouth articulation only in the supplied window, without any audio correlation or identity inference.
+visual_blocks are concise visual evidence; segment_views follow the supplied segment windows in order, with matching visible_entity_ids and entity_observations.
+Write natural Subject definitions and retention descriptions. Pipeline code owns exact Picture provenance: omit Picture labels from definition descriptions. subject_label already owns the label; do not repeat it in definition/retention descriptions. Attribute Subjects describe only their attribute; attribute retention is judged on the owning entity. Use only fully_preserved, partially_preserved or weak_reference.
+style_opening is one concise global style/camera/lighting sentence. The pipeline owns [Shot 1]; do not emit shot markers, timestamps or placeholders.
+Only use supplied Subject/Picture labels and visible entity IDs, never example assets.
+A later task may supply audiovisual facts and its own response schema; follow that task while retaining this visual draft."""
+
+
 SYSTEM_PROMPT = """ROLE / OUTPUT
-Return one compact JSON object in the supplied schema for this H3 shadow pipeline. Populate visual/audio observations, AV grounding, and h3_semantics in ONE response; do not emit hidden reasoning.
+The previous assistant response is the authoritative visual draft for this clip.
+Return one compact MimoFinalAVAssemblyDraft JSON object. Do not regenerate visual_observation, subject_definitions, visual_retention_analysis or style_opening; they are owned by Turn 1.
+Do NOT replace the visual draft with a new shorter visual summary or discard observations because Audio evidence is now supplied.
+Preserve composition, Subjects, appearance, spatial relationships, environment/background, lighting/color, camera behavior, actions, gestures, gaze, expressions, pose/state changes and chronological visual progression.
+Use the newly supplied facts to resolve acoustic speakers and AV grounding, bind visible speakers when full AV reasonably supports it, keep genuinely offscreen sources separate, insert exact authoritative <d> dialogue at its chronological position, assign stable Sx, and integrate only localized diegetic/shot-synchronized sound events.
+Write overall_soundscape and non_diegetic_music separately, plus the final summary and shot1_caption.
+Minimal connective rephrasing is allowed to integrate dialogue/audio; retain all materially useful visual observations. Do not collapse the visual description into a short caption.
+Do not expose internal binding_status, speech_presentation, confidence, evidence_codes, source_cluster_conflict, LR-ASD, offscreen_audio, visible_lip_motion/no_visible_lip_motion, resolved/unresolved pipeline states, "low confidence due to..." or "classified as..." in consumer-facing prose.
+Express final vocal presentation naturally with stable (Sx), never explain classification rationale.
 
 AUTHORITY
 - DiariZen owns exact segment/sample boundaries. All decision inventories follow allowed_segment_ids, including LR-ASD=0, unbound, and zero-anchor segments. Never split, merge, filter, or invent segments.
-- If allowed_segment_ids is empty, output empty visual_observation.segment_views, audio_observation.segment_decisions, and av_grounding.segment_groundings. Never invent a synthetic segment.
+- If allowed_segment_ids is empty, output empty audio_observation.segment_decisions and av_grounding.segment_groundings. Never invent a synthetic segment; the preceding visual draft already owns segment_views.
 - Preserve supplied Qwen3-ASR dialogue content and language without additions or omissions. Consecutive speech by the same speaker may share one natural <d> block; never alter upstream segment boundaries.
 - Frozen entities, Subjects, Pictures, order, and ownership are immutable. Use H3 reference labels ONLY from allowed_h3_reference_labels. If no <Audio N> appears in allowed_h3_reference_labels, NEVER emit <Audio N>. Do not mention a referenced voice timbre, Audio reference, or "using the voice from <Audio N>" unless that exact Audio label is explicitly allowed. Target video is observation-only, never <Video N>. Current LR-ASD bindings and source clusters are proposals, not truth.
-
-VISUAL OBSERVATION
-- visual_blocks are concise English visual evidence, not a second caption draft: use one coherent block by default, more only for meaningful progression. No timestamps, transcript, audio inference, pipeline labels, or invented psychology, intent, causality, relationships, or unseen details.
-- segment_views follow allowed_segment_ids. visible_entity_ids and entity_observations agree exactly on entities visible in that interval. Back/profile views, occluded faces, and hidden/cropped mouths still count as visible presence. speech_correlated_articulation records exact-window observation, not speaker identity.
 
 AUDIO + AV GROUNDING
 - Stage B identifies acoustic speakers as contiguous gN by first appearance, not turns. Pauses, language, sentences, ASR, or segment boundaries alone never create groups. Record vocal_composition, delivery, secondary_vocal_activity, and non-speech evidence, without entity identity or spatial presentation.
@@ -1234,7 +1287,7 @@ VISIBLE SPEAKER BINDING
 - A visible listener must still not inherit speech when the AV clearly indicates another source. Reinspect conflicting Stage A articulation and Stage C lip-motion evidence. Never invent an entity.
 
 EXISTING REFERENCE FIELDS
-- Write natural visual Subject definitions, concise summary, and retention rows. Pipeline code appends exact Picture provenance; omit Picture labels from definition descriptions. Entity Subjects describe reusable entities. Attribute Subjects describe only their attribute, not a second person/object or their owner: hair shape/color/texture, facial features, eyewear, garment, or accessory as applicable.
+- Keep the preceding natural visual Subject definitions and retention rows unchanged; write the final summary. Pipeline code appends exact Picture provenance; omit Picture labels from definition descriptions. Entity Subjects describe reusable entities. Attribute Subjects describe only their attribute, not a second person/object or their owner: hair shape/color/texture, facial features, eyewear, garment, or accessory as applicable.
 - Attribute retention is judged on its owning entity, not independent existence. Allowed markers: fully_preserved, partially_preserved, weak_reference; attribute_transfer is forbidden.
 - In both subject_definitions and visual_retention_analysis, subject_label already owns the label; description should not repeat <Subject N> or bare Subject numbering.
 
@@ -1253,7 +1306,7 @@ AUXILIARY AUDIO EVIDENCE
 - overall_soundscape contains ZERO music. An event classified as music must NOT also appear in overall_soundscape: non-diegetic music -> non_diegetic_music; diegetic music -> shot1_caption; never overall_soundscape. Do not write "no voices/music" there; write eligible ambience/SFX or "N/A".
 
 PRIMARY H3 WRITING TASK
-- This pilot is exactly one shot. Write style_opening and shot1_caption; the pipeline inserts [Shot 1]. Never output [Shot N], shot timing, or placeholders.
+- This pilot is exactly one shot. Preserve style_opening and assemble shot1_caption; the pipeline inserts [Shot 1]. Never output [Shot N], shot timing, or placeholders.
 - style_opening: one concise sentence about global visual/cinematographic style, camera language, and lighting only. Do not summarize people, clothing, scene contents, Subjects, actions, chronology, dialogue, or audio.
 
 SHOT1 CAPTION / DETAILED DESCRIPTION
@@ -1383,6 +1436,8 @@ def _completion_diagnostic(
     choice: object,
     *,
     modality: Literal[
+        "target_video_visual_only",
+        "target_video_av_assembly",
         "target_video_with_embedded_audio",
         "target_video_plus_canonical_full_audio_fallback",
         "full_av_recheck_embedded_audio",
@@ -2655,8 +2710,6 @@ class OpenAIMimo25Backend:
         )
         self._sleep = sleep
         self._jitter = jitter
-        self._av_request_started = False
-        self._av_raw_response = None
 
     @property
     def provenance(self) -> MimoBackendProvenance:
@@ -2785,12 +2838,15 @@ class OpenAIMimo25Backend:
     ) -> str:
         schema = (
             "Return one JSON object matching this schema, with no markdown or extra fields:\n"
-            + _compact_json(MimoAVAnnotationDraft.model_json_schema())
+            + _compact_json(MimoFinalAVAssemblyDraft.model_json_schema())
             + "\n"
             if self.config.transport == "xiaomi"
             else "Return one JSON object constrained by the supplied response_format.\n"
         )
         contract = self.build_compact_task_contract(job)
+        # Visual provenance is already in the unchanged first-turn prefix.
+        for key in ("reference_selection", "reference_image_mapping", "subject_definition_requirements"):
+            del contract[key]
         contract["allowed_h3_reference_labels"] = sorted(allowed_reference_labels)
         prompt = schema + "AUTHORITATIVE INPUT:\n" + _compact_json(contract)
         if auxiliary_audio_evidence is not None:
@@ -2803,73 +2859,150 @@ class OpenAIMimo25Backend:
         self, job: MimoBackendJob, *,
         allowed_reference_labels: set[str],
         auxiliary_audio_evidence: dict[str, str] | None = None,
-    ) -> tuple[str, MimoCompletionDiagnostic, int]:
-        content = self._media_content(job)
-        content.append({
-            "type": "text",
-            "text": self._prompt(
-                job, allowed_reference_labels=allowed_reference_labels,
-                auxiliary_audio_evidence=auxiliary_audio_evidence,
-            ),
-        })
-        modality = self._input_modality
-        payload: dict[str, object] = {
-            "model": self.config.model,
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
+    ) -> tuple[str, tuple[str, str], list[MimoCompletionDiagnostic], dict[str, int]]:
+        diagnostics: list[MimoCompletionDiagnostic] = []
+        raws: list[str | None] = [None, None]
+
+        def request_turn(
+            messages: list[dict[str, object]],
+            schema: type[SchemaModel],
+            *,
+            visual_only: bool,
+        ) -> str:
+            modality = "target_video_visual_only" if visual_only else "target_video_av_assembly"
+            payload: dict[str, object] = {
+                "model": self.config.model, "messages": messages,
+                "temperature": self.config.temperature,
+                "max_completion_tokens": self.config.max_completion_tokens,
+                "stream": False,
+            }
+            if self.config.transport == "sglang":
+                payload["response_format"] = {"type": "json_schema", "json_schema": {
+                    "name": schema.__name__, "schema": schema.model_json_schema(), "strict": True,
+                }}
+                if self.config.thinking == "disabled":
+                    payload["reasoning_effort"] = "none"
+                payload["extra_body"] = {
+                    "use_audio_in_video": not visual_only,
+                    "chat_template_kwargs": {
+                        "thinking": self.config.thinking == "enabled",
+                        "enable_thinking": self.config.thinking == "enabled",
+                    },
+                }
+            else:
+                payload["response_format"] = {"type": "json_object"}
+                payload["extra_body"] = {
+                    "thinking": {"type": self.config.thinking},
+                    "use_audio_in_video": not visual_only,
+                }
+            diagnostic = MimoCompletionDiagnostic(
+                input_modality=modality, usage=MimoUsage(), http_attempt_count=1,
+            )
+            diagnostics.append(diagnostic)
+            try:
+                completion, _, _ = self._call(payload)
+                choices = _value(completion, "choices")
+                if not isinstance(choices, list) or not choices:
+                    raise TypeError("MiMo response has no choices")
+                choice = choices[0]
+                raw = _value(_value(choice, "message"), "content")
+                if not isinstance(raw, str):
+                    raise TypeError("MiMo response content must be text")
+                raws[0 if visual_only else 1] = raw
+                diagnostic = _completion_diagnostic(
+                    completion, choice, modality=modality,
+                    http_attempt_count=1, thinking=self.config.thinking,
+                )
+                diagnostics[-1] = diagnostic
+            except Exception as exc:
+                diagnostic.request_error = f"{type(exc).__name__}: {exc}"
+                raise
+            _validate_finish_reason(diagnostic)
+            _validate_av_observation_usage(diagnostic, require_explicit_audio=False)
+            if visual_only:
+                diagnostic.warnings = [
+                    warning for warning in diagnostic.warnings if warning != "audio_tokens_unavailable"
+                ]
+            elif diagnostic.usage.audio_tokens == 0:
+                diagnostic.warnings.append("embedded_audio_tokens_zero")
+            return raw
+
+        try:
+            full_contract = self.build_compact_task_contract(job)
+            visual_contract = {
+                key: full_contract[key] for key in (
+                    "clip_uid", "target_duration_seconds", "reference_selection",
+                    "reference_image_mapping", "subject_definition_requirements",
+                )
+            }
+            visual_contract["segment_windows"] = [
+                {"segment_id": item.segment_id, "start_time": item.start_time, "end_time": item.end_time}
+                for item in job.segments
+            ]
+            visual_contract["allowed_visible_entity_ids"] = full_contract["allowed_speaker_bindable_entity_ids"]
+            visual_contract["allowed_h3_reference_labels"] = sorted(
+                label for label in allowed_reference_labels if label.startswith(("<Subject ", "<Picture "))
+            )
+            visual_instruction = "VISUAL-ONLY INPUT:\n" + _compact_json(visual_contract)
+            if self.config.transport == "xiaomi":
+                visual_instruction += "\nRESPONSE SCHEMA:\n" + _compact_json(MimoVisualDraft.model_json_schema())
+            content = self._media_content(job)
+            content.append({"type": "text", "text": visual_instruction})
+            turn1_messages = [
+                {"role": "system", "content": VISUAL_SYSTEM_PROMPT},
                 *(_official_detailed_description_icl_messages() if self.config.icl == "official_ref2va_v1" else []),
                 {"role": "user", "content": content},
-            ],
-            "temperature": self.config.temperature,
-            "max_completion_tokens": self.config.max_completion_tokens,
-            "stream": False,
-        }
-        if self.config.transport == "sglang":
-            payload["response_format"] = {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "MimoAVAnnotationDraft",
-                    "schema": MimoAVAnnotationDraft.model_json_schema(),
-                    "strict": True,
+            ]
+            visual_raw = request_turn(turn1_messages, MimoVisualDraft, visual_only=True)
+            visual, issues = parse_structured_json_issues(visual_raw, MimoVisualDraft)
+            if visual is None or issues:
+                raise MimoBackendFailure(
+                    code="mimo_visual_structured_output_failed",
+                    reason="MiMo visual draft failed structured validation", issues=tuple(issues),
+                )
+            turn2_messages = [
+                *turn1_messages,
+                {"role": "assistant", "content": visual_raw},
+                {"role": "user", "content": SYSTEM_PROMPT + "\n" + self._prompt(
+                    job, allowed_reference_labels=allowed_reference_labels,
+                    auxiliary_audio_evidence=auxiliary_audio_evidence,
+                )},
+            ]
+            av_raw = request_turn(turn2_messages, MimoFinalAVAssemblyDraft, visual_only=False)
+            canonical_av, corrections = _canonicalize_raw_annotation_payload(av_raw)
+            assembly, issues = parse_structured_json_issues(canonical_av, MimoFinalAVAssemblyDraft)
+            if assembly is None or issues:
+                raise MimoBackendFailure(
+                    code="mimo_structured_output_failed",
+                    reason="MiMo final AV assembly failed structured validation", issues=tuple(issues),
+                )
+            final = {
+                "schema_version": MIMO25_SCHEMA_VERSION,
+                "visual_observation": visual.visual_observation.model_dump(mode="json"),
+                "audio_observation": assembly.audio_observation.model_dump(mode="json"),
+                "av_grounding": assembly.av_grounding.model_dump(mode="json"),
+                "warnings": [item.model_dump(mode="json") for item in assembly.warnings],
+                "h3_semantics": {
+                    **assembly.model_dump(
+                        mode="json", exclude={"audio_observation", "av_grounding", "warnings"},
+                    ),
+                    **visual.model_dump(
+                        mode="json", exclude={"visual_observation", "shot1_visual_description"},
+                    ),
                 },
             }
-            if self.config.thinking == "disabled":
-                payload["reasoning_effort"] = "none"
-            payload["extra_body"] = {
-                "use_audio_in_video": True,
-                "chat_template_kwargs": {
-                    "thinking": self.config.thinking == "enabled",
-                    "enable_thinking": self.config.thinking == "enabled",
-                },
-            }
-        else:
-            payload["response_format"] = {"type": "json_object"}
-            payload["extra_body"] = {"thinking": {"type": self.config.thinking}}
-        self._av_request_started = True
-        completion, attempts, retries = self._call(payload)
-        try:
-            choices = _value(completion, "choices")
-            if not isinstance(choices, list) or not choices:
-                raise TypeError("MiMo response has no choices")
-            choice = choices[0]
-            message = _value(choice, "message")
-            raw = _value(message, "content")
-            if not isinstance(raw, str):
-                raise TypeError("MiMo response content must be text")
-            self._av_raw_response = raw
+            return _compact_json(final), (visual_raw, av_raw), diagnostics, corrections
         except Exception as exc:
-            raise _MimoResponseContractError(
-                exc,
-                attempts=attempts,
-                retries=retries,
+            raise MimoBackendFailure(
+                code=exc.code if isinstance(exc, MimoBackendFailure) else "mimo_request_failed",
+                reason=exc.reason if isinstance(exc, MimoBackendFailure) else f"{type(exc).__name__}: {exc}",
+                issues=exc.issues if isinstance(exc, MimoBackendFailure) else (),
+                raw_responses=tuple(raw for raw in raws if raw is not None),
+                diagnostics=tuple(diagnostics), model_call_count=len(diagnostics),
+                http_attempt_count=len(diagnostics),
+                visual_model_call_count=sum(d.input_modality == "target_video_visual_only" for d in diagnostics),
+                visual_raw_response=raws[0], final_av_raw_response=raws[1],
             ) from exc
-        return raw, _completion_diagnostic(
-            completion,
-            choice,
-            modality=modality,
-            http_attempt_count=attempts,
-            thinking=self.config.thinking,
-        ), retries
 
     def describe_auxiliary_audio(self, path: Path) -> MimoAuxAudioDescriptionCall:
         raw = None
@@ -3038,57 +3171,19 @@ class OpenAIMimo25Backend:
         allowed_reference_labels: set[str],
         auxiliary_audio_evidence: dict[str, str] | None = None,
     ) -> MimoBackendResult:
-        self._av_request_started = False
-        try:
-            raw, diagnostic, _ = self._request(
-                job, allowed_reference_labels=allowed_reference_labels,
-                auxiliary_audio_evidence=auxiliary_audio_evidence,
-            )
-        except Exception as exc:
-            reason = f"{type(exc).__name__}: {exc}"
-            diagnostics = (
-                (
-                    MimoCompletionDiagnostic(
-                        input_modality=self._input_modality,
-                        usage=MimoUsage(),
-                        http_attempt_count=1,
-                        request_error=reason,
-                    ),
-                )
-                if self._av_request_started
-                else ()
-            )
-            raise MimoBackendFailure(
-                code="mimo_request_failed",
-                reason=reason,
-                diagnostics=diagnostics,
-                raw_responses=(self._av_raw_response,)
-                if self._av_raw_response is not None
-                else (),
-                model_call_count=int(self._av_request_started),
-                http_attempt_count=int(self._av_request_started),
-            ) from exc
-        try:
-            _validate_finish_reason(diagnostic)
-            _validate_av_observation_usage(diagnostic, require_explicit_audio=False)
-            if diagnostic.usage.audio_tokens == 0:
-                diagnostic.warnings.append("embedded_audio_tokens_zero")
-        except MimoBackendFailure as exc:
-            raise MimoBackendFailure(
-                code=exc.code,
-                reason=exc.reason,
-                raw_responses=(raw,),
-                diagnostics=(diagnostic,),
-                model_call_count=1,
-                http_attempt_count=1,
-            ) from exc
+        raw, raw_responses, diagnostics, stage_corrections = self._request(
+            job, allowed_reference_labels=allowed_reference_labels,
+            auxiliary_audio_evidence=auxiliary_audio_evidence,
+        )
+        visual_raw, av_raw = raw_responses
+        diagnostic = diagnostics[-1]
         canonical_raw, raw_corrections = _canonicalize_raw_annotation_payload(raw)
         corrections = Counter(raw_corrections)
+        corrections.update(stage_corrections)
         annotation, issues = parse_structured_json_issues(
             canonical_raw, MimoAVAnnotationDraft
         )
         polish = MimoSpeakerMarkerPolishAudit()
-        diagnostics = [diagnostic]
         if annotation is not None:
             annotation, grounding_corrections = _normalize_speaker_annotation(
                 annotation,
@@ -3163,22 +3258,28 @@ class OpenAIMimo25Backend:
         if annotation is None or issues:
             raise MimoBackendFailure(
                 code="mimo_structured_output_failed",
-                reason="MiMo single AV observation failed validation",
-                raw_responses=(raw,),
+                reason="MiMo two-turn observation failed validation",
+                raw_responses=raw_responses,
                 diagnostics=tuple(diagnostics),
                 issues=tuple(issues),
-                model_call_count=1 + text_calls,
-                http_attempt_count=1 + text_calls,
+                model_call_count=2 + text_calls,
+                http_attempt_count=2 + text_calls,
+                visual_model_call_count=1,
+                visual_raw_response=visual_raw,
+                final_av_raw_response=av_raw,
                 annotation=annotation,
                 text_model_call_count=text_calls,
                 speaker_marker_polish=polish,
             )
         return MimoBackendResult(
             annotation=annotation,
-            raw_responses=(raw,),
+            raw_responses=raw_responses,
             diagnostics=tuple(diagnostics),
-            model_call_count=1 + text_calls,
-            http_attempt_count=1 + text_calls,
+            model_call_count=2 + text_calls,
+            http_attempt_count=2 + text_calls,
+            visual_model_call_count=1,
+            visual_raw_response=visual_raw,
+            final_av_raw_response=av_raw,
             http_retry_count=0,
             recheck_count=0,
             input_modality=self._input_modality,

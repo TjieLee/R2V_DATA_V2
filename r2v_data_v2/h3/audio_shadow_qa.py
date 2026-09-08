@@ -44,7 +44,7 @@ from r2v_data_v2.h3.sam_audio_stem_shadow import (
 )
 from r2v_data_v2.structured_output import normalize_structured_json_envelope
 
-QA_DATA_VERSION = "r2v.h3.audio_shadow_qa.5"
+QA_DATA_VERSION = "r2v.h3.audio_shadow_qa.6"
 QA_REVIEW_VERSION = "r2v.h3.audio_shadow_human_qa.2"
 QA_LABELS = (
     "better", "same", "worse", "speaker_wrong",
@@ -68,14 +68,21 @@ def _direct_h3(record: object) -> dict[str, object] | None:
     if annotation is not None:
         return annotation.h3_semantics.model_dump(mode="json")
     # Failed final publication must not hide parseable model-authored prose.
-    for raw in reversed(record.raw_responses):
+    fields: dict[str, object] = {}
+    for raw, keys in (
+        (record.visual_raw_response, ("subject_definitions", "visual_retention_analysis", "style_opening")),
+        (record.final_av_raw_response, ("summary", "shot1_caption", "overall_soundscape", "non_diegetic_music")),
+    ):
+        if raw is None:
+            continue
         try:
             payload = json.loads(normalize_structured_json_envelope(raw))
         except (ValueError, TypeError):
             continue
-        if isinstance(payload, dict) and isinstance(payload.get("h3_semantics"), dict):
-            return payload["h3_semantics"]
-    return None
+        if not isinstance(payload, dict):
+            continue
+        fields.update({key: payload[key] for key in keys if key in payload})
+    return fields or None
 
 
 def _json(value: object) -> str:
@@ -203,6 +210,7 @@ def build_audio_shadow_qa(
         or summary.model_call_count != sum(item.model_call_count for item in reconcile)
         or summary.audio_model_call_count != sum(item.audio_model_call_count for item in reconcile)
         or summary.av_model_call_count != sum(item.av_model_call_count for item in reconcile)
+        or summary.visual_model_call_count != sum(item.visual_model_call_count for item in reconcile)
         or summary.text_model_call_count != sum(item.text_model_call_count for item in reconcile)
     ):
         raise ValueError("QA reconcile summary differs from current run inventory")

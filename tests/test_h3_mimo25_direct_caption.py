@@ -17,6 +17,7 @@ from r2v_data_v2.h3.mimo25_backend import (
     protect_direct_dialogue,
 )
 from r2v_data_v2.h3.mimo25_h3_materializer import _materialize_sample
+from tests.h3_mimo_two_turn_helpers import split_annotation
 from tests.test_h3_mimo25_av_shadow import (
     _annotation,
     _backend,
@@ -36,17 +37,19 @@ def _run(backend, job):
     )
 
 
-def test_official_example_and_single_av_message_order(tmp_path):
+def test_official_examples_preserved_in_two_turn_prefix(tmp_path):
     job = _job_fixture(tmp_path)
-    backend, calls = _backend(tmp_path, [(_annotation().model_dump_json(), 8)],
+    visual, assembly = split_annotation(_annotation().model_dump_json())
+    backend, calls = _backend(tmp_path, [(visual, 0), (assembly, 8)],
                              icl="official_ref2va_v1")
     result = _run(backend, job)
     defaults = MimoBackendConfig(media_resolver=backend.config.media_resolver, api_key="test")
     assert (defaults.thinking, defaults.icl, defaults.temperature) == (
         "disabled", "official_ref2va_v1", 0.0,
     )
-    assert result.model_call_count == len(calls.requests) == 1
+    assert result.model_call_count == len(calls.requests) == 2
     messages = calls.requests[0]["messages"]
+    assert calls.requests[1]["messages"][:len(messages)] == messages
     assert [m["role"] for m in messages] == ["system", *(["user", "assistant"] * 4), "user"]
     assert messages[1:-1] == _official_detailed_description_icl_messages()
     guide = (Path(__file__).parents[1] / "docs/VIDEO_PROMPT_WRITING_GUIDE_ref_en.md").read_text()
@@ -89,8 +92,8 @@ def test_official_example_and_single_av_message_order(tmp_path):
         assert "How the reference pictures align" not in message["content"]
         assert "Case 1: T2VA" not in message["content"]
     assert backend.provenance.icl_version == MIMO25_ICL_VERSION == "h3_official_ref2va_detailed_shot1_v4"
-    assert backend.provenance.prompt_version == "h3_mimo25_unified_av_reconcile_v38"
-    assert backend.provenance.schema_version == "r2v.h3.mimo25_backend.46"
+    assert backend.provenance.prompt_version == "h3_mimo25_two_turn_av_reconcile_v39"
+    assert backend.provenance.schema_version == "r2v.h3.mimo25_backend.47"
     assert backend.provenance.annotation_schema_version == "r2v.h3.mimo25_av_annotation.20"
     assert backend.provenance.materializer_version == "h3_mimo25_materializer_v23"
     assert "This pilot is exactly one shot." in SYSTEM_PROMPT

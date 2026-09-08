@@ -33,6 +33,7 @@ from r2v_data_v2.h3.sam_audio_stem_shadow import (
     sha256_file,
     validate_stem_diarization_lineage,
 )
+from tests.h3_mimo_two_turn_helpers import split_annotation
 from tests.test_h3_mimo25_av_shadow import _annotation, _sample
 from tests.test_h3_sam_audio_stem_shadow import (
     _mimo_inventory_for_clip_order,
@@ -58,11 +59,18 @@ class _Reconcile:
         )
 
     def reconcile(self, job, **kwargs):
+        raw = _annotation().model_dump_json()
+        visual_raw, av_raw = split_annotation(raw)
+        diagnostics = tuple(
+            MimoCompletionDiagnostic(input_modality=modality, usage=MimoUsage(), http_attempt_count=1)
+            for modality in ("target_video_visual_only", "target_video_av_assembly")
+        )
         if job.clip_uid == "clip-a":
             raise MimoBackendFailure(
                 code="synthetic_failed", reason="failed <script>not markup</script>",
-                model_call_count=1,
-                raw_responses=(_annotation().model_dump_json(),),
+                model_call_count=2, visual_model_call_count=1,
+                visual_raw_response=visual_raw, final_av_raw_response=av_raw,
+                raw_responses=(visual_raw, av_raw), diagnostics=diagnostics,
             )
         # Pure fixture output; no client or model is called.
         annotation = MimoAVAnnotationDraft.model_validate_json(
@@ -76,7 +84,12 @@ class _Reconcile:
             values["av_grounding"]["segment_groundings"] = []
             values["h3_semantics"]["shot1_caption"] = "The seated person remains still."
         annotation = MimoAVAnnotationDraft.model_validate(values)
-        return SimpleNamespace(annotation=annotation, raw_responses=(), diagnostics=(), model_call_count=1)
+        visual_raw, av_raw = split_annotation(annotation.model_dump_json())
+        return SimpleNamespace(
+            annotation=annotation, raw_responses=(visual_raw, av_raw), diagnostics=diagnostics,
+            model_call_count=2, visual_model_call_count=1,
+            visual_raw_response=visual_raw, final_av_raw_response=av_raw,
+        )
 
 
 def _fixture(tmp_path, monkeypatch, *, mixed=False, variants=False):
@@ -176,13 +189,15 @@ def test_builder_ready_failed_order_media_and_sources_unchanged(tmp_path, monkey
     assert result["output_root"] == str(output)
     data = json.loads((output / "data.json").read_text())
     reconcile_summary = json.loads((shadow / MIMO25_STEM_RECONCILE_STAGE / "summary.json").read_text())
-    assert reconcile_summary["schema_version"] == "r2v.h3.mimo25_stem_reconcile_summary.13"
+    assert reconcile_summary["schema_version"] == "r2v.h3.mimo25_stem_reconcile_summary.14"
     assert reconcile_summary["current_mimo_versions_modified"] is True
     assert data["clip_uids"] == ["clip-z", "clip-a", "clip-m"]
     assert [clip["reconcile"]["status"] for clip in data["clips"]] == ["ready", "failed", "ready"]
     failed = data["clips"][1]["reconcile"]
     assert failed["failure_code"] == "synthetic_failed"
-    assert failed["model_call_count"] == 3
+    assert failed["model_call_count"] == 4
+    assert failed["visual_raw_response"] and failed["final_av_raw_response"]
+    assert failed["visual_model_call_count"] == 1
     assert data["clips"][1]["direct_h3"]["style_opening"]
     assert data["clips"][1]["direct_h3"]["shot1_caption"]
     assert data["clips"][0]["reconcile"]["annotation"]["audio_observation"]
@@ -364,15 +379,15 @@ def test_ready_annotation_with_blocked_materialization_is_unavailable(tmp_path, 
                                  evidence_codes=["insufficient_evidence"])
         else:
             values["h3_semantics"]["shot1_caption"] += " [[unknown]]"
-        return SimpleNamespace(annotation=MimoAVAnnotationDraft.model_validate(values),
-                               raw_responses=(), diagnostics=(), model_call_count=1)
+        result.annotation = MimoAVAnnotationDraft.model_validate(values)
+        return result
 
     monkeypatch.setattr(_Reconcile, "reconcile", reconcile)
     kwargs, shadow = _fixture(tmp_path, monkeypatch, variants=True)
     before = _snapshot(tmp_path)
     qa.build_audio_shadow_qa(**kwargs)
     data = json.loads((shadow / "qa/data.json").read_text())
-    assert data["schema_version"] == "r2v.h3.audio_shadow_qa.5"
+    assert data["schema_version"] == "r2v.h3.audio_shadow_qa.6"
     for clip in (data["clips"][0], data["clips"][2]):
         assert clip["reconcile"]["status"] == "ready"
         final = clip["final_h3"]

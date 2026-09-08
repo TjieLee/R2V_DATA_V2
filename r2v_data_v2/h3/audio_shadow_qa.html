@@ -248,7 +248,8 @@ function render() {
     Object.entries(result.annotation).filter(([name]) => name !== "schema_version").forEach(([name, value]) =>
       $("reconcile-body").append(details(name, value, name === "av_grounding" || name === "audio_observation")));
   }
-  $("reconcile-body").append(details("Final AV raw response", result.raw_responses || []));
+  $("reconcile-body").append(details("Turn 1 visual draft raw response", result.visual_raw_response ?? "[unavailable]"));
+  $("reconcile-body").append(details("Final AV raw response", result.final_av_raw_response ?? "[unavailable]"));
   $("reconcile-body").append(details("Speaker marker polish", {
     attempted: result.speaker_marker_polish_attempted,
     applied: result.speaker_marker_polish_applied,
@@ -261,6 +262,7 @@ function render() {
     backend_provenance: result.backend_provenance, source_job_fingerprint: result.source_job_fingerprint,
     source_stem_record_fingerprint: result.source_stem_record_fingerprint,
     av_model_call_count: result.av_model_call_count, audio_model_call_count: result.audio_model_call_count,
+    visual_model_call_count: result.visual_model_call_count,
     text_model_call_count: result.text_model_call_count,
     issues: result.failure_issues
   }));

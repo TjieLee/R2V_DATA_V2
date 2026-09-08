@@ -263,10 +263,15 @@ image, ASR, references, caption or ICL. Hashes are checked against separation
 provenance. Temperature 0, disabled thinking, 1024 tokens and one-string JSON
 remain unchanged. Results/errors are stored by music/SFX pipeline role.
 
-Only after both requests finish or fail, one final AV request receives the
-original target video with embedded audio, existing reference images, unchanged
-authoritative text facts and official opening + Shot 1 ICL, plus:
-`music_separator_candidate` and `sfx_separator_candidate`. Missing evidence is
+Only after both requests finish or fail, a visual-only Turn 1 receives the
+original target video, frozen references, official ICL v4 and visual-only
+provenance/windows (`use_audio_in_video=false` in SGLang). Turn 2 extends that
+exact message prefix with the raw visual draft and a new text-only user turn:
+authoritative ASR/speaker/audio facts plus `music_separator_candidate` and
+`sfx_separator_candidate`. It enables `use_audio_in_video=true` and returns the
+final AV assembly. There is no duplicate media attachment in the new user turn,
+no generated muted video and no server session ID. Cache hits are optional.
+Missing evidence is
 `SOURCE_UNAVAILABLE`, never silence. Generated candidates are ephemeral request
 text, not fields added to `MimoClipJob`. No independent audio enters final AV.
 
@@ -286,25 +291,27 @@ or text fusion. The materializer reads these annotation fields directly.
 Caption, grounding, relaxed dialogue, multi-speaker exclusion and six-section
 Ref2VA formatting remain unchanged.
 
-Normal per-clip counts: audio=2, AV=1, text=0, total=3. Eligible Sx projection
-issues alone may trigger one text-only polish (text=1, total=4).
+Normal per-clip counts: audio=2, visual=1, AV=1, text=0, total=4. Eligible Sx projection
+issues alone may trigger one unchanged text-only polish (text=1, total=5).
 One attempt per request, no
 SDK retry, repair, fallback, AV recheck or resend. Auxiliary errors do not
-automatically fail a clip; final AV still runs. Final AV failures retain raw
-annotation/error and both candidates. Polish failure preserves the original
+automatically fail a clip; the two-turn path still runs. A failed visual turn
+stops before AV assembly. Records and QA retain separate visual/final-AV raw
+responses and diagnostics, plus both candidates. Polish failure preserves the original
 status and caption. No video/audio/images are sent to polish. Zero/missing
 embedded audio tokens remain warnings only. AV defaults still include
 `--thinking disabled --icl official_ref2va_v1`, `use_audio_in_video=true`,
 temperature 0.0 and 32768 completion tokens.
 
-Versions: prompt v35, annotation .20, backend .40, materializer v23, authority
-v17, ICL v2; reconcile record .11, summary .13, policy v6. New output:
+Versions: main prompt v39, visual prompt v1, annotation .20, backend .47,
+materializer v23, authority v17, ICL v4, marker polish v4; reconcile record .12,
+summary .14, policy v6, QA data .6. Fixed output:
 `mimo_reconcile_stemtext_final_av_markerpolish_v1/`. Old
 `mimo_reconcile_av_stemtext_sound_partition/`, `mimo_v29_oneclip_smoke/`,
 and `mimo_v30_833_oneclip_smoke/` are preserved, not migrated.
 
-For a fresh v35/backend .40 random10 run, keep `CASE_MANIFEST` as the existing ordered
-random10 manifest. This reuses SAM/DiariZen/ASR without reruns and leaves the
+For a manually requested v39/backend .47 pilot, keep `CASE_MANIFEST` as the selected
+ordered manifest. This reuses SAM/DiariZen/ASR without reruns and leaves the
 previous `mimo_reconcile_stemtext_final_av_v35_backend39/`, v35, and earlier outputs untouched:
 
 ```bash
