@@ -303,14 +303,14 @@ embedded audio tokens remain warnings only. AV defaults still include
 `--thinking disabled --icl official_ref2va_v1`, `use_audio_in_video=true`,
 temperature 0.0 and 32768 completion tokens.
 
-Versions: main prompt v39, visual prompt v1, annotation .20, backend .47,
+Versions: main prompt v39, visual prompt v2, annotation .20, backend .48,
 materializer v23, authority v17, ICL v4, marker polish v4; reconcile record .12,
 summary .14, policy v6, QA data .6. Fixed output:
 `mimo_reconcile_stemtext_final_av_markerpolish_v1/`. Old
 `mimo_reconcile_av_stemtext_sound_partition/`, `mimo_v29_oneclip_smoke/`,
 and `mimo_v30_833_oneclip_smoke/` are preserved, not migrated.
 
-For a manually requested v39/backend .47 pilot, keep `CASE_MANIFEST` as the selected
+For a manually requested v39/backend .48 pilot, keep `CASE_MANIFEST` as the selected
 ordered manifest. This reuses SAM/DiariZen/ASR without reruns and leaves the
 previous `mimo_reconcile_stemtext_final_av_v35_backend39/`, v35, and earlier outputs untouched:
 

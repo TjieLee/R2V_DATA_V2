@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
 
 import pytest
+from pydantic import ValidationError
 
 from r2v_data_v2.h3 import mimo25_backend as mb
 from tests.h3_mimo_two_turn_helpers import split_annotation
@@ -22,7 +24,7 @@ def _run(backend, job):
 def test_intermediate_schema_field_ownership():
     visual = mb.MimoVisualDraft.model_json_schema()
     assert set(visual["properties"]) == {
-        "visual_observation", "subject_definitions", "visual_retention_analysis",
+        "segment_views", "subject_definitions", "visual_retention_analysis",
         "style_opening", "shot1_visual_description",
     }
     keys = set()
@@ -37,6 +39,10 @@ def test_intermediate_schema_field_ownership():
                 collect(item)
 
     collect(visual)
+    assert not {"visual_observation", "visual_blocks"} & keys
+    assert "MimoVisualObservation" not in visual["$defs"]
+    assert "MimoVisualBlock" not in visual["$defs"]
+    assert "maxLength" not in visual["properties"]["shot1_visual_description"]
     assert not keys & {
         "audio_observation", "av_grounding", "overall_soundscape", "non_diegetic_music",
         "speaker_group", "primary_speaker_group", "confidence", "evidence_codes",
@@ -58,7 +64,8 @@ def test_two_turn_prefix_is_literal_and_visual_facts_are_isolated(tmp_path, monk
     expected = _annotation()
     visual_raw, assembly_raw = split_annotation(expected.model_dump_json())
     visual = json.loads(visual_raw)
-    visual["shot1_visual_description"] = "A richly detailed visual-only draft."
+    visual["shot1_visual_description"] = "<Subject 1> turns, then lowers a hand. The camera stays static."
+    expected.visual_observation.visual_blocks[0].text = visual["shot1_visual_description"]
     visual_raw = json.dumps(visual, indent=2)
     job = _job_fixture(tmp_path)
     backend, calls = _backend(
@@ -76,6 +83,9 @@ def test_two_turn_prefix_is_literal_and_visual_facts_are_isolated(tmp_path, monk
     monkeypatch.setattr(mb, "validate_annotation", checked)
     result = _run(backend, job)
     assert result.annotation == expected
+    assert result.annotation.visual_observation.visual_blocks[0].block_id == "v1"
+    assert result.annotation.visual_observation.visual_blocks[0].text == visual["shot1_visual_description"]
+    assert len(result.annotation.visual_observation.visual_blocks) == 1
     assert validations == [expected]
     assert result.raw_responses == (visual_raw, assembly_raw)
     assert result.visual_raw_response == visual_raw and result.final_av_raw_response == assembly_raw
@@ -162,6 +172,54 @@ def test_visual_and_assembly_prompt_ownership():
     assert "retain all materially useful visual observations" in mb.SYSTEM_PROMPT
 
 
+def test_visual_v2_keeps_only_caption_long_and_definitions_concise():
+    prompt = mb.VISUAL_SYSTEM_PROMPT
+    for requirement in (
+        "shot1_visual_description is the ONLY full visual description",
+        "Do not generate visual_blocks",
+        "exactly one definition for every required Subject, in required order",
+        "ONE concise sentence", "stable visual identity / appearance only",
+        "Do NOT describe actions, frame position, chronology, camera, or speaker state",
+        "Do NOT mention <Picture N>",
+        "Never repeat a fact or clause inside a definition",
+        "Subject definitions are not mini-captions",
+        'Do NOT use provenance/analysis boilerplate such as "consistent with the visual evidence"',
+        '"consistent with the video frames"', '"primary subject of the shot"',
+        '"only visible person"',
+        "one concise retention statement per required item",
+        "Do not repeat appearance descriptions",
+        "foreground/midground/background composition", "appearance",
+        "lighting and color", "camera motion or clearly static camera",
+        "body/hand/arm motion", "gaze", "facial expression and visible expression changes",
+        "early through middle to late",
+    ):
+        assert requirement in prompt
+    visual, _ = split_annotation(_annotation().model_dump_json())
+    payload = json.loads(visual)
+    # No word cap, repetition detector, truncation, or deduplication.
+    payload["shot1_visual_description"] = "<Subject 1> remains still. " * 600
+    parsed = mb.MimoVisualDraft.model_validate(payload)
+    block = mb.MimoVisualBlock(block_id="v1", text=parsed.shot1_visual_description)
+    assert block.text == payload["shot1_visual_description"]
+
+
+@pytest.mark.parametrize("syntax", ["<Picture 1>", "<Audio 1>", "(S1)", "<d>x</d>", "[[segment:x]]", "<Subject 0>"])
+def test_reused_visual_caption_still_rejects_non_visual_syntax(syntax):
+    with pytest.raises(ValidationError, match="non-visual or pipeline syntax"):
+        mb.MimoVisualBlock(block_id="v1", text=f"<Subject 1> stands. {syntax}")
+
+
+def test_turn2_prompt_and_schema_are_byte_identical_to_v39_baseline():
+    # b1278ce: Turn 1 is changing, not final AV assembly.
+    assert hashlib.sha256(mb.SYSTEM_PROMPT.encode()).hexdigest() == (
+        "270eaac7f8001ef12d455fb4687e4e13194dd6318d19ea1ebcad658dc31864db"
+    )
+    schema = json.dumps(mb.MimoFinalAVAssemblyDraft.model_json_schema(), sort_keys=True)
+    assert hashlib.sha256(schema.encode()).hexdigest() == (
+        "f7d154d4d6add878a387d0a910d8fe2b7a710d4277b0118db1fd1c2f40a1e1d5"
+    )
+
+
 @pytest.mark.parametrize("cached_tokens", [0, 73])
 def test_cache_is_diagnostic_only_and_two_turn_provenance_is_fingerprinted(tmp_path, cached_tokens):
     visual, assembly = split_annotation(_annotation().model_dump_json())
@@ -178,9 +236,9 @@ def test_cache_is_diagnostic_only_and_two_turn_provenance_is_fingerprinted(tmp_p
     assert result.model_call_count == 2
     assert [d.usage.cached_tokens for d in result.diagnostics] == [cached_tokens] * 2
     provenance = backend.provenance
-    assert provenance.schema_version == "r2v.h3.mimo25_backend.47"
+    assert provenance.schema_version == "r2v.h3.mimo25_backend.48"
     assert provenance.prompt_version == "h3_mimo25_two_turn_av_reconcile_v39"
-    assert provenance.visual_prompt_version == "h3_mimo25_visual_only_v1"
+    assert provenance.visual_prompt_version == "h3_mimo25_visual_only_v2"
     assert provenance.materializer_version == "h3_mimo25_materializer_v23"
     assert provenance.policy_version == "h3_mimo25_av_authority_contract_v17"
     values = provenance.model_dump(mode="json", exclude={"configuration_fingerprint"})

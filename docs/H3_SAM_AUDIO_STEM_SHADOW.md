@@ -131,7 +131,10 @@ uncovered tail.
    After both finish/fail, Turn 1 receives the original video and frozen reference
    images, with official ICL v4 and visual provenance/windows only. SGLang uses
    `use_audio_in_video=false`; no ASR, clusters, bindings or auxiliary candidates
-   enter this visual-only request. It returns `MimoVisualDraft`.
+   enter this visual-only request. It returns `MimoVisualDraft`: segment views,
+   one-sentence Subject definitions, short retention statements, style opening
+   and one full `shot1_visual_description`. The latter is reused verbatim as
+   final `visual_blocks[0].text` (block ID `v1`), not independently generated.
    Turn 2 literally extends those same messages with the raw visual assistant
    response and newly supplied authoritative speech/audio facts plus candidates.
    SGLang uses `use_audio_in_video=true`. No duplicate media is attached in the
@@ -186,7 +189,7 @@ success. Failed AV cannot authorize unsafe identity products. Multi-speaker
 exclusions remain. The materializer leaves dialogue intact and reads final
 sound fields directly from annotation; no timing is invented.
 Prompt `h3_mimo25_two_turn_av_reconcile_v39`, visual prompt
-`h3_mimo25_visual_only_v1`, backend .47, reconcile record .12 / summary .14,
+`h3_mimo25_visual_only_v2`, backend .48, reconcile record .12 / summary .14,
 and QA data .6 identify the two-turn contract. Annotation .20, materializer v23,
 authority v17, stem policy v6, official ICL v4 and marker polish v4 are unchanged.
 Records/QA preserve `visual_raw_response`, `final_av_raw_response` and separate

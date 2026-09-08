@@ -93,7 +93,7 @@ def test_official_examples_preserved_in_two_turn_prefix(tmp_path):
         assert "Case 1: T2VA" not in message["content"]
     assert backend.provenance.icl_version == MIMO25_ICL_VERSION == "h3_official_ref2va_detailed_shot1_v4"
     assert backend.provenance.prompt_version == "h3_mimo25_two_turn_av_reconcile_v39"
-    assert backend.provenance.schema_version == "r2v.h3.mimo25_backend.47"
+    assert backend.provenance.schema_version == "r2v.h3.mimo25_backend.48"
     assert backend.provenance.annotation_schema_version == "r2v.h3.mimo25_av_annotation.20"
     assert backend.provenance.materializer_version == "h3_mimo25_materializer_v23"
     assert "This pilot is exactly one shot." in SYSTEM_PROMPT

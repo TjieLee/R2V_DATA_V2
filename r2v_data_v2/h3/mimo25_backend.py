@@ -29,10 +29,10 @@ from r2v_data_v2.structured_output import (
 MIMO25_MODEL = "mimo-v2.5"
 MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
 MIMO25_PROMPT_VERSION = "h3_mimo25_two_turn_av_reconcile_v39"
-MIMO25_VISUAL_PROMPT_VERSION = "h3_mimo25_visual_only_v1"
+MIMO25_VISUAL_PROMPT_VERSION = "h3_mimo25_visual_only_v2"
 MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v17"
 MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.20"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.47"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.48"
 MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION = "h3_mimo25_speaker_marker_polish_v4"
 MIMO25_ICL_VERSION = "h3_official_ref2va_detailed_shot1_v4"
 MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v23"
@@ -721,14 +721,16 @@ class MimoVisualBlock(SchemaModel):
 
     @model_validator(mode="after")
     def validate_visual_text(self) -> MimoVisualBlock:
+        # The reused visual caption may identify a visible reference Subject.
+        syntax = re.sub(r"<Subject [1-9]\d*>", "", self.text)
         if (
             not self.text.strip()
             or "[[" in self.text
             or "]]" in self.text
-            or _PIPELINE_OWNED.search(self.text)
-            or _PICTURE_OR_SUBJECT.search(self.text)
-            or "<" in self.text
-            or ">" in self.text
+            or _PIPELINE_OWNED.search(syntax)
+            or _PICTURE_OR_SUBJECT.search(syntax)
+            or "<" in syntax
+            or ">" in syntax
         ):
             raise ValueError("MiMo visual block contains non-visual or pipeline syntax")
         return self
@@ -871,7 +873,7 @@ MimoH3Draft = MimoH3Semantics
 
 
 class MimoVisualDraft(SchemaModel):
-    visual_observation: MimoVisualObservation
+    segment_views: list[MimoVisualSegmentView]
     subject_definitions: list[MimoSubjectDefinitionDraft]
     visual_retention_analysis: list[MimoVisualRetentionDraft]
     style_opening: StrictStr
@@ -910,8 +912,8 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.47"] = MIMO25_BACKEND_VERSION
-    visual_prompt_version: Literal["h3_mimo25_visual_only_v1"] = MIMO25_VISUAL_PROMPT_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.48"] = MIMO25_BACKEND_VERSION
+    visual_prompt_version: Literal["h3_mimo25_visual_only_v2"] = MIMO25_VISUAL_PROMPT_VERSION
     speaker_marker_polish_prompt_version: Literal["h3_mimo25_speaker_marker_polish_v4"] = (
         MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION
     )
@@ -1240,14 +1242,18 @@ VISUAL_SYSTEM_PROMPT = """This conversation stages visual observation before aud
 For the first task, observe the ENTIRE target video from beginning to end, using only visual evidence.
 Return only MimoVisualDraft, constrained by the current response schema. Official ICL examples demonstrate writing and field boundaries, not this task's response schema.
 Produce a generation-quality dense VISUAL description, not a plot summary.
+shot1_visual_description is the ONLY full visual description. Do not generate visual_blocks or duplicate this long prose in any other field.
 shot1_visual_description covers every applicable observed dimension: visual style; shot scale and framing; camera angle/viewpoint; foreground/midground/background composition; every salient visible subject; appearance, spatial positions and relationships; pose; body/hand/arm motion; head motion; gaze; facial expression and visible expression changes; object interactions and state changes; environment and major props; materials and visible text when clear; lighting and color; camera motion or clearly static camera; chronological visual progression from early through middle to late.
 A single shot is NOT a reason to make the description short. Do not stop after the opening composition. Describe meaningful visual evolution through the final frame.
 Prefer concrete observation over interpretation. Do not invent psychology, intention, causality, relationships or unseen details. No hard word-count requirement.
 Do not infer sounds or dialogue. Do not decide speaker identity or use offscreen/voice-over classification. Do not output dialogue, (Sx), <d>, acoustic groups, or audio fields in this first response.
 Visible profile/back/occluded/silent subjects remain visible. Every defined ENTITY <Subject N> visibly present must use its exact label at first clear appearance. Attribute-only Subjects do not need mechanical insertion.
 Observable mouth/lip state is visual and allowed, but never derive voice/source conclusions from it. The existing speech_correlated_articulation field records visible mouth articulation only in the supplied window, without any audio correlation or identity inference.
-visual_blocks are concise visual evidence; segment_views follow the supplied segment windows in order, with matching visible_entity_ids and entity_observations.
+segment_views follow the supplied segment windows in order, with matching visible_entity_ids and entity_observations.
 Write natural Subject definitions and retention descriptions. Pipeline code owns exact Picture provenance: omit Picture labels from definition descriptions. subject_label already owns the label; do not repeat it in definition/retention descriptions. Attribute Subjects describe only their attribute; attribute retention is judged on the owning entity. Use only fully_preserved, partially_preserved or weak_reference.
+subject_definitions: exactly one definition for every required Subject, in required order. Each description is ONE concise sentence about stable visual identity / appearance only. Do NOT describe actions, frame position, chronology, camera, or speaker state. Do NOT mention <Picture N>. Never repeat a fact or clause inside a definition. Subject definitions are not mini-captions.
+Do NOT use provenance/analysis boilerplate such as "consistent with the visual evidence", "consistent with the video frames", "primary subject of the shot", "only visible person", or similar phrases.
+visual_retention_analysis: one concise retention statement per required item. Do not repeat appearance descriptions from subject_definitions or shot1_visual_description.
 style_opening is one concise global style/camera/lighting sentence. The pipeline owns [Shot 1]; do not emit shot markers, timestamps or placeholders.
 Only use supplied Subject/Picture labels and visible entity IDs, never example assets.
 A later task may supply audiovisual facts and its own response schema; follow that task while retaining this visual draft."""
@@ -2978,7 +2984,12 @@ class OpenAIMimo25Backend:
                 )
             final = {
                 "schema_version": MIMO25_SCHEMA_VERSION,
-                "visual_observation": visual.visual_observation.model_dump(mode="json"),
+                "visual_observation": MimoVisualObservation(
+                    visual_blocks=[
+                        MimoVisualBlock(block_id="v1", text=visual.shot1_visual_description),
+                    ],
+                    segment_views=visual.segment_views,
+                ).model_dump(mode="json"),
                 "audio_observation": assembly.audio_observation.model_dump(mode="json"),
                 "av_grounding": assembly.av_grounding.model_dump(mode="json"),
                 "warnings": [item.model_dump(mode="json") for item in assembly.warnings],
@@ -2987,7 +2998,7 @@ class OpenAIMimo25Backend:
                         mode="json", exclude={"audio_observation", "av_grounding", "warnings"},
                     ),
                     **visual.model_dump(
-                        mode="json", exclude={"visual_observation", "shot1_visual_description"},
+                        mode="json", exclude={"segment_views", "shot1_visual_description"},
                     ),
                 },
             }
