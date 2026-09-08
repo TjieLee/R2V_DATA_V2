@@ -113,8 +113,8 @@ def test_polish_applies_only_sx_and_rescues_marker_projection(
 
 
 def test_polish_v4_prompt_makes_aligned_speaker_projection_unambiguous():
-    assert mb.MIMO25_PROMPT_VERSION == "h3_mimo25_two_turn_av_reconcile_v39"
-    assert mb.MIMO25_BACKEND_VERSION == "r2v.h3.mimo25_backend.48"
+    assert mb.MIMO25_PROMPT_VERSION == "h3_mimo25_two_turn_av_reconcile_v40"
+    assert mb.MIMO25_BACKEND_VERSION == "r2v.h3.mimo25_backend.49"
     assert mb.MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION == "h3_mimo25_speaker_marker_polish_v4"
     prompt = mb.SPEAKER_MARKER_POLISH_PROMPT
     assert "exactly one distinct speaker_id" in prompt

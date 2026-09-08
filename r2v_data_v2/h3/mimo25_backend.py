@@ -28,11 +28,11 @@ from r2v_data_v2.structured_output import (
 
 MIMO25_MODEL = "mimo-v2.5"
 MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
-MIMO25_PROMPT_VERSION = "h3_mimo25_two_turn_av_reconcile_v39"
+MIMO25_PROMPT_VERSION = "h3_mimo25_two_turn_av_reconcile_v40"
 MIMO25_VISUAL_PROMPT_VERSION = "h3_mimo25_visual_only_v2"
 MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v17"
 MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.20"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.48"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.49"
 MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION = "h3_mimo25_speaker_marker_polish_v4"
 MIMO25_ICL_VERSION = "h3_official_ref2va_detailed_shot1_v4"
 MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v23"
@@ -912,7 +912,7 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.48"] = MIMO25_BACKEND_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.49"] = MIMO25_BACKEND_VERSION
     visual_prompt_version: Literal["h3_mimo25_visual_only_v2"] = MIMO25_VISUAL_PROMPT_VERSION
     speaker_marker_polish_prompt_version: Literal["h3_mimo25_speaker_marker_polish_v4"] = (
         MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION
@@ -934,7 +934,7 @@ class MimoBackendProvenance(SchemaModel):
     media_mode: Literal["base64", "http"]
     media_root: str
     media_base_url: str | None = None
-    prompt_version: Literal["h3_mimo25_two_turn_av_reconcile_v39"] = (
+    prompt_version: Literal["h3_mimo25_two_turn_av_reconcile_v40"] = (
         MIMO25_PROMPT_VERSION
     )
     policy_version: Literal["h3_mimo25_av_authority_contract_v17"] = (
@@ -1260,15 +1260,24 @@ A later task may supply audiovisual facts and its own response schema; follow th
 
 
 SYSTEM_PROMPT = """ROLE / OUTPUT
-The previous assistant response is the authoritative visual draft for this clip.
 Return one compact MimoFinalAVAssemblyDraft JSON object. Do not regenerate visual_observation, subject_definitions, visual_retention_analysis or style_opening; they are owned by Turn 1.
-Do NOT replace the visual draft with a new shorter visual summary or discard observations because Audio evidence is now supplied.
-Preserve composition, Subjects, appearance, spatial relationships, environment/background, lighting/color, camera behavior, actions, gestures, gaze, expressions, pose/state changes and chronological visual progression.
-Use the newly supplied facts to resolve acoustic speakers and AV grounding, bind visible speakers when full AV reasonably supports it, keep genuinely offscreen sources separate, insert exact authoritative <d> dialogue at its chronological position, assign stable Sx, and integrate only localized diegetic/shot-synchronized sound events.
-Write overall_soundscape and non_diegetic_music separately, plus the final summary and shot1_caption.
-Minimal connective rephrasing is allowed to integrate dialogue/audio; retain all materially useful visual observations. Do not collapse the visual description into a short caption.
-Do not expose internal binding_status, speech_presentation, confidence, evidence_codes, source_cluster_conflict, LR-ASD, offscreen_audio, visible_lip_motion/no_visible_lip_motion, resolved/unresolved pipeline states, "low confidence due to..." or "classified as..." in consumer-facing prose.
-Express final vocal presentation naturally with stable (Sx), never explain classification rationale.
+
+FINAL H3 FIELD OWNERSHIP
+- shot1_caption: preserve the Turn 1 visual description and insert dialogue / Sx at the correct chronological position. Only localized diegetic or shot-synchronized audible events whose occurrence belongs at a specific point in playback order may be included. MUST NOT contain continuous ambience / room tone / hum / rumble or audience-only non-diegetic music.
+- overall_soundscape: owns non-musical, non-dialogue ambience and SFX. Continuous ambience / room tone / hum / rumble / environmental noise -> overall_soundscape ONLY. No dialogue, singing, or music.
+- non_diegetic_music: audience-only score/background music -> non_diegetic_music ONLY. No duplication into shot1_caption or overall_soundscape.
+- Diegetic/in-scene music -> shot1_caption ONLY, at its chronological position; non_diegetic_music must be N/A for that music.
+- Every audible fact has ONE narrative home among shot1_caption / overall_soundscape / non_diegetic_music. Do not duplicate an audible event across those three fields; do not append a soundscape/music recap to the caption.
+- This exclusivity applies after deciding what the event is. "Preserve evidence" means preserve the factual event in its CORRECT owning field, not copy it into multiple fields.
+- Use N/A for a sound field only when no eligible content remains for that field. summary is exempt from this exclusivity because it is a summary field.
+
+VISUAL OWNERSHIP
+- The previous assistant Turn 1 visual draft is the authoritative visual draft for observable visual prose. Do NOT replace the visual draft with a new shorter visual summary or discard observations because Audio evidence is now supplied.
+- Minimal connective rephrasing is allowed to insert dialogue/audio; retain all materially useful visual observations. MUST NOT invent or reverse a Turn 1 observable visual fact merely to support speaker grounding.
+- If Turn 1 says "Her lips remain closed.", do NOT change it to "Her lips move subtly" solely because the model decided she is the speaker.
+- Speaker binding and visual articulation are separate decisions. Stage A articulation is an observable visual clue, not speaker authority. speech_correlated_articulation=not_observed means absence of observed articulation, NOT evidence that the person is not speaking; it does not block visible binding.
+- Full AV may still bind a visible entity when articulation is subtle, the mouth is partially visible, articulation is not observed, or LR-ASD support is absent. Do not manufacture visible_lip_motion, mouth movement, or another visual observation to rationalize the binding. not_observed must not be converted into visible_lip_motion without actual positive visual observation.
+- Only correct a Turn 1 visual fact if the target video itself provides a concrete, unambiguous visual contradiction. Grounding preference alone is not such a contradiction. Do not alter final visual prose to make grounding look more supported.
 
 AUTHORITY
 - DiariZen owns exact segment/sample boundaries. All decision inventories follow allowed_segment_ids, including LR-ASD=0, unbound, and zero-anchor segments. Never split, merge, filter, or invent segments.
@@ -1290,7 +1299,7 @@ VISIBLE SPEAKER BINDING
 - LR-ASD, source clusters, lip motion, mouth visibility, temporal alignment, and voice continuity are supporting clues, NOT mandatory prerequisites. Absence of supporting evidence is NOT a contradiction.
 - Do not downgrade a plausible visible speaker merely because lip articulation is subtle, occluded, profile-view, cropped, or not independently confirmed by LR-ASD.
 - Use no_reliable_entity / uncertain only when the speaker is genuinely ambiguous, multiple speakers prevent safe attribution, or the AV contains concrete contradictory evidence.
-- A visible listener must still not inherit speech when the AV clearly indicates another source. Reinspect conflicting Stage A articulation and Stage C lip-motion evidence. Never invent an entity.
+- A visible listener must still not inherit speech when the AV clearly indicates another source. Never invent an entity.
 
 EXISTING REFERENCE FIELDS
 - Keep the preceding natural visual Subject definitions and retention rows unchanged; write the final summary. Pipeline code appends exact Picture provenance; omit Picture labels from definition descriptions. Entity Subjects describe reusable entities. Attribute Subjects describe only their attribute, not a second person/object or their owner: hair shape/color/texture, facial features, eyewear, garment, or accessory as applicable.
@@ -1298,18 +1307,13 @@ EXISTING REFERENCE FIELDS
 - In both subject_definitions and visual_retention_analysis, subject_label already owns the label; description should not repeat <Subject N> or bare Subject numbering.
 
 AUXILIARY AUDIO EVIDENCE
-- Auxiliary descriptions are positive acoustic observations from source-separated tracks of the SAME target clip. Treat clearly reported audible events as valid recall evidence: separation exposes sounds that may be weak or masked in the original mixture. SOURCE_UNAVAILABLE means no candidate evidence, never silence.
-- FINAL AV IS A FACTUAL CONTRADICTION FILTER, NOT A REQUIREMENT TO RE-PROVE EVERY AUXILIARY DETAIL. Preserve positive observations by default. Do NOT require every auxiliary detail to be independently re-proven from the original mixture before keeping it.
-- Use the ORIGINAL TARGET AV to correct CONCRETE FACTUAL ERRORS: a clearly wrong source or physical cause, incorrect scene/context claim, speech/music leakage misclassified as another sound, incorrect diegetic versus non-diegetic interpretation, or clear separator artifact. Otherwise preserve useful auxiliary detail.
-- Do not discard a candidate merely because it is faint, masked, not independently clear in the original mix, subjectively worded, or lacks an exact source. Harmless acoustic/perceptual descriptions such as slow, gentle, simple, soft, continuous, melancholic, reflective, tense, light, slight hiss, muffled or reverberant may remain unless they introduce a concrete factual contradiction.
-- Correct only the mistaken source/context interpretation, not the underlying audible event. For "a low rumble, possibly from an engine", if engine is unsupported but the rumble is not contradicted, retain "a low rumble"; do not turn it into "N/A". Remove the entire event only for a concrete factual falsehood or clear leakage/artifact.
-- For music_separator_candidate, preserve clearly reported music and useful acoustic wording by default. Original AV determines H3 placement: audience-facing score -> non_diegetic_music; diegetic/in-scene music -> chronological shot1_caption and "N/A" for non_diegetic_music; concrete separator leakage/artifact -> discard. Never output "N/A" merely because music is weak or masked, or strip harmless adjectives merely because AV cannot independently verify them.
-- An unseen source does not prove non-diegetic music. If the distinction is uncertain, preserve conservative audible-music prose in shot1_caption and use "N/A" for non_diegetic_music. Music never belongs in overall_soundscape.
-- For sfx_separator_candidate, preserve positive non-musical, non-dialogue observations by default, including room tone, footsteps, handling, mechanical/environmental sounds and human non-speech. An unsupported engine guess may become "A low continuous rumble or hum is audible", not "N/A".
-- Auxiliary negative/absence claims never establish absence.
-- Negative/absence statements from an auxiliary track are TRACK-LOCAL and MUST NOT be copied into final H3. From "A piano melody is audible. There are no voices or other sounds", use only the positive melody observation. Never propagate "no other instruments", "no background noise", "no music" or similar absence prose into shot1_caption, overall_soundscape or non_diegetic_music.
-- Keep observed acoustic content; remove unsupported causal/source/environment inference. Do not inherit "possibly an engine", "moving vehicle", "machinery", "large empty room", "recorded from a distance", "recorded through a barrier", "recording of a recording", or claims about synthesis/processing effects unless ORIGINAL TARGET AV itself establishes that specific fact. Preserve hum, rumble, rhythmic clicking, piano/violin, hiss, muffled/reverberant qualities and harmless perceptual wording without requiring independent re-proof.
-- overall_soundscape contains ZERO music. An event classified as music must NOT also appear in overall_soundscape: non-diegetic music -> non_diegetic_music; diegetic music -> shot1_caption; never overall_soundscape. Do not write "no voices/music" there; write eligible ambience/SFX or "N/A".
+- Auxiliary stem descriptions are positive recall evidence from the SAME target clip, not final field placement. SOURCE_UNAVAILABLE means no candidate evidence, never silence.
+- Keep a positively observed acoustic fact unless original AV provides a concrete factual contradiction or it is clear separator leakage/artifact. Correct an unsupported source/context interpretation without deleting the underlying sound; remove unsupported causal/source/environment inference.
+- After retaining the fact, route it to exactly ONE final H3 field according to FINAL H3 FIELD OWNERSHIP. Preservation is not duplication.
+- Weak/masked audibility is not by itself a reason to delete a positive fact or demand independent re-proof. Harmless acoustic adjectives may remain, but only in the owning field.
+- Negative/absence claims are TRACK-LOCAL and MUST NOT be copied into final H3; they never establish absence.
+- music_separator_candidate: use original AV to classify retained music as diegetic or non-diegetic, then follow its single destination in FINAL H3 FIELD OWNERSHIP. Discard clear artifact. An unseen source alone does not establish non-diegetic music. For uncertain placement, make the best final classification from original AV; if genuinely unresolved, choose ONE conservative presentation, never both. Never duplicate music merely to ensure preservation.
+- sfx_separator_candidate: distinguish continuous ambience from localized synchronized SFX using FINAL H3 FIELD OWNERSHIP. Do not repeat a localized event in another field solely because it appeared in auxiliary evidence.
 
 PRIMARY H3 WRITING TASK
 - This pilot is exactly one shot. Preserve style_opening and assemble shot1_caption; the pipeline inserts [Shot 1]. Never output [Shot N], shot timing, or placeholders.
@@ -1327,8 +1331,8 @@ For the shot, cover the observable dimensions that are present:
 5. camera behavior: static, pan, push, tracking, handheld motion, etc.;
 6. visible actions, gestures, gaze changes, facial-expression changes, posture changes, object interactions, and other state changes in chronological order;
 7. dialogue and speaker markers at the moment they occur; do not append all dialogue at the end;
-8. Only localized diegetic or shot-synchronized sound events that need to appear at a specific point in playback order belong in shot1_caption;
-9. where referenced Subjects/Pictures actually appear or affect the shot.
+8. where referenced Subjects/Pictures actually appear or affect the shot.
+Follow FINAL H3 FIELD OWNERSHIP for all audible content.
 Important:
 - A single shot is NOT a reason to make the description short.
 - Do not stop after describing the opening composition and dialogue.
@@ -1338,13 +1342,9 @@ Important:
 - Do NOT invent psychology, causality, relationships, unseen objects, camera motion, lighting changes, or actions that are not observable.
 - No hard word-count requirement. Detail should scale with actual information visible in the clip.
 - Avoid repeating the exact same fact merely to increase length.
-- Continuous ambience / room tone / hum / rumble belongs only in overall_soundscape.
-- Audience-only score/background music belongs only in non_diegetic_music.
-- Do not summarize overall_soundscape or non_diegetic_music at the end of shot1_caption.
-- Diegetic/in-scene music may remain in shot1_caption at its actual chronological position.
 - shot1_caption states observable audiovisual events, not AV-grounding reasoning or diagnostic explanation.
 - Never explain speaker/source inference with prose such as "indicating", "suggesting", "therefore", "because this means", "may be offscreen", or "may be a voice-over".
-- Binding/presentation rationale belongs only in av_grounding.
+- Binding/presentation rationale belongs only in av_grounding. Never expose binding_status, speech_presentation, confidence, evidence_codes, source_cluster_conflict, LR-ASD, offscreen_audio, visible_lip_motion/no_visible_lip_motion, resolved/unresolved pipeline states, "low confidence due to..." or "classified as..." in consumer-facing prose.
 - If a source is determined as offscreen/voice-over, express the final presentation naturally rather than explaining why it was classified that way.
 - Observable lip/action facts may be described when visually relevant, but do not turn them into analytical conclusions.
 
@@ -1357,7 +1357,6 @@ VISIBLE SUBJECT PRESERVATION
 - If the AV reasonably establishes that a visible defined Subject is the speaker, write <Subject N> (Sx) at the corresponding vocal event.
 - If a defined Subject is visible but the vocal source is genuinely offscreen/other, preserve the visible <Subject N> in the visual prose and describe the vocal source separately.
 - Back/profile/occluded mouth is still visible presence and is not equivalent to offscreen.
-- Do not downgrade a clearly onscreen speaker merely because mouth motion is subtle/not assessable when the full AV supports that binding. Concrete offscreen evidence can still override.
 - Do NOT create <Audio N> merely because target audio/dialogue/music exists. Only use an allowed <Audio N> when the input/reference contract actually contains that Audio reference asset.
 
 SPEAKER MARKERS
@@ -1368,8 +1367,6 @@ SPEAKER MARKERS
 - Consecutive dialogue blocks from the SAME continuing speaker may inherit the already established (Sx); mechanical repetition of the same marker is not required. If speaker continuity is uncertain, repeat the explicit (Sx).
 - Allowed same-speaker continuity: "A man (S1) says, <d>[English] First.</d> He continues, <d>[English] Second.</d>".
 - Required transition: "A man (S1) says, <d>[English] First.</d> A woman (S2) replies, <d>[English] Second.</d>".
-- overall_soundscape: Write only non-musical, non-dialogue audible ambience/SFX. Preserve positive auxiliary observations and useful acoustic detail unless original AV provides a concrete factual contradiction; correct a mistaken source without deleting the sound. Exclude spoken dialogue, singing, and all music. Use "N/A" only when no eligible content remains, not merely because a positive candidate is weak or masked.
-- non_diegetic_music: Write audience-facing background music/score, preserving clearly reported auxiliary music and harmless acoustic wording by default. Use original AV to correct factual errors and determine placement, not to re-prove every detail. If music is diegetic/in-scene, describe it naturally at its observed chronological position in shot1_caption instead and output "N/A" here. Discard music only for concrete factual falsehood or clear leakage/artifact, not merely weak original-mix audibility.
 - The official ICL is an official H3 writing/field-boundary demonstration, not the response-schema definition. Follow the actual supplied schema and official six-section Ref2VA semantics."""
 
 

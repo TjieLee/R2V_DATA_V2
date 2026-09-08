@@ -172,6 +172,60 @@ def test_visual_and_assembly_prompt_ownership():
     assert "retain all materially useful visual observations" in mb.SYSTEM_PROMPT
 
 
+def test_final_av_has_one_canonical_audio_ownership_contract():
+    prompt = mb.SYSTEM_PROMPT
+    assert prompt.count("\nFINAL H3 FIELD OWNERSHIP\n") == 1
+    ownership = prompt.split("FINAL H3 FIELD OWNERSHIP\n", 1)[1].split("VISUAL OWNERSHIP\n", 1)[0]
+    for rule in (
+        "Only localized diegetic or shot-synchronized audible events",
+        "MUST NOT contain continuous ambience / room tone / hum / rumble",
+        "Continuous ambience / room tone / hum / rumble / environmental noise -> overall_soundscape ONLY",
+        "audience-only score/background music -> non_diegetic_music ONLY",
+        "Diegetic/in-scene music -> shot1_caption ONLY",
+        "non_diegetic_music must be N/A for that music",
+        "Every audible fact has ONE narrative home",
+        "Do not duplicate an audible event across those three fields",
+        '"Preserve evidence" means preserve the factual event in its CORRECT owning field',
+        "not copy it into multiple fields",
+        "summary is exempt from this exclusivity",
+    ):
+        assert rule in ownership
+    caption = prompt.split("SHOT1 CAPTION / DETAILED DESCRIPTION\n", 1)[1].split(
+        "VISIBLE SUBJECT PRESERVATION\n", 1,
+    )[0]
+    assert "Follow FINAL H3 FIELD OWNERSHIP for all audible content." in caption
+    markers = prompt.split("SPEAKER MARKERS\n", 1)[1]
+    for section in (caption, markers):
+        assert "overall_soundscape" not in section
+        assert "non_diegetic_music" not in section
+        assert "hum" not in section and "rumble" not in section
+    assert len(prompt) < 17905  # v39 baseline size, not a generated-caption gate.
+
+
+def test_visual_facts_are_not_reversed_to_justify_speaker_binding():
+    prompt = mb.SYSTEM_PROMPT
+    assert prompt.count("\nVISUAL OWNERSHIP\n") == 1
+    visual = prompt.split("VISUAL OWNERSHIP\n", 1)[1].split("\nAUTHORITY\n", 1)[0]
+    for rule in (
+        "MUST NOT invent or reverse a Turn 1 observable visual fact merely to support speaker grounding",
+        'If Turn 1 says "Her lips remain closed.", do NOT change it to "Her lips move subtly"',
+        "Speaker binding and visual articulation are separate decisions",
+        "Stage A articulation is an observable visual clue, not speaker authority",
+        "speech_correlated_articulation=not_observed",
+        "NOT evidence that the person is not speaking; it does not block visible binding",
+        "Full AV may still bind a visible entity",
+        "LR-ASD support is absent",
+        "Do not manufacture visible_lip_motion, mouth movement, or another visual observation",
+        "not_observed must not be converted into visible_lip_motion without actual positive visual observation",
+        "concrete, unambiguous visual contradiction",
+        "Grounding preference alone is not such a contradiction",
+    ):
+        assert rule in visual
+    assert "supporting clues, NOT mandatory prerequisites" in prompt
+    assert "bind that entity directly" in prompt
+    assert "Reinspect conflicting Stage A articulation and Stage C lip-motion evidence" not in prompt
+
+
 def test_visual_v2_keeps_only_caption_long_and_definitions_concise():
     prompt = mb.VISUAL_SYSTEM_PROMPT
     for requirement in (
@@ -209,10 +263,14 @@ def test_reused_visual_caption_still_rejects_non_visual_syntax(syntax):
         mb.MimoVisualBlock(block_id="v1", text=f"<Subject 1> stands. {syntax}")
 
 
-def test_turn2_prompt_and_schema_are_byte_identical_to_v39_baseline():
-    # b1278ce: Turn 1 is changing, not final AV assembly.
-    assert hashlib.sha256(mb.SYSTEM_PROMPT.encode()).hexdigest() == (
-        "270eaac7f8001ef12d455fb4687e4e13194dd6318d19ea1ebcad658dc31864db"
+def test_visual_prompt_and_both_schemas_remain_frozen():
+    # 4e631ab: only the final AV prompt is changing.
+    assert hashlib.sha256(mb.VISUAL_SYSTEM_PROMPT.encode()).hexdigest() == (
+        "d838c696eab622b16f2aa2f2cc83408eab5bed4b0f225e413eb345d914f9ca1d"
+    )
+    visual_schema = json.dumps(mb.MimoVisualDraft.model_json_schema(), sort_keys=True)
+    assert hashlib.sha256(visual_schema.encode()).hexdigest() == (
+        "12c091fc52f25d61a205cfd13a8b0d5603cca7006b276b368500653ff9022045"
     )
     schema = json.dumps(mb.MimoFinalAVAssemblyDraft.model_json_schema(), sort_keys=True)
     assert hashlib.sha256(schema.encode()).hexdigest() == (
@@ -236,8 +294,8 @@ def test_cache_is_diagnostic_only_and_two_turn_provenance_is_fingerprinted(tmp_p
     assert result.model_call_count == 2
     assert [d.usage.cached_tokens for d in result.diagnostics] == [cached_tokens] * 2
     provenance = backend.provenance
-    assert provenance.schema_version == "r2v.h3.mimo25_backend.48"
-    assert provenance.prompt_version == "h3_mimo25_two_turn_av_reconcile_v39"
+    assert provenance.schema_version == "r2v.h3.mimo25_backend.49"
+    assert provenance.prompt_version == "h3_mimo25_two_turn_av_reconcile_v40"
     assert provenance.visual_prompt_version == "h3_mimo25_visual_only_v2"
     assert provenance.materializer_version == "h3_mimo25_materializer_v23"
     assert provenance.policy_version == "h3_mimo25_av_authority_contract_v17"

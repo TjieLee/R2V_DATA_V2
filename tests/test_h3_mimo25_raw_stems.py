@@ -49,16 +49,24 @@ def _subset_inventory(base, clip_ids):
 
 
 def test_final_av_prompt_preserves_positive_auxiliary_observations():
-    assert MIMO25_PROMPT_VERSION == "h3_mimo25_two_turn_av_reconcile_v39"
-    assert "FACTUAL CONTRADICTION FILTER" in SYSTEM_PROMPT
-    assert "NOT A REQUIREMENT TO RE-PROVE EVERY AUXILIARY DETAIL" in SYSTEM_PROMPT
-    assert "Preserve positive observations by default" in SYSTEM_PROMPT
-    assert "Do NOT require every auxiliary detail to be independently re-proven" in SYSTEM_PROMPT
-    assert "melancholic, reflective, tense, light" in SYSTEM_PROMPT
-    assert "correct a mistaken source without deleting the sound" in SYSTEM_PROMPT
-    assert "Auxiliary negative/absence claims never establish absence" in SYSTEM_PROMPT
-    assert "Music never belongs in overall_soundscape" in SYSTEM_PROMPT
-    assert "not merely because a positive candidate is weak or masked" in SYSTEM_PROMPT
+    assert MIMO25_PROMPT_VERSION == "h3_mimo25_two_turn_av_reconcile_v40"
+    auxiliary = SYSTEM_PROMPT.split("AUXILIARY AUDIO EVIDENCE\n", 1)[1].split(
+        "PRIMARY H3 WRITING TASK", 1,
+    )[0]
+    for rule in (
+        "positive recall evidence", "not final field placement",
+        "concrete factual contradiction", "clear separator leakage/artifact",
+        "Correct an unsupported source/context interpretation without deleting the underlying sound",
+        "exactly ONE final H3 field according to FINAL H3 FIELD OWNERSHIP",
+        "Weak/masked audibility is not by itself a reason to delete a positive fact",
+        "Harmless acoustic adjectives may remain, but only in the owning field",
+        "Negative/absence claims", "they never establish absence",
+        "if genuinely unresolved, choose ONE conservative presentation, never both",
+        "Never duplicate music merely to ensure preservation",
+    ):
+        assert rule in auxiliary
+    assert "Preserve positive observations by default" not in SYSTEM_PROMPT
+    assert "preserve conservative audible-music prose in shot1_caption" not in SYSTEM_PROMPT
     assert "Reinspect the ORIGINAL TARGET AV before using any claim" not in SYSTEM_PROMPT
     assert "unless the original AV supports them" not in SYSTEM_PROMPT
 
@@ -75,7 +83,7 @@ def test_full_shot_visual_coverage_without_word_count_gate():
         "gestures, gaze changes, facial-expression changes, posture changes",
         "object interactions", "state changes in chronological order",
         "dialogue and speaker markers at the moment they occur",
-        "Only localized diegetic or shot-synchronized sound events", "referenced Subjects/Pictures",
+        "Follow FINAL H3 FIELD OWNERSHIP for all audible content", "referenced Subjects/Pictures",
         "single shot is NOT a reason", "Do not stop after describing the opening",
         "Continue through the end", "concrete observable visual detail",
         "Do NOT pad", "Do NOT invent psychology, causality, relationships, unseen objects",
@@ -92,12 +100,12 @@ def test_full_shot_visual_coverage_without_word_count_gate():
 
 def test_caption_field_boundaries_and_no_grounding_explanation():
     for requirement in (
-        "Only localized diegetic or shot-synchronized sound events",
-        "specific point in playback order belong in shot1_caption",
-        "Continuous ambience / room tone / hum / rumble belongs only in overall_soundscape",
-        "Audience-only score/background music belongs only in non_diegetic_music",
-        "Do not summarize overall_soundscape or non_diegetic_music at the end of shot1_caption",
-        "Diegetic/in-scene music may remain in shot1_caption at its actual chronological position",
+        "Only localized diegetic or shot-synchronized audible events",
+        "specific point in playback order may be included",
+        "Continuous ambience / room tone / hum / rumble / environmental noise -> overall_soundscape ONLY",
+        "audience-only score/background music -> non_diegetic_music ONLY",
+        "do not append a soundscape/music recap to the caption",
+        "Diegetic/in-scene music -> shot1_caption ONLY",
         "not AV-grounding reasoning or diagnostic explanation",
         '"indicating", "suggesting", "therefore", "because this means", "may be offscreen", or "may be a voice-over"',
         "Binding/presentation rationale belongs only in av_grounding",
@@ -123,8 +131,8 @@ def test_v38_visible_subject_preservation_is_separate_from_speaker_binding():
         "write <Subject N> (Sx) at the corresponding vocal event",
         "preserve the visible <Subject N> in the visual prose and describe the vocal source separately",
         "Back/profile/occluded mouth is still visible presence and is not equivalent to offscreen",
-        "mouth motion is subtle/not assessable when the full AV supports that binding",
-        "Concrete offscreen evidence can still override",
+        "Full AV may still bind a visible entity when articulation is subtle",
+        "A visible listener must still not inherit speech when the AV clearly indicates another source",
         "Do NOT create <Audio N> merely because target audio/dialogue/music exists",
         "Only use an allowed <Audio N> when the input/reference contract actually contains that Audio reference asset",
     ):
@@ -152,7 +160,7 @@ def test_prompt_reference_vocal_and_positive_audio_contracts():
     assert "If allowed_segment_ids is empty, output empty" in SYSTEM_PROMPT
     assert "description should not repeat <Subject N>" in SYSTEM_PROMPT
     assert "TRACK-LOCAL and MUST NOT be copied into final H3" in SYSTEM_PROMPT
-    assert "overall_soundscape contains ZERO music" in SYSTEM_PROMPT
+    assert "No dialogue, singing, or music" in SYSTEM_PROMPT
     assert "remove unsupported causal/source/environment inference" in SYSTEM_PROMPT
     assert "describe only POSITIVE audible content" in AUXILIARY_AUDIO_PROMPT
     assert "Do NOT summarize what is absent" in AUXILIARY_AUDIO_PROMPT
@@ -1234,8 +1242,8 @@ def test_explicit_marker_mismatch_remains_hard_in_backend(tmp_path, monkeypatch)
     assert "direct_dialogue_speaker_marker_mismatch" not in row["diagnostics"][-1]["warnings"]
     assert summary.model_call_count == len(completions.requests) == 5
     assert row["text_model_call_count"] == 1
-    assert backend.provenance.schema_version == MIMO25_BACKEND_VERSION == "r2v.h3.mimo25_backend.48"
-    assert backend.provenance.prompt_version == "h3_mimo25_two_turn_av_reconcile_v39"
+    assert backend.provenance.schema_version == MIMO25_BACKEND_VERSION == "r2v.h3.mimo25_backend.49"
+    assert backend.provenance.prompt_version == "h3_mimo25_two_turn_av_reconcile_v40"
 
 
 @pytest.mark.parametrize(
