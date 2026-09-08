@@ -32,12 +32,12 @@ from r2v_data_v2.structured_output import (
 MIMO25_MODEL = "mimo-v2.5"
 MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
 MIMO25_PROMPT_VERSION = "h3_mimo25_speech_assembly_v46"
-MIMO25_SPEAKER_PROFILE_PROMPT_VERSION = "h3_mimo25_speaker_profile_v1"
+MIMO25_SPEAKER_PROFILE_PROMPT_VERSION = "h3_mimo25_speaker_profile_v2"
 MIMO25_AUDIO_FINALIZE_PROMPT_VERSION = "h3_mimo25_audio_finalize_v6"
 MIMO25_VISUAL_PROMPT_VERSION = "h3_mimo25_visual_only_v4"
 MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v17"
 MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.20"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.59"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.60"
 MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION = "h3_mimo25_speaker_marker_polish_v4"
 MIMO25_ICL_VERSION = "h3_official_ref2va_detailed_shot1_v4"
 MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v26"
@@ -940,8 +940,12 @@ class MimoSpeechAVAssemblyDraft(SchemaModel):
     warnings: list[MimoAnnotationWarning]
 
 
+class MimoSpeakerProfileItem(MimoSpeakerVoiceProfile):
+    voice_characteristics: StrictStr
+
+
 class MimoSpeakerProfileDraft(SchemaModel):
-    speaker_voice_profiles: list[MimoSpeakerVoiceProfile]
+    speaker_voice_profiles: list[MimoSpeakerProfileItem]
 
 
 class MimoAudioFinalizeDraft(SchemaModel):
@@ -971,11 +975,11 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.59"] = MIMO25_BACKEND_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.60"] = MIMO25_BACKEND_VERSION
     audio_finalize_prompt_version: Literal["h3_mimo25_audio_finalize_v6"] = (
         MIMO25_AUDIO_FINALIZE_PROMPT_VERSION
     )
-    speaker_profile_prompt_version: Literal["h3_mimo25_speaker_profile_v1"] = (
+    speaker_profile_prompt_version: Literal["h3_mimo25_speaker_profile_v2"] = (
         MIMO25_SPEAKER_PROFILE_PROMPT_VERSION
     )
     visual_prompt_version: Literal["h3_mimo25_visual_only_v4"] = MIMO25_VISUAL_PROMPT_VERSION
@@ -1395,7 +1399,7 @@ SPEAKER MARKERS
 
 
 SPEAKER_PROFILE_SYSTEM_PROMPT = """Listen to the supplied localized speech snippets and return ONLY speaker_voice_profiles for the already-supplied speaker groups, in target order.
-Each labeled snippet is an exact speech-stem crop for the named speaker_group/speaker_id and interval. Describe supported pitch/register, timbre/texture, cadence/speaking rate and energy/delivery only; use voice_characteristics=null when genuinely unsupported.
+Each labeled snippet is an exact speech-stem crop for the named speaker_group/speaker_id and interval. For each supplied target, describe the supported audible acoustic traits: pitch/register, timbre/texture, cadence/speaking rate and energy/delivery. Include only traits supported by the supplied snippet.
 Never infer identity, profession, personality, nationality, role or demographics. Do not re-decide speaker grouping or binding."""
 
 

@@ -37,7 +37,7 @@ def _fixture(tmp_path, source_rate=16000):
     final = json.loads(final)
     profile = json.loads(profile)
     profile["speaker_voice_profiles"] = [
-        {"speaker_group": group, "voice_characteristics": None} for group in ("g1", "g2")
+        {"speaker_group": group, "voice_characteristics": "A low, steady voice."} for group in ("g1", "g2")
     ]
     job = job.model_copy(update={"segments": segments})
     assembly = mb.MimoSpeechAVAssemblyDraft.model_validate(speech)
@@ -93,7 +93,7 @@ def test_exact_snippets_keep_real_uncertain_groups_all_intervals_and_source_byte
         backend.config.media_resolver.resolve(stems[kind]) for kind in ("music", "sfx")
     ]
     assert json.loads(result[0])["audio_observation"]["speaker_voice_profiles"] == [
-        {"speaker_group": group, "voice_characteristics": None} for group in ("g1", "g2")
+        {"speaker_group": group, "voice_characteristics": "A low, steady voice."} for group in ("g1", "g2")
     ]
     repeated = backend._speaker_snippet_content(job, targets, stems["speech"])
     assert repeated == content[1:]

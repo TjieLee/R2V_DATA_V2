@@ -312,7 +312,8 @@ def test_profile_and_finalizer_prompts_have_separate_ownership():
     profile = mb.SPEAKER_PROFILE_SYSTEM_PROMPT
     for text in ("localized speech snippets", "exact speech-stem crop", "speaker_group/speaker_id",
                  "pitch/register", "timbre/texture", "cadence/speaking rate", "energy/delivery",
-                 "voice_characteristics=null when genuinely unsupported",
+                 "For each supplied target, describe the supported audible acoustic traits",
+                 "Include only traits supported by the supplied snippet",
                  "Never infer identity, profession, personality, nationality, role or demographics"):
         assert text in profile
     assert len(profile.split()) < 110
@@ -320,7 +321,7 @@ def test_profile_and_finalizer_prompts_have_separate_ownership():
         assert forbidden not in mb.AUDIO_FINALIZE_SYSTEM_PROMPT
     for forbidden in ("threshold", "minimum", "mandatory non-null"):
         assert forbidden not in profile
-    assert mb.MIMO25_SPEAKER_PROFILE_PROMPT_VERSION == "h3_mimo25_speaker_profile_v1"
+    assert mb.MIMO25_SPEAKER_PROFILE_PROMPT_VERSION == "h3_mimo25_speaker_profile_v2"
     assert mb.MIMO25_AUDIO_FINALIZE_PROMPT_VERSION == "h3_mimo25_audio_finalize_v6"
 
 
@@ -437,7 +438,7 @@ def test_cache_is_diagnostic_only_and_four_stage_provenance_is_fingerprinted(tmp
     assert result.model_call_count == 4
     assert [d.usage.cached_tokens for d in result.diagnostics] == [cached_tokens] * 4
     provenance = backend.provenance
-    assert provenance.schema_version == "r2v.h3.mimo25_backend.59"
+    assert provenance.schema_version == "r2v.h3.mimo25_backend.60"
     assert provenance.prompt_version == "h3_mimo25_speech_assembly_v46"
     assert provenance.visual_prompt_version == "h3_mimo25_visual_only_v4"
     assert provenance.materializer_version == "h3_mimo25_materializer_v26"
@@ -445,7 +446,7 @@ def test_cache_is_diagnostic_only_and_four_stage_provenance_is_fingerprinted(tmp
     values = provenance.model_dump(mode="json", exclude={"configuration_fingerprint"})
     assert provenance.configuration_fingerprint == mb._sha256_text(mb._compact_json(values))
     assert provenance.audio_finalize_prompt_version == "h3_mimo25_audio_finalize_v6"
-    assert provenance.speaker_profile_prompt_version == "h3_mimo25_speaker_profile_v1"
+    assert provenance.speaker_profile_prompt_version == "h3_mimo25_speaker_profile_v2"
     del values["speaker_profile_prompt_version"]
     assert provenance.configuration_fingerprint != mb._sha256_text(mb._compact_json(values))
 
@@ -474,7 +475,7 @@ def test_final_fields_come_from_their_owning_turns(tmp_path):
     assert annotation.visual_observation.visual_blocks[0].text == visual["shot1_visual_description"]
     assert annotation.visual_observation.segment_views == source.visual_observation.segment_views
     assert annotation.audio_observation.segment_decisions == source.audio_observation.segment_decisions
-    assert annotation.audio_observation.speaker_voice_profiles == mb.MimoSpeakerProfileDraft.model_validate(profile).speaker_voice_profiles
+    assert [item.model_dump() for item in annotation.audio_observation.speaker_voice_profiles] == profile["speaker_voice_profiles"]
     assert annotation.av_grounding == source.av_grounding
     assert annotation.warnings == source.warnings
     for key in ("subject_definitions", "visual_retention_analysis", "style_opening"):
@@ -488,15 +489,53 @@ def test_final_fields_come_from_their_owning_turns(tmp_path):
     assert not result.speaker_marker_polish.attempted
 
 
-def test_unsupported_turn3_voice_profile_stays_null(tmp_path):
+def test_turn3_null_profile_fails_without_retry_or_fallback(tmp_path):
     raws = list(split_annotation(_annotation().model_dump_json()))
     finalized = json.loads(raws[2])
     finalized["speaker_voice_profiles"][0]["voice_characteristics"] = None
     raws[2] = json.dumps(finalized)
     backend, calls = _backend(tmp_path, [(raw, 8) for raw in raws])
-    result = _run(backend, _job_fixture(tmp_path))
-    assert result.annotation.speaker_voice_profiles[0].voice_characteristics is None
-    assert result.model_call_count == len(calls.requests) == 4
+    with pytest.raises(mb.MimoBackendFailure) as caught:
+        _run(backend, _job_fixture(tmp_path))
+    assert caught.value.code == "mimo_speaker_profile_structured_output_failed"
+    assert caught.value.model_call_count == len(calls.requests) == 3
+    assert caught.value.speaker_profile_raw_response == raws[2]
+    assert caught.value.audio_finalize_raw_response is None
+
+
+def test_turn3_profile_schema_is_strict_but_final_annotation_stays_nullable():
+    schema = mb.MimoSpeakerProfileDraft.model_json_schema()
+    item_ref = schema["properties"]["speaker_voice_profiles"]["items"]["$ref"]
+    item = schema["$defs"][item_ref.rsplit("/", 1)[1]]
+    assert set(item["required"]) == {"speaker_group", "voice_characteristics"}
+    assert item["properties"]["voice_characteristics"]["type"] == "string"
+    assert "anyOf" not in item["properties"]["voice_characteristics"]
+    assert item["properties"]["speaker_group"]["pattern"] == r"^g[1-9]\d*$"
+    profile = {"speaker_group": "g1", "voice_characteristics": "A low, even voice."}
+    parsed = mb.MimoSpeakerProfileDraft.model_validate({"speaker_voice_profiles": [profile]})
+    assert parsed.speaker_voice_profiles[0].model_dump() == profile
+
+    legacy = _annotation().model_dump(mode="json")
+    legacy["audio_observation"]["speaker_voice_profiles"][0]["voice_characteristics"] = None
+    restored = mb.MimoAVAnnotationDraft.model_validate(legacy)
+    assert restored.schema_version == "r2v.h3.mimo25_av_annotation.20"
+    assert restored.speaker_voice_profiles[0].voice_characteristics is None
+    assert "voice_characteristics=null" not in mb.SPEAKER_PROFILE_SYSTEM_PROMPT
+
+
+@pytest.mark.parametrize("characteristics", [None, 42, "", "   "])
+def test_turn3_profile_rejects_invalid_characteristics(characteristics):
+    with pytest.raises(ValidationError):
+        mb.MimoSpeakerProfileDraft.model_validate({"speaker_voice_profiles": [
+            {"speaker_group": "g1", "voice_characteristics": characteristics},
+        ]})
+
+
+def test_turn3_profile_requires_characteristics():
+    with pytest.raises(ValidationError):
+        mb.MimoSpeakerProfileDraft.model_validate({"speaker_voice_profiles": [
+            {"speaker_group": "g1"},
+        ]})
 
 
 @pytest.mark.parametrize("resolution", ["resolved", "uncertain", "needs_acoustic_refinement"])
@@ -569,7 +608,7 @@ def test_spatial_presentation_and_audible_music_prompt_contract():
     assert "speaker_voice_profiles" not in speech
     for rule in (
         "localized speech snippets", "pitch/register", "timbre/texture",
-        "cadence/speaking rate", "energy/delivery", "voice_characteristics=null",
+        "cadence/speaking rate", "energy/delivery", "Include only traits supported by the supplied snippet",
         "Never infer identity, profession, personality, nationality, role or demographics",
         "Do not re-decide speaker grouping or binding",
     ):

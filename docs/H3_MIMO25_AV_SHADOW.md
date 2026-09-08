@@ -104,12 +104,14 @@ cadence/rate and energy/delivery; the prompt forbids identity, profession,
 personality, nationality, role and demographics. No full-AV recheck is sent.
 
 Turn 2's intermediate audio schema contains only segment decisions, not voice
-profiles. Turn 3 supplies one nullable profile for each non-null primary group
+profiles. Turn 3 requires a string profile for each non-null primary group
 with transcribed speech, using exact speech-stem snippets and compact
 group/Sx/segment/time locators only. Entity/Subject/final-binding/presentation
 context is never sent to the pure-audio profiler.
 It cannot re-decide grouping, binding, presentation, ASR, summary or caption.
 The final annotation combines Turn 2 segment decisions with Turn 3 profiles.
+Its existing nullable profile contract remains unchanged for legacy compatibility;
+only the Turn 3 response item disallows null.
 Stage-B uncertain/refinement status does not suppress a real acoustic group.
 An unbound/offscreen profile alone never publishes an identity-specific Audio
 reference. Recovery still requires a non-null group, final visible entity with
@@ -306,8 +308,8 @@ is null when skipped; `raw_responses` excludes that absent slot. Profiling has
 its own `speaker_profile_audio_only` diagnostic modality. Legacy standalone-stem description fields are
 null in new records; current provenance identifies this request contract.
 
-Current versions: backend .59, visual prompt v4, speech assembly v46,
-speaker-profile prompt v1, audio finalizer v6, materializer v26; annotation .20, authority v17, official ICL v4
+Current versions: backend .60, visual prompt v4, speech assembly v46,
+speaker-profile prompt v2, audio finalizer v6, materializer v26; annotation .20, authority v17, official ICL v4
 and speaker polish v4 remain unchanged. V26 records the recovery-eligibility
 alignment; the acoustic quality policy remains v1. Materializer v25 resolves each
 attribute Subject's owner from the frozen reference contract and explicitly
