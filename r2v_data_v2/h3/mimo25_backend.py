@@ -28,12 +28,12 @@ from r2v_data_v2.structured_output import (
 
 MIMO25_MODEL = "mimo-v2.5"
 MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
-MIMO25_PROMPT_VERSION = "h3_mimo25_speech_assembly_v44"
-MIMO25_AUDIO_FINALIZE_PROMPT_VERSION = "h3_mimo25_audio_finalize_v3"
-MIMO25_VISUAL_PROMPT_VERSION = "h3_mimo25_visual_only_v3"
+MIMO25_PROMPT_VERSION = "h3_mimo25_speech_assembly_v45"
+MIMO25_AUDIO_FINALIZE_PROMPT_VERSION = "h3_mimo25_audio_finalize_v4"
+MIMO25_VISUAL_PROMPT_VERSION = "h3_mimo25_visual_only_v4"
 MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v17"
 MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.20"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.54"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.55"
 MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION = "h3_mimo25_speaker_marker_polish_v4"
 MIMO25_ICL_VERSION = "h3_official_ref2va_detailed_shot1_v4"
 MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v25"
@@ -933,6 +933,7 @@ class MimoSpeechAVAssemblyDraft(SchemaModel):
 
 
 class MimoAudioFinalizeDraft(SchemaModel):
+    speaker_voice_profiles: list[MimoSpeakerVoiceProfile]
     overall_soundscape: StrictStr
     non_diegetic_music: StrictStr
 
@@ -959,11 +960,11 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.54"] = MIMO25_BACKEND_VERSION
-    audio_finalize_prompt_version: Literal["h3_mimo25_audio_finalize_v3"] = (
+    schema_version: Literal["r2v.h3.mimo25_backend.55"] = MIMO25_BACKEND_VERSION
+    audio_finalize_prompt_version: Literal["h3_mimo25_audio_finalize_v4"] = (
         MIMO25_AUDIO_FINALIZE_PROMPT_VERSION
     )
-    visual_prompt_version: Literal["h3_mimo25_visual_only_v3"] = MIMO25_VISUAL_PROMPT_VERSION
+    visual_prompt_version: Literal["h3_mimo25_visual_only_v4"] = MIMO25_VISUAL_PROMPT_VERSION
     speaker_marker_polish_prompt_version: Literal["h3_mimo25_speaker_marker_polish_v4"] = (
         MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION
     )
@@ -984,7 +985,7 @@ class MimoBackendProvenance(SchemaModel):
     media_mode: Literal["base64", "http"]
     media_root: str
     media_base_url: str | None = None
-    prompt_version: Literal["h3_mimo25_speech_assembly_v44"] = (
+    prompt_version: Literal["h3_mimo25_speech_assembly_v45"] = (
         MIMO25_PROMPT_VERSION
     )
     policy_version: Literal["h3_mimo25_av_authority_contract_v17"] = (
@@ -1299,7 +1300,7 @@ VISUAL_SYSTEM_PROMPT = """Observe the full target video using visual evidence on
 Official ICL demonstrates H3 writing and field boundaries, not the response schema.
 shot1_visual_description is the single generation-quality visual description: cover composition/framing, foreground/background, visible referenced subjects and attributes, appearance, environment and lighting/color, observable actions/state changes, gaze/expression, camera behavior, and meaningful early-to-middle-to-late progression.
 Prefer observable description over plot interpretation. If object identity, function, material, setting, relationship, intention or psychology is uncertain, describe visible appearance instead of guessing (not "likely alcohol", "possibly candles", "presumably", unsupported "nightclub/KTV" or "celebratory/relaxed gathering"). No hard word-count requirement.
-Naturally name every supplied Subject actually visible and relevant, INCLUDING attribute Subjects, at its first relevant description. Use "<Subject 1>, a middle-aged woman, sits on the left..." or "<Subject 1>'s <Subject 3> short dark hair...", "her <Subject 4> concerned facial expression...", "his <Subject 5> grey shirt...". Never use parenthetical metadata such as "a woman (<Subject 1>)" or "hair (<Subject 3>)".
+Naturally cite visible entity Subjects when they appear, and a visible background Subject when it defines the current scene/background. Stable appearance/reference identity belongs in subject_definitions. Do not mechanically repeat attribute Subjects or stable appearance in detailed_description; cite an attribute only when useful for action, composition, state change or disambiguation. Emphasize spatial relations, action, interaction, camera and temporal progression. Use natural H3 label syntax, never parenthetical metadata such as "a woman (<Subject 1>)" or "hair (<Subject 3>)".
 Profile/back/occluded/silent subjects remain visible; visual presence alone never assigns a speaker. Do not output internal IDs such as (e1), (e2), g1, v1 or segment_0001 in consumer-facing prose.
 Keep segment_views for supplied windows in order; list visible entities and only the detailed observations actually assessable. speech_correlated_articulation records visible articulation only, without audio correlation or identity inference.
 subject_definitions: exactly one per required Subject in order, each ONE concise sentence of stable visual appearance, not actions, frame position, chronology or a mini-caption. Do not repeat facts or provenance/analysis boilerplate. Omit <Picture N> from definition descriptions: pipeline code owns Picture provenance and attribute ownership. Attribute descriptions concern only that attribute.
@@ -1328,7 +1329,7 @@ AUTHORITY
 
 AUDIO + AV GROUNDING
 - Stage B identifies acoustic speakers as contiguous gN by first appearance, not turns. Pauses, language, sentences, ASR, or segment boundaries alone never create groups. Record vocal_composition, delivery, secondary_vocal_activity, and non-speech evidence, without entity identity or spatial presentation.
-- Multiple vocal sounds are valid observations; use needs_acoustic_refinement if primary identity is unsafe. Each transcribed segment needs nonempty delivery_style; non-transcribed segments use null. Voice profiles cover resolved transcribed groups in first-appearance order with supported acoustic traits, not transcript or identity claims.
+- Multiple vocal sounds are valid observations; use needs_acoustic_refinement if primary identity is unsafe. Each transcribed segment needs nonempty delivery_style; non-transcribed segments use null. Return audio_observation.speaker_voice_profiles=[]; Turn 3 owns acoustic voice profiling using the speech stem and these finalized speaker decisions.
 - Original AV is the sound authority.
 - Keep binding_status, speech_presentation and entity_id semantically consistent. If the vocal source is judged offscreen: binding_status=offscreen, speech_presentation=offscreen_spoken, entity_id=null; represent the vocal source separately from visible Subjects in shot1_caption. If a visible entity is judged to be the speaker: binding_status=visible_entity, speech_presentation=onscreen_spoken, entity_id=that visible entity.
 - Stage C preserves each Stage B primary group. Stage B acoustic grouping remains evidence, but resolution == resolved is NOT a prerequisite for final visible binding. Single, likely-single, or ordinary uncertain acoustic evidence may receive a direct final AV visible binding; confirmed transcribed overlapping/sequential multi-speaker speech remains excluded from identity publication.
@@ -1340,6 +1341,7 @@ VISIBLE SPEAKER BINDING
 - The final target AV is allowed to identify a visible speaker directly. If the full AV reasonably indicates that a known visible entity is speaking, bind that entity directly.
 - LR-ASD, source clusters and supporting visual cues are supporting clues, NOT mandatory prerequisites. Absence of supporting evidence is NOT a contradiction.
 - Use no_reliable_entity / uncertain only when the speaker is genuinely ambiguous, multiple speakers prevent safe attribution, or the AV contains concrete contradictory evidence.
+- A visible Subject is not automatically the speaker merely because it is the only or most salient visible person. If the full AV spatial presentation clearly places the voice offscreen, keep it offscreen even when LR-ASD has no binding.
 - A visible listener must still not inherit speech when the AV clearly indicates another source. Never invent an entity.
 - Use evidence_codes only for evidence actually supported by the current input. Keep the list concise and do not repeat the same code.
 
@@ -1369,8 +1371,9 @@ SPEAKER MARKERS
 - The official ICL is an official H3 writing/field-boundary demonstration, not the response-schema definition. Follow the actual supplied schema and official six-section Ref2VA semantics."""
 
 
-AUDIO_FINALIZE_SYSTEM_PROMPT = """Return ONLY overall_soundscape and non_diegetic_music.
-Judge the target audio using the original target AV and two separated audio views of that SAME target together. Original AV remains primary authority.
+AUDIO_FINALIZE_SYSTEM_PROMPT = """Return ONLY speaker_voice_profiles, overall_soundscape and non_diegetic_music.
+Judge the target audio using the original target AV and three separated audio views of that SAME target together. Original AV remains primary authority.
+The speech stem supplies acoustic voice evidence. Use the finalized speaker-profile targets ONLY to locate each already-decided voice in the supplied time intervals. Return exactly one profile per supplied speaker_group in target order; use voice_characteristics=null when unsupported. Describe supported pitch/register, timbre/texture, cadence/speaking rate and energy/delivery only. Never infer identity, profession, personality, nationality, role or demographics. Do not re-decide speaker identity, grouping, Subject binding, on/offscreen presentation or ASR; Turn 2 owns those decisions.
 The music stem supplies recall/evidence for musical content; the sfx stem supplies recall/evidence for ambience, physical and environmental sounds. Separator residuals are not automatically true.
 Do not discard a coherent musical layer clearly exposed by the music stem merely because it is quiet in the original mix. Preserve coherent piano/music compatible with the original AV in non_diegetic_music when it is audience-only BGM. Do not output N/A for clearly established music.
 overall_soundscape describes ambience and physical/environmental sound, excluding dialogue and non-diegetic music. non_diegetic_music describes audience-only BGM; N/A only when no such music is established.
@@ -2309,6 +2312,43 @@ def _required_voice_profile_groups(
     return required_groups
 
 
+def _speaker_profile_targets(
+    assembly: MimoSpeechAVAssemblyDraft,
+    job: MimoBackendJob,
+) -> list[dict[str, Any]]:
+    audio = {item.segment_id: item for item in assembly.audio_observation.segment_decisions}
+    grounding = {item.segment_id: item for item in assembly.av_grounding.segment_groundings}
+    subjects = {
+        item.entity_id: item.subject_label for item in job.reference_subjects
+        if item.kind == "entity" and item.entity_id is not None
+    }
+    speaker_ids: dict[str, str] = {}
+    targets: dict[str, dict[str, Any]] = {}
+    for segment in job.segments:
+        if segment.asr_status != "transcribed":
+            continue
+        decision, bound = audio.get(segment.segment_id), grounding.get(segment.segment_id)
+        if decision is None or bound is None:
+            continue  # The final inventory validator reports missing decisions.
+        resolved = decision.resolution == "resolved" or bound.binding_status == "visible_entity"
+        group = decision.primary_speaker_group if resolved else f"fallback__{segment.source_speaker_cluster_id}"
+        if group not in speaker_ids:
+            speaker_ids[group] = f"S{len(speaker_ids) + 1}"
+        if decision.resolution != "resolved" or group is None:
+            continue
+        target = targets.setdefault(group, {
+            "speaker_group": group, "speaker_id": speaker_ids[group], "segments": [],
+        })
+        target["segments"].append({
+            "segment_id": segment.segment_id,
+            "start_time": segment.start_time,
+            "end_time": segment.end_time,
+            "final_binding": subjects.get(bound.entity_id, bound.binding_status),
+            "speech_presentation": bound.speech_presentation,
+        })
+    return list(targets.values())
+
+
 def _normalize_speaker_voice_profiles(
     annotation: MimoAVAnnotationDraft,
     *,
@@ -2998,16 +3038,20 @@ class OpenAIMimo25Backend:
                     code="mimo_structured_output_failed",
                     reason="MiMo speech AV assembly failed structured validation", issues=tuple(issues),
                 )
-            finalize_instruction = "Judge the non-dialogue audio of the supplied target AV."
+            finalize_instruction = (
+                "Judge the target audio and profile only the finalized speaker targets.\n"
+                "FINALIZED SPEAKER-PROFILE TARGETS:\n"
+                + _compact_json(_speaker_profile_targets(assembly, job))
+            )
             if self.config.transport == "xiaomi":
                 finalize_instruction += "\nRESPONSE SCHEMA:\n" + _compact_json(
                     MimoAudioFinalizeDraft.model_json_schema()
                 )
             finalize_content = [target_video, {"type": "text", "text": finalize_instruction}]
             if auxiliary_audio_paths is not None:
-                if set(auxiliary_audio_paths) != {"music", "sfx"}:
-                    raise ValueError("audio finalization requires both music and sfx stems")
-                for kind in ("music", "sfx"):
+                if set(auxiliary_audio_paths) != {"speech", "music", "sfx"}:
+                    raise ValueError("audio finalization requires speech, music and sfx stems")
+                for kind in ("speech", "music", "sfx"):
                     finalize_content.extend([
                         {"type": "text", "text": f"{kind} stem: separated audio of the SAME target"},
                         {"type": "audio_url", "audio_url": {
@@ -3038,13 +3082,21 @@ class OpenAIMimo25Backend:
                     ],
                     segment_views=visual.segment_views,
                 ).model_dump(mode="json"),
-                "audio_observation": assembly.audio_observation.model_dump(mode="json"),
+                "audio_observation": {
+                    "segment_decisions": [
+                        item.model_dump(mode="json")
+                        for item in assembly.audio_observation.segment_decisions
+                    ],
+                    "speaker_voice_profiles": [
+                        item.model_dump(mode="json") for item in finalized.speaker_voice_profiles
+                    ],
+                },
                 "av_grounding": assembly.av_grounding.model_dump(mode="json"),
                 "warnings": [item.model_dump(mode="json") for item in assembly.warnings],
                 "h3_semantics": {
                     "summary": assembly.summary,
                     "shot1_caption": assembly.shot1_caption,
-                    **finalized.model_dump(mode="json"),
+                    **finalized.model_dump(mode="json", exclude={"speaker_voice_profiles"}),
                     **visual.model_dump(
                         mode="json", exclude={"segment_views", "shot1_visual_description"},
                     ),

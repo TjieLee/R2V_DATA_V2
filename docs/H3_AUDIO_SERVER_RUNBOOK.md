@@ -257,22 +257,25 @@ stem-video proxies are inputs.
   --allow-unverified
 ```
 
-There are no standalone stem-description calls. Canonical music/SFX stem hashes
+There are no standalone stem-description calls. Canonical speech/music/SFX stem hashes
 are checked against separation provenance before inference.
 
 Turn 1 receives target video, frozen reference images and official ICL v4
 (`use_audio_in_video=false`) and produces the visual draft. It writes factual
-appearance/action progression and naturally cites relevant entity and attribute
-Subjects without speculative plot interpretation.
+appearance/action progression and naturally cites visible entity Subjects and
+scene-defining background Subjects. Attribute labels are used only for useful
+action/composition/state-change/disambiguation, not repeated stable appearance.
 
 Turn 2 is a fresh request: original target AV, canonical Turn 1 result as text,
 compact entity-to-Subject mapping, and authoritative ASR/diarization/speaker
 facts. It owns speaker observations/grounding, a short target-video summary and
 the final caption with exact dialogue/Sx. It receives no ICL or reference images.
 
-Turn 3 is another fresh request: original target AV plus actual canonical music
-and SFX `audio_url` assets. It owns ONLY `overall_soundscape` and
-`non_diegetic_music`; it cannot rewrite summary, caption, dialogue or binding.
+Turn 3 is another fresh request: original target AV plus actual canonical
+speech/music/SFX `audio_url` assets and compact finalized Turn 2 group/Sx/time
+windows/final-binding targets. It owns `speaker_voice_profiles`,
+`overall_soundscape` and `non_diegetic_music`; it cannot rewrite summary, caption,
+dialogue or binding.
 Stems are separated views of the same audio, not factual guarantees. Coherent
 music compatible with the original AV should not be discarded merely because it
 is quiet in the original mix. No text fusion or deterministic music insertion.
@@ -290,8 +293,8 @@ null for new runs. Runtime defaults remain disabled thinking, official ICL,
 temperature 0.0 and 32768 completion tokens. No new runtime canary has been run
 as part of this CPU-only change.
 
-Versions: speech prompt v41, audio finalizer v1, visual v2, annotation .20,
-backend .50, materializer v23, authority v17, ICL v4, marker polish v4;
+Versions: speech prompt v45, audio finalizer v4, visual v4, annotation .20,
+backend .55, materializer v25, authority v17, ICL v4, marker polish v4;
 reconcile record .13, summary .15, policy v6, QA data .7. Fixed output:
 `mimo_reconcile_stemtext_final_av_markerpolish_v1/`. Old
 `mimo_reconcile_av_stemtext_sound_partition/`, `mimo_v29_oneclip_smoke/`,

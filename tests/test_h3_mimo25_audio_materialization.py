@@ -1,23 +1,112 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
+from r2v_data_v2.h3 import mimo25_backend as mb
 from r2v_data_v2.h3 import mimo25_h3_materializer as mm
 from r2v_data_v2.h3.jea_final_renderer import FinalH3SampleV2
+from r2v_data_v2.h3.mimo25_av_reconcile import _job
+from r2v_data_v2.h3.mimo25_recovered_voice import recover_mimo_target_voices
 from r2v_data_v2.h3.qwen38_h3_recaption import (
     RecaptionAudioContract,
     _canonical_audio_definition,
     _canonical_audio_retention,
 )
+from tests.h3_mimo_two_turn_helpers import split_annotation
 from tests.test_h3_mimo25_av_shadow import (
     _annotation,
+    _as_asd_miss,
+    _backend,
     _job_fixture,
     _job_for_reference_inventory,
     _record_fixture,
+    _RecoveredVoiceAnalyzer,
+    _RecoveredVoiceMediaBackend,
     _sample,
     _sample_with_reference_inventory,
     _visual_reference_inventory,
 )
+
+
+def test_turn3_profile_reaches_mimo_only_recovered_s2_audio_reference(tmp_path):
+    job = _as_asd_miss(_job_fixture(tmp_path))
+    values = job.model_dump(mode="json", exclude={"request_fingerprint"})
+    values["segments"].append({
+        **values["segments"][0], "segment_id": "segment_2", "start_time": 1.0,
+        "end_time": 2.0, "source_start_sample": 32000, "source_end_sample": 64000,
+        "source_speaker_cluster_id": "speaker_1", "asr_text": "Reply.",
+    })
+    job = _job(values)
+    payload = _annotation().model_dump(mode="json")
+    payload["audio_observation"]["segment_decisions"].append({
+        **payload["audio_observation"]["segment_decisions"][0],
+        "segment_id": "segment_2", "primary_speaker_group": "g2",
+    })
+    first_bound = payload["av_grounding"]["segment_groundings"][0]
+    payload["av_grounding"]["segment_groundings"].append({
+        **first_bound, "segment_id": "segment_2", "primary_speaker_group": "g2",
+    })
+    first_bound.update(binding_status="offscreen", speech_presentation="offscreen_spoken",
+                       entity_id=None, evidence_codes=["offscreen_audio"])
+    payload["visual_observation"]["segment_views"].append({
+        **payload["visual_observation"]["segment_views"][0], "segment_id": "segment_2",
+    })
+    profile = "low register, dry texture, brisk cadence"
+    payload["audio_observation"]["speaker_voice_profiles"] = [
+        {"speaker_group": "g1", "voice_characteristics": "high register, soft texture"},
+        {"speaker_group": "g2", "voice_characteristics": profile},
+    ]
+    payload["h3_semantics"]["shot1_caption"] = (
+        "<Subject 1> stands. An offscreen voice (S1) says, <d>[English] Exact, text!</d> "
+        "<Subject 1> (S2) replies, <d>[English] Reply.</d>"
+    )
+    raws = split_annotation(json.dumps(payload))
+    backend, calls = _backend(tmp_path, [(raw, 8) for raw in raws])
+    result = backend.reconcile(
+        job, segment_ids=["segment_1", "segment_2"],
+        transcribed_segment_ids=["segment_1", "segment_2"], allowed_entity_ids={"e1"},
+        allowed_reference_labels={"<Subject 1>", "<Picture 1>"},
+        auxiliary_audio_paths={kind: tmp_path / "full.flac" for kind in ("speech", "music", "sfx")},
+    )
+    assert result.model_call_count == len(calls.requests) == 3
+    assert all(s.current_entity_id is None and s.direct_anchor_seconds == 0 for s in job.segments)
+    assert result.annotation.av_grounding.segment_groundings[0].binding_status == "offscreen"
+    assert result.annotation.av_grounding.segment_groundings[1].entity_id == "e1"
+    text = calls.requests[2]["messages"][1]["content"][1]["text"]
+    targets = json.loads(text.split("FINALIZED SPEAKER-PROFILE TARGETS:\n")[1].split("\nRESPONSE SCHEMA:", 1)[0])
+    assert [(t["speaker_group"], t["speaker_id"]) for t in targets] == [("g1", "S1"), ("g2", "S2")]
+    assert [t["segments"][0]["final_binding"] for t in targets] == ["offscreen", "<Subject 1>"]
+    assert [t["segments"][0]["start_time"] for t in targets] == [0.0, 1.0]
+    assert json.loads(raws[1])["audio_observation"]["speaker_voice_profiles"] == []
+    assert result.annotation.speaker_voice_profiles[1].voice_characteristics == profile
+    record = _record_fixture(tmp_path, result.annotation, job=job)
+    analyzer = _RecoveredVoiceAnalyzer()
+    analyzer.analysis.mono_pcm16[32000:64000] = 3000
+    recovered, voices, _ = recover_mimo_target_voices(
+        job=job, record=record, subject_index_by_entity={"e1": 1}, existing_entity_ids=set(),
+        reference_capacity=3, temporary_root=tmp_path / "voice-temp", final_root=tmp_path / "voices",
+        audio_backend=_RecoveredVoiceMediaBackend(), analyzer=analyzer,
+    )
+    assert len(voices) == 1, recovered
+    assert recovered[0].status == "selected" and recovered[0].source_segment_id == "segment_2"
+    sample = _sample(tmp_path)
+    sample_values = sample.model_dump(mode="python")
+    sample_values["subject_voices"] = [v.model_dump(mode="python") for v in voices]
+    original = sample_values["speech_segments"][0]
+    sample_values["speech_segments"] = [{
+        **original, "segment_id": s.segment_id, "speaker_cluster_id": s.source_speaker_cluster_id,
+        "entity_id": None, "entity_occurrence_id": None,
+        "start_time": s.start_time, "end_time": s.end_time,
+        "source_start_sample": s.source_start_sample, "source_end_sample": s.source_end_sample,
+        "text": s.asr_text,
+    } for s in job.segments]
+    sample = FinalH3SampleV2.model_validate(sample_values)
+    _, rendered, _ = mm._materialize_sample(sample, job, record)
+    assert f"<Audio 1> is the voice-timbre reference for <Subject 1> (S2), featuring {profile}." in rendered
+    assert "<Audio 1>: reference -" in rendered
+    assert mb.MIMO25_MATERIALIZER_VERSION == "h3_mimo25_materializer_v25"
 
 
 @pytest.mark.parametrize("variant", [

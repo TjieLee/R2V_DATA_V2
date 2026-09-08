@@ -19,10 +19,12 @@ def split_annotation(raw):
         "shot1_caption": semantics.get("shot1_caption", ""),
     }
     finalized = {
+        "speaker_voice_profiles": payload["audio_observation"]["speaker_voice_profiles"],
         **{key: semantics[key] for key in (
             "overall_soundscape", "non_diegetic_music",
         ) if key in semantics},
     }
+    speech["audio_observation"] = {**speech["audio_observation"], "speaker_voice_profiles": []}
     return json.dumps(visual), json.dumps(speech), json.dumps(finalized)
 
 

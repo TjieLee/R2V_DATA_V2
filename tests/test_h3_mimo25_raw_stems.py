@@ -48,8 +48,8 @@ def _subset_inventory(base, clip_ids):
 
 
 def test_finalizer_uses_raw_stems_without_evidence_gates():
-    assert MIMO25_PROMPT_VERSION == "h3_mimo25_speech_assembly_v44"
-    assert "two separated audio views of that SAME target" in AUDIO_FINALIZE_SYSTEM_PROMPT
+    assert MIMO25_PROMPT_VERSION == "h3_mimo25_speech_assembly_v45"
+    assert "three separated audio views of that SAME target" in AUDIO_FINALIZE_SYSTEM_PROMPT
     assert "Original AV remains primary authority" in AUDIO_FINALIZE_SYSTEM_PROMPT
     assert "quiet in the original mix" in AUDIO_FINALIZE_SYSTEM_PROMPT
     assert "residuals are not automatically true" in AUDIO_FINALIZE_SYSTEM_PROMPT
@@ -80,7 +80,7 @@ def test_caption_field_boundaries_and_no_grounding_explanation():
 
 
 def test_visual_subject_preservation_remains_in_frozen_turn1():
-    assert "every supplied Subject actually visible and relevant, INCLUDING attribute Subjects" in VISUAL_SYSTEM_PROMPT
+    assert "Naturally cite visible entity Subjects when they appear" in VISUAL_SYSTEM_PROMPT
     assert "Profile/back/occluded/silent subjects remain visible" in VISUAL_SYSTEM_PROMPT
     assert "Preserve its visual content and ordering" in SYSTEM_PROMPT
     assert "If the full AV reasonably indicates that a known visible entity is speaking, bind that entity directly" in SYSTEM_PROMPT
@@ -293,8 +293,9 @@ def test_embedded_audio_accounting_is_warning_only(tmp_path, monkeypatch, audio_
     )
 
 
+@pytest.mark.parametrize("stem_kind", ["speech", "music", "sfx"])
 @pytest.mark.parametrize("source_state", ["valid", "changed", "missing"])
-def test_raw_stem_assets_replace_standalone_calls(tmp_path, monkeypatch, source_state):
+def test_raw_stem_assets_replace_standalone_calls(tmp_path, monkeypatch, source_state, stem_kind):
     _, shadow = _fixture(tmp_path, monkeypatch)
     payload = json.loads(_raw())
     payload["h3_semantics"].update(
@@ -302,7 +303,7 @@ def test_raw_stem_assets_replace_standalone_calls(tmp_path, monkeypatch, source_
     )
     backend, completions, stems, jobs = _backend(tmp_path, shadow, [(json.dumps(payload), 8)])
     record = next(r for r in stems if r.clip_uid == jobs[0].clip_uid and r.route == "music_first")
-    path = Path(record.stem("music").canonical_stem_path)
+    path = Path(record.stem(stem_kind).canonical_stem_path)
     if source_state == "changed":
         path.write_bytes(b"changed")
     elif source_state == "missing":
@@ -324,7 +325,7 @@ def test_raw_stem_assets_replace_standalone_calls(tmp_path, monkeypatch, source_
     media = completions.requests[-1]["messages"][-1]["content"]
     assert [item["audio_url"]["url"] for item in media if item["type"] == "audio_url"] == [
         backend.config.media_resolver.resolve(Path(record.stem(kind).canonical_stem_path))
-        for kind in ("music", "sfx")
+        for kind in ("speech", "music", "sfx")
     ]
     assert not any(d["input_modality"] == "auxiliary_audio_only" for d in result["diagnostics"])
     assert sum(item["type"] == "video_url" for item in media) == 1
@@ -409,7 +410,7 @@ def test_final_av_authors_sound_and_diegetic_caption_without_postprocessing(
     def create(**request):
         assert request["response_format"]["json_schema"]["name"] != "MimoAuxAudioDescription"
         if request["response_format"]["json_schema"]["name"] == "MimoAudioFinalizeDraft":
-            assert sum(p["type"] == "audio_url" for p in request["messages"][-1]["content"]) == 2
+            assert sum(p["type"] == "audio_url" for p in request["messages"][-1]["content"]) == 3
         assert candidate not in json.dumps(request["messages"])
         return original(**request)
 
@@ -494,7 +495,7 @@ def test_real_entry_without_facts_sends_two_audio_then_visual_and_final_av(tmp_p
         assert request["reasoning_effort"] == "none"
     assert visual["extra_body"]["use_audio_in_video"] is False
     expected_urls = [backend.config.media_resolver.resolve(Path(selected.stem(kind).canonical_stem_path))
-                     for kind in ("music", "sfx")]
+                     for kind in ("speech", "music", "sfx")]
     assert [p["audio_url"]["url"] for p in first["messages"][-1]["content"] if p["type"] == "audio_url"] == expected_urls
     assert not any(p["type"] == "audio_url" for p in speech["messages"][-1]["content"])
     full = speech["messages"][-1]["content"][-1]["text"]
@@ -504,7 +505,7 @@ def test_real_entry_without_facts_sends_two_audio_then_visual_and_final_av(tmp_p
     assert "stem_facts" not in full and "separator_candidate" not in full
     schema = speech["response_format"]["json_schema"]["schema"]
     assert set(schema["properties"]) == {"summary", "audio_observation", "av_grounding", "shot1_caption", "warnings"}
-    assert set(first["response_format"]["json_schema"]["schema"]["properties"]) == {"overall_soundscape", "non_diegetic_music"}
+    assert set(first["response_format"]["json_schema"]["schema"]["properties"]) == {"speaker_voice_profiles", "overall_soundscape", "non_diegetic_music"}
     assert not hasattr(backend, "reconcile_sound_descriptions")
     assert not hasattr(backend, "partition_sound_description")
     assert all(path.read_bytes() == data for path, data in source_before.items())
@@ -1105,8 +1106,8 @@ def test_explicit_marker_mismatch_remains_hard_in_backend(tmp_path, monkeypatch)
     assert "direct_dialogue_speaker_marker_mismatch" not in row["diagnostics"][-1]["warnings"]
     assert summary.model_call_count == len(completions.requests) == 4
     assert row["text_model_call_count"] == 1
-    assert backend.provenance.schema_version == MIMO25_BACKEND_VERSION == "r2v.h3.mimo25_backend.54"
-    assert backend.provenance.prompt_version == "h3_mimo25_speech_assembly_v44"
+    assert backend.provenance.schema_version == MIMO25_BACKEND_VERSION == "r2v.h3.mimo25_backend.55"
+    assert backend.provenance.prompt_version == "h3_mimo25_speech_assembly_v45"
 
 
 @pytest.mark.parametrize(

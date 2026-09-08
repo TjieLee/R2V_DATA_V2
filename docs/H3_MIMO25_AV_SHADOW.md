@@ -23,8 +23,9 @@ speaker reconciliation; MiMo is the final AV authority for this shadow path.
   2. original target AV plus the canonical visual draft as text, compact
      entity/Subject mapping and authoritative speech facts produces speaker
      observations/grounding, target-video summary and the dialogue caption;
-  3. original target AV plus actual canonical music and SFX audio assets produces
-     only soundscape and audience-only music. It cannot rewrite dialogue,
+  3. original target AV plus actual canonical speech/music/SFX audio assets and
+     compact finalized Turn 2 speaker-profile targets produces acoustic voice
+     profiles, soundscape and audience-only music. It cannot rewrite dialogue,
      visuals, speaker labels or the summary.
   Turns 2/3 are independent system/user requests: no inherited ICL, images or
   assistant history, and no reference-image-token requirement.
@@ -47,8 +48,8 @@ audio `segment_decisions` row, and one Stage C `segment_groundings` row,
 including empty or otherwise non-transcribed segments. Stage A records only
 visible entities and exact-window visibility/orientation/face/mouth/articulation
 observations. Stage B owns clip-local `gN`, vocal composition, acoustic
-resolution, segment delivery, secondary vocal activity and voice profiles. Stage C may map that exact Stage B group to one frozen `eN` or
-null and classify presentation. Supplied transcribed speech belongs in the
+resolution, segment delivery and secondary vocal activity. Stage C may map that
+exact Stage B group to one frozen `eN` or null and classify presentation. Supplied transcribed speech belongs in the
 caption, preserving dialogue and language. The first dialogue block and speaker
 transitions need an explicit known `(Sx)`. Consecutive blocks may omit a repeated
 marker only when block count equals chronological speech-fact count and the
@@ -94,17 +95,20 @@ typed `subject_label`, constrained `marker`, and visual `description`. The
 materializer joins the description with the exact frozen Picture labels as
 normal official Ref2VA prose. MiMo does not author Picture provenance, and a
 model-authored Picture label is rejected rather than treated as authority.
-Subject descriptions reject narrow speaker-profile vocabulary. Voice profiles
-remain acoustic-first; supported audible age/gender descriptors are allowed,
-while nationality, role, named identity, relationship, or personality claims
-remain invalid. No full-AV recheck is sent.
+Subject descriptions reject narrow speaker-profile vocabulary. Turn 3 voice
+profiles are acoustic-only: pitch/register, timbre/texture,
+cadence/rate and energy/delivery; the prompt forbids identity, profession,
+personality, nationality, role and demographics. No full-AV recheck is sent.
 
-Stage B also carries one nullable `speaker_voice_profiles` row for each
-resolved speaker group that owns authoritative transcribed speech. A non-null
-profile is limited to stable audible pitch register, timbre, texture, cadence,
-articulation, and genuinely supported accent or dialect; it cannot copy
-dialogue or infer nationality, identity, role, relationship, or personality.
-Profiles remain available for real voice-asset provenance. MiMo authors natural
+Turn 2 returns an empty `speaker_voice_profiles` list. Turn 3 supplies one
+nullable profile for each resolved group with transcribed speech, using the
+actual speech stem and compact group/Sx/time-window/final-binding targets.
+It cannot re-decide grouping, binding, presentation, ASR, summary or caption.
+The final annotation combines Turn 2 segment decisions with Turn 3 profiles.
+Profiles remain available for real voice-asset provenance, including MiMo-only
+recovered visible speakers with no LR-ASD binding. The existing materializer
+maps group to Sx to `RecaptionAudioContract.voice_characteristics`; canonical
+Audio definitions retain their `featuring ...` wording. MiMo authors natural
 speaker/delivery lead-ins in the direct caption; code never splices fixed speech
 clauses into that prose.
 
@@ -269,7 +273,7 @@ The exact request contract keeps `fps` and `media_resolution` beside the
 
 Xiaomi retains disabled thinking. SGLang uses strict JSON schema, disabled
 thinking and `use_audio_in_video=false` for Turn 1, `true` for Turns 2/3.
-Turn 3 receives ordered `music` then `sfx` canonical stem `audio_url` items
+Turn 3 receives ordered `speech`, `music`, `sfx` canonical stem `audio_url` items
 beside the original target video. Stem hashes are checked before any model
 call; invalid media produces a per-clip failure without mutating upstream data.
 Missing/unreported reference-image usage is not an error for Turns 2/3.
@@ -280,8 +284,8 @@ The raw fields remain `visual_raw_response`, `speech_av_raw_response` and
 `audio_finalize_raw_response`. Legacy standalone-stem description fields are
 null in new records; current provenance identifies this request contract.
 
-Current versions: backend .54, visual prompt v3, speech assembly v44, audio
-finalizer v3, materializer v25; annotation .20, authority v17, official ICL v4
+Current versions: backend .55, visual prompt v4, speech assembly v45, audio
+finalizer v4, materializer v25; annotation .20, authority v17, official ICL v4
 and speaker polish v4 remain unchanged. Materializer v25 resolves each
 attribute Subject's owner from the frozen reference contract and explicitly
 names that entity Subject in its definition. Background Subjects remain

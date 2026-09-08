@@ -1800,7 +1800,7 @@ class StemReconcileBackend(Protocol):
 def _validated_auxiliary_stems(record: SAMAudioStemRecord) -> dict[str, Path]:
     paths = {}
     try:
-        for kind in ("music", "sfx"):
+        for kind in ("speech", "music", "sfx"):
             stem = record.stem(kind)
             path = Path(stem.canonical_stem_path)
             if sha256_file(path) != stem.canonical_stem_sha256:
