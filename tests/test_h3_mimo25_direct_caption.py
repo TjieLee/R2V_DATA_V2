@@ -10,6 +10,7 @@ from pydantic import ValidationError
 from r2v_data_v2.h3.mimo25_backend import (
     MIMO25_ICL_VERSION,
     SYSTEM_PROMPT,
+    VISUAL_SYSTEM_PROMPT,
     MimoAVAnnotationDraft,
     MimoBackendConfig,
     MimoBackendFailure,
@@ -92,13 +93,13 @@ def test_official_examples_preserved_in_two_turn_prefix(tmp_path):
         assert "How the reference pictures align" not in message["content"]
         assert "Case 1: T2VA" not in message["content"]
     assert backend.provenance.icl_version == MIMO25_ICL_VERSION == "h3_official_ref2va_detailed_shot1_v4"
-    assert backend.provenance.prompt_version == "h3_mimo25_speech_assembly_v41"
-    assert backend.provenance.schema_version == "r2v.h3.mimo25_backend.50"
+    assert backend.provenance.prompt_version == "h3_mimo25_speech_assembly_v42"
+    assert backend.provenance.schema_version == "r2v.h3.mimo25_backend.51"
     assert backend.provenance.annotation_schema_version == "r2v.h3.mimo25_av_annotation.20"
     assert backend.provenance.materializer_version == "h3_mimo25_materializer_v23"
-    assert "This pilot is exactly one shot." in SYSTEM_PROMPT
+    assert "The pipeline owns [Shot 1]" in SYSTEM_PROMPT
     assert "Do not repeat the marker before every utterance" not in SYSTEM_PROMPT
-    assert "style_opening: one concise sentence about global visual/cinematographic style" in SYSTEM_PROMPT
+    assert "style_opening is one concise global style/camera/lighting sentence" in VISUAL_SYSTEM_PROMPT
 
 
 def test_direct_caption_materializes_without_reconstructing_prose(tmp_path):

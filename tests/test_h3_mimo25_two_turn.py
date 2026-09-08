@@ -182,10 +182,9 @@ def test_visual_and_assembly_prompt_ownership():
     assert "early through middle to late" in mb.VISUAL_SYSTEM_PROMPT
     assert "Do not infer sounds or dialogue" in mb.VISUAL_SYSTEM_PROMPT
     assert "No hard word-count requirement" in mb.VISUAL_SYSTEM_PROMPT
-    assert "authoritative visual draft" in mb.SYSTEM_PROMPT
-    assert "Do NOT replace the visual draft with a new shorter visual summary" in mb.SYSTEM_PROMPT
-    assert "Minimal connective rephrasing" in mb.SYSTEM_PROMPT
-    assert "retain all materially useful visual observations" in mb.SYSTEM_PROMPT
+    assert "Turn 1 visual draft owns observable visual facts" in mb.SYSTEM_PROMPT
+    assert "minimum local grammatical edits" in mb.SYSTEM_PROMPT
+    assert "speaker markers and exact dialogue" in mb.SYSTEM_PROMPT
 
 
 def test_speech_prompt_defers_sound_and_finalizer_is_short():
@@ -215,28 +214,49 @@ def test_speech_prompt_defers_sound_and_finalizer_is_short():
     assert len(prompt.split()) < 250
 
 
-def test_visual_facts_are_not_reversed_to_justify_speaker_binding():
+def test_turn2_is_minimal_speech_integration_without_visual_priming():
     prompt = mb.SYSTEM_PROMPT
-    assert prompt.count("\nVISUAL OWNERSHIP\n") == 1
-    visual = prompt.split("VISUAL OWNERSHIP\n", 1)[1].split("\nAUTHORITY\n", 1)[0]
-    for rule in (
-        "MUST NOT invent or reverse a Turn 1 observable visual fact merely to support speaker grounding",
-        'If Turn 1 says "Her lips remain closed.", do NOT change it to "Her lips move subtly"',
-        "Speaker binding and visual articulation are separate decisions",
-        "Stage A articulation is an observable visual clue, not speaker authority",
-        "speech_correlated_articulation=not_observed",
-        "NOT evidence that the person is not speaking; it does not block visible binding",
-        "Full AV may still bind a visible entity",
-        "LR-ASD support is absent",
-        "Do not manufacture visible_lip_motion, mouth movement, or another visual observation",
-        "not_observed must not be converted into visible_lip_motion without actual positive visual observation",
-        "concrete, unambiguous visual contradiction",
-        "Grounding preference alone is not such a contradiction",
+    for forbidden in (
+        "lips", "mouth", "articulation", "visible_lip_motion", "no_visible_lip_motion",
+        "speech_correlated_articulation", "lip motion",
+        "PRIMARY H3 WRITING TASK", "SHOT1 CAPTION / DETAILED DESCRIPTION",
+        "VISIBLE SUBJECT PRESERVATION", "Observe the ENTIRE target video",
+        "shot scale", "framing", "lighting", "Continue through the end",
     ):
-        assert rule in visual
-    assert "supporting clues, NOT mandatory prerequisites" in prompt
-    assert "bind that entity directly" in prompt
-    assert "Reinspect conflicting Stage A articulation and Stage C lip-motion evidence" not in prompt
+        assert forbidden.lower() not in prompt.lower()
+    assert [line for line in prompt.splitlines() if line.isupper()] == [
+        "ROLE / OUTPUT", "SPEECH-ONLY ASSEMBLY", "VISUAL OWNERSHIP", "AUTHORITY",
+        "AUDIO + AV GROUNDING", "VISIBLE SPEAKER BINDING", "SHOT1 CAPTION", "SPEAKER MARKERS",
+    ]
+    for rule in (
+        "Start from the Turn 1 shot1_visual_description",
+        "Preserve its visual content and ordering",
+        "Only make the minimum edits needed",
+        "establish the correct speaker with (Sx)",
+        "insert exact authoritative <d> dialogue at the appropriate point",
+        "make the resulting prose grammatical",
+        "Do not add new visual observations",
+        "Do not add, reverse, or invent visual observations to justify speaker grounding",
+        "Speaker grounding is a separate AV decision",
+        "does not require an independent visual speech cue",
+        "Use evidence_codes only for evidence actually supported by the current input",
+        "Keep the list concise and do not repeat the same code",
+        "supporting clues, NOT mandatory prerequisites",
+        "bind that entity directly",
+    ):
+        assert rule in prompt
+    assert len(prompt) < 8000  # Prompt cleanup only, not a generated-caption length gate.
+
+
+def test_turn3_prompt_and_both_assembly_schemas_are_frozen():
+    assert hashlib.sha256(mb.AUDIO_FINALIZE_SYSTEM_PROMPT.encode()).hexdigest() == (
+        "7218c8074f36f8f211ffee8711c179ca72c0216ad3c7a02af90ca4c3f5c3d019"
+    )
+    for schema, digest in (
+        (mb.MimoSpeechAVAssemblyDraft, "d0382d939597478c30b23a5b791641fbde93984ecf74ca427c23cbe95e456aa5"),
+        (mb.MimoAudioFinalizeDraft, "82967c3b5918b051613dbe6c5cae774469cf34066e1a570e408e60a485c54239"),
+    ):
+        assert hashlib.sha256(json.dumps(schema.model_json_schema(), sort_keys=True).encode()).hexdigest() == digest
 
 
 def test_visual_v2_keeps_only_caption_long_and_definitions_concise():
@@ -303,8 +323,8 @@ def test_cache_is_diagnostic_only_and_three_turn_provenance_is_fingerprinted(tmp
     assert result.model_call_count == 3
     assert [d.usage.cached_tokens for d in result.diagnostics] == [cached_tokens] * 3
     provenance = backend.provenance
-    assert provenance.schema_version == "r2v.h3.mimo25_backend.50"
-    assert provenance.prompt_version == "h3_mimo25_speech_assembly_v41"
+    assert provenance.schema_version == "r2v.h3.mimo25_backend.51"
+    assert provenance.prompt_version == "h3_mimo25_speech_assembly_v42"
     assert provenance.visual_prompt_version == "h3_mimo25_visual_only_v2"
     assert provenance.materializer_version == "h3_mimo25_materializer_v23"
     assert provenance.policy_version == "h3_mimo25_av_authority_contract_v17"

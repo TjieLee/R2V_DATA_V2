@@ -28,12 +28,12 @@ from r2v_data_v2.structured_output import (
 
 MIMO25_MODEL = "mimo-v2.5"
 MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
-MIMO25_PROMPT_VERSION = "h3_mimo25_speech_assembly_v41"
+MIMO25_PROMPT_VERSION = "h3_mimo25_speech_assembly_v42"
 MIMO25_AUDIO_FINALIZE_PROMPT_VERSION = "h3_mimo25_audio_finalize_v1"
 MIMO25_VISUAL_PROMPT_VERSION = "h3_mimo25_visual_only_v2"
 MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v17"
 MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.20"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.50"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.51"
 MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION = "h3_mimo25_speaker_marker_polish_v4"
 MIMO25_ICL_VERSION = "h3_official_ref2va_detailed_shot1_v4"
 MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v23"
@@ -917,7 +917,7 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.50"] = MIMO25_BACKEND_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.51"] = MIMO25_BACKEND_VERSION
     audio_finalize_prompt_version: Literal["h3_mimo25_audio_finalize_v1"] = (
         MIMO25_AUDIO_FINALIZE_PROMPT_VERSION
     )
@@ -942,7 +942,7 @@ class MimoBackendProvenance(SchemaModel):
     media_mode: Literal["base64", "http"]
     media_root: str
     media_base_url: str | None = None
-    prompt_version: Literal["h3_mimo25_speech_assembly_v41"] = (
+    prompt_version: Literal["h3_mimo25_speech_assembly_v42"] = (
         MIMO25_PROMPT_VERSION
     )
     policy_version: Literal["h3_mimo25_av_authority_contract_v17"] = (
@@ -1280,12 +1280,9 @@ Return only audio_observation, av_grounding, shot1_caption and warnings.
 Turn 2 caption is Turn 1 visual prose plus speaker markers and exact <d> ASR dialogue, in playback order. Defer ALL non-dialogue audio to Turn 3. Do NOT add music, hum, rumble, room tone, SFX, or any other non-dialogue audio prose.
 
 VISUAL OWNERSHIP
-- The previous assistant Turn 1 visual draft is the authoritative visual draft for observable visual prose. Do NOT replace the visual draft with a new shorter visual summary or discard observations because Audio evidence is now supplied.
-- Minimal connective rephrasing is allowed to insert dialogue/Sx; retain all materially useful visual observations. MUST NOT invent or reverse a Turn 1 observable visual fact merely to support speaker grounding.
-- If Turn 1 says "Her lips remain closed.", do NOT change it to "Her lips move subtly" solely because the model decided she is the speaker.
-- Speaker binding and visual articulation are separate decisions. Stage A articulation is an observable visual clue, not speaker authority. speech_correlated_articulation=not_observed means absence of observed articulation, NOT evidence that the person is not speaking; it does not block visible binding.
-- Full AV may still bind a visible entity when articulation is subtle, the mouth is partially visible, articulation is not observed, or LR-ASD support is absent. Do not manufacture visible_lip_motion, mouth movement, or another visual observation to rationalize the binding. not_observed must not be converted into visible_lip_motion without actual positive visual observation.
-- Only correct a Turn 1 visual fact if the target video itself provides a concrete, unambiguous visual contradiction. Grounding preference alone is not such a contradiction. Do not alter final visual prose to make grounding look more supported.
+The Turn 1 visual draft owns observable visual facts. Preserve it with only the minimum local grammatical edits needed to insert speaker markers and exact dialogue.
+Do not add, reverse, or invent visual observations to justify speaker grounding.
+Speaker grounding is a separate AV decision and does not require an independent visual speech cue.
 
 AUTHORITY
 - DiariZen owns exact segment/sample boundaries. All decision inventories follow allowed_segment_ids, including LR-ASD=0, unbound, and zero-anchor segments. Never split, merge, filter, or invent segments.
@@ -1298,60 +1295,26 @@ AUDIO + AV GROUNDING
 - Multiple vocal sounds are valid observations; use needs_acoustic_refinement if primary identity is unsafe. Each transcribed segment needs nonempty delivery_style; non-transcribed segments use null. Voice profiles cover resolved transcribed groups in first-appearance order with supported acoustic traits, not transcript or identity claims.
 - Original AV is the sound authority.
 - Stage C preserves each Stage B primary group. Stage B acoustic grouping remains evidence, but resolution == resolved is NOT a prerequisite for final visible binding. Single, likely-single, or ordinary uncertain acoustic evidence may receive a direct final AV visible binding; confirmed transcribed overlapping/sequential multi-speaker speech remains excluded from identity publication.
-- Offscreen is spatial: hidden lips/face or partial occlusion of a visible person is not offscreen. offscreen_spoken requires offscreen/null entity/offscreen_audio; voice_over requires null/voice_over_context; device_playback requires null/device_playback_context; message_voice_over requires null/message_text_alignment/voice_over_context. Do not infer offscreen from missing supporting evidence.
+- Offscreen is spatial, not a lack of supporting evidence. offscreen_spoken requires offscreen/null entity/offscreen_audio; voice_over requires null/voice_over_context; device_playback requires null/device_playback_context; message_voice_over requires null/message_text_alignment/voice_over_context. Do not infer offscreen from missing supporting evidence.
 - direct_anchor_present without explicit LR-ASD conflict is a strong prior, overridden only by current-segment AV contradiction. LR-ASD support is not required to recover a true visible speaker. The same reliably resolved visible entity reuses one group; split/merge source clusters only with AV support.
 - Transcribed overlapping_secondary_speech or sequential_multi_speaker_speech blocks final publication pending authoritative turn refinement; preserve the raw caption for QA, never heuristically split ASR.
 
 VISIBLE SPEAKER BINDING
 - The final target AV is allowed to identify a visible speaker directly. If the full AV reasonably indicates that a known visible entity is speaking, bind that entity directly.
-- LR-ASD, source clusters, lip motion, mouth visibility, temporal alignment, and voice continuity are supporting clues, NOT mandatory prerequisites. Absence of supporting evidence is NOT a contradiction.
-- Do not downgrade a plausible visible speaker merely because lip articulation is subtle, occluded, profile-view, cropped, or not independently confirmed by LR-ASD.
+- LR-ASD, source clusters and supporting visual cues are supporting clues, NOT mandatory prerequisites. Absence of supporting evidence is NOT a contradiction.
 - Use no_reliable_entity / uncertain only when the speaker is genuinely ambiguous, multiple speakers prevent safe attribution, or the AV contains concrete contradictory evidence.
 - A visible listener must still not inherit speech when the AV clearly indicates another source. Never invent an entity.
+- Use evidence_codes only for evidence actually supported by the current input. Keep the list concise and do not repeat the same code.
 
-PRIMARY H3 WRITING TASK
-- This pilot is exactly one shot. Preserve style_opening and assemble shot1_caption; the pipeline inserts [Shot 1]. Never output [Shot N], shot timing, or placeholders.
-- style_opening: one concise sentence about global visual/cinematographic style, camera language, and lighting only. Do not summarize people, clothing, scene contents, Subjects, actions, chronology, dialogue, or audio.
-
-SHOT1 CAPTION / DETAILED DESCRIPTION
-- shot1_caption is the full detailed_description body for this single-shot clip, not a short caption or summary.
-- Observe the ENTIRE target video from beginning to end before writing.
-- Describe the shot in natural playback order using natural English audiovisual prose, with enough visual detail to reconstruct what is actually seen and how it changes.
-For the shot, cover the observable dimensions that are present:
-1. shot scale, framing, viewpoint, and composition;
-2. each important visible subject's appearance, position, orientation, and spatial relationship to other subjects/objects;
-3. environment, background, foreground, major props, and scene layout;
-4. lighting, color, and clearly visible visual atmosphere;
-5. camera behavior: static, pan, push, tracking, handheld motion, etc.;
-6. visible actions, gestures, gaze changes, facial-expression changes, posture changes, object interactions, and other state changes in chronological order;
-7. dialogue and speaker markers at the moment they occur; do not append all dialogue at the end;
-8. where referenced Subjects/Pictures actually appear or affect the shot.
-Preserve the Turn 1 visual facts; add only speech and its speaker markers.
-Important:
-- A single shot is NOT a reason to make the description short.
-- Do not stop after describing the opening composition and dialogue.
-- Continue through the end of the clip and describe meaningful visible developments and reactions.
-- Prefer concrete observable visual detail over plot summary or interpretation.
-- Do NOT pad the description with invented details just to make it longer.
-- Do NOT invent psychology, causality, relationships, unseen objects, camera motion, lighting changes, or actions that are not observable.
-- No hard word-count requirement. Detail should scale with actual information visible in the clip.
-- Avoid repeating the exact same fact merely to increase length.
-- shot1_caption states observable audiovisual events, not AV-grounding reasoning or diagnostic explanation.
-- Never explain speaker/source inference with prose such as "indicating", "suggesting", "therefore", "because this means", "may be offscreen", or "may be a voice-over".
-- Binding/presentation rationale belongs only in av_grounding. Never expose binding_status, speech_presentation, confidence, evidence_codes, source_cluster_conflict, LR-ASD, offscreen_audio, visible_lip_motion/no_visible_lip_motion, resolved/unresolved pipeline states, "low confidence due to..." or "classified as..." in consumer-facing prose.
-- If a source is determined as offscreen/voice-over, express the final presentation naturally rather than explaining why it was classified that way.
-- Observable lip/action facts may be described when visually relevant, but do not turn them into analytical conclusions.
-
-VISIBLE SUBJECT PRESERVATION
-- Every defined ENTITY <Subject N> that is visibly present in the target shot MUST appear with its exact <Subject N> label at its first clear visual appearance in shot1_caption.
-- Do not replace a defined visible entity only with generic prose such as "a woman", "a man", "the doctor", "the church", etc. After first establishment, natural pronouns/descriptions may be used.
-- A visible entity remains visually present even when profile-view, back-facing, partially occluded, face/mouth occluded, or silent. Do not drop a visible Subject merely because it is not the speaker.
-- Attribute-only Subjects do not need mechanical repetition unless that referenced attribute is specifically being cited.
-- Visual presence does NOT by itself assign (Sx).
-- If the AV reasonably establishes that a visible defined Subject is the speaker, write <Subject N> (Sx) at the corresponding vocal event.
-- If a defined Subject is visible but the vocal source is genuinely offscreen/other, preserve the visible <Subject N> in the visual prose and describe the vocal source separately.
-- Back/profile/occluded mouth is still visible presence and is not equivalent to offscreen.
-- Do NOT create <Audio N> merely because target audio/dialogue/music exists. Only use an allowed <Audio N> when the input/reference contract actually contains that Audio reference asset.
+SHOT1 CAPTION
+Start from the Turn 1 shot1_visual_description. Preserve its visual content and ordering.
+Only make the minimum edits needed to:
+- establish the correct speaker with (Sx);
+- insert exact authoritative <d> dialogue at the appropriate point;
+- make the resulting prose grammatical.
+Do not add new visual observations. Do not add non-dialogue audio.
+Grounding rationale and internal evidence belong only in av_grounding, not in shot1_caption. Do not expose internal grounding fields or evidence codes in consumer-facing prose.
+The pipeline owns [Shot 1]; do not emit shot markers, timestamps or placeholders.
 
 SPEAKER MARKERS
 - Number stable (Sx) by final groups' first transcribed appearance. Referenced visible speakers use <Subject N> (Sx); unbound sources use a natural semantic source plus (Sx). No fixed says clause or immediate adjacency is required.

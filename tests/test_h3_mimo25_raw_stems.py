@@ -16,6 +16,7 @@ from r2v_data_v2.h3.mimo25_backend import (
     MIMO25_BACKEND_VERSION,
     MIMO25_PROMPT_VERSION,
     SYSTEM_PROMPT,
+    VISUAL_SYSTEM_PROMPT,
     MimoAuxAudioDescription,
     MimoAVAnnotationDraft,
     MimoBackendConfig,
@@ -50,7 +51,7 @@ def _subset_inventory(base, clip_ids):
 
 
 def test_finalizer_uses_auxiliary_hints_without_evidence_gates():
-    assert MIMO25_PROMPT_VERSION == "h3_mimo25_speech_assembly_v41"
+    assert MIMO25_PROMPT_VERSION == "h3_mimo25_speech_assembly_v42"
     assert "AUXILIARY AUDIO EVIDENCE" not in SYSTEM_PROMPT
     assert "useful hints, not mandatory truth" in AUDIO_FINALIZE_SYSTEM_PROMPT
     assert "primary audio authority" in AUDIO_FINALIZE_SYSTEM_PROMPT
@@ -59,27 +60,16 @@ def test_finalizer_uses_auxiliary_hints_without_evidence_gates():
         assert old_gate not in AUDIO_FINALIZE_SYSTEM_PROMPT
 
 
-def test_full_shot_visual_coverage_without_word_count_gate():
-    writing = SYSTEM_PROMPT.split("PRIMARY H3 WRITING TASK", 1)[1].split("SPEAKER MARKERS", 1)[0]
+def test_visual_coverage_stays_in_turn1_without_word_count_gate():
     for requirement in (
-        "full detailed_description body", "not a short caption or summary",
-        "ENTIRE target video from beginning to end", "natural playback order",
-        "shot scale, framing, viewpoint, and composition",
-        "appearance, position, orientation", "spatial relationship",
-        "environment, background, foreground, major props, and scene layout",
-        "lighting, color", "static, pan, push, tracking, handheld motion",
-        "gestures, gaze changes, facial-expression changes, posture changes",
-        "object interactions", "state changes in chronological order",
-        "dialogue and speaker markers at the moment they occur",
-        "Preserve the Turn 1 visual facts", "referenced Subjects/Pictures",
-        "single shot is NOT a reason", "Do not stop after describing the opening",
-        "Continue through the end", "concrete observable visual detail",
-        "Do NOT pad", "Do NOT invent psychology, causality, relationships, unseen objects",
-        "No hard word-count requirement", "Avoid repeating the exact same fact",
-        "style_opening: one concise sentence", "pipeline inserts [Shot 1]",
-        "Never output [Shot N], shot timing, or placeholders",
+        "shot scale and framing", "foreground/midground/background composition",
+        "appearance", "lighting and color", "camera motion or clearly static camera",
+        "gaze", "facial expression", "object interactions and state changes",
+        "early through middle to late", "No hard word-count requirement",
     ):
-        assert requirement in writing
+        assert requirement in VISUAL_SYSTEM_PROMPT
+    assert "PRIMARY H3 WRITING TASK" not in SYSTEM_PROMPT
+    assert "SHOT1 CAPTION / DETAILED DESCRIPTION" not in SYSTEM_PROMPT
     values = json.loads(_raw())["h3_semantics"]
     values["shot1_caption"] = "A person stands still."
     assert MimoH3Semantics.model_validate(values).shot1_caption == values["shot1_caption"]
@@ -87,38 +77,19 @@ def test_full_shot_visual_coverage_without_word_count_gate():
 
 
 def test_caption_field_boundaries_and_no_grounding_explanation():
-    for requirement in (
-        "not AV-grounding reasoning or diagnostic explanation",
-        '"indicating", "suggesting", "therefore", "because this means", "may be offscreen", or "may be a voice-over"',
-        "Binding/presentation rationale belongs only in av_grounding",
-        "express the final presentation naturally rather than explaining why it was classified",
-        "Observable lip/action facts may be described when visually relevant",
-        "do not turn them into analytical conclusions",
-    ):
-        assert requirement in SYSTEM_PROMPT
-    assert "relevant diegetic/current audible sound when it naturally belongs" not in SYSTEM_PROMPT
+    assert "Grounding rationale and internal evidence belong only in av_grounding, not in shot1_caption" in SYSTEM_PROMPT
+    assert "Do not expose internal grounding fields or evidence codes in consumer-facing prose" in SYSTEM_PROMPT
+    assert "Do not add non-dialogue audio" in SYSTEM_PROMPT
     assert "An offscreen female voice (S1) says" not in SYSTEM_PROMPT
 
 
-def test_v38_visible_subject_preservation_is_separate_from_speaker_binding():
-    for requirement in (
-        "Every defined ENTITY <Subject N>",
-        "MUST appear with its exact <Subject N> label at its first clear visual appearance",
-        'generic prose such as "a woman", "a man", "the doctor", "the church"',
-        "After first establishment, natural pronouns/descriptions may be used",
-        "profile-view, back-facing, partially occluded, face/mouth occluded, or silent",
-        "Do not drop a visible Subject merely because it is not the speaker",
-        "Attribute-only Subjects do not need mechanical repetition",
-        "Visual presence does NOT by itself assign (Sx)",
-        "write <Subject N> (Sx) at the corresponding vocal event",
-        "preserve the visible <Subject N> in the visual prose and describe the vocal source separately",
-        "Back/profile/occluded mouth is still visible presence and is not equivalent to offscreen",
-        "Full AV may still bind a visible entity when articulation is subtle",
-        "A visible listener must still not inherit speech when the AV clearly indicates another source",
-        "Do NOT create <Audio N> merely because target audio/dialogue/music exists",
-        "Only use an allowed <Audio N> when the input/reference contract actually contains that Audio reference asset",
-    ):
-        assert requirement in SYSTEM_PROMPT
+def test_visual_subject_preservation_remains_in_frozen_turn1():
+    assert "Every defined ENTITY <Subject N> visibly present must use its exact label at first clear appearance" in VISUAL_SYSTEM_PROMPT
+    assert "Visible profile/back/occluded/silent subjects remain visible" in VISUAL_SYSTEM_PROMPT
+    assert "Preserve its visual content and ordering" in SYSTEM_PROMPT
+    assert "If the full AV reasonably indicates that a known visible entity is speaking, bind that entity directly" in SYSTEM_PROMPT
+    assert "A visible listener must still not inherit speech when the AV clearly indicates another source" in SYSTEM_PROMPT
+    assert "Use H3 reference labels ONLY from allowed_h3_reference_labels" in SYSTEM_PROMPT
 
 
 def test_prompt_reference_vocal_and_positive_audio_contracts():
@@ -1230,8 +1201,8 @@ def test_explicit_marker_mismatch_remains_hard_in_backend(tmp_path, monkeypatch)
     assert "direct_dialogue_speaker_marker_mismatch" not in row["diagnostics"][-1]["warnings"]
     assert summary.model_call_count == len(completions.requests) == 6
     assert row["text_model_call_count"] == 1
-    assert backend.provenance.schema_version == MIMO25_BACKEND_VERSION == "r2v.h3.mimo25_backend.50"
-    assert backend.provenance.prompt_version == "h3_mimo25_speech_assembly_v41"
+    assert backend.provenance.schema_version == MIMO25_BACKEND_VERSION == "r2v.h3.mimo25_backend.51"
+    assert backend.provenance.prompt_version == "h3_mimo25_speech_assembly_v42"
 
 
 @pytest.mark.parametrize(
