@@ -28,12 +28,12 @@ from r2v_data_v2.structured_output import (
 
 MIMO25_MODEL = "mimo-v2.5"
 MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
-MIMO25_PROMPT_VERSION = "h3_mimo25_speech_assembly_v42"
-MIMO25_AUDIO_FINALIZE_PROMPT_VERSION = "h3_mimo25_audio_finalize_v1"
+MIMO25_PROMPT_VERSION = "h3_mimo25_speech_assembly_v43"
+MIMO25_AUDIO_FINALIZE_PROMPT_VERSION = "h3_mimo25_audio_finalize_v2"
 MIMO25_VISUAL_PROMPT_VERSION = "h3_mimo25_visual_only_v2"
 MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v17"
 MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.20"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.51"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.52"
 MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION = "h3_mimo25_speaker_marker_polish_v4"
 MIMO25_ICL_VERSION = "h3_official_ref2va_detailed_shot1_v4"
 MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v23"
@@ -917,8 +917,8 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.51"] = MIMO25_BACKEND_VERSION
-    audio_finalize_prompt_version: Literal["h3_mimo25_audio_finalize_v1"] = (
+    schema_version: Literal["r2v.h3.mimo25_backend.52"] = MIMO25_BACKEND_VERSION
+    audio_finalize_prompt_version: Literal["h3_mimo25_audio_finalize_v2"] = (
         MIMO25_AUDIO_FINALIZE_PROMPT_VERSION
     )
     visual_prompt_version: Literal["h3_mimo25_visual_only_v2"] = MIMO25_VISUAL_PROMPT_VERSION
@@ -942,7 +942,7 @@ class MimoBackendProvenance(SchemaModel):
     media_mode: Literal["base64", "http"]
     media_root: str
     media_base_url: str | None = None
-    prompt_version: Literal["h3_mimo25_speech_assembly_v42"] = (
+    prompt_version: Literal["h3_mimo25_speech_assembly_v43"] = (
         MIMO25_PROMPT_VERSION
     )
     policy_version: Literal["h3_mimo25_av_authority_contract_v17"] = (
@@ -1294,6 +1294,7 @@ AUDIO + AV GROUNDING
 - Stage B identifies acoustic speakers as contiguous gN by first appearance, not turns. Pauses, language, sentences, ASR, or segment boundaries alone never create groups. Record vocal_composition, delivery, secondary_vocal_activity, and non-speech evidence, without entity identity or spatial presentation.
 - Multiple vocal sounds are valid observations; use needs_acoustic_refinement if primary identity is unsafe. Each transcribed segment needs nonempty delivery_style; non-transcribed segments use null. Voice profiles cover resolved transcribed groups in first-appearance order with supported acoustic traits, not transcript or identity claims.
 - Original AV is the sound authority.
+- Keep binding_status, speech_presentation and entity_id semantically consistent. If the vocal source is judged offscreen: binding_status=offscreen, speech_presentation=offscreen_spoken, entity_id=null; represent the vocal source separately from visible Subjects in shot1_caption. If a visible entity is judged to be the speaker: binding_status=visible_entity, speech_presentation=onscreen_spoken, entity_id=that visible entity.
 - Stage C preserves each Stage B primary group. Stage B acoustic grouping remains evidence, but resolution == resolved is NOT a prerequisite for final visible binding. Single, likely-single, or ordinary uncertain acoustic evidence may receive a direct final AV visible binding; confirmed transcribed overlapping/sequential multi-speaker speech remains excluded from identity publication.
 - Offscreen is spatial, not a lack of supporting evidence. offscreen_spoken requires offscreen/null entity/offscreen_audio; voice_over requires null/voice_over_context; device_playback requires null/device_playback_context; message_voice_over requires null/message_text_alignment/voice_over_context. Do not infer offscreen from missing supporting evidence.
 - direct_anchor_present without explicit LR-ASD conflict is a strong prior, overridden only by current-segment AV contradiction. LR-ASD support is not required to recover a true visible speaker. The same reliably resolved visible entity reuses one group; split/merge source clusters only with AV support.
@@ -1313,6 +1314,7 @@ Only make the minimum edits needed to:
 - insert exact authoritative <d> dialogue at the appropriate point;
 - make the resulting prose grammatical.
 Do not add new visual observations. Do not add non-dialogue audio.
+Do not attach (Sx) to a visible Subject when the final AV judgment says the voice is offscreen. Keep the visible Subject in the visual prose and introduce the offscreen vocal source separately.
 Grounding rationale and internal evidence belong only in av_grounding, not in shot1_caption. Do not expose internal grounding fields or evidence codes in consumer-facing prose.
 The pipeline owns [Shot 1]; do not emit shot markers, timestamps or placeholders.
 
@@ -1330,6 +1332,7 @@ SPEAKER MARKERS
 AUDIO_FINALIZE_SYSTEM_PROMPT = """Finalize ONLY non-dialogue audio presentation.
 The previous assistant response owns visual content, exact <d> dialogue, Sx and speaker identity. Do not change those facts or re-decide grounding.
 Use the original target AV as the primary audio authority. The two separator descriptions are useful hints, not mandatory truth. Make the best direct factual audiovisual judgment.
+If music is audibly present in the original target AV, preserve it in the appropriate final field: audience-only/background score in non_diegetic_music; in-scene/diegetic music in shot1_caption. Do not output N/A for music that is clearly audible in the original target AV.
 Final placement:
 - Continuous ambience / room tone / hum / rumble / general environmental sound -> overall_soundscape.
 - Audience-only background score/music -> non_diegetic_music.

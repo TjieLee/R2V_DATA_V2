@@ -51,7 +51,7 @@ def _subset_inventory(base, clip_ids):
 
 
 def test_finalizer_uses_auxiliary_hints_without_evidence_gates():
-    assert MIMO25_PROMPT_VERSION == "h3_mimo25_speech_assembly_v42"
+    assert MIMO25_PROMPT_VERSION == "h3_mimo25_speech_assembly_v43"
     assert "AUXILIARY AUDIO EVIDENCE" not in SYSTEM_PROMPT
     assert "useful hints, not mandatory truth" in AUDIO_FINALIZE_SYSTEM_PROMPT
     assert "primary audio authority" in AUDIO_FINALIZE_SYSTEM_PROMPT
@@ -1201,8 +1201,8 @@ def test_explicit_marker_mismatch_remains_hard_in_backend(tmp_path, monkeypatch)
     assert "direct_dialogue_speaker_marker_mismatch" not in row["diagnostics"][-1]["warnings"]
     assert summary.model_call_count == len(completions.requests) == 6
     assert row["text_model_call_count"] == 1
-    assert backend.provenance.schema_version == MIMO25_BACKEND_VERSION == "r2v.h3.mimo25_backend.51"
-    assert backend.provenance.prompt_version == "h3_mimo25_speech_assembly_v42"
+    assert backend.provenance.schema_version == MIMO25_BACKEND_VERSION == "r2v.h3.mimo25_backend.52"
+    assert backend.provenance.prompt_version == "h3_mimo25_speech_assembly_v43"
 
 
 @pytest.mark.parametrize(

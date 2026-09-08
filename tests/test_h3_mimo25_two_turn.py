@@ -248,10 +248,7 @@ def test_turn2_is_minimal_speech_integration_without_visual_priming():
     assert len(prompt) < 8000  # Prompt cleanup only, not a generated-caption length gate.
 
 
-def test_turn3_prompt_and_both_assembly_schemas_are_frozen():
-    assert hashlib.sha256(mb.AUDIO_FINALIZE_SYSTEM_PROMPT.encode()).hexdigest() == (
-        "7218c8074f36f8f211ffee8711c179ca72c0216ad3c7a02af90ca4c3f5c3d019"
-    )
+def test_both_assembly_schemas_remain_frozen():
     for schema, digest in (
         (mb.MimoSpeechAVAssemblyDraft, "d0382d939597478c30b23a5b791641fbde93984ecf74ca427c23cbe95e456aa5"),
         (mb.MimoAudioFinalizeDraft, "82967c3b5918b051613dbe6c5cae774469cf34066e1a570e408e60a485c54239"),
@@ -323,14 +320,14 @@ def test_cache_is_diagnostic_only_and_three_turn_provenance_is_fingerprinted(tmp
     assert result.model_call_count == 3
     assert [d.usage.cached_tokens for d in result.diagnostics] == [cached_tokens] * 3
     provenance = backend.provenance
-    assert provenance.schema_version == "r2v.h3.mimo25_backend.51"
-    assert provenance.prompt_version == "h3_mimo25_speech_assembly_v42"
+    assert provenance.schema_version == "r2v.h3.mimo25_backend.52"
+    assert provenance.prompt_version == "h3_mimo25_speech_assembly_v43"
     assert provenance.visual_prompt_version == "h3_mimo25_visual_only_v2"
     assert provenance.materializer_version == "h3_mimo25_materializer_v23"
     assert provenance.policy_version == "h3_mimo25_av_authority_contract_v17"
     values = provenance.model_dump(mode="json", exclude={"configuration_fingerprint"})
     assert provenance.configuration_fingerprint == mb._sha256_text(mb._compact_json(values))
-    assert provenance.audio_finalize_prompt_version == "h3_mimo25_audio_finalize_v1"
+    assert provenance.audio_finalize_prompt_version == "h3_mimo25_audio_finalize_v2"
     del values["audio_finalize_prompt_version"]
     assert provenance.configuration_fingerprint != mb._sha256_text(mb._compact_json(values))
 
@@ -382,3 +379,48 @@ def test_intermediate_schema_rejects_other_turn_fields(schema, foreign_field):
     payload[foreign_field] = {}
     with pytest.raises(ValidationError, match="Extra inputs"):
         schema.model_validate(payload)
+
+
+def test_spatial_presentation_and_audible_music_prompt_contract():
+    speech = mb.SYSTEM_PROMPT
+    for rule in (
+        "Keep binding_status, speech_presentation and entity_id semantically consistent",
+        "If the vocal source is judged offscreen: binding_status=offscreen, speech_presentation=offscreen_spoken, entity_id=null",
+        "represent the vocal source separately from visible Subjects in shot1_caption",
+        "If a visible entity is judged to be the speaker: binding_status=visible_entity, speech_presentation=onscreen_spoken, entity_id=that visible entity",
+        "Do not attach (Sx) to a visible Subject when the final AV judgment says the voice is offscreen",
+        "Keep the visible Subject in the visual prose and introduce the offscreen vocal source separately",
+        "supporting clues, NOT mandatory prerequisites",
+        "bind that entity directly",
+    ):
+        assert rule in speech
+    for forbidden in ("lips", "mouth", "articulation", "visible_lip_motion", "no_visible_lip_motion"):
+        assert forbidden not in speech
+    finalize = mb.AUDIO_FINALIZE_SYSTEM_PROMPT
+    for rule in (
+        "If music is audibly present in the original target AV, preserve it in the appropriate final field",
+        "audience-only/background score in non_diegetic_music",
+        "in-scene/diegetic music in shot1_caption",
+        "Do not output N/A for music that is clearly audible in the original target AV",
+        "useful hints, not mandatory truth",
+        "original target AV as the primary audio authority",
+    ):
+        assert rule in finalize
+    for forbidden in ("unless", "threshold", "confidence gate"):
+        assert forbidden not in finalize
+
+
+def test_correction_rules_reach_only_their_owning_request(tmp_path):
+    responses = split_annotation(_annotation().model_dump_json())
+    backend, calls = _backend(tmp_path, [(raw, 8) for raw in responses])
+    result = _run(backend, _job_fixture(tmp_path))
+    first, second, third = calls.requests
+    consistency = "Keep binding_status, speech_presentation and entity_id semantically consistent"
+    music = "Do not output N/A for music that is clearly audible in the original target AV"
+    assert consistency not in json.dumps(first["messages"])
+    assert consistency in second["messages"][-1]["content"]
+    assert music not in second["messages"][-1]["content"]
+    assert music in third["messages"][-1]["content"]
+    assert consistency not in third["messages"][-1]["content"]
+    assert result.model_call_count == len(calls.requests) == 3
+    assert result.recheck_count == result.http_retry_count == 0
