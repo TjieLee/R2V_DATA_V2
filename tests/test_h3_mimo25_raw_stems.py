@@ -48,7 +48,7 @@ def _subset_inventory(base, clip_ids):
 
 
 def test_final_av_prompt_preserves_positive_auxiliary_observations():
-    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v35"
+    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v36"
     assert "FACTUAL CONTRADICTION FILTER" in SYSTEM_PROMPT
     assert "NOT A REQUIREMENT TO RE-PROVE EVERY AUXILIARY DETAIL" in SYSTEM_PROMPT
     assert "Preserve positive observations by default" in SYSTEM_PROMPT
@@ -62,7 +62,34 @@ def test_final_av_prompt_preserves_positive_auxiliary_observations():
     assert "unless the original AV supports them" not in SYSTEM_PROMPT
 
 
-def test_v35_prompt_reference_vocal_and_positive_audio_contracts():
+def test_v36_full_shot_visual_coverage_without_word_count_gate():
+    writing = SYSTEM_PROMPT.split("PRIMARY H3 WRITING TASK", 1)[1].split("SPEAKER MARKERS", 1)[0]
+    for requirement in (
+        "full detailed_description body", "not a short caption or summary",
+        "ENTIRE target video from beginning to end", "natural playback order",
+        "shot scale, framing, viewpoint, and composition",
+        "appearance, position, orientation", "spatial relationship",
+        "environment, background, foreground, major props, and scene layout",
+        "lighting, color", "static, pan, push, tracking, handheld motion",
+        "gestures, gaze changes, facial-expression changes, posture changes",
+        "object interactions", "state changes in chronological order",
+        "dialogue and speaker markers at the moment they occur",
+        "relevant diegetic/current audible sound", "referenced Subjects/Pictures",
+        "single shot is NOT a reason", "Do not stop after describing the opening",
+        "Continue through the end", "concrete observable visual detail",
+        "Do NOT pad", "Do NOT invent psychology, causality, relationships, unseen objects",
+        "No hard word-count requirement", "Avoid repeating the exact same fact",
+        "style_opening: one concise sentence", "pipeline inserts [Shot 1]",
+        "Never output [Shot N], shot timing, or placeholders",
+    ):
+        assert requirement in writing
+    values = json.loads(_raw())["h3_semantics"]
+    values["shot1_caption"] = "A person stands still."
+    assert MimoH3Semantics.model_validate(values).shot1_caption == values["shot1_caption"]
+    assert MimoH3Semantics.model_json_schema()["properties"]["shot1_caption"]["minLength"] == 1
+
+
+def test_prompt_reference_vocal_and_positive_audio_contracts():
     assert "VISIBLE SPEAKER BINDING" in SYSTEM_PROMPT
     assert "supporting clues, NOT mandatory prerequisites" in SYSTEM_PROMPT
     assert "Absence of supporting evidence is NOT a contradiction" in SYSTEM_PROMPT
@@ -1103,8 +1130,8 @@ def test_explicit_marker_mismatch_remains_hard_in_backend(tmp_path, monkeypatch)
     assert "direct_dialogue_speaker_marker_mismatch" not in row["diagnostics"][-1]["warnings"]
     assert summary.model_call_count == len(completions.requests) == 4
     assert row["text_model_call_count"] == 1
-    assert backend.provenance.schema_version == MIMO25_BACKEND_VERSION == "r2v.h3.mimo25_backend.43"
-    assert backend.provenance.prompt_version == "h3_mimo25_unified_av_reconcile_v35"
+    assert backend.provenance.schema_version == MIMO25_BACKEND_VERSION == "r2v.h3.mimo25_backend.44"
+    assert backend.provenance.prompt_version == "h3_mimo25_unified_av_reconcile_v36"
 
 
 @pytest.mark.parametrize(

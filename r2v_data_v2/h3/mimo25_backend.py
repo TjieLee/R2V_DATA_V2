@@ -28,10 +28,10 @@ from r2v_data_v2.structured_output import (
 
 MIMO25_MODEL = "mimo-v2.5"
 MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
-MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v35"
+MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v36"
 MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v17"
 MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.20"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.43"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.44"
 MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION = "h3_mimo25_speaker_marker_polish_v4"
 MIMO25_ICL_VERSION = "h3_official_ref2va_detailed_shot1_v2"
 MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v23"
@@ -891,7 +891,7 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.43"] = MIMO25_BACKEND_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.44"] = MIMO25_BACKEND_VERSION
     speaker_marker_polish_prompt_version: Literal["h3_mimo25_speaker_marker_polish_v4"] = (
         MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION
     )
@@ -912,7 +912,7 @@ class MimoBackendProvenance(SchemaModel):
     media_mode: Literal["base64", "http"]
     media_root: str
     media_base_url: str | None = None
-    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v35"] = (
+    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v36"] = (
         MIMO25_PROMPT_VERSION
     )
     policy_version: Literal["h3_mimo25_av_authority_contract_v17"] = (
@@ -1255,7 +1255,30 @@ AUXILIARY AUDIO EVIDENCE
 PRIMARY H3 WRITING TASK
 - This pilot is exactly one shot. Write style_opening and shot1_caption; the pipeline inserts [Shot 1]. Never output [Shot N], shot timing, or placeholders.
 - style_opening: one concise sentence about global visual/cinematographic style, camera language, and lighting only. Do not summarize people, clothing, scene contents, Subjects, actions, chronology, dialogue, or audio.
-- shot1_caption: complete natural English audiovisual prose in playback order. Integrate visible setup, actions, dialogue, and reactions where they occur; do not append all dialogue at the end.
+
+SHOT1 CAPTION / DETAILED DESCRIPTION
+- shot1_caption is the full detailed_description body for this single-shot clip, not a short caption or summary.
+- Observe the ENTIRE target video from beginning to end before writing.
+- Describe the shot in natural playback order using natural English audiovisual prose, with enough visual detail to reconstruct what is actually seen and how it changes.
+For the shot, cover the observable dimensions that are present:
+1. shot scale, framing, viewpoint, and composition;
+2. each important visible subject's appearance, position, orientation, and spatial relationship to other subjects/objects;
+3. environment, background, foreground, major props, and scene layout;
+4. lighting, color, and clearly visible visual atmosphere;
+5. camera behavior: static, pan, push, tracking, handheld motion, etc.;
+6. visible actions, gestures, gaze changes, facial-expression changes, posture changes, object interactions, and other state changes in chronological order;
+7. dialogue and speaker markers at the moment they occur; do not append all dialogue at the end;
+8. relevant diegetic/current audible sound when it naturally belongs in the shot description;
+9. where referenced Subjects/Pictures actually appear or affect the shot.
+Important:
+- A single shot is NOT a reason to make the description short.
+- Do not stop after describing the opening composition and dialogue.
+- Continue through the end of the clip and describe meaningful visible developments and reactions.
+- Prefer concrete observable visual detail over plot summary or interpretation.
+- Do NOT pad the description with invented details just to make it longer.
+- Do NOT invent psychology, causality, relationships, unseen objects, camera motion, lighting changes, or actions that are not observable.
+- No hard word-count requirement. Detail should scale with actual information visible in the clip.
+- Avoid repeating the exact same fact merely to increase length.
 
 SPEAKER MARKERS
 - Number stable (Sx) by final groups' first transcribed appearance. Referenced visible speakers use <Subject N> (Sx); unbound sources use a natural semantic source plus (Sx). No fixed says clause or immediate adjacency is required.
