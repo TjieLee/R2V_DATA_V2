@@ -28,12 +28,12 @@ from r2v_data_v2.structured_output import (
 
 MIMO25_MODEL = "mimo-v2.5"
 MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
-MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v36"
+MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v37"
 MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v17"
 MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.20"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.44"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.45"
 MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION = "h3_mimo25_speaker_marker_polish_v4"
-MIMO25_ICL_VERSION = "h3_official_ref2va_detailed_shot1_v2"
+MIMO25_ICL_VERSION = "h3_official_ref2va_detailed_shot1_v3"
 MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v23"
 MIMO25_CANONICAL_ABSENT_SOUNDSCAPE = (
     "No distinct environmental, mechanical, physical, or non-verbal human "
@@ -891,7 +891,7 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.44"] = MIMO25_BACKEND_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.45"] = MIMO25_BACKEND_VERSION
     speaker_marker_polish_prompt_version: Literal["h3_mimo25_speaker_marker_polish_v4"] = (
         MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION
     )
@@ -904,7 +904,7 @@ class MimoBackendProvenance(SchemaModel):
     video_fps: Literal[4.0] = 4.0
     media_resolution: Literal["default"] = "default"
     thinking: MimoThinkingContract
-    icl_version: Literal["h3_official_ref2va_detailed_shot1_v2"] | None
+    icl_version: Literal["h3_official_ref2va_detailed_shot1_v3"] | None
     temperature: float = Field(ge=0, allow_inf_nan=False)
     max_completion_tokens: int = Field(gt=0)
     response_format: Literal["json_object", "json_schema"]
@@ -912,7 +912,7 @@ class MimoBackendProvenance(SchemaModel):
     media_mode: Literal["base64", "http"]
     media_root: str
     media_base_url: str | None = None
-    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v36"] = (
+    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v37"] = (
         MIMO25_PROMPT_VERSION
     )
     policy_version: Literal["h3_mimo25_av_authority_contract_v17"] = (
@@ -1268,7 +1268,7 @@ For the shot, cover the observable dimensions that are present:
 5. camera behavior: static, pan, push, tracking, handheld motion, etc.;
 6. visible actions, gestures, gaze changes, facial-expression changes, posture changes, object interactions, and other state changes in chronological order;
 7. dialogue and speaker markers at the moment they occur; do not append all dialogue at the end;
-8. relevant diegetic/current audible sound when it naturally belongs in the shot description;
+8. Only localized diegetic or shot-synchronized sound events that need to appear at a specific point in playback order belong in shot1_caption;
 9. where referenced Subjects/Pictures actually appear or affect the shot.
 Important:
 - A single shot is NOT a reason to make the description short.
@@ -1279,6 +1279,15 @@ Important:
 - Do NOT invent psychology, causality, relationships, unseen objects, camera motion, lighting changes, or actions that are not observable.
 - No hard word-count requirement. Detail should scale with actual information visible in the clip.
 - Avoid repeating the exact same fact merely to increase length.
+- Continuous ambience / room tone / hum / rumble belongs only in overall_soundscape.
+- Audience-only score/background music belongs only in non_diegetic_music.
+- Do not summarize overall_soundscape or non_diegetic_music at the end of shot1_caption.
+- Diegetic/in-scene music may remain in shot1_caption at its actual chronological position.
+- shot1_caption states observable audiovisual events, not AV-grounding reasoning or diagnostic explanation.
+- Never explain speaker/source inference with prose such as "indicating", "suggesting", "therefore", "because this means", "may be offscreen", or "may be a voice-over".
+- Binding/presentation rationale belongs only in av_grounding.
+- If a source is determined as offscreen/voice-over, express the final presentation naturally, e.g. "An offscreen female voice (S1) says..." rather than explaining why it was classified that way.
+- Observable lip/action facts may be described when visually relevant, but do not turn them into analytical conclusions.
 
 SPEAKER MARKERS
 - Number stable (Sx) by final groups' first transcribed appearance. Referenced visible speakers use <Subject N> (Sx); unbound sources use a natural semantic source plus (Sx). No fixed says clause or immediate adjacency is required.
@@ -1290,27 +1299,33 @@ SPEAKER MARKERS
 - Required transition: "A man (S1) says, <d>[English] First.</d> A woman (S2) replies, <d>[English] Second.</d>".
 - overall_soundscape: Write only non-musical, non-dialogue audible ambience/SFX. Preserve positive auxiliary observations and useful acoustic detail unless original AV provides a concrete factual contradiction; correct a mistaken source without deleting the sound. Exclude spoken dialogue, singing, and all music. Use "N/A" only when no eligible content remains, not merely because a positive candidate is weak or masked.
 - non_diegetic_music: Write audience-facing background music/score, preserving clearly reported auxiliary music and harmless acoustic wording by default. Use original AV to correct factual errors and determine placement, not to re-prove every detail. If music is diegetic/in-scene, describe it naturally at its observed chronological position in shot1_caption instead and output "N/A" here. Discard music only for concrete factual falsehood or clear leakage/artifact, not merely weak original-mix audibility.
-- The official ICL is a detailed-description prose-style subset, not a response-schema demonstration. Follow the actual supplied schema and official six-section Ref2VA semantics."""
+- The official ICL is an official H3 writing/field-boundary demonstration, not the response-schema definition. Follow the actual supplied schema and official six-section Ref2VA semantics."""
 
 
 def _official_detailed_description_icl_messages() -> list[dict[str, str]]:
-    """Extract the official global opening and first shot without rewriting prose."""
+    """Extract official opening, first shot and audio sections without rewriting prose."""
     path = Path(__file__).resolve().parents[2] / "docs/VIDEO_PROMPT_WRITING_GUIDE_ref_en.md"
     guide = path.read_text(encoding="utf-8")
     section = guide.split("## 7. Complete Example", 1)[1]
     example = section.split("```text\n", 1)[1].split("\n```", 1)[0]
-    detailed = example.split("detailed_description:\n", 1)[1]
+    detailed, audio_sections = example.split("detailed_description:\n", 1)[1].split(
+        "\n\noverall_soundscape:\n", 1,
+    )
+    soundscape, music = audio_sections.split("\n\nnon_diegetic_music:\n", 1)
     opening, shot_body = detailed.split("[Shot 1] ", 1)
     shot_body = shot_body.split("\n[Shot 2]", 1)[0]
     return [
         {"role": "user", "content": (
-            "Style-only MiniMax-H3 Ref2VA demonstration. Show how to write the global "
-            "detailed-description opening and one natural shot body. This example "
-            "demonstrates prose organization only, not the response schema."
+            "This is an official H3 writing/field-boundary demonstration from the "
+            "MiniMax-H3 Ref2VA Complete Example, not the response-schema definition. "
+            "It shows the global style opening, only the first shot body, and the "
+            "separate overall_soundscape and non_diegetic_music sections."
         )},
         {"role": "assistant", "content": _compact_json({
             "style_opening": opening.strip(),
             "shot1_caption": shot_body,
+            "overall_soundscape": soundscape.strip(),
+            "non_diegetic_music": music.strip(),
         })},
     ]
 

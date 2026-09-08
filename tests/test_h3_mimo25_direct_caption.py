@@ -56,15 +56,20 @@ def test_official_example_and_single_av_message_order(tmp_path):
     body = body.split("\n[Shot 2]", 1)[0]
     assert json.loads(messages[2]["content"]) == {
         "style_opening": opening, "shot1_caption": body,
+        "overall_soundscape": example.split("\noverall_soundscape:\n", 1)[1].split("\n\nnon_diegetic_music:\n", 1)[0],
+        "non_diegetic_music": example.split("\nnon_diegetic_music:\n", 1)[1],
     }
+    assert "official H3 writing/field-boundary demonstration" in messages[1]["content"]
+    assert "not the response-schema definition" in messages[1]["content"]
     for excluded in ("subject_definitions:", "summary:", "retention_analysis:",
                      "overall_soundscape:", "non_diegetic_music:", "[Shot 1]", "[Shot 2]", "[Shot 3]"):
         assert excluded not in messages[2]["content"]
-    assert backend.provenance.icl_version == MIMO25_ICL_VERSION == "h3_official_ref2va_detailed_shot1_v2"
-    assert backend.provenance.prompt_version == "h3_mimo25_unified_av_reconcile_v28"
-    assert backend.provenance.schema_version == "r2v.h3.mimo25_backend.31"
-    assert backend.provenance.annotation_schema_version == "r2v.h3.mimo25_av_annotation.18"
-    assert backend.provenance.materializer_version == "h3_mimo25_materializer_v21"
+    assert not re.search(r"\d{2}:\d{2}(?:\.\d+)?", messages[2]["content"])
+    assert backend.provenance.icl_version == MIMO25_ICL_VERSION == "h3_official_ref2va_detailed_shot1_v3"
+    assert backend.provenance.prompt_version == "h3_mimo25_unified_av_reconcile_v37"
+    assert backend.provenance.schema_version == "r2v.h3.mimo25_backend.45"
+    assert backend.provenance.annotation_schema_version == "r2v.h3.mimo25_av_annotation.20"
+    assert backend.provenance.materializer_version == "h3_mimo25_materializer_v23"
     assert "This pilot is exactly one shot." in SYSTEM_PROMPT
     assert "Do not repeat the marker before every utterance" not in SYSTEM_PROMPT
     assert "style_opening: one concise sentence about global visual/cinematographic style" in SYSTEM_PROMPT
