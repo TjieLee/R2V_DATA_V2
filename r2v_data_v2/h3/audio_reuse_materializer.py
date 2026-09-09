@@ -16,6 +16,7 @@ from r2v_data_v2.h3.audio_reuse import (
     AudioReuseManifest,
     MusicReuseAsset,
     SpeakerSpeechReuseAsset,
+    probe_canonical_target_frames,
 )
 from r2v_data_v2.h3.jea_audio_production import jea_production_paths
 from r2v_data_v2.h3.jea_final_renderer import FinalH3SampleV2, FinalQwen3SpeechSegment
@@ -93,7 +94,7 @@ def load_reuse_source(
         or manifest.source_stem_record_fingerprint != stem_record.record_fingerprint
     ):
         raise ValueError("reuse manifest lineage mismatch")
-    frames = _audio_frames(job.target_full_audio_path, job.target_full_audio_sha256)
+    frames = probe_canonical_target_frames(Path(job.target_full_audio_path), job.target_full_audio_sha256)
     if sha256_file(Path(job.target_video_path)) != job.target_video_sha256:
         raise ValueError("reuse target video changed")
     segments = {s.segment_id: s for s in job.segments}

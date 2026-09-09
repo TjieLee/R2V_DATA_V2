@@ -162,13 +162,27 @@ def _fingerprint(value: SchemaModel) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
+def probe_canonical_target_frames(path: Path, expected_hash: str) -> int:
+    """Probe the frozen target timeline without quantizing its sample subtype."""
+    import soundfile as sf
+
+    if not path.is_file() or sha256_file(path) != expected_hash:
+        raise AudioReuseIntegrityError(f"audio_reuse_source_hash_mismatch: {path}")
+    info = sf.info(str(path))
+    if (info.format, info.samplerate, info.channels) != ("FLAC", SAMPLE_RATE, 2):
+        raise AudioReuseIntegrityError(f"audio_reuse_target_requires_32k_stereo_flac: {path}")
+    if info.frames <= 0:
+        raise AudioReuseIntegrityError(f"audio_reuse_invalid_frame_count: {path}")
+    return info.frames
+
+
 def _read_pcm(path: Path, expected_hash: str) -> np.ndarray:
     import soundfile as sf
 
     if not path.is_file() or sha256_file(path) != expected_hash:
         raise AudioReuseIntegrityError(f"audio_reuse_source_hash_mismatch: {path}")
     info = sf.info(str(path))
-    if (info.samplerate, info.channels, info.subtype) != (SAMPLE_RATE, 2, "PCM_16"):
+    if (info.samplerate, info.channels, info.subtype, info.format) != (SAMPLE_RATE, 2, "PCM_16", "FLAC"):
         raise AudioReuseIntegrityError(f"audio_reuse_requires_32k_stereo_pcm16: {path}")
     pcm, _ = sf.read(str(path), dtype="int16", always_2d=True)
     if not len(pcm) or len(pcm) != info.frames:
@@ -241,8 +255,7 @@ def build_audio_reuse_assets(
         if path.is_relative_to(output):
             raise ValueError("audio reuse output cannot contain source media")
         sources[path] = stem.canonical_stem_sha256
-    target_pcm = _read_pcm(target, job.target_full_audio_sha256)
-    frames = len(target_pcm)
+    frames = probe_canonical_target_frames(target, job.target_full_audio_sha256)
     if abs(frames / SAMPLE_RATE - job.target_duration_seconds) > STEM_ALIGNMENT_TOLERANCE_SECONDS:
         raise AudioReuseIntegrityError("audio_reuse_job_target_timeline_mismatch")
     speech_pcm = _check_stem(speech, target, job.target_full_audio_sha256, frames)

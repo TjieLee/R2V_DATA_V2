@@ -29,10 +29,10 @@ from tests.test_h3_mimo25_av_shadow import _record_fixture, _sample
 
 
 def _case(tmp_path, groups=("g1",), *, music="N/A", offscreen=False, clip="clip-1", composition=None,
-          text="Exact, text!", profile="Target bright voice", all_visible=False):
+          text="Exact, text!", profile="Target bright voice", all_visible=False, target_subtype="PCM_16"):
     tmp_path.mkdir(parents=True, exist_ok=True)
     intervals = [(i * .3, i * .3 + .2, group) for i, group in enumerate(groups)]
-    args = _fixture(tmp_path, intervals, offscreen=offscreen)
+    args = _fixture(tmp_path, intervals, offscreen=offscreen, target_subtype=target_subtype)
     values = args["job"].model_dump(mode="json")
     values["clip_uid"] = clip
     for segment in values["segments"]:
@@ -344,3 +344,35 @@ def test_late_input_change_cannot_publish_partial_product_stage(tmp_path, monkey
     with pytest.raises(ValueError, match="changed during materialization"):
         product.materialize_audio_reuse_products(**args)
     assert not args["output_root"].exists()
+
+
+def test_pcm24_target_phase2_and_full_audio_reuse_unchanged(tmp_path):
+    import soundfile as sf
+
+    _, sample, source = _case(tmp_path, target_subtype="PCM_24", music="Gentle piano continues.")
+    target = Path(source.job.target_full_audio_path)
+    before = target.read_bytes()
+    refs, _, _, _ = _render(sample, source)
+    assert [r.role for r in refs] == ["speaker_speech_reuse", "music_reuse"]
+    assert all(r.reuse_asset.target_frame_count == sf.info(target).frames for r in refs)
+    contract = build_reference_contract(sample, "full_audio_reuse")
+    assert len(contract.audios) == 1
+    assert contract.audios[0].path == str(target)
+    assert contract.audios[0].sha256 == sha256_file(target)
+    _, prompt, _ = _materialize_sample(sample, source.job, source.record, conditioning_variant="full_audio_reuse")
+    assert _canonical_audio_retention(contract.audios[0]) in prompt
+    assert target.read_bytes() == before
+    assert sf.info(target).subtype == "PCM_24"
+
+
+@pytest.mark.parametrize("media", ["speech", "music", "output"])
+def test_phase2_pcm24_stems_and_assets_remain_rejected(tmp_path, media):
+    import soundfile as sf
+
+    _, _, source = _case(tmp_path, target_subtype="PCM_24")
+    asset = source.manifest.music if media == "music" else source.manifest.speakers[0]
+    path = Path(asset.output_path if media == "output" else asset.source_stem_path)
+    pcm, rate = sf.read(path, dtype="int16", always_2d=True)
+    sf.write(path, pcm, rate, subtype="PCM_24", format="FLAC")
+    with pytest.raises(ValueError, match="PCM16 FLAC"):
+        product._audio_frames(str(path), sha256_file(path))

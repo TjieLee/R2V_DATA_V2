@@ -40,11 +40,14 @@ def _write(path, pcm):
     return sha256_file(path)
 
 
-def _fixture(tmp_path, intervals=((0.1, 0.3, "g1"), (0.9, 1.1, "g1")), *, drift=0, offscreen=False, mixed=False):
+def _fixture(tmp_path, intervals=((0.1, 0.3, "g1"), (0.9, 1.1, "g1")), *, drift=0, offscreen=False, mixed=False,
+             target_subtype="PCM_16", target_format="FLAC", target_rate=32000, target_channels=2):
     production = tmp_path / "production"
     production.mkdir()
     target = production / "target.flac"
-    target_hash = _write(target, _signal(64000))
+    sf.write(str(target), _signal(64000)[:, :target_channels], target_rate,
+             subtype=target_subtype, format=target_format)
+    target_hash = sha256_file(target)
     job = _job_fixture(tmp_path)
     template = _annotation().model_dump(mode="json")
     segments, decisions, groundings, views = [], [], [], []
@@ -377,5 +380,67 @@ def test_missing_segment_decision_fails_closed(tmp_path):
     values["audio_observation"]["segment_decisions"].pop()
     args["annotation"] = MimoAVAnnotationDraft.model_validate(values)
     with pytest.raises(reuse.AudioReuseIntegrityError, match="segment_inventory_mismatch"):
+        reuse.build_audio_reuse_assets(**args)
+    assert not args["output_root"].exists()
+
+
+def test_pcm24_target_is_probed_without_pcm_decode(tmp_path, monkeypatch):
+    args = _fixture(tmp_path, target_subtype="PCM_24")
+    target = Path(args["job"].target_full_audio_path)
+    before = {p: sha256_file(p) for p in args["audio_production_root"].rglob("*") if p.is_file()}
+    original_read = sf.read
+
+    def read_stem_only(path, *a, **kw):
+        assert Path(path) != target, "target timeline must not be decoded to PCM16"
+        return original_read(path, *a, **kw)
+
+    monkeypatch.setattr(sf, "read", read_stem_only)
+    result = reuse.build_audio_reuse_assets(**args)
+    assert sf.info(target).subtype == "PCM_24"
+    for asset in [*result.speakers, result.music]:
+        info = sf.info(asset.output_path)
+        assert (info.frames, info.format, info.samplerate, info.channels, info.subtype) == (
+            sf.info(target).frames, "FLAC", 32000, 2, "PCM_16",
+        )
+        assert asset.target_frame_count == 64000
+    expected = np.zeros((64000, 2), dtype=np.int16)
+    speaker = result.speakers[0]
+    source = _pcm(speaker.source_stem_path)
+    for interval in speaker.source_sample_ranges:
+        start, end = interval.target_start_sample, interval.target_end_sample
+        expected[start:end] = source[start:end]
+    np.testing.assert_array_equal(_pcm(speaker.output_path), expected)
+    np.testing.assert_array_equal(_pcm(result.music.output_path), _pcm(result.music.source_stem_path))
+    assert before == {p: sha256_file(p) for p in before}
+
+
+@pytest.mark.parametrize("options", [
+    {"target_format": "WAV"}, {"target_rate": 16000}, {"target_channels": 1},
+])
+def test_invalid_canonical_target_format_fails(tmp_path, options):
+    args = _fixture(tmp_path, **options)
+    with pytest.raises(reuse.AudioReuseIntegrityError, match="target_requires_32k_stereo_flac"):
+        reuse.build_audio_reuse_assets(**args)
+    assert not args["output_root"].exists()
+
+
+def test_canonical_target_hash_is_verified(tmp_path):
+    args = _fixture(tmp_path, target_subtype="PCM_24")
+    target = Path(args["job"].target_full_audio_path)
+    target.write_bytes(target.read_bytes() + b"changed")
+    with pytest.raises(reuse.AudioReuseIntegrityError, match="hash_mismatch"):
+        reuse.build_audio_reuse_assets(**args)
+
+
+@pytest.mark.parametrize("kind", ["speech", "music"])
+def test_pcm24_stem_rejected_before_generation(tmp_path, kind):
+    args = _fixture(tmp_path, target_subtype="PCM_24")
+    values = args["stem_record"].model_dump(mode="json")
+    stem = next(s for s in values["stems"] if s["stem_type"] == kind)
+    path = Path(stem["canonical_stem_path"])
+    sf.write(path, _pcm(path), 32000, subtype="PCM_24", format="FLAC")
+    stem["canonical_stem_sha256"] = sha256_file(path)
+    args["stem_record"] = _seal(SAMAudioStemRecord, values, "record_fingerprint")
+    with pytest.raises(reuse.AudioReuseIntegrityError, match="requires_32k_stereo_pcm16"):
         reuse.build_audio_reuse_assets(**args)
     assert not args["output_root"].exists()
