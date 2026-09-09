@@ -213,9 +213,76 @@ def test_cross_speaker_overlap_excludes_both_tracks(tmp_path):
 
 def test_production_root_cannot_be_output(tmp_path):
     args = _fixture(tmp_path)
-    for path in (args["audio_production_root"], args["audio_production_root"] / "primary_voice", tmp_path):
+    from r2v_data_v2.h3.jea_audio_production import jea_production_paths
+
+    paths = jea_production_paths(args["audio_production_root"])
+    for path in (paths.root, tmp_path, paths.audio, paths.primary_voice, paths.embedding,
+                 paths.pairs, paths.diarization, paths.asr, paths.h3, paths.h3 / "new-assets"):
         with pytest.raises(ValueError, match="separate"):
             reuse.build_audio_reuse_assets(**{**args, "output_root": path})
+
+
+def test_shadow_output_under_production_is_allowed_and_immutable(tmp_path):
+    args = _fixture(tmp_path)
+    production = args["audio_production_root"]
+    before = {p: sha256_file(p) for p in production.rglob("*") if p.is_file()}
+    output = production / "sam_audio_stem_shadow_v1/runs/pilot/audio_reuse_assets" / args["job"].clip_uid
+    result = reuse.build_audio_reuse_assets(**{**args, "output_root": output})
+    assert result.production_artifacts_modified is False
+    assert result.speakers and (output / "manifest.json").is_file()
+    assert before == {p: sha256_file(p) for p in before}
+    published = {p: sha256_file(p) for p in output.rglob("*") if p.is_file()}
+    with pytest.raises(FileExistsError):
+        reuse.build_audio_reuse_assets(**{**args, "output_root": output})
+    assert published == {p: sha256_file(p) for p in published}
+
+
+def test_source_media_collision_and_symlink_production_collision(tmp_path):
+    args = _fixture(tmp_path)
+    source = Path(args["stem_record"].stem("speech").canonical_stem_path)
+    before = sha256_file(source)
+    with pytest.raises(FileExistsError):
+        reuse.build_audio_reuse_assets(**{**args, "output_root": source})
+    with pytest.raises(ValueError, match="source media"):
+        reuse.build_audio_reuse_assets(**{**args, "output_root": source / "assets"})
+    protected = args["audio_production_root"] / "audio"
+    protected.mkdir()
+    alias = tmp_path / "shadow-alias"
+    alias.symlink_to(protected, target_is_directory=True)
+    with pytest.raises(ValueError, match="production stages"):
+        reuse.build_audio_reuse_assets(**{**args, "output_root": alias / "assets"})
+    assert sha256_file(source) == before
+    assert not (protected / "assets").exists()
+
+
+@pytest.mark.parametrize("group", [None, "g1"])
+@pytest.mark.parametrize("single", [False, True])
+@pytest.mark.parametrize("secondary", [False, True])
+def test_shared_ownership_preserves_legacy_semantic_reasons(group, single, secondary):
+    from r2v_data_v2.h3.mimo25_recovered_voice import _semantic_reasons
+    from r2v_data_v2.h3.speaker_ownership import speaker_ownership_reasons
+
+    annotation = _annotation()
+    original = annotation.audio_observation.segment_decisions[0]
+    decision = original.model_copy(update={
+        "primary_speaker_group": group,
+        "vocal_composition": "single_speaker" if single else "sequential_multi_speaker_speech",
+        "secondary_vocal_activity": original.secondary_vocal_activity.model_copy(update={"present": secondary}),
+    })
+    expected = ([] if group else ["unresolved"])
+    expected += [] if single else ["non_single_speaker"]
+    expected += ["secondary_vocal_activity"] if secondary else []
+    assert speaker_ownership_reasons(decision) == expected
+    grounding = annotation.av_grounding.segment_groundings[0]
+    assert _semantic_reasons(decision, grounding) == expected
+    offscreen = grounding.model_copy(update={
+        "binding_status": "offscreen", "entity_id": None, "speech_presentation": "offscreen_spoken",
+    })
+    assert _semantic_reasons(decision, offscreen) == (
+        ([] if group else ["unresolved"]) + ["not_visible_entity", "not_onscreen_spoken"]
+        + ([] if single else ["non_single_speaker"])
+        + (["secondary_vocal_activity"] if secondary else [])
+    )
 
 
 def test_tampered_source_fails_without_publication(tmp_path):

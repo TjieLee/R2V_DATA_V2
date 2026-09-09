@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import tempfile
+from dataclasses import fields
 from fractions import Fraction
 from pathlib import Path
 from typing import Literal
@@ -12,9 +13,9 @@ from typing import Literal
 import numpy as np
 from pydantic import Field, model_validator
 
+from r2v_data_v2.h3.jea_audio_production import jea_production_paths
 from r2v_data_v2.h3.mimo25_av_reconcile import MimoClipJob
 from r2v_data_v2.h3.mimo25_backend import MimoAVAnnotationDraft, direct_speech_facts
-from r2v_data_v2.h3.mimo25_recovered_voice import _semantic_reasons
 from r2v_data_v2.h3.sam_audio_stem_shadow import (
     STEM_ALIGNMENT_TOLERANCE_SECONDS,
     SAMAudioStemRecord,
@@ -23,6 +24,7 @@ from r2v_data_v2.h3.sam_audio_stem_shadow import (
     sha256_file,
 )
 from r2v_data_v2.h3.schemas import SchemaModel
+from r2v_data_v2.h3.speaker_ownership import speaker_ownership_reasons
 
 SAMPLE_RATE = 32000
 SAMPLE_MAPPING_POLICY = "source_sample_rational_to_32k_round_half_even_v1"
@@ -201,7 +203,7 @@ def build_audio_reuse_assets(
     stem_record: SAMAudioStemRecord, audio_production_root: Path,
     output_root: Path, allow_unverified: bool = False,
 ) -> AudioReuseManifest:
-    """Build one clip into a NEW external shadow directory, never overwrite.
+    """Build one clip into a NEW caller-owned shadow directory, never overwrite.
 
     Call with the finalized annotation and its authoritative stem-reconcile job.
     PCM support requires soundfile/libsndfile. No model/runtime construction occurs.
@@ -211,8 +213,12 @@ def build_audio_reuse_assets(
     stem_record = SAMAudioStemRecord.model_validate(stem_record.model_dump())
     output = output_root.expanduser().resolve()
     production = audio_production_root.expanduser().resolve(strict=True)
-    if output.is_relative_to(production) or production.is_relative_to(output):
-        raise ValueError("audio reuse output must be separate from the production root")
+    paths = jea_production_paths(production)
+    protected = [getattr(paths, field.name).resolve() for field in fields(paths) if field.name != "root"]
+    if production.is_relative_to(output) or any(
+        output.is_relative_to(path) or path.is_relative_to(output) for path in protected
+    ):
+        raise ValueError("audio reuse output must be separate from production stages")
     if output.exists():
         raise FileExistsError(output)
     if stem_record.clip_uid != job.clip_uid or stem_record.separation_state == "failure":
@@ -220,6 +226,13 @@ def build_audio_reuse_assets(
     if stem_record.separation_state != "success" and not allow_unverified:
         raise ValueError("unverified SAM stems require explicit allow_unverified")
     target = Path(job.target_full_audio_path).resolve(strict=True)
+    source_media = [target, Path(job.target_video_path).resolve()]
+    for stem in stem_record.stems:
+        source_media.extend(Path(path).resolve() for path in (
+            stem.source_audio_path, stem.raw_stem_path, stem.canonical_stem_path,
+        ))
+    if any(path.is_relative_to(output) or output.is_relative_to(path) for path in source_media):
+        raise ValueError("audio reuse output cannot contain or overlap source media")
     speech = stem_record.stem("speech")
     music = stem_record.stem("music")
     sources = {target: job.target_full_audio_sha256}
@@ -261,9 +274,7 @@ def build_audio_reuse_assets(
 
     for segment, decision, grounding in zip(job.segments, decisions, groundings, strict=True):
         group = decision.primary_speaker_group
-        # Reuse semantic exclusions, NOT legacy visibility or quality gates.
-        ownership_reasons = [r for r in _semantic_reasons(decision, grounding)
-                             if r in {"unresolved", "non_single_speaker", "secondary_vocal_activity"}]
+        ownership_reasons = speaker_ownership_reasons(decision)
         if not ownership_reasons and grounding.binding_status == "visible_entity" and grounding.entity_id is not None:
             group_entities.setdefault(group, set()).add(grounding.entity_id)
         start = round(Fraction(segment.source_start_sample * SAMPLE_RATE, segment.source_sample_rate_hz))

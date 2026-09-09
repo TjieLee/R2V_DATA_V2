@@ -30,6 +30,7 @@ from r2v_data_v2.h3.mimo25_backend import (
     MimoAVSegmentGrounding,
 )
 from r2v_data_v2.h3.schemas import SchemaModel
+from r2v_data_v2.h3.speaker_ownership import speaker_ownership_reasons
 from r2v_data_v2.h3.voice_quality import _audio_metrics
 
 RECOVERED_VOICE_POLICY_VERSION = "h3_mimo25_recovered_voice_quality_v1"
@@ -328,17 +329,11 @@ def _semantic_reasons(
     audio_decision: MimoAudioSegmentDecision,
     grounding: MimoAVSegmentGrounding,
 ) -> list[RecoveredVoiceReasonCode]:
-    reasons: list[RecoveredVoiceReasonCode] = []
-    if audio_decision.primary_speaker_group is None:
-        reasons.append("unresolved")
+    reasons: list[RecoveredVoiceReasonCode] = list(speaker_ownership_reasons(audio_decision))
     if grounding.binding_status != "visible_entity" or grounding.entity_id is None:
         reasons.append("not_visible_entity")
     if grounding.speech_presentation != "onscreen_spoken":
         reasons.append("not_onscreen_spoken")
-    if audio_decision.vocal_composition != "single_speaker":
-        reasons.append("non_single_speaker")
-    if audio_decision.secondary_vocal_activity.present:
-        reasons.append("secondary_vocal_activity")
     return [code for code in _REASON_ORDER if code in reasons]
 
 

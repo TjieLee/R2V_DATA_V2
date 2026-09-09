@@ -15,8 +15,10 @@ unchanged. Phase 2 requires separate review.
 - `audio_production_root` and a new, separate `output_root`;
 - explicit `allow_unverified=True` for the current unverified SAM pilot outputs.
 
-The output directory must be outside the production root, must not contain source
-media, and must not already exist. One invocation builds one clip. The caller
+The output directory may be in a caller-owned shadow subtree, for example
+`<audio-production-root>/sam_audio_stem_shadow_v1/runs/<run-id>/audio_reuse_assets/<clip-uid>/`.
+It must not overlap production stages or source media, and must not already exist.
+One invocation builds one clip. The caller
 owns clip enumeration and output naming. The function returns an
 `AudioReuseManifest` and atomically publishes `manifest.json`, `Sx_gN.flac` speaker
 tracks and `music.flac`. There is no CLI or production-stage integration.
