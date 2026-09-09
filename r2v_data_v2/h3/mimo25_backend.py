@@ -37,7 +37,7 @@ MIMO25_AUDIO_FINALIZE_PROMPT_VERSION = "h3_mimo25_audio_finalize_v6"
 MIMO25_VISUAL_PROMPT_VERSION = "h3_mimo25_visual_only_v4"
 MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v17"
 MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.20"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.60"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.61"
 MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION = "h3_mimo25_speaker_marker_polish_v4"
 MIMO25_ICL_VERSION = "h3_official_ref2va_detailed_shot1_v4"
 MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v26"
@@ -975,7 +975,7 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.60"] = MIMO25_BACKEND_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.61"] = MIMO25_BACKEND_VERSION
     audio_finalize_prompt_version: Literal["h3_mimo25_audio_finalize_v6"] = (
         MIMO25_AUDIO_FINALIZE_PROMPT_VERSION
     )
@@ -1645,6 +1645,7 @@ _SPEAKER_MARKER_POLISH_ISSUES = frozenset({
     "direct_single_speaker_marker_missing",
     "direct_dialogue_speaker_marker_missing",
     "direct_dialogue_speaker_marker_mismatch",
+    "direct_unknown_speaker",
 })
 
 
@@ -3185,6 +3186,11 @@ class OpenAIMimo25Backend:
                     reason="MiMo audio finalization failed structured validation",
                     issues=tuple(issues),
                 )
+            shot1_caption = assembly.shot1_caption
+            if not any(segment.asr_status == "transcribed" for segment in job.segments):
+                shot1_caption = visual.shot1_visual_description
+                if shot1_caption != assembly.shot1_caption:
+                    corrections["no_transcript_visual_caption_projection"] = 1
             final = {
                 "schema_version": MIMO25_SCHEMA_VERSION,
                 "visual_observation": MimoVisualObservation(
@@ -3206,7 +3212,7 @@ class OpenAIMimo25Backend:
                 "warnings": [item.model_dump(mode="json") for item in assembly.warnings],
                 "h3_semantics": {
                     "summary": assembly.summary,
-                    "shot1_caption": assembly.shot1_caption,
+                    "shot1_caption": shot1_caption,
                     **finalized.model_dump(mode="json"),
                     **visual.model_dump(
                         mode="json", exclude={"segment_views", "shot1_visual_description"},

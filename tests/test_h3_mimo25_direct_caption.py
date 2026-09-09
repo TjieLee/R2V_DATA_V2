@@ -31,6 +31,101 @@ LABELS = {"<Subject 1>", "<Picture 1>"}
 SPEECH = [{"segment_id": "segment_1", "speaker_id": "S1", "language": "English", "text": "Exact, text!"}]
 
 
+@pytest.mark.parametrize("invented", [False, True])
+def test_no_transcript_caption_uses_visual_ownership(tmp_path, invented):
+    job = _job_fixture(tmp_path)
+    job = job.model_copy(update={"segments": [
+        segment.model_copy(update={"asr_status": "empty", "asr_text": None})
+        for segment in job.segments
+    ]})
+    visual, speech, _, finalized = map(json.loads, split_annotation(_annotation().model_dump_json()))
+    visual["shot1_visual_description"] = "VISUAL_ONLY_SENTINEL"
+    speech["shot1_caption"] = (
+        "A voice (S1) says, <d>[English] invented dialogue</d>"
+        if invented else visual["shot1_visual_description"]
+    )
+    speech["audio_observation"]["segment_decisions"][0]["delivery_style"] = None
+    speech_raw = json.dumps(speech)
+    backend, calls = _backend(tmp_path, [(json.dumps(visual), 0), (speech_raw, 8), (json.dumps(finalized), 8)])
+    before = job.model_dump()
+    result = backend.reconcile(
+        job, segment_ids=["segment_1"], transcribed_segment_ids=[],
+        allowed_entity_ids={"e1"}, allowed_reference_labels=LABELS,
+        auxiliary_audio_paths={kind: Path(job.target_full_audio_path) for kind in ("speech", "music", "sfx")},
+    )
+    caption = result.annotation.h3_semantics.shot1_caption
+    assert caption == visual["shot1_visual_description"]
+    assert "(S1)" not in caption and "<d>" not in caption
+    assert result.speech_av_raw_response == speech_raw
+    assert result.annotation.av_grounding.model_dump() == speech["av_grounding"]
+    assert result.annotation.h3_semantics.summary == speech["summary"]
+    assert [d.model_dump() for d in result.annotation.audio_observation.segment_decisions] == speech["audio_observation"]["segment_decisions"]
+    for key, value in finalized.items():
+        assert getattr(result.annotation.h3_semantics, key) == value
+    assert result.deterministic_correction_counts.get("no_transcript_visual_caption_projection", 0) == int(invented)
+    assert result.model_call_count == len(calls.requests) == 3
+    assert result.text_model_call_count == result.audio_model_call_count == 0
+    assert result.speaker_profile_raw_response is None
+    assert not result.speaker_marker_polish.attempted
+    assert job.model_dump() == before
+
+
+def test_unknown_sx_uses_marker_polish_without_changing_dialogue(tmp_path):
+    visual, speech, profile, finalized = map(json.loads, split_annotation(_annotation().model_dump_json()))
+    original = "(S2) says, <d>[English] Exact, text!</d>"
+    candidate = "(S1) says, <d>[English] Exact, text!</d>"
+    speech["shot1_caption"] = original
+    responses = [json.dumps(item) for item in (visual, speech, profile, finalized)]
+    responses.append(json.dumps({"shot1_caption": candidate, "needs_review": False}))
+    backend, calls = _backend(tmp_path, [(raw, 8) for raw in responses])
+    result = _run(backend, _job_fixture(tmp_path))
+    assert result.speaker_marker_polish.attempted and result.speaker_marker_polish.applied
+    assert result.text_model_call_count == 1 and result.model_call_count == len(calls.requests) == 5
+    assert result.annotation.h3_semantics.shot1_caption == candidate
+    assert result.speech_av_raw_response == responses[1]
+    assert re.findall(r"<d>.*?</d>", original) == re.findall(r"<d>.*?</d>", candidate)
+    assert original.replace("(S2)", "") == candidate.replace("(S1)", "")
+    _, issues, _ = protect_direct_dialogue(candidate, SPEECH, allowed_labels=LABELS)
+    assert not issues
+    payload = json.loads(calls.requests[-1]["messages"][-1]["content"])
+    assert "direct_unknown_speaker" in payload["speaker_marker_projection_issues"]
+    assert payload["dialogue_marker_targets"] == [{"dialogue_index": 1, "speaker_id": "S1"}]
+
+
+def test_transcribed_job_with_missing_decision_does_not_use_visual_caption(tmp_path):
+    visual, speech, _, finalized = map(json.loads, split_annotation(_annotation().model_dump_json()))
+    visual["shot1_visual_description"] = "VISUAL_ONLY_SENTINEL"
+    speech["audio_observation"]["segment_decisions"] = []
+    responses = [json.dumps(item) for item in (visual, speech, finalized)]
+    backend, calls = _backend(tmp_path, [(raw, 8) for raw in responses])
+    with pytest.raises(MimoBackendFailure) as caught:
+        _run(backend, _job_fixture(tmp_path))
+    assert "segment_inventory_mismatch" in {issue.code for issue in caught.value.issues}
+    assert caught.value.annotation.h3_semantics.shot1_caption == speech["shot1_caption"]
+    assert caught.value.model_call_count == len(calls.requests) == 3
+    assert caught.value.text_model_call_count == 0
+
+
+@pytest.mark.parametrize("failure", ["unaligned", "unrelated"])
+def test_unknown_sx_still_fails_closed_outside_polish_scope(tmp_path, failure):
+    visual, speech, profile, finalized = map(json.loads, split_annotation(_annotation().model_dump_json()))
+    speech["shot1_caption"] = "(S2) says, <d>[English] Exact, text!</d>"
+    if failure == "unaligned":
+        speech["shot1_caption"] += " then <d>[English] extra</d>"
+    else:
+        speech["summary"] = "<Subject 99> stands in the room."
+    responses = [json.dumps(item) for item in (visual, speech, profile, finalized)]
+    backend, calls = _backend(tmp_path, [(raw, 8) for raw in responses])
+    with pytest.raises(MimoBackendFailure) as caught:
+        _run(backend, _job_fixture(tmp_path))
+    assert "direct_unknown_speaker" in {issue.code for issue in caught.value.issues}
+    if failure == "unrelated":
+        assert "direct_unknown_reference" in {issue.code for issue in caught.value.issues}
+    assert not caught.value.speaker_marker_polish.attempted
+    assert caught.value.text_model_call_count == 0
+    assert caught.value.model_call_count == len(calls.requests) == 4
+
+
 def _run(backend, job):
     return backend.reconcile(
         job, segment_ids=["segment_1"], transcribed_segment_ids=["segment_1"],
@@ -96,7 +191,7 @@ def test_official_examples_preserved_in_two_turn_prefix(tmp_path):
         assert "Case 1: T2VA" not in message["content"]
     assert backend.provenance.icl_version == MIMO25_ICL_VERSION == "h3_official_ref2va_detailed_shot1_v4"
     assert backend.provenance.prompt_version == "h3_mimo25_speech_assembly_v46"
-    assert backend.provenance.schema_version == "r2v.h3.mimo25_backend.60"
+    assert backend.provenance.schema_version == "r2v.h3.mimo25_backend.61"
     assert backend.provenance.annotation_schema_version == "r2v.h3.mimo25_av_annotation.20"
     assert backend.provenance.materializer_version == "h3_mimo25_materializer_v26"
     assert "The pipeline owns [Shot 1]" in SYSTEM_PROMPT

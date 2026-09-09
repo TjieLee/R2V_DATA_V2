@@ -115,7 +115,7 @@ def test_polish_applies_only_sx_and_rescues_marker_projection(
 
 def test_polish_v4_prompt_makes_aligned_speaker_projection_unambiguous():
     assert mb.MIMO25_PROMPT_VERSION == "h3_mimo25_speech_assembly_v46"
-    assert mb.MIMO25_BACKEND_VERSION == "r2v.h3.mimo25_backend.60"
+    assert mb.MIMO25_BACKEND_VERSION == "r2v.h3.mimo25_backend.61"
     assert mb.MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION == "h3_mimo25_speaker_marker_polish_v4"
     prompt = mb.SPEAKER_MARKER_POLISH_PROMPT
     assert "exactly one distinct speaker_id" in prompt
@@ -250,7 +250,6 @@ def test_raw_downgrade_preserves_evidence_uniqueness_and_capacity(evidence):
 
 @pytest.mark.parametrize("original,code", [
     (SINGLE_FIXED, None),
-    ("(S2)<d>[Chinese] a</d>", "direct_unknown_speaker"),
     ("<Audio 1> says <d>[Chinese] a</d>", "direct_unknown_reference"),
     ("She says <d>[Chinese] a", "direct_dialogue_format"),
     ("She says <d>a</d>", "direct_dialogue_language_missing"),

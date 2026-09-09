@@ -438,7 +438,7 @@ def test_cache_is_diagnostic_only_and_four_stage_provenance_is_fingerprinted(tmp
     assert result.model_call_count == 4
     assert [d.usage.cached_tokens for d in result.diagnostics] == [cached_tokens] * 4
     provenance = backend.provenance
-    assert provenance.schema_version == "r2v.h3.mimo25_backend.60"
+    assert provenance.schema_version == "r2v.h3.mimo25_backend.61"
     assert provenance.prompt_version == "h3_mimo25_speech_assembly_v46"
     assert provenance.visual_prompt_version == "h3_mimo25_visual_only_v4"
     assert provenance.materializer_version == "h3_mimo25_materializer_v26"

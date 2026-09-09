@@ -658,7 +658,9 @@ def test_direct_format_hard_gates_keep_parseable_annotation(tmp_path, monkeypatc
     assert row["status"] == "failed" and row["annotation"] is not None
     assert issue in {item["code"] for item in row["failure_issues"]}
     assert row["annotation"]["h3_semantics"]["shot1_caption"] == caption
-    assert summary.model_call_count == len(completions.requests) == 4
+    text_calls = int(issue == "direct_unknown_speaker")
+    assert summary.text_model_call_count == text_calls
+    assert summary.model_call_count == len(completions.requests) == 4 + text_calls
 
 
 @pytest.mark.parametrize("has_transcribed,empty_inventory", [(False, True), (False, False), (True, False)])
@@ -706,7 +708,8 @@ def test_segment_inventory_is_review_only_without_transcribed_speech(
             ),
         )
         assert corrected == []
-        assert payload["h3_semantics"]["shot1_caption"] in text
+        assert payload["visual_observation"]["visual_blocks"][0]["text"] in text
+        assert "deterministic_correction:no_transcript_visual_caption_projection" in row["diagnostics"][-1]["warnings"]
         assert "overall_soundscape:\nA quiet room tone and a clink." in text
     assert row["annotation"]["audio_observation"]["segment_decisions"][0]["segment_id"] == "extra_segment"
     assert summary.model_call_count == len(completions.requests) == 3
@@ -1106,10 +1109,7 @@ def test_marker_severity_uses_distinct_authoritative_speakers(
     assert row["annotation"]["h3_semantics"]["shot1_caption"] == caption
     assert row["audio_finalize_raw_response"] == assembly_raw(json.dumps(payload))
     assert row["annotation"]["av_grounding"] == payload["av_grounding"]
-    text_calls = int(
-        hard_code != "direct_unknown_speaker"
-        and 0 < caption.count("<d>") == len(speakers)
-    )
+    text_calls = int(0 < caption.count("<d>") == len(speakers))
     assert summary.model_call_count == len(completions.requests) == (4 + text_calls) * len(jobs)
     assert row["model_call_count"] == 4 + text_calls
     assert row["text_model_call_count"] == text_calls
@@ -1150,7 +1150,7 @@ def test_explicit_marker_mismatch_remains_hard_in_backend(tmp_path, monkeypatch)
     assert "direct_dialogue_speaker_marker_mismatch" not in row["diagnostics"][-1]["warnings"]
     assert summary.model_call_count == len(completions.requests) == 5
     assert row["text_model_call_count"] == 1
-    assert backend.provenance.schema_version == MIMO25_BACKEND_VERSION == "r2v.h3.mimo25_backend.60"
+    assert backend.provenance.schema_version == MIMO25_BACKEND_VERSION == "r2v.h3.mimo25_backend.61"
     assert backend.provenance.prompt_version == "h3_mimo25_speech_assembly_v46"
 
 
