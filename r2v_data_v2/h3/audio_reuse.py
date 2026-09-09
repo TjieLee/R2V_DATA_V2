@@ -287,7 +287,7 @@ def build_audio_reuse_assets(
             target_start_sample=start, target_end_sample=end,
         )
         if segment.asr_status != "transcribed":
-            if decision.vocal_composition != "single_speaker" or decision.secondary_vocal_activity.present:
+            if ownership_reasons:
                 unsafe.add(segment.segment_id)
             continue
         for reason in ownership_reasons:

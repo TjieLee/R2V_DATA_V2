@@ -330,6 +330,11 @@ def _semantic_reasons(
     grounding: MimoAVSegmentGrounding,
 ) -> list[RecoveredVoiceReasonCode]:
     reasons: list[RecoveredVoiceReasonCode] = list(speaker_ownership_reasons(audio_decision))
+    # Signal reuse permits same-speaker nonlexical sound; legacy voice QC does not.
+    if audio_decision.vocal_composition != "single_speaker":
+        reasons.append("non_single_speaker")
+    if audio_decision.secondary_vocal_activity.present:
+        reasons.append("secondary_vocal_activity")
     if grounding.binding_status != "visible_entity" or grounding.entity_id is None:
         reasons.append("not_visible_entity")
     if grounding.speech_presentation != "onscreen_spoken":

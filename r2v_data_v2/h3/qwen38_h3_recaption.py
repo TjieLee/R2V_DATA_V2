@@ -55,6 +55,8 @@ OFFICIAL_H3_SOURCE_FILES = (
 )
 
 ConditioningVariant = Literal[
+    "target_speech_reuse",
+    "music_reuse",
     "visual_only",
     "target_voice_reference",
     "cross_voice_reference",
@@ -64,6 +66,8 @@ ConditioningVariant = Literal[
 RecaptionStatus = Literal["ready", "failed", "unsupported"]
 SubjectKind = Literal["entity", "attribute", "background"]
 AudioKind = Literal[
+    "speaker_speech_reuse",
+    "music_reuse",
     "target_voice",
     "cross_voice",
     "music_reference",
@@ -207,7 +211,7 @@ class RecaptionAudioContract(SchemaModel):
     speaker_id: str | None = Field(default=None, pattern=r"^S[1-9]\d*$")
     voice_characteristics: str | None = None
     music_characteristics: str | None = None
-    retention_marker: Literal["fully_copy", "reference"]
+    retention_marker: Literal["fully_copy", "reference", "partially_copy"]
 
     @model_validator(mode="after")
     def validate_audio(self) -> RecaptionAudioContract:
@@ -223,6 +227,23 @@ class RecaptionAudioContract(SchemaModel):
                 or self.music_characteristics is not None
             ):
                 raise ValueError("full-audio reuse must be an unbound full copy")
+        elif self.kind == "speaker_speech_reuse":
+            if (
+                self.retention_marker != "partially_copy"
+                or self.speaker_id is None
+                or (self.entity_id is None) != (self.subject_label is None)
+                or self.voice_characteristics is not None
+                or self.music_characteristics is not None
+            ):
+                raise ValueError("speaker speech reuse requires signal-copy speaker ownership")
+        elif self.kind == "music_reuse":
+            if (
+                self.retention_marker != "partially_copy"
+                or self.subject_label is not None or self.entity_id is not None
+                or self.speaker_id is not None or self.voice_characteristics is not None
+                or self.music_characteristics is not None
+            ):
+                raise ValueError("music reuse must be an unbound signal copy")
         elif self.kind == "music_reference":
             if (
                 self.retention_marker != "reference"
@@ -292,6 +313,13 @@ class RecaptionReferenceContract(SchemaModel):
             raise ValueError("official H3 per-modality reference limit exceeded")
         if len(self.pictures) + len(self.audios) > 12:
             raise ValueError("official H3 total reference-file limit exceeded")
+        subjects_by_label = {item.subject_label: item for item in self.subjects}
+        if any(
+            audio.subject_label is not None
+            and subjects_by_label[audio.subject_label].entity_id != audio.entity_id
+            for audio in self.audios
+        ):
+            raise ValueError("Audio entity differs from owning Subject")
         return self
 
 
@@ -928,6 +956,16 @@ def build_audio_facts(
     )
 
 
+def audio_task_prefix(audios: Sequence[RecaptionAudioContract]) -> str:
+    """Task semantics come from actual assets, including mixed reference/reuse."""
+    tasks = ["reference generation"]
+    if any(audio.retention_marker == "reference" for audio in audios):
+        tasks.append("audio reference")
+    if any(audio.retention_marker in {"fully_copy", "partially_copy"} for audio in audios):
+        tasks.append("audio reuse")
+    return "[" + " + ".join(tasks) + "]"
+
+
 def _summary_prefix(variant: ConditioningVariant) -> str:
     if variant == "visual_only":
         return "[reference generation]"
@@ -1316,6 +1354,14 @@ def validate_h3_draft(
 
 
 def _canonical_audio_definition(audio: RecaptionAudioContract) -> str:
+    if audio.kind == "speaker_speech_reuse":
+        owner = f"{audio.subject_label} " if audio.subject_label else ""
+        return (
+            f"{audio.audio_label} is the synchronized speech track for {owner}({audio.speaker_id}), "
+            "containing the supplied speaker's speech at its original timeline positions."
+        )
+    if audio.kind == "music_reuse":
+        return f"{audio.audio_label} is the synchronized music track for the target's audience-only score."
     if audio.kind == "full_audio_reuse":
         return f"{audio.audio_label} is the supplied full-audio reference for the target."
     if audio.kind == "music_reference":
@@ -1337,6 +1383,16 @@ def _canonical_audio_definition(audio: RecaptionAudioContract) -> str:
 
 
 def _canonical_audio_retention(audio: RecaptionAudioContract) -> str:
+    if audio.kind == "speaker_speech_reuse":
+        return (
+            f"{audio.audio_label}: partially_copy - the supplied speech signal is copied directly "
+            "at its original timeline positions while the target's other audio layers remain separate."
+        )
+    if audio.kind == "music_reuse":
+        return (
+            f"{audio.audio_label}: partially_copy - the supplied music signal is copied directly "
+            "while other target audio layers remain separate."
+        )
     if audio.kind == "full_audio_reuse":
         return (
             f"{audio.audio_label}: fully_copy - the supplied full audio is reused "

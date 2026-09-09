@@ -1,9 +1,9 @@
-# H3 Audio Reuse Assets (Phase 1)
+# H3 Audio Reuse Assets and Shadow Products
 
-This is an additive, model-free library prototype. It is **not wired into H3
-publication**, ConditioningVariant, AudioKind, retention markers or slot allocation.
-Existing target/cross voice references, music references and full-audio reuse remain
-unchanged. Phase 2 requires separate review.
+These are additive, model-free libraries. Phase 1 builds verified PCM assets;
+Phase 2 consumes them in a separate shadow product materializer. Neither changes
+production H3 or reruns MiMo. The legacy materializer entrypoint and its target/cross
+voice references, music references and full-audio reuse remain available unchanged.
 
 ## API
 
@@ -50,7 +50,10 @@ and compared sample-for-sample against the expected full PCM array.
 
 Only transcribed, attributable single-speaker intervals are copied into target-sized
 digital silence. The existing semantic exclusions for non-single speech and
-secondary vocal activity are reused, without visibility or voice-quality gates.
+secondary vocal activity are checked without visibility or voice-quality gates.
+Explicit `same_speaker_nonlexical` activity belongs to the same speaker and may
+be copied. Different/uncertain secondary speakers remain excluded. Legacy recovered
+voice deliberately retains its stricter single-speaker/no-secondary-activity gates.
 There is no minimum duration, RMS, SNR, clipping or LR-ASD threshold. Original
 sample coordinates map using exact rational arithmetic and round-half-even under
 `source_sample_rational_to_32k_round_half_even_v1`. There is no concatenation,
@@ -69,12 +72,83 @@ zeroes for an uncovered target tail. Existing SAM zero-offset bounded drift of
 `semantic_presence_evaluated=false`. Future publication must consult finalized
 Audio semantics, not separator existence.
 
-## Phase 2 (Not Implemented)
+## Phase 2 Shadow Products
 
-After review, integrate target speech signal reuse (`partially_copy`), keep donor
-voice conditioning as `reference` using existing donor selections, and optionally
-add music reuse based on finalized semantics. Allocate at most three Audio slots,
-speakers first. Preserve target dialogue, full-audio `fully_copy`, legacy
-music-reference behavior and donor-specific profile ownership. Derive the task
-prefix from the actual Audio contract and distinguish signal-copy wording from
-voice-reference wording. None of these product changes is implemented here.
+`audio_reuse_materializer.materialize_audio_reuse_products()` reads a prepared,
+frozen MiMo `inventory.json` / `records.jsonl`, the matching H3 `samples.jsonl`,
+SAM separation `records.jsonl`, and `<reuse-root>/<clip-uid>/manifest.json`.
+The prepared root must validate through the current MiMo inventory/record models;
+this tool does not rewrite old backend provenance or migrate stale annotations.
+All selected ready clips, including any donor clips to be used, need matching
+manifests. A donor outside the prepared inventory is excluded, never substituted.
+
+Validation covers job/annotation/SAM fingerprints, target media, source intervals,
+speaker ownership, entity/Subject ownership, media hashes, decoded frame counts,
+32 kHz stereo PCM16 FLAC, and manifest ordering. No PCM is generated here. Stale
+lineage fails before publication. Inputs are rehashed before atomic publication;
+existing output directories, source roots and production stages cannot be replaced.
+
+Products use `RecaptionReferenceContract.audios` as the task authority:
+
+| Audio kind | Retention | Ownership |
+| --- | --- | --- |
+| `speaker_speech_reuse` | `partially_copy` | target Sx; optional paired entity/Subject |
+| `cross_voice` | `reference` | target Subject/Sx; full donor speaker track |
+| `music_reuse` | `partially_copy` | unbound target music track |
+| `full_audio_reuse` | `fully_copy` | unchanged, unbound full target audio |
+| `music_reference` | `reference` | existing music-style reference semantics |
+
+In-pair products replace short voice conditioning with target speaker tracks.
+When no in-pair exists, a reuse product is derived from the canonical sample.
+Canonical visual-only products are retained. Cross products read the existing
+`FinalSubjectVoice` donor clip/occurrence mapping, without new matching. Ambiguous
+or unavailable donor assets produce explicit omission warnings. Only a uniquely
+resolved donor profile may describe donor Audio; target profiles are never used.
+
+Speakers are allocated first in stable Sx order, at most three. Music is last;
+capacity omissions are warnings and never remove factual dialogue. Annotation .20
+has a final `non_diegetic_music` section rather than a separate music-status enum:
+its nonempty non-`N/A`, non-`unknown` content is the frozen positive music decision.
+Stem existence alone is never positive evidence. The original music prose is
+preserved even if there is no Audio slot. Empty final sections still fail the
+existing renderer validation.
+
+Summary prefixes inspect the actual Audio retention types. Mixed donor reference
+and target music copy becomes
+`[reference generation + audio reference + audio reuse]`; no Audio remains
+`[reference generation]`. Signal-copy Audio has no voice-characteristics prose.
+Audio relationships are inserted once at each speaker's first verifiable speech
+lead-in, without rewriting `<d>` content or existing presentation prose. Music
+relationships are added to `non_diegetic_music`, not dialogue. Unlocatable speaker
+relationships fail the product rather than guessing. Full-audio reuse wording and
+the six-section H3 layout remain unchanged.
+
+The new product contracts are `r2v.h3.audio_reuse_product.1` and
+`r2v.h3.audio_reuse_product_summary.1`, with materializer policy
+`h3_mimo25_audio_reuse_materializer_v1`. `ReuseAudioReference` carries the full
+multi-segment asset plus manifest path/hash/fingerprint and donor provenance.
+This separate versioned product leaves MiMo backend .61, annotation .20, all
+prompts and legacy materializer v26 provenance untouched.
+
+## CPU-Only Server Materialization
+
+Run only after matching Phase-1 assets have been produced. No inference, asset
+regeneration or production overwrite is performed:
+
+```bash
+"$R2V_PYTHON" tools/materialize_h3_audio_reuse_shadow.py \
+  --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
+  --mimo-root "$PREPARED_MIMO_ROOT" \
+  --source-h3-root "$FROZEN_H3_ROOT" \
+  --separation-root "$SHADOW_RUN_ROOT/separation" \
+  --reuse-root "$SHADOW_RUN_ROOT/audio_reuse_assets" \
+  --output-root "$SHADOW_RUN_ROOT/h3_audio_reuse_products_v1" \
+  --enable-full-audio-reuse
+```
+
+Outputs are `records.jsonl` (rendered H3, exact corrected speech and actual Audio
+asset paths/provenance) and `summary.json` (input hashes, Audio kinds, task-prefix
+counts, failures and capacity warnings). `model_call_count=0` and
+`production_artifacts_modified=false`. There is intentionally no overwrite flag.
+The legacy music-reference selection/export path remains separate; it is not
+renamed to music reuse or rerun by this CLI.

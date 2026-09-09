@@ -53,6 +53,7 @@ from r2v_data_v2.h3.qwen38_h3_recaption import (
     RecaptionSubjectContract,
     _canonical_audio_definition,
     _canonical_audio_retention,
+    audio_task_prefix,
     build_reference_contract,
     render_h3_prompt,
 )
@@ -619,6 +620,58 @@ def _render_subject_definition(
     return f"{contract.subject_label} is {description}, {connector} {pictures}."
 
 
+def project_audio_relationships(
+    caption: str,
+    music: str,
+    speech: Sequence[RecaptionSpeechFact],
+    audios: Sequence[RecaptionAudioContract],
+) -> tuple[str, str]:
+    """Insert once in a verified speech lead-in; never rewrite dialogue or prose."""
+    by_speaker = {audio.speaker_id: audio for audio in audios
+                  if audio.kind in {"speaker_speech_reuse", "cross_voice", "target_voice"}}
+    if len(by_speaker) != sum(audio.kind in {"speaker_speech_reuse", "cross_voice", "target_voice"}
+                              for audio in audios):
+        raise ValueError("multiple conditioning assets for the same speaker")
+    blocks = list(re.finditer(r"<d>[\s\S]*?</d>", caption))
+    insertions: list[tuple[int, str]] = []
+    used: set[str] = set()
+    previous_end = 0
+    for index, block in enumerate(blocks):
+        lead = caption[previous_end:block.start()]
+        markers = list(re.finditer(r"\((S[1-9]\d*)\)", lead))
+        expected = speech[index].speaker_id if len(blocks) == len(speech) else None
+        # With unaligned blocks, only an unambiguous explicit marker can locate use.
+        candidates = [m for m in markers if m.group(1) == expected] if expected else markers
+        if candidates and len({m.group(1) for m in candidates}) == 1:
+            marker = candidates[-1]
+            speaker = marker.group(1)
+            audio = by_speaker.get(speaker)
+            if audio is not None and speaker not in used:
+                relation = (
+                    f", with the synchronized speech signal copied directly from {audio.audio_label},"
+                    if audio.kind == "speaker_speech_reuse"
+                    else f", using the voice characteristics referenced from {audio.audio_label},"
+                )
+                if lead[marker.end():].lstrip().startswith((",", ";", ":", ".", "!", "?")):
+                    relation = relation[:-1]
+                insertions.append((previous_end + marker.end(), relation))
+                used.add(speaker)
+        previous_end = block.end()
+    if set(by_speaker) - used:
+        raise MimoH3MaterializationContractError([ValidationIssue(
+            "audio_relationship_speech_location_unresolved", "detailed_description",
+            "cannot locate first speech lead-in for " + ",".join(sorted(set(by_speaker) - used)),
+        )])
+    for position, text in reversed(insertions):
+        caption = caption[:position] + text + caption[position:]
+    for audio in audios:
+        if audio.kind == "music_reuse":
+            music = f"The audience-only score uses the synchronized music signal copied directly from {audio.audio_label}. {music}"
+        elif audio.kind == "music_reference":
+            music = f"The audience-only score follows the musical characteristics referenced from {audio.audio_label}. {music}"
+    return caption, music
+
+
 def _materialize_sample(
     sample: FinalH3SampleV2,
     job: MimoClipJob,
@@ -626,6 +679,7 @@ def _materialize_sample(
     *,
     conditioning_variant: ConditioningVariant | None = None,
     extra_audio_contract: RecaptionAudioContract | None = None,
+    reuse_audio_contracts: Sequence[RecaptionAudioContract] | None = None,
 ) -> tuple[list[FinalQwen3SpeechSegment], str, list[str]]:
     assert record.annotation is not None
     transcribed_ids = [item.segment_id for item in job.segments if item.asr_status == "transcribed"]
@@ -653,7 +707,7 @@ def _materialize_sample(
     contract = _contract_with_voice_profiles(
         build_reference_contract(
             corrected_sample,
-            "visual_only" if extra_audio_contract is not None else variant,
+            "visual_only" if extra_audio_contract is not None or reuse_audio_contracts is not None else variant,
         ),
         corrected=corrected,
         record=record,
@@ -665,13 +719,20 @@ def _materialize_sample(
                 "audios": [extra_audio_contract.model_dump(mode="json")],
             }
         )
+    if reuse_audio_contracts is not None:
+        if extra_audio_contract is not None:
+            raise ValueError("reuse Audio contract cannot also supply legacy extra Audio")
+        contract = RecaptionReferenceContract.model_validate({
+            **contract.model_dump(mode="json"),
+            "audios": [audio.model_dump(mode="json") for audio in reuse_audio_contracts],
+        })
     facts = _audio_facts(
         sample=corrected_sample,
         corrected=corrected,
         record=record,
         contract=contract,
     )
-    prefix = {
+    prefix = audio_task_prefix(contract.audios) if reuse_audio_contracts is not None else {
         "visual_only": "[reference generation]",
         "target_voice_reference": "[reference generation + audio reference]",
         "cross_voice_reference": "[reference generation + audio reference]",
@@ -691,6 +752,9 @@ def _materialize_sample(
     if direct_issues:
         raise MimoH3MaterializationContractError(direct_issues)
     warnings.extend(correction_warnings)
+    music = direct.non_diegetic_music
+    if reuse_audio_contracts is not None:
+        detailed, music = project_audio_relationships(detailed, music, facts.speech, contract.audios)
     structured = Qwen38H3StructuredResponse(
         subject_definitions=[
             _render_subject_definition(item, subject, subjects=contract.subjects)
@@ -707,7 +771,7 @@ def _materialize_sample(
         ] + [_canonical_audio_retention(audio) for audio in contract.audios],
         detailed_description=f"{direct.style_opening}\n[Shot 1] {detailed}",
         overall_soundscape=direct.overall_soundscape,
-        non_diegetic_music=direct.non_diegetic_music,
+        non_diegetic_music=music,
         audio_fact_audit=[
             AudioFactAuditItem(fact_id=item.fact_id, action="preserved")
             for item in facts.non_speech_events

@@ -18,8 +18,14 @@ def speaker_ownership_reasons(
     reasons: list[SpeakerOwnershipReason] = []
     if decision.primary_speaker_group is None:
         reasons.append("unresolved")
-    if decision.vocal_composition != "single_speaker":
+    same_speaker_nonlexical = (
+        decision.vocal_composition == "same_speaker_nonlexical"
+        and decision.secondary_vocal_activity.present
+        and decision.secondary_vocal_activity.speaker_relation == "same_speaker"
+        and decision.secondary_vocal_activity.kind != "speech"
+    )
+    if decision.vocal_composition != "single_speaker" and not same_speaker_nonlexical:
         reasons.append("non_single_speaker")
-    if decision.secondary_vocal_activity.present:
+    if decision.secondary_vocal_activity.present and not same_speaker_nonlexical:
         reasons.append("secondary_vocal_activity")
     return reasons
