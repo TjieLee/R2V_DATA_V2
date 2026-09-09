@@ -1333,7 +1333,7 @@ def _canonical_audio_definition(audio: RecaptionAudioContract) -> str:
     )
     if audio.voice_characteristics is not None:
         definition += f", featuring {audio.voice_characteristics}"
-    return definition + "."
+    return definition if definition.endswith((".", "!", "?")) else definition + "."
 
 
 def _canonical_audio_retention(audio: RecaptionAudioContract) -> str:

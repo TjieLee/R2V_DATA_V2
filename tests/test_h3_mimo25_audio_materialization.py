@@ -31,6 +31,23 @@ from tests.test_h3_mimo25_av_shadow import (
 )
 
 
+@pytest.mark.parametrize("ending", [".", "!", "?", ""])
+def test_voice_definition_terminal_punctuation_does_not_mutate_profile(ending):
+    characteristics = "a matter-of-fact tone" + ending
+    audio = RecaptionAudioContract(
+        audio_index=1, audio_label="<Audio 1>", kind="target_voice",
+        path="/synthetic/voice.flac", sha256="a" * 64,
+        subject_label="<Subject 1>", entity_id="e1", speaker_id="S1",
+        voice_characteristics=characteristics, retention_marker="reference",
+    )
+    before = audio.model_dump()
+    assert _canonical_audio_definition(audio) == (
+        "<Audio 1> is the voice-timbre reference for <Subject 1> (S1), featuring "
+        + characteristics + ("" if ending else ".")
+    )
+    assert audio.model_dump() == before
+
+
 @pytest.mark.parametrize("resolution", ["resolved", "uncertain", "needs_acoustic_refinement"])
 @pytest.mark.parametrize("unbound_status", ["offscreen", "no_reliable_entity"])
 def test_turn3_profile_reaches_mimo_only_recovered_s2_audio_reference(tmp_path, resolution, unbound_status):
