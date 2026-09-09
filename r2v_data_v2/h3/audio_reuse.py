@@ -176,14 +176,24 @@ def probe_canonical_target_frames(path: Path, expected_hash: str) -> int:
     return info.frames
 
 
-def _read_pcm(path: Path, expected_hash: str) -> np.ndarray:
+def read_canonical_stem_pcm16(path: Path, expected_hash: str) -> np.ndarray:
+    """Read the upstream SAM canonical WAV as the exact copy source."""
+    return _read_pcm16(path, expected_hash, container="WAV")
+
+
+def read_reuse_asset_pcm16(path: Path, expected_hash: str) -> np.ndarray:
+    """Read a generated lossless reuse FLAC for decoded-sample verification."""
+    return _read_pcm16(path, expected_hash, container="FLAC")
+
+
+def _read_pcm16(path: Path, expected_hash: str, *, container: str) -> np.ndarray:
     import soundfile as sf
 
     if not path.is_file() or sha256_file(path) != expected_hash:
         raise AudioReuseIntegrityError(f"audio_reuse_source_hash_mismatch: {path}")
     info = sf.info(str(path))
-    if (info.samplerate, info.channels, info.subtype, info.format) != (SAMPLE_RATE, 2, "PCM_16", "FLAC"):
-        raise AudioReuseIntegrityError(f"audio_reuse_requires_32k_stereo_pcm16: {path}")
+    if (info.samplerate, info.channels, info.subtype, info.format) != (SAMPLE_RATE, 2, "PCM_16", container):
+        raise AudioReuseIntegrityError(f"audio reuse requires 32 kHz stereo PCM16 {container}: {path}")
     pcm, _ = sf.read(str(path), dtype="int16", always_2d=True)
     if not len(pcm) or len(pcm) != info.frames:
         raise AudioReuseIntegrityError(f"audio_reuse_invalid_frame_count: {path}")
@@ -195,7 +205,7 @@ def _write_verified(path: Path, pcm: np.ndarray) -> str:
 
     sf.write(str(path), pcm, SAMPLE_RATE, format="FLAC", subtype="PCM_16")
     digest = sha256_file(path)
-    if sf.info(str(path)).format != "FLAC" or not np.array_equal(_read_pcm(path, digest), pcm):
+    if not np.array_equal(read_reuse_asset_pcm16(path, digest), pcm):
         raise AudioReuseIntegrityError("audio_reuse_decoded_samples_differ")
     return digest
 
@@ -204,7 +214,7 @@ def _check_stem(stem: StemArtifact, target: Path, target_hash: str, frame_count:
     if (Path(stem.source_audio_path).resolve() != target
             or stem.source_audio_sha256 != target_hash or stem.source_end_sample != frame_count):
         raise AudioReuseIntegrityError("audio_reuse_stem_target_lineage_mismatch")
-    pcm = _read_pcm(Path(stem.canonical_stem_path), stem.canonical_stem_sha256)
+    pcm = read_canonical_stem_pcm16(Path(stem.canonical_stem_path), stem.canonical_stem_sha256)
     if len(pcm) != stem.canonical_frame_count:
         raise AudioReuseIntegrityError("audio_reuse_stem_frame_count_mismatch")
     if abs(len(pcm) - frame_count) / SAMPLE_RATE > STEM_ALIGNMENT_TOLERANCE_SECONDS:

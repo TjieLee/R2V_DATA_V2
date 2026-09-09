@@ -35,8 +35,8 @@ def _signal(frames, offset=0):
                             (samples * 3 + offset) % 21001 - 10500)).astype(np.int16)
 
 
-def _write(path, pcm):
-    sf.write(str(path), pcm, 32000, subtype="PCM_16", format="FLAC")
+def _write(path, pcm, *, container="FLAC"):
+    sf.write(str(path), pcm, 32000, subtype="PCM_16", format=container)
     return sha256_file(path)
 
 
@@ -85,8 +85,8 @@ def _fixture(tmp_path, intervals=((0.1, 0.3, "g1"), (0.9, 1.1, "g1")), *, drift=
     stems = []
     frames = 64000 + round(drift * 32000)
     for kind, offset in (("music", 7), ("speech", 11), ("sfx", 19)):
-        path = production / f"{kind}.flac"
-        digest = _write(path, _signal(frames, offset))
+        path = production / f"{kind}.wav"
+        digest = _write(path, _signal(frames, offset), container="WAV")
         raw_path = production / f"{kind}-raw.flac"
         raw_digest = _write(raw_path, _signal(frames, offset)[:, 0])
         duration = frames / 32000
@@ -118,10 +118,10 @@ def _fixture(tmp_path, intervals=((0.1, 0.3, "g1"), (0.9, 1.1, "g1")), *, drift=
                 "audio_production_root": production, "output_root": tmp_path / "reuse-shadow", "allow_unverified": True}
 
 
-def _pcm(path):
+def _pcm(path, *, container="FLAC"):
     pcm, rate = sf.read(str(path), dtype="int16", always_2d=True)
     assert rate == 32000 and pcm.shape[1] == 2
-    assert sf.info(str(path)).format == "FLAC"
+    assert sf.info(str(path)).format == container
     return pcm
 
 
@@ -142,7 +142,7 @@ def test_multiple_short_intervals_preserve_exact_samples_and_silence(tmp_path, m
     assert asset.source_segment_ids == ["segment_1", "segment_2"]
     assert asset.target_frame_count == 64000 and asset.target_duration_seconds == 2
     assert asset.timeline_preserved and asset.silence_fill
-    source = _pcm(asset.source_stem_path)
+    source = _pcm(asset.source_stem_path, container="WAV")
     expected = np.zeros((64000, 2), dtype=np.int16)
     for r in asset.source_sample_ranges:
         assert r.target_start_sample == r.source_start_sample * 2
@@ -168,7 +168,7 @@ def test_two_speakers_are_isolated_and_offscreen_is_not_identity_bound(tmp_path)
         assert asset.entity_id is None and asset.subject_index is None
         expected = np.zeros((64000, 2), dtype=np.int16)
         for r in asset.source_sample_ranges:
-            expected[r.target_start_sample:r.target_end_sample] = _pcm(asset.source_stem_path)[r.target_start_sample:r.target_end_sample]
+            expected[r.target_start_sample:r.target_end_sample] = _pcm(asset.source_stem_path, container="WAV")[r.target_start_sample:r.target_end_sample]
         np.testing.assert_array_equal(_pcm(asset.output_path), expected)
     assert not np.any(np.any(_pcm(result.speakers[0].output_path) != 0, axis=1)
                       & np.any(_pcm(result.speakers[1].output_path) != 0, axis=1))
@@ -179,7 +179,7 @@ def test_music_target_timeline_padding_and_truncation(tmp_path, drift):
     result = reuse.build_audio_reuse_assets(**_fixture(tmp_path, drift=drift))
     asset = result.music
     expected = np.zeros((64000, 2), dtype=np.int16)
-    source = _pcm(asset.source_stem_path)
+    source = _pcm(asset.source_stem_path, container="WAV")
     copied = min(64000, len(source))
     expected[:copied] = source[:copied]
     np.testing.assert_array_equal(_pcm(asset.output_path), expected)
@@ -398,6 +398,10 @@ def test_pcm24_target_is_probed_without_pcm_decode(tmp_path, monkeypatch):
     result = reuse.build_audio_reuse_assets(**args)
     assert sf.info(target).subtype == "PCM_24"
     for asset in [*result.speakers, result.music]:
+        stem_info = sf.info(asset.source_stem_path)
+        assert (stem_info.format, stem_info.subtype, stem_info.samplerate, stem_info.channels) == (
+            "WAV", "PCM_16", 32000, 2,
+        )
         info = sf.info(asset.output_path)
         assert (info.frames, info.format, info.samplerate, info.channels, info.subtype) == (
             sf.info(target).frames, "FLAC", 32000, 2, "PCM_16",
@@ -405,12 +409,12 @@ def test_pcm24_target_is_probed_without_pcm_decode(tmp_path, monkeypatch):
         assert asset.target_frame_count == 64000
     expected = np.zeros((64000, 2), dtype=np.int16)
     speaker = result.speakers[0]
-    source = _pcm(speaker.source_stem_path)
+    source = _pcm(speaker.source_stem_path, container="WAV")
     for interval in speaker.source_sample_ranges:
         start, end = interval.target_start_sample, interval.target_end_sample
         expected[start:end] = source[start:end]
     np.testing.assert_array_equal(_pcm(speaker.output_path), expected)
-    np.testing.assert_array_equal(_pcm(result.music.output_path), _pcm(result.music.source_stem_path))
+    np.testing.assert_array_equal(_pcm(result.music.output_path), _pcm(result.music.source_stem_path, container="WAV"))
     assert before == {p: sha256_file(p) for p in before}
 
 
@@ -433,14 +437,15 @@ def test_canonical_target_hash_is_verified(tmp_path):
 
 
 @pytest.mark.parametrize("kind", ["speech", "music"])
-def test_pcm24_stem_rejected_before_generation(tmp_path, kind):
+@pytest.mark.parametrize("container,subtype", [("WAV", "PCM_24"), ("FLAC", "PCM_16")])
+def test_invalid_stem_rejected_before_generation(tmp_path, kind, container, subtype):
     args = _fixture(tmp_path, target_subtype="PCM_24")
     values = args["stem_record"].model_dump(mode="json")
     stem = next(s for s in values["stems"] if s["stem_type"] == kind)
     path = Path(stem["canonical_stem_path"])
-    sf.write(path, _pcm(path), 32000, subtype="PCM_24", format="FLAC")
+    sf.write(path, _pcm(path, container="WAV"), 32000, subtype=subtype, format=container)
     stem["canonical_stem_sha256"] = sha256_file(path)
     args["stem_record"] = _seal(SAMAudioStemRecord, values, "record_fingerprint")
-    with pytest.raises(reuse.AudioReuseIntegrityError, match="requires_32k_stereo_pcm16"):
+    with pytest.raises(reuse.AudioReuseIntegrityError, match="PCM16 WAV"):
         reuse.build_audio_reuse_assets(**args)
     assert not args["output_root"].exists()

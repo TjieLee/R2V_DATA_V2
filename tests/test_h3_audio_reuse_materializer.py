@@ -365,14 +365,36 @@ def test_pcm24_target_phase2_and_full_audio_reuse_unchanged(tmp_path):
     assert sf.info(target).subtype == "PCM_24"
 
 
-@pytest.mark.parametrize("media", ["speech", "music", "output"])
-def test_phase2_pcm24_stems_and_assets_remain_rejected(tmp_path, media):
+@pytest.mark.parametrize("media", ["speech", "music", "speaker_output", "music_output"])
+@pytest.mark.parametrize("wrong_container", [False, True])
+def test_phase2_stem_and_output_contracts_remain_distinct(tmp_path, media, wrong_container):
     import soundfile as sf
 
-    _, _, source = _case(tmp_path, target_subtype="PCM_24")
-    asset = source.manifest.music if media == "music" else source.manifest.speakers[0]
-    path = Path(asset.output_path if media == "output" else asset.source_stem_path)
+    args, _, source = _case(tmp_path, target_subtype="PCM_24")
+    is_output = media.endswith("_output")
+    is_music = media.startswith("music")
+    asset = source.manifest.music if is_music else source.manifest.speakers[0]
+    path = Path(asset.output_path if is_output else asset.source_stem_path)
     pcm, rate = sf.read(path, dtype="int16", always_2d=True)
-    sf.write(path, pcm, rate, subtype="PCM_24", format="FLAC")
-    with pytest.raises(ValueError, match="PCM16 FLAC"):
-        product._audio_frames(str(path), sha256_file(path))
+    expected = "FLAC" if is_output else "WAV"
+    container = ("WAV" if is_output else "FLAC") if wrong_container else expected
+    sf.write(path, pcm, rate, subtype="PCM_16" if wrong_container else "PCM_24", format=container)
+    digest = sha256_file(path)
+    values = source.manifest.model_dump(mode="json")
+    changed = values["music"] if is_music else values["speakers"][0]
+    stem_record = args["stem_record"]
+    if is_output:
+        changed["output_sha256"] = digest
+    else:
+        stem_values = stem_record.model_dump(mode="json")
+        next(s for s in stem_values["stems"] if s["stem_type"] == media)["canonical_stem_sha256"] = digest
+        stem_record = _seal(SAMAudioStemRecord, stem_values, "record_fingerprint")
+        changed["source_stem_sha256"] = digest
+        values["source_stem_record_fingerprint"] = stem_record.record_fingerprint
+        for item in [*values["speakers"], values["music"]]:
+            item["source_stem_record_fingerprint"] = stem_record.record_fingerprint
+    source.manifest_path.write_text(json.dumps(values))
+    with pytest.raises(ValueError, match=f"PCM16 {expected}"):
+        product.load_reuse_source(
+            manifest_path=source.manifest_path, job=source.job, record=source.record, stem_record=stem_record,
+        )

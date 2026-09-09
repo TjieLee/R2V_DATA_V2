@@ -17,6 +17,8 @@ from r2v_data_v2.h3.audio_reuse import (
     MusicReuseAsset,
     SpeakerSpeechReuseAsset,
     probe_canonical_target_frames,
+    read_canonical_stem_pcm16,
+    read_reuse_asset_pcm16,
 )
 from r2v_data_v2.h3.jea_audio_production import jea_production_paths
 from r2v_data_v2.h3.jea_final_renderer import FinalH3SampleV2, FinalQwen3SpeechSegment
@@ -46,21 +48,6 @@ def _hash(value: SchemaModel | dict) -> str:
 
 def _rows(path: Path, model: type[SchemaModel]) -> list:
     return [model.model_validate_json(line) for line in path.read_text().splitlines() if line.strip()]
-
-
-def _audio_frames(path: str, digest: str) -> int:
-    import soundfile as sf
-
-    source = Path(path).resolve(strict=True)
-    if not source.is_file() or sha256_file(source) != digest:
-        raise ValueError("reuse media hash mismatch")
-    info = sf.info(str(source))
-    if (info.samplerate, info.channels, info.subtype, info.format) != (32000, 2, "PCM_16", "FLAC"):
-        raise ValueError("reuse media must be 32 kHz stereo PCM16 FLAC")
-    decoded, _ = sf.read(str(source), dtype="int16", always_2d=True)
-    if len(decoded) != info.frames or not info.frames:
-        raise ValueError("reuse decoded frame count mismatch")
-    return info.frames
 
 
 @dataclass(frozen=True)
@@ -120,9 +107,9 @@ def load_reuse_source(
             or Path(asset.output_path).resolve().parent != path.parent
         ):
             raise ValueError("reuse asset source provenance mismatch")
-        if _audio_frames(asset.source_stem_path, asset.source_stem_sha256) != asset.source_stem_frame_count:
+        if len(read_canonical_stem_pcm16(Path(asset.source_stem_path), asset.source_stem_sha256)) != asset.source_stem_frame_count:
             raise ValueError("reuse source stem frame count mismatch")
-        if _audio_frames(asset.output_path, asset.output_sha256) != frames:
+        if len(read_reuse_asset_pcm16(Path(asset.output_path), asset.output_sha256)) != frames:
             raise ValueError("reuse asset frame count mismatch")
         if isinstance(asset, SpeakerSpeechReuseAsset):
             if asset.source_job_fingerprint != job.request_fingerprint or asset.source_annotation_sha256 != _hash(annotation):
