@@ -4866,6 +4866,150 @@ def _job_for_reference_inventory(
     return _job(values)
 
 
+def _augmentation_draws(monkeypatch, draws):
+    class Draws:
+        def __init__(self, seed):
+            self.draws = iter(draws)
+
+        def random(self):
+            return next(self.draws)
+
+    monkeypatch.setattr("r2v_data_v2.h3.mimo25_av_reconcile.random.Random", Draws)
+
+
+@pytest.mark.parametrize("draw,kind,count", [
+    (0.0, "subject_only", 1), (.4999, "subject_only", 1),
+    (.50, "subject_plus_face", 2), (.6999, "subject_plus_face", 2),
+    (.70, "face_replaces_subject", 1), (.999, "face_replaces_subject", 1),
+])
+def test_reference_augmentation_face_branches(tmp_path, monkeypatch, draw, kind, count):
+    refs = _visual_reference_inventory(tmp_path, ["subject", "face"], same_entity=True)
+    before = [r.model_dump() for r in refs]
+    _augmentation_draws(monkeypatch, [draw])
+    selection, images = select_mimo_reference_projection("branch", refs)
+    assert len(images) == count
+    if kind == "face_replaces_subject":
+        assert images[0].kind == "subject" and images[0].source_image_index == 2
+        assert images[0].entity_id == "e1" and images[0].attribute_id is None
+        assert selection.dropped_references[0].drop_reason == "person_replaced_by_face"
+    else:
+        assert images[0].source_image_index == 1
+        assert bool(selection.dropped_references) == (kind == "subject_only")
+    assert [r.model_dump() for r in refs] == before
+
+
+def test_reference_augmentation_rates_and_repeatability(tmp_path):
+    import random
+    from collections import Counter
+
+    from r2v_data_v2.h3.mimo25_av_reconcile import _sample_reference_augmentation
+
+    refs = _visual_reference_inventory(tmp_path, ["subject", "face", "hair"], same_entity=True)
+    counts = Counter()
+    for seed in range(10000):
+        drops, promotions = _sample_reference_augmentation(refs, random.Random(seed))
+        counts["hair_keep"] += 3 not in drops
+        counts["replace" if promotions else "only" if 2 in drops else "both"] += 1
+    for key, expected in (("hair_keep", .10), ("only", .50), ("both", .20), ("replace", .30)):
+        assert abs(counts[key] / 10000 - expected) < .02
+    assert select_mimo_reference_projection("repeat", refs) == select_mimo_reference_projection("repeat", refs[::-1])
+
+
+@pytest.mark.parametrize("hair_draw", [.0, .1, .99])
+def test_reference_augmentation_mixed_people_surviving_graph(tmp_path, monkeypatch, hair_draw):
+    refs = _visual_reference_inventory(tmp_path, ["subject", "subject", "face", "face", "hair", "clothing"])
+    values = refs[3].model_dump()
+    values["owner_entity_id"] = "e2"
+    refs[3] = FinalVisualReference.model_validate(values)
+    sample = _sample_with_reference_inventory(tmp_path, refs)
+    snapshot = sample.model_dump_json()
+    _augmentation_draws(monkeypatch, [.8, .6, hair_draw])
+    job = _job_for_reference_inventory(tmp_path, sample)
+    projected = project_mimo_h3_sample_references(sample, reference_images=job.reference_images,
+                                                 reference_selection=job.reference_selection)
+    assert 1 not in job.reference_selection.selected_source_image_indexes
+    assert [s.entity_id for s in job.reference_subjects if s.kind == "entity"] == ["e2", "e1"]
+    assert [s.subject_label for s in job.reference_subjects] == [
+        f"<Subject {i}>" for i in range(1, len(job.reference_subjects) + 1)]
+    attributes = [s for s in job.reference_subjects if s.kind == "attribute"]
+    assert any(s.attribute_type == "upper_clothing" and s.owner_entity_id == "e1" for s in attributes)
+    assert any(s.attribute_type == "hair" for s in attributes) == (hair_draw < .1)
+    assert not any(s.attribute_type == "face" and s.owner_entity_id == "e1" for s in attributes)
+    owners = {s.entity_id for s in job.reference_subjects if s.kind == "entity"}
+    assert all(s.owner_entity_id in owners for s in attributes)
+    assert {p for s in job.reference_subjects for p in s.source_picture_labels} == {
+        r.picture_label for r in job.reference_images}
+    contract = mimo25_materializer.build_reference_contract(projected, "visual_only")
+    assert contract.subjects == job.reference_subjects
+    assert sample.model_dump_json() == snapshot
+    backend, completions = _backend(tmp_path, [])
+    content = backend._media_content(job)
+    metadata = [json.loads(i["text"]) for i in content if i["type"] == "text"]
+    assert [i["picture_label"] for i in metadata] == [r.picture_label for r in job.reference_images]
+    assert [i["image_url"]["url"] for i in content if i["type"] == "image_url"] == [
+        backend.config.media_resolver.resolve(Path(r.image_artifact_path)) for r in job.reference_images]
+    # Only graph inputs change: no prose field is cleaned or rewritten.
+    assert projected.r2v_instruction == sample.r2v_instruction
+    assert projected.speech_segments == sample.speech_segments
+    task = backend.build_compact_task_contract(job)
+    assert [r["subject_label"] for r in task["subject_definition_requirements"]] == [
+        s.subject_label for s in contract.subjects]
+    assert task["allowed_speaker_bindable_entity_ids"] == ["e1", "e2"]
+    assert not completions.requests
+
+    voiced = _sample(tmp_path).model_dump(mode="python")
+    voiced["visual_references"] = [r.model_dump() for r in refs]
+    voiced_sample = FinalH3SampleV2.model_validate(voiced)
+    projected_voice = project_mimo_h3_sample_references(
+        voiced_sample, reference_images=job.reference_images, reference_selection=job.reference_selection,
+    )
+    assert projected_voice.subject_voices[0].subject_index == 2
+    assert projected_voice.subject_voices[0].entity_id == "e1"
+    before_voice = voiced_sample.subject_voices[0].model_dump(exclude={"subject_index"})
+    assert projected_voice.subject_voices[0].model_dump(exclude={"subject_index"}) == before_voice
+
+
+@pytest.mark.parametrize("unavailable", ["missing", "empty", "directory"])
+def test_reference_augmentation_missing_face_and_no_face_keep_person(tmp_path, monkeypatch, unavailable):
+    refs = _visual_reference_inventory(tmp_path, ["subject", "face", "hair"], same_entity=True)
+    Path(refs[1].image_artifact_path).unlink()
+    if unavailable == "empty":
+        Path(refs[1].image_artifact_path).touch()
+    elif unavailable == "directory":
+        Path(refs[1].image_artifact_path).mkdir()
+    _augmentation_draws(monkeypatch, [.9])
+    selection, images = select_mimo_reference_projection("missing", refs)
+    assert [r.source_image_index for r in images] == [1]
+    assert not selection.face_promotions
+    assert {r.drop_reason for r in selection.dropped_references} == {"face_unavailable", "hair_sampling_drop"}
+    no_face = tmp_path / "no-face"
+    no_face.mkdir()
+    refs = _visual_reference_inventory(no_face, ["subject", "clothing"], same_entity=True)
+    _augmentation_draws(monkeypatch, [])
+    assert len(select_mimo_reference_projection("no-face", refs)[1]) == 2
+
+
+def test_reference_augmentation_rejects_forged_promotion(tmp_path, monkeypatch):
+    refs = _visual_reference_inventory(tmp_path, ["subject", "face"], same_entity=True)
+    sample = _sample_with_reference_inventory(tmp_path, refs)
+    _augmentation_draws(monkeypatch, [.8])
+    selection, images = select_mimo_reference_projection("forged", refs)
+    values = selection.model_dump()
+    values["face_promotions"][0]["entity_id"] = "e9"
+    with pytest.raises(ValueError, match="promotion provenance"):
+        project_mimo_h3_sample_references(sample, reference_images=images,
+            reference_selection=MimoReferenceSelection.model_validate(values))
+
+
+def test_reference_augmentation_preserves_legacy_selection_serialization(tmp_path):
+    refs = _visual_reference_inventory(tmp_path, ["subject"])
+    selection, _ = select_mimo_reference_projection("legacy", refs)
+    values = selection.model_dump()
+    values["policy_version"] = "h3_mimo25_reference_selection_v1"
+    values.pop("face_promotions")
+    assert MimoReferenceSelection.model_validate(values).model_dump() == values
+
+
 def _attribute_subject_annotation(description: str) -> MimoAVAnnotationDraft:
     payload = _annotation().model_dump(mode="json")
     payload["h3_semantics"]["subject_definitions"] = [
@@ -4922,7 +5066,9 @@ def test_attribute_subject_contract_is_attribute_only_and_owner_aware(
 
 def test_attribute_subject_rejects_standalone_owner_and_accepts_attribute_prose(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
+    monkeypatch.setattr("r2v_data_v2.h3.mimo25_av_reconcile._sample_reference_augmentation", lambda refs, rng: ({}, []))
     references = _visual_reference_inventory(
         tmp_path,
         ["subject", "hair"],
@@ -5022,7 +5168,9 @@ def test_mimo_reference_selection_is_exact_noop_at_or_below_limit(
 
 def test_mimo_reference_selection_drops_one_hair_deterministically(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
+    monkeypatch.setattr("r2v_data_v2.h3.mimo25_av_reconcile._sample_reference_augmentation", lambda refs, rng: ({}, []))
     kinds = ["subject", "subject", "subject", "hair"] + ["subject"] * 6
     references = _visual_reference_inventory(tmp_path, kinds, same_entity=True)
 
@@ -5056,7 +5204,9 @@ def test_mimo_reference_selection_drops_one_hair_deterministically(
 
 def test_reference_selection_review_audit_preserves_source_and_task_labels(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
+    monkeypatch.setattr("r2v_data_v2.h3.mimo25_av_reconcile._sample_reference_augmentation", lambda refs, rng: ({}, []))
     kinds = ["subject", "subject", "subject", "hair"] + ["subject"] * 6
     references = _visual_reference_inventory(tmp_path, kinds, same_entity=True)
     sample = _sample_with_reference_inventory(tmp_path, references)
@@ -5100,7 +5250,9 @@ def test_mimo_reference_selection_uses_exact_priority_cycle(
     tmp_path: Path,
     kinds: list[str],
     expected_reasons: list[str],
+    monkeypatch,
 ) -> None:
+    monkeypatch.setattr("r2v_data_v2.h3.mimo25_av_reconcile._sample_reference_augmentation", lambda refs, rng: ({}, []))
     references = _visual_reference_inventory(tmp_path, kinds, same_entity=True)
     selection, projected = select_mimo_reference_projection("clip-1", references)
 

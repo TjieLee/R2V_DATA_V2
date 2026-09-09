@@ -207,7 +207,7 @@ Prompt, policy, annotation schema, and materializer versions are:
 - `r2v.h3.mimo25_av_annotation.20`
 - `r2v.h3.mimo25_backend.40`
 - `h3_mimo25_materializer_v23`
-- `h3_mimo25_reference_selection_v1`
+- `h3_mimo25_reference_selection_v2`
 - `h3_mimo25_recovered_voice_quality_v1`
 - `r2v.h3.mimo25_inventory.4`
 - `r2v.h3.mimo25_record.11`
@@ -244,14 +244,21 @@ No semantic equivalence, absence, leakage, keyword or scoring gate is added.
 `N/A` denotes no eligible content. The same AV validators remain; no recheck.
 
 MiniMax H3 Ref2VA retains its official hard reference limits: at most 9 Images,
-3 Audio files, and 12 mixed reference files total. MiMo reference-selection V1
-does not relax or bypass those checks. For a frozen Visual sample with more than
-9 Pictures, it creates an Audio/H3 task-local projection by repeatedly dropping
+3 Audio files, and 12 mixed reference files total. MiMo reference-selection V2
+first samples each subject entity with an available face attribute independently:
+50% subject-only, 20% subject-plus-face, 30% face-replaces-subject. Hair attributes
+are independently retained with probability 10%. A missing/empty face file cannot
+replace a subject. Entities without a face keep their existing subject selection.
+The promoted face keeps the same entity identity but replaces the original subject
+image nodes; surviving attributes resolve their host through that entity in the
+new graph. Promotion/source/drop provenance is serialized with the selection.
+
+For a surviving graph with more than 9 Pictures, capacity trimming drops
 one deterministically random hair attribute, then one face attribute, then one
 remaining attribute while capacity is still exceeded. It never drops a subject,
 object, group, or background reference and fails closed when no attribute can be
-removed. Clips already containing at most 9 Pictures remain byte-semantically
-unchanged at the selected-reference level.
+removed. Promoted faces are now subjects and cannot be capacity-trimmed as attributes.
+The old v1 serialized selection remains readable without adding v2 fields to it.
 
 Selection uses a per-clip PRNG seeded from the selection-policy version and
 `clip_uid`; sorted candidates make it independent of process order and Python
@@ -259,7 +266,7 @@ hash randomization. Surviving source `<Image N>` identities retain their origina
 indexes and image IDs in provenance, while their task-local `<Picture N>` labels
 are reassigned contiguously. The frozen `r2v_instruction` is not rewritten.
 Instead, the machine contract publishes the exact source-Image-to-Picture map
-and dropped-attribute provenance. MiMo media input, Subject ownership, shadow
+and dropped-reference provenance. MiMo media input, Subject ownership, shadow
 materialization, Audio capacity accounting, and human review all consume that
 same serialized projection. Frozen Visual samples and image artifacts remain
 unchanged. The limits and label semantics follow the official MiniMax H3
@@ -380,10 +387,10 @@ types, drop-reason counts, and over-limit clip count. The review page shows the
 source `<Image N>` and task-local `<Picture M>` mapping for selected references,
 dropped attributes and reasons, Stage A/B/C records, per-segment source and
 direct-anchor evidence, presentation/binding-change counts, and final
-materialized H3. These diagnostics do not change
-`h3_mimo25_reference_selection_v1`: clips at or below nine Pictures remain an
-exact no-op, and over-capacity clips retain the existing deterministic
-attribute-only trimming policy.
+materialized H3. V2 sampling precedes stable Picture/Subject relabeling and
+existing attribute-only capacity trimming. No caption prose is removed or
+rewritten because a hair/face reference was dropped; natural visual descriptions
+of hair and faces remain allowed.
 
 Shadow materialization isolates only final Ref2VA response-contract failures at
 the individual sample level. Such a record remains `status="failed"`, carries a

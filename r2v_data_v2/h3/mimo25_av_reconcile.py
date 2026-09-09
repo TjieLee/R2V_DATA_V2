@@ -10,7 +10,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Literal, Protocol
 
-from pydantic import Field, model_validator
+from pydantic import Field, model_serializer, model_validator
 
 from r2v_data_v2.h3.binding_audit import SpeakerBindingSegmentAudit
 from r2v_data_v2.h3.diarization_binding import (
@@ -46,7 +46,7 @@ MIMO25_FAILURE_VERSION = "r2v.h3.mimo25_failure.5"
 MIMO25_RAW_VERSION = "r2v.h3.mimo25_raw_response.5"
 MIMO25_CASE_MANIFEST_VERSION = "r2v.h3.mimo25_case_manifest.1"
 MIMO25_INVENTORY_SCOPE = "canonical_visual_target_inventory"
-MIMO25_REFERENCE_SELECTION_POLICY_VERSION = "h3_mimo25_reference_selection_v1"
+MIMO25_REFERENCE_SELECTION_POLICY_VERSION = "h3_mimo25_reference_selection_v2"
 MIMO25_MAXIMUM_PICTURE_COUNT = 9
 
 
@@ -132,6 +132,10 @@ class MimoReferenceImage(SchemaModel):
 
 
 MimoReferenceDropReason = Literal[
+    "hair_sampling_drop",
+    "face_sampling_drop",
+    "face_unavailable",
+    "person_replaced_by_face",
     "hair_capacity_trim",
     "face_capacity_trim",
     "attribute_capacity_trim",
@@ -142,21 +146,29 @@ class MimoDroppedReference(SchemaModel):
     source_image_index: int = Field(gt=0)
     source_image_id: str = Field(min_length=1)
     source_image_label: str = Field(pattern=r"^<Image [1-9]\d*>$")
-    kind: Literal["attribute"]
-    entity_id: None = None
-    attribute_id: str
-    owner_entity_id: str
-    attribute_type: str
+    kind: Literal["attribute", "subject"]
+    entity_id: str | None = None
+    attribute_id: str | None = None
+    owner_entity_id: str | None = None
+    attribute_type: str | None = None
     drop_reason: MimoReferenceDropReason
 
     @model_validator(mode="after")
     def validate_drop(self) -> MimoDroppedReference:
         if self.source_image_label != f"<Image {self.source_image_index}>":
             raise ValueError("dropped MiMo source Image label differs")
+        if self.kind == "subject":
+            if self.drop_reason != "person_replaced_by_face" or not self.entity_id or any(
+                v is not None for v in (self.attribute_id, self.owner_entity_id, self.attribute_type)
+            ):
+                raise ValueError("dropped subject requires face replacement provenance")
+            return self
+        if self.entity_id is not None or self.drop_reason == "person_replaced_by_face":
+            raise ValueError("dropped attribute cannot claim entity identity")
         if not all(
-            value.strip()
+            value and value.strip()
             for value in (self.source_image_id, self.attribute_id, self.owner_entity_id)
-        ) or not self.attribute_type.strip():
+        ) or not self.attribute_type or not self.attribute_type.strip():
             raise ValueError("dropped MiMo attribute provenance is incomplete")
         if self.drop_reason == "hair_capacity_trim" and self.attribute_type != "hair":
             raise ValueError("MiMo hair trim requires a hair attribute")
@@ -165,8 +177,14 @@ class MimoDroppedReference(SchemaModel):
         return self
 
 
+class MimoFacePromotion(SchemaModel):
+    source_image_index: int = Field(gt=0)
+    entity_id: str = Field(min_length=1)
+    replaced_source_image_indexes: list[int] = Field(min_length=1)
+
+
 class MimoReferenceSelection(SchemaModel):
-    policy_version: Literal["h3_mimo25_reference_selection_v1"] = (
+    policy_version: Literal["h3_mimo25_reference_selection_v1", "h3_mimo25_reference_selection_v2"] = (
         MIMO25_REFERENCE_SELECTION_POLICY_VERSION
     )
     original_picture_count: int = Field(gt=0)
@@ -174,9 +192,19 @@ class MimoReferenceSelection(SchemaModel):
     selected_source_image_indexes: list[int] = Field(min_length=1)
     selected_source_image_ids: list[str] = Field(min_length=1)
     dropped_references: list[MimoDroppedReference]
+    face_promotions: list[MimoFacePromotion] = Field(default_factory=list)
+
+    @model_serializer(mode="wrap")
+    def serialize_selection(self, handler):
+        values = handler(self)
+        if self.policy_version == "h3_mimo25_reference_selection_v1":
+            values.pop("face_promotions", None)
+        return values
 
     @model_validator(mode="after")
     def validate_selection(self) -> MimoReferenceSelection:
+        if self.policy_version == "h3_mimo25_reference_selection_v1" and self.face_promotions:
+            raise ValueError("legacy reference selection cannot promote faces")
         if (
             self.selected_picture_count != len(self.selected_source_image_indexes)
             or self.selected_picture_count != len(self.selected_source_image_ids)
@@ -198,6 +226,15 @@ class MimoReferenceSelection(SchemaModel):
             raise ValueError("MiMo reference selection identities must be unique")
         if sorted(all_indexes) != list(range(1, self.original_picture_count + 1)):
             raise ValueError("MiMo reference selection must cover the source inventory")
+        promoted = [p.source_image_index for p in self.face_promotions]
+        entities = [p.entity_id for p in self.face_promotions]
+        replaced = [i for p in self.face_promotions for i in p.replaced_source_image_indexes]
+        if (len(promoted) != len(set(promoted)) or len(entities) != len(set(entities))
+                or len(replaced) != len(set(replaced))
+                or not set(promoted).issubset(self.selected_source_image_indexes)
+                or set(replaced) != {d.source_image_index for d in self.dropped_references
+                                     if d.drop_reason == "person_replaced_by_face"}):
+            raise ValueError("MiMo face promotion inventory differs")
         return self
 
 
@@ -205,6 +242,12 @@ def _dropped_reference(
     reference: FinalVisualReference,
     reason: MimoReferenceDropReason,
 ) -> MimoDroppedReference:
+    if reason == "person_replaced_by_face" and reference.kind == "subject":
+        return MimoDroppedReference(
+            source_image_index=reference.image_index, source_image_id=reference.image_id,
+            source_image_label=f"<Image {reference.image_index}>", kind="subject",
+            entity_id=reference.entity_id, drop_reason=reason,
+        )
     if (
         reference.kind != "attribute"
         or reference.attribute_id is None
@@ -224,6 +267,57 @@ def _dropped_reference(
     )
 
 
+def _face_file_available(reference: FinalVisualReference) -> bool:
+    try:
+        with Path(reference.image_artifact_path).open("rb") as source:
+            return bool(source.read(1))
+    except OSError:
+        return False
+
+
+def _sample_reference_augmentation(
+    ordered: Sequence[FinalVisualReference], rng: random.Random,
+) -> tuple[dict[int, MimoReferenceDropReason], list[MimoFacePromotion]]:
+    """Decide first; retain entity identity while replacing its source image node."""
+    drops: dict[int, MimoReferenceDropReason] = {}
+    promotions: list[MimoFacePromotion] = []
+    people: dict[str, list[FinalVisualReference]] = {}
+    for ref in ordered:
+        if ref.kind == "subject" and ref.entity_id is not None:
+            people.setdefault(ref.entity_id, []).append(ref)
+    for entity, subjects in people.items():
+        faces = [r for r in ordered if r.kind == "attribute" and r.attribute_type == "face"
+                 and r.owner_entity_id == entity]
+        available = [r for r in faces if _face_file_available(r)]
+        for ref in faces:
+            if ref not in available:
+                drops[ref.image_index] = "face_unavailable"
+        if not available:
+            continue
+        draw = rng.random()
+        if draw < .50:
+            drops.update((r.image_index, "face_sampling_drop") for r in available)
+        elif draw >= .70:
+            face = available[0]
+            promotions.append(MimoFacePromotion(
+                source_image_index=face.image_index, entity_id=entity,
+                replaced_source_image_indexes=[s.image_index for s in subjects],
+            ))
+            drops.update((s.image_index, "person_replaced_by_face") for s in subjects)
+            drops.update((r.image_index, "face_sampling_drop") for r in available[1:])
+    for ref in ordered:
+        if ref.kind == "attribute" and ref.attribute_type == "hair" and rng.random() >= .10:
+            drops[ref.image_index] = "hair_sampling_drop"
+    return drops, promotions
+
+
+def _promote_face(reference: FinalVisualReference, entity_id: str) -> FinalVisualReference:
+    values = reference.model_dump(mode="python")
+    values.update(kind="subject", entity_id=entity_id, attribute_id=None,
+                  owner_entity_id=None, attribute_type=None, scope="local", visible_region="head_shoulders")
+    return FinalVisualReference.model_validate(values)
+
+
 def select_mimo_reference_projection(
     clip_uid: str,
     references: Sequence[FinalVisualReference],
@@ -233,10 +327,13 @@ def select_mimo_reference_projection(
         raise ValueError("MiMo source references must use contiguous image indexes")
     if not ordered:
         raise ValueError("MiMo source reference inventory must not be empty")
-    selected = list(ordered)
-    dropped: list[MimoDroppedReference] = []
     seed_text = f"{MIMO25_REFERENCE_SELECTION_POLICY_VERSION}:{clip_uid}"
     rng = random.Random(int(_sha256_text(seed_text), 16))
+    decisions, promotions = _sample_reference_augmentation(ordered, rng)
+    promoted = {p.source_image_index: p.entity_id for p in promotions}
+    selected = [_promote_face(r, promoted[r.image_index]) if r.image_index in promoted else r
+                for r in ordered if r.image_index not in decisions]
+    dropped = [_dropped_reference(r, decisions[r.image_index]) for r in ordered if r.image_index in decisions]
     tiers: tuple[
         tuple[MimoReferenceDropReason, Callable[[FinalVisualReference], bool]], ...
     ] = (
@@ -271,6 +368,9 @@ def select_mimo_reference_projection(
                 "without a droppable attribute reference"
             )
     selected.sort(key=lambda item: (item.image_index, item.image_id))
+    entities = {r.entity_id for r in selected if r.kind in {"subject", "object", "group"}}
+    if any(r.kind == "attribute" and r.owner_entity_id not in entities for r in selected):
+        raise ValueError("MiMo surviving attribute has no entity host")
     projected = [
         MimoReferenceImage(
             image_index=index,
@@ -298,6 +398,7 @@ def select_mimo_reference_projection(
         selected_source_image_indexes=[item.source_image_index for item in projected],
         selected_source_image_ids=[item.source_image_id for item in projected],
         dropped_references=dropped,
+        face_promotions=promotions,
     )
     return selection, projected
 
@@ -354,10 +455,21 @@ def project_mimo_h3_sample_references(
         ):
             raise ValueError("MiMo dropped reference provenance differs from source H3")
     projected: list[dict[str, object]] = []
+    promotions = {p.source_image_index: p for p in reference_selection.face_promotions}
+    for promotion in promotions.values():
+        face = source_by_index[promotion.source_image_index]
+        if (face.kind != "attribute" or face.attribute_type != "face"
+                or face.owner_entity_id != promotion.entity_id
+                or promotion.replaced_source_image_indexes != [
+                    r.image_index for r in sample.visual_references
+                    if r.kind == "subject" and r.entity_id == promotion.entity_id]):
+            raise ValueError("MiMo face promotion provenance differs from source H3")
     for reference in reference_images:
         source = source_by_index.get(reference.source_image_index)
         if source is None:
             raise ValueError("MiMo selected source reference is missing")
+        if reference.source_image_index in promotions:
+            source = _promote_face(source, promotions[reference.source_image_index].entity_id)
         expected = (
             source.image_id,
             source.kind,
@@ -384,6 +496,11 @@ def project_mimo_h3_sample_references(
         projected.append(values)
     sample_values = sample.model_dump(mode="python")
     sample_values["visual_references"] = projected
+    subject_indexes = {r["entity_id"]: i for i, r in enumerate(
+        (r for r in projected if r["kind"] == "subject"), start=1,
+    )}
+    for voice in sample_values["subject_voices"]:
+        voice["subject_index"] = subject_indexes[voice["entity_id"]]
     return FinalH3SampleV2.model_validate(sample_values)
 
 
@@ -1057,13 +1174,16 @@ def run_mimo25_av_reconcile(
         selected_reference_kinds.update(item.kind for item in job.reference_images)
         original_reference_kinds.update(item.kind for item in job.reference_images)
         original_reference_kinds.update(item.kind for item in selection.dropped_references)
+        if selection.face_promotions:
+            original_reference_kinds["subject"] -= len(selection.face_promotions)
+            original_reference_kinds["attribute"] += len(selection.face_promotions)
         selected_attribute_types.update(
             item.attribute_type
             for item in job.reference_images
             if item.kind == "attribute" and item.attribute_type is not None
         )
         dropped_attribute_types.update(
-            item.attribute_type for item in selection.dropped_references
+            item.attribute_type for item in selection.dropped_references if item.attribute_type is not None
         )
         drop_reasons.update(item.drop_reason for item in selection.dropped_references)
     try:
