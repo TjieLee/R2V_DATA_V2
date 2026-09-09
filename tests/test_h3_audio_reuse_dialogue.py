@@ -13,6 +13,8 @@ from r2v_data_v2.h3.audio_reuse_materializer import (
 from r2v_data_v2.h3.mimo25_h3_materializer import (
     _materialize_sample,
     project_authoritative_dialogue,
+    prune_summary_dialogue,
+    validate_product_dialogue_sections,
 )
 from r2v_data_v2.h3.qwen38_h3_recaption import (
     RecaptionSpeechFact,
@@ -147,9 +149,79 @@ def test_published_product_validator_enforces_exact_dialogue(tmp_path):
     args = _prepared(tmp_path)
     product.materialize_audio_reuse_products(**args)
     rows = product._rows(args["output_root"] / "records.jsonl", AudioReuseProduct)
-    assert AUDIO_REUSE_MATERIALIZER_VERSION == "h3_mimo25_audio_reuse_materializer_v2"
+    assert AUDIO_REUSE_MATERIALIZER_VERSION == "h3_mimo25_audio_reuse_materializer_v3"
     values = rows[0].model_dump(mode="json")
     values["rendered_h3_prompt"] = values["rendered_h3_prompt"].replace("Exact, text!", "Translated text")
     values["record_fingerprint"] = product._hash({k: v for k, v in values.items() if k != "record_fingerprint"})
     with pytest.raises(ValueError, match="authoritative_dialogue_mismatch"):
         AudioReuseProduct.model_validate(values)
+
+
+def test_zero_speech_stale_summary_pruned_product_ready_and_legacy_unchanged(tmp_path):
+    from r2v_data_v2.h3 import audio_reuse_materializer as product
+
+    visual = "A woman stands on a stage."
+    stale = " A woman (S1) speaks to the audience, saying, <d>[Chinese] stale speech.</d>."
+    _, sample, source = _case(tmp_path, (), summary=visual + stale)
+    before = source.record.model_dump()
+    _, _, corrected, prompt = _render(sample, source)
+    assert corrected == []
+    assert prompt.split("\n\nsummary:\n", 1)[1].split("\n\nretention_analysis:\n", 1)[0].endswith(visual)
+    assert "<d>" not in prompt and "</d>" not in prompt and "(S1)" not in prompt
+    assert source.record.model_dump() == before
+    _, legacy, _ = _materialize_sample(sample, source.job, source.record)
+    assert visual + stale in legacy
+    # The persisted product validator also accepts this zero-ASR result.
+    args = _prepared(tmp_path / "prepared")
+    product.materialize_audio_reuse_products(**args)
+    row = product._rows(args["output_root"] / "records.jsonl", AudioReuseProduct)[0]
+    values = row.model_dump(mode="json")
+    values.update(rendered_h3_prompt=prompt, corrected_speech_segments=[])
+    values["record_fingerprint"] = product._hash({k: v for k, v in values.items() if k != "record_fingerprint"})
+    assert AudioReuseProduct.model_validate(values).status == "ready"
+
+
+def test_clean_zero_speech_visual_summary_is_byte_stable(tmp_path):
+    visual = "A woman appears to be speaking on stage.  The camera stays still."
+    assert prune_summary_dialogue(visual) == visual
+    _, sample, source = _case(tmp_path, (), summary=visual)
+    _, _, _, prompt = _render(sample, source)
+    assert visual in prompt
+    validate_product_dialogue_sections(prompt, [])
+
+
+def test_real_speech_summary_pruning_preserves_high_level_sx_and_exact_asr(tmp_path):
+    retained = "A woman stands indoors. (S1) speaks offscreen."
+    stale = " A voice says <d>[English] copied. Another sentence!</d>."
+    _, sample, source = _case(tmp_path, summary=retained + stale)
+    _, _, _, prompt = _render(sample, source)
+    assert retained in prompt and "Another sentence!" not in prompt
+    assert _blocks(prompt) == ["<d>[English] Exact, text!</d>"]
+    validate_product_dialogue_sections(prompt, _blocks(prompt))
+
+
+@pytest.mark.parametrize("section", [
+    "subject_definitions", "summary", "retention_analysis", "overall_soundscape", "non_diegetic_music",
+])
+@pytest.mark.parametrize("tag", ["<d>", "</d>"])
+def test_dialogue_tags_in_other_sections_fail_closed(tmp_path, section, tag):
+    _, sample, source = _case(tmp_path, ())
+    _, _, _, prompt = _render(sample, source)
+    prompt = prompt.replace(section + ":\n", section + ":\n" + tag, 1)
+    with pytest.raises(ValueError, match="dialogue_outside_detailed_description"):
+        validate_product_dialogue_sections(prompt, [])
+
+
+def test_summary_pruning_preserves_retained_slices_and_fails_if_empty():
+    assert prune_summary_dialogue("Visual. Speech (S1) <d>[English] a. b!</d>.  More visual.") == "Visual.  More visual."
+    with pytest.raises(ValueError, match="summary_empty_after_dialogue_pruning"):
+        prune_summary_dialogue("(S1) says <d>[Chinese] a</d>.")
+
+
+def test_zero_speech_detail_rejects_dialogue_and_bad_section_order(tmp_path):
+    _, sample, source = _case(tmp_path, ())
+    _, _, _, prompt = _render(sample, source)
+    with pytest.raises(ValueError, match="authoritative_dialogue_mismatch"):
+        validate_product_dialogue_sections(prompt.replace("[Shot 1]", "[Shot 1] <d>[English] extra</d>"), [])
+    with pytest.raises(ValueError, match="section_structure_invalid"):
+        validate_product_dialogue_sections(prompt.replace("summary:\n", "unknown:\n"), [])

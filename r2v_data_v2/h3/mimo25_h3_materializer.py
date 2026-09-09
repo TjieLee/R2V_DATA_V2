@@ -628,6 +628,51 @@ def _render_subject_definition(
     return f"{contract.subject_label} is {description}, {connector} {pictures}."
 
 
+def prune_summary_dialogue(summary: str) -> str:
+    """Drop whole dialogue-bearing sentence units without rewriting retained prose."""
+    units: list[str] = []
+    start, depth = 0, 0
+    # Dialogue punctuation belongs to its surrounding sentence, not a new unit.
+    for token in re.finditer(r"<d>|</d>|[.!?\u3002\uff01\uff1f](?=\s|$)", summary):
+        if token.group() == "<d>":
+            depth += 1
+        elif token.group() == "</d>":
+            depth = max(0, depth - 1)
+        elif depth == 0:
+            units.append(summary[start:token.end()])
+            start = token.end()
+    units.append(summary[start:])
+    result = "".join(unit for unit in units if "<d>" not in unit and "</d>" not in unit)
+    if not result.strip():
+        raise MimoH3MaterializationContractError([ValidationIssue(
+            "audio_reuse_summary_empty_after_dialogue_pruning", "summary",
+            "summary must retain non-dialogue prose",
+        )])
+    return result
+
+
+def validate_product_dialogue_sections(rendered: str, expected_blocks: Sequence[str]) -> None:
+    """Validate the canonical six-section renderer without pooling dialogue fields."""
+    names = ("subject_definitions", "summary", "retention_analysis", "detailed_description",
+             "overall_soundscape", "non_diegetic_music")
+    headers = list(re.finditer(r"(?:\A|\n\n)(" + "|".join(names) + r"):\n", rendered))
+    if not rendered.startswith("subject_definitions:\n") or [header.group(1) for header in headers] != list(names):
+        raise MimoH3MaterializationContractError([ValidationIssue(
+            "audio_reuse_section_structure_invalid", "rendered_h3_prompt",
+            "expected exactly the canonical six H3 sections in order",
+        )])
+    for index, header in enumerate(headers):
+        name = header.group(1)
+        body = rendered[header.end():headers[index + 1].start() if index + 1 < len(headers) else len(rendered)]
+        if name == "detailed_description":
+            validate_authoritative_dialogue(body, expected_blocks)
+        elif "<d>" in body or "</d>" in body:
+            raise MimoH3MaterializationContractError([ValidationIssue(
+                "audio_reuse_dialogue_outside_detailed_description", name,
+                "dialogue tags belong only in detailed_description",
+            )])
+
+
 def validate_authoritative_dialogue(caption: str, expected_blocks: Sequence[str]) -> None:
     """The Audio-reuse product alone requires one exact block per ASR segment."""
     blocks = re.findall(r"<d>[\s\S]*?</d>", caption)
@@ -823,7 +868,9 @@ def _materialize_sample(
         raise MimoH3MaterializationContractError(direct_issues)
     warnings.extend(correction_warnings)
     music = direct.non_diegetic_music
+    summary = direct.summary
     if reuse_audio_contracts is not None:
+        summary = prune_summary_dialogue(summary)
         detailed = project_authoritative_dialogue(
             detailed, facts.speech,
             {g.segment_id: g.speech_presentation for g in record.annotation.av_grounding.segment_groundings},
@@ -839,7 +886,7 @@ def _materialize_sample(
                 strict=True,
             )
         ] + [_canonical_audio_definition(audio) for audio in contract.audios],
-        summary=f"{prefix} {record.annotation.h3_semantics.summary}",
+        summary=f"{prefix} {summary}",
         retention_analysis=[
             item.render()
             for item in record.annotation.h3_semantics.visual_retention_analysis
@@ -858,7 +905,7 @@ def _materialize_sample(
         )
     rendered = render_h3_prompt(structured)
     if reuse_audio_contracts is not None:
-        validate_authoritative_dialogue(rendered, [s.locked_dialogue_block for s in facts.speech])
+        validate_product_dialogue_sections(rendered, [s.locked_dialogue_block for s in facts.speech])
     return corrected, rendered, sorted(set(warnings))
 
 

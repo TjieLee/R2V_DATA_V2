@@ -32,7 +32,7 @@ from tests.test_h3_mimo25_av_shadow import _sample
 
 def _case(tmp_path, groups=("g1",), *, music="N/A", offscreen=False, clip="clip-1", composition=None,
           text="Exact, text!", profile="Target bright voice", all_visible=False, target_subtype="PCM_16",
-          caption=None, speech_payloads=None):
+          caption=None, speech_payloads=None, summary=None):
     tmp_path.mkdir(parents=True, exist_ok=True)
     intervals = [(i * .3, i * .3 + .2, group) for i, group in enumerate(groups)]
     args = _fixture(tmp_path, intervals, offscreen=offscreen, target_subtype=target_subtype)
@@ -63,6 +63,8 @@ def _case(tmp_path, groups=("g1",), *, music="N/A", offscreen=False, clip="clip-
     payload["h3_semantics"]["non_diegetic_music"] = music
     if caption is not None:
         payload["h3_semantics"]["shot1_caption"] = caption
+    if summary is not None:
+        payload["h3_semantics"]["summary"] = summary
     if composition:
         payload["audio_observation"]["segment_decisions"][0].update(
             vocal_composition=composition,
