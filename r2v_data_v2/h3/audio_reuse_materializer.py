@@ -32,6 +32,7 @@ from r2v_data_v2.h3.mimo25_h3_materializer import (
     MimoH3MaterializationContractError,
     _materialize_sample,
     _validate_job_media_integrity,
+    validate_authoritative_dialogue,
 )
 from r2v_data_v2.h3.qwen38_h3_recaption import (
     ConditioningVariant,
@@ -42,7 +43,7 @@ from r2v_data_v2.h3.sam_audio_stem_shadow import SAMAudioStemRecord, sha256_file
 from r2v_data_v2.h3.schemas import SchemaModel
 from r2v_data_v2.h3.speaker_ownership import speaker_ownership_reasons
 
-AUDIO_REUSE_MATERIALIZER_VERSION = "h3_mimo25_audio_reuse_materializer_v1"
+AUDIO_REUSE_MATERIALIZER_VERSION = "h3_mimo25_audio_reuse_materializer_v2"
 
 
 def _hash(value: SchemaModel | dict) -> str:
@@ -288,7 +289,7 @@ def select_reuse_audio(
 
 class AudioReuseProduct(SchemaModel):
     schema_version: Literal["r2v.h3.audio_reuse_product.1"] = "r2v.h3.audio_reuse_product.1"
-    materializer_version: Literal["h3_mimo25_audio_reuse_materializer_v1"] = AUDIO_REUSE_MATERIALIZER_VERSION
+    materializer_version: Literal["h3_mimo25_audio_reuse_materializer_v2"] = AUDIO_REUSE_MATERIALIZER_VERSION
     sample_id: str
     source_h3_sample_id: str
     source_h3_sample_sha256: str
@@ -314,6 +315,10 @@ class AudioReuseProduct(SchemaModel):
         if self.status == "ready":
             if not self.rendered_h3_prompt or self.failure_reason:
                 raise ValueError("ready reuse product is incomplete")
+            validate_authoritative_dialogue(
+                self.rendered_h3_prompt,
+                [f"<d>[{s.language or 'Unknown'}] {s.text}</d>" for s in self.corrected_speech_segments],
+            )
         elif self.rendered_h3_prompt is not None or not self.failure_reason or self.audio_references:
             raise ValueError("failed reuse product cannot publish Audio")
         if self.record_fingerprint != _hash(self.model_dump(mode="json", exclude={"record_fingerprint"})):

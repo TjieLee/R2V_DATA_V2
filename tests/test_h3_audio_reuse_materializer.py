@@ -31,15 +31,18 @@ from tests.test_h3_mimo25_av_shadow import _sample
 
 
 def _case(tmp_path, groups=("g1",), *, music="N/A", offscreen=False, clip="clip-1", composition=None,
-          text="Exact, text!", profile="Target bright voice", all_visible=False, target_subtype="PCM_16"):
+          text="Exact, text!", profile="Target bright voice", all_visible=False, target_subtype="PCM_16",
+          caption=None, speech_payloads=None):
     tmp_path.mkdir(parents=True, exist_ok=True)
     intervals = [(i * .3, i * .3 + .2, group) for i, group in enumerate(groups)]
     args = _fixture(tmp_path, intervals, offscreen=offscreen, target_subtype=target_subtype)
     values = args["job"].model_dump(mode="json")
     values["clip_uid"] = clip
-    for segment in values["segments"]:
+    for index, segment in enumerate(values["segments"]):
         segment.update(source_start_sample=round(segment["start_time"] * 32000),
                        source_end_sample=round(segment["end_time"] * 32000), source_sample_rate_hz=32000, asr_text=text)
+        if speech_payloads is not None:
+            segment["asr_language"], segment["asr_text"] = speech_payloads[index]
     args["job"] = _seal(MimoClipJob, values, "request_fingerprint")
     stem_values = args["stem_record"].model_dump(mode="json")
     stem_values["clip_uid"] = clip
@@ -58,6 +61,8 @@ def _case(tmp_path, groups=("g1",), *, music="N/A", offscreen=False, clip="clip-
         f"<d>[English] {text}</d>" for group in groups
     )
     payload["h3_semantics"]["non_diegetic_music"] = music
+    if caption is not None:
+        payload["h3_semantics"]["shot1_caption"] = caption
     if composition:
         payload["audio_observation"]["segment_decisions"][0].update(
             vocal_composition=composition,

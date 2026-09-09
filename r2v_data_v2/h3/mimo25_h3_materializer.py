@@ -7,7 +7,7 @@ import re
 import shutil
 import uuid
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Literal, Protocol
 
@@ -54,11 +54,13 @@ from r2v_data_v2.h3.qwen38_h3_recaption import (
     RecaptionSubjectContract,
     _canonical_audio_definition,
     _canonical_audio_retention,
+    _render_locked_speech,
     audio_task_prefix,
     build_reference_contract,
     render_h3_prompt,
 )
 from r2v_data_v2.h3.schemas import SchemaModel
+from r2v_data_v2.h3.speech_presentation import SpeechPresentation
 from r2v_data_v2.structured_output import ValidationIssue
 
 MIMO25_SHADOW_RECORD_VERSION = "r2v.h3.mimo25_h3_shadow.16"
@@ -626,6 +628,68 @@ def _render_subject_definition(
     return f"{contract.subject_label} is {description}, {connector} {pictures}."
 
 
+def validate_authoritative_dialogue(caption: str, expected_blocks: Sequence[str]) -> None:
+    """The Audio-reuse product alone requires one exact block per ASR segment."""
+    blocks = re.findall(r"<d>[\s\S]*?</d>", caption)
+    if (blocks != list(expected_blocks) or caption.count("<d>") != len(blocks)
+            or caption.count("</d>") != len(blocks)):
+        raise MimoH3MaterializationContractError([ValidationIssue(
+            "audio_reuse_authoritative_dialogue_mismatch", "detailed_description",
+            "dialogue blocks must exactly equal chronological authoritative ASR",
+        )])
+
+
+def project_authoritative_dialogue(
+    caption: str, speech: Sequence[RecaptionSpeechFact],
+    presentations: Mapping[str, SpeechPresentation], contract: RecaptionReferenceContract,
+) -> str:
+    """Use protected MiMo blocks as placement slots, never as dialogue authority."""
+    blocks = list(re.finditer(r"<d>[\s\S]*?</d>", caption))
+    known = {s.speaker_id for s in speech}
+    cursor, previous_end = 0, 0
+    previous_speaker = None
+    pieces: list[str] = []
+
+    def missing_clause(fact: RecaptionSpeechFact) -> str:
+        return _render_locked_speech(
+            fact, contract, include_audio_reference=False,
+            presentation=presentations[fact.segment_id],
+        )
+
+    for index, block in enumerate(blocks):
+        lead = caption[previous_end:block.start()]
+        markers = {m for m in re.findall(r"\((S[1-9]\d*)\)", lead) if m in known}
+        if len(blocks) == len(speech) and speech[index].speaker_id in markers:
+            speaker = speech[index].speaker_id
+        elif len(markers) == 1:
+            speaker = next(iter(markers))
+        elif not markers and previous_speaker is not None and cursor < len(speech) and (
+            speech[cursor].speaker_id == previous_speaker
+        ):
+            speaker = previous_speaker
+        else:
+            raise MimoH3MaterializationContractError([ValidationIssue(
+                "audio_reuse_dialogue_slot_ambiguous", f"dialogue_{index + 1}",
+                "existing dialogue slot has no unambiguous speaker",
+            )])
+        match = next((i for i in range(cursor, len(speech)) if speech[i].speaker_id == speaker), None)
+        if match is None:
+            raise MimoH3MaterializationContractError([ValidationIssue(
+                "audio_reuse_dialogue_slot_order_mismatch", f"dialogue_{index + 1}",
+                "existing speaker slot has no remaining chronological authoritative fact",
+            )])
+        if match > cursor:
+            pieces.append("\n" + "\n".join(missing_clause(s) for s in speech[cursor:match]) + "\n")
+        pieces.extend((lead, speech[match].locked_dialogue_block))
+        cursor, previous_end, previous_speaker = match + 1, block.end(), speaker
+    pieces.append(caption[previous_end:])
+    if cursor < len(speech):
+        pieces.append("\n" + "\n".join(missing_clause(s) for s in speech[cursor:]))
+    projected = "".join(pieces)
+    validate_authoritative_dialogue(projected, [s.locked_dialogue_block for s in speech])
+    return projected
+
+
 def project_audio_relationships(
     caption: str,
     music: str,
@@ -760,6 +824,11 @@ def _materialize_sample(
     warnings.extend(correction_warnings)
     music = direct.non_diegetic_music
     if reuse_audio_contracts is not None:
+        detailed = project_authoritative_dialogue(
+            detailed, facts.speech,
+            {g.segment_id: g.speech_presentation for g in record.annotation.av_grounding.segment_groundings},
+            contract,
+        )
         detailed, music = project_audio_relationships(detailed, music, facts.speech, contract.audios)
     structured = Qwen38H3StructuredResponse(
         subject_definitions=[
@@ -787,7 +856,10 @@ def _materialize_sample(
         warnings.extend(
             f"{item.segment_id}:{item.code}" for item in record.annotation.warnings
         )
-    return corrected, render_h3_prompt(structured), sorted(set(warnings))
+    rendered = render_h3_prompt(structured)
+    if reuse_audio_contracts is not None:
+        validate_authoritative_dialogue(rendered, [s.locked_dialogue_block for s in facts.speech])
+    return corrected, rendered, sorted(set(warnings))
 
 
 def _record(values: dict[str, object]) -> MimoH3ShadowRecord:

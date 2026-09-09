@@ -130,7 +130,11 @@ the six-section H3 layout remain unchanged.
 
 The new product contracts are `r2v.h3.audio_reuse_product.1` and
 `r2v.h3.audio_reuse_product_summary.1`, with materializer policy
-`h3_mimo25_audio_reuse_materializer_v1`. `ReuseAudioReference` carries the full
+`h3_mimo25_audio_reuse_materializer_v2`. Only this product path projects exact
+chronological ASR dialogue into protected frozen caption slots, inserts missing
+speech with finalized presentation, and then projects Audio relationships.
+Extra or contradictory speaker slots fail closed. Legacy v26 rendering is unchanged.
+`ReuseAudioReference` carries the full
 multi-segment asset plus manifest path/hash/fingerprint and donor provenance.
 This separate versioned product leaves MiMo backend .61, annotation .20, all
 prompts and legacy materializer v26 provenance untouched.
