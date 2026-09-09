@@ -20,14 +20,18 @@ from r2v_data_v2.h3.audio_reuse import (
     read_canonical_stem_pcm16,
     read_reuse_asset_pcm16,
 )
+from r2v_data_v2.h3.audio_reuse_prepared import (
+    AudioReusePreparedSource,
+    validate_prepared_inputs,
+)
 from r2v_data_v2.h3.jea_audio_production import jea_production_paths
 from r2v_data_v2.h3.jea_final_renderer import FinalH3SampleV2, FinalQwen3SpeechSegment
-from r2v_data_v2.h3.mimo25_av_reconcile import MimoClipJob, MimoInventory, MimoRecord
+from r2v_data_v2.h3.mimo25_av_reconcile import MimoClipJob, MimoInventory
 from r2v_data_v2.h3.mimo25_backend import direct_speech_facts
 from r2v_data_v2.h3.mimo25_h3_materializer import (
     MimoH3MaterializationContractError,
     _materialize_sample,
-    _validate_materializer_provenance,
+    _validate_job_media_integrity,
 )
 from r2v_data_v2.h3.qwen38_h3_recaption import (
     ConditioningVariant,
@@ -53,18 +57,18 @@ def _rows(path: Path, model: type[SchemaModel]) -> list:
 @dataclass(frozen=True)
 class ValidatedReuseSource:
     job: MimoClipJob
-    record: MimoRecord
+    record: AudioReusePreparedSource
     manifest: AudioReuseManifest
     manifest_path: Path
     manifest_sha256: str
 
 
 def load_reuse_source(
-    *, manifest_path: Path, job: MimoClipJob, record: MimoRecord, stem_record: SAMAudioStemRecord,
+    *, manifest_path: Path, job: MimoClipJob, record: AudioReusePreparedSource, stem_record: SAMAudioStemRecord,
 ) -> ValidatedReuseSource:
     """Validate published assets against independent frozen job/annotation/SAM inputs."""
     job = MimoClipJob.model_validate(job.model_dump())
-    record = MimoRecord.model_validate(record.model_dump())
+    record = AudioReusePreparedSource.model_validate(record.model_dump())
     stem_record = SAMAudioStemRecord.model_validate(stem_record.model_dump())
     path = manifest_path.resolve(strict=True)
     digest = sha256_file(path)
@@ -73,7 +77,8 @@ def load_reuse_source(
     if record.status != "ready" or annotation is None:
         raise ValueError("reuse needs a ready frozen MiMo annotation")
     if (
-        record.clip_uid != job.clip_uid or record.request_fingerprint != job.request_fingerprint
+        record.clip_uid != job.clip_uid or record.source_job_fingerprint != job.request_fingerprint
+        or record.source_stem_record_fingerprint != stem_record.record_fingerprint
         or stem_record.clip_uid != job.clip_uid or stem_record.separation_state == "failure"
         or manifest.clip_uid != job.clip_uid
         or manifest.source_job_fingerprint != job.request_fingerprint
@@ -188,7 +193,7 @@ def _reference(source: ValidatedReuseSource, asset: SpeakerSpeechReuseAsset | Mu
     return ReuseAudioReference(
         source_clip_uid=source.job.clip_uid, reuse_manifest_path=str(source.manifest_path),
         reuse_manifest_sha256=source.manifest_sha256, reuse_manifest_fingerprint=_hash(source.manifest),
-        reuse_asset=asset, source_mimo_record_fingerprint=source.record.record_fingerprint, **values,
+        reuse_asset=asset, source_mimo_record_fingerprint=source.record.source_reconcile_record_fingerprint, **values,
     )
 
 
@@ -357,7 +362,7 @@ def materialize_audio_reuse_products(
                    source_h3_root / "samples.jsonl", separation_root / "records.jsonl"]
     hashes = {str(p): sha256_file(p) for p in input_files}
     inventory = MimoInventory.model_validate_json(input_files[0].read_text())
-    records = _rows(input_files[1], MimoRecord)
+    records = _rows(input_files[1], AudioReusePreparedSource)
     samples = _rows(input_files[2], FinalH3SampleV2)
     stems = _rows(input_files[3], SAMAudioStemRecord)
     if hashes[str(input_files[2])] != inventory.source_h3_samples_sha256:
@@ -366,7 +371,9 @@ def materialize_audio_reuse_products(
     stem_by_clip = {r.clip_uid: r for r in stems}
     if len(by_clip) != len(records) or set(by_clip) != {j.clip_uid for j in inventory.jobs} or len(stem_by_clip) != len(stems):
         raise ValueError("duplicate or missing frozen clip inventory")
-    _validate_materializer_provenance(inventory=inventory, records=records, source_samples=samples)
+    validate_prepared_inputs(inventory, records, samples, stems)
+    for job in inventory.jobs:
+        _validate_job_media_integrity(job)
     sources = {}
     for job in inventory.jobs:
         record = by_clip[job.clip_uid]
@@ -414,7 +421,7 @@ def materialize_audio_reuse_products(
                                                        path=job.target_full_audio_path, sha256=job.target_full_audio_sha256,
                                                        retention_marker="fully_copy"),
                         role="full_audio_reuse", source_type="canonical_full_audio", source_clip_uid=job.clip_uid,
-                        source_mimo_record_fingerprint=source.record.record_fingerprint,
+                        source_mimo_record_fingerprint=source.record.source_reconcile_record_fingerprint,
                     )]
                 elif variant != "visual_only":
                     refs, warnings = select_reuse_audio(sample, source, sources)
@@ -430,7 +437,7 @@ def materialize_audio_reuse_products(
                 "schema_version": "r2v.h3.audio_reuse_product.1", "materializer_version": AUDIO_REUSE_MATERIALIZER_VERSION,
                 "sample_id": sample_id, "source_h3_sample_id": sample.sample_id, "source_h3_sample_sha256": _hash(sample),
                 "clip_uid": job.clip_uid, "pair_type": sample.pair_type, "conditioning_variant": variant,
-                "source_mimo_record_fingerprint": by_clip[job.clip_uid].record_fingerprint,
+                "source_mimo_record_fingerprint": by_clip[job.clip_uid].source_reconcile_record_fingerprint,
                 "status": "failed" if failure else "ready", "audio_references": [r.model_dump(mode="json") for r in refs],
                 "corrected_speech_segments": [s.model_dump(mode="json") for s in corrected], "rendered_h3_prompt": rendered,
                 "task_prefix": audio_task_prefix([r.contract for r in refs]), "warnings": sorted(set(warnings)), "failure_reason": failure,

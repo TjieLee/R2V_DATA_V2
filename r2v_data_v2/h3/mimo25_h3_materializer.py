@@ -9,7 +9,7 @@ import uuid
 from collections import Counter
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Protocol
 
 import numpy as np
 from pydantic import Field, model_validator
@@ -32,6 +32,7 @@ from r2v_data_v2.h3.mimo25_av_reconcile import (
 from r2v_data_v2.h3.mimo25_backend import (
     MIMO25_MATERIALIZER_VERSION,
     MimoAudioEvent,
+    MimoAVAnnotationDraft,
     MimoSubjectDefinitionDraft,
     protect_direct_dialogue,
 )
@@ -406,10 +407,15 @@ def _variant(sample: FinalH3SampleV2) -> ConditioningVariant:
     }[sample.pair_type]
 
 
+class FrozenAnnotationSource(Protocol):
+    @property
+    def annotation(self) -> MimoAVAnnotationDraft | None: ...
+
+
 def _corrected_segments(
     sample: FinalH3SampleV2,
     job: MimoClipJob,
-    record: MimoRecord,
+    record: FrozenAnnotationSource,
 ) -> tuple[list[FinalQwen3SpeechSegment], list[str]]:
     assert record.annotation is not None
     audio_decisions = {
@@ -495,7 +501,7 @@ def _audio_facts(
     *,
     sample: FinalH3SampleV2,
     corrected: list[FinalQwen3SpeechSegment],
-    record: MimoRecord,
+    record: FrozenAnnotationSource,
     contract: object,
 ) -> RecaptionAudioFacts:
     assert record.annotation is not None
@@ -564,7 +570,7 @@ def _contract_with_voice_profiles(
     contract: RecaptionReferenceContract,
     *,
     corrected: Sequence[FinalQwen3SpeechSegment],
-    record: MimoRecord,
+    record: FrozenAnnotationSource,
 ) -> RecaptionReferenceContract:
     assert record.annotation is not None
     speaker_by_group = _speaker_ids(corrected)
@@ -675,7 +681,7 @@ def project_audio_relationships(
 def _materialize_sample(
     sample: FinalH3SampleV2,
     job: MimoClipJob,
-    record: MimoRecord,
+    record: FrozenAnnotationSource,
     *,
     conditioning_variant: ConditioningVariant | None = None,
     extra_audio_contract: RecaptionAudioContract | None = None,

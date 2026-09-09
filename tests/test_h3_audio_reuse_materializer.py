@@ -10,6 +10,7 @@ pytest.importorskip("soundfile")
 
 from r2v_data_v2.h3 import audio_reuse_materializer as product
 from r2v_data_v2.h3.audio_reuse import build_audio_reuse_assets
+from r2v_data_v2.h3.audio_reuse_prepared import project_prepared_samples
 from r2v_data_v2.h3.jea_final_renderer import FinalH3SampleV2
 from r2v_data_v2.h3.mimo25_av_reconcile import MimoClipJob, _inventory
 from r2v_data_v2.h3.mimo25_backend import MimoAVAnnotationDraft
@@ -24,8 +25,9 @@ from r2v_data_v2.h3.qwen38_h3_recaption import (
 )
 from r2v_data_v2.h3.sam_audio_stem_shadow import SAMAudioStemRecord, sha256_file
 from r2v_data_v2.h3.speaker_ownership import speaker_ownership_reasons
+from tests.h3_audio_reuse_prepared_helpers import prepared_record
 from tests.test_h3_audio_reuse import _fixture, _seal
-from tests.test_h3_mimo25_av_shadow import _record_fixture, _sample
+from tests.test_h3_mimo25_av_shadow import _sample
 
 
 def _case(tmp_path, groups=("g1",), *, music="N/A", offscreen=False, clip="clip-1", composition=None,
@@ -81,7 +83,7 @@ def _case(tmp_path, groups=("g1",), *, music="N/A", offscreen=False, clip="clip-
         "text": s.asr_text, "language": s.asr_language,
     } for s in args["job"].segments]
     sample = FinalH3SampleV2.model_validate(sample_values)
-    record = _record_fixture(tmp_path, args["annotation"], job=args["job"])
+    record = prepared_record(tmp_path, args["job"], args["annotation"], args["stem_record"])
     manifest = build_audio_reuse_assets(**args)
     path = args["output_root"] / "manifest.json"
     source = product.load_reuse_source(manifest_path=path, job=args["job"], record=record, stem_record=args["stem_record"])
@@ -229,7 +231,7 @@ def _prepared(tmp_path):
     for path in (h3, mimo, stems, reuse):
         path.mkdir(parents=True)
     samples_file = h3 / "samples.jsonl"
-    samples_file.write_text(canonical.model_dump_json() + "\n" + sample.model_dump_json() + "\n")
+    samples_file.write_text("".join(s.model_dump_json() + "\n" for s in project_prepared_samples([source.job], [canonical, sample])))
     values = source.job.model_dump(mode="json")
     values["source_h3_sample_ids"] = [canonical.sample_id, sample.sample_id]
     job = _seal(MimoClipJob, values, "request_fingerprint")
@@ -240,7 +242,7 @@ def _prepared(tmp_path):
     inventory = _inventory({**iv, "schema_version": "r2v.h3.mimo25_inventory.4", "inventory_scope": "explicit_case_subset",
                             "canonical_wide_coverage": False, "source_h3_samples_sha256": sha256_file(samples_file),
                             "clip_count": 1, "jobs": [job.model_dump(mode="json")]})
-    record = _record_fixture(tmp_path / "case", source.record.annotation, job=job, inventory_fingerprint=inventory.inventory_fingerprint)
+    record = prepared_record(tmp_path / "case", job, source.record.annotation, args["stem_record"])
     (mimo / "inventory.json").write_text(inventory.model_dump_json())
     (mimo / "records.jsonl").write_text(record.model_dump_json() + "\n")
     (stems / "records.jsonl").write_text(args["stem_record"].model_dump_json() + "\n")
@@ -394,7 +396,14 @@ def test_phase2_stem_and_output_contracts_remain_distinct(tmp_path, media, wrong
         for item in [*values["speakers"], values["music"]]:
             item["source_stem_record_fingerprint"] = stem_record.record_fingerprint
     source.manifest_path.write_text(json.dumps(values))
+    record = source.record
+    if not is_output:
+        from r2v_data_v2.h3.audio_reuse_prepared import AudioReusePreparedSource
+
+        record_values = record.model_dump(mode="json")
+        record_values["source_stem_record_fingerprint"] = stem_record.record_fingerprint
+        record = _seal(AudioReusePreparedSource, record_values, "prepared_fingerprint")
     with pytest.raises(ValueError, match=f"PCM16 {expected}"):
         product.load_reuse_source(
-            manifest_path=source.manifest_path, job=source.job, record=source.record, stem_record=stem_record,
+            manifest_path=source.manifest_path, job=source.job, record=record, stem_record=stem_record,
         )

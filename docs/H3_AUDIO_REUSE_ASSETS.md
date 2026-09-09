@@ -77,14 +77,19 @@ Audio semantics, not separator existence.
 `audio_reuse_materializer.materialize_audio_reuse_products()` reads a prepared,
 frozen MiMo `inventory.json` / `records.jsonl`, the matching H3 `samples.jsonl`,
 SAM separation `records.jsonl`, and `<reuse-root>/<clip-uid>/manifest.json`.
-The prepared root must validate through the current MiMo inventory/record models;
-this tool does not rewrite old backend provenance or migrate stale annotations.
+The prepared root uses the explicit
+`r2v.h3.audio_reuse_prepared_source.1` record contract, not legacy
+`MimoRecord`. The bridge validates frozen stem-reconcile .14 records with
+backend .60 or .61, retaining their original backend/configuration and record
+fingerprints. It does not rewrite provenance or migrate annotations.
 All selected ready clips, including any donor clips to be used, need matching
 manifests. A donor outside the prepared inventory is excluded, never substituted.
 
 Validation covers job/annotation/SAM fingerprints, target media, source intervals,
 speaker ownership, entity/Subject ownership, media hashes, decoded frame counts,
-32 kHz stereo PCM16 FLAC, and manifest ordering. No PCM is generated here. Stale
+32 kHz stereo media, and manifest ordering. Target FLAC subtypes are unrestricted;
+SAM canonical stems are PCM16 WAV and reuse outputs are PCM16 FLAC.
+No PCM is generated here. Stale
 lineage fails before publication. Inputs are rehashed before atomic publication;
 existing output directories, source roots and production stages cannot be replaced.
 
@@ -132,16 +137,44 @@ prompts and legacy materializer v26 provenance untouched.
 
 ## CPU-Only Server Materialization
 
-Run only after matching Phase-1 assets have been produced. No inference, asset
-regeneration or production overwrite is performed:
+First prepare the frozen effective input after Phase-1 assets have been produced.
+The base defines clip order; an optional override replaces whole records only,
+including failures. Unknown/duplicate clips or mismatched job/SAM fingerprints
+fail closed. Counts come from the files, never a fixed clip quota.
+
+The bridge reuses the existing production inventory and stem-reconcile job
+builders. Prepared H3 keeps every non-speech field, including frozen cross-donor
+subject voices, and projects only the exact current transcribed job segments.
+Prepared speech has null entity binding; finalized MiMo remains binding authority.
+The outer inventory hashes the prepared H3 file without changing job fingerprints.
+Both prepare and materialize publish into new owned directories atomically.
+
+```bash
+"$R2V_PYTHON" tools/prepare_h3_audio_reuse_sources.py \
+  --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
+  --visual-production-root "$VISUAL_PRODUCTION_ROOT" \
+  --visual-runs-root "$VISUAL_RUNS_ROOT" \
+  --stem-shadow-root "$SHADOW_RUN_ROOT" \
+  --base-reconcile-root "$BASE_RECONCILE_ROOT" \
+  --override-reconcile-root "$OVERRIDE_RECONCILE_ROOT" \
+  --source-h3-root "$FROZEN_H3_ROOT" \
+  --prepared-root "$PREPARED_ROOT"
+```
+
+Prepared output: `inventory.json`, `records.jsonl`, `h3/samples.jsonl`,
+and `summary.json` (`r2v.h3.audio_reuse_prepared_source_summary.1`).
+The summary records input hashes, chosen base/override roots, output hashes,
+effective ready/failed counts and zero model calls.
+
+Then materialize. No inference, asset regeneration or production overwrite:
 
 ```bash
 "$R2V_PYTHON" tools/materialize_h3_audio_reuse_shadow.py \
   --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
-  --mimo-root "$PREPARED_MIMO_ROOT" \
-  --source-h3-root "$FROZEN_H3_ROOT" \
+  --mimo-root "$PREPARED_ROOT" \
+  --source-h3-root "$PREPARED_ROOT/h3" \
   --separation-root "$SHADOW_RUN_ROOT/separation" \
-  --reuse-root "$SHADOW_RUN_ROOT/audio_reuse_assets" \
+  --reuse-root "$SHADOW_RUN_ROOT/audio_reuse_assets_v1" \
   --output-root "$SHADOW_RUN_ROOT/h3_audio_reuse_products_v1" \
   --enable-full-audio-reuse
 ```
