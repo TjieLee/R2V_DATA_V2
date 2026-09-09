@@ -20,7 +20,7 @@ from r2v_data_v2.h3.jea_final_renderer import (
     FinalFullClipAudioSemantics,
     FinalH3SampleV2,
 )
-from r2v_data_v2.h3.schemas import SchemaModel
+from r2v_data_v2.h3.schemas import SchemaModel, entity_reference_order
 from r2v_data_v2.h3.semantic_augmentation import MediaURLResolver
 from r2v_data_v2.h3.specialized_audio_semantics import (
     SpecializedAudioSemanticsRecord,
@@ -743,14 +743,13 @@ def build_reference_contract(
         for item in sample.visual_references
     ]
     entity_sources: dict[str, list[str]] = {}
-    entity_order: list[str] = []
+    entity_order = entity_reference_order((p.kind, p.entity_id) for p in pictures)
     for picture in pictures:
         if picture.kind not in {"subject", "object", "group"}:
             continue
         assert picture.entity_id is not None
         if picture.entity_id not in entity_sources:
             entity_sources[picture.entity_id] = []
-            entity_order.append(picture.entity_id)
         entity_sources[picture.entity_id].append(picture.picture_label)
     subjects: list[RecaptionSubjectContract] = []
     for entity_id in entity_order:

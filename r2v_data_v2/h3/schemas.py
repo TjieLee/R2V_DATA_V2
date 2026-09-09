@@ -2,12 +2,22 @@ from __future__ import annotations
 
 import math
 import re
+from collections.abc import Iterable
 from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 H3_AUDIO_BINDING_SCHEMA_VERSION = "r2v.h3.audio_binding.2"
 H3_AUDIO_IR_SCHEMA_VERSION = "r2v.h3.audio_ir.2"
+
+
+def entity_reference_order(references: Iterable[tuple[str, str | None]]) -> list[str]:
+    """Unique H3 entity Subjects in surviving Picture first-appearance order."""
+    return list(dict.fromkeys(
+        entity_id for kind, entity_id in references
+        if kind in {"subject", "object", "group"} and entity_id is not None
+    ))
+
 
 _ENTITY_ID = re.compile(r"e[1-9]\d*")
 _FACE_TRACK_ID = re.compile(r"face_[1-9]\d*")

@@ -817,7 +817,7 @@ def _materialize_sample(
     corrected_payload["speech_segments"] = [
         item.model_dump(mode="python") for item in corrected
     ]
-    corrected_sample = FinalH3SampleV2.model_validate(corrected_payload)
+    corrected_sample = FinalH3SampleV2.model_validate(corrected_payload, context={"h3_reference_graph": True})
     variant = conditioning_variant or _variant(corrected_sample)
     contract = _contract_with_voice_profiles(
         build_reference_contract(

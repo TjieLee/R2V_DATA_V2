@@ -36,7 +36,7 @@ from r2v_data_v2.h3.qwen38_h3_recaption import (
     RecaptionSubjectContract,
     build_reference_contract,
 )
-from r2v_data_v2.h3.schemas import SchemaModel
+from r2v_data_v2.h3.schemas import SchemaModel, entity_reference_order
 from r2v_data_v2.h3.visual_production_source import load_visual_production_inventory
 
 MIMO25_INVENTORY_VERSION = "r2v.h3.mimo25_inventory.4"
@@ -496,12 +496,14 @@ def project_mimo_h3_sample_references(
         projected.append(values)
     sample_values = sample.model_dump(mode="python")
     sample_values["visual_references"] = projected
-    subject_indexes = {r["entity_id"]: i for i, r in enumerate(
-        (r for r in projected if r["kind"] == "subject"), start=1,
+    subject_indexes = {entity_id: i for i, entity_id in enumerate(
+        entity_reference_order((r["kind"], r["entity_id"]) for r in projected), start=1,
     )}
     for voice in sample_values["subject_voices"]:
+        if voice["entity_id"] not in subject_indexes:
+            raise ValueError("MiMo subject voice has no surviving entity Subject")
         voice["subject_index"] = subject_indexes[voice["entity_id"]]
-    return FinalH3SampleV2.model_validate(sample_values)
+    return FinalH3SampleV2.model_validate(sample_values, context={"h3_reference_graph": True})
 
 
 class MimoSegmentEvidence(SchemaModel):

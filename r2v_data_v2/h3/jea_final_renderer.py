@@ -9,7 +9,7 @@ from collections import Counter
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, ValidationInfo, field_validator, model_validator
 
 from r2v_data_v2.h3.binding_audit import (
     BINDING_AUDIT_POLICY_VERSION,
@@ -32,7 +32,7 @@ from r2v_data_v2.h3.jea_audio_production import (
 )
 from r2v_data_v2.h3.primary_voice import PrimaryVoiceReferenceSelection
 from r2v_data_v2.h3.qwen3_asr import Qwen3ASRSegment
-from r2v_data_v2.h3.schemas import SchemaModel
+from r2v_data_v2.h3.schemas import SchemaModel, entity_reference_order
 from r2v_data_v2.h3.specialized_audio_semantics import (
     SpecializedAudioSemanticsRecord,
 )
@@ -180,7 +180,7 @@ class FinalH3SampleV2(SchemaModel):
     full_clip_audio_semantics: FinalFullClipAudioSemantics | None = None
 
     @model_validator(mode="after")
-    def validate_sample(self) -> FinalH3SampleV2:
+    def validate_sample(self, info: ValidationInfo) -> FinalH3SampleV2:
         indexes = [item.image_index for item in self.visual_references]
         if indexes != list(range(1, len(indexes) + 1)):
             raise ValueError("final Visual references must preserve canonical order")
@@ -197,6 +197,13 @@ class FinalH3SampleV2(SchemaModel):
             raise ValueError(
                 "only canonical subject references may receive voice binding"
             )
+        # Production retains its legacy person indexes; MiMo projections use all entity Subjects.
+        if info.context and info.context.get("h3_reference_graph") is True:
+            subject_index_by_entity = {
+                entity_id: index for index, entity_id in enumerate(
+                    entity_reference_order((r.kind, r.entity_id) for r in self.visual_references), start=1,
+                )
+            }
         for voice in self.subject_voices:
             if voice.target_occurrence_id != f"{self.clip_uid}/{voice.entity_id}":
                 raise ValueError("subject voice target occurrence is inconsistent")

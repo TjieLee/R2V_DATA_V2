@@ -5010,6 +5010,75 @@ def test_reference_augmentation_preserves_legacy_selection_serialization(tmp_pat
     assert MimoReferenceSelection.model_validate(values).model_dump() == values
 
 
+@pytest.mark.parametrize("other_kind", ["object", "group"])
+@pytest.mark.parametrize("duplicate", [False, True])
+def test_reference_augmentation_voice_index_matches_entity_graph(tmp_path, monkeypatch, other_kind, duplicate):
+    kinds = ["subject", other_kind] + ([other_kind] if duplicate else []) + ["face"]
+    refs = _visual_reference_inventory(tmp_path, kinds)
+    if duplicate:
+        values = refs[2].model_dump()
+        values["entity_id"] = "e2"
+        refs[2] = FinalVisualReference.model_validate(values)
+    values = _sample(tmp_path).model_dump(mode="python")
+    values["visual_references"] = [r.model_dump() for r in refs]
+    sample = FinalH3SampleV2.model_validate(values)
+    _augmentation_draws(monkeypatch, [.8])
+    selection, images = select_mimo_reference_projection(sample.clip_uid, refs)
+    projected = project_mimo_h3_sample_references(
+        sample, reference_images=images, reference_selection=selection,
+    )
+    contract = mimo25_materializer.build_reference_contract(projected, "visual_only")
+    indexes = {s.entity_id: s.subject_index for s in contract.subjects if s.kind == "entity"}
+    assert indexes == {"e2": 1, "e1": 2}
+    voice = projected.subject_voices[0]
+    assert voice.subject_index == indexes[voice.entity_id]
+    assert voice.subject_index == 2
+    # The source/production contract remains legacy person-only; context is task-local.
+    assert FinalH3SampleV2.model_validate(sample.model_dump()).subject_voices[0].subject_index == 1
+    with pytest.raises(ValueError, match="subject voice index"):
+        FinalH3SampleV2.model_validate(projected.model_dump())
+    assert FinalH3SampleV2.model_validate(
+        projected.model_dump(), context={"h3_reference_graph": True},
+    ) == projected
+    # Exercise the materializer's intervening sample validation before contract assembly.
+    from types import SimpleNamespace
+
+    job = _job_for_reference_inventory(tmp_path, sample)
+    record = SimpleNamespace(annotation=SimpleNamespace(
+        audio_observation=SimpleNamespace(segment_decisions=[]),
+    ))
+    monkeypatch.setattr(mimo25_materializer, "_corrected_segments", lambda *args: ([], []))
+
+    class ReachedContract(Exception):
+        pass
+
+    build_contract = mimo25_materializer.build_reference_contract
+
+    def checked_contract(current, variant):
+        actual = build_contract(current, variant)
+        assert current.subject_voices[0].subject_index == 2
+        assert {s.entity_id: s.subject_index for s in actual.subjects if s.kind == "entity"} == indexes
+        raise ReachedContract
+
+    monkeypatch.setattr(mimo25_materializer, "build_reference_contract", checked_contract)
+    with pytest.raises(ReachedContract):
+        _materialize_sample(sample, job, record, conditioning_variant="visual_only")
+
+
+def test_reference_augmentation_voice_without_surviving_host_fails_explicitly(tmp_path, monkeypatch):
+    refs = _visual_reference_inventory(tmp_path, ["subject", "face"], same_entity=True)
+    values = _sample(tmp_path).model_dump(mode="python")
+    values["visual_references"] = [r.model_dump() for r in refs]
+    sample = FinalH3SampleV2.model_validate(values)
+    _augmentation_draws(monkeypatch, [.8])
+    selection, images = select_mimo_reference_projection(sample.clip_uid, refs)
+    # Deliberately corrupt the trusted model to exercise the projection boundary.
+    bad_voice = sample.subject_voices[0].model_copy(update={"entity_id": "e9"})
+    bad_sample = sample.model_copy(update={"subject_voices": [bad_voice]})
+    with pytest.raises(ValueError, match="MiMo subject voice has no surviving entity Subject"):
+        project_mimo_h3_sample_references(bad_sample, reference_images=images, reference_selection=selection)
+
+
 def _attribute_subject_annotation(description: str) -> MimoAVAnnotationDraft:
     payload = _annotation().model_dump(mode="json")
     payload["h3_semantics"]["subject_definitions"] = [
