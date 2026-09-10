@@ -769,6 +769,23 @@ def test_direct_format_hard_gates_keep_parseable_annotation(tmp_path, monkeypatc
     assert summary.model_call_count == len(completions.requests) == 4 + text_calls
 
 
+def test_c7cf_unknown_second_speaker_stays_hard_without_polish(tmp_path, monkeypatch):
+    _, shadow = _fixture(tmp_path, monkeypatch)
+    payload = json.loads(_raw())
+    caption = "<Subject 1> (S1) says, <d>[Chinese] a</d> Another voice (S2) says, <d>[Chinese] b</d>"
+    payload["h3_semantics"]["shot1_caption"] = caption
+    backend, completions, stems, jobs = _backend(tmp_path, shadow, [(json.dumps(payload), 8)])
+    assert len(jobs[0].segments) == 1
+    summary = _run(shadow, backend, stems, jobs[:1])
+    row = _records(shadow)[0]
+    assert summary.failed_count == 1 and row["status"] == "failed"
+    assert "direct_unknown_speaker" in {issue["code"] for issue in row["failure_issues"]}
+    assert row["annotation"]["h3_semantics"]["shot1_caption"] == caption
+    assert not row["speaker_marker_polish_attempted"]
+    assert summary.text_model_call_count == 0
+    assert summary.model_call_count == len(completions.requests) == 4
+
+
 @pytest.mark.parametrize("has_transcribed,empty_inventory", [(False, True), (False, False), (True, False)])
 def test_segment_inventory_is_review_only_without_transcribed_speech(
     tmp_path, monkeypatch, has_transcribed, empty_inventory,

@@ -214,7 +214,7 @@ def test_legacy_record_rendering_is_identical(tmp_path):
     _, sample, source = _case(tmp_path)
     legacy = _record_fixture(tmp_path, source.record.annotation, job=source.job)
     assert MimoRecord.model_validate_json(legacy.model_dump_json()) == legacy
-    assert MIMO25_MATERIALIZER_VERSION == "h3_mimo25_materializer_v27"
+    assert MIMO25_MATERIALIZER_VERSION == "h3_mimo25_materializer_v28"
     assert _materialize_sample(sample, source.job, legacy, conditioning_variant="visual_only") == (
         _materialize_sample(sample, source.job, source.record, conditioning_variant="visual_only")
     )

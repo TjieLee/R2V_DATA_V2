@@ -40,7 +40,7 @@ MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.20"
 MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.63"
 MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION = "h3_mimo25_speaker_marker_polish_v4"
 MIMO25_ICL_VERSION = "h3_official_ref2va_detailed_shot1_v4"
-MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v27"
+MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v28"
 MIMO25_CANONICAL_ABSENT_SOUNDSCAPE = (
     "No distinct environmental, mechanical, physical, or non-verbal human "
     "sounds are clearly discernible."
@@ -1030,6 +1030,7 @@ class MimoBackendProvenance(SchemaModel):
         "h3_mimo25_materializer_v25",
         "h3_mimo25_materializer_v26",
         "h3_mimo25_materializer_v27",
+        "h3_mimo25_materializer_v28",
     ] = (
         MIMO25_MATERIALIZER_VERSION
     )

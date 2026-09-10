@@ -149,7 +149,7 @@ def test_published_product_validator_enforces_exact_dialogue(tmp_path):
     args = _prepared(tmp_path)
     product.materialize_audio_reuse_products(**args)
     rows = product._rows(args["output_root"] / "records.jsonl", AudioReuseProduct)
-    assert AUDIO_REUSE_MATERIALIZER_VERSION == "h3_mimo25_audio_reuse_materializer_v4"
+    assert AUDIO_REUSE_MATERIALIZER_VERSION == "h3_mimo25_audio_reuse_materializer_v5"
     values = rows[0].model_dump(mode="json")
     values["rendered_h3_prompt"] = values["rendered_h3_prompt"].replace("Exact, text!", "Translated text")
     values["record_fingerprint"] = product._hash({k: v for k, v in values.items() if k != "record_fingerprint"})

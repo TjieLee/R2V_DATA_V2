@@ -239,6 +239,7 @@ class MimoH3ShadowRecord(SchemaModel):
         "h3_mimo25_materializer_v25",
         "h3_mimo25_materializer_v26",
         "h3_mimo25_materializer_v27",
+        "h3_mimo25_materializer_v28",
     ] = (
         MIMO25_MATERIALIZER_VERSION
     )
@@ -793,26 +794,20 @@ def _visual_retention_lines(
     subjects: Sequence[RecaptionSubjectContract],
     retention: Sequence[MimoVisualRetentionDraft],
     caption: str,
-) -> list[str]:
+) -> tuple[list[str], list[str]]:
     markers = {item.subject_label: item.marker for item in retention}
-    issues = [
-        ValidationIssue(
-            "preserved_visual_subject_missing_from_detailed_description",
-            subject.subject_label,
-            "fully/partially preserved entity or background must be cited in the shot description",
-        )
+    warnings = [
+        f"{subject.subject_label}:preserved_visual_subject_missing_from_detailed_description"
         for subject in subjects
         if subject.kind in {"entity", "background"}
         and markers.get(subject.subject_label) in {"fully_preserved", "partially_preserved"}
         and subject.subject_label not in caption
     ]
-    if issues:
-        raise MimoH3MaterializationContractError(issues)
     # Single-shot locator is pipeline-owned; model descriptions remain untouched.
     return [
         f"{item.subject_label} (appears in [Shot 1]): {item.marker} - {item.description.strip()}"
         for item in retention
-    ]
+    ], warnings
 
 
 def _materialize_sample(
@@ -905,6 +900,10 @@ def _materialize_sample(
             contract,
         )
         detailed, music = project_audio_relationships(detailed, music, facts.speech, contract.audios)
+    visual_retention, coverage_warnings = _visual_retention_lines(
+        job.reference_subjects, direct.visual_retention_analysis, detailed,
+    )
+    warnings.extend(coverage_warnings)
     structured = Qwen38H3StructuredResponse(
         subject_definitions=[
             _render_subject_definition(item, subject, subjects=contract.subjects)
@@ -915,9 +914,7 @@ def _materialize_sample(
             )
         ] + [_canonical_audio_definition(audio) for audio in contract.audios],
         summary=f"{prefix} {summary}",
-        retention_analysis=_visual_retention_lines(
-            job.reference_subjects, direct.visual_retention_analysis, detailed,
-        ) + [_canonical_audio_retention(audio) for audio in contract.audios],
+        retention_analysis=visual_retention + [_canonical_audio_retention(audio) for audio in contract.audios],
         detailed_description=f"{direct.style_opening}\n[Shot 1] {detailed}",
         overall_soundscape=direct.overall_soundscape,
         non_diegetic_music=music,

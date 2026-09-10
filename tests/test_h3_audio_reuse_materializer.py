@@ -20,7 +20,6 @@ from r2v_data_v2.h3.mimo25_backend import (
     MimoVisualRetentionDraft,
 )
 from r2v_data_v2.h3.mimo25_h3_materializer import (
-    MimoH3MaterializationContractError,
     _materialize_sample,
     _visual_retention_lines,
 )
@@ -132,14 +131,10 @@ def test_ref2va_visual_retention_locator_and_narrow_coverage(kind, marker, prese
     row = MimoVisualRetentionDraft(subject_label="<Subject 1>", marker=marker, description="Visible form retained.")
     caption = "<Subject 1> remains in view." if present else "A truck remains in view."
     before = (subject.model_dump(), row.model_dump())
-    if not present and kind in {"entity", "background"} and marker != "weak_reference":
-        with pytest.raises(MimoH3MaterializationContractError) as exc:
-            _visual_retention_lines([subject], [row], caption)
-        assert [i.code for i in exc.value.issues] == ["preserved_visual_subject_missing_from_detailed_description"]
-    else:
-        assert _visual_retention_lines([subject], [row], caption) == [
-            f"<Subject 1> (appears in [Shot 1]): {marker} - Visible form retained."
-        ]
+    lines, warnings = _visual_retention_lines([subject], [row], caption)
+    assert lines == [f"<Subject 1> (appears in [Shot 1]): {marker} - Visible form retained."]
+    expected = ["<Subject 1>:preserved_visual_subject_missing_from_detailed_description"]
+    assert warnings == (expected if not present and kind in {"entity", "background"} and marker != "weak_reference" else [])
     assert (subject.model_dump(), row.model_dump()) == before
     assert row.render() == f"<Subject 1>: {marker} - Visible form retained."
 
@@ -147,8 +142,11 @@ def test_ref2va_visual_retention_locator_and_narrow_coverage(kind, marker, prese
 def test_ref2va_materializer_checks_caption_not_definition_or_summary(tmp_path):
     _, sample, source = _case(tmp_path, (), caption="A woman stands in a room.",
                               summary="<Subject 1> stands in a room.")
-    with pytest.raises(MimoH3MaterializationContractError, match="preserved_visual_subject_missing"):
-        _materialize_sample(sample, source.job, source.record, conditioning_variant="visual_only")
+    _, prompt, warnings = _materialize_sample(sample, source.job, source.record, conditioning_variant="visual_only")
+    assert warnings == ["<Subject 1>:preserved_visual_subject_missing_from_detailed_description"]
+    detail = prompt.split("detailed_description:\n")[1].split("\n\noverall_soundscape:")[0]
+    assert detail == source.record.annotation.h3_semantics.style_opening + "\n[Shot 1] A woman stands in a room."
+    assert "<Subject 1> (appears in [Shot 1]): fully_preserved -" in prompt
 
 
 def test_ref2va_mixed_subject_retention_keeps_graph_order_and_picture_provenance():
@@ -167,13 +165,23 @@ def test_ref2va_mixed_subject_retention_keeps_graph_order_and_picture_provenance
                                     description=f"Retained features {s.subject_index}.") for s in subjects]
     before = [s.model_dump() for s in subjects]
     caption = "<Subject 1> stands on <Subject 3> beside <Subject 4>."
-    lines = _visual_retention_lines(subjects, rows, caption)
+    lines, warnings = _visual_retention_lines(subjects, rows, caption)
+    assert warnings == []
     assert lines == [
         f"<Subject {i}> (appears in [Shot 1]): fully_preserved - Retained features {i}." for i in range(1, 5)
     ]
     assert [s.model_dump() for s in subjects] == before
-    with pytest.raises(MimoH3MaterializationContractError):
-        _visual_retention_lines(subjects, rows, caption.replace("<Subject 4>", "<Subject 40>"))
+    same_lines, warnings = _visual_retention_lines(
+        subjects, rows, "A woman stands in an exhibition beside <Subject 4>.",
+    )
+    assert same_lines == lines
+    assert warnings == [
+        "<Subject 1>:preserved_visual_subject_missing_from_detailed_description",
+        "<Subject 3>:preserved_visual_subject_missing_from_detailed_description",
+    ]
+    assert _visual_retention_lines(subjects, rows, caption.replace("<Subject 4>", "<Subject 40>"))[1] == [
+        "<Subject 4>:preserved_visual_subject_missing_from_detailed_description",
+    ]
 
 
 @pytest.mark.parametrize("kind", ["visual_only", "target_voice_reference", "music_reference", "full_audio_reuse"])
