@@ -54,7 +54,7 @@ from r2v_data_v2.h3.sam_audio_stem_shadow import (
 )
 from r2v_data_v2.structured_output import normalize_structured_json_envelope
 
-QA_DATA_VERSION = "r2v.h3.audio_shadow_qa.9"
+QA_DATA_VERSION = "r2v.h3.audio_shadow_qa.10"
 QA_REVIEW_VERSION = "r2v.h3.audio_shadow_human_qa.4"
 QA_LABELS = (
     "better", "same", "worse", "speaker_wrong",
@@ -210,7 +210,7 @@ def _destination(
         try:
             previous = json.loads((destination / "data.json").read_text(encoding="utf-8"))
             owned = (
-                previous["schema_version"] in {"r2v.h3.audio_shadow_qa.7", "r2v.h3.audio_shadow_qa.8", QA_DATA_VERSION}
+                previous["schema_version"] in {"r2v.h3.audio_shadow_qa.7", "r2v.h3.audio_shadow_qa.8", "r2v.h3.audio_shadow_qa.9", QA_DATA_VERSION}
                 and previous["source_shadow_root"] == str(shadow)
             )
         except (OSError, ValueError, KeyError, TypeError):
@@ -431,10 +431,12 @@ def build_audio_shadow_qa(
                 if product.clip_uid != clip:
                     continue
                 refs = None
-                if product.status == "ready":
+                frame_product = source_kind == "frame_conditioned_product"
+                status = "ready" if frame_product else product.status
+                if status == "ready":
                     values = {**source.model_dump(mode="python"), "speech_segments": speech}
                     options = {"conditioning_variant": product.conditioning_variant}
-                    if source_kind == "audio_reuse_product":
+                    if source_kind in {"audio_reuse_product", "frame_conditioned_product"}:
                         options["reuse_audio_contracts"] = [r.contract for r in product.audio_references]
                         provenance = {r.contract.audio_label: r.model_dump(mode="json") for r in product.audio_references}
                     else:
@@ -459,13 +461,27 @@ def build_audio_shadow_qa(
                     ] != [(a.audio_path, a.audio_sha256, a.entity_id, a.speaker_id) for a in product.audio_references]:
                         raise ValueError("QA published Audio differs from effective reference contract")
                     refs = _reference_payload(context, current, [source], media_link, audio_provenance=provenance)
+                    if frame_product:
+                        refs["dropped_visual_references"] = [
+                            {**p, "drop_reason": "original RA2V Pictures replaced by frame-conditioning projection"}
+                            for p in refs["pictures"]
+                        ]
+                        refs["pictures"] = [
+                            {**p.model_dump(mode="json"), "image_index": p.picture_index,
+                             "url": media_link(p.image_path, p.image_sha256)}
+                            for p in product.frame_references
+                        ]
+                        refs["subjects"] = [s.model_dump(mode="json") for s in product.subjects]
+                        refs["visual_selection"] = None
                 variants.append({
                     "sample_id": product.sample_id, "source_h3_sample_id": product.source_h3_sample_id,
                     "pair_type": product.pair_type, "conditioning_variant": product.conditioning_variant,
                     "source_kind": source_kind, "source_root": str(product_root), "publication_status": "published",
-                    "status": "ready" if product.status == "ready" else "unavailable",
+                    "status": "ready" if status == "ready" else "unavailable",
                     "text": product.rendered_h3_prompt, "warnings": product.warnings,
-                    "reason": product.failure_reason, "references": refs,
+                    "reason": None if frame_product else product.failure_reason, "references": refs,
+                    "visual_reference_mode": product.visual_reference_mode if frame_product else "reference",
+                    "source_product_sample_id": product.source_product_sample_id if frame_product else product.sample_id,
                 })
             variants, _ = finalize_registry(variants, _fingerprint)
             final_h3.update(variants[0], variants=variants)

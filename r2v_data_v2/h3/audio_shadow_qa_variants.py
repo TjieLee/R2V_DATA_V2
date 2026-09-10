@@ -16,6 +16,11 @@ from r2v_data_v2.h3.audio_reuse_prepared import (
     project_prepared_samples,
     validate_prepared_inputs,
 )
+from r2v_data_v2.h3.frame_conditioning_projection import (
+    FRAME_STAGE,
+    VISUAL_TASKS,
+    load_frame_conditioned_products,
+)
 from r2v_data_v2.h3.jea_final_renderer import FinalH3SampleV2
 from r2v_data_v2.h3.mimo25_av_reconcile import MimoInventory, MimoRecord
 from r2v_data_v2.h3.mimo25_backend import MIMO25_MATERIALIZER_VERSION
@@ -30,15 +35,22 @@ VARIANT_TYPES = (
     "visual_only", "target_voice_reference", "cross_voice_reference", "full_audio_reuse",
     "music_reference", "speaker_speech_reuse", "music_reuse",
 )
-_PRIORITY = {"audio_reuse_product": 0, "mimo_h3_shadow": 1, "source_h3": 2, "qa_derived": 3}
+_PRIORITY = {"audio_reuse_product": 0, "frame_conditioned_product": 0, "mimo_h3_shadow": 1, "source_h3": 2, "qa_derived": 3}
 
 
 def finalize_registry(variants: list[dict], fingerprint: Callable) -> tuple[list[dict], dict]:
     """Deduplicate only equivalent contracts/media/text, preferring publication."""
     unique = {}
+    published_keys = set()
     for variant in sorted(variants, key=lambda v: (_PRIORITY[v["source_kind"]], v["sample_id"], v.get("source_root", ""))):
+        mode = variant.setdefault("visual_reference_mode", "reference")
+        variant["visual_task"] = VISUAL_TASKS[mode]
+        final = variant["source_kind"] in {"audio_reuse_product", "frame_conditioned_product"} and variant["status"] == "ready"
+        variant["review_family"] = "final_4way" if final else "legacy_other"
+        variant.setdefault("source_product_sample_id", variant["sample_id"] if final else None)
         refs = variant.get("references") or {}
         key = fingerprint({
+            "visual_reference_mode": mode,
             "conditioning_variant": variant["conditioning_variant"],
             "pictures": refs.get("pictures"), "subjects": refs.get("subjects"),
             "audios": [{k: v for k, v in a.items() if k not in {"provenance", "role", "source_type", "url"}}
@@ -47,8 +59,15 @@ def finalize_registry(variants: list[dict], fingerprint: Callable) -> tuple[list
             # Distinct unavailable variants must not erase one another.
             "failure": variant.get("issues", variant.get("reason")),
         })
-        unique.setdefault(key, variant)
+        if final:
+            published_keys.add(key)
+        elif key in published_keys:
+            continue
+        unique.setdefault((key, variant["source_product_sample_id"] if final else None), variant)
     result = sorted(unique.values(), key=lambda v: (
+        0 if v["review_family"] == "final_4way" else 1,
+        v["source_product_sample_id"] or "",
+        list(VISUAL_TASKS).index(v["visual_reference_mode"]),
         0 if v["conditioning_variant"] == "visual_only" else 1 if v["source_kind"] == "source_h3" else 2,
         v["sample_id"], _PRIORITY[v["source_kind"]], v.get("source_root", ""),
     ))
@@ -91,7 +110,7 @@ def discover_products(*, shadow: Path, jobs: list, reconcile: list, samples: lis
         if not root.is_dir() or root.name.startswith(".") or root.name == "qa":
             continue
         summary_path = root / "summary.json"
-        known = root.name in {"h3_audio_reuse_products_v1", "mimo25_h3_shadow_v5"}
+        known = root.name in {"h3_audio_reuse_products_v1", "mimo25_h3_shadow_v5", FRAME_STAGE}
         if not summary_path.exists():
             if known and (root / "records.jsonl").exists():
                 raise ValueError("QA published stage is missing its summary")
@@ -184,6 +203,8 @@ def discover_products(*, shadow: Path, jobs: list, reconcile: list, samples: lis
                     if any(s != prepared.get(s.sample_id) for s in source_samples.values()):
                         raise ValueError("QA MiMo source H3 differs from frozen current samples")
             kind = "mimo_h3_shadow"
+        elif schema == "r2v.h3.frame_conditioned_product_summary.1":
+            continue  # Load after the source Audio products have been validated.
         elif known:
             raise ValueError("QA published stage schema is not recognized")
         else:
@@ -237,4 +258,30 @@ def discover_products(*, shadow: Path, jobs: list, reconcile: list, samples: lis
                     ):
                         raise ValueError("QA recovered voice differs from published Audio")
             result.append((kind, root, record, sample))
+    audio_products = {record.sample_id: (record, sample) for kind, _, record, sample in result if kind == "audio_reuse_product"}
+    frame_keys = set()
+    for root in stage_roots:
+        path = root / "summary.json"
+        if not path.is_file():
+            continue
+        try:
+            schema = json.loads(path.read_text()).get("schema_version")
+        except (ValueError, AttributeError):
+            continue
+        if schema != "r2v.h3.frame_conditioned_product_summary.1":
+            continue
+        projected, dependencies = load_frame_conditioned_products(root, shadow)
+        source_hashes.update(dependencies)
+        for record in projected:
+            key = (record.source_product_sample_id, record.visual_reference_mode)
+            if key in frame_keys:
+                raise ValueError("QA frame projection source/mode is ambiguous across stages")
+            frame_keys.add(key)
+            source = audio_products.get(record.source_product_sample_id)
+            if (source is None or source[0].status != "ready"
+                    or source[0].record_fingerprint != record.source_product_record_fingerprint
+                    or source[0].audio_references != record.audio_references
+                    or source[0].corrected_speech_segments != record.corrected_speech_segments):
+                raise ValueError("QA frame projection is not bound to current published Audio product")
+            result.append(("frame_conditioned_product", root, record, source[1]))
     return result

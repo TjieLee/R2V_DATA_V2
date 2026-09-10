@@ -83,6 +83,7 @@ small{color:#626e73}a{color:#176c9a}#loading{padding:20px}
 <section id="conditioning">
 <h2>Reference Conditioning <small id="conditioning-variant"></small></h2>
 <p id="variant-source"></p>
+<p id="visual-mode"></p>
 <details><summary>Reference Variant Coverage</summary><div id="variant-coverage"></div></details>
 <p id="reference-unavailable" hidden>[reference contract unavailable]</p>
 <div id="reference-counts" class="ref-meta"></div>
@@ -188,6 +189,7 @@ function renderReferences(variant) {
   const refs = variant.references;
   $("conditioning-variant").textContent = " / " + (variant.sample_id || "selected H3 variant");
   $("variant-source").textContent = [variant.source_kind, variant.publication_status, variant.source_root].filter(Boolean).join(" / ");
+  $("visual-mode").textContent = "Visual mode: " + (variant.visual_reference_mode === "reference" ? "reference" : variant.visual_task);
   $("variant-coverage").replaceChildren();
   Object.entries(data.clips[index].reference_variant_coverage || {}).forEach(([kind, status]) => {
     const selected = variant.conditioning_variant === kind || (refs?.audios || []).some(a => a.kind === kind);
@@ -211,6 +213,11 @@ function renderReferences(variant) {
   pictures.forEach(ref => {
     const card = referenceCard(ref.picture_label); card.id = "picture-" + ref.image_index;
     metadata(card, "Kind", [ref.kind, ref.attribute_type].filter(Boolean).join(" / "));
+    if (ref.frame_role) {
+      metadata(card, "Frame", ref.frame_role.replaceAll("_", " "));
+      metadata(card, "Target video", ref.source_video_path);
+      metadata(card, "Target SHA256", ref.source_video_sha256);
+    }
     metadata(card, "Subjects", subjects.filter(s => s.source_picture_labels.includes(ref.picture_label)).map(s => s.subject_label).join(", "));
     metadata(card, "Entity", ref.entity_id); metadata(card, "Owner", ref.owner_entity_id);
     metadata(card, "Attribute", ref.attribute_id); metadata(card, "Source", ref.source_image_label);
@@ -300,7 +307,9 @@ function render() {
   $("final-variant").replaceChildren();
   final.variants.forEach((variant, i) => {
     const option = document.createElement("option"); option.value = String(i);
-    option.textContent = variant.sample_id + " / " + variant.conditioning_variant +
+    option.textContent = variant.review_family === "final_4way" ?
+      "FINAL | " + variant.visual_reference_mode + " | " + variant.conditioning_variant + " | " + variant.source_product_sample_id :
+      variant.sample_id + " / " + variant.conditioning_variant +
       " [" + (variant.publication_status === "published" ? "published" : "review") + "; " + variant.source_kind + "]";
     $("final-variant").append(option);
   });
@@ -450,7 +459,7 @@ fetch("data.json", {cache: "no-store"}).then(response => {
   if (!response.ok) throw new Error("Cannot load data.json: " + response.status);
   return response.json();
 }).then(payload => {
-  if (payload.schema_version !== "r2v.h3.audio_shadow_qa.9" || !payload.clips.length) throw new Error("Invalid QA dataset.");
+  if (payload.schema_version !== "r2v.h3.audio_shadow_qa.10" || !payload.clips.length) throw new Error("Invalid QA dataset.");
   data = payload;
   data.clips.forEach((clip, i) => {
     const option = document.createElement("option"); option.value = String(i);

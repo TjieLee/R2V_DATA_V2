@@ -735,8 +735,8 @@ const {chromium} = require(process.argv[2]);
     assert(await page.locator("#final-text").isVisible());
     assert.strictEqual(await page.locator("#final-h3").evaluate(el => el.closest("details")), null);
     assert.strictEqual(await page.locator("#materializer-version").textContent(), dataset.clips[0].final_h3.materializer_version);
-    assert.strictEqual(await page.locator("#audio-references audio").count(), 0);
-    assert.strictEqual(await page.locator("#references img").count(), 1);
+    assert.strictEqual(await page.locator("#audio-references audio").count(), dataset.clips[0].final_h3.variants[0].references.audios.length);
+    assert.strictEqual(await page.locator("#references img").count(), dataset.clips[0].final_h3.variants[0].references.pictures.length);
     const variants = dataset.clips[0].final_h3.variants;
     for (let i = 0; i < variants.length; i++) {
       await page.locator("#final-variant").selectOption(String(i));
@@ -753,16 +753,20 @@ const {chromium} = require(process.argv[2]);
     }
     await page.locator("#final-variant").selectOption("0");
     assert.match(await page.locator("#subject-graph").textContent(), /<Subject 1>.*<Picture 1>/s);
-    await page.locator("#final-variant").selectOption("1");
-    assert.strictEqual(await page.locator("#final-text").textContent(), dataset.clips[0].final_h3.variants[1].text);
+    const crossIndex = variants.findIndex(v => v.references.audios.some(a => a.kind === "cross_voice" && a.provenance.donor_occurrence_id === "donor/e3"));
+    const targetIndex = variants.findIndex(v => v.references.audios.some(a => a.kind === "target_voice" && a.source_type === "existing_target_voice"));
+    const visualIndex = variants.findIndex(v => v.references.audios.length === 0);
+    assert(crossIndex >= 0 && targetIndex >= 0 && visualIndex >= 0);
+    await page.locator("#final-variant").selectOption(String(crossIndex));
+    assert.strictEqual(await page.locator("#final-text").textContent(), variants[crossIndex].text);
     assert.strictEqual(await page.locator("#audio-references audio").count(), 1);
     assert.match(await page.locator("#audio-references").textContent(), /cross_voice.*donor\/e3/s);
-    await page.locator("#final-variant").selectOption("2");
+    await page.locator("#final-variant").selectOption(String(targetIndex));
     assert.match(await page.locator("#audio-references").textContent(), /target_voice.*existing_target_voice/s);
     await page.waitForFunction(() => document.querySelector("#audio-references audio").readyState >= 1);
-    const audioURL = dataset.clips[0].final_h3.variants[2].references.audios[0].url;
+    const audioURL = variants[targetIndex].references.audios[0].url;
     assert((await page.locator("#audio-references audio").getAttribute("src")).endsWith(audioURL));
-    await page.locator("#final-variant").selectOption("0");
+    await page.locator("#final-variant").selectOption(String(visualIndex));
     assert.strictEqual(await page.locator("#audio-references audio").count(), 0);
     const label = name => page.locator('input[data-qa-label="' + name + '"]');
     async function assertSelection(expected) {
