@@ -438,6 +438,51 @@ and structural row provenance remain validated by the worker. Missing workspaces
 behind an already canonical shard do not trigger a rebuild in this tool. Valid
 completed chunks, canonical bytes, chunk identity, and Stage2 schema are unchanged.
 
+### Read-only canonical closure audit before recovery
+
+Run this once from the control/server checkout, with production/recovery writers
+stopped for a stable audit. No GPU allocation, RANK/WORLD_SIZE, SAM3 import overlay,
+or `--confirm-production-stopped` flag is needed:
+
+```bash
+/mnt/workspace/litengjie/data/R2V_DATA_V2/.venv/bin/python -B \
+  /mnt/workspace/litengjie/data/R2V_DATA_V2/tools/run_v3_entity_mask_recovery.py \
+  --audit-canonical
+```
+
+This uses the existing production input/output/config defaults and validates the
+frozen topology. It enumerates Stage1 shards, then audits each existing canonical
+`parts/shard-*.jsonl` using the normal full publication validator
+`_validate_completed_shard(..., validate_artifacts=True)`: row order/count and
+lineage, checkpoint identity, clip workspace/metadata, frames, masks, deterministic
+coverage, and required background state/artifacts. Missing canonical shards are
+counted separately without inspecting their incomplete workspaces.
+An orphan canonical part with no matching completed Stage1 shard is reported
+invalid, not silently omitted from the audit.
+
+Stdout contains `canonical_audit_shard` JSON events with `VALID_CANONICAL` or
+`INVALID_CANONICAL`. Invalid entries include the shard, exception type, concise
+message, and clip UID/source index when the validator's row context identifies
+them safely. A bad shard does not stop the remaining shard audits. The final
+JSON event has this shape:
+
+```json
+{"event":"canonical_audit_completed","canonical_total":12,"valid_canonical":12,"invalid_canonical":0,"missing_canonical":3,"invalid":[]}
+```
+
+Exit status is 0 when no canonical shards are invalid, or 1 after the complete
+summary when any are invalid. Missing canonical shards alone are not errors;
+global topology/config preflight errors still fail closed. Only the Python
+process returns this status; the tool does not terminate its parent shell.
+
+The audit performs no model calls, GPU detection, plan creation/update, logs,
+locks, checkpoint writes, truncation, publication, or repair. `-B` also disables
+Python bytecode-cache writes. It is a separate mode, not combinable with
+`--cluster-auto` or `--single-shard`. Existing recovery-plan canonical skipping
+remains unchanged (`validate_artifacts=False`); invalid canonical shards are
+**not** inserted into that plan. Inspect the audit result before deciding any
+future already-published-shard repair policy.
+
 ### Scheduling and safety
 
 The supervisor **reads**, never initializes/rewrites, the existing frozen

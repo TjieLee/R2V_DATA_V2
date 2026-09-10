@@ -20,6 +20,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
+from r2v_data_v2.v3 import pre_qwen_production as stage2
 from r2v_data_v2.v3.pre_qwen_production import (
     ALLOWED_WRITABLE_ROOT,
     STAGE2_META_SCHEMA_VERSION,
@@ -238,6 +239,86 @@ def emit_event(**payload: object) -> None:
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True), flush=True)
 
 
+def _canonical_failure_context(exc: Exception) -> dict[str, object]:
+    """Identify only the validated row being checked, without a second audit pass."""
+    traceback = exc.__traceback__
+    while traceback is not None:
+        frame = traceback.tb_frame
+        if frame.f_code is stage2._validate_materialized_row.__code__:
+            value = frame.f_locals.get("value")
+            source = frame.f_locals.get("input_row")
+            if (
+                isinstance(value, stage2.Stage2Row)
+                and isinstance(source, dict)
+                and value.source_index == source.get("source_index")
+                and value.clip_uid == source.get("clip_uid")
+            ):
+                return {
+                    "clip_uid": value.clip_uid,
+                    "source_index": value.source_index,
+                }
+        traceback = traceback.tb_next
+    return {}
+
+
+def audit_canonical(
+    *, input_root: Path, output_root: Path, identity: ConfigIdentity
+) -> dict[str, object]:
+    """Read-only full publication closure audit, independent of recovery planning."""
+    _, paths = campaign.frozen_topology(input_root, output_root, identity)
+    known_names = {path.name for path in paths}
+    # Do not silently omit a published part with no matching Stage1 shard.
+    paths += [
+        input_root / "parts" / part.name
+        for part in sorted((output_root / "parts").glob("shard-*.jsonl"))
+        if part.name not in known_names
+    ]
+    canonical_total = valid = missing = 0
+    invalid = []
+    for path in paths:
+        part = output_root / "parts" / path.name
+        if not part.exists() and not part.is_symlink():
+            missing += 1
+            continue
+        canonical_total += 1
+        emit_event(event="canonical_audit_shard_started", shard=path.name)
+        result = {"shard": path.name}
+        try:
+            if path.name not in known_names:
+                raise ValueError("canonical shard has no matching completed Stage1 shard")
+            shard = stage2.load_annotation_shard(path)
+            campaign.validate_shard_metadata(shard, output_root, identity)
+            stage2._validate_completed_shard(
+                part,
+                shard=shard,
+                output_root=output_root,
+                config_identity=identity,
+                validate_artifacts=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - report each broken shard and continue auditing
+            result.update(
+                status="INVALID_CANONICAL",
+                exception_type=type(exc).__name__,
+                message=" ".join(str(exc).split())[:500],
+                **_canonical_failure_context(exc),
+            )
+            invalid.append(result)
+        else:
+            result["status"] = "VALID_CANONICAL"
+            valid += 1
+        emit_event(event="canonical_audit_shard", **result)
+    summary = {
+        "event": "canonical_audit_completed",
+        "canonical_total": canonical_total,
+        "valid_canonical": valid,
+        "invalid_canonical": len(invalid),
+        "missing_canonical": missing,
+        "invalid": invalid,
+    }
+    emit_event(**summary)
+    return summary
+
+
 def _private_recovery_path(path: Path, *, args: argparse.Namespace) -> Path:
     resolved = path.expanduser().resolve(strict=False)
     if ALLOWED_WRITABLE_ROOT.resolve(strict=False) not in resolved.parents:
@@ -422,6 +503,11 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
     parser.add_argument("--confirm-production-stopped", action="store_true")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
+        "--audit-canonical",
+        action="store_true",
+        help="Read-only full closure audit of existing canonical shards; no recovery",
+    )
+    mode.add_argument(
         "--cluster-auto",
         action="store_true",
         help="Recover all planned whole shards using physical RANK/WORLD_SIZE",
@@ -435,6 +521,13 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
     args.input_root = args.input_root.expanduser().resolve(strict=True)
     args.output_root = _safe_output_root(args.output_root)
     identity = load_config_identity(args.base_config)
+    if args.audit_canonical:
+        report = audit_canonical(
+            input_root=args.input_root, output_root=args.output_root, identity=identity
+        )
+        if report["invalid_canonical"]:
+            raise SystemExit(1)
+        return report
     if args.cluster_auto or args.single_shard:
         return run_cluster_recovery(args, identity)
     report = recovery_inventory(
