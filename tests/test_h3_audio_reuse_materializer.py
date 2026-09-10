@@ -364,8 +364,8 @@ def test_asset_hash_and_range_mismatch_fail_closed(tmp_path):
         product.load_reuse_source(manifest_path=source.manifest_path, job=source.job, record=source.record, stem_record=args["stem_record"])
 
 
-def _prepared(tmp_path):
-    args, sample, source = _case(tmp_path / "case")
+def _prepared(tmp_path, *, music="N/A"):
+    args, sample, source = _case(tmp_path / "case", music=music)
     canonical = sample.model_copy(update={"sample_id": "clip-1/canonical", "pair_type": "canonical", "pair_id": "canonical/clip-1", "subject_voices": []})
     root = tmp_path / "prepared"
     h3, mimo, stems, reuse = [root / name for name in ("h3", "mimo", "separation", "reuse")]
@@ -409,6 +409,70 @@ def test_model_free_cli_atomic_products_and_input_immutability(tmp_path):
     argv = [part for key, value in args.items() for part in ("--" + key.replace("_", "-"), str(value))]
     argv[-1] += "-second"
     assert main(argv)["model_call_count"] == 0
+
+
+@pytest.mark.parametrize("kinds", [[], ["music_reuse"], ["speaker_speech_reuse"], ["speaker_speech_reuse", "music_reuse"]])
+def test_target_publication_requires_actual_speech_audio(tmp_path, monkeypatch, kinds):
+    args = _prepared(tmp_path, music="Quiet piano continues.")
+    if kinds == ["speaker_speech_reuse", "music_reuse"]:
+        baseline_root = args["output_root"].with_name("baseline")
+        product.materialize_audio_reuse_products(**{**args, "output_root": baseline_root})
+        baseline = product._rows(baseline_root / "records.jsonl", product.AudioReuseProduct)
+    original = product.select_reuse_audio
+    selected = []
+
+    def select(*a, **kw):
+        refs, warnings = original(*a, **kw)
+        refs = [r for r in refs if r.contract.kind in kinds]
+        refs = [r.model_copy(update={"contract": r.contract.model_copy(update={
+            "audio_index": i, "audio_label": f"<Audio {i}>"})}) for i, r in enumerate(refs, 1)]
+        selected.extend(refs)
+        return refs, warnings
+
+    monkeypatch.setattr(product, "select_reuse_audio", select)
+    summary = product.materialize_audio_reuse_products(**args)
+    rows = product._rows(args["output_root"] / "records.jsonl", product.AudioReuseProduct)
+    targets = [r for r in rows if r.conditioning_variant == "target_speech_reuse"]
+    eligible = "speaker_speech_reuse" in kinds
+    assert len(targets) == int(eligible)
+    assert summary.sample_count == summary.ready_count == 1 + int(eligible)
+    assert summary.failed_count == 0
+    if eligible:
+        assert targets[0].audio_references == selected
+        assert [r.contract.kind for r in selected] == kinds
+        if kinds == ["speaker_speech_reuse", "music_reuse"]:
+            assert rows == baseline
+    else:
+        assert [r.conditioning_variant for r in rows] == ["visual_only"]
+
+
+@pytest.mark.parametrize("variant", ["target_speech_reuse", "cross_voice_reference", "full_audio_reuse"])
+def test_ready_product_rejects_phantom_variant(tmp_path, variant):
+    args = _prepared(tmp_path)
+    product.materialize_audio_reuse_products(**args)
+    row = product._rows(args["output_root"] / "records.jsonl", product.AudioReuseProduct)[0]
+    values = row.model_dump(mode="json", exclude={"record_fingerprint"})
+    values["conditioning_variant"] = variant
+    with pytest.raises(ValueError, match="variant differs from actual Audio"):
+        product.AudioReuseProduct(**values, record_fingerprint=product._hash(values))
+
+
+@pytest.mark.parametrize("variant,music_only", [
+    ("target_speech_reuse", True), ("cross_voice_reference", True),
+    ("visual_only", False), ("full_audio_reuse", False),
+])
+def test_record_audio_variant_invariants(tmp_path, variant, music_only):
+    args = _prepared(tmp_path, music="Quiet piano continues.")
+    product.materialize_audio_reuse_products(**args)
+    row = product._rows(args["output_root"] / "records.jsonl", product.AudioReuseProduct)[1]
+    refs = row.audio_references[-1:] if music_only else row.audio_references
+    refs = [r.model_copy(update={"contract": r.contract.model_copy(update={
+        "audio_index": i, "audio_label": f"<Audio {i}>"})}) for i, r in enumerate(refs, 1)]
+    values = row.model_dump(mode="json", exclude={"record_fingerprint"})
+    values.update(conditioning_variant=variant, audio_references=[r.model_dump(mode="json") for r in refs],
+                  task_prefix=audio_task_prefix([r.contract for r in refs]))
+    with pytest.raises(ValueError, match="variant differs from actual Audio"):
+        product.AudioReuseProduct(**values, record_fingerprint=product._hash(values))
 
 
 def test_no_publication_when_lineage_changes(tmp_path):

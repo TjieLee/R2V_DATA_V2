@@ -14,6 +14,7 @@ from PIL import Image
 
 pytest.importorskip("soundfile")
 
+from r2v_data_v2.h3 import audio_reuse_materializer as reuse_product
 from r2v_data_v2.h3 import frame_conditioning_projection as frame
 from r2v_data_v2.h3.audio_reuse_finalizer import finalize_audio_reuse_shadow
 from r2v_data_v2.h3.audio_reuse_materializer import _hash
@@ -241,6 +242,35 @@ def test_registry_never_deduplicates_across_modes_or_source_products():
     assert len(result) == 8
     assert [v["visual_reference_mode"] for v in result] == list(frame.VISUAL_TASKS) * 2
     assert Counter(v["source_product_sample_id"] for v in result) == {"clip/z": 4, "clip/a": 4}
+
+
+@pytest.mark.parametrize("music_only", [False, True])
+def test_phantom_speech_products_never_enter_projection_or_qa(tmp_path, monkeypatch, ffmpeg, music_only):
+    original = reuse_product.select_reuse_audio
+
+    def select(*a, **kw):
+        refs, warnings = original(*a, **kw)
+        refs = [r for r in refs if music_only and r.contract.kind == "music_reuse"]
+        return [r.model_copy(update={"contract": r.contract.model_copy(update={
+            "audio_index": 1, "audio_label": "<Audio 1>"})}) for r in refs], warnings
+
+    monkeypatch.setattr(reuse_product, "select_reuse_audio", select)
+    args, shadow, _ = _fixture(tmp_path, monkeypatch, ffmpeg)
+    sources, _ = frame.load_projection_sources(shadow)
+    assert sources and all(s.product.conditioning_variant != "target_speech_reuse" for s in sources)
+    summary = frame.materialize_frame_conditioned_products(audio_production_root=args["audio_production_root"],
+        shadow_run_id=args["shadow_run_id"], ffmpeg=ffmpeg)
+    assert summary.derived_product_count == 3 * len(sources)
+    final_fixture.qa_fixture.qa.build_audio_shadow_qa(**{k: v for k, v in args.items() if k != "allow_unverified"})
+    data = json.loads((shadow / "qa/data.json").read_text())
+    families = {}
+    for clip in data["clips"]:
+        for variant in clip["final_h3"]["variants"]:
+            if variant["review_family"] == "final_4way":
+                assert variant["conditioning_variant"] != "target_speech_reuse"
+                families.setdefault(variant["source_product_sample_id"], []).append(variant["visual_reference_mode"])
+    assert len(families) == len(sources)
+    assert all(modes == list(frame.VISUAL_TASKS) for modes in families.values())
 
 
 def test_source_must_match_frozen_deterministic_materialization(tmp_path, monkeypatch, ffmpeg):

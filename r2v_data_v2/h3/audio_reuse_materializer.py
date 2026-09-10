@@ -43,7 +43,7 @@ from r2v_data_v2.h3.sam_audio_stem_shadow import SAMAudioStemRecord, sha256_file
 from r2v_data_v2.h3.schemas import SchemaModel
 from r2v_data_v2.h3.speaker_ownership import speaker_ownership_reasons
 
-AUDIO_REUSE_MATERIALIZER_VERSION = "h3_mimo25_audio_reuse_materializer_v5"
+AUDIO_REUSE_MATERIALIZER_VERSION = "h3_mimo25_audio_reuse_materializer_v6"
 
 
 def _hash(value: SchemaModel | dict) -> str:
@@ -290,7 +290,7 @@ def select_reuse_audio(
 class AudioReuseProduct(SchemaModel):
     schema_version: Literal["r2v.h3.audio_reuse_product.1"] = "r2v.h3.audio_reuse_product.1"
     materializer_version: Literal["h3_mimo25_audio_reuse_materializer_v3", "h3_mimo25_audio_reuse_materializer_v4",
-                                "h3_mimo25_audio_reuse_materializer_v5"] = AUDIO_REUSE_MATERIALIZER_VERSION
+                                "h3_mimo25_audio_reuse_materializer_v5", "h3_mimo25_audio_reuse_materializer_v6"] = AUDIO_REUSE_MATERIALIZER_VERSION
     sample_id: str
     source_h3_sample_id: str
     source_h3_sample_sha256: str
@@ -314,6 +314,14 @@ class AudioReuseProduct(SchemaModel):
         if [r.contract.audio_index for r in self.audio_references] != list(range(1, len(self.audio_references) + 1)) or len(self.audio_references) > 3:
             raise ValueError("product Audio capacity/order mismatch")
         if self.status == "ready":
+            kinds = [r.contract.kind for r in self.audio_references]
+            if (self.conditioning_variant == "target_speech_reuse" and "speaker_speech_reuse" not in kinds
+                    or self.conditioning_variant == "cross_voice_reference" and "cross_voice" not in kinds
+                    or self.conditioning_variant == "visual_only" and kinds
+                    or self.conditioning_variant == "full_audio_reuse" and (
+                        kinds != ["full_audio_reuse"] or self.audio_references[0].contract.retention_marker != "fully_copy"
+                        or self.audio_references[0].source_type != "canonical_full_audio")):
+                raise ValueError("product conditioning variant differs from actual Audio")
             if not self.rendered_h3_prompt or self.failure_reason:
                 raise ValueError("ready reuse product is incomplete")
             validate_product_dialogue_sections(
@@ -330,7 +338,8 @@ class AudioReuseProduct(SchemaModel):
 class AudioReuseProductSummary(SchemaModel):
     schema_version: Literal["r2v.h3.audio_reuse_product_summary.1"] = "r2v.h3.audio_reuse_product_summary.1"
     materializer_version: Literal["h3_mimo25_audio_reuse_materializer_v1", "h3_mimo25_audio_reuse_materializer_v3",
-                                "h3_mimo25_audio_reuse_materializer_v4", "h3_mimo25_audio_reuse_materializer_v5"] = AUDIO_REUSE_MATERIALIZER_VERSION
+                                "h3_mimo25_audio_reuse_materializer_v4", "h3_mimo25_audio_reuse_materializer_v5",
+                                "h3_mimo25_audio_reuse_materializer_v6"] = AUDIO_REUSE_MATERIALIZER_VERSION
     source_hashes: dict[str, str]
     clip_uids: list[str]
     sample_count: int
@@ -432,6 +441,9 @@ def materialize_audio_reuse_products(
                     )]
                 elif variant != "visual_only":
                     refs, warnings = select_reuse_audio(sample, source, sources)
+                    required_kind = "cross_voice" if variant == "cross_voice_reference" else "speaker_speech_reuse"
+                    if not any(r.contract.kind == required_kind for r in refs):
+                        continue  # Unavailable variant, not a failed materialization.
                 corrected, rendered, render_warnings = _materialize_sample(
                     sample, job, source.record, conditioning_variant=variant,
                     reuse_audio_contracts=[r.contract for r in refs],

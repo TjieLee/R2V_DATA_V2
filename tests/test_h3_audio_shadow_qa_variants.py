@@ -122,16 +122,21 @@ def _write_products(kwargs, shadow):
             **({"donor_occurrence_id": "donor/e1", "donor_entity_id": "e1", "donor_clip_display_path": "01/show/donor"}
                if kind == "cross_voice" else {}),
         )
+        refs = [ref]
+        if kind == "music_reuse":
+            # Music is a companion, never a standalone target-speech product.
+            refs = [products[0].audio_references[0], ref.model_copy(update={
+                "contract": contract.model_copy(update={"audio_index": 2, "audio_label": "<Audio 2>"})})]
         corrected, text, warnings = qa._materialize_sample(
             sample, job, qa._MaterializerInput(record.annotation, job.request_fingerprint),
-            conditioning_variant=variant, reuse_audio_contracts=[contract],
+            conditioning_variant=variant, reuse_audio_contracts=[r.contract for r in refs],
         )
         products.append(_seal(AudioReuseProduct,
             sample_id=job.clip_uid + "/" + kind, source_h3_sample_id=sample.sample_id,
             source_h3_sample_sha256=qa._fingerprint(sample.model_dump(mode="json")), clip_uid=job.clip_uid,
             pair_type="canonical", conditioning_variant=variant, source_mimo_record_fingerprint=record.record_fingerprint,
-            status="ready", audio_references=[ref.model_dump(mode="json")], corrected_speech_segments=[s.model_dump(mode="json") for s in corrected],
-            rendered_h3_prompt=text, task_prefix=audio_task_prefix([contract]), warnings=warnings,
+            status="ready", audio_references=[r.model_dump(mode="json") for r in refs], corrected_speech_segments=[s.model_dump(mode="json") for s in corrected],
+            rendered_h3_prompt=text, task_prefix=audio_task_prefix([r.contract for r in refs]), warnings=warnings,
         ))
     root = shadow / "h3_audio_reuse_products_v1"
     root.mkdir()

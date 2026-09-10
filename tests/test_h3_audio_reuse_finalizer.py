@@ -132,6 +132,15 @@ def _rows(path, model):
     return [model.model_validate_json(line) for line in path.read_text().splitlines() if line.strip()]
 
 
+def test_cross_without_actual_donor_audio_is_unavailable(tmp_path, monkeypatch):
+    args, shadow = _fixture(tmp_path, monkeypatch, cross=True, one_clip=True)
+    result = finalizer.finalize_audio_reuse_shadow(**args)
+    rows = [json.loads(line) for line in (shadow / "h3_audio_reuse_products_v1/records.jsonl").read_text().splitlines()]
+    assert rows and all(r["conditioning_variant"] != "cross_voice_reference" for r in rows)
+    assert result.product_failed_count == 0
+    assert result.product_sample_count == result.product_ready_count == len(rows)
+
+
 def test_named_finalizer_real_stages_pcm_subject_s2_and_qa(tmp_path, monkeypatch):
     args, shadow = _fixture(tmp_path, monkeypatch)
     before = {p: sha256_file(p) for p in tmp_path.rglob("*") if p.is_file()}
@@ -277,7 +286,7 @@ def test_upstream_diarization_failure_remains_explicit(tmp_path, monkeypatch):
     assert result.upstream_unavailable_count == 1
     assert result.unavailable_clips == {"clip-a": "stem_diarization_failed"}
     assert result.reconcile_ready_count == 2 and result.reconcile_failed_count == 0
-    assert result.product_ready_count == 6 and result.product_failed_count == 0
+    assert result.product_ready_count == 5 and result.product_failed_count == 0
     assert not (shadow / finalizer.ASSETS_STAGE / "clip-a").exists()
 
 
