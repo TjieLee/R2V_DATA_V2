@@ -444,27 +444,110 @@ The supervisor **reads**, never initializes/rewrites, the existing frozen
 `_internal/entity-mask-static-assignment.json`, execution marker, and session
 marker. It requires `world_size=5`, `local_gpu_count=8`, and
 `global_worker_count=40`, regardless of how many recovery GPUs are available.
-Each original logical worker keeps its original contiguous whole-shard range.
-Mapping worker 19 to physical GPU 7, for example, retains logical rank 2 / local
-slot 3; only the child `CUDA_VISIBLE_DEVICES=7` changes.
+This is **original ownership provenance**, not the recovery scheduling unit.
+`--cluster-auto` schedules unfinished **whole shards**. Five unfinished shards
+from one original worker can run concurrently on five physical recovery GPUs.
+Each planned shard records its original worker/rank/local slot and range; that
+membership is validated before execution. Canonical schema and original static
+ownership never change.
 
-Execution requires an explicit `--logical-workers` list. Separate recovery nodes
-must receive **disjoint** lists. There is no shared-filesystem work stealing or
-new shard assignment. One persistent backend is created per logical-worker
-process. When it exits, the supervisor reuses its physical GPU for the next
-explicitly selected logical worker. Child failures produce a nonzero supervisor
-exit; interruption cleans up only children started by that supervisor.
+The training platform's `RANK` and `WORLD_SIZE` describe only the **current
+physical recovery allocation**. They are never substituted for the frozen 5x8
+marker. With the same visible GPU count on every allocated node:
+
+```text
+physical_global_slot = recovery_rank * recovery_local_gpu_count + local_gpu_slot
+```
+
+All physical ranks use the same immutable plan, physical world size, and visible
+local GPU count to derive disjoint ordered shard lists using deterministic
+longest-processing-time-first assignment (`remaining_rows_lpt_v1`). The sort key
+is descending estimated remaining rows, then canonical shard position; ties
+between physical slots use load, assigned count, then slot ID. It is not merely
+equal shard counts. Canonical completions after plan creation are skipped without
+changing the persisted weights or assignments midway through a recovery job.
+
+One persistent SAM3 process is started per visible physical GPU. Its backend is
+loaded lazily once, reused across that slot's assigned shards, and closed once.
+Empty/all-canonical assignments do not load SAM3. There is no per-original-worker
+serialization and no dynamic cross-node work stealing. Retryable shard failures
+remain retryable, emit `shard_retryable`, and produce a nonzero job exit; other
+independent assigned shards can still finish. Interruption cleans only the
+launcher's own child processes.
+
+### Immutable recovery campaign
+
+The default shared plan is:
+
+```text
+/mnt/workspace/litengjie/data/entity_mask_recovery/plan-v1.json
+```
+
+On the first real launch, physical rank 0 validates/inventories Stage2 and
+atomically publishes the plan; other physical ranks wait for it. The plan stores
+its schema/version and checksum, frozen original topology (including ordered
+Stage1 shard-list hash), source shard hashes, config SHA/fingerprint, previously
+canonical shard hashes, every unfinished shard's original ownership, row count,
+and estimated durable/remaining rows.
+
+Row estimates are cheap scheduling estimates: complete JSONL prefixes with
+existing checkpoint/run/clip metadata and frame/mask manifests. Torn partial EOF
+lines are ignored without truncation during planning. The existing `0a4d4adb`
+reconciler still performs exact artifact/hash/semantic validation before reuse;
+estimates are **not** acceptance decisions. Pending shards with zero estimated
+remaining rows still receive a small compaction weight.
+
+Restarts reuse and validate the same plan, not a fresh inventory merely because
+more shards finished. Missing/corrupt/stale plan identity, changed source hashes,
+ownership mismatch, or changed previously canonical bytes fail closed. Do not
+edit/delete the campaign plan to bypass this. A deliberately new campaign can
+use an explicit private `--plan` path after all previous owners are stopped;
+changing the physical allocation does not change original 5x8 provenance.
 
 **Stop the original production owners before recovery.** The required
 `--confirm-production-stopped` switch is an operator acknowledgement, not process
-discovery. Recovery workers hold a nonblocking, lifetime, per-logical-worker
-lock under `_internal/recovery-workers/`; duplicate recovery invocations fail
-instead of competing. Original static production workers do not use those locks
-and must not coexist with recovery owners. Never delete a lock file to bypass it.
-No `--overwrite` is used. Logs are separate, under the private
-`entity_mask_logs/recovery/` directory, never mixed into production data.
+discovery. Stop old manual recovery jobs too before cluster-auto recovery. New
+workers use nonblocking physical-slot and whole-shard guards; busy ownership is
+a failure, never permission to steal/skip a shard. These are duplicate-execution
+guards, not a shared task queue. Never delete lock files to bypass them. No
+`--overwrite` is used. The legacy `--logical-workers` interface remains available
+for compatibility, but is **not** the multi-node production recovery interface
+and must not run alongside cluster-auto/single-shard recovery.
 
-### Read-only inventory and one-worker canary
+Logs are separate and plan-specific:
+
+```text
+/mnt/workspace/litengjie/data/entity_mask_logs/recovery/<plan_sha256>/physical-rank-<RANK>-slot-<slot>.log
+```
+
+Stdout exposes flushed JSON events: `recovery_plan_waiting`,
+`recovery_inventory_shard`, `recovery_plan_ready`, `physical_assignment`,
+`shard_started`, `shard_completed`, `shard_retryable`, and
+`physical_worker_completed`. Physical workers emit a heartbeat every 30 seconds
+while loading/processing. Model console output goes to their log; progress events
+are both logged and visible in the training task stdout.
+
+### One-click training-platform recovery block
+
+`stage_entity_mask_run_v2.sh` is the existing external, validated training-style
+entrypoint (not a new repository bootstrap script). Keep its RANK/WORLD_SIZE
+exports, dreamidv activation, CUDA_HOME/CPATH/LD_LIBRARY_PATH setup, and all other
+environment preparation unchanged. Replace **only its final Entity Mask Python
+command** with this block, identically on every allocated compute node:
+
+```bash
+export PYTHONPATH=/mnt/workspace/litengjie/data/vendor/sam3:${PYTHONPATH:-}
+/mnt/workspace/litengjie/data/R2V_DATA_V2/.venv/bin/python \
+  /mnt/workspace/litengjie/data/R2V_DATA_V2/tools/run_v3_entity_mask_recovery.py \
+  --cluster-auto \
+  --confirm-production-stopped
+```
+
+Do not set RANK/WORLD_SIZE to the old 5x8 topology in this block. No per-node
+logical worker list or manually enumerated physical GPUs is required. Normal
+`run_v3_entity_mask_auto.py` behavior is unchanged.
+
+### Read-only inventory and optional single-shard canary
 
 Use the same server environment and import setup described above. Inventory
 checks frozen topology and existing shard metadata/source hashes, without
@@ -476,22 +559,28 @@ cd /mnt/workspace/litengjie/data/R2V_DATA_V2
 .venv/bin/python tools/run_v3_entity_mask_recovery.py --dry-run
 ```
 
-After stopping production owners, choose **one unfinished logical ID** reported
-by inventory. For example, if worker 0 is unfinished and physical GPU 7 is free:
+To preview weighted physical assignments on rank 0 without publishing a new plan
+or loading models, use `--cluster-auto --dry-run`. With an existing plan this
+validates/reuses it. The initial unpublished-plan dry-run is rank-0 only; ordinary
+first cluster launch publishes the shared plan automatically.
+
+For a local/control-server canary, select a single shard name in that plan and an
+available GPU (example below). This processes just that whole shard; it is not
+the normal multi-node interface and must not overlap a running cluster job:
 
 ```bash
 cd /mnt/workspace/litengjie/data/R2V_DATA_V2
 export PYTHONPATH=/mnt/workspace/litengjie/data/vendor/sam3${PYTHONPATH:+:$PYTHONPATH}
 .venv/bin/python tools/run_v3_entity_mask_recovery.py \
-  --logical-workers 0 --gpus 7 --confirm-production-stopped
+  --single-shard shard-000000000-000009999.jsonl \
+  --gpus 7 --confirm-production-stopped
 ```
 
-This is a **one-logical-worker** canary, not a one-clip limit: it resumes that
-worker's remaining original shard range. A completed selected worker is a no-op.
-Review `entity_mask_logs/recovery/recovery-worker-0-gpu-7.log` and canonical
-completion before assigning more disjoint logical IDs to recovery nodes. A
-second invocation uses the same persisted selection-by-ownership and checkpoints;
-do not delete output roots or change the frozen topology to resume.
+Use an actual planned shard name; a shard completed since planning is safely
+skipped. Single-shard mode uses a one-node physical layout without changing the
+campaign or original owner identity. Review plan-specific logs and canonical
+completion before launching the ordinary cluster-auto block. Do not delete
+output roots or change frozen topology to resume.
 
 The recovery implementation is covered by local mocked tests. No real GPU
 production recovery is implied by those tests.

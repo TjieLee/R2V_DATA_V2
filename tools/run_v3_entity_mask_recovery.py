@@ -1,7 +1,8 @@
-"""Explicit recovery of frozen Entity Mask logical workers on available GPUs.
+"""Explicit recovery of frozen Entity Mask shards on available physical GPUs.
 
-Normal production owners must be stopped before using this tool. Different
-recovery nodes must receive disjoint explicit --logical-workers lists.
+Cluster-auto uses a shared immutable plan and physical RANK/WORLD_SIZE. The
+explicit logical-worker interface remains available for legacy manual recovery.
+All old production/recovery owners must be stopped before starting either mode.
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ from r2v_data_v2.v3.pre_qwen_production import (
     validate_execution_identity,
     validate_sam3_session_reuse_identity,
 )
+from tools import entity_mask_recovery_plan as campaign
 from tools import run_v3_entity_mask_auto as production
 from tools.run_v3_pre_qwen_auto import parse_gpus
 
@@ -232,6 +234,170 @@ def run_workers(
     return codes
 
 
+def emit_event(**payload: object) -> None:
+    print(json.dumps(payload, ensure_ascii=False, sort_keys=True), flush=True)
+
+
+def _private_recovery_path(path: Path, *, args: argparse.Namespace) -> Path:
+    resolved = path.expanduser().resolve(strict=False)
+    if ALLOWED_WRITABLE_ROOT.resolve(strict=False) not in resolved.parents:
+        raise ValueError("recovery plan/logs must stay under the private writable root")
+    for protected in (args.input_root, args.output_root):
+        if (
+            resolved == protected
+            or resolved in protected.parents
+            or protected in resolved.parents
+        ):
+            raise ValueError(
+                "recovery plan/logs must be separate from input/output roots"
+            )
+    return resolved
+
+
+def run_cluster_recovery(
+    args: argparse.Namespace, identity: ConfigIdentity
+) -> dict[str, object]:
+    if args.logical_workers is not None:
+        raise ValueError("cluster/single-shard recovery cannot use --logical-workers")
+    if not args.dry_run and not args.confirm_production_stopped:
+        raise ValueError("recovery requires --confirm-production-stopped")
+    rank, world_size = (
+        (0, 1) if args.single_shard else production._environment_topology()
+    )
+    gpus = parse_gpus(args.gpus)  # Auto-detect every visible GPU by default.
+    args.plan = _private_recovery_path(args.plan, args=args)
+    args.log_root = _private_recovery_path(args.log_root, args=args)
+    emit_event(
+        event="recovery_plan_loading",
+        recovery_rank=rank,
+        recovery_world_size=world_size,
+        plan_path=str(args.plan),
+    )
+    if args.dry_run and not args.plan.is_file():
+        if rank != 0:
+            raise ValueError("first unpublished plan dry-run must use physical rank 0")
+        plan = campaign.build_plan(
+            args.input_root, args.output_root, identity, emit=emit_event
+        )
+    else:
+        plan = campaign.obtain_plan(
+            args.plan,
+            args.input_root,
+            args.output_root,
+            identity,
+            rank=rank,
+            timeout_seconds=args.plan_wait_seconds,
+            emit=emit_event,
+        )
+    emit_event(
+        event="recovery_plan_ready",
+        plan_path=str(args.plan),
+        plan_sha256=plan.plan_sha256,
+        planned_shards=len(plan.shards),
+        recovery_rank=rank,
+        dry_run=args.dry_run,
+    )
+    selected = plan.shards
+    if args.single_shard:
+        selected = [shard for shard in selected if shard.name == args.single_shard]
+        if not selected:
+            raise ValueError("single shard is not in the immutable recovery campaign")
+    # Never rebalance using live completion counts: every rank uses the same frozen weights.
+    assignments = campaign.weighted_assignment(
+        selected, world_size=world_size, local_gpu_count=len(gpus)
+    )
+    for slot, gpu in enumerate(gpus):
+        global_slot = rank * len(gpus) + slot
+        emit_event(
+            event="physical_assignment",
+            plan_sha256=plan.plan_sha256,
+            recovery_rank=rank,
+            recovery_world_size=world_size,
+            recovery_local_gpu_count=len(gpus),
+            local_gpu_slot=slot,
+            physical_global_slot=global_slot,
+            gpu=gpu,
+            estimated_remaining_rows=sum(
+                shard.estimated_remaining_rows for shard in assignments[global_slot]
+            ),
+            shards=[
+                shard.model_dump(mode="json") for shard in assignments[global_slot]
+            ],
+        )
+    report = {
+        "plan_sha256": plan.plan_sha256,
+        "recovery_rank": rank,
+        "recovery_world_size": world_size,
+        "local_gpu_count": len(gpus),
+    }
+    if args.dry_run:
+        return report
+    log_root = args.log_root / plan.plan_sha256
+    log_root.mkdir(parents=True, exist_ok=True)
+    worker_tool = Path(__file__).with_name("run_v3_entity_mask_recovery_worker.py")
+    processes, logs = [], []
+    with production._launcher_signal_handlers():
+        try:
+            for slot, gpu in enumerate(gpus):
+                log_path = log_root / f"physical-rank-{rank}-slot-{slot}.log"
+                log = log_path.open("ab")
+                logs.append(log)
+                command = [
+                    sys.executable,
+                    str(worker_tool),
+                    "--input-root",
+                    str(args.input_root),
+                    "--output-root",
+                    str(args.output_root),
+                    "--base-config",
+                    str(args.base_config),
+                    "--plan",
+                    str(args.plan),
+                    "--plan-sha256",
+                    plan.plan_sha256,
+                    "--rank",
+                    str(rank),
+                    "--world-size",
+                    str(world_size),
+                    "--local-gpu-count",
+                    str(len(gpus)),
+                    "--local-slot",
+                    str(slot),
+                    "--gpu",
+                    gpu,
+                    "--log-file",
+                    str(log_path),
+                ]
+                if args.single_shard:
+                    command.extend(["--single-shard", args.single_shard])
+                log.write((json.dumps({"command": command}) + "\n").encode())
+                log.flush()
+                processes.append(
+                    subprocess.Popen(
+                        command,
+                        env=dict(os.environ, CUDA_VISIBLE_DEVICES=gpu),
+                        # Child JSON events remain visible in the training task's stdout.
+                        stdout=None,
+                        stderr=log,
+                    )
+                )
+            codes = [process.wait() for process in processes]
+        except production.LauncherTermination as exc:
+            production.terminate_worker_processes(processes)
+            raise SystemExit(128 + exc.signum) from exc
+        except BaseException:
+            production.terminate_worker_processes(processes)
+            raise
+        finally:
+            for log in logs:
+                log.close()
+    report.update(worker_exit_codes=codes, success=all(code == 0 for code in codes))
+    emit_event(event="recovery_node_completed", **report)
+    if not report["success"]:
+        raise SystemExit(production.normalized_worker_exit_code(codes))
+    return report
+
+
 def main(argv: list[str] | None = None) -> dict[str, object]:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -254,10 +420,23 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
     )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--confirm-production-stopped", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--cluster-auto",
+        action="store_true",
+        help="Recover all planned whole shards using physical RANK/WORLD_SIZE",
+    )
+    mode.add_argument(
+        "--single-shard", help="Run just one canonical shard name from the recovery plan"
+    )
+    parser.add_argument("--plan", type=Path, default=campaign.DEFAULT_PLAN)
+    parser.add_argument("--plan-wait-seconds", type=float, default=1800)
     args = parser.parse_args(argv)
     args.input_root = args.input_root.expanduser().resolve(strict=True)
     args.output_root = _safe_output_root(args.output_root)
     identity = load_config_identity(args.base_config)
+    if args.cluster_auto or args.single_shard:
+        return run_cluster_recovery(args, identity)
     report = recovery_inventory(
         input_root=args.input_root, output_root=args.output_root, identity=identity
     )
