@@ -4,6 +4,7 @@ import hashlib
 import json
 import shutil
 import uuid
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TypeVar
@@ -17,14 +18,20 @@ from r2v_data_v2.h3.diarization_binding import (
     RawDiarizationSegment,
 )
 from r2v_data_v2.h3.jea_final_renderer import FinalH3SampleV2, FinalQwen3SpeechSegment
-from r2v_data_v2.h3.mimo25_av_reconcile import MimoCaseManifest, build_mimo25_inventory
+from r2v_data_v2.h3.mimo25_av_reconcile import (
+    MimoCaseManifest,
+    MimoClipJob,
+    build_mimo25_inventory,
+)
 from r2v_data_v2.h3.mimo25_backend import (
     MIMO25_MATERIALIZER_VERSION,
     MimoAVAnnotationDraft,
 )
 from r2v_data_v2.h3.mimo25_h3_materializer import (
     MimoH3MaterializationContractError,
+    _MaterializationContext,
     _materialize_sample,
+    _prepare_materialization_context,
 )
 from r2v_data_v2.h3.mimo25_stem_shadow import (
     MIMO25_STEM_RECONCILE_STAGE,
@@ -44,8 +51,8 @@ from r2v_data_v2.h3.sam_audio_stem_shadow import (
 )
 from r2v_data_v2.structured_output import normalize_structured_json_envelope
 
-QA_DATA_VERSION = "r2v.h3.audio_shadow_qa.7"
-QA_REVIEW_VERSION = "r2v.h3.audio_shadow_human_qa.2"
+QA_DATA_VERSION = "r2v.h3.audio_shadow_qa.8"
+QA_REVIEW_VERSION = "r2v.h3.audio_shadow_human_qa.3"
 QA_LABELS = (
     "better", "same", "worse", "speaker_wrong",
     "dialogue_wrong", "audio_wrong", "visual_hallucination",
@@ -105,6 +112,77 @@ def _overlaps(first: Path, second: Path) -> bool:
     return first == second or first in second.parents or second in first.parents
 
 
+def _reference_payload(
+    context: _MaterializationContext,
+    job: MimoClipJob,
+    source_samples: Sequence[FinalH3SampleV2],
+    media_link: Callable[[str, str], str],
+    *,
+    audio_provenance: Mapping[str, dict[str, object]] | None = None,
+) -> dict[str, object]:
+    """Project the rendering contract, never infer references from rendered prose."""
+    selection = job.reference_selection
+    images = {image.picture_label: image for image in job.reference_images}
+    promotions = {item.source_image_index: item for item in selection.face_promotions}
+    pictures = []
+    for picture in context.contract.pictures:
+        source = images[picture.picture_label]
+        if picture.image_sha256 != source.image_sha256:
+            raise ValueError(f"QA source media changed: {picture.image_path}")
+        promotion = promotions.get(source.source_image_index)
+        pictures.append({
+            **picture.model_dump(mode="json"),
+            "source_image_index": source.source_image_index,
+            "source_image_id": source.source_image_id,
+            "source_image_label": source.source_image_label,
+            "face_promotion": promotion.model_dump(mode="json") if promotion else None,
+            "url": media_link(picture.image_path, picture.image_sha256),
+        })
+    subjects = [subject.model_dump(mode="json") for subject in context.contract.subjects]
+    audios = []
+    for audio in context.contract.audios:
+        provenance = dict((audio_provenance or {}).get(audio.audio_label, {}))
+        voices = [v for v in context.sample.subject_voices
+                  if v.voice_reference_path == audio.path
+                  and v.entity_id == audio.entity_id]
+        if any(v.voice_reference_sha256 != audio.sha256 for v in voices):
+            raise ValueError(f"QA source media changed: {audio.path}")
+        if len(voices) == 1 and audio.kind in {"target_voice", "cross_voice"}:
+            voice = voices[0]
+            provenance = {
+                "role": "voice_reference",
+                "source_type": "cross_donor" if voice.voice_source == "cross_donor" else "existing_target_voice",
+                **voice.model_dump(mode="json"), **provenance,
+            }
+        elif audio.kind == "full_audio_reuse":
+            provenance = {"role": "full_audio_reuse", "source_type": "canonical_full_audio", **provenance}
+        audios.append({
+            **audio.model_dump(mode="json"), "provenance": provenance,
+            "role": provenance.get("role"), "source_type": provenance.get("source_type"),
+            "url": media_link(audio.path, audio.sha256),
+        })
+    dropped = []
+    for item in selection.dropped_references:
+        row = item.model_dump(mode="json")
+        candidates = {
+            ref.image_artifact_path
+            for sample in source_samples for ref in sample.visual_references
+            if ref.image_id == item.source_image_id and ref.image_index == item.source_image_index
+        }
+        if len(candidates) == 1:
+            path = Path(next(iter(candidates)))
+            if path.is_file():
+                digest = sha256_file(path)
+                row.update(url=media_link(str(path), digest), image_sha256=digest)
+        dropped.append(row)
+    return {
+        "conditioning_variant": context.variant,
+        "pictures": pictures, "subjects": subjects, "audios": audios,
+        "visual_selection": selection.model_dump(mode="json"),
+        "dropped_visual_references": dropped,
+    }
+
+
 def _destination(
     output_root: Path | None, shadow: Path, protected: list[Path], overwrite: bool,
 ) -> Path:
@@ -124,7 +202,7 @@ def _destination(
         try:
             previous = json.loads((destination / "data.json").read_text(encoding="utf-8"))
             owned = (
-                previous["schema_version"] == QA_DATA_VERSION
+                previous["schema_version"] in {"r2v.h3.audio_shadow_qa.7", QA_DATA_VERSION}
                 and previous["source_shadow_root"] == str(shadow)
             )
         except (OSError, ValueError, KeyError, TypeError):
@@ -302,16 +380,24 @@ def build_audio_shadow_qa(
                     **source.model_dump(mode="python"), "speech_segments": speech,
                 })
                 try:
+                    materializer_input = _MaterializerInput(record.annotation, record.source_job_fingerprint)
+                    context = _prepare_materialization_context(sample, current, materializer_input)
+                except MimoH3MaterializationContractError:
+                    context = None
+                references = _reference_payload(
+                    context, current, [samples_by_id[sid] for sid in current.source_h3_sample_ids], media_link,
+                ) if context is not None else None
+                try:
                     _, text, warnings = _materialize_sample(
-                        sample, current,
-                        _MaterializerInput(record.annotation, record.source_job_fingerprint),
+                        sample, current, materializer_input,
                     )
                     variant = {"status": "ready", "text": text, "warnings": warnings, "reason": None}
                 except MimoH3MaterializationContractError as error:
                     variant = {"status": "unavailable", "text": None,
                                "reason": "materialization_contract_failed",
                                "issues": [item.to_dict() for item in error.issues]}
-                variants.append({"sample_id": sample_id, "pair_type": source.pair_type, **variant})
+                variants.append({"sample_id": sample_id, "pair_type": source.pair_type,
+                                 "references": references, **variant})
             final_h3.update(variants[0], variants=variants)
         elif record is not None:
             final_h3.update(
@@ -379,6 +465,8 @@ def build_audio_shadow_qa(
         shutil.copyfile(Path(__file__).with_name("audio_shadow_qa.html"), temporary / "review.html")
         if any(sha256_file(Path(path)) != digest for path, digest in source_hashes.items()):
             raise ValueError("QA source artifacts changed during build")
+        if any(sha256_file(Path(item["source_path"])) != item["sha256"] for item in media.values()):
+            raise ValueError("QA source media changed during build")
         _publish_directory(temporary, destination, overwrite=overwrite)
     finally:
         if temporary.exists():

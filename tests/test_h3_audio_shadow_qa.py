@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import subprocess
+import wave
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -96,7 +97,7 @@ class _Reconcile:
         return SimpleNamespace(annotation=annotation, **fields)
 
 
-def _fixture(tmp_path, monkeypatch, *, mixed=False, variants=False):
+def _fixture(tmp_path, monkeypatch, *, mixed=False, variants=False, cross_variant=False):
     root = tmp_path / "production"
     root.mkdir()
     separation, diarization, asr, inventory, order = _run_three_clip_shadow_to_asr(
@@ -116,6 +117,8 @@ def _fixture(tmp_path, monkeypatch, *, mixed=False, variants=False):
         )
         if variants:
             values["source_h3_sample_ids"].append(f"{old.clip_uid}/canonical")
+        if cross_variant:
+            values["source_h3_sample_ids"].append(f"{old.clip_uid}/cross_pair")
         for ref in values["reference_images"]:
             Image.new("RGB", (160, 200), (98, 150, 140)).save(ref["image_artifact_path"])
             ref["image_sha256"] = sha256_file(Path(ref["image_artifact_path"]))
@@ -125,6 +128,12 @@ def _fixture(tmp_path, monkeypatch, *, mixed=False, variants=False):
     sample_root = tmp_path / "sample-template"
     sample_root.mkdir()
     template = _sample(sample_root)
+    voice_path = sample_root / "voice.wav"
+    with wave.open(str(voice_path), "wb") as stream:
+        stream.setparams((2, 2, 32000, 0, "NONE", "not compressed"))
+        stream.writeframes(b"\0" * 128000)
+    template.subject_voices[0].voice_reference_path = str(voice_path)
+    template.subject_voices[0].voice_reference_sha256 = sha256_file(voice_path)
     samples_path = root / "h3/samples.jsonl"
     samples_path.parent.mkdir()
     samples = []
@@ -141,6 +150,16 @@ def _fixture(tmp_path, monkeypatch, *, mixed=False, variants=False):
             samples.append(FinalH3SampleV2.model_validate({
                 **sample_values, "sample_id": f"{job.clip_uid}/canonical",
                 "pair_type": "canonical", "subject_voices": [],
+            }))
+        if cross_variant:
+            donor_path = sample_root / "donor.wav"
+            donor_path.write_bytes(voice_path.read_bytes())
+            voice = {**sample_values["subject_voices"][0], "voice_source": "cross_donor",
+                     "voice_reference_path": str(donor_path), "donor_clip_uid": "donor",
+                     "donor_occurrence_id": "donor/e3", "donor_clip_display_path": "01/show/donor"}
+            samples.append(FinalH3SampleV2.model_validate({
+                **sample_values, "sample_id": f"{job.clip_uid}/cross_pair",
+                "pair_type": "cross_pair", "subject_voices": [voice],
             }))
     samples_path.write_text("".join(sample.model_dump_json() + "\n" for sample in samples))
     values["source_h3_samples_sha256"] = sha256_file(samples_path)
@@ -209,7 +228,7 @@ def test_builder_ready_failed_order_media_and_sources_unchanged(tmp_path, monkey
     for clip, call in zip((data["clips"][0], data["clips"][2]), materialized, strict=True):
         final = clip["final_h3"]
         assert final["status"] == "ready"
-        assert final["materializer_version"] == "h3_mimo25_materializer_v26"
+        assert final["materializer_version"] == qa.MIMO25_MATERIALIZER_VERSION
         assert final["text"] == call[3] == original(*call[:3])[1]
         assert final["variants"][0]["text"] == final["text"]
         assert "[[" not in final["text"]
@@ -222,7 +241,7 @@ def test_builder_ready_failed_order_media_and_sources_unchanged(tmp_path, monkey
         positions = [final["text"].index(section + ":\n") for section in sections]
         assert positions == sorted(positions)
         assert clip["direct_h3"]["shot1_caption"] in final["text"]
-        assert final["text"].count("[Shot 1]") == 1
+        assert final["text"].count("\n[Shot 1] ") == 1
     assert data["clips"][1]["final_h3"]["status"] == "unavailable"
     assert data["clips"][1]["final_h3"]["text"] is None
     assert data["clips"][1]["final_h3"]["reason"] == "AV reconcile failed: failed <script>not markup</script>"
@@ -297,6 +316,148 @@ def test_final_h3_keeps_conditioning_variants_separate(tmp_path, monkeypatch):
     assert "<Audio 1>" not in canonical["text"]
     assert "[reference generation + audio reference]" in voice["text"]
     assert voice["text"].split("detailed_description:", 1)[1] == canonical["text"].split("detailed_description:", 1)[1]
+    assert canonical["references"]["audios"] == []
+    assert canonical["references"]["conditioning_variant"] == "visual_only"
+    assert voice["references"]["audios"][0]["audio_label"] == "<Audio 1>"
+    assert voice["references"]["audios"][0]["kind"] == "target_voice"
+    assert voice["references"]["audios"][0]["subject_label"] == "<Subject 1>"
+    assert voice["references"]["audios"][0]["speaker_id"] == "S1"
+
+
+def test_reference_media_and_cross_provenance_are_variant_owned(tmp_path, monkeypatch):
+    kwargs, shadow = _fixture(tmp_path, monkeypatch, variants=True, cross_variant=True)
+    before = _snapshot(tmp_path)
+    qa.build_audio_shadow_qa(**kwargs)
+    data = json.loads((shadow / "qa/data.json").read_text())
+    canonical, cross, target = data["clips"][0]["final_h3"]["variants"]
+    for variant in (canonical, cross, target):
+        refs = variant["references"]
+        assert refs["subjects"][0]["source_picture_labels"] == ["<Picture 1>"]
+        assert refs["pictures"][0]["url"] in data["media"]
+        assert not any("video" in ref.get("kind", "") for ref in refs["pictures"])
+    assert canonical["references"]["audios"] == []
+    cross_audio, target_audio = cross["references"]["audios"][0], target["references"]["audios"][0]
+    assert cross_audio["kind"] == "cross_voice" and cross_audio["source_type"] == "cross_donor"
+    assert cross_audio["provenance"]["donor_occurrence_id"] == "donor/e3"
+    assert cross_audio["provenance"]["donor_clip_uid"] == "donor"
+    assert target_audio["source_type"] == "existing_target_voice"
+    assert cross_audio["url"] != target_audio["url"]
+    for item in (cross_audio, target_audio):
+        assert data["media"][item["url"]]["source_path"] == item["path"]
+        assert (shadow / "qa" / item["url"]).is_symlink()
+    assert not set(data["clips"][0]["separation"]["media"].values()) & {cross_audio["url"], target_audio["url"]}
+    assert all(path.read_bytes() == content for path, content in before.items())
+
+
+def test_variant_coverage_warnings_are_preserved(tmp_path, monkeypatch):
+    original = _Reconcile.reconcile
+
+    def reconcile(self, job, **kwargs):
+        result = original(self, job, **kwargs)
+        values = result.annotation.model_dump(mode="json")
+        values["h3_semantics"]["shot1_caption"] = values["h3_semantics"]["shot1_caption"].replace(
+            "<Subject 1>", "The person",
+        )
+        result.annotation = MimoAVAnnotationDraft.model_validate(values)
+        return result
+
+    monkeypatch.setattr(_Reconcile, "reconcile", reconcile)
+    kwargs, shadow = _fixture(tmp_path, monkeypatch, variants=True)
+    qa.build_audio_shadow_qa(**kwargs)
+    final = json.loads((shadow / "qa/data.json").read_text())["clips"][0]["final_h3"]
+    warning = "<Subject 1>:preserved_visual_subject_missing_from_detailed_description"
+    for variant in final["variants"]:
+        assert variant["status"] == "ready"
+        assert warning in variant["warnings"]
+        assert variant["references"]["subjects"][0]["subject_label"] == "<Subject 1>"
+
+
+@pytest.mark.parametrize("kind", ["target_voice", "cross_voice", "speaker_speech_reuse",
+                                  "music_reuse", "music_reference", "full_audio_reuse"])
+def test_reference_projection_supports_current_typed_audio_kinds(tmp_path, kind):
+    from r2v_data_v2.h3.qwen38_h3_recaption import RecaptionAudioContract
+    from tests.test_h3_audio_reuse_materializer import _case
+
+    _, sample, source = _case(tmp_path)
+    ownership = ({"subject_label": "<Subject 1>", "entity_id": "e1", "speaker_id": "S1"}
+                 if kind in {"target_voice", "cross_voice", "speaker_speech_reuse"} else {})
+    audio = RecaptionAudioContract(
+        audio_index=1, audio_label="<Audio 1>", kind=kind, path=source.job.target_full_audio_path,
+        sha256=source.job.target_full_audio_sha256,
+        retention_marker="fully_copy" if kind == "full_audio_reuse" else (
+            "partially_copy" if kind.endswith("_reuse") else "reference"),
+        music_characteristics="Gentle piano" if kind == "music_reference" else None,
+        **ownership,
+    )
+    context = qa._prepare_materialization_context(sample, source.job, source.record,
+                                                 reuse_audio_contracts=[audio])
+    media = {}
+
+    def link(path, digest):
+        assert sha256_file(Path(path)) == digest
+        url = f"media/{digest}{Path(path).suffix}"
+        media[url] = path
+        return url
+
+    source_type = {"target_voice": "mimo_recovered_target_voice", "cross_voice": "cross_donor",
+                   "speaker_speech_reuse": "target_speaker_reuse_asset", "music_reuse": "target_music_reuse_asset",
+                   "music_reference": "mimo_non_diegetic_music_event", "full_audio_reuse": "canonical_full_audio"}[kind]
+    provenance = {"role": "voice_reference" if kind in {"target_voice", "cross_voice"} else kind,
+                  "source_type": source_type, "source_segment_id": "segment_1"}
+    refs = qa._reference_payload(context, source.job, [sample], link,
+                                 audio_provenance={"<Audio 1>": provenance})
+    result = refs["audios"][0]
+    assert {key: result[key] for key in audio.model_dump()} == audio.model_dump(mode="json")
+    assert result["provenance"]["source_segment_id"] == "segment_1"
+    assert result["url"] in media
+
+
+@pytest.mark.parametrize("media_kind", ["voice", "image"])
+def test_added_reference_media_hash_mismatch_fails_closed(tmp_path, monkeypatch, media_kind):
+    kwargs, shadow = _fixture(tmp_path, monkeypatch)
+    sample = qa._rows(kwargs["audio_production_root"] / "h3/samples.jsonl", FinalH3SampleV2)[0]
+    path = sample.subject_voices[0].voice_reference_path if media_kind == "voice" else sample.visual_references[0].image_artifact_path
+    Path(path).write_bytes(b"tampered")
+    with pytest.raises(ValueError, match="QA source media changed"):
+        qa.build_audio_shadow_qa(**kwargs)
+    assert not (shadow / "qa").exists()
+
+
+def test_promoted_and_dropped_references_remain_separate(tmp_path, monkeypatch):
+    from r2v_data_v2.h3.mimo25_av_reconcile import project_mimo_h3_sample_references
+    from r2v_data_v2.h3.qwen38_h3_recaption import build_reference_contract
+    from tests.test_h3_mimo25_av_shadow import (
+        _augmentation_draws,
+        _job_for_reference_inventory,
+        _sample_with_reference_inventory,
+        _visual_reference_inventory,
+    )
+
+    originals = _visual_reference_inventory(tmp_path, ["subject", "face", "hair", "clothing"])
+    sample = _sample_with_reference_inventory(tmp_path, originals)
+    _augmentation_draws(monkeypatch, [.8, .9])
+    job = _job_for_reference_inventory(tmp_path, sample)
+    projected = project_mimo_h3_sample_references(sample, reference_images=job.reference_images,
+                                                 reference_selection=job.reference_selection)
+    context = qa._MaterializationContext(projected, [], [], "visual_only",
+                                        build_reference_contract(projected, "visual_only"))
+    links = {}
+
+    def link(path, digest):
+        assert sha256_file(Path(path)) == digest
+        url = "media/" + digest + ".png"
+        links[url] = path
+        return url
+
+    before = sample.model_dump_json()
+    refs = qa._reference_payload(context, job, [sample], link)
+    promoted = next(p for p in refs["pictures"] if p["face_promotion"])
+    assert promoted["kind"] == "subject" and promoted["source_image_index"] == 2
+    assert promoted["face_promotion"]["replaced_source_image_indexes"] == [1]
+    assert {r["source_image_index"] for r in refs["dropped_visual_references"]} == {1, 3}
+    assert all(r["url"] in links for r in refs["dropped_visual_references"])
+    assert {p["source_image_index"] for p in refs["pictures"]} == {2, 4}
+    assert refs["audios"] == [] and sample.model_dump_json() == before
 
 
 def test_output_safety_and_atomic_failure_preserve_existing_qa(tmp_path, monkeypatch):
@@ -391,7 +552,7 @@ def test_ready_annotation_with_blocked_materialization_is_unavailable(tmp_path, 
     before = _snapshot(tmp_path)
     qa.build_audio_shadow_qa(**kwargs)
     data = json.loads((shadow / "qa/data.json").read_text())
-    assert data["schema_version"] == "r2v.h3.audio_shadow_qa.7"
+    assert data["schema_version"] == qa.QA_DATA_VERSION
     for clip in (data["clips"][0], data["clips"][2]):
         assert clip["reconcile"]["status"] == "ready"
         final = clip["final_h3"]
@@ -401,6 +562,7 @@ def test_ready_annotation_with_blocked_materialization_is_unavailable(tmp_path, 
         for variant in final["variants"]:
             assert variant["text"] is None
             assert expected in {issue["code"] for issue in variant["issues"]}
+            assert (variant["references"] is None) == (blocked == "multi")
     assert all(path.read_bytes() == content for path, content in before.items())
 
 
@@ -428,13 +590,17 @@ const dataset = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
 const elements = new Map(), saved = new Map();
 const inputs = dataset.qa_labels.map(label => ({dataset:{qaLabel:label}, checked:false}));
 function el(id) {
-  if (!elements.has(id)) elements.set(id, {value: "", hidden: false, textContent: ""});
+  if (!elements.has(id)) elements.set(id, {value: "", hidden: false, textContent: "", children: [],
+    append(...children) { this.children.push(...children); },
+    replaceChildren(...children) { this.children = children; }});
   return elements.get(id);
 }
 const document = {
   getElementById: el,
   querySelector: selector => inputs.find(input => selector.includes('"' + input.dataset.qaLabel + '"')),
-  querySelectorAll: () => inputs,
+  querySelectorAll: selector => selector.includes("data-qa-label") ? inputs : [],
+  createElement: tag => ({tagName:tag, textContent:"", children:[], append(...children) {this.children.push(...children);}}),
+  createDocumentFragment: () => ({children:[], append(...children) {this.children.push(...children);}}),
   addEventListener: () => {}
 };
 const localStorage = {
@@ -529,7 +695,7 @@ def test_synthetic_browser_review_desktop_mobile(tmp_path, monkeypatch):
     playwright = os.environ.get("QA_PLAYWRIGHT_MODULE")
     if not node or not playwright:
         pytest.skip("optional preinstalled Playwright not configured")
-    kwargs, shadow = _fixture(tmp_path, monkeypatch, variants=True)
+    kwargs, shadow = _fixture(tmp_path, monkeypatch, variants=True, cross_variant=True)
     qa.build_audio_shadow_qa(**kwargs)
     script = tmp_path / "browser.cjs"
     script.write_text(r'''
@@ -558,10 +724,21 @@ const {chromium} = require(process.argv[2]);
     assert.strictEqual(await page.locator("#final-text").textContent(), expectedFinal);
     assert(await page.locator("#final-text").isVisible());
     assert.strictEqual(await page.locator("#final-h3").evaluate(el => el.closest("details")), null);
-    assert.strictEqual(await page.locator("#materializer-version").textContent(), "h3_mimo25_materializer_v26");
+    assert.strictEqual(await page.locator("#materializer-version").textContent(), dataset.clips[0].final_h3.materializer_version);
+    assert.strictEqual(await page.locator("#audio-references audio").count(), 0);
+    assert.strictEqual(await page.locator("#references img").count(), 1);
+    assert.match(await page.locator("#subject-graph").textContent(), /<Subject 1>.*<Picture 1>/s);
     await page.locator("#final-variant").selectOption("1");
     assert.strictEqual(await page.locator("#final-text").textContent(), dataset.clips[0].final_h3.variants[1].text);
+    assert.strictEqual(await page.locator("#audio-references audio").count(), 1);
+    assert.match(await page.locator("#audio-references").textContent(), /cross_voice.*donor\/e3/s);
+    await page.locator("#final-variant").selectOption("2");
+    assert.match(await page.locator("#audio-references").textContent(), /target_voice.*existing_target_voice/s);
+    await page.waitForFunction(() => document.querySelector("#audio-references audio").readyState >= 1);
+    const audioURL = dataset.clips[0].final_h3.variants[2].references.audios[0].url;
+    assert((await page.locator("#audio-references audio").getAttribute("src")).endsWith(audioURL));
     await page.locator("#final-variant").selectOption("0");
+    assert.strictEqual(await page.locator("#audio-references audio").count(), 0);
     const label = name => page.locator('input[data-qa-label="' + name + '"]');
     async function assertSelection(expected) {
       assert.deepStrictEqual(await page.locator("input[data-qa-label]:checked").evaluateAll(
@@ -579,7 +756,9 @@ const {chromium} = require(process.argv[2]);
     await page.locator("#next").click();
     assert.strictEqual(await page.locator("#status").textContent(), "failed");
     assert(await page.locator("#final-unavailable").isVisible());
-    assert.match(await page.locator("#final-unavailable").textContent(), /Final H3 Prompt unavailable.*Reconcile failed: synthetic_failed/s);
+    assert.match(await page.locator("#final-unavailable").textContent(), /Final H3 Prompt unavailable.*AV reconcile failed/s);
+    assert.strictEqual(await page.locator("#audio-references audio").count(), 0);
+    assert(await page.locator("#reference-unavailable").isVisible());
     assert.strictEqual(await page.locator("#final-text").textContent(), "");
     assert(await page.locator("#copy-final").isDisabled());
     assert.match(await page.locator("#reconcile-body").textContent(), /synthetic_failed/);
@@ -602,6 +781,22 @@ const {chromium} = require(process.argv[2]);
     await page.locator("#import-file").setInputFiles({name:"invalid.json", mimeType:"application/json", buffer:Buffer.from(JSON.stringify(contradictory))});
     await page.waitForFunction(() => document.getElementById("message").textContent === "Invalid, duplicate, or stale QA annotation.");
     await assertSelection(["audio_wrong"]);
+    await page.locator("#final-variant").selectOption("2");
+    await page.evaluate(() => {
+      const variant = data.clips[index].final_h3.variants[2];
+      variant.warnings = ["<Subject 1>:preserved_visual_subject_missing_from_detailed_description"];
+      const template = variant.references.audios[0];
+      variant.references.audios = ["target_voice", "cross_voice", "speaker_speech_reuse", "music_reuse", "music_reference", "full_audio_reuse", "future_kind"].map((kind, i) => ({
+        ...template, audio_label:"<Audio " + (i+1) + ">", kind,
+        voice_characteristics:"<script>window.injected=true</script>", provenance:{donor_clip_uid:null}
+      }));
+      renderFinalVariant();
+    });
+    assert.strictEqual(await page.locator("#audio-references audio").count(), 7);
+    assert.match(await page.locator("#variant-warnings").textContent(), /preserved_visual_subject_missing/);
+    assert.strictEqual(await page.locator("#variant-warnings.failed").count(), 0);
+    assert.strictEqual(await page.evaluate(() => window.injected), undefined);
+    assert.strictEqual(await page.locator("#audio-references script").count(), 0);
     await page.screenshot({path:path.join(process.argv[4], "qa-desktop.png"), fullPage:true});
     await page.setViewportSize({width:390,height:844});
     await page.screenshot({path:path.join(process.argv[4], "qa-mobile.png"), fullPage:true});

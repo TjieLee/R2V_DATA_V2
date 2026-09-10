@@ -8,6 +8,7 @@ import shutil
 import uuid
 from collections import Counter
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Protocol
 
@@ -810,7 +811,16 @@ def _visual_retention_lines(
     ], warnings
 
 
-def _materialize_sample(
+@dataclass(frozen=True)
+class _MaterializationContext:
+    sample: FinalH3SampleV2
+    corrected: list[FinalQwen3SpeechSegment]
+    warnings: list[str]
+    variant: ConditioningVariant
+    contract: RecaptionReferenceContract
+
+
+def _prepare_materialization_context(
     sample: FinalH3SampleV2,
     job: MimoClipJob,
     record: FrozenAnnotationSource,
@@ -818,7 +828,7 @@ def _materialize_sample(
     conditioning_variant: ConditioningVariant | None = None,
     extra_audio_contract: RecaptionAudioContract | None = None,
     reuse_audio_contracts: Sequence[RecaptionAudioContract] | None = None,
-) -> tuple[list[FinalQwen3SpeechSegment], str, list[str]]:
+) -> _MaterializationContext:
     assert record.annotation is not None
     transcribed_ids = [item.segment_id for item in job.segments if item.asr_status == "transcribed"]
     blocked = [item.segment_id for item in record.annotation.audio_observation.segment_decisions
@@ -864,6 +874,25 @@ def _materialize_sample(
             **contract.model_dump(mode="json"),
             "audios": [audio.model_dump(mode="json") for audio in reuse_audio_contracts],
         })
+    return _MaterializationContext(corrected_sample, corrected, warnings, variant, contract)
+
+
+def _materialize_sample(
+    sample: FinalH3SampleV2,
+    job: MimoClipJob,
+    record: FrozenAnnotationSource,
+    *,
+    conditioning_variant: ConditioningVariant | None = None,
+    extra_audio_contract: RecaptionAudioContract | None = None,
+    reuse_audio_contracts: Sequence[RecaptionAudioContract] | None = None,
+) -> tuple[list[FinalQwen3SpeechSegment], str, list[str]]:
+    context = _prepare_materialization_context(
+        sample, job, record, conditioning_variant=conditioning_variant,
+        extra_audio_contract=extra_audio_contract, reuse_audio_contracts=reuse_audio_contracts,
+    )
+    corrected_sample, corrected = context.sample, context.corrected
+    warnings, variant, contract = context.warnings, context.variant, context.contract
+    assert record.annotation is not None
     facts = _audio_facts(
         sample=corrected_sample,
         corrected=corrected,

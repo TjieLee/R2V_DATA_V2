@@ -24,6 +24,16 @@ textarea{display:block;width:100%;resize:vertical;min-height:64px;border:1px sol
 .final-heading{display:flex;align-items:center;gap:10px;flex-wrap:wrap}#final-variant{max-width:100%}
 video{width:100%;aspect-ratio:16/9;max-height:540px;background:#151817}audio{width:100%;height:34px}
 .references{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:10px}
+#conditioning{border-block:1px solid #cbd2d6;margin:18px 0;padding:16px 0}
+.ref-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(240px,100%),1fr));gap:12px}
+.ref-card{border:1px solid #d7dde0;border-radius:4px;padding:10px;background:white;min-width:0;overflow-wrap:anywhere}
+.ref-card h3{margin-top:0}.ref-card p{margin:5px 0;font-size:12px}.ref-card audio{margin-top:8px}
+.ref-card img{width:100%;height:180px;object-fit:contain;background:#f7f8fa}
+.ref-label{color:#176c9a;font-weight:700}.ref-meta{display:flex;gap:12px;flex-wrap:wrap;margin:8px 0 14px}
+.ref-meta span{font-size:12px;font-weight:650}#subject-graph{margin-bottom:14px}
+#dropped-references .ref-card{background:#f0f2f4}#dropped-references img{opacity:.6}
+#variant-warnings{color:#795811;background:#fff8e7;padding:10px;margin:10px 0;overflow-wrap:anywhere}
+#variant-warnings:empty{display:none}#conditioning h2{margin-bottom:4px}
 figure{margin:0;min-width:0}figure img{width:100%;height:150px;object-fit:contain;background:white;border:1px solid #d7dde0}
 figcaption{font-size:12px;overflow-wrap:anywhere}details{border-top:1px solid #cbd2d6;padding:12px 0;margin-top:12px}
 summary{font-weight:650;cursor:pointer}pre{white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.5 ui-monospace,monospace;max-height:400px;overflow:auto;margin:8px 0}
@@ -68,12 +78,22 @@ small{color:#626e73}a{color:#176c9a}#loading{padding:20px}
 <pre id="final-text"></pre>
 </section>
 </div>
+<section id="conditioning">
+<h2>Reference Conditioning <small id="conditioning-variant"></small></h2>
+<p id="reference-unavailable" hidden>[reference contract unavailable]</p>
+<div id="reference-counts" class="ref-meta"></div>
+<div id="variant-warnings" role="status"></div>
+<h3>Visual References</h3><div id="references" class="ref-grid"></div>
+<h3>Audio References</h3><div id="audio-references" class="ref-grid"></div>
+<h3>Subject Graph</h3><div id="subject-graph" class="ref-grid"></div>
+<details id="dropped"><summary>Dropped / Not Conditioned</summary><div id="face-promotions"></div><div id="dropped-references" class="ref-grid"></div></details>
+</section>
 <div class="evidence">
 <section><h2>MiMo DIRECT H3 (raw)</h2><pre id="direct-text"></pre></section>
 <section><h2>Production instruction (as published)</h2><pre id="production-text"></pre></section>
 </div>
 <details open><summary>Frozen Visual evidence</summary>
-<div id="references" class="references"></div>
+<div id="frozen-references" class="references"></div>
 <details open><summary>Subjects / Pictures</summary><pre id="subjects"></pre></details>
 <details><summary>Visual selection / provenance</summary><pre id="visual-provenance"></pre></details>
 </details>
@@ -138,14 +158,111 @@ function details(title, value, open = false) {
   heading.textContent = title; element.append(heading, pre(value)); element.open = open; return element;
 }
 function cell(row, value) { const el = document.createElement("td"); el.textContent = value == null ? "[unavailable]" : String(value); row.append(el); return el; }
+function textElement(tag, text, className = "") {
+  const element = document.createElement(tag); element.textContent = text; element.className = className; return element;
+}
+function mediaURL(url) { return typeof url === "string" && /^media\/[a-f0-9]{64}\.[a-z0-9]+$/.test(url) ? url : null; }
+function metadata(card, label, value) {
+  if (value !== null && value !== undefined && value !== "") card.append(textElement("p", label + ": " + (typeof value === "object" ? pretty(value) : value)));
+}
+function thumbnail(ref) {
+  const url = mediaURL(ref.url), fragment = document.createDocumentFragment();
+  if (!url) return fragment;
+  const link = document.createElement("a"), img = document.createElement("img");
+  link.href = url; link.target = "_blank"; link.rel = "noopener";
+  img.src = url; img.alt = ref.picture_label || ref.source_image_label || "Reference"; img.loading = "lazy";
+  link.append(img); fragment.append(link); return fragment;
+}
+function referenceCard(label) {
+  const card = document.createElement("article"); card.className = "ref-card";
+  card.append(textElement("h3", label, "ref-label")); return card;
+}
+function renderReferences(variant) {
+  document.querySelectorAll("#conditioning audio").forEach(media => media.pause());
+  for (const id of ["references", "audio-references", "subject-graph", "dropped-references", "face-promotions", "reference-counts", "variant-warnings", "frozen-references"])
+    $(id).replaceChildren();
+  const refs = variant.references;
+  $("conditioning-variant").textContent = " / " + (variant.sample_id || "selected H3 variant");
+  $("reference-unavailable").hidden = !!refs;
+  if ((variant.warnings || []).length) {
+    $("variant-warnings").append(textElement("strong", "Warnings"));
+    variant.warnings.forEach(warning => $("variant-warnings").append(textElement("div", warning)));
+  }
+  if (!refs) {
+    (data.clips[index].visual.reference_images || []).forEach(ref => {
+      const figure = document.createElement("figure"); figure.append(thumbnail(ref), textElement("figcaption", ref.picture_label));
+      $("frozen-references").append(figure);
+    });
+    return;
+  }
+  const pictures = refs.pictures || [], subjects = refs.subjects || [], audios = refs.audios || [];
+  ["Pictures " + pictures.length, "Subjects " + subjects.length, "Audio " + audios.length, refs.conditioning_variant]
+    .filter(Boolean).forEach(value => $("reference-counts").append(textElement("span", value)));
+  pictures.forEach(ref => {
+    const card = referenceCard(ref.picture_label); card.id = "picture-" + ref.image_index;
+    metadata(card, "Kind", [ref.kind, ref.attribute_type].filter(Boolean).join(" / "));
+    metadata(card, "Subjects", subjects.filter(s => s.source_picture_labels.includes(ref.picture_label)).map(s => s.subject_label).join(", "));
+    metadata(card, "Entity", ref.entity_id); metadata(card, "Owner", ref.owner_entity_id);
+    metadata(card, "Attribute", ref.attribute_id); metadata(card, "Source", ref.source_image_label);
+    if (ref.face_promotion) card.append(textElement("p", "Promoted face → entity Subject", "badge"));
+    card.append(thumbnail(ref), details("Raw Picture provenance", ref)); $("references").append(card);
+  });
+  audios.forEach(ref => {
+    const card = referenceCard(ref.audio_label);
+    metadata(card, "Kind", ref.kind); metadata(card, "Retention", ref.retention_marker);
+    if (ref.kind !== "full_audio_reuse") {
+      metadata(card, "Subject", ref.subject_label); metadata(card, "Entity", ref.entity_id); metadata(card, "Speaker", ref.speaker_id);
+    }
+    metadata(card, "Role", ref.role); metadata(card, "Source", ref.source_type);
+    metadata(card, "Voice", ref.voice_characteristics); metadata(card, "Music", ref.music_characteristics);
+    const provenance = ref.provenance || {};
+    for (const name of ["source_segment_id", "source_segment_ids", "source_sample_ranges", "source_start", "source_end",
+      "donor_clip_uid", "donor_occurrence_id", "donor_entity_id", "event_id", "music_description", "rms_dbfs", "clipping_ratio"])
+      metadata(card, name, provenance[name] ?? provenance.reuse_asset?.[name]);
+    if (ref.source_type === "mimo_recovered_target_voice") card.append(textElement("p", "Recovered", "badge"));
+    const url = mediaURL(ref.url);
+    if (url) { const audio = document.createElement("audio"); audio.controls = true; audio.preload = "metadata"; audio.src = url; card.append(audio); }
+    card.append(details("Raw Audio provenance", ref)); $("audio-references").append(card);
+  });
+  if (!audios.length) $("audio-references").append(textElement("p", "None"));
+  subjects.forEach(subject => {
+    const card = referenceCard(subject.subject_label);
+    metadata(card, "Kind", [subject.kind, subject.attribute_type].filter(Boolean).join(" / "));
+    metadata(card, "Entity", subject.entity_id); metadata(card, "Attribute", subject.attribute_id);
+    const owner = subjects.find(s => s.kind === "entity" && s.entity_id === subject.owner_entity_id);
+    metadata(card, "Owner", [owner?.subject_label, subject.owner_entity_id].filter(Boolean).join(" / "));
+    const sources = textElement("p", "Source: ");
+    subject.source_picture_labels.forEach(label => {
+      const picture = pictures.find(p => p.picture_label === label);
+      const link = textElement(picture ? "a" : "span", label + " ");
+      if (picture) link.href = "#picture-" + picture.image_index;
+      sources.append(link);
+    });
+    card.append(sources); $("subject-graph").append(card);
+  });
+  (refs.visual_selection?.face_promotions || []).forEach(promotion => {
+    const picture = pictures.find(p => p.source_image_index === promotion.source_image_index);
+    $("face-promotions").append(textElement("p", "Promoted face → entity Subject: source Image " +
+      promotion.source_image_index + " → " + (picture?.picture_label || "[unavailable]") +
+      "; replaced Images " + promotion.replaced_source_image_indexes.join(", ")));
+  });
+  (refs.dropped_visual_references || []).forEach(ref => {
+    const card = referenceCard(ref.source_image_label);
+    for (const name of ["source_image_id", "kind", "entity_id", "owner_entity_id", "attribute_type", "drop_reason"])
+      metadata(card, name, ref[name]);
+    card.append(thumbnail(ref)); $("dropped-references").append(card);
+  });
+}
 function renderFinalVariant() {
   const final = data.clips[index].final_h3;
   const variant = final.variants[Number($("final-variant").value)] || final;
+  renderReferences(variant);
   $("final-text").textContent = variant.status === "ready" ? variant.text : "";
   $("copy-final").disabled = variant.status !== "ready";
   $("final-unavailable").hidden = variant.status === "ready";
-  if (variant.issues) $("final-unavailable").textContent = "Final H3 Prompt unavailable\n" +
-    variant.issues.map(issue => issue.code + ": " + issue.message).join("\n");
+  $("final-unavailable").textContent = variant.status === "ready" ? "" : "Final H3 Prompt unavailable\n" +
+    (variant.reason || "Reconcile failed") + "\n" +
+    (variant.issues || []).map(issue => issue.code + ": " + issue.message).join("\n");
 }
 function render() {
   const clip = data.clips[index], state = stateFor(clip);
@@ -188,15 +305,6 @@ function render() {
   $("target-video").src = clip.target.video_url;
   $("duration").textContent = clip.target.duration_seconds.toFixed(3) + " s";
   $("target-details").querySelector("pre").textContent = pretty(clip.target);
-  $("references").replaceChildren();
-  clip.visual.reference_images.forEach(ref => {
-    const fig = document.createElement("figure"), link = document.createElement("a");
-    const img = document.createElement("img"), caption = document.createElement("figcaption");
-    link.href = ref.url; link.target = "_blank"; link.rel = "noopener";
-    img.src = ref.url; img.alt = ref.picture_label; img.loading = "lazy"; link.append(img);
-    caption.textContent = [ref.picture_label, ref.entity_id || ref.owner_entity_id || "", ref.kind, ref.attribute_type || ""].filter(Boolean).join(" / ");
-    fig.append(link, caption); $("references").append(fig);
-  });
   $("subjects").textContent = pretty(clip.visual.reference_subjects);
   $("visual-provenance").textContent = pretty(clip.visual);
   const diar = clip.diarization.clip_result;
@@ -239,6 +347,7 @@ function render() {
   $("final-soundscape").textContent = clip.direct_h3?.overall_soundscape ?? "[unavailable]";
   $("final-music").textContent = clip.direct_h3?.non_diegetic_music ?? "[unavailable]";
   const result = clip.reconcile;
+  $("reconcile-body").replaceChildren();
   if (result.status !== "ready") {
     const failure = pre({status: result.status, failure_code: result.failure_code,
       failure_reason: result.failure_reason, upstream_failure: result.upstream_failure,
@@ -329,7 +438,7 @@ fetch("data.json", {cache: "no-store"}).then(response => {
   if (!response.ok) throw new Error("Cannot load data.json: " + response.status);
   return response.json();
 }).then(payload => {
-  if (payload.schema_version !== "r2v.h3.audio_shadow_qa.7" || !payload.clips.length) throw new Error("Invalid QA dataset.");
+  if (payload.schema_version !== "r2v.h3.audio_shadow_qa.8" || !payload.clips.length) throw new Error("Invalid QA dataset.");
   data = payload;
   data.clips.forEach((clip, i) => {
     const option = document.createElement("option"); option.value = String(i);
