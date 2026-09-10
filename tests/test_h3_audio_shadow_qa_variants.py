@@ -65,7 +65,8 @@ def _write_products(kwargs, shadow):
     (prepared / "records.jsonl").write_text("".join(r.model_dump_json() + "\n" for r in prepared_records))
     job, record = jobs[0], records[0]
     sample = next(s for s in projected if s.clip_uid == job.clip_uid and s.pair_type == "canonical")
-    stem = next(s for s in qa.load_stem_shadow(shadow / "separation")[1] if s.clip_uid == job.clip_uid)
+    _, _, stems = qa.validate_stem_diarization_lineage(shadow / "diarization")
+    stem = next(s for s in stems if s.clip_uid == job.clip_uid)
     assets_root = shadow / "audio_reuse_assets_v1" / job.clip_uid
     assets_root.mkdir(parents=True)
     assets = {}

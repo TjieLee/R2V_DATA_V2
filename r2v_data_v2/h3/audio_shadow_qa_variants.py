@@ -84,7 +84,7 @@ def finalize_registry(variants: list[dict], fingerprint: Callable) -> tuple[list
     return result, coverage
 
 
-def discover_products(*, shadow: Path, jobs: list, reconcile: list, samples: list,
+def discover_products(*, shadow: Path, source_stem_root: Path, jobs: list, reconcile: list, samples: list,
                       stems: list, inventories: list[MimoInventory], source_hashes: dict,
                       fingerprint: Callable) -> list[tuple[str, Path, object, FinalH3SampleV2]]:
     """Inspect only immediate current-run stage summaries, never search other runs."""
@@ -129,8 +129,8 @@ def discover_products(*, shadow: Path, jobs: list, reconcile: list, samples: lis
             records = rows(root / "records.jsonl", AudioReuseProduct)
             if summary.materializer_version != AUDIO_REUSE_MATERIALIZER_VERSION:
                 raise ValueError("QA reuse materializer provenance is stale")
-            if str(shadow / "separation/records.jsonl") not in summary.source_hashes:
-                raise ValueError("QA reuse separation lineage is not current run")
+            if str(source_stem_root / "records.jsonl") not in summary.source_hashes:
+                raise ValueError("QA reuse stem lineage is not current run")
             # The publisher records every dependency, including the prepared snapshot.
             for path, digest in summary.source_hashes.items():
                 if sha256_file(Path(path)) != digest:

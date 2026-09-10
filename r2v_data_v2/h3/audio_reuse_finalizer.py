@@ -31,11 +31,10 @@ from r2v_data_v2.h3.mimo25_stem_shadow import (
 )
 from r2v_data_v2.h3.sam_audio_stem_shadow import (
     SAMRoute,
-    load_stem_shadow,
+    StemRoute,
     require_shadow_output_path,
     selected_stem_records,
     sha256_file,
-    stem_separation_root,
     stem_shadow_root,
     validate_stem_diarization_lineage,
 )
@@ -48,9 +47,9 @@ FINALIZATION_STAGE = "audio_reuse_finalization_v1"
 
 
 class AudioReuseFinalizationSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.audio_reuse_finalization_summary.1"] = "r2v.h3.audio_reuse_finalization_summary.1"
+    schema_version: Literal["r2v.h3.audio_reuse_finalization_summary.1", "r2v.h3.audio_reuse_finalization_summary.2"] = "r2v.h3.audio_reuse_finalization_summary.1"
     shadow_run_id: str
-    sam_route: SAMRoute
+    sam_route: StemRoute
     allow_unverified: bool
     clip_uids: list[str]
     clip_count: int = Field(ge=0)
@@ -81,6 +80,8 @@ class AudioReuseFinalizationSummary(SchemaModel):
 
     @model_validator(mode="after")
     def validate_counts(self) -> AudioReuseFinalizationSummary:
+        if self.schema_version.endswith(".2") != (self.sam_route == "resolved"):
+            raise ValueError("Audio reuse finalization source contract/version differs")
         if (
             len(set(self.clip_uids)) != self.clip_count
             or len(self.clip_uids) != self.clip_count
@@ -99,7 +100,7 @@ class AudioReuseFinalizationSummary(SchemaModel):
 
 def finalize_audio_reuse_shadow(
     *, audio_production_root: Path, visual_production_root: Path, visual_runs_root: Path,
-    shadow_run_id: str, case_manifest: Path, sam_route: SAMRoute = "music_first",
+    shadow_run_id: str, case_manifest: Path, sam_route: SAMRoute | None = None,
     allow_unverified: bool = False,
 ) -> AudioReuseFinalizationSummary:
     """Publish new shadow outputs, preserving each existing stage's atomic writer.
@@ -109,7 +110,16 @@ def finalize_audio_reuse_shadow(
     """
     paths = jea_production_paths(audio_production_root)
     shadow = stem_shadow_root(paths.root, shadow_run_id).resolve(strict=True)
-    separation = stem_separation_root(paths.root, shadow_run_id).resolve(strict=True)
+    provenance, stem_inventory, stems = validate_stem_diarization_lineage(
+        shadow / "diarization", expected_shadow_root=shadow,
+    )
+    separation = Path(provenance.source_stem_root).resolve(strict=True)
+    if provenance.route == "resolved":
+        if sam_route not in (None, "voice_first"):
+            raise ValueError("resolved finalizer requires fixed voice_first SAM lineage")
+        sam_route = "resolved"
+    else:
+        sam_route = sam_route or "music_first"
     reconcile = shadow / MIMO25_STEM_RECONCILE_STAGE
     roots = {}
     for name, stage in (
@@ -127,10 +137,6 @@ def finalize_audio_reuse_shadow(
         sources.update(stage.rglob("*.json"))
         sources.update(stage.rglob("*.jsonl"))
     hashes = {str(p): sha256_file(p) for p in sorted(sources)}
-    stem_inventory, stems, _ = load_stem_shadow(separation)
-    provenance, _, _ = validate_stem_diarization_lineage(
-        shadow / "diarization", expected_shadow_root=shadow,
-    )
     selected_ids = set(cases.clip_uids)
     if (
         [uid for uid in stem_inventory.clip_uids if uid in selected_ids] != cases.clip_uids
@@ -209,6 +215,8 @@ def finalize_audio_reuse_shadow(
         for name in ("records.jsonl", "summary.json"):
             hashes[str(root / name)] = sha256_file(root / name)
     result = AudioReuseFinalizationSummary(
+        schema_version=("r2v.h3.audio_reuse_finalization_summary.2" if sam_route == "resolved"
+                        else "r2v.h3.audio_reuse_finalization_summary.1"),
         shadow_run_id=shadow_run_id, sam_route=sam_route, allow_unverified=allow_unverified,
         clip_uids=cases.clip_uids, clip_count=len(cases.clip_uids),
         reconcile_ready_count=summary.ready_count, reconcile_failed_count=summary.failed_count,

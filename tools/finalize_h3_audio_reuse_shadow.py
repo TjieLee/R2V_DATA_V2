@@ -21,7 +21,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
     parser.add_argument("--visual-runs-root", type=Path, required=True)
     parser.add_argument("--shadow-run-id", required=True)
     parser.add_argument("--case-manifest", type=Path, required=True)
-    parser.add_argument("--sam-route", choices=("music_first", "voice_first"), default="music_first")
+    parser.add_argument("--sam-route", choices=("music_first", "voice_first"), default=None)
     parser.add_argument("--allow-unverified", action="store_true")
     result = finalize_audio_reuse_shadow(**vars(parser.parse_args(argv))).model_dump(mode="json")
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))

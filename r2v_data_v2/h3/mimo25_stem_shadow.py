@@ -37,12 +37,14 @@ from r2v_data_v2.h3.mimo25_backend import (
     OpenAIMimo25Backend,
 )
 from r2v_data_v2.h3.qwen3_asr import Qwen3ASRSegment
+from r2v_data_v2.h3.resolved_audio_stems import StemRecord
 from r2v_data_v2.h3.sam_audio_stem_shadow import (
     SAMAudioStemInventory,
     SAMAudioStemRecord,
     SAMRoute,
     StemDiarizationClipFailure,
     StemDiarizationShadowProvenance,
+    StemRoute,
     StemShadowClipSkip,
     StemType,
     load_stem_shadow,
@@ -1466,7 +1468,7 @@ class StemAwareOpenAIMimo25Backend(OpenAIMimo25Backend):
         self,
         config: MimoBackendConfig,
         *,
-        stem_records_by_clip: dict[str, SAMAudioStemRecord],
+        stem_records_by_clip: dict[str, StemRecord],
         client: Any | None = None,
         audio_media_backend: AudioMediaBackend | None = None,
     ) -> None:
@@ -1503,7 +1505,7 @@ def build_stem_reconcile_jobs(
     base_inventory: MimoInventory,
     stem_diarization_root: Path,
     stem_asr_root: Path,
-    route: SAMRoute | None = None,
+    route: StemRoute | None = None,
 ) -> list[MimoClipJob]:
     diarization = stem_diarization_root.expanduser().resolve(strict=True)
     asr_root = stem_asr_root.expanduser().resolve(strict=True)
@@ -1734,10 +1736,10 @@ class StemReconcileUpstreamFailure(SchemaModel):
 
 
 class MimoStemReconcileSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_stem_reconcile_summary.16"] = (
+    schema_version: Literal["r2v.h3.mimo25_stem_reconcile_summary.16", "r2v.h3.mimo25_stem_reconcile_summary.17"] = (
         MIMO25_STEM_RECONCILE_SUMMARY_VERSION
     )
-    route: SAMRoute
+    route: StemRoute
     clip_count: int = Field(ge=1)
     processed_clip_count: int = Field(ge=0)
     skipped_clip_count: int = Field(ge=0)
@@ -1758,6 +1760,8 @@ class MimoStemReconcileSummary(SchemaModel):
 
     @model_validator(mode="after")
     def validate_counts(self) -> MimoStemReconcileSummary:
+        if self.schema_version.endswith(".17") != (self.route == "resolved"):
+            raise ValueError("stem reconcile source contract/version differs")
         if (
             self.model_call_count != (
                 self.visual_model_call_count + self.av_model_call_count
@@ -1812,7 +1816,7 @@ class StemReconcileBackend(Protocol):
     ) -> MimoBackendResult: ...
 
 
-def _validated_auxiliary_stems(record: SAMAudioStemRecord) -> dict[str, Path]:
+def _validated_auxiliary_stems(record: StemRecord) -> dict[str, Path]:
     paths = {}
     try:
         for kind in ("speech", "music", "sfx"):
@@ -1831,13 +1835,13 @@ def _validated_auxiliary_stems(record: SAMAudioStemRecord) -> dict[str, Path]:
 def run_mimo25_stem_reconcile_shadow(
     *,
     jobs: Sequence[MimoClipJob],
-    stem_records: Sequence[SAMAudioStemRecord],
+    stem_records: Sequence[StemRecord],
     backend: StemReconcileBackend,
     output_root: Path,
     source_clip_uids: Sequence[str] | None = None,
     skipped_clips: Sequence[StemShadowClipSkip] = (),
     diarization_failed_clips: Sequence[StemDiarizationClipFailure] = (),
-    route: SAMRoute,
+    route: StemRoute,
     allow_unverified: bool = False,
     overwrite: bool = False,
 ) -> MimoStemReconcileSummary:
@@ -1973,6 +1977,7 @@ def run_mimo25_stem_reconcile_shadow(
             )
         counts = Counter(record.status for record in records)
         summary = MimoStemReconcileSummary(
+            schema_version=("r2v.h3.mimo25_stem_reconcile_summary.17" if route == "resolved" else MIMO25_STEM_RECONCILE_SUMMARY_VERSION),
             route=route,
             clip_count=len(ordered_source),
             processed_clip_count=len(records),

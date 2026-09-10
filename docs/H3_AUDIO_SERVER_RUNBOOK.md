@@ -275,7 +275,7 @@ RUN_ARGS=(
   --audio-production-root "$AUDIO_PRODUCTION_ROOT"
   --shadow-run-id "$SHADOW_RUN_ID"
   --case-manifest "$CASE_MANIFEST"
-  --sam-route music_first
+  --sam-route voice_first
 )
 ```
 
@@ -294,14 +294,36 @@ PYTHONPATH="$SAM_AUDIO_RUNTIME_PYTHONPATH" \
   --sam-reranking-candidates 1
 ```
 
-### 2. Speech-stem DiariZen
+### 2. AuK speech and model-free resolution
+
+Configure the existing isolated AuK Python/checkpoint paths explicitly. SAM and
+AuK remain separate processes. New named runs have fixed speech=AuK,
+music/SFX=SAM voice_first; missing/failed AuK never falls back to SAM speech.
+
+```bash
+"$R2V_PYTHON" tools/run_h3_auk_speech_shadow.py \
+  --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
+  --shadow-run-id "$SHADOW_RUN_ID" --case-manifest "$CASE_MANIFEST" \
+  --auk-python "$AUK_PYTHON" --auk-code-root "$AUK_CODE_ROOT" \
+  --auk-checkpoint "$AUK_CHECKPOINT" --auk-qwen-path "$AUK_QWEN_PATH"
+
+"$R2V_PYTHON" tools/resolve_h3_audio_stems.py \
+  --audio-production-root "$AUDIO_PRODUCTION_ROOT" --shadow-run-id "$SHADOW_RUN_ID"
+```
+
+DiariZen -> ASR -> MiMo -> Audio reuse finalizer -> frame projection -> QA now
+consume this resolved lineage. Existing frozen SAM-only artifacts remain readable;
+new named-run inference requires `resolved_stems_v1/`. These are operator commands,
+not evidence of a new model run.
+
+### 3. Resolved speech-stem DiariZen
 
 ```bash
 "$R2V_PYTHON" tools/run_h3_stem_diarization_shadow.py "${RUN_ARGS[@]}" \
   --allow-unverified
 ```
 
-### 3. Speech-stem Qwen3-ASR
+### 4. Resolved speech-stem Qwen3-ASR
 
 ```bash
 "$R2V_PYTHON" tools/run_h3_stem_qwen3_asr_shadow.py "${RUN_ARGS[@]}" \
@@ -309,7 +331,7 @@ PYTHONPATH="$SAM_AUDIO_RUNTIME_PYTHONPATH" \
   --allow-unverified
 ```
 
-### 4. Four-stage visual / speech-AV / speaker-profile / audio-finalize requests
+### 5. Four-stage visual / speech-AV / speaker-profile / audio-finalize requests
 
 After separation, DiariZen and ASR, run this entry directly. Do not run
 `run_h3_mimo25_stem_facts_shadow.py`; neither `mimo_stem_facts/` nor three
@@ -374,7 +396,10 @@ reconcile record .14, summary .16, policy v6, QA data .7. Fixed output:
 `mimo_reconcile_av_stemtext_sound_partition/`, `mimo_v29_oneclip_smoke/`,
 and `mimo_v30_833_oneclip_smoke/` are preserved, not migrated.
 
-For a manually requested v41/backend .50 pilot, keep `CASE_MANIFEST` as the selected
+Historical v41/backend .50 command (requires its historical checkout; do not use
+this SAM-only named-run command with the current resolved-source runner):
+
+For that pilot, keep `CASE_MANIFEST` as the selected
 ordered manifest. This reuses SAM/DiariZen/ASR without reruns and leaves the
 previous `mimo_reconcile_stemtext_final_av_v35_backend39/`, v35, and earlier outputs untouched:
 
@@ -418,7 +443,7 @@ Final AV must not copy track-local absence claims, must remove unsupported
 source interpretations while preserving acoustic content, and must never put
 music in overall_soundscape. These are prompt instructions, not code checkers.
 
-### 5. Optional stem-native primary voice references
+### 6. Legacy optional SAM-native primary voice references
 
 ```bash
 "$R2V_PYTHON" tools/export_h3_sam_audio_stem_references.py "${RUN_ARGS[@]}" \

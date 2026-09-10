@@ -24,14 +24,17 @@ from r2v_data_v2.h3.mimo25_stem_shadow import (
     run_mimo25_stem_reconcile_shadow,
     usable_stem_reconcile_inventory,
 )
+from r2v_data_v2.h3.resolved_audio_stems import (
+    StemInventory,
+    downstream_stem_root,
+    downstream_stem_route,
+    load_stem_source,
+)
 from r2v_data_v2.h3.sam_audio_stem_shadow import (
-    SAMAudioStemInventory,
     StemDiarizationShadowProvenance,
-    load_stem_shadow,
     require_shadow_output_path,
     selected_stem_records,
     separation_skips,
-    stem_separation_root,
     stem_shadow_root,
     validate_stem_diarization_lineage,
 )
@@ -40,7 +43,7 @@ from r2v_data_v2.h3.sam_audio_stem_shadow import (
 def _validate_stage_closure(
     *,
     case_manifest: MimoCaseManifest,
-    stem_inventory: SAMAudioStemInventory,
+    stem_inventory: StemInventory,
     separation_root: Path,
     diarization_provenance: StemDiarizationShadowProvenance,
 ) -> None:
@@ -70,7 +73,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--sam-route",
         choices=("music_first", "voice_first"),
-        default="music_first",
+        default=None,
     )
     parser.add_argument("--model", default="mimo-v2.5")
     parser.add_argument("--base-url", default="http://127.0.0.1:8092/v1")
@@ -91,8 +94,9 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> dict[str, object]:
     arguments = _parser().parse_args(argv)
     paths = jea_production_paths(arguments.audio_production_root)
+    route = downstream_stem_route(arguments.shadow_run_id, arguments.sam_route)
     shadow = stem_shadow_root(paths.root, arguments.shadow_run_id)
-    separation = stem_separation_root(paths.root, arguments.shadow_run_id)
+    separation = downstream_stem_root(paths.root, arguments.shadow_run_id)
     output = require_shadow_output_path(
         shadow_root=shadow,
         output_path=arguments.output_root or shadow / MIMO25_STEM_RECONCILE_STAGE,
@@ -100,7 +104,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
     case_manifest = MimoCaseManifest.model_validate_json(
         arguments.case_manifest.read_text(encoding="utf-8")
     )
-    stem_inventory, stem_records, _ = load_stem_shadow(separation)
+    stem_inventory, stem_records, _ = load_stem_source(separation)
     diarization_provenance, _, _ = validate_stem_diarization_lineage(
         shadow / "diarization", expected_shadow_root=shadow,
     )
@@ -120,14 +124,14 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         base_inventory=usable_stem_reconcile_inventory(base, diarization_provenance),
         stem_diarization_root=shadow / "diarization",
         stem_asr_root=shadow / "asr",
-        route=arguments.sam_route,
+        route=route,
     )
     selected_ids = set(case_manifest.clip_uids)
     skipped = [
         item for item in separation_skips(
             inventory=stem_inventory,
             records=stem_records,
-            route=arguments.sam_route,
+            route=route,
         )
         if item.clip_uid in selected_ids
     ]
@@ -137,7 +141,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
     ]
     selected = selected_stem_records(
         [record for record in stem_records if record.clip_uid in {job.clip_uid for job in jobs}],
-        route=arguments.sam_route, allow_unverified=arguments.allow_unverified,
+        route=route, allow_unverified=arguments.allow_unverified,
     )
     result: dict[str, object] = {
         "dry_run": arguments.dry_run,
@@ -177,7 +181,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
             source_clip_uids=case_manifest.clip_uids,
             skipped_clips=skipped,
             diarization_failed_clips=diarization_failed,
-            route=arguments.sam_route,
+            route=route,
             allow_unverified=arguments.allow_unverified,
             overwrite=arguments.overwrite,
         )

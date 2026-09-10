@@ -22,6 +22,8 @@ or, for an explicit named pilot:
 ```text
 <audio-production-root>/sam_audio_stem_shadow_v1/runs/<shadow-run-id>/
   separation/
+  auk_speech_v1/
+  resolved_stems_v1/
   diarization/
   asr/
   mimo_reconcile_stemtext_final_av_markerpolish_v1/
@@ -31,16 +33,41 @@ or, for an explicit named pilot:
 Each directory is an independently owned atomic stage. In particular,
 `separation --overwrite` replaces only `separation/`; it cannot remove a
 previously published downstream stage. Every downstream consumer verifies the
-current upstream byte lineage before a model call: DiariZen binds the separation
+current upstream byte lineage before a model call: new named-run DiariZen binds the resolved
 records hash, ASR binds the DiariZen provenance hash, and reconcile verifies
-the same separation -> DiariZen -> ASR chain. Stem-facts are not a dependency. An overwritten
+the same resolved -> DiariZen -> ASR chain. The model-free resolver binds both
+SAM and AuK inventories, records and canonical waveform hashes.
+Stem-facts are not a dependency. An overwritten
 separation therefore makes older downstream stages explicitly stale; they are
 never deleted or silently reused.
 
+## Fixed resolved source contract
+
+New named runs require SAM `voice_first`, then the independent AuK Base worker,
+then `tools/resolve_h3_audio_stems.py`. Resolution never invokes a model or writes
+waveforms. It publishes `resolved_stems_v1` manifests with speech=AuK and
+music/SFX=SAM. Clip order, original target audio/hash/frame extent and zero-offset
+timeline must agree. AuK failure makes that clip unavailable; there is no SAM
+speech fallback, mixing or ranking. SAM speech remains available for standalone
+A/B QA only.
+
+DiariZen and Qwen3-ASR consume resolved speech; MiMo speaker snippets and speaker
+reuse use the same AuK PCM. MiMo's final audio turn and music reuse use resolved
+SAM music/SFX. Full-audio reuse remains the original canonical full audio.
+Original AV remains identity/factual authority, with unchanged speaker ownership,
+multiple-speaker exclusions, exact intervals and 3/4-call MiMo architecture.
+
+Resolved inventory/record/summary use independent `.1` schemas. New resolved
+DiariZen/ASR provenance uses `.5`, reconcile summary `.17`, and finalization
+summary `.2`. Existing SAM-only lineage remains readable for already-published
+runs; new named-run inference CLIs require the resolved stage and fail if absent.
+Audio asset/product shapes and materializer/prompt versions are unchanged:
+their existing source-record fingerprints now bind the resolved contract.
+
 ## Authority
 
-The original target audiovisual clip remains final factual authority. SAM Audio
-speech, music, and SFX/ambience stems are separated auxiliary evidence and may
+The original target audiovisual clip remains final factual authority. Resolved AuK
+speech and SAM music/SFX stems are auxiliary evidence and may
 become sources for explicitly requested stem-native reference assets. A
 separator target label is not semantic ground truth and cannot override a
 contradiction in the original AV.
@@ -223,7 +250,7 @@ one-clip smoke remains there; no migration, copy, or overwrite is needed.
 For an independent pilot, pass the same `--shadow-run-id random10-v1` to every
 stage. Its root is
 `$AUDIO_PRODUCTION_ROOT/sam_audio_stem_shadow_v1/runs/random10-v1/`, containing
-`separation/`, `diarization/`, `asr/`,
+`separation/`, `auk_speech_v1/`, `resolved_stems_v1/`, `diarization/`, `asr/`,
 `mimo_reconcile_stemtext_final_av_markerpolish_v1/`, and optional `references/`.
 Old `mimo_stem_facts/` and `mimo_reconcile/` outputs are left untouched.
 Run IDs must match `[A-Za-z0-9][A-Za-z0-9._-]{0,63}` exactly. Invalid IDs and
@@ -247,7 +274,7 @@ RUN_ARGS=(
   --audio-production-root "$AUDIO_PRODUCTION_ROOT"
   --shadow-run-id random10-v1
   --case-manifest "$CASE_MANIFEST"
-  --sam-route music_first
+  --sam-route voice_first
 )
 
 PYTHONPATH="$SAM_AUDIO_RUNTIME_PYTHONPATH" \
@@ -257,6 +284,15 @@ PYTHONPATH="$SAM_AUDIO_RUNTIME_PYTHONPATH" \
   --sam-audio-model-name "$SAM_AUDIO_MODEL_NAME" \
   --sam-audio-t5-base-path "$SAM_AUDIO_T5_BASE_PATH" \
   --sam-reranking-candidates 1
+
+"$R2V_PYTHON" tools/run_h3_auk_speech_shadow.py \
+  --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
+  --shadow-run-id random10-v1 --case-manifest "$CASE_MANIFEST" \
+  --auk-python "$AUK_PYTHON" --auk-code-root "$AUK_CODE_ROOT" \
+  --auk-checkpoint "$AUK_CHECKPOINT" --auk-qwen-path "$AUK_QWEN_PATH"
+
+"$R2V_PYTHON" tools/resolve_h3_audio_stems.py \
+  --audio-production-root "$AUDIO_PRODUCTION_ROOT" --shadow-run-id random10-v1
 
 "$R2V_PYTHON" tools/run_h3_stem_diarization_shadow.py "${RUN_ARGS[@]}" \
   --allow-unverified
@@ -273,8 +309,9 @@ PYTHONPATH="$SAM_AUDIO_RUNTIME_PYTHONPATH" \
   --max-completion-tokens 32768 \
   --allow-unverified
 
-"$R2V_PYTHON" tools/export_h3_sam_audio_stem_references.py "${RUN_ARGS[@]}" \
-  --primary-voice-root "$AUDIO_PRODUCTION_ROOT/primary_voice" \
+"$R2V_PYTHON" tools/finalize_h3_audio_reuse_shadow.py "${RUN_ARGS[@]}" \
+  --visual-production-root "$VISUAL_PRODUCTION_ROOT" \
+  --visual-runs-root "$VISUAL_RUNS_ROOT" \
   --allow-unverified
 ```
 

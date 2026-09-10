@@ -46,9 +46,7 @@ from r2v_data_v2.h3.mimo25_stem_shadow import (
 from r2v_data_v2.h3.qwen3_asr import Qwen3ASRSegment
 from r2v_data_v2.h3.sam_audio_stem_shadow import (
     _publish_directory,
-    load_stem_shadow,
     sha256_file,
-    stem_separation_root,
     stem_shadow_root,
     validate_stem_diarization_lineage,
 )
@@ -240,8 +238,11 @@ def build_audio_shadow_qa(
     if _overlaps(destination, case_path):
         raise ValueError("QA output overlaps its case manifest")
     cases = MimoCaseManifest.model_validate_json(case_path.read_text(encoding="utf-8"))
-    separation = stem_separation_root(audio, shadow_run_id)
     diarization, asr = shadow / "diarization", shadow / "asr"
+    diar_provenance, inventory, stems = validate_stem_diarization_lineage(
+        diarization, expected_shadow_root=shadow,
+    )
+    separation = Path(diar_provenance.source_stem_root).resolve(strict=True)
     reconcile_root = shadow / MIMO25_STEM_RECONCILE_STAGE
     # Hash the source JSON sidecars before loading, then verify the same snapshot at publication.
     samples_path = audio / "h3/samples.jsonl"
@@ -250,12 +251,8 @@ def build_audio_shadow_qa(
         for pattern in ("*.json", "*.jsonl", "raw_responses/*.json"):
             sources.update(stage.glob(pattern))
     source_hashes = {str(path): sha256_file(path) for path in sorted(sources)}
-    inventory, stems, _ = load_stem_shadow(separation)
     if inventory.clip_uids != cases.clip_uids:
         raise ValueError("QA case manifest differs from selected separation order")
-    diar_provenance, _, _ = validate_stem_diarization_lineage(
-        diarization, expected_shadow_root=shadow,
-    )
     base = build_mimo25_inventory(
         visual_production_root=visual, visual_runs_root=runs,
         audio_production_root=audio, case_manifest_path=case_path,
@@ -327,7 +324,7 @@ def build_audio_shadow_qa(
         "clip_count": len(jobs),
     })
     published = discover_products(
-        shadow=shadow, jobs=jobs, reconcile=reconcile, samples=samples,
+        shadow=shadow, source_stem_root=separation, jobs=jobs, reconcile=reconcile, samples=samples,
         stems=[s for s in stems if s.route == summary.route], inventories=[base, effective_inventory],
         source_hashes=source_hashes, fingerprint=_fingerprint,
     )

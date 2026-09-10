@@ -27,9 +27,8 @@ from r2v_data_v2.h3.mimo25_stem_shadow import (
     build_stem_reconcile_jobs,
     usable_stem_reconcile_inventory,
 )
+from r2v_data_v2.h3.resolved_audio_stems import StemRecord
 from r2v_data_v2.h3.sam_audio_stem_shadow import (
-    SAMAudioStemRecord,
-    load_stem_shadow,
     sha256_file,
     validate_stem_diarization_lineage,
 )
@@ -160,7 +159,7 @@ def overlay_reconcile_sources(
 
 def validate_prepared_inputs(
     inventory: MimoInventory, records: list[AudioReusePreparedSource],
-    samples: list[FinalH3SampleV2], stems: list[SAMAudioStemRecord],
+    samples: list[FinalH3SampleV2], stems: list[StemRecord],
 ) -> None:
     if [r.clip_uid for r in records] != [j.clip_uid for j in inventory.jobs]:
         raise ValueError("prepared records differ from ordered job inventory")
@@ -217,7 +216,7 @@ def prepare_audio_reuse_sources(
     if override_reconcile_root is not None:
         inputs.append(override_reconcile_root.resolve(strict=True))
     protected = [getattr(paths, f.name).resolve() for f in fields(paths) if f.name != "root"]
-    protected += inputs + [shadow / n for n in ("separation", "diarization", "asr")]
+    protected += inputs + [shadow / n for n in ("separation", "auk_speech_v1", "resolved_stems_v1", "diarization", "asr")]
     protected += [visual_production_root.resolve(), visual_runs_root.resolve()]
     if paths.root.is_relative_to(output) or shadow.is_relative_to(output) or any(
         output.is_relative_to(p) or p.is_relative_to(output) for p in protected
@@ -227,7 +226,7 @@ def prepare_audio_reuse_sources(
         raise FileExistsError(output)
     # Capture durable inputs before reconstruction and verify again before publication.
     source_files = set()
-    for root in inputs + [shadow / n for n in ("separation", "diarization", "asr")]:
+    for root in inputs + [shadow / n for n in ("separation", "auk_speech_v1", "resolved_stems_v1", "diarization", "asr")]:
         if root.is_dir():
             source_files.update(p for p in root.rglob("*.json") if p.is_file())
             source_files.update(p for p in root.rglob("*.jsonl") if p.is_file())
@@ -242,10 +241,9 @@ def prepare_audio_reuse_sources(
     override = load_reconcile_sources(override_reconcile_root) if override_reconcile_root else []
     effective = overlay_reconcile_sources(base, override)
     manifest = MimoCaseManifest(clip_uids=[r.clip_uid for r in base])
-    stem_inventory, stems, _ = load_stem_shadow(shadow / "separation")
-    provenance, _, _ = validate_stem_diarization_lineage(shadow / "diarization", expected_shadow_root=shadow)
-    if Path(provenance.source_stem_root).resolve() != shadow / "separation":
-        raise ValueError("prepared separation lineage differs")
+    provenance, stem_inventory, stems = validate_stem_diarization_lineage(
+        shadow / "diarization", expected_shadow_root=shadow,
+    )
     if [uid for uid in stem_inventory.clip_uids if uid in set(manifest.clip_uids)] != manifest.clip_uids:
         raise ValueError("prepared clips are not an ordered separation subset")
     base_inventory = build_mimo25_inventory(

@@ -13,12 +13,15 @@ if str(REPOSITORY_ROOT) not in sys.path:
 
 from r2v_data_v2.h3.jea_audio_production import jea_production_paths
 from r2v_data_v2.h3.mimo25_av_reconcile import MimoCaseManifest
+from r2v_data_v2.h3.resolved_audio_stems import (
+    downstream_stem_root,
+    downstream_stem_route,
+    load_stem_source,
+)
 from r2v_data_v2.h3.sam_audio_stem_shadow import (
     build_stem_diarization_inventory,
-    load_stem_shadow,
     require_shadow_output_path,
     run_stem_diarization_shadow,
-    stem_separation_root,
     stem_shadow_root,
 )
 from tools.run_h3_diarization_binding import _runtime_backend
@@ -31,7 +34,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--sam-route",
         choices=("music_first", "voice_first"),
-        default="music_first",
+        default=None,
     )
     parser.add_argument("--case-manifest", type=Path)
     parser.add_argument("--output-root", type=Path)
@@ -44,13 +47,14 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> dict[str, object]:
     arguments = _parser().parse_args(argv)
     paths = jea_production_paths(arguments.audio_production_root)
+    route = downstream_stem_route(arguments.shadow_run_id, arguments.sam_route)
     shadow = stem_shadow_root(paths.root, arguments.shadow_run_id)
-    separation = stem_separation_root(paths.root, arguments.shadow_run_id)
+    separation = downstream_stem_root(paths.root, arguments.shadow_run_id)
     output = require_shadow_output_path(
         shadow_root=shadow,
         output_path=arguments.output_root or shadow / "diarization",
     )
-    stem_inventory, records, _ = load_stem_shadow(separation)
+    stem_inventory, records, _ = load_stem_source(separation)
     if arguments.case_manifest is not None:
         manifest = MimoCaseManifest.model_validate_json(
             arguments.case_manifest.read_text(encoding="utf-8")
@@ -66,7 +70,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         stem_inventory=stem_inventory,
         stem_records=records,
         production_diarization_inventory=production_inventory,
-        route=arguments.sam_route,
+        route=route,
         allow_unverified=arguments.allow_unverified,
     )
     result: dict[str, object] = {
@@ -75,7 +79,9 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         "output_root": str(output),
         "target_count": len(inventory.targets),
         "target_clip_uids": [item.target_clip_uid for item in inventory.targets],
-        "diarization_source_kind": "sam_audio_speech_stem",
+        "diarization_source_kind": (
+            "resolved_speech_stem" if route == "resolved" else "sam_audio_speech_stem"
+        ),
     }
     if not arguments.dry_run:
         backend, diagnostics = _runtime_backend(
@@ -88,7 +94,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
                     stem_root=separation,
                     production_diarization_root=paths.diarization,
                     backend=backend,
-                    route=arguments.sam_route,
+                    route=route,
                     output_root=output,
                     allow_unverified=arguments.allow_unverified,
                     overwrite=arguments.overwrite,

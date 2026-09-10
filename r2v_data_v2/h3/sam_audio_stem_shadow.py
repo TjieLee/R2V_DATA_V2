@@ -12,7 +12,7 @@ import uuid
 from collections import Counter
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Annotated, Literal, Protocol
+from typing import TYPE_CHECKING, Annotated, Literal, Protocol
 
 from pydantic import AfterValidator, Field, StrictBool, StrictStr, model_validator
 
@@ -1338,12 +1338,19 @@ def load_stem_shadow(
     return inventory, records, summary
 
 
+if TYPE_CHECKING:
+    from r2v_data_v2.h3.resolved_audio_stems import StemInventory, StemRecord
+
+
+StemRoute = Literal["music_first", "voice_first", "resolved"]
+
+
 def selected_stem_records(
-    records: Sequence[SAMAudioStemRecord],
+    records: Sequence[StemRecord],
     *,
-    route: SAMRoute,
+    route: StemRoute,
     allow_unverified: bool = False,
-) -> list[SAMAudioStemRecord]:
+) -> list[StemRecord]:
     selected = [
         item
         for item in records
@@ -1362,13 +1369,13 @@ def selected_stem_records(
 
 
 class StemShadowClipSkip(SchemaModel):
-    schema_version: Literal["r2v.h3.sam_audio_stem_clip_skip.1"] = (
+    schema_version: Literal["r2v.h3.sam_audio_stem_clip_skip.1", "r2v.h3.resolved_stem_clip_skip.1"] = (
         STEM_CLIP_SKIP_VERSION
     )
     clip_uid: str
-    route: SAMRoute
-    source_stage: Literal["separation"] = "separation"
-    reason_code: Literal["sam_audio_separation_failed"] = (
+    route: StemRoute
+    source_stage: Literal["separation", "resolved_stems_v1"] = "separation"
+    reason_code: Literal["sam_audio_separation_failed", "resolved_stems_failed"] = (
         "sam_audio_separation_failed"
     )
     reason: str
@@ -1379,7 +1386,7 @@ class StemDiarizationClipFailure(SchemaModel):
         STEM_DIARIZATION_FAILURE_VERSION
     )
     clip_uid: str
-    route: SAMRoute
+    route: StemRoute
     source_stage: Literal["diarization"] = "diarization"
     reason_code: Literal["stem_diarization_failed"] = "stem_diarization_failed"
     reason: str
@@ -1389,7 +1396,7 @@ class StemDiarizationClipFailure(SchemaModel):
 def _diarization_failure(
     result: DiarizationClipResult,
     *,
-    route: SAMRoute,
+    route: StemRoute,
 ) -> StemDiarizationClipFailure:
     if result.status != "failed" or not result.reason:
         raise ValueError("stem DiariZen failure requires a failed clip result")
@@ -1405,9 +1412,9 @@ def _diarization_failure(
 
 def separation_skips(
     *,
-    inventory: SAMAudioStemInventory,
-    records: Sequence[SAMAudioStemRecord],
-    route: SAMRoute,
+    inventory: StemInventory,
+    records: Sequence[StemRecord],
+    route: StemRoute,
 ) -> list[StemShadowClipSkip]:
     route_records = [item for item in records if item.route == route]
     by_clip = {item.clip_uid: item for item in route_records}
@@ -1415,6 +1422,8 @@ def separation_skips(
         raise ValueError("SAM Audio route records differ from ordered inventory")
     return [
         StemShadowClipSkip(
+            **({"schema_version": "r2v.h3.resolved_stem_clip_skip.1", "source_stage": "resolved_stems_v1",
+                "reason_code": "resolved_stems_failed"} if route == "resolved" else {}),
             clip_uid=clip_uid,
             route=route,
             reason=by_clip[clip_uid].failure_reason or "SAM Audio separation failed",
@@ -1737,10 +1746,10 @@ def export_stem_native_references(
 
 
 class StemDiarizationShadowProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.stem_diarization_shadow.4"] = (
+    schema_version: Literal["r2v.h3.stem_diarization_shadow.4", "r2v.h3.stem_diarization_shadow.5"] = (
         STEM_DIARIZATION_SHADOW_VERSION
     )
-    diarization_source_kind: Literal["sam_audio_speech_stem"] = (
+    diarization_source_kind: Literal["sam_audio_speech_stem", "resolved_speech_stem"] = (
         "sam_audio_speech_stem"
     )
     source_stem_root: str
@@ -1750,8 +1759,8 @@ class StemDiarizationShadowProvenance(SchemaModel):
     bound_segments_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     cluster_bindings_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     clip_results_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    route: SAMRoute
-    target_count: int = Field(ge=1)
+    route: StemRoute
+    target_count: int = Field(ge=0)
     clip_uids: list[str] = Field(min_length=1)
     ready_clip_uids: list[str]
     empty_clip_uids: list[str]
@@ -1769,6 +1778,12 @@ class StemDiarizationShadowProvenance(SchemaModel):
 
     @model_validator(mode="after")
     def validate_clip_provenance(self) -> StemDiarizationShadowProvenance:
+        if (self.schema_version.endswith(".5")) != (self.route == "resolved") or (
+            (self.diarization_source_kind == "resolved_speech_stem") != (self.route == "resolved")
+        ):
+            raise ValueError("stem DiariZen source contract/version differs")
+        if self.route != "resolved" and self.target_count == 0:
+            raise ValueError("legacy stem DiariZen requires a nonempty selection")
         skipped = {item.clip_uid for item in self.skipped_clips}
         attempted = [item for item in self.clip_uids if item not in skipped]
         ready = set(self.ready_clip_uids)
@@ -1846,9 +1861,11 @@ def validate_stem_diarization_lineage(
     expected_shadow_root: Path | None = None,
 ) -> tuple[
     StemDiarizationShadowProvenance,
-    SAMAudioStemInventory,
-    list[SAMAudioStemRecord],
+    StemInventory,
+    list[StemRecord],
 ]:
+    from r2v_data_v2.h3.resolved_audio_stems import RESOLVED_STAGE, load_stem_source
+
     diarization = root.expanduser().resolve(strict=True)
     provenance = StemDiarizationShadowProvenance.model_validate_json(
         (diarization / "stem_provenance.json").read_text(encoding="utf-8")
@@ -1857,9 +1874,12 @@ def validate_stem_diarization_lineage(
     if expected_shadow_root is not None:
         expected = expected_shadow_root.expanduser().resolve(strict=True)
         require_shadow_output_path(shadow_root=expected, output_path=diarization)
-        if separation != expected / SAM_AUDIO_SEPARATION_STAGE_NAME:
+        source_stage = RESOLVED_STAGE if provenance.route == "resolved" else SAM_AUDIO_SEPARATION_STAGE_NAME
+        if separation != expected / source_stage:
             raise ValueError("stem DiariZen source root differs from selected shadow run")
-    inventory, records, _ = load_stem_shadow(separation)
+    inventory, records, _ = load_stem_source(separation)
+    if (separation.name == RESOLVED_STAGE) != (provenance.route == "resolved"):
+        raise ValueError("stem DiariZen source kind differs from lineage")
     if sha256_file(separation / "records.jsonl") != provenance.source_stem_records_sha256:
         raise ValueError("stem DiariZen source separation records changed")
     if (
@@ -1970,7 +1990,7 @@ def validate_stem_diarization_lineage(
     return provenance, inventory, records
 
 
-def _canonical_by_clip(inventory: SAMAudioStemInventory) -> dict[str, CanonicalAudioClip]:
+def _canonical_by_clip(inventory: StemInventory) -> dict[str, CanonicalAudioClip]:
     records = [
         CanonicalAudioClip.model_validate(row)
         for row in _read_jsonl(Path(inventory.source_canonical_audio_manifest_path))
@@ -1983,10 +2003,10 @@ def _canonical_by_clip(inventory: SAMAudioStemInventory) -> dict[str, CanonicalA
 
 def build_stem_diarization_inventory(
     *,
-    stem_inventory: SAMAudioStemInventory,
-    stem_records: Sequence[SAMAudioStemRecord],
+    stem_inventory: StemInventory,
+    stem_records: Sequence[StemRecord],
     production_diarization_inventory: DiarizationInventory,
-    route: SAMRoute,
+    route: StemRoute,
     allow_unverified: bool = False,
 ) -> DiarizationInventory:
     selected = selected_stem_records(
@@ -2158,12 +2178,16 @@ def run_stem_diarization_shadow(
     stem_root: Path,
     production_diarization_root: Path,
     backend: DiarizationBackend,
-    route: SAMRoute,
+    route: StemRoute,
     output_root: Path,
     allow_unverified: bool = False,
     overwrite: bool = False,
 ) -> StemDiarizationShadowProvenance:
-    stem_inventory, stem_records, _ = load_stem_shadow(stem_root)
+    from r2v_data_v2.h3.resolved_audio_stems import RESOLVED_STAGE, load_stem_source
+
+    stem_inventory, stem_records, _ = load_stem_source(stem_root)
+    if (stem_root.name == RESOLVED_STAGE) != (route == "resolved"):
+        raise ValueError("stem DiariZen source kind differs from requested contract")
     production_inventory_path = (
         production_diarization_root.expanduser().resolve(strict=True) / "inventory.json"
     )
@@ -2236,6 +2260,8 @@ def run_stem_diarization_shadow(
             usable_clip_uids=usable_clip_uids,
         )
         provenance = StemDiarizationShadowProvenance(
+            **({"schema_version": "r2v.h3.stem_diarization_shadow.5",
+                "diarization_source_kind": "resolved_speech_stem"} if route == "resolved" else {}),
             source_stem_root=str(stem_root.expanduser().resolve(strict=True)),
             source_stem_inventory_fingerprint=stem_inventory.inventory_fingerprint,
             source_stem_records_sha256=sha256_file(records_path),
@@ -2289,14 +2315,14 @@ def run_stem_diarization_shadow(
 
 
 class StemASRShadowProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.stem_asr_shadow.4"] = STEM_ASR_SHADOW_VERSION
-    asr_source_kind: Literal["sam_audio_speech_stem_segments"] = (
+    schema_version: Literal["r2v.h3.stem_asr_shadow.4", "r2v.h3.stem_asr_shadow.5"] = STEM_ASR_SHADOW_VERSION
+    asr_source_kind: Literal["sam_audio_speech_stem_segments", "resolved_speech_stem_segments"] = (
         "sam_audio_speech_stem_segments"
     )
     source_stem_diarization_root: str
     source_stem_diarization_provenance_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_stem_inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
-    route: SAMRoute
+    route: StemRoute
     source_clip_uids: list[str] = Field(min_length=1)
     clip_uids: list[str]
     source_diarization_ready_clip_uids: list[str]
@@ -2311,6 +2337,10 @@ class StemASRShadowProvenance(SchemaModel):
 
     @model_validator(mode="after")
     def validate_clip_provenance(self) -> StemASRShadowProvenance:
+        if (self.schema_version.endswith(".5")) != (self.route == "resolved") or (
+            (self.asr_source_kind == "resolved_speech_stem_segments") != (self.route == "resolved")
+        ):
+            raise ValueError("stem ASR source contract/version differs")
         excluded = {item.clip_uid for item in self.skipped_clips}.union(
             item.clip_uid for item in self.diarization_failed_clips
         )
@@ -2426,7 +2456,7 @@ def run_stem_qwen3_asr_shadow(
     case_manifest: MimoCaseManifest | None = None,
     segment_audio_loader: SegmentAudioLoader | None = None,
     ffmpeg: str = "ffmpeg",
-    route: SAMRoute | None = None,
+    route: StemRoute | None = None,
     allow_unverified: bool = False,
     overwrite: bool = False,
 ) -> tuple[Qwen3ASRSummary, StemASRShadowProvenance]:
@@ -2456,6 +2486,8 @@ def run_stem_qwen3_asr_shadow(
             ffmpeg=ffmpeg,
         )
         provenance = StemASRShadowProvenance(
+            **({"schema_version": "r2v.h3.stem_asr_shadow.5",
+                "asr_source_kind": "resolved_speech_stem_segments"} if source_provenance.route == "resolved" else {}),
             source_stem_diarization_root=str(diarization),
             source_stem_diarization_provenance_sha256=sha256_file(
                 source_provenance_path

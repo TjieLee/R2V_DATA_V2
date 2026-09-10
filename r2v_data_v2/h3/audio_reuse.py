@@ -16,10 +16,14 @@ from pydantic import Field, model_validator
 from r2v_data_v2.h3.jea_audio_production import jea_production_paths
 from r2v_data_v2.h3.mimo25_av_reconcile import MimoClipJob
 from r2v_data_v2.h3.mimo25_backend import MimoAVAnnotationDraft, direct_speech_facts
+from r2v_data_v2.h3.resolved_audio_stems import (
+    StemMedia,
+    StemRecord,
+    validate_stem_record,
+)
 from r2v_data_v2.h3.sam_audio_stem_shadow import (
     STEM_ALIGNMENT_TOLERANCE_SECONDS,
     SAMAudioStemRecord,
-    StemArtifact,
     VerificationState,
     sha256_file,
 )
@@ -210,7 +214,7 @@ def _write_verified(path: Path, pcm: np.ndarray) -> str:
     return digest
 
 
-def _check_stem(stem: StemArtifact, target: Path, target_hash: str, frame_count: int) -> np.ndarray:
+def _check_stem(stem: StemMedia, target: Path, target_hash: str, frame_count: int) -> np.ndarray:
     if (Path(stem.source_audio_path).resolve() != target
             or stem.source_audio_sha256 != target_hash or stem.source_end_sample != frame_count):
         raise AudioReuseIntegrityError("audio_reuse_stem_target_lineage_mismatch")
@@ -224,7 +228,7 @@ def _check_stem(stem: StemArtifact, target: Path, target_hash: str, frame_count:
 
 def build_audio_reuse_assets(
     *, job: MimoClipJob, annotation: MimoAVAnnotationDraft,
-    stem_record: SAMAudioStemRecord, audio_production_root: Path,
+    stem_record: StemRecord, audio_production_root: Path,
     output_root: Path, allow_unverified: bool = False,
 ) -> AudioReuseManifest:
     """Build one clip into a NEW caller-owned shadow directory, never overwrite.
@@ -234,7 +238,7 @@ def build_audio_reuse_assets(
     """
     job = MimoClipJob.model_validate(job.model_dump())
     annotation = MimoAVAnnotationDraft.model_validate(annotation.model_dump())
-    stem_record = SAMAudioStemRecord.model_validate(stem_record.model_dump())
+    stem_record = validate_stem_record(stem_record)
     output = output_root.expanduser().resolve()
     production = audio_production_root.expanduser().resolve(strict=True)
     paths = jea_production_paths(production)
@@ -253,8 +257,10 @@ def build_audio_reuse_assets(
     source_media = [target, Path(job.target_video_path).resolve()]
     for stem in stem_record.stems:
         source_media.extend(Path(path).resolve() for path in (
-            stem.source_audio_path, stem.raw_stem_path, stem.canonical_stem_path,
+            stem.source_audio_path, stem.canonical_stem_path,
         ))
+        if isinstance(stem_record, SAMAudioStemRecord):
+            source_media.append(Path(stem.raw_stem_path).resolve())
     if any(path.is_relative_to(output) or output.is_relative_to(path) for path in source_media):
         raise ValueError("audio reuse output cannot contain or overlap source media")
     speech = stem_record.stem("speech")
@@ -346,7 +352,7 @@ def build_audio_reuse_assets(
         stage = Path(temporary) / "assets"
         stage.mkdir()
 
-        def common(stem: StemArtifact) -> dict:
+        def common(stem: StemMedia) -> dict:
             return {
                 "clip_uid": job.clip_uid, "source_stem_path": str(Path(stem.canonical_stem_path).resolve()),
                 "source_stem_sha256": stem.canonical_stem_sha256,

@@ -15,6 +15,9 @@ from r2v_data_v2.h3.jea_audio_production import jea_production_paths
 from r2v_data_v2.h3.mimo25_av_reconcile import MimoCaseManifest
 from r2v_data_v2.h3.qwen3_asr import Qwen3ASRConfiguration
 from r2v_data_v2.h3.qwen3_asr_subprocess import PersistentQwen3ASRBackend
+from r2v_data_v2.h3.resolved_audio_stems import (
+    downstream_stem_route,
+)
 from r2v_data_v2.h3.sam_audio_stem_shadow import (
     require_shadow_output_path,
     run_stem_qwen3_asr_shadow,
@@ -32,7 +35,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--sam-route",
         choices=("music_first", "voice_first"),
-        default="music_first",
+        default=None,
     )
     parser.add_argument("--output-root", type=Path)
     parser.add_argument("--ffmpeg", default="ffmpeg")
@@ -64,6 +67,7 @@ def _isolated_backend() -> PersistentQwen3ASRBackend:
 def main(argv: list[str] | None = None) -> dict[str, object]:
     arguments = _parser().parse_args(argv)
     paths = jea_production_paths(arguments.audio_production_root)
+    route = downstream_stem_route(arguments.shadow_run_id, arguments.sam_route)
     shadow = stem_shadow_root(paths.root, arguments.shadow_run_id)
     output = require_shadow_output_path(
         shadow_root=shadow,
@@ -85,7 +89,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
     source_provenance, _, _ = validate_stem_diarization_lineage(
         shadow / "diarization", expected_shadow_root=shadow,
     )
-    if source_provenance.route != arguments.sam_route:
+    if source_provenance.route != route:
         raise ValueError("stem ASR route differs from selected SAM route")
     if manifest is not None and manifest.clip_uids != source_provenance.clip_uids:
         raise ValueError("stem ASR case manifest differs from stem diarization order")
@@ -102,7 +106,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
                 output_root=output,
                 case_manifest=manifest,
                 ffmpeg=arguments.ffmpeg,
-                route=arguments.sam_route,
+                route=route,
                 allow_unverified=arguments.allow_unverified,
                 overwrite=arguments.overwrite,
             )

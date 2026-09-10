@@ -108,7 +108,7 @@ small{color:#626e73}a{color:#176c9a}#loading{padding:20px}
 <details><summary>Exact source sample ranges / ASR provenance</summary><pre id="speech-provenance"></pre></details>
 </details>
 <details><summary>Speaker-binding evidence: frozen production and shadow (separate sources)</summary><pre id="binding"></pre></details>
-<h2>Auxiliary SAM stem evidence</h2><p id="separation-status"></p>
+<h2>Auxiliary stem evidence</h2><p id="separation-status"></p>
 <div id="stems" class="stem-grid"></div>
 <details><summary>Separation provenance / alignment</summary><pre id="separation"></pre></details>
 <div class="evidence"><section><h2>Music-stem candidate description</h2><pre id="music-stem-description"></pre></section><section><h2>SFX-stem candidate description</h2><pre id="sfx-stem-description"></pre></section></div>
@@ -351,7 +351,7 @@ function render() {
   });
   $("speech-provenance").textContent = pretty({diarization: clip.diarization, asr: clip.asr});
   $("binding").textContent = pretty(clip.speaker_binding);
-  $("separation-status").textContent = "Separation: " + clip.separation.separation_state;
+  $("separation-status").textContent = "Stem source: " + (clip.separation.separation_state ?? clip.separation.status);
   $("separation").textContent = pretty(clip.separation);
   $("stems").replaceChildren();
   ["speech", "music", "sfx"].forEach(kind => {

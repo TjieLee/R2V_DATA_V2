@@ -39,6 +39,7 @@ from r2v_data_v2.h3.qwen38_h3_recaption import (
     RecaptionAudioContract,
     audio_task_prefix,
 )
+from r2v_data_v2.h3.resolved_audio_stems import StemRecord, validate_stem_record
 from r2v_data_v2.h3.sam_audio_stem_shadow import SAMAudioStemRecord, sha256_file
 from r2v_data_v2.h3.schemas import SchemaModel
 from r2v_data_v2.h3.speaker_ownership import speaker_ownership_reasons
@@ -65,12 +66,12 @@ class ValidatedReuseSource:
 
 
 def load_reuse_source(
-    *, manifest_path: Path, job: MimoClipJob, record: AudioReusePreparedSource, stem_record: SAMAudioStemRecord,
+    *, manifest_path: Path, job: MimoClipJob, record: AudioReusePreparedSource, stem_record: StemRecord,
 ) -> ValidatedReuseSource:
-    """Validate published assets against independent frozen job/annotation/SAM inputs."""
+    """Validate published assets against independent frozen job/annotation/stem inputs."""
     job = MimoClipJob.model_validate(job.model_dump())
     record = AudioReusePreparedSource.model_validate(record.model_dump())
-    stem_record = SAMAudioStemRecord.model_validate(stem_record.model_dump())
+    stem_record = validate_stem_record(stem_record)
     path = manifest_path.resolve(strict=True)
     digest = sha256_file(path)
     manifest = AudioReuseManifest.model_validate_json(path.read_text())
@@ -380,7 +381,12 @@ def materialize_audio_reuse_products(
     inventory = MimoInventory.model_validate_json(input_files[0].read_text())
     records = _rows(input_files[1], AudioReusePreparedSource)
     samples = _rows(input_files[2], FinalH3SampleV2)
-    stems = _rows(input_files[3], SAMAudioStemRecord)
+    from r2v_data_v2.h3.resolved_audio_stems import RESOLVED_STAGE, load_stem_source
+
+    stems = (
+        load_stem_source(separation_root)[1] if separation_root.name == RESOLVED_STAGE
+        else _rows(input_files[3], SAMAudioStemRecord)
+    )
     if hashes[str(input_files[2])] != inventory.source_h3_samples_sha256:
         raise ValueError("frozen H3 samples changed")
     by_clip = {r.clip_uid: r for r in records}
