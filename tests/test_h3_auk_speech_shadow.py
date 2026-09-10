@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -23,6 +24,7 @@ from r2v_data_v2.h3.sam_audio_stem_shadow import (
     stem_separation_root,
 )
 from tools import run_h3_auk_speech_shadow as cli
+from tools.run_h3_auk_speech_worker import validate_dependencies
 
 FAKE_AUK = """import json, os, wave
 from pathlib import Path
@@ -269,6 +271,91 @@ def test_missing_local_dependencies_fail_before_model(setup, missing):
     ):
         pytest.fail("must not reach model startup")
     assert not Path(c.config_path).with_name("worker_calls.jsonl").exists()
+
+
+def test_empty_python_sources_are_hashed_and_worker_startup_accepts(setup):
+    c = setup.model_configuration
+    paths = [
+        Path(c.code_root) / name
+        for name in (
+            "src/auk/__init__.py",
+            "src/auk/model/__init__.py",
+            "src/auk/model/vae/modules/__init__.py",
+        )
+    ]
+    for path in paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"")
+    configuration = auk.auk_configuration(
+        python_path=Path(c.python_path),
+        code_root=Path(c.code_root),
+        checkpoint=Path(c.checkpoint_path),
+        qwen_path=Path(c.qwen_path),
+    )
+    for path in paths:
+        assert (
+            configuration.dependency_files[str(path)] == hashlib.sha256(b"").hexdigest()
+        )
+    validate_dependencies(configuration.model_dump(mode="json"))
+    with auk.PersistentAukBackend(configuration) as backend:
+        assert backend.process.poll() is None  # fake engine startup only, no generation
+    assert all(path.read_bytes() == b"" for path in paths)
+    paths[-1].write_text("# changed source\n")
+    with pytest.raises(ValueError, match="hash differs"):
+        validate_dependencies(configuration.model_dump(mode="json"))
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "auk_base.safetensors",
+        "config.yaml",
+        "vae.safetensors",
+        "model.safetensors",
+        "config.json",
+        "tokenizer_config.json",
+        "preprocessor_config.json",
+        "tokenizer.json",
+        "model-00001-of-00001.safetensors",
+    ],
+)
+def test_empty_runtime_artifacts_rejected_by_parent_and_worker(setup, name):
+    c = setup.model_configuration
+    if name.startswith("model-00001"):
+        root = Path(c.qwen_path)
+        (root / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {"w": name}})
+        )
+        (root / name).write_bytes(b"mock shard")
+        c = auk.auk_configuration(
+            python_path=Path(c.python_path),
+            code_root=Path(c.code_root),
+            checkpoint=Path(c.checkpoint_path),
+            qwen_path=root,
+        )
+    parent = (
+        Path(c.checkpoint_path).parent
+        if name
+        in {
+            "auk_base.safetensors",
+            "config.yaml",
+            "vae.safetensors",
+        }
+        else Path(c.qwen_path)
+    )
+    path = parent / name
+    path.write_bytes(b"")
+    with pytest.raises(ValueError, match="non-empty"):
+        auk.auk_configuration(
+            python_path=Path(c.python_path),
+            code_root=Path(c.code_root),
+            checkpoint=Path(c.checkpoint_path),
+            qwen_path=Path(c.qwen_path),
+        )
+    payload = c.model_dump(mode="json")
+    payload["dependency_files"][str(path)] = hashlib.sha256(b"").hexdigest()
+    with pytest.raises(ValueError, match="non-empty"):
+        validate_dependencies(payload)  # reject even when the empty-file hash matches
 
 
 def test_persistent_worker_offline_exact_request_once(setup, tmp_path, monkeypatch):

@@ -22,9 +22,16 @@ def file_hash(path: Path) -> str:
 
 
 def validate_dependencies(configuration: dict) -> None:
+    source_root = Path(configuration["code_root"]) / "src/auk"
     for name, expected in configuration["dependency_files"].items():
         path = Path(name)
-        if not path.is_absolute() or not path.is_file() or path.stat().st_size == 0:
+        if not path.is_absolute() or not path.is_file():
+            raise ValueError(
+                f"AuK requires a regular absolute local dependency: {name}"
+            )
+        # Empty Python package files are valid source, not missing model assets.
+        is_source = path.suffix == ".py" and path.is_relative_to(source_root)
+        if not is_source and path.stat().st_size == 0:
             raise ValueError(f"AuK requires a non-empty local dependency: {name}")
         actual = file_hash(path)
         if actual != expected:

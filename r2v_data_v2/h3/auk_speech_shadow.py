@@ -68,9 +68,16 @@ def _check_fingerprint(model: SchemaModel, field: str) -> None:
         raise ValueError(f"AuK {field} differs")
 
 
-def _file(path: Path) -> Path:
+def _local_file(path: Path) -> Path:
     path = path.expanduser().resolve(strict=True)
-    if not path.is_file() or path.stat().st_size == 0:
+    if not path.is_file():
+        raise ValueError(f"AuK requires a regular local file: {path}")
+    return path
+
+
+def _file(path: Path) -> Path:
+    path = _local_file(path)
+    if path.stat().st_size == 0:
         raise ValueError(f"AuK requires a non-empty local file: {path}")
     return path
 
@@ -136,7 +143,7 @@ def auk_configuration(
         raise ValueError("AuK v1 requires the Base auk_base.safetensors checkpoint")
     config = _file(checkpoint.with_name("config.yaml"))
     vae = _file(checkpoint.with_name("vae.safetensors"))
-    _file(code_root / "src/auk/infer/infer_auk.py")
+    _local_file(code_root / "src/auk/infer/infer_auk.py")
     for name in ("config.json", "tokenizer_config.json", "preprocessor_config.json"):
         _file(qwen_path / name)
     if not (qwen_path / "tokenizer.json").is_file():
@@ -154,7 +161,8 @@ def auk_configuration(
     else:
         _file(qwen_path / "model.safetensors")
     dependencies = [checkpoint, config, vae, _file(code_root / "pyproject.toml")]
-    dependencies += sorted((code_root / "src/auk").rglob("*.py"))
+    source_files = set((code_root / "src/auk").rglob("*.py"))
+    dependencies += sorted(source_files)
     dependencies += sorted(
         p
         for p in qwen_path.rglob("*")
@@ -172,7 +180,8 @@ def auk_configuration(
             "vae_path": str(vae),
             "qwen_path": str(qwen_path),
             "dependency_files": {
-                str(p): sha256_file(_file(p)) for p in sorted(set(dependencies))
+                str(p): sha256_file(_local_file(p) if p in source_files else _file(p))
+                for p in sorted(set(dependencies))
             },
             "worker_sha256": sha256_file(worker_path()),
             "device": device,
