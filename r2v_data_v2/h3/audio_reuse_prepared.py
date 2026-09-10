@@ -43,8 +43,11 @@ def _hash(value: dict) -> str:
 
 class FrozenReuseBackendProvenance(MimoBackendProvenance):
     # These frozen versions share the consumed annotation/runtime contract.
-    schema_version: Literal["r2v.h3.mimo25_backend.60", "r2v.h3.mimo25_backend.61", "r2v.h3.mimo25_backend.62"]
-    prompt_version: Literal["h3_mimo25_speech_assembly_v46", "h3_mimo25_speech_assembly_v47"]
+    schema_version: Literal["r2v.h3.mimo25_backend.60", "r2v.h3.mimo25_backend.61", "r2v.h3.mimo25_backend.62",
+                            "r2v.h3.mimo25_backend.63"]
+    prompt_version: Literal["h3_mimo25_speech_assembly_v46", "h3_mimo25_speech_assembly_v47",
+                            "h3_mimo25_speech_assembly_v48"]
+    visual_prompt_version: Literal["h3_mimo25_visual_only_v4", "h3_mimo25_visual_only_v5"]
 
 
 class _FrozenStemRecord(MimoStemReconcileRecord):

@@ -72,7 +72,7 @@ def test_merged_or_missing_same_speaker_expands_exact_segments(tmp_path, caption
 
 
 def test_missing_middle_speaker_inserted_before_next_aligned_slot(tmp_path):
-    caption = "(S1) says, <d>[English] a</d> Then (S3) responds, <d>[English] c</d> The camera stays still."
+    caption = "<Subject 1> stands nearby. (S1) says, <d>[English] a</d> Then (S3) responds, <d>[English] c</d> The camera stays still."
     _, sample, source = _case(tmp_path, ("g1", "g2", "g3"), caption=caption,
                              speech_payloads=[("English", "a"), ("Malay", "b"), ("English", "c")])
     _, _, _, prompt = _render(sample, source)
@@ -119,7 +119,7 @@ def test_missing_clause_reuses_semantic_speech_source(tmp_path, presentation):
 
 
 def test_all_product_variants_project_target_not_donor_dialogue(tmp_path):
-    _, sample, source = _case(tmp_path / "target", caption="(S1) says, <d>[English] translation</d>",
+    _, sample, source = _case(tmp_path / "target", caption="<Subject 1> stands nearby. (S1) says, <d>[English] translation</d>",
                              speech_payloads=[("Chinese", "\u554a\u3002")])
     _, _, donor = _case(tmp_path / "donor", clip="donor", text="Donor must never enter target.")
     from r2v_data_v2.h3.jea_final_renderer import FinalH3SampleV2
@@ -149,7 +149,7 @@ def test_published_product_validator_enforces_exact_dialogue(tmp_path):
     args = _prepared(tmp_path)
     product.materialize_audio_reuse_products(**args)
     rows = product._rows(args["output_root"] / "records.jsonl", AudioReuseProduct)
-    assert AUDIO_REUSE_MATERIALIZER_VERSION == "h3_mimo25_audio_reuse_materializer_v3"
+    assert AUDIO_REUSE_MATERIALIZER_VERSION == "h3_mimo25_audio_reuse_materializer_v4"
     values = rows[0].model_dump(mode="json")
     values["rendered_h3_prompt"] = values["rendered_h3_prompt"].replace("Exact, text!", "Translated text")
     values["record_fingerprint"] = product._hash({k: v for k, v in values.items() if k != "record_fingerprint"})
@@ -222,6 +222,6 @@ def test_zero_speech_detail_rejects_dialogue_and_bad_section_order(tmp_path):
     _, sample, source = _case(tmp_path, ())
     _, _, _, prompt = _render(sample, source)
     with pytest.raises(ValueError, match="authoritative_dialogue_mismatch"):
-        validate_product_dialogue_sections(prompt.replace("[Shot 1]", "[Shot 1] <d>[English] extra</d>"), [])
+        validate_product_dialogue_sections(prompt.replace("\n[Shot 1] ", "\n[Shot 1] <d>[English] extra</d>"), [])
     with pytest.raises(ValueError, match="section_structure_invalid"):
         validate_product_dialogue_sections(prompt.replace("summary:\n", "unknown:\n"), [])

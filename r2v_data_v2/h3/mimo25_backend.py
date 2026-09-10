@@ -31,16 +31,16 @@ from r2v_data_v2.structured_output import (
 
 MIMO25_MODEL = "mimo-v2.5"
 MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
-MIMO25_PROMPT_VERSION = "h3_mimo25_speech_assembly_v47"
+MIMO25_PROMPT_VERSION = "h3_mimo25_speech_assembly_v48"
 MIMO25_SPEAKER_PROFILE_PROMPT_VERSION = "h3_mimo25_speaker_profile_v2"
 MIMO25_AUDIO_FINALIZE_PROMPT_VERSION = "h3_mimo25_audio_finalize_v6"
-MIMO25_VISUAL_PROMPT_VERSION = "h3_mimo25_visual_only_v4"
+MIMO25_VISUAL_PROMPT_VERSION = "h3_mimo25_visual_only_v5"
 MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v17"
 MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.20"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.62"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.63"
 MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION = "h3_mimo25_speaker_marker_polish_v4"
 MIMO25_ICL_VERSION = "h3_official_ref2va_detailed_shot1_v4"
-MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v26"
+MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v27"
 MIMO25_CANONICAL_ABSENT_SOUNDSCAPE = (
     "No distinct environmental, mechanical, physical, or non-verbal human "
     "sounds are clearly discernible."
@@ -975,14 +975,14 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.62"] = MIMO25_BACKEND_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.63"] = MIMO25_BACKEND_VERSION
     audio_finalize_prompt_version: Literal["h3_mimo25_audio_finalize_v6"] = (
         MIMO25_AUDIO_FINALIZE_PROMPT_VERSION
     )
     speaker_profile_prompt_version: Literal["h3_mimo25_speaker_profile_v2"] = (
         MIMO25_SPEAKER_PROFILE_PROMPT_VERSION
     )
-    visual_prompt_version: Literal["h3_mimo25_visual_only_v4"] = MIMO25_VISUAL_PROMPT_VERSION
+    visual_prompt_version: Literal["h3_mimo25_visual_only_v5"] = MIMO25_VISUAL_PROMPT_VERSION
     speaker_marker_polish_prompt_version: Literal["h3_mimo25_speaker_marker_polish_v4"] = (
         MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION
     )
@@ -1003,7 +1003,7 @@ class MimoBackendProvenance(SchemaModel):
     media_mode: Literal["base64", "http"]
     media_root: str
     media_base_url: str | None = None
-    prompt_version: Literal["h3_mimo25_speech_assembly_v47"] = (
+    prompt_version: Literal["h3_mimo25_speech_assembly_v48"] = (
         MIMO25_PROMPT_VERSION
     )
     policy_version: Literal["h3_mimo25_av_authority_contract_v17"] = (
@@ -1029,6 +1029,7 @@ class MimoBackendProvenance(SchemaModel):
         "h3_mimo25_materializer_v24",
         "h3_mimo25_materializer_v25",
         "h3_mimo25_materializer_v26",
+        "h3_mimo25_materializer_v27",
     ] = (
         MIMO25_MATERIALIZER_VERSION
     )
@@ -1332,6 +1333,8 @@ Profile/back/occluded/silent subjects remain visible; visual presence alone neve
 Keep segment_views for supplied windows in order; list visible entities and only the detailed observations actually assessable. speech_correlated_articulation records visible articulation only, without audio correlation or identity inference.
 subject_definitions: exactly one per required Subject in order, each ONE concise sentence of stable visual appearance, not actions, frame position, chronology or a mini-caption. Do not repeat facts or provenance/analysis boilerplate. Omit <Picture N> from definition descriptions: pipeline code owns Picture provenance and attribute ownership. Attribute descriptions concern only that attribute.
 visual_retention_analysis: one concise statement per required item, without repeating appearance prose; attribute retention concerns its owning entity. Use fully_preserved, partially_preserved or weak_reference only.
+Assess preservation of the Subject definition's referenced visual role/features, not target-only placement or action as source-reference fidelity unless composition/position is itself a defined reference property.
+An entity/background Subject marked fully_preserved or partially_preserved must be cited with its exact <Subject N> label at its first clear appearance in shot1_visual_description. Integrate the label naturally; subsequent mentions need not repeat it. Attribute Subjects remain optional, cited only for useful action, composition, state change, disambiguation or another generation cue.
 style_opening is one concise global style/camera/lighting sentence. Use only supplied Subject/Picture labels in visual prose. Pipeline owns [Shot 1]; no shot markers, timestamps or placeholders.
 Do not infer sounds, dialogue or speaker identity; no (Sx), <d>, acoustic groups or audio fields."""
 
@@ -1376,6 +1379,7 @@ VISIBLE SPEAKER BINDING
 
 SHOT1 CAPTION
 Start from the Turn 1 shot1_visual_description. Preserve its visual content and ordering.
+Preserve the natural first-appearance <Subject N> citation for every fully_preserved or partially_preserved entity/background Subject in shot1_caption; do not mechanically repeat labels or require attribute citations.
 Only make the minimum edits needed to:
 - establish the correct speaker with (Sx);
 - insert exact authoritative <d> dialogue at the appropriate point;
@@ -1388,6 +1392,7 @@ The pipeline owns [Shot 1]; do not emit shot markers, timestamps or placeholders
 TARGET-VIDEO SUMMARY
 Write one short overall target-video summary: the main visible subject/action and important speech presentation. This is not an audio report. Do not enumerate audio layers, list absent music/SFX, write "The audio consists of...", or add a [reference generation ...] task prefix. The materializer owns that prefix.
 Do not invent visual details beyond the supplied Turn 1 draft.
+Naturally use the principal supplied <Subject N> labels for the main reference relationships in summary; do not enumerate every Subject or require every attribute. Task-prefix and Audio relationships remain pipeline-owned.
 
 SPEAKER MARKERS
 - Number stable (Sx) by final groups' first transcribed appearance. Referenced visible speakers use <Subject N> (Sx); unbound sources use a natural semantic source plus (Sx). No fixed says clause or immediate adjacency is required.

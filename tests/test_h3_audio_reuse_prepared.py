@@ -59,13 +59,15 @@ def test_overlay_rejects_foreign_provenance(tmp_path, change, message):
         prep.overlay_reconcile_sources([source.record], [source.record, source.record])
 
 
-@pytest.mark.parametrize("version", [60, 61, 62])
+@pytest.mark.parametrize("version", [60, 61, 62, 63])
 def test_frozen_source_preserves_real_schema_provenance_and_annotation(tmp_path, version):
     args = _fixture(tmp_path)
     raw = stem_record_values(tmp_path, args["job"], args["annotation"], args["stem_record"], backend_version=version)
-    if version < 62:
+    if version < 63:
         provenance = raw["backend_provenance"]
-        provenance["prompt_version"] = "h3_mimo25_speech_assembly_v46"
+        provenance["prompt_version"] = f"h3_mimo25_speech_assembly_v{46 if version < 62 else 47}"
+        provenance["visual_prompt_version"] = "h3_mimo25_visual_only_v4"
+        provenance["materializer_version"] = "h3_mimo25_materializer_v26"
         provenance["configuration_fingerprint"] = prep._hash({
             k: v for k, v in provenance.items() if k != "configuration_fingerprint"
         })
@@ -212,7 +214,7 @@ def test_legacy_record_rendering_is_identical(tmp_path):
     _, sample, source = _case(tmp_path)
     legacy = _record_fixture(tmp_path, source.record.annotation, job=source.job)
     assert MimoRecord.model_validate_json(legacy.model_dump_json()) == legacy
-    assert MIMO25_MATERIALIZER_VERSION == "h3_mimo25_materializer_v26"
+    assert MIMO25_MATERIALIZER_VERSION == "h3_mimo25_materializer_v27"
     assert _materialize_sample(sample, source.job, legacy, conditioning_variant="visual_only") == (
         _materialize_sample(sample, source.job, source.record, conditioning_variant="visual_only")
     )

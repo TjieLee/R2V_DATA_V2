@@ -6400,7 +6400,7 @@ def test_materializer_renders_typed_subject_and_retention_as_official_h3(
         in rendered
     )
     assert (
-        "<Subject 1>: fully_preserved - the referenced visual appearance remains "
+        "<Subject 1> (appears in [Shot 1]): fully_preserved - the referenced visual appearance remains "
         "intact."
     ) in rendered
     assert "Subject 1 is" not in rendered

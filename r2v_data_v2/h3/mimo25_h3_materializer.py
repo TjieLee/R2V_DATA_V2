@@ -34,6 +34,7 @@ from r2v_data_v2.h3.mimo25_backend import (
     MimoAudioEvent,
     MimoAVAnnotationDraft,
     MimoSubjectDefinitionDraft,
+    MimoVisualRetentionDraft,
     protect_direct_dialogue,
 )
 from r2v_data_v2.h3.mimo25_recovered_voice import (
@@ -237,6 +238,7 @@ class MimoH3ShadowRecord(SchemaModel):
         "h3_mimo25_materializer_v24",
         "h3_mimo25_materializer_v25",
         "h3_mimo25_materializer_v26",
+        "h3_mimo25_materializer_v27",
     ] = (
         MIMO25_MATERIALIZER_VERSION
     )
@@ -787,6 +789,32 @@ def project_audio_relationships(
     return caption, music
 
 
+def _visual_retention_lines(
+    subjects: Sequence[RecaptionSubjectContract],
+    retention: Sequence[MimoVisualRetentionDraft],
+    caption: str,
+) -> list[str]:
+    markers = {item.subject_label: item.marker for item in retention}
+    issues = [
+        ValidationIssue(
+            "preserved_visual_subject_missing_from_detailed_description",
+            subject.subject_label,
+            "fully/partially preserved entity or background must be cited in the shot description",
+        )
+        for subject in subjects
+        if subject.kind in {"entity", "background"}
+        and markers.get(subject.subject_label) in {"fully_preserved", "partially_preserved"}
+        and subject.subject_label not in caption
+    ]
+    if issues:
+        raise MimoH3MaterializationContractError(issues)
+    # Single-shot locator is pipeline-owned; model descriptions remain untouched.
+    return [
+        f"{item.subject_label} (appears in [Shot 1]): {item.marker} - {item.description.strip()}"
+        for item in retention
+    ]
+
+
 def _materialize_sample(
     sample: FinalH3SampleV2,
     job: MimoClipJob,
@@ -887,10 +915,9 @@ def _materialize_sample(
             )
         ] + [_canonical_audio_definition(audio) for audio in contract.audios],
         summary=f"{prefix} {summary}",
-        retention_analysis=[
-            item.render()
-            for item in record.annotation.h3_semantics.visual_retention_analysis
-        ] + [_canonical_audio_retention(audio) for audio in contract.audios],
+        retention_analysis=_visual_retention_lines(
+            job.reference_subjects, direct.visual_retention_analysis, detailed,
+        ) + [_canonical_audio_retention(audio) for audio in contract.audios],
         detailed_description=f"{direct.style_opening}\n[Shot 1] {detailed}",
         overall_soundscape=direct.overall_soundscape,
         non_diegetic_music=music,

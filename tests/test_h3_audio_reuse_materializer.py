@@ -13,11 +13,21 @@ from r2v_data_v2.h3.audio_reuse import build_audio_reuse_assets
 from r2v_data_v2.h3.audio_reuse_prepared import project_prepared_samples
 from r2v_data_v2.h3.jea_final_renderer import FinalH3SampleV2
 from r2v_data_v2.h3.mimo25_av_reconcile import MimoClipJob, _inventory
-from r2v_data_v2.h3.mimo25_backend import MimoAVAnnotationDraft
-from r2v_data_v2.h3.mimo25_h3_materializer import _materialize_sample
+from r2v_data_v2.h3.mimo25_backend import (
+    SYSTEM_PROMPT,
+    VISUAL_SYSTEM_PROMPT,
+    MimoAVAnnotationDraft,
+    MimoVisualRetentionDraft,
+)
+from r2v_data_v2.h3.mimo25_h3_materializer import (
+    MimoH3MaterializationContractError,
+    _materialize_sample,
+    _visual_retention_lines,
+)
 from r2v_data_v2.h3.mimo25_recovered_voice import _semantic_reasons
 from r2v_data_v2.h3.qwen38_h3_recaption import (
     RecaptionAudioContract,
+    RecaptionSubjectContract,
     _canonical_audio_definition,
     _canonical_audio_retention,
     audio_task_prefix,
@@ -105,6 +115,122 @@ def _render(sample, source, sources=None):
         reuse_audio_contracts=[r.contract for r in refs],
     )
     return refs, warnings + render_warnings, corrected, prompt
+
+
+@pytest.mark.parametrize("kind", ["entity", "background", "attribute"])
+@pytest.mark.parametrize("marker", ["fully_preserved", "partially_preserved", "weak_reference"])
+@pytest.mark.parametrize("present", [False, True])
+def test_ref2va_visual_retention_locator_and_narrow_coverage(kind, marker, present):
+    ownership = {"entity_id": "e1"} if kind == "entity" else (
+        {"attribute_id": "a1", "owner_entity_id": "e1", "attribute_type": "hair"}
+        if kind == "attribute" else {}
+    )
+    subject = RecaptionSubjectContract(
+        subject_index=1, subject_label="<Subject 1>", kind=kind,
+        source_picture_labels=["<Picture 2>"], **ownership,
+    )
+    row = MimoVisualRetentionDraft(subject_label="<Subject 1>", marker=marker, description="Visible form retained.")
+    caption = "<Subject 1> remains in view." if present else "A truck remains in view."
+    before = (subject.model_dump(), row.model_dump())
+    if not present and kind in {"entity", "background"} and marker != "weak_reference":
+        with pytest.raises(MimoH3MaterializationContractError) as exc:
+            _visual_retention_lines([subject], [row], caption)
+        assert [i.code for i in exc.value.issues] == ["preserved_visual_subject_missing_from_detailed_description"]
+    else:
+        assert _visual_retention_lines([subject], [row], caption) == [
+            f"<Subject 1> (appears in [Shot 1]): {marker} - Visible form retained."
+        ]
+    assert (subject.model_dump(), row.model_dump()) == before
+    assert row.render() == f"<Subject 1>: {marker} - Visible form retained."
+
+
+def test_ref2va_materializer_checks_caption_not_definition_or_summary(tmp_path):
+    _, sample, source = _case(tmp_path, (), caption="A woman stands in a room.",
+                              summary="<Subject 1> stands in a room.")
+    with pytest.raises(MimoH3MaterializationContractError, match="preserved_visual_subject_missing"):
+        _materialize_sample(sample, source.job, source.record, conditioning_variant="visual_only")
+
+
+def test_ref2va_mixed_subject_retention_keeps_graph_order_and_picture_provenance():
+    subjects = [
+        RecaptionSubjectContract(subject_index=1, subject_label="<Subject 1>", kind="entity",
+                                entity_id="e1", source_picture_labels=["<Picture 1>", "<Picture 2>"]),
+        RecaptionSubjectContract(subject_index=2, subject_label="<Subject 2>", kind="attribute",
+                                owner_entity_id="e1", attribute_id="a1", attribute_type="shoes",
+                                source_picture_labels=["<Picture 3>"]),
+        RecaptionSubjectContract(subject_index=3, subject_label="<Subject 3>", kind="background",
+                                source_picture_labels=["<Picture 4>"]),
+        RecaptionSubjectContract(subject_index=4, subject_label="<Subject 4>", kind="entity",
+                                entity_id="e2", source_picture_labels=["<Picture 5>"]),
+    ]
+    rows = [MimoVisualRetentionDraft(subject_label=s.subject_label, marker="fully_preserved",
+                                    description=f"Retained features {s.subject_index}.") for s in subjects]
+    before = [s.model_dump() for s in subjects]
+    caption = "<Subject 1> stands on <Subject 3> beside <Subject 4>."
+    lines = _visual_retention_lines(subjects, rows, caption)
+    assert lines == [
+        f"<Subject {i}> (appears in [Shot 1]): fully_preserved - Retained features {i}." for i in range(1, 5)
+    ]
+    assert [s.model_dump() for s in subjects] == before
+    with pytest.raises(MimoH3MaterializationContractError):
+        _visual_retention_lines(subjects, rows, caption.replace("<Subject 4>", "<Subject 40>"))
+
+
+@pytest.mark.parametrize("kind", ["visual_only", "target_voice_reference", "music_reference", "full_audio_reuse"])
+def test_ref2va_final_retention_preserves_audio_picture_and_section_contract(tmp_path, kind):
+    from r2v_data_v2.h3.mimo25_h3_materializer import _render_subject_definition
+
+    _, sample, source = _case(tmp_path, music="Gentle piano continues.")
+    extra = None
+    if kind in {"music_reference", "full_audio_reuse"}:
+        extra = RecaptionAudioContract(
+            audio_index=1, audio_label="<Audio 1>", kind=kind,
+            path=source.job.target_full_audio_path, sha256=source.job.target_full_audio_sha256,
+            retention_marker="reference" if kind == "music_reference" else "fully_copy",
+            music_characteristics="gentle piano" if kind == "music_reference" else None,
+        )
+    _, prompt, _ = _materialize_sample(
+        sample, source.job, source.record, conditioning_variant=kind, extra_audio_contract=extra,
+    )
+    names = ["subject_definitions", "summary", "retention_analysis", "detailed_description",
+             "overall_soundscape", "non_diegetic_music"]
+    parts = re.split(r"(?:^|\n\n)(" + "|".join(names) + r"):\n", prompt)
+    assert parts[1::2] == names
+    sections = dict(zip(parts[1::2], parts[2::2], strict=True))
+    direct = source.record.annotation.h3_semantics
+    assert sections["detailed_description"] == f"{direct.style_opening}\n[Shot 1] {direct.shot1_caption}"
+    assert sections["overall_soundscape"] == direct.overall_soundscape
+    assert sections["non_diegetic_music"] == direct.non_diegetic_music
+    expected_definitions = [
+        _render_subject_definition(d, s, subjects=source.job.reference_subjects)
+        for d, s in zip(direct.subject_definitions, source.job.reference_subjects, strict=True)
+    ]
+    assert sections["subject_definitions"].splitlines()[:len(expected_definitions)] == expected_definitions
+    assert "<Picture 1>" in sections["subject_definitions"]
+    assert sections["retention_analysis"].splitlines()[0] == (
+        f"<Subject 1> (appears in [Shot 1]): {direct.visual_retention_analysis[0].marker} - "
+        f"{direct.visual_retention_analysis[0].description}"
+    )
+    contract = build_reference_contract(sample, kind if extra is None else "visual_only")
+    audios = [extra] if extra else contract.audios
+    for audio in audios:
+        if audio.kind == "target_voice":
+            audio = audio.model_copy(update={"voice_characteristics": "Target bright voice"})
+        assert _canonical_audio_retention(audio) in sections["retention_analysis"].splitlines()
+    assert "<Audio 1> (appears" not in prompt
+    if kind == "visual_only":
+        assert "<Audio " not in prompt
+
+
+def test_ref2va_prompt_coverage_preserves_optional_attributes_and_retention_role():
+    assert "first clear appearance in shot1_visual_description" in VISUAL_SYSTEM_PROMPT
+    assert "Attribute Subjects remain optional" in VISUAL_SYSTEM_PROMPT
+    assert "referenced visual role/features" in VISUAL_SYSTEM_PROMPT
+    assert "not target-only placement or action" in VISUAL_SYSTEM_PROMPT
+    assert "Pipeline owns [Shot 1]" in VISUAL_SYSTEM_PROMPT
+    assert "do not mechanically repeat labels or require attribute citations" in SYSTEM_PROMPT
+    assert "principal supplied <Subject N> labels" in SYSTEM_PROMPT
+    assert "do not enumerate every Subject or require every attribute" in SYSTEM_PROMPT
 
 
 @pytest.mark.parametrize("count,music", [(0, True), (1, False), (1, True), (2, True), (3, True), (4, True)])

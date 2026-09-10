@@ -54,7 +54,7 @@ def _subset_inventory(base, clip_ids):
 
 
 def test_finalizer_uses_raw_stems_without_evidence_gates():
-    assert MIMO25_PROMPT_VERSION == "h3_mimo25_speech_assembly_v47"
+    assert MIMO25_PROMPT_VERSION == "h3_mimo25_speech_assembly_v48"
     assert "separated music and sfx audio views of that SAME target" in AUDIO_FINALIZE_SYSTEM_PROMPT
     assert "Original AV remains primary authority" in AUDIO_FINALIZE_SYSTEM_PROMPT
     assert "quiet in the original mix" in AUDIO_FINALIZE_SYSTEM_PROMPT
@@ -638,7 +638,7 @@ def test_real_entry_without_facts_sends_two_audio_then_visual_and_final_av(tmp_p
         == "target_video_speech_assembly"
     )
     final = data["clips"][0]["final_h3"]["text"]
-    assert final.count("[Shot 1]") == 1 and "[[" not in final
+    assert final.count("\n[Shot 1] ") == 1 and "[[" not in final
     assert _annotation().h3_semantics.shot1_caption in final
     assert "overall_soundscape:\nA quiet room tone and a clink." in final
     assert "non_diegetic_music:\nN/A" in final
@@ -784,6 +784,7 @@ def test_segment_inventory_is_review_only_without_transcribed_speech(
         payload[section][field][0]["segment_id"] = "extra_segment"
     payload["audio_observation"]["segment_decisions"][0]["delivery_style"] = None
     payload["h3_semantics"]["shot1_caption"] = "The person sits by a table."
+    payload["visual_observation"]["visual_blocks"][0]["text"] = "<Subject 1> sits by a table."
     backend, completions, stems, jobs = _backend(tmp_path, shadow, [(json.dumps(payload), 8)])
     values = jobs[0].model_dump(mode="json", exclude={"request_fingerprint"})
     if empty_inventory:
@@ -1204,6 +1205,7 @@ def test_marker_severity_uses_distinct_authoritative_speakers(
 ):
     from r2v_data_v2.h3 import mimo25_backend
 
+    caption = "<Subject 1> stands nearby. " + caption
     kwargs, shadow = _fixture(tmp_path, monkeypatch)
     payload = json.loads(_raw())
     payload["h3_semantics"]["shot1_caption"] = caption
@@ -1258,8 +1260,8 @@ def test_explicit_marker_mismatch_remains_hard_in_backend(tmp_path, monkeypatch)
     assert "direct_dialogue_speaker_marker_mismatch" not in row["diagnostics"][-1]["warnings"]
     assert summary.model_call_count == len(completions.requests) == 5
     assert row["text_model_call_count"] == 1
-    assert backend.provenance.schema_version == MIMO25_BACKEND_VERSION == "r2v.h3.mimo25_backend.62"
-    assert backend.provenance.prompt_version == "h3_mimo25_speech_assembly_v47"
+    assert backend.provenance.schema_version == MIMO25_BACKEND_VERSION == "r2v.h3.mimo25_backend.63"
+    assert backend.provenance.prompt_version == "h3_mimo25_speech_assembly_v48"
 
 
 @pytest.mark.parametrize(
