@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -703,6 +704,7 @@ def test_configurable_prompt_route_and_actual_call_provenance(tmp_path, route, e
     assert [call.prompt for call in records[0].calls] == expected
     assert inventory.model_configuration.speech_prompt == "man speaking"
     assert inventory.model_configuration.music_prompt == "music soundtrack"
+    assert inventory.schema_version == "r2v.h3.sam_audio_stem_inventory.3"
 
 
 @pytest.mark.parametrize("field", ["speech_prompt", "music_prompt"])
@@ -715,6 +717,7 @@ def test_invalid_prompt_fails_closed(tmp_path, field, value):
 def test_prompt_configuration_and_inventory_identity(tmp_path):
     _, inventory, _, _ = _run_stems(tmp_path)
     default = inventory.model_configuration
+    assert inventory.schema_version == "r2v.h3.sam_audio_stem_inventory.3"
     assert (default.speech_prompt, default.music_prompt) == ("human voices", "music soundtrack")
     for prompts in ({"speech_prompt": "man speaking"}, {"music_prompt": "piano music"}):
         changed = _configuration(tmp_path, **prompts)
@@ -728,6 +731,77 @@ def test_prompt_configuration_and_inventory_identity(tmp_path):
     old["schema_version"] = "r2v.h3.sam_audio_stem_inventory.2"
     with pytest.raises(ValueError):
         type(inventory).model_validate(old)
+
+
+def _legacy_stem_fixture(tmp_path):
+    output, inventory, _, _ = _run_stems(tmp_path)
+
+    def seal(values, field):
+        values[field] = hashlib.sha256(json.dumps(
+            {k: v for k, v in values.items() if k != field}, ensure_ascii=False,
+            sort_keys=True, separators=(",", ":"), allow_nan=False,
+        ).encode()).hexdigest()
+
+    values = inventory.model_dump(mode="json")
+    values["schema_version"] = "r2v.h3.sam_audio_stem_inventory.2"
+    config = values["model_configuration"]
+    del config["speech_prompt"], config["music_prompt"]
+    seal(config, "configuration_fingerprint")
+    seal(values, "inventory_fingerprint")
+    (output / "inventory.json").write_text(json.dumps(values))
+    records = [json.loads(line) for line in (output / "records.jsonl").read_text().splitlines()]
+    for record in records:
+        record["inventory_fingerprint"] = values["inventory_fingerprint"]
+        record["model_configuration_fingerprint"] = config["configuration_fingerprint"]
+        seal(record, "record_fingerprint")
+    (output / "records.jsonl").write_text("".join(json.dumps(r) + "\n" for r in records))
+    summary = json.loads((output / "summary.json").read_text())
+    summary["inventory_fingerprint"] = values["inventory_fingerprint"]
+    (output / "summary.json").write_text(json.dumps(summary))
+    return output, values
+
+
+def test_frozen_v2_load_preserves_exact_lineage_and_files(tmp_path):
+    output, original = _legacy_stem_fixture(tmp_path)
+    before = {p: p.read_bytes() for p in output.rglob("*") if p.is_file()}
+    inventory, records, summary = load_stem_shadow(output)
+    assert inventory.schema_version == "r2v.h3.sam_audio_stem_inventory.2"
+    assert inventory.model_configuration.speech_prompt == "human voices"
+    assert inventory.model_configuration.music_prompt == "music soundtrack"
+    assert inventory.model_configuration.configuration_fingerprint == original["model_configuration"]["configuration_fingerprint"]
+    assert inventory.inventory_fingerprint == original["inventory_fingerprint"]
+    assert all(r.inventory_fingerprint == inventory.inventory_fingerprint for r in records)
+    assert all(r.model_configuration_fingerprint == inventory.model_configuration.configuration_fingerprint for r in records)
+    assert summary.inventory_fingerprint == inventory.inventory_fingerprint
+    assert all(p.read_bytes() == data for p, data in before.items())
+    assert type(inventory).model_validate_json(inventory.model_dump_json()) == inventory
+    with pytest.raises(ValueError, match="read-only"):
+        run_sam_audio_stem_shadow(inventory=inventory, output_root=output,
+            backend=_SAM(inventory.model_configuration), canonicalizer=_Canonicalizer(), raw_probe_backend=_Media())
+
+
+@pytest.mark.parametrize("change", ["config", "inventory", "nondefault", "v3_legacy_hash", "v3_legacy_inventory_hash", "v3_missing_prompts"])
+def test_versioned_legacy_hash_policy_fails_closed(tmp_path, change):
+    output, values = _legacy_stem_fixture(tmp_path)
+    if change == "config":
+        values["model_configuration"]["device"] = "cpu"
+    elif change == "inventory":
+        values["route"] = "voice_first"
+    elif change == "nondefault":
+        values["model_configuration"]["speech_prompt"] = "man speaking"
+    else:
+        values["schema_version"] = "r2v.h3.sam_audio_stem_inventory.3"
+        if change in {"v3_legacy_hash", "v3_legacy_inventory_hash"}:
+            values["model_configuration"].update(speech_prompt="human voices", music_prompt="music soundtrack")
+        if change == "v3_legacy_inventory_hash":
+            config = values["model_configuration"]
+            config["configuration_fingerprint"] = hashlib.sha256(json.dumps(
+                {k: v for k, v in config.items() if k != "configuration_fingerprint"},
+                ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False,
+            ).encode()).hexdigest()
+    (output / "inventory.json").write_text(json.dumps(values))
+    with pytest.raises(ValueError):
+        load_stem_shadow(output)
 
 
 def test_cli_prompt_defaults_and_override():

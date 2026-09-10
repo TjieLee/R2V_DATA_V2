@@ -212,6 +212,20 @@ class SAMAudioModelConfiguration(SchemaModel):
         return self
 
 
+class _LegacySAMAudioModelConfiguration(SAMAudioModelConfiguration):
+    """Read-only v2 configuration: inferred prompts never enter its legacy hash."""
+
+    speech_prompt: Literal["human voices"] = "human voices"
+    music_prompt: Literal["music soundtrack"] = "music soundtrack"
+
+    @model_validator(mode="after")
+    def validate_configuration(self) -> _LegacySAMAudioModelConfiguration:
+        values = self.model_dump(mode="json", exclude={"configuration_fingerprint", "speech_prompt", "music_prompt"})
+        if self.configuration_fingerprint != _sha256_text(_compact_json(values)):
+            raise ValueError("legacy SAM Audio configuration fingerprint is invalid")
+        return self
+
+
 def _t5_dependency_files(root: Path) -> dict[str, str]:
     required = [root / "config.json"]
     tokenizer = next(
@@ -642,7 +656,7 @@ class SAMAudioStemJob(SchemaModel):
 
 
 class SAMAudioStemInventory(SchemaModel):
-    schema_version: Literal["r2v.h3.sam_audio_stem_inventory.3"] = (
+    schema_version: Literal["r2v.h3.sam_audio_stem_inventory.2", "r2v.h3.sam_audio_stem_inventory.3"] = (
         SAM_AUDIO_STEM_INVENTORY_VERSION
     )
     source_canonical_audio_manifest_path: str
@@ -655,11 +669,24 @@ class SAMAudioStemInventory(SchemaModel):
     selection_mode: Literal["all_canonical_clips", "explicit_case_manifest"]
     route: SAMRoute
     run_both_routes: bool = False
-    model_configuration: SAMAudioModelConfiguration
+    model_configuration: SAMAudioModelConfiguration | _LegacySAMAudioModelConfiguration
     job_count: int = Field(ge=1)
     clip_uids: list[str] = Field(min_length=1)
     jobs: list[SAMAudioStemJob] = Field(min_length=1)
     inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="before")
+    @classmethod
+    def parse_versioned_configuration(cls, values):
+        if isinstance(values, dict) and "model_configuration" in values:
+            configuration = values["model_configuration"]
+            if isinstance(configuration, SAMAudioModelConfiguration):
+                configuration = configuration.model_dump(mode="json")
+            model = (_LegacySAMAudioModelConfiguration
+                     if values.get("schema_version") == "r2v.h3.sam_audio_stem_inventory.2"
+                     else SAMAudioModelConfiguration)
+            return {**values, "model_configuration": model.model_validate(configuration)}
+        return values
 
     @model_validator(mode="after")
     def validate_inventory(self) -> SAMAudioStemInventory:
@@ -674,6 +701,9 @@ class SAMAudioStemInventory(SchemaModel):
         ):
             raise ValueError("SAM Audio case-manifest provenance is incomplete")
         values = self.model_dump(mode="json", exclude={"inventory_fingerprint"})
+        if self.schema_version == "r2v.h3.sam_audio_stem_inventory.2":
+            for name in ("speech_prompt", "music_prompt"):
+                values["model_configuration"].pop(name)
         if self.inventory_fingerprint != _sha256_text(_compact_json(values)):
             raise ValueError("SAM Audio stem inventory fingerprint is invalid")
         return self
@@ -1134,6 +1164,8 @@ def run_sam_audio_stem_shadow(
     raw_probe_backend: AudioMediaBackend,
     overwrite: bool = False,
 ) -> SAMAudioStemSummary:
+    if inventory.schema_version != SAM_AUDIO_STEM_INVENTORY_VERSION:
+        raise ValueError("legacy SAM Audio inventory is read-only; build a current inventory to run")
     if backend.configuration != inventory.model_configuration:
         raise ValueError("SAM Audio backend differs from inventory configuration")
     destination = output_root.expanduser().resolve(strict=False)
