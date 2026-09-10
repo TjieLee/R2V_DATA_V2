@@ -35,10 +35,11 @@ from r2v_data_v2.h3.qwen38_h3_recaption import (
     ConditioningVariant,
     RecaptionSubjectContract,
 )
+from r2v_data_v2.h3.resolved_audio_stems import StemRecord
 from r2v_data_v2.h3.sam_audio_stem_shadow import (
-    SAMAudioStemRecord,
     sha256_file,
     stem_shadow_root,
+    validate_stem_diarization_lineage,
 )
 from r2v_data_v2.h3.schemas import SchemaModel
 
@@ -239,7 +240,12 @@ def _owned_file(path: Path, root: Path) -> Path:
 def load_projection_sources(shadow: Path) -> tuple[list[ProjectionSource], dict[str, str]]:
     """Reconstruct frozen products with existing materialization, never trust prose alone."""
     prepared, products = shadow / PREPARED_STAGE, shadow / PRODUCTS_STAGE
-    for root in (prepared, products, shadow / "separation"):
+    provenance, _, source_stems = validate_stem_diarization_lineage(
+        shadow / "diarization", expected_shadow_root=shadow,
+    )
+    stem_root = Path(provenance.source_stem_root)
+    stems: list[StemRecord] = source_stems
+    for root in (prepared, products, stem_root):
         if root.is_symlink() or root.resolve().parent != shadow.resolve():
             raise ValueError("frame source stage escapes current run")
     hashes = {}
@@ -256,10 +262,11 @@ def load_projection_sources(shadow: Path) -> tuple[list[ProjectionSource], dict[
     inventory = read(prepared / "inventory.json", MimoInventory)
     annotations = read(prepared / "records.jsonl", AudioReusePreparedSource, rows=True)
     samples = read(prepared / "h3/samples.jsonl", FinalH3SampleV2, rows=True)
-    stems = read(shadow / "separation/records.jsonl", SAMAudioStemRecord, rows=True)
-    for path in (prepared / "inventory.json", prepared / "records.jsonl", prepared / "h3/samples.jsonl", shadow / "separation/records.jsonl"):
+    stem_records_path = _owned_file(stem_root / "records.jsonl", shadow)
+    hashes[str(stem_records_path)] = sha256_file(stem_records_path)
+    for path in (prepared / "inventory.json", prepared / "records.jsonl", prepared / "h3/samples.jsonl", stem_records_path):
         if summary.source_hashes.get(str(path)) != hashes[str(path.resolve())]:
-            raise ValueError("frame source product is not bound to current prepared/separation inputs")
+            raise ValueError("frame source product is not bound to current prepared/stem inputs")
     if (summary.materializer_version != AUDIO_REUSE_MATERIALIZER_VERSION
             or summary.clip_uids != [j.clip_uid for j in inventory.jobs]
             or len({p.sample_id for p in records}) != len(records)

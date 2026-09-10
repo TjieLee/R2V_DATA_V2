@@ -7,6 +7,7 @@ import shutil
 import subprocess
 from collections import Counter
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -19,6 +20,7 @@ from r2v_data_v2.h3 import frame_conditioning_projection as frame
 from r2v_data_v2.h3.audio_reuse_finalizer import finalize_audio_reuse_shadow
 from r2v_data_v2.h3.audio_reuse_materializer import _hash
 from r2v_data_v2.h3.audio_shadow_qa_variants import finalize_registry
+from r2v_data_v2.h3.resolved_audio_stems import ResolvedStem, ResolvedStemRecord
 from tests import test_h3_audio_reuse_finalizer as final_fixture
 from tests import test_h3_sam_audio_stem_shadow as sam_fixture
 from tools.materialize_h3_frame_conditioned_products import main
@@ -282,6 +284,104 @@ def test_source_must_match_frozen_deterministic_materialization(tmp_path, monkey
     row["record_fingerprint"] = _hash({k: v for k, v in row.items() if k != "record_fingerprint"})
     path.write_text("".join(json.dumps(r) + "\n" for r in rows))
     with pytest.raises(ValueError, match="deterministic reconstruction"):
+        frame.load_projection_sources(shadow)
+
+
+def _resolved_projection_fixture(tmp_path, monkeypatch, ffmpeg):
+    args, shadow, _ = _fixture(tmp_path, monkeypatch, ffmpeg)
+    original_sources, _ = frame.load_projection_sources(shadow)
+    _, _, legacy = frame.validate_stem_diarization_lineage(
+        shadow / "diarization", expected_shadow_root=shadow,
+    )
+    resolved = []
+    for record in legacy:
+        media = {}
+        for kind in ("speech", "music", "sfx"):
+            stem = record.stem(kind)
+            path = Path(stem.canonical_stem_path)
+            if kind == "speech":
+                path = shadow / "auk_speech_v1/canonical" / f"{record.clip_uid}.wav"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                # Synthetic AuK fixture media only; no inference or production mutation.
+                path.write_bytes(Path(stem.canonical_stem_path).read_bytes())
+            media[kind] = ResolvedStem(
+                kind=kind, source_backend="auk" if kind == "speech" else "sam_audio",
+                canonical_stem_path=str(path), canonical_stem_sha256=frame.sha256_file(path),
+                canonical_frame_count=stem.canonical_frame_count,
+                source_audio_path=stem.source_audio_path, source_audio_sha256=stem.source_audio_sha256,
+                source_end_sample=stem.source_end_sample,
+            ).model_dump(mode="json")
+        values = {
+            "schema_version": "r2v.h3.resolved_stem_record.1", "clip_uid": record.clip_uid,
+            "inventory_fingerprint": "a" * 64, "source_sam_record_fingerprint": record.record_fingerprint,
+            "source_auk_record_fingerprint": "b" * 64, "status": "ready",
+            "verification_state": "unverified", "failure_reason": None, **media,
+        }
+        resolved.append(ResolvedStemRecord(**values, record_fingerprint=_hash(values)))
+    root = shadow / "resolved_stems_v1"
+    root.mkdir()
+    records_path = root / "records.jsonl"
+    records_path.write_text("".join(r.model_dump_json() + "\n" for r in resolved))
+    by_clip = {r.clip_uid: r for r in resolved}
+    prepared = shadow / frame.PREPARED_STAGE
+    annotations = [json.loads(line) for line in (prepared / "records.jsonl").read_text().splitlines()]
+    for row in annotations:
+        row["source_stem_record_fingerprint"] = by_clip[row["clip_uid"]].record_fingerprint
+        row["prepared_fingerprint"] = _hash({k: v for k, v in row.items() if k != "prepared_fingerprint"})
+    (prepared / "records.jsonl").write_text("".join(json.dumps(r) + "\n" for r in annotations))
+    for path in (prepared / "summary.json", shadow / frame.PRODUCTS_STAGE / "summary.json"):
+        summary = json.loads(path.read_text())
+        dependencies = summary["source_hashes"]
+        dependencies.pop(str(shadow / "separation/records.jsonl"), None)
+        dependencies[str(records_path)] = frame.sha256_file(records_path)
+        for name in dependencies:
+            dependencies[name] = frame.sha256_file(Path(name))
+        if path.parent == prepared:
+            summary["prepared_records_sha256"] = frame.sha256_file(prepared / "records.jsonl")
+        path.write_text(json.dumps(summary))
+    calls = []
+
+    def load(diarization, *, expected_shadow_root):
+        assert diarization == shadow / "diarization" and expected_shadow_root == shadow
+        calls.append(diarization)
+        return SimpleNamespace(source_stem_root=str(root)), None, resolved
+
+    # Stub only the shared upstream lineage loader. Its real resolved/legacy
+    # validation is covered by test_h3_resolved_audio_stems; projection remains real.
+    monkeypatch.setattr(frame, "validate_stem_diarization_lineage", load)
+    return args, shadow, original_sources, resolved, calls
+
+
+def test_resolved_projection_preserves_products_and_3n(tmp_path, monkeypatch, ffmpeg):
+    args, shadow, original, resolved, calls = _resolved_projection_fixture(tmp_path, monkeypatch, ffmpeg)
+    before = {p: frame.sha256_file(p) for p in shadow.rglob("*") if p.is_file()}
+    sources, hashes = frame.load_projection_sources(shadow)
+    assert calls and sources == original
+    assert all(r.speech.source_backend == "auk" for r in resolved)
+    assert str(shadow / "resolved_stems_v1/records.jsonl") in hashes
+    assert str(shadow / "separation/records.jsonl") not in hashes
+    summary = frame.materialize_frame_conditioned_products(
+        audio_production_root=args["audio_production_root"], shadow_run_id=args["shadow_run_id"], ffmpeg=ffmpeg,
+    )
+    assert summary.source_ready_product_count == len(sources)
+    assert summary.derived_product_count == 3 * len(sources)
+    assert summary.model_call_count == 0 and not summary.production_artifacts_modified
+    assert all(frame.sha256_file(p) == digest for p, digest in before.items())
+
+
+@pytest.mark.parametrize("stale", ["product_hash", "prepared_fingerprint"])
+def test_resolved_projection_rejects_wrong_stem_snapshot(tmp_path, monkeypatch, ffmpeg, stale):
+    _, shadow, _, resolved, _ = _resolved_projection_fixture(tmp_path, monkeypatch, ffmpeg)
+    if stale == "product_hash":
+        path = shadow / frame.PRODUCTS_STAGE / "summary.json"
+        summary = json.loads(path.read_text())
+        summary["source_hashes"][str(shadow / "resolved_stems_v1/records.jsonl")] = "0" * 64
+        path.write_text(json.dumps(summary))
+        match = "current prepared/stem"
+    else:
+        resolved[0] = resolved[0].model_copy(update={"record_fingerprint": "0" * 64})
+        match = "source SAM fingerprint"
+    with pytest.raises(ValueError, match=match):
         frame.load_projection_sources(shadow)
 
 
