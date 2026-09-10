@@ -59,10 +59,17 @@ def test_overlay_rejects_foreign_provenance(tmp_path, change, message):
         prep.overlay_reconcile_sources([source.record], [source.record, source.record])
 
 
-@pytest.mark.parametrize("version", [60, 61])
+@pytest.mark.parametrize("version", [60, 61, 62])
 def test_frozen_source_preserves_real_schema_provenance_and_annotation(tmp_path, version):
     args = _fixture(tmp_path)
     raw = stem_record_values(tmp_path, args["job"], args["annotation"], args["stem_record"], backend_version=version)
+    if version < 62:
+        provenance = raw["backend_provenance"]
+        provenance["prompt_version"] = "h3_mimo25_speech_assembly_v46"
+        provenance["configuration_fingerprint"] = prep._hash({
+            k: v for k, v in provenance.items() if k != "configuration_fingerprint"
+        })
+        raw["record_fingerprint"] = prep._hash({k: v for k, v in raw.items() if k != "record_fingerprint"})
     (tmp_path / "records.jsonl").write_text(json.dumps(raw))
     before = (tmp_path / "records.jsonl").read_bytes()
     record = prep.load_reconcile_sources(tmp_path)[0]

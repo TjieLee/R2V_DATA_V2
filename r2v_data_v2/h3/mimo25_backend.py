@@ -31,13 +31,13 @@ from r2v_data_v2.structured_output import (
 
 MIMO25_MODEL = "mimo-v2.5"
 MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
-MIMO25_PROMPT_VERSION = "h3_mimo25_speech_assembly_v46"
+MIMO25_PROMPT_VERSION = "h3_mimo25_speech_assembly_v47"
 MIMO25_SPEAKER_PROFILE_PROMPT_VERSION = "h3_mimo25_speaker_profile_v2"
 MIMO25_AUDIO_FINALIZE_PROMPT_VERSION = "h3_mimo25_audio_finalize_v6"
 MIMO25_VISUAL_PROMPT_VERSION = "h3_mimo25_visual_only_v4"
 MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v17"
 MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.20"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.61"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.62"
 MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION = "h3_mimo25_speaker_marker_polish_v4"
 MIMO25_ICL_VERSION = "h3_official_ref2va_detailed_shot1_v4"
 MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v26"
@@ -975,7 +975,7 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.61"] = MIMO25_BACKEND_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.62"] = MIMO25_BACKEND_VERSION
     audio_finalize_prompt_version: Literal["h3_mimo25_audio_finalize_v6"] = (
         MIMO25_AUDIO_FINALIZE_PROMPT_VERSION
     )
@@ -1003,7 +1003,7 @@ class MimoBackendProvenance(SchemaModel):
     media_mode: Literal["base64", "http"]
     media_root: str
     media_base_url: str | None = None
-    prompt_version: Literal["h3_mimo25_speech_assembly_v46"] = (
+    prompt_version: Literal["h3_mimo25_speech_assembly_v47"] = (
         MIMO25_PROMPT_VERSION
     )
     policy_version: Literal["h3_mimo25_av_authority_contract_v17"] = (
@@ -1365,6 +1365,8 @@ AUDIO + AV GROUNDING
 - Transcribed overlapping_secondary_speech or sequential_multi_speaker_speech blocks final publication pending authoritative turn refinement; preserve the raw caption for QA, never heuristically split ASR.
 
 VISIBLE SPEAKER BINDING
+- For each exact segment, binding_status="visible_entity", entity_id=eX is legal ONLY if eX is in that segment's Turn 1 visible_entity_ids. An entity explicitly absent from that exact visible set is a current-segment visual contradiction, overriding current_entity_id, direct_anchor_present, LR-ASD and source-cluster proposals. Never publish an absent entity as the visible speaker to follow an upstream proposal.
+- In this contradiction, do not guess another visible entity and do not infer offscreen. Without explicit original-AV offscreen evidence, use entity_id=null, binding_status=no_reliable_entity or uncertain, and speech_presentation=uncertain.
 - The final target AV is allowed to identify a visible speaker directly. If the full AV reasonably indicates that a known visible entity is speaking, bind that entity directly.
 - LR-ASD, source clusters and supporting visual cues are supporting clues, NOT mandatory prerequisites. Absence of supporting evidence is NOT a contradiction.
 - Use no_reliable_entity / uncertain only when the speaker is genuinely ambiguous, multiple speakers prevent safe attribution, or the AV contains concrete contradictory evidence.
@@ -2508,6 +2510,30 @@ def _downgrade_unknown_grounding_entities(
     return MimoAVAnnotationDraft.model_validate(payload), correction_count
 
 
+def _downgrade_absent_visible_entities(
+    annotation: MimoAVAnnotationDraft,
+) -> tuple[MimoAVAnnotationDraft, int]:
+    views = {view.segment_id: view for view in annotation.visual_observation.segment_views}
+    payload = annotation.model_dump(mode="python")
+    count = 0
+    for decision in payload["av_grounding"]["segment_groundings"]:
+        view = views.get(decision["segment_id"])
+        if (view is None or decision["binding_status"] != "visible_entity"
+                or decision["entity_id"] is None or decision["entity_id"] in view.visible_entity_ids):
+            continue
+        offscreen = "offscreen_audio" in decision["evidence_codes"]
+        decision.update(
+            entity_id=None, confidence="low",
+            binding_status="offscreen" if offscreen else "no_reliable_entity",
+            speech_presentation="offscreen_spoken" if offscreen else "uncertain",
+        )
+        _append_insufficient_evidence(decision)
+        count += 1
+    if not count:
+        return annotation, 0
+    return MimoAVAnnotationDraft.model_validate(payload), count
+
+
 def _drop_voice_profile_identity_claims(
     annotation: MimoAVAnnotationDraft,
 ) -> tuple[MimoAVAnnotationDraft, int]:
@@ -2747,6 +2773,9 @@ def _normalize_speaker_annotation(
         allowed_entity_ids=allowed_entity_ids,
     )
     corrections["unknown_grounding_entity_downgrade"] += count
+
+    annotation, count = _downgrade_absent_visible_entities(annotation)
+    corrections["visible_entity_absent_from_visual_segment_downgrade"] += count
 
     annotation, count = _conservative_offscreen_presentation_downgrade(annotation)
     corrections["conservative_offscreen_presentation_downgrade"] += count
