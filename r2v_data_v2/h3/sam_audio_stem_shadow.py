@@ -12,9 +12,9 @@ import uuid
 from collections import Counter
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Annotated, Literal, Protocol
 
-from pydantic import Field, model_validator
+from pydantic import AfterValidator, Field, StrictStr, model_validator
 
 from r2v_data_v2.h3.audio_backends import (
     AudioFileProbe,
@@ -55,7 +55,7 @@ from r2v_data_v2.h3.schemas import SchemaModel
 
 SAM_AUDIO_SHADOW_ROOT_NAME = "sam_audio_stem_shadow_v1"
 SAM_AUDIO_SEPARATION_STAGE_NAME = "separation"
-SAM_AUDIO_STEM_INVENTORY_VERSION = "r2v.h3.sam_audio_stem_inventory.2"
+SAM_AUDIO_STEM_INVENTORY_VERSION = "r2v.h3.sam_audio_stem_inventory.3"
 SAM_AUDIO_STEM_RECORD_VERSION = "r2v.h3.sam_audio_stem_record.3"
 SAM_AUDIO_STEM_SUMMARY_VERSION = "r2v.h3.sam_audio_stem_summary.2"
 STEM_DIARIZATION_SHADOW_VERSION = "r2v.h3.stem_diarization_shadow.4"
@@ -173,7 +173,18 @@ def require_shadow_output_path(*, shadow_root: Path, output_path: Path) -> Path:
     return output
 
 
+def _validate_sam_prompt(prompt: str) -> str:
+    if not prompt or prompt != prompt.strip() or prompt != prompt.lower():
+        raise ValueError("SAM Audio prompt must be non-empty, lowercase, and trimmed")
+    return prompt
+
+
+SAMAudioPrompt = Annotated[StrictStr, Field(min_length=1), AfterValidator(_validate_sam_prompt)]
+
+
 class SAMAudioModelConfiguration(SchemaModel):
+    speech_prompt: SAMAudioPrompt
+    music_prompt: SAMAudioPrompt
     implementation_root: str
     implementation_files: dict[str, str]
     model_path: str
@@ -281,7 +292,11 @@ def sam_audio_configuration(
     t5_base_path: Path,
     device: str,
     reranking_candidates: int,
+    speech_prompt: str = "human voices",
+    music_prompt: str = "music soundtrack",
 ) -> SAMAudioModelConfiguration:
+    _validate_sam_prompt(speech_prompt)
+    _validate_sam_prompt(music_prompt)
     code = implementation_root.expanduser().resolve(strict=True)
     checkpoint = model_path.expanduser().resolve(strict=True)
     t5 = t5_base_path.expanduser().resolve(strict=True)
@@ -318,6 +333,8 @@ def sam_audio_configuration(
         raise ValueError("SAM Audio runtime configuration is incomplete")
     values = {
         "implementation_root": str(code),
+        "speech_prompt": speech_prompt,
+        "music_prompt": music_prompt,
         "implementation_files": _implementation_files(code),
         "model_path": str(checkpoint),
         "model_name": derived_name,
@@ -506,7 +523,7 @@ class OfficialSAMAudioBackend:
 
 class SAMAudioCallProvenance(SchemaModel):
     pass_index: Literal[1, 2]
-    prompt: Literal["music soundtrack", "human voices"]
+    prompt: SAMAudioPrompt
     input_path: str
     input_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     target_path: str
@@ -625,7 +642,7 @@ class SAMAudioStemJob(SchemaModel):
 
 
 class SAMAudioStemInventory(SchemaModel):
-    schema_version: Literal["r2v.h3.sam_audio_stem_inventory.2"] = (
+    schema_version: Literal["r2v.h3.sam_audio_stem_inventory.3"] = (
         SAM_AUDIO_STEM_INVENTORY_VERSION
     )
     source_canonical_audio_manifest_path: str
@@ -838,7 +855,7 @@ def build_sam_audio_stem_inventory(
 def _call_provenance(
     *,
     pass_index: Literal[1, 2],
-    prompt: Literal["music soundtrack", "human voices"],
+    prompt: str,
     input_path: Path,
     result: SAMAudioSeparationResult,
 ) -> SAMAudioCallProvenance:
@@ -968,11 +985,11 @@ def _separate_one_route(
     canonical_root = output_root / "canonical_stems" / job.clip_uid / route
     raw_root.mkdir(parents=True, exist_ok=True)
     canonical_root.mkdir(parents=True, exist_ok=True)
-    first_prompt: Literal["music soundtrack", "human voices"] = (
-        "music soundtrack" if route == "music_first" else "human voices"
+    first_prompt = (
+        inventory.model_configuration.music_prompt if route == "music_first" else inventory.model_configuration.speech_prompt
     )
-    second_prompt: Literal["music soundtrack", "human voices"] = (
-        "human voices" if route == "music_first" else "music soundtrack"
+    second_prompt = (
+        inventory.model_configuration.speech_prompt if route == "music_first" else inventory.model_configuration.music_prompt
     )
     first_target = raw_root / f"{'music' if route == 'music_first' else 'speech'}.raw.wav"
     intermediate = raw_root / "residual_1.raw.wav"

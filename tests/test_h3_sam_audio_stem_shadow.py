@@ -395,7 +395,7 @@ def _multi_canonical_fixture(
     return manifest, records, case
 
 
-def _configuration(tmp_path: Path):
+def _configuration(tmp_path: Path, **prompts):
     code = tmp_path / "sam-code"
     model = tmp_path / "sam-model"
     t5 = tmp_path / "t5-base"
@@ -431,6 +431,7 @@ def _configuration(tmp_path: Path):
         t5_base_path=t5,
         device="cuda:0",
         reranking_candidates=1,
+        **prompts,
     )
 
 
@@ -442,9 +443,11 @@ def _run_stems(
     canonicalizer: _Canonicalizer | None = None,
     raw_duration_delta: float | None = None,
     shadow_run_id: str | None = None,
+    speech_prompt: str = "human voices",
+    music_prompt: str = "music soundtrack",
 ) -> tuple[Path, object, _SAM, _Canonicalizer]:
     manifest, _, _ = _canonical_fixture(tmp_path)
-    configuration = _configuration(tmp_path)
+    configuration = _configuration(tmp_path, speech_prompt=speech_prompt, music_prompt=music_prompt)
     inventory = build_sam_audio_stem_inventory(
         canonical_audio_manifest_path=manifest,
         model_configuration=configuration,
@@ -687,6 +690,54 @@ def test_voice_first_mapping_and_route_provenance(tmp_path: Path) -> None:
     assert records[0].route == "voice_first"
     assert records[0].stem("speech").raw_stem_path.endswith("speech.raw.wav")
     assert records[0].stem("music").raw_stem_path.endswith("music.raw.wav")
+
+
+@pytest.mark.parametrize("route,expected", [
+    ("voice_first", ["man speaking", "music soundtrack"]),
+    ("music_first", ["music soundtrack", "man speaking"]),
+])
+def test_configurable_prompt_route_and_actual_call_provenance(tmp_path, route, expected):
+    output, inventory, backend, _ = _run_stems(tmp_path, route=route, speech_prompt="man speaking")
+    _, records, _ = load_stem_shadow(output)
+    assert [call[1] for call in backend.calls] == expected
+    assert [call.prompt for call in records[0].calls] == expected
+    assert inventory.model_configuration.speech_prompt == "man speaking"
+    assert inventory.model_configuration.music_prompt == "music soundtrack"
+
+
+@pytest.mark.parametrize("field", ["speech_prompt", "music_prompt"])
+@pytest.mark.parametrize("value", ["", "   ", "Human voices", " human voices", "human voices "])
+def test_invalid_prompt_fails_closed(tmp_path, field, value):
+    with pytest.raises(ValueError, match="non-empty, lowercase, and trimmed"):
+        _configuration(tmp_path, **{field: value})
+
+
+def test_prompt_configuration_and_inventory_identity(tmp_path):
+    _, inventory, _, _ = _run_stems(tmp_path)
+    default = inventory.model_configuration
+    assert (default.speech_prompt, default.music_prompt) == ("human voices", "music soundtrack")
+    for prompts in ({"speech_prompt": "man speaking"}, {"music_prompt": "piano music"}):
+        changed = _configuration(tmp_path, **prompts)
+        assert changed.configuration_fingerprint != default.configuration_fingerprint
+        derived = build_sam_audio_stem_inventory(
+            canonical_audio_manifest_path=Path(inventory.source_canonical_audio_manifest_path),
+            model_configuration=changed, route=inventory.route,
+        )
+        assert derived.inventory_fingerprint != inventory.inventory_fingerprint
+    old = inventory.model_dump(mode="json")
+    old["schema_version"] = "r2v.h3.sam_audio_stem_inventory.2"
+    with pytest.raises(ValueError):
+        type(inventory).model_validate(old)
+
+
+def test_cli_prompt_defaults_and_override():
+    from tools.run_h3_sam_audio_stem_shadow import _parser
+    required = ["--audio-production-root", "/audio", "--sam-audio-code-root", "/code",
+                "--sam-audio-model-path", "/model", "--sam-audio-t5-base-path", "/t5"]
+    args = _parser().parse_args(required)
+    assert (args.sam_speech_prompt, args.sam_music_prompt) == ("human voices", "music soundtrack")
+    args = _parser().parse_args(required + ["--sam-route", "voice_first", "--sam-speech-prompt", "man speaking"])
+    assert (args.sam_route, args.sam_speech_prompt, args.sam_music_prompt) == ("voice_first", "man speaking", "music soundtrack")
 
 
 def test_both_routes_are_explicit_and_bounded(tmp_path: Path) -> None:
