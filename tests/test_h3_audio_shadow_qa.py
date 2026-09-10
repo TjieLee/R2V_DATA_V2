@@ -308,9 +308,12 @@ def test_final_h3_keeps_conditioning_variants_separate(tmp_path, monkeypatch):
     qa.build_audio_shadow_qa(**kwargs)
     final = json.loads((shadow / "qa/data.json").read_text())["clips"][0]["final_h3"]
     assert [row["sample_id"] for row in final["variants"]] == [
-        "clip-z/canonical", "clip-z/in_pair",
+        "clip-z/canonical", "clip-z/in_pair", "clip-z/audio_reuse",
     ]
-    canonical, voice = final["variants"]
+    canonical, voice, full = final["variants"]
+    assert full["source_kind"] == "qa_derived" and full["publication_status"] == "review_only"
+    assert full["references"]["audios"][0]["kind"] == "full_audio_reuse"
+    assert full["references"]["audios"][0]["retention_marker"] == "fully_copy"
     assert final["text"] == canonical["text"]
     assert "[reference generation]" in canonical["text"]
     assert "<Audio 1>" not in canonical["text"]
@@ -329,7 +332,10 @@ def test_reference_media_and_cross_provenance_are_variant_owned(tmp_path, monkey
     before = _snapshot(tmp_path)
     qa.build_audio_shadow_qa(**kwargs)
     data = json.loads((shadow / "qa/data.json").read_text())
-    canonical, cross, target = data["clips"][0]["final_h3"]["variants"]
+    canonical, cross, target, full = data["clips"][0]["final_h3"]["variants"]
+    assert full["references"]["audios"][0]["sha256"] == qa._rows(
+        kwargs["audio_production_root"] / "h3/samples.jsonl", FinalH3SampleV2,
+    )[0].target_full_audio_sha256
     for variant in (canonical, cross, target):
         refs = variant["references"]
         assert refs["subjects"][0]["source_picture_labels"] == ["<Picture 1>"]
@@ -696,6 +702,10 @@ def test_synthetic_browser_review_desktop_mobile(tmp_path, monkeypatch):
     if not node or not playwright:
         pytest.skip("optional preinstalled Playwright not configured")
     kwargs, shadow = _fixture(tmp_path, monkeypatch, variants=True, cross_variant=True)
+    from tests.test_h3_audio_shadow_qa_variants import _write_mimo, _write_products
+
+    _write_products(kwargs, shadow)
+    _write_mimo(kwargs, shadow, kind="music_reference")
     qa.build_audio_shadow_qa(**kwargs)
     script = tmp_path / "browser.cjs"
     script.write_text(r'''
@@ -727,6 +737,21 @@ const {chromium} = require(process.argv[2]);
     assert.strictEqual(await page.locator("#materializer-version").textContent(), dataset.clips[0].final_h3.materializer_version);
     assert.strictEqual(await page.locator("#audio-references audio").count(), 0);
     assert.strictEqual(await page.locator("#references img").count(), 1);
+    const variants = dataset.clips[0].final_h3.variants;
+    for (let i = 0; i < variants.length; i++) {
+      await page.locator("#final-variant").selectOption(String(i));
+      assert.strictEqual(await page.locator("#final-text").textContent(), variants[i].text);
+      assert.strictEqual(await page.locator("#audio-references audio").count(), variants[i].references.audios.length);
+      assert((await page.locator("#variant-source").textContent()).includes(variants[i].source_kind));
+      assert.deepStrictEqual(await page.locator("#references img").evaluateAll(images => images.map(x => x.getAttribute("src"))),
+        variants[i].references.pictures.map(p => p.url));
+      if (variants[i].conditioning_variant === "full_audio_reuse") {
+        assert.match(await page.locator("#audio-references").textContent(), /fully_copy.*canonical_full_audio/s);
+        assert(!/Subject:|Speaker:/.test(await page.locator("#audio-references").textContent()));
+      }
+      assert.strictEqual(await page.locator("#variant-coverage .selected").count() > 0, true);
+    }
+    await page.locator("#final-variant").selectOption("0");
     assert.match(await page.locator("#subject-graph").textContent(), /<Subject 1>.*<Picture 1>/s);
     await page.locator("#final-variant").selectOption("1");
     assert.strictEqual(await page.locator("#final-text").textContent(), dataset.clips[0].final_h3.variants[1].text);
@@ -797,6 +822,10 @@ const {chromium} = require(process.argv[2]);
     assert.strictEqual(await page.locator("#variant-warnings.failed").count(), 0);
     assert.strictEqual(await page.evaluate(() => window.injected), undefined);
     assert.strictEqual(await page.locator("#audio-references script").count(), 0);
+    await page.evaluate(clip => { data.clips[0] = clip; document.getElementById("message").textContent = ""; }, dataset.clips[0]);
+    const fullIndex = variants.findIndex(v => v.conditioning_variant === "full_audio_reuse" && v.publication_status === "published");
+    await page.locator("#final-variant").selectOption(String(fullIndex));
+    await page.getByText("Reference Variant Coverage", {exact:true}).click();
     await page.screenshot({path:path.join(process.argv[4], "qa-desktop.png"), fullPage:true});
     await page.setViewportSize({width:390,height:844});
     await page.screenshot({path:path.join(process.argv[4], "qa-mobile.png"), fullPage:true});

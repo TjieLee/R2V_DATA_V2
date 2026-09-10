@@ -34,6 +34,8 @@ video{width:100%;aspect-ratio:16/9;max-height:540px;background:#151817}audio{wid
 #dropped-references .ref-card{background:#f0f2f4}#dropped-references img{opacity:.6}
 #variant-warnings{color:#795811;background:#fff8e7;padding:10px;margin:10px 0;overflow-wrap:anywhere}
 #variant-warnings:empty{display:none}#conditioning h2{margin-bottom:4px}
+#variant-coverage{display:flex;flex-wrap:wrap;gap:6px 18px;font-size:12px;padding:8px 0}
+#variant-coverage .selected{font-weight:700;color:#176c9a}#variant-source{font-size:12px;overflow-wrap:anywhere}
 figure{margin:0;min-width:0}figure img{width:100%;height:150px;object-fit:contain;background:white;border:1px solid #d7dde0}
 figcaption{font-size:12px;overflow-wrap:anywhere}details{border-top:1px solid #cbd2d6;padding:12px 0;margin-top:12px}
 summary{font-weight:650;cursor:pointer}pre{white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.5 ui-monospace,monospace;max-height:400px;overflow:auto;margin:8px 0}
@@ -80,6 +82,8 @@ small{color:#626e73}a{color:#176c9a}#loading{padding:20px}
 </div>
 <section id="conditioning">
 <h2>Reference Conditioning <small id="conditioning-variant"></small></h2>
+<p id="variant-source"></p>
+<details><summary>Reference Variant Coverage</summary><div id="variant-coverage"></div></details>
 <p id="reference-unavailable" hidden>[reference contract unavailable]</p>
 <div id="reference-counts" class="ref-meta"></div>
 <div id="variant-warnings" role="status"></div>
@@ -183,6 +187,12 @@ function renderReferences(variant) {
     $(id).replaceChildren();
   const refs = variant.references;
   $("conditioning-variant").textContent = " / " + (variant.sample_id || "selected H3 variant");
+  $("variant-source").textContent = [variant.source_kind, variant.publication_status, variant.source_root].filter(Boolean).join(" / ");
+  $("variant-coverage").replaceChildren();
+  Object.entries(data.clips[index].reference_variant_coverage || {}).forEach(([kind, status]) => {
+    const selected = variant.conditioning_variant === kind || (refs?.audios || []).some(a => a.kind === kind);
+    $("variant-coverage").append(textElement("span", kind + ": " + status, selected ? "selected" : ""));
+  });
   $("reference-unavailable").hidden = !!refs;
   if ((variant.warnings || []).length) {
     $("variant-warnings").append(textElement("strong", "Warnings"));
@@ -217,7 +227,8 @@ function renderReferences(variant) {
     metadata(card, "Voice", ref.voice_characteristics); metadata(card, "Music", ref.music_characteristics);
     const provenance = ref.provenance || {};
     for (const name of ["source_segment_id", "source_segment_ids", "source_sample_ranges", "source_start", "source_end",
-      "donor_clip_uid", "donor_occurrence_id", "donor_entity_id", "event_id", "music_description", "rms_dbfs", "clipping_ratio"])
+      "source_clip_uid", "donor_clip_uid", "donor_occurrence_id", "donor_entity_id", "event_id", "source_event_id",
+      "source_start_time", "source_end_time", "music_description", "rms_dbfs", "clipping_ratio"])
       metadata(card, name, provenance[name] ?? provenance.reuse_asset?.[name]);
     if (ref.source_type === "mimo_recovered_target_voice") card.append(textElement("p", "Recovered", "badge"));
     const url = mediaURL(ref.url);
@@ -289,7 +300,8 @@ function render() {
   $("final-variant").replaceChildren();
   final.variants.forEach((variant, i) => {
     const option = document.createElement("option"); option.value = String(i);
-    option.textContent = variant.sample_id + " / " + variant.pair_type;
+    option.textContent = variant.sample_id + " / " + variant.conditioning_variant +
+      " [" + (variant.publication_status === "published" ? "published" : "review") + "; " + variant.source_kind + "]";
     $("final-variant").append(option);
   });
   $("final-variant").value = "0";
@@ -438,7 +450,7 @@ fetch("data.json", {cache: "no-store"}).then(response => {
   if (!response.ok) throw new Error("Cannot load data.json: " + response.status);
   return response.json();
 }).then(payload => {
-  if (payload.schema_version !== "r2v.h3.audio_shadow_qa.8" || !payload.clips.length) throw new Error("Invalid QA dataset.");
+  if (payload.schema_version !== "r2v.h3.audio_shadow_qa.9" || !payload.clips.length) throw new Error("Invalid QA dataset.");
   data = payload;
   data.clips.forEach((clip, i) => {
     const option = document.createElement("option"); option.value = String(i);

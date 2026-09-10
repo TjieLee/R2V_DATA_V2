@@ -11,6 +11,7 @@ from typing import TypeVar
 
 from pydantic import BaseModel
 
+from r2v_data_v2.h3.audio_shadow_qa_variants import discover_products, finalize_registry
 from r2v_data_v2.h3.diarization_binding import (
     BoundDiarizationSegment,
     DiarizationClipResult,
@@ -21,6 +22,7 @@ from r2v_data_v2.h3.jea_final_renderer import FinalH3SampleV2, FinalQwen3SpeechS
 from r2v_data_v2.h3.mimo25_av_reconcile import (
     MimoCaseManifest,
     MimoClipJob,
+    _inventory,
     build_mimo25_inventory,
 )
 from r2v_data_v2.h3.mimo25_backend import (
@@ -29,6 +31,7 @@ from r2v_data_v2.h3.mimo25_backend import (
 )
 from r2v_data_v2.h3.mimo25_h3_materializer import (
     MimoH3MaterializationContractError,
+    _extra_audio_contract,
     _MaterializationContext,
     _materialize_sample,
     _prepare_materialization_context,
@@ -51,8 +54,8 @@ from r2v_data_v2.h3.sam_audio_stem_shadow import (
 )
 from r2v_data_v2.structured_output import normalize_structured_json_envelope
 
-QA_DATA_VERSION = "r2v.h3.audio_shadow_qa.8"
-QA_REVIEW_VERSION = "r2v.h3.audio_shadow_human_qa.3"
+QA_DATA_VERSION = "r2v.h3.audio_shadow_qa.9"
+QA_REVIEW_VERSION = "r2v.h3.audio_shadow_human_qa.4"
 QA_LABELS = (
     "better", "same", "worse", "speaker_wrong",
     "dialogue_wrong", "audio_wrong", "visual_hallucination",
@@ -141,6 +144,11 @@ def _reference_payload(
     subjects = [subject.model_dump(mode="json") for subject in context.contract.subjects]
     audios = []
     for audio in context.contract.audios:
+        if audio.kind == "full_audio_reuse" and (
+            Path(audio.path).resolve() != Path(job.target_full_audio_path).resolve()
+            or audio.sha256 != job.target_full_audio_sha256
+        ):
+            raise ValueError("QA canonical full Audio provenance differs from current job")
         provenance = dict((audio_provenance or {}).get(audio.audio_label, {}))
         voices = [v for v in context.sample.subject_voices
                   if v.voice_reference_path == audio.path
@@ -202,7 +210,7 @@ def _destination(
         try:
             previous = json.loads((destination / "data.json").read_text(encoding="utf-8"))
             owned = (
-                previous["schema_version"] in {"r2v.h3.audio_shadow_qa.7", QA_DATA_VERSION}
+                previous["schema_version"] in {"r2v.h3.audio_shadow_qa.7", "r2v.h3.audio_shadow_qa.8", QA_DATA_VERSION}
                 and previous["source_shadow_root"] == str(shadow)
             )
         except (OSError, ValueError, KeyError, TypeError):
@@ -313,6 +321,16 @@ def build_audio_shadow_qa(
     clusters = _rows(diarization / "cluster_bindings.jsonl", DiarizationClusterBinding)
     clip_results = _rows(diarization / "clip_results.jsonl", DiarizationClipResult)
     transcripts = _rows(asr / "segments.jsonl", Qwen3ASRSegment)
+    effective_inventory = _inventory({
+        **base.model_dump(mode="json", exclude={"inventory_fingerprint"}),
+        "jobs": [j.model_dump(mode="json") for j in jobs],
+        "clip_count": len(jobs),
+    })
+    published = discover_products(
+        shadow=shadow, jobs=jobs, reconcile=reconcile, samples=samples,
+        stems=[s for s in stems if s.route == summary.route], inventories=[base, effective_inventory],
+        source_hashes=source_hashes, fingerprint=_fingerprint,
+    )
     media: dict[str, dict[str, str]] = {}
 
     def media_link(source: str, expected_sha256: str) -> str:
@@ -374,14 +392,19 @@ def build_audio_shadow_qa(
             ).model_dump(mode="python") for item in current.segments
                 if item.asr_status == "transcribed"]
             variants = []
-            for sample_id in sorted(current.source_h3_sample_ids):
+            plans = [(sid, None) for sid in sorted(current.source_h3_sample_ids)]
+            plans += [(sid, "full_audio_reuse") for sid in sorted(current.source_h3_sample_ids)
+                      if samples_by_id[sid].pair_type == "canonical" and len(current.reference_images) < 12]
+            for sample_id, requested_variant in plans:
                 source = samples_by_id[sample_id]
                 sample = FinalH3SampleV2.model_validate({
                     **source.model_dump(mode="python"), "speech_segments": speech,
                 })
                 try:
                     materializer_input = _MaterializerInput(record.annotation, record.source_job_fingerprint)
-                    context = _prepare_materialization_context(sample, current, materializer_input)
+                    context = _prepare_materialization_context(
+                        sample, current, materializer_input, conditioning_variant=requested_variant,
+                    )
                 except MimoH3MaterializationContractError:
                     context = None
                 references = _reference_payload(
@@ -389,15 +412,62 @@ def build_audio_shadow_qa(
                 ) if context is not None else None
                 try:
                     _, text, warnings = _materialize_sample(
-                        sample, current, materializer_input,
+                        sample, current, materializer_input, conditioning_variant=requested_variant,
                     )
                     variant = {"status": "ready", "text": text, "warnings": warnings, "reason": None}
                 except MimoH3MaterializationContractError as error:
                     variant = {"status": "unavailable", "text": None,
                                "reason": "materialization_contract_failed",
                                "issues": [item.to_dict() for item in error.issues]}
-                variants.append({"sample_id": sample_id, "pair_type": source.pair_type,
+                variant_name = requested_variant or {"canonical": "visual_only", "in_pair": "target_voice_reference",
+                                                     "cross_pair": "cross_voice_reference"}[source.pair_type]
+                variants.append({"sample_id": f"{clip}/audio_reuse" if requested_variant else sample_id,
+                                 "source_h3_sample_id": sample_id, "pair_type": source.pair_type,
+                                 "conditioning_variant": variant_name,
+                                 "source_kind": "qa_derived" if requested_variant else "source_h3",
+                                 "publication_status": "review_only",
                                  "references": references, **variant})
+            for source_kind, product_root, product, source in published:
+                if product.clip_uid != clip:
+                    continue
+                refs = None
+                if product.status == "ready":
+                    values = {**source.model_dump(mode="python"), "speech_segments": speech}
+                    options = {"conditioning_variant": product.conditioning_variant}
+                    if source_kind == "audio_reuse_product":
+                        options["reuse_audio_contracts"] = [r.contract for r in product.audio_references]
+                        provenance = {r.contract.audio_label: r.model_dump(mode="json") for r in product.audio_references}
+                    else:
+                        values["subject_voices"] = product.effective_subject_voices
+                        provenance = {f"<Audio {r.audio_index}>": r.model_dump(mode="json") for r in product.audio_references}
+                        for ref in product.audio_references:
+                            recovery = next((r for r in product.recovered_voice_references
+                                             if r.status == "selected" and r.source_segment_id == ref.source_segment_id
+                                             and r.entity_id == ref.entity_id), None)
+                            if recovery is not None:
+                                provenance[f"<Audio {ref.audio_index}>"]["recovery"] = recovery.model_dump(mode="json")
+                        extras = [r for r in product.audio_references if r.role != "voice_reference"]
+                        if extras:
+                            options["extra_audio_contract"] = _extra_audio_contract(extras[0], render_path=Path(extras[0].audio_path))
+                    context = _prepare_materialization_context(
+                        FinalH3SampleV2.model_validate(values), current, materializer_input, **options,
+                    )
+                    if context.corrected != product.corrected_speech_segments:
+                        raise ValueError("QA published speech differs from current materialization contract")
+                    if source_kind == "mimo_h3_shadow" and [
+                        (a.path, a.sha256, a.entity_id, a.speaker_id) for a in context.contract.audios
+                    ] != [(a.audio_path, a.audio_sha256, a.entity_id, a.speaker_id) for a in product.audio_references]:
+                        raise ValueError("QA published Audio differs from effective reference contract")
+                    refs = _reference_payload(context, current, [source], media_link, audio_provenance=provenance)
+                variants.append({
+                    "sample_id": product.sample_id, "source_h3_sample_id": product.source_h3_sample_id,
+                    "pair_type": product.pair_type, "conditioning_variant": product.conditioning_variant,
+                    "source_kind": source_kind, "source_root": str(product_root), "publication_status": "published",
+                    "status": "ready" if product.status == "ready" else "unavailable",
+                    "text": product.rendered_h3_prompt, "warnings": product.warnings,
+                    "reason": product.failure_reason, "references": refs,
+                })
+            variants, _ = finalize_registry(variants, _fingerprint)
             final_h3.update(variants[0], variants=variants)
         elif record is not None:
             final_h3.update(
@@ -434,6 +504,7 @@ def build_audio_shadow_qa(
             },
             "separation": {**stem_record.model_dump(mode="json"), "media": stem_media},
             "final_h3": final_h3,
+            "reference_variant_coverage": finalize_registry(final_h3["variants"], _fingerprint)[1],
             "direct_h3": _direct_h3(record),
             "production_h3": [
                 {"sample_id": sample_id, "text": samples_by_id[sample_id].r2v_instruction}
