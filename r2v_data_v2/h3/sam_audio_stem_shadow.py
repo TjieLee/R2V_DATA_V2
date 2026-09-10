@@ -14,7 +14,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Annotated, Literal, Protocol
 
-from pydantic import AfterValidator, Field, StrictStr, model_validator
+from pydantic import AfterValidator, Field, StrictBool, StrictStr, model_validator
 
 from r2v_data_v2.h3.audio_backends import (
     AudioFileProbe,
@@ -55,7 +55,7 @@ from r2v_data_v2.h3.schemas import SchemaModel
 
 SAM_AUDIO_SHADOW_ROOT_NAME = "sam_audio_stem_shadow_v1"
 SAM_AUDIO_SEPARATION_STAGE_NAME = "separation"
-SAM_AUDIO_STEM_INVENTORY_VERSION = "r2v.h3.sam_audio_stem_inventory.3"
+SAM_AUDIO_STEM_INVENTORY_VERSION = "r2v.h3.sam_audio_stem_inventory.4"
 SAM_AUDIO_STEM_RECORD_VERSION = "r2v.h3.sam_audio_stem_record.3"
 SAM_AUDIO_STEM_SUMMARY_VERSION = "r2v.h3.sam_audio_stem_summary.2"
 STEM_DIARIZATION_SHADOW_VERSION = "r2v.h3.stem_diarization_shadow.4"
@@ -197,22 +197,48 @@ class SAMAudioModelConfiguration(SchemaModel):
     t5_dependency_files: dict[str, str]
     device: str
     reranking_candidates: Literal[1] = 1
-    predict_spans: Literal[False] = False
+    predict_spans: StrictBool = False
+    span_predictor_path: str | None
+    span_predictor_files: dict[str, str]
     local_files_only: Literal[True] = True
     visual_ranker_disabled: Literal[True] = True
     text_ranker_disabled: Literal[True] = True
-    span_predictor_disabled: Literal[True] = True
+    span_predictor_disabled: StrictBool = True
     configuration_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
 
     @model_validator(mode="after")
     def validate_configuration(self) -> SAMAudioModelConfiguration:
+        if self.span_predictor_disabled == self.predict_spans:
+            raise ValueError("SAM Audio span predictor enabled/disabled configuration differs")
+        if self.predict_spans:
+            if (not self.span_predictor_path or not Path(self.span_predictor_path).is_absolute()
+                    or not self.span_predictor_files):
+                raise ValueError("SAM Audio spans require a local predictor path and file hashes")
+        elif self.span_predictor_path is not None or self.span_predictor_files:
+            raise ValueError("disabled SAM Audio spans cannot contain a predictor")
         values = self.model_dump(mode="json", exclude={"configuration_fingerprint"})
         if self.configuration_fingerprint != _sha256_text(_compact_json(values)):
             raise ValueError("SAM Audio configuration fingerprint is invalid")
         return self
 
 
-class _LegacySAMAudioModelConfiguration(SAMAudioModelConfiguration):
+class _V3SAMAudioModelConfiguration(SAMAudioModelConfiguration):
+    """Frozen prompt-configured v3 runs predate optional span dependencies."""
+
+    predict_spans: Literal[False] = False
+    span_predictor_disabled: Literal[True] = True
+    span_predictor_path: None = None
+    span_predictor_files: dict[str, str] = Field(default_factory=dict, max_length=0)
+
+    @model_validator(mode="after")
+    def validate_configuration(self) -> _V3SAMAudioModelConfiguration:
+        values = self.model_dump(mode="json", exclude={"configuration_fingerprint", "span_predictor_path", "span_predictor_files"})
+        if self.configuration_fingerprint != _sha256_text(_compact_json(values)):
+            raise ValueError("v3 SAM Audio configuration fingerprint is invalid")
+        return self
+
+
+class _LegacySAMAudioModelConfiguration(_V3SAMAudioModelConfiguration):
     """Read-only v2 configuration: inferred prompts never enter its legacy hash."""
 
     speech_prompt: Literal["human voices"] = "human voices"
@@ -220,7 +246,8 @@ class _LegacySAMAudioModelConfiguration(SAMAudioModelConfiguration):
 
     @model_validator(mode="after")
     def validate_configuration(self) -> _LegacySAMAudioModelConfiguration:
-        values = self.model_dump(mode="json", exclude={"configuration_fingerprint", "speech_prompt", "music_prompt"})
+        values = self.model_dump(mode="json", exclude={"configuration_fingerprint", "speech_prompt", "music_prompt",
+                                                      "span_predictor_path", "span_predictor_files"})
         if self.configuration_fingerprint != _sha256_text(_compact_json(values)):
             raise ValueError("legacy SAM Audio configuration fingerprint is invalid")
         return self
@@ -298,6 +325,14 @@ def _implementation_files(root: Path) -> dict[str, str]:
     return output
 
 
+def _span_predictor_files(root: Path) -> dict[str, str]:
+    required = ("config.json", "model.safetensors", "tokenizer.json", "tokenizer_config.json")
+    if not root.is_dir() or any(not (root / name).is_file() for name in required):
+        raise ValueError("local SAM span predictor lacks required config/checkpoint/tokenizer files")
+    optional = ("special_tokens_map.json", "added_tokens.json", "preprocessor_config.json", "processor_config.json")
+    return {name: sha256_file(root / name) for name in sorted((*required, *(n for n in optional if (root / n).is_file())))}
+
+
 def sam_audio_configuration(
     *,
     implementation_root: Path,
@@ -308,9 +343,15 @@ def sam_audio_configuration(
     reranking_candidates: int,
     speech_prompt: str = "human voices",
     music_prompt: str = "music soundtrack",
+    predict_spans: bool = False,
+    span_predictor_path: Path | None = None,
 ) -> SAMAudioModelConfiguration:
     _validate_sam_prompt(speech_prompt)
     _validate_sam_prompt(music_prompt)
+    if predict_spans != (span_predictor_path is not None):
+        raise ValueError("predict_spans requires a predictor path; disabled spans must not supply one")
+    predictor = span_predictor_path.expanduser().resolve() if span_predictor_path is not None else None
+    predictor_files = _span_predictor_files(predictor) if predictor is not None else {}
     code = implementation_root.expanduser().resolve(strict=True)
     checkpoint = model_path.expanduser().resolve(strict=True)
     t5 = t5_base_path.expanduser().resolve(strict=True)
@@ -360,11 +401,13 @@ def sam_audio_configuration(
         "t5_dependency_files": _t5_dependency_files(t5),
         "device": device,
         "reranking_candidates": reranking_candidates,
-        "predict_spans": False,
+        "predict_spans": predict_spans,
+        "span_predictor_path": str(predictor) if predictor is not None else None,
+        "span_predictor_files": predictor_files,
         "local_files_only": True,
         "visual_ranker_disabled": True,
         "text_ranker_disabled": True,
-        "span_predictor_disabled": True,
+        "span_predictor_disabled": not predict_spans,
     }
     return SAMAudioModelConfiguration(
         **values,
@@ -446,6 +489,8 @@ class OfficialSAMAudioBackend:
             != self.configuration.model_checkpoint_sha256
             or _t5_dependency_files(Path(self.configuration.t5_base_path))
             != self.configuration.t5_dependency_files
+            or (self.configuration.predict_spans and _span_predictor_files(Path(self.configuration.span_predictor_path))
+                != self.configuration.span_predictor_files)
         ):
             raise ValueError("local SAM Audio model dependency fingerprint changed")
         code_root = self.configuration.implementation_root
@@ -472,7 +517,7 @@ class OfficialSAMAudioBackend:
             text_encoder=text_encoder,
             visual_ranker=None,
             text_ranker=None,
-            span_predictor=None,
+            span_predictor=self.configuration.span_predictor_path if self.configuration.predict_spans else None,
         )
         processor = SAMAudioProcessor.from_pretrained(self.configuration.model_path)
         model = model.eval().to(self.configuration.device)
@@ -503,7 +548,7 @@ class OfficialSAMAudioBackend:
         with torch.inference_mode():
             result = model.separate(
                 batch,
-                predict_spans=False,
+                predict_spans=self.configuration.predict_spans,
                 reranking_candidates=self.configuration.reranking_candidates,
             )
         sample_rate = int(processor.audio_sampling_rate)
@@ -528,7 +573,10 @@ class OfficialSAMAudioBackend:
             runtime_seconds=time.monotonic() - started,
             backend_metadata={
                 "official_api": "SAMAudio.separate",
-                "predict_spans": False,
+                "predict_spans": self.configuration.predict_spans,
+                "span_predictor_path": self.configuration.span_predictor_path,
+                "span_predictor_fingerprint": _sha256_text(_compact_json(self.configuration.span_predictor_files))
+                if self.configuration.predict_spans else None,
                 "reranking_candidates": self.configuration.reranking_candidates,
                 "quality_scores_exposed": False,
             },
@@ -656,7 +704,7 @@ class SAMAudioStemJob(SchemaModel):
 
 
 class SAMAudioStemInventory(SchemaModel):
-    schema_version: Literal["r2v.h3.sam_audio_stem_inventory.2", "r2v.h3.sam_audio_stem_inventory.3"] = (
+    schema_version: Literal["r2v.h3.sam_audio_stem_inventory.2", "r2v.h3.sam_audio_stem_inventory.3", "r2v.h3.sam_audio_stem_inventory.4"] = (
         SAM_AUDIO_STEM_INVENTORY_VERSION
     )
     source_canonical_audio_manifest_path: str
@@ -669,7 +717,7 @@ class SAMAudioStemInventory(SchemaModel):
     selection_mode: Literal["all_canonical_clips", "explicit_case_manifest"]
     route: SAMRoute
     run_both_routes: bool = False
-    model_configuration: SAMAudioModelConfiguration | _LegacySAMAudioModelConfiguration
+    model_configuration: SAMAudioModelConfiguration | _V3SAMAudioModelConfiguration | _LegacySAMAudioModelConfiguration
     job_count: int = Field(ge=1)
     clip_uids: list[str] = Field(min_length=1)
     jobs: list[SAMAudioStemJob] = Field(min_length=1)
@@ -682,9 +730,9 @@ class SAMAudioStemInventory(SchemaModel):
             configuration = values["model_configuration"]
             if isinstance(configuration, SAMAudioModelConfiguration):
                 configuration = configuration.model_dump(mode="json")
-            model = (_LegacySAMAudioModelConfiguration
-                     if values.get("schema_version") == "r2v.h3.sam_audio_stem_inventory.2"
-                     else SAMAudioModelConfiguration)
+            model = {"r2v.h3.sam_audio_stem_inventory.2": _LegacySAMAudioModelConfiguration,
+                     "r2v.h3.sam_audio_stem_inventory.3": _V3SAMAudioModelConfiguration}.get(
+                         values.get("schema_version"), SAMAudioModelConfiguration)
             return {**values, "model_configuration": model.model_validate(configuration)}
         return values
 
@@ -701,6 +749,9 @@ class SAMAudioStemInventory(SchemaModel):
         ):
             raise ValueError("SAM Audio case-manifest provenance is incomplete")
         values = self.model_dump(mode="json", exclude={"inventory_fingerprint"})
+        if self.schema_version in {"r2v.h3.sam_audio_stem_inventory.2", "r2v.h3.sam_audio_stem_inventory.3"}:
+            for name in ("span_predictor_path", "span_predictor_files"):
+                values["model_configuration"].pop(name)
         if self.schema_version == "r2v.h3.sam_audio_stem_inventory.2":
             for name in ("speech_prompt", "music_prompt"):
                 values["model_configuration"].pop(name)

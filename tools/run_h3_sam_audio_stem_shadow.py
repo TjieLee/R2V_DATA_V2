@@ -35,6 +35,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--sam-device", default="cuda:0")
     parser.add_argument("--sam-speech-prompt", default="human voices")
     parser.add_argument("--sam-music-prompt", default="music soundtrack")
+    parser.add_argument("--sam-predict-spans", action="store_true")
+    parser.add_argument("--sam-span-predictor-path", type=Path)
     parser.add_argument(
         "--sam-route",
         choices=("music_first", "voice_first"),
@@ -75,6 +77,8 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         reranking_candidates=arguments.sam_reranking_candidates,
         speech_prompt=arguments.sam_speech_prompt,
         music_prompt=arguments.sam_music_prompt,
+        predict_spans=arguments.sam_predict_spans,
+        span_predictor_path=arguments.sam_span_predictor_path,
     )
     inventory = build_sam_audio_stem_inventory(
         canonical_audio_manifest_path=paths.audio / "canonical_clips.jsonl",

@@ -446,9 +446,12 @@ def _run_stems(
     shadow_run_id: str | None = None,
     speech_prompt: str = "human voices",
     music_prompt: str = "music soundtrack",
+    predict_spans: bool = False,
+    span_predictor_path: Path | None = None,
 ) -> tuple[Path, object, _SAM, _Canonicalizer]:
     manifest, _, _ = _canonical_fixture(tmp_path)
-    configuration = _configuration(tmp_path, speech_prompt=speech_prompt, music_prompt=music_prompt)
+    configuration = _configuration(tmp_path, speech_prompt=speech_prompt, music_prompt=music_prompt,
+                                   predict_spans=predict_spans, span_predictor_path=span_predictor_path)
     inventory = build_sam_audio_stem_inventory(
         canonical_audio_manifest_path=manifest,
         model_configuration=configuration,
@@ -704,7 +707,7 @@ def test_configurable_prompt_route_and_actual_call_provenance(tmp_path, route, e
     assert [call.prompt for call in records[0].calls] == expected
     assert inventory.model_configuration.speech_prompt == "man speaking"
     assert inventory.model_configuration.music_prompt == "music soundtrack"
-    assert inventory.schema_version == "r2v.h3.sam_audio_stem_inventory.3"
+    assert inventory.schema_version == "r2v.h3.sam_audio_stem_inventory.4"
 
 
 @pytest.mark.parametrize("field", ["speech_prompt", "music_prompt"])
@@ -717,7 +720,7 @@ def test_invalid_prompt_fails_closed(tmp_path, field, value):
 def test_prompt_configuration_and_inventory_identity(tmp_path):
     _, inventory, _, _ = _run_stems(tmp_path)
     default = inventory.model_configuration
-    assert inventory.schema_version == "r2v.h3.sam_audio_stem_inventory.3"
+    assert inventory.schema_version == "r2v.h3.sam_audio_stem_inventory.4"
     assert (default.speech_prompt, default.music_prompt) == ("human voices", "music soundtrack")
     for prompts in ({"speech_prompt": "man speaking"}, {"music_prompt": "piano music"}):
         changed = _configuration(tmp_path, **prompts)
@@ -733,7 +736,7 @@ def test_prompt_configuration_and_inventory_identity(tmp_path):
         type(inventory).model_validate(old)
 
 
-def _legacy_stem_fixture(tmp_path):
+def _legacy_stem_fixture(tmp_path, version=2):
     output, inventory, _, _ = _run_stems(tmp_path)
 
     def seal(values, field):
@@ -743,9 +746,11 @@ def _legacy_stem_fixture(tmp_path):
         ).encode()).hexdigest()
 
     values = inventory.model_dump(mode="json")
-    values["schema_version"] = "r2v.h3.sam_audio_stem_inventory.2"
+    values["schema_version"] = f"r2v.h3.sam_audio_stem_inventory.{version}"
     config = values["model_configuration"]
-    del config["speech_prompt"], config["music_prompt"]
+    if version == 2:
+        del config["speech_prompt"], config["music_prompt"]
+    del config["span_predictor_path"], config["span_predictor_files"]
     seal(config, "configuration_fingerprint")
     seal(values, "inventory_fingerprint")
     (output / "inventory.json").write_text(json.dumps(values))
@@ -761,11 +766,14 @@ def _legacy_stem_fixture(tmp_path):
     return output, values
 
 
-def test_frozen_v2_load_preserves_exact_lineage_and_files(tmp_path):
-    output, original = _legacy_stem_fixture(tmp_path)
+@pytest.mark.parametrize("version", [2, 3])
+def test_frozen_v2_load_preserves_exact_lineage_and_files(tmp_path, version):
+    output, original = _legacy_stem_fixture(tmp_path, version)
     before = {p: p.read_bytes() for p in output.rglob("*") if p.is_file()}
     inventory, records, summary = load_stem_shadow(output)
-    assert inventory.schema_version == "r2v.h3.sam_audio_stem_inventory.2"
+    assert inventory.schema_version == f"r2v.h3.sam_audio_stem_inventory.{version}"
+    assert inventory.model_configuration.predict_spans is False
+    assert inventory.model_configuration.span_predictor_path is None
     assert inventory.model_configuration.speech_prompt == "human voices"
     assert inventory.model_configuration.music_prompt == "music soundtrack"
     assert inventory.model_configuration.configuration_fingerprint == original["model_configuration"]["configuration_fingerprint"]
@@ -809,9 +817,12 @@ def test_cli_prompt_defaults_and_override():
     required = ["--audio-production-root", "/audio", "--sam-audio-code-root", "/code",
                 "--sam-audio-model-path", "/model", "--sam-audio-t5-base-path", "/t5"]
     args = _parser().parse_args(required)
+    assert args.sam_predict_spans is False and args.sam_span_predictor_path is None
     assert (args.sam_speech_prompt, args.sam_music_prompt) == ("human voices", "music soundtrack")
     args = _parser().parse_args(required + ["--sam-route", "voice_first", "--sam-speech-prompt", "man speaking"])
     assert (args.sam_route, args.sam_speech_prompt, args.sam_music_prompt) == ("voice_first", "man speaking", "music soundtrack")
+    args = _parser().parse_args(required + ["--sam-predict-spans", "--sam-span-predictor-path", "/local/predictor"])
+    assert args.sam_predict_spans is True and args.sam_span_predictor_path == Path("/local/predictor")
 
 
 def test_both_routes_are_explicit_and_bounded(tmp_path: Path) -> None:
@@ -993,11 +1004,23 @@ def test_case_manifest_preserves_exact_selection_order(tmp_path: Path) -> None:
     assert inventory.selection_mode == "explicit_case_manifest"
 
 
+def _span_predictor(tmp_path):
+    root = tmp_path / "span-predictor"
+    root.mkdir()
+    for name in ("config.json", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"):
+        (root / name).write_text("{}")
+    (root / "model.safetensors").write_bytes(b"local predictor weights")
+    return root
+
+
+@pytest.mark.parametrize("predict_spans", [False, True])
 def test_official_backend_matches_current_local_api_and_list_outputs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    predict_spans: bool,
 ) -> None:
-    configuration = _configuration(tmp_path)
+    predictor = _span_predictor(tmp_path) if predict_spans else None
+    configuration = _configuration(tmp_path, predict_spans=predict_spans, span_predictor_path=predictor)
     source = tmp_path / "source.wav"
     _write_wav(source)
     calls: dict[str, object] = {}
@@ -1100,7 +1123,7 @@ def test_official_backend_matches_current_local_api_and_list_outputs(
 
     target = tmp_path / "target.wav"
     residual = tmp_path / "residual.wav"
-    OfficialSAMAudioBackend(configuration).separate(
+    result = OfficialSAMAudioBackend(configuration).separate(
         clip_uid="clip-1",
         source_audio_path=source,
         prompt="music soundtrack",
@@ -1119,8 +1142,12 @@ def test_official_backend_matches_current_local_api_and_list_outputs(
         },
         "visual_ranker": None,
         "text_ranker": None,
-        "span_predictor": None,
+        "span_predictor": str(predictor) if predict_spans else None,
     }
+    assert calls["separate"][1] == {"predict_spans": predict_spans, "reranking_candidates": 1}
+    assert result.backend_metadata["predict_spans"] == predict_spans
+    assert result.backend_metadata["span_predictor_path"] == configuration.span_predictor_path
+    assert bool(result.backend_metadata["span_predictor_fingerprint"]) == predict_spans
     assert calls["processor_load"] == configuration.model_path
     assert [item[1] for item in calls["saved"]] == ["target", "residual"]
     assert os.environ["HF_HUB_OFFLINE"] == "1"
@@ -1129,6 +1156,61 @@ def test_official_backend_matches_current_local_api_and_list_outputs(
         "name": "google/t5-base",
         "dim": 768,
     }
+
+
+@pytest.mark.parametrize("missing", [None, "absent_dir", "config.json", "model.safetensors", "tokenizer.json", "tokenizer_config.json"])
+def test_span_predictor_requires_complete_local_dependency(tmp_path, missing):
+    root = _span_predictor(tmp_path)
+    if missing is None:
+        root = None
+    elif missing == "absent_dir":
+        root = root / "absent"
+    else:
+        (root / missing).unlink()
+    with pytest.raises(ValueError, match="predictor"):
+        _configuration(tmp_path, predict_spans=True, span_predictor_path=root)
+
+
+def test_span_checkpoint_changes_configuration_inventory_and_fails_before_load(tmp_path):
+    root = _span_predictor(tmp_path)
+    manifest, _, _ = _canonical_fixture(tmp_path)
+    old = _configuration(tmp_path, predict_spans=True, span_predictor_path=root)
+    inventory = build_sam_audio_stem_inventory(canonical_audio_manifest_path=manifest, model_configuration=old)
+    assert inventory.schema_version == "r2v.h3.sam_audio_stem_inventory.4"
+    assert old.span_predictor_disabled is False
+    assert set(old.span_predictor_files) == {"config.json", "model.safetensors", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"}
+    (root / "model.safetensors").write_bytes(b"different weights")
+    changed = _configuration(tmp_path, predict_spans=True, span_predictor_path=root)
+    assert changed.configuration_fingerprint != old.configuration_fingerprint
+    assert build_sam_audio_stem_inventory(canonical_audio_manifest_path=manifest, model_configuration=changed).inventory_fingerprint != inventory.inventory_fingerprint
+    with pytest.raises(ValueError, match="dependency fingerprint changed"):
+        OfficialSAMAudioBackend(old)._load()
+    with pytest.raises(ValueError, match="disabled spans"):
+        _configuration(tmp_path, span_predictor_path=root)
+
+
+def test_span_enabled_voice_first_retains_two_pass_prompt_order(tmp_path):
+    root = _span_predictor(tmp_path)
+    output, inventory, backend, _ = _run_stems(tmp_path, route="voice_first", predict_spans=True, span_predictor_path=root)
+    _, records, _ = load_stem_shadow(output)
+    assert inventory.model_configuration.predict_spans is True
+    assert [call[1] for call in backend.calls] == ["human voices", "music soundtrack"]
+    assert [call.prompt for call in records[0].calls] == ["human voices", "music soundtrack"]
+    assert records[0].model_call_count == 2
+
+
+@pytest.mark.parametrize("version", [2, 3])
+def test_legacy_cannot_enable_span_prediction(tmp_path, version):
+    output, values = _legacy_stem_fixture(tmp_path, version)
+    values["model_configuration"]["predict_spans"] = True
+    (output / "inventory.json").write_text(json.dumps(values))
+    with pytest.raises(ValueError):
+        load_stem_shadow(output)
+    values["model_configuration"]["predict_spans"] = False
+    values["schema_version"] = "r2v.h3.sam_audio_stem_inventory.4"
+    (output / "inventory.json").write_text(json.dumps(values))
+    with pytest.raises(ValueError):
+        load_stem_shadow(output)
 
 
 def test_local_model_identifier_cannot_disagree_with_checkpoint_config(
