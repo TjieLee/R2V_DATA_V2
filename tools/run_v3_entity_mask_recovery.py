@@ -14,7 +14,9 @@ import subprocess
 import sys
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Lock
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
@@ -36,6 +38,7 @@ from r2v_data_v2.v3.pre_qwen_production import (
 )
 from tools import entity_mask_recovery_plan as campaign
 from tools import run_v3_entity_mask_auto as production
+from tools.entity_mask_canonical_audit import validate_fast_materialized_row
 from tools.run_v3_pre_qwen_auto import parse_gpus
 
 # This supervisor recovers the existing 5 x 8 run, never creates a new topology.
@@ -244,7 +247,10 @@ def _canonical_failure_context(exc: Exception) -> dict[str, object]:
     traceback = exc.__traceback__
     while traceback is not None:
         frame = traceback.tb_frame
-        if frame.f_code is stage2._validate_materialized_row.__code__:
+        if frame.f_code in (
+            stage2._validate_materialized_row.__code__,
+            validate_fast_materialized_row.__code__,
+        ):
             value = frame.f_locals.get("value")
             source = frame.f_locals.get("input_row")
             if (
@@ -262,9 +268,16 @@ def _canonical_failure_context(exc: Exception) -> dict[str, object]:
 
 
 def audit_canonical(
-    *, input_root: Path, output_root: Path, identity: ConfigIdentity
+    *,
+    input_root: Path,
+    output_root: Path,
+    identity: ConfigIdentity,
+    full: bool = False,
+    workers: int = 16,
 ) -> dict[str, object]:
-    """Read-only full publication closure audit, independent of recovery planning."""
+    """Read-only shard-parallel audit, independent of recovery planning."""
+    if workers < 1:
+        raise ValueError("audit-workers must be positive")
     _, paths = campaign.frozen_topology(input_root, output_root, identity)
     known_names = {path.name for path in paths}
     # Do not silently omit a published part with no matching Stage1 shard.
@@ -273,28 +286,42 @@ def audit_canonical(
         for part in sorted((output_root / "parts").glob("shard-*.jsonl"))
         if part.name not in known_names
     ]
-    canonical_total = valid = missing = 0
-    invalid = []
-    for path in paths:
+    paths.sort(key=lambda path: path.name)
+    event_lock = Lock()
+
+    def audit_event(**payload: object) -> None:
+        with event_lock:
+            emit_event(**payload)
+
+    def audit_shard(path: Path) -> dict[str, object] | None:
         part = output_root / "parts" / path.name
         if not part.exists() and not part.is_symlink():
-            missing += 1
-            continue
-        canonical_total += 1
-        emit_event(event="canonical_audit_shard_started", shard=path.name)
+            return None
+        audit_event(event="canonical_audit_shard_started", shard=path.name)
         result = {"shard": path.name}
         try:
             if path.name not in known_names:
-                raise ValueError("canonical shard has no matching completed Stage1 shard")
+                raise ValueError(
+                    "canonical shard has no matching completed Stage1 shard"
+                )
             shard = stage2.load_annotation_shard(path)
             campaign.validate_shard_metadata(shard, output_root, identity)
-            stage2._validate_completed_shard(
+            rows = stage2._validate_completed_shard(
                 part,
                 shard=shard,
                 output_root=output_root,
                 config_identity=identity,
-                validate_artifacts=True,
+                validate_artifacts=full,
             )
+            if not full:
+                for value, input_row in zip(rows, shard.rows):
+                    validate_fast_materialized_row(
+                        value,
+                        input_row=input_row,
+                        shard=shard,
+                        output_root=output_root,
+                        config_identity=identity,
+                    )
         except Exception as exc:  # noqa: BLE001 - report each broken shard and continue auditing
             result.update(
                 status="INVALID_CANONICAL",
@@ -302,13 +329,28 @@ def audit_canonical(
                 message=" ".join(str(exc).split())[:500],
                 **_canonical_failure_context(exc),
             )
-            invalid.append(result)
         else:
             result["status"] = "VALID_CANONICAL"
-            valid += 1
-        emit_event(event="canonical_audit_shard", **result)
+        return result
+
+    canonical_total = valid = missing = 0
+    invalid = []
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        # map yields in source-shard order, regardless of completion order.
+        for result in pool.map(audit_shard, paths):
+            if result is None:
+                missing += 1
+                continue
+            canonical_total += 1
+            if result["status"] == "VALID_CANONICAL":
+                valid += 1
+            else:
+                invalid.append(result)
+            audit_event(event="canonical_audit_shard", **result)
     summary = {
         "event": "canonical_audit_completed",
+        "audit_mode": "full" if full else "fast",
+        "audit_workers": workers,
         "canonical_total": canonical_total,
         "valid_canonical": valid,
         "invalid_canonical": len(invalid),
@@ -505,7 +547,12 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
     mode.add_argument(
         "--audit-canonical",
         action="store_true",
-        help="Read-only full closure audit of existing canonical shards; no recovery",
+        help="Read-only FAST metadata/path closure audit; no image content validation",
+    )
+    mode.add_argument(
+        "--audit-canonical-full",
+        action="store_true",
+        help="Read-only full publication validation, including image content hashes",
     )
     mode.add_argument(
         "--cluster-auto",
@@ -515,15 +562,23 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
     mode.add_argument(
         "--single-shard", help="Run just one canonical shard name from the recovery plan"
     )
+    parser.add_argument(
+        "--audit-workers", type=int, default=16,
+        help="Parallel read-only shard audit threads (default: 16)",
+    )
     parser.add_argument("--plan", type=Path, default=campaign.DEFAULT_PLAN)
     parser.add_argument("--plan-wait-seconds", type=float, default=1800)
     args = parser.parse_args(argv)
     args.input_root = args.input_root.expanduser().resolve(strict=True)
     args.output_root = _safe_output_root(args.output_root)
     identity = load_config_identity(args.base_config)
-    if args.audit_canonical:
+    if args.audit_canonical or args.audit_canonical_full:
         report = audit_canonical(
-            input_root=args.input_root, output_root=args.output_root, identity=identity
+            input_root=args.input_root,
+            output_root=args.output_root,
+            identity=identity,
+            full=args.audit_canonical_full,
+            workers=args.audit_workers,
         )
         if report["invalid_canonical"]:
             raise SystemExit(1)

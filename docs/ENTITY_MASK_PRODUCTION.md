@@ -447,16 +447,41 @@ or `--confirm-production-stopped` flag is needed:
 ```bash
 /mnt/workspace/litengjie/data/R2V_DATA_V2/.venv/bin/python -B \
   /mnt/workspace/litengjie/data/R2V_DATA_V2/tools/run_v3_entity_mask_recovery.py \
-  --audit-canonical
+  --audit-canonical --audit-workers 16
 ```
 
 This uses the existing production input/output/config defaults and validates the
 frozen topology. It enumerates Stage1 shards, then audits each existing canonical
-`parts/shard-*.jsonl` using the normal full publication validator
-`_validate_completed_shard(..., validate_artifacts=True)`: row order/count and
-lineage, checkpoint identity, clip workspace/metadata, frames, masks, deterministic
-coverage, and required background state/artifacts. Missing canonical shards are
-counted separately without inspecting their incomplete workspaces.
+`parts/shard-*.jsonl`. **`--audit-canonical` defaults to FAST closure validation**:
+canonical row count/order/lineage; workspace and required file existence/path
+identity; parsed `state.json`, `run.json`, `clip.json`, frames manifest, and
+`masks.rle.json`; checkpoint/run/clip identity; mask-metadata-derived coverage and
+terminal row consistency; required background state and referenced files.
+
+FAST does **not** read/hash sampled JPEG bytes, open images with PIL, decode mask
+pixels, or perform expensive frame-content validation. It still parses the JSON
+manifests and checks source/config/row lineage; it is not proof of image-byte
+integrity. Terminal skipped/input-failure rows do not require unproduced artifacts;
+a terminal `failed_frames` row does not require completed frames/masks.
+
+The previous full publication validation remains available explicitly:
+
+```bash
+/mnt/workspace/litengjie/data/R2V_DATA_V2/.venv/bin/python -B \
+  /mnt/workspace/litengjie/data/R2V_DATA_V2/tools/run_v3_entity_mask_recovery.py \
+  --audit-canonical-full --audit-workers 1
+```
+
+FULL uses the unchanged `_validate_completed_shard(..., validate_artifacts=True)`,
+including sampled-image SHA256/PIL validation and background content checks.
+Use it only when that content-level assurance is needed. Both modes support
+`--audit-workers N` (positive integer, default **16**) with shard-level threads.
+Start events may arrive concurrently, but per-shard result events and the final
+invalid list are always emitted in canonical shard order. This is audit-only
+parallelism, not a change to recovery shard scheduling or model workers.
+
+Missing canonical shards are counted separately without inspecting their
+incomplete workspaces.
 An orphan canonical part with no matching completed Stage1 shard is reported
 invalid, not silently omitted from the audit.
 
@@ -467,7 +492,7 @@ them safely. A bad shard does not stop the remaining shard audits. The final
 JSON event has this shape:
 
 ```json
-{"event":"canonical_audit_completed","canonical_total":12,"valid_canonical":12,"invalid_canonical":0,"missing_canonical":3,"invalid":[]}
+{"event":"canonical_audit_completed","audit_mode":"fast","audit_workers":16,"canonical_total":12,"valid_canonical":12,"invalid_canonical":0,"missing_canonical":3,"invalid":[]}
 ```
 
 Exit status is 0 when no canonical shards are invalid, or 1 after the complete
@@ -475,10 +500,11 @@ summary when any are invalid. Missing canonical shards alone are not errors;
 global topology/config preflight errors still fail closed. Only the Python
 process returns this status; the tool does not terminate its parent shell.
 
-The audit performs no model calls, GPU detection, plan creation/update, logs,
-locks, checkpoint writes, truncation, publication, or repair. `-B` also disables
-Python bytecode-cache writes. It is a separate mode, not combinable with
-`--cluster-auto` or `--single-shard`. Existing recovery-plan canonical skipping
+Neither audit performs model calls, GPU detection, plan creation/update, log-file
+or lock-file writes, checkpoint writes, truncation, publication, or repair. `-B`
+also disables Python bytecode-cache writes. FAST/FULL are mutually exclusive and
+neither can be combined with `--cluster-auto` or `--single-shard`.
+Existing recovery-plan canonical skipping
 remains unchanged (`validate_artifacts=False`); invalid canonical shards are
 **not** inserted into that plan. Inspect the audit result before deciding any
 future already-published-shard repair policy.
