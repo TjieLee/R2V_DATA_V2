@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AuK / SAM speech QA</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#f3f5f4;color:#202723;font:14px system-ui;letter-spacing:0}
+header{display:flex;align-items:center;gap:12px;padding:16px 24px;border-bottom:1px solid #cbd4ce;background:white;flex-wrap:wrap}
+h1{font-size:20px;margin:0 auto 0 0}button,select{font:inherit;padding:8px;border:1px solid #a4b5ac;background:white;border-radius:4px;max-width:100%}
+main{max-width:1450px;margin:auto;padding:24px;display:grid;grid-template-columns:minmax(0,3fr) minmax(0,2fr);gap:24px}
+h2{font-size:16px;margin:0 0 10px}video{width:100%;aspect-ratio:16/10;background:#151a18;object-fit:contain}audio{width:100%;height:48px}
+section{min-width:0}article{padding:0 0 20px;margin-bottom:20px;border-bottom:1px solid #cbd4ce}p{overflow-wrap:anywhere;line-height:1.5}
+.meta{font-size:12px;color:#4b5e53}.status{color:#8c3920}#position{min-width:65px;font-variant-numeric:tabular-nums}
+#provenance{white-space:pre-line}
+@media(max-width:800px){main{grid-template-columns:minmax(0,1fr);padding:16px}header{padding:12px}}
+</style></head><body>
+<header><h1>AuK / SAM speech QA</h1><button id="prev" title="Previous clip">Previous</button>
+<select id="clips" aria-label="Clip"></select><button id="next" title="Next clip">Next</button><span id="position"></span></header>
+<main><section><h2>Original target video</h2><video id="original" controls preload="metadata"></video>
+<p id="clip"></p><p class="meta" id="source"></p></section><section>
+<article><h2>SAM speech</h2><p class="meta">voice_first / human voices / predict_spans=false</p>
+<audio id="sam_speech" controls preload="metadata"></audio><p class="status" id="sam_status"></p></article>
+<article><h2>AuK speech</h2><p class="meta" id="instruction"></p><audio id="auk" controls preload="metadata"></audio>
+<p class="status" id="auk_status"></p><p class="meta" id="settings"></p></article>
+<article><h2>SAM SFX</h2><audio id="sam_sfx" controls preload="metadata"></audio></article>
+<p class="meta" id="provenance"></p></section></main>
+<script id="data" type="application/json">__AUK_QA_DATA__</script>
+<script>
+"use strict";
+const data=JSON.parse(document.getElementById("data").textContent);
+if(data.schema_version!=="r2v.h3.auk_speech_qa.1")throw new Error("Invalid AuK QA schema");
+const el=id=>document.getElementById(id);let index=0;
+data.cases.forEach((item,i)=>{const option=document.createElement("option");option.value=i;option.textContent=item.clip_uid;el("clips").append(option)});
+function render(){const item=data.cases[index];el("clips").value=index;el("position").textContent=`${index+1} / ${data.cases.length}`;
+el("prev").disabled=index===0;el("next").disabled=index===data.cases.length-1;
+for(const id of ["original","sam_speech","auk","sam_sfx"]){const player=el(id);player.pause();player.removeAttribute("src");if(item[id])player.src=item[id];player.hidden=!item[id];player.load()}
+el("clip").textContent=item.clip_display_path;el("source").textContent=`Source audio SHA256: ${item.source_audio_sha256}`;
+el("instruction").textContent=data.instruction;
+el("sam_status").textContent=item.sam_failure||item.sam_status;el("auk_status").textContent=item.auk_failure||item.auk_status;
+const c=data.auk_configuration;el("settings").textContent=`${c.model_identifier} / ${c.dtype} / ${c.device} / NFE ${c.nfe} / CFG ${c.cfg_strength} / sway ${c.sway_sampling_coef} / seed ${c.seed}`;
+el("provenance").textContent=`SAM inventory: ${data.sam_inventory_fingerprint}\nAuK inventory: ${data.auk_inventory_fingerprint}\nAuK record: ${item.auk_record_fingerprint}`;}
+el("prev").onclick=()=>{if(index>0){index--;render()}};el("next").onclick=()=>{if(index<data.cases.length-1){index++;render()}};
+el("clips").onchange=()=>{index=Number(el("clips").value);render()};render();
+</script></body></html>
