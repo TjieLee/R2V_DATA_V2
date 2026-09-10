@@ -40,7 +40,9 @@ from r2v_data_v2.v3.frames import (
 from r2v_data_v2.v3.rank import build_coverage_state
 from r2v_data_v2.v3.schemas import (
     AnnotationState,
+    ClipRecord,
     ClipSource,
+    ReferencesState,
 )
 from r2v_data_v2.v3.segment import (
     SegmentationBackend,
@@ -1347,6 +1349,162 @@ def _validate_checkpoint_identity(
         raise ValueError("existing clip checkpoint provenance does not match input")
 
 
+class _Stage2RecoveryArtifactReader(RunStorage):
+    """Read retained artifacts even when clip.json is missing; never used to write."""
+
+    def __init__(self, storage: RunStorage, clip_uid: str) -> None:
+        self.config = storage.config
+        self.root = storage.root
+        self.clip_uid = clip_uid
+
+    def _require_clip(self, clip_uid: str) -> None:
+        if clip_uid != self.clip_uid:
+            raise ValueError("recovery artifact reader clip identity mismatch")
+
+
+def _recovery_durable_stage(
+    *,
+    storage: RunStorage,
+    workspace: Path,
+    row: dict[str, object],
+    shard: AnnotationShard,
+    config_identity: ConfigIdentity,
+) -> tuple[str, ClipRecord]:
+    """Read-only recovery inspection. Identity/hash corruption is NOT repairable.
+
+    Missing files and missing/stale derived coverage/background can be rebuilt.
+    Present but malformed manifests, differing source/annotation/config identities,
+    and content hash mismatches still fail closed, before any recovery mutation.
+    """
+    clip_uid = str(row["clip_uid"])
+    expected = ClipRecord(
+        clip_uid=clip_uid,
+        source=_clip_source(row, _validate_video_path(row.get("video_path"))),
+        annotation=_annotation_state(row),
+    )
+    if not workspace.exists() or not any(workspace.iterdir()):
+        return "annotation_ready", expected
+    checkpoint = _read_checkpoint(workspace)
+    if checkpoint is None:
+        raise ValueError("recovery workspace has no checkpoint provenance")
+    _validate_checkpoint_identity(
+        checkpoint,
+        row=row,
+        shard_sha256=shard.sha256,
+        config_identity=config_identity,
+    )
+    # initialize is read-only when run.json exists; never synthesize lost identity.
+    if not storage.run_path.is_file():
+        raise ValueError("recovery workspace has no run.json identity")
+    storage.initialize(git_commit=VISUAL_ALGORITHM_FREEZE)
+    clip = expected
+    if storage.clip_path(clip_uid).is_file():
+        clip = storage.read_clip(clip_uid)
+        if (clip.clip_uid, clip.source, clip.annotation) != (
+            expected.clip_uid,
+            expected.source,
+            expected.annotation,
+        ):
+            raise ValueError("recovery clip source/annotation identity mismatch")
+    reader = _Stage2RecoveryArtifactReader(storage, clip_uid)
+    frames_present = reader.frames_manifest_path(clip_uid).is_file()
+    masks_present = reader.masks_path(clip_uid).is_file()
+    # Validate all surviving identity evidence, even beyond a missing earlier file.
+    frames = reader.read_frames(clip_uid) if frames_present else None
+    masks = reader.read_masks(clip_uid) if masks_present else None
+    if frames is not None and frames.clip_uid != clip_uid:
+        raise ValueError("recovery frames clip identity mismatch")
+    assert expected.annotation is not None
+    entities = expected.annotation.entities
+    if masks is not None:
+        if masks.clip_uid != clip_uid or list(masks.entities) != [
+            entity.entity_id for entity in entities
+        ]:
+            raise ValueError("recovery masks entity identity mismatch")
+        for entity in entities:
+            mask = masks.entities[entity.entity_id]
+            if (mask.reference_type, mask.grounding_prompt) != (
+                entity.reference_type,
+                entity.grounding_prompt,
+            ):
+                raise ValueError("recovery masks annotation semantics mismatch")
+    if frames is None:
+        return "annotation_ready", clip
+    clip_dir = reader.clip_dir(clip_uid).resolve(strict=False)
+    missing_frames = False
+    for frame in frames.frames:
+        path = (clip_dir / frame.image_path).resolve(strict=False)
+        if clip_dir not in path.parents:
+            raise ValueError("recovery frame path escaped clip directory")
+        if not path.is_file():
+            missing_frames = True
+        elif _sha256_file(path) != frame.sha256:
+            raise ValueError("recovery sampled frame hash mismatch")
+    if missing_frames:
+        return "annotation_ready", clip
+    validate_sampled_frames(reader, clip_uid)
+    if masks is None:
+        return "frames_ready", clip
+    _validate_existing_masks(reader, clip_uid=clip_uid, entities=entities)
+    expected_coverage = build_coverage_state(
+        artifact=masks,
+        entities=entities,
+        required_visible_frames=storage.config.coverage.required_visible_frames,
+    )
+    if clip.coverage != expected_coverage:
+        return "masks_ready", clip
+    if not expected_coverage.passed:
+        return (
+            "coverage_ready" if clip.references.background is None else "masks_ready"
+        ), clip
+    if clip.references.background is None:
+        return "coverage_ready", clip
+    try:
+        validate_background_reference(
+            reader, clip_uid, clip.references.background, frames=frames
+        )
+    except FileNotFoundError:
+        return "coverage_ready", clip
+    return "background_ready", clip
+
+
+def _recover_clip_checkpoint(
+    *,
+    storage: RunStorage,
+    workspace: Path,
+    row: dict[str, object],
+    shard: AnnotationShard,
+    config_identity: ConfigIdentity,
+) -> ClipCheckpoint:
+    stage, clip = _recovery_durable_stage(
+        storage=storage,
+        workspace=workspace,
+        row=row,
+        shard=shard,
+        config_identity=config_identity,
+    )
+    clip_uid = str(row["clip_uid"])
+    if not storage.clip_path(clip_uid).is_file():
+        # Stage2-only reconstruction: NEVER write_annotation here. Its normal
+        # invalidation would delete the validated frames and expensive SAM masks.
+        write_json_atomic(storage.clip_path(clip_uid), clip.model_dump(mode="json"))
+    if stage == "annotation_ready":
+        storage.prepare_frames_publication(clip_uid)
+    elif stage == "frames_ready":
+        storage.prepare_masks_publication(clip_uid)
+    elif stage == "masks_ready":
+        storage.clear_coverage(clip_uid)
+    elif stage == "coverage_ready" and clip.references.background is not None:
+        storage.write_references(clip_uid, ReferencesState())
+    return _write_checkpoint(
+        workspace,
+        stage=stage,
+        row=row,
+        shard_sha256=shard.sha256,
+        config_identity=config_identity,
+    )
+
+
 class _RecordingBackend:
     def __init__(self, backend: SegmentationBackend) -> None:
         self.backend = backend
@@ -1441,6 +1599,7 @@ def prepare_clip_frames(
     config_identity: ConfigIdentity,
     decoder: FrameDecoder | None = None,
     static_owner: bool = False,
+    recover_incomplete_artifacts: bool = False,
 ) -> FramePreparationResult:
     annotation = _annotation_state(row)
     if annotation.status != "ready" or not annotation.entities:
@@ -1488,6 +1647,12 @@ def prepare_clip_frames(
                 config_identity=config_identity,
             )
 
+        if recover_incomplete_artifacts:
+            checkpoint = _recover_clip_checkpoint(
+                storage=storage, workspace=resolved_workspace, row=row,
+                shard=shard, config_identity=config_identity,
+            )
+
         if _STAGES[checkpoint.stage] >= _STAGES["frames_ready"]:
             validate_sampled_frames(storage, clip_uid)
             return FramePreparationResult(checkpoint=checkpoint, built=False)
@@ -1531,6 +1696,7 @@ def process_ready_clip(
     backend: SegmentationBackend,
     decoder: FrameDecoder | None = None,
     static_owner: bool = False,
+    recover_incomplete_artifacts: bool = False,
 ) -> Stage2Row:
     annotation = _annotation_state(row)
     if annotation.status != "ready" or not annotation.entities:
@@ -1545,6 +1711,7 @@ def process_ready_clip(
             config_identity=config_identity,
             decoder=decoder,
             static_owner=static_owner,
+            recover_incomplete_artifacts=recover_incomplete_artifacts,
         )
     except DeterministicFrameBuildError as exc:
         return Stage2Row(
@@ -1927,10 +2094,15 @@ def _validate_completed_shard(
     shard: AnnotationShard,
     output_root: Path,
     config_identity: ConfigIdentity,
+    validate_artifacts: bool = True,
 ) -> list[Stage2Row]:
     completed = _read_output_rows(part, shard=shard, recover_tail=False)
     if len(completed) != len(shard.rows):
         raise ValueError("completed Stage2 shard is missing rows")
+    if not validate_artifacts:
+        if any(row.input_annotation_shard != str(shard.path) for row in completed):
+            raise ValueError("canonical Stage2 shard path provenance mismatch")
+        return completed
     for value, input_row in zip(completed, shard.rows):
         _validate_materialized_row(
             value,
@@ -1940,6 +2112,105 @@ def _validate_completed_shard(
             config_identity=config_identity,
         )
     return completed
+
+
+def _recover_chunk_prefix(
+    path: Path,
+    *,
+    partial: Path,
+    rows: list[Stage2Row],
+    expected_rows: Sequence[dict[str, object]],
+    shard: AnnotationShard,
+    chunk: ExecutionChunk,
+    root: Path,
+    config_identity: ConfigIdentity,
+) -> list[Stage2Row]:
+    """Preserve prefix bytes, only after checking every surviving row's lineage."""
+    meta_path = path.parent / f"{chunk.stem}.meta.json"
+    if meta_path.is_file():
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        for key, expected in {
+            "schema_version": STAGE2_EXECUTION_SCHEMA_VERSION,
+            "execution_strategy": STAGE2_EXECUTION_STRATEGY,
+            "input_annotation_shard": str(shard.path),
+            "input_annotation_shard_sha256": shard.sha256,
+            "source_index_start": chunk.source_index_start,
+            "source_index_end": chunk.source_index_end,
+            "rows": chunk.row_count,
+        }.items():
+            if meta.get(key) != expected:
+                raise ValueError(f"recovery chunk metadata mismatch: {key}")
+    first_invalid = len(rows)
+    for index, (value, input_row) in enumerate(zip(rows, expected_rows)):
+        if value.input_annotation_shard != str(shard.path):
+            raise ValueError("recovery row annotation shard path mismatch")
+        if value.artifact_root is None:
+            if value.status.startswith("ready_") or value.status == "coverage_rejected":
+                raise ValueError("recovery row has no artifact provenance")
+            continue
+        expected_workspace = root / "artifacts" / shard.path.stem / str(value.clip_uid)
+        workspace = (root / value.artifact_root).resolve(strict=False)
+        if workspace != expected_workspace or root not in workspace.parents:
+            raise ValueError("recovery row artifact path identity mismatch")
+        _, storage = _stage2_workspace_storage(
+            config_identity.config, workspace, output_root=root
+        )
+        stage, clip = _recovery_durable_stage(
+            storage=storage,
+            workspace=workspace,
+            row=input_row,
+            shard=shard,
+            config_identity=config_identity,
+        )
+        valid = storage.clip_path(str(value.clip_uid)).is_file() and (
+            value.status == "failed_frames"
+            or stage == "background_ready"
+            or (
+                stage == "coverage_ready"
+                and clip.coverage is not None
+                and not clip.coverage.passed
+            )
+        )
+        if valid:
+            _validate_materialized_row(
+                value,
+                input_row=input_row,
+                shard=shard,
+                output_root=root,
+                config_identity=config_identity,
+            )
+        else:
+            first_invalid = min(first_invalid, index)
+    if first_invalid == len(rows):
+        return rows
+    if path != partial and partial.exists():
+        raise ValueError("recovery found both completed and partial chunk")
+    # Count the original bytes, not reserialized models (whitespace is preserved).
+    with path.open("rb") as handle:
+        for _ in range(first_invalid):
+            handle.readline()
+        prefix_end = handle.tell()
+    meta_path.unlink(missing_ok=True)
+    if path != partial:
+        os.replace(path, partial)
+    with partial.open("r+b") as handle:
+        handle.truncate(prefix_end)
+        handle.flush()
+        os.fsync(handle.fileno())
+    _fsync_directory(partial.parent)
+    return rows[:first_invalid]
+
+
+def _require_recovery_shard_lineage(root: Path, shard: AnnotationShard) -> None:
+    if not _meta_path(root, shard).is_file() and any(
+        path.exists()
+        for path in (
+            root / "parts" / shard.path.name,
+            _chunk_directory(root, shard),
+            root / "artifacts" / shard.path.stem,
+        )
+    ):
+        raise ValueError("existing recovery shard is missing metadata provenance")
 
 
 def process_execution_chunk(
@@ -1954,6 +2225,7 @@ def process_execution_chunk(
     execution_identity_prevalidated: bool = False,
     static_owner: bool = False,
     chunk_rows: int = DEFAULT_STAGE2_EXECUTION_CHUNK_ROWS,
+    recover_incomplete_artifacts: bool = False,
 ) -> dict[str, object]:
     validate_stage2_preflight(config_identity.config)
     _validate_live_config_identity(config_identity)
@@ -1962,6 +2234,8 @@ def process_execution_chunk(
         _validate_existing_execution_identity(root, chunk_rows=chunk_rows)
     else:
         _ensure_execution_identity(root, chunk_rows=chunk_rows)
+    if recover_incomplete_artifacts:
+        _require_recovery_shard_lineage(root, shard)
     _ensure_meta(
         shard,
         output_root=root,
@@ -1982,6 +2256,19 @@ def process_execution_chunk(
 
     with maybe_lock():
         expected_rows = shard.rows[chunk.row_offset_start : chunk.row_offset_end]
+        if recover_incomplete_artifacts:
+            recovery_path = final if final.is_file() else partial
+            existing_rows = _read_chunk_rows(
+                recovery_path, shard=shard, chunk=chunk,
+                recover_tail=recovery_path == partial,
+            )
+            if recovery_path == final and len(existing_rows) != chunk.row_count:
+                raise ValueError("completed Stage2 chunk is missing rows")
+            _recover_chunk_prefix(
+                recovery_path, partial=partial, rows=existing_rows,
+                expected_rows=expected_rows, shard=shard, chunk=chunk,
+                root=root, config_identity=config_identity,
+            )
         if final.is_file():
             completed = _read_chunk_rows(
                 final, shard=shard, chunk=chunk, recover_tail=False
@@ -2034,6 +2321,7 @@ def process_execution_chunk(
                         backend=backend,
                         decoder=decoder,
                         static_owner=static_owner,
+                        recover_incomplete_artifacts=recover_incomplete_artifacts,
                     )
                 except RetryableStageError as exc:
                     _failure_attempt(root, shard, row, exc)
@@ -2226,11 +2514,14 @@ def process_shard(
     execution_identity_prevalidated: bool = False,
     static_owner: bool = False,
     chunk_rows: int = DEFAULT_STAGE2_EXECUTION_CHUNK_ROWS,
+    recover_incomplete_artifacts: bool = False,
 ) -> dict[str, object]:
     validate_stage2_preflight(config_identity.config)
     _validate_live_config_identity(config_identity)
     root = _safe_output_root(output_root)
     shard = load_annotation_shard(input_shard)
+    if recover_incomplete_artifacts:
+        _require_recovery_shard_lineage(root, shard)
     part = root / "parts" / shard.path.name
     if execution_identity_prevalidated:
         _validate_existing_execution_identity(root, chunk_rows=chunk_rows)
@@ -2248,6 +2539,7 @@ def process_shard(
             shard=shard,
             output_root=root,
             config_identity=config_identity,
+            validate_artifacts=not recover_incomplete_artifacts,
         )
         return {"path": str(part), "rows": len(completed), "skipped": True}
     if not execution_identity_prevalidated:
@@ -2264,6 +2556,7 @@ def process_shard(
             execution_identity_prevalidated=execution_identity_prevalidated,
             static_owner=static_owner,
             chunk_rows=chunk_rows,
+            recover_incomplete_artifacts=recover_incomplete_artifacts,
         )
         if result.get("retryable") is True:
             return result

@@ -13,12 +13,14 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from r2v_data_v2.v3.pre_qwen_production import (
+    _safe_output_root,
     close_backend,
     default_backend_factory,
     enable_sam3_session_reuse,
     enumerate_annotation_shards,
     load_config_identity,
     process_shard,
+    shard_lock,
     validate_execution_identity,
     validate_sam3_session_reuse_identity,
 )
@@ -45,11 +47,27 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--global-worker-id", type=int, required=True)
     parser.add_argument("--shard-start-position", type=int, required=True)
     parser.add_argument("--shard-end-position", type=int, required=True)
+    parser.add_argument("--recover-incomplete-artifacts", action="store_true")
     return parser
 
 
 def main(argv: list[str] | None = None) -> dict[str, object]:
     args = _parser().parse_args(argv)
+    if args.recover_incomplete_artifacts:
+        root = _safe_output_root(args.output_root)
+        # A lifetime guard, NOT a work-stealing lock. Duplicate recovery owners
+        # fail immediately; normal static production must be stopped first.
+        with shard_lock(
+            root
+            / "_internal"
+            / "recovery-workers"
+            / f"worker-{args.global_worker_id}.lock"
+        ):
+            return _run(args)
+    return _run(args)
+
+
+def _run(args: argparse.Namespace) -> dict[str, object]:
     if args.world_size < 1 or args.local_gpu_count < 1:
         raise ValueError("world size and local GPU count must be positive")
     if not 0 <= args.rank < args.world_size:
@@ -129,6 +147,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
                 execution_identity_prevalidated=True,
                 static_owner=True,
                 chunk_rows=PRODUCTION_CHUNK_ROWS,
+                recover_incomplete_artifacts=args.recover_incomplete_artifacts,
             )
             if shard_result.get("retryable") is True:
                 result.update(

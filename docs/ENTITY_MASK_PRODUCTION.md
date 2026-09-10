@@ -399,3 +399,99 @@ docs. They do not modify `r2v_data_v2/h3/*`, Audio/H3 tools, or the stable
 Audio/H3 remains on its own branches and is not directly changed unless these
 Visual commits are explicitly merged/cherry-picked. Read
 `V3_VISUAL_AUDIO_INTEGRATION.md` before future cross-branch integration.
+
+## Explicit disaster recovery (existing 5 x 8 production only)
+
+The recovery supervisor is `tools/run_v3_entity_mask_recovery.py`. It does not
+replace the normal launcher. Ordinary production retains strict checkpoint and
+artifact validation; it never silently repairs damaged workspaces.
+
+The opt-in worker flag `--recover-incomplete-artifacts` validates the retained
+checkpoint, run/config identity, Stage1 row/shard lineage, frame hashes, and mask
+entity semantics before deriving the effective durable stage from actual files:
+
+| Surviving artifacts | Recovery |
+| --- | --- |
+| `row_committed`, missing `clip.json`, valid frames + masks | Reconstruct only clip source/annotation, reuse frames + masks, recompute frozen coverage/background; **no SAM3** |
+| `frames_ready`, missing `clip.json` and masks, valid frames | Reconstruct clip, reuse frames, resume at SAM3 |
+| Valid passed coverage, missing background state/artifact | Resume deterministic background only; **no SAM3** |
+| Whole clip workspace absent | Rebuild from the earliest required stage |
+
+Stage promotion/demotion is recovery-only. Reconstruction does **not** call
+ordinary `write_annotation()`, which would invalidate expensive frames/masks.
+This is not a general corruption bypass: malformed retained manifests and any
+identity, source, annotation, config, shard, hash, or topology mismatch remain
+fatal. A non-empty workspace without its checkpoint or `run.json` identity also
+fails closed. Missing sampled images require rebuilding frames and their
+dependent masks; differing content hashes are not silently repaired.
+
+For unfinished logical shards, recovery validates all structurally complete
+chunk rows and surviving lineage first. It then keeps the **original prefix
+bytes** before the first missing/invalid materialized row, demotes a completed
+chunk to `.partial` if needed, removes that chunk's stale completion metadata,
+and resumes at the damaged row. Earlier valid rows are not rerun. A retryable
+model failure remains retryable and does not become a terminal Stage2 row.
+
+Already published canonical `parts/shard-*.jsonl` are an immutable boundary:
+they are skipped, not reopened for artifact repair. Their input/config metadata
+and structural row provenance remain validated by the worker. Missing workspaces
+behind an already canonical shard do not trigger a rebuild in this tool. Valid
+completed chunks, canonical bytes, chunk identity, and Stage2 schema are unchanged.
+
+### Scheduling and safety
+
+The supervisor **reads**, never initializes/rewrites, the existing frozen
+`_internal/entity-mask-static-assignment.json`, execution marker, and session
+marker. It requires `world_size=5`, `local_gpu_count=8`, and
+`global_worker_count=40`, regardless of how many recovery GPUs are available.
+Each original logical worker keeps its original contiguous whole-shard range.
+Mapping worker 19 to physical GPU 7, for example, retains logical rank 2 / local
+slot 3; only the child `CUDA_VISIBLE_DEVICES=7` changes.
+
+Execution requires an explicit `--logical-workers` list. Separate recovery nodes
+must receive **disjoint** lists. There is no shared-filesystem work stealing or
+new shard assignment. One persistent backend is created per logical-worker
+process. When it exits, the supervisor reuses its physical GPU for the next
+explicitly selected logical worker. Child failures produce a nonzero supervisor
+exit; interruption cleans up only children started by that supervisor.
+
+**Stop the original production owners before recovery.** The required
+`--confirm-production-stopped` switch is an operator acknowledgement, not process
+discovery. Recovery workers hold a nonblocking, lifetime, per-logical-worker
+lock under `_internal/recovery-workers/`; duplicate recovery invocations fail
+instead of competing. Original static production workers do not use those locks
+and must not coexist with recovery owners. Never delete a lock file to bypass it.
+No `--overwrite` is used. Logs are separate, under the private
+`entity_mask_logs/recovery/` directory, never mixed into production data.
+
+### Read-only inventory and one-worker canary
+
+Use the same server environment and import setup described above. Inventory
+checks frozen topology and existing shard metadata/source hashes, without
+scanning clip artifacts, loading SAM3, calling Qwen, creating logs, or modifying
+output. It reports `unfinished_logical_workers` and each original shard range.
+
+```bash
+cd /mnt/workspace/litengjie/data/R2V_DATA_V2
+.venv/bin/python tools/run_v3_entity_mask_recovery.py --dry-run
+```
+
+After stopping production owners, choose **one unfinished logical ID** reported
+by inventory. For example, if worker 0 is unfinished and physical GPU 7 is free:
+
+```bash
+cd /mnt/workspace/litengjie/data/R2V_DATA_V2
+export PYTHONPATH=/mnt/workspace/litengjie/data/vendor/sam3${PYTHONPATH:+:$PYTHONPATH}
+.venv/bin/python tools/run_v3_entity_mask_recovery.py \
+  --logical-workers 0 --gpus 7 --confirm-production-stopped
+```
+
+This is a **one-logical-worker** canary, not a one-clip limit: it resumes that
+worker's remaining original shard range. A completed selected worker is a no-op.
+Review `entity_mask_logs/recovery/recovery-worker-0-gpu-7.log` and canonical
+completion before assigning more disjoint logical IDs to recovery nodes. A
+second invocation uses the same persisted selection-by-ownership and checkpoints;
+do not delete output roots or change the frozen topology to resume.
+
+The recovery implementation is covered by local mocked tests. No real GPU
+production recovery is implied by those tests.
