@@ -37,8 +37,20 @@ def test_exactly_one_original_av_request(job, tmp_path, transport):
     assert base64.b64decode(url.split(",", 1)[1]) == b"original AV fixture"
     contract = json.loads(content[1]["text"])
     assert contract["speech_facts"] == [
-        s.model_dump(mode="json") for s in job.speech_facts
+        {
+            "segment_id": s.segment_id,
+            "source_speaker_cluster": s.source_speaker_cluster,
+            "start_time": s.start_time,
+            "end_time": s.end_time,
+            "language": s.language,
+            "has_transcript": s.text is not None,
+        }
+        for s in job.speech_facts
     ]
+    assert contract["dialogue_segment_ids"] == [s.segment_id for s in job.speech_facts]
+    assert all(
+        s.text not in json.dumps(request, ensure_ascii=False) for s in job.speech_facts
+    )
     for banned in (
         "entity_id",
         "reference_subjects",
@@ -140,7 +152,7 @@ def test_typed_response_schema_and_one_call_exact_dialogue(job, tmp_path):
     speech = schema["$defs"]["T2VASpeechPart"]
     assert set(speech["properties"]) == {"kind", "segment_id", "lead_in"}
     assert speech["additionalProperties"] is False
-    assert "reproducing them is NOT your task" in T2VA_SYSTEM_PROMPT
+    assert "Reproducing them is NOT your task" in T2VA_SYSTEM_PROMPT
     assert (
         "Do NOT return ASR words, translations, transliterations" in T2VA_SYSTEM_PROMPT
     )
@@ -149,6 +161,55 @@ def test_typed_response_schema_and_one_call_exact_dialogue(job, tmp_path):
     core = validate_t2va_draft(job, T2VAMimoDraft.model_validate_json(raw.response))
     assert "<d>[Chinese] 你好。</d>" in render_t2va_prompt(core)
     assert raw.model_call_count == len(client.calls) == 1
+
+
+def test_request_separates_all_segments_from_dialogue_slots(job, tmp_path):
+    from r2v_data_v2.h3.t2va_shadow import render_t2va_prompt, validate_t2va_draft
+
+    job.speech_facts[0].text = job.speech_facts[0].language = None
+    before = job.model_dump()
+    backend = T2VAMimoBackend(config(tmp_path), client=Client([]))
+    contract = json.loads(
+        backend.build_request(job)["messages"][1]["content"][1]["text"]
+    )
+    assert [s["segment_id"] for s in contract["speech_facts"]] == [
+        "segment_1",
+        "segment_2",
+    ]
+    assert [s["has_transcript"] for s in contract["speech_facts"]] == [False, True]
+    assert contract["dialogue_segment_ids"] == ["segment_2"]
+    assert all("text" not in s for s in contract["speech_facts"])
+    assert job.model_dump() == before
+    draft = draft_for(job)
+    core = validate_t2va_draft(job, draft)
+    assert len(core.speaker_assignments) == 2
+    assert "(S2) <d>[Chinese] 好的！</d>" in render_t2va_prompt(core)
+    draft.integrated_sequence[-1].segment_id = "segment_1"
+    with pytest.raises(ValueError, match="speech placement inventory"):
+        validate_t2va_draft(job, draft)
+    job.speech_facts[1].text = job.speech_facts[1].language = None
+    empty = json.loads(backend.build_request(job)["messages"][1]["content"][1]["text"])
+    assert empty["dialogue_segment_ids"] == []
+    assert len(empty["speech_facts"]) == 2
+
+
+def test_v3_prompt_inventory_and_positive_audio_contract():
+    for rule in (
+        "speaker_assignments = every supplied segment",
+        "Speech slots = dialogue_segment_ids only",
+        "Non-transcribed segments still receive speaker assignments, but NEVER speech slots",
+        "neither S1 nor (S1) belongs there",
+        "Listen across the ENTIRE embedded audio from beginning to end",
+        "ambience / room tone / outdoor background",
+        "physical movement/contact/impact",
+        "mechanical/electronic sounds",
+        "non-verbal human sounds",
+        "excluding dialogue, singing and music",
+        "Only when none of those soundscape layers are actually discernible",
+        "Preserve clearly audible music",
+        "Use N/A only when no such music is established",
+    ):
+        assert rule in T2VA_SYSTEM_PROMPT
 
 
 @pytest.mark.parametrize("problem", ["length", "audio_zero", "video_zero"])

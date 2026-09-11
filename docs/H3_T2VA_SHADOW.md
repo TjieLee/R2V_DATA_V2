@@ -28,7 +28,7 @@ provided as model evidence. There is no repair, retry, polish or fallback call.
 
 ## Core and Authority
 
-`H3NoReferenceAVCore` .2 stores speaker assignments, the typed integrated sequence,
+`H3NoReferenceAVCore` .3 stores speaker assignments, the typed integrated sequence,
 authoritative speech facts/target duration, and the two sound fields. The pure
 renderer produces only, in order:
 
@@ -67,8 +67,18 @@ retention and entity-binding instructions. The canonical absent-soundscape
 sentence is reused; absent audience-only music is `N/A`. Semantic sound
 classification remains a model judgment, not a keyword-based validator.
 
-The typed-output contract uses T2VA prompt v2/backend .2 and core .2; it is not
-fingerprint-compatible with the prior model-written dialogue string. Use a new
+The current contract uses T2VA prompt v3/backend .3 and core .3. Model-visible
+speech facts contain only segment/cluster, times, language and `has_transcript`;
+exact ASR words stay inside the job/core and are never sent in text conditioning.
+The explicit ordered `dialogue_segment_ids` list controls speech slots, while
+assignments still cover every supplied segment. Bare Sx tokens, as well as
+parenthesized markers, are forbidden in model-owned text. Only the renderer
+emits final Sx/dialogue serialization. The prompt requires listening across the
+entire original AV before an absent soundscape/music decision; no acoustic
+threshold, keyword sound validator or extra call is added.
+
+This is not fingerprint-compatible with v2 or the prior model-written dialogue
+string. A prior-contract run ID is rejected even with `--overwrite`: use a new
 run ID; frozen prior outputs are not rewritten. Record/summary shapes and the
 three-section final format are unchanged. QA .2 shows segment/cluster, Sx and
 presentation, model lead-in, authoritative ASR and the rendered speech side by

@@ -49,6 +49,7 @@ _FORBIDDEN = re.compile(
 )
 _DIALOGUE = re.compile(r"<d>(.*?)</d>", re.DOTALL)
 _SPEAKER = re.compile(r"\(S(\d+)\)")
+_MODEL_SPEAKER_TOKEN = re.compile(r"\bS[1-9]\d*\b")
 _SHOT = re.compile(r"\[Shot ([1-9]\d*)\]")
 _CUT = re.compile(r"\s+At (\d{2,}):([0-5]\d)\.(\d{3}),")
 
@@ -154,7 +155,12 @@ class T2VAMimoDraft(SchemaModel):
                 raise ValueError(
                     "T2VA fields cannot contain conditioning labels, headers or placeholders"
                 )
-            if "<" in value or ">" in value or _SPEAKER.search(value):
+            if (
+                "<" in value
+                or ">" in value
+                or _SPEAKER.search(value)
+                or _MODEL_SPEAKER_TOKEN.search(value)
+            ):
                 raise ValueError(
                     "T2VA model prose cannot contain dialogue/conditioning syntax or speaker markers"
                 )
@@ -179,8 +185,8 @@ class T2VAMimoDraft(SchemaModel):
 
 
 class H3NoReferenceAVCore(T2VAMimoDraft):
-    schema_version: Literal["r2v.h3.no_reference_av_core.2"] = (
-        "r2v.h3.no_reference_av_core.2"
+    schema_version: Literal["r2v.h3.no_reference_av_core.3"] = (
+        "r2v.h3.no_reference_av_core.3"
     )
     speech_facts: list[T2VASpeechFact]
     target_duration_seconds: float = Field(gt=0, allow_inf_nan=False)
@@ -372,8 +378,8 @@ def render_t2va_prompt(core: H3NoReferenceAVCore) -> str:
 
 
 class T2VABackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.t2va_mimo_backend.2"] = "r2v.h3.t2va_mimo_backend.2"
-    prompt_version: Literal["h3_t2va_joint_av_v2"] = "h3_t2va_joint_av_v2"
+    schema_version: Literal["r2v.h3.t2va_mimo_backend.3"] = "r2v.h3.t2va_mimo_backend.3"
+    prompt_version: Literal["h3_t2va_joint_av_v3"] = "h3_t2va_joint_av_v3"
     prompt_sha256: Hash
     response_schema_sha256: Hash
     transport: Literal["sglang", "xiaomi"]
@@ -779,6 +785,14 @@ def run_t2va_shadow(
     if destination.exists():
         if not overwrite:
             raise FileExistsError(destination)
+        old_backend = json.loads((destination / "inventory.json").read_text()).get(
+            "backend", {}
+        )
+        if (old_backend.get("schema_version"), old_backend.get("prompt_version")) != (
+            inventory.backend.schema_version,
+            inventory.backend.prompt_version,
+        ):
+            raise ValueError("T2VA contract changed; use a new T2VA run ID")
         old, _, _ = load_t2va_shadow(destination)
         if (old.audio_production_root, old.t2va_run_id) != (
             inventory.audio_production_root,

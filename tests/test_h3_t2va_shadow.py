@@ -744,3 +744,48 @@ def test_core_cannot_substitute_its_own_asr_facts(job):
     changed = t2va.H3NoReferenceAVCore.model_validate(data)
     with pytest.raises(ValueError, match="core speech facts differ"):
         t2va.validate_t2va_draft(job, changed)
+
+
+@pytest.mark.parametrize("token", ["S1", "(S1)", "S2", "(S2)", "S123"])
+@pytest.mark.parametrize(
+    "field", ["prose", "lead_in", "overall_soundscape", "non_diegetic_music"]
+)
+def test_model_owned_speaker_tokens_forbidden(job, token, field):
+    draft = draft_for(job)
+    if field == "prose":
+        draft.integrated_sequence[0].text += f" {token} speaks."
+    elif field == "lead_in":
+        draft.integrated_sequence[1].lead_in = f"{token} speaks"
+    else:
+        setattr(draft, field, f"{token} makes a sound.")
+    with pytest.raises(ValueError, match="speaker markers"):
+        t2va.validate_t2va_draft(job, draft)
+
+
+def test_v2_run_requires_new_id_before_call(finalized, tmp_path, monkeypatch):
+    inventory = build(finalized, tmp_path)
+    destination = t2va.t2va_root(
+        Path(inventory.audio_production_root), inventory.t2va_run_id
+    )
+    destination.mkdir(parents=True)
+    values = inventory.model_dump(mode="json")
+    values["backend"]["schema_version"] = "r2v.h3.t2va_mimo_backend.2"
+    values["backend"]["prompt_version"] = "h3_t2va_joint_av_v2"
+    values["inventory_fingerprint"] = t2va.fingerprint(
+        {k: v for k, v in values.items() if k != "inventory_fingerprint"}
+    )
+    path = destination / "inventory.json"
+    path.write_text(json.dumps(values))
+    before = path.read_bytes()
+    monkeypatch.setattr(
+        t2va,
+        "_check_sources",
+        lambda _: pytest.fail("contract mismatch must fail before source checks"),
+    )
+    client = Client([])
+    with pytest.raises(ValueError, match="new T2VA run ID"):
+        t2va.run_t2va_shadow(
+            inventory, T2VAMimoBackend(config(tmp_path), client=client), overwrite=True
+        )
+    assert not client.calls
+    assert path.read_bytes() == before

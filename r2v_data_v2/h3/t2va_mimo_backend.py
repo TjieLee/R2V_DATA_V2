@@ -35,7 +35,9 @@ Use ordinary natural descriptions of people and objects. No production identitie
 
 SPEECH AUTHORITY AND SPEAKERS
 DiariZen owns exact supplied segment boundaries. Never split, filter, invent or change the speech facts. speaker_assignments must cover every supplied segment exactly once in supplied order and repeat its source_speaker_cluster unchanged.
-Supplied Qwen3-ASR text and language are exact and authoritative, but reproducing them is NOT your task. Never paraphrase, translate, correct, normalize, invent, drop or reorder dialogue. The deterministic renderer alone copies exact language/text and creates <d> syntax and speaker markers. Do NOT return ASR words, translations, transliterations, <d> tags or (Sx) markers in any prose or lead_in. Return exactly one speech part for each supplied segment with non-null text, in supplied chronological order; never place a non-transcribed segment in a speech part. A speech part has no dialogue-text field. Its lead_in describes ONLY the vocal source, presentation and audible delivery, not what was said. No transcribed text means no speech parts; non-transcribed vocal events may be described without invented words.
+Qwen3-ASR text and language remain exact and authoritative internally; transcript words are deliberately NOT supplied to you. Reproducing them is NOT your task. Never paraphrase, translate, correct, normalize, invent, drop or reorder dialogue. The deterministic renderer alone copies exact language/text and creates <d> syntax and speaker markers. Do NOT return ASR words, translations, transliterations or <d> tags in any prose or lead_in.
+MANDATORY INVENTORIES: speaker_assignments = every supplied segment, exactly once in supplied order. Speech slots = dialogue_segment_ids only, exactly once in that explicit chronological order. Each supplied segment exposes segment_id, source_speaker_cluster, start_time, end_time, language and has_transcript, never transcript words. The flattened speech-part segment_id sequence MUST equal dialogue_segment_ids exactly. Non-transcribed segments still receive speaker assignments, but NEVER speech slots. If dialogue_segment_ids is empty, return no speech parts. Audible non-transcribed vocal events may be described naturally in prose without invented words.
+A speech part has no dialogue-text field. Its lead_in describes ONLY the vocal source, presentation and audible delivery, not what was said. Sx identities belong ONLY in structured speaker_assignments.speaker_id. Model-owned prose, lead_in and audio fields must contain NO standalone S1/S2/... tokens, bare or parenthesized; neither S1 nor (S1) belongs there. The deterministic renderer is the sole producer of final (Sx) syntax.
 Assign stable S1/S2/... only to actual vocalizing sources, numbered contiguously by first vocal appearance, not visible-person order. The same acoustic source cluster must not split across different speaker IDs. Acoustic grouping is evidence, not visual identity; clusters may share an Sx only when original AV strongly supports the same speaker. Pauses, language, sentences or segment boundaries alone never create speakers.
 Pitch/register, timbre/texture, cadence/speaking rate and energy/delivery may support stable speaker assignment. Include only traits supported by audible evidence; never infer personality, nationality or profession from voice. No separate voice profile is requested.
 The final target AV may identify an onscreen speaker directly. Do not require an independent visual speech cue. A visible person is not automatically the speaker merely because they are the only or most salient visible person. A visible listener must not inherit speech when the AV clearly indicates another source.
@@ -44,8 +46,8 @@ Place each speech part among the surrounding visual/action prose at its observed
 
 AUDIO FIELD BOUNDARIES
 Original AV remains primary authority for all sounds. Only localized diegetic or shot-synchronized sound events that need a specific position in playback order belong in integrated_multimodal_description. Singing, in-scene instruments, radio/TV/phone music audible to characters belong there, not in audience-only score.
-overall_soundscape describes ambience and physical/environmental, mechanical/electronic and non-verbal human sound, excluding dialogue, singing and music. Continuous room tone/hum/rumble belongs here, not as an appended sound summary in the integrated description. Do not hallucinate sounds from visible actions.
-If no clearly discernible non-dialogue sound is established, use exactly: """
+Listen across the ENTIRE embedded audio from beginning to end before deciding either sound field or using an absent fallback. Positively describe actually audible ambience / room tone / outdoor background, physical movement/contact/impact, mechanical/electronic sounds and non-verbal human sounds in overall_soundscape, excluding dialogue, singing and music. Continuous room tone/hum/rumble belongs here, not as an appended sound summary in the integrated description. Do not hallucinate sounds from visible actions. Do not default to absence merely because dialogue is prominent or no salient isolated event stands out.
+Only when none of those soundscape layers are actually discernible after listening across the entire audio, use exactly: """
     + MIMO25_CANONICAL_ABSENT_SOUNDSCAPE
     + """
 non_diegetic_music describes audience-only BGM, with audible instrumentation, tempo/rhythm and dynamics rather than emotional function. Preserve clearly audible music; do not output N/A for clearly established score. Use N/A only when no such music is established.
@@ -117,7 +119,20 @@ class T2VAMimoBackend:
         contract = {
             "clip_uid": job.clip_uid,
             "target_duration_seconds": job.target_duration_seconds,
-            "speech_facts": [s.model_dump(mode="json") for s in job.speech_facts],
+            "speech_facts": [
+                {
+                    "segment_id": s.segment_id,
+                    "source_speaker_cluster": s.source_speaker_cluster,
+                    "start_time": s.start_time,
+                    "end_time": s.end_time,
+                    "language": s.language,
+                    "has_transcript": s.text is not None,
+                }
+                for s in job.speech_facts
+            ],
+            "dialogue_segment_ids": [
+                s.segment_id for s in job.speech_facts if s.text is not None
+            ],
         }
         request = {
             "model": self.config.model,
