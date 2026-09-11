@@ -94,6 +94,53 @@ def source(tmp_path, monkeypatch):
             "legacy_mimo_root": legacy, "no_lrasd_mimo_root": new, "output_root": tmp_path / "review"}
 
 
+def test_uncapped_frozen_visual_context(source, monkeypatch):
+    from r2v_data_v2.h3 import qwen38_h3_recaption as recaption
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("review must not construct conditioning contracts")
+
+    monkeypatch.setattr(recaption, "build_reference_contract", forbidden)
+    monkeypatch.setattr(recaption, "RecaptionReferenceContract", forbidden)
+    inventory = ab.load_visual_production_inventory()
+    base = inventory.canonical_clips[0].sample.references[0]
+    specs = [
+        ("object", "e3"), ("subject", "e1"), ("group", "e2"),
+        ("subject", "e1"), ("object", "e3"), ("group", "e2"),
+        ("subject", "e1"), ("subject", "e1"),
+        ("attribute", None), ("attribute", None),
+        ("background", None), ("background", None),
+    ]
+    refs = [base.model_copy(update={
+        "image_index": i, "image_id": f"image_{i}", "kind": kind, "entity_id": entity,
+        "attribute_id": f"a{i}" if kind == "attribute" else None,
+        "attribute_type": "hair" if kind == "attribute" else None,
+        "owner_entity_id": "e1" if kind == "attribute" else None,
+    }) for i, (kind, entity) in enumerate(specs, 1)]
+    for clip in inventory.canonical_clips:
+        clip.sample.references = refs
+    monkeypatch.setattr(ab, "load_visual_production_inventory", lambda **kw: inventory)
+    ab.build_review(**source)
+    data = json.loads((source["output_root"] / "data.json").read_text())
+    case = data["cases"][0]
+    assert len(case["references"]) == 12
+    assert [p["picture_label"] for p in case["references"]] == [f"<Picture {i}>" for i in range(1, 13)]
+    subjects = case["subjects"]
+    assert [s["entity_id"] for s in subjects[:3]] == ["e3", "e1", "e2"]
+    assert subjects[0]["source_picture_labels"] == ["<Picture 1>", "<Picture 5>"]
+    assert subjects[1]["source_picture_labels"] == ["<Picture 2>", "<Picture 4>", "<Picture 7>", "<Picture 8>"]
+    assert [s["attribute_id"] for s in subjects[3:5]] == ["a9", "a10"]
+    assert all(s["owner_entity_id"] == "e1" and s["attribute_type"] == "hair" for s in subjects[3:5])
+    assert subjects[5]["kind"] == "background"
+    assert subjects[5]["source_picture_labels"] == ["<Picture 11>", "<Picture 12>"]
+    assert [s["subject_label"] for s in subjects] == [f"<Subject {i}>" for i in range(1, 7)]
+    assert case["references"][8]["attribute_id"] == "a9"
+    # Labels come from frozen indices, not enumeration or a first-nine selection.
+    pictures, _ = ab._visual_context([refs[11], refs[1]], lambda path: path)
+    assert [p["picture_label"] for p in pictures] == ["<Picture 2>", "<Picture 12>"]
+    assert all(p["media"] == base.artifact_path for p in pictures)
+
+
 def test_pairing_summary_failed_annotations_and_isolation(source, tmp_path):
     before = {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
     summary = ab.build_review(**source)

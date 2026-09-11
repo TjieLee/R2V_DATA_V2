@@ -9,15 +9,13 @@ import shutil
 import tempfile
 from collections import Counter
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictStr
 
-from r2v_data_v2.h3.jea_final_renderer import FinalVisualReference
 from r2v_data_v2.h3.mimo25_av_reconcile import MimoCaseManifest
-from r2v_data_v2.h3.qwen38_h3_recaption import build_reference_contract
 from r2v_data_v2.h3.sam_audio_stem_shadow import sha256_file
+from r2v_data_v2.h3.schemas import entity_reference_order
 from r2v_data_v2.h3.visual_production_source import load_visual_production_inventory
 
 VERSION = "r2v.h3.ra2va_binding_ab_review.1"
@@ -139,6 +137,43 @@ def _overlap(a: Path, b: Path) -> bool:
     return a.is_relative_to(b) or b.is_relative_to(a)
 
 
+def _visual_context(references, own_media):
+    # Display the complete frozen inventory, not a capped H3 conditioning request.
+    references = sorted(references, key=lambda r: r.image_index)
+    pictures = [
+        {"picture_label": f"<Picture {r.image_index}>", "kind": r.kind,
+         "entity_id": r.entity_id, "owner_entity_id": r.owner_entity_id,
+         "attribute_id": r.attribute_id, "attribute_type": r.attribute_type,
+         "media": own_media(r.artifact_path)}
+        for r in references
+    ]
+    subjects = []
+
+    def append_subject(kind, labels, **fields):
+        index = len(subjects) + 1
+        subjects.append({
+            "subject_index": index, "subject_label": f"<Subject {index}>",
+            "kind": kind, "entity_id": None, "attribute_id": None,
+            "owner_entity_id": None, "attribute_type": None,
+            "source_picture_labels": labels, **fields,
+        })
+
+    for entity_id in entity_reference_order((r.kind, r.entity_id) for r in references):
+        append_subject("entity", [
+            p["picture_label"] for p in pictures
+            if p["kind"] in {"subject", "object", "group"} and p["entity_id"] == entity_id
+        ], entity_id=entity_id)
+    for picture in pictures:
+        if picture["kind"] == "attribute":
+            append_subject("attribute", [picture["picture_label"]], **{
+                k: picture[k] for k in ("attribute_id", "owner_entity_id", "attribute_type")
+            })
+    backgrounds = [p["picture_label"] for p in pictures if p["kind"] == "background"]
+    if backgrounds:
+        append_subject("background", backgrounds)
+    return pictures, subjects
+
+
 def build_review(*, visual_production_root: Path, visual_runs_root: Path, case_manifest: Path,
                  legacy_mimo_root: Path, no_lrasd_mimo_root: Path, output_root: Path) -> dict:
     visual_production_root = visual_production_root.resolve(strict=True)
@@ -186,9 +221,7 @@ def build_review(*, visual_production_root: Path, visual_runs_root: Path, case_m
     transitions, visible_changes = Counter(), Counter(same_entity_id=0, changed_entity_id=0)
     for uid in manifest.clip_uids:
         context = clips[uid]
-        references = [FinalVisualReference.from_visual(r) for r in context.sample.references]
-        # Reuse canonical reference-label semantics, never derive speaker bindings.
-        contract = build_reference_contract(SimpleNamespace(visual_references=references), "visual_only")
+        pictures, subjects = _visual_context(context.sample.references, own_media)
         old, current = _side(old_rows[uid]), _side(new_rows[uid])
         aligned = []
         for sid in dict.fromkeys([*old["segments"], *current["segments"]]):
@@ -208,9 +241,7 @@ def build_review(*, visual_production_root: Path, visual_runs_root: Path, case_m
                     counts[name]["null_entity"] += int(row["entity_id"] is None)
         cases.append({
             "clip_uid": uid, "target_video": own_media(context.sample.target_video),
-            "references": [{"picture_label": p.picture_label, "kind": p.kind, "entity_id": p.entity_id,
-                            "owner_entity_id": p.owner_entity_id, "media": own_media(p.image_path)} for p in contract.pictures],
-            "subjects": [s.model_dump(mode="json") for s in contract.subjects],
+            "references": pictures, "subjects": subjects,
             "old": old, "new": current, "aligned_segments": aligned,
             "segment_inventory_diff": set(old["segments"]) != set(current["segments"]),
         })
