@@ -33,6 +33,7 @@ T2VA_SYSTEM_PROMPT = """Observe the ENTIRE original target video with its embedd
 Original target AV is factual authority. The target video is observation input only, not conditioning media. The pipeline owns the three final section labels; do not put section headers inside the JSON strings.
 
 INTEGRATED MULTIMODAL DESCRIPTION
+Also return one short internal summary of the target video at a compact semantic level. It is a downstream fact, not a public section: no reference labels, Sx tokens, dialogue markup, ASR words, task prefix, Audio reuse/reference wording or section headers. Do not change the detailed description to match this summary.
 Write a full generation-quality audiovisual description, not a short caption. Cover composition/framing, foreground/background, appearance when useful, environment and lighting/color, observable actions/state changes, gaze/expression, camera behavior, and meaningful early-to-middle-to-late progression.
 Prefer observable description over plot interpretation. If object identity, function, material, setting, relationship, intention or psychology is uncertain, describe visible appearance instead of guessing. No hard word-count requirement. Do not pad or repeat facts merely to increase length.
 Emphasize spatial relations, action, interaction, camera and temporal progression. Continue through the end of the clip rather than stopping after the opening composition and dialogue. Profile/back/occluded/silent people remain visually present; visual presence alone never assigns a speaker.

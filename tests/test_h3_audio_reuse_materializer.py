@@ -513,7 +513,7 @@ def test_music_stem_existence_is_not_semantic_presence(tmp_path, music):
 
 @pytest.mark.parametrize("updates", [
     {"speaker_id": None}, {"retention_marker": "reference"},
-    {"voice_characteristics": "low voice"}, {"entity_id": "e1", "subject_label": None},
+    {"music_characteristics": "piano"}, {"entity_id": "e1", "subject_label": None},
 ])
 def test_signal_reuse_contract_rejects_identity_reference_semantics(updates):
     values = {"audio_index": 1, "audio_label": "<Audio 1>", "kind": "speaker_speech_reuse",

@@ -127,6 +127,7 @@ def draft_for(job):
                 }
             )
     return t2va.T2VAMimoDraft(
+        summary="People converse in a quiet setting.",
         speaker_assignments=assignments,
         integrated_sequence=parts,
         warnings=[],

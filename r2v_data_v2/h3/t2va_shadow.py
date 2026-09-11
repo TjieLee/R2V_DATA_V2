@@ -140,6 +140,7 @@ T2VASequencePart = Annotated[
 
 
 class T2VAMimoDraft(SchemaModel):
+    summary: Text = Field(max_length=1024)
     speaker_assignments: list[T2VASpeakerAssignment]
     integrated_sequence: list[T2VASequencePart] = Field(min_length=1)
     warnings: list[Text]
@@ -147,6 +148,7 @@ class T2VAMimoDraft(SchemaModel):
     @model_validator(mode="after")
     def validate_no_references(self) -> Self:
         values = [
+            self.summary,
             *(
                 p.text if p.kind == "prose" else p.lead_in
                 for p in self.integrated_sequence
@@ -167,6 +169,13 @@ class T2VAMimoDraft(SchemaModel):
                 raise ValueError(
                     "T2VA model prose cannot contain dialogue/conditioning syntax or speaker markers"
                 )
+        if "[" in self.summary or "]" in self.summary or re.search(
+            r"\b(?:subject_definitions|summary|retention_analysis|detailed_description|integrated_multimodal_description|overall_soundscape|non_diegetic_music)\s*:"
+            r"|\b(?:audio|voice|music)\s+(?:reuse|reference)\b",
+            self.summary,
+            re.IGNORECASE,
+        ):
+            raise ValueError("T2VA internal summary cannot contain task/section syntax")
         if any(
             _SHOT.search(p.lead_in)
             for p in self.integrated_sequence
@@ -201,8 +210,8 @@ def _validate_repetition(parts: list[str]) -> None:
 
 
 class H3NoReferenceAVCore(T2VAMimoDraft):
-    schema_version: Literal["r2v.h3.no_reference_av_core.4"] = (
-        "r2v.h3.no_reference_av_core.4"
+    schema_version: Literal["r2v.h3.no_reference_av_core.5"] = (
+        "r2v.h3.no_reference_av_core.5"
     )
     overall_soundscape: Text
     non_diegetic_music: Text
@@ -370,6 +379,12 @@ def _validate_t2va_content(
     ):
         raise ValueError("T2VA speech exceeds canonical timeline tolerance")
     _validate_assignments(facts, draft.speaker_assignments)
+    if any(
+        s.text is not None
+        and re.search(r"(?<!\w)" + re.escape(s.text) + r"(?!\w)", draft.summary)
+        for s in facts
+    ):
+        raise ValueError("T2VA internal summary must not copy authoritative ASR text")
     placed = [p.segment_id for p in draft.integrated_sequence if p.kind == "speech"]
     required = [s.segment_id for s in facts if s.text is not None]
     if placed != required:
@@ -525,8 +540,8 @@ def render_t2va_prompt(core: H3NoReferenceAVCore) -> str:
 
 
 class T2VABackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.t2va_mimo_backend.5"] = "r2v.h3.t2va_mimo_backend.5"
-    prompt_version: Literal["h3_t2va_joint_av_v5"] = "h3_t2va_joint_av_v5"
+    schema_version: Literal["r2v.h3.t2va_mimo_backend.6"] = "r2v.h3.t2va_mimo_backend.6"
+    prompt_version: Literal["h3_t2va_joint_av_v6"] = "h3_t2va_joint_av_v6"
     audio_finalize_prompt_version: Literal["h3_mimo25_audio_finalize_v6"] = (
         MIMO25_AUDIO_FINALIZE_PROMPT_VERSION
     )

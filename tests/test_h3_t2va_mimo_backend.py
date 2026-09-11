@@ -263,8 +263,8 @@ def test_required_slots_are_structural_only(job, tmp_path):
         "not insertion positions or answers",
     ):
         assert rule in T2VA_SYSTEM_PROMPT
-    assert backend.provenance().prompt_version == "h3_t2va_joint_av_v5"
-    assert backend.provenance().schema_version == "r2v.h3.t2va_mimo_backend.5"
+    assert backend.provenance().prompt_version == "h3_t2va_joint_av_v6"
+    assert backend.provenance().schema_version == "r2v.h3.t2va_mimo_backend.6"
 
 
 def test_prose_substitution_fails_before_audio_finalize(job, tmp_path):

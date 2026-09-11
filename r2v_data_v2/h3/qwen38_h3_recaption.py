@@ -232,7 +232,6 @@ class RecaptionAudioContract(SchemaModel):
                 self.retention_marker != "partially_copy"
                 or self.speaker_id is None
                 or (self.entity_id is None) != (self.subject_label is None)
-                or self.voice_characteristics is not None
                 or self.music_characteristics is not None
             ):
                 raise ValueError("speaker speech reuse requires signal-copy speaker ownership")
@@ -1355,10 +1354,15 @@ def validate_h3_draft(
 def _canonical_audio_definition(audio: RecaptionAudioContract) -> str:
     if audio.kind == "speaker_speech_reuse":
         owner = f"{audio.subject_label} " if audio.subject_label else ""
-        return (
+        definition = (
             f"{audio.audio_label} is the synchronized speech track for {owner}({audio.speaker_id}), "
             "containing the supplied speaker's speech at its original timeline positions."
         )
+        if audio.voice_characteristics is not None:
+            definition = definition[:-1] + f", featuring {audio.voice_characteristics}"
+            if not definition.endswith((".", "!", "?")):
+                definition += "."
+        return definition
     if audio.kind == "music_reuse":
         return f"{audio.audio_label} is the synchronized music track for the target's audience-only score."
     if audio.kind == "full_audio_reuse":

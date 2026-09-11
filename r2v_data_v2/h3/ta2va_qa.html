@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TA2VA QA</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#f5f6f6;color:#242629;font:14px system-ui,sans-serif;letter-spacing:0}
+header{padding:16px 20px;display:flex;gap:16px;align-items:center;flex-wrap:wrap;border-bottom:1px solid #ccd1d3;background:white}h1{font-size:20px;margin:0}select{font:inherit;min-width:200px;max-width:100%;flex:1;padding:8px;border:1px solid #adb5b9;border-radius:4px}
+main{max-width:1600px;margin:auto;padding:20px}.target{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:24px}video{width:100%;aspect-ratio:16/9;background:#121313}audio{width:100%;max-width:600px}h2{font-size:17px}h3{font-size:14px}pre{white-space:pre-wrap;overflow-wrap:anywhere;font:14px/1.6 system-ui;margin:0}.scroll{overflow:auto}table{border-collapse:collapse;min-width:720px;width:100%}th,td{text-align:left;padding:10px;border-bottom:1px solid #d8dcdf;vertical-align:top}section.variant{border-top:1px solid #ccd1d3;margin-top:24px;padding-top:12px}.refs{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:20px}.ref{min-width:0}summary{cursor:pointer;font-weight:600}details{margin-top:16px}.muted{color:#606970}.failed,#error{color:#a02334}
+@media(max-width:760px){header,main{padding:12px}.target{grid-template-columns:minmax(0,1fr)}select{flex-basis:100%}}
+</style>
+<header><h1>TA2VA QA</h1><span id="count"></span><select id="clips" aria-label="Clip"></select></header>
+<main><p id="error" role="alert"></p><h2 id="uid"></h2><div class="target"><section><h2>Original target</h2><video id="video" controls preload="metadata"></video><h3>Canonical full target audio</h3><audio id="full" controls preload="metadata"></audio></section><section><h2>Frozen T2VA</h2><pre id="t2va"></pre></section></div>
+<h2>Frozen speech / Sx assignments</h2><div class="scroll"><table><thead><tr><th>Segment / time</th><th>Source cluster</th><th>Sx / presentation</th><th>Language / exact ASR</th></tr></thead><tbody id="speech"></tbody></table></div>
+<div id="variants"></div><details><summary>Speaker-profile raw / diagnostics</summary><pre id="raw"></pre></details></main>
+<script type="application/json" id="data">__DATA__</script><script>
+"use strict";
+const $=id=>document.getElementById(id),node=(tag,text)=>{const n=document.createElement(tag);if(text!==undefined)n.textContent=text;return n;};
+try{
+const data=JSON.parse($("data").textContent);if(data.schema_version!=="r2v.h3.ta2va_shadow.1")throw Error("Invalid QA data");
+$("count").textContent=data.summary.ready_count+" ready products / "+data.cases.length+" clips";
+for(const [i,c]of data.cases.entries()){const o=node("option",c.clip_uid);o.value=i;$("clips").append(o);}
+function show(){
+ document.querySelectorAll("audio,video").forEach(p=>p.pause());
+ const c=data.cases[Number($("clips").value)];if(!c)return;
+ $("uid").textContent=c.clip_uid;$("video").src=c.video_url;$("full").src=c.full_audio_url;
+ $("t2va").textContent=c.t2va_prompt;$("raw").textContent=JSON.stringify(c.profile_raw,null,2);$("speech").replaceChildren();
+ for(const f of c.speech){const row=node("tr");for(const v of [f.segment_id+" / "+f.start_time+"–"+f.end_time+" s",f.source_speaker_cluster,f.assignment.speaker_id+" / "+f.assignment.speech_presentation,(f.language||"No transcript")+"\n"+(f.text||"")])row.append(node("td",v));$("speech").append(row);}
+ $("variants").replaceChildren();
+ for(const p of c.variants){
+  const section=node("section");section.className="variant";section.append(node("h2",p.variant+" · "+p.status));
+  if(p.failure_reason){const e=node("p",p.failure_reason);e.className="failed";section.append(e);}
+  if(p.warnings.length)section.append(node("pre",p.warnings.join("\n")));
+  const refs=node("div");refs.className="refs";
+  for(const r of p.references){
+   const box=node("div");box.className="ref";box.append(node("h3",r.contract.audio_label+" / "+r.contract.kind));
+   box.append(node("p",(r.contract.speaker_id||"Unbound")+" · "+r.contract.retention_marker));
+   if(r.contract.voice_characteristics)box.append(node("p",r.contract.voice_characteristics));
+   const audio=node("audio");audio.controls=true;audio.preload="metadata";audio.src=r.url;box.append(audio);
+   const details=node("details");details.append(node("summary","Source / exact sample ranges"));
+   details.append(node("pre",JSON.stringify(r.asset||r.contract,null,2)));box.append(details);refs.append(box);
+  }
+  section.append(refs,node("h3","Final six-section TA2VA prompt"),node("pre",p.prompt||"[unavailable]"));$("variants").append(section);
+ }
+}
+$("clips").addEventListener("change",show);show();
+}catch(e){$("error").textContent=e.message;}
+</script></html>

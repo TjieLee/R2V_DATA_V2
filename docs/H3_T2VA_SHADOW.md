@@ -68,7 +68,7 @@ It removes reference/retention/entity-binding instructions and final sound field
 The separate audio call uses frozen `audio_finalize_v6` unchanged. Semantic sound
 classification remains a model judgment, not a keyword-based validator.
 
-The current contract uses T2VA prompt v5/backend .5 and core .4. Model-visible
+The current contract uses T2VA prompt v6/backend .6 and core .5. Model-visible
 speech facts contain only segment/cluster, times, language and `has_transcript`;
 exact ASR words stay inside the job/core and are never sent in text conditioning.
 The explicit ordered `dialogue_segment_ids` list controls speech slots, while
@@ -86,7 +86,11 @@ positions. Prose describing someone speaking never replaces a required slot.
 Missing slots remain hard failures; obvious prose substitution adds only a
 diagnostic, never repair. The frozen audio-finalizer and two-call flow are unchanged.
 
-This is not fingerprint-compatible with v4 or the prior model-written dialogue
+The semantic draft also returns a short internal summary for downstream TA2VA.
+It cannot contain reference/task/section syntax, Sx or copied ASR. The public
+T2VA renderer still emits only its original three sections. No extra call is added.
+
+This is not fingerprint-compatible with v5 or the prior model-written dialogue
 string. A prior-contract run ID is rejected even with `--overwrite`: use a new
 run ID; frozen prior outputs are not rewritten. Inventory .3 binds resolved media;
 raw .2 separates both attempts; record/summary .2 account for up to two calls.
@@ -94,8 +98,8 @@ The three-section final format is unchanged. QA .3 shows segment/cluster, Sx and
 presentation, model lead-in, authoritative ASR and rendered speech side by side,
 plus original video, four Audio sources and both calls' raw responses/diagnostics.
 
-TA2VA is intentionally not implemented. A future renderer can reuse the stored
-core and add separately validated Audio contracts without another AV inference.
+Target-side TA2VA consumes this stored core; see `H3_TA2VA_SHADOW.md`. It adds
+validated Audio contracts without another AV inference. Cross-pair remains deferred.
 Existing Ref2VA/RA2VA, Audio reuse, Visual and frame-conditioned products are
 unchanged.
 
@@ -152,7 +156,7 @@ First inspect a model-free dry run:
   --clips-root "$JEA_CLIPS_ROOT" --source-videos-root "$JEA_SOURCE_VIDEOS_ROOT" \
   --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
   --audio-shadow-run-id "$AUDIO_SHADOW_RUN_ID" \
-  --t2va-run-id t2va-random20-v5 \
+  --t2va-run-id t2va-random20-v6 \
   --case-manifest "$AUDIO_PRODUCTION_ROOT/case_manifest.json" \
   --base-url http://127.0.0.1:8092/v1 \
   --transport sglang --model mimo-v2.5 \
@@ -196,7 +200,7 @@ existing exhaustive lookup and exact valid-row count.
 Inventory .3 records source shot manifest path/hash, adapter roots, source row
 index/hash, source video/shot identity and selected video path/hash. The no-Visual
 DiariZen/ASR inventories use .5; legacy .4 inputs remain readable and retain their
-existing behavior. No TA2VA is implemented.
+existing behavior.
 
 Outputs are isolated under:
 
@@ -227,7 +231,7 @@ python -m http.server 8765 --bind 127.0.0.1 --directory /mnt/workspace
 
 ```bash
 "$R2V_PYTHON" tools/build_h3_t2va_qa.py \
-  --t2va-root "$AUDIO_PRODUCTION_ROOT/t2va_shadow_v1/runs/t2va-random20-v5" \
+  --t2va-root "$AUDIO_PRODUCTION_ROOT/t2va_shadow_v1/runs/t2va-random20-v6" \
   --media-root /mnt/workspace \
   --media-base-url http://127.0.0.1:8765
 ```
