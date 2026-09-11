@@ -21,6 +21,7 @@ from r2v_data_v2.h3.audio_backends import (
     AudioMediaBackend,
     FFmpegAudioMediaBackend,
 )
+from r2v_data_v2.h3.binding_evidence import BindingEvidenceMode, BindingEvidenceSource
 from r2v_data_v2.h3.diarization_binding import (
     BoundDiarizationSegment,
     DiarizationBackend,
@@ -1745,8 +1746,8 @@ def export_stem_native_references(
     return output
 
 
-class StemDiarizationShadowProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.stem_diarization_shadow.4", "r2v.h3.stem_diarization_shadow.5"] = (
+class StemDiarizationShadowProvenance(BindingEvidenceSource):
+    schema_version: Literal["r2v.h3.stem_diarization_shadow.4", "r2v.h3.stem_diarization_shadow.5", "r2v.h3.stem_diarization_shadow.6"] = (
         STEM_DIARIZATION_SHADOW_VERSION
     )
     diarization_source_kind: Literal["sam_audio_speech_stem", "resolved_speech_stem"] = (
@@ -1756,8 +1757,8 @@ class StemDiarizationShadowProvenance(SchemaModel):
     source_stem_inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_stem_records_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     raw_segments_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    bound_segments_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    cluster_bindings_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    bound_segments_sha256: str | None = Field(pattern=r"^[0-9a-f]{64}$")
+    cluster_bindings_sha256: str | None = Field(pattern=r"^[0-9a-f]{64}$")
     clip_results_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     route: StemRoute
     target_count: int = Field(ge=0)
@@ -1778,7 +1779,15 @@ class StemDiarizationShadowProvenance(SchemaModel):
 
     @model_validator(mode="after")
     def validate_clip_provenance(self) -> StemDiarizationShadowProvenance:
-        if (self.schema_version.endswith(".5")) != (self.route == "resolved") or (
+        if (self.schema_version.endswith(".6")) != (self.binding_evidence_mode == "none"):
+            raise ValueError("stem DiariZen binding source version differs")
+        if self.binding_evidence_mode == "none":
+            if self.bound_segments_sha256 is not None or self.cluster_bindings_sha256 is not None:
+                raise ValueError("no-binding DiariZen cannot claim binding evidence hashes")
+        elif self.bound_segments_sha256 is None or self.cluster_bindings_sha256 is None:
+            raise ValueError("legacy DiariZen requires binding evidence hashes")
+        if (self.binding_evidence_mode == "legacy_lr_asd" and
+            (self.schema_version.endswith(".5")) != (self.route == "resolved")) or (
             (self.diarization_source_kind == "resolved_speech_stem") != (self.route == "resolved")
         ):
             raise ValueError("stem DiariZen source contract/version differs")
@@ -1964,7 +1973,7 @@ def validate_stem_diarization_lineage(
         RawDiarizationSegment.model_validate(item)
         for item in _read_jsonl(diarization / "raw_segments.jsonl")
     ]
-    bound_segments = [
+    bound_segments = [] if provenance.binding_evidence_mode == "none" else [
         BoundDiarizationSegment.model_validate(item)
         for item in _read_jsonl(diarization / "bound_segments.jsonl")
     ]
@@ -1985,8 +1994,15 @@ def validate_stem_diarization_lineage(
         ("cluster_bindings.jsonl", provenance.cluster_bindings_sha256),
         ("clip_results.jsonl", provenance.clip_results_sha256),
     ):
+        if expected_hash is None:
+            continue
         if sha256_file(diarization / filename) != expected_hash:
             raise ValueError(f"stem DiariZen {filename} changed")
+    if provenance.binding_evidence_mode == "none":
+        source_inventory = DiarizationInventory.model_validate_json((diarization / "inventory.json").read_text())
+        if any(t.target_audio_binding_path or t.target_audio_binding_sha256 or t.visual_references
+               for t in source_inventory.targets):
+            raise ValueError("no-binding stem inventory contains binding priors")
     return provenance, inventory, records
 
 
@@ -2005,10 +2021,18 @@ def build_stem_diarization_inventory(
     *,
     stem_inventory: StemInventory,
     stem_records: Sequence[StemRecord],
-    production_diarization_inventory: DiarizationInventory,
+    production_diarization_inventory: DiarizationInventory | None,
     route: StemRoute,
     allow_unverified: bool = False,
+    binding_evidence_mode: BindingEvidenceMode = "legacy_lr_asd",
+    visual_production_root: Path | None = None,
 ) -> DiarizationInventory:
+    if binding_evidence_mode == "none":
+        return _build_unbound_stem_inventory(
+            stem_inventory, stem_records, route, visual_production_root, allow_unverified,
+        )
+    if binding_evidence_mode != "legacy_lr_asd" or production_diarization_inventory is None:
+        raise ValueError("legacy stem DiariZen requires production inventory")
     selected = selected_stem_records(
         stem_records,
         route=route,
@@ -2096,25 +2120,79 @@ def build_stem_diarization_inventory(
     )
 
 
+def _build_unbound_stem_inventory(
+    stem_inventory: StemInventory,
+    stem_records: Sequence[StemRecord],
+    route: StemRoute,
+    visual_root: Path | None,
+    allow_unverified: bool,
+) -> DiarizationInventory:
+    if visual_root is None:
+        raise ValueError("no-binding RA2VA DiariZen requires Visual source provenance")
+    visual_root = Path(visual_root).resolve(strict=True)
+    visual_path = visual_root / "samples.jsonl"
+    visual_hash = sha256_file(visual_path)
+    canonical_path = Path(stem_inventory.source_canonical_audio_manifest_path).resolve(strict=True)
+    canonical_hash = sha256_file(canonical_path)
+    canonical = _canonical_by_clip(stem_inventory)
+    selected = {r.clip_uid: r for r in selected_stem_records(
+        stem_records, route=route, allow_unverified=allow_unverified,
+    )}
+    targets = []
+    for uid in stem_inventory.clip_uids:
+        if uid not in selected:
+            continue
+        source = canonical[uid]
+        speech = selected[uid].stem("speech")
+        if (Path(speech.source_audio_path).resolve(strict=True) != Path(source.target_full_audio_path).resolve(strict=True)
+            or speech.source_audio_sha256 != source.target_full_audio_sha256
+            or sha256_file(Path(source.target_full_audio_path)) != source.target_full_audio_sha256
+            or sha256_file(Path(source.target_video_path)) != source.target_video_sha256
+            or sha256_file(Path(speech.canonical_stem_path)) != speech.canonical_stem_sha256):
+            raise ValueError("unbound DiariZen canonical/stem media provenance differs")
+        targets.append(DiarizationTargetClip(
+            target_clip_uid=uid, target_video_path=source.target_video_path,
+            source_audio_path=speech.canonical_stem_path, source_audio_sha256=speech.canonical_stem_sha256,
+            source_sample_rate_hz=speech.canonical_sample_rate_hz, source_channels=speech.canonical_channels,
+            source_frame_count=min(source.frame_count, speech.canonical_frame_count),
+            target_audio_binding_path=None, target_audio_binding_sha256=None, visual_references=[],
+        ))
+    return DiarizationInventory(
+        mode="production", source_inventory_kind="canonical_audio_manifest",
+        source_visual_production_root=str(visual_root), source_visual_inventory_path=str(visual_path),
+        source_visual_inventory_sha256=visual_hash,
+        source_canonical_audio_manifest_path=str(canonical_path),
+        source_canonical_audio_manifest_sha256=canonical_hash,
+        inventory_fingerprint=_diarization_inventory_fingerprint(
+            source_pairs_sha256=None, source_asr_inventory_fingerprint=None, mode="production",
+            targets=targets, source_inventory_kind="canonical_audio_manifest",
+            source_visual_inventory_sha256=visual_hash, source_canonical_audio_manifest_sha256=canonical_hash,
+        ),
+        source_target_count=len(targets), selected_target_count=len(targets),
+        selection_mode="canonical_visual_target_inventory_v1", bounded_selection_applied=False, targets=targets,
+    )
+
+
 def _publish_shadow_readable(
     *,
     diarization_root: Path,
     canonical_by_clip: dict[str, CanonicalAudioClip],
     inventory: DiarizationInventory,
     usable_clip_uids: Sequence[str],
+    binding_evidence_mode: BindingEvidenceMode = "legacy_lr_asd",
 ) -> JEAReadableDiarizationSummary:
     raw = [
         RawDiarizationSegment.model_validate(row)
         for row in _read_jsonl(diarization_root / "raw_segments.jsonl")
     ]
-    bound = [
+    bound = [] if binding_evidence_mode == "none" else [
         BoundDiarizationSegment.model_validate(row)
         for row in _read_jsonl(diarization_root / "bound_segments.jsonl")
     ]
     bound_by_key = {(item.target_clip_uid, item.segment_id): item for item in bound}
-    if len(bound_by_key) != len(bound) or set(bound_by_key) != {
+    if binding_evidence_mode != "none" and (len(bound_by_key) != len(bound) or set(bound_by_key) != {
         (item.target_clip_uid, item.segment_id) for item in raw
-    }:
+    }):
         raise ValueError("stem DiariZen raw and bound inventories differ")
     usable = set(usable_clip_uids)
     if not {item.target_clip_uid for item in raw}.issubset(usable):
@@ -2142,7 +2220,7 @@ def _publish_shadow_readable(
     segments: list[JEAReadableDiarizationSegment] = []
     for source in raw:
         canonical = canonical_by_clip[source.target_clip_uid]
-        mapped = bound_by_key[(source.target_clip_uid, source.segment_id)]
+        mapped = bound_by_key.get((source.target_clip_uid, source.segment_id))
         segments.append(
             JEAReadableDiarizationSegment(
                 clip_uid=canonical.clip_uid,
@@ -2154,8 +2232,8 @@ def _publish_shadow_readable(
                 shard_id=canonical.shard_id,
                 segment_id=source.segment_id,
                 speaker_cluster_id=source.speaker_cluster_id,
-                entity_id=mapped.entity_id,
-                entity_occurrence_id=mapped.entity_occurrence_id,
+                entity_id=mapped.entity_id if mapped else None,
+                entity_occurrence_id=mapped.entity_occurrence_id if mapped else None,
                 source_audio_path=source.source_audio_path,
                 source_start_sample=source.source_start_sample,
                 source_end_sample=source.source_end_sample,
@@ -2193,24 +2271,30 @@ def run_stem_diarization_shadow(
     output_root: Path,
     allow_unverified: bool = False,
     overwrite: bool = False,
+    binding_evidence_mode: BindingEvidenceMode = "legacy_lr_asd",
+    visual_production_root: Path | None = None,
 ) -> StemDiarizationShadowProvenance:
     from r2v_data_v2.h3.resolved_audio_stems import RESOLVED_STAGE, load_stem_source
 
     stem_inventory, stem_records, _ = load_stem_source(stem_root)
     if (stem_root.name == RESOLVED_STAGE) != (route == "resolved"):
         raise ValueError("stem DiariZen source kind differs from requested contract")
-    production_inventory_path = (
-        production_diarization_root.expanduser().resolve(strict=True) / "inventory.json"
-    )
-    production_inventory = DiarizationInventory.model_validate_json(
-        production_inventory_path.read_text(encoding="utf-8")
-    )
+    production_inventory = None
+    if binding_evidence_mode != "none":
+        production_inventory_path = (
+            production_diarization_root.expanduser().resolve(strict=True) / "inventory.json"
+        )
+        production_inventory = DiarizationInventory.model_validate_json(
+            production_inventory_path.read_text(encoding="utf-8")
+        )
     inventory = build_stem_diarization_inventory(
         stem_inventory=stem_inventory,
         stem_records=stem_records,
         production_diarization_inventory=production_inventory,
         route=route,
         allow_unverified=allow_unverified,
+        binding_evidence_mode=binding_evidence_mode,
+        visual_production_root=visual_production_root,
     )
     destination = output_root.expanduser().resolve(strict=False)
     outer = destination.with_name(f".{destination.name}.tmp-{uuid.uuid4().hex}")
@@ -2269,16 +2353,20 @@ def run_stem_diarization_shadow(
             canonical_by_clip=_canonical_by_clip(stem_inventory),
             inventory=inventory,
             usable_clip_uids=usable_clip_uids,
+            binding_evidence_mode=binding_evidence_mode,
         )
         provenance = StemDiarizationShadowProvenance(
-            **({"schema_version": "r2v.h3.stem_diarization_shadow.5",
+            **({"schema_version": "r2v.h3.stem_diarization_shadow.6", "binding_evidence_mode": "none",
+                "diarization_source_kind": "resolved_speech_stem" if route == "resolved" else "sam_audio_speech_stem"}
+               if binding_evidence_mode == "none" else
+               {"schema_version": "r2v.h3.stem_diarization_shadow.5",
                 "diarization_source_kind": "resolved_speech_stem"} if route == "resolved" else {}),
             source_stem_root=str(stem_root.expanduser().resolve(strict=True)),
             source_stem_inventory_fingerprint=stem_inventory.inventory_fingerprint,
             source_stem_records_sha256=sha256_file(records_path),
             raw_segments_sha256=sha256_file(stage / "raw_segments.jsonl"),
-            bound_segments_sha256=sha256_file(stage / "bound_segments.jsonl"),
-            cluster_bindings_sha256=sha256_file(stage / "cluster_bindings.jsonl"),
+            bound_segments_sha256=None if binding_evidence_mode == "none" else sha256_file(stage / "bound_segments.jsonl"),
+            cluster_bindings_sha256=None if binding_evidence_mode == "none" else sha256_file(stage / "cluster_bindings.jsonl"),
             clip_results_sha256=sha256_file(stage / "clip_results.jsonl"),
             route=route,
             target_count=len(inventory.targets),
@@ -2325,8 +2413,8 @@ def run_stem_diarization_shadow(
         raise
 
 
-class StemASRShadowProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.stem_asr_shadow.4", "r2v.h3.stem_asr_shadow.5"] = STEM_ASR_SHADOW_VERSION
+class StemASRShadowProvenance(BindingEvidenceSource):
+    schema_version: Literal["r2v.h3.stem_asr_shadow.4", "r2v.h3.stem_asr_shadow.5", "r2v.h3.stem_asr_shadow.6"] = STEM_ASR_SHADOW_VERSION
     asr_source_kind: Literal["sam_audio_speech_stem_segments", "resolved_speech_stem_segments"] = (
         "sam_audio_speech_stem_segments"
     )
@@ -2348,7 +2436,10 @@ class StemASRShadowProvenance(SchemaModel):
 
     @model_validator(mode="after")
     def validate_clip_provenance(self) -> StemASRShadowProvenance:
-        if (self.schema_version.endswith(".5")) != (self.route == "resolved") or (
+        if self.schema_version.endswith(".6") != (self.binding_evidence_mode == "none"):
+            raise ValueError("stem ASR binding source version differs")
+        if (self.binding_evidence_mode == "legacy_lr_asd" and
+            (self.schema_version.endswith(".5")) != (self.route == "resolved")) or (
             (self.asr_source_kind == "resolved_speech_stem_segments") != (self.route == "resolved")
         ):
             raise ValueError("stem ASR source contract/version differs")
@@ -2410,6 +2501,7 @@ def validate_stem_asr_lineage(
     root: Path,
     *,
     expected_shadow_root: Path | None = None,
+    expected_diarization_root: Path | None = None,
 ) -> tuple[StemASRShadowProvenance, StemDiarizationShadowProvenance]:
     asr_root = root.expanduser().resolve(strict=True)
     provenance = StemASRShadowProvenance.model_validate_json(
@@ -2421,7 +2513,9 @@ def validate_stem_asr_lineage(
     if expected_shadow_root is not None:
         expected = expected_shadow_root.expanduser().resolve(strict=True)
         require_shadow_output_path(shadow_root=expected, output_path=asr_root)
-        if diarization != expected / "diarization":
+        expected_source = (expected_diarization_root.expanduser().resolve(strict=True)
+                           if expected_diarization_root is not None else expected / "diarization")
+        if diarization != expected_source:
             raise ValueError("stem ASR source root differs from selected shadow run")
     source_path = diarization / "stem_provenance.json"
     if sha256_file(source_path) != provenance.source_stem_diarization_provenance_sha256:
@@ -2430,6 +2524,8 @@ def validate_stem_asr_lineage(
         diarization, expected_shadow_root=expected_shadow_root,
     )
     if (
+        provenance.binding_evidence_mode != source.binding_evidence_mode
+        or
         provenance.source_stem_inventory_fingerprint
         != source.source_stem_inventory_fingerprint
         or provenance.route != source.route
@@ -2495,9 +2591,13 @@ def run_stem_qwen3_asr_shadow(
             backend=backend,
             segment_audio_loader=segment_audio_loader,
             ffmpeg=ffmpeg,
+            **({"binding_evidence_mode": "none"} if source_provenance.binding_evidence_mode == "none" else {}),
         )
         provenance = StemASRShadowProvenance(
-            **({"schema_version": "r2v.h3.stem_asr_shadow.5",
+            **({"schema_version": "r2v.h3.stem_asr_shadow.6", "binding_evidence_mode": "none",
+                "asr_source_kind": "resolved_speech_stem_segments" if source_provenance.route == "resolved" else "sam_audio_speech_stem_segments"}
+               if source_provenance.binding_evidence_mode == "none" else
+               {"schema_version": "r2v.h3.stem_asr_shadow.5",
                 "asr_source_kind": "resolved_speech_stem_segments"} if source_provenance.route == "resolved" else {}),
             source_stem_diarization_root=str(diarization),
             source_stem_diarization_provenance_sha256=sha256_file(

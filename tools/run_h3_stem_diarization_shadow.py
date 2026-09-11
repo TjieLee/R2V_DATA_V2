@@ -31,6 +31,8 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run DiariZen on SAM speech stems")
     parser.add_argument("--audio-production-root", type=Path, required=True)
     parser.add_argument("--shadow-run-id")
+    parser.add_argument("--binding-evidence-mode", choices=("legacy_lr_asd", "none"), default="legacy_lr_asd")
+    parser.add_argument("--visual-production-root", type=Path)
     parser.add_argument(
         "--sam-route",
         choices=("music_first", "voice_first"),
@@ -52,8 +54,12 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
     separation = downstream_stem_root(paths.root, arguments.shadow_run_id)
     output = require_shadow_output_path(
         shadow_root=shadow,
-        output_path=arguments.output_root or shadow / "diarization",
+        output_path=arguments.output_root or shadow / (
+            "diarization_no_lrasd_v1" if arguments.binding_evidence_mode == "none" else "diarization"
+        ),
     )
+    if arguments.binding_evidence_mode == "none" and output == shadow / "diarization":
+        raise ValueError("no-LR-ASD pilot requires an isolated DiariZen output root")
     stem_inventory, records, _ = load_stem_source(separation)
     if arguments.case_manifest is not None:
         manifest = MimoCaseManifest.model_validate_json(
@@ -63,7 +69,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
             raise ValueError("case manifest differs from SAM Audio stem inventory")
     from r2v_data_v2.h3.diarization_binding import DiarizationInventory
 
-    production_inventory = DiarizationInventory.model_validate_json(
+    production_inventory = None if arguments.binding_evidence_mode == "none" else DiarizationInventory.model_validate_json(
         (paths.diarization / "inventory.json").read_text(encoding="utf-8")
     )
     inventory = build_stem_diarization_inventory(
@@ -72,12 +78,15 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         production_diarization_inventory=production_inventory,
         route=route,
         allow_unverified=arguments.allow_unverified,
+        binding_evidence_mode=arguments.binding_evidence_mode,
+        visual_production_root=arguments.visual_production_root,
     )
     result: dict[str, object] = {
         "dry_run": arguments.dry_run,
         "model_called": False,
         "output_root": str(output),
         "target_count": len(inventory.targets),
+        "binding_evidence_mode": arguments.binding_evidence_mode,
         "target_clip_uids": [item.target_clip_uid for item in inventory.targets],
         "diarization_source_kind": (
             "resolved_speech_stem" if route == "resolved" else "sam_audio_speech_stem"
@@ -98,6 +107,8 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
                     output_root=output,
                     allow_unverified=arguments.allow_unverified,
                     overwrite=arguments.overwrite,
+                    binding_evidence_mode=arguments.binding_evidence_mode,
+                    visual_production_root=arguments.visual_production_root,
                 )
         finally:
             if diagnostics.exists():

@@ -1813,10 +1813,18 @@ def validate_annotation(
     allowed_reference_labels: set[str],
     reference_subjects: list[Any],
     target_duration_seconds: float,
+    binding_evidence_mode: Literal["legacy_lr_asd", "none"] = "legacy_lr_asd",
 ) -> list[ValidationIssue]:
     issues: list[ValidationIssue] = []
     audio_decisions = annotation.audio_observation.segment_decisions
     groundings = annotation.av_grounding.segment_groundings
+    if binding_evidence_mode == "none":
+        for grounding in groundings:
+            if {"lr_asd_support", "lr_asd_conflict"}.intersection(grounding.evidence_codes):
+                issues.append(ValidationIssue(
+                    "unsupplied_lr_asd_evidence", grounding.segment_id,
+                    "No LR-ASD evidence was supplied in binding_evidence_mode=none",
+                ))
     visual_views = annotation.visual_observation.segment_views
     if [item.segment_id for item in audio_decisions] != segment_ids:
         issues.append(
@@ -2890,6 +2898,7 @@ class OpenAIMimo25Backend:
             raise TypeError("MiMo segment inventory is invalid")
         return {
             "clip_uid": job.clip_uid,
+            **({"binding_evidence_mode": "none"} if getattr(job, "binding_evidence_mode", "legacy_lr_asd") == "none" else {}),
             "target_duration_seconds": job.target_duration_seconds,
             "reference_selection": job.reference_selection.model_dump(mode="json"),
             "reference_image_mapping": [
@@ -3135,7 +3144,14 @@ class OpenAIMimo25Backend:
                 )
             target_video = next(item for item in content if item["type"] == "video_url")
             turn2_messages = [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": SYSTEM_PROMPT + (
+                    "\nNO PRIOR BINDING EVIDENCE: binding_evidence_mode=none. No LR-ASD or current speaker/entity proposal is supplied. "
+                    "Neutral prior fields mean unavailable proposals, not measured LR-ASD negatives. "
+                    "Use Turn 1 exact-window visible entities, original target AV, DiariZen segments and acoustic clusters. "
+                    "Original target AV remains final speaker-binding authority. Never claim lr_asd_support or lr_asd_conflict. "
+                    "Do not assume a visible salient person is speaking; do not add a lip-motion prerequisite."
+                    if getattr(job, "binding_evidence_mode", "legacy_lr_asd") == "none" else ""
+                )},
                 {"role": "user", "content": [
                     target_video,
                     {"type": "text", "text": (
@@ -3452,6 +3468,15 @@ class OpenAIMimo25Backend:
         )
         polish = MimoSpeakerMarkerPolishAudit()
         if annotation is not None:
+            unsupplied_evidence = [
+                ValidationIssue(
+                    "unsupplied_lr_asd_evidence", item.segment_id,
+                    "LR-ASD evidence was not supplied in binding_evidence_mode=none",
+                )
+                for item in annotation.av_grounding.segment_groundings
+                if getattr(job, "binding_evidence_mode", "legacy_lr_asd") == "none"
+                and {"lr_asd_support", "lr_asd_conflict"}.intersection(item.evidence_codes)
+            ]
             annotation, grounding_corrections = _normalize_speaker_annotation(
                 annotation,
                 segment_ids=segment_ids,
@@ -3479,8 +3504,10 @@ class OpenAIMimo25Backend:
                 allowed_reference_labels=allowed_reference_labels,
                 reference_subjects=job.reference_subjects,
                 target_duration_seconds=job.target_duration_seconds,
+                binding_evidence_mode=getattr(job, "binding_evidence_mode", "legacy_lr_asd"),
             )
             review_only = _REVIEW_ONLY_ISSUES
+            issues.extend(item for item in unsupplied_evidence if item not in issues)
             if not transcribed_segment_ids:
                 review_only = review_only | {
                     "segment_inventory_mismatch", "visual_segment_inventory_mismatch",

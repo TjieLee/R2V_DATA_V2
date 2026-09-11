@@ -570,7 +570,9 @@ def _index_by_key(
     return result
 
 
-def _load_inputs(diarization_root: Path) -> _Inputs:
+def _load_inputs(diarization_root: Path, *, binding_evidence_mode: str = "legacy_lr_asd") -> _Inputs:
+    if binding_evidence_mode not in {"legacy_lr_asd", "none"}:
+        raise ValueError("invalid ASR binding evidence mode")
     root = diarization_root.expanduser().resolve(strict=True)
     readable_summary = _ReadableDiarizationSummary.model_validate_json(
         (root / "readable_summary.json").read_text(encoding="utf-8")
@@ -592,7 +594,7 @@ def _load_inputs(diarization_root: Path) -> _Inputs:
         _RawSegmentProvenance.model_validate(row)
         for row in _read_rows(root / "raw_segments.jsonl")
     ]
-    bound = [
+    bound = [] if binding_evidence_mode == "none" else [
         _BoundSegmentProvenance.model_validate(row)
         for row in _read_rows(root / "bound_segments.jsonl")
     ]
@@ -612,14 +614,27 @@ def _load_inputs(diarization_root: Path) -> _Inputs:
     readable_by_key = _index_by_key(readable, source_name="readable")
     raw_by_key = _index_by_key(raw, source_name="raw")
     bound_by_key = _index_by_key(bound, source_name="bound")
-    if set(readable_by_key) != set(raw_by_key) or set(readable_by_key) != set(
-        bound_by_key
+    if set(readable_by_key) != set(raw_by_key) or (
+        binding_evidence_mode != "none" and set(readable_by_key) != set(bound_by_key)
     ):
         raise ValueError("readable, raw, and bound DiariZen inventories differ")
     for key, readable_item in readable_by_key.items():
         if not isinstance(readable_item, _ReadableDiarizationSegment):
             raise TypeError("invalid readable DiariZen provenance row")
         raw_item = raw_by_key[key]
+        if binding_evidence_mode == "none":
+            if (
+                readable_item.entity_id is not None or readable_item.entity_occurrence_id is not None
+                or any(getattr(readable_item, name) != getattr(raw_item, name) for name in (
+                    "source_start_sample", "source_end_sample", "speaker_cluster_id",
+                    "source_audio_path", "source_sample_rate_hz", "source_channels", "start_time", "end_time",
+                ))
+                or any(t.target_audio_binding_path or t.target_audio_binding_sha256 for t in targets)
+            ):
+                raise ValueError("unbound readable DiariZen provenance differs from raw")
+            if not Path(readable_item.source_audio_path).is_file():
+                raise FileNotFoundError(readable_item.source_audio_path)
+            continue
         bound_item = bound_by_key[key]
         if not isinstance(raw_item, _RawSegmentProvenance) or not isinstance(
             bound_item, _BoundSegmentProvenance
@@ -663,8 +678,9 @@ def run_qwen3_asr(
     segment_audio_loader: SegmentAudioLoader | None = None,
     ffmpeg: str = "ffmpeg",
     overwrite: bool = False,
+    binding_evidence_mode: str = "legacy_lr_asd",
 ) -> Qwen3ASRSummary:
-    inputs = _load_inputs(diarization_root)
+    inputs = _load_inputs(diarization_root, binding_evidence_mode=binding_evidence_mode)
     if source_visual_production_root is None:
         from r2v_data_v2.h3.diarization_binding import DiarizationInventory
 

@@ -19,6 +19,7 @@ from r2v_data_v2.h3.mimo25_av_reconcile import (
     MimoInventory,
     _inventory,
     build_mimo25_inventory,
+    build_mimo25_reference_inventory,
 )
 from r2v_data_v2.h3.mimo25_backend import MimoAVAnnotationDraft, MimoBackendProvenance
 from r2v_data_v2.h3.mimo25_stem_shadow import (
@@ -207,16 +208,28 @@ def prepare_audio_reuse_sources(
     *, audio_production_root: Path, visual_production_root: Path, visual_runs_root: Path,
     stem_shadow_root: Path, base_reconcile_root: Path, override_reconcile_root: Path | None,
     source_h3_root: Path, prepared_root: Path,
+    binding_evidence_mode: Literal["legacy_lr_asd", "none"] = "legacy_lr_asd",
+    stem_diarization_root: Path | None = None, stem_asr_root: Path | None = None,
 ) -> AudioReusePreparedSummary:
     """Publish a NEW prepared shadow root without invoking any model or media writer."""
     output = prepared_root.resolve()
     paths = jea_production_paths(audio_production_root)
     shadow = stem_shadow_root.resolve(strict=True)
+    from r2v_data_v2.h3.sam_audio_stem_shadow import require_shadow_output_path
+
+    diarization = require_shadow_output_path(
+        shadow_root=shadow, output_path=stem_diarization_root or shadow / "diarization",
+    )
+    asr = require_shadow_output_path(
+        shadow_root=shadow, output_path=stem_asr_root or shadow / "asr",
+    )
+    stem_sources = [shadow / n for n in ("separation", "auk_speech_v1", "resolved_stems_v1")]
+    stem_sources += [diarization, asr]
     inputs = [base_reconcile_root.resolve(strict=True), source_h3_root.resolve(strict=True)]
     if override_reconcile_root is not None:
         inputs.append(override_reconcile_root.resolve(strict=True))
     protected = [getattr(paths, f.name).resolve() for f in fields(paths) if f.name != "root"]
-    protected += inputs + [shadow / n for n in ("separation", "auk_speech_v1", "resolved_stems_v1", "diarization", "asr")]
+    protected += inputs + stem_sources
     protected += [visual_production_root.resolve(), visual_runs_root.resolve()]
     if paths.root.is_relative_to(output) or shadow.is_relative_to(output) or any(
         output.is_relative_to(p) or p.is_relative_to(output) for p in protected
@@ -226,27 +239,36 @@ def prepare_audio_reuse_sources(
         raise FileExistsError(output)
     # Capture durable inputs before reconstruction and verify again before publication.
     source_files = set()
-    for root in inputs + [shadow / n for n in ("separation", "auk_speech_v1", "resolved_stems_v1", "diarization", "asr")]:
+    for root in inputs + stem_sources:
         if root.is_dir():
             source_files.update(p for p in root.rglob("*.json") if p.is_file())
             source_files.update(p for p in root.rglob("*.jsonl") if p.is_file())
     source_files.update([
         visual_production_root / "samples.jsonl", paths.audio / "canonical_clips.jsonl",
+        paths.h3 / "samples.jsonl",
+    ])
+    if binding_evidence_mode == "legacy_lr_asd":
+        source_files.update([
         paths.diarization / "inventory.json", paths.diarization / "raw_segments.jsonl",
         paths.diarization / "bound_segments.jsonl", paths.asr / "segments.jsonl",
         paths.root / "binding_audit_v1/segments.jsonl", paths.h3 / "samples.jsonl",
-    ])
+        ])
+    elif binding_evidence_mode == "none":
+        source_files = {p for p in source_files if p.name not in {"bound_segments.jsonl", "cluster_bindings.jsonl"}}
+    else:
+        raise ValueError("invalid prepared binding evidence mode")
     hashes = {str(p): sha256_file(p) for p in sorted(source_files)}
     base = load_reconcile_sources(base_reconcile_root)
     override = load_reconcile_sources(override_reconcile_root) if override_reconcile_root else []
     effective = overlay_reconcile_sources(base, override)
     manifest = MimoCaseManifest(clip_uids=[r.clip_uid for r in base])
     provenance, stem_inventory, stems = validate_stem_diarization_lineage(
-        shadow / "diarization", expected_shadow_root=shadow,
+        diarization, expected_shadow_root=shadow,
     )
     if [uid for uid in stem_inventory.clip_uids if uid in set(manifest.clip_uids)] != manifest.clip_uids:
         raise ValueError("prepared clips are not an ordered separation subset")
-    base_inventory = build_mimo25_inventory(
+    builder = build_mimo25_reference_inventory if binding_evidence_mode == "none" else build_mimo25_inventory
+    base_inventory = builder(
         visual_production_root=visual_production_root, visual_runs_root=visual_runs_root,
         audio_production_root=audio_production_root, case_manifest=manifest,
     )
@@ -254,7 +276,8 @@ def prepare_audio_reuse_sources(
         raise ValueError("frozen H3 source differs from reconstruction source")
     jobs = build_stem_reconcile_jobs(
         base_inventory=usable_stem_reconcile_inventory(base_inventory, provenance),
-        stem_diarization_root=shadow / "diarization", stem_asr_root=shadow / "asr", route=provenance.route,
+        stem_diarization_root=diarization, stem_asr_root=asr, route=provenance.route,
+        binding_evidence_mode=binding_evidence_mode,
     )
     samples = project_prepared_samples(jobs, [
         FinalH3SampleV2.model_validate_json(line)
@@ -265,11 +288,13 @@ def prepare_audio_reuse_sources(
         values.pop("source_diarization_inventory_sha256")
     values.update(jobs=[j.model_dump(mode="json") for j in jobs], clip_count=len(jobs))
     for name, path in (
-        ("source_diarization_inventory_sha256", shadow / "diarization/inventory.json"),
-        ("source_diarization_raw_segments_sha256", shadow / "diarization/raw_segments.jsonl"),
-        ("source_diarization_bound_segments_sha256", shadow / "diarization/bound_segments.jsonl"),
-        ("source_qwen3_asr_segments_sha256", shadow / "asr/segments.jsonl"),
+        ("source_diarization_inventory_sha256", diarization / "inventory.json"),
+        ("source_diarization_raw_segments_sha256", diarization / "raw_segments.jsonl"),
+        ("source_diarization_bound_segments_sha256", diarization / "bound_segments.jsonl"),
+        ("source_qwen3_asr_segments_sha256", asr / "segments.jsonl"),
     ):
+        if name == "source_diarization_bound_segments_sha256" and binding_evidence_mode == "none":
+            continue
         values[name] = sha256_file(path)
     # The outer inventory binds the new H3 file; the reconstructed jobs are unchanged.
     samples_text = "".join(s.model_dump_json() + "\n" for s in samples)

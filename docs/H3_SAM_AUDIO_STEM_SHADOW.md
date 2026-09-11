@@ -382,3 +382,71 @@ original AV, production comparison and final six-section H3 when safe.
 Use `--dry-run` to validate inventory selection without constructing a model
 backend. Production migration requires a later explicit decision after shadow
 distribution and human review.
+
+## RA2VA no-LR-ASD shadow
+
+This is an explicit target-side pilot, not the production default. The default
+`--binding-evidence-mode legacy_lr_asd` remains available for rollback with its
+existing readers, payloads and directories. Cross-pair is out of scope.
+
+`--binding-evidence-mode none` keeps the frozen Visual reference graph and reads
+raw stem DiariZen segments plus exact Qwen3-ASR facts. No current speaker/entity
+proposal is supplied. Neutral prior fields are unavailable evidence, not measured
+LR-ASD negatives. Original target AV remains MiMo's final speaker-binding
+authority. MiMo retains visual, speech/AV, optional acoustic profile and audio
+finalize stages; claiming `lr_asd_support` or `lr_asd_conflict` fails closed.
+
+No-binding base jobs use MiMo inventory `.5`; legacy `.4` remains readable with
+unchanged fingerprints. No-binding DiariZen/ASR provenance uses `.6`; legacy
+`.4`/`.5` retain their old serialization. The new reconcile stage also publishes
+`source_contract.json` containing the explicit mode and fingerprinted jobs.
+The acoustic DiariZen implementation may emit neutral bound/cluster compatibility
+files, but this mode neither reads nor hashes them as dependencies.
+
+The commands below are intended server commands, not a Codex inference run.
+Reuse the existing validated runtime environment variables from the server
+runbook. `SHADOW_RUN_ID` identifies an existing resolved AuK/SAM run and
+`CASE_MANIFEST` matches that run's ordered inventory. Use fresh output roots;
+do not add `--overwrite` to replace the validated legacy stages.
+
+```bash
+SHADOW="$AUDIO_PRODUCTION_ROOT/sam_audio_stem_shadow_v1/runs/$SHADOW_RUN_ID"
+DIARI_NONE="$SHADOW/diarization_no_lrasd_v1"
+ASR_NONE="$SHADOW/asr_no_lrasd_v1"
+MIMO_NONE="$SHADOW/mimo_reconcile_no_lrasd_v1"
+
+"$R2V_PYTHON" tools/run_h3_stem_diarization_shadow.py \
+  --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
+  --visual-production-root "$VISUAL_PRODUCTION_ROOT" \
+  --shadow-run-id "$SHADOW_RUN_ID" --case-manifest "$CASE_MANIFEST" \
+  --binding-evidence-mode none --output-root "$DIARI_NONE" --allow-unverified
+
+"$R2V_PYTHON" tools/run_h3_stem_qwen3_asr_shadow.py \
+  --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
+  --visual-production-root "$VISUAL_PRODUCTION_ROOT" \
+  --shadow-run-id "$SHADOW_RUN_ID" --case-manifest "$CASE_MANIFEST" \
+  --diarization-root "$DIARI_NONE" --output-root "$ASR_NONE" --allow-unverified
+
+"$R2V_PYTHON" tools/run_h3_mimo25_stem_reconcile_shadow.py \
+  --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
+  --visual-production-root "$VISUAL_PRODUCTION_ROOT" \
+  --visual-runs-root "$VISUAL_RUNS_ROOT" \
+  --shadow-run-id "$SHADOW_RUN_ID" --case-manifest "$CASE_MANIFEST" \
+  --binding-evidence-mode none --stem-diarization-root "$DIARI_NONE" \
+  --stem-asr-root "$ASR_NONE" --output-root "$MIMO_NONE" \
+  --base-url "$MIMO_BASE_URL" --model "$MIMO_MODEL" --allow-unverified
+
+"$R2V_PYTHON" tools/prepare_h3_audio_reuse_sources.py \
+  --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
+  --visual-production-root "$VISUAL_PRODUCTION_ROOT" \
+  --visual-runs-root "$VISUAL_RUNS_ROOT" --stem-shadow-root "$SHADOW" \
+  --base-reconcile-root "$MIMO_NONE" --source-h3-root "$AUDIO_PRODUCTION_ROOT/h3" \
+  --prepared-root "$SHADOW/prepared_no_lrasd_v1" \
+  --binding-evidence-mode none --stem-diarization-root "$DIARI_NONE" \
+  --stem-asr-root "$ASR_NONE"
+```
+
+`--allow-unverified` remains the explicit pilot opt-in for unverified stems.
+The first three commands support `--dry-run` for source-only preflight. Prepared
+publication is model-free and preserves the unchanged Audio-reuse semantics.
+Rollback selects the old roots and `legacy_lr_asd`; it does not rewrite artifacts.

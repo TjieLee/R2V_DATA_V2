@@ -1506,6 +1506,7 @@ def build_stem_reconcile_jobs(
     stem_diarization_root: Path,
     stem_asr_root: Path,
     route: StemRoute | None = None,
+    binding_evidence_mode: Literal["legacy_lr_asd", "none"] = "legacy_lr_asd",
 ) -> list[MimoClipJob]:
     diarization = stem_diarization_root.expanduser().resolve(strict=True)
     asr_root = stem_asr_root.expanduser().resolve(strict=True)
@@ -1514,8 +1515,12 @@ def build_stem_reconcile_jobs(
     )
     asr_provenance, asr_source = validate_stem_asr_lineage(
         asr_root, expected_shadow_root=diarization.parent,
+        expected_diarization_root=diarization,
     )
     if (
+        binding_evidence_mode != getattr(base_inventory, "binding_evidence_mode", "legacy_lr_asd")
+        or binding_evidence_mode != diarization_provenance.binding_evidence_mode
+        or
         asr_source != diarization_provenance
         or asr_provenance.source_clip_uids != diarization_provenance.clip_uids
         or asr_provenance.clip_uids != diarization_provenance.usable_clip_uids
@@ -1528,11 +1533,11 @@ def build_stem_reconcile_jobs(
         RawDiarizationSegment.model_validate(item)
         for item in _read_jsonl(diarization / "raw_segments.jsonl")
     ]
-    bound = [
+    bound = [] if binding_evidence_mode == "none" else [
         BoundDiarizationSegment.model_validate(item)
         for item in _read_jsonl(diarization / "bound_segments.jsonl")
     ]
-    clusters = [
+    clusters = [] if binding_evidence_mode == "none" else [
         DiarizationClusterBinding.model_validate(item)
         for item in _read_jsonl(diarization / "cluster_bindings.jsonl")
     ]
@@ -1550,8 +1555,14 @@ def build_stem_reconcile_jobs(
         }
         for item in clusters
     }
-    if not (set(raw_by_key) == set(bound_by_key) == set(asr_by_key)):
+    if (set(raw_by_key) != set(asr_by_key) or (
+        binding_evidence_mode != "none" and set(raw_by_key) != set(bound_by_key)
+    )):
         raise ValueError("stem reconcile DiariZen/ASR inventories differ")
+    if binding_evidence_mode == "none" and (
+        len(raw) != len(raw_by_key) or len(asr) != len(asr_by_key)
+    ):
+        raise ValueError("duplicate raw/ASR segment")
     available_ids = set(diarization_provenance.usable_clip_uids)
     if {key[0] for key in raw_by_key} - available_ids:
         raise ValueError("stem reconcile segments contain a skipped clip")
@@ -1578,6 +1589,31 @@ def build_stem_reconcile_jobs(
         segments: list[MimoSegmentEvidence] = []
         for key in keys:
             raw_row = raw_by_key[key]
+            if binding_evidence_mode == "none":
+                asr_row = asr_by_key[key]
+                if (
+                    any(getattr(raw_row, name) != getattr(asr_row, name) for name in (
+                        "segment_id", "speaker_cluster_id", "start_time", "end_time",
+                        "source_start_sample", "source_end_sample", "source_sample_rate_hz",
+                        "source_channels", "source_audio_path",
+                    ))
+                    or raw_row.source_audio_path != diarization_provenance.speech_stem_paths_by_clip[clip_uid]
+                    or raw_row.source_audio_sha256 != diarization_provenance.speech_stem_hashes_by_clip[clip_uid]
+                    or asr_row.entity_id is not None or asr_row.entity_occurrence_id is not None
+                ):
+                    raise ValueError("unbound raw/ASR identity differs")
+                segments.append(MimoSegmentEvidence(
+                    segment_id=raw_row.segment_id, start_time=raw_row.start_time, end_time=raw_row.end_time,
+                    source_start_sample=raw_row.source_start_sample, source_end_sample=raw_row.source_end_sample,
+                    source_sample_rate_hz=raw_row.source_sample_rate_hz,
+                    source_speaker_cluster_id=raw_row.speaker_cluster_id,
+                    current_entity_id=None, entity_occurrence_id=None, identity_scope="unresolved",
+                    direct_anchor_seconds=0, cluster_binding_status="unbound",
+                    overlapping_visible_entities=[], direct_support_seconds_by_entity={},
+                    competing_visible_speaker_evidence=[], asr_status=asr_row.status,
+                    asr_text=asr_row.text, asr_language=asr_row.language,
+                ))
+                continue
             bound_row = bound_by_key[key]
             asr_row = asr_by_key[key]
             support = support_by_cluster.get(
@@ -1844,7 +1880,10 @@ def run_mimo25_stem_reconcile_shadow(
     route: StemRoute,
     allow_unverified: bool = False,
     overwrite: bool = False,
+    binding_evidence_mode: Literal["legacy_lr_asd", "none"] = "legacy_lr_asd",
 ) -> MimoStemReconcileSummary:
+    if any(job.binding_evidence_mode != binding_evidence_mode for job in jobs):
+        raise ValueError("reconcile publication binding evidence mode differs from jobs")
     job_ids = [job.clip_uid for job in jobs]
     selected = selected_stem_records(
         [record for record in stem_records if record.clip_uid in set(job_ids)],
@@ -2000,6 +2039,13 @@ def run_mimo25_stem_reconcile_shadow(
             temporary / "diarization_failed_clips.jsonl", list(diarization_failed_clips)
         )
         _write_json(temporary / "summary.json", summary)
+        if binding_evidence_mode == "none":
+            _write_json(temporary / "source_contract.json", {
+                "schema_version": "r2v.h3.mimo25_stem_source_contract.1",
+                "binding_evidence_mode": binding_evidence_mode,
+                "clip_uids": ordered_source,
+                "jobs": [job.model_dump(mode="json") for job in jobs],
+            })
         _publish_directory(temporary, destination, overwrite=overwrite)
         return summary
     except Exception:

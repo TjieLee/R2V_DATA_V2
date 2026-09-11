@@ -19,6 +19,9 @@ def main(argv: list[str] | None = None) -> dict:
                  "base-reconcile-root", "source-h3-root", "prepared-root"):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--override-reconcile-root", type=Path)
+    parser.add_argument("--binding-evidence-mode", choices=("legacy_lr_asd", "none"), default="legacy_lr_asd")
+    parser.add_argument("--stem-diarization-root", type=Path)
+    parser.add_argument("--stem-asr-root", type=Path)
     result = prepare_audio_reuse_sources(**vars(parser.parse_args(argv))).model_dump(mode="json")
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return result

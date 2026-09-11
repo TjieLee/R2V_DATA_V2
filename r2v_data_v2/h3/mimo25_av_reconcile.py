@@ -13,6 +13,7 @@ from typing import Literal, Protocol
 from pydantic import Field, model_serializer, model_validator
 
 from r2v_data_v2.h3.binding_audit import SpeakerBindingSegmentAudit
+from r2v_data_v2.h3.binding_evidence import BindingEvidenceSource
 from r2v_data_v2.h3.diarization_binding import (
     BoundDiarizationSegment,
     DiarizationInventory,
@@ -542,7 +543,7 @@ class MimoSegmentEvidence(SchemaModel):
         return self
 
 
-class MimoClipJob(SchemaModel):
+class MimoClipJob(BindingEvidenceSource):
     clip_uid: str
     r2v_instruction: str = Field(min_length=1)
     target_video_path: str
@@ -559,6 +560,14 @@ class MimoClipJob(SchemaModel):
 
     @model_validator(mode="after")
     def validate_job(self) -> MimoClipJob:
+        if self.binding_evidence_mode == "none" and any(
+            s.current_entity_id is not None or s.entity_occurrence_id is not None
+            or s.identity_scope != "unresolved" or s.direct_anchor_seconds != 0
+            or s.cluster_binding_status != "unbound" or s.overlapping_visible_entities
+            or s.direct_support_seconds_by_entity or s.competing_visible_speaker_evidence
+            for s in self.segments
+        ):
+            raise ValueError("no-binding MiMo job cannot carry speaker/entity proposals")
         if not self.r2v_instruction.strip():
             raise ValueError("MiMo R2V instruction must not be blank")
         indexes = [item.image_index for item in self.reference_images]
@@ -604,8 +613,8 @@ class MimoCaseManifest(SchemaModel):
         return self
 
 
-class MimoInventory(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_inventory.4"] = MIMO25_INVENTORY_VERSION
+class MimoInventory(BindingEvidenceSource):
+    schema_version: Literal["r2v.h3.mimo25_inventory.4", "r2v.h3.mimo25_inventory.5"] = MIMO25_INVENTORY_VERSION
     inventory_scope: Literal[
         "current_diarization_asr_target_inventory",
         "canonical_visual_target_inventory",
@@ -618,10 +627,10 @@ class MimoInventory(SchemaModel):
         default=None,
         pattern=r"^[0-9a-f]{64}$",
     )
-    source_diarization_raw_segments_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    source_diarization_bound_segments_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    source_qwen3_asr_segments_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    source_binding_audit_segments_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_diarization_raw_segments_sha256: str | None = Field(pattern=r"^[0-9a-f]{64}$")
+    source_diarization_bound_segments_sha256: str | None = Field(pattern=r"^[0-9a-f]{64}$")
+    source_qwen3_asr_segments_sha256: str | None = Field(pattern=r"^[0-9a-f]{64}$")
+    source_binding_audit_segments_sha256: str | None = Field(pattern=r"^[0-9a-f]{64}$")
     source_h3_samples_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     clip_count: int = Field(ge=0)
     jobs: list[MimoClipJob]
@@ -629,6 +638,18 @@ class MimoInventory(SchemaModel):
 
     @model_validator(mode="after")
     def validate_inventory(self) -> MimoInventory:
+        if (self.schema_version.endswith(".5")) != (self.binding_evidence_mode == "none"):
+            raise ValueError("MiMo inventory binding source version differs")
+        if any(j.binding_evidence_mode != self.binding_evidence_mode for j in self.jobs):
+            raise ValueError("MiMo inventory/job binding modes differ")
+        if self.binding_evidence_mode == "none":
+            if self.source_diarization_bound_segments_sha256 or self.source_binding_audit_segments_sha256:
+                raise ValueError("no-binding inventory cannot claim binding source hashes")
+        elif any(value is None for value in (
+            self.source_diarization_raw_segments_sha256, self.source_diarization_bound_segments_sha256,
+            self.source_qwen3_asr_segments_sha256, self.source_binding_audit_segments_sha256,
+        )):
+            raise ValueError("legacy MiMo inventory requires binding/ASR sources")
         if self.clip_count != len(self.jobs):
             raise ValueError("MiMo inventory clip count is inconsistent")
         clip_ids = [job.clip_uid for job in self.jobs]
@@ -1102,6 +1123,84 @@ def build_mimo25_inventory(
         "jobs": [job.model_dump(mode="json") for job in jobs],
     }
     return _inventory(values)
+
+
+def build_mimo25_reference_inventory(
+    *, visual_production_root: Path, visual_runs_root: Path,
+    audio_production_root: Path, case_manifest_path: Path | None = None,
+    case_manifest: MimoCaseManifest | None = None,
+) -> MimoInventory:
+    """Reference-only source adapter. Never opens production speaker evidence."""
+    if case_manifest_path is not None and case_manifest is not None:
+        raise ValueError("provide only one MiMo case manifest source")
+    paths = jea_production_paths(audio_production_root)
+    visual = load_visual_production_inventory(
+        visual_production_root=visual_production_root, visual_runs_root=visual_runs_root,
+    )
+    visual_by_clip = {c.identity.clip_uid: c for c in visual.canonical_clips}
+    canonical_path = paths.audio / "canonical_clips.jsonl"
+    canonical = [CanonicalAudioClip.model_validate(r) for r in _read_jsonl(canonical_path)]
+    canonical_by_clip = {c.clip_uid: c for c in canonical}
+    samples = [FinalH3SampleV2.model_validate(r) for r in _read_jsonl(paths.h3 / "samples.jsonl")]
+    by_clip: dict[str, list[FinalH3SampleV2]] = defaultdict(list)
+    for sample in samples:
+        by_clip[sample.clip_uid].append(sample)
+    canonical_h3_ids = [s.clip_uid for s in samples if s.pair_type == "canonical"]
+    if (len(canonical_by_clip) != len(canonical)
+        or len(visual_by_clip) != len(visual.canonical_clips)
+        or len(canonical_h3_ids) != len(set(canonical_h3_ids))
+        or set(canonical_h3_ids) != set(visual_by_clip)
+        or set(canonical_by_clip) != set(visual_by_clip) or set(by_clip) != set(visual_by_clip)):
+        raise ValueError("MiMo reference inventory is not canonical-wide")
+    if case_manifest_path is not None:
+        case_manifest = MimoCaseManifest.model_validate_json(case_manifest_path.read_text())
+    selected = case_manifest.clip_uids if case_manifest is not None else list(visual_by_clip)
+    if set(selected) - set(visual_by_clip):
+        raise ValueError("MiMo manifest contains unknown clips")
+    jobs = []
+    for clip_uid in selected:
+        canonical_clip = canonical_by_clip[clip_uid]
+        clip_samples = sorted(by_clip[clip_uid], key=lambda s: s.sample_id)
+        representative = _validate_h3_variant_observations(clip_uid, clip_samples)
+        video = Path(representative.target_video).resolve(strict=True)
+        audio = Path(representative.target_full_audio_path).resolve(strict=True)
+        if (
+            video != Path(canonical_clip.target_video_path).resolve(strict=True)
+            or audio != Path(canonical_clip.target_full_audio_path).resolve(strict=True)
+            or video != Path(visual_by_clip[clip_uid].sample.target_video).resolve(strict=True)
+            or sha256_file(video) != canonical_clip.target_video_sha256
+            or sha256_file(audio) != canonical_clip.target_full_audio_sha256
+        ):
+            raise ValueError(f"MiMo target media provenance differs: {clip_uid}")
+        selection, images = select_mimo_reference_projection(clip_uid, representative.visual_references)
+        projected = project_mimo_h3_sample_references(
+            representative, reference_images=images, reference_selection=selection,
+        )
+        subjects = build_reference_contract(projected, "visual_only").subjects
+        jobs.append(_job({
+            "binding_evidence_mode": "none",
+            "clip_uid": clip_uid, "r2v_instruction": representative.r2v_instruction,
+            "target_video_path": str(video), "target_video_sha256": canonical_clip.target_video_sha256,
+            "target_full_audio_path": str(audio), "target_full_audio_sha256": canonical_clip.target_full_audio_sha256,
+            "target_duration_seconds": canonical_clip.target_duration_seconds,
+            "reference_selection": selection.model_dump(mode="json"),
+            "reference_images": [i.model_dump(mode="json") for i in images],
+            "reference_subjects": [s.model_dump(mode="json") for s in subjects],
+            "segments": [], "source_h3_sample_ids": [s.sample_id for s in clip_samples],
+        }))
+    return _inventory({
+        "schema_version": "r2v.h3.mimo25_inventory.5", "binding_evidence_mode": "none",
+        "inventory_scope": "explicit_case_subset" if case_manifest is not None else MIMO25_INVENTORY_SCOPE,
+        "canonical_wide_coverage": case_manifest is None,
+        "source_visual_inventory_sha256": sha256_file(visual_production_root / "samples.jsonl"),
+        "source_canonical_audio_manifest_sha256": sha256_file(canonical_path),
+        "source_diarization_raw_segments_sha256": None,
+        "source_diarization_bound_segments_sha256": None,
+        "source_qwen3_asr_segments_sha256": None,
+        "source_binding_audit_segments_sha256": None,
+        "source_h3_samples_sha256": sha256_file(paths.h3 / "samples.jsonl"),
+        "clip_count": len(jobs), "jobs": [j.model_dump(mode="json") for j in jobs],
+    })
 
 
 def _correction_counts(job: MimoClipJob, annotation: MimoAVAnnotationDraft) -> Counter[str]:

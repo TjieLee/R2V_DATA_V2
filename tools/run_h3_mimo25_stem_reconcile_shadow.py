@@ -15,6 +15,7 @@ from r2v_data_v2.h3.jea_audio_production import jea_production_paths
 from r2v_data_v2.h3.mimo25_av_reconcile import (
     MimoCaseManifest,
     build_mimo25_inventory,
+    build_mimo25_reference_inventory,
 )
 from r2v_data_v2.h3.mimo25_backend import MimoBackendConfig, MimoMediaResolver
 from r2v_data_v2.h3.mimo25_stem_shadow import (
@@ -69,6 +70,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--visual-runs-root", type=Path, required=True)
     parser.add_argument("--audio-production-root", type=Path, required=True)
     parser.add_argument("--shadow-run-id")
+    parser.add_argument("--binding-evidence-mode", choices=("legacy_lr_asd", "none"), default="legacy_lr_asd")
+    parser.add_argument("--stem-diarization-root", type=Path)
+    parser.add_argument("--stem-asr-root", type=Path)
     parser.add_argument("--case-manifest", type=Path, required=True)
     parser.add_argument(
         "--sam-route",
@@ -97,24 +101,37 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
     route = downstream_stem_route(arguments.shadow_run_id, arguments.sam_route)
     shadow = stem_shadow_root(paths.root, arguments.shadow_run_id)
     separation = downstream_stem_root(paths.root, arguments.shadow_run_id)
+    diarization = require_shadow_output_path(
+        shadow_root=shadow, output_path=arguments.stem_diarization_root or shadow / "diarization",
+    )
+    asr = require_shadow_output_path(
+        shadow_root=shadow, output_path=arguments.stem_asr_root or shadow / "asr",
+    )
     output = require_shadow_output_path(
         shadow_root=shadow,
-        output_path=arguments.output_root or shadow / MIMO25_STEM_RECONCILE_STAGE,
+        output_path=arguments.output_root or shadow / (
+            "mimo_reconcile_no_lrasd_v1" if arguments.binding_evidence_mode == "none" else MIMO25_STEM_RECONCILE_STAGE
+        ),
     )
+    if arguments.binding_evidence_mode == "none" and output == shadow / MIMO25_STEM_RECONCILE_STAGE:
+        raise ValueError("no-LR-ASD pilot requires an isolated MiMo output root")
     case_manifest = MimoCaseManifest.model_validate_json(
         arguments.case_manifest.read_text(encoding="utf-8")
     )
     stem_inventory, stem_records, _ = load_stem_source(separation)
     diarization_provenance, _, _ = validate_stem_diarization_lineage(
-        shadow / "diarization", expected_shadow_root=shadow,
+        diarization, expected_shadow_root=shadow,
     )
+    if diarization_provenance.binding_evidence_mode != arguments.binding_evidence_mode:
+        raise ValueError("selected binding mode differs from DiariZen source")
     _validate_stage_closure(
         case_manifest=case_manifest,
         stem_inventory=stem_inventory,
         separation_root=separation,
         diarization_provenance=diarization_provenance,
     )
-    base = build_mimo25_inventory(
+    builder = build_mimo25_reference_inventory if arguments.binding_evidence_mode == "none" else build_mimo25_inventory
+    base = builder(
         visual_production_root=arguments.visual_production_root,
         visual_runs_root=arguments.visual_runs_root,
         audio_production_root=arguments.audio_production_root,
@@ -122,9 +139,10 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
     )
     jobs = build_stem_reconcile_jobs(
         base_inventory=usable_stem_reconcile_inventory(base, diarization_provenance),
-        stem_diarization_root=shadow / "diarization",
-        stem_asr_root=shadow / "asr",
+        stem_diarization_root=diarization,
+        stem_asr_root=asr,
         route=route,
+        binding_evidence_mode=arguments.binding_evidence_mode,
     )
     selected_ids = set(case_manifest.clip_uids)
     skipped = [
@@ -148,6 +166,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         "model_called": False,
         "output_root": str(output),
         "clip_count": len(jobs),
+        "binding_evidence_mode": arguments.binding_evidence_mode,
         "clip_uids": [item.clip_uid for item in jobs],
         "temperature": arguments.temperature,
         "thinking": arguments.thinking,
@@ -179,6 +198,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
             backend=backend,
             output_root=output,
             source_clip_uids=case_manifest.clip_uids,
+            binding_evidence_mode=arguments.binding_evidence_mode,
             skipped_clips=skipped,
             diarization_failed_clips=diarization_failed,
             route=route,

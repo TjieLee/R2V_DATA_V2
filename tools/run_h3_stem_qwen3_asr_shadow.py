@@ -38,6 +38,7 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
     )
     parser.add_argument("--output-root", type=Path)
+    parser.add_argument("--diarization-root", type=Path)
     parser.add_argument("--ffmpeg", default="ffmpeg")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--allow-unverified", action="store_true")
@@ -69,10 +70,20 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
     paths = jea_production_paths(arguments.audio_production_root)
     route = downstream_stem_route(arguments.shadow_run_id, arguments.sam_route)
     shadow = stem_shadow_root(paths.root, arguments.shadow_run_id)
+    diarization = require_shadow_output_path(
+        shadow_root=shadow, output_path=arguments.diarization_root or shadow / "diarization",
+    )
+    source_provenance, _, _ = validate_stem_diarization_lineage(
+        diarization, expected_shadow_root=shadow,
+    )
     output = require_shadow_output_path(
         shadow_root=shadow,
-        output_path=arguments.output_root or shadow / "asr",
+        output_path=arguments.output_root or shadow / (
+            "asr_no_lrasd_v1" if source_provenance.binding_evidence_mode == "none" else "asr"
+        ),
     )
+    if source_provenance.binding_evidence_mode == "none" and output == shadow / "asr":
+        raise ValueError("no-LR-ASD pilot requires an isolated ASR output root")
     manifest = (
         MimoCaseManifest.model_validate_json(
             arguments.case_manifest.read_text(encoding="utf-8")
@@ -83,12 +94,10 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
     result: dict[str, object] = {
         "dry_run": arguments.dry_run,
         "model_called": False,
-        "diarization_root": str(shadow / "diarization"),
+        "diarization_root": str(diarization),
+        "binding_evidence_mode": source_provenance.binding_evidence_mode,
         "output_root": str(output),
     }
-    source_provenance, _, _ = validate_stem_diarization_lineage(
-        shadow / "diarization", expected_shadow_root=shadow,
-    )
     if source_provenance.route != route:
         raise ValueError("stem ASR route differs from selected SAM route")
     if manifest is not None and manifest.clip_uids != source_provenance.clip_uids:
@@ -99,14 +108,14 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
             from r2v_data_v2.h3.diarization_binding import DiarizationInventory
 
             source = DiarizationInventory.model_validate_json(
-                (shadow / "diarization/inventory.json").read_text()
+                (diarization / "inventory.json").read_text()
             )
             if source.source_inventory_kind != "jea_shot_manifest":
                 raise ValueError("--visual-production-root is required for legacy Visual-rooted ASR")
         backend = _isolated_backend()
         with backend:
             summary, provenance = run_stem_qwen3_asr_shadow(
-                stem_diarization_root=shadow / "diarization",
+                stem_diarization_root=diarization,
                 source_visual_production_root=str(
                     arguments.visual_production_root.expanduser().resolve(strict=True)
                 ) if arguments.visual_production_root is not None else None,
