@@ -8,24 +8,87 @@
 header{display:flex;align-items:center;gap:14px;padding:14px 20px;border-bottom:1px solid #ced2d4;background:#fff;flex-wrap:wrap}
 h1{font-size:20px;margin:0}select,button{font:inherit;background:#fff;border:1px solid #aeb5b9;border-radius:4px;padding:8px}select{min-width:180px;max-width:100%;flex:1}button{width:38px;height:36px;padding:0;cursor:pointer}button:disabled{opacity:.35;cursor:default}
 main{max-width:1600px;margin:auto;padding:20px}.workspace{display:grid;grid-template-columns:minmax(300px,1fr) minmax(350px,1.2fr);gap:24px}video{width:100%;aspect-ratio:16/9;background:#121313;object-fit:contain}h2{font-size:16px;margin:0 0 10px}h3{font-size:14px;margin:12px 0 8px}.meta{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:14px}.path{overflow-wrap:anywhere;color:#60686c}.status{font-weight:650;color:#137448}.status.failed{color:#af2536}.status.skipped{color:#795818}pre{white-space:pre-wrap;overflow-wrap:anywhere;font:14px/1.65 system-ui,sans-serif;margin:0}.prompt{max-height:65vh;overflow:auto;padding-right:10px}.speech{margin-top:24px;border-top:1px solid #ced2d4;padding-top:18px;overflow:auto}table{border-collapse:collapse;width:100%;min-width:1100px;text-align:left}td,th{border-bottom:1px solid #dde0e1;padding:10px 8px;vertical-align:top}th{font-size:12px;color:#60686c}td{max-width:440px;overflow-wrap:anywhere}.raw{margin-top:20px;border-top:1px solid #ced2d4;padding-top:12px}.raw pre{font-family:monospace;font-size:12px;max-height:400px;overflow:auto}summary{cursor:pointer;font-weight:600}#error{color:#a1192b}#warnings{margin-top:14px;color:#795818}
-@media(max-width:760px){header,main{padding:12px}.workspace{grid-template-columns:minmax(0,1fr)}.prompt{max-height:none}select{flex-basis:100%}h1{font-size:18px}}
+.audio-evidence{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-top:18px}audio{width:100%;min-width:0}.play-segment{width:auto;height:auto;padding:6px 8px;display:block;margin-bottom:6px;white-space:nowrap}.finalized{margin-top:20px;border-top:1px solid #ced2d4;padding-top:16px}#playback-status{color:#60686c;min-height:20px}
+@media(max-width:760px){header,main{padding:12px}.workspace{grid-template-columns:minmax(0,1fr)}.prompt{max-height:none}select{flex-basis:100%}h1{font-size:18px}.audio-evidence{grid-template-columns:minmax(0,1fr)}}
 </style>
 <header><h1>T2VA QA</h1><span id="totals"></span><select id="clips" aria-label="Clip"></select><button id="prev" title="Previous clip" aria-label="Previous clip">&#8592;</button><span id="position"></span><button id="next" title="Next clip" aria-label="Next clip">&#8594;</button></header>
 <main><p id="error" role="alert"></p><div class="meta"><strong id="uid"></strong><span id="status" class="status"></span><span id="path" class="path"></span></div>
-<div class="workspace"><section><h2>Original target video</h2><video id="video" controls preload="metadata"></video><pre id="warnings"></pre></section><section><h2>T2VA prompt</h2><pre id="prompt" class="prompt"></pre></section></div>
-<section class="speech"><h2>Speech facts</h2><table><thead><tr><th>Segment / time</th><th>Acoustic cluster</th><th>Language / exact ASR</th><th>Speaker</th><th>Presentation</th><th>Model lead-in</th><th>Rendered speech</th></tr></thead><tbody id="speech"></tbody></table></section>
-<details class="raw"><summary>Raw MiMo response / diagnostics</summary><pre id="raw"></pre></details></main>
+<div class="workspace"><section><h2>Original target video</h2><video id="video" controls preload="metadata"></video>
+<div class="audio-evidence"><div><h3>Original/full target audio</h3><audio id="full_audio" controls preload="metadata"></audio></div><div><h3>AuK speech stem</h3><audio id="speech_audio" controls preload="metadata"></audio></div><div><h3>SAM music stem</h3><audio id="music" controls preload="metadata"></audio></div><div><h3>SAM SFX stem</h3><audio id="sfx" controls preload="metadata"></audio></div></div>
+<p id="playback-status" role="status"></p><pre id="warnings"></pre></section><section><h2>T2VA prompt</h2><pre id="prompt" class="prompt"></pre></section></div>
+<section class="finalized"><h2>Dedicated R2VA-style audio finalizer</h2><span id="audio-version" class="path"></span><h3>Overall soundscape</h3><pre id="soundscape"></pre><h3>Non-diegetic music</h3><pre id="score"></pre></section>
+<section class="speech"><h2>Speech facts</h2><table><thead><tr><th>Segment / time</th><th>Acoustic cluster</th><th>Language / exact ASR</th><th>Speaker</th><th>Presentation</th><th>Model lead-in</th><th>Rendered speech</th><th>Listen</th></tr></thead><tbody id="speech"></tbody></table></section>
+<details class="raw"><summary>T2VA semantic response / diagnostics</summary><pre id="raw"></pre></details>
+<details class="raw"><summary>Audio-finalize response / diagnostics</summary><pre id="audio-raw"></pre></details>
+<details class="raw"><summary>Audio lineage / pipeline error</summary><pre id="lineage"></pre></details></main>
 <script id="data" type="application/json">__T2VA_DATA__</script>
 <script>
 "use strict";
 const $=id=>document.getElementById(id);
 try{
  const data=JSON.parse($("data").textContent);
- if(data.schema_version!=="r2v.h3.t2va_qa.2"||!Array.isArray(data.cases))throw Error("Invalid T2VA QA data");
+ if(data.schema_version!=="r2v.h3.t2va_qa.3"||!Array.isArray(data.cases))throw Error("Invalid T2VA QA data");
  let index=0;
+ const audioIDs={full_audio:"full_audio",speech:"speech_audio",music:"music",sfx:"sfx"};
+ const players=[$("video"),...Object.values(audioIDs).map($)];
+ let cancelSegment=()=>{};
+ let playbackGeneration=0;
+ function stopPlayback(){playbackGeneration++;cancelSegment();cancelSegment=()=>{};players.forEach(p=>p.pause());}
+ async function playSegment(kind,s){
+  stopPlayback();const generation=playbackGeneration;const player=$(audioIDs[kind]);
+  $("playback-status").textContent="";
+  try{
+   if(!player.getAttribute("src"))throw Error("Audio unavailable");
+   if(player.readyState<1)await new Promise((resolve,reject)=>{
+    const done=()=>{player.removeEventListener("loadedmetadata",ok);player.removeEventListener("error",bad);clearTimeout(timer);};
+    const ok=()=>{done();resolve();};const bad=()=>{done();reject(Error("Cannot load audio"));};
+    const timer=setTimeout(bad,10000);player.addEventListener("loadedmetadata",ok);player.addEventListener("error",bad);
+   });
+   if(generation!==playbackGeneration)return;
+   const end=Math.min(s.end_time,player.duration);
+   if(!Number.isFinite(end)||s.start_time<0||s.start_time>=end)throw Error("Segment outside available audio");
+   player.currentTime=s.start_time;
+   let timer;
+   const stop=()=>{clearTimeout(timer);player.removeEventListener("timeupdate",check);player.removeEventListener("ended",stop);player.pause();};
+   const check=()=>{if(player.currentTime>=end)stop();};
+   cancelSegment=stop;player.addEventListener("timeupdate",check);player.addEventListener("ended",stop);
+   await player.play();
+   if(generation!==playbackGeneration){stop();return;}
+   const tick=()=>{check();if(!player.paused)timer=setTimeout(tick,25);};tick();
+   $("playback-status").textContent=s.segment_id+" · "+(kind==="speech"?"AuK speech":"Original audio")+" · "+s.start_time.toFixed(3)+"–"+end.toFixed(3)+" s";
+  }catch(e){if(generation===playbackGeneration)$("playback-status").textContent=e.message;}
+ }
  for(const [i,c] of data.cases.entries()){const o=document.createElement("option");o.value=String(i);o.textContent=c.clip_uid+" · "+c.status;$("clips").append(o);}
  $("totals").textContent=`${data.summary.ready_count} ready / ${data.cases.length} clips`;
- function show(){const c=data.cases[index];if(!c)return;$("clips").value=String(index);$("position").textContent=`${index+1} / ${data.cases.length}`;$("prev").disabled=index===0;$("next").disabled=index===data.cases.length-1;$("uid").textContent=c.clip_uid;$("path").textContent=c.clip_display_path;$("status").textContent=c.status;$("status").className="status "+c.status;$("video").src=c.video_url;$("prompt").textContent=c.prompt||c.failure_reason||"[unavailable]";$("warnings").textContent=c.warnings.join("\n");$("raw").textContent=JSON.stringify(c.raw,null,2);$("speech").replaceChildren();for(const s of c.speech){const row=document.createElement("tr");for(const value of [s.segment_id+` (${s.start_time.toFixed(3)}–${s.end_time.toFixed(3)} s)`,s.source_speaker_cluster,(s.language||"[no transcript]")+"\n"+(s.text||""),s.assignment?.speaker_id||"[unavailable]",s.assignment?.speech_presentation||"[unavailable]",s.model_lead_in||"[none]",s.rendered_speech||"[none]"]){const cell=document.createElement("td");cell.textContent=value;row.append(cell);}$("speech").append(row);}}
+ function show(){
+  stopPlayback();$("playback-status").textContent="";
+  const c=data.cases[index];if(!c)return;
+  $("clips").value=String(index);$("position").textContent=`${index+1} / ${data.cases.length}`;
+  $("prev").disabled=index===0;$("next").disabled=index===data.cases.length-1;
+  $("uid").textContent=c.clip_uid;$("path").textContent=c.clip_display_path;
+  $("status").textContent=c.status;$("status").className="status "+c.status;
+  $("video").src=c.video_url;
+  for(const [kind,id] of Object.entries(audioIDs)){const p=$(id);if(c.audio_media[kind])p.src=c.audio_media[kind].url;else p.removeAttribute("src");p.load();}
+  $("prompt").textContent=c.prompt||c.failure_reason||"[unavailable]";
+  $("warnings").textContent=c.warnings.join("\n");
+  $("raw").textContent=JSON.stringify(c.semantic_raw,null,2);
+  $("audio-raw").textContent=JSON.stringify(c.audio_finalize_raw,null,2);
+  $("lineage").textContent=JSON.stringify({audio:c.audio_lineage,error:c.pipeline_error},null,2);
+  $("audio-version").textContent=c.finalized_audio?.prompt_version||"[unavailable]";
+  $("soundscape").textContent=c.finalized_audio?.overall_soundscape||"[unavailable]";
+  $("score").textContent=c.finalized_audio?.non_diegetic_music||"[unavailable]";
+  $("speech").replaceChildren();
+  for(const s of c.speech){
+   const row=document.createElement("tr");
+   for(const value of [s.segment_id+` (${s.start_time.toFixed(3)}–${s.end_time.toFixed(3)} s)`,s.source_speaker_cluster,(s.language||"[no transcript]")+"\n"+(s.text||""),s.assignment?.speaker_id||"[unavailable]",s.assignment?.speech_presentation||"[unavailable]",s.model_lead_in||"[none]",s.rendered_speech||"[none]"]){const cell=document.createElement("td");cell.textContent=value;row.append(cell);}
+   const controls=document.createElement("td");
+   for(const [kind,label] of [["full_audio","Play original segment"],["speech","Play speech-stem segment"]]){
+    const button=document.createElement("button");button.className="play-segment";button.textContent=label;
+    button.disabled=!c.audio_media[kind];button.addEventListener("click",()=>playSegment(kind,s));controls.append(button);
+   }
+   row.append(controls);$("speech").append(row);
+  }
+ }
  $("clips").addEventListener("change",()=>{index=Number($("clips").value);show();});$("prev").addEventListener("click",()=>{if(index>0){index--;show();}});$("next").addEventListener("click",()=>{if(index<data.cases.length-1){index++;show();}});show();
 }catch(e){$("error").textContent=e.message;}
 </script></html>

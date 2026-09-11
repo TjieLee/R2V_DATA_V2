@@ -84,9 +84,9 @@ This is not fingerprint-compatible with v3 or the prior model-written dialogue
 string. A prior-contract run ID is rejected even with `--overwrite`: use a new
 run ID; frozen prior outputs are not rewritten. Inventory .3 binds resolved media;
 raw .2 separates both attempts; record/summary .2 account for up to two calls.
-The three-section final format is unchanged. QA .2 shows segment/cluster, Sx and
-presentation, model lead-in, authoritative ASR and the rendered speech side by
-side, plus the existing original video, raw response and diagnostics.
+The three-section final format is unchanged. QA .3 shows segment/cluster, Sx and
+presentation, model lead-in, authoritative ASR and rendered speech side by side,
+plus original video, four Audio sources and both calls' raw responses/diagnostics.
 
 TA2VA is intentionally not implemented. A future renderer can reuse the stored
 core and add separately validated Audio contracts without another AV inference.
@@ -150,7 +150,7 @@ First inspect a model-free dry run:
   --case-manifest "$AUDIO_PRODUCTION_ROOT/case_manifest.json" \
   --base-url http://127.0.0.1:8092/v1 \
   --transport sglang --model mimo-v2.5 \
-  --media-root "$JEA_MEDIA_ROOT" \
+  --media-root /mnt/workspace \
   --max-completion-tokens 32768 \
   --dry-run
 ```
@@ -212,18 +212,39 @@ auditable. `core/` and `prompts/` exist only for ready records.
 
 ## Static QA
 
+Serve the common root containing both the selected JEA videos and resolved Audio,
+not only the QA directory. This is a manual local review command, not an inference:
+
 ```bash
-"$R2V_PYTHON" tools/build_h3_t2va_qa.py \
-  --t2va-root "$AUDIO_PRODUCTION_ROOT/t2va_shadow_v1/runs/t2va-random20-v1"
+python -m http.server 8765 --bind 127.0.0.1 --directory /mnt/workspace
 ```
 
-Open the emitted `qa/review.html` alongside accessible original media. Default
-video URLs are relative filesystem paths; no media is copied. For an existing
-HTTP media host, provide both `--media-root "$JEA_MEDIA_ROOT"` and
-`--media-base-url "$JEA_MEDIA_BASE_URL"`; paths must remain under that media root.
-The page has no external dependencies and displays the original video, rendered
-prompt, factual speech table with assigned Sx/presentation, warnings and raw
-response. It does not alter annotations or integrate with existing H3 QA.
+```bash
+"$R2V_PYTHON" tools/build_h3_t2va_qa.py \
+  --t2va-root "$AUDIO_PRODUCTION_ROOT/t2va_shadow_v1/runs/t2va-random20-v4" \
+  --media-root /mnt/workspace \
+  --media-base-url http://127.0.0.1:8765
+```
+
+Open the emitted `qa/review.html` through that HTTP server using its path relative
+to /mnt/workspace (or locally with the HTTP media URLs). Without the two media
+options, URLs remain relative filesystem paths. All exposed media must remain
+under the supplied media root, including resolved symlink targets. No media is
+copied, symlinked, cropped or transcoded.
+
+Before exposing media, QA validates the named resolved inventory, canonical
+target identity, resolved record fingerprints and all four Audio hashes.
+Players show original/full target audio, AuK speech, SAM music and SAM SFX.
+Each speech row offers original-audio and speech-stem segment playback by seeking
+the existing full-timeline file and pausing at the available segment end. No
+segment WAV is created. Changing clips stops segment playback.
+
+The dedicated R2VA-style audio-finalizer section shows final soundscape/music,
+with its response and diagnostics separate from T2VA semantic raw output.
+Compare those judgments against original audio and the two SAM stems; compare
+speaker/presentation and exact dialogue against original video and AuK speech.
+The page has no external dependencies and does not alter annotations or integrate
+with existing H3 QA.
 
 Manually inspect a fresh small unseen canary for full-shot visual coverage,
 speaker transitions, exact speech timing/text, soundscape/music partition and

@@ -14,8 +14,15 @@ def main(argv: list[str] | None = None) -> Path:
         description="Build independent static T2VA QA (no model calls)"
     )
     parser.add_argument("--t2va-root", required=True, type=Path)
-    parser.add_argument("--media-root", type=Path)
-    parser.add_argument("--media-base-url")
+    parser.add_argument(
+        "--media-root",
+        type=Path,
+        help="Shared served root containing original video and Audio lineage, e.g. /mnt/workspace",
+    )
+    parser.add_argument(
+        "--media-base-url",
+        help="HTTP origin serving media-root, e.g. http://127.0.0.1:8765",
+    )
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args(argv)
     return build_t2va_qa(
