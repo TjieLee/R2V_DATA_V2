@@ -3,7 +3,10 @@ import json
 
 import pytest
 
-from r2v_data_v2.h3.mimo25_backend import MIMO25_CANONICAL_ABSENT_SOUNDSCAPE
+from r2v_data_v2.h3.mimo25_backend import (
+    AUDIO_FINALIZE_SYSTEM_PROMPT,
+    MimoAudioFinalizeDraft,
+)
 from r2v_data_v2.h3.t2va_mimo_backend import (
     T2VA_SYSTEM_PROMPT,
     T2VAMimoBackend,
@@ -17,13 +20,14 @@ job = shadow_tests.job
 
 
 @pytest.mark.parametrize("transport", ["sglang", "xiaomi"])
-def test_exactly_one_original_av_request(job, tmp_path, transport):
+def test_semantic_and_frozen_audio_finalize_requests(job, tmp_path, transport):
     cfg = config(tmp_path)
     cfg = T2VAMimoConfig(**{**cfg.__dict__, "transport": transport})
     client = Client([draft_for(job).model_dump_json()])
     backend = T2VAMimoBackend(cfg, client=client)
     raw = backend.annotate(job, "a" * 64)
-    assert raw.model_call_count == 1 and raw.error is None and len(client.calls) == 1
+    assert raw.model_call_count == 2 and raw.error is None and len(client.calls) == 2
+    assert raw.semantic_model_call_count == raw.audio_finalize.model_call_count == 1
     request = client.calls[0]
     assert request["temperature"] == 0 and request["stream"] is False
     assert request["extra_body"]["use_audio_in_video"] is True
@@ -75,7 +79,32 @@ def test_exactly_one_original_av_request(job, tmp_path, transport):
     else:
         assert request["response_format"] == {"type": "json_object"}
         assert request["extra_body"]["thinking"] == {"type": "disabled"}
-    assert backend.provenance().maximum_attempts == 1
+    assert backend.provenance().maximum_attempts == 2
+    finalizer = client.calls[1]
+    assert finalizer["messages"][0]["content"] == AUDIO_FINALIZE_SYSTEM_PROMPT
+    media = finalizer["messages"][1]["content"]
+    assert [p["type"] for p in media] == [
+        "video_url",
+        "text",
+        "text",
+        "audio_url",
+        "text",
+        "audio_url",
+    ]
+    assert media[0] == content[0]
+    for index, kind in [(3, "music"), (5, "sfx")]:
+        from pathlib import Path
+
+        assert media[index]["audio_url"]["url"] == cfg.media_resolver.resolve(
+            Path(getattr(job.audio_evidence, f"{kind}_path"))
+        )
+    if transport == "sglang":
+        assert (
+            finalizer["response_format"]["json_schema"]["schema"]
+            == MimoAudioFinalizeDraft.model_json_schema()
+        )
+    else:
+        assert "RESPONSE SCHEMA" in media[1]["text"]
 
 
 def test_no_retry_on_transport_error(job, tmp_path):
@@ -101,10 +130,6 @@ def test_prompt_adapts_existing_quality_and_authority_without_staged_concepts():
         "Acoustic grouping is evidence, not visual identity",
         "offscreen",
         "BEFORE every corresponding <d>",
-        "non-verbal human sound",
-        "audience-only BGM",
-        "N/A",
-        MIMO25_CANONICAL_ABSENT_SOUNDSCAPE,
     ):
         assert phrase in T2VA_SYSTEM_PROMPT
     for phrase in (
@@ -139,7 +164,7 @@ def test_sdk_retries_disabled(tmp_path, monkeypatch):
 
 
 def test_typed_response_schema_and_one_call_exact_dialogue(job, tmp_path):
-    from r2v_data_v2.h3.t2va_shadow import render_t2va_prompt, validate_t2va_draft
+    from r2v_data_v2.h3.t2va_shadow import render_t2va_prompt
 
     schema = T2VAMimoDraft.model_json_schema()
     assert "integrated_multimodal_description" not in schema["properties"]
@@ -158,13 +183,15 @@ def test_typed_response_schema_and_one_call_exact_dialogue(job, tmp_path):
     )
     client = Client([draft_for(job).model_dump_json()])
     raw = T2VAMimoBackend(config(tmp_path), client=client).annotate(job, "a" * 64)
-    core = validate_t2va_draft(job, T2VAMimoDraft.model_validate_json(raw.response))
+    core = shadow_tests.materialize(
+        job, T2VAMimoDraft.model_validate_json(raw.response)
+    )
     assert "<d>[Chinese] 你好。</d>" in render_t2va_prompt(core)
-    assert raw.model_call_count == len(client.calls) == 1
+    assert raw.model_call_count == len(client.calls) == 2
 
 
 def test_request_separates_all_segments_from_dialogue_slots(job, tmp_path):
-    from r2v_data_v2.h3.t2va_shadow import render_t2va_prompt, validate_t2va_draft
+    from r2v_data_v2.h3.t2va_shadow import render_t2va_prompt
 
     job.speech_facts[0].text = job.speech_facts[0].language = None
     before = job.model_dump()
@@ -181,35 +208,31 @@ def test_request_separates_all_segments_from_dialogue_slots(job, tmp_path):
     assert all("text" not in s for s in contract["speech_facts"])
     assert job.model_dump() == before
     draft = draft_for(job)
-    core = validate_t2va_draft(job, draft)
+    core = shadow_tests.materialize(job, draft)
     assert len(core.speaker_assignments) == 2
     assert "(S2) <d>[Chinese] 好的！</d>" in render_t2va_prompt(core)
     draft.integrated_sequence[-1].segment_id = "segment_1"
     with pytest.raises(ValueError, match="speech placement inventory"):
-        validate_t2va_draft(job, draft)
+        shadow_tests.materialize(job, draft)
     job.speech_facts[1].text = job.speech_facts[1].language = None
     empty = json.loads(backend.build_request(job)["messages"][1]["content"][1]["text"])
     assert empty["dialogue_segment_ids"] == []
     assert len(empty["speech_facts"]) == 2
 
 
-def test_v3_prompt_inventory_and_positive_audio_contract():
+def test_v4_prompt_preserves_inventory_without_final_audio_fields():
     for rule in (
         "speaker_assignments = every supplied segment",
         "Speech slots = dialogue_segment_ids only",
         "Non-transcribed segments still receive speaker assignments, but NEVER speech slots",
         "neither S1 nor (S1) belongs there",
-        "Listen across the ENTIRE embedded audio from beginning to end",
-        "ambience / room tone / outdoor background",
-        "physical movement/contact/impact",
-        "mechanical/electronic sounds",
-        "non-verbal human sounds",
-        "excluding dialogue, singing and music",
-        "Only when none of those soundscape layers are actually discernible",
-        "Preserve clearly audible music",
-        "Use N/A only when no such music is established",
+        "Describe each stable visual fact once",
+        "Stop once the observed clip progression has been covered",
     ):
         assert rule in T2VA_SYSTEM_PROMPT
+    for field in ("overall_soundscape", "non_diegetic_music"):
+        assert field not in T2VA_SYSTEM_PROMPT
+        assert field not in T2VAMimoDraft.model_json_schema()["properties"]
 
 
 @pytest.mark.parametrize("problem", ["length", "audio_zero", "video_zero"])
@@ -230,3 +253,51 @@ def test_incomplete_av_response_fails_once(job, tmp_path, problem):
     client.chat.completions.create = create
     raw = T2VAMimoBackend(config(tmp_path), client=client).annotate(job, "a" * 64)
     assert raw.error and raw.model_call_count == len(client.calls) == 1
+
+
+@pytest.mark.parametrize("failure", ["not JSON", RuntimeError("finalizer unavailable")])
+def test_audio_finalize_failure_has_two_attempts_no_fallback(job, tmp_path, failure):
+    client = Client([draft_for(job).model_dump_json()], audio_response=failure)
+    raw = T2VAMimoBackend(config(tmp_path), client=client).annotate(job, "a" * 64)
+    assert raw.error and raw.model_call_count == len(client.calls) == 2
+    assert raw.response and raw.audio_finalize is not None
+
+
+def test_audio_finalize_supplies_final_audio_and_preserves_semantic_raw(job, tmp_path):
+    from r2v_data_v2.h3 import t2va_shadow as t
+
+    payload = draft_for(job).model_dump()
+    payload["integrated_sequence"][1]["lead_in"] = "S1 speaks calmly"
+    semantic_raw = json.dumps(payload)
+    audio = MimoAudioFinalizeDraft(
+        overall_soundscape="Footsteps tap on the floor.",
+        non_diegetic_music="A gentle piano melody plays.",
+    )
+    client = Client([semantic_raw], audio_response=audio.model_dump_json())
+    raw = T2VAMimoBackend(config(tmp_path), client=client).annotate(job, "a" * 64)
+    assert raw.error is None and raw.model_call_count == 2
+    assert raw.response == semantic_raw
+    assert raw.deterministic_corrections == {
+        "redundant_speech_lead_in_speaker_marker": 1
+    }
+    draft, _ = t.parse_t2va_semantic(job, raw.response)
+    core = t.validate_t2va_draft(
+        job,
+        draft,
+        MimoAudioFinalizeDraft.model_validate_json(raw.audio_finalize.response),
+    )
+    assert core.non_diegetic_music == audio.non_diegetic_music
+    assert list(t.SECTIONS) == [
+        line[:-1]
+        for line in t.render_t2va_prompt(core).splitlines()
+        if line.endswith(":")
+    ]
+
+
+def test_missing_or_changed_auxiliary_audio_fails_before_model(job, tmp_path):
+    from pathlib import Path
+
+    Path(job.audio_evidence.music_path).write_bytes(b"changed")
+    client = Client([])
+    raw = T2VAMimoBackend(config(tmp_path), client=client).annotate(job, "a" * 64)
+    assert raw.error and raw.model_call_count == 0 and not client.calls

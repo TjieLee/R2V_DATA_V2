@@ -10,6 +10,7 @@ import pytest
 from r2v_data_v2.h3 import t2va_shadow as t2va
 from r2v_data_v2.h3.mimo25_backend import (
     MIMO25_CANONICAL_ABSENT_SOUNDSCAPE,
+    MimoAudioFinalizeDraft,
     MimoMediaResolver,
 )
 from r2v_data_v2.h3.sam_audio_stem_shadow import (
@@ -67,12 +68,24 @@ def shot_manifest(tmp_path):
 def job(tmp_path):
     video = tmp_path / "original.mp4"
     video.write_bytes(b"original AV fixture")
+    evidence = {
+        "resolved_root": str(tmp_path / "resolved_stems_v1"),
+        "resolved_record_fingerprint": "b" * 64,
+    }
+    for kind in ("full_audio", "speech", "music", "sfx"):
+        path = tmp_path / f"{kind}.wav"
+        import soundfile as sf
+
+        sf.write(path, np.zeros((160000, 2)), 32000, subtype="PCM_16")
+        evidence[f"{kind}_path"] = str(path)
+        evidence[f"{kind}_sha256"] = t2va.sha256_file(path)
     return t2va.T2VAJob(
         clip_uid="clip",
         clip_display_path="collection/episode/clip",
         target_video_path=str(video),
         target_video_sha256=t2va.sha256_file(video),
         target_duration_seconds=5,
+        audio_evidence=t2va.T2VAAudioEvidence(**evidence),
         speech_facts=[
             t2va.T2VASpeechFact(
                 segment_id=f"segment_{i}",
@@ -116,10 +129,18 @@ def draft_for(job):
     return t2va.T2VAMimoDraft(
         speaker_assignments=assignments,
         integrated_sequence=parts,
-        overall_soundscape=MIMO25_CANONICAL_ABSENT_SOUNDSCAPE,
-        non_diegetic_music="N/A",
         warnings=[],
     )
+
+
+def audio_for():
+    return MimoAudioFinalizeDraft(
+        overall_soundscape=MIMO25_CANONICAL_ABSENT_SOUNDSCAPE, non_diegetic_music="N/A"
+    )
+
+
+def materialize(job, draft):
+    return t2va.validate_t2va_draft(job, draft, audio_for())
 
 
 def config(tmp_path):
@@ -131,14 +152,22 @@ def config(tmp_path):
 
 
 class Client:
-    def __init__(self, responses):
+    def __init__(self, responses, *, audio_response=None):
         self.responses = iter(responses)
+        self.audio_response = (
+            audio_response
+            if audio_response is not None
+            else audio_for().model_dump_json()
+        )
         self.calls = []
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
 
     def create(self, **request):
         self.calls.append(request)
-        response = next(self.responses)
+        finalizer = (
+            request["messages"][0]["content"] == t2va.AUDIO_FINALIZE_SYSTEM_PROMPT
+        )
+        response = self.audio_response if finalizer else next(self.responses)
         if isinstance(response, Exception):
             raise response
         return {
@@ -148,7 +177,7 @@ class Client:
 
 
 def test_core_renderer_exact_and_reusable(job):
-    core = t2va.validate_t2va_draft(job, draft_for(job))
+    core = materialize(job, draft_for(job))
     restored = t2va.H3NoReferenceAVCore.model_validate_json(core.model_dump_json())
     assert t2va.render_t2va_prompt(core) == t2va.render_t2va_prompt(restored)
     prompt = t2va.render_t2va_prompt(restored)
@@ -162,6 +191,12 @@ def test_core_renderer_exact_and_reusable(job):
 @pytest.mark.parametrize("label", ["Picture", "Subject", "Audio", "Video"])
 @pytest.mark.parametrize("field", ["prose", "lead_in", *t2va.SECTIONS[1:], "warnings"])
 def test_no_reference_conditioning(job, label, field):
+    if field in t2va.SECTIONS[1:]:
+        audio = audio_for()
+        setattr(audio, field, f"<{label} 1>")
+        with pytest.raises(ValueError, match="syntax"):
+            t2va.validate_t2va_draft(job, draft_for(job), audio)
+        return
     data = draft_for(job).model_dump()
     if field in {"prose", "lead_in"}:
         data["integrated_sequence"][0 if field == "prose" else 1][
@@ -205,7 +240,7 @@ def test_no_embedded_section_headers(job, header):
 )
 def test_exact_dialogue_fails_without_repair(job, change):
     draft = draft_for(job)
-    caption = t2va.validate_t2va_draft(job, draft).integrated_multimodal_description
+    caption = materialize(job, draft).integrated_multimodal_description
     if change == "text":
         caption = caption.replace("你好。", "Hello.")
     elif change == "language":
@@ -237,27 +272,19 @@ def test_speaker_cluster_cannot_split_and_ids_contiguous(job):
     job.speech_facts[1].source_speaker_cluster = "cluster_1"
     draft.speaker_assignments[1].source_speaker_cluster = "cluster_1"
     with pytest.raises(ValueError, match="cannot split"):
-        t2va.validate_t2va_draft(job, draft)
+        materialize(job, draft)
     clean = draft_for(job)
-    assert (
-        len(
-            {
-                a.speaker_id
-                for a in t2va.validate_t2va_draft(job, clean).speaker_assignments
-            }
-        )
-        == 1
-    )
+    assert len({a.speaker_id for a in materialize(job, clean).speaker_assignments}) == 1
     clean.speaker_assignments[0].speaker_id = "S3"
     clean.speaker_assignments[1].speaker_id = "S3"
     with pytest.raises(ValueError, match="contiguous"):
-        t2va.validate_t2va_draft(job, clean)
+        materialize(job, clean)
 
 
 def test_acoustic_clusters_can_merge_without_entity_binding(job):
     draft = draft_for(job)
     draft.speaker_assignments[1].speaker_id = "S1"
-    core = t2va.validate_t2va_draft(job, draft)
+    core = materialize(job, draft)
     assert [a.speaker_id for a in core.speaker_assignments] == ["S1", "S1"]
     assert "entity_id" not in core.model_dump_json()
 
@@ -265,25 +292,25 @@ def test_acoustic_clusters_can_merge_without_entity_binding(job):
 def test_empty_asr_never_invents_dialogue(job):
     job.speech_facts = []
     draft = draft_for(job)
-    t2va.validate_t2va_draft(job, draft)
+    materialize(job, draft)
     draft.integrated_sequence[0].text += " <d>[English] Invented</d>"
     with pytest.raises(ValueError, match="syntax"):
-        t2va.validate_t2va_draft(job, draft)
+        materialize(job, draft)
 
 
 def test_nontranscribed_vocal_segment_keeps_assignment_without_dialogue(job):
     job.speech_facts[0].text = job.speech_facts[0].language = None
-    core = t2va.validate_t2va_draft(job, draft_for(job))
+    core = materialize(job, draft_for(job))
     assert len(core.speaker_assignments) == 2
     assert core.integrated_multimodal_description.count("<d>") == 1
 
 
 @pytest.mark.parametrize("field", ["overall_soundscape", "non_diegetic_music"])
 def test_no_dialogue_in_audio_fields(job, field):
-    data = draft_for(job).model_dump()
-    data[field] = "<d>[Chinese] copied</d>"
+    audio = audio_for()
+    setattr(audio, field, "<d>[Chinese] copied</d>")
     with pytest.raises(ValueError, match="syntax"):
-        t2va.T2VAMimoDraft.model_validate(data)
+        t2va.validate_t2va_draft(job, draft_for(job), audio)
 
 
 @pytest.mark.parametrize(
@@ -300,10 +327,10 @@ def test_shot_order_and_boundaries(job, suffix, valid):
     draft = draft_for(job)
     draft.integrated_sequence.append(t2va.T2VAProsePart(kind="prose", text=suffix))
     if valid:
-        t2va.validate_t2va_draft(job, draft)
+        materialize(job, draft)
     else:
         with pytest.raises(ValueError):
-            t2va.validate_t2va_draft(job, draft)
+            materialize(job, draft)
 
 
 def test_first_shot_timestamp_rejected(job):
@@ -312,7 +339,7 @@ def test_first_shot_timestamp_rejected(job):
         "[Shot 1]", "[Shot 1] At 00:00.000,"
     )
     with pytest.raises(ValueError, match="first shot"):
-        t2va.validate_t2va_draft(job, draft)
+        materialize(job, draft)
 
 
 def test_selection_modes(tmp_path):
@@ -413,8 +440,8 @@ def test_finalized_source_projection_and_publication(finalized, tmp_path):
         summary.ready_count,
         summary.skipped_count,
         summary.model_call_count,
-    ) == (3, 2, 1, 2)
-    assert len(client.calls) == 2
+    ) == (3, 2, 1, 4)
+    assert len(client.calls) == 4
     root = t2va.t2va_root(production, "t2va-test")
     loaded, records, restored = t2va.load_t2va_shadow(root)
     assert loaded == inventory and restored == summary
@@ -428,7 +455,7 @@ def test_finalized_source_projection_and_publication(finalized, tmp_path):
     assert not summary.production_artifacts_modified
     with pytest.raises(FileExistsError):
         t2va.run_t2va_shadow(inventory, backend)
-    assert len(client.calls) == 2
+    assert len(client.calls) == 4
 
 
 def test_case_manifest_order_and_dry_run_no_client(finalized, tmp_path, monkeypatch):
@@ -476,7 +503,7 @@ def test_one_failed_clip_does_not_stop_next(finalized, tmp_path):
         result.failed_count,
         result.skipped_count,
         result.model_call_count,
-    ) == (1, 1, 1, 2)
+    ) == (1, 1, 1, 3)
     root = t2va.t2va_root(finalized[0], "t2va-test")
     assert (
         json.loads((root / "raw" / f"{inventory.clip_uids[1]}.json").read_text())[
@@ -632,7 +659,7 @@ def test_source_binding_fields_are_dropped_not_transmitted(
         request = T2VAMimoBackend(config(tmp_path), client=Client([])).build_request(
             item
         )
-        assert "e99" not in json.dumps(request)
+        assert '"e99"' not in request["messages"][1]["content"][1]["text"]
         assert "private_entity_occurrence" not in json.dumps(request)
 
 
@@ -641,7 +668,7 @@ def test_unknown_speaker_markers_rejected(job, marker):
     draft = draft_for(job)
     draft.integrated_sequence[0].text += f" ({marker})"
     with pytest.raises(ValueError, match="speaker markers"):
-        t2va.validate_t2va_draft(job, draft)
+        materialize(job, draft)
 
 
 @pytest.mark.parametrize(
@@ -660,7 +687,7 @@ def test_typed_speech_inventory_fails_closed(job, mutation):
     else:
         job.speech_facts[-1].text = job.speech_facts[-1].language = None
     with pytest.raises(ValueError, match="speech placement inventory"):
-        t2va.validate_t2va_draft(job, draft)
+        materialize(job, draft)
 
 
 @pytest.mark.parametrize("mutation", ["missing", "duplicate", "unknown", "reorder"])
@@ -675,7 +702,7 @@ def test_assignment_inventory_still_exact(job, mutation):
     else:
         draft.speaker_assignments.reverse()
     with pytest.raises(ValueError, match="speaker assignment inventory"):
-        t2va.validate_t2va_draft(job, draft)
+        materialize(job, draft)
 
 
 def test_asr_not_model_owned_and_placement_preserves_exact_bytes(job):
@@ -687,7 +714,7 @@ def test_asr_not_model_owned_and_placement_preserves_exact_bytes(job):
         2,
         t2va.T2VAProsePart(kind="prose", text="The listener turns toward the doorway."),
     )
-    core = t2va.validate_t2va_draft(job, draft)
+    core = materialize(job, draft)
     prompt = t2va.render_t2va_prompt(core)
     assert (
         prompt.index("你好。</d>")
@@ -719,13 +746,13 @@ def test_lead_in_cannot_own_dialogue_or_pipeline_syntax(job, value):
     draft = draft_for(job)
     draft.integrated_sequence[1].lead_in = value
     with pytest.raises(ValueError):
-        t2va.validate_t2va_draft(job, draft)
+        materialize(job, draft)
 
 
 def test_voice_over_rendering_outside_exact_dialogue(job):
     draft = draft_for(job)
     draft.speaker_assignments[0].speech_presentation = "voice_over"
-    core = t2va.validate_t2va_draft(job, draft)
+    core = materialize(job, draft)
     assert (
         "says in an off-screen voiceover (S1) <d>[Chinese] 你好。</d>"
         in core.integrated_multimodal_description
@@ -738,12 +765,12 @@ def test_voice_over_rendering_outside_exact_dialogue(job):
 
 
 def test_core_cannot_substitute_its_own_asr_facts(job):
-    core = t2va.validate_t2va_draft(job, draft_for(job))
+    core = materialize(job, draft_for(job))
     data = core.model_dump()
     data["speech_facts"][0]["text"] = "Hello."
     changed = t2va.H3NoReferenceAVCore.model_validate(data)
     with pytest.raises(ValueError, match="core speech facts differ"):
-        t2va.validate_t2va_draft(job, changed)
+        materialize(job, changed)
 
 
 @pytest.mark.parametrize("token", ["S1", "(S1)", "S2", "(S2)", "S123"])
@@ -751,6 +778,12 @@ def test_core_cannot_substitute_its_own_asr_facts(job):
     "field", ["prose", "lead_in", "overall_soundscape", "non_diegetic_music"]
 )
 def test_model_owned_speaker_tokens_forbidden(job, token, field):
+    if field in t2va.SECTIONS[1:]:
+        audio = audio_for()
+        setattr(audio, field, f"{token} makes a sound.")
+        with pytest.raises(ValueError, match="syntax"):
+            t2va.validate_t2va_draft(job, draft_for(job), audio)
+        return
     draft = draft_for(job)
     if field == "prose":
         draft.integrated_sequence[0].text += f" {token} speaks."
@@ -759,7 +792,7 @@ def test_model_owned_speaker_tokens_forbidden(job, token, field):
     else:
         setattr(draft, field, f"{token} makes a sound.")
     with pytest.raises(ValueError, match="speaker markers"):
-        t2va.validate_t2va_draft(job, draft)
+        materialize(job, draft)
 
 
 def test_v2_run_requires_new_id_before_call(finalized, tmp_path, monkeypatch):
@@ -789,3 +822,87 @@ def test_v2_run_requires_new_id_before_call(finalized, tmp_path, monkeypatch):
         )
     assert not client.calls
     assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "lead", ["S1 speaks calmly", "(S1) speaks calmly", "A woman (S1) speaks calmly"]
+)
+def test_matching_lead_marker_cleanup_is_auditable(job, lead):
+    raw = draft_for(job).model_dump()
+    raw["integrated_sequence"][1]["lead_in"] = lead
+    serialized = json.dumps(raw)
+    draft, corrections = t2va.parse_t2va_semantic(job, serialized)
+    assert "S1" not in draft.integrated_sequence[1].lead_in
+    assert corrections == {"redundant_speech_lead_in_speaker_marker": 1}
+    assert json.loads(serialized) == raw
+    assert "(S1) <d>[Chinese] 你好。</d>" in t2va.render_t2va_prompt(
+        materialize(job, draft)
+    )
+
+
+@pytest.mark.parametrize(
+    "lead",
+    [
+        "S2 speaks",
+        "S1 and S2 speak",
+        "S99 speaks",
+        "(S1)",
+        "S1,",
+        "( S1",
+        "A voice, S1, speaks",
+    ],
+)
+def test_lead_marker_cleanup_never_guesses_or_leaves_malformed(job, lead):
+    raw = draft_for(job).model_dump()
+    raw["integrated_sequence"][1]["lead_in"] = lead
+    with pytest.raises(ValueError):
+        t2va.parse_t2va_semantic(job, json.dumps(raw))
+
+
+def test_cleanup_does_not_allow_sx_in_visual_prose(job):
+    raw = draft_for(job).model_dump()
+    raw["integrated_sequence"][0]["text"] += " S1 stands near the door."
+    with pytest.raises(ValueError, match="speaker markers"):
+        t2va.parse_t2va_semantic(job, json.dumps(raw))
+
+
+def test_bounded_strings_and_completed_repetition(job):
+    schema = t2va.T2VAMimoDraft.model_json_schema()["$defs"]
+    assert schema["T2VAProsePart"]["properties"]["text"]["maxLength"] == 12000
+    assert schema["T2VASpeechPart"]["properties"]["lead_in"]["maxLength"] == 512
+    sentence = "The seated man holds his hands together while the standing man stays beside the doorway without changing his posture."
+    raw = draft_for(job).model_dump()
+    raw["integrated_sequence"][0]["text"] += f" {sentence} {sentence.upper()} {sentence}"
+    with pytest.raises(ValueError, match="sentence loop"):
+        t2va.T2VAMimoDraft.model_validate(raw)
+    block = (
+        sentence
+        + " The camera remains fixed on the two men with the window and table still visible behind them."
+    )
+    raw["integrated_sequence"][0]["text"] = (
+        "[Shot 1] " + block + " " + block + " " + block
+    )
+    with pytest.raises(ValueError, match="loop|block"):
+        t2va.T2VAMimoDraft.model_validate(raw)
+    raw["integrated_sequence"][0]["text"] = (
+        "[Shot 1] A person waves. A person waves. A person waves."
+    )
+    t2va.T2VAMimoDraft.model_validate(raw)
+    raw["integrated_sequence"][0]["text"] = "x" * 12001
+    with pytest.raises(ValueError):
+        t2va.T2VAMimoDraft.model_validate(raw)
+
+
+def test_inventory_binds_resolved_audio_and_no_alternate_route(finalized, tmp_path):
+    inventory = build(finalized, tmp_path)
+    for job in inventory.jobs:
+        if job.upstream_failure is None:
+            assert job.audio_evidence.resolved_root.endswith("/resolved_stems_v1")
+            assert Path(job.audio_evidence.music_path).is_file()
+            t2va.check_audio_files(job.audio_evidence)
+    t2va.validate_t2va_audio_lineage(inventory)
+    good = next(j for j in inventory.jobs if j.upstream_failure is None)
+    good.audio_evidence.music_path = good.audio_evidence.sfx_path
+    good.audio_evidence.music_sha256 = good.audio_evidence.sfx_sha256
+    with pytest.raises(ValueError, match="differs from resolved lineage"):
+        t2va.validate_t2va_audio_lineage(inventory)

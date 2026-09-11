@@ -1,4 +1,4 @@
-"""One original-AV request; deliberately independent of Ref2VA's staged backend."""
+"""T2VA semantics plus the frozen R2VA audio-finalize contract, without retries."""
 
 from __future__ import annotations
 
@@ -9,21 +9,27 @@ from pathlib import Path
 from typing import Any, Literal
 
 from r2v_data_v2.h3.mimo25_backend import (
-    MIMO25_CANONICAL_ABSENT_SOUNDSCAPE,
+    AUDIO_FINALIZE_SYSTEM_PROMPT,
+    MimoAudioFinalizeDraft,
     MimoMediaResolver,
+    _completion_diagnostic,
+    _validate_av_observation_usage,
+    _validate_finish_reason,
 )
 from r2v_data_v2.h3.t2va_shadow import (
     T2VABackendProvenance,
+    T2VACompletion,
     T2VAJob,
     T2VAMimoDraft,
     T2VARawResponse,
+    check_audio_files,
     fingerprint,
+    parse_t2va_semantic,
 )
 
 # No-reference adaptation of visual_only_v5, speech_assembly_v48,
 # speaker_profile_v2 and audio_finalize_v6. Existing prompt constants stay frozen.
-T2VA_SYSTEM_PROMPT = (
-    """Observe the ENTIRE original target video with its embedded audio and return one T2VAMimoDraft JSON object.
+T2VA_SYSTEM_PROMPT = """Observe the ENTIRE original target video with its embedded audio and return one T2VAMimoDraft JSON object.
 Original target AV is factual authority. The target video is observation input only, not conditioning media. The pipeline owns the three final section labels; do not put section headers inside the JSON strings.
 
 INTEGRATED MULTIMODAL DESCRIPTION
@@ -44,15 +50,8 @@ The final target AV may identify an onscreen speaker directly. Do not require an
 Keep each assignment's speech_presentation consistent with the final AV judgment: onscreen_spoken, offscreen_spoken, voice_over or uncertain. Offscreen is spatial, not a lack of supporting evidence; do not infer offscreen from uncertainty. When the source is offscreen, preserve visible people in visual prose and introduce the vocal source separately; do not attach its (Sx) to a visible listener.
 Place each speech part among the surrounding visual/action prose at its observed playback position. speaker_assignments owns its Sx and presentation; the renderer places that correct (Sx) BEFORE every corresponding <d> block. Describe the actual source and delivery in lead_in without copying speech. For a voiceover, naturally use says in an off-screen voiceover. Preserve playback-order speech placement alongside actions/reactions. Do not invent a visual action to justify attribution.
 
-AUDIO FIELD BOUNDARIES
-Original AV remains primary authority for all sounds. Only localized diegetic or shot-synchronized sound events that need a specific position in playback order belong in integrated_multimodal_description. Singing, in-scene instruments, radio/TV/phone music audible to characters belong there, not in audience-only score.
-Listen across the ENTIRE embedded audio from beginning to end before deciding either sound field or using an absent fallback. Positively describe actually audible ambience / room tone / outdoor background, physical movement/contact/impact, mechanical/electronic sounds and non-verbal human sounds in overall_soundscape, excluding dialogue, singing and music. Continuous room tone/hum/rumble belongs here, not as an appended sound summary in the integrated description. Do not hallucinate sounds from visible actions. Do not default to absence merely because dialogue is prominent or no salient isolated event stands out.
-Only when none of those soundscape layers are actually discernible after listening across the entire audio, use exactly: """
-    + MIMO25_CANONICAL_ABSENT_SOUNDSCAPE
-    + """
-non_diegetic_music describes audience-only BGM, with audible instrumentation, tempo/rhythm and dynamics rather than emotional function. Preserve clearly audible music; do not output N/A for clearly established score. Use N/A only when no such music is established.
-Do not summarize overall_soundscape or non_diegetic_music at the end of the integrated description. Return warnings only for genuinely uncertain observations; do not invent facts to fill a field."""
-)
+Describe each stable visual fact once. After the initial composition, describe only meaningful new actions, state, camera or shot changes. Do not repeatedly restate unchanged posture, gaze, composition, atmosphere, silence or relationship merely to extend the description. Stop once the observed clip progression has been covered.
+Only localized diegetic or shot-synchronized sounds that need a specific playback position belong in prose; do not append general ambience or background score summaries. Return warnings only for genuinely uncertain observations."""
 
 
 @dataclass(frozen=True)
@@ -187,10 +186,54 @@ class T2VAMimoBackend:
             }
         return request
 
-    def annotate(self, job: T2VAJob, request_fingerprint: str) -> T2VARawResponse:
-        raw = T2VARawResponse(
-            clip_uid=job.clip_uid,
-            request_fingerprint=request_fingerprint,
+    def build_audio_finalize_request(self, job: T2VAJob) -> dict:
+        if job.audio_evidence is None:
+            raise ValueError("T2VA requires resolved music/sfx evidence")
+        request = self.build_request(job)
+        target_video = request["messages"][1]["content"][0]
+        instruction = "Judge the non-dialogue target audio."
+        schema = MimoAudioFinalizeDraft.model_json_schema()
+        if self.config.transport == "xiaomi":
+            instruction += "\nRESPONSE SCHEMA:\n" + json.dumps(
+                schema, ensure_ascii=False, separators=(",", ":")
+            )
+        content = [target_video, {"type": "text", "text": instruction}]
+        for kind in ("music", "sfx"):
+            content.extend(
+                [
+                    {
+                        "type": "text",
+                        "text": f"{kind} stem: separated audio of the SAME target",
+                    },
+                    {
+                        "type": "audio_url",
+                        "audio_url": {
+                            "url": self.config.media_resolver.resolve(
+                                Path(getattr(job.audio_evidence, f"{kind}_path"))
+                            )
+                        },
+                    },
+                ]
+            )
+        request["messages"] = [
+            {"role": "system", "content": AUDIO_FINALIZE_SYSTEM_PROMPT},
+            {"role": "user", "content": content},
+        ]
+        if self.config.transport == "sglang":
+            request["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "MimoAudioFinalizeDraft",
+                    "schema": schema,
+                    "strict": True,
+                },
+            }
+        return request
+
+    def _complete(
+        self, request: dict, *, audio_finalize: bool = False
+    ) -> T2VACompletion:
+        raw = T2VACompletion(
             model_call_count=0,
             response=None,
             finish_reason=None,
@@ -199,7 +242,6 @@ class T2VAMimoBackend:
             error=None,
         )
         try:
-            request = self.build_request(job)
             raw.model_call_count = 1
             completion = self.client.chat.completions.create(**request)
             usage = _get(completion, "usage")
@@ -216,6 +258,24 @@ class T2VAMimoBackend:
             if not isinstance(content, str):
                 raise TypeError("T2VA response must be text")
             raw.response = content
+            if audio_finalize:
+                diagnostic = _completion_diagnostic(
+                    completion,
+                    choice,
+                    modality="target_video_audio_finalize",
+                    http_attempt_count=1,
+                    thinking="disabled",
+                )
+                _validate_finish_reason(diagnostic)
+                _validate_av_observation_usage(
+                    diagnostic,
+                    require_explicit_audio=False,
+                    require_reference_images=False,
+                )
+                if diagnostic.usage.audio_tokens == 0:
+                    diagnostic.warnings.append("embedded_audio_tokens_zero")
+                raw.warnings = diagnostic.warnings
+                return raw
             if raw.finish_reason not in {None, "stop"}:
                 raise ValueError(f"T2VA incomplete response: {raw.finish_reason}")
             if raw.finish_reason is None:
@@ -230,5 +290,45 @@ class T2VAMimoBackend:
                 if count is None:
                     raw.warnings.append(f"{modality}_tokens_unavailable")
         except Exception as exc:  # noqa: BLE001 - persist the sole SDK attempt, never retry.
+            raw.error = f"{type(exc).__name__}: {exc}"
+        return raw
+
+    def annotate(self, job: T2VAJob, request_fingerprint: str) -> T2VARawResponse:
+        from r2v_data_v2.structured_output import parse_structured_json_response
+
+        raw = T2VARawResponse(
+            clip_uid=job.clip_uid,
+            request_fingerprint=request_fingerprint,
+            model_call_count=0,
+            response=None,
+            finish_reason=None,
+            usage={},
+            warnings=[],
+            error=None,
+        )
+        try:
+            if job.audio_evidence is None:
+                raise ValueError("T2VA requires resolved music/sfx evidence")
+            check_audio_files(job.audio_evidence)
+            semantic = self._complete(self.build_request(job))
+            for key, value in semantic.model_dump().items():
+                setattr(raw, key, value)
+            raw.semantic_model_call_count = semantic.model_call_count
+            if semantic.error:
+                return raw
+            _, corrections = parse_t2va_semantic(job, semantic.response or "")
+            raw.deterministic_corrections = corrections
+            raw.audio_finalize = self._complete(
+                self.build_audio_finalize_request(job), audio_finalize=True
+            )
+            raw.model_call_count += raw.audio_finalize.model_call_count
+            if raw.audio_finalize.error:
+                raw.error = raw.audio_finalize.error
+                return raw
+            parse_structured_json_response(
+                raw.audio_finalize.response or "", MimoAudioFinalizeDraft
+            )
+            check_audio_files(job.audio_evidence)
+        except Exception as exc:  # noqa: BLE001 - persist both stages, never retry.
             raw.error = f"{type(exc).__name__}: {exc}"
         return raw

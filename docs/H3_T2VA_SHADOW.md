@@ -17,18 +17,21 @@ failed upstream speech remains a skip, never an empty-speech fallback.
 ```text
 JEA shots -> deterministic selection -> original processed shot videos
   -> canonical Audio -> SAM music_first + AuK speech -> resolved_stems
-  -> DiariZen -> Qwen3-ASR -> one-call MiMo T2VA
+  -> DiariZen -> Qwen3-ASR -> T2VA AV semantics -> frozen R2VA audio finalizer
 ```
 
-Each eligible clip makes one MiMo AV request with the **original target MP4 and
-its embedded audio**, plus a compact table of segment ID, acoustic cluster,
-start/end, exact ASR language and text. No additional media is attached. Generic
-lineage validation hashes upstream files read-only; stems are not decoded or
-provided as model evidence. There is no repair, retry, polish or fallback call.
+Each normally completed eligible clip makes two MiMo requests. The first uses
+the **original target MP4 and its embedded audio**, plus segment ID, acoustic
+cluster, start/end, language and has_transcript, never the exact ASR words.
+The second imports the frozen R2VA audio-finalize prompt/schema/validation and
+uses original AV plus the exact resolved SAM music and SFX stems. AuK speech is
+not sent to this finalizer. Named resolved lineage and file hashes are validated
+read-only; no alternate SAM route is used. There is no repair, retry, polish or
+fallback. A failed first call prevents the second; actual calls are counted.
 
 ## Core and Authority
 
-`H3NoReferenceAVCore` .3 stores speaker assignments, the typed integrated sequence,
+`H3NoReferenceAVCore` .4 stores speaker assignments, the typed integrated sequence,
 authoritative speech facts/target duration, and the two sound fields. The pure
 renderer produces only, in order:
 
@@ -58,29 +61,30 @@ are rejected. The first shot has no timestamp; later sequential shot markers
 require increasing in-range cut timestamps, matching the local official
 `VIDEO_PROMPT_WRITING_GUIDE_base_en.md` T2VA conventions.
 
-The T2VA system prompt is a no-reference adaptation of the frozen current
-`visual_only_v5`, `speech_assembly_v48`, `speaker_profile_v2` and
-`audio_finalize_v6` prompts, not their concatenation. It retains visual detail,
-observational restraint, original-AV authority, exact ASR, stable speaker placement
-and physical-sound/score separation. It removes all staged-turn, reference,
-retention and entity-binding instructions. The canonical absent-soundscape
-sentence is reused; absent audience-only music is `N/A`. Semantic sound
+The first T2VA system prompt is a no-reference adaptation of the frozen visual
+and speech instructions, not their concatenation. It retains visual detail,
+observational restraint, original-AV authority and stable speaker placement.
+It removes reference/retention/entity-binding instructions and final sound fields.
+The separate audio call uses frozen `audio_finalize_v6` unchanged. Semantic sound
 classification remains a model judgment, not a keyword-based validator.
 
-The current contract uses T2VA prompt v3/backend .3 and core .3. Model-visible
+The current contract uses T2VA prompt v4/backend .4 and core .4. Model-visible
 speech facts contain only segment/cluster, times, language and `has_transcript`;
 exact ASR words stay inside the job/core and are never sent in text conditioning.
 The explicit ordered `dialogue_segment_ids` list controls speech slots, while
 assignments still cover every supplied segment. Bare Sx tokens, as well as
 parenthesized markers, are forbidden in model-owned text. Only the renderer
-emits final Sx/dialogue serialization. The prompt requires listening across the
-entire original AV before an absent soundscape/music decision; no acoustic
-threshold, keyword sound validator or extra call is added.
+emits final Sx/dialogue serialization. A narrow cleanup removes redundant Sx only
+from a speech lead-in when it matches that segment's validated assignment.
+Conflicting markers and markers elsewhere still fail. Raw output and correction
+counts are retained. Prose parts are bounded at 12,000 characters and lead-ins
+at 512; substantial exact normalized sentence/block loops fail without rewriting.
 
-This is not fingerprint-compatible with v2 or the prior model-written dialogue
+This is not fingerprint-compatible with v3 or the prior model-written dialogue
 string. A prior-contract run ID is rejected even with `--overwrite`: use a new
-run ID; frozen prior outputs are not rewritten. Record/summary shapes and the
-three-section final format are unchanged. QA .2 shows segment/cluster, Sx and
+run ID; frozen prior outputs are not rewritten. Inventory .3 binds resolved media;
+raw .2 separates both attempts; record/summary .2 account for up to two calls.
+The three-section final format is unchanged. QA .2 shows segment/cluster, Sx and
 presentation, model lead-in, authoritative ASR and the rendered speech side by
 side, plus the existing original video, raw response and diagnostics.
 
@@ -142,7 +146,7 @@ First inspect a model-free dry run:
   --clips-root "$JEA_CLIPS_ROOT" --source-videos-root "$JEA_SOURCE_VIDEOS_ROOT" \
   --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
   --audio-shadow-run-id "$AUDIO_SHADOW_RUN_ID" \
-  --t2va-run-id t2va-random20-v1 \
+  --t2va-run-id t2va-random20-v4 \
   --case-manifest "$AUDIO_PRODUCTION_ROOT/case_manifest.json" \
   --base-url http://127.0.0.1:8092/v1 \
   --transport sglang --model mimo-v2.5 \
@@ -183,11 +187,10 @@ their row/clip/video provenance. Random `valid_row_count` is null because the
 unvisited population has not been validated; all/case selection retains its
 existing exhaustive lookup and exact valid-row count.
 
-Inventory .2 records source shot manifest path/hash, adapter roots, source row
+Inventory .3 records source shot manifest path/hash, adapter roots, source row
 index/hash, source video/shot identity and selected video path/hash. The no-Visual
 DiariZen/ASR inventories use .5; legacy .4 inputs remain readable and retain their
-existing behavior. T2VA prompt, no-reference core, request, renderer and QA
-semantics are unchanged. No TA2VA is implemented.
+existing behavior. No TA2VA is implemented.
 
 Outputs are isolated under:
 

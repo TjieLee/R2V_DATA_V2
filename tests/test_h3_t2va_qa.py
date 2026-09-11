@@ -43,7 +43,7 @@ def published(job, tmp_path, monkeypatch):
     production = tmp_path / "production"
     production.mkdir()
     values = {
-        "schema_version": "r2v.h3.t2va_inventory.2",
+        "schema_version": "r2v.h3.t2va_inventory.3",
         "shot_selection": {
             "schema_version": "r2v.h3.t2va_shot_selection.1",
             "shot_manifest_path": "/synthetic/shots.jsonl",
@@ -190,4 +190,4 @@ def test_qa_summary_reconciles(published):
     data = json.loads(page.with_name("data.json").read_text())
     assert data["summary"]["record_count"] == len(data["cases"]) == 2
     assert data["summary"]["ready_count"] == 2
-    assert data["summary"]["model_call_count"] == 2
+    assert data["summary"]["model_call_count"] == 4

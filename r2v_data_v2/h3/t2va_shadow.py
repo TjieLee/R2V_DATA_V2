@@ -8,20 +8,26 @@ import random
 import re
 import shutil
 import uuid
+from collections import Counter
 from pathlib import Path
 from typing import Annotated, Literal, Protocol, Self
 
-from pydantic import Field, StrictStr, model_validator
+from pydantic import Field, StrictStr, TypeAdapter, model_validator
 
 from r2v_data_v2.h3.diarization_binding import RawDiarizationSegment
 from r2v_data_v2.h3.jea_audio_production import CanonicalAudioClip
 from r2v_data_v2.h3.jea_target_audio_caption import (
     AUDIO_TIMELINE_DURATION_TOLERANCE_SECONDS,
 )
+from r2v_data_v2.h3.mimo25_backend import (
+    AUDIO_FINALIZE_SYSTEM_PROMPT,
+    MIMO25_AUDIO_FINALIZE_PROMPT_VERSION,
+    MimoAudioFinalizeDraft,
+)
 from r2v_data_v2.h3.qwen3_asr import Qwen3ASRSegment
 from r2v_data_v2.h3.resolved_audio_stems import (
-    ResolvedStemInventory,
     downstream_stem_root,
+    load_resolved_stems,
 )
 from r2v_data_v2.h3.sam_audio_stem_shadow import (
     _publish_directory,
@@ -116,14 +122,15 @@ class T2VASpeakerAssignment(SchemaModel):
 
 class T2VAProsePart(SchemaModel):
     kind: Literal["prose"]
-    text: Text
+    text: Text = Field(max_length=12000)
 
 
 class T2VASpeechPart(SchemaModel):
     kind: Literal["speech"]
     segment_id: SafeID
     lead_in: Text = Field(
-        description="Source/presentation/delivery prose only; no dialogue words or speaker markers"
+        max_length=512,
+        description="Source/presentation/delivery prose only; no dialogue words or speaker markers",
     )
 
 
@@ -135,8 +142,6 @@ T2VASequencePart = Annotated[
 class T2VAMimoDraft(SchemaModel):
     speaker_assignments: list[T2VASpeakerAssignment]
     integrated_sequence: list[T2VASequencePart] = Field(min_length=1)
-    overall_soundscape: Text
-    non_diegetic_music: Text
     warnings: list[Text]
 
     @model_validator(mode="after")
@@ -146,8 +151,6 @@ class T2VAMimoDraft(SchemaModel):
                 p.text if p.kind == "prose" else p.lead_in
                 for p in self.integrated_sequence
             ),
-            self.overall_soundscape,
-            self.non_diegetic_music,
             *self.warnings,
         ]
         for value in values:
@@ -170,6 +173,44 @@ class T2VAMimoDraft(SchemaModel):
             if p.kind == "speech"
         ):
             raise ValueError("T2VA speech lead-in cannot contain shot syntax")
+        _validate_repetition(
+            [p.text for p in self.integrated_sequence if p.kind == "prose"]
+        )
+        return self
+
+
+def _validate_repetition(parts: list[str]) -> None:
+    sentences = [
+        " ".join(s.casefold().split())
+        for s in re.split(r"(?<=[.!?])\s+|\n+", "\n".join(parts))
+    ]
+    if any(
+        count >= 3
+        for sentence, count in Counter(sentences).items()
+        if len(sentence) >= 80
+    ):
+        raise ValueError("T2VA repeated substantial sentence loop")
+    for size in range(2, min(8, len(sentences) // 2) + 1):
+        for start in range(len(sentences) - 2 * size + 1):
+            block = sentences[start : start + size]
+            if (
+                sum(map(len, block)) >= 160
+                and block == sentences[start + size : start + 2 * size]
+            ):
+                raise ValueError("T2VA repeated contiguous sentence block")
+
+
+class H3NoReferenceAVCore(T2VAMimoDraft):
+    schema_version: Literal["r2v.h3.no_reference_av_core.4"] = (
+        "r2v.h3.no_reference_av_core.4"
+    )
+    overall_soundscape: Text
+    non_diegetic_music: Text
+    speech_facts: list[T2VASpeechFact]
+    target_duration_seconds: float = Field(gt=0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def validate_core(self) -> Self:
         for field in SECTIONS[1:]:
             value = getattr(self, field)
             if (
@@ -177,28 +218,69 @@ class T2VAMimoDraft(SchemaModel):
                 or "</d>" in value
                 or _SPEAKER.search(value)
                 or _SHOT.search(value)
+                or _MODEL_SPEAKER_TOKEN.search(value)
+                or _FORBIDDEN.search(value)
+                or not value.strip()
             ):
                 raise ValueError(
                     "dialogue/speaker/shot syntax belongs only in integrated description"
                 )
-        return self
-
-
-class H3NoReferenceAVCore(T2VAMimoDraft):
-    schema_version: Literal["r2v.h3.no_reference_av_core.3"] = (
-        "r2v.h3.no_reference_av_core.3"
-    )
-    speech_facts: list[T2VASpeechFact]
-    target_duration_seconds: float = Field(gt=0, allow_inf_nan=False)
-
-    @model_validator(mode="after")
-    def validate_core(self) -> Self:
         _validate_t2va_content(self.speech_facts, self.target_duration_seconds, self)
         return self
 
     @property
     def integrated_multimodal_description(self) -> str:
         return _render_sequence(self.speech_facts, self)
+
+
+class T2VAAudioEvidence(SchemaModel):
+    resolved_root: Text
+    resolved_record_fingerprint: Hash
+    full_audio_path: Text
+    full_audio_sha256: Hash
+    speech_path: Text
+    speech_sha256: Hash
+    music_path: Text
+    music_sha256: Hash
+    sfx_path: Text
+    sfx_sha256: Hash
+
+
+def check_audio_files(evidence: T2VAAudioEvidence) -> None:
+    for kind in ("full_audio", "speech", "music", "sfx"):
+        path = Path(getattr(evidence, f"{kind}_path"))
+        if not path.is_absolute() or sha256_file(path) != getattr(
+            evidence, f"{kind}_sha256"
+        ):
+            raise ValueError(f"T2VA {kind} evidence hash differs")
+
+
+def audio_evidence(clip: CanonicalAudioClip, record, root: Path) -> T2VAAudioEvidence:
+    if record.status != "ready" or record.clip_uid != clip.clip_uid:
+        raise ValueError("T2VA audio requires ready matching resolved stems")
+    values = {
+        "resolved_root": str(root),
+        "resolved_record_fingerprint": record.record_fingerprint,
+        "full_audio_path": clip.target_full_audio_path,
+        "full_audio_sha256": clip.target_full_audio_sha256,
+    }
+    for kind in ("speech", "music", "sfx"):
+        stem = record.stem(kind)
+        if (
+            stem.source_audio_path,
+            stem.source_audio_sha256,
+            stem.source_end_sample,
+        ) != (
+            clip.target_full_audio_path,
+            clip.target_full_audio_sha256,
+            clip.frame_count,
+        ):
+            raise ValueError("T2VA resolved audio differs from canonical target")
+        values[f"{kind}_path"] = stem.canonical_stem_path
+        values[f"{kind}_sha256"] = stem.canonical_stem_sha256
+    evidence = T2VAAudioEvidence(**values)
+    check_audio_files(evidence)
+    return evidence
 
 
 class T2VAJob(SchemaModel):
@@ -208,6 +290,7 @@ class T2VAJob(SchemaModel):
     target_video_sha256: Hash
     target_duration_seconds: float = Field(gt=0, allow_inf_nan=False)
     speech_facts: list[T2VASpeechFact]
+    audio_evidence: T2VAAudioEvidence | None = None
     upstream_failure: Text | None = None
 
     @model_validator(mode="after")
@@ -227,7 +310,9 @@ class T2VAJob(SchemaModel):
         return self
 
 
-def validate_t2va_draft(job: T2VAJob, draft: T2VAMimoDraft) -> H3NoReferenceAVCore:
+def validate_t2va_draft(
+    job: T2VAJob, draft: T2VAMimoDraft, audio: MimoAudioFinalizeDraft | None = None
+) -> H3NoReferenceAVCore:
     """Bind model placement to immutable ASR facts, without semantic repair."""
     if isinstance(draft, H3NoReferenceAVCore) and (
         draft.speech_facts != job.speech_facts
@@ -235,8 +320,16 @@ def validate_t2va_draft(job: T2VAJob, draft: T2VAMimoDraft) -> H3NoReferenceAVCo
     ):
         raise ValueError("T2VA core speech facts differ from authoritative job")
     values = draft.model_dump(include=set(T2VAMimoDraft.model_fields))
+    if audio is None:
+        if not isinstance(draft, H3NoReferenceAVCore):
+            raise ValueError("T2VA requires dedicated audio-finalize output")
+        audio = MimoAudioFinalizeDraft(
+            overall_soundscape=draft.overall_soundscape,
+            non_diegetic_music=draft.non_diegetic_music,
+        )
     return H3NoReferenceAVCore(
         **values,
+        **audio.model_dump(),
         speech_facts=job.speech_facts,
         target_duration_seconds=job.target_duration_seconds,
     )
@@ -276,26 +369,7 @@ def _validate_t2va_content(
         s.end_time > duration + AUDIO_TIMELINE_DURATION_TOLERANCE_SECONDS for s in facts
     ):
         raise ValueError("T2VA speech exceeds canonical timeline tolerance")
-    if [
-        (a.segment_id, a.source_speaker_cluster) for a in draft.speaker_assignments
-    ] != [(s.segment_id, s.source_speaker_cluster) for s in facts]:
-        raise ValueError("T2VA speaker assignment inventory differs from speech facts")
-    clusters: dict[str, str] = {}
-    speakers: list[str] = []
-    for assignment in draft.speaker_assignments:
-        prior = clusters.setdefault(
-            assignment.source_speaker_cluster, assignment.speaker_id
-        )
-        if prior != assignment.speaker_id:
-            raise ValueError(
-                "T2VA acoustic source cluster cannot split across speakers"
-            )
-        if assignment.speaker_id not in speakers:
-            speakers.append(assignment.speaker_id)
-    if speakers != [f"S{i + 1}" for i in range(len(speakers))]:
-        raise ValueError(
-            "T2VA speaker IDs must be contiguous by first vocal appearance"
-        )
+    _validate_assignments(facts, draft.speaker_assignments)
     if [p.segment_id for p in draft.integrated_sequence if p.kind == "speech"] != [
         s.segment_id for s in facts if s.text is not None
     ]:
@@ -312,9 +386,70 @@ def _validate_t2va_content(
             raise ValueError("T2VA model prose must not copy authoritative ASR text")
     caption = _render_sequence(facts, draft)
     validate_t2va_dialogue(facts, draft.speaker_assignments, caption)
-    # Dialogue is immutable content, not a place to interpret shot delimiters.
-    visual = _DIALOGUE.sub("", caption)
-    _validate_t2va_shots(visual, duration)
+    _validate_t2va_shots(_DIALOGUE.sub("", caption), duration)
+
+
+def _validate_assignments(facts, assignments) -> None:
+    if [(a.segment_id, a.source_speaker_cluster) for a in assignments] != [
+        (s.segment_id, s.source_speaker_cluster) for s in facts
+    ]:
+        raise ValueError("T2VA speaker assignment inventory differs from speech facts")
+    clusters: dict[str, str] = {}
+    speakers: list[str] = []
+    for assignment in assignments:
+        prior = clusters.setdefault(
+            assignment.source_speaker_cluster, assignment.speaker_id
+        )
+        if prior != assignment.speaker_id:
+            raise ValueError(
+                "T2VA acoustic source cluster cannot split across speakers"
+            )
+        if assignment.speaker_id not in speakers:
+            speakers.append(assignment.speaker_id)
+    if speakers != [f"S{i + 1}" for i in range(len(speakers))]:
+        raise ValueError(
+            "T2VA speaker IDs must be contiguous by first vocal appearance"
+        )
+
+
+def parse_t2va_semantic(job: T2VAJob, raw: str) -> tuple[T2VAMimoDraft, dict[str, int]]:
+    from r2v_data_v2.structured_output import normalize_structured_json_envelope
+
+    payload = json.loads(normalize_structured_json_envelope(raw))
+    if not isinstance(payload, dict):
+        raise TypeError("T2VA response must be a JSON object")
+    assignments = TypeAdapter(list[T2VASpeakerAssignment]).validate_python(
+        payload.get("speaker_assignments")
+    )
+    _validate_assignments(job.speech_facts, assignments)
+    by_id = {a.segment_id: a.speaker_id for a in assignments}
+    corrections = Counter()
+    token = re.compile(r"\(S[1-9]\d*\)|\bS[1-9]\d*\b")
+    for part in payload.get("integrated_sequence", []):
+        if (
+            not isinstance(part, dict)
+            or part.get("kind") != "speech"
+            or not isinstance(part.get("lead_in"), str)
+        ):
+            continue
+        lead = part["lead_in"]
+        found = {m.group().strip("()") for m in token.finditer(lead)}
+        if found and found == {by_id.get(part.get("segment_id"))}:
+            clean = re.sub(r" {2,}", " ", token.sub("", lead)).strip()
+            if (
+                not any(c.isalpha() for c in clean)
+                or clean[0] in ",;:.!?"
+                or clean.count("(") != clean.count(")")
+                or re.search(r"[,;:]\s*[,;:]", clean)
+            ):
+                raise ValueError(
+                    "T2VA redundant speaker cleanup leaves malformed lead-in"
+                )
+            part["lead_in"] = clean
+            corrections["redundant_speech_lead_in_speaker_marker"] += 1
+    draft = T2VAMimoDraft.model_validate(payload)
+    _validate_t2va_content(job.speech_facts, job.target_duration_seconds, draft)
+    return draft, dict(corrections)
 
 
 def validate_t2va_dialogue(
@@ -378,8 +513,17 @@ def render_t2va_prompt(core: H3NoReferenceAVCore) -> str:
 
 
 class T2VABackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.t2va_mimo_backend.3"] = "r2v.h3.t2va_mimo_backend.3"
-    prompt_version: Literal["h3_t2va_joint_av_v3"] = "h3_t2va_joint_av_v3"
+    schema_version: Literal["r2v.h3.t2va_mimo_backend.4"] = "r2v.h3.t2va_mimo_backend.4"
+    prompt_version: Literal["h3_t2va_joint_av_v4"] = "h3_t2va_joint_av_v4"
+    audio_finalize_prompt_version: Literal["h3_mimo25_audio_finalize_v6"] = (
+        MIMO25_AUDIO_FINALIZE_PROMPT_VERSION
+    )
+    audio_finalize_prompt_sha256: Hash = hashlib.sha256(
+        AUDIO_FINALIZE_SYSTEM_PROMPT.encode()
+    ).hexdigest()
+    audio_finalize_schema_sha256: Hash = fingerprint(
+        MimoAudioFinalizeDraft.model_json_schema()
+    )
     prompt_sha256: Hash
     response_schema_sha256: Hash
     transport: Literal["sglang", "xiaomi"]
@@ -393,11 +537,11 @@ class T2VABackendProvenance(SchemaModel):
     video_fps: Literal[4] = 4
     media_resolution: Literal["default"] = "default"
     max_completion_tokens: int = Field(gt=0)
-    maximum_attempts: Literal[1] = 1
+    maximum_attempts: Literal[2] = 2
 
 
 class T2VAInventory(SchemaModel):
-    schema_version: Literal["r2v.h3.t2va_inventory.2"] = "r2v.h3.t2va_inventory.2"
+    schema_version: Literal["r2v.h3.t2va_inventory.3"] = "r2v.h3.t2va_inventory.3"
     shot_selection: T2VAShotSelection
     audio_production_root: Text
     audio_shadow_run_id: SafeID
@@ -527,7 +671,7 @@ def build_t2va_inventory(
         if uid in by_clip:
             validate_cached_target(shots[uid], by_clip[uid])
 
-    def job_for(uid, facts, reason):
+    def job_for(uid, facts, reason, evidence=None):
         shot = shots[uid]
         return T2VAJob(
             clip_uid=uid,
@@ -536,6 +680,7 @@ def build_t2va_inventory(
             target_video_sha256=shot.video_sha256,
             target_duration_seconds=shot.duration_seconds,
             speech_facts=facts,
+            audio_evidence=evidence,
             upstream_failure=reason,
         )
 
@@ -545,7 +690,7 @@ def build_t2va_inventory(
         if selection.case_manifest_path:
             hashes[selection.case_manifest_path] = selection.case_manifest_sha256
         values = {
-            "schema_version": "r2v.h3.t2va_inventory.2",
+            "schema_version": "r2v.h3.t2va_inventory.3",
             "shot_selection": selection.model_dump(mode="json"),
             "audio_production_root": str(production),
             "audio_shadow_run_id": audio_shadow_run_id,
@@ -578,9 +723,8 @@ def build_t2va_inventory(
         raise ValueError(
             "T2VA requires finalized named-run resolved speech, never legacy SAM speech"
         )
-    resolved = ResolvedStemInventory.model_validate_json(
-        (resolved_root / "inventory.json").read_text()
-    )
+    resolved, stem_records, _ = load_resolved_stems(resolved_root)
+    stems_by_uid = {r.clip_uid: r for r in stem_records}
     if (
         Path(resolved.source_canonical_audio_manifest_path).resolve() != canonical_path
         or resolved.source_canonical_audio_manifest_sha256
@@ -669,7 +813,15 @@ def build_t2va_inventory(
                     text=result.text,
                 )
             )
-        jobs.append(job_for(uid, facts, reason))
+        stem_record = stems_by_uid[uid]
+        evidence = (
+            audio_evidence(clip, stem_record, resolved_root)
+            if stem_record.status == "ready"
+            else None
+        )
+        if evidence is None:
+            reason = reason or "resolved_audio_unavailable"
+        jobs.append(job_for(uid, facts, reason, evidence))
     paths = [
         canonical_path,
         raw_path,
@@ -677,14 +829,13 @@ def build_t2va_inventory(
         root / "diarization/stem_provenance.json",
         root / "asr/stem_provenance.json",
         resolved_root / "inventory.json",
+        resolved_root / "records.jsonl",
+        resolved_root / "summary.json",
     ]
     return finish(jobs, paths)
 
 
-class T2VARawResponse(SchemaModel):
-    schema_version: Literal["r2v.h3.t2va_raw_response.1"] = "r2v.h3.t2va_raw_response.1"
-    clip_uid: SafeID
-    request_fingerprint: Hash
+class T2VACompletion(SchemaModel):
     model_call_count: int = Field(ge=0, le=1)
     response: str | None
     finish_reason: str | None
@@ -693,14 +844,32 @@ class T2VARawResponse(SchemaModel):
     error: str | None
 
 
+class T2VARawResponse(T2VACompletion):
+    schema_version: Literal["r2v.h3.t2va_raw_response.2"] = "r2v.h3.t2va_raw_response.2"
+    clip_uid: SafeID
+    request_fingerprint: Hash
+    model_call_count: int = Field(ge=0, le=2)
+    semantic_model_call_count: int = Field(default=0, ge=0, le=1)
+    audio_finalize: T2VACompletion | None = None
+    deterministic_corrections: dict[str, int] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_calls(self) -> Self:
+        if self.model_call_count != self.semantic_model_call_count + (
+            self.audio_finalize.model_call_count if self.audio_finalize else 0
+        ):
+            raise ValueError("T2VA per-stage model call counts differ")
+        return self
+
+
 class T2VARecord(SchemaModel):
-    schema_version: Literal["r2v.h3.t2va_record.1"] = "r2v.h3.t2va_record.1"
+    schema_version: Literal["r2v.h3.t2va_record.2"] = "r2v.h3.t2va_record.2"
     clip_uid: SafeID
     inventory_fingerprint: Hash
     request_fingerprint: Hash
     status: Literal["ready", "failed", "skipped"]
     failure_reason: str | None
-    model_call_count: int = Field(ge=0, le=1)
+    model_call_count: int = Field(ge=0, le=2)
     raw_sha256: Hash
     core_sha256: Hash | None
     prompt_sha256: Hash | None
@@ -713,10 +882,10 @@ class T2VARecord(SchemaModel):
                 self.failure_reason
                 or not self.core_sha256
                 or not self.prompt_sha256
-                or self.model_call_count != 1
+                or self.model_call_count != 2
             ):
                 raise ValueError(
-                    "ready T2VA record requires a validated one-call core/prompt"
+                    "ready T2VA record requires a validated two-call core/prompt"
                 )
         elif not self.failure_reason or self.core_sha256 or self.prompt_sha256:
             raise ValueError("unavailable T2VA cannot publish core/prompt")
@@ -726,7 +895,7 @@ class T2VARecord(SchemaModel):
 
 
 class T2VASummary(SchemaModel):
-    schema_version: Literal["r2v.h3.t2va_summary.1"] = "r2v.h3.t2va_summary.1"
+    schema_version: Literal["r2v.h3.t2va_summary.2"] = "r2v.h3.t2va_summary.2"
     inventory_fingerprint: Hash
     clip_uids: list[SafeID]
     record_count: int
@@ -769,6 +938,32 @@ def _check_sources(inventory: T2VAInventory) -> None:
     )
     if str(root / "asr/stem_provenance.json") in inventory.source_hashes:
         validate_stem_asr_lineage(root / "asr", expected_shadow_root=root)
+        validate_t2va_audio_lineage(inventory)
+
+
+def validate_t2va_audio_lineage(inventory: T2VAInventory) -> None:
+    production = Path(inventory.audio_production_root)
+    root = downstream_stem_root(production, inventory.audio_shadow_run_id)
+    resolved, records, _ = load_resolved_stems(root)
+    canonical_path = production / "audio/canonical_clips.jsonl"
+    if (
+        str(canonical_path) != resolved.source_canonical_audio_manifest_path
+        or sha256_file(canonical_path)
+        != resolved.source_canonical_audio_manifest_sha256
+    ):
+        raise ValueError("T2VA resolved/canonical audio lineage differs")
+    clips = {c.clip_uid: c for c in read_rows(canonical_path, CanonicalAudioClip)}
+    by_uid = {r.clip_uid: r for r in records}
+    for job in inventory.jobs:
+        if job.audio_evidence is not None:
+            clip = clips[job.clip_uid]
+            if (clip.target_video_path, clip.target_video_sha256) != (
+                job.target_video_path,
+                job.target_video_sha256,
+            ) or audio_evidence(clip, by_uid[job.clip_uid], root) != job.audio_evidence:
+                raise ValueError(
+                    "T2VA job audio evidence differs from resolved lineage"
+                )
 
 
 def run_t2va_shadow(
@@ -842,10 +1037,19 @@ def run_t2va_shadow(
                         raise ValueError("T2VA raw response ownership differs")
                     if raw.error:
                         raise ValueError(raw.error)
-                    draft = parse_structured_json_response(
-                        raw.response or "", T2VAMimoDraft
+                    draft, corrections = parse_t2va_semantic(job, raw.response or "")
+                    if (
+                        corrections != raw.deterministic_corrections
+                        or raw.audio_finalize is None
+                        or raw.audio_finalize.error
+                    ):
+                        raise ValueError(
+                            "T2VA audio-finalize/correction provenance differs"
+                        )
+                    audio = parse_structured_json_response(
+                        raw.audio_finalize.response or "", MimoAudioFinalizeDraft
                     )
-                    core = validate_t2va_draft(job, draft)
+                    core = validate_t2va_draft(job, draft, audio)
                     if (
                         sha256_file(Path(job.target_video_path))
                         != job.target_video_sha256
@@ -881,7 +1085,11 @@ def run_t2va_shadow(
                     raw_sha256=sha256_file(raw_path),
                     core_sha256=core_hash,
                     prompt_sha256=prompt_hash,
-                    warnings=[*raw.warnings, *(core.warnings if core else [])],
+                    warnings=[
+                        *raw.warnings,
+                        *(raw.audio_finalize.warnings if raw.audio_finalize else []),
+                        *(core.warnings if core else []),
+                    ],
                 )
             )
         (temporary / "records.jsonl").write_text(
