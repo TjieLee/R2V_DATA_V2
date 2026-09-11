@@ -17,6 +17,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Build read-only RA2VA speaker-binding A/B review")
     for name in ("visual-production-root", "visual-runs-root", "case-manifest", "legacy-mimo-root", "no-lrasd-mimo-root", "output-root"):
         parser.add_argument("--" + name, type=Path, required=True)
+    parser.add_argument("--legacy-source-contract", type=Path, help="Exact frozen OLD source contract or job inventory; never resampled")
     result = build_review(**vars(parser.parse_args(argv)))
     print(json.dumps(result, sort_keys=True))
     return result

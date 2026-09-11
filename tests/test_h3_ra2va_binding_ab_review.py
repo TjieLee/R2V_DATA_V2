@@ -175,6 +175,120 @@ def test_pairing_summary_failed_annotations_and_isolation(source, tmp_path):
     assert (second / "data.json").read_bytes() == (root / "data.json").read_bytes()
 
 
+def _freeze_projected_context(source, *, root_key="no_lrasd_mimo_root", selected=(1, 3), promotion=False):
+    root = source[root_key]
+    image = source["visual_production_root"] / "reference.png"
+    video = source["visual_production_root"] / "target.mp4"
+    images, subjects = [], []
+    for i, original in enumerate(selected, 1):
+        entity = i == 1 or (len(selected) == 4 and i == 2)
+        owner = "e2" if i == 4 else "e1"
+        images.append({
+            "image_index": i, "picture_label": f"<Picture {i}>", "source_image_index": original,
+            "source_image_id": f"image_{original}", "source_image_label": f"<Image {original}>",
+            "kind": "subject" if entity else "attribute", "entity_id": f"e{i}" if entity else None,
+            "owner_entity_id": None if entity else owner, "attribute_id": None if entity else f"a{original}",
+            "attribute_type": None if entity else "face" if len(selected) == 2 else "clothing" if i == 3 else "hair",
+            "image_artifact_path": str(image), "image_sha256": ab.sha256_file(image),
+        })
+        subjects.append({"subject_index": i, "subject_label": f"<Subject {i}>",
+                         "kind": "entity" if entity else "attribute", "entity_id": images[-1]["entity_id"],
+                         "attribute_id": images[-1]["attribute_id"], "owner_entity_id": images[-1]["owner_entity_id"],
+                         "attribute_type": images[-1]["attribute_type"], "source_picture_labels": [f"<Picture {i}>"]})
+    selection = {"selected_source_image_indexes": list(selected), "dropped_references": [{
+        "source_image_index": 2 if len(selected) == 2 else 3,
+        "kind": "attribute", "attribute_type": "hair", "owner_entity_id": "e1", "drop_reason": "hair_sampling_drop",
+    }], "face_promotions": []}
+    if promotion:
+        selection["face_promotions"] = [{"source_image_index": selected[0], "entity_id": "e1", "replaced_source_image_indexes": [1]}]
+        selection["dropped_references"].append({"source_image_index": 1, "kind": "subject", "entity_id": "e1", "drop_reason": "person_replaced_by_face"})
+    rows = [json.loads(line) for line in (root / "records.jsonl").read_text().splitlines()]
+    jobs = []
+    for record in rows:
+        job = {"clip_uid": record["clip_uid"], "target_video_path": str(video), "target_video_sha256": ab.sha256_file(video),
+               "reference_images": images, "reference_subjects": subjects, "reference_selection": selection}
+        job["request_fingerprint"] = ab._hash(job)
+        jobs.append(job)
+        record["source_job_fingerprint"] = job["request_fingerprint"]
+        record["record_fingerprint"] = ab._hash({k: v for k, v in record.items() if k != "record_fingerprint"})
+    (root / "records.jsonl").write_text("".join(json.dumps(r)+"\n" for r in rows))
+    path = root / "source_contract.json"
+    path.write_text(json.dumps({"schema_version": "r2v.h3.mimo25_stem_source_contract.1", "jobs": jobs}))
+    return path
+
+
+@pytest.mark.parametrize("selected,promotion", [((1, 3), False), ((1, 2, 4, 5), False), ((3, 4), True)])
+def test_actual_frozen_projection_not_recomputed(source, monkeypatch, selected, promotion):
+    from r2v_data_v2.h3 import mimo25_av_reconcile as reconcile
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("never recompute reference selection")
+
+    monkeypatch.setattr(reconcile, "build_mimo25_reference_inventory", forbidden)
+    inventory = ab.load_visual_production_inventory()
+    base = inventory.canonical_clips[0].sample.references[0]
+    specs = [("subject", "e1", None), ("attribute", None, "hair"), ("attribute", None, "face")]
+    if len(selected) == 4:
+        specs = [("subject", "e1", None), ("subject", "e2", None),
+                 ("attribute", None, "hair"), ("attribute", None, "clothing"), ("attribute", None, "hair")]
+    elif promotion:
+        specs.append(("attribute", None, "clothing"))
+    refs = [base.model_copy(update={
+        "image_index": i, "image_id": f"image_{i}", "kind": kind, "entity_id": entity,
+        "attribute_id": f"a{i}" if attr else None, "attribute_type": attr,
+        "owner_entity_id": ("e2" if i == 5 else "e1") if attr else None,
+    }) for i, (kind, entity, attr) in enumerate(specs, 1)]
+    for clip in inventory.canonical_clips:
+        clip.sample.references = refs
+    monkeypatch.setattr(ab, "load_visual_production_inventory", lambda **kw: inventory)
+    path = _freeze_projected_context(source, selected=selected, promotion=promotion)
+    before = path.read_bytes()
+    ab.build_review(**source)
+    data = json.loads((source["output_root"] / "data.json").read_text())
+    case = data["cases"][0]
+    actual = case["new_reference_context"]
+    assert actual["available"] and not case["old_reference_context"]["available"]
+    assert [r["source_image_index"] for r in actual["references"]] == list(selected)
+    assert [r["picture_label"] for r in actual["references"]] == [f"<Picture {i}>" for i in range(1, len(selected)+1)]
+    assert [s["subject_label"] for s in actual["subjects"]] == [f"<Subject {i}>" for i in range(1, len(selected)+1)]
+    frozen = json.loads(path.read_text())["jobs"][0]
+    assert actual["subjects"] == frozen["reference_subjects"]
+    assert actual["reference_selection"] == frozen["reference_selection"]
+    assert len(case["references"]) == len(specs)
+    assert case["references"][-1]["source_image_index"] == len(specs)
+    assert path.read_bytes() == before
+    assert str(path) in data["source_hashes"]
+
+
+def test_explicit_historical_contract_and_lineage_checks(source, tmp_path):
+    path = _freeze_projected_context(source, root_key="legacy_mimo_root")
+    external = tmp_path / "old-exact-contract.json"
+    path.rename(external)
+    ab.build_review(**source, legacy_source_contract=external)
+    data = json.loads((source["output_root"] / "data.json").read_text())
+    assert data["cases"][0]["old_reference_context"]["available"]
+    payload = json.loads(external.read_text())
+    payload["jobs"][0]["reference_selection"]["selected_source_image_indexes"] = [1, 9]
+    external.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="fingerprint"):
+        ab.build_review(**{**source, "output_root": tmp_path / "bad"}, legacy_source_contract=external)
+
+
+@pytest.mark.parametrize("tamper", ["record", "media"])
+def test_actual_reference_context_fails_closed(source, tamper):
+    path = _freeze_projected_context(source)
+    payload = json.loads(path.read_text())
+    job = payload["jobs"][0]
+    if tamper == "record":
+        job["extra_frozen_field"] = "different job"
+        job["request_fingerprint"] = ab._hash({k: v for k, v in job.items() if k != "request_fingerprint"})
+        path.write_text(json.dumps(payload))
+    else:
+        (source["visual_production_root"] / "reference.png").write_bytes(b"changed")
+    with pytest.raises(ValueError, match="differs from run record|image hash mismatch"):
+        ab.build_review(**source)
+
+
 @pytest.mark.parametrize("where", ["legacy_mimo_root", "no_lrasd_mimo_root", "visual_production_root", "visual_runs_root"])
 def test_source_overlap_rejected(source, where):
     with pytest.raises(ValueError, match="overlaps"):
@@ -206,6 +320,7 @@ def test_browser_review_export_roundtrip(source, tmp_path):
                     "-t", "1", "-c:v", "libx264", "-pix_fmt", "yuv420p",
                     str(source["visual_production_root"] / "target.mp4")],
                    check=True, capture_output=True)
+    _freeze_projected_context(source, selected=(3, 4), promotion=True)
     ab.build_review(**source)
     script = tmp_path / "browser.cjs"
     script.write_text(r'''
@@ -215,6 +330,9 @@ const {chromium}=require(process.argv[2]);
 try{const page=await browser.newPage({viewport:{width:1400,height:1000},acceptDownloads:true});const errors=[];page.on('pageerror',e=>errors.push(e.message));
 await page.route('**/*',async route=>{const u=new URL(route.request().url());assert.equal(u.hostname,'ab.invalid');const file=path.join(process.argv[3],u.pathname);if(!fs.existsSync(file))return route.fulfill({status:404});return route.fulfill({body:fs.readFileSync(file),contentType:file.endsWith('.html')?'text/html':file.endsWith('.json')?'application/json':file.endsWith('.png')?'image/png':'video/mp4'});});
 await page.goto('http://ab.invalid/review.html');await page.locator('#review').waitFor({state:'visible'});
+assert((await page.locator('#old-refs').innerText()).includes('OLD actual MiMo reference context: unavailable'));
+const actual=await page.locator('#new-refs').innerText();assert(actual.includes('<Picture 2>'));assert(actual.includes('<Subject 2>'));assert(actual.includes('DROPPED: hair_sampling_drop'));assert(actual.includes('promoted to entity e1'));assert(actual.includes('replaced source person image indexes: [1]'));
+assert((await page.locator('.media').innerText()).includes('SOURCE / frozen Visual context (not MiMo numbering)'));
 await page.waitForFunction(()=>document.getElementById('video').readyState>=2&&[...document.querySelectorAll('#refs img')].every(i=>i.naturalWidth>0));
 assert(await page.evaluate(()=>{const cells=document.querySelector('#grounding tr').children;return Math.abs(cells[1].getBoundingClientRect().width-cells[2].getBoundingClientRect().width)<2&&cells[2].getBoundingClientRect().height<400;}));
 assert.equal(await page.locator('input[name=label]').count(),5);await page.locator('input[value=SAME]').check();await page.locator('#note').fill('Exact review note');

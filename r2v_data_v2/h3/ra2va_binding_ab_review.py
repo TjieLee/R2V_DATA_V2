@@ -75,6 +75,7 @@ class _Record(_Projection):
     failure_issues: list[dict]
     model_call_count: int = Field(ge=0)
     record_fingerprint: StrictStr
+    source_job_fingerprint: StrictStr | None = None
 
 
 def _hash(value: object) -> str:
@@ -141,7 +142,8 @@ def _visual_context(references, own_media):
     # Display the complete frozen inventory, not a capped H3 conditioning request.
     references = sorted(references, key=lambda r: r.image_index)
     pictures = [
-        {"picture_label": f"<Picture {r.image_index}>", "kind": r.kind,
+        {"picture_label": f"<Picture {r.image_index}>", "source_image_index": r.image_index,
+         "source_image_label": f"<Image {r.image_index}>", "kind": r.kind,
          "entity_id": r.entity_id, "owner_entity_id": r.owner_entity_id,
          "attribute_id": r.attribute_id, "attribute_type": r.attribute_type,
          "media": own_media(r.artifact_path)}
@@ -174,14 +176,74 @@ def _visual_context(references, own_media):
     return pictures, subjects
 
 
+def _frozen_jobs(root: Path, explicit: Path | None, source_hashes: dict) -> tuple[Path | None, dict]:
+    candidates = [explicit] if explicit is not None else [root / "source_contract.json", root / "inventory.json"]
+    for path in candidates:
+        if not path.exists():
+            if explicit is not None:
+                raise FileNotFoundError(path)
+            continue
+        path = path.resolve(strict=True)
+        source_hashes[str(path)] = sha256_file(path)
+        raw = json.loads(path.read_text())
+        # A historical inventory without frozen jobs is not an exact input replay.
+        if "jobs" not in raw and explicit is None and path.name == "inventory.json":
+            continue
+        jobs = raw["jobs"]
+        by_clip = {}
+        for job in jobs:
+            uid = job["clip_uid"]
+            if uid in by_clip:
+                raise ValueError("duplicate frozen MiMo reference job")
+            if job["request_fingerprint"] != _hash({k: v for k, v in job.items() if k != "request_fingerprint"}):
+                raise ValueError("frozen MiMo reference job fingerprint mismatch")
+            by_clip[uid] = job
+        return path, by_clip
+    return None, {}
+
+
+def _actual_context(record, source, jobs, target_video, own_media):
+    if source is None:
+        return {"available": False, "reason": "Exact frozen MiMo job unavailable; only frozen Visual source context is available."}
+    job = jobs.get(record.clip_uid)
+    if job is None or job["request_fingerprint"] != record.source_job_fingerprint:
+        raise ValueError("frozen MiMo reference job differs from run record")
+    video = Path(job["target_video_path"]).resolve(strict=True)
+    if video != Path(target_video).resolve(strict=True) or sha256_file(video) != job["target_video_sha256"]:
+        raise ValueError("frozen MiMo reference target video differs")
+    images, subjects, selection = job["reference_images"], job["reference_subjects"], job["reference_selection"]
+    labels = [f"<Picture {i}>" for i in range(1, len(images) + 1)]
+    if ([r["image_index"] for r in images] != list(range(1, len(images) + 1))
+            or [r["picture_label"] for r in images] != labels
+            or selection["selected_source_image_indexes"] != [r["source_image_index"] for r in images]
+            or [s["subject_label"] for s in subjects] != [f"<Subject {i}>" for i in range(1, len(subjects) + 1)]
+            or any(not set(s["source_picture_labels"]).issubset(labels) for s in subjects)):
+        raise ValueError("inconsistent frozen MiMo reference projection")
+    pictures = []
+    for r in images:
+        path = Path(r["image_artifact_path"])
+        if not path.is_absolute() or sha256_file(path.resolve(strict=True)) != r["image_sha256"]:
+            raise ValueError("frozen MiMo reference image hash mismatch")
+        pictures.append({**r, "media": own_media(path), "subject_labels": [
+            s["subject_label"] for s in subjects if r["picture_label"] in s["source_picture_labels"]
+        ]})
+    return {"available": True, "source_contract": str(source),
+            "request_fingerprint": job["request_fingerprint"], "references": pictures,
+            "subjects": subjects, "reference_selection": selection}
+
+
 def build_review(*, visual_production_root: Path, visual_runs_root: Path, case_manifest: Path,
-                 legacy_mimo_root: Path, no_lrasd_mimo_root: Path, output_root: Path) -> dict:
+                 legacy_mimo_root: Path, no_lrasd_mimo_root: Path, output_root: Path,
+                 legacy_source_contract: Path | None = None) -> dict:
     visual_production_root = visual_production_root.resolve(strict=True)
     visual_runs_root = visual_runs_root.resolve(strict=True)
     legacy, new = legacy_mimo_root.resolve(strict=True), no_lrasd_mimo_root.resolve(strict=True)
     manifest_path = case_manifest.resolve(strict=True)
     output = output_root.resolve()
     protected = [visual_production_root, visual_runs_root, legacy, new, manifest_path]
+    if legacy_source_contract is not None:
+        legacy_source_contract = legacy_source_contract.resolve(strict=True)
+        protected.append(legacy_source_contract)
     # A MiMo stage can be deep inside Audio production; never publish inside it.
     for root in (legacy, new):
         protected.extend(p.parent for p in root.parents if p.name == "sam_audio_stem_shadow_v1")
@@ -194,6 +256,8 @@ def build_review(*, visual_production_root: Path, visual_runs_root: Path, case_m
     )}
     manifest = MimoCaseManifest.model_validate_json(manifest_path.read_text())
     old_rows, new_rows = _records(legacy), _records(new)
+    old_source, old_jobs = _frozen_jobs(legacy, legacy_source_contract, source_hashes)
+    new_source, new_jobs = _frozen_jobs(new, None, source_hashes)
     visual = load_visual_production_inventory(
         visual_production_root=visual_production_root, visual_runs_root=visual_runs_root,
     )
@@ -242,6 +306,8 @@ def build_review(*, visual_production_root: Path, visual_runs_root: Path, case_m
         cases.append({
             "clip_uid": uid, "target_video": own_media(context.sample.target_video),
             "references": pictures, "subjects": subjects,
+            "old_reference_context": _actual_context(old_rows[uid], old_source, old_jobs, context.sample.target_video, own_media),
+            "new_reference_context": _actual_context(new_rows[uid], new_source, new_jobs, context.sample.target_video, own_media),
             "old": old, "new": current, "aligned_segments": aligned,
             "segment_inventory_diff": set(old["segments"]) != set(current["segments"]),
         })

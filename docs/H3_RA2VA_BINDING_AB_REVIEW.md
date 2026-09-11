@@ -22,9 +22,16 @@ production/source trees. The validated random20 manifest supplies the clip order
 ```
 
 Open `http://127.0.0.1:8774/review.html`. Export contains `review.html`, `data.json`,
-`summary.json` and copied review-owned media only. Frozen Visual Subjects are
-context, not reconstructed run-specific binding evidence or a replay of reference
-augmentation. Grounding and captions always come from their respective frozen run.
+`summary.json` and copied review-owned media only. SOURCE displays every frozen
+Visual reference with its original numbering, not the actual MiMo numbering.
+Separate OLD/NEW contexts display the frozen jobs' actual Pictures, Subjects,
+selection/drop reasons and face promotions. Jobs are read from `source_contract.json`
+(or a frozen `inventory.json` containing jobs), with request fingerprints checked
+against each run record and reference media hashes verified. Selection is never
+recomputed. For an externally stored exact OLD job inventory, optionally pass
+`--legacy-source-contract PATH`. Without exact frozen input, OLD actual context
+is explicitly unavailable; SOURCE is not substituted as actual context.
+Grounding and captions always come from their respective frozen run.
 
 Labels are exactly SAME, NEW_BETTER, NEW_WORSE, BOTH_WRONG and FORMAT_ONLY.
 Keys 1-5 select them; notes and labels save immediately in localStorage, keyed by
