@@ -29,11 +29,13 @@ finalized = shared.finalized
 
 
 class ProfileClient:
-    def __init__(self, *, fail=False, identity=False, wrong=False):
+    def __init__(self, *, fail=False, identity=False, wrong=False, output_groups=None, traits=None):
         self.calls = []
         self.fail = fail
         self.identity = identity
         self.wrong = wrong
+        self.output_groups = output_groups
+        self.traits = traits
         self.chat = SimpleNamespace(completions=self)
 
     def create(self, **request):
@@ -41,13 +43,15 @@ class ProfileClient:
         if self.fail:
             raise RuntimeError("synthetic profile failure")
         text = request["messages"][1]["content"][0]["text"]
-        targets = json.loads(text.split("\nRESPONSE SCHEMA:")[0].split("\n", 1)[1])
+        targets = json.loads(text.split("\nRESPONSE SCHEMA:")[0].split("\n", 1)[1])["targets"]
+        if self.output_groups is not None:
+            targets = [{"speaker_group": group} for group in self.output_groups]
         profiles = [
             {
                 "speaker_group": "S99" if self.wrong else t["speaker_group"],
-                "voice_characteristics": "A teacher's voice."
+                "voice_characteristics": self.traits or ("A teacher's voice."
                 if self.identity
-                else "A low resonant register with measured cadence and clear articulation.",
+                else "A low resonant register with measured cadence and clear articulation."),
             }
             for t in targets
         ]
@@ -479,7 +483,23 @@ def test_profile_fixed_targets_one_audio_only_call(job, tmp_path, transport):
     assert [p.speaker_group for p in profiles] == ["S1", "S2"]
     assert raw["model_call_count"] == 1 and not raw["error"]
     request = client.calls[0]
-    assert request["messages"][0]["content"] == SPEAKER_PROFILE_SYSTEM_PROMPT
+    assert request["messages"][0]["content"] == ta.TA2VA_PROFILE_SYSTEM_PROMPT
+    assert ta.TA2VA_PROFILE_SYSTEM_PROMPT.startswith(SPEAKER_PROFILE_SYSTEM_PROMPT)
+    metadata = json.loads(
+        request["messages"][1]["content"][0]["text"].split("\nRESPONSE SCHEMA:")[0].split("\n", 1)[1]
+    )
+    assert metadata["targets"] == targets
+    assert metadata["required_speaker_groups"] == ["S1", "S2"]
+    assert [s["speaker_group"] for s in metadata["required_profile_slots"]] == ["S1", "S2"]
+    assert raw["required_speaker_groups"] == ["S1", "S2"]
+    schema = ta._profile_request_schema(["S1", "S2"])
+    assert raw["request_schema_sha256"] == ta.fingerprint(schema)
+    if transport == "sglang":
+        assert request["response_format"]["json_schema"]["schema"] == schema
+        assert request["response_format"]["json_schema"]["strict"] is True
+    else:
+        assert request["response_format"] == {"type": "json_object"}
+        assert "\nRESPONSE SCHEMA:" in request["messages"][1]["content"][0]["text"]
     assert [m["type"] for m in request["messages"][1]["content"]] == [
         "text",
         "text",
@@ -490,9 +510,15 @@ def test_profile_fixed_targets_one_audio_only_call(job, tmp_path, transport):
     assert request["extra_body"]["use_audio_in_video"] is False
 
 
-@pytest.mark.parametrize("failure", ["fail", "identity", "wrong"])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        {"fail": True}, {"identity": True}, {"wrong": True},
+        {"output_groups": []}, {"traits": "Conveys sorrow or empathy."},
+    ],
+)
 def test_profile_failure_only_speech_variant(source, tmp_path, failure):
-    root, products, client = run(source, tmp_path, **{failure: True})
+    root, products, client = run(source, tmp_path, **failure)
     assert all(p.status == "ready" for p in products if p.variant == "full_audio_reuse")
     assert all(
         p.status == "failed" for p in products if p.variant == "target_speech_reuse"
@@ -500,6 +526,72 @@ def test_profile_failure_only_speech_variant(source, tmp_path, failure):
     summary = json.loads((root / "summary.json").read_text())
     assert summary["model_call_count"] == len(client.calls) == 2
     assert summary["ready_count"] == summary["failed_count"] == 2
+
+
+@pytest.mark.parametrize("transport", ["sglang", "xiaomi"])
+@pytest.mark.parametrize("groups", [["S1"], ["S1", "S2", "S3"], ["S2", "S1"]])
+def test_profile_missing_extra_reordered_rejected_once(tmp_path, transport, groups):
+    from dataclasses import replace
+
+    client = ProfileClient(output_groups=groups)
+    backend = ta.TA2VAProfileBackend(
+        replace(shared.config(tmp_path), transport=transport), client=client
+    )
+    profiles, raw = backend.profile(
+        [{"speaker_group": sx} for sx in ("S1", "S2")], []
+    )
+    assert profiles == []
+    assert "inventory/order" in raw["error"]
+    assert raw["model_call_count"] == len(client.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "traits",
+    [
+        "S1 has a soft voice.", "Higher pitch and register compared to S1.",
+        "S2 has a high register.", "Higher than the other speaker.",
+        "Compared with another voice, the register is lower.",
+        "Conveys a sense of sorrow or empathy.", "Suggests sadness.",
+        "Expresses happiness.", "Conveys anger.", "Has a forceful personality.",
+        "Shows intent to persuade.",
+    ],
+)
+def test_profile_not_self_contained_or_psychological_rejected(traits):
+    with pytest.raises(ValueError):
+        ta.TA2VAProfile(speaker_group="S2", voice_characteristics=traits)
+
+
+@pytest.mark.parametrize(
+    "traits",
+    [
+        "Higher-register voice with a soft, breathy timbre, slow drawn-out cadence, and gentle low-energy delivery.",
+        "Subdued, rough texture with measured cadence.",
+        "Energetic, forceful delivery with clear articulation.",
+    ],
+)
+def test_profile_acoustic_delivery_remains_valid(traits):
+    assert ta.TA2VAProfile(speaker_group="S1", voice_characteristics=traits).voice_characteristics == traits
+
+
+def test_request_specific_profile_slots_schema_and_provenance(tmp_path):
+    schema = ta._profile_request_schema(["S1", "S3"])
+    array = schema["properties"]["speaker_voice_profiles"]
+    assert array["minItems"] == array["maxItems"] == 2
+    assert array["items"] is False
+    assert [item["properties"]["speaker_group"]["const"] for item in array["prefixItems"]] == ["S1", "S3"]
+    for item in array["prefixItems"]:
+        assert set(item["required"]) == {"speaker_group", "voice_characteristics"}
+        assert item["properties"]["voice_characteristics"]["type"] == "string"
+        assert item["additionalProperties"] is False
+    assert schema != ta._profile_request_schema(["S1"])
+    assert schema != ta._profile_request_schema(["S3", "S1"])
+    provenance = ta.TA2VAProfileBackend(shared.config(tmp_path), client=ProfileClient()).provenance()
+    assert provenance["version"] == "r2v.h3.ta2va_shadow.2"
+    assert provenance["prompt_version"] == "h3_ta2va_speaker_profile_v2"
+    assert provenance["base_prompt_version"] == "h3_mimo25_speaker_profile_v2"
+    assert provenance["maximum_attempts"] == 1
+    assert provenance["request_schema_policy"] == ta.PROFILE_SCHEMA_POLICY
+    assert provenance["prompt_sha256"] == ta.fingerprint({"text": ta.TA2VA_PROFILE_SYSTEM_PROMPT})
 
 
 def test_real_lineage_pcm_products_and_qa(source, tmp_path):

@@ -15,7 +15,7 @@ main{max-width:1600px;margin:auto;padding:20px}.target{display:grid;grid-templat
 "use strict";
 const $=id=>document.getElementById(id),node=(tag,text)=>{const n=document.createElement(tag);if(text!==undefined)n.textContent=text;return n;};
 try{
-const data=JSON.parse($("data").textContent);if(data.schema_version!=="r2v.h3.ta2va_shadow.1")throw Error("Invalid QA data");
+const data=JSON.parse($("data").textContent);if(data.schema_version!=="r2v.h3.ta2va_shadow.2")throw Error("Invalid QA data");
 $("count").textContent=data.summary.ready_count+" ready products / "+data.cases.length+" clips";
 for(const [i,c]of data.cases.entries()){const o=node("option",c.clip_uid);o.value=i;$("clips").append(o);}
 function show(){

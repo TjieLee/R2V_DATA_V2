@@ -58,7 +58,26 @@ from r2v_data_v2.h3.t2va_shadow import (
 )
 from r2v_data_v2.structured_output import parse_structured_json_response
 
-VERSION = "r2v.h3.ta2va_shadow.1"
+VERSION = "r2v.h3.ta2va_shadow.2"
+PROFILE_PROMPT_VERSION = "h3_ta2va_speaker_profile_v2"
+PROFILE_SCHEMA_POLICY = "exact_ordered_sx_profile_slots_v1"
+TA2VA_PROFILE_SYSTEM_PROMPT = SPEAKER_PROFILE_SYSTEM_PROMPT + """
+
+MANDATORY TA2VA PROFILE SLOTS
+speaker_voice_profiles must contain exactly one item for every required_speaker_groups entry, in exactly that order. Never omit a required_profile_slots item or add another slot. Copy speaker_group exactly from its required slot.
+voice_characteristics is a self-contained description of only that Audio reference. Never mention its own or another Sx token, and never compare one supplied speaker with another. Use only supported acoustic/prosodic traits: pitch/register, timbre/texture, cadence/speaking rate, energy/delivery, and audible articulation/breathiness/roughness.
+Do not infer emotion, psychology, personality, intent, identity, role, profession, nationality or demographics. Do not copy dialogue/transcript content. Gentle, subdued, energetic, low-energy, forceful, breathy, rough and soft may describe audible delivery; inferred sorrow or empathy does not describe acoustic traits.
+"""
+# These explicit internal-state nouns are not an acoustic delivery vocabulary.
+_PROFILE_INTERNAL_STATE = re.compile(
+    r"\b(?:sorrow|empathy|sadness|happiness|anger|personality|intent|intention)\b",
+    re.IGNORECASE,
+)
+_PROFILE_COMPARISON = re.compile(
+    r"\b(?:than|unlike|compared\s+(?:to|with))\s+"
+    r"(?:(?:the|other|another|first|second|third|supplied)\s+)*(?:speaker|voice)\b",
+    re.IGNORECASE,
+)
 Variant = Literal["target_speech_reuse", "full_audio_reuse"]
 Sx = str
 
@@ -75,13 +94,37 @@ class TA2VAProfile(SchemaModel):
             not value.strip()
             or _VOICE_IDENTITY_PROFILE.search(value)
             or re.search(r"[<>\[\]]|\bS[1-9]\d*\b", value)
+            or _PROFILE_INTERNAL_STATE.search(value)
+            or _PROFILE_COMPARISON.search(value)
         ):
-            raise ValueError("TA2VA profile contains identity/serialization claims")
+            raise ValueError("TA2VA profile contains identity/serialization or non-acoustic claims")
         return self
 
 
 class TA2VAProfileDraft(SchemaModel):
     speaker_voice_profiles: list[TA2VAProfile]
+
+
+def _profile_request_schema(groups: list[str]) -> dict:
+    schema = TA2VAProfileDraft.model_json_schema()
+    item = schema["$defs"]["TA2VAProfile"]
+    schema["properties"]["speaker_voice_profiles"] = {
+        "type": "array",
+        "minItems": len(groups),
+        "maxItems": len(groups),
+        "prefixItems": [
+            {
+                **item,
+                "properties": {
+                    **item["properties"],
+                    "speaker_group": {"type": "string", "const": group},
+                },
+            }
+            for group in groups
+        ],
+        "items": False,
+    }
+    return schema
 
 
 class TA2VAAsset(SchemaModel):
@@ -122,7 +165,7 @@ class TA2VAAsset(SchemaModel):
 
 
 class TA2VAProduct(SchemaModel):
-    schema_version: Literal["r2v.h3.ta2va_shadow.1"] = VERSION
+    schema_version: Literal["r2v.h3.ta2va_shadow.2"] = VERSION
     clip_uid: str
     variant: Variant
     source_inventory_fingerprint: str
@@ -414,8 +457,10 @@ class TA2VAProfileBackend:
     def provenance(self):
         return {
             "version": VERSION,
-            "prompt_version": MIMO25_SPEAKER_PROFILE_PROMPT_VERSION,
-            "prompt_sha256": fingerprint({"text": SPEAKER_PROFILE_SYSTEM_PROMPT}),
+            "prompt_version": PROFILE_PROMPT_VERSION,
+            "base_prompt_version": MIMO25_SPEAKER_PROFILE_PROMPT_VERSION,
+            "prompt_sha256": fingerprint({"text": TA2VA_PROFILE_SYSTEM_PROMPT}),
+            "request_schema_policy": PROFILE_SCHEMA_POLICY,
             "response_schema_sha256": fingerprint(
                 TA2VAProfileDraft.model_json_schema()
             ),
@@ -431,8 +476,26 @@ class TA2VAProfileBackend:
         }
 
     def profile(self, targets, snippets):
-        schema = TA2VAProfileDraft.model_json_schema()
-        instruction = "SPEAKER-PROFILE TARGETS:\n" + json.dumps(targets)
+        groups = [t["speaker_group"] for t in targets]
+        if (
+            not 1 <= len(groups) <= 3
+            or len(set(groups)) != len(groups)
+            or any(not re.fullmatch(r"S[1-9]\d*", group) for group in groups)
+        ):
+            raise ValueError("TA2VA profile requires unique fixed Sx targets")
+        schema = _profile_request_schema(groups)
+        metadata = {
+            "targets": targets,
+            "required_speaker_groups": groups,
+            "required_profile_slots": [
+                {
+                    "speaker_group": group,
+                    "voice_characteristics": "<describe only this supplied speaker's supported acoustic traits>",
+                }
+                for group in groups
+            ],
+        }
+        instruction = "SPEAKER-PROFILE TARGETS:\n" + json.dumps(metadata)
         if self.config.transport == "xiaomi":
             instruction += "\nRESPONSE SCHEMA:\n" + json.dumps(schema)
         content = [{"type": "text", "text": instruction}]
@@ -452,7 +515,7 @@ class TA2VAProfileBackend:
             "stream": False,
             "max_completion_tokens": self.config.max_completion_tokens,
             "messages": [
-                {"role": "system", "content": SPEAKER_PROFILE_SYSTEM_PROMPT},
+                {"role": "system", "content": TA2VA_PROFILE_SYSTEM_PROMPT},
                 {"role": "user", "content": content},
             ],
         }
@@ -488,6 +551,9 @@ class TA2VAProfileBackend:
             "diagnostic": None,
             "model_call_count": 0,
             "error": None,
+            "required_speaker_groups": groups,
+            "request_schema_sha256": fingerprint(schema),
+            "request_schema_policy": PROFILE_SCHEMA_POLICY,
         }
         profiles = []
         try:

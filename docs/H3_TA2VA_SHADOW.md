@@ -1,6 +1,6 @@
 # Target-Side TA2VA Shadow
 
-TA2VA .1 is an additive downstream consumer of an **ownership-enabled T2VA v7**
+TA2VA .2 is an additive downstream consumer of an **ownership-enabled T2VA v7**
 run (backend .7, no-reference core .6). Old T2VA runs are not rewritten or given
 invented summaries. T2VA itself still publishes exactly three sections and makes
 two calls: semantic AV, then the unchanged frozen audio_finalize_v6.
@@ -11,7 +11,8 @@ TA2VA publishes only:
   unbound `<Audio 1>`, `fully_copy`, zero model calls.
 - `target_speech_reuse`: one synchronized 32 kHz stereo PCM16 FLAC per eligible
   frozen Sx, `partially_copy`. One audio-only profile call covers all selected
-  Sx, using localized AuK snippets and frozen speaker_profile_v2. Failed profiles
+  Sx, using localized AuK snippets and TA2VA speaker_profile_v2 (extending the
+  unchanged frozen RA2VA profile prompt). Failed profiles
   fail only this variant; no fallback descriptions or retries.
 
 There are no Pictures, Subjects, entities, frame modes, cross-pair, target-voice
@@ -65,6 +66,18 @@ raw sample ranges. The profile schema likewise uses fixed Sx in speaker_group,
 not newly invented gN. It imports the frozen profile prompt, finish diagnostics
 and identity-claim check; invalid profiles fail rather than inventing prose.
 
+TA2VA profile v2 requires self-contained acoustic descriptions without Sx tokens,
+cross-speaker comparisons, transcript copying or inferred internal states.
+Each request supplies exact `required_speaker_groups` and `required_profile_slots`.
+SGLang receives a request-specific strict schema with fixed array length and
+positional `speaker_group` constants. Xiaomi retains JSON-object transport with
+the same required slots and deterministic post-validation. Missing, extra or
+reordered profiles fail; no retry or slot repair is performed. Raw profile
+provenance includes required groups and the actual request schema hash.
+
+Use a fresh TA2VA run ID for .2. Existing T2VA v7/core .6 outputs are reusable
+directly; no new semantic AV or audio-finalize run is needed for this change.
+
 `RecaptionAudioContract` now allows optional speech-reuse voice characteristics.
 Canonical wording appends them only when present. Existing RA2VA contracts with
 `None` render exactly as before, with no new inputs or calls.
@@ -90,7 +103,7 @@ export T2VA_ROOT="$AUDIO_PRODUCTION_ROOT/t2va_shadow_v1/runs/ta2va-core-v7-pilot
 
 "$R2V_PYTHON" tools/run_h3_ta2va_shadow.py \
   --t2va-root "$T2VA_ROOT" \
-  --ta2va-run-id target-ta2va-v1-pilot2 \
+  --ta2va-run-id target-ta2va-v2-pilot2 \
   --base-url http://127.0.0.1:8092/v1 \
   --transport sglang --model mimo-v2.5 \
   --media-root /mnt/workspace --allow-unverified --dry-run
@@ -122,7 +135,7 @@ and production outputs remain untouched.
 ## Manual Review
 
 ```bash
-export TA2VA_ROOT="$AUDIO_PRODUCTION_ROOT/ta2va_shadow_v1/runs/target-ta2va-v1-pilot2"
+export TA2VA_ROOT="$AUDIO_PRODUCTION_ROOT/ta2va_shadow_v1/runs/target-ta2va-v2-pilot2"
 "$R2V_PYTHON" tools/build_h3_ta2va_qa.py \
   --ta2va-root "$TA2VA_ROOT" \
   --media-root /mnt/workspace --media-base-url http://127.0.0.1:8765
