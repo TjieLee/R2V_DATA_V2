@@ -10,7 +10,12 @@ from pathlib import Path
 from urllib.parse import quote, urlsplit
 
 from r2v_data_v2.h3.sam_audio_stem_shadow import _publish_directory, sha256_file
-from r2v_data_v2.h3.t2va_shadow import H3NoReferenceAVCore, load_t2va_shadow, t2va_root
+from r2v_data_v2.h3.t2va_shadow import (
+    H3NoReferenceAVCore,
+    load_t2va_shadow,
+    render_t2va_speech,
+    t2va_root,
+)
 
 
 def build_t2va_qa(
@@ -38,9 +43,10 @@ def build_t2va_qa(
         if not overwrite:
             raise FileExistsError(destination)
         old = json.loads((destination / "data.json").read_text())
-        if old.get("schema_version") != "r2v.h3.t2va_qa.1" or old.get(
-            "run_root"
-        ) != str(root):
+        if old.get("schema_version") not in {
+            "r2v.h3.t2va_qa.1",
+            "r2v.h3.t2va_qa.2",
+        } or old.get("run_root") != str(root):
             raise ValueError("T2VA QA overwrite ownership differs")
     cases = []
     for job, record in zip(inventory.jobs, records, strict=True):
@@ -56,6 +62,8 @@ def build_t2va_qa(
         else:
             url = quote(os.path.relpath(video, destination), safe="/")
         assignments = {}
+        placements = {}
+        rendered = {}
         prompt = None
         if record.status == "ready":
             core = H3NoReferenceAVCore.model_validate_json(
@@ -65,6 +73,16 @@ def build_t2va_qa(
                 a.segment_id: a.model_dump(mode="json")
                 for a in core.speaker_assignments
             }
+            placements = {
+                p.segment_id: p for p in core.integrated_sequence if p.kind == "speech"
+            }
+            for fact, assignment in zip(
+                core.speech_facts, core.speaker_assignments, strict=True
+            ):
+                if fact.segment_id in placements:
+                    rendered[fact.segment_id] = render_t2va_speech(
+                        fact, assignment, placements[fact.segment_id]
+                    )
             prompt = (root / "prompts" / f"{job.clip_uid}.txt").read_text()
         cases.append(
             {
@@ -79,6 +97,10 @@ def build_t2va_qa(
                     {
                         **s.model_dump(mode="json"),
                         "assignment": assignments.get(s.segment_id),
+                        "model_lead_in": placements[s.segment_id].lead_in
+                        if s.segment_id in placements
+                        else None,
+                        "rendered_speech": rendered.get(s.segment_id),
                     }
                     for s in job.speech_facts
                 ],
@@ -86,7 +108,7 @@ def build_t2va_qa(
             }
         )
     payload = {
-        "schema_version": "r2v.h3.t2va_qa.1",
+        "schema_version": "r2v.h3.t2va_qa.2",
         "run_root": str(root),
         "inventory_fingerprint": inventory.inventory_fingerprint,
         "summary": summary.model_dump(mode="json"),

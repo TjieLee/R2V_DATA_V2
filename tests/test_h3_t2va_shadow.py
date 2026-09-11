@@ -89,7 +89,10 @@ def job(tmp_path):
 
 def draft_for(job):
     speakers = {}
-    assignments, prose = [], []
+    assignments, parts = (
+        [],
+        [{"kind": "prose", "text": "[Shot 1] Live-action, a static medium shot."}],
+    )
     for fact in job.speech_facts:
         speaker = speakers.setdefault(
             fact.source_speaker_cluster, f"S{len(speakers) + 1}"
@@ -103,13 +106,16 @@ def draft_for(job):
             }
         )
         if fact.text is not None:
-            prose.append(
-                f"A person ({speaker}) says: <d>[{fact.language}] {fact.text}</d>"
+            parts.append(
+                {
+                    "kind": "speech",
+                    "segment_id": fact.segment_id,
+                    "lead_in": "A person says",
+                }
             )
     return t2va.T2VAMimoDraft(
         speaker_assignments=assignments,
-        integrated_multimodal_description="[Shot 1] Live-action, a static medium shot. "
-        + " ".join(prose),
+        integrated_sequence=parts,
         overall_soundscape=MIMO25_CANONICAL_ABSENT_SOUNDSCAPE,
         non_diegetic_music="N/A",
         warnings=[],
@@ -154,10 +160,15 @@ def test_core_renderer_exact_and_reusable(job):
 
 
 @pytest.mark.parametrize("label", ["Picture", "Subject", "Audio", "Video"])
-@pytest.mark.parametrize("field", list(t2va.SECTIONS) + ["warnings"])
+@pytest.mark.parametrize("field", ["prose", "lead_in", *t2va.SECTIONS[1:], "warnings"])
 def test_no_reference_conditioning(job, label, field):
     data = draft_for(job).model_dump()
-    data[field] = [f"<{label} 1>"] if field == "warnings" else f"<{label} 1>"
+    if field in {"prose", "lead_in"}:
+        data["integrated_sequence"][0 if field == "prose" else 1][
+            "text" if field == "prose" else "lead_in"
+        ] = f"<{label} 1>"
+    else:
+        data[field] = [f"<{label} 1>"] if field == "warnings" else f"<{label} 1>"
     with pytest.raises(ValueError, match="conditioning"):
         t2va.T2VAMimoDraft.model_validate(data)
 
@@ -174,7 +185,7 @@ def test_no_reference_conditioning(job, label, field):
 )
 def test_no_embedded_section_headers(job, header):
     data = draft_for(job).model_dump()
-    data["integrated_multimodal_description"] += f"\n{header}: text"
+    data["integrated_sequence"][0]["text"] += f"\n{header}: text"
     with pytest.raises(ValueError, match="headers"):
         t2va.T2VAMimoDraft.model_validate(data)
 
@@ -193,8 +204,8 @@ def test_no_embedded_section_headers(job, header):
     ],
 )
 def test_exact_dialogue_fails_without_repair(job, change):
-    data = draft_for(job).model_dump()
-    caption = data["integrated_multimodal_description"]
+    draft = draft_for(job)
+    caption = t2va.validate_t2va_draft(job, draft).integrated_multimodal_description
     if change == "text":
         caption = caption.replace("你好。", "Hello.")
     elif change == "language":
@@ -215,9 +226,10 @@ def test_exact_dialogue_fails_without_repair(job, change):
         caption = caption.replace("(S2)", "") + " (S2)"
     else:
         caption = caption.replace("你好。", "<d>你好。</d>")
-    data["integrated_multimodal_description"] = caption
     with pytest.raises(ValueError):
-        t2va.validate_t2va_draft(job, t2va.T2VAMimoDraft.model_validate(data))
+        t2va.validate_t2va_dialogue(
+            job.speech_facts, draft.speaker_assignments, caption
+        )
 
 
 def test_speaker_cluster_cannot_split_and_ids_contiguous(job):
@@ -245,9 +257,6 @@ def test_speaker_cluster_cannot_split_and_ids_contiguous(job):
 def test_acoustic_clusters_can_merge_without_entity_binding(job):
     draft = draft_for(job)
     draft.speaker_assignments[1].speaker_id = "S1"
-    draft.integrated_multimodal_description = (
-        draft.integrated_multimodal_description.replace("(S2)", "(S1)")
-    )
     core = t2va.validate_t2va_draft(job, draft)
     assert [a.speaker_id for a in core.speaker_assignments] == ["S1", "S1"]
     assert "entity_id" not in core.model_dump_json()
@@ -257,8 +266,8 @@ def test_empty_asr_never_invents_dialogue(job):
     job.speech_facts = []
     draft = draft_for(job)
     t2va.validate_t2va_draft(job, draft)
-    draft.integrated_multimodal_description += " <d>[English] Invented</d>"
-    with pytest.raises(ValueError, match="inventory"):
+    draft.integrated_sequence[0].text += " <d>[English] Invented</d>"
+    with pytest.raises(ValueError, match="syntax"):
         t2va.validate_t2va_draft(job, draft)
 
 
@@ -273,7 +282,7 @@ def test_nontranscribed_vocal_segment_keeps_assignment_without_dialogue(job):
 def test_no_dialogue_in_audio_fields(job, field):
     data = draft_for(job).model_dump()
     data[field] = "<d>[Chinese] copied</d>"
-    with pytest.raises(ValueError, match="only in integrated"):
+    with pytest.raises(ValueError, match="syntax"):
         t2va.T2VAMimoDraft.model_validate(data)
 
 
@@ -289,7 +298,7 @@ def test_no_dialogue_in_audio_fields(job, field):
 )
 def test_shot_order_and_boundaries(job, suffix, valid):
     draft = draft_for(job)
-    draft.integrated_multimodal_description += suffix
+    draft.integrated_sequence.append(t2va.T2VAProsePart(kind="prose", text=suffix))
     if valid:
         t2va.validate_t2va_draft(job, draft)
     else:
@@ -299,10 +308,8 @@ def test_shot_order_and_boundaries(job, suffix, valid):
 
 def test_first_shot_timestamp_rejected(job):
     draft = draft_for(job)
-    draft.integrated_multimodal_description = (
-        draft.integrated_multimodal_description.replace(
-            "[Shot 1]", "[Shot 1] At 00:00.000,"
-        )
+    draft.integrated_sequence[0].text = draft.integrated_sequence[0].text.replace(
+        "[Shot 1]", "[Shot 1] At 00:00.000,"
     )
     with pytest.raises(ValueError, match="first shot"):
         t2va.validate_t2va_draft(job, draft)
@@ -632,6 +639,108 @@ def test_source_binding_fields_are_dropped_not_transmitted(
 @pytest.mark.parametrize("marker", ["S0", "S01", "S9"])
 def test_unknown_speaker_markers_rejected(job, marker):
     draft = draft_for(job)
-    draft.integrated_multimodal_description += f" ({marker})"
-    with pytest.raises(ValueError, match="unknown speaker"):
+    draft.integrated_sequence[0].text += f" ({marker})"
+    with pytest.raises(ValueError, match="speaker markers"):
         t2va.validate_t2va_draft(job, draft)
+
+
+@pytest.mark.parametrize(
+    "mutation", ["missing", "duplicate", "reorder", "unknown", "nontranscribed"]
+)
+def test_typed_speech_inventory_fails_closed(job, mutation):
+    draft = draft_for(job)
+    if mutation == "missing":
+        draft.integrated_sequence.pop()
+    elif mutation == "duplicate":
+        draft.integrated_sequence.append(draft.integrated_sequence[-1])
+    elif mutation == "reorder":
+        draft.integrated_sequence[1:] = reversed(draft.integrated_sequence[1:])
+    elif mutation == "unknown":
+        draft.integrated_sequence[-1].segment_id = "unknown"
+    else:
+        job.speech_facts[-1].text = job.speech_facts[-1].language = None
+    with pytest.raises(ValueError, match="speech placement inventory"):
+        t2va.validate_t2va_draft(job, draft)
+
+
+@pytest.mark.parametrize("mutation", ["missing", "duplicate", "unknown", "reorder"])
+def test_assignment_inventory_still_exact(job, mutation):
+    draft = draft_for(job)
+    if mutation == "missing":
+        draft.speaker_assignments.pop()
+    elif mutation == "duplicate":
+        draft.speaker_assignments.append(draft.speaker_assignments[-1])
+    elif mutation == "unknown":
+        draft.speaker_assignments[-1].segment_id = "unknown"
+    else:
+        draft.speaker_assignments.reverse()
+    with pytest.raises(ValueError, match="speaker assignment inventory"):
+        t2va.validate_t2va_draft(job, draft)
+
+
+def test_asr_not_model_owned_and_placement_preserves_exact_bytes(job):
+    draft = draft_for(job)
+    raw = draft.model_dump_json()
+    assert "<d>" not in raw
+    assert all(fact.text not in raw for fact in job.speech_facts)
+    draft.integrated_sequence.insert(
+        2,
+        t2va.T2VAProsePart(kind="prose", text="The listener turns toward the doorway."),
+    )
+    core = t2va.validate_t2va_draft(job, draft)
+    prompt = t2va.render_t2va_prompt(core)
+    assert (
+        prompt.index("你好。</d>")
+        < prompt.index("listener turns")
+        < prompt.index("好的！</d>")
+    )
+    assert t2va._DIALOGUE.findall(prompt) == [
+        f"[{s.language}] {s.text}" for s in job.speech_facts
+    ]
+    for field in ["text", "translation", "transliteration", "language", "asr_text"]:
+        data = draft.model_dump()
+        data["integrated_sequence"][1][field] = "Hello."
+        with pytest.raises(ValueError, match="Extra inputs"):
+            t2va.T2VAMimoDraft.model_validate(data)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "<d>你好。</d>",
+        "(S1) speaks",
+        "<Audio 1>",
+        "[[segment:segment_1]]",
+        "[Shot 2]",
+        "A person says 你好。",
+    ],
+)
+def test_lead_in_cannot_own_dialogue_or_pipeline_syntax(job, value):
+    draft = draft_for(job)
+    draft.integrated_sequence[1].lead_in = value
+    with pytest.raises(ValueError):
+        t2va.validate_t2va_draft(job, draft)
+
+
+def test_voice_over_rendering_outside_exact_dialogue(job):
+    draft = draft_for(job)
+    draft.speaker_assignments[0].speech_presentation = "voice_over"
+    core = t2va.validate_t2va_draft(job, draft)
+    assert (
+        "says in an off-screen voiceover (S1) <d>[Chinese] 你好。</d>"
+        in core.integrated_multimodal_description
+    )
+    assert (
+        "voiceover"
+        not in t2va._DIALOGUE.findall(core.integrated_multimodal_description)[0]
+    )
+    assert draft.integrated_sequence[1].lead_in == "A person says"
+
+
+def test_core_cannot_substitute_its_own_asr_facts(job):
+    core = t2va.validate_t2va_draft(job, draft_for(job))
+    data = core.model_dump()
+    data["speech_facts"][0]["text"] = "Hello."
+    changed = t2va.H3NoReferenceAVCore.model_validate(data)
+    with pytest.raises(ValueError, match="core speech facts differ"):
+        t2va.validate_t2va_draft(job, changed)

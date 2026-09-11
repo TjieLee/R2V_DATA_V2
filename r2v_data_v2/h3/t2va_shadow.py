@@ -113,20 +113,57 @@ class T2VASpeakerAssignment(SchemaModel):
     ]
 
 
+class T2VAProsePart(SchemaModel):
+    kind: Literal["prose"]
+    text: Text
+
+
+class T2VASpeechPart(SchemaModel):
+    kind: Literal["speech"]
+    segment_id: SafeID
+    lead_in: Text = Field(
+        description="Source/presentation/delivery prose only; no dialogue words or speaker markers"
+    )
+
+
+T2VASequencePart = Annotated[
+    T2VAProsePart | T2VASpeechPart, Field(discriminator="kind")
+]
+
+
 class T2VAMimoDraft(SchemaModel):
     speaker_assignments: list[T2VASpeakerAssignment]
-    integrated_multimodal_description: Text
+    integrated_sequence: list[T2VASequencePart] = Field(min_length=1)
     overall_soundscape: Text
     non_diegetic_music: Text
     warnings: list[Text]
 
     @model_validator(mode="after")
     def validate_no_references(self) -> Self:
-        for value in [*(getattr(self, field) for field in SECTIONS), *self.warnings]:
+        values = [
+            *(
+                p.text if p.kind == "prose" else p.lead_in
+                for p in self.integrated_sequence
+            ),
+            self.overall_soundscape,
+            self.non_diegetic_music,
+            *self.warnings,
+        ]
+        for value in values:
             if not value.strip() or _FORBIDDEN.search(value) or "[[" in value:
                 raise ValueError(
                     "T2VA fields cannot contain conditioning labels, headers or placeholders"
                 )
+            if "<" in value or ">" in value or _SPEAKER.search(value):
+                raise ValueError(
+                    "T2VA model prose cannot contain dialogue/conditioning syntax or speaker markers"
+                )
+        if any(
+            _SHOT.search(p.lead_in)
+            for p in self.integrated_sequence
+            if p.kind == "speech"
+        ):
+            raise ValueError("T2VA speech lead-in cannot contain shot syntax")
         for field in SECTIONS[1:]:
             value = getattr(self, field)
             if (
@@ -142,9 +179,20 @@ class T2VAMimoDraft(SchemaModel):
 
 
 class H3NoReferenceAVCore(T2VAMimoDraft):
-    schema_version: Literal["r2v.h3.no_reference_av_core.1"] = (
-        "r2v.h3.no_reference_av_core.1"
+    schema_version: Literal["r2v.h3.no_reference_av_core.2"] = (
+        "r2v.h3.no_reference_av_core.2"
     )
+    speech_facts: list[T2VASpeechFact]
+    target_duration_seconds: float = Field(gt=0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def validate_core(self) -> Self:
+        _validate_t2va_content(self.speech_facts, self.target_duration_seconds, self)
+        return self
+
+    @property
+    def integrated_multimodal_description(self) -> str:
+        return _render_sequence(self.speech_facts, self)
 
 
 class T2VAJob(SchemaModel):
@@ -174,11 +222,57 @@ class T2VAJob(SchemaModel):
 
 
 def validate_t2va_draft(job: T2VAJob, draft: T2VAMimoDraft) -> H3NoReferenceAVCore:
-    """No semantic repair: exact ASR and structural speaker/shot constraints only."""
-    draft = T2VAMimoDraft.model_validate(draft.model_dump(exclude={"schema_version"}))
+    """Bind model placement to immutable ASR facts, without semantic repair."""
+    if isinstance(draft, H3NoReferenceAVCore) and (
+        draft.speech_facts != job.speech_facts
+        or draft.target_duration_seconds != job.target_duration_seconds
+    ):
+        raise ValueError("T2VA core speech facts differ from authoritative job")
+    values = draft.model_dump(include=set(T2VAMimoDraft.model_fields))
+    return H3NoReferenceAVCore(
+        **values,
+        speech_facts=job.speech_facts,
+        target_duration_seconds=job.target_duration_seconds,
+    )
+
+
+def render_t2va_speech(
+    fact: T2VASpeechFact, assignment: T2VASpeakerAssignment, part: T2VASpeechPart
+) -> str:
+    lead_in = part.lead_in
+    if (
+        assignment.speech_presentation == "voice_over"
+        and "says in an off-screen voiceover" not in lead_in
+    ):
+        lead_in += "; the voice says in an off-screen voiceover"
+    return f"{lead_in} ({assignment.speaker_id}) <d>[{fact.language}] {fact.text}</d>"
+
+
+def _render_sequence(facts: list[T2VASpeechFact], draft: T2VAMimoDraft) -> str:
+    by_id = {s.segment_id: s for s in facts}
+    assignments = {a.segment_id: a for a in draft.speaker_assignments}
+    return " ".join(
+        p.text
+        if p.kind == "prose"
+        else render_t2va_speech(by_id[p.segment_id], assignments[p.segment_id], p)
+        for p in draft.integrated_sequence
+    )
+
+
+def _validate_t2va_content(
+    facts: list[T2VASpeechFact], duration: float, draft: T2VAMimoDraft
+) -> None:
+    if len({s.segment_id for s in facts}) != len(facts) or facts != sorted(
+        facts, key=lambda s: (s.start_time, s.end_time, s.segment_id)
+    ):
+        raise ValueError("T2VA core speech facts must be unique and chronological")
+    if any(
+        s.end_time > duration + AUDIO_TIMELINE_DURATION_TOLERANCE_SECONDS for s in facts
+    ):
+        raise ValueError("T2VA speech exceeds canonical timeline tolerance")
     if [
         (a.segment_id, a.source_speaker_cluster) for a in draft.speaker_assignments
-    ] != [(s.segment_id, s.source_speaker_cluster) for s in job.speech_facts]:
+    ] != [(s.segment_id, s.source_speaker_cluster) for s in facts]:
         raise ValueError("T2VA speaker assignment inventory differs from speech facts")
     clusters: dict[str, str] = {}
     speakers: list[str] = []
@@ -196,14 +290,36 @@ def validate_t2va_draft(job: T2VAJob, draft: T2VAMimoDraft) -> H3NoReferenceAVCo
         raise ValueError(
             "T2VA speaker IDs must be contiguous by first vocal appearance"
         )
-    caption = draft.integrated_multimodal_description
+    if [p.segment_id for p in draft.integrated_sequence if p.kind == "speech"] != [
+        s.segment_id for s in facts if s.text is not None
+    ]:
+        raise ValueError(
+            "T2VA speech placement inventory differs from chronological ASR"
+        )
+    for part in draft.integrated_sequence:
+        value = part.text if part.kind == "prose" else part.lead_in
+        if any(
+            s.text is not None
+            and re.search(r"(?<!\w)" + re.escape(s.text) + r"(?!\w)", value)
+            for s in facts
+        ):
+            raise ValueError("T2VA model prose must not copy authoritative ASR text")
+    caption = _render_sequence(facts, draft)
+    validate_t2va_dialogue(facts, draft.speaker_assignments, caption)
+    # Dialogue is immutable content, not a place to interpret shot delimiters.
+    visual = _DIALOGUE.sub("", caption)
+    _validate_t2va_shots(visual, duration)
+
+
+def validate_t2va_dialogue(
+    facts: list[T2VASpeechFact], assignments: list[T2VASpeakerAssignment], caption: str
+) -> None:
+    speakers = {a.speaker_id for a in assignments}
     if {f"S{m}" for m in _SPEAKER.findall(caption)} - set(speakers):
         raise ValueError("T2VA unknown speaker marker")
     blocks = list(_DIALOGUE.finditer(caption))
     speech = [
-        (s, a)
-        for s, a in zip(job.speech_facts, draft.speaker_assignments, strict=True)
-        if s.text is not None
+        (s, a) for s, a in zip(facts, assignments, strict=True) if s.text is not None
     ]
     if (
         len(blocks) != len(speech)
@@ -216,13 +332,16 @@ def validate_t2va_draft(job: T2VAJob, draft: T2VAMimoDraft) -> H3NoReferenceAVCo
         if block.group(1) != f"[{fact.language}] {fact.text}":
             raise ValueError("T2VA exact ASR text/language differs")
         markers = _SPEAKER.findall(caption[previous_end : block.start()])
-        if not markers or f"S{markers[-1]}" != assignment.speaker_id:
+        if markers != [assignment.speaker_id[1:]] or not caption[
+            previous_end : block.start()
+        ].rstrip().endswith(f"({assignment.speaker_id})"):
             raise ValueError(
                 "T2VA dialogue requires its authoritative speaker marker in the lead-in"
             )
         previous_end = block.end()
-    # Dialogue is immutable content, not a place to interpret shot delimiters.
-    visual = _DIALOGUE.sub("", caption)
+
+
+def _validate_t2va_shots(visual: str, duration: float) -> None:
     shots = list(_SHOT.finditer(visual))
     if not visual.startswith("[Shot 1]") or [int(s.group(1)) for s in shots] != list(
         range(1, len(shots) + 1)
@@ -240,12 +359,11 @@ def validate_t2va_draft(job: T2VAJob, draft: T2VAMimoDraft) -> H3NoReferenceAVCo
             raise ValueError("T2VA later shots require At MM:SS.mmm cut timestamps")
         minute, second, milli = map(int, cut.groups())
         time = minute * 60 + second + milli / 1000
-        if not previous_time < time < job.target_duration_seconds:
+        if not previous_time < time < duration:
             raise ValueError(
                 "T2VA cut timestamps must be chronological and inside target"
             )
         previous_time = time
-    return H3NoReferenceAVCore(**draft.model_dump())
 
 
 def render_t2va_prompt(core: H3NoReferenceAVCore) -> str:
@@ -254,8 +372,8 @@ def render_t2va_prompt(core: H3NoReferenceAVCore) -> str:
 
 
 class T2VABackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.t2va_mimo_backend.1"] = "r2v.h3.t2va_mimo_backend.1"
-    prompt_version: Literal["h3_t2va_joint_av_v1"] = "h3_t2va_joint_av_v1"
+    schema_version: Literal["r2v.h3.t2va_mimo_backend.2"] = "r2v.h3.t2va_mimo_backend.2"
+    prompt_version: Literal["h3_t2va_joint_av_v2"] = "h3_t2va_joint_av_v2"
     prompt_sha256: Hash
     response_schema_sha256: Hash
     transport: Literal["sglang", "xiaomi"]

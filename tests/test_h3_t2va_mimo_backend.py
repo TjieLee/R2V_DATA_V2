@@ -126,6 +126,31 @@ def test_sdk_retries_disabled(tmp_path, monkeypatch):
     assert captured["max_retries"] == 0
 
 
+def test_typed_response_schema_and_one_call_exact_dialogue(job, tmp_path):
+    from r2v_data_v2.h3.t2va_shadow import render_t2va_prompt, validate_t2va_draft
+
+    schema = T2VAMimoDraft.model_json_schema()
+    assert "integrated_multimodal_description" not in schema["properties"]
+    assert (
+        schema["properties"]["integrated_sequence"]["items"]["discriminator"][
+            "propertyName"
+        ]
+        == "kind"
+    )
+    speech = schema["$defs"]["T2VASpeechPart"]
+    assert set(speech["properties"]) == {"kind", "segment_id", "lead_in"}
+    assert speech["additionalProperties"] is False
+    assert "reproducing them is NOT your task" in T2VA_SYSTEM_PROMPT
+    assert (
+        "Do NOT return ASR words, translations, transliterations" in T2VA_SYSTEM_PROMPT
+    )
+    client = Client([draft_for(job).model_dump_json()])
+    raw = T2VAMimoBackend(config(tmp_path), client=client).annotate(job, "a" * 64)
+    core = validate_t2va_draft(job, T2VAMimoDraft.model_validate_json(raw.response))
+    assert "<d>[Chinese] 你好。</d>" in render_t2va_prompt(core)
+    assert raw.model_call_count == len(client.calls) == 1
+
+
 @pytest.mark.parametrize("problem", ["length", "audio_zero", "video_zero"])
 def test_incomplete_av_response_fails_once(job, tmp_path, problem):
     client = Client([draft_for(job).model_dump_json()])

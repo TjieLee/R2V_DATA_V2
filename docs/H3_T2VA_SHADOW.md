@@ -28,8 +28,9 @@ provided as model evidence. There is no repair, retry, polish or fallback call.
 
 ## Core and Authority
 
-`H3NoReferenceAVCore` stores speaker assignments and the three no-reference
-semantic fields. The pure renderer produces only, in order:
+`H3NoReferenceAVCore` .2 stores speaker assignments, the typed integrated sequence,
+authoritative speech facts/target duration, and the two sound fields. The pure
+renderer produces only, in order:
 
 1. `integrated_multimodal_description`
 2. `overall_soundscape`
@@ -39,8 +40,19 @@ MiMo assigns descriptive, stable, contiguous Sx identities by first vocal
 appearance. The same acoustic source cluster cannot split into multiple Sx;
 different clusters may share one Sx. These are not production entity bindings.
 Assignments cover all supplied segments; only transcribed segments receive
-dialogue. Exact language/text, chronological dialogue inventory and each dialogue's
-speaker lead-in are checked without rewriting output. Invalid output fails that
+dialogue. MiMo returns `integrated_sequence` with discriminated `prose{text}` and
+`speech{segment_id, lead_in}` parts. It owns source/presentation/delivery prose and
+placement, but never dialogue words, translations, transliterations or `<d>`/Sx
+serialization. There must be exactly one speech slot per transcribed segment in
+chronological order; missing, duplicate, unknown or non-transcribed slots fail.
+
+The renderer copies `[Language] EXACT_ASR_TEXT` from immutable input facts and
+inserts the assignment's `(Sx)` immediately before the generated `<d>` block.
+Voice-over wording remains outside dialogue. It never fills missing slots or
+reassigns speakers. Final dialogue count, byte-exact payloads, order and speaker
+markers are still validated. No translation inference or text-repair model is
+used; speech slots have no model-owned transcript field. Copied ASR in model prose
+and pipeline syntax are rejected rather than cleaned. Invalid output fails that
 clip and retains the original response. Conditioning labels and Ref2VA headers
 are rejected. The first shot has no timestamp; later sequential shot markers
 require increasing in-range cut timestamps, matching the local official
@@ -54,6 +66,13 @@ and physical-sound/score separation. It removes all staged-turn, reference,
 retention and entity-binding instructions. The canonical absent-soundscape
 sentence is reused; absent audience-only music is `N/A`. Semantic sound
 classification remains a model judgment, not a keyword-based validator.
+
+The typed-output contract uses T2VA prompt v2/backend .2 and core .2; it is not
+fingerprint-compatible with the prior model-written dialogue string. Use a new
+run ID; frozen prior outputs are not rewritten. Record/summary shapes and the
+three-section final format are unchanged. QA .2 shows segment/cluster, Sx and
+presentation, model lead-in, authoritative ASR and the rendered speech side by
+side, plus the existing original video, raw response and diagnostics.
 
 TA2VA is intentionally not implemented. A future renderer can reuse the stored
 core and add separately validated Audio contracts without another AV inference.

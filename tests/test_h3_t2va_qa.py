@@ -99,6 +99,16 @@ def test_static_payload_safe_and_inputs_immutable(published):
     before = {p: p.read_bytes() for p in published.rglob("*") if p.is_file()}
     page = build_t2va_qa(published)
     data = page.with_name("data.json").read_bytes()
+    payload = json.loads(data)
+    assert payload["schema_version"] == "r2v.h3.t2va_qa.2"
+    speech = payload["cases"][0]["speech"][0]
+    assert speech["segment_id"] == "segment_1"
+    assert speech["source_speaker_cluster"] == "cluster_1"
+    assert speech["assignment"]["speaker_id"] == "S1"
+    assert speech["assignment"]["speech_presentation"] == "onscreen_spoken"
+    assert speech["model_lead_in"] == "A person says"
+    assert speech["text"] == "你好。"
+    assert speech["rendered_speech"] == "A person says (S1) <d>[Chinese] 你好。</d>"
     assert "<script>window.injected=true</script>" not in page.read_text()
     assert "\\u003c/script" in page.read_text()
     build_t2va_qa(published, overwrite=True)
@@ -144,6 +154,9 @@ const {chromium}=require(process.argv[2]);
   assert.strictEqual(await page.locator('#error').textContent(),'');
   assert.strictEqual(await page.evaluate(()=>window.injected),undefined);
   assert.strictEqual(await page.locator('#speech tr').count(),2);
+  assert.strictEqual(await page.locator('#speech tr').first().locator('td').count(),7);
+  assert.strictEqual(await page.locator('#speech tr').first().locator('td').nth(5).textContent(),'A person says');
+  assert.strictEqual(await page.locator('#speech tr').first().locator('td').nth(6).textContent(),'A person says (S1) <d>[Chinese] 你好。</d>');
   assert((await page.locator('#prompt').textContent()).startsWith('integrated_multimodal_description:'));
   await page.waitForFunction(()=>document.querySelector('video').readyState>=2);
   await page.evaluate(()=>{const v=document.querySelector('video');v.muted=true;return v.play();});
