@@ -343,8 +343,6 @@ def test_speech_prompt_defers_sound_and_finalizer_is_short():
 def test_turn2_is_minimal_speech_integration_without_visual_priming():
     prompt = mb.SYSTEM_PROMPT
     for forbidden in (
-        "lips", "mouth", "articulation", "visible_lip_motion", "no_visible_lip_motion",
-        "speech_correlated_articulation", "lip motion",
         "PRIMARY H3 WRITING TASK", "SHOT1 CAPTION / DETAILED DESCRIPTION",
         "VISIBLE SUBJECT PRESERVATION", "Observe the ENTIRE target video",
         "shot scale", "framing", "lighting", "Continue through the end",
@@ -442,7 +440,7 @@ def test_cache_is_diagnostic_only_and_four_stage_provenance_is_fingerprinted(tmp
     assert provenance.prompt_version == "h3_mimo25_speech_assembly_v46"
     assert provenance.visual_prompt_version == "h3_mimo25_visual_only_v4"
     assert provenance.materializer_version == "h3_mimo25_materializer_v26"
-    assert provenance.policy_version == "h3_mimo25_av_authority_contract_v17"
+    assert provenance.policy_version == "h3_mimo25_av_authority_contract_v18"
     values = provenance.model_dump(mode="json", exclude={"configuration_fingerprint"})
     assert provenance.configuration_fingerprint == mb._sha256_text(mb._compact_json(values))
     assert provenance.audio_finalize_prompt_version == "h3_mimo25_audio_finalize_v6"
@@ -600,8 +598,7 @@ def test_spatial_presentation_and_audible_music_prompt_contract():
         "bind that entity directly",
     ):
         assert rule in speech
-    for forbidden in ("lips", "mouth", "articulation", "visible_lip_motion", "no_visible_lip_motion"):
-        assert forbidden not in speech
+    assert "Visible lip motion is strong positive evidence, not a mandatory prerequisite" in speech
     assert "Do not output N/A for clearly established music" in mb.AUDIO_FINALIZE_SYSTEM_PROMPT
     assert "only or most salient visible person" in speech
     assert "keep it offscreen even when LR-ASD has no binding" in speech

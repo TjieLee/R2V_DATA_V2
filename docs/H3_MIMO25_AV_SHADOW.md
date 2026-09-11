@@ -37,9 +37,11 @@ speaker reconciliation; MiMo is the final AV authority for this shadow path.
   the original mix; separator residuals are not automatically factual. There is
   no deterministic music insertion or text-only sound fusion.
 - the deterministic boundary preserves frozen Subject/Picture ownership and
-  checks generated vocal-event formatting without rewriting dialogue. Adjacent
-  same-speaker ASR turns may share one natural `<d>` block; ASR artifacts stay
-  unchanged and remain visible in QA. There is no segment-count/order zip.
+  checks generated vocal-event formatting without rewriting dialogue. Every
+  transcribed ASR segment requires its exact language/text block in chronological
+  order, including short interjections and repeated identical text. Missing or
+  reordered blocks produce hard `direct_transcribed_dialogue_missing` issues,
+  never marker polish or inserted dialogue. ASR artifacts stay unchanged.
 - post-MiMo voice recovery may create a real target voice asset only from a
   validated clean single-speaker, final `visible_entity` / `onscreen_spoken`
   segment for an entity that has no existing target voice. It uses the exact
@@ -137,7 +139,12 @@ facts. Final original AV may directly bind a known visible speaker and materiali
 an `onscreen_spoken` segment as `<Subject N> (Sx) says, ...`.
 LR-ASD, source clusters, lip motion, mouth visibility, temporal alignment,
 voice continuity, and Stage B resolved status are supporting clues, not binding
-prerequisites. Missing supporting evidence does not clear a plausible binding.
+prerequisites. At 4 FPS, unobserved articulation is unknown, not negative evidence.
+Direct binding needs a positive AV basis: `av_temporal_alignment` suffices without
+lip motion; voice continuity alone does not. The existing mouth-occluded
+continuity path remains valid. Explicit `no_visible_lip_motion`, offscreen/
+voice-over/device evidence, or a competing positively articulated speaker
+precludes binding the chosen entity. Exact segment visibility remains required.
 A hidden mouth does not make a visible person offscreen. A visible listener
 must not inherit speech when AV explicitly indicates another source.
 The same clip-local group may therefore remain `g1` while a later segment becomes
@@ -161,7 +168,10 @@ The production normalization path no longer calls
 `visible_entity_requires_resolved_audio`, `onscreen_grounding_incomplete`,
 `visible_entity_requires_confirmed_onscreen_speech`, and
 `onscreen_speech_requires_reliable_visible_speaker_evidence` are review-only
-diagnostic warnings. They neither clear entity IDs nor block H3 publication.
+diagnostic warnings. The separate `visible_entity_binding_not_permitted` gate
+is hard for visible bindings that violate the direct AV requirements above.
+Strong lip/occlusion evidence remains required for conservative group merging;
+the broader binding predicate does not make merging more aggressive.
 Stage B single-speaker or ordinary uncertain evidence may receive a final AV
 visible binding. Confirmed transcribed overlapping or sequential multi-speaker
 speech still blocks identity/H3 publication pending turn refinement.
@@ -202,10 +212,10 @@ they do not create additional MiMo model jobs.
 
 Prompt, policy, annotation schema, and materializer versions are:
 
-- `h3_mimo25_unified_av_reconcile_v35`
-- `h3_mimo25_av_authority_contract_v17`
+- `h3_mimo25_speech_assembly_v49`
+- `h3_mimo25_av_authority_contract_v18`
 - `r2v.h3.mimo25_av_annotation.20`
-- `r2v.h3.mimo25_backend.40`
+- `r2v.h3.mimo25_backend.64`
 - `h3_mimo25_materializer_v23`
 - `h3_mimo25_reference_selection_v2`
 - `h3_mimo25_recovered_voice_quality_v1`

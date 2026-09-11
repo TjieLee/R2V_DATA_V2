@@ -54,7 +54,7 @@ def _subset_inventory(base, clip_ids):
 
 
 def test_finalizer_uses_raw_stems_without_evidence_gates():
-    assert MIMO25_PROMPT_VERSION == "h3_mimo25_speech_assembly_v48"
+    assert MIMO25_PROMPT_VERSION == "h3_mimo25_speech_assembly_v49"
     assert "separated music and sfx audio views of that SAME target" in AUDIO_FINALIZE_SYSTEM_PROMPT
     assert "Original AV remains primary authority" in AUDIO_FINALIZE_SYSTEM_PROMPT
     assert "quiet in the original mix" in AUDIO_FINALIZE_SYSTEM_PROMPT
@@ -190,7 +190,7 @@ def test_reconcile_rejects_invalid_subsets(tmp_path, monkeypatch, clip_ids):
 
 
 def _raw():
-    return _annotation().model_dump_json().replace("segment_1", "segment_0001")
+    return _annotation().model_dump_json().replace("segment_1", "segment_0001").replace("Exact, text!", "exact transcript")
 
 
 def test_turn2_exact_segment_visibility_contract():
@@ -750,7 +750,7 @@ def test_reference_prose_still_requires_nonempty_description(field):
 
 @pytest.mark.parametrize("caption,issue", [
     ("<Subject 1> (S1) speaks using <Audio 1>, <d>[Chinese] text</d>", "direct_unknown_reference"),
-    ("A man (S2) says, <d>[Chinese] text</d>", "direct_unknown_speaker"),
+    ("A man (S2) says, <d>[English] exact transcript</d>", "direct_unknown_speaker"),
     ("A man (S1) says, <d>text</d>", "direct_dialogue_language_missing"),
     ("A man (S1) says, <d>[Chinese] text", "direct_dialogue_format"),
 ])
@@ -989,10 +989,10 @@ def test_multiple_same_speaker_segments_keep_merged_or_continuing_dialogue(
         payload[section][key] = [
             {**template, "segment_id": s["segment_id"]} for s in values["segments"]
         ]
-    caption = "(S1) <Subject 1> gestures. <d>[Chinese] Original model wording stays intact.</d>"
+    caption = "(S1) <Subject 1> gestures. <d>[English] exact transcript</d>"
     if split_blocks:
         caption += " ".join(
-            f" <d>[Chinese] Model-owned continuation {i}.</d>" for i in range(2, 5)
+            " <d>[English] exact transcript</d>" for i in range(2, 5)
         )
     payload["h3_semantics"]["shot1_caption"] = caption
     from r2v_data_v2.h3.mimo25_av_reconcile import _job
@@ -1000,6 +1000,12 @@ def test_multiple_same_speaker_segments_keep_merged_or_continuing_dialogue(
     values.pop("request_fingerprint")
     job = _job(values)
     backend.client.chat.completions.responses = [(json.dumps(payload), 8)]
+    if not split_blocks:
+        with pytest.raises(MimoBackendFailure) as error:
+            _reconcile(backend, job)
+        assert "direct_transcribed_dialogue_missing" in {i.code for i in error.value.issues}
+        assert error.value.model_call_count == 4
+        return
     result = _reconcile(backend, job)
     assert result.model_call_count == 4
     assert result.annotation.h3_semantics.shot1_caption == caption
@@ -1077,7 +1083,7 @@ def test_visible_binding_without_supporting_evidence_is_retained(
     audio = payload["audio_observation"]["segment_decisions"][0]
     audio.update(resolution=resolution, vocal_composition=composition)
     grounding = payload["av_grounding"]["segment_groundings"][0]
-    grounding["evidence_codes"] = ["insufficient_evidence"]
+    grounding["evidence_codes"] = ["av_temporal_alignment"]
     annotation = MimoAVAnnotationDraft.model_validate(payload)
 
     def forbidden_downgrade(*args, **kwargs):
@@ -1097,10 +1103,10 @@ def test_visible_binding_without_supporting_evidence_is_retained(
     assert row["annotation"]["av_grounding"]["segment_groundings"][0] == grounding
     assert row["failure_issues"] == []
     warnings = set(row["diagnostics"][-1]["warnings"])
-    assert {
+    assert not {
         "visible_entity_requires_confirmed_onscreen_speech",
         "onscreen_speech_requires_reliable_visible_speaker_evidence",
-    } <= warnings
+    } & warnings
     if composition == "uncertain":
         assert "visible_entity_requires_resolved_audio" in warnings
     assert summary.model_call_count == len(completions.requests) == 4
@@ -1229,7 +1235,10 @@ def test_marker_severity_uses_distinct_authoritative_speakers(
     backend, completions, stems, jobs = _backend(tmp_path, shadow, [(json.dumps(payload), 8)] * 3)
     monkeypatch.setattr(
         mimo25_backend, "direct_speech_facts",
-        lambda annotation, segments: [{"speaker_id": speaker} for speaker in speakers],
+        lambda annotation, segments: [
+            {"speaker_id": speaker, "segment_id": f"segment_{i}", "language": "Chinese", "text": chr(97 + i)}
+            for i, speaker in enumerate(speakers)
+        ],
     )
     summary = _run(shadow, backend, stems, jobs)
     row = _records(shadow)[0]
@@ -1265,7 +1274,10 @@ def test_explicit_marker_mismatch_remains_hard_in_backend(tmp_path, monkeypatch)
     backend, completions, stems, jobs = _backend(tmp_path, shadow, [(json.dumps(payload), 8)])
     monkeypatch.setattr(
         mimo25_backend, "direct_speech_facts",
-        lambda annotation, segments: [{"speaker_id": "S1"}, {"speaker_id": "S2"}],
+        lambda annotation, segments: [
+            {"speaker_id": speaker, "segment_id": f"segment_{i}", "language": "English", "text": chr(97 + i)}
+            for i, speaker in enumerate(("S1", "S2"))
+        ],
     )
     summary = _run(shadow, backend, stems, jobs[:1])
     row = _records(shadow)[0]
@@ -1277,8 +1289,8 @@ def test_explicit_marker_mismatch_remains_hard_in_backend(tmp_path, monkeypatch)
     assert "direct_dialogue_speaker_marker_mismatch" not in row["diagnostics"][-1]["warnings"]
     assert summary.model_call_count == len(completions.requests) == 5
     assert row["text_model_call_count"] == 1
-    assert backend.provenance.schema_version == MIMO25_BACKEND_VERSION == "r2v.h3.mimo25_backend.63"
-    assert backend.provenance.prompt_version == "h3_mimo25_speech_assembly_v48"
+    assert backend.provenance.schema_version == MIMO25_BACKEND_VERSION == "r2v.h3.mimo25_backend.64"
+    assert backend.provenance.prompt_version == "h3_mimo25_speech_assembly_v49"
 
 
 @pytest.mark.parametrize(

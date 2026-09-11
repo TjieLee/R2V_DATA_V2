@@ -22,6 +22,25 @@ def _replace(record, **updates):
     return _seal(prep.AudioReusePreparedSource, {**record.model_dump(mode="json"), **updates}, "prepared_fingerprint")
 
 
+@pytest.mark.parametrize("backend,prompt,policy", [(63, 48, 17), (64, 49, 18)])
+def test_frozen_and_current_binding_policy_provenance_remains_readable(tmp_path, backend, prompt, policy):
+    args = _fixture(tmp_path)
+    values = stem_record_values(tmp_path, args["job"], args["annotation"], args["stem_record"], backend_version=backend)
+    provenance = values["backend_provenance"]
+    provenance["prompt_version"] = f"h3_mimo25_speech_assembly_v{prompt}"
+    provenance["policy_version"] = f"h3_mimo25_av_authority_contract_v{policy}"
+    provenance["configuration_fingerprint"] = prep._hash({k: v for k, v in provenance.items() if k != "configuration_fingerprint"})
+    values["record_fingerprint"] = prep._hash({k: v for k, v in values.items() if k != "record_fingerprint"})
+    root = tmp_path / "frozen"
+    root.mkdir()
+    path = root / "records.jsonl"
+    path.write_text(json.dumps(values))
+    before = path.read_bytes()
+    loaded = prep.load_reconcile_sources(root)[0]
+    assert loaded.source_backend_provenance.model_dump(mode="json") == provenance
+    assert path.read_bytes() == before
+
+
 def test_exact_134_overlay_preserves_order_and_failure_replacement(tmp_path):
     args = _fixture(tmp_path)
     root = tmp_path / "base"

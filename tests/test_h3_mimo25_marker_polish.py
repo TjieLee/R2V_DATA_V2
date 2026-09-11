@@ -174,11 +174,12 @@ def test_unaligned_dialogue_never_polishes_or_rewrites(tmp_path, monkeypatch, sp
         tmp_path, monkeypatch, caption, "MUST NOT BE USED", speakers,
     )
     assert pending == ["MUST NOT BE USED"]
-    assert summary.ready_count == 1 and summary.model_call_count == 4
+    missing_fact = len(speakers) > caption.count("<d>")
+    assert summary.ready_count == int(not missing_fact) and summary.model_call_count == 4
     assert summary.text_model_call_count == 0
     assert not row["speaker_marker_polish_attempted"]
     assert row["annotation"]["h3_semantics"]["shot1_caption"] == caption
-    assert row["failure_issues"] == []
+    assert [i["code"] for i in row["failure_issues"]] == (["direct_transcribed_dialogue_missing"] if missing_fact else [])
     assert "direct_single_speaker_marker_missing" in row["diagnostics"][-1]["warnings"]
 
 
@@ -186,7 +187,7 @@ def test_unaligned_dialogue_never_polishes_or_rewrites(tmp_path, monkeypatch, sp
 def test_raw_visible_offscreen_downgrade_preserves_audio_and_caption(tmp_path, monkeypatch, offscreen):
     _, shadow = _fixture(tmp_path, monkeypatch)
     payload = json.loads(_raw())
-    payload["h3_semantics"]["shot1_caption"] = SINGLE_FIXED
+    payload["h3_semantics"]["shot1_caption"] = SINGLE_FIXED.replace("[Chinese] a", "[English] exact transcript")
     grounding = payload["av_grounding"]["segment_groundings"][0]
     grounding["speech_presentation"] = "offscreen_spoken"
     grounding["evidence_codes"] = ["offscreen_audio"] if offscreen else ["visible_lip_motion"]
@@ -333,8 +334,9 @@ def test_marker_only_guard_preserves_dialogue_bytes_and_non_marker_tokens(origin
 def test_token_limited_polish_keeps_single_speaker_ready(tmp_path, monkeypatch):
     _, shadow = _fixture(tmp_path, monkeypatch)
     payload = json.loads(_raw())
-    payload["h3_semantics"]["shot1_caption"] = SINGLE
-    raw_polish = json.dumps({"shot1_caption": SINGLE_FIXED, "needs_review": False})
+    caption = SINGLE.replace("[Chinese] a", "[English] exact transcript")
+    payload["h3_semantics"]["shot1_caption"] = caption
+    raw_polish = json.dumps({"shot1_caption": caption.replace("woman", "woman (S1)"), "needs_review": False})
     backend, completions, stems, jobs = _backend(
         tmp_path, shadow, [(json.dumps(payload), 8)], polish_responses=[raw_polish],
     )
@@ -352,7 +354,7 @@ def test_token_limited_polish_keeps_single_speaker_ready(tmp_path, monkeypatch):
     assert summary.ready_count == 1 and summary.model_call_count == 5
     assert not row["speaker_marker_polish_applied"]
     assert row["speaker_marker_polish_raw_response"] == raw_polish
-    assert row["annotation"]["h3_semantics"]["shot1_caption"] == SINGLE
+    assert row["annotation"]["h3_semantics"]["shot1_caption"] == caption
     assert "speaker_marker_polish_failed" in row["diagnostics"][-1]["warnings"]
     assert row["diagnostics"][-1]["finish_reason"] == "length"
 
@@ -360,9 +362,11 @@ def test_token_limited_polish_keeps_single_speaker_ready(tmp_path, monkeypatch):
 def test_polish_summary_audit_and_qa_keep_av_raw_separate(tmp_path, monkeypatch):
     kwargs, shadow = _fixture(tmp_path, monkeypatch)
     payload = json.loads(_raw())
-    payload["h3_semantics"]["shot1_caption"] = SINGLE
+    caption = SINGLE.replace("[Chinese] a", "[English] exact transcript")
+    fixed = caption.replace("woman", "woman (S1)")
+    payload["h3_semantics"]["shot1_caption"] = caption
     raw = json.dumps(payload)
-    polish = json.dumps({"shot1_caption": SINGLE_FIXED, "needs_review": False})
+    polish = json.dumps({"shot1_caption": fixed, "needs_review": False})
     backend, _, stems, jobs = _backend(
         tmp_path, shadow, [(raw, 8)] * 3, polish_responses=[polish] * 3,
     )
@@ -374,7 +378,7 @@ def test_polish_summary_audit_and_qa_keep_av_raw_separate(tmp_path, monkeypatch)
     assert first["reconcile"]["audio_finalize_raw_response"] == assembly_raw(raw)
     assert first["reconcile"]["speaker_marker_polish_raw_response"] == polish
     assert first["final_h3"]["status"] == "ready"
-    assert SINGLE_FIXED in first["final_h3"]["text"]
+    assert fixed in first["final_h3"]["text"]
     page = (shadow / "qa/review.html").read_text()
     assert 'details("Speaker marker polish"' in page
     assert 'details("Turn 4 audio finalizer raw response"' in page

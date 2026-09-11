@@ -31,13 +31,13 @@ from r2v_data_v2.structured_output import (
 
 MIMO25_MODEL = "mimo-v2.5"
 MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
-MIMO25_PROMPT_VERSION = "h3_mimo25_speech_assembly_v48"
+MIMO25_PROMPT_VERSION = "h3_mimo25_speech_assembly_v49"
 MIMO25_SPEAKER_PROFILE_PROMPT_VERSION = "h3_mimo25_speaker_profile_v2"
 MIMO25_AUDIO_FINALIZE_PROMPT_VERSION = "h3_mimo25_audio_finalize_v6"
 MIMO25_VISUAL_PROMPT_VERSION = "h3_mimo25_visual_only_v5"
-MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v17"
+MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v18"
 MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.20"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.63"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.64"
 MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION = "h3_mimo25_speaker_marker_polish_v4"
 MIMO25_ICL_VERSION = "h3_official_ref2va_detailed_shot1_v4"
 MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v28"
@@ -261,6 +261,32 @@ def _observed_articulation_entity_ids(
         if item.entity_id in allowed_entity_ids
         and item.speech_correlated_articulation == "observed"
     }
+
+
+def _visible_binding_is_permitted(
+    decision: MimoAVSegmentGrounding,
+    view: MimoVisualSegmentView | None,
+) -> bool:
+    """Direct AV legality is weaker than the evidence needed to merge groups."""
+    if (
+        view is None
+        or decision.entity_id not in view.visible_entity_ids
+        or decision.binding_status != "visible_entity"
+        or decision.speech_presentation != "onscreen_spoken"
+    ):
+        return False
+    evidence = set(decision.evidence_codes)
+    if evidence & (_VISIBLE_PRESENTATION_CONTRADICTIONS | {"no_visible_lip_motion"}):
+        return False
+    articulated = _observed_articulation_entity_ids(
+        view, allowed_entity_ids=set(view.visible_entity_ids),
+    )
+    if articulated and decision.entity_id not in articulated:
+        return False
+    return (
+        "av_temporal_alignment" in evidence
+        or _has_grounded_onscreen_evidence(decision, view)
+    )
 
 
 def _has_stage_a_c_articulation_contradiction(
@@ -975,7 +1001,7 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.63"] = MIMO25_BACKEND_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.64"] = MIMO25_BACKEND_VERSION
     audio_finalize_prompt_version: Literal["h3_mimo25_audio_finalize_v6"] = (
         MIMO25_AUDIO_FINALIZE_PROMPT_VERSION
     )
@@ -1003,10 +1029,10 @@ class MimoBackendProvenance(SchemaModel):
     media_mode: Literal["base64", "http"]
     media_root: str
     media_base_url: str | None = None
-    prompt_version: Literal["h3_mimo25_speech_assembly_v48"] = (
+    prompt_version: Literal["h3_mimo25_speech_assembly_v49"] = (
         MIMO25_PROMPT_VERSION
     )
-    policy_version: Literal["h3_mimo25_av_authority_contract_v17"] = (
+    policy_version: Literal["h3_mimo25_av_authority_contract_v18"] = (
         MIMO25_POLICY_VERSION
     )
     annotation_schema_version: Literal["r2v.h3.mimo25_av_annotation.20"] = (
@@ -1355,7 +1381,7 @@ Speaker grounding is a separate AV decision and does not require an independent 
 AUTHORITY
 - DiariZen owns exact segment/sample boundaries. All decision inventories follow allowed_segment_ids, including LR-ASD=0, unbound, and zero-anchor segments. Never split, merge, filter, or invent segments.
 - If allowed_segment_ids is empty, output empty audio_observation.segment_decisions and av_grounding.segment_groundings. Never invent a synthetic segment; the preceding visual draft already owns segment_views.
-- Preserve supplied Qwen3-ASR dialogue content and language without additions or omissions. Consecutive speech by the same speaker may share one natural <d> block; never alter upstream segment boundaries.
+- Every supplied transcribed segment is a locked speech fact. Preserve its exact language and ASR text in one chronological <d>...</d> block per segment. Do not omit, paraphrase, merge away, or demote a transcribed speech fact into non-dialogue prose, even if the text is extremely short. Non-transcribed vocalizations may be described naturally, but transcribed segments must remain locked dialogue. Never alter upstream segment boundaries.
 - Frozen entities, Subjects, Pictures, order, and ownership are immutable. Use H3 reference labels ONLY from allowed_h3_reference_labels. If no <Audio N> appears in allowed_h3_reference_labels, NEVER emit <Audio N>. Do not mention a referenced voice timbre, Audio reference, or "using the voice from <Audio N>" unless that exact Audio label is explicitly allowed. Target video is observation-only, never <Video N>. Current LR-ASD bindings and source clusters are proposals, not truth.
 
 AUDIO + AV GROUNDING
@@ -1369,6 +1395,9 @@ AUDIO + AV GROUNDING
 - Transcribed overlapping_secondary_speech or sequential_multi_speaker_speech blocks final publication pending authoritative turn refinement; preserve the raw caption for QA, never heuristically split ASR.
 
 VISIBLE SPEAKER BINDING
+- Visible lip motion is strong positive evidence, not a mandatory prerequisite. At 4 FPS, failure to observe mouth articulation may simply be sparse temporal sampling. Do not turn missing sampled articulation into negative evidence.
+- Sparse sampling / no observed articulation is UNKNOWN, not no_visible_lip_motion. Use no_visible_lip_motion only when the available original AV provides affirmative evidence that the chosen visible entity is not articulating during the relevant speech interval.
+- A known visible entity may still be bound when broader original-AV temporal/spatial behavior reasonably supports that speaker and no competing/contradictory evidence exists. av_temporal_alignment is a direct non-lip AV cue; voice_continuity alone is insufficient. The speaker_visible_mouth_occluded path with av_temporal_alignment or voice_continuity remains available. Do not select an entity lacking observed articulation when another visible entity positively articulates during that interval.
 - For each exact segment, binding_status="visible_entity", entity_id=eX is legal ONLY if eX is in that segment's Turn 1 visible_entity_ids. An entity explicitly absent from that exact visible set is a current-segment visual contradiction, overriding current_entity_id, direct_anchor_present, LR-ASD and source-cluster proposals. Never publish an absent entity as the visible speaker to follow an upstream proposal.
 - In this contradiction, do not guess another visible entity and do not infer offscreen. Without explicit original-AV offscreen evidence, use entity_id=null, binding_status=no_reliable_entity or uncertain, and speech_presentation=uncertain.
 - The final target AV is allowed to identify a visible speaker directly. If the full AV reasonably indicates that a known visible entity is speaking, bind that entity directly.
@@ -1786,6 +1815,25 @@ def direct_speech_facts(annotation: MimoAVAnnotationDraft, segments: list[Any]) 
     return facts
 
 
+def _validate_direct_transcribed_dialogue(
+    text: str, speech: list[dict[str, Any]],
+) -> list[ValidationIssue]:
+    """Consume exact ordered occurrences, including identical repeated ASR facts."""
+    blocks = [match.group(0) for match in _DIALOGUE.finditer(text)]
+    cursor = 0
+    issues = []
+    for fact in speech:
+        locked = f"<d>[{fact['language'] or 'Unknown'}] {fact['text']}</d>"
+        try:
+            cursor = blocks.index(locked, cursor) + 1
+        except ValueError:
+            issues.append(ValidationIssue(
+                "direct_transcribed_dialogue_missing", fact["segment_id"],
+                f"required exact chronological ASR dialogue missing or reordered: {locked}",
+            ))
+    return issues
+
+
 _REVIEW_ONLY_ISSUES = frozenset({
     "direct_single_speaker_marker_missing", "stage_a_av_articulation_contradiction",
     "visible_entity_requires_resolved_audio", "onscreen_grounding_incomplete",
@@ -1927,7 +1975,7 @@ def validate_annotation(
         if decision.binding_status == "visible_entity" and (
             decision.speech_presentation != "onscreen_spoken"
             or decision.entity_id is None
-            or not _has_grounded_onscreen_evidence(decision, view)
+            or not _visible_binding_is_permitted(decision, view)
         ):
             issues.append(
                 ValidationIssue(
@@ -1936,14 +1984,19 @@ def validate_annotation(
                     "visible_entity requires onscreen_spoken, entity_id, and reliable onscreen speaker evidence",
                 )
             )
+            issues.append(ValidationIssue(
+                "visible_entity_binding_not_permitted", decision.segment_id,
+                "visible binding requires exact visibility and a positive direct AV cue "
+                "without explicit source, negative articulation, or competing-speaker contradiction",
+            ))
         if decision.speech_presentation == "onscreen_spoken" and not (
-            _has_grounded_onscreen_evidence(decision, view)
+            _visible_binding_is_permitted(decision, view)
         ):
             issues.append(
                 ValidationIssue(
                     "onscreen_speech_requires_reliable_visible_speaker_evidence",
                     decision.segment_id,
-                    "onscreen_spoken requires visible articulation or mouth-occluded visible-speaker continuity",
+                    "onscreen_spoken requires permitted direct visible-speaker AV evidence",
                 )
             )
         presentation_contradictions = sorted(
@@ -2593,7 +2646,7 @@ def _conservative_visible_speaker_downgrade(
             grounding.binding_status == "visible_entity"
             or grounding.speech_presentation == "onscreen_spoken"
         )
-        if not claims_visible_speech or _has_grounded_onscreen_evidence(
+        if not claims_visible_speech or _visible_binding_is_permitted(
             grounding,
             view,
         ):
@@ -3522,6 +3575,9 @@ class OpenAIMimo25Backend:
                 speech,
                 allowed_labels=allowed_reference_labels,
             )
+            direct_issues.extend(_validate_direct_transcribed_dialogue(
+                annotation.h3_semantics.shot1_caption, speech,
+            ))
             for name in ("summary", "style_opening"):
                 unknown = (
                     set(

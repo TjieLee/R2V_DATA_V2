@@ -245,7 +245,7 @@ def _annotation(
                 ],
                 "summary": "A person speaks while remaining visible.",
                 "style_opening": "The live-action video shows a seated person.",
-                "shot1_caption": "<Subject 1> (S1) turns and asks gently, <d>[Chinese] 错误文本</d> while lowering a hand. A clink sounds nearby.",
+                "shot1_caption": "<Subject 1> (S1) turns and asks gently, <d>[English] Exact, text!</d> while lowering a hand. A clink sounds nearby.",
                 "overall_soundscape": "A quiet room tone and a clink.",
                 "non_diegetic_music": "N/A",
                 "visual_retention_analysis": [
@@ -916,7 +916,7 @@ def test_current_backend_schema_keeps_existing_materializer_v6_provenance_readab
 
 def test_mimo_v23_prompt_preserves_staged_visual_audio_authority_contract() -> None:
     assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v25"
-    assert MIMO25_POLICY_VERSION == "h3_mimo25_av_authority_contract_v17"
+    assert MIMO25_POLICY_VERSION == "h3_mimo25_av_authority_contract_v18"
     assert MIMO25_SCHEMA_VERSION == "r2v.h3.mimo25_av_annotation.16"
     for phrase in (
         "STAGE A visual_observation: PURE VISUAL EVIDENCE",
@@ -1518,7 +1518,7 @@ def test_visible_entity_structural_relationships_remain_model_validated() -> Non
         ],
     ],
 )
-def test_indirect_continuity_parses_then_fails_visible_speaker_validation(
+def test_temporal_av_alignment_allows_visible_speaker_without_lip_observation(
     evidence_codes: list[str],
 ) -> None:
     payload = _annotation().model_dump(mode="json")
@@ -1537,11 +1537,7 @@ def test_indirect_continuity_parses_then_fails_visible_speaker_validation(
     issues = _validate(annotation)
 
     assert annotation.segment_decisions[0].entity_id == "e1"
-    assert {item.code for item in issues} == {
-        "visible_entity_requires_confirmed_onscreen_speech",
-        "onscreen_speech_requires_reliable_visible_speaker_evidence",
-    }
-    assert {item.field for item in issues} == {"segment_1"}
+    assert not issues
 
 
 @pytest.mark.parametrize(
@@ -1562,15 +1558,18 @@ def test_single_indirect_signal_has_segment_level_semantic_issues(
     expected = {
         "visible_entity_requires_confirmed_onscreen_speech",
         "onscreen_speech_requires_reliable_visible_speaker_evidence",
+        "visible_entity_binding_not_permitted",
     }
+    if "av_temporal_alignment" in evidence_codes:
+        expected = set()
     assert {item.code for item in issues} == expected
-    assert {item.field for item in issues} == {"segment_1"}
+    assert {item.field for item in issues} == ({"segment_1"} if expected else set())
 
 
 @pytest.mark.parametrize(
     "conflict_code", ["lr_asd_conflict", "source_cluster_conflict"]
 )
-def test_explicit_conflict_does_not_make_indirect_continuity_visible_evidence(
+def test_upstream_conflict_does_not_override_direct_av_temporal_evidence(
     conflict_code: str,
 ) -> None:
     payload = _annotation().model_dump(mode="json")
@@ -1581,10 +1580,7 @@ def test_explicit_conflict_does_not_make_indirect_continuity_visible_evidence(
     ]
     issues = _validate(MimoAVAnnotationDraft.model_validate(payload))
 
-    assert {item.code for item in issues} == {
-        "visible_entity_requires_confirmed_onscreen_speech",
-        "onscreen_speech_requires_reliable_visible_speaker_evidence",
-    }
+    assert not issues
 
 
 def test_visible_lip_motion_remains_valid_onscreen_evidence() -> None:
@@ -1623,7 +1619,7 @@ def test_visible_entity_allows_mouth_occluded_continuity_evidence(
     assert "lr_asd_support" not in evidence_codes
 
 
-def test_mouth_occluded_path_allows_explicit_no_visible_lip_motion() -> None:
+def test_mouth_occluded_path_does_not_override_explicit_negative_articulation() -> None:
     payload = _annotation().model_dump(mode="json")
     payload["av_grounding"]["segment_groundings"][0]["evidence_codes"] = [
         "speaker_visible_mouth_occluded",
@@ -1642,7 +1638,7 @@ def test_mouth_occluded_path_allows_explicit_no_visible_lip_motion() -> None:
 
     annotation = MimoAVAnnotationDraft.model_validate(payload)
 
-    assert not _validate(annotation)
+    assert "visible_entity_binding_not_permitted" in {i.code for i in _validate(annotation)}
 
 
 @pytest.mark.parametrize(
@@ -1671,6 +1667,7 @@ def test_mouth_occlusion_without_continuity_is_not_onscreen_evidence() -> None:
     assert {item.code for item in _validate(annotation)} == {
         "visible_entity_requires_confirmed_onscreen_speech",
         "onscreen_speech_requires_reliable_visible_speaker_evidence",
+        "visible_entity_binding_not_permitted",
     }
 
 

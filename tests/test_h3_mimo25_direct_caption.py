@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from r2v_data_v2.h3 import mimo25_backend as mb
 from r2v_data_v2.h3.mimo25_backend import (
     MIMO25_ICL_VERSION,
     SYSTEM_PROMPT,
@@ -25,10 +26,193 @@ from tests.test_h3_mimo25_av_shadow import (
     _job_fixture,
     _record_fixture,
     _sample,
+    _validate,
 )
 
 LABELS = {"<Subject 1>", "<Picture 1>"}
 SPEECH = [{"segment_id": "segment_1", "speaker_id": "S1", "language": "English", "text": "Exact, text!"}]
+
+
+@pytest.mark.parametrize("evidence,articulation,allowed", [
+    (["av_temporal_alignment"], "not_observed", True),
+    (["av_temporal_alignment"], "not_assessable", True),
+    (["visible_lip_motion"], "observed", True),
+    (["voice_continuity"], "not_observed", False),
+    (["insufficient_evidence"], "not_observed", False),
+    (["av_temporal_alignment", "no_visible_lip_motion"], "not_observed", False),
+    (["av_temporal_alignment", "offscreen_audio"], "not_observed", False),
+    (["av_temporal_alignment", "voice_over_context"], "not_observed", False),
+    (["av_temporal_alignment", "device_playback_context"], "not_observed", False),
+])
+def test_sparse_av_binding_legality(evidence, articulation, allowed):
+    annotation = _annotation()
+    view = annotation.visual_observation.segment_views[0]
+    view.entity_observations[0].speech_correlated_articulation = articulation
+    grounding = annotation.segment_decisions[0]
+    grounding.evidence_codes = evidence
+    assert mb._visible_binding_is_permitted(grounding, view) == allowed
+    codes = {issue.code for issue in _validate(annotation)}
+    assert ("visible_entity_binding_not_permitted" not in codes) == allowed
+    if allowed:
+        assert "onscreen_speech_requires_reliable_visible_speaker_evidence" not in codes
+        assert "visible_entity_requires_confirmed_onscreen_speech" not in codes
+        normalized, count = mb._conservative_visible_speaker_downgrade(annotation, allowed_entity_ids={"e1"})
+        assert count == 0 and normalized.model_dump() == annotation.model_dump()
+    assert "visible_entity_binding_not_permitted" not in mb._REVIEW_ONLY_ISSUES
+
+
+@pytest.mark.parametrize("cue", ["av_temporal_alignment", "voice_continuity"])
+def test_occluded_binding_still_permitted(cue):
+    annotation = _annotation()
+    view = annotation.visual_observation.segment_views[0]
+    observation = view.entity_observations[0]
+    observation.mouth_visibility = "occluded"
+    observation.speech_correlated_articulation = "not_assessable"
+    annotation.segment_decisions[0].evidence_codes = ["speaker_visible_mouth_occluded", cue]
+    assert mb._visible_binding_is_permitted(annotation.segment_decisions[0], view)
+    assert not _validate(annotation)
+
+
+def test_competing_articulation_and_exact_visibility_remain_exclusions():
+    annotation = _annotation()
+    view = annotation.visual_observation.segment_views[0]
+    other = view.entity_observations[0].model_copy(update={"entity_id": "e2"})
+    view.entity_observations[0].speech_correlated_articulation = "not_observed"
+    view.entity_observations.append(other)
+    view.visible_entity_ids.append("e2")
+    annotation.segment_decisions[0].evidence_codes = ["av_temporal_alignment"]
+    assert not mb._visible_binding_is_permitted(annotation.segment_decisions[0], view)
+    assert "visible_entity_binding_not_permitted" in {i.code for i in _validate(annotation, allowed_entity_ids={"e1", "e2"})}
+    view.visible_entity_ids = ["e2"]
+    view.entity_observations = [other]
+    assert "visible_entity_absent_from_visual_segment" in {i.code for i in _validate(annotation, allowed_entity_ids={"e1", "e2"})}
+
+
+def test_temporal_cue_does_not_enable_strong_group_merging():
+    annotation = _annotation()
+    annotation.segment_decisions[0].evidence_codes = ["av_temporal_alignment"]
+    annotation.visual_observation.segment_views[0].entity_observations[0].speech_correlated_articulation = "not_observed"
+    payload = annotation.model_dump()
+    for section, field in (("audio_observation", "segment_decisions"), ("av_grounding", "segment_groundings")):
+        payload[section][field].append({**payload[section][field][0], "segment_id": "segment_2", "primary_speaker_group": "g2"})
+    payload["visual_observation"]["segment_views"].append({
+        **payload["visual_observation"]["segment_views"][0], "segment_id": "segment_2",
+    })
+    annotation = MimoAVAnnotationDraft.model_validate(payload)
+    result, corrections, groups = mb._canonicalize_same_visible_entity_speaker_groups(
+        annotation, segment_ids=["segment_1", "segment_2"], allowed_entity_ids={"e1"},
+    )
+    assert result.model_dump() == annotation.model_dump()
+    assert corrections == {} and groups is None
+
+
+@pytest.mark.parametrize("composition", ["overlapping_secondary_speech", "sequential_multi_speaker_speech"])
+def test_sparse_cue_does_not_relax_multi_speaker_exclusion(composition):
+    annotation = _annotation(composition=composition, resolution="needs_acoustic_refinement")
+    annotation.segment_decisions[0].evidence_codes = ["av_temporal_alignment"]
+    issues = _validate(annotation)
+    assert "visible_entity_requires_resolved_audio" in {i.code for i in issues}
+    assert not mb._audio_allows_visible_entity_resolution(annotation.audio_observation.segment_decisions[0])
+
+
+@pytest.mark.parametrize("blocks,missing", [
+    (["哪里不着急？"], ["segment_0001"]),
+    (["我。", "哪里不着急？"], []),
+    (["哪里不着急？", "我。"], ["segment_0003"]),
+])
+def test_exact_short_dialogue_inventory(blocks, missing):
+    facts = [
+        {"segment_id": "segment_0001", "speaker_id": "S1", "language": "Chinese", "text": "我。"},
+        {"segment_id": "segment_0003", "speaker_id": "S2", "language": "Chinese", "text": "哪里不着急？"},
+    ]
+    caption = "A brief vocalization is heard. " + " ".join(f"<d>[Chinese] {text}</d>" for text in blocks)
+    issues = mb._validate_direct_transcribed_dialogue(caption, facts)
+    assert [(i.code, i.field) for i in issues] == [("direct_transcribed_dialogue_missing", sid) for sid in missing]
+
+
+def test_duplicate_locked_dialogue_requires_distinct_ordered_occurrences():
+    facts = [{**SPEECH[0], "segment_id": f"segment_{i}"} for i in (1, 2)]
+    block = "<d>[English] Exact, text!</d>"
+    assert not mb._validate_direct_transcribed_dialogue(block + block, facts)
+    assert [i.field for i in mb._validate_direct_transcribed_dialogue(block, facts)] == ["segment_2"]
+
+
+@pytest.mark.parametrize("caption", ["A brief vocalization is heard.", "(S1)<d>[English] paraphrased</d>"])
+def test_missing_exact_asr_is_hard_and_never_marker_polished(tmp_path, caption):
+    visual, speech, profile, finalized = map(json.loads, split_annotation(_annotation().model_dump_json()))
+    speech["shot1_caption"] = caption
+    backend, calls = _backend(tmp_path, [(json.dumps(item), 8) for item in (visual, speech, profile, finalized)])
+    with pytest.raises(MimoBackendFailure) as exc:
+        _run(backend, _job_fixture(tmp_path))
+    assert "direct_transcribed_dialogue_missing" in {i.code for i in exc.value.issues}
+    assert len(calls.requests) == 4
+    assert not exc.value.speaker_marker_polish.attempted
+
+
+def test_sparse_binding_and_locked_dialogue_prompt_contract():
+    for rule in (
+        "Visible lip motion is strong positive evidence, not a mandatory prerequisite",
+        "At 4 FPS", "UNKNOWN, not no_visible_lip_motion",
+        "affirmative evidence", "voice_continuity alone is insufficient",
+        "Every supplied transcribed segment is a locked speech fact",
+        "one chronological <d>...</d> block per segment",
+        "even if the text is extremely short",
+    ):
+        assert rule in SYSTEM_PROMPT
+    assert "may share one natural <d> block" not in SYSTEM_PROMPT
+
+
+@pytest.mark.parametrize("omit_short", [False, True])
+def test_25755_short_asr_survives_without_lip_frames_or_extra_calls(tmp_path, omit_short):
+    job = _job_fixture(tmp_path)
+    template = job.segments[0]
+    parts = [("segment_0001", "我。", 0.0125, 0.1925), ("segment_0003", "哪里不着急？", 0.3, 0.9)]
+    job = job.model_copy(update={"segments": [
+        template.model_copy(update={
+            "segment_id": sid, "asr_language": "Chinese", "asr_text": words,
+            "start_time": start, "end_time": end,
+            "source_start_sample": round(start * template.source_sample_rate_hz),
+            "source_end_sample": round(end * template.source_sample_rate_hz),
+        }) for sid, words, start, end in parts
+    ]})
+    values = _annotation().model_dump()
+    for section, key in (("visual_observation", "segment_views"), ("audio_observation", "segment_decisions"),
+                         ("av_grounding", "segment_groundings")):
+        base = values[section][key][0]
+        values[section][key] = [{**base, "segment_id": sid} for sid, *_ in parts]
+    for view in values["visual_observation"]["segment_views"]:
+        view["entity_observations"] = []
+    values["av_grounding"]["segment_groundings"][0]["evidence_codes"] = ["av_temporal_alignment"]
+    # The later source is offscreen; no entity/group identity merge is implied.
+    values["audio_observation"]["segment_decisions"][1]["primary_speaker_group"] = "g2"
+    values["av_grounding"]["segment_groundings"][1].update(
+        primary_speaker_group="g2", binding_status="offscreen", entity_id=None,
+        speech_presentation="offscreen_spoken", evidence_codes=["offscreen_audio"],
+    )
+    values["audio_observation"]["speaker_voice_profiles"].append({
+        "speaker_group": "g2", "voice_characteristics": "A clear low register.",
+    })
+    caption = "(S1)<d>[Chinese] 我。</d> " if not omit_short else "A brief vocalization is heard. "
+    caption += "A voice (S2) asks, <d>[Chinese] 哪里不着急？</d>"
+    values["h3_semantics"]["shot1_caption"] = caption
+    backend, calls = _backend(tmp_path, [(raw, 8) for raw in split_annotation(json.dumps(values))])
+    kwargs = {
+        "segment_ids": [p[0] for p in parts], "transcribed_segment_ids": [p[0] for p in parts],
+        "allowed_entity_ids": {"e1"}, "allowed_reference_labels": LABELS,
+        "auxiliary_audio_paths": {kind: Path(job.target_full_audio_path) for kind in ("speech", "music", "sfx")},
+    }
+    if omit_short:
+        with pytest.raises(MimoBackendFailure) as exc:
+            backend.reconcile(job, **kwargs)
+        assert ("direct_transcribed_dialogue_missing", "segment_0001") in {(i.code, i.field) for i in exc.value.issues}
+        assert not exc.value.speaker_marker_polish.attempted
+    else:
+        result = backend.reconcile(job, **kwargs)
+        assert result.annotation.h3_semantics.shot1_caption == caption
+        assert result.annotation.segment_decisions[0].entity_id == "e1"
+        assert result.model_call_count == 4 and not result.speaker_marker_polish.attempted
+    assert len(calls.requests) == 4
+    assert backend.config.video_fps == 4.0
 
 
 @pytest.mark.parametrize("invented", [False, True])
