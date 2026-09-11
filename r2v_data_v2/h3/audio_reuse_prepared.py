@@ -20,6 +20,7 @@ from r2v_data_v2.h3.mimo25_av_reconcile import (
     _inventory,
     build_mimo25_inventory,
     build_mimo25_reference_inventory,
+    load_mimo25_reference_sources,
 )
 from r2v_data_v2.h3.mimo25_backend import MimoAVAnnotationDraft, MimoBackendProvenance
 from r2v_data_v2.h3.mimo25_stem_shadow import (
@@ -207,7 +208,7 @@ def project_prepared_samples(jobs: list[MimoClipJob], samples: list[FinalH3Sampl
 def prepare_audio_reuse_sources(
     *, audio_production_root: Path, visual_production_root: Path, visual_runs_root: Path,
     stem_shadow_root: Path, base_reconcile_root: Path, override_reconcile_root: Path | None,
-    source_h3_root: Path, prepared_root: Path,
+    source_h3_root: Path | None = None, prepared_root: Path,
     binding_evidence_mode: Literal["legacy_lr_asd", "none"] = "legacy_lr_asd",
     stem_diarization_root: Path | None = None, stem_asr_root: Path | None = None,
 ) -> AudioReusePreparedSummary:
@@ -225,7 +226,11 @@ def prepare_audio_reuse_sources(
     )
     stem_sources = [shadow / n for n in ("separation", "auk_speech_v1", "resolved_stems_v1")]
     stem_sources += [diarization, asr]
-    inputs = [base_reconcile_root.resolve(strict=True), source_h3_root.resolve(strict=True)]
+    inputs = [base_reconcile_root.resolve(strict=True)]
+    if binding_evidence_mode == "legacy_lr_asd":
+        if source_h3_root is None:
+            raise ValueError("legacy preparation requires source_h3_root")
+        inputs.append(source_h3_root.resolve(strict=True))
     if override_reconcile_root is not None:
         inputs.append(override_reconcile_root.resolve(strict=True))
     protected = [getattr(paths, f.name).resolve() for f in fields(paths) if f.name != "root"]
@@ -245,7 +250,6 @@ def prepare_audio_reuse_sources(
             source_files.update(p for p in root.rglob("*.jsonl") if p.is_file())
     source_files.update([
         visual_production_root / "samples.jsonl", paths.audio / "canonical_clips.jsonl",
-        paths.h3 / "samples.jsonl",
     ])
     if binding_evidence_mode == "legacy_lr_asd":
         source_files.update([
@@ -272,17 +276,28 @@ def prepare_audio_reuse_sources(
         visual_production_root=visual_production_root, visual_runs_root=visual_runs_root,
         audio_production_root=audio_production_root, case_manifest=manifest,
     )
-    if sha256_file(source_h3_root / "samples.jsonl") != base_inventory.source_h3_samples_sha256:
+    if (binding_evidence_mode == "legacy_lr_asd"
+        and sha256_file(source_h3_root / "samples.jsonl") != base_inventory.source_h3_samples_sha256):
         raise ValueError("frozen H3 source differs from reconstruction source")
     jobs = build_stem_reconcile_jobs(
         base_inventory=usable_stem_reconcile_inventory(base_inventory, provenance),
         stem_diarization_root=diarization, stem_asr_root=asr, route=provenance.route,
         binding_evidence_mode=binding_evidence_mode,
     )
-    samples = project_prepared_samples(jobs, [
-        FinalH3SampleV2.model_validate_json(line)
-        for line in (source_h3_root / "samples.jsonl").read_text().splitlines() if line.strip()
-    ])
+    if binding_evidence_mode == "none":
+        source_samples, _ = load_mimo25_reference_sources(
+            visual_production_root=visual_production_root, visual_runs_root=visual_runs_root,
+            audio_production_root=audio_production_root,
+        )
+        source_text = "".join(s.model_dump_json() + "\n" for s in source_samples)
+        if hashlib.sha256(source_text.encode()).hexdigest() != base_inventory.source_h3_samples_sha256:
+            raise ValueError("shadow canonical source changed during reconstruction")
+    else:
+        source_samples = [
+            FinalH3SampleV2.model_validate_json(line)
+            for line in (source_h3_root / "samples.jsonl").read_text().splitlines() if line.strip()
+        ]
+    samples = project_prepared_samples(jobs, source_samples)
     values = base_inventory.model_dump(mode="json", exclude={"inventory_fingerprint"})
     if values["source_diarization_inventory_sha256"] is None:
         values.pop("source_diarization_inventory_sha256")

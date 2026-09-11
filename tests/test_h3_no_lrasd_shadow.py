@@ -137,24 +137,66 @@ def test_resolved_raw_asr_without_production_binding(setup, tmp_path, ffmpeg, mo
 
 
 def test_reference_builder_never_reads_speaker_evidence(tmp_path, monkeypatch):
+    import shutil
+
+    from r2v_data_v2.h3.jea_audio_production import CanonicalAudioClip
+    from r2v_data_v2.h3.visual_production_source import (
+        NormalizedVisualReference,
+        NormalizedVisualSample,
+        ReadableClipIdentity,
+    )
     from tests.test_h3_audio_shadow_qa import _fixture
     args, shadow = _fixture(tmp_path, monkeypatch, variants=True)
     (args["visual_production_root"] / "samples.jsonl").write_text("{}\n")
     samples = [json.loads(line) for line in (args["audio_production_root"] / "h3/samples.jsonl").read_text().splitlines()]
     canonical = [s for s in samples if s["pair_type"] == "canonical"]
+    audio = {c.clip_uid: c for c in (
+        CanonicalAudioClip.model_validate_json(line) for line in
+        (args["audio_production_root"] / "audio/canonical_clips.jsonl").read_text().splitlines()
+    )}
+    clips = [SimpleNamespace(
+        identity=ReadableClipIdentity.model_validate({k: getattr(audio[s["clip_uid"]], k) for k in ReadableClipIdentity.model_fields}),
+        sample=NormalizedVisualSample(
+            sample_id=f'{s["clip_uid"]}/visual', clip_uid=s["clip_uid"], target_video=s["target_video"],
+            t2v_caption="Frozen visual caption", r2v_instruction=s["r2v_instruction"],
+            references=[NormalizedVisualReference.model_validate({
+                **{k: v for k, v in r.items() if k != "image_artifact_path"},
+                "artifact_path": r["image_artifact_path"],
+            }) for r in s["visual_references"]],
+        ),
+    ) for s in canonical]
     monkeypatch.setattr(reconcile, "load_visual_production_inventory", lambda **kw: SimpleNamespace(
-        canonical_clips=[SimpleNamespace(identity=SimpleNamespace(clip_uid=s["clip_uid"]),
-                                        sample=SimpleNamespace(target_video=s["target_video"])) for s in canonical],
+        canonical_clips=clips,
     ))
+    production_h3 = args["audio_production_root"] / "h3"
+    shutil.rmtree(production_h3)
     _deny_binding_reads(monkeypatch)
+    guarded_open = Path.open
+
+    def no_h3(path, *a, **kw):
+        assert not path.is_relative_to(production_h3)
+        return guarded_open(path, *a, **kw)
+
+    monkeypatch.setattr(Path, "open", no_h3)
     inventory = reconcile.build_mimo25_reference_inventory(
         visual_production_root=args["visual_production_root"],
         visual_runs_root=args["visual_runs_root"], audio_production_root=args["audio_production_root"],
     )
     assert inventory.binding_evidence_mode == "none"
+    assert inventory.schema_version == "r2v.h3.mimo25_inventory.6"
     assert all(j.segments == [] and j.reference_subjects for j in inventory.jobs)
     assert inventory.source_binding_audit_segments_sha256 is None
     assert reconcile.MimoInventory.model_validate_json(inventory.model_dump_json()) == inventory
+    source_samples, _ = reconcile.load_mimo25_reference_sources(
+        visual_production_root=args["visual_production_root"], visual_runs_root=args["visual_runs_root"],
+        audio_production_root=args["audio_production_root"],
+    )
+    for sample, clip in zip(source_samples, clips, strict=True):
+        assert sample.r2v_instruction == clip.sample.r2v_instruction
+        assert sample.sample_id == f"{clip.sample.sample_id}/canonical"
+        assert sample.visual_references == [reconcile.FinalVisualReference.from_visual(r) for r in clip.sample.references]
+        assert sample.subject_voices == [] and sample.pair_type == "canonical"
+        assert sample.target_full_audio_sha256 == audio[sample.clip_uid].target_full_audio_sha256
     from r2v_data_v2.h3.audio_reuse_prepared import prepare_audio_reuse_sources
     from r2v_data_v2.h3.mimo25_stem_shadow import run_mimo25_stem_reconcile_shadow
     from r2v_data_v2.h3.sam_audio_stem_shadow import load_stem_shadow
@@ -190,12 +232,24 @@ def test_reference_builder_never_reads_speaker_evidence(tmp_path, monkeypatch):
         audio_production_root=args["audio_production_root"],
         visual_production_root=args["visual_production_root"], visual_runs_root=args["visual_runs_root"],
         stem_shadow_root=shadow, base_reconcile_root=output, override_reconcile_root=None,
-        source_h3_root=args["audio_production_root"] / "h3", prepared_root=prepared,
+        prepared_root=prepared,
         binding_evidence_mode="none", stem_diarization_root=diari, stem_asr_root=asr,
     )
     assert not summary.production_artifacts_modified
     published = reconcile.MimoInventory.model_validate_json((prepared / "inventory.json").read_text())
     assert published.binding_evidence_mode == "none"
+    generated = [reconcile.FinalH3SampleV2.model_validate_json(line) for line in (prepared / "h3/samples.jsonl").read_text().splitlines()]
+    assert len(generated) == len(jobs)
+    for sample, job in zip(generated, jobs, strict=True):
+        assert sample.pair_type == "canonical" and sample.subject_voices == []
+        for speech, fact in zip(sample.speech_segments, job.segments, strict=True):
+            assert (speech.segment_id, speech.text, speech.language, speech.start_time, speech.end_time,
+                    speech.source_start_sample, speech.source_end_sample, speech.speaker_cluster_id) == (
+                fact.segment_id, fact.asr_text, fact.asr_language, fact.start_time, fact.end_time,
+                fact.source_start_sample, fact.source_end_sample, fact.source_speaker_cluster_id,
+            )
+            assert speech.entity_id is None
+    assert not production_h3.exists()
     assert all(p.read_bytes() == contents for p, contents in before.items())
 
 

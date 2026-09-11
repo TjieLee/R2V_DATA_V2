@@ -396,8 +396,17 @@ LR-ASD negatives. Original target AV remains MiMo's final speaker-binding
 authority. MiMo retains visual, speech/AV, optional acoustic profile and audio
 finalize stages; claiming `lr_asd_support` or `lr_asd_conflict` fails closed.
 
-No-binding base jobs use MiMo inventory `.5`; legacy `.4` remains readable with
-unchanged fingerprints. No-binding DiariZen/ASR provenance uses `.6`; legacy
+No-binding base jobs use MiMo inventory `.6`, sourced directly from frozen Visual
+production and canonical target Audio, without production `h3/samples.jsonl`.
+Canonical shadow samples retain Visual order, ownership, instruction and sample
+identity; they have no subject voices or inferred entity bindings. Prepared
+publication fills exact raw-DiariZen/Qwen3-ASR speech segments under its own
+`h3/samples.jsonl` only. No in-pair or cross-pair samples are created. The inventory's
+`source_h3_samples_sha256` hashes the deterministic constructed shadow sample
+serialization (and the published samples after preparation), not production H3.
+Legacy `.4` and previous no-binding `.5` inventories remain readable with unchanged
+fingerprints. Use a fresh reconcile/prepared namespace for the new source contract;
+old reconcile jobs are not silently reinterpreted. No-binding DiariZen/ASR provenance uses `.6`; legacy
 `.4`/`.5` retain their old serialization. The new reconcile stage also publishes
 `source_contract.json` containing the explicit mode and fingerprinted jobs.
 The acoustic DiariZen implementation may emit neutral bound/cluster compatibility
@@ -440,7 +449,7 @@ MIMO_NONE="$SHADOW/mimo_reconcile_no_lrasd_v1"
   --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
   --visual-production-root "$VISUAL_PRODUCTION_ROOT" \
   --visual-runs-root "$VISUAL_RUNS_ROOT" --stem-shadow-root "$SHADOW" \
-  --base-reconcile-root "$MIMO_NONE" --source-h3-root "$AUDIO_PRODUCTION_ROOT/h3" \
+  --base-reconcile-root "$MIMO_NONE" \
   --prepared-root "$SHADOW/prepared_no_lrasd_v1" \
   --binding-evidence-mode none --stem-diarization-root "$DIARI_NONE" \
   --stem-asr-root "$ASR_NONE"
@@ -449,4 +458,6 @@ MIMO_NONE="$SHADOW/mimo_reconcile_no_lrasd_v1"
 `--allow-unverified` remains the explicit pilot opt-in for unverified stems.
 The first three commands support `--dry-run` for source-only preflight. Prepared
 publication is model-free and preserves the unchanged Audio-reuse semantics.
+`--source-h3-root` is required only by legacy preparation and is not read in
+no-binding mode. Production `h3/` is never created or modified by this adapter.
 Rollback selects the old roots and `legacy_lr_asd`; it does not rewrite artifacts.
