@@ -79,7 +79,7 @@ def test_semantic_and_frozen_audio_finalize_requests(job, tmp_path, transport):
     else:
         assert request["response_format"] == {"type": "json_object"}
         assert request["extra_body"]["thinking"] == {"type": "disabled"}
-    assert backend.provenance().maximum_attempts == 2
+    assert backend.provenance().maximum_attempts == 1
     finalizer = client.calls[1]
     assert finalizer["messages"][0]["content"] == AUDIO_FINALIZE_SYSTEM_PROMPT
     media = finalizer["messages"][1]["content"]

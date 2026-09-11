@@ -73,7 +73,7 @@ class T2VAMimoConfig:
             or self.max_completion_tokens <= 0
             or self.timeout_seconds <= 0
         ):
-            raise ValueError("invalid one-call T2VA backend configuration")
+            raise ValueError("invalid T2VA backend configuration")
 
     def provenance(self) -> T2VABackendProvenance:
         return T2VABackendProvenance(

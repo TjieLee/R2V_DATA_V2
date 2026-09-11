@@ -537,7 +537,7 @@ class T2VABackendProvenance(SchemaModel):
     video_fps: Literal[4] = 4
     media_resolution: Literal["default"] = "default"
     max_completion_tokens: int = Field(gt=0)
-    maximum_attempts: Literal[2] = 2
+    maximum_attempts: Literal[1] = 1
 
 
 class T2VAInventory(SchemaModel):
