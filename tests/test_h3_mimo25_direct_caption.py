@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
@@ -31,6 +32,62 @@ from tests.test_h3_mimo25_av_shadow import (
 
 LABELS = {"<Subject 1>", "<Picture 1>"}
 SPEECH = [{"segment_id": "segment_1", "speaker_id": "S1", "language": "English", "text": "Exact, text!"}]
+
+
+@pytest.mark.parametrize("groups,clusters,expected", [
+    (["g1", "g1", "g1"], ["speaker_0", "speaker_1", "speaker_1"], ["S1", "S1", "S1"]),
+    (["g1", "g2", "g1"], ["speaker_0", "speaker_1", "speaker_1"], ["S1", "S2", "S1"]),
+    ([None, None], ["speaker_0", "speaker_1"], ["S1", "S2"]),
+    ([None, "g1"], ["speaker_0", "speaker_1"], ["S1", "S2"]),
+])
+def test_final_group_sx_projection_ignores_resolution_and_binding(tmp_path, groups, clusters, expected):
+    from r2v_data_v2.h3.mimo25_h3_materializer import (
+        _audio_facts,
+        _corrected_segments,
+        _speaker_ids,
+    )
+    from r2v_data_v2.h3.qwen38_h3_recaption import build_reference_contract
+
+    job, sample, annotation = _job_fixture(tmp_path), _sample(tmp_path), _annotation()
+    source, speech = job.segments[0], sample.speech_segments[0]
+    decision = annotation.audio_observation.segment_decisions[0]
+    grounding = annotation.segment_decisions[0]
+    job.segments = []
+    sample.speech_segments = []
+    annotation.audio_observation.segment_decisions = []
+    annotation.av_grounding.segment_groundings = []
+    for i, (group, cluster) in enumerate(zip(groups, clusters, strict=True)):
+        common = {"segment_id": f"segment_{i+1}", "start_time": float(i), "end_time": float(i+1),
+                  "source_start_sample": i*32000, "source_end_sample": (i+1)*32000}
+        job.segments.append(source.model_copy(update={**common, "source_speaker_cluster_id": cluster}))
+        sample.speech_segments.append(speech.model_copy(update={**common, "speaker_cluster_id": cluster}))
+        annotation.audio_observation.segment_decisions.append(mb.MimoUncertainAudioSegmentDecision.model_validate({
+            **decision.model_dump(), "segment_id": common["segment_id"],
+            "primary_speaker_group": group, "resolution": "uncertain",
+        }))
+        annotation.av_grounding.segment_groundings.append(grounding.model_copy(update={
+            "segment_id": common["segment_id"], "primary_speaker_group": group,
+            "binding_status": "no_reliable_entity", "entity_id": None, "speech_presentation": "uncertain",
+        }))
+    before = annotation.model_dump()
+    facts = mb.direct_speech_facts(annotation, job.segments)
+    assert [f["speaker_id"] for f in facts] == expected
+    targets = mb._speaker_profile_targets(annotation, job)
+    assert [(t["speaker_group"], t["speaker_id"]) for t in targets] == list(dict.fromkeys(
+        (group, sx) for group, sx in zip(groups, expected, strict=True) if group is not None
+    ))
+    corrected, warnings = _corrected_segments(sample, job, SimpleNamespace(annotation=annotation))
+    ids = _speaker_ids(corrected)
+    assert [ids[s.speaker_cluster_id] for s in corrected] == expected
+    assert all(s.entity_id is None for s in corrected)
+    assert len(warnings) == len(groups)
+    materialized_facts = _audio_facts(
+        sample=sample, corrected=corrected, record=SimpleNamespace(annotation=annotation),
+        contract=build_reference_contract(sample, "visual_only"),
+    )
+    assert [f.speaker_id for f in materialized_facts.speech] == expected
+    assert all(f.locked_dialogue_block == "<d>[English] Exact, text!</d>" for f in materialized_facts.speech)
+    assert annotation.model_dump() == before
 
 
 @pytest.mark.parametrize("evidence,articulation,allowed", [

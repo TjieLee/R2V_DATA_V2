@@ -22,7 +22,7 @@ def _replace(record, **updates):
     return _seal(prep.AudioReusePreparedSource, {**record.model_dump(mode="json"), **updates}, "prepared_fingerprint")
 
 
-@pytest.mark.parametrize("backend,prompt,policy", [(63, 48, 17), (64, 49, 18)])
+@pytest.mark.parametrize("backend,prompt,policy", [(63, 48, 17), (64, 49, 18), (65, 49, 18)])
 def test_frozen_and_current_binding_policy_provenance_remains_readable(tmp_path, backend, prompt, policy):
     args = _fixture(tmp_path)
     values = stem_record_values(tmp_path, args["job"], args["annotation"], args["stem_record"], backend_version=backend)
@@ -233,7 +233,7 @@ def test_legacy_record_rendering_is_identical(tmp_path):
     _, sample, source = _case(tmp_path)
     legacy = _record_fixture(tmp_path, source.record.annotation, job=source.job)
     assert MimoRecord.model_validate_json(legacy.model_dump_json()) == legacy
-    assert MIMO25_MATERIALIZER_VERSION == "h3_mimo25_materializer_v28"
+    assert MIMO25_MATERIALIZER_VERSION == "h3_mimo25_materializer_v29"
     assert _materialize_sample(sample, source.job, legacy, conditioning_variant="visual_only") == (
         _materialize_sample(sample, source.job, source.record, conditioning_variant="visual_only")
     )

@@ -37,10 +37,10 @@ MIMO25_AUDIO_FINALIZE_PROMPT_VERSION = "h3_mimo25_audio_finalize_v6"
 MIMO25_VISUAL_PROMPT_VERSION = "h3_mimo25_visual_only_v5"
 MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v18"
 MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.20"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.64"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.65"
 MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION = "h3_mimo25_speaker_marker_polish_v4"
 MIMO25_ICL_VERSION = "h3_official_ref2va_detailed_shot1_v4"
-MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v28"
+MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v29"
 MIMO25_CANONICAL_ABSENT_SOUNDSCAPE = (
     "No distinct environmental, mechanical, physical, or non-verbal human "
     "sounds are clearly discernible."
@@ -1001,7 +1001,7 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.64"] = MIMO25_BACKEND_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.65"] = MIMO25_BACKEND_VERSION
     audio_finalize_prompt_version: Literal["h3_mimo25_audio_finalize_v6"] = (
         MIMO25_AUDIO_FINALIZE_PROMPT_VERSION
     )
@@ -1057,6 +1057,7 @@ class MimoBackendProvenance(SchemaModel):
         "h3_mimo25_materializer_v26",
         "h3_mimo25_materializer_v27",
         "h3_mimo25_materializer_v28",
+        "h3_mimo25_materializer_v29",
     ] = (
         MIMO25_MATERIALIZER_VERSION
     )
@@ -1804,8 +1805,9 @@ def direct_speech_facts(annotation: MimoAVAnnotationDraft, segments: list[Any]) 
         decision, bound = audio.get(segment.segment_id), grounding.get(segment.segment_id)
         if decision is None or bound is None:
             continue  # the authoritative inventory validator reports this mismatch
-        resolved = decision.resolution == "resolved" or bound.binding_status == "visible_entity"
-        group = decision.primary_speaker_group if resolved else f"fallback__{segment.source_speaker_cluster_id}"
+        group = decision.primary_speaker_group
+        if group is None:
+            group = f"fallback__{segment.source_speaker_cluster_id}"
         if group not in speaker_ids:
             speaker_ids[group] = f"S{len(speaker_ids) + 1}"
         facts.append({
@@ -2432,10 +2434,11 @@ def _speaker_profile_targets(
         if decision is None or bound is None:
             continue  # The final inventory validator reports missing decisions.
         group = decision.primary_speaker_group
+        speaker_key = group if group is not None else f"fallback__{segment.source_speaker_cluster_id}"
+        if speaker_key not in speaker_ids:
+            speaker_ids[speaker_key] = f"S{len(speaker_ids) + 1}"
         if group is None:
             continue
-        if group not in speaker_ids:
-            speaker_ids[group] = f"S{len(speaker_ids) + 1}"
         target = targets.setdefault(group, {
             "speaker_group": group, "speaker_id": speaker_ids[group], "segments": [],
         })

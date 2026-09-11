@@ -241,6 +241,7 @@ class MimoH3ShadowRecord(SchemaModel):
         "h3_mimo25_materializer_v26",
         "h3_mimo25_materializer_v27",
         "h3_mimo25_materializer_v28",
+        "h3_mimo25_materializer_v29",
     ] = (
         MIMO25_MATERIALIZER_VERSION
     )
@@ -469,7 +470,7 @@ def _corrected_segments(
         resolved = audio_resolved or visible_entity_resolved
         group = (
             audio_decision.primary_speaker_group
-            if resolved
+            if audio_decision.primary_speaker_group is not None
             else f"fallback__{source.source_speaker_cluster_id}"
         )
         entity_id = grounding.entity_id if visible_entity_resolved else None
