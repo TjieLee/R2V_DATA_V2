@@ -8,7 +8,6 @@ import numpy as np
 import pytest
 
 from r2v_data_v2.h3 import t2va_shadow as t2va
-from r2v_data_v2.h3.jea_audio_production import CanonicalAudioClip
 from r2v_data_v2.h3.mimo25_backend import (
     MIMO25_CANONICAL_ABSENT_SOUNDSCAPE,
     MimoMediaResolver,
@@ -19,16 +18,49 @@ from r2v_data_v2.h3.sam_audio_stem_shadow import (
 )
 from r2v_data_v2.h3.t2va_mimo_backend import T2VAMimoBackend, T2VAMimoConfig
 from r2v_data_v2.h3.t2va_qa import build_t2va_qa
+from r2v_data_v2.h3.t2va_source import prepare_t2va_audio, select_t2va_shots
+from r2v_data_v2.naming import clip_uid
 from tests import test_h3_auk_speech_shadow as auk_tests
 from tests.test_h3_resolved_audio_stems import _resolve
 from tests.test_h3_sam_audio_stem_shadow import (
     _Diarization,
-    _production_diarization_inventory_for_records,
     _Qwen,
 )
 
 setup = auk_tests.setup
 ffmpeg = auk_tests.ffmpeg
+
+
+class Audio:
+    def materialize_full_audio(self, *, source_video_path, destination, **kwargs):
+        import soundfile as sf
+
+        assert source_video_path.suffix == ".mp4"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        sf.write(destination, np.full((32000, 2), 0.125), 32000, subtype="PCM_24")
+
+
+def shot_ids(tmp_path):
+    return [clip_uid(tmp_path / f"movie_{i}.mp4") for i in (1, 2, 3)]
+
+
+def shot_manifest(tmp_path):
+    rows = []
+    for i in (1, 2, 3):
+        path = tmp_path / f"movie_{i}.mp4"
+        path.write_bytes(f"original AV {i}".encode())
+        rows.append(
+            {
+                "video_path": str(path),
+                "source_video_path": str(tmp_path / "movie.mp4"),
+                "source_video_id": "movie",
+                "shot_index": i,
+                "duration": 1,
+            }
+        )
+    manifest = tmp_path / "shots_f03_motion.jsonl"
+    manifest.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    return manifest
 
 
 @pytest.fixture
@@ -300,20 +332,23 @@ def test_selection_modes(tmp_path):
 
 @pytest.fixture
 def finalized(setup, tmp_path, ffmpeg):
-    root, _ = _resolve(setup, tmp_path, ffmpeg, fail="a")
-    production = Path(setup.audio_production_root)
-    canonical = t2va.read_rows(
-        Path(setup.source_canonical_audio_manifest_path), CanonicalAudioClip
+    shots = shot_manifest(tmp_path)
+    selection = select_t2va_shots(shots)
+    production = prepare_t2va_audio(
+        selection,
+        output_root=tmp_path / "no-reference-audio",
+        audio_backend=Audio(),
     )
-    source = production / "diarization"
-    source.mkdir()
-    source_inventory = _production_diarization_inventory_for_records(
-        production, canonical
+    inventory = auk_tests.auk.build_auk_inventory(
+        audio_production_root=production,
+        shadow_run_id=setup.shadow_run_id,
+        case_manifest_path=production / "case_manifest.json",
+        configuration=setup.model_configuration,
     )
-    (source / "inventory.json").write_text(source_inventory.model_dump_json())
+    root, _ = _resolve(inventory, tmp_path, ffmpeg, fail=selection.shots[0].clip_uid)
     run_stem_diarization_shadow(
         stem_root=root,
-        production_diarization_root=source,
+        production_diarization_root=production / "diarization",
         backend=_Diarization(),
         route="resolved",
         output_root=root.parent / "diarization",
@@ -321,7 +356,7 @@ def finalized(setup, tmp_path, ffmpeg):
     )
     run_stem_qwen3_asr_shadow(
         stem_diarization_root=root.parent / "diarization",
-        source_visual_production_root="/unused",
+        source_visual_production_root=None,
         backend=_Qwen(),
         output_root=root.parent / "asr",
         route="resolved",
@@ -337,6 +372,7 @@ def finalized(setup, tmp_path, ffmpeg):
 def build(finalized, tmp_path, **kwargs):
     production, run_id = finalized
     return t2va.build_t2va_inventory(
+        shot_manifest=tmp_path / "shots_f03_motion.jsonl",
         audio_production_root=production,
         audio_shadow_run_id=run_id,
         t2va_run_id="t2va-test",
@@ -347,11 +383,7 @@ def build(finalized, tmp_path, **kwargs):
 
 def test_finalized_source_projection_and_publication(finalized, tmp_path):
     inventory = build(finalized, tmp_path)
-    assert inventory.clip_uids == [
-        "a",
-        "b",
-        "c",
-    ]  # Canonical order, not resolved order.
+    assert inventory.clip_uids == shot_ids(tmp_path)
     assert inventory.jobs[0].upstream_failure
     facts_json = json.dumps([j.model_dump(mode="json") for j in inventory.jobs])
     for forbidden in (
@@ -380,11 +412,11 @@ def test_finalized_source_projection_and_publication(finalized, tmp_path):
     loaded, records, restored = t2va.load_t2va_shadow(root)
     assert loaded == inventory and restored == summary
     assert records[0].status == "skipped"
-    assert not (root / "core/a.json").exists()
+    assert not (root / "core" / f"{inventory.clip_uids[0]}.json").exists()
     page = build_t2va_qa(root)
     payload = json.loads(page.with_name("data.json").read_text())
     assert payload["cases"][1]["speech"][0]["assignment"]["speaker_id"] == "S1"
-    assert payload["cases"][1]["video_url"].endswith("b.mp4")
+    assert payload["cases"][1]["video_url"].endswith("movie_2.mp4")
     assert all(path.read_bytes() == value for path, value in before.items())
     assert not summary.production_artifacts_modified
     with pytest.raises(FileExistsError):
@@ -396,7 +428,8 @@ def test_case_manifest_order_and_dry_run_no_client(finalized, tmp_path, monkeypa
     from tools import run_h3_t2va_shadow as cli
 
     manifest = tmp_path / "selected.json"
-    manifest.write_text('{"clip_uids":["c","b"]}')
+    ids = shot_ids(tmp_path)
+    manifest.write_text(json.dumps({"clip_uids": [ids[2], ids[1]]}))
     monkeypatch.setattr(
         cli,
         "T2VAMimoBackend",
@@ -404,6 +437,8 @@ def test_case_manifest_order_and_dry_run_no_client(finalized, tmp_path, monkeypa
     )
     report = cli.main(
         [
+            "--shot-manifest",
+            str(tmp_path / "shots_f03_motion.jsonl"),
             "--audio-production-root",
             str(finalized[0]),
             "--audio-shadow-run-id",
@@ -419,7 +454,7 @@ def test_case_manifest_order_and_dry_run_no_client(finalized, tmp_path, monkeypa
             "--dry-run",
         ]
     )
-    assert report["clip_uids"] == ["c", "b"] and report["model_call_count"] == 0
+    assert report["clip_uids"] == [ids[2], ids[1]] and report["model_call_count"] == 0
     assert not Path(report["output_root"]).exists()
 
 
@@ -436,7 +471,12 @@ def test_one_failed_clip_does_not_stop_next(finalized, tmp_path):
         result.model_call_count,
     ) == (1, 1, 1, 2)
     root = t2va.t2va_root(finalized[0], "t2va-test")
-    assert json.loads((root / "raw/b.json").read_text())["response"] == "not JSON"
+    assert (
+        json.loads((root / "raw" / f"{inventory.clip_uids[1]}.json").read_text())[
+            "response"
+        ]
+        == "not JSON"
+    )
 
 
 def test_lineage_mismatch_before_call(finalized, tmp_path):

@@ -28,7 +28,7 @@ from r2v_data_v2.h3.sam_audio_stem_shadow import (
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run Qwen3-ASR on SAM speech stems")
-    parser.add_argument("--visual-production-root", type=Path, required=True)
+    parser.add_argument("--visual-production-root", type=Path)
     parser.add_argument("--audio-production-root", type=Path, required=True)
     parser.add_argument("--shadow-run-id")
     parser.add_argument("--case-manifest", type=Path)
@@ -95,13 +95,21 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         raise ValueError("stem ASR case manifest differs from stem diarization order")
     result["clip_uids"] = source_provenance.usable_clip_uids
     if not arguments.dry_run:
+        if arguments.visual_production_root is None:
+            from r2v_data_v2.h3.diarization_binding import DiarizationInventory
+
+            source = DiarizationInventory.model_validate_json(
+                (shadow / "diarization/inventory.json").read_text()
+            )
+            if source.source_inventory_kind != "jea_shot_manifest":
+                raise ValueError("--visual-production-root is required for legacy Visual-rooted ASR")
         backend = _isolated_backend()
         with backend:
             summary, provenance = run_stem_qwen3_asr_shadow(
                 stem_diarization_root=shadow / "diarization",
                 source_visual_production_root=str(
                     arguments.visual_production_root.expanduser().resolve(strict=True)
-                ),
+                ) if arguments.visual_production_root is not None else None,
                 backend=backend,
                 output_root=output,
                 case_manifest=manifest,

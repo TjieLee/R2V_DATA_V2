@@ -30,6 +30,7 @@ from r2v_data_v2.h3.sam_audio_stem_shadow import (
     validate_stem_asr_lineage,
 )
 from r2v_data_v2.h3.schemas import SchemaModel
+from r2v_data_v2.h3.t2va_source import T2VAShotSelection
 
 Text = Annotated[StrictStr, Field(min_length=1)]
 Hash = Annotated[StrictStr, Field(pattern=r"^[0-9a-f]{64}$")]
@@ -272,7 +273,8 @@ class T2VABackendProvenance(SchemaModel):
 
 
 class T2VAInventory(SchemaModel):
-    schema_version: Literal["r2v.h3.t2va_inventory.1"] = "r2v.h3.t2va_inventory.1"
+    schema_version: Literal["r2v.h3.t2va_inventory.2"] = "r2v.h3.t2va_inventory.2"
+    shot_selection: T2VAShotSelection
     audio_production_root: Text
     audio_shadow_run_id: SafeID
     t2va_run_id: SafeID
@@ -286,6 +288,18 @@ class T2VAInventory(SchemaModel):
 
     @model_validator(mode="after")
     def validate_inventory(self) -> Self:
+        selection = self.shot_selection
+        if (
+            [s.clip_uid for s in selection.shots] != self.clip_uids
+            or self.source_hashes.get(selection.shot_manifest_path)
+            != selection.shot_manifest_sha256
+            or any(
+                (j.target_video_path, j.target_video_sha256, j.target_duration_seconds)
+                != (s.video_path, s.video_sha256, s.duration_seconds)
+                for j, s in zip(self.jobs, selection.shots, strict=True)
+            )
+        ):
+            raise ValueError("T2VA jobs differ from authoritative JEA shot selection")
         if self.clip_uids != [j.clip_uid for j in self.jobs] or len(
             set(self.clip_uids)
         ) != len(self.clip_uids):
@@ -306,14 +320,14 @@ class T2VACaseManifest(SchemaModel):
 
 
 def select_clip_uids(
-    canonical_ids: list[str],
+    source_ids: list[str],
     *,
     case_manifest: Path | None = None,
     sample_size: int | None = None,
     sample_seed: int | None = None,
 ) -> list[str]:
-    if len(set(canonical_ids)) != len(canonical_ids) or not canonical_ids:
-        raise ValueError("canonical clip inventory must be nonempty and unique")
+    if len(set(source_ids)) != len(source_ids) or not source_ids:
+        raise ValueError("source clip inventory must be nonempty and unique")
     if case_manifest is not None and (
         sample_size is not None or sample_seed is not None
     ):
@@ -325,13 +339,13 @@ def select_clip_uids(
             case_manifest.read_text()
         ).clip_uids
     elif sample_size is not None:
-        if not 0 < sample_size <= len(canonical_ids):
-            raise ValueError("sample size outside canonical inventory")
-        selected = random.Random(sample_seed).sample(canonical_ids, sample_size)
+        if not 0 < sample_size <= len(source_ids):
+            raise ValueError("sample size outside source inventory")
+        selected = random.Random(sample_seed).sample(source_ids, sample_size)
     else:
-        selected = canonical_ids.copy()
-    if len(set(selected)) != len(selected) or set(selected) - set(canonical_ids):
-        raise ValueError("selected clips must be unique members of canonical inventory")
+        selected = source_ids.copy()
+    if len(set(selected)) != len(selected) or set(selected) - set(source_ids):
+        raise ValueError("selected clips must be unique members of source inventory")
     return selected
 
 
@@ -351,6 +365,9 @@ def t2va_root(audio_production_root: Path, run_id: str) -> Path:
 
 def build_t2va_inventory(
     *,
+    shot_manifest: Path,
+    clips_root: Path | None = None,
+    source_videos_root: Path | None = None,
     audio_production_root: Path,
     audio_shadow_run_id: str,
     t2va_run_id: str,
@@ -359,17 +376,69 @@ def build_t2va_inventory(
     sample_size: int | None = None,
     sample_seed: int | None = None,
 ) -> T2VAInventory:
-    production = audio_production_root.expanduser().resolve(strict=True)
-    t2va_root(production, t2va_run_id)
-    canonical_path = production / "audio/canonical_clips.jsonl"
-    canonical = read_rows(canonical_path, CanonicalAudioClip)
-    selected = select_clip_uids(
-        [c.clip_uid for c in canonical],
+    from r2v_data_v2.h3.t2va_source import select_t2va_shots, validate_cached_target
+
+    selection = select_t2va_shots(
+        shot_manifest,
+        clips_root=clips_root,
+        source_videos_root=source_videos_root,
         case_manifest=case_manifest,
         sample_size=sample_size,
         sample_seed=sample_seed,
     )
+    selected = [s.clip_uid for s in selection.shots]
+    shots = {s.clip_uid: s for s in selection.shots}
+    production = audio_production_root.expanduser().resolve()
+    t2va_root(production, t2va_run_id)
+    canonical_path = production / "audio/canonical_clips.jsonl"
+    canonical = (
+        read_rows(canonical_path, CanonicalAudioClip) if canonical_path.exists() else []
+    )
+    by_clip = {c.clip_uid: c for c in canonical}
+    if len(by_clip) != len(canonical):
+        raise ValueError("duplicate cached canonical Audio identity")
+    for uid in selected:
+        if uid in by_clip:
+            validate_cached_target(shots[uid], by_clip[uid])
+
+    def job_for(uid, facts, reason):
+        shot = shots[uid]
+        return T2VAJob(
+            clip_uid=uid,
+            clip_display_path=shot.clip_display_path,
+            target_video_path=shot.video_path,
+            target_video_sha256=shot.video_sha256,
+            target_duration_seconds=shot.duration_seconds,
+            speech_facts=facts,
+            upstream_failure=reason,
+        )
+
+    def finish(jobs, paths):
+        hashes = {selection.shot_manifest_path: selection.shot_manifest_sha256}
+        hashes.update({str(p): sha256_file(p) for p in paths})
+        if selection.case_manifest_path:
+            hashes[selection.case_manifest_path] = selection.case_manifest_sha256
+        values = {
+            "schema_version": "r2v.h3.t2va_inventory.2",
+            "shot_selection": selection.model_dump(mode="json"),
+            "audio_production_root": str(production),
+            "audio_shadow_run_id": audio_shadow_run_id,
+            "t2va_run_id": t2va_run_id,
+            "source_hashes": hashes,
+            "selection_mode": selection.selection_mode,
+            "sample_seed": sample_seed,
+            "clip_uids": selected,
+            "jobs": [j.model_dump(mode="json") for j in jobs],
+            "backend": backend.model_dump(mode="json"),
+        }
+        return T2VAInventory(**values, inventory_fingerprint=fingerprint(values))
+
     root = stem_shadow_root(production, audio_shadow_run_id)
+    if not (root / "asr").exists():
+        return finish(
+            [job_for(uid, [], "audio_preprocessing_required") for uid in selected],
+            [canonical_path] if canonical_path.exists() else [],
+        )
     asr_provenance, diarization = validate_stem_asr_lineage(
         root / "asr", expected_shadow_root=root
     )
@@ -408,10 +477,21 @@ def build_t2va_inventory(
         or raw_by_key.keys() != asr_by_key.keys()
     ):
         raise ValueError("T2VA DiariZen/ASR segment inventory differs")
-    by_clip = {c.clip_uid: c for c in canonical}
     jobs = []
     for uid in selected:
+        if uid not in by_clip or uid not in resolved.clip_uids:
+            jobs.append(job_for(uid, [], "audio_preprocessing_required"))
+            continue
+        source_job = next(j for j in resolved.jobs if j.clip_uid == uid)
         clip = by_clip[uid]
+        if (
+            source_job.target_video_path != shots[uid].video_path
+            or source_job.target_video_sha256 != shots[uid].video_sha256
+            or source_job.source_audio_path != clip.target_full_audio_path
+            or source_job.source_audio_sha256 != clip.target_full_audio_sha256
+            or source_job.source_frame_count != clip.frame_count
+        ):
+            raise ValueError("T2VA selected JEA shot differs from resolved cache")
         reason = (
             None if uid in asr_provenance.clip_uids else "resolved_speech_unavailable"
         )
@@ -463,17 +543,7 @@ def build_t2va_inventory(
                     text=result.text,
                 )
             )
-        jobs.append(
-            T2VAJob(
-                clip_uid=uid,
-                clip_display_path=clip.clip_display_path,
-                target_video_path=clip.target_video_path,
-                target_video_sha256=clip.target_video_sha256,
-                target_duration_seconds=clip.target_duration_seconds,
-                speech_facts=facts,
-                upstream_failure=reason,
-            )
-        )
+        jobs.append(job_for(uid, facts, reason))
     paths = [
         canonical_path,
         raw_path,
@@ -482,25 +552,7 @@ def build_t2va_inventory(
         root / "asr/stem_provenance.json",
         resolved_root / "inventory.json",
     ]
-    if case_manifest is not None:
-        paths.append(case_manifest.resolve())
-    values = {
-        "schema_version": "r2v.h3.t2va_inventory.1",
-        "audio_production_root": str(production),
-        "audio_shadow_run_id": audio_shadow_run_id,
-        "t2va_run_id": t2va_run_id,
-        "source_hashes": {str(p): sha256_file(p) for p in paths},
-        "selection_mode": "case_manifest"
-        if case_manifest
-        else "random"
-        if sample_size is not None
-        else "all",
-        "sample_seed": sample_seed,
-        "clip_uids": selected,
-        "jobs": [j.model_dump(mode="json") for j in jobs],
-        "backend": backend.model_dump(mode="json"),
-    }
-    return T2VAInventory(**values, inventory_fingerprint=fingerprint(values))
+    return finish(jobs, paths)
 
 
 class T2VARawResponse(SchemaModel):
@@ -589,7 +641,8 @@ def _check_sources(inventory: T2VAInventory) -> None:
     root = stem_shadow_root(
         Path(inventory.audio_production_root), inventory.audio_shadow_run_id
     )
-    validate_stem_asr_lineage(root / "asr", expected_shadow_root=root)
+    if str(root / "asr/stem_provenance.json") in inventory.source_hashes:
+        validate_stem_asr_lineage(root / "asr", expected_shadow_root=root)
 
 
 def run_t2va_shadow(

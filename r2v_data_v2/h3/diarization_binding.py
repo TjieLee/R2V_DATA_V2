@@ -180,12 +180,12 @@ class DiarizationTargetClip(SchemaModel):
 
 
 class DiarizationInventory(SchemaModel):
-    schema_version: Literal["r2v.h3.diarization_inventory.4"] = (
+    schema_version: Literal["r2v.h3.diarization_inventory.4", "r2v.h3.diarization_inventory.5"] = (
         DIARIZATION_INVENTORY_VERSION
     )
     mode: Literal["pilot20", "production"]
     source_inventory_kind: Literal[
-        "pair_inventory", "canonical_audio_manifest"
+        "pair_inventory", "canonical_audio_manifest", "jea_shot_manifest"
     ] = "pair_inventory"
     source_pairs_path: str | None = None
     source_pairs_sha256: str | None = Field(
@@ -193,6 +193,8 @@ class DiarizationInventory(SchemaModel):
         pattern=r"^[0-9a-f]{64}$",
     )
     source_visual_production_root: str | None = None
+    source_shot_manifest_path: str | None = None
+    source_shot_manifest_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     source_visual_inventory_path: str | None = None
     source_visual_inventory_sha256: str | None = Field(
         default=None,
@@ -226,6 +228,7 @@ class DiarizationInventory(SchemaModel):
         "same_ordered_asr_pilot20_targets_v1",
         "complete_in_pair_target_inventory_v1",
         "canonical_visual_target_inventory_v1",
+        "selected_jea_shot_inventory_v1",
     ]
     bounded_selection_applied: bool
     parent_quota_applied: Literal[False] = False
@@ -250,7 +253,23 @@ class DiarizationInventory(SchemaModel):
             self.source_canonical_audio_manifest_path,
             self.source_canonical_audio_manifest_sha256,
         )
-        if self.source_inventory_kind == "pair_inventory":
+        if (self.schema_version == "r2v.h3.diarization_inventory.5") != (
+            self.source_inventory_kind == "jea_shot_manifest"
+        ):
+            raise ValueError("JEA shot provenance requires diarization inventory .5")
+        if self.source_inventory_kind == "jea_shot_manifest":
+            if (
+                self.schema_version != "r2v.h3.diarization_inventory.5"
+                or not self.source_shot_manifest_path or not self.source_shot_manifest_sha256
+                or any(v is not None for v in canonical_fields[:3])
+                or any(v is None for v in canonical_fields[3:])
+                or self.source_pairs_path is not None or self.source_pairs_sha256 is not None
+                or any(t.visual_references or t.target_audio_binding_path or t.target_audio_binding_sha256 for t in self.targets)
+            ):
+                raise ValueError("JEA shot diarization requires source/Audio provenance and no Visual bindings")
+        elif self.source_shot_manifest_path is not None or self.source_shot_manifest_sha256 is not None:
+            raise ValueError("legacy diarization cannot claim JEA shot provenance")
+        elif self.source_inventory_kind == "pair_inventory":
             if self.source_pairs_path is None or self.source_pairs_sha256 is None:
                 raise ValueError("pair-rooted diarization inventory requires pair provenance")
             if any(value is not None for value in canonical_fields):
@@ -279,6 +298,7 @@ class DiarizationInventory(SchemaModel):
             not in {
                 "complete_in_pair_target_inventory_v1",
                 "canonical_visual_target_inventory_v1",
+                "selected_jea_shot_inventory_v1",
             }
             or self.selected_target_count != self.source_target_count
             or self.bounded_selection_applied
@@ -292,6 +312,10 @@ class DiarizationInventory(SchemaModel):
             self.source_inventory_kind == "canonical_audio_manifest"
         ) != (self.selection_mode == "canonical_visual_target_inventory_v1"):
             raise ValueError("production diarization source kind and selection differ")
+        if (self.source_inventory_kind == "jea_shot_manifest") != (
+            self.selection_mode == "selected_jea_shot_inventory_v1"
+        ):
+            raise ValueError("JEA shot diarization source kind and selection differ")
         if self.source_inventory_kind == "canonical_audio_manifest" and any(
             (target.target_audio_binding_path is None)
             != (target.target_audio_binding_sha256 is None)
@@ -1034,9 +1058,16 @@ def _inventory_fingerprint(
     source_inventory_kind: str = "pair_inventory",
     source_visual_inventory_sha256: str | None = None,
     source_canonical_audio_manifest_sha256: str | None = None,
+    source_shot_manifest_sha256: str | None = None,
 ) -> str:
     source: dict[str, str | None] = {}
-    if source_inventory_kind == "canonical_audio_manifest":
+    if source_inventory_kind == "jea_shot_manifest":
+        source.update(
+            source_inventory_kind=source_inventory_kind,
+            source_shot_manifest_sha256=source_shot_manifest_sha256,
+            source_canonical_audio_manifest_sha256=source_canonical_audio_manifest_sha256,
+        )
+    elif source_inventory_kind == "canonical_audio_manifest":
         source.update(
             {
                 "source_inventory_kind": source_inventory_kind,

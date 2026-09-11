@@ -1,9 +1,24 @@
 # Independent T2VA Shadow
 
-This additive product reads the JEA canonical clip inventory and the selected
-named run's finalized **resolved-speech DiariZen + Qwen3-ASR** lineage. It does
-not require a Visual export, reference graph, or a previous MiMo annotation.
-Missing/failed upstream speech is a recorded skip, never an empty-speech fallback.
+The authoritative population is the ordered valid rows of JEA
+`shots_f03_motion.jsonl`, not an Audio production manifest. The whole-video
+`videos.jsonl` precedes shot/temporal processing; each processed shot's
+`video_path` is the T2VA target. Selection reuses the Video branch's
+`JeaVideoMotionAdapter` and path-based `parse_clip_identity`, without running
+Visual annotation, SAM3, entity/reference selection or any pair pipeline.
+Clips without Pictures/Subjects remain eligible.
+
+Canonical Audio and finalized **resolved-speech DiariZen + Qwen3-ASR** are
+downstream caches only. A selected shot may reuse them only with matching clip
+ID, target path/hash and compatible timeline, followed by full resolved lineage
+validation. Missing Audio remains selected with `audio_preprocessing_required`;
+failed upstream speech remains a skip, never an empty-speech fallback.
+
+```text
+JEA shots -> deterministic selection -> original processed shot videos
+  -> canonical Audio -> SAM music_first + AuK speech -> resolved_stems
+  -> DiariZen -> Qwen3-ASR -> one-call MiMo T2VA
+```
 
 Each eligible clip makes one MiMo AV request with the **original target MP4 and
 its embedded audio**, plus a compact table of segment ID, acoustic cluster,
@@ -47,16 +62,59 @@ unchanged.
 
 ## Run
 
+### Select and prepare Audio without Visual
+
+Use a NEW caller-owned Audio workspace, not an existing production root.
+The CPU-only bootstrap reuses `FFmpegAudioMediaBackend.materialize_full_audio`
+to extract 32 kHz stereo FLAC directly from selected shot videos. It does not
+transcode an existing analysis file or run a model. It atomically publishes
+`selection.json`, `case_manifest.json`, `audio/canonical_clips.jsonl`,
+`audio/full_audio/` and a no-reference `diarization/inventory.json`.
+Existing output roots are rejected; no production artifacts are overwritten.
+
+```bash
+export SHOT_MANIFEST=/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/shots_f03_motion.jsonl
+export JEA_CLIPS_ROOT=/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/clips_clean_cropped
+export JEA_SOURCE_VIDEOS_ROOT=/mnt/workspace/public/dataset/jea-video/moive-183t-0808
+export T2VA_AUDIO_ROOT=/mnt/workspace/litengjie/data/t2va_audio/unseen20-v1
+
+"$R2V_PYTHON" tools/prepare_h3_t2va_audio.py \
+  --shot-manifest "$SHOT_MANIFEST" \
+  --clips-root "$JEA_CLIPS_ROOT" --source-videos-root "$JEA_SOURCE_VIDEOS_ROOT" \
+  --sample-size 20 --sample-seed 20260911 \
+  --output-root "$T2VA_AUDIO_ROOT" --dry-run
+```
+
+Remove `--dry-run` for CPU extraction only when ready. Alternatively select by
+`--case-manifest`. Relative media paths use the explicit adapter roots; omitted
+roots default to the shot manifest's directory (use the explicit roots above
+for the server dataset). Invalid rows are recorded with source indices; duplicate
+clip identities fail closed. No reference eligibility field is consulted.
+
+Then use the existing named Audio commands in `H3_AUDIO_SERVER_RUNBOOK.md` with
+`AUDIO_PRODUCTION_ROOT="$T2VA_AUDIO_ROOT"`,
+`CASE_MANIFEST="$T2VA_AUDIO_ROOT/case_manifest.json"`, one new shadow run ID,
+and `--sam-route music_first`: SAM -> AuK -> resolve -> DiariZen -> Qwen3-ASR.
+Do not run the Visual/MiMo Ref2VA/finalizer steps for T2VA.
+The Qwen3-ASR stem CLI needs no `--visual-production-root` for this explicit
+JEA-shot lineage; legacy Visual-rooted runs still require that provenance.
+Model stages remain separate explicit operator actions, not bootstrap side effects.
+
+### T2VA from finalized speech
+
 Use the main R2V Python without a SAM/AuK runtime overlay. The named source run
-must already have `resolved_stems_v1/`, `diarization/` and `asr/` finalized.
+must have `resolved_stems_v1/`, `diarization/` and `asr/` finalized for a clip
+to receive a MiMo call. A dry run can inspect selection before Audio exists.
 First inspect a model-free dry run:
 
 ```bash
 "$R2V_PYTHON" tools/run_h3_t2va_shadow.py \
+  --shot-manifest "$SHOT_MANIFEST" \
+  --clips-root "$JEA_CLIPS_ROOT" --source-videos-root "$JEA_SOURCE_VIDEOS_ROOT" \
   --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
   --audio-shadow-run-id "$AUDIO_SHADOW_RUN_ID" \
   --t2va-run-id t2va-random20-v1 \
-  --sample-size 20 --sample-seed 20260911 \
+  --case-manifest "$AUDIO_PRODUCTION_ROOT/case_manifest.json" \
   --base-url http://127.0.0.1:8092/v1 \
   --transport sglang --model mimo-v2.5 \
   --media-root "$JEA_MEDIA_ROOT" \
@@ -73,8 +131,14 @@ persisted. `--media-mode http --media-base-url URL` is optional; Base64 is defau
 
 Alternatively use `--case-manifest PATH` with ordered `clip_uids` (the existing
 MiMo case manifest format is also accepted), or omit selection arguments for all
-canonical clips. Random size and seed must be supplied together. Selection order
+valid JEA shots. Random size and seed must be supplied together. Selection order
 is persisted and independent of upstream map ordering.
+
+Inventory .2 records source shot manifest path/hash, adapter roots, source row
+index/hash, source video/shot identity and selected video path/hash. The no-Visual
+DiariZen/ASR inventories use .5; legacy .4 inputs remain readable and retain their
+existing behavior. T2VA prompt, no-reference core, request, renderer and QA
+semantics are unchanged. No TA2VA is implemented.
 
 Outputs are isolated under:
 

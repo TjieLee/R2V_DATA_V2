@@ -2046,25 +2046,36 @@ def build_stem_diarization_inventory(
             ),
         )
         targets.append(DiarizationTargetClip.model_validate(values))
-    if production_diarization_inventory.source_inventory_kind != "canonical_audio_manifest":
+    source_kind = production_diarization_inventory.source_inventory_kind
+    if source_kind not in ("canonical_audio_manifest", "jea_shot_manifest"):
         raise ValueError("stem shadow requires canonical production DiariZen provenance")
+    if source_kind == "jea_shot_manifest":
+        for name in ("shot_manifest", "canonical_audio_manifest"):
+            path = getattr(production_diarization_inventory, f"source_{name}_path")
+            digest = getattr(production_diarization_inventory, f"source_{name}_sha256")
+            if sha256_file(Path(path)) != digest:
+                raise ValueError("JEA shot Audio preparation provenance changed")
     source_visual_hash = production_diarization_inventory.source_visual_inventory_sha256
     source_canonical_hash = (
         production_diarization_inventory.source_canonical_audio_manifest_sha256
     )
-    assert source_visual_hash is not None and source_canonical_hash is not None
+    assert source_canonical_hash is not None
     fingerprint = _diarization_inventory_fingerprint(
         source_pairs_sha256=None,
         source_asr_inventory_fingerprint=None,
         mode="production",
         targets=targets,
-        source_inventory_kind="canonical_audio_manifest",
+        source_inventory_kind=source_kind,
+        source_shot_manifest_sha256=production_diarization_inventory.source_shot_manifest_sha256,
         source_visual_inventory_sha256=source_visual_hash,
         source_canonical_audio_manifest_sha256=source_canonical_hash,
     )
     return DiarizationInventory(
         mode="production",
-        source_inventory_kind="canonical_audio_manifest",
+        schema_version=production_diarization_inventory.schema_version,
+        source_inventory_kind=source_kind,
+        source_shot_manifest_path=production_diarization_inventory.source_shot_manifest_path,
+        source_shot_manifest_sha256=production_diarization_inventory.source_shot_manifest_sha256,
         source_visual_production_root=(
             production_diarization_inventory.source_visual_production_root
         ),
@@ -2079,7 +2090,7 @@ def build_stem_diarization_inventory(
         inventory_fingerprint=fingerprint,
         source_target_count=len(targets),
         selected_target_count=len(targets),
-        selection_mode="canonical_visual_target_inventory_v1",
+        selection_mode=production_diarization_inventory.selection_mode,
         bounded_selection_applied=False,
         targets=targets,
     )
@@ -2450,7 +2461,7 @@ def validate_stem_asr_lineage(
 def run_stem_qwen3_asr_shadow(
     *,
     stem_diarization_root: Path,
-    source_visual_production_root: str,
+    source_visual_production_root: str | None,
     backend: Qwen3ASRBackend,
     output_root: Path,
     case_manifest: MimoCaseManifest | None = None,

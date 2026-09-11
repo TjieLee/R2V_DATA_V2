@@ -43,11 +43,38 @@ def published(job, tmp_path, monkeypatch):
     production = tmp_path / "production"
     production.mkdir()
     values = {
-        "schema_version": "r2v.h3.t2va_inventory.1",
+        "schema_version": "r2v.h3.t2va_inventory.2",
+        "shot_selection": {
+            "schema_version": "r2v.h3.t2va_shot_selection.1",
+            "shot_manifest_path": "/synthetic/shots.jsonl",
+            "shot_manifest_sha256": "a" * 64,
+            "clips_root": str(tmp_path),
+            "source_videos_root": str(tmp_path),
+            "selection_mode": "all",
+            "sample_seed": None,
+            "case_manifest_path": None,
+            "case_manifest_sha256": None,
+            "valid_row_count": 2,
+            "excluded_rows": [],
+            "shots": [
+                {
+                    "clip_uid": j.clip_uid,
+                    "source_index": i,
+                    "source_row_sha256": "b" * 64,
+                    "source_video_id": "synthetic",
+                    "shot_index": i,
+                    "clip_display_path": j.clip_display_path,
+                    "video_path": j.target_video_path,
+                    "video_sha256": j.target_video_sha256,
+                    "duration_seconds": j.target_duration_seconds,
+                }
+                for i, j in enumerate([job, other])
+            ],
+        },
         "audio_production_root": str(production),
         "audio_shadow_run_id": "synthetic",
         "t2va_run_id": "qa-test",
-        "source_hashes": {},
+        "source_hashes": {"/synthetic/shots.jsonl": "a" * 64},
         "selection_mode": "all",
         "sample_seed": None,
         "clip_uids": ["clip", "second"],

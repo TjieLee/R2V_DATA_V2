@@ -17,6 +17,9 @@ from r2v_data_v2.h3.t2va_shadow import build_t2va_inventory, run_t2va_shadow, t2
 
 def main(argv: list[str] | None = None) -> dict:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--shot-manifest", type=Path, required=True)
+    parser.add_argument("--clips-root", type=Path)
+    parser.add_argument("--source-videos-root", type=Path)
     parser.add_argument("--audio-production-root", type=Path, required=True)
     parser.add_argument("--audio-shadow-run-id", required=True)
     parser.add_argument("--t2va-run-id", required=True)
@@ -47,6 +50,9 @@ def main(argv: list[str] | None = None) -> dict:
         max_completion_tokens=args.max_completion_tokens,
     )
     inventory = build_t2va_inventory(
+        shot_manifest=args.shot_manifest,
+        clips_root=args.clips_root,
+        source_videos_root=args.source_videos_root,
         audio_production_root=args.audio_production_root,
         audio_shadow_run_id=args.audio_shadow_run_id,
         t2va_run_id=args.t2va_run_id,

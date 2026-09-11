@@ -128,11 +128,11 @@ class Qwen3ASRSegment(SchemaModel):
 
 
 class Qwen3ASRInventory(SchemaModel):
-    schema_version: Literal["r2v.h3.qwen3_asr_inventory.4"] = (
+    schema_version: Literal["r2v.h3.qwen3_asr_inventory.4", "r2v.h3.qwen3_asr_inventory.5"] = (
         QWEN3_ASR_INVENTORY_VERSION
     )
     source_diarization_root: str
-    source_visual_production_root: str
+    source_visual_production_root: str | None
     segment_count: int = Field(ge=0)
     clip_count: int = Field(ge=0)
     source_target_clip_count: int = Field(default=0, ge=0)
@@ -151,7 +151,9 @@ class Qwen3ASRInventory(SchemaModel):
 
     @model_validator(mode="after")
     def validate_target_coverage(self) -> Qwen3ASRInventory:
-        if self.schema_version == QWEN3_ASR_INVENTORY_VERSION:
+        if (self.schema_version == "r2v.h3.qwen3_asr_inventory.5") != (self.source_visual_production_root is None):
+            raise ValueError("Qwen3 ASR no-Visual provenance requires inventory .5")
+        if self.schema_version in (QWEN3_ASR_INVENTORY_VERSION, "r2v.h3.qwen3_asr_inventory.5"):
             if self.source_target_clip_count != (
                 self.clips_with_diarization_segments
                 + self.clips_without_diarization_segments
@@ -655,7 +657,7 @@ def _load_inputs(diarization_root: Path) -> _Inputs:
 def run_qwen3_asr(
     *,
     diarization_root: Path,
-    source_visual_production_root: str,
+    source_visual_production_root: str | None,
     output_root: Path,
     backend: Qwen3ASRBackend,
     segment_audio_loader: SegmentAudioLoader | None = None,
@@ -663,7 +665,15 @@ def run_qwen3_asr(
     overwrite: bool = False,
 ) -> Qwen3ASRSummary:
     inputs = _load_inputs(diarization_root)
-    if not source_visual_production_root.strip():
+    if source_visual_production_root is None:
+        from r2v_data_v2.h3.diarization_binding import DiarizationInventory
+
+        source_inventory = DiarizationInventory.model_validate_json(
+            (Path(diarization_root) / "inventory.json").read_text()
+        )
+        if source_inventory.source_inventory_kind != "jea_shot_manifest":
+            raise ValueError("Qwen3 ASR requires Visual provenance unless sourced from JEA shots")
+    elif not source_visual_production_root.strip():
         raise ValueError("Qwen3 ASR Visual production provenance is empty")
     destination = output_root.expanduser().resolve(strict=False)
     if destination.exists() and not overwrite:
@@ -761,6 +771,7 @@ def run_qwen3_asr(
         source_target_count = len(inputs.target_clip_ids)
         clips_without_segments = source_target_count - clips_with_segments
         inventory = Qwen3ASRInventory(
+            schema_version=("r2v.h3.qwen3_asr_inventory.5" if source_visual_production_root is None else QWEN3_ASR_INVENTORY_VERSION),
             source_diarization_root=str(
                 Path(diarization_root).expanduser().resolve(strict=True)
             ),
