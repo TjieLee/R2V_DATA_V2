@@ -115,8 +115,8 @@ def finalize_audio_reuse_shadow(
     )
     separation = Path(provenance.source_stem_root).resolve(strict=True)
     if provenance.route == "resolved":
-        if sam_route not in (None, "voice_first"):
-            raise ValueError("resolved finalizer requires fixed voice_first SAM lineage")
+        if sam_route not in (None, "music_first"):
+            raise ValueError("resolved finalizer requires fixed music_first SAM lineage")
         sam_route = "resolved"
     else:
         sam_route = sam_route or "music_first"

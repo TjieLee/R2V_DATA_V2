@@ -12,7 +12,7 @@ from r2v_data_v2.h3.resolved_audio_stems import resolve_audio_stems
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="Resolve fixed AuK speech + SAM voice_first music/SFX"
+        description="Resolve fixed AuK speech + SAM music_first music/SFX"
     )
     parser.add_argument("--audio-production-root", type=Path, required=True)
     parser.add_argument("--shadow-run-id", required=True)

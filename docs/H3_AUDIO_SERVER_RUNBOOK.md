@@ -1,6 +1,6 @@
 # H3 Audio Server Runbook
 
-Last updated: 2026-09-08
+Last updated: 2026-09-11
 
 This is the server operating runbook for Audio/H3 development on
 `feature/h3-audio-jea-qwen3-v1`. It complements the Visual-focused
@@ -41,10 +41,18 @@ The current named run uses these owned stages:
 ```text
 sam_audio_stem_shadow_v1/runs/<shadow-run-id>/
   separation/
+  auk_speech_v1/
+  resolved_stems_v1/
   diarization/
   asr/
   mimo_reconcile_stemtext_final_av_markerpolish_v1/
   references/
+  audio_reuse_assets_v1/
+  audio_reuse_prepared_v1/
+  h3_audio_reuse_products_v1/
+  audio_reuse_finalization_v1/
+  h3_frame_conditioned_products_v1/
+  qa/
 ```
 
 All commands must receive the same run ID and ordered case manifest. Hash
@@ -275,7 +283,7 @@ RUN_ARGS=(
   --audio-production-root "$AUDIO_PRODUCTION_ROOT"
   --shadow-run-id "$SHADOW_RUN_ID"
   --case-manifest "$CASE_MANIFEST"
-  --sam-route voice_first
+  --sam-route music_first
 )
 ```
 
@@ -298,7 +306,9 @@ PYTHONPATH="$SAM_AUDIO_RUNTIME_PYTHONPATH" \
 
 Configure the existing isolated AuK Python/checkpoint paths explicitly. SAM and
 AuK remain separate processes. New named runs have fixed speech=AuK,
-music/SFX=SAM voice_first; missing/failed AuK never falls back to SAM speech.
+music/SFX=SAM music_first; missing/failed AuK never falls back to SAM speech.
+SAM speech remains QA/debug only. This is a fixed source assignment, not a
+selector, union, ranking or low-volume filter. SAM must not use both routes.
 
 ```bash
 "$R2V_PYTHON" tools/run_h3_auk_speech_shadow.py \
@@ -315,6 +325,14 @@ DiariZen -> ASR -> MiMo -> Audio reuse finalizer -> frame projection -> QA now
 consume this resolved lineage. Existing frozen SAM-only artifacts remain readable;
 new named-run inference requires `resolved_stems_v1/`. These are operator commands,
 not evidence of a new model run.
+
+Current flow: SAM music_first music/SFX + AuK Base speech -> generic resolved
+`StemRecord` -> DiariZen -> Qwen3-ASR -> MiMo -> Audio reuse -> frame projection
+-> QA. Speaker reuse copies resolved AuK speech; music reuse copies resolved SAM
+music. Canonical full-audio reuse is unchanged. Unnamed legacy SAM-only runs can
+still read their historical music_first or voice_first route; they are compatibility
+inputs only. T2VA continues consuming finalized resolved speech/ASR, without a
+SAM route dependency or any prompt/core/renderer/QA changes.
 
 ### 3. Resolved speech-stem DiariZen
 
@@ -375,7 +393,7 @@ music compatible with the original AV should not be discarded merely because it
 is quiet in the original mix. No text fusion or deterministic music insertion.
 
 Both AV turns enable embedded audio and do not require reference-image tokens.
-The final annotation stays .20. Materializer v26 retains canonical Audio
+The final annotation stays .20. Materializer v28 retains canonical Audio
 definitions/retention and the current recovered-voice profile mapping.
 
 With profile targets: audio=1, visual=1, AV=2, text=0, total=4. Without targets:
@@ -389,9 +407,10 @@ null for new runs. Runtime defaults remain disabled thinking, official ICL,
 temperature 0.0 and 32768 completion tokens. No new runtime canary has been run
 as part of this CPU-only change.
 
-Versions: speech prompt v46, speaker-profile prompt v2, audio finalizer v6, visual v4, annotation .20,
-backend .60, materializer v26, authority v17, ICL v4, marker polish v4;
-reconcile record .14, summary .16, policy v6, QA data .7. Fixed output:
+Versions: speech prompt v48, speaker-profile prompt v2, audio finalizer v6, visual v5, annotation .20,
+backend .63, materializer v28, authority v17, ICL v4, marker polish v4;
+reconcile record .14, resolved summary .17 (legacy SAM summary .16), policy v6,
+QA data .10, Audio reuse materializer v6. Fixed output:
 `mimo_reconcile_stemtext_final_av_markerpolish_v1/`. Old
 `mimo_reconcile_av_stemtext_sound_partition/`, `mimo_v29_oneclip_smoke/`,
 and `mimo_v30_833_oneclip_smoke/` are preserved, not migrated.
@@ -501,7 +520,7 @@ Final raw caption and AV sound fields remain visible for parseable failed record
 music/SFX candidates and errors, final AV sound fields/raw/error, and
 AV/audio call counts are shown separately.
 
-The exact final six-section prompt uses the existing six-section materializer v23 path
+The exact final six-section prompt uses the existing six-section materializer v28 path
 when AV validation permits it. Each source conditioning variant
 remains separate. Multi-speaker attribution still blocks identity-specific
 materialization, and blocked variants expose issues instead of best-effort text.

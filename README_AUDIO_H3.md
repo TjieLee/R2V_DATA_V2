@@ -30,14 +30,18 @@ JEA Audio base production
         ▼
 Named Audio run
 │
-├─ SAM Audio
-│    ├─ speech stem
+├─ SAM Audio (music_first)
+│    ├─ speech stem (QA/debug only)
 │    ├─ music stem
 │    └─ SFX
 │
-├─ DiariZen (speech stem)
+├─ AuK Base → speech
 │
-├─ Qwen3-ASR (speech stem)
+├─ resolved_stems_v1 (speech=AuK, music/SFX=SAM)
+│
+├─ DiariZen (resolved AuK speech)
+│
+├─ Qwen3-ASR (resolved AuK speech)
 │
 ├─ MiMo
 │    ├─ Turn 1: visual
@@ -65,6 +69,9 @@ Audio reuse finalizer   [0 model calls]
 rendered_h3_prompt
         │
         ▼
+Frame-conditioning projection [0 model calls]
+        │
+        ▼
 QA review page
 ```
 
@@ -73,8 +80,8 @@ QA review page
 The final Audio/H3 products are built around these conditioning assets:
 
 - **Visual references**: selected `<Picture N>` / `<Subject N>` graph from the frozen Visual output. Audio does not redo Visual ownership or Subject numbering.
-- **`speaker_speech_reuse`**: target-speaker speech copied from the SAM speech stem back onto the original target timeline. Each output track has the same decoded frame count and zero offset as the canonical target audio; non-owned regions are digital zero. This is timeline-preserving reuse, not tight concatenation.
-- **`music_reuse`**: target-timeline music reuse from the SAM music stem. Stem existence alone is not sufficient to publish it; finalized MiMo `non_diegetic_music` semantics decide whether the Audio slot is used.
+- **`speaker_speech_reuse`**: target-speaker speech copied from the resolved AuK speech stem back onto the original target timeline. Each output track has the same decoded frame count and zero offset as the canonical target audio; non-owned regions are digital zero. This is timeline-preserving reuse, not tight concatenation.
+- **`music_reuse`**: target-timeline music reuse from the resolved SAM `music_first` music stem. Stem existence alone is not sufficient to publish it; finalized MiMo `non_diegetic_music` semantics decide whether the Audio slot is used.
 - **`full_audio_reuse`**: unchanged canonical full target audio as a separate `fully_copy` variant.
 - **`cross_voice`**: for a frozen cross-pair, the target Subject/Sx uses the frozen donor speaker reuse track as a voice/timbre reference. No new identity matching is performed in the reuse path. A donor outside the prepared/reuse inventory is omitted with an explicit warning rather than substituted.
 
@@ -108,13 +115,22 @@ The resulting `AUDIO_PRODUCTION_ROOT/h3/samples.jsonl` contains canonical/in-pai
 The current named-run generation path is:
 
 ```text
-SAM separation
-→ speech-stem DiariZen
-→ speech-stem Qwen3-ASR
+SAM music_first (music/SFX) + AuK Base (speech)
+→ resolved_stems_v1
+→ resolved-speech DiariZen
+→ resolved-speech Qwen3-ASR
 → MiMo reconcile
 → Audio reuse finalizer
+→ frame-conditioning projection
 → QA
 ```
+
+Named runs require the fixed SAM `music_first` source, with no both-route run.
+SAM speech is QA/debug only; unavailable AuK speech never falls back to SAM.
+Generic `StemRecord` lineage follows the resolved source through every downstream
+stage. Historical/default SAM-only runs remain readable for compatibility only.
+Independent T2VA consumes finalized resolved speech/ASR facts; it is not changed
+by this source-policy cleanup.
 
 MiMo ownership is intentionally separated:
 

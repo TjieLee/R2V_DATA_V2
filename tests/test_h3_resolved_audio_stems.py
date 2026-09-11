@@ -25,7 +25,7 @@ ffmpeg = auk_tests.ffmpeg
 
 
 def _resolve(inventory, tmp_path, ffmpeg, *, fail=None):
-    sam_baseline(inventory, tmp_path)
+    sam_baseline(inventory, tmp_path, route="music_first")
     run(inventory, ffmpeg, fail=fail)
     production = Path(inventory.audio_production_root)
     root = resolved.downstream_stem_root(production, inventory.shadow_run_id)
@@ -43,6 +43,9 @@ def _resolve(inventory, tmp_path, ffmpeg, *, fail=None):
 def test_fixed_sources_and_determinism(setup, tmp_path, ffmpeg):
     root, (inventory, records, summary) = _resolve(setup, tmp_path, ffmpeg)
     assert inventory.clip_uids == ["c", "a", "b"]
+    sam_inventory, _, _ = resolved.load_stem_shadow(root.parent / "separation")
+    assert sam_inventory.route == "music_first"
+    assert not sam_inventory.run_both_routes
     assert summary.ready_count == 3
     for record in records:
         assert record.speech.source_backend == "auk"
@@ -81,16 +84,67 @@ def test_failed_auk_has_no_fallback(setup, tmp_path, ffmpeg):
     assert skips[0].reason_code == "resolved_stems_failed"
 
 
+@pytest.mark.parametrize("route,both", [("voice_first", False), ("music_first", True)])
+def test_resolution_rejects_nonfixed_sam_route(setup, tmp_path, ffmpeg, route, both):
+    sam_root = sam_baseline(setup, tmp_path, route=route, run_both_routes=both)
+    run(setup, ffmpeg)
+    # The old SAM artifacts remain readable, but cannot back a new resolved run.
+    assert resolved.load_stem_shadow(sam_root)[0].route == route
+    with pytest.raises(ValueError, match="requires SAM music_first only"):
+        resolved.resolve_audio_stems(
+            audio_production_root=Path(setup.audio_production_root),
+            shadow_run_id=setup.shadow_run_id,
+        )
+    assert not (sam_root.parent / resolved.RESOLVED_STAGE).exists()
+
+
+@pytest.mark.parametrize("sam_speech_change", ["removed", "changed"])
+def test_sam_speech_is_never_requested_as_a_resolved_candidate(
+    setup, tmp_path, ffmpeg, monkeypatch, sam_speech_change
+):
+    from r2v_data_v2.h3.sam_audio_stem_shadow import SAMAudioStemRecord
+
+    sam_root = sam_baseline(setup, tmp_path, route="music_first")
+    run(setup, ffmpeg, fail="a")
+    _, sam_records, _ = resolved.load_stem_shadow(sam_root)
+    for record in sam_records:
+        # Only synthetic QA speech artifacts; music/SFX and signed records stay frozen.
+        path = Path(record.stem("speech").canonical_stem_path)
+        if sam_speech_change == "removed":
+            path.unlink()
+        else:
+            path.write_bytes(b"changed QA-only SAM speech")
+    original = SAMAudioStemRecord.stem
+    requested = []
+
+    def nonspeech_only(self, kind):
+        requested.append(kind)
+        assert kind != "speech", "SAM speech is QA-only, never a downstream candidate"
+        return original(self, kind)
+
+    monkeypatch.setattr(SAMAudioStemRecord, "stem", nonspeech_only)
+    summary = resolved.resolve_audio_stems(
+        audio_production_root=Path(setup.audio_production_root),
+        shadow_run_id=setup.shadow_run_id,
+    )
+    # Atomic publication resolves twice to catch upstream changes.
+    assert requested == ["music", "sfx", "music", "sfx"] * 2
+    assert (summary.ready_count, summary.failed_count) == (2, 1)
+
+
 def test_named_run_never_falls_back(setup, tmp_path):
-    sam_baseline(setup, tmp_path)
+    sam_baseline(setup, tmp_path, route="music_first")
     root = resolved.downstream_stem_root(
         Path(setup.audio_production_root), setup.shadow_run_id
     )
     with pytest.raises(FileNotFoundError):
         resolved.load_stem_source(root)
     assert resolved.downstream_stem_route(setup.shadow_run_id) == "resolved"
+    assert resolved.downstream_stem_route(setup.shadow_run_id, "music_first") == "resolved"
     with pytest.raises(ValueError):
-        resolved.downstream_stem_route(setup.shadow_run_id, "music_first")
+        resolved.downstream_stem_route(setup.shadow_run_id, "voice_first")
+    for route in ("music_first", "voice_first"):
+        assert resolved.downstream_stem_route(None, route) == route
 
 
 def test_all_auk_failures_publish_only_skips(setup, tmp_path, ffmpeg, monkeypatch):
@@ -373,7 +427,7 @@ def test_resolved_run_finalizer_and_qa(setup, tmp_path, ffmpeg, monkeypatch):
     inventory = sam.build_sam_audio_stem_inventory(
         canonical_audio_manifest_path=Path(old.source_canonical_audio_manifest_path),
         model_configuration=old.model_configuration,
-        route="voice_first",
+        route="music_first",
         case_manifest_path=args["case_manifest"],
     )
     sam.run_sam_audio_stem_shadow(
@@ -440,7 +494,9 @@ def test_resolved_run_finalizer_and_qa(setup, tmp_path, ffmpeg, monkeypatch):
     assert reconcile.schema_version.endswith(".17")
     assert reconcile.model_call_count == 12
     before = {p: sha256_file(p) for p in production.rglob("*") if p.is_file()}
-    summary = finalize_audio_reuse_shadow(**args)
+    with pytest.raises(ValueError, match="fixed music_first SAM lineage"):
+        finalize_audio_reuse_shadow(**{**args, "sam_route": "voice_first"})
+    summary = finalize_audio_reuse_shadow(**{**args, "sam_route": "music_first"})
     assert summary.product_ready_count == 6
     assert summary.model_call_count == 0
     assert summary.schema_version.endswith(".2")

@@ -11,7 +11,7 @@ voice references, music references and full-audio reuse remain available unchang
 
 - the authoritative `MimoClipJob` from stem reconcile;
 - its finalized `MimoAVAnnotationDraft`;
-- the matching `SAMAudioStemRecord`;
+- the matching generic `StemRecord` from `resolved_stems_v1` for named runs;
 - `audio_production_root` and a new, separate `output_root`;
 - explicit `allow_unverified=True` for the current unverified SAM pilot outputs.
 
@@ -76,19 +76,23 @@ Audio semantics, not separator existence.
 
 `audio_reuse_materializer.materialize_audio_reuse_products()` reads a prepared,
 frozen MiMo `inventory.json` / `records.jsonl`, the matching H3 `samples.jsonl`,
-SAM separation `records.jsonl`, and `<reuse-root>/<clip-uid>/manifest.json`.
+resolved stem `records.jsonl`, and `<reuse-root>/<clip-uid>/manifest.json`.
 The prepared root uses the explicit
 `r2v.h3.audio_reuse_prepared_source.1` record contract, not legacy
 `MimoRecord`. The bridge validates frozen stem-reconcile .14 records with
-backend .60 or .61, retaining their original backend/configuration and record
+backend .60 through .63, retaining their original backend/configuration and record
 fingerprints. It does not rewrite provenance or migrate annotations.
 All selected ready clips, including any donor clips to be used, need matching
 manifests. A donor outside the prepared inventory is excluded, never substituted.
 
-Validation covers job/annotation/SAM fingerprints, target media, source intervals,
+Validation covers job/annotation/stem fingerprints, target media, source intervals,
 speaker ownership, entity/Subject ownership, media hashes, decoded frame counts,
 32 kHz stereo media, and manifest ordering. Target FLAC subtypes are unrestricted;
-SAM canonical stems are PCM16 WAV and reuse outputs are PCM16 FLAC.
+Resolved AuK speech and SAM music/SFX are PCM16 WAV; reuse outputs are PCM16 FLAC.
+Named runs use AuK Base speech and SAM `music_first` music/SFX through generic
+`StemRecord` lineage. SAM speech is QA/debug only, never a fallback.
+Historical SAM-only `SAMAudioStemRecord` inputs remain supported for read
+compatibility, not as the new named-run policy.
 No PCM is generated here. Stale
 lineage fails before publication. Inputs are rehashed before atomic publication;
 existing output directories, source roots and production stages cannot be replaced.
@@ -130,7 +134,7 @@ the six-section H3 layout remain unchanged.
 
 The new product contracts are `r2v.h3.audio_reuse_product.1` and
 `r2v.h3.audio_reuse_product_summary.1`, with materializer policy
-`h3_mimo25_audio_reuse_materializer_v3`. Only this product path projects exact
+`h3_mimo25_audio_reuse_materializer_v6`. Only this product path projects exact
 chronological ASR dialogue into protected frozen caption slots, inserts missing
 speech with finalized presentation, and then projects Audio relationships.
 Extra or contradictory speaker slots fail closed. Legacy v26 rendering is unchanged.
@@ -138,14 +142,15 @@ Dialogue-bearing summary sentences are pruned without rewriting retained prose;
 final dialogue is validated per section and allowed only in detailed_description.
 `ReuseAudioReference` carries the full
 multi-segment asset plus manifest path/hash/fingerprint and donor provenance.
-This separate versioned product leaves MiMo backend .61, annotation .20, all
-prompts and legacy materializer v26 provenance untouched.
+This separate versioned product leaves MiMo backend .63, annotation .20, all
+prompts and materializer v28 provenance untouched. Historical v26 outputs are
+not migrated.
 
 ## CPU-Only Server Materialization
 
 First prepare the frozen effective input after Phase-1 assets have been produced.
 The base defines clip order; an optional override replaces whole records only,
-including failures. Unknown/duplicate clips or mismatched job/SAM fingerprints
+including failures. Unknown/duplicate clips or mismatched job/stem fingerprints
 fail closed. Counts come from the files, never a fixed clip quota.
 
 The bridge reuses the existing production inventory and stem-reconcile job
@@ -179,7 +184,7 @@ Then materialize. No inference, asset regeneration or production overwrite:
   --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
   --mimo-root "$PREPARED_ROOT" \
   --source-h3-root "$PREPARED_ROOT/h3" \
-  --separation-root "$SHADOW_RUN_ROOT/separation" \
+  --separation-root "$SHADOW_RUN_ROOT/resolved_stems_v1" \
   --reuse-root "$SHADOW_RUN_ROOT/audio_reuse_assets_v1" \
   --output-root "$SHADOW_RUN_ROOT/h3_audio_reuse_products_v1" \
   --enable-full-audio-reuse

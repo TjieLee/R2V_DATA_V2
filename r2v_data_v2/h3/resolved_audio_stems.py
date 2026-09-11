@@ -202,9 +202,9 @@ def downstream_stem_route(
     run_id: str | None, legacy_route: str | None = None
 ) -> Literal["resolved", "music_first", "voice_first"]:
     if run_id is not None:
-        if legacy_route not in (None, "voice_first"):
+        if legacy_route not in (None, "music_first"):
             raise ValueError(
-                "named resolved runs require the fixed SAM voice_first source"
+                "named resolved runs require the fixed SAM music_first source"
             )
         return "resolved"
     if legacy_route not in (None, "music_first", "voice_first"):
@@ -218,8 +218,8 @@ def _resolve(
     sam_root, auk_root = root.parent / "separation", root.parent / "auk_speech_v1"
     sam, sam_records, _ = load_stem_shadow(sam_root)
     auk, auk_records, _ = load_auk_shadow(auk_root)
-    if sam.route != "voice_first" or sam.run_both_routes:
-        raise ValueError("resolved policy requires SAM voice_first only")
+    if sam.route != "music_first" or sam.run_both_routes:
+        raise ValueError("resolved policy requires SAM music_first only")
     if (
         sam.clip_uids != auk.clip_uids
         or [r.clip_uid for r in sam_records] != sam.clip_uids

@@ -532,7 +532,7 @@ def test_cli_preflight_before_worker_startup(setup, monkeypatch):
         )
 
 
-def sam_baseline(inventory, tmp_path):
+def sam_baseline(inventory, tmp_path, *, route="voice_first", run_both_routes=False):
     from r2v_data_v2.h3.audio_backends import AudioFileProbe
     from tests.test_h3_sam_audio_stem_shadow import (
         _Canonicalizer,
@@ -582,7 +582,8 @@ def sam_baseline(inventory, tmp_path):
             inventory.source_canonical_audio_manifest_path
         ),
         model_configuration=config,
-        route="voice_first",
+        route=route,
+        run_both_routes=run_both_routes,
         case_manifest_path=Path(inventory.source_case_manifest_path),
     )
     root = stem_separation_root(
