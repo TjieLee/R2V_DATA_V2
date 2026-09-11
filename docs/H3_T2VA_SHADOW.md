@@ -8,6 +8,9 @@ The authoritative population is the ordered valid rows of JEA
 Visual annotation, SAM3, entity/reference selection or any pair pipeline.
 Clips without Pictures/Subjects remain eligible.
 
+For the current frozen server-side happy path, including the validated random20
+commands and downstream TA2VA `.2`, use `H3_T2VA_TA2VA_SERVER_RUNBOOK.md`.
+
 Canonical Audio and finalized **resolved-speech DiariZen + Qwen3-ASR** are
 downstream caches only. A selected shot may reuse them only with matching clip
 ID, target path/hash and compatible timeline, followed by full resolved lineage
@@ -31,9 +34,10 @@ fallback. A failed first call prevents the second; actual calls are counted.
 
 ## Core and Authority
 
-`H3NoReferenceAVCore` .4 stores speaker assignments, the typed integrated sequence,
+`H3NoReferenceAVCore` `.6` stores speaker assignments, the typed integrated
+sequence, the internal TA2VA summary, per-segment waveform-ownership evidence,
 authoritative speech facts/target duration, and the two sound fields. The pure
-renderer produces only, in order:
+public renderer still produces only, in order:
 
 1. `integrated_multimodal_description`
 2. `overall_soundscape`
@@ -68,20 +72,22 @@ It removes reference/retention/entity-binding instructions and final sound field
 The separate audio call uses frozen `audio_finalize_v6` unchanged. Semantic sound
 classification remains a model judgment, not a keyword-based validator.
 
-The current contract uses T2VA prompt v7/backend .7 and core .6. Per-segment
-primary ownership, vocal composition and secondary activity are required internal
-evidence for downstream waveform reuse; they do not change Sx, presentation,
-ASR or the public three sections. Fresh run IDs are required. Model-visible
-speech facts contain only segment/cluster, times, language and `has_transcript`;
-exact ASR words stay inside the job/core and are never sent in text conditioning.
+The frozen target-side contract uses T2VA prompt v7/backend `.7` and core `.6`.
+Per-segment primary ownership, vocal composition and secondary activity are
+required internal evidence for downstream waveform reuse; they do not change Sx,
+presentation, ASR or the public three sections. Fresh run IDs are required for
+contract changes. Model-visible speech facts contain only segment/cluster, times,
+language and `has_transcript`; exact ASR words stay inside the job/core and are
+never sent in text conditioning.
+
 The explicit ordered `dialogue_segment_ids` list controls speech slots, while
 assignments still cover every supplied segment. Bare Sx tokens, as well as
-parenthesized markers, are forbidden in model-owned text. Only the renderer
-emits final Sx/dialogue serialization. A narrow cleanup removes redundant Sx only
-from a speech lead-in when it matches that segment's validated assignment.
-Conflicting markers and markers elsewhere still fail. Raw output and correction
-counts are retained. Prose parts are bounded at 12,000 characters and lead-ins
-at 512; substantial exact normalized sentence/block loops fail without rewriting.
+parenthesized markers, are forbidden in model-owned text. Only the renderer emits
+final Sx/dialogue serialization. A narrow cleanup removes redundant Sx only from
+a speech lead-in when it matches that segment's validated assignment. Conflicting
+markers and markers elsewhere still fail. Raw output and correction counts are
+retained. Prose parts are bounded at 12,000 characters and lead-ins at 512;
+substantial exact normalized sentence/block loops fail without rewriting.
 
 The first-call contract supplies deterministic `required_speech_slots` alongside
 `dialogue_segment_ids`, without ASR words, Sx, presentation answers or insertion
@@ -93,18 +99,18 @@ The semantic draft also returns a short internal summary for downstream TA2VA.
 It cannot contain reference/task/section syntax, Sx or copied ASR. The public
 T2VA renderer still emits only its original three sections. No extra call is added.
 
-This is not fingerprint-compatible with v5 or the prior model-written dialogue
-string. A prior-contract run ID is rejected even with `--overwrite`: use a new
-run ID; frozen prior outputs are not rewritten. Inventory .3 binds resolved media;
-raw .2 separates both attempts; record/summary .2 account for up to two calls.
-The three-section final format is unchanged. QA .3 shows segment/cluster, Sx and
-presentation, model lead-in, authoritative ASR and rendered speech side by side,
-plus original video, four Audio sources and both calls' raw responses/diagnostics.
+This v7 contract is not fingerprint-compatible with v6 or earlier T2VA semantic
+contracts. A prior-contract run ID is rejected even with `--overwrite`: use a new
+run ID; frozen prior outputs are not rewritten. Inventory `.3` binds resolved
+media; raw `.2` separates both attempts; record/summary `.2` account for up to two
+calls. QA `.3` shows segment/cluster, Sx and presentation, model lead-in,
+authoritative ASR and rendered speech side by side, plus original video, four
+Audio sources and both calls' raw responses/diagnostics.
 
-Target-side TA2VA consumes this stored core; see `H3_TA2VA_SHADOW.md`. It adds
-validated Audio contracts without another AV inference. Cross-pair remains deferred.
-Existing Ref2VA/RA2VA, Audio reuse, Visual and frame-conditioned products are
-unchanged.
+Target-side TA2VA consumes this stored v7 core; see `H3_TA2VA_SHADOW.md`. It adds
+validated Audio contracts without another AV inference. Cross-pair remains
+deferred to GitHub Issue #13. Existing Ref2VA/RA2VA, Audio reuse, Visual and
+frame-conditioned products are unchanged.
 
 ## Run
 
@@ -151,7 +157,9 @@ Model stages remain separate explicit operator actions, not bootstrap side effec
 Use the main R2V Python without a SAM/AuK runtime overlay. The named source run
 must have `resolved_stems_v1/`, `diarization/` and `asr/` finalized for a clip
 to receive a MiMo call. A dry run can inspect selection before Audio exists.
-First inspect a model-free dry run:
+
+The current exact tested server command is maintained in
+`H3_T2VA_TA2VA_SERVER_RUNBOOK.md`. A generic model-free dry run is:
 
 ```bash
 "$R2V_PYTHON" tools/run_h3_t2va_shadow.py \
@@ -168,12 +176,12 @@ First inspect a model-free dry run:
   --dry-run
 ```
 
-Remove `--dry-run` only for an explicitly approved real run. This coding task
-does not perform one. Temperature is fixed at zero, thinking disabled, video
-sampling 4 fps, and OpenAI SDK retries disabled. SGLang uses strict JSON-schema
-output and `use_audio_in_video=true`; Xiaomi remains available with JSON-object
-output and disabled thinking. API credentials use `MIMO_API_KEY` and are never
-persisted. `--media-mode http --media-base-url URL` is optional; Base64 is default.
+Remove `--dry-run` only when the real run is intended. Temperature is fixed at
+zero, thinking disabled, video sampling 4 fps, and OpenAI SDK retries disabled.
+SGLang uses strict JSON-schema output and `use_audio_in_video=true`; Xiaomi remains
+available with JSON-object output and disabled thinking. API credentials use
+`MIMO_API_KEY` and are never persisted. `--media-mode http --media-base-url URL`
+is optional; Base64 is default.
 
 Alternatively use `--case-manifest PATH` with ordered `clip_uids` (the existing
 MiMo case manifest format is also accepted), or omit selection arguments for all
@@ -183,8 +191,8 @@ is persisted and independent of upstream map ordering.
 Random JSONL selection uses a lazy seeded permutation of nonblank row indices,
 not a parsed population. Only drawn rows are decoded/adapted; invalid rows and
 duplicate clip identities consume a draw and are replaced until N valid unique
-clips are selected. Exhaustion fails closed. Selection .2 records this indexed
-policy; .1 remains readable. Seeds are reproducible within this policy, but do
+clips are selected. Exhaustion fails closed. Selection `.2` records this indexed
+policy; `.1` remains readable. Seeds are reproducible within this policy, but do
 not reproduce the previous full-population `random.sample` selection.
 
 Both selection CLIs accept `--shot-index-root PATH`, a writable cache outside
@@ -195,15 +203,15 @@ rows. Cache identity includes resolved path, device/inode, size, mtime and ctime
 changes rebuild the index, and changes during selection fail closed. Offset
 checksums detect damaged caches. Cached manifest hashes rely on these filesystem
 identity fields, so use a local filesystem that reports file changes faithfully.
-No index is written beside the public source manifest. Selected rows retain
-their row/clip/video provenance. Random `valid_row_count` is null because the
-unvisited population has not been validated; all/case selection retains its
-existing exhaustive lookup and exact valid-row count.
+No index is written beside the public source manifest. Selected rows retain their
+row/clip/video provenance. Random `valid_row_count` is null because the unvisited
+population has not been validated; all/case selection retains its existing
+exhaustive lookup and exact valid-row count.
 
-Inventory .3 records source shot manifest path/hash, adapter roots, source row
+Inventory `.3` records source shot manifest path/hash, adapter roots, source row
 index/hash, source video/shot identity and selected video path/hash. The no-Visual
-DiariZen/ASR inventories use .5; legacy .4 inputs remain readable and retain their
-existing behavior.
+DiariZen/ASR inventories use `.5`; legacy `.4` inputs remain readable and retain
+their existing behavior.
 
 Outputs are isolated under:
 
@@ -240,26 +248,33 @@ python -m http.server 8765 --bind 127.0.0.1 --directory /mnt/workspace
 ```
 
 Open the emitted `qa/review.html` through that HTTP server using its path relative
-to /mnt/workspace (or locally with the HTTP media URLs). Without the two media
+to `/mnt/workspace` (or locally with the HTTP media URLs). Without the two media
 options, URLs remain relative filesystem paths. All exposed media must remain
 under the supplied media root, including resolved symlink targets. No media is
 copied, symlinked, cropped or transcoded.
 
 Before exposing media, QA validates the named resolved inventory, canonical
-target identity, resolved record fingerprints and all four Audio hashes.
-Players show original/full target audio, AuK speech, SAM music and SAM SFX.
-Each speech row offers original-audio and speech-stem segment playback by seeking
-the existing full-timeline file and pausing at the available segment end. No
-segment WAV is created. Changing clips stops segment playback.
+target identity, resolved record fingerprints and all four Audio hashes. Players
+show original/full target audio, AuK speech, SAM music and SAM SFX. Each speech row
+offers original-audio and speech-stem segment playback by seeking the existing
+full-timeline file and pausing at the available segment end. No segment WAV is
+created. Changing clips stops segment playback.
 
 The dedicated R2VA-style audio-finalizer section shows final soundscape/music,
-with its response and diagnostics separate from T2VA semantic raw output.
-Compare those judgments against original audio and the two SAM stems; compare
+with its response and diagnostics separate from T2VA semantic raw output. Compare
+those judgments against original audio and the two SAM stems; compare
 speaker/presentation and exact dialogue against original video and AuK speech.
 The page has no external dependencies and does not alter annotations or integrate
 with existing H3 QA.
 
 Manually inspect a fresh small unseen canary for full-shot visual coverage,
-speaker transitions, exact speech timing/text, soundscape/music partition and
-absence of reference syntax before scaling. Local synthetic tests prove transport
-shape and deterministic contracts, not model accuracy or server performance.
+speaker transitions, exact speech timing/text, ownership evidence,
+soundscape/music partition and absence of reference syntax before scaling. Local
+synthetic tests prove transport shape and deterministic contracts, not model
+accuracy or server performance.
+
+## Freeze
+
+Target-side T2VA v7/core `.6` is frozen together with downstream TA2VA `.2` after
+the validated random20 acceptance. Do not change this path for unrelated cleanup.
+Cross-pair is separate deferred work tracked in Issue #13.
