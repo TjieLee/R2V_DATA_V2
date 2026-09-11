@@ -1,7 +1,7 @@
 # Target-Side TA2VA Shadow
 
-TA2VA .1 is an additive downstream consumer of a **summary-enabled T2VA v6**
-run (backend .6, no-reference core .5). Old T2VA runs are not rewritten or given
+TA2VA .1 is an additive downstream consumer of an **ownership-enabled T2VA v7**
+run (backend .7, no-reference core .6). Old T2VA runs are not rewritten or given
 invented summaries. T2VA itself still publishes exactly three sections and makes
 two calls: semantic AV, then the unchanged frozen audio_finalize_v6.
 
@@ -33,8 +33,17 @@ placement. Cross-Sx overlaps and ranges outside available target/stem media make
 the affected Sx unavailable, matching the shared-stem isolation constraint.
 There is no LR-ASD, visibility, duration or voice-quality ranking gate.
 
+Required per-segment acoustic ownership evidence is internal to the T2VA core.
+TA2VA uses the shared `speaker_ownership_reasons()` rule, including its
+same-speaker nonlexical exception. Any unsafe segment blocks its frozen Sx from
+speech reuse without changing Sx assignments, presentation or ASR. Exclusions
+include Sx/segment/reason in summary `reuse_exclusions` and warning counts,
+including clips with no published speech variant. A fresh T2VA v7 run is required;
+missing evidence in old cores is never inferred as safe.
+
 Speakers are selected in numeric Sx order, up to three. Music is added only when
-the frozen T2VA finalizer's music field is not `N/A` and capacity remains.
+the frozen T2VA finalizer's stripped music field is non-empty and is neither
+`n/a` nor `unknown` (case-insensitive), and capacity remains, matching RA2VA.
 Music uses the same bounded copy/silence-tail policy as RA2VA. Omitted speakers
 and music have explicit capacity warnings. No eligible speech means no
 `target_speech_reuse` product, even when music is positive.
@@ -69,15 +78,15 @@ speech-reuse music adds only the canonical relation when music Audio is present.
 
 ## Small Pilot
 
-First produce a fresh, small T2VA v6 run with the existing source/case selection
+First produce a fresh, small T2VA v7 run with the existing source/case selection
 CLI in `H3_T2VA_SHADOW.md`. Do not rerun separation/ASR for an already matching
-resolved Audio cache. The old v5 core cannot provide the newly required summary.
+resolved Audio cache. Older cores lack the required structured ownership evidence.
 
 With `T2VA_ROOT` pointing to that completed run:
 
 ```bash
 cd /mnt/workspace/litengjie/data/R2V_DATA_V2
-export T2VA_ROOT="$AUDIO_PRODUCTION_ROOT/t2va_shadow_v1/runs/ta2va-core-v6-pilot2"
+export T2VA_ROOT="$AUDIO_PRODUCTION_ROOT/t2va_shadow_v1/runs/ta2va-core-v7-pilot2"
 
 "$R2V_PYTHON" tools/run_h3_ta2va_shadow.py \
   --t2va-root "$T2VA_ROOT" \

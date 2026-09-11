@@ -68,7 +68,10 @@ It removes reference/retention/entity-binding instructions and final sound field
 The separate audio call uses frozen `audio_finalize_v6` unchanged. Semantic sound
 classification remains a model judgment, not a keyword-based validator.
 
-The current contract uses T2VA prompt v6/backend .6 and core .5. Model-visible
+The current contract uses T2VA prompt v7/backend .7 and core .6. Per-segment
+primary ownership, vocal composition and secondary activity are required internal
+evidence for downstream waveform reuse; they do not change Sx, presentation,
+ASR or the public three sections. Fresh run IDs are required. Model-visible
 speech facts contain only segment/cluster, times, language and `has_transcript`;
 exact ASR words stay inside the job/core and are never sent in text conditioning.
 The explicit ordered `dialogue_segment_ids` list controls speech slots, while
@@ -156,7 +159,7 @@ First inspect a model-free dry run:
   --clips-root "$JEA_CLIPS_ROOT" --source-videos-root "$JEA_SOURCE_VIDEOS_ROOT" \
   --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
   --audio-shadow-run-id "$AUDIO_SHADOW_RUN_ID" \
-  --t2va-run-id t2va-random20-v6 \
+  --t2va-run-id t2va-random20-v7 \
   --case-manifest "$AUDIO_PRODUCTION_ROOT/case_manifest.json" \
   --base-url http://127.0.0.1:8092/v1 \
   --transport sglang --model mimo-v2.5 \
@@ -231,7 +234,7 @@ python -m http.server 8765 --bind 127.0.0.1 --directory /mnt/workspace
 
 ```bash
 "$R2V_PYTHON" tools/build_h3_t2va_qa.py \
-  --t2va-root "$AUDIO_PRODUCTION_ROOT/t2va_shadow_v1/runs/t2va-random20-v6" \
+  --t2va-root "$AUDIO_PRODUCTION_ROOT/t2va_shadow_v1/runs/t2va-random20-v7" \
   --media-root /mnt/workspace \
   --media-base-url http://127.0.0.1:8765
 ```

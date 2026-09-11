@@ -2,17 +2,28 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, Protocol
 
-from r2v_data_v2.h3.mimo25_backend import MimoAudioSegmentDecision
+from r2v_data_v2.h3.mimo25_backend import MimoSecondaryVocalActivity, VocalComposition
 
 SpeakerOwnershipReason = Literal[
     "unresolved", "non_single_speaker", "secondary_vocal_activity",
 ]
 
 
+class SpeakerOwnershipEvidence(Protocol):
+    @property
+    def primary_speaker_group(self) -> str | None: ...
+
+    @property
+    def vocal_composition(self) -> VocalComposition: ...
+
+    @property
+    def secondary_vocal_activity(self) -> MimoSecondaryVocalActivity: ...
+
+
 def speaker_ownership_reasons(
-    decision: MimoAudioSegmentDecision,
+    decision: SpeakerOwnershipEvidence,
 ) -> list[SpeakerOwnershipReason]:
     """Return only reasons that prevent isolated primary-speaker ownership."""
     reasons: list[SpeakerOwnershipReason] = []

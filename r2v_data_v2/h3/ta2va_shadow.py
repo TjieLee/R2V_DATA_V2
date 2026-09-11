@@ -43,6 +43,7 @@ from r2v_data_v2.h3.qwen38_h3_recaption import (
 from r2v_data_v2.h3.resolved_audio_stems import load_resolved_stems
 from r2v_data_v2.h3.sam_audio_stem_shadow import sha256_file, stem_shadow_root
 from r2v_data_v2.h3.schemas import SchemaModel
+from r2v_data_v2.h3.speaker_ownership import speaker_ownership_reasons
 from r2v_data_v2.h3.t2va_mimo_backend import T2VAMimoBackend, T2VAMimoConfig
 from r2v_data_v2.h3.t2va_shadow import (
     H3NoReferenceAVCore,
@@ -296,6 +297,10 @@ def sample_ranges(
             target_end_sample=end,
         )
         sx = assignment.speaker_id
+        reasons = speaker_ownership_reasons(assignment)
+        if reasons:
+            blocked.add(sx)
+            warnings.extend(f"{sx}:{fact.segment_id}:{reason}" for reason in reasons)
         all_ranges.append((sx, r))
         if fact.text is not None:
             groups.setdefault(sx, []).append(r)
@@ -324,6 +329,11 @@ def select_speakers(groups, music_positive: bool):
     if music_positive and not include_music:
         warnings.append("music:omitted_audio_capacity")
     return selected, include_music, warnings
+
+
+def _music_present(description: str) -> bool:
+    music = description.strip()
+    return bool(music) and music.casefold() not in {"n/a", "unknown"}
 
 
 def speech_track(pcm, frames, ranges):
@@ -546,6 +556,8 @@ def run_ta2va_shadow(
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_name(f".{run_id}.tmp-{uuid.uuid4().hex}")
     products = []
+    reuse_exclusions = {}
+    unpublished_warnings = []
     try:
         for folder in ("assets", "raw_profiles", "prompts"):
             (temporary / folder).mkdir(parents=True, exist_ok=True)
@@ -634,10 +646,13 @@ def run_ta2va_shadow(
             groups, exclusions = sample_ranges(
                 job, core, segments, frames, len(speech_pcm)
             )
+            if exclusions:
+                reuse_exclusions[job.clip_uid] = exclusions
             selected, include_music, warnings = select_speakers(
-                groups, core.non_diegetic_music.strip() != "N/A"
+                groups, _music_present(core.non_diegetic_music)
             )
             if not selected:
+                unpublished_warnings.extend(exclusions)
                 continue
             warnings = [*exclusions, *warnings]
             assets, snippets, targets = [], [], []
@@ -799,9 +814,15 @@ def run_ta2va_shadow(
             ),
             "model_call_count": sum(p.model_call_count for p in products),
             "warning_counts": dict(
-                sorted(Counter(w for p in products for w in p.warnings).items())
+                sorted(
+                    (
+                        Counter(w for p in products for w in p.warnings)
+                        + Counter(unpublished_warnings)
+                    ).items()
+                )
             ),
             "production_artifacts_modified": False,
+            "reuse_exclusions": reuse_exclusions,
         }
         _json(temporary / "inventory.json", values)
         _json(temporary / "summary.json", summary)

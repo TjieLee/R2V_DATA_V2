@@ -116,6 +116,11 @@ def draft_for(job):
                 "source_speaker_cluster": fact.source_speaker_cluster,
                 "speaker_id": speaker,
                 "speech_presentation": "onscreen_spoken",
+                "primary_speaker_ownership_resolved": True,
+                "vocal_composition": "single_speaker",
+                "secondary_vocal_activity": {
+                    "present": False, "speaker_relation": "none", "kind": None,
+                },
             }
         )
         if fact.text is not None:

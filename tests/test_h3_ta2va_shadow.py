@@ -102,14 +102,18 @@ def playable_manifest(monkeypatch, ffmpeg):
 
 
 @pytest.fixture
-def source(playable_manifest, finalized, tmp_path):
+def source(playable_manifest, finalized, tmp_path, request):
     inventory = shared.build(finalized, tmp_path)
+    drafts = []
+    for job in inventory.jobs:
+        if job.upstream_failure:
+            continue
+        draft = shared.draft_for(job)
+        if getattr(request, "param", None) == "unsafe":
+            draft.speaker_assignments[0].primary_speaker_ownership_resolved = False
+        drafts.append(draft.model_dump_json())
     client = shared.Client(
-        [
-            shared.draft_for(j).model_dump_json()
-            for j in inventory.jobs
-            if not j.upstream_failure
-        ],
+        drafts,
         audio_response=json.dumps(
             {
                 "overall_soundscape": "Light footsteps are audible.",
@@ -226,6 +230,103 @@ def test_same_sx_keeps_multiple_separated_intervals(job):
     assert not np.any(result[:32000])
     assert not np.any(result[48000:64000])
     assert not np.any(result[80000:])
+
+
+@pytest.mark.parametrize(
+    "resolved,composition,present,relation,kind,reusable",
+    [
+        (True, "single_speaker", False, "none", None, True),
+        (False, "single_speaker", False, "none", None, False),
+        (True, "same_speaker_nonlexical", True, "same_speaker", "laughter", True),
+        (True, "same_speaker_nonlexical", True, "same_speaker", "speech", False),
+        (True, "secondary_non_speech_vocalization", True, "different_speaker", "laughter", False),
+        (True, "overlapping_secondary_speech", True, "different_speaker", "speech", False),
+        (True, "sequential_multi_speaker_speech", True, "different_speaker", "speech", False),
+        (True, "uncertain", False, "none", None, False),
+    ],
+)
+def test_frozen_ownership_blocks_entire_sx(
+    job, resolved, composition, present, relation, kind, reusable
+):
+    from r2v_data_v2.h3.speaker_ownership import speaker_ownership_reasons
+
+    job.speech_facts[1].source_speaker_cluster = job.speech_facts[0].source_speaker_cluster
+    draft = shared.draft_for(job)
+    assignment = draft.speaker_assignments[0]
+    values = assignment.model_dump()
+    values.update(
+        primary_speaker_ownership_resolved=resolved,
+        vocal_composition=composition,
+        secondary_vocal_activity={"present": present, "speaker_relation": relation, "kind": kind},
+    )
+    draft.speaker_assignments[0] = type(assignment).model_validate(values)
+    before = render_t2va_prompt(shared.materialize(job, shared.draft_for(job)))
+    core = shared.materialize(job, draft)
+    assert render_t2va_prompt(core) == before
+    assert [a.speaker_id for a in core.speaker_assignments] == ["S1", "S1"]
+    assert "entity_id" not in values and "subject_label" not in values
+    groups, warnings = ta.sample_ranges(job, core, samples(job), 160000, 160000)
+    assert bool(groups) is reusable
+    reasons = speaker_ownership_reasons(draft.speaker_assignments[0])
+    assert warnings == [f"S1:{job.speech_facts[0].segment_id}:{r}" for r in reasons]
+    if not reusable:
+        assert "S1" not in groups  # The otherwise-safe second segment cannot rescue this Sx.
+
+
+@pytest.mark.parametrize("source", ["unsafe"], indirect=True)
+def test_unsafe_sx_no_speech_product_and_summary_exclusions(source, tmp_path):
+    root, products, client = run(source, tmp_path)
+    assert not client.calls
+    assert all(p.variant == "full_audio_reuse" and p.status == "ready" for p in products)
+    summary = json.loads((root / "summary.json").read_text())
+    assert summary["model_call_count"] == 0
+    assert len(summary["reuse_exclusions"]) == 2
+    assert all(w.endswith(":unresolved")
+               for rows in summary["reuse_exclusions"].values() for w in rows)
+    assert sum(summary["warning_counts"].values()) == 2
+
+
+@pytest.mark.parametrize("music", ["N/A", "n/a", "Unknown", "unknown", "", "  ", " N/a "])
+def test_music_absence_matches_ra2va(music):
+    assert not ta._music_present(music)
+    assert not ta.select_speakers({"S1": []}, ta._music_present(music))[1]
+
+
+def test_positive_music_gate():
+    assert ta._music_present(" A piano melody. ")
+    assert ta.select_speakers({"S1": []}, ta._music_present("A piano melody."))[1]
+
+
+def test_unsafe_nontranscribed_segment_also_blocks_sx(job):
+    job.speech_facts[0].text = job.speech_facts[0].language = None
+    job.speech_facts[1].source_speaker_cluster = job.speech_facts[0].source_speaker_cluster
+    draft = shared.draft_for(job)
+    draft.speaker_assignments[0].vocal_composition = "uncertain"
+    core = shared.materialize(job, draft)
+    groups, warnings = ta.sample_ranges(job, core, samples(job), 160000, 160000)
+    assert not groups
+    assert warnings == [f"S1:{job.speech_facts[0].segment_id}:non_single_speaker"]
+
+
+def test_ownership_evidence_required_and_not_public(job):
+    from r2v_data_v2.h3.t2va_mimo_backend import T2VA_SYSTEM_PROMPT
+
+    model = shared.t2va.T2VASpeakerAssignment
+    fields = {
+        "primary_speaker_ownership_resolved", "vocal_composition", "secondary_vocal_activity",
+    }
+    assert fields <= set(model.model_json_schema()["required"])
+    values = shared.draft_for(job).speaker_assignments[0].model_dump()
+    for field in fields:
+        with pytest.raises(ValueError):
+            model.model_validate({k: v for k, v in values.items() if k != field})
+        assert field in T2VA_SYSTEM_PROMPT
+    assert "eligibility evidence only" in T2VA_SYSTEM_PROMPT
+    assert "do not change Sx, speech presentation, boundaries or ASR" in T2VA_SYSTEM_PROMPT
+    core = shared.materialize(job, shared.draft_for(job))
+    public = render_t2va_prompt(core)
+    assert all(field not in public for field in fields)
+    assert core.schema_version == "r2v.h3.no_reference_av_core.6"
 
 
 def test_two_sx_tracks_are_separate(job):

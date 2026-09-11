@@ -23,6 +23,8 @@ from r2v_data_v2.h3.mimo25_backend import (
     AUDIO_FINALIZE_SYSTEM_PROMPT,
     MIMO25_AUDIO_FINALIZE_PROMPT_VERSION,
     MimoAudioFinalizeDraft,
+    MimoSecondaryVocalActivity,
+    VocalComposition,
 )
 from r2v_data_v2.h3.qwen3_asr import Qwen3ASRSegment
 from r2v_data_v2.h3.resolved_audio_stems import (
@@ -118,6 +120,14 @@ class T2VASpeakerAssignment(SchemaModel):
     speech_presentation: Literal[
         "onscreen_spoken", "offscreen_spoken", "voice_over", "uncertain"
     ]
+    primary_speaker_ownership_resolved: bool = Field(strict=True)
+    vocal_composition: VocalComposition
+    secondary_vocal_activity: MimoSecondaryVocalActivity
+
+    @property
+    def primary_speaker_group(self) -> str | None:
+        # Eligibility evidence does not change the frozen consumer Sx assignment.
+        return self.speaker_id if self.primary_speaker_ownership_resolved else None
 
 
 class T2VAProsePart(SchemaModel):
@@ -210,8 +220,8 @@ def _validate_repetition(parts: list[str]) -> None:
 
 
 class H3NoReferenceAVCore(T2VAMimoDraft):
-    schema_version: Literal["r2v.h3.no_reference_av_core.5"] = (
-        "r2v.h3.no_reference_av_core.5"
+    schema_version: Literal["r2v.h3.no_reference_av_core.6"] = (
+        "r2v.h3.no_reference_av_core.6"
     )
     overall_soundscape: Text
     non_diegetic_music: Text
@@ -540,8 +550,8 @@ def render_t2va_prompt(core: H3NoReferenceAVCore) -> str:
 
 
 class T2VABackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.t2va_mimo_backend.6"] = "r2v.h3.t2va_mimo_backend.6"
-    prompt_version: Literal["h3_t2va_joint_av_v6"] = "h3_t2va_joint_av_v6"
+    schema_version: Literal["r2v.h3.t2va_mimo_backend.7"] = "r2v.h3.t2va_mimo_backend.7"
+    prompt_version: Literal["h3_t2va_joint_av_v7"] = "h3_t2va_joint_av_v7"
     audio_finalize_prompt_version: Literal["h3_mimo25_audio_finalize_v6"] = (
         MIMO25_AUDIO_FINALIZE_PROMPT_VERSION
     )
