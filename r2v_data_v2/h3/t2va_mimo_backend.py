@@ -43,6 +43,7 @@ SPEECH AUTHORITY AND SPEAKERS
 DiariZen owns exact supplied segment boundaries. Never split, filter, invent or change the speech facts. speaker_assignments must cover every supplied segment exactly once in supplied order and repeat its source_speaker_cluster unchanged.
 Qwen3-ASR text and language remain exact and authoritative internally; transcript words are deliberately NOT supplied to you. Reproducing them is NOT your task. Never paraphrase, translate, correct, normalize, invent, drop or reorder dialogue. The deterministic renderer alone copies exact language/text and creates <d> syntax and speaker markers. Do NOT return ASR words, translations, transliterations or <d> tags in any prose or lead_in.
 MANDATORY INVENTORIES: speaker_assignments = every supplied segment, exactly once in supplied order. Speech slots = dialogue_segment_ids only, exactly once in that explicit chronological order. Each supplied segment exposes segment_id, source_speaker_cluster, start_time, end_time, language and has_transcript, never transcript words. The flattened speech-part segment_id sequence MUST equal dialogue_segment_ids exactly. Non-transcribed segments still receive speaker assignments, but NEVER speech slots. If dialogue_segment_ids is empty, return no speech parts. Audible non-transcribed vocal events may be described naturally in prose without invented words.
+dialogue_segment_ids is a hard structural inventory. For EVERY ID, integrated_sequence MUST contain exactly one {"kind":"speech","segment_id":"<that exact ID>","lead_in":"..."} part. The flattened speech-part segment_id list MUST equal dialogue_segment_ids exactly and in the same order. required_speech_slots supplies the mandatory skeleton, not insertion positions or answers: write each lead_in and place each speech part at its observed AV position among the prose parts. A prose sentence saying that someone speaks, talks, says something, or speaks in a language NEVER substitutes for a required speech part. If dialogue_segment_ids is non-empty, returning zero speech parts is invalid.
 A speech part has no dialogue-text field. Its lead_in describes ONLY the vocal source, presentation and audible delivery, not what was said. Sx identities belong ONLY in structured speaker_assignments.speaker_id. Model-owned prose, lead_in and audio fields must contain NO standalone S1/S2/... tokens, bare or parenthesized; neither S1 nor (S1) belongs there. The deterministic renderer is the sole producer of final (Sx) syntax.
 Assign stable S1/S2/... only to actual vocalizing sources, numbered contiguously by first vocal appearance, not visible-person order. The same acoustic source cluster must not split across different speaker IDs. Acoustic grouping is evidence, not visual identity; clusters may share an Sx only when original AV strongly supports the same speaker. Pauses, language, sentences or segment boundaries alone never create speakers.
 Pitch/register, timbre/texture, cadence/speaking rate and energy/delivery may support stable speaker assignment. Include only traits supported by audible evidence; never infer personality, nationality or profession from voice. No separate voice profile is requested.
@@ -115,6 +116,9 @@ class T2VAMimoBackend:
         return self.config.provenance()
 
     def build_request(self, job: T2VAJob) -> dict:
+        dialogue_segment_ids = [
+            s.segment_id for s in job.speech_facts if s.text is not None
+        ]
         contract = {
             "clip_uid": job.clip_uid,
             "target_duration_seconds": job.target_duration_seconds,
@@ -129,8 +133,14 @@ class T2VAMimoBackend:
                 }
                 for s in job.speech_facts
             ],
-            "dialogue_segment_ids": [
-                s.segment_id for s in job.speech_facts if s.text is not None
+            "dialogue_segment_ids": dialogue_segment_ids,
+            "required_speech_slots": [
+                {
+                    "kind": "speech",
+                    "segment_id": segment_id,
+                    "lead_in": "<model writes source/presentation/delivery only>",
+                }
+                for segment_id in dialogue_segment_ids
             ],
         }
         request = {

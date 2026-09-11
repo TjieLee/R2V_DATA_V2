@@ -205,6 +205,7 @@ def test_request_separates_all_segments_from_dialogue_slots(job, tmp_path):
     ]
     assert [s["has_transcript"] for s in contract["speech_facts"]] == [False, True]
     assert contract["dialogue_segment_ids"] == ["segment_2"]
+    assert [s["segment_id"] for s in contract["required_speech_slots"]] == ["segment_2"]
     assert all("text" not in s for s in contract["speech_facts"])
     assert job.model_dump() == before
     draft = draft_for(job)
@@ -217,6 +218,7 @@ def test_request_separates_all_segments_from_dialogue_slots(job, tmp_path):
     job.speech_facts[1].text = job.speech_facts[1].language = None
     empty = json.loads(backend.build_request(job)["messages"][1]["content"][1]["text"])
     assert empty["dialogue_segment_ids"] == []
+    assert empty["required_speech_slots"] == []
     assert len(empty["speech_facts"]) == 2
 
 
@@ -233,6 +235,50 @@ def test_v4_prompt_preserves_inventory_without_final_audio_fields():
     for field in ("overall_soundscape", "non_diegetic_music"):
         assert field not in T2VA_SYSTEM_PROMPT
         assert field not in T2VAMimoDraft.model_json_schema()["properties"]
+
+
+def test_required_slots_are_structural_only(job, tmp_path):
+    backend = T2VAMimoBackend(config(tmp_path), client=Client([]))
+    request = backend.build_request(job)
+    contract = json.loads(request["messages"][1]["content"][1]["text"])
+    assert contract["required_speech_slots"] == [
+        {
+            "kind": "speech",
+            "segment_id": fact.segment_id,
+            "lead_in": "<model writes source/presentation/delivery only>",
+        }
+        for fact in job.speech_facts
+    ]
+    assert len(contract["required_speech_slots"]) == 2
+    assert backend.build_request(job) == request
+    for fact in job.speech_facts:
+        assert fact.text not in json.dumps(request, ensure_ascii=False)
+    slots = json.dumps(contract["required_speech_slots"])
+    for forbidden in ("S1", "S2", "onscreen_spoken", "offscreen_spoken", "voice_over"):
+        assert forbidden not in slots
+    for rule in (
+        "dialogue_segment_ids is a hard structural inventory",
+        "NEVER substitutes for a required speech part",
+        "returning zero speech parts is invalid",
+        "not insertion positions or answers",
+    ):
+        assert rule in T2VA_SYSTEM_PROMPT
+    assert backend.provenance().prompt_version == "h3_t2va_joint_av_v5"
+    assert backend.provenance().schema_version == "r2v.h3.t2va_mimo_backend.5"
+
+
+def test_prose_substitution_fails_before_audio_finalize(job, tmp_path):
+    draft = draft_for(job).model_dump()
+    draft["integrated_sequence"] = [
+        {"kind": "prose", "text": "[Shot 1] The man speaks in Chinese."}
+    ]
+    client = Client([json.dumps(draft)])
+    raw = T2VAMimoBackend(config(tmp_path), client=client).annotate(job, "a" * 64)
+    assert "speech placement inventory differs" in raw.error
+    assert "possible_prose_substitution_for_required_speech_slots" in raw.error
+    assert raw.model_call_count == 1
+    assert raw.audio_finalize is None
+    assert len(client.calls) == 1
 
 
 @pytest.mark.parametrize("problem", ["length", "audio_zero", "video_zero"])

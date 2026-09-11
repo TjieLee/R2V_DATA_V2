@@ -68,7 +68,7 @@ It removes reference/retention/entity-binding instructions and final sound field
 The separate audio call uses frozen `audio_finalize_v6` unchanged. Semantic sound
 classification remains a model judgment, not a keyword-based validator.
 
-The current contract uses T2VA prompt v4/backend .4 and core .4. Model-visible
+The current contract uses T2VA prompt v5/backend .5 and core .4. Model-visible
 speech facts contain only segment/cluster, times, language and `has_transcript`;
 exact ASR words stay inside the job/core and are never sent in text conditioning.
 The explicit ordered `dialogue_segment_ids` list controls speech slots, while
@@ -80,7 +80,13 @@ Conflicting markers and markers elsewhere still fail. Raw output and correction
 counts are retained. Prose parts are bounded at 12,000 characters and lead-ins
 at 512; substantial exact normalized sentence/block loops fail without rewriting.
 
-This is not fingerprint-compatible with v3 or the prior model-written dialogue
+The first-call contract supplies deterministic `required_speech_slots` alongside
+`dialogue_segment_ids`, without ASR words, Sx, presentation answers or insertion
+positions. Prose describing someone speaking never replaces a required slot.
+Missing slots remain hard failures; obvious prose substitution adds only a
+diagnostic, never repair. The frozen audio-finalizer and two-call flow are unchanged.
+
+This is not fingerprint-compatible with v4 or the prior model-written dialogue
 string. A prior-contract run ID is rejected even with `--overwrite`: use a new
 run ID; frozen prior outputs are not rewritten. Inventory .3 binds resolved media;
 raw .2 separates both attempts; record/summary .2 account for up to two calls.
@@ -146,7 +152,7 @@ First inspect a model-free dry run:
   --clips-root "$JEA_CLIPS_ROOT" --source-videos-root "$JEA_SOURCE_VIDEOS_ROOT" \
   --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
   --audio-shadow-run-id "$AUDIO_SHADOW_RUN_ID" \
-  --t2va-run-id t2va-random20-v4 \
+  --t2va-run-id t2va-random20-v5 \
   --case-manifest "$AUDIO_PRODUCTION_ROOT/case_manifest.json" \
   --base-url http://127.0.0.1:8092/v1 \
   --transport sglang --model mimo-v2.5 \
@@ -221,7 +227,7 @@ python -m http.server 8765 --bind 127.0.0.1 --directory /mnt/workspace
 
 ```bash
 "$R2V_PYTHON" tools/build_h3_t2va_qa.py \
-  --t2va-root "$AUDIO_PRODUCTION_ROOT/t2va_shadow_v1/runs/t2va-random20-v4" \
+  --t2va-root "$AUDIO_PRODUCTION_ROOT/t2va_shadow_v1/runs/t2va-random20-v5" \
   --media-root /mnt/workspace \
   --media-base-url http://127.0.0.1:8765
 ```

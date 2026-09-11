@@ -370,12 +370,24 @@ def _validate_t2va_content(
     ):
         raise ValueError("T2VA speech exceeds canonical timeline tolerance")
     _validate_assignments(facts, draft.speaker_assignments)
-    if [p.segment_id for p in draft.integrated_sequence if p.kind == "speech"] != [
-        s.segment_id for s in facts if s.text is not None
-    ]:
-        raise ValueError(
-            "T2VA speech placement inventory differs from chronological ASR"
-        )
+    placed = [p.segment_id for p in draft.integrated_sequence if p.kind == "speech"]
+    required = [s.segment_id for s in facts if s.text is not None]
+    if placed != required:
+        message = "T2VA speech placement inventory differs from chronological ASR"
+        # Diagnostic only, and only after the authoritative inventory has failed.
+        if set(required) - set(placed) and any(
+            re.search(
+                r"\b(?:the|a|an)\s+(?:man|woman|person|speaker|voice)\s+"
+                r"(?:(?:then|again|also)\s+){0,2}(?:speaks|talks|says)\b"
+                r"|\bvoice\s+speaking\s+in\b",
+                p.text,
+                re.IGNORECASE,
+            )
+            for p in draft.integrated_sequence
+            if p.kind == "prose"
+        ):
+            message += "; possible_prose_substitution_for_required_speech_slots"
+        raise ValueError(message)
     for part in draft.integrated_sequence:
         value = part.text if part.kind == "prose" else part.lead_in
         if any(
@@ -513,8 +525,8 @@ def render_t2va_prompt(core: H3NoReferenceAVCore) -> str:
 
 
 class T2VABackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.t2va_mimo_backend.4"] = "r2v.h3.t2va_mimo_backend.4"
-    prompt_version: Literal["h3_t2va_joint_av_v4"] = "h3_t2va_joint_av_v4"
+    schema_version: Literal["r2v.h3.t2va_mimo_backend.5"] = "r2v.h3.t2va_mimo_backend.5"
+    prompt_version: Literal["h3_t2va_joint_av_v5"] = "h3_t2va_joint_av_v5"
     audio_finalize_prompt_version: Literal["h3_mimo25_audio_finalize_v6"] = (
         MIMO25_AUDIO_FINALIZE_PROMPT_VERSION
     )

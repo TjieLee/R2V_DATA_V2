@@ -690,6 +690,35 @@ def test_typed_speech_inventory_fails_closed(job, mutation):
         materialize(job, draft)
 
 
+@pytest.mark.parametrize("prose", [
+    "The man speaks in Chinese.",
+    "The audio features a male voice speaking in Chinese.",
+    "The man then speaks again in Chinese.",
+    "A woman talks to the other person.",
+])
+def test_missing_slots_prose_substitution_is_diagnostic_only(job, prose):
+    draft = draft_for(job)
+    draft.integrated_sequence = [
+        t2va.T2VAProsePart(kind="prose", text="[Shot 1] " + prose)
+    ]
+    with pytest.raises(ValueError, match="possible_prose_substitution"):
+        materialize(job, draft)
+    correct = draft_for(job)
+    correct.integrated_sequence[0].text += " " + prose
+    assert materialize(job, correct)
+    for fact in job.speech_facts:
+        fact.text = fact.language = None
+    assert materialize(job, draft)
+
+
+def test_zero_slots_without_speech_prose_keeps_inventory_failure(job):
+    draft = draft_for(job)
+    draft.integrated_sequence = draft.integrated_sequence[:1]
+    with pytest.raises(ValueError, match="speech placement inventory") as exc:
+        materialize(job, draft)
+    assert "possible_prose_substitution" not in str(exc.value)
+
+
 @pytest.mark.parametrize("mutation", ["missing", "duplicate", "unknown", "reorder"])
 def test_assignment_inventory_still_exact(job, mutation):
     draft = draft_for(job)
