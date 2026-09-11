@@ -27,6 +27,11 @@ def main(argv: list[str] | None = None) -> dict:
     selection.add_argument("--case-manifest", type=Path)
     selection.add_argument("--sample-size", type=int)
     parser.add_argument("--sample-seed", type=int)
+    parser.add_argument(
+        "--shot-index-root",
+        type=Path,
+        help="Writable JSONL offset cache (outside source directory)",
+    )
     parser.add_argument("--model", default="mimo-v2.5", choices=["mimo-v2.5"])
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--transport", choices=["sglang", "xiaomi"], default="sglang")
@@ -60,6 +65,7 @@ def main(argv: list[str] | None = None) -> dict:
         case_manifest=args.case_manifest,
         sample_size=args.sample_size,
         sample_seed=args.sample_seed,
+        shot_index_root=args.shot_index_root,
     )
     if args.dry_run:
         return {

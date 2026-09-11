@@ -375,6 +375,7 @@ def build_t2va_inventory(
     case_manifest: Path | None = None,
     sample_size: int | None = None,
     sample_seed: int | None = None,
+    shot_index_root: Path | None = None,
 ) -> T2VAInventory:
     from r2v_data_v2.h3.t2va_source import select_t2va_shots, validate_cached_target
 
@@ -385,6 +386,7 @@ def build_t2va_inventory(
         case_manifest=case_manifest,
         sample_size=sample_size,
         sample_seed=sample_seed,
+        shot_index_root=shot_index_root,
     )
     selected = [s.clip_uid for s in selection.shots]
     shots = {s.clip_uid: s for s in selection.shots}

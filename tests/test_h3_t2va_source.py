@@ -1,13 +1,16 @@
 import json
+import os
 from pathlib import Path
 
 import pytest
 
 from r2v_data_v2.h3 import t2va_shadow as t2va
+from r2v_data_v2.h3 import t2va_shot_index as shot_index
 from r2v_data_v2.h3.diarization_binding import DiarizationInventory
 from r2v_data_v2.h3.jea_audio_production import CanonicalAudioClip
 from r2v_data_v2.h3.t2va_source import prepare_t2va_audio, select_t2va_shots
 from r2v_data_v2.naming import parse_clip_identity
+from r2v_data_v2.v3.production_source import JeaVideoMotionAdapter
 from tests import test_h3_t2va_shadow as fixtures
 
 setup = fixtures.setup
@@ -19,10 +22,10 @@ def test_shot_population_without_audio_or_visual(tmp_path):
     manifest = fixtures.shot_manifest(tmp_path)
     selection = select_t2va_shots(manifest, sample_size=2, sample_seed=17)
     assert selection == select_t2va_shots(manifest, sample_size=2, sample_seed=17)
-    assert selection.valid_row_count == 3
-    assert [s.clip_uid for s in selection.shots] == t2va.select_clip_uids(
-        fixtures.shot_ids(tmp_path), sample_size=2, sample_seed=17
-    )
+    assert selection.valid_row_count is None
+    assert [s.source_index for s in selection.shots] == [
+        *shot_index.random_indices(3, 17)
+    ][:2]
     for shot in selection.shots:
         assert shot.clip_uid == parse_clip_identity(shot.video_path).clip_uid
     production = tmp_path / "absent-audio"
@@ -180,7 +183,162 @@ def test_prepare_cli_dry_run_requires_only_shots(tmp_path, monkeypatch):
             "--sample-seed",
             "7",
             "--dry-run",
+            "--shot-index-root",
+            str(tmp_path.parent / (tmp_path.name + "-index")),
         ]
     )
     assert len(result["clip_uids"]) == 1 and result["model_call_count"] == 0
     assert not (tmp_path / "audio").exists()
+    assert list((tmp_path.parent / (tmp_path.name + "-index")).glob("*/metadata.json"))
+
+
+def test_random_sampling_parses_only_selected_rows_and_reuses_index(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    template_path = fixtures.shot_manifest(source)
+    template = json.loads(template_path.read_text().splitlines()[0])
+    count, size, seed = 5000, 7, 83
+    rows = []
+    for index in range(count):
+        video = source / f"movie_{index + 1}.mp4"
+        video.write_bytes(b"synthetic video")
+        rows.append({**template, "video_path": str(video), "shot_index": index + 1})
+    template_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    before = template_path.read_bytes()
+    original = JeaVideoMotionAdapter.parse
+    calls = []
+
+    def parse(self, raw, *, source_index):
+        calls.append(source_index)
+        return original(self, raw, source_index=source_index)
+
+    monkeypatch.setattr(JeaVideoMotionAdapter, "parse", parse)
+    cache = tmp_path / "cache"
+    options = {"sample_size": size, "sample_seed": seed, "shot_index_root": cache}
+    selected = select_t2va_shots(template_path, **options)
+    assert len(calls) == size
+    assert calls == [s.source_index for s in selected.shots]
+    assert selected.shot_manifest_sha256 == t2va.sha256_file(template_path)
+    for shot in selected.shots:
+        assert shot.source_row_sha256 == t2va.fingerprint(rows[shot.source_index])
+        assert shot.video_sha256 == t2va.sha256_file(Path(shot.video_path))
+        assert shot.clip_uid == parse_clip_identity(shot.video_path).clip_uid
+
+    # Warm selection must not hash/scan the manifest or rebuild the index.
+    original_hash = shot_index.sha256_file
+
+    def hash_file(path):
+        assert path != template_path
+        return original_hash(path)
+
+    monkeypatch.setattr(shot_index, "sha256_file", hash_file)
+    original_open = Path.open
+
+    class SeekOnly:
+        def __init__(self, handle):
+            self.handle = handle
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.handle.close()
+
+        def seek(self, *args):
+            return self.handle.seek(*args)
+
+        def readline(self):
+            return self.handle.readline()
+
+    def open_file(path, *args, **kwargs):
+        handle = original_open(path, *args, **kwargs)
+        return SeekOnly(handle) if path == template_path else handle
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "open", open_file)
+        again = select_t2va_shots(template_path, **options)
+    assert again == selected
+    assert len(calls) == 2 * size
+    assert len(list(cache.glob("*/metadata.json"))) == 1
+    assert template_path.read_bytes() == before
+
+
+def test_indexed_invalid_and_duplicate_rows_have_deterministic_replacements(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    manifest = fixtures.shot_manifest(source)
+    valid = manifest.read_text().splitlines()
+    order = list(shot_index.random_indices(7, 17))
+    by_draw = [
+        "{broken",
+        "[]",
+        valid[0],
+        valid[0],
+        '{"duration": 1}',
+        valid[1],
+        valid[2],
+    ]
+    lines = [""] * len(order)
+    for index, raw in zip(order, by_draw, strict=True):
+        lines[index] = raw
+    # Blank lines do not consume source_index, matching the existing adapter loop.
+    manifest.write_text("\n\n".join(lines) + "\n")
+    options = {"sample_size": 3, "sample_seed": 17, "shot_index_root": tmp_path / "cache"}
+    result = select_t2va_shots(manifest, **options)
+    assert [s.source_index for s in result.shots] == [order[2], order[5], order[6]]
+    assert [r["source_index"] for r in result.excluded_rows] == [
+        order[i] for i in (0, 1, 3, 4)
+    ]
+    assert result == select_t2va_shots(manifest, **options)
+    with pytest.raises(ValueError, match="not enough valid unique"):
+        select_t2va_shots(manifest, **{**options, "sample_size": 4})
+
+
+def test_index_rebuilds_for_changed_manifest_and_damaged_offsets(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    manifest = fixtures.shot_manifest(source)
+    cache = tmp_path / "cache"
+    options = {"sample_size": 3, "sample_seed": 11, "shot_index_root": cache}
+    initial = select_t2va_shots(manifest, **options)
+    offset = next(cache.glob("*/offsets.bin"))
+    offset.write_bytes(b"corrupt")
+    assert select_t2va_shots(manifest, **options) == initial
+    assert len(list(cache.glob("*/metadata.json"))) == 1
+    stat = manifest.stat()
+    # Same byte size and restored mtime still changes ctime, invalidating the cache.
+    manifest.write_text(manifest.read_text().replace('"duration": 1', '"duration": 2'))
+    os.utime(manifest, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+    result = select_t2va_shots(manifest, **options)
+    assert result.shot_manifest_sha256 != initial.shot_manifest_sha256
+    assert result.shot_manifest_sha256 == t2va.sha256_file(manifest)
+    assert all(s.duration_seconds == 2 for s in result.shots)
+    assert len(list(cache.glob("*/metadata.json"))) == 2
+
+
+def test_random_index_is_unique_and_detects_mid_selection_source_change(tmp_path):
+    order = list(shot_index.random_indices(100, 2))
+    assert sorted(order) == list(range(100))
+    assert order == list(shot_index.random_indices(100, 2))
+    manifest = fixtures.shot_manifest(tmp_path)
+    with (
+        pytest.raises(ValueError, match="changed during selection"),
+        shot_index.indexed_rows(manifest, None) as (_, read),
+    ):
+        assert json.loads(read(0))["shot_index"] == 1
+        with manifest.open("a") as handle:
+            handle.write("{}\n")
+    with pytest.raises(ValueError, match="separate writable cache"):
+        select_t2va_shots(
+            manifest, sample_size=1, sample_seed=1, shot_index_root=tmp_path / "index"
+        )
+
+
+def test_legacy_selection_shape_roundtrips(tmp_path):
+    from r2v_data_v2.h3.t2va_source import T2VAShotSelection
+
+    values = select_t2va_shots(fixtures.shot_manifest(tmp_path)).model_dump(mode="json")
+    values["schema_version"] = "r2v.h3.t2va_shot_selection.1"
+    assert T2VAShotSelection.model_validate(values).model_dump(mode="json") == values

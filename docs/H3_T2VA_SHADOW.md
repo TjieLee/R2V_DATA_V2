@@ -134,6 +134,26 @@ MiMo case manifest format is also accepted), or omit selection arguments for all
 valid JEA shots. Random size and seed must be supplied together. Selection order
 is persisted and independent of upstream map ordering.
 
+Random JSONL selection uses a lazy seeded permutation of nonblank row indices,
+not a parsed population. Only drawn rows are decoded/adapted; invalid rows and
+duplicate clip identities consume a draw and are replaced until N valid unique
+clips are selected. Exhaustion fails closed. Selection .2 records this indexed
+policy; .1 remains readable. Seeds are reproducible within this policy, but do
+not reproduce the previous full-population `random.sample` selection.
+
+Both selection CLIs accept `--shot-index-root PATH`, a writable cache outside
+the source directory (default: the system temporary directory's
+`r2v-t2va-shot-index`). The initial streaming scan hashes the manifest and writes
+8-byte offsets, without JSON parsing. Warm selection seeks directly to drawn
+rows. Cache identity includes resolved path, device/inode, size, mtime and ctime;
+changes rebuild the index, and changes during selection fail closed. Offset
+checksums detect damaged caches. Cached manifest hashes rely on these filesystem
+identity fields, so use a local filesystem that reports file changes faithfully.
+No index is written beside the public source manifest. Selected rows retain
+their row/clip/video provenance. Random `valid_row_count` is null because the
+unvisited population has not been validated; all/case selection retains its
+existing exhaustive lookup and exact valid-row count.
+
 Inventory .2 records source shot manifest path/hash, adapter roots, source row
 index/hash, source video/shot identity and selected video path/hash. The no-Visual
 DiariZen/ASR inventories use .5; legacy .4 inputs remain readable and retain their

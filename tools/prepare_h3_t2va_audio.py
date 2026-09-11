@@ -23,6 +23,11 @@ def main(argv=None):
     selection.add_argument("--case-manifest", type=Path)
     selection.add_argument("--sample-size", type=int)
     parser.add_argument("--sample-seed", type=int)
+    parser.add_argument(
+        "--shot-index-root",
+        type=Path,
+        help="Writable JSONL offset cache (outside source directory)",
+    )
     parser.add_argument("--ffmpeg", default="ffmpeg")
     parser.add_argument("--ffprobe", default="ffprobe")
     parser.add_argument("--dry-run", action="store_true")
@@ -34,6 +39,7 @@ def main(argv=None):
         case_manifest=args.case_manifest,
         sample_size=args.sample_size,
         sample_seed=args.sample_seed,
+        shot_index_root=args.shot_index_root,
     )
     if not args.dry_run:
         prepare_t2va_audio(
