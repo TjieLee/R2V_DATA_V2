@@ -36,6 +36,7 @@ class _Projection(BaseModel):
 
 class _Grounding(_Projection):
     segment_id: StrictStr
+    primary_speaker_group: StrictStr | None
     binding_status: StrictStr
     entity_id: StrictStr | None
     speech_presentation: StrictStr
@@ -113,7 +114,7 @@ def _side(record: _Record) -> dict:
         for uid in dict.fromkeys([*decisions, *groundings]):
             grounding, decision = groundings.get(uid), decisions.get(uid)
             rows[uid] = {
-                "segment_id": uid, "primary_speaker_group": decision.primary_speaker_group if decision else None,
+                "segment_id": uid, "primary_speaker_group": grounding.primary_speaker_group if grounding else None,
                 "grounding_present": grounding is not None, "decision_present": decision is not None,
                 **(grounding.model_dump() if grounding else {
                     "binding_status": None, "entity_id": None, "speech_presentation": None, "evidence_codes": [],

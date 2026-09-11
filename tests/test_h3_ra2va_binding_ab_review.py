@@ -11,7 +11,8 @@ from r2v_data_v2.h3.visual_production_source import NormalizedVisualReference
 
 
 def _record(uid, *, entity="e1", status="ready", annotation=True, extra=False):
-    segment = {"segment_id": "segment_0001", "binding_status": "visible_entity" if entity else "offscreen",
+    segment = {"segment_id": "segment_0001", "primary_speaker_group": "g1",
+               "binding_status": "visible_entity" if entity else "offscreen",
                "entity_id": entity, "speech_presentation": "onscreen_spoken" if entity else "offscreen_spoken",
                "evidence_codes": ["av_correspondence"]}
     segments = [segment, {**segment, "segment_id": "segment_0002"}] if extra else [segment]
@@ -29,6 +30,31 @@ def _record(uid, *, entity="e1", status="ready", annotation=True, extra=False):
         } if annotation else None,
     }
     return {**raw, "record_fingerprint": ab._hash(raw)}
+
+
+@pytest.mark.parametrize("group", ["g2", None])
+def test_display_preserves_frozen_grounding_group(group):
+    raw = _record("clip", status="failed")
+    raw["annotation"]["av_grounding"]["segment_groundings"][0]["primary_speaker_group"] = group
+    row = ab._side(ab._Record.model_validate(raw))["segments"]["segment_0001"]
+    assert row["primary_speaker_group"] == group
+    assert row["grounding_present"] and row["decision_present"]
+
+
+def test_decision_only_does_not_supply_display_group():
+    raw = _record("clip", status="failed")
+    raw["annotation"]["av_grounding"]["segment_groundings"] = []
+    row = ab._side(ab._Record.model_validate(raw))["segments"]["segment_0001"]
+    assert row["primary_speaker_group"] is None
+    assert not row["grounding_present"] and row["decision_present"]
+
+
+def test_grounding_only_preserves_display_group():
+    raw = _record("clip", status="failed")
+    raw["annotation"]["audio_observation"]["segment_decisions"] = []
+    row = ab._side(ab._Record.model_validate(raw))["segments"]["segment_0001"]
+    assert row["primary_speaker_group"] == "g1"
+    assert row["grounding_present"] and not row["decision_present"]
 
 
 @pytest.fixture
