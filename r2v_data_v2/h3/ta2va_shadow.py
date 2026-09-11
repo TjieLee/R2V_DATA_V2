@@ -37,7 +37,6 @@ from r2v_data_v2.h3.qwen38_h3_recaption import (
     RecaptionSpeechFact,
     _canonical_audio_definition,
     _canonical_audio_retention,
-    audio_task_prefix,
     render_h3_prompt,
 )
 from r2v_data_v2.h3.resolved_audio_stems import load_resolved_stems
@@ -390,6 +389,17 @@ def speech_track(pcm, frames, ranges):
     return result
 
 
+def _ta2va_task_prefix(audios):
+    tasks = []
+    if any(a.retention_marker == "reference" for a in audios):
+        tasks.append("audio reference")
+    if any(a.retention_marker in {"fully_copy", "partially_copy"} for a in audios):
+        tasks.append("audio reuse")
+    if not tasks:
+        raise ValueError("TA2VA requires Audio conditioning")
+    return "[" + " + ".join(tasks) + "]"
+
+
 def render_product(core, variant, audios):
     validate_references(variant, audios)
     original = core.integrated_multimodal_description
@@ -428,7 +438,7 @@ def render_product(core, variant, audios):
         previous = block.end()
     response = Qwen38H3StructuredResponse(
         subject_definitions=[_canonical_audio_definition(a) for a in audios],
-        summary=audio_task_prefix(audios) + " " + core.summary,
+        summary=_ta2va_task_prefix(audios) + " " + core.summary,
         retention_analysis=[_canonical_audio_retention(a) for a in audios],
         detailed_description=caption,
         overall_soundscape=core.overall_soundscape,

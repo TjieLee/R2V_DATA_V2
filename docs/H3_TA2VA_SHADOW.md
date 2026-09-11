@@ -57,7 +57,8 @@ Resolved stems currently remain unverified: explicitly supply
 The adapter reuses `probe_canonical_target_frames`, `_check_stem`,
 `ReuseSampleRange`, `_write_verified`, `project_audio_relationships`,
 `_canonical_audio_definition`, `_canonical_audio_retention`,
-`audio_task_prefix`, and `render_h3_prompt`.
+`render_h3_prompt`. TA2VA uses its own Audio-only task prefix; the shared
+Ref2VA/RA2VA `audio_task_prefix` remains unchanged.
 
 The existing top-level reuse builder requires MiMo gN/entity jobs, and
 `RecaptionReferenceContract` requires Pictures/Subjects. TA2VA deliberately does
@@ -83,7 +84,7 @@ Canonical wording appends them only when present. Existing RA2VA contracts with
 `None` render exactly as before, with no new inputs or calls.
 
 The six official section names/order are reused unchanged. Subject definitions
-contain only Audio definitions. Summary is `audio_task_prefix` plus the frozen
+contain only Audio definitions. Summary is `[audio reuse]` plus the frozen
 internal summary. Detailed prose is never model-rewritten; only canonical Audio
 relationships are inserted. Exact dialogue payloads/order and Sx are checked
 before and after injection. Full-audio prose and both sound fields stay unchanged;

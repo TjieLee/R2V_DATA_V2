@@ -16,6 +16,7 @@ from r2v_data_v2.h3.qwen38_h3_recaption import (
     RecaptionAudioContract,
     _canonical_audio_definition,
     _canonical_audio_retention,
+    audio_task_prefix,
 )
 from r2v_data_v2.h3.schemas import SchemaModel
 from r2v_data_v2.h3.t2va_shadow import render_t2va_prompt
@@ -413,7 +414,7 @@ def test_profiles_reject_frozen_identity_claims_and_null(value):
 
 
 @pytest.mark.parametrize("variant", ["full_audio_reuse", "target_speech_reuse"])
-def test_six_sections_preserve_prose_and_exact_dialogue(job, variant):
+def test_six_sections_preserve_prose_and_exact_dialogue(job, variant, monkeypatch):
     core = shared.materialize(job, shared.draft_for(job))
     core.non_diegetic_music = "A piano melody."
     refs = (
@@ -436,7 +437,17 @@ def test_six_sections_preserve_prose_and_exact_dialogue(job, variant):
         "non_diegetic_music:",
     ]
     assert not any(label in result for label in ("<Picture", "<Subject", "<Video"))
-    assert "[reference generation + audio reuse] " + core.summary in result
+    assert "summary:\n[audio reuse] " + core.summary in result
+    assert "[reference generation" not in result
+    assert audio_task_prefix(refs) == "[reference generation + audio reuse]"
+    with monkeypatch.context() as patch:
+        patch.setattr(ta, "_ta2va_task_prefix", audio_task_prefix)
+        legacy = ta.render_product(core, variant, refs)
+    assert result == legacy.replace(
+        "summary:\n[reference generation + audio reuse] ",
+        "summary:\n[audio reuse] ",
+        1,
+    )
     caption = result.split("detailed_description:\n", 1)[1].split(
         "\n\noverall_soundscape:", 1
     )[0]
@@ -457,6 +468,25 @@ def test_six_sections_preserve_prose_and_exact_dialogue(job, variant):
         core.speech_facts, core.speaker_assignments, caption
     )
     assert core.overall_soundscape in result
+
+
+@pytest.mark.parametrize(
+    "markers,expected",
+    [
+        (["partially_copy"], "[audio reuse]"),
+        (["fully_copy"], "[audio reuse]"),
+        (["reference"], "[audio reference]"),
+        (["reference", "partially_copy"], "[audio reference + audio reuse]"),
+    ],
+)
+def test_audio_only_task_prefix(markers, expected):
+    audios = [SimpleNamespace(retention_marker=marker) for marker in markers]
+    assert ta._ta2va_task_prefix(audios) == expected
+
+
+def test_audio_only_task_prefix_requires_conditioning():
+    with pytest.raises(ValueError, match="requires Audio conditioning"):
+        ta._ta2va_task_prefix([])
 
 
 @pytest.mark.parametrize("transport", ["sglang", "xiaomi"])
