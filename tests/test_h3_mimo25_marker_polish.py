@@ -174,12 +174,12 @@ def test_unaligned_dialogue_never_polishes_or_rewrites(tmp_path, monkeypatch, sp
         tmp_path, monkeypatch, caption, "MUST NOT BE USED", speakers,
     )
     assert pending == ["MUST NOT BE USED"]
-    missing_fact = len(speakers) > caption.count("<d>")
-    assert summary.ready_count == int(not missing_fact) and summary.model_call_count == 4
+    # Omitted one-unit synthetic ASR fragments no longer block publication.
+    assert summary.ready_count == 1 and summary.model_call_count == 4
     assert summary.text_model_call_count == 0
     assert not row["speaker_marker_polish_attempted"]
     assert row["annotation"]["h3_semantics"]["shot1_caption"] == caption
-    assert [i["code"] for i in row["failure_issues"]] == (["direct_transcribed_dialogue_missing"] if missing_fact else [])
+    assert row["failure_issues"] == []
     assert "direct_single_speaker_marker_missing" in row["diagnostics"][-1]["warnings"]
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -46,9 +47,14 @@ def _fixture(tmp_path, source_rate=16000):
 
 @pytest.mark.parametrize("source_rate", [16000, 32000, 44100])
 @pytest.mark.parametrize("transport", ["xiaomi", "sglang"])
-def test_exact_snippets_keep_real_uncertain_groups_all_intervals_and_source_bytes(tmp_path, source_rate, transport):
+@pytest.mark.parametrize("media_mode", ["base64", "http"])
+def test_exact_snippets_keep_real_uncertain_groups_all_intervals_and_source_bytes(tmp_path, source_rate, transport, media_mode, monkeypatch):
     job, assembly, raws = _fixture(tmp_path, source_rate)
     backend, calls = _backend(tmp_path, [(raw, 8) for raw in raws], transport=transport)
+    if media_mode == "http":
+        backend.config = replace(backend.config, media_resolver=mb.MimoMediaResolver(
+            mode="http", media_root=tmp_path, media_base_url="http://127.0.0.1:8766/",
+        ))
     media = SnippetAudioBackend()
     backend._audio_media_backend = media
     stems = {}
@@ -56,7 +62,22 @@ def test_exact_snippets_keep_real_uncertain_groups_all_intervals_and_source_byte
         stems[kind] = tmp_path / f"{kind}.flac"
         stems[kind].write_bytes(kind.encode())
     before = {p: hashlib.sha256(p.read_bytes()).hexdigest() for p in tmp_path.rglob("*") if p.is_file()}
-    result = backend._request(job, allowed_reference_labels={"<Subject 1>", "<Picture 1>"}, auxiliary_audio_paths=stems)
+    read_bytes = Path.read_bytes
+    def read_only_temporary(path):
+        if path in before:
+            raise AssertionError("persistent HTTP media must not be base64 encoded")
+        return read_bytes(path)
+    with monkeypatch.context() as patch:
+        if media_mode == "http":
+            patch.setattr(Path, "read_bytes", read_only_temporary)
+        result = backend._request(job, allowed_reference_labels={"<Subject 1>", "<Picture 1>"}, auxiliary_audio_paths=stems)
+    if media_mode == "http":
+        for request in calls.requests:
+            for message in request["messages"]:
+                if isinstance(message["content"], list):
+                    for item in message["content"]:
+                        if item["type"] in {"video_url", "image_url"}:
+                            assert item[item["type"]]["url"].startswith("http://127.0.0.1:8766/")
     assert len(calls.requests) == 4
     content = calls.requests[2]["messages"][-1]["content"]
     assert content[0]["type"] == "text"

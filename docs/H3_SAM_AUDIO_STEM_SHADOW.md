@@ -461,3 +461,34 @@ publication is model-free and preserves the unchanged Audio-reuse semantics.
 `--source-h3-root` is required only by legacy preparation and is not read in
 no-binding mode. Production `h3/` is never created or modified by this adapter.
 Rollback selects the old roots and `legacy_lr_asd`; it does not rewrite artifacts.
+
+### Optional local HTTP media for SGLang
+
+The reconcile runner reuses its existing HTTP resolver. In a separate terminal
+on the same host/network namespace as local SGLang, start Python's static server:
+
+```bash
+python -m http.server 8766 \
+  --bind 127.0.0.1 \
+  --directory /mnt/workspace
+```
+
+Then, in the reconcile shell:
+
+```bash
+export MIMO_MEDIA_MODE=http
+export MIMO_MEDIA_BASE_URL=http://127.0.0.1:8766/
+```
+
+Run the existing no-LR reconcile command above with a fresh output root. The
+default `--media-root /mnt/workspace` matches this server directory. Explicit
+`--media-mode` and `--media-base-url` take precedence over their respective
+environment defaults. With neither variable nor flag set, base64 remains the
+default. To return to base64, unset both environment variables.
+
+Persistent target videos, reference images and applicable stem/full media use
+quoted HTTP URLs, avoiding base64 encoding and large JSON-body expansion.
+Small temporary speaker-profile snippets remain base64 and are not exposed by
+the static server. This does not reduce video token counts or model compute;
+measure any speed improvement empirically. Keep the server loopback-only and
+stop it after the experiment; it exposes files under the configured directory.

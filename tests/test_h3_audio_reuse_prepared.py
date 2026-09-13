@@ -22,7 +22,7 @@ def _replace(record, **updates):
     return _seal(prep.AudioReusePreparedSource, {**record.model_dump(mode="json"), **updates}, "prepared_fingerprint")
 
 
-@pytest.mark.parametrize("backend,prompt,policy", [(63, 48, 17), (64, 49, 18), (65, 49, 18)])
+@pytest.mark.parametrize("backend,prompt,policy", [(63, 48, 17), (64, 49, 18), (65, 49, 18), (66, 49, 18)])
 def test_frozen_and_current_binding_policy_provenance_remains_readable(tmp_path, backend, prompt, policy):
     args = _fixture(tmp_path)
     values = stem_record_values(tmp_path, args["job"], args["annotation"], args["stem_record"], backend_version=backend)

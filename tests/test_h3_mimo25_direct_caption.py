@@ -173,7 +173,7 @@ def test_sparse_cue_does_not_relax_multi_speaker_exclusion(composition):
 
 
 @pytest.mark.parametrize("blocks,missing", [
-    (["哪里不着急？"], ["segment_0001"]),
+    (["哪里不着急？"], []),
     (["我。", "哪里不着急？"], []),
     (["哪里不着急？", "我。"], ["segment_0003"]),
 ])
@@ -187,9 +187,35 @@ def test_exact_short_dialogue_inventory(blocks, missing):
     assert [(i.code, i.field) for i in issues] == [("direct_transcribed_dialogue_missing", sid) for sid in missing]
 
 
+@pytest.mark.parametrize("text,count", [
+    ("我。", 1), ("好。", 1), ("谢谢。", 2), ("不要走。", 3), ("那我先就过去帮忙了。", 9),
+    ("yes", 1), ("thank you", 2), ("come with me", 3), ("", 0), ("  ...!? ", 0),
+    ("ｔｈａｎｋ　ｙｏｕ", 2), ("cafe\u0301 noir", 2), ("我say谢谢123", 5), ("ありがとう", 5),
+])
+def test_lexical_units_and_missing_dialogue_policy(text, count):
+    assert mb._lexical_unit_count(text) == count
+    fact = {"segment_id": "segment_1", "language": "Chinese", "text": text}
+    issues = mb._validate_direct_transcribed_dialogue("A quiet visual scene.", [fact])
+    assert [i.code for i in issues] == (["direct_transcribed_dialogue_missing"] if count >= 3 else [])
+    assert not mb._validate_direct_transcribed_dialogue(f"<d>[Chinese] {text}</d>", [fact])
+
+
+def test_tiny_omission_keeps_substantive_order_and_other_hard_guards():
+    facts = [{"segment_id": f"segment_{i}", "language": "Chinese", "text": text, "speaker_id": "S1"}
+             for i, text in enumerate(("我。", "不要走。", "那我先就过去帮忙了。"))]
+    text = "(S1)<d>[Chinese] 那我先就过去帮忙了。</d> (S1)<d>[Chinese] 不要走。</d>"
+    assert [i.field for i in mb._validate_direct_transcribed_dialogue(text, facts)] == ["segment_2"]
+    for caption, code in [("(S9)<d>[Chinese] 好。</d>", "direct_unknown_speaker"),
+                          ("(S1)<d>好。</d>", "direct_dialogue_language_missing"),
+                          ("(S1)<d>[Chinese] 好。", "direct_dialogue_format"),
+                          ("<Picture 99>", "direct_unknown_reference")]:
+        _, issues, _ = protect_direct_dialogue(caption, facts, allowed_labels=LABELS)
+        assert code in {i.code for i in issues}
+
+
 def test_duplicate_locked_dialogue_requires_distinct_ordered_occurrences():
-    facts = [{**SPEECH[0], "segment_id": f"segment_{i}"} for i in (1, 2)]
-    block = "<d>[English] Exact, text!</d>"
+    facts = [{**SPEECH[0], "text": "Exact spoken text!", "segment_id": f"segment_{i}"} for i in (1, 2)]
+    block = "<d>[English] Exact spoken text!</d>"
     assert not mb._validate_direct_transcribed_dialogue(block + block, facts)
     assert [i.field for i in mb._validate_direct_transcribed_dialogue(block, facts)] == ["segment_2"]
 
@@ -199,8 +225,10 @@ def test_missing_exact_asr_is_hard_and_never_marker_polished(tmp_path, caption):
     visual, speech, profile, finalized = map(json.loads, split_annotation(_annotation().model_dump_json()))
     speech["shot1_caption"] = caption
     backend, calls = _backend(tmp_path, [(json.dumps(item), 8) for item in (visual, speech, profile, finalized)])
+    job = _job_fixture(tmp_path)
+    job.segments[0].asr_text = "Exact spoken text!"
     with pytest.raises(MimoBackendFailure) as exc:
-        _run(backend, _job_fixture(tmp_path))
+        _run(backend, job)
     assert "direct_transcribed_dialogue_missing" in {i.code for i in exc.value.issues}
     assert len(calls.requests) == 4
     assert not exc.value.speaker_marker_polish.attempted
@@ -258,16 +286,11 @@ def test_25755_short_asr_survives_without_lip_frames_or_extra_calls(tmp_path, om
         "allowed_entity_ids": {"e1"}, "allowed_reference_labels": LABELS,
         "auxiliary_audio_paths": {kind: Path(job.target_full_audio_path) for kind in ("speech", "music", "sfx")},
     }
-    if omit_short:
-        with pytest.raises(MimoBackendFailure) as exc:
-            backend.reconcile(job, **kwargs)
-        assert ("direct_transcribed_dialogue_missing", "segment_0001") in {(i.code, i.field) for i in exc.value.issues}
-        assert not exc.value.speaker_marker_polish.attempted
-    else:
-        result = backend.reconcile(job, **kwargs)
-        assert result.annotation.h3_semantics.shot1_caption == caption
-        assert result.annotation.segment_decisions[0].entity_id == "e1"
-        assert result.model_call_count == 4 and not result.speaker_marker_polish.attempted
+    result = backend.reconcile(job, **kwargs)
+    assert result.annotation.h3_semantics.shot1_caption == caption
+    assert result.annotation.segment_decisions[0].entity_id == "e1"
+    assert result.model_call_count == 4 and not result.speaker_marker_polish.attempted
+    assert all("direct_transcribed_dialogue_missing" not in d.warnings for d in result.diagnostics)
     assert len(calls.requests) == 4
     assert backend.config.video_fps == 4.0
 

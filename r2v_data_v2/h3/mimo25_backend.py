@@ -37,7 +37,7 @@ MIMO25_AUDIO_FINALIZE_PROMPT_VERSION = "h3_mimo25_audio_finalize_v6"
 MIMO25_VISUAL_PROMPT_VERSION = "h3_mimo25_visual_only_v5"
 MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v18"
 MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.20"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.65"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.66"
 MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION = "h3_mimo25_speaker_marker_polish_v4"
 MIMO25_ICL_VERSION = "h3_official_ref2va_detailed_shot1_v4"
 MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v29"
@@ -1001,7 +1001,7 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.65"] = MIMO25_BACKEND_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.66"] = MIMO25_BACKEND_VERSION
     audio_finalize_prompt_version: Literal["h3_mimo25_audio_finalize_v6"] = (
         MIMO25_AUDIO_FINALIZE_PROMPT_VERSION
     )
@@ -1817,6 +1817,23 @@ def direct_speech_facts(annotation: MimoAVAnnotationDraft, segments: list[Any]) 
     return facts
 
 
+def _lexical_unit_count(text: str) -> int:
+    """Count CJK characters and other alphanumeric runs, excluding punctuation."""
+    count, in_word = 0, False
+    for character in unicodedata.normalize("NFKC", text):
+        name = unicodedata.name(character, "")
+        if name.startswith(("CJK UNIFIED IDEOGRAPH", "CJK COMPATIBILITY IDEOGRAPH",
+                            "HIRAGANA LETTER", "KATAKANA LETTER", "HANGUL")):
+            count += 1
+            in_word = False
+        elif character.isalnum():
+            count += int(not in_word)
+            in_word = True
+        elif not unicodedata.category(character).startswith("M"):
+            in_word = False
+    return count
+
+
 def _validate_direct_transcribed_dialogue(
     text: str, speech: list[dict[str, Any]],
 ) -> list[ValidationIssue]:
@@ -1829,6 +1846,8 @@ def _validate_direct_transcribed_dialogue(
         try:
             cursor = blocks.index(locked, cursor) + 1
         except ValueError:
+            if _lexical_unit_count(fact["text"]) < 3:
+                continue
             issues.append(ValidationIssue(
                 "direct_transcribed_dialogue_missing", fact["segment_id"],
                 f"required exact chronological ASR dialogue missing or reordered: {locked}",

@@ -966,6 +966,7 @@ def test_multiple_same_speaker_segments_keep_merged_or_continuing_dialogue(
     job = jobs[0]
     values = job.model_dump(mode="json")
     segment = values["segments"][0]
+    segment["asr_text"] = "exact substantive transcript"
     values["segments"] = []
     for i in range(1, 5):
         start, end = (i - 1) * 0.25, (i - 1) * 0.25 + 0.2
@@ -989,10 +990,10 @@ def test_multiple_same_speaker_segments_keep_merged_or_continuing_dialogue(
         payload[section][key] = [
             {**template, "segment_id": s["segment_id"]} for s in values["segments"]
         ]
-    caption = "(S1) <Subject 1> gestures. <d>[English] exact transcript</d>"
+    caption = "(S1) <Subject 1> gestures. <d>[English] exact substantive transcript</d>"
     if split_blocks:
         caption += " ".join(
-            " <d>[English] exact transcript</d>" for i in range(2, 5)
+            " <d>[English] exact substantive transcript</d>" for i in range(2, 5)
         )
     payload["h3_semantics"]["shot1_caption"] = caption
     from r2v_data_v2.h3.mimo25_av_reconcile import _job
@@ -1289,7 +1290,7 @@ def test_explicit_marker_mismatch_remains_hard_in_backend(tmp_path, monkeypatch)
     assert "direct_dialogue_speaker_marker_mismatch" not in row["diagnostics"][-1]["warnings"]
     assert summary.model_call_count == len(completions.requests) == 5
     assert row["text_model_call_count"] == 1
-    assert backend.provenance.schema_version == MIMO25_BACKEND_VERSION == "r2v.h3.mimo25_backend.65"
+    assert backend.provenance.schema_version == MIMO25_BACKEND_VERSION == "r2v.h3.mimo25_backend.66"
     assert backend.provenance.prompt_version == "h3_mimo25_speech_assembly_v49"
 
 
