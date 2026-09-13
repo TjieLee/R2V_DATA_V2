@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from r2v_data_v2.h3.mimo25_backend import MimoMediaResolver
-from tools.run_h3_mimo25_stem_reconcile_shadow import _parser
+from tools.run_h3_mimo25_stem_reconcile_shadow import _parse_arguments
 
 
 def test_http_persistent_media_quoted_without_reading_bytes(tmp_path, monkeypatch):
@@ -41,18 +41,31 @@ def test_base64_media_unchanged(tmp_path):
     ({"MIMO_MEDIA_MODE": "base64", "MIMO_MEDIA_BASE_URL": "http://env.invalid/"},
      ["--media-mode", "http", "--media-base-url", "http://explicit.invalid/"], ("http", "http://explicit.invalid/")),
     ({"MIMO_MEDIA_MODE": "http"}, ["--media-mode", "base64"], ("base64", None)),
+    ({"MIMO_MEDIA_MODE": "http", "MIMO_MEDIA_BASE_URL": "http://127.0.0.1:8766/"},
+     ["--media-mode", "base64"], ("base64", None)),
+    ({"MIMO_MEDIA_BASE_URL": "http://127.0.0.1:8766/"},
+     ["--media-mode", "http"], ("http", "http://127.0.0.1:8766/")),
+    ({"MIMO_MEDIA_MODE": "http", "MIMO_MEDIA_BASE_URL": "http://127.0.0.1:8766/"},
+     ["--media-mode", "http", "--media-base-url", "http://explicit.invalid/"], ("http", "http://explicit.invalid/")),
+    ({"MIMO_MEDIA_MODE": "http", "MIMO_MEDIA_BASE_URL": "http://127.0.0.1:8766/"},
+     ["--media-mode=base64", "--media-base-url=http://explicit.invalid/"], ("base64", "http://explicit.invalid/")),
 ])
-def test_runner_media_environment_defaults_and_explicit_precedence(monkeypatch, environment, explicit, expected):
+def test_runner_media_environment_defaults_and_explicit_precedence(tmp_path, monkeypatch, environment, explicit, expected):
     for name in ("MIMO_MEDIA_MODE", "MIMO_MEDIA_BASE_URL"):
         monkeypatch.delenv(name, raising=False)
     for name, value in environment.items():
         monkeypatch.setenv(name, value)
-    args = _parser().parse_args([
+    args = _parse_arguments([
         "--visual-production-root", "/visual", "--visual-runs-root", "/runs",
         "--audio-production-root", "/audio", "--case-manifest", "/cases.json", *explicit,
     ])
     assert (args.media_mode, args.media_base_url) == expected
     assert args.media_root == Path("/mnt/workspace")
+    if expected[0] == "base64" and expected[1] is not None:
+        with pytest.raises(ValueError, match="Base64 media mode cannot define an HTTP URL"):
+            MimoMediaResolver(mode=args.media_mode, media_root=tmp_path, media_base_url=args.media_base_url)
+    else:
+        MimoMediaResolver(mode=args.media_mode, media_root=tmp_path, media_base_url=args.media_base_url)
 
 
 def test_http_requires_base_url(tmp_path):

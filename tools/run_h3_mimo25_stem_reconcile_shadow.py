@@ -81,9 +81,9 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--model", default="mimo-v2.5")
     parser.add_argument("--base-url", default="http://127.0.0.1:8092/v1")
-    parser.add_argument("--media-mode", choices=("base64", "http"), default=os.environ.get("MIMO_MEDIA_MODE", "base64"))
+    parser.add_argument("--media-mode", choices=("base64", "http"))
     parser.add_argument("--media-root", type=Path, default=Path("/mnt/workspace"))
-    parser.add_argument("--media-base-url", default=os.environ.get("MIMO_MEDIA_BASE_URL"))
+    parser.add_argument("--media-base-url")
     parser.add_argument("--output-root", type=Path)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--thinking", choices=("disabled", "enabled"), default="disabled")
@@ -95,8 +95,18 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> dict[str, object]:
+def _parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     arguments = _parser().parse_args(argv)
+    # Explicit base64 suppresses only an inherited URL, never an explicit one.
+    if arguments.media_base_url is None and arguments.media_mode != "base64":
+        arguments.media_base_url = os.environ.get("MIMO_MEDIA_BASE_URL")
+    if arguments.media_mode is None:
+        arguments.media_mode = os.environ.get("MIMO_MEDIA_MODE", "base64")
+    return arguments
+
+
+def main(argv: list[str] | None = None) -> dict[str, object]:
+    arguments = _parse_arguments(argv)
     paths = jea_production_paths(arguments.audio_production_root)
     route = downstream_stem_route(arguments.shadow_run_id, arguments.sam_route)
     shadow = stem_shadow_root(paths.root, arguments.shadow_run_id)
