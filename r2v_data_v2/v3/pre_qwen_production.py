@@ -1505,6 +1505,20 @@ def _recover_clip_checkpoint(
     )
 
 
+class _RecoverySingleClipStorage:
+    """Constrain frozen batch stages to the exact recovery target, without scanning."""
+
+    def __init__(self, storage: RunStorage, clip_uid: str) -> None:
+        self.storage = storage
+        self.clip_uid = clip_uid
+
+    def iter_clips(self) -> Iterator[ClipRecord]:
+        yield self.storage.read_clip(self.clip_uid)
+
+    def __getattr__(self, name: str):
+        return getattr(self.storage, name)
+
+
 class _RecordingBackend:
     def __init__(self, backend: SegmentationBackend) -> None:
         self.backend = backend
@@ -1732,19 +1746,29 @@ def process_ready_clip(
         output_root=output_root,
     )
 
+    stage_storage = (
+        _RecoverySingleClipStorage(storage, clip_uid)
+        if recover_incomplete_artifacts else storage
+    )
+
     if _STAGES[checkpoint.stage] < _STAGES["masks_ready"]:
         if storage.masks_path(clip_uid).is_file():
             _validate_existing_masks(storage, clip_uid=clip_uid, entities=annotation.entities)
         else:
             recording = _RecordingBackend(backend)
-            stats = segment_clips(config, storage, backend=recording)  # type: ignore[arg-type]
+            stats = segment_clips(config, stage_storage, backend=recording)  # type: ignore[arg-type]
             if recording.exceptions:
                 storage.masks_path(clip_uid).unlink(missing_ok=True)
                 raise RetryableStageError("sam3", str(recording.exceptions[0]))
             if stats.failed:
                 storage.masks_path(clip_uid).unlink(missing_ok=True)
                 raise RetryableStageError("sam3", "SAM3 stage failed without artifact")
-            _validate_existing_masks(storage, clip_uid=clip_uid, entities=annotation.entities)
+            try:
+                _validate_existing_masks(storage, clip_uid=clip_uid, entities=annotation.entities)
+            except FileNotFoundError as exc:
+                if not recover_incomplete_artifacts:
+                    raise
+                raise RetryableStageError("sam3", "target masks were not materialized") from exc
         checkpoint = _write_checkpoint(
             workspace,
             stage="masks_ready",
@@ -1801,11 +1825,21 @@ def process_ready_clip(
                 clip.references.background,
             )
         else:
-            stats = build_background_candidates(config, storage)
+            stats = build_background_candidates(config, stage_storage)
             if stats.failed:
                 raise RetryableStageError(
                     "background", "background stage failed without valid state"
                 )
+        if recover_incomplete_artifacts:
+            try:
+                background = storage.read_clip(clip_uid).references.background
+                if background is None:
+                    raise RetryableStageError(
+                        "background", "target background state was not materialized"
+                    )
+                validate_background_reference(storage, clip_uid, background)
+            except FileNotFoundError as exc:
+                raise RetryableStageError("background", str(exc)) from exc
         _write_checkpoint(
             workspace,
             stage="background_ready",
@@ -2303,64 +2337,88 @@ def process_execution_chunk(
                 output_root=root,
                 config_identity=config_identity,
             )
-        for row in expected_rows[len(completed) :]:
-            annotation = _annotation_state(row)
-            if annotation.status == "failed" or not annotation.entities:
-                result = _skipped_row(row, shard)
-            else:
-                if backend is None:
-                    raise RuntimeError("unfinished Stage2 chunk requires SAM3 backend")
-                workspace = root / "artifacts" / shard.path.stem / str(row["clip_uid"])
-                try:
-                    result = process_ready_clip(
-                        row=row,
+        # One suffix retry only; persistent artifact loss remains resumable.
+        for finalization_attempt in range(2 if recover_incomplete_artifacts else 1):
+            for row in expected_rows[len(completed) :]:
+                annotation = _annotation_state(row)
+                if annotation.status == "failed" or not annotation.entities:
+                    result = _skipped_row(row, shard)
+                else:
+                    if backend is None:
+                        raise RuntimeError("unfinished Stage2 chunk requires SAM3 backend")
+                    workspace = root / "artifacts" / shard.path.stem / str(row["clip_uid"])
+                    try:
+                        result = process_ready_clip(
+                            row=row,
+                            shard=shard,
+                            output_root=root,
+                            workspace=workspace,
+                            config_identity=config_identity,
+                            backend=backend,
+                            decoder=decoder,
+                            static_owner=static_owner,
+                            recover_incomplete_artifacts=recover_incomplete_artifacts,
+                        )
+                    except RetryableStageError as exc:
+                        _failure_attempt(root, shard, row, exc)
+                        return {
+                            "path": str(partial),
+                            "rows": len(completed),
+                            "skipped": False,
+                            "retryable": True,
+                            "source_index": row["source_index"],
+                            "stage": exc.stage,
+                            "chunk": chunk.stem,
+                            "resumed": resumed,
+                        }
+                if result.artifact_root is not None:
+                    workspace = root / result.artifact_root
+                    checkpoint = _read_checkpoint(workspace)
+                    if checkpoint is not None:
+                        _write_checkpoint(
+                            workspace,
+                            stage="row_committed",
+                            row=row,
+                            shard_sha256=shard.sha256,
+                            config_identity=config_identity,
+                        )
+                _append_jsonl(partial, result.model_dump(mode="json"))
+                completed.append(result)
+            validated = _read_chunk_rows(
+                partial, shard=shard, chunk=chunk, recover_tail=False
+            )
+            if len(validated) != chunk.row_count:
+                raise RuntimeError("Stage2 did not publish every chunk row")
+            if not recover_incomplete_artifacts:
+                for value, input_row in zip(validated, expected_rows):
+                    _validate_materialized_row(
+                        value,
+                        input_row=input_row,
                         shard=shard,
                         output_root=root,
-                        workspace=workspace,
-                        config_identity=config_identity,
-                        backend=backend,
-                        decoder=decoder,
-                        static_owner=static_owner,
-                        recover_incomplete_artifacts=recover_incomplete_artifacts,
-                    )
-                except RetryableStageError as exc:
-                    _failure_attempt(root, shard, row, exc)
-                    return {
-                        "path": str(partial),
-                        "rows": len(completed),
-                        "skipped": False,
-                        "retryable": True,
-                        "source_index": row["source_index"],
-                        "stage": exc.stage,
-                        "chunk": chunk.stem,
-                        "resumed": resumed,
-                    }
-            if result.artifact_root is not None:
-                workspace = root / result.artifact_root
-                checkpoint = _read_checkpoint(workspace)
-                if checkpoint is not None:
-                    _write_checkpoint(
-                        workspace,
-                        stage="row_committed",
-                        row=row,
-                        shard_sha256=shard.sha256,
                         config_identity=config_identity,
                     )
-            _append_jsonl(partial, result.model_dump(mode="json"))
-            completed.append(result)
-        validated = _read_chunk_rows(
-            partial, shard=shard, chunk=chunk, recover_tail=False
-        )
-        if len(validated) != chunk.row_count:
-            raise RuntimeError("Stage2 did not publish every chunk row")
-        for value, input_row in zip(validated, expected_rows):
-            _validate_materialized_row(
-                value,
-                input_row=input_row,
-                shard=shard,
-                output_root=root,
-                config_identity=config_identity,
+                break
+            # This validates every surviving row as well as reconciling loss.
+            prefix = _recover_chunk_prefix(
+                partial, partial=partial, rows=validated,
+                expected_rows=expected_rows, shard=shard, chunk=chunk,
+                root=root, config_identity=config_identity,
             )
+            if len(prefix) == len(validated):
+                break
+            completed = prefix
+            if finalization_attempt == 1:
+                row = expected_rows[len(prefix)]
+                exc = RetryableStageError(
+                    "finalization", "target artifacts lost after bounded suffix retry"
+                )
+                _failure_attempt(root, shard, row, exc)
+                return {
+                    "path": str(partial), "rows": len(prefix), "skipped": False,
+                    "retryable": True, "source_index": row["source_index"],
+                    "stage": exc.stage, "chunk": chunk.stem, "resumed": resumed,
+                }
         if _sha256_file(shard.path) != shard.sha256:
             raise ValueError("input annotation shard changed during Stage2 processing")
         os.replace(partial, final)

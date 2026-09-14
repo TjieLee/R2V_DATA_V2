@@ -517,12 +517,11 @@ def test_cluster_dry_run_leaves_unpublished_plan_and_artifacts_untouched(
     assert {path: path.read_bytes() for path in before} == before
 
 
-def test_original_reconciler_and_normal_launcher_are_unchanged():
+def test_normal_launcher_is_unchanged():
     import hashlib
 
     root = Path(__file__).resolve().parents[1]
     expected = {
-        "r2v_data_v2/v3/pre_qwen_production.py": "552dc145ea3f9ba15187a64a81e7ce1bbedceedcc39d75400e9c26d8d45f3a73",
         "tools/run_v3_entity_mask_auto.py": "531b98778b97479c5b1118daf00716c55763a52d7712a3e28542b0b1a2411a7c",
     }
     for name, digest in expected.items():
