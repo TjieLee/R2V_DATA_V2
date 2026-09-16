@@ -189,9 +189,11 @@ def test_qwen_two_calls_one_local_model_and_plain_text(tmp_path, monkeypatch):
     assert events.count("model") == events.count("processor") == 1
     requests = [e for e in events if isinstance(e, tuple)]
     assert requests[0][0][0]["content"][0] == {"type": "video", "path": str(video)}
-    assert requests[0][1]["num_frames"] == 16
+    assert "num_frames" not in requests[0][1]
+    assert "fps" not in requests[0][1]
     assert requests[1][0][0]["content"][0]["type"] == "text"
     assert "num_frames" not in requests[1][1]
+    assert "fps" not in requests[1][1]
 
 
 def test_launcher_demo_loop_is_one_case_and_cli_seed_without_modifying_source(tmp_path, monkeypatch):
