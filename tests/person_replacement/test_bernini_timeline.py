@@ -104,7 +104,9 @@ def test_trim_only_tail_and_restore_exact_rational(tmp_path, monkeypatch):
     cmd = calls[0]
     assert cmd[cmd.index("-vf") + 1] == "trim=end_frame=138,settb=expr=1/24000,setpts=N*1001"
     assert cmd[cmd.index("-r") + 1] == "24000/1001"
-    assert cmd[cmd.index("-fps_mode") + 1] == "passthrough"
+    assert cmd[cmd.index("-fps_mode") + 1] == "cfr"
+    assert cmd[cmd.index("-enc_time_base") + 1] == "1001:24000"
+    assert cmd[cmd.index("-video_track_timescale") + 1] == "24000"
     assert "-shortest" not in cmd and "-t" not in cmd
 
 
@@ -150,22 +152,37 @@ def test_pipeline_never_publishes_mismatching_output(tmp_path, monkeypatch, bad)
 
 
 @pytest.mark.skipif(not shutil.which("ffmpeg") or not shutil.which("ffprobe"), reason="FFmpeg tools unavailable")
-def test_real_ffmpeg_tail_padding_trim_and_fractional_timing(tmp_path):
+@pytest.mark.parametrize("count,rate,internal_count,internal_fps", [
+    (80, "25/1", 81, 25),
+    (138, "25/1", 141, 25),
+    (138, "24000/1001", 141, 24),
+    (137, "24000/1001", 137, 24),
+])
+def test_real_ffmpeg_tail_padding_trim_and_fractional_timing(
+    tmp_path, count, rate, internal_count, internal_fps,
+):
     import cv2
     import numpy as np
 
     original = tmp_path / "original.mp4"
-    # Each frame is a distinct gray level; verify decoded order after real FFmpeg.
-    pixels = b"".join(np.full((16, 16, 3), i, dtype=np.uint8).tobytes() for i in range(138))
+    # Eight high-contrast blocks encode the exact frame index. Unlike nearby gray
+    # levels with a tolerance, this detects even a single dropped/duplicated frame.
+    pixels = b"".join(np.concatenate([
+        np.full((16, 16, 3), 235 if i & (1 << bit) else 16, dtype=np.uint8)
+        for bit in range(8)
+    ], axis=1).tobytes() for i in range(count))
     subprocess.run(["ffmpeg", "-v", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
-        "-s", "16x16", "-r", "24000/1001", "-i", "pipe:0", "-c:v", "libx264",
+        "-s", "128x16", "-r", rate, "-i", "pipe:0", "-c:v", "libx264",
         "-crf", "0", "-pix_fmt", "yuv420p", str(original)], input=pixels, check=True)
     before = original.read_bytes()
     plan = bernini.plan_bernini_timeline(timeline.inspect_video_timeline(original))
-    assert plan.source.rate.numerator == 24000 and plan.source.rate.denominator == 1001
+    from fractions import Fraction
+
+    assert plan.source.rate == Fraction(rate)
+    assert (plan.internal_frame_count, plan.internal_fps) == (internal_count, internal_fps)
     padded = bernini.prepare_generation_input(original, tmp_path, plan)
 
-    def levels(path):
+    def frame_indices(path):
         capture = cv2.VideoCapture(str(path))
         result = []
         try:
@@ -173,17 +190,17 @@ def test_real_ffmpeg_tail_padding_trim_and_fractional_timing(tmp_path):
                 ok, frame = capture.read()
                 if not ok:
                     return result
-                result.append(float(frame.mean()))
+                result.append(sum(1 << bit for bit in range(8)
+                    if frame[:, bit*16:(bit+1)*16].mean() > 128))
         finally:
             capture.release()
 
-    real = levels(original)
-    internal = levels(padded)
-    assert len(internal) == 141
-    assert np.allclose(internal[:138], real, atol=1)
-    assert np.allclose(internal[138:], [real[-1]] * 3, atol=1)
+    assert frame_indices(original) == list(range(count))
+    assert frame_indices(padded) == list(range(count)) + [count-1] * (internal_count-count)
+    internal = timeline.inspect_video_timeline(padded)
+    assert internal.frame_count == internal_count and internal.rate == internal_fps
     final = tmp_path / "replacement.mp4"
     _, result = bernini.normalize_output(padded, final, plan)
-    assert result.frame_count == 138 and result.rate == plan.source.rate
-    assert np.allclose(levels(final), real, atol=3)
+    assert result.frame_count == count and result.rate == Fraction(rate)
+    assert frame_indices(final) == list(range(count))
     assert original.read_bytes() == before

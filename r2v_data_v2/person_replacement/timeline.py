@@ -87,7 +87,7 @@ def transcode_timeline(source: Path, output: Path, *, rate: Fraction, prefix_fil
     command = [
         "ffmpeg", "-nostdin", "-v", "error", "-n", "-i", str(source),
         "-map", "0:v:0", "-an", "-vf", filters,
-        "-r", f"{num}/{den}", "-fps_mode", "passthrough",
+        "-r", f"{num}/{den}", "-fps_mode", "cfr",
         "-enc_time_base", f"{den}:{num}", "-video_track_timescale", str(num),
         "-c:v", "libx264", "-preset", "slow", "-crf", "0" if lossless else "12",
         "-pix_fmt", "yuv420p", str(output),
