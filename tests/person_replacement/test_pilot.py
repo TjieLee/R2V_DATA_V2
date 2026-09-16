@@ -9,6 +9,8 @@ import pytest
 from PIL import Image
 
 from r2v_data_v2.person_replacement import bernini, pipeline, qwen3vl
+from r2v_data_v2.person_replacement.timeline import VideoTimeline
+from tools.person_replacement import run_bernini_pilot
 from tools.person_replacement.run_bernini_pilot import main
 
 
@@ -55,12 +57,16 @@ def test_dry_run_with_mock_resolver_is_read_only_and_model_free(tmp_path, monkey
     monkeypatch.setattr(pipeline.JeaVideoMotionAdapter, "resolve_clip_path", resolve)
     monkeypatch.setattr(qwen3vl.LocalQwen, "_load", lambda self: pytest.fail("model loaded"))
     monkeypatch.setattr(bernini.BerniniAdapter, "run", lambda *a: pytest.fail("Bernini called"))
+    monkeypatch.setattr(run_bernini_pilot, "inspect_video_timeline",
+                        lambda p: VideoTimeline(138, 25, 25, 1, 640, 480, 5.52))
     output = tmp_path / "output"
     assert main(["--input-jsonl", str(source), "--clips-root", str(clips),
                  "--output-root", str(output), "--dry-run"]) == 0
     report = json.loads(capsys.readouterr().out)
     assert seen == [video.name]
     assert report["cases"][0]["target_video_path"] == str(video)
+    assert report["cases"][0]["bernini_timeline"] == {
+        "internal_frame_count": 141, "internal_fps": 25, "pad_frames": 3}
     assert not output.exists()
 
 
@@ -107,15 +113,18 @@ def test_manifest_pairs_replacement_with_original_and_releases_qwen(tmp_path, mo
         def validate(self):
             pass
 
-        def run(self, case_path, seed):
+        def run(self, case_path, seed, *, plan):
             events.append("bernini")
             assert seed == 37
+            assert plan.internal_frame_count == 81
             case = json.loads(case_path.read_text())
             assert case["video"] == str(video)
             Path(case["output"]).write_bytes(b"generated video")
 
     monkeypatch.setattr(pipeline, "extract_frame_zero", lambda v, p: p.write_bytes(b"jpeg"))
-    monkeypatch.setattr(pipeline, "validate_video", lambda p: None)
+    metadata = VideoTimeline(81, 16, 16, 1, 640, 480, 81 / 16)
+    monkeypatch.setattr(pipeline, "inspect_video_timeline", lambda p: metadata)
+    monkeypatch.setattr(bernini, "inspect_video_timeline", lambda p: metadata)
     manifests = pipeline.run_cases(cases, qwen=Qwen(), bernini=Bernini(), seed=37)
     assert events == ["describe", "invent", "release qwen", "bernini"]
     manifest = json.loads(manifests[0].read_text())
@@ -123,6 +132,8 @@ def test_manifest_pairs_replacement_with_original_and_releases_qwen(tmp_path, mo
     assert manifest["input_video_path"].endswith("replacement.mp4")
     assert manifest["reference_image_path"].endswith("reference_frame0.jpg")
     assert manifest["seed"] == 37
+    assert manifest["source_frame_count"] == manifest["output_frame_count"] == 81
+    assert manifest["bernini_pad_frames"] == 0
     assert video.read_bytes() == b"mock video"
     with pytest.raises(FileExistsError):
         pipeline.run_cases(cases, qwen=Qwen(), bernini=Bernini(), seed=37)
@@ -206,20 +217,21 @@ CASE_PATH=${CASE_PATH:-assets/testcases/v2v/v2v_case3.json}
 for CASE_PATH in assets/testcases/v2v/v2v_case1.json assets/testcases/v2v/v2v_case2.json assets/testcases/v2v/v2v_case3.json;
 do
 BERNINI_CONFIG=${BERNINI_CONFIG:-ByteDance/Bernini-Diffusers}
-torchrun --standalone --nproc-per-node 8 infer_multi_gpu.py --config "$BERNINI_CONFIG" --seed 42 --case "$CASE_PATH"
+torchrun --standalone --nproc-per-node 8 infer_multi_gpu.py --config "$BERNINI_CONFIG" --seed 42 --num_frames 81 --fps 16 --case "$CASE_PATH"
 done
 ''')
     (code / "infer_multi_gpu.py").touch()
     model = tmp_path / "checkpoint"
     model.mkdir()
     before = launcher.read_bytes()
-    effective = bernini.prepare_launcher(launcher.read_text(), 19)
+    effective = bernini.prepare_launcher(launcher.read_text(), seed=19, num_frames=137, fps=25)
     assert 'for CASE_PATH' not in effective
     assert '--seed 19' in effective
     assert launcher.read_bytes() == before
     assert effective.count('torchrun') == 1
     with pytest.raises(ValueError):
-        bernini.prepare_launcher(launcher.read_text().replace('--case', '--use_pe --case'), 19)
+        bernini.prepare_launcher(launcher.read_text().replace('--case', '--use_pe --case'),
+                                 seed=19, num_frames=137, fps=25)
     case_dir = tmp_path / "case"
     case_dir.mkdir()
     generated = case_dir / "replacement.mp4"
@@ -240,11 +252,15 @@ Path(case['output']).write_bytes(b'fake generated video')
 ''')
     fake_torchrun.chmod(0o755)
     monkeypatch.setenv("PATH", str(fake_bin) + os.pathsep + os.environ["PATH"])
-    bernini.BerniniAdapter(code, model).run(case_path, 19)
+    monkeypatch.setattr(subprocess, "check_output", lambda *a, **kw: bernini.UPSTREAM_COMMIT + "\n")
+    plan = bernini.plan_bernini_timeline(VideoTimeline(137, 25, 25, 1, 640, 480, 137 / 25))
+    bernini.BerniniAdapter(code, model).run(case_path, 19, plan=plan)
     calls = (case_dir / "invocations.jsonl").read_text().splitlines()
     assert len(calls) == 1  # no three-demo loop
     call = json.loads(calls[0])
     assert call["args"][call["args"].index("--seed") + 1] == "19"
+    assert call["args"][call["args"].index("--num_frames") + 1] == "137"
+    assert call["args"][call["args"].index("--fps") + 1] == "25"
     assert call["args"][call["args"].index("--config") + 1] == str(model)
     assert call["cwd"] == str(code) and call["offline"] == "1"
     assert generated.read_bytes() == b"fake generated video"
@@ -256,9 +272,15 @@ def test_failed_generation_never_publishes_success_manifest(tmp_path, monkeypatc
     cases = pipeline.select_cases(source, clips, tmp_path / "out", limit=1)
     qwen = SimpleNamespace(model_path=tmp_path, describe=lambda v: "source",
                            invent=lambda d: "replacement", close=lambda: None)
-    adapter = SimpleNamespace(config=tmp_path, validate=lambda: None, run=lambda p, s: None)
+    adapter = SimpleNamespace(config=tmp_path, validate=lambda: None, run=lambda p, s, **kw: None)
     monkeypatch.setattr(pipeline, "extract_frame_zero", lambda v, p: p.write_bytes(b"jpeg"))
-    with pytest.raises(ValueError, match="no video"):
+    monkeypatch.setattr(pipeline, "inspect_video_timeline",
+                        lambda p: VideoTimeline(81, 16, 16, 1, 640, 480, 81 / 16))
+    def missing_output(path):
+        assert not path.exists()
+        raise FileNotFoundError(path)
+    monkeypatch.setattr(bernini, "inspect_video_timeline", missing_output)
+    with pytest.raises(FileNotFoundError):
         pipeline.run_cases(cases, qwen=qwen, bernini=adapter, seed=42)
     assert not (Path(cases[0]["output_dir"]) / "manifest.json").exists()
 
@@ -266,7 +288,7 @@ def test_failed_generation_never_publishes_success_manifest(tmp_path, monkeypatc
 def test_launcher_refuses_unrecognized_case_override():
     script = 'CASE_PATH=wrong.json\nBERNINI_CONFIG=wrong-model\ntorchrun infer_multi_gpu.py --config "$BERNINI_CONFIG" --case "$CASE_PATH" --seed 42\n'
     with pytest.raises(ValueError, match="override"):
-        bernini.prepare_launcher(script, 42)
+        bernini.prepare_launcher(script, seed=42, num_frames=81, fps=16)
 
 
 def test_missing_bernini_root_has_clear_error(tmp_path, monkeypatch):

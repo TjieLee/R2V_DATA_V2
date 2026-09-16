@@ -1,5 +1,6 @@
 """Small sequential pilot. Existing Visual/H3 pipelines are never invoked."""
 
+from dataclasses import asdict
 from itertools import islice
 from pathlib import Path
 
@@ -9,7 +10,13 @@ from r2v_data_v2.reconciliation import write_json_atomic
 from r2v_data_v2.v3.frames import OpenCvFrameDecoder
 from r2v_data_v2.v3.production_source import JeaVideoMotionAdapter
 
-from .bernini import serialize_case
+from .bernini import (
+    normalize_output,
+    plan_bernini_timeline,
+    prepare_generation_input,
+    serialize_case,
+)
+from .timeline import inspect_video_timeline
 
 
 def build_prompt(source: str, replacement: str) -> str:
@@ -104,6 +111,8 @@ def run_cases(cases, *, qwen, bernini, seed: int) -> list[Path]:
             output = Path(case["output_dir"])
             output.mkdir(parents=True, exist_ok=False)
             video = Path(case["target_video_path"])
+            source_timeline = inspect_video_timeline(video)
+            plan = plan_bernini_timeline(source_timeline)
             reference = output / "reference_frame0.jpg"
             extract_frame_zero(video, reference)
             source = qwen.describe(video)
@@ -113,21 +122,29 @@ def run_cases(cases, *, qwen, bernini, seed: int) -> list[Path]:
                                ("bernini_prompt", prompt)):
                 (output / f"{name}.txt").write_text(text + "\n", encoding="utf-8")
             generated = output / "replacement.mp4"
+            raw_output = output / "replacement_raw.mp4"
+            generation_input = prepare_generation_input(video, output, plan)
             case_path = output / "bernini_case.json"
-            write_json_atomic(case_path, serialize_case(video, generated, prompt))
-            prepared.append((case_path, {
+            write_json_atomic(case_path, serialize_case(generation_input, raw_output, prompt))
+            prepared.append((case_path, plan, {
                 **case, "reference_image_path": str(reference), "input_video_path": str(generated),
                 "source_person_description": source, "replacement_person_description": replacement,
                 "bernini_prompt": prompt, "qwen_model_path": str(qwen.model_path),
                 "bernini_model_path": str(bernini.config), "seed": seed,
+                **{f"source_{key}": value for key, value in asdict(source_timeline).items()},
+                "bernini_internal_frame_count": plan.internal_frame_count,
+                "bernini_internal_fps": plan.internal_fps, "bernini_pad_frames": plan.pad_frames,
             }))
     finally:
         qwen.close()
     # Avoid resident Qwen competing with the official multi-GPU Bernini subprocess.
     manifests = []
-    for case_path, manifest in prepared:
-        bernini.run(case_path, seed)
-        validate_video(Path(manifest["input_video_path"]))
+    for case_path, plan, manifest in prepared:
+        bernini.run(case_path, seed, plan=plan)
+        raw, final = normalize_output(case_path.parent / "replacement_raw.mp4",
+                                      Path(manifest["input_video_path"]), plan)
+        manifest.update({f"raw_output_{key}": value for key, value in asdict(raw).items()})
+        manifest.update({f"output_{key}": value for key, value in asdict(final).items()})
         path = case_path.parent / "manifest.json"
         write_json_atomic(path, manifest)
         manifests.append(path)

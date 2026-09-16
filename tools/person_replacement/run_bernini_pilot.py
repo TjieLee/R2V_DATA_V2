@@ -4,14 +4,16 @@ import argparse
 import json
 import os
 import sys
+from dataclasses import asdict
 from pathlib import Path
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from r2v_data_v2.person_replacement.bernini import BerniniAdapter
+from r2v_data_v2.person_replacement.bernini import BerniniAdapter, plan_bernini_timeline
 from r2v_data_v2.person_replacement.pipeline import run_cases, select_cases
 from r2v_data_v2.person_replacement.qwen3vl import LocalQwen
+from r2v_data_v2.person_replacement.timeline import inspect_video_timeline
 
 
 def main(argv=None):
@@ -35,6 +37,12 @@ def main(argv=None):
         parser.error("--seed must be non-negative")
     cases = select_cases(args.input_jsonl, args.clips_root, args.output_root, limit=args.limit)
     if args.dry_run:
+        for case in cases:
+            source = inspect_video_timeline(Path(case["target_video_path"]))
+            plan = plan_bernini_timeline(source)
+            case["source_timeline"] = asdict(source)
+            case["bernini_timeline"] = {"internal_frame_count": plan.internal_frame_count,
+                                        "internal_fps": plan.internal_fps, "pad_frames": plan.pad_frames}
         print(json.dumps({"dry_run": True, "cases": cases}, ensure_ascii=False, indent=2))
         return 0
     results = run_cases(
