@@ -29,7 +29,7 @@ def read_jsonl(path: Path):
 
 def test_reference_products_split_visual_and_audio_variants(tmp_path: Path):
     shadow = tmp_path / "shadow"
-    prepared = shadow / "h3_audio_reuse_prepared_v1"
+    prepared = shadow / "audio_reuse_prepared_v1"
     products = shadow / "h3_audio_reuse_products_v1"
     video = "/data/clip-a.mp4"
     images = ["/data/p1.png", "/data/p2.png"]
@@ -115,7 +115,7 @@ def test_reference_products_split_visual_and_audio_variants(tmp_path: Path):
 
 def test_frame_products_split_visual_modes_and_audio_variants(tmp_path: Path):
     shadow = tmp_path / "shadow"
-    prepared = shadow / "h3_audio_reuse_prepared_v1"
+    prepared = shadow / "audio_reuse_prepared_v1"
     products = shadow / "h3_audio_reuse_products_v1"
     frames = shadow / "h3_frame_conditioned_products_v1"
     video = "/data/clip-a.mp4"
@@ -256,7 +256,7 @@ def test_video_summary_lists_fine_grained_tasks(tmp_path: Path):
     t2va = tmp_path / "t2va"
     video = "/data/shared.mp4"
     write_json(
-        shadow / "h3_audio_reuse_prepared_v1" / "inventory.json",
+        shadow / "audio_reuse_prepared_v1" / "inventory.json",
         {"jobs": [{"clip_uid": "shared", "target_video_path": video, "reference_images": []}]},
     )
     write_jsonl(
