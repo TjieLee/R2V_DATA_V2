@@ -1,31 +1,58 @@
 # H3 training manifest export
 
-Use `tools/export_h3_training_manifests.py` to flatten the frozen H3 products into one summary JSONL plus one JSONL per training task. The exporter is read-only with respect to all frozen R(A)2VA / T(A)2VA artifacts.
+Use `tools/export_h3_training_manifests.py` to flatten frozen H3 products into one summary JSONL plus one JSONL per training task. The exporter is read-only with respect to frozen R(A)2VA / T(A)2VA artifacts.
 
-Output:
-
-```text
-<output-root>/
-  videos.jsonl
-  r2va.jsonl
-  ra2va.jsonl
-  t2va.jsonl
-  ta2va.jsonl
-```
-
-`videos.jsonl` contains only:
-
-```json
-{"video":"/path/to/video.mp4","tasks":["r2va","ra2va","t2va","ta2va"]}
-```
-
-Every task file uses exactly this loader-facing row shape:
+Each task row has exactly:
 
 ```json
 {"video":"/path/to/video.mp4","images":["/path/to/p1.png"],"audios":["/path/to/a1.flac"],"caption":"final caption"}
 ```
 
-Missing modalities use empty arrays. Exported rows intentionally contain no hashes, fingerprints, stage names, or internal provenance. Media payloads remain external files referenced only by path.
+Missing modalities use `[]`. Exported rows intentionally contain no hashes, fingerprints, stage names, or internal provenance.
+
+Output task files:
+
+```text
+videos.jsonl
+
+r2va_reference.jsonl
+r2va_first_frame.jsonl
+r2va_last_frame.jsonl
+r2va_first_last_frame.jsonl
+
+ra2va_reference_full_audio.jsonl
+ra2va_reference_speech_bgm.jsonl
+ra2va_first_frame_full_audio.jsonl
+ra2va_first_frame_speech_bgm.jsonl
+ra2va_last_frame_full_audio.jsonl
+ra2va_last_frame_speech_bgm.jsonl
+ra2va_first_last_frame_full_audio.jsonl
+ra2va_first_last_frame_speech_bgm.jsonl
+
+t2va.jsonl
+ta2va_full_audio.jsonl
+ta2va_speech_bgm.jsonl
+```
+
+`videos.jsonl` contains one row per target video and lists the exact available fine-grained task names:
+
+```json
+{"video":"/path/to/video.mp4","tasks":["r2va_reference","ra2va_reference_full_audio","t2va"]}
+```
+
+Visual modes:
+
+- `reference`: frozen selected reference Pictures;
+- `first_frame`: extracted first frame;
+- `last_frame`: extracted last frame;
+- `first_last_frame`: both extracted first and last frames.
+
+Audio modes:
+
+- `full_audio`: canonical full target-audio reuse;
+- `speech_bgm`: target speaker-speech reuse plus optional BGM/music reuse. If the finalized product contains no music reference, the task remains `speech_bgm` and `audios` contains only the speech track(s).
+
+Cross-voice/reference-only Audio variants are not exported by this training manifest layer.
 
 Run:
 
@@ -37,13 +64,6 @@ Run:
   --output-root "$EXPORT_ROOT"
 ```
 
-Arguments are optional except `--output-root`; omitted task families produce empty JSONL files. The output root must not already exist.
-
-Task mapping:
-
-- `r2va.jsonl`: ready reference-conditioned `visual_only` products; reference Picture paths are taken from the frozen prepared MiMo inventory.
-- `ra2va.jsonl`: ready reference + Audio products; Audio paths come from the final published Audio contracts.
-- `t2va.jsonl`: ready T2VA samples; video comes from the frozen T2VA inventory and caption comes from the published per-clip prompt.
-- `ta2va.jsonl`: ready TA2VA products; video is resolved through the frozen source T2VA inventory and Audio paths come from the TA2VA product row.
+For R(A)2VA, the exporter reads both the reference-conditioned final products and, when present, `h3_frame_conditioned_products_v1/records.jsonl` under the same shadow root. Arguments are optional except `--output-root`; omitted families produce empty task JSONL files. The output root must not already exist.
 
 The exporter does not change any frozen caption, reference selection, speaker binding, Audio selection, or inference artifact.
