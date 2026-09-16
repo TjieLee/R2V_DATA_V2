@@ -17,13 +17,13 @@ Detailed operational documentation lives in:
 
 Target-side T2VA v7 + TA2VA .2 are complete and frozen. The accepted reference-side/no-LR-ASD path is also frozen at MiMo backend `.66`, speech prompt `v49`, authority policy `v18`, materializer `v29`, reference selection `v2`, 4 FPS, and binding mode `none`. Persistent target video/reference images/music/SFX media use HTTP transport to SGLang; short request-specific speaker snippets remain base64.
 
-For dataset loading, prefer the final publication manifests rather than traversing internal stage folders:
+For dataset loading, prefer final publication manifests rather than traversing internal stage folders:
 
 - R(A)2VA Audio-reuse products: `<shadow-run>/h3_audio_reuse_products_v1/records.jsonl`.
 - derived first/last-frame products: `<shadow-run>/h3_frame_conditioned_products_v1/records.jsonl`.
 - TA2VA products: `<ta2va-run>/records.jsonl`.
 
-Those manifests carry final prompt/conditioning metadata per row and reference media by validated path/hash. T2VA is the exception: its top-level `records.jsonl` is an index/provenance manifest and the semantic core remains under `core/<clip_uid>.json`. See `docs/H3_AUDIO_FREEZE_20260916.md` for the exact dataloader-facing contract.
+The flattening level differs by family. TA2VA and the derived first/last-frame products are already close to direct single-manifest consumption. R(A)2VA Audio-reuse rows contain final prompt, speech and Audio contracts but still need the frozen source H3/Visual contract to resolve reference Pictures; T2VA `records.jsonl` is only an index/provenance manifest and its semantic core remains under `core/<clip_uid>.json`. See `docs/H3_AUDIO_FREEZE_20260916.md` for the exact dataloader-facing contract and the recommended model-free flattening boundary.
 
 ## Pipeline overview
 
