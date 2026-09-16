@@ -78,12 +78,18 @@ def _caption_row(video: str, images: list[str], audios: list[str], caption: str)
     return {"video": video, "images": images, "audios": audios, "caption": caption}
 
 
-def _audio_paths(references: object, *, clip_uid: object, nested_contract: bool) -> list[str]:
+def _audio_paths(
+    references: object, *, clip_uid: object, nested_contract: bool
+) -> list[str]:
     if not isinstance(references, list):
         raise ValueError(f"invalid audio_references for {clip_uid}")
     result = []
     for reference in references:
-        item = reference.get("contract") if nested_contract and isinstance(reference, dict) else reference
+        item = (
+            reference.get("contract")
+            if nested_contract and isinstance(reference, dict)
+            else reference
+        )
         path = item.get("path") if isinstance(item, dict) else None
         if not isinstance(path, str) or not path:
             raise ValueError(f"Audio path missing for {clip_uid}")
@@ -120,8 +126,12 @@ def _audio_task(mode: str, variant: object) -> str | None:
 
 
 def _export_ra2va(shadow: Path) -> dict[str, list[dict]]:
-    rows = {task: [] for task in TASK_ORDER if task.startswith(("r2va_", "ra2va_"))}
-    prepared = shadow / "h3_audio_reuse_prepared_v1"
+    rows = {
+        task: []
+        for task in TASK_ORDER
+        if task.startswith(("r2va_", "ra2va_"))
+    }
+    prepared = shadow / "audio_reuse_prepared_v1"
     products = shadow / "h3_audio_reuse_products_v1"
     jobs = _jobs_by_clip(prepared / "inventory.json")
 
@@ -131,7 +141,9 @@ def _export_ra2va(shadow: Path) -> dict[str, list[dict]]:
         clip_uid = product.get("clip_uid")
         job = jobs.get(clip_uid)
         if job is None:
-            raise ValueError(f"R(A)2VA product clip missing from inventory: {clip_uid}")
+            raise ValueError(
+                f"R(A)2VA product clip missing from inventory: {clip_uid}"
+            )
         images = _reference_images(job, clip_uid)
         variant = product.get("conditioning_variant")
         caption = product.get("rendered_h3_prompt")
@@ -162,7 +174,9 @@ def _export_ra2va(shadow: Path) -> dict[str, list[dict]]:
             caption = product.get("rendered_h3_prompt")
             variant = product.get("conditioning_variant")
             if variant == "visual_only":
-                rows[f"r2va_{mode}"].append(_caption_row(video, images, [], caption))
+                rows[f"r2va_{mode}"].append(
+                    _caption_row(video, images, [], caption)
+                )
                 continue
             task = _audio_task(mode, variant)
             if task is not None:
@@ -171,7 +185,9 @@ def _export_ra2va(shadow: Path) -> dict[str, list[dict]]:
                     clip_uid=product.get("clip_uid"),
                     nested_contract=True,
                 )
-                rows[task].append(_caption_row(video, images, audios, caption))
+                rows[task].append(
+                    _caption_row(video, images, audios, caption)
+                )
     return rows
 
 
@@ -184,9 +200,15 @@ def _export_t2va(root: Path) -> list[dict]:
         clip_uid = record.get("clip_uid")
         job = jobs.get(clip_uid)
         if job is None:
-            raise ValueError(f"T2VA record clip missing from inventory: {clip_uid}")
-        caption = (root / "prompts" / f"{clip_uid}.txt").read_text(encoding="utf-8")
-        result.append(_caption_row(job["target_video_path"], [], [], caption))
+            raise ValueError(
+                f"T2VA record clip missing from inventory: {clip_uid}"
+            )
+        caption = (root / "prompts" / f"{clip_uid}.txt").read_text(
+            encoding="utf-8"
+        )
+        result.append(
+            _caption_row(job["target_video_path"], [], [], caption)
+        )
     return result
 
 
@@ -210,14 +232,18 @@ def _export_ta2va(root: Path) -> dict[str, list[dict]]:
         clip_uid = product.get("clip_uid")
         job = jobs.get(clip_uid)
         if job is None:
-            raise ValueError(f"TA2VA product clip missing from T2VA inventory: {clip_uid}")
+            raise ValueError(
+                f"TA2VA product clip missing from T2VA inventory: {clip_uid}"
+            )
         audios = _audio_paths(
             product.get("audio_references", []),
             clip_uid=clip_uid,
             nested_contract=False,
         )
         result[task].append(
-            _caption_row(job["target_video_path"], [], audios, product.get("prompt"))
+            _caption_row(
+                job["target_video_path"], [], audios, product.get("prompt")
+            )
         )
     return result
 
@@ -250,7 +276,10 @@ def export_training_manifests(
         for row in rows[task]:
             tasks_by_video[row["video"]].add(task)
     summary = [
-        {"video": video, "tasks": [task for task in TASK_ORDER if task in tasks]}
+        {
+            "video": video,
+            "tasks": [task for task in TASK_ORDER if task in tasks],
+        }
         for video, tasks in sorted(tasks_by_video.items())
     ]
     _write_jsonl(output / "videos.jsonl", summary)
