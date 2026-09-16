@@ -4554,6 +4554,96 @@ def test_recovery_real_clip_corruption_cases(
     assert storage.read_clip("clip-0").references.background is not None
 
 
+def test_recovery_missing_run_identity_rebuilds_without_reusing_stale_subtree(
+    tmp_path, monkeypatch,
+):
+    fixture, shard, chunk = _recovery_fixture(tmp_path, monkeypatch, rows=2)
+    final = execution_chunk_path(fixture.output_root, shard, chunk)
+    lines = final.read_bytes().splitlines(keepends=True)
+    prefix = b"  " + lines[0]
+    final.write_bytes(prefix + lines[1])
+    workspace = fixture.output_root / "artifacts" / shard.path.stem / "clip-1"
+    run = workspace / "run"
+    (run / "run.json").unlink()
+    stale = run / "stale-descendant"
+    stale.write_bytes(b"must not survive")
+    outside = workspace / "keep-outside-run"
+    outside.write_bytes(b"keep")
+    backend, decoder = FakeBackend(), FakeDecoder()
+    stages = []
+    original = production._write_checkpoint
+
+    def checkpoint(*args, **kwargs):
+        stages.append(kwargs["stage"])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(production, "_write_checkpoint", checkpoint)
+    result = process_execution_chunk(
+        shard, chunk, output_root=fixture.output_root,
+        config_identity=fixture.identity, backend=backend, decoder=decoder,
+        recover_incomplete_artifacts=True,
+    )
+    assert result["rows"] == 2
+    assert final.read_bytes().startswith(prefix)
+    assert backend.calls == ["e1"]
+    assert decoder.calls  # retained valid frames must be rebuilt, not reused
+    assert stages[0] == "annotation_ready"
+    assert (run / "run.json").is_file()
+    assert not stale.exists()
+    assert outside.read_bytes() == b"keep"
+
+
+@pytest.mark.parametrize("damage", [
+    "malformed_run", "mismatching_run", "checkpoint", "frame_hash", "source",
+    "non_recovery", "run_directory", "run_symlink",
+])
+def test_recovery_run_identity_fail_closed_without_mutation(tmp_path, monkeypatch, damage):
+    fixture, shard, chunk = _recovery_fixture(tmp_path, monkeypatch)
+    workspace = fixture.output_root / "artifacts" / shard.path.stem / "clip-0"
+    run = workspace / "run"
+    run_json = run / "run.json"
+    if damage == "malformed_run":
+        run_json.write_text("{")
+    elif damage == "mismatching_run":
+        payload = json.loads(run_json.read_text())
+        payload["config_hash"] = "0" * 64
+        run_json.write_text(json.dumps(payload))
+    else:
+        run_json.unlink()
+        if damage == "checkpoint":
+            path = workspace / "state.json"
+            payload = json.loads(path.read_text())
+            payload["input_row_sha256"] = "0" * 64
+            path.write_text(json.dumps(payload))
+        elif damage == "frame_hash":
+            (run / "clips/clip-0/frames/00.jpg").write_bytes(b"corrupt")
+        elif damage == "source":
+            path = run / "clips/clip-0/clip.json"
+            payload = json.loads(path.read_text())
+            payload["source"]["source_index"] = 99
+            path.write_text(json.dumps(payload))
+        elif damage == "run_directory":
+            run_json.mkdir()
+        elif damage == "run_symlink":
+            run_json.symlink_to(run / "missing-identity")
+    before = {p: p.read_bytes() for p in fixture.output_root.rglob("*") if p.is_file()}
+    backend, decoder = FakeBackend(), FakeDecoder()
+    def run_chunk():
+        return process_execution_chunk(
+            shard, chunk, output_root=fixture.output_root,
+            config_identity=fixture.identity, backend=backend, decoder=decoder,
+            recover_incomplete_artifacts=damage != "non_recovery",
+        )
+    if damage == "non_recovery":
+        assert run_chunk()["skipped"]
+        assert not run_json.exists()
+    else:
+        with pytest.raises((ValueError, FileNotFoundError)):
+            run_chunk()
+    assert {p: p.read_bytes() for p in before} == before
+    assert backend.calls == decoder.calls == []
+
+
 @pytest.mark.parametrize("partial", [False, True])
 def test_recovery_preserves_exact_chunk_prefix_and_resumes_first_broken_row(
     tmp_path: Path,
