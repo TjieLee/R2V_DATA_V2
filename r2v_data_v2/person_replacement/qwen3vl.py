@@ -4,6 +4,7 @@ from pathlib import Path
 
 SOURCE_PROMPT = """Watch this video and briefly describe the single main person so that a video-editing model can unambiguously identify which person should be replaced.
 Use stable visible characteristics such as clothing, hair, overall appearance, and approximate location in the frame.
+Also include any stable pose or action and any hand-body or hand-object contact that is clearly visible and useful for preserving the original performance, for example both hands inside trouser pockets, holding an object, or resting a hand on the body.
 Keep it concise. Do not describe the background or explain your reasoning. Do not infer ethnicity or race.
 Output only one short natural-language description of the person."""
 
@@ -12,6 +13,7 @@ REPLACEMENT_PROMPT = """The source video contains this person:
 Invent one realistic person who looks clearly different and could plausibly replace this person in the same video.
 Change several strong visible characteristics. You may vary apparent gender presentation, age, hairstyle, hair color, skin tone, facial appearance, body build, clothing style, and clothing colors.
 The replacement should remain an ordinary realistic human, not a fantasy character, costume character, celebrity, or exaggerated body type.
+Describe only the replacement person's appearance; do not invent a different pose or action.
 Keep the description concise and suitable for a video-editing prompt.
 Output only the replacement-person description. Do not explain your choices."""
 
