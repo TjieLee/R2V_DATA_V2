@@ -15,11 +15,19 @@ from .bernini import serialize_case
 def build_prompt(source: str, replacement: str) -> str:
     return (
         f"Replace {source} with {replacement}.\n\n"
-        "Preserve the original person's motion, body pose, body orientation, limb configuration, "
-        "head pose, facial expression, gaze, mouth state, spatial position, scale, occlusion "
-        "relationships, and interactions with objects.\n\n"
-        "Keep the background, foreground objects, camera motion, framing, crop, lighting, "
-        "shadows, scene geometry, composition, and all non-human regions unchanged."
+        "This is an appearance-only person replacement. Keep the original performance and motion "
+        "exactly unchanged. Do not invent, reinterpret, simplify, or adjust the person's action or "
+        "pose to fit the replacement appearance.\n\n"
+        "For every frame, preserve the original body pose sequence, body orientation, limb positions, "
+        "hand placement, hand-body and hand-object contact states, foot placement, head pose, facial "
+        "expression, gaze direction, mouth state, spatial position, scale, occlusion relationships, "
+        "and timing of all movements. The replacement person must follow the source person's motion "
+        "frame by frame. Preserve all contacts exactly: if a hand is inside a pocket, resting on the "
+        "body, holding an object, or touching another surface, keep the same contact state and placement.\n\n"
+        "Only change the person's identity and visible appearance. Keep the background, foreground "
+        "objects, camera motion, framing, crop, lighting, shadows, reflections, scene geometry, "
+        "composition, and all non-human regions unchanged. Do not move, add, remove, or redesign any "
+        "scene element."
     )
 
 
