@@ -1,5 +1,27 @@
 # RA2VA binding A/B review
 
+## Final accepted freeze
+
+The final no-LR-ASD HTTP random20 review was completed and accepted. The frozen
+reference-side configuration is:
+
+- MiMo backend `r2v.h3.mimo25_backend.66`
+- speech prompt `h3_mimo25_speech_assembly_v49`
+- authority policy `h3_mimo25_av_authority_contract_v18`
+- materializer `h3_mimo25_materializer_v29`
+- reference selection `h3_mimo25_reference_selection_v2`
+- video FPS `4.0`
+- binding mode `none`
+- persistent target video/reference image/music/SFX media over HTTP
+- request-specific speaker snippets over base64
+
+The accepted HTTP run produced 19/20 ready records, one expected substantive
+`direct_transcribed_dialogue_missing` hard failure, zero text-polish calls, and
+77 total model calls. Production artifacts were not modified. This review is now
+an acceptance artifact, not a pending gate. Do not reopen validator, prompt, or
+binding behavior for unrelated cleanup. See `H3_AUDIO_FREEZE_20260916.md` for the
+compact frozen-state and dataloader publication contract.
+
 This standalone, model-free export compares frozen legacy-LR-ASD and no-LR-ASD
 MiMo records. It does not re-render H3, reconstruct bindings or alter existing QA.
 Failed records retain their available annotation and original diagnostics.
