@@ -17,9 +17,8 @@ Output only the replacement-person description. Do not explain your choices."""
 
 
 class LocalQwen:
-    def __init__(self, model_path, *, num_frames=16, max_new_tokens=128, dtype="auto"):
+    def __init__(self, model_path, *, max_new_tokens=128, dtype="auto"):
         self.model_path = Path(model_path).expanduser()
-        self.num_frames = num_frames
         self.max_new_tokens = max_new_tokens
         self.dtype = dtype
         self.model = self.processor = None
@@ -44,15 +43,14 @@ class LocalQwen:
             str(self.model_path), local_files_only=True, device_map="auto", dtype=self.dtype,
         ).eval()
 
-    def _text(self, content, *, video=False):
+    def _text(self, content):
         self._load()
         import torch
 
-        options = {"num_frames": self.num_frames} if video else {}
         try:
             inputs = self.processor.apply_chat_template(
                 [{"role": "user", "content": content}], tokenize=True,
-                add_generation_prompt=True, return_dict=True, return_tensors="pt", **options,
+                add_generation_prompt=True, return_dict=True, return_tensors="pt",
             ).to(self.model.device)
         except (ImportError, ValueError, TypeError) as exc:
             raise RuntimeError(
@@ -76,7 +74,7 @@ class LocalQwen:
         return self._text([
             {"type": "video", "path": str(video.resolve(strict=True))},
             {"type": "text", "text": SOURCE_PROMPT},
-        ], video=True)
+        ])
 
     def invent(self, description: str) -> str:
         return self._text([{
