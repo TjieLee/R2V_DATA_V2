@@ -56,10 +56,12 @@ python tools/person_replacement/run_bernini_pilot.py \
 
 Qwen lazily loads one local `Qwen3VLForConditionalGeneration` and `AutoProcessor`
 with `local_files_only=True`, `device_map="auto"`, `dtype="auto"`. Per case it
-makes exactly two plain-text calls: 16 uniformly sampled video frames for a short
-source-person description, then text-only invention of a different ordinary
-person. No JSON parsing, ethnicity/race inference, prompt enhancer or donor pool.
-Both calls use at most 128 generated tokens. The prompt template is fixed in
+makes exactly two plain-text calls: the source video is sampled using the
+Qwen3-VL processor's official default video policy (currently 2 FPS) for a short
+source-person description, then a text-only call invents a different ordinary
+person. The pilot does not override `fps` or `num_frames`. No JSON parsing,
+ethnicity/race inference, prompt enhancer or donor pool is used. Both calls use
+at most 128 generated tokens. The prompt template is fixed in
 `pipeline.build_prompt`.
 
 Use an isolated Qwen3-VL-capable Transformers/PyTorch/Accelerate environment with
@@ -122,5 +124,6 @@ Use a new output root for a retry. Keep server outputs below
 ```
 
 Tests cover prompt/case/manifest contracts, frame-zero extraction calls, real
-resolver containment, lazy Qwen mock calls, read-only dry-run, output failure,
-and a fake `torchrun` subprocess proving one requested case/seed is launched.
+resolver containment, lazy Qwen mock calls including preservation of Qwen's
+default video sampling policy, read-only dry-run, output failure, and a fake
+`torchrun` subprocess proving one requested case/seed is launched.
