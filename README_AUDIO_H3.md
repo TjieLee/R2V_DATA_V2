@@ -7,6 +7,7 @@ The accepted freeze checkpoint is `docs/H3_AUDIO_FREEZE_20260916.md`. Historical
 Detailed operational documentation lives in:
 
 - `docs/H3_AUDIO_FREEZE_20260916.md`
+- `docs/H3_TRAINING_MANIFEST_EXPORT.md`
 - `docs/H3_AUDIO_SERVER_RUNBOOK.md`
 - `docs/H3_AUDIO_REUSE_ASSETS.md`
 - `docs/H3_T2VA_TA2VA_SERVER_RUNBOOK.md`
@@ -23,7 +24,7 @@ For dataset loading, prefer final publication manifests rather than traversing i
 - derived first/last-frame products: `<shadow-run>/h3_frame_conditioned_products_v1/records.jsonl`.
 - TA2VA products: `<ta2va-run>/records.jsonl`.
 
-The flattening level differs by family. TA2VA and the derived first/last-frame products are already close to direct single-manifest consumption. R(A)2VA Audio-reuse rows contain final prompt, speech and Audio contracts but still need the frozen source H3/Visual contract to resolve reference Pictures; T2VA `records.jsonl` is only an index/provenance manifest and its semantic core remains under `core/<clip_uid>.json`. See `docs/H3_AUDIO_FREEZE_20260916.md` for the exact dataloader-facing contract and the recommended model-free flattening boundary.
+The flattening level differs by family. TA2VA and the derived first/last-frame products are already close to direct single-manifest consumption. R(A)2VA Audio-reuse rows contain final prompt, speech and Audio contracts but still need the frozen source H3/Visual contract to resolve reference Pictures; T2VA `records.jsonl` is only an index/provenance manifest and its semantic core remains under `core/<clip_uid>.json`. The model-free flat exporter in `tools/export_h3_training_manifests.py` resolves these differences into one summary JSONL plus fine-grained task JSONL files using only `video`, `images`, `audios`, and `caption`. Formal production export is currently deferred; see `docs/H3_TRAINING_MANIFEST_EXPORT.md` for the task split and later-use command.
 
 ## Pipeline overview
 
