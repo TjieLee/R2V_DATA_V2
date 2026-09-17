@@ -12,7 +12,7 @@ import pytest
 
 from r2v_data_v2.h3 import sam_audio_stem_shadow as frozen
 from tests import test_h3_t2va_shadow as fixtures
-from tests.test_h3_sam_audio_stem_shadow import _Diarization
+from tests.test_h3_sam_audio_stem_shadow import _Diarization, _Qwen
 
 finalized = fixtures.finalized
 ffmpeg = fixtures.ffmpeg
@@ -24,11 +24,20 @@ def speech(monkeypatch):
     module = importlib.import_module("r2v_data_v2.h3.t2va_full_speech")
     # Factories normally run in child processes; direct tests must restore env.
     monkeypatch.setenv("DIARIZEN_DEVICE", "cuda:5")
+    monkeypatch.setenv("QWEN3_ASR_DEVICE", "cuda:6")
     monkeypatch.setattr(
         module,
         "_diar_configuration",
         lambda: {
             "provenance": _Diarization.provenance.model_dump(mode="json"),
+            "environment": {},
+        },
+    )
+    monkeypatch.setattr(
+        module,
+        "_asr_configuration",
+        lambda: {
+            "configuration": _Qwen.configuration.model_dump(mode="json"),
             "environment": {},
         },
     )
@@ -59,16 +68,18 @@ class Executor:
                         "failure_reason": "sample failure",
                     }
                     continue
-                assert factory.endswith(":diarizen_worker")
-                result = {
-                    "segments": [
-                        {
-                            "start_time": 0.0,
-                            "end_time": 1.02,
-                            "speaker_label": "A",
-                        }
-                    ]
-                }
+                if factory.endswith(":diarizen_worker"):
+                    result = {
+                        "segments": [
+                            {
+                                "start_time": 0.0,
+                                "end_time": 1.02,
+                                "speaker_label": "A",
+                            }
+                        ]
+                    }
+                else:
+                    result = {"text": "  exact transcript!  ", "language": "English"}
                 self.cache[key] = {
                     "status": "ready",
                     "result": result,
@@ -110,6 +121,30 @@ def test_frozen_lineage_partial_failure_resume(speech, finalized, tmp_path, ffmp
     ]
     assert all(row["end_time"] == 1.0 for row in raw)
     assert all(row["boundary_reconciliation"]["end_clamped"] for row in raw)
+    speech.run_asr(*args, ffmpeg=ffmpeg, execute=executor)
+    asr_jobs = executor.batches[-1][1]
+    executor.fail.add(asr_jobs[0]["job_id"])
+    executor.cache.clear()
+    speech.run_asr(*args, ffmpeg=ffmpeg, execute=executor)
+    rows = [
+        json.loads(line)
+        for line in (shadow / "asr/segments.jsonl").read_text().splitlines()
+    ]
+    assert Counter(row["status"] for row in rows) == {"failed": 1, "transcribed": 1}
+    before = executor.calls.copy()
+    executor.fail.clear()
+    speech.run_asr(*args, ffmpeg=ffmpeg, execute=executor)
+    assert executor.calls - before == Counter({asr_jobs[0]["job_id"]: 1})
+    asr, diar = frozen.validate_stem_asr_lineage(
+        shadow / "asr", expected_shadow_root=shadow
+    )
+    assert asr.clip_uids == diar.usable_clip_uids
+    assert asr.asr_source_kind == "resolved_speech_stem_segments"
+    rows = [
+        json.loads(line)
+        for line in (shadow / "asr/segments.jsonl").read_text().splitlines()
+    ]
+    assert all(row["text"] == "  exact transcript!  " for row in rows)
     assert (audio / "diarization/inventory.json").read_bytes() == source_before
 
 
@@ -148,6 +183,7 @@ def test_factories_load_once_and_use_frozen_crops(
     speech, finalized, tmp_path, ffmpeg, monkeypatch
 ):
     from tools import run_h3_diarization_binding as diar_cli
+    from tools import run_h3_stem_qwen3_asr_shadow as asr_cli
 
     audio, run_id = finalized
     executor = Executor()
@@ -155,6 +191,8 @@ def test_factories_load_once_and_use_frozen_crops(
     parent_environment = dict(os.environ)
     speech.run_diarizen(*args, ffmpeg=ffmpeg, execute=executor)
     diar_jobs = executor.batches[-1][1]
+    speech.run_asr(*args, ffmpeg=ffmpeg, execute=executor)
+    asr_jobs = executor.batches[-1][1]
     assert dict(os.environ) == parent_environment
 
     class DiarBackend(_Diarization):
@@ -173,7 +211,27 @@ def test_factories_load_once_and_use_frozen_crops(
         def close(self):
             self.closes += 1
 
-    db = DiarBackend()
+    class ASRBackend(_Qwen):
+        starts = 0
+        closes = 0
+        calls = 0
+
+        def __enter__(self):
+            self.starts += 1
+            self._process = SimpleNamespace(poll=lambda: None)
+            return self
+
+        def close(self, **kwargs):
+            self.closes += 1
+
+        def transcribe(self, *, waveform, sample_rate_hz):
+            self.calls += 1
+            assert (
+                waveform.size == 16000
+            )  # Frozen loader cropped the clamped 1s segment.
+            return super().transcribe(waveform=waveform, sample_rate_hz=sample_rate_hz)
+
+    db, ab = DiarBackend(), ASRBackend()
 
     def runtime(*, output_root, input_profile):
         assert input_profile == "canonical_32k_stereo"
@@ -181,12 +239,17 @@ def test_factories_load_once_and_use_frozen_crops(
         return db, output_root
 
     monkeypatch.setattr(diar_cli, "_runtime_backend", runtime)
+    monkeypatch.setattr(asr_cli, "_isolated_backend", lambda: ab)
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "7")
     with speech.diarizen_worker(speech._diar_configuration()) as worker:
         for job in diar_jobs:
             assert worker.process(job, tmp_path)["segments"]
         assert db.environment["CUDA_VISIBLE_DEVICES"] == "7"
+    with speech.asr_worker({**speech._asr_configuration(), "ffmpeg": ffmpeg}) as worker:
+        for job in asr_jobs:
+            assert worker.process(job, tmp_path)["text"] == "exact transcript"
     assert (db.starts, db.closes, len(db.paths)) == (1, 1, 2)
+    assert (ab.starts, ab.closes, ab.calls) == (1, 1, 2)
 
 
 def test_invalid_diarization_not_cacheable(speech, finalized, tmp_path, ffmpeg):
@@ -215,18 +278,48 @@ def test_invalid_diarization_not_cacheable(speech, finalized, tmp_path, ffmpeg):
         speech._DiarWorker(backend).process(job, tmp_path)
 
 
+@pytest.mark.parametrize(
+    "result", [None, {}, {"text": 2, "language": None}, {"text": "ok", "language": []}]
+)
+def test_invalid_asr_not_cacheable(speech, result):
+    with pytest.raises(ValueError, match="invalid Qwen3"):
+        speech._asr_result(result)
+
+
 def test_model_configuration_changes_cache_identity(monkeypatch, tmp_path):
     speech = importlib.import_module("r2v_data_v2.h3.t2va_full_speech")
     monkeypatch.setattr(speech, "fingerprint_local_model_path", lambda path: "a" * 64)
     monkeypatch.setenv("DIARIZEN_MODEL_PATH", str(tmp_path))
     monkeypatch.setenv("DIARIZEN_DEVICE", "cuda:5")
+    monkeypatch.setenv("QWEN3_ASR_MODEL_PATH", str(tmp_path))
+    monkeypatch.setenv("QWEN3_ASR_DEVICE", "cuda:6")
+    monkeypatch.setenv("QWEN3_ASR_DTYPE", "bfloat16")
     before = dict(os.environ)
     dc = speech._diar_configuration()
+    ac = speech._asr_configuration()
     assert dc == speech._diar_configuration()
+    assert ac == speech._asr_configuration()
+    assert ac["configuration"]["device"] == "cuda:0"
     assert dc["environment"]["DIARIZEN_DEVICE"] == "cuda:0"
     assert dict(os.environ) == before
+    monkeypatch.setenv("QWEN3_ASR_DTYPE", "float32")
+    assert ac != speech._asr_configuration()
     monkeypatch.setattr(speech, "fingerprint_local_model_path", lambda path: "b" * 64)
     assert dc != speech._diar_configuration()
+
+
+def test_startup_failure_is_fatal(speech, monkeypatch):
+    from tools import run_h3_stem_qwen3_asr_shadow as cli
+
+    def fail():
+        raise RuntimeError("startup failed")
+
+    monkeypatch.setattr(cli, "_isolated_backend", fail)
+    with (
+        pytest.raises(SystemExit, match="initialization failed"),
+        speech.asr_worker(speech._asr_configuration()),
+    ):
+        pytest.fail("worker must not yield")
 
 
 @contextmanager

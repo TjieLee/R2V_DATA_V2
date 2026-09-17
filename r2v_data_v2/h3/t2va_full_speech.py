@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import subprocess
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 
+import numpy as np
+
 from r2v_data_v2.h3 import diarization_binding as diar
+from r2v_data_v2.h3 import qwen3_asr as asr
 from r2v_data_v2.h3 import sam_audio_stem_shadow as frozen
 from r2v_data_v2.h3.audio_backends import fingerprint_local_model_path
 from r2v_data_v2.h3.resolved_audio_stems import RESOLVED_STAGE, load_stem_source
@@ -28,6 +33,13 @@ def _environment(prefix):
             "CODE_ROOT",
             "MODEL_PATH",
             "MODEL_IDENTIFIER",
+            "TIMEOUT_SECONDS",
+        ),
+        "QWEN3_ASR": (
+            "ENV",
+            "MODEL_PATH",
+            "DTYPE",
+            "MAX_INFERENCE_BATCH_SIZE",
             "TIMEOUT_SECONDS",
         ),
     }[prefix]
@@ -73,6 +85,21 @@ def _diar_configuration():
     }
 
 
+def _asr_configuration():
+    configuration = asr.Qwen3ASRConfiguration.from_environment().model_copy(
+        update={"device": "cuda:0"}
+    )
+    return {
+        "adapter_version": 1,
+        "environment": _environment("QWEN3_ASR"),
+        "configuration": configuration.model_dump(mode="json"),
+        "model_fingerprint": fingerprint_local_model_path(
+            Path(configuration.local_model_path)
+        ),
+        "preprocessing": asr.QWEN3_ASR_PREPROCESSING_POLICY,
+    }
+
+
 def _inference(backend, call):
     """Do not let a dead persistent child become a durable sample failure."""
     process = getattr(backend, "_process", None)
@@ -111,6 +138,17 @@ def _diar_result(result, target, provenance):
     return segments
 
 
+def _asr_result(result):
+    if (
+        not isinstance(result, dict)
+        or not isinstance(result.get("text"), str)
+        or "language" not in result
+        or (result["language"] is not None and not isinstance(result["language"], str))
+    ):
+        raise ValueError("invalid Qwen3-ASR result")
+    return result["text"], result["language"]
+
+
 class _DiarWorker:
     def __init__(self, backend):
         self.backend = backend
@@ -130,6 +168,35 @@ class _DiarWorker:
         )
         result = {"segments": [item.model_dump(mode="json") for item in segments]}
         _diar_result(result, target, self.backend.provenance)
+        return result
+
+
+class _ASRWorker:
+    def __init__(self, backend, ffmpeg):
+        self.backend = backend
+        self.ffmpeg = ffmpeg
+
+    def process(self, job, output_dir):
+        del output_dir
+        row = asr._ReadableDiarizationSegment.model_validate(job["segment"])
+        path = Path(row.source_audio_path)
+        if frozen.sha256_file(path) != job["source_audio_sha256"]:
+            raise ValueError("ASR source audio changed")
+        waveform, rate = asr.load_qwen3_asr_model_input(
+            path,
+            row.start_time,
+            row.end_time,
+            ffmpeg=self.ffmpeg,
+        )
+        text, language = _inference(
+            self.backend,
+            lambda: self.backend.transcribe(
+                waveform=waveform,
+                sample_rate_hz=rate,
+            ),
+        )
+        result = {"text": text, "language": language}
+        _asr_result(result)
         return result
 
 
@@ -165,6 +232,31 @@ def diarizen_worker(configuration):
             yield _DiarWorker(backend)
         finally:
             backend.close()
+
+
+@contextmanager
+def asr_worker(configuration):
+    from tools.run_h3_stem_qwen3_asr_shadow import _isolated_backend
+
+    backend = None
+    try:
+        os.environ.update(configuration["environment"])
+        os.environ["QWEN3_ASR_DEVICE"] = "cuda:0"
+        backend = _isolated_backend()
+        if (
+            backend.configuration.model_dump(mode="json")
+            != configuration["configuration"]
+        ):
+            raise ValueError("Qwen3-ASR worker configuration changed")
+        backend.__enter__()
+    except Exception as exc:
+        if backend is not None:
+            backend.close(force=True)
+        raise SystemExit(f"Qwen3-ASR initialization failed: {exc}") from exc
+    try:
+        yield _ASRWorker(backend, configuration["ffmpeg"])
+    finally:
+        backend.close()
 
 
 def _ready(results, job_id):
@@ -249,3 +341,86 @@ def run_diarizen(
         overwrite=True,
     )
     return {"provenance": published.model_dump(mode="json"), "job_count": len(jobs)}
+
+
+def run_asr(
+    audio_root,
+    run_id,
+    stage_state,
+    gpu_ids,
+    allow_unverified,
+    ffmpeg="ffmpeg",
+    execute=execute_stage,
+):
+    shadow = frozen.stem_shadow_root(Path(audio_root), run_id)
+    root = shadow / "diarization"
+    provenance, _, _ = frozen.validate_stem_diarization_lineage(
+        root, expected_shadow_root=shadow
+    )
+    if (
+        provenance.route != "resolved"
+        or provenance.binding_evidence_mode != "legacy_lr_asd"
+    ):
+        raise ValueError("T2VA ASR requires resolved target-side speech lineage")
+    if provenance.unverified_clip_uids and not allow_unverified:
+        raise ValueError("unverified stems require allow_unverified")
+    inputs = asr._load_inputs(root)
+    configuration = {**_asr_configuration(), "ffmpeg": ffmpeg}
+    jobs = []
+    keys = {}
+    for row in inputs.readable_segments:
+        job_id = hashlib.sha256(
+            json.dumps([row.clip_uid, row.segment_id]).encode()
+        ).hexdigest()
+        jobs.append(
+            {
+                "job_id": job_id,
+                "segment": row.model_dump(mode="json"),
+                "source_audio_sha256": provenance.speech_stem_hashes_by_clip[
+                    row.clip_uid
+                ],
+            }
+        )
+        key = (row.source_audio_path, row.start_time, row.end_time)
+        keys.setdefault(key, []).append(job_id)
+    results = execute(
+        stage_root=Path(stage_state),
+        jobs=jobs,
+        gpu_ids=list(gpu_ids),
+        factory=f"{__name__}:asr_worker",
+        configuration=configuration,
+        environment=configuration["environment"],
+    )
+
+    configuration_data = configuration["configuration"]
+
+    class Replay:
+        current = None
+        configuration = asr.Qwen3ASRConfiguration.model_validate(configuration_data)
+
+        def load(self, path, start, end):
+            self.current = keys[(str(path), start, end)].pop(0)
+            # Only a shape-valid token is needed: the worker already used the
+            # frozen crop loader, and transcribe below replays its exact result.
+            return np.zeros(1, dtype=np.float32), 16000
+
+        def transcribe(self, *, waveform, sample_rate_hz):
+            return _asr_result(_ready(results, self.current))
+
+    replay = Replay()
+    summary, published = frozen.run_stem_qwen3_asr_shadow(
+        stem_diarization_root=root,
+        source_visual_production_root=None,
+        backend=replay,
+        output_root=shadow / "asr",
+        segment_audio_loader=replay.load,
+        ffmpeg=ffmpeg,
+        route="resolved",
+        allow_unverified=allow_unverified,
+        overwrite=True,
+    )
+    return {
+        "summary": summary.model_dump(mode="json"),
+        "provenance": published.model_dump(mode="json"),
+        "job_count": len(jobs),
+    }
