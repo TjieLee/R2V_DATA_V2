@@ -142,14 +142,17 @@ def test_owned_group_one_outstanding_and_order(module, tmp_path, capsys):
     )
 
 
-def test_blocks_on_canonical_lock(module, tmp_path):
+@pytest.mark.parametrize("lock_name", ["canonical.lock", "invocation.lock"])
+def test_blocks_on_shard_writers(module, tmp_path, lock_name):
     from r2v_data_v2.h3.t2va_production import file_lock, shard_name
 
     with make(module, tmp_path) as prefetch:
         with file_lock(
-            tmp_path / "shards" / shard_name(0) / "canonical.lock", blocking=True
+            tmp_path / "shards" / shard_name(0) / lock_name, blocking=True
         ):
             prefetch.start(0)
+            log = tmp_path / "shards" / shard_name(0) / "logs/canonical-prefetch.log"
+            until(lambda: "canonical_prefetch_started" in log.read_text())
             time.sleep(0.2)
             assert not (tmp_path / "entered-0.json").exists()
         assert prefetch.wait(0)["summary"]["ready"] == 2

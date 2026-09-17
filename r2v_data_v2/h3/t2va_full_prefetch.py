@@ -264,7 +264,13 @@ def _worker(request_path: Path) -> None:
         name = request["worker_factory"]
         module, attribute = name.split(":") if ":" in name else name.rsplit(".", 1)
         prepare = getattr(importlib.import_module(module), attribute)
-        with file_lock(Path(request["shard_root"]) / "canonical.lock", blocking=True):
+        # A duplicate node must not republish canonical manifests while the
+        # current owner is consuming them in GPU stages. Keep lock order aligned
+        # with the synchronous path (invocation, then canonical).
+        with (
+            file_lock(Path(request["shard_root"]) / "invocation.lock", blocking=True),
+            file_lock(Path(request["shard_root"]) / "canonical.lock", blocking=True),
+        ):
             result = _validate_result(prepare(request))
         payload = {"shard_id": shard_id, "result": result}
     except Exception as exc:  # noqa: BLE001 - return child failure through the control file

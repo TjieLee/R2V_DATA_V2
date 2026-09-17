@@ -15,10 +15,29 @@ workspace. One node owns one fixed shard through these barriers:
 
 MiMo starts once per launcher invocation and stays alive across stages/shards.
 The serving arguments are unchanged. Client REQUEST_WORKERS defaults to 1.
-Upstream stages use GPU_IDS=0,1,2,3,4,5,6,7 by default, one model instance per
-nonempty worker partition. Each child sees its physical GPU through
-CUDA_VISIBLE_DEVICES and uses cuda:0; the parent environment is unchanged.
-Workers exit at the barrier. There is no automatic GPU memory manager or restart.
+Upstream stages use GPU_IDS=0,1,2,3,4,5,6,7 by default. SAM, AuK, DiariZen and
+Qwen3-ASR each have eight node-lifetime resident workers (32 upstream workers,
+in addition to MiMo). Every worker loads once before its READY handshake,
+processes requests across shards and closes only at node shutdown. Stage barriers
+remain sequential; residency does not mean concurrent GPU stages. Each child sees
+its physical GPU through CUDA_VISIBLE_DEVICES and uses cuda:0; the parent
+environment is unchanged. There is no automatic GPU memory manager or restart.
+
+Canonical preparation uses CANONICAL_WORKERS=16 (Python --canonical-workers),
+configurable to any positive integer. Per-clip publication and hash checks are
+unchanged; the final manifest is always in source order. An owned CPU subprocess
+prepares at most one next shard while the current shard runs its GPU stages.
+First-shard canonical preparation starts before pool initialization, so CPU work
+can overlap model startup. Every canonical path takes blocking canonical.lock;
+invocation.lock still prevents duplicate GPU-stage writers. Background canonical
+also waits for that lock before canonical.lock, so another node cannot republish
+the same shard's input manifest during active GPU consumption. Termination cleans
+the prefetch process and its FFmpeg children. Prepared state is per shard, not a
+mutable current Audio root.
+
+Within each ASR worker, a single CPU thread prefetches the next waveform.
+Transcription remains serial (one GPU inference at a time). Loader failures are
+attributed to their own segment. SAM/AuK postprocessing is not pipelined.
 
 The full runner needs the existing server_env.sh dependency settings:
 SAM_AUDIO_CODE_ROOT, SAM_AUDIO_MODEL_PATH, SAM_AUDIO_T5_BASE_PATH,
@@ -48,9 +67,12 @@ binding sidecars. It uses the same default target-side loader path as the frozen
 T2VA fixtures, not the RA2VA binding_evidence_mode=none Visual adapter. The name
 of that default mode does not introduce LR-ASD execution or evidence.
 
-Each stage has durable job receipts beneath stage_state/<stage>/jobs and
-worker-private request directories. Per-GPU logs append beneath the shard's
-logs/<stage>-gpu<ID>.log; stage summaries and exceptions have separate logs.
+Each stage has durable job receipts beneath stage_state/<stage>/jobs.
+Persistent worker control uses owned request files, never model stdout.
+Per-GPU logs append beneath workers/<stage>-gpu<ID>.log; stage summaries and
+exceptions remain under shard logs. Canonical subprocess logs are
+logs/canonical-prefetch.log within the shard. Pool startup and stage wall seconds,
+plus canonical prefetch start/completion, are printed in the supervisor log.
 Node logs are logs/<hostname>/{mimo,supervisor}-<timestamp>-<pid>.log.
 Only the parent publishes full ordered
 inventories. Worker outputs never race on canonical records.jsonl. Successful
@@ -61,7 +83,8 @@ Never delete ready receipts merely to rerun the stage.
 
 stage_state/<stage>/invocation.json records scheduled_job_count,
 reused_ready_count and worker_count for the latest invocation. Zero scheduled
-jobs means no worker/model is started for that stage. Frozen publication model
+jobs means no inference request is sent; already-resident workers remain idle.
+Frozen publication model
 counts still describe the cached artifacts, not new calls in this invocation.
 Keep interpreters and dependency environments pinned for a resumed run; use a
 fresh production root when upgrading runtimes rather than adopting old caches.
@@ -74,7 +97,9 @@ Published data remains available to the existing snapshot builder.
 
 ### Raw-Video Server Acceptance
 
-No real inference was performed during local development. Before 10k production:
+The pre-performance raw-5 run passed on the server as reported by the operator.
+No real inference was performed for this performance refactor locally. Before
+2k production, validate the new lifecycle using fresh roots:
 
 1. Create a new five-row shot JSONL containing the original five target video
    rows, preserving paths and order; do not copy a prior Audio cache.
@@ -87,16 +112,28 @@ No real inference was performed during local development. Before 10k production:
    ready T2VA/TA2VA artifacts made zero additional model calls.
 6. In another fresh smoke root, interrupt during ASR, rerun, and verify only
    unfinished/failed ASR jobs ran. Confirm one MiMo PID per invocation and no
-   surviving upstream child processes after each stage.
+   surviving owned child processes after node shutdown. After each stage, the
+   corresponding upstream workers MUST still exist; inspect their PIDs and GPUs.
 7. Only after the five-clip checks pass, try a roughly 100-row bounded manifest,
-   then one actual 10k shard. Do not start the entire source population first.
+   then one actual 2,000-row shard. Record canonical/SAM/AuK/resolve/DiariZen/
+   ASR/MiMo and total wall time.
+8. Finally run SHARDS=0,1 on two real 2,000-row shards. Verify identical worker
+   PIDs across both shards and exactly one model load per worker. Confirm that
+   shard 1 canonical preparation overlaps shard 0 GPU processing. Do not start
+   the entire source population before these checks pass.
 
 ## Standalone Downstream Prerequisites
 
 The population authority is the original ordered JEA shot JSONL, not an Audio
-or Visual inventory. Each physical source row belongs permanently to a 10,000-row
+or Visual inventory. Production shard size is 2,000. Each physical source row belongs permanently to a 2,000-row
 shard, including malformed/unavailable rows. Shard 59 is source indexes
-590000 through 599999. The last shard can be shorter.
+118000 through 119999. Shards 0 and 1 cover 0..1999 and 2000..3999.
+The last shard can be shorter; shard count is derived from the actual source.
+
+An old 10,000-row-shard root is incompatible and raises
+"source index shard size mismatch". Use a fresh root, including for raw-5 smoke;
+do not reuse raw5-20260918-005405/production. No old root is rewritten,
+deleted or migrated. Shard size is part of source-index identity.
 
 The selected clips need matching, finalized canonical Audio and a named
 resolved AuK/SAM -> DiariZen -> Qwen3-ASR cache. Missing upstream data retains the

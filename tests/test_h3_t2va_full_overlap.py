@@ -101,7 +101,7 @@ def test_one_canonical_lookahead_and_serial_gpu_barriers(tmp_path):
     class Pipeline(full.FullPipeline):
         def stage(self, name, shard):
             if name == "canonical":
-                return super().stage(name, shard)
+                return self.prepared[shard].summary
             assert self.prepared[shard].audio_root == tmp_path / str(shard)
             events.append((shard, name))
             if shard == 0 and name == "sam":

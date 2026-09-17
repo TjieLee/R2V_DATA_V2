@@ -224,7 +224,25 @@ class FullPipeline:
         execution = {"execute": self.pools.execute_stage} if self.pools else {}
         if name == "canonical":
             if self.prefetch is not None and shard_id in self.prepared:
-                return self.prepared[shard_id].summary
+                # Re-read after taking invocation ownership: another node may
+                # have recovered canonical failures since our prefetch finished.
+                audio_root = self.prepared[shard_id].audio_root
+                selection = T2VAShotSelection.model_validate_json(
+                    (shard / "source/selection.json").read_text()
+                )
+                count = sum(
+                    1
+                    for _ in production.complete_rows(
+                        audio_root / "audio/canonical_clips.jsonl"
+                    )
+                )
+                summary = {
+                    "ready": count,
+                    "failed": len(selection.shots) - count,
+                    "skipped": len(selection.excluded_rows),
+                }
+                self.prepared[shard_id] = PreparedShard(audio_root, summary)
+                return summary
             with production.file_lock(shard / "canonical.lock", blocking=True):
                 selection = shard_selection(
                     self.root,

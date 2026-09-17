@@ -479,3 +479,39 @@ def test_parallel_canonical_is_bounded_ordered_and_failure_isolated(tmp_path):
 def test_canonical_workers_must_be_positive(tmp_path):
     with pytest.raises(ValueError, match="canonical workers"):
         full.bootstrap_audio(tmp_path, None, None, canonical_workers=0)
+
+
+def test_canonical_consumption_refreshes_recovered_inputs_under_ownership(
+    tmp_path, monkeypatch
+):
+    from r2v_data_v2.h3 import sam_audio_stem_shadow as sam
+    from r2v_data_v2.h3 import t2va_full_stems as stems
+
+    manifest = shot_manifest(tmp_path)
+    root = tmp_path / "out"
+    index = production.build_source_index(manifest, root)
+    selection = full.shard_selection(root, index, 0, tmp_path, tmp_path)
+    shard = root / "shards" / production.shard_name(0)
+    audio_root = full.bootstrap_audio(shard, selection, Audio())
+    pipeline = full.FullPipeline(
+        root=root,
+        index=index,
+        clips_root=tmp_path,
+        source_videos_root=tmp_path,
+        gpu_ids=["0"],
+        sam_configuration=None,
+        auk_configuration=None,
+        backend=None,
+        profiles=None,
+    )
+    # The previous preparation failed; a competing preparation has since
+    # published the now-ready canonical clips before consumer lock acquisition.
+    pipeline.prefetch = object()
+    pipeline.prepared[0] = full.PreparedShard(
+        audio_root, {"ready": 0, "failed": 3, "skipped": 0}
+    )
+    monkeypatch.setattr(sam, "build_sam_audio_stem_inventory", lambda **kw: object())
+    monkeypatch.setattr(stems, "run_sam", lambda *args, **kw: {"ran": True})
+    with production.file_lock(shard / "invocation.lock"):
+        assert pipeline.stage("canonical", 0) == {"ready": 3, "failed": 0, "skipped": 0}
+        assert pipeline.stage("sam", 0) == {"ran": True}
