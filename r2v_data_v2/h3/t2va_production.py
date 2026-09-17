@@ -14,7 +14,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from pathlib import Path
 
-SHARD_SIZE = 10_000
+SHARD_SIZE = 2_000
 DEFAULT_ROOT = Path(
     "/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/T2VA"
 )
@@ -109,7 +109,9 @@ def build_source_index(source: Path, root: Path) -> dict:
         identity = _source_identity(source)
         if path.exists():
             index = json.loads(path.read_text())
-            if index["shard_size"] != SHARD_SIZE or (
+            if index["shard_size"] != SHARD_SIZE:
+                raise ValueError("source index shard size mismatch; use a fresh production root")
+            if (
                 index["source_identity"] != identity
                 and _sha(source) != index["source_sha256"]
             ):
