@@ -55,11 +55,27 @@ def event(value):
         f.write(value + "\\n")
 def pid(name):
     (root / (name + ".pid")).write_text(str(os.getpid()))
+    (root / (name + ".session.json")).write_text(json.dumps({
+        "pid": os.getpid(), "pgid": os.getpgrp(), "sid": os.getsid(0),
+        "stdin_is_devnull": os.fstat(0).st_rdev == os.stat("/dev/null").st_rdev,
+    }))
+def stubborn_child(name):
+    child_ready = root / (name + "-child-ready")
+    worker = subprocess.Popen([sys.executable, "-c",
+        "import signal,time,sys; from pathlib import Path; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "Path(sys.argv[1]).touch(); time.sleep(60)", str(child_ready)])
+    (root / (name + ".pid")).write_text(str(worker.pid))
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    while not child_ready.exists(): time.sleep(.01)
+    (root / (name + "-ready")).touch()
+    while True: time.sleep(.01)
 """
     )
     programs = {
         "sglang": """pid("mimo")
 event("mimo-start")
+if os.environ.get("FORCE_STAGE") == "mimo": stubborn_child("mimo-worker")
 def stop(*args):
     event("mimo-stop")
     sys.exit(0)
@@ -97,11 +113,20 @@ if os.environ.get("RUN_MODE") == "wait":
     signal.signal(signal.SIGTERM, stop)
     (root / "runner-ready").touch()
     while True: time.sleep(.01)
+if os.environ.get("FORCE_STAGE") == "runner": stubborn_child("worker")
+time.sleep(.1)
+event("runner-exit")
 sys.exit(int(os.environ.get("RUN_STATUS", "0")))
 """,
+        # macOS has no util-linux command. This test shim performs the actual
+        # POSIX session syscall and exec without forking or changing PID.
+        "setsid": "os.setsid()\nos.execvp(sys.argv[1], sys.argv[1:])\n",
     }
     for name, body in programs.items():
         path = binary / name
+        if name == "setsid" and (native_setsid := shutil.which(name)):
+            path.symlink_to(native_setsid)
+            continue
         path.write_text(common + body)
         path.chmod(0o755)
     env = {
@@ -126,7 +151,7 @@ sys.exit(int(os.environ.get("RUN_STATUS", "0")))
         CLEANUP_GRACE_SECONDS="2",
     )
     yield script, env, tmp_path
-    for name in ("runner", "worker", "mimo"):
+    for name in ("runner", "worker", "mimo", "mimo-worker"):
         path = tmp_path / f"{name}.pid"
         if path.exists():
             try:
@@ -137,6 +162,24 @@ sys.exit(int(os.environ.get("RUN_STATUS", "0")))
 
 def events(root):
     return (root / "events").read_text().splitlines()
+
+
+def test_no_shell_job_control():
+    assert "set -m" not in (REPO / "scripts" / NAME).read_text()
+
+
+def test_missing_setsid_only_blocks_execution(sandbox):
+    script, env, root = sandbox
+    binary = root / "bin"
+    (binary / "setsid").unlink()
+    for name in ("bash", "dirname", "mkdir", "date", "hostname", "sleep"):
+        (binary / name).symlink_to(shutil.which(name))
+    env = {**env, "PATH": str(binary)}
+    assert invoke(script, env, "--dry-run").returncode == 0
+    result = invoke(script, env)
+    assert result.returncode == 2
+    assert "setsid is required" in result.stderr
+    assert not (root / "events").exists()
 
 
 def test_dry_run_exact_accepted_server_and_full_cli(sandbox):
@@ -207,6 +250,12 @@ def test_one_server_for_all_shards_and_proxy_readiness(sandbox, status):
     log = events(root)
     assert log.count("mimo-start") == log.count("mimo-stop") == 1
     assert log.count("runner-start") == 1
+    assert log.index("runner-exit") < log.index("mimo-stop")
+    for name in ("mimo", "runner"):
+        session = json.loads((root / f"{name}.session.json").read_text())
+        assert session["pid"] == session["pgid"] == session["sid"]
+        assert session["sid"] != os.getsid(0)
+        assert session["stdin_is_devnull"]
     calls = [json.loads(line[5:]) for line in log if line.startswith("curl:")]
     assert sum(args[-1].endswith("/model_info") for args in calls) == 2
     assert sum(args[-1].endswith("/v1/models") for args in calls) == 2
@@ -287,3 +336,60 @@ def test_term_waits_for_supervisor_workers_before_mimo(
         if proc.poll() is None:
             proc.kill()
         proc.communicate(timeout=5)
+
+
+@pytest.mark.parametrize("stage", ["runner", "mimo"])
+def test_forced_cleanup_kills_only_owned_process_groups(sandbox, stage):
+    script, env, root = sandbox
+    env = {**env, "FORCE_STAGE": stage, "CLEANUP_GRACE_SECONDS": "1"}
+    if stage == "mimo":
+        env["RUN_MODE"] = "wait"
+    foreign = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True
+    )
+    proc = subprocess.Popen(
+        ["bash", str(script)], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    try:
+        flags = (
+            ["worker-ready"]
+            if stage == "runner"
+            else ["runner-ready", "mimo-worker-ready"]
+        )
+        deadline = time.monotonic() + 8
+        while (
+            not all((root / name).exists() for name in flags)
+            and time.monotonic() < deadline
+        ):
+            assert proc.poll() is None
+            time.sleep(0.01)
+        assert all((root / name).exists() for name in flags)
+        proc.terminate()
+        _, stderr = proc.communicate(timeout=8)
+        assert proc.returncode == 143, stderr
+        assert foreign.poll() is None
+        for name in ("runner", "worker", "mimo", "mimo-worker"):
+            path = root / f"{name}.pid"
+            if not path.exists():
+                continue
+            pid = int(path.read_text())
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                # An orphan zombie is already dead; PID 1 owns its final reap.
+                state = subprocess.run(
+                    ["ps", "-p", str(pid), "-o", "stat="],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                ).stdout.strip()
+                if not state or state.startswith("Z"):
+                    break
+                time.sleep(0.02)
+            else:
+                pytest.fail(f"owned {name} process survived forced cleanup")
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.communicate(timeout=5)
+        foreign.terminate()
+        foreign.wait(timeout=5)

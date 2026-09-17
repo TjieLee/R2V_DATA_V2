@@ -82,6 +82,10 @@ if "$dry_run"; then
   exit 0
 fi
 
+command -v setsid >/dev/null 2>&1 || {
+  echo "setsid is required for full-production process isolation" >&2
+  exit 2
+}
 mkdir -p "$PRODUCTION_ROOT"
 test -w "$PRODUCTION_ROOT" || { echo "Output not writable: $PRODUCTION_ROOT" >&2; exit 1; }
 # Never adopt an endpoint or discover processes by port/name for cleanup.
@@ -113,7 +117,7 @@ cleanup() {
   if [[ -n "$mimo_pid" ]]; then
     kill -TERM "$mimo_pid" 2>/dev/null || true
     if ! wait_grace "$mimo_pid"; then
-      kill -KILL "$mimo_pid" 2>/dev/null || true
+      kill -KILL -- "-$mimo_pid" 2>/dev/null || true
     fi
     wait "$mimo_pid" 2>/dev/null || true
     mimo_pid=""
@@ -122,9 +126,8 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-# Give each background job its own process group without changing CUDA mapping.
-set -m
-"${serve[@]}" >"$logs/mimo-$stamp.log" 2>&1 &
+# Isolate owned sessions without enabling shell job-control.
+setsid "${serve[@]}" </dev/null >"$logs/mimo-$stamp.log" 2>&1 &
 mimo_pid=$!
 ready=false
 for ((i=0; i<MIMO_STARTUP_POLLS; i++)); do
@@ -138,7 +141,7 @@ for ((i=0; i<MIMO_STARTUP_POLLS; i++)); do
 done
 "$ready" || { echo "MiMo readiness timeout" >&2; exit 1; }
 echo "Supervisor log: $logs/supervisor-$stamp.log"
-"${run[@]}" >"$logs/supervisor-$stamp.log" 2>&1 &
+setsid "${run[@]}" </dev/null >"$logs/supervisor-$stamp.log" 2>&1 &
 runner_pid=$!
 status=0
 wait "$runner_pid" || status=$?
