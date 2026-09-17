@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import threading
 from collections import Counter
 from contextlib import contextmanager
 from pathlib import Path
@@ -17,6 +18,171 @@ from tests.test_h3_sam_audio_stem_shadow import _Diarization, _Qwen
 finalized = fixtures.finalized
 ffmpeg = fixtures.ffmpeg
 setup = fixtures.setup
+
+
+@pytest.fixture
+def asr_jobs(tmp_path):
+    path = tmp_path / "speech.wav"
+    path.write_bytes(b"fake source audio")
+    return [
+        {
+            "job_id": f"job-{index}",
+            "source_audio_sha256": frozen.sha256_file(path),
+            "segment": {
+                "clip_uid": "clip",
+                "clip_display_path": "clip.mp4",
+                "media_collection_relpath": "collection",
+                "media_collection_name": "collection",
+                "episode_name": "episode",
+                "clip_name": "clip",
+                "shard_id": "shard",
+                "segment_id": f"segment-{index}",
+                "speaker_cluster_id": "speaker",
+                "source_audio_path": str(path),
+                "source_start_sample": index * 32000,
+                "source_end_sample": (index + 1) * 32000,
+                "start_time": float(index),
+                "end_time": float(index + 1),
+            },
+        }
+        for index in range(3)
+    ]
+
+
+def test_asr_prefetch_overlaps_only_next_load_and_preserves_results(
+    speech, asr_jobs, tmp_path, monkeypatch
+):
+    before = json.dumps(asr_jobs, sort_keys=True)
+    caller = threading.current_thread()
+    infer_started = [threading.Event() for _ in asr_jobs]
+    load_started = [threading.Event() for _ in asr_jobs]
+    loaded = [threading.Event() for _ in asr_jobs]
+    loader_threads = set()
+    active = maximum = 0
+    check_overlap = True
+
+    def load(path, start, end, *, ffmpeg):
+        index = int(start)
+        assert path == Path(asr_jobs[index]["segment"]["source_audio_path"])
+        assert end == start + 1 and ffmpeg == "test-ffmpeg"
+        loader_threads.add(threading.current_thread())
+        load_started[index].set()
+        if index and check_overlap:
+            assert infer_started[index - 1].wait(5)
+        loaded[index].set()
+        return index, 16000
+
+    def transcribe(*, waveform, sample_rate_hz):
+        nonlocal active, maximum
+        assert threading.current_thread() is caller
+        assert sample_rate_hz == 16000
+        active += 1
+        maximum = max(maximum, active)
+        try:
+            infer_started[waveform].set()
+            if waveform < 2 and check_overlap:
+                assert loaded[waveform + 1].wait(5)
+            if waveform == 0 and check_overlap:
+                assert not load_started[2].is_set()
+            return f" exact {waveform} ", "English"
+        finally:
+            active -= 1
+
+    monkeypatch.setattr(speech.asr, "load_qwen3_asr_model_input", load)
+    backend = SimpleNamespace(
+        _process=SimpleNamespace(poll=lambda: None), transcribe=transcribe
+    )
+    worker = speech._ASRWorker(backend, "test-ffmpeg")
+    with worker.batch_jobs(asr_jobs):
+        results = [worker.process(job, tmp_path) for job in asr_jobs]
+    assert results == [
+        {"text": " exact 0 ", "language": "English"},
+        {"text": " exact 1 ", "language": "English"},
+        {"text": " exact 2 ", "language": "English"},
+    ]
+    assert maximum == 1
+    assert len(loader_threads) == 1 and caller not in loader_threads
+    assert all(not thread.is_alive() for thread in loader_threads)
+    assert json.dumps(asr_jobs, sort_keys=True) == before
+    # The same worker can enter another request and retain exact direct behavior.
+    check_overlap = False
+    with worker.batch_jobs(asr_jobs):
+        repeated = [worker.process(job, tmp_path) for job in asr_jobs]
+    assert repeated == results
+    assert [worker.process(job, tmp_path) for job in asr_jobs] == results
+
+
+@pytest.mark.parametrize("failure", ["loader", "hash", "inference"])
+def test_asr_prefetch_failure_belongs_to_current_job(
+    speech, asr_jobs, tmp_path, monkeypatch, failure
+):
+    failed = threading.Event()
+    inferred = []
+    if failure == "hash":
+        asr_jobs[1]["source_audio_sha256"] = "0" * 64
+
+    def load(path, start, end, *, ffmpeg):
+        if start == 1 and failure == "loader":
+            failed.set()
+            raise ValueError("crop failed")
+        return int(start), 16000
+
+    def transcribe(*, waveform, sample_rate_hz):
+        inferred.append(waveform)
+        if waveform == 0 and failure == "loader":
+            assert failed.wait(5)
+        if waveform == 1 and failure == "inference":
+            raise ValueError("bad sample")
+        return str(waveform), None
+
+    monkeypatch.setattr(speech.asr, "load_qwen3_asr_model_input", load)
+    worker = speech._ASRWorker(
+        SimpleNamespace(_process=SimpleNamespace(poll=lambda: None), transcribe=transcribe),
+        "test-ffmpeg",
+    )
+    with worker.batch_jobs(asr_jobs):
+        assert worker.process(asr_jobs[0], tmp_path) == {"text": "0", "language": None}
+        expected = {
+            "loader": "crop failed",
+            "hash": "audio changed",
+            "inference": "bad sample",
+        }
+        with pytest.raises(ValueError, match=expected[failure]):
+            worker.process(asr_jobs[1], tmp_path)
+        assert worker.process(asr_jobs[2], tmp_path) == {"text": "2", "language": None}
+    assert inferred == ([0, 1, 2] if failure == "inference" else [0, 2])
+
+
+@pytest.mark.parametrize("error", [SystemExit, KeyboardInterrupt])
+def test_asr_prefetch_cleans_up_after_base_exception(
+    speech, asr_jobs, tmp_path, monkeypatch, error
+):
+    next_loaded = threading.Event()
+    threads = set()
+
+    def load(path, start, end, *, ffmpeg):
+        threads.add(threading.current_thread())
+        if start == 1:
+            next_loaded.set()
+        return int(start), 16000
+
+    def transcribe(**kwargs):
+        assert next_loaded.wait(5)
+        raise error("abort")
+
+    monkeypatch.setattr(speech.asr, "load_qwen3_asr_model_input", load)
+    backend = SimpleNamespace(
+        _process=SimpleNamespace(poll=lambda: None), transcribe=transcribe
+    )
+    worker = speech._ASRWorker(backend, "test-ffmpeg")
+    with pytest.raises(error, match="abort"), worker.batch_jobs(asr_jobs):
+        worker.process(asr_jobs[0], tmp_path)
+    assert threads and all(not thread.is_alive() for thread in threads)
+    backend.transcribe = lambda **kwargs: ("recovered", None)
+    with worker.batch_jobs([asr_jobs[2]]):
+        assert worker.process(asr_jobs[2], tmp_path)["text"] == "recovered"
+    with worker.batch_jobs([]):
+        pass
 
 
 @pytest.fixture

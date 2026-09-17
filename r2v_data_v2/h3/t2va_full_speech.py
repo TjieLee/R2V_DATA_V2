@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -175,19 +176,61 @@ class _ASRWorker:
     def __init__(self, backend, ffmpeg):
         self.backend = backend
         self.ffmpeg = ffmpeg
+        self._loader = None
+        self._jobs = None
+        self._prefetched = None
 
-    def process(self, job, output_dir):
-        del output_dir
+    @contextmanager
+    def batch_jobs(self, jobs):
+        """Bind one ordered request; only CPU waveform preparation runs ahead."""
+        if self._loader is not None:
+            raise RuntimeError("ASR batch already active")
+        loader = ThreadPoolExecutor(max_workers=1, thread_name_prefix="asr-waveform")
+        try:
+            self._loader = loader
+            self._jobs = iter(jobs)
+            self._prefetched = self._prefetch_next()
+            yield self
+        finally:
+            self._prefetched = None
+            self._jobs = None
+            self._loader = None
+            # FFmpeg inherits the worker process group, owned by the executor.
+            # Join CPU work here; process-group termination handles killed workers.
+            loader.shutdown(wait=True, cancel_futures=True)
+
+    def _prefetch_next(self):
+        job = next(self._jobs, None)
+        if job is None:
+            return None
+        return job, self._loader.submit(self._load_waveform, job)
+
+    def _load_waveform(self, job):
         row = asr._ReadableDiarizationSegment.model_validate(job["segment"])
         path = Path(row.source_audio_path)
         if frozen.sha256_file(path) != job["source_audio_sha256"]:
             raise ValueError("ASR source audio changed")
-        waveform, rate = asr.load_qwen3_asr_model_input(
+        return asr.load_qwen3_asr_model_input(
             path,
             row.start_time,
             row.end_time,
             ffmpeg=self.ffmpeg,
         )
+
+    def process(self, job, output_dir):
+        del output_dir
+        if self._loader is None:
+            waveform, rate = self._load_waveform(job)
+        else:
+            if self._prefetched is None or self._prefetched[0] != job:
+                raise RuntimeError("ASR jobs must follow batch order")
+            future = self._prefetched[1]
+            self._prefetched = None
+            try:
+                waveform, rate = future.result()
+            finally:
+                # Never observe the next job's exception in the current job.
+                self._prefetched = self._prefetch_next()
         text, language = _inference(
             self.backend,
             lambda: self.backend.transcribe(
