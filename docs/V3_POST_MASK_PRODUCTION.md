@@ -160,7 +160,7 @@ device is written into the semantic RunStorage identity.
 
 Worker ID is `rank * local_group_count + slot`; worker count is
 `world_size * local_group_count`. Worker `i` receives sorted shard positions
-`i, i + worker_count, ...`. Shards run sequentially inside each GPU group.
+`i, i + worker_count, ...`. A bounded window overlaps assigned shards inside each GPU group.
 Each shard's shared `flock` covers receipt checking, hydration, all missing
 phases, export and completed-marker publication. No work stealing is used.
 
@@ -174,6 +174,7 @@ phases, export and completed-marker publication. No work stealing is used.
 | `POST_MASK_ROOT` | `--post-mask-root` | Writable campaign state root; basename determines tag |
 | `POST_MASK_QWEN_MAX_INFLIGHT` | `--qwen-max-inflight` | Per-node capacity; otherwise actual base `runtime.qwen_max_inflight` |
 | `POST_MASK_CLIP_INFLIGHT` | `--clip-inflight` | Positive per-heavy-stage clip concurrency; default 8; execution-only |
+| `POST_MASK_SHARD_INFLIGHT` | `--shard-inflight` | Positive assigned-shard sliding-window size; default 2; execution-only |
 | `RANK`, `WORLD_SIZE` | `--rank`, `--world-size` | Platform topology; default `0`, `1` |
 | — | `--cpu-workers` | Override actual base runtime CPU workers |
 | — | `--worker-timeout-seconds` | Override actual base runtime worker timeout |
@@ -203,16 +204,31 @@ hydrate -> remove -> pair -> reference_edit -> reference_integrity
 
 Existing algorithms and durable owner artifacts decide missing work. Pairing
 uses the full eligible shard, retaining completed donors while excluding clips
-with pending predecessor work. Remove, reference_edit and subject_attributes each
-run up to `clip_inflight` clip tasks through one shared phase adapter. All remove
-tasks finish before the single whole-shard pair pass; no donor view is clipped
-per task. Integrity/instruct concurrency retains actual CPU/stage settings.
+with pending predecessor work. All remove tasks finish before the single
+whole-shard pair pass; no donor view is clipped per task. After pair, up to
+`clip_inflight` independent clip chains advance in this order:
+`reference_edit → reference_integrity → instruct → subject_attributes`.
+There is no whole-shard barrier between those four stages. Each clip reloads its
+durable state at each step; retryable predecessors block only that clip.
+Integrity/instruct retain their actual CPU/stage concurrency caps.
+
+Each worker admits at most `shard_inflight` assigned shards in a sliding window,
+without enqueueing its entire assignment. When one finishes or returns
+incomplete, the next assigned shard may enter; there is no in-launch retry or
+work stealing. Thus shard A's pair Qwen can overlap shard B's Boogu remove.
+Each active shard retains its own flock and write lock. An ordinary shard
+failure is recorded while siblings/later shards continue; worker failure is
+reported after the window drains. External interruption stops admission and
+model-resource acceptance before draining active tasks.
 
 One lazy Boogu subprocess belongs to the worker, not the phase or shard. Healthy
 operation starts it once and reuses it across all three heavy stages and all
 assigned shards. Actual Boogu edits remain serialized (one request per process).
-SAM models remain phase-owned, with a worker-shared lock around actual inference
-entrypoints only. Different clips can overlap Boogu, SAM and Qwen; neither
+The underlying lazy SAM backend is also worker-owned: reference editing and
+attribute adapters inject the same backend rather than loading separate
+predictors. Actual inference entrypoints share one FIFO lock across active
+shards; Boogu has a separate FIFO lock so resource waiters cannot repeatedly
+be overtaken by a single shard. Different clips can overlap Boogu, SAM and Qwen; neither
 resource lock covers an entire clip or its subsequent judge call. Shard storage
 mutations share one write lock, released before model calls.
 
@@ -365,3 +381,16 @@ actual Boogu/SAM peak inflight must each stay at 1 (0 if unused). Boogu service
 time measures edits, excluding initial model startup. Existing stage/profile
 events remain the detailed timing source; no prompts or payloads are added to
 resource summaries.
+
+V2 additionally records `shard_inflight`, `max_active_shards_observed`,
+`max_active_clip_pipelines_observed`, `worker_wall_seconds` and shared SAM
+startup/Qwen concurrency measurements: `sam_model_start_count`,
+`qwen_max_inflight_observed`, `qwen_queue_wait_seconds`. The SAM count observes
+successful predictor construction, not wrapper creation; healthy use is one.
+Qwen peak is observed for this worker; the underlying file-slot gate still
+enforces the configured node-wide limit across workers. Clip-pipeline maxima are worker-wide:
+with two active shards and eight chains per shard the bound is sixteen.
+Logical stage counters remain per shard, with one completion event per stage
+after that shard's chains resolve. Events from different shards may interleave;
+they do not represent a global stage barrier. V2 has no measured server speedup
+yet; rerun the same 20-clip selection before judging throughput.

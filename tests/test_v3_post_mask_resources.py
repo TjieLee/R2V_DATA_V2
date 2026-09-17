@@ -86,7 +86,24 @@ def test_lazy_boogu_reuses_exact_worker_configuration_and_closes_once(
     runtime_root = tmp_path / "campaign-state" / "worker-0"
 
     resources = PostMaskWorkerResources(config, execution, runtime_root=runtime_root)
-    assert resources.summary() == {
+    initial_summary = resources.summary()
+    assert {
+        key: initial_summary[key]
+        for key in (
+            "clip_inflight",
+            "boogu_start_count",
+            "boogu_restart_count",
+            "boogu_call_count",
+            "boogu_queue_wait_seconds",
+            "boogu_service_seconds",
+            "boogu_max_inflight_observed",
+            "sam_call_count",
+            "sam_queue_wait_seconds",
+            "sam_service_seconds",
+            "sam_max_inflight_observed",
+            "qwen_max_inflight_configured",
+        )
+    } == {
         "clip_inflight": 6,
         "boogu_start_count": 0,
         "boogu_restart_count": 0,
@@ -414,3 +431,138 @@ def test_close_before_first_use_does_not_create_resources(tmp_path, monkeypatch)
     assert not _HealthyBackend.instances
     with pytest.raises(RuntimeError, match="closed"):
         resources.edit(unused=SimpleNamespace())
+
+
+@pytest.mark.parametrize("resource_name", ["boogu", "sam"])
+def test_fifo_services_other_shard_before_first_shard_drains(
+    tmp_path, monkeypatch, resource_name
+):
+    from r2v_data_v2.v3 import reference_edit_boogu
+    from r2v_data_v2.v3.post_mask_resources import PostMaskWorkerResources
+
+    order = []
+
+    class OrderedBackend(_HealthyBackend):
+        def edit(self, **kwargs):
+            order.append(kwargs["label"])
+            return super().edit(**kwargs)
+
+    monkeypatch.setattr(reference_edit_boogu, "BooguSubprocessBackend", OrderedBackend)
+    resources = PostMaskWorkerResources(
+        _config(tmp_path),
+        _settings(tmp_path, monkeypatch),
+        runtime_root=tmp_path / "runtime",
+    )
+    lock = getattr(resources, f"_{resource_name}_lock")
+
+    def request(label):
+        if resource_name == "sam":
+            resources.sam_call(order.append, label)
+        else:
+            resources.edit(label=label)
+
+    # Hold the resource while deterministically queuing different shards.
+    with resources, ThreadPoolExecutor(max_workers=3) as pool:
+        with lock:
+            futures = []
+            for index, label in enumerate(("a1", "b1", "a2"), start=2):
+                futures.append(pool.submit(request, label))
+                with lock._condition:
+                    assert lock._condition.wait_for(
+                        lambda index=index: len(lock._queue) == index, timeout=2
+                    )
+        for future in futures:
+            future.result(timeout=2)
+    assert order == ["a1", "b1", "a2"]
+    assert resources.summary()[f"{resource_name}_max_inflight_observed"] == 1
+
+
+def test_worker_shares_lazy_sam_and_closes_only_once(tmp_path, monkeypatch):
+    from r2v_data_v2.v3 import sam3_backend
+    from r2v_data_v2.v3.post_mask_resources import PostMaskWorkerResources
+
+    closed = []
+
+    class Predictor:
+        def shutdown(self):
+            closed.append(self)
+
+    monkeypatch.setattr(
+        sam3_backend.Sam3SegmentationBackend,
+        "_build_predictor",
+        lambda self, **kwargs: Predictor(),
+    )
+    config = _config(tmp_path)
+    config = replace(config, sam3=replace(config.sam3, model_path=tmp_path / "sam"))
+    config.sam3.model_path.touch()
+    resources = PostMaskWorkerResources(
+        config, _settings(tmp_path, monkeypatch), runtime_root=tmp_path / "runtime"
+    )
+    with resources:
+        backend = resources.sam_backend(config.sam3)
+        assert resources.summary()["sam_model_start_count"] == 0
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            backends = list(
+                pool.map(lambda _: resources.sam_backend(config.sam3), range(2))
+            )
+        assert all(item is backend for item in backends)
+        one = resources.sam_call(backend._load_predictor)
+        assert resources.sam_call(backend._load_predictor) is one
+        assert resources.summary()["sam_model_start_count"] == 1
+        assert not closed
+    resources.close()
+    assert closed == [one]
+
+
+def test_activity_peaks_and_worker_wall_freeze_after_close(tmp_path, monkeypatch):
+    from r2v_data_v2.v3.post_mask_resources import PostMaskWorkerResources
+
+    resources = PostMaskWorkerResources(
+        _config(tmp_path),
+        _settings(tmp_path, monkeypatch),
+        runtime_root=tmp_path / "runtime",
+    )
+    with (
+        resources.activity("shards"),
+        resources.activity("shards"),
+        resources.activity("clip_pipelines"),
+    ):
+        assert resources.summary()["max_active_shards_observed"] == 2
+    with resources.activity("shards"):
+        assert resources.summary()["max_active_shards_observed"] == 2
+    assert resources.summary()["max_active_clip_pipelines_observed"] == 1
+    assert not resources.stopping
+    resources.stop_accepting()
+    assert resources.stopping
+    resources.close()
+    assert resources.summary()["worker_wall_seconds"] > 0
+    assert (
+        resources.summary()["worker_wall_seconds"]
+        == resources.summary()["worker_wall_seconds"]
+    )
+
+
+def test_shared_qwen_gate_observes_parallel_acquisitions_without_double_gate(
+    tmp_path, monkeypatch
+):
+    from r2v_data_v2.v3.post_mask_resources import PostMaskWorkerResources
+
+    settings = _settings(tmp_path, monkeypatch)
+    settings = replace(settings, runtime=replace(settings.runtime, qwen_max_inflight=2))
+    resources = PostMaskWorkerResources(
+        _config(tmp_path), settings, runtime_root=tmp_path / "runtime"
+    )
+    barrier = threading.Barrier(2)
+
+    def request():
+        with resources.qwen_gate.acquire() as observation:
+            barrier.wait(timeout=2)
+            assert observation.queue_wait_seconds >= 0
+            return observation.qwen_slot
+
+    with resources, ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(request) for _ in range(2)]
+        slots = [future.result(timeout=3) for future in futures]
+    assert len(set(slots)) == 2
+    assert resources.summary()["qwen_max_inflight_observed"] == 2
+    assert resources.summary()["qwen_queue_wait_seconds"] >= 0

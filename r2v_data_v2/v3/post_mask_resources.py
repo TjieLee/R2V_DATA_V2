@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import threading
 import time
-from collections.abc import Callable
-from contextlib import suppress
+from collections import deque
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, Self, TypeVar
 
-from r2v_data_v2.v3.config import V3Config
+from r2v_data_v2.v3.config import Sam3Config, V3Config
 
 if TYPE_CHECKING:
     from r2v_data_v2.v3.post_mask_runtime import ExecutionSettings
@@ -19,8 +20,64 @@ if TYPE_CHECKING:
 _T = TypeVar("_T")
 
 
+class _FifoLock:
+    """Serve one bounded clip request at a time, in arrival order."""
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._queue: deque[object] = deque()
+
+    def __enter__(self) -> Self:
+        ticket = object()
+        with self._condition:
+            self._queue.append(ticket)
+            self._condition.notify_all()
+            try:
+                self._condition.wait_for(lambda: self._queue[0] is ticket)
+            except BaseException:
+                self._queue.remove(ticket)
+                self._condition.notify_all()
+                raise
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        with self._condition:
+            self._queue.popleft()
+            self._condition.notify_all()
+
+
+class _ObservedQwenGate:
+    """Observe the existing node-wide gate, never acquire a second slot."""
+
+    def __init__(self, gate: Any, owner: PostMaskWorkerResources) -> None:
+        self._gate = gate
+        self._owner = owner
+
+    @property
+    def maximum(self) -> int:
+        return self._gate.maximum
+
+    @contextmanager
+    def acquire(self) -> Iterator[Any]:
+        self._owner._require_open()
+        with self._gate.acquire() as observation:
+            self._owner._require_open()
+            with self._owner._metrics_lock:
+                self._owner._qwen_queue_wait_seconds += observation.queue_wait_seconds
+                self._owner._qwen_inflight += 1
+                self._owner._qwen_max_inflight_observed = max(
+                    self._owner._qwen_max_inflight_observed,
+                    self._owner._qwen_inflight,
+                )
+            try:
+                yield observation
+            finally:
+                with self._owner._metrics_lock:
+                    self._owner._qwen_inflight -= 1
+
+
 class PostMaskWorkerResources:
-    """Own one lazy Boogu process and narrow Boogu/SAM call locks.
+    """Own lazy Boogu/SAM resources and narrow FIFO call locks.
 
     ``boogu_start_count`` counts successful starts only. Its first successful
     start is the normal worker start; every later successful start also
@@ -53,13 +110,23 @@ class PostMaskWorkerResources:
         self._boogu_scratch_root = resolved_root / "boogu-scratch"
         self._boogu_log_path = resolved_root / "boogu.log"
 
-        self._boogu_lock = threading.Lock()
-        self._sam_lock = threading.Lock()
+        self._boogu_lock = _FifoLock()
+        self._sam_lock = _FifoLock()
         self._lifecycle_lock = threading.Lock()
         self._metrics_lock = threading.Lock()
         self._boogu_backend: Any | None = None
+        self._sam_backend: Any | None = None
+        self._qwen_gate: _ObservedQwenGate | None = None
         self._closed = False
         self._stopping = False
+        self._started_at = time.perf_counter()
+        self._finished_at: float | None = None
+        self._active = {"shards": 0, "clip_pipelines": 0}
+        self._max_active = dict(self._active)
+        self._sam_model_start_count = 0
+        self._qwen_inflight = 0
+        self._qwen_max_inflight_observed = 0
+        self._qwen_queue_wait_seconds = 0.0
 
         self._boogu_start_count = 0
         self._boogu_restart_count = 0
@@ -93,6 +160,65 @@ class PostMaskWorkerResources:
         with self._lifecycle_lock:
             if self._closed or self._stopping:
                 raise RuntimeError("Post-Mask worker resources are closed")
+
+    @property
+    def stopping(self) -> bool:
+        with self._lifecycle_lock:
+            return self._stopping or self._closed
+
+    @property
+    def qwen_gate(self) -> _ObservedQwenGate:
+        with self._lifecycle_lock:
+            if self._closed or self._stopping:
+                raise RuntimeError("Post-Mask worker resources are closed")
+            if self._qwen_gate is None:
+                self._qwen_gate = _ObservedQwenGate(self.execution.qwen_gate(), self)
+            return self._qwen_gate
+
+    @contextmanager
+    def activity(self, kind: str) -> Iterator[None]:
+        """Measure active orchestration without locking its work."""
+        if kind not in self._active:
+            raise ValueError(f"Unknown worker activity: {kind}")
+        self._require_open()
+        with self._metrics_lock:
+            self._active[kind] += 1
+            self._max_active[kind] = max(self._max_active[kind], self._active[kind])
+        try:
+            yield
+        finally:
+            with self._metrics_lock:
+                self._active[kind] -= 1
+
+    def sam_backend(self, config: Sam3Config) -> Any:
+        """Return the same lazy backend across phases and shards.
+
+        The resource-local subclass only observes successful predictor builds,
+        including a backend-owned compile fallback; all SAM policy is inherited.
+        Construction is cheap; callers still serialize inference with sam_call.
+        """
+        with self._sam_lock:
+            self._require_open()
+            if self._sam_backend is None:
+                from r2v_data_v2.v3.sam3_backend import Sam3SegmentationBackend
+
+                owner = self
+
+                class WorkerSamBackend(Sam3SegmentationBackend):
+                    def _build_predictor(self, *, compile_enabled: bool) -> object:
+                        predictor = super()._build_predictor(
+                            compile_enabled=compile_enabled
+                        )
+                        with owner._metrics_lock:
+                            owner._sam_model_start_count += 1
+                        return predictor
+
+                self._sam_backend = WorkerSamBackend(config)
+            elif self._sam_backend.config != config:
+                raise ValueError(
+                    "Worker SAM configuration must be identical across shards"
+                )
+            return self._sam_backend
 
     def _backend_for_request(self) -> Any:
         backend = self._boogu_backend
@@ -196,6 +322,17 @@ class PostMaskWorkerResources:
         with self._metrics_lock:
             return {
                 "clip_inflight": self.execution.clip_inflight,
+                "shard_inflight": self.execution.shard_inflight,
+                "max_active_shards_observed": self._max_active["shards"],
+                "max_active_clip_pipelines_observed": self._max_active[
+                    "clip_pipelines"
+                ],
+                "worker_wall_seconds": (
+                    self._finished_at
+                    if self._finished_at is not None
+                    else time.perf_counter()
+                )
+                - self._started_at,
                 "boogu_start_count": self._boogu_start_count,
                 "boogu_restart_count": self._boogu_restart_count,
                 "boogu_call_count": self._boogu_call_count,
@@ -203,26 +340,40 @@ class PostMaskWorkerResources:
                 "boogu_service_seconds": self._boogu_service_seconds,
                 "boogu_max_inflight_observed": self._boogu_max_inflight_observed,
                 "sam_call_count": self._sam_call_count,
+                "sam_model_start_count": self._sam_model_start_count,
                 "sam_queue_wait_seconds": self._sam_queue_wait_seconds,
                 "sam_service_seconds": self._sam_service_seconds,
                 "sam_max_inflight_observed": self._sam_max_inflight_observed,
                 "qwen_max_inflight_configured": (
                     self.execution.runtime.qwen_max_inflight
                 ),
+                "qwen_max_inflight_observed": self._qwen_max_inflight_observed,
+                "qwen_queue_wait_seconds": self._qwen_queue_wait_seconds,
             }
 
     def close(self) -> None:
-        """Close the healthy owned Boogu process at most once."""
+        """Drain call locks and close owned Boogu and SAM at most once."""
 
         with self._lifecycle_lock:
             if self._closed:
                 return
             self._closed = True
-        with self._boogu_lock:
-            backend = self._boogu_backend
-            self._boogu_backend = None
-            if backend is not None and backend.started:
-                backend.close()
+        try:
+            with self._boogu_lock:
+                backend = self._boogu_backend
+                self._boogu_backend = None
+                if backend is not None and backend.started:
+                    backend.close()
+        finally:
+            try:
+                with self._sam_lock:
+                    backend = self._sam_backend
+                    self._sam_backend = None
+                    if backend is not None:
+                        backend.close()
+            finally:
+                with self._metrics_lock:
+                    self._finished_at = time.perf_counter()
 
     def stop_accepting(self) -> None:
         """Prevent resource-queued clips starting new calls during interruption."""

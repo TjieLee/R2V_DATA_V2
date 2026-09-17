@@ -16,7 +16,7 @@ import sys
 import threading
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -301,7 +301,12 @@ def heartbeat(state, callback, seconds=45):
 
     def tick():
         while not stop.wait(seconds):
-            callback({**state, "event": "post_mask_heartbeat"})
+            callback(
+                {
+                    **(state() if callable(state) else state),
+                    "event": "post_mask_heartbeat",
+                }
+            )
 
     thread = threading.Thread(target=tick, daemon=True)
     thread.start()
@@ -338,17 +343,24 @@ def run_worker(
     event_callback=emit,
     heartbeat_seconds=45,
     clip_inflight=8,
+    shard_inflight=2,
 ):
     sam_gpu, boogu_gpu = groups[slot]
     if os.environ.get("CUDA_VISIBLE_DEVICES") != sam_gpu:
         raise ValueError("worker requires SAM GPU isolation before imports")
     from r2v_data_v2.v3.post_mask_runtime import ExecutionSettings, run_post_mask_shard
+    from r2v_data_v2.v3.post_mask_wavefront import bounded_results
 
     runner = runner or run_post_mask_shard
     assigned = assigned_shards(campaign.shards, rank, world_size, slot, len(groups))
     node = hashlib.sha256(socket.gethostname().encode()).hexdigest()[:24]
     execution = ExecutionSettings(
-        runtime, sam_gpu, boogu_gpu, campaign.root / "qwen-gates" / node, clip_inflight
+        runtime,
+        sam_gpu,
+        boogu_gpu,
+        campaign.root / "qwen-gates" / node,
+        clip_inflight,
+        shard_inflight,
     )
     state = {
         "worker_id": rank * len(groups) + slot,
@@ -361,16 +373,47 @@ def run_worker(
         "current_shard": None,
         "current_stage": None,
     }
-    previous_counts = {key: 0 for key in ("ready", "excluded", "corrupt")}
+    state_lock = threading.RLock()
+    progress = {}
     unresolved_shards = []
+    failures = []
+
+    def snapshot():
+        with state_lock:
+            return {
+                **state,
+                "active_shards": {
+                    name: value["stage"]
+                    for name, value in progress.items()
+                    if value["active"]
+                },
+            }
+
+    def update(shard, *, stage=None, counts=None, active=None):
+        with state_lock:
+            item = progress.setdefault(
+                shard.stem,
+                {
+                    "stage": "waiting_for_shard_lock",
+                    "active": True,
+                    "ready": 0,
+                    "excluded": 0,
+                    "corrupt": 0,
+                },
+            )
+            if stage is not None:
+                item["stage"] = stage
+            if active is not None:
+                item["active"] = active
+            if counts is not None:
+                item.update(counts)
+            for key in ("ready", "excluded", "corrupt"):
+                state[key] = sum(value[key] for value in progress.values())
+            state.update(current_shard=shard.stem, current_stage=item["stage"])
 
     def event(value):
-        if "stage" in value:
-            state["current_stage"] = value["stage"]
-        if value["event"] == "post_mask_hydrate_completed":
-            for key in previous_counts:
-                state[key] = previous_counts[key] + value[key]
-        event_callback({**state, **value})
+        with state_lock:
+            event_callback({**snapshot(), **value})
 
     event(
         {
@@ -387,72 +430,138 @@ def run_worker(
     )
     with (
         _worker_model_resources(config, execution, runtime_root, event) as resources,
-        heartbeat(state, event_callback, heartbeat_seconds),
+        heartbeat(snapshot, event_callback, heartbeat_seconds),
     ):
-        for shard in assigned:
+
+        def run_shard(shard):
             paths = campaign.paths(shard)
-            previous_counts = {key: state[key] for key in previous_counts}
-            state.update(
-                current_shard=shard.stem, current_stage="waiting_for_shard_lock"
-            )
-            with exclusive_lock(paths.state_root / "shard.lock"):
-                receipt = completed_receipt(campaign, shard)
-                if receipt is None:
-                    legacy_hash = campaign.identity["shards"][shard.stem].get(
-                        "shard_sha256"
+            update(shard)
+
+            def shard_event(value):
+                with state_lock:
+                    counts = (
+                        {key: value[key] for key in ("ready", "excluded", "corrupt")}
+                        if value["event"] == "post_mask_hydrate_completed"
+                        else None
                     )
-                    if legacy_hash is not None and file_digest(shard) != legacy_hash:
-                        raise ValueError("Post-Mask legacy shard identity mismatch")
-                    state["current_stage"] = "hydrate"
-                    result = runner(
-                        config,
-                        entity_mask_root=campaign.entity_mask_root,
-                        paths=paths,
-                        git_commit=git_commit,
-                        execution=execution,
-                        event_callback=event,
-                        resources=resources,
-                    )
-                    for key in ("ready", "excluded", "corrupt"):
-                        state[key] = previous_counts[key] + getattr(result, key)
-                    if not result.completed:
-                        unresolved_shards.append(shard.stem)
-                        event(
-                            {
-                                "event": "post_mask_shard_incomplete",
-                                "shard": shard.stem,
-                                "retryable_clip_uids": list(result.retryable_clip_uids),
-                            }
-                        )
-                        continue
-                    if completed_receipt(campaign, shard) is None:
-                        raise RuntimeError(
-                            "worker returned without durable shard completion"
-                        )
-                else:
-                    state["ready"] += receipt["identity"]["clip_count"]
-                    for key, inventory in (
-                        ("excluded", paths.exclusions_path),
-                        ("corrupt", paths.input_failures_path),
-                    ):
-                        with inventory.open() as handle:
-                            state[key] += sum(bool(line.strip()) for line in handle)
+                    update(shard, stage=value.get("stage"), counts=counts)
                     event(
                         {
-                            "event": "post_mask_shard_completed",
-                            "shard": shard.stem,
-                            "skipped": True,
+                            **value,
+                            "current_shard": shard.stem,
+                            "current_stage": progress[shard.stem]["stage"],
                         }
                     )
+
+            try:
+                with resources.activity("shards"):
+                    while not resources.stopping:
+                        with ExitStack() as locks:
+                            try:
+                                locks.enter_context(
+                                    exclusive_lock(
+                                        paths.state_root / "shard.lock", blocking=False
+                                    )
+                                )
+                            except BlockingIOError:
+                                # A blocking flock in a pool thread cannot receive
+                                # the main thread's SIGTERM/KeyboardInterrupt.
+                                time.sleep(0.1)
+                                continue
+                            if resources.stopping:
+                                return
+                            return execute_shard(shard, paths, shard_event)
+            except Exception as exc:  # noqa: BLE001 - isolate shard infrastructure failures
+                with state_lock:
+                    failures.append((shard.stem, exc))
+                shard_event(
+                    {
+                        "event": "post_mask_shard_failed",
+                        "shard": shard.stem,
+                        "reason": str(exc),
+                    }
+                )
+            finally:
+                update(shard, active=False)
+
+        def execute_shard(shard, paths, shard_event):
+            receipt = completed_receipt(campaign, shard)
+            if receipt is None:
+                legacy_hash = campaign.identity["shards"][shard.stem].get(
+                    "shard_sha256"
+                )
+                if legacy_hash is not None and file_digest(shard) != legacy_hash:
+                    raise ValueError("Post-Mask legacy shard identity mismatch")
+                update(shard, stage="hydrate")
+                result = runner(
+                    config,
+                    entity_mask_root=campaign.entity_mask_root,
+                    paths=paths,
+                    git_commit=git_commit,
+                    execution=execution,
+                    event_callback=shard_event,
+                    resources=resources,
+                )
+                update(
+                    shard,
+                    counts={
+                        key: getattr(result, key)
+                        for key in ("ready", "excluded", "corrupt")
+                    },
+                )
+                if not result.completed:
+                    with state_lock:
+                        unresolved_shards.append(shard.stem)
+                    shard_event(
+                        {
+                            "event": "post_mask_shard_incomplete",
+                            "shard": shard.stem,
+                            "retryable_clip_uids": list(result.retryable_clip_uids),
+                        }
+                    )
+                    return
+                if completed_receipt(campaign, shard) is None:
+                    raise RuntimeError(
+                        "worker returned without durable shard completion"
+                    )
+            else:
+                counts = {"ready": receipt["identity"]["clip_count"]}
+                for key, inventory in (
+                    ("excluded", paths.exclusions_path),
+                    ("corrupt", paths.input_failures_path),
+                ):
+                    with inventory.open() as handle:
+                        counts[key] = sum(bool(line.strip()) for line in handle)
+                update(shard, counts=counts)
+                shard_event(
+                    {
+                        "event": "post_mask_shard_completed",
+                        "shard": shard.stem,
+                        "skipped": True,
+                    }
+                )
+            with state_lock:
                 state["completed_shards"] += 1
-        state.update(current_shard=None, current_stage=None)
-        if unresolved_shards:
+
+        for _ in bounded_results(
+            run_shard,
+            assigned,
+            execution.shard_inflight,
+            on_interrupt=resources.stop_accepting,
+        ):
+            pass
+        with state_lock:
+            state.update(current_shard=None, current_stage=None)
+        if unresolved_shards or failures:
             event(
                 {
                     "event": "post_mask_worker_incomplete",
-                    "unresolved_shards": unresolved_shards,
+                    "unresolved_shards": sorted(unresolved_shards),
+                    "failed_shards": sorted(name for name, _ in failures),
                 }
             )
+            if failures:
+                raise failures[0][1]
             raise RuntimeError(
                 f"Post-Mask shards have retryable work: {', '.join(unresolved_shards)}"
             )
@@ -687,6 +796,11 @@ def parser():
         default=os.environ.get("POST_MASK_CLIP_INFLIGHT", "8"),
     )
     p.add_argument("--worker-timeout-seconds", type=int)
+    p.add_argument(
+        "--shard-inflight",
+        type=_positive_int,
+        default=os.environ.get("POST_MASK_SHARD_INFLIGHT", "2"),
+    )
     p.add_argument("--global-wait-timeout-seconds", type=float, default=604800)
     return p
 

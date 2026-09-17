@@ -55,6 +55,7 @@ def main(argv=None):
             groups=groups,
             git_commit=commit,
             clip_inflight=args.clip_inflight,
+            shard_inflight=args.shard_inflight,
         )
         return 0
     except (Exception, KeyboardInterrupt) as exc:  # noqa: BLE001 - CLI failure boundary

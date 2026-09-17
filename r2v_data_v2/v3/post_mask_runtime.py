@@ -16,7 +16,6 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
@@ -51,12 +50,15 @@ class ExecutionSettings:
     boogu_gpu: str
     qwen_lock_directory: Path
     clip_inflight: int = 8
+    shard_inflight: int = 2
 
     def __post_init__(self) -> None:
         from r2v_data_v2.v3 import config as config_module
 
         if type(self.clip_inflight) is not int or self.clip_inflight <= 0:
             raise ValueError("clip_inflight must be a positive integer")
+        if type(self.shard_inflight) is not int or self.shard_inflight <= 0:
+            raise ValueError("shard_inflight must be a positive integer")
 
         if not self.sam_gpu.isdigit() or not self.boogu_gpu.isdigit():
             raise ValueError("Post-Mask requires physical numeric GPU IDs")
@@ -419,7 +421,6 @@ class DownstreamPhaseAdapter:
                 QwenBooguReferenceEditJudge,
                 Sam3BooguReferenceReviewer,
             )
-            from r2v_data_v2.v3.sam3_backend import Sam3SegmentationBackend
             from r2v_data_v2.v3.scale_collapse_fallback_guard import (
                 QwenScaleCollapseFallbackJudge,
             )
@@ -431,7 +432,7 @@ class DownstreamPhaseAdapter:
             judge = self._own(
                 QwenBooguReferenceEditJudge(config.qwen.reference_edit_judge)
             )
-            segmenter = self._own(Sam3SegmentationBackend(config.sam3))
+            segmenter = self.resources.sam_backend(config.sam3)
             reviewer = Sam3BooguReferenceReviewer(
                 _SerializedSam(segmenter, self.resources),
                 temporary_root=scratch,
@@ -487,7 +488,10 @@ class DownstreamPhaseAdapter:
                 "discovery_client": client,
                 "review_client": client,
                 "segmentation_backend": _SerializedSam(
-                    self._own(Sam3AttributeFrameSegmenter(config.sam3)), self.resources
+                    Sam3AttributeFrameSegmenter(
+                        config.sam3, backend=self.resources.sam_backend(config.sam3)
+                    ),
+                    self.resources,
                 ),
             }
             if config.subject_attributes.completion.enabled:
@@ -701,6 +705,133 @@ def _cleanup_export_staging(storage: RunStorage, paths: ShardPaths) -> None:
             shutil.rmtree(path)
 
 
+def _record_phase_result(
+    storage, stage, affected, values, error, counts, pending, emit
+):
+    """Keep V1 terminal/retryable bookkeeping shared by both execution paths."""
+    for key, value in values.items():
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            counts[key] = counts.get(key, 0) + value
+    for uid in affected:
+        clip = storage.read_clip(uid)
+        retryable = phase_needed(storage, clip, stage) or (
+            error is not None and not _terminal(clip)
+        )
+        if values.get("retryable_pending", 0):
+            retryable = True
+        if retryable:
+            pending.add(uid)
+        if (
+            error is not None
+            or retryable
+            or values.get("failures", 0)
+            or _terminal(clip)
+            and clip.reference_edit is not None
+            and clip.reference_edit.status == "failed"
+        ):
+            reason = str(error) if error else "phase has no durable successful outcome"
+            storage.append_failure(
+                stage=stage,
+                clip_uid=uid,
+                reason=reason,
+                details={"retryable": retryable},
+            )
+            counts["clip_failures"] = counts.get("clip_failures", 0) + 1
+            emit(
+                "post_mask_clip_failed",
+                stage=stage,
+                clip_uid=uid,
+                reason=reason,
+                retryable=retryable,
+            )
+
+
+def _post_pair_wavefront(
+    storage, execution, resources, gate, pending, emit, stage_counts, adapter_factory
+):
+    from r2v_data_v2.v3.post_mask_wavefront import bounded_results
+
+    stages = PHASES[2:]
+    counts_lock = threading.Lock()
+    adapter_lock = threading.Lock()
+    adapters, setup_errors = {}, {}
+    stage_limits = {
+        stage: threading.Semaphore(execution.workers_for(stage))
+        for stage in ("reference_integrity", "instruct")
+    }
+    for stage in stages:
+        stage_counts[stage] = {"scheduled": 0}
+    with ExitStack() as stack:
+
+        def adapter_for(stage):
+            # Lazy initialization is serialized, not the per-clip algorithms.
+            with adapter_lock:
+                if stage in setup_errors:
+                    raise setup_errors[stage]
+                if stage not in adapters:
+                    extra = (
+                        {"resources": resources}
+                        if adapter_factory is DownstreamPhaseAdapter
+                        else {}
+                    )
+                    try:
+                        adapters[stage] = stack.enter_context(
+                            adapter_factory(stage, storage, execution, **extra)
+                        )
+                    except Exception as exc:
+                        setup_errors[stage] = exc
+                        raise
+                return adapters[stage]
+
+        def clip_pipeline(uid):
+            with resources.activity("clip_pipelines"), qwen_concurrency_gate(gate):
+                for stage in stages:
+                    if resources.stopping:
+                        with counts_lock:
+                            pending.add(uid)
+                        return
+                    clip = storage.read_clip(uid)
+                    if not phase_needed(storage, clip, stage):
+                        continue
+                    with counts_lock:
+                        counts = stage_counts[stage]
+                        counts["scheduled"] += 1
+                        if counts["scheduled"] == 1:
+                            emit("post_mask_stage_started", stage=stage)
+                    values, error = {}, None
+                    try:
+                        adapter = adapter_for(stage)
+                        with ExitStack() as call_stack:
+                            if stage in stage_limits:
+                                call_stack.enter_context(stage_limits[stage])
+                            values = adapter.run(uid)
+                    except Exception as exc:  # noqa: BLE001 - same clip isolation as V1
+                        error = exc
+                    with counts_lock:
+                        _record_phase_result(
+                            storage, stage, [uid], values, error, counts, pending, emit
+                        )
+                        if uid in pending:
+                            return
+
+        for _ in bounded_results(
+            clip_pipeline,
+            (uid for uid in storage.clip_uids if uid not in pending),
+            execution.clip_inflight,
+            on_interrupt=resources.stop_accepting,
+        ):
+            pass
+    for stage in stages:
+        counts = stage_counts[stage]
+        counts["skipped_existing_or_ineligible"] = (
+            len(storage.clip_uids) - counts["scheduled"]
+        )
+        storage.update_stage_counts(
+            stage, {k: v for k, v in counts.items() if isinstance(v, int)}
+        )
+        emit("post_mask_stage_completed", stage=stage, counters=counts)
+
+
 def _run_post_mask_shard(
     base_config: V3Config,
     *,
@@ -740,9 +871,9 @@ def _run_post_mask_shard(
     _cleanup_export_staging(selected, paths)
     stage_counts: dict[str, dict[str, int | float]] = {}
     pending: set[str] = set()
-    gate = execution.qwen_gate()
+    gate = resources.qwen_gate
     if not paths.export_root.exists():
-        for stage in PHASES:
+        for stage in PHASES[:2]:
             todo = [
                 uid
                 for uid in hydrated.clip_uids
@@ -789,68 +920,47 @@ def _run_post_mask_shard(
                         elif execution.workers_for(stage) == 1:
                             results = [invoke(uid) for uid in todo]
                         else:
-                            with ThreadPoolExecutor(
-                                max_workers=execution.workers_for(stage)
-                            ) as pool:
-                                try:
-                                    results = list(pool.map(invoke, todo))
-                                except BaseException:
-                                    # Wake resource waiters only to fail; do not
-                                    # restart models while executor tasks drain.
-                                    resources.stop_accepting()
-                                    raise
+                            from r2v_data_v2.v3.post_mask_wavefront import (
+                                bounded_results,
+                            )
+
+                            results = list(
+                                bounded_results(
+                                    invoke,
+                                    todo,
+                                    execution.workers_for(stage),
+                                    on_interrupt=resources.stop_accepting,
+                                )
+                            )
                 except Exception as exc:  # noqa: BLE001 - close resources, preserve shard progress
                     results.append((None, {}, exc))
                 for uid, values, error in results:
-                    for key, value in values.items():
-                        if isinstance(value, (int, float)) and not isinstance(
-                            value, bool
-                        ):
-                            counts[key] = counts.get(key, 0) + value
-                    affected = todo if uid is None else [uid]
-                    for current in affected:
-                        clip = selected.read_clip(current)
-                        outstanding = phase_needed(selected, clip, stage)
-                        retryable = outstanding or (
-                            error is not None and not _terminal(clip)
-                        )
-                        if values.get("retryable_pending", 0):
-                            retryable = True
-                        if retryable:
-                            pending.add(current)
-                        if (
-                            error is not None
-                            or retryable
-                            or values.get("failures", 0)
-                            or _terminal(clip)
-                            and clip.reference_edit is not None
-                            and clip.reference_edit.status == "failed"
-                        ):
-                            reason = (
-                                str(error)
-                                if error
-                                else "phase has no durable successful outcome"
-                            )
-                            storage.append_failure(
-                                stage=stage,
-                                clip_uid=current,
-                                reason=reason,
-                                details={"retryable": retryable},
-                            )
-                            counts["clip_failures"] = counts.get("clip_failures", 0) + 1
-                            emit(
-                                "post_mask_clip_failed",
-                                stage=stage,
-                                clip_uid=current,
-                                reason=reason,
-                                retryable=retryable,
-                            )
+                    _record_phase_result(
+                        selected,
+                        stage,
+                        todo if uid is None else [uid],
+                        values,
+                        error,
+                        counts,
+                        pending,
+                        emit,
+                    )
             stage_counts[stage] = counts
             storage.update_stage_counts(
                 stage,
                 {key: value for key, value in counts.items() if isinstance(value, int)},
             )
             emit("post_mask_stage_completed", stage=stage, counters=counts)
+        _post_pair_wavefront(
+            selected,
+            execution,
+            resources,
+            gate,
+            pending,
+            emit,
+            stage_counts,
+            adapter_factory,
+        )
         if pending:
             emit("post_mask_shard_incomplete", retryable_clip_uids=sorted(pending))
             return ShardResult(

@@ -32,10 +32,255 @@ def test_clip_inflight_cli_env_and_validation(monkeypatch):
             api().parser().parse_args(["--clip-inflight", value])
 
 
-@pytest.mark.parametrize("interrupted", [False, True])
-def test_worker_boogu_persists_through_three_adapters_and_two_shards(
-    case, monkeypatch, interrupted
+def test_worker_interrupt_does_not_wait_for_other_process_shard_lock(case, monkeypatch):
+    import threading
+    from contextlib import contextmanager
+
+    from r2v_data_v2.v3 import post_mask_wavefront
+
+    _write_rows(case, [])
+    c = campaign(case)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "4")
+    lock_path = c.paths(c.shards[0]).state_root / "shard.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    owner = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import fcntl,sys; f=open(sys.argv[1],'a'); "
+                "fcntl.flock(f,fcntl.LOCK_EX); print('locked',flush=True); sys.stdin.read()"
+            ),
+            str(lock_path),
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    attempted, finished = threading.Event(), threading.Event()
+    failures, runner_calls = [], []
+    original_lock = api().exclusive_lock
+
+    @contextmanager
+    def observed_lock(path, **kwargs):
+        attempted.set()
+        with original_lock(path, **kwargs):
+            yield
+
+    def interrupted_wait(*args, **kwargs):
+        assert attempted.wait(2)
+        raise KeyboardInterrupt("external SIGTERM while waiting for flock")
+
+    monkeypatch.setattr(api(), "exclusive_lock", observed_lock)
+    monkeypatch.setattr(post_mask_wavefront, "wait", interrupted_wait)
+
+    def worker():
+        try:
+            api().run_worker(
+                c,
+                accepted(case[0]),
+                runtime=case[0].runtime,
+                rank=0,
+                world_size=1,
+                slot=0,
+                groups=(("4", "5"),),
+                git_commit="test",
+                runner=lambda *a, **kw: runner_calls.append(kw),
+                event_callback=lambda e: None,
+            )
+        except BaseException as exc:  # noqa: BLE001 - convey thread failures to test
+            failures.append(exc)
+        finally:
+            finished.set()
+
+    thread = threading.Thread(target=worker)
+    try:
+        assert owner.stdout.readline().strip() == "locked"
+        thread.start()
+        completed_while_locked = finished.wait(2)
+        assert owner.poll() is None
+    finally:
+        owner.communicate("release", timeout=3)
+        thread.join(3)
+    assert completed_while_locked, "interrupt blocked on another process's flock"
+    assert len(failures) == 1 and isinstance(failures[0], KeyboardInterrupt)
+    assert not runner_calls
+
+
+def test_shard_inflight_cli_env_and_validation(monkeypatch):
+    monkeypatch.delenv("POST_MASK_SHARD_INFLIGHT", raising=False)
+    assert api().parser().parse_args([]).shard_inflight == 2
+    monkeypatch.setenv("POST_MASK_SHARD_INFLIGHT", "3")
+    assert api().parser().parse_args([]).shard_inflight == 3
+    assert api().parser().parse_args(["--shard-inflight", "5"]).shard_inflight == 5
+    for value in ("0", "-1"):
+        with pytest.raises(SystemExit):
+            api().parser().parse_args(["--shard-inflight", value])
+        monkeypatch.setenv("POST_MASK_SHARD_INFLIGHT", value)
+        with pytest.raises(SystemExit):
+            api().parser().parse_args([])
+
+
+def test_worker_bounded_shards_overlap_pair_with_remove_and_isolate_failure(
+    case, monkeypatch
 ):
+    import threading
+
+    from r2v_data_v2.v3 import reference_edit_boogu
+    from r2v_data_v2.v3.post_mask_runtime import ShardResult
+
+    _write_rows(case, [])
+    for i in range(1, 5):
+        case[2].with_name(f"shard-{i * 100:09d}-{i * 100 + 99:09d}.jsonl").write_text(
+            ""
+        )
+    c = campaign(case)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "4")
+    pair_entered, boogu_remove_entered = threading.Event(), threading.Event()
+    lock = threading.Lock()
+    active, maximum = 0, 0
+    attempted, events, owners = [], [], []
+
+    class Backend:
+        started = False
+
+        def __init__(self, config):
+            self.config = config
+
+        def start(self, **kwargs):
+            self.started = True
+
+        def edit(self, **kwargs):
+            assert pair_entered.is_set()
+            boogu_remove_entered.set()
+
+        def close(self):
+            self.started = False
+
+    monkeypatch.setattr(reference_edit_boogu, "BooguSubprocessBackend", Backend)
+
+    def runner(config, *, paths, resources, event_callback, **kwargs):
+        nonlocal active, maximum
+        with lock:
+            active += 1
+            maximum = max(active, maximum)
+            attempted.append(paths.shard_path)
+            owners.append(resources)
+        try:
+            event_callback(
+                {
+                    "event": "post_mask_hydrate_completed",
+                    "ready": 1,
+                    "excluded": 2,
+                    "corrupt": 3,
+                }
+            )
+            if paths.shard_path == c.shards[0]:
+                event_callback({"event": "post_mask_stage_started", "stage": "pair"})
+                pair_entered.set()
+                assert boogu_remove_entered.wait(2), (
+                    "second shard remove blocked behind pair"
+                )
+                raise RuntimeError("injected shard failure")
+            if paths.shard_path == c.shards[1]:
+                assert pair_entered.wait(2)
+                event_callback({"event": "post_mask_stage_started", "stage": "remove"})
+                resources.edit(label="shard_b_remove")
+                return ShardResult(False, 1, 2, 3, 0, ("retryable",), {})
+            _completed(c, paths.shard_path, count=0)
+            return ShardResult(True, 1, 2, 3, 0, (), {})
+        finally:
+            with lock:
+                active -= 1
+
+    with pytest.raises(RuntimeError):
+        api().run_worker(
+            c,
+            accepted(case[0]),
+            runtime=case[0].runtime,
+            rank=0,
+            world_size=1,
+            slot=0,
+            groups=(("4", "5"),),
+            git_commit="test",
+            runner=runner,
+            event_callback=events.append,
+        )
+    assert maximum == 2
+    assert sorted(attempted) == list(c.shards)
+    assert len({id(owner) for owner in owners}) == 1
+    assert all(api().completed_receipt(c, shard) is not None for shard in c.shards[2:])
+    summary = events[-1]
+    assert summary["event"] == "post_mask_worker_resource_summary"
+    assert (summary["ready"], summary["excluded"], summary["corrupt"]) == (5, 10, 15)
+    assert summary["completed_shards"] == 3
+    assert summary["max_active_shards_observed"] == 2
+    assert summary["boogu_start_count"] == 1
+    assert summary["boogu_max_inflight_observed"] == 1
+
+
+def test_worker_interrupt_stops_admission_and_drains_sibling_receipt(case, monkeypatch):
+    import threading
+
+    from r2v_data_v2.v3.post_mask_resources import PostMaskWorkerResources
+    from r2v_data_v2.v3.post_mask_runtime import ShardResult
+
+    _write_rows(case, [])
+    for i in range(1, 5):
+        case[2].with_name(f"shard-{i * 100:09d}-{i * 100 + 99:09d}.jsonl").write_text(
+            ""
+        )
+    c = campaign(case)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "4")
+    sibling_entered, stopped = threading.Event(), threading.Event()
+    attempted, events = [], []
+    original_stop = PostMaskWorkerResources.stop_accepting
+
+    def stop(owner):
+        original_stop(owner)
+        stopped.set()
+
+    monkeypatch.setattr(PostMaskWorkerResources, "stop_accepting", stop)
+
+    def runner(config, *, paths, resources, **kwargs):
+        attempted.append(paths.shard_path)
+        if paths.shard_path == c.shards[0]:
+            assert sibling_entered.wait(2)
+            raise KeyboardInterrupt("external stop")
+        assert paths.shard_path == c.shards[1], "admitted shard after interruption"
+        sibling_entered.set()
+        assert stopped.wait(2), "resources were not stopped before sibling drain"
+        assert resources.stopping
+        _completed(c, paths.shard_path, count=0)
+        return ShardResult(True, 0, 0, 0, 0, (), {})
+
+    with pytest.raises(KeyboardInterrupt):
+        api().run_worker(
+            c,
+            accepted(case[0]),
+            runtime=case[0].runtime,
+            rank=0,
+            world_size=1,
+            slot=0,
+            groups=(("4", "5"),),
+            git_commit="test",
+            runner=runner,
+            event_callback=events.append,
+        )
+    assert sorted(attempted) == list(c.shards[:2])
+    assert api().completed_receipt(c, c.shards[1]) is not None
+    assert events[-1]["event"] == "post_mask_worker_resource_summary"
+    assert events[-1]["completed_shards"] == 1
+
+
+@pytest.mark.parametrize(
+    "interrupted,shard_inflight", [(False, 1), (True, 1), (False, 2)]
+)
+def test_worker_boogu_persists_through_three_adapters_and_two_shards(
+    case, monkeypatch, interrupted, shard_inflight
+):
+    import threading
+
     from r2v_data_v2.v3 import (
         reference_edit_boogu,
         removal_judge,
@@ -63,10 +308,11 @@ def test_worker_boogu_persists_through_three_adapters_and_two_shards(
     second.write_text("")
     c = campaign(case)
     backends, calls, events = [], [], []
+    concurrent = threading.Barrier(shard_inflight)
 
     class Client:
         def __init__(self, *a, **kw):
-            pass
+            self.config = a[0] if a else None
 
         def close(self):
             pass
@@ -101,6 +347,7 @@ def test_worker_boogu_persists_through_three_adapters_and_two_shards(
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "4")
 
     def runner(config, *, paths, execution, resources, **kwargs):
+        concurrent.wait(timeout=2)
         if interrupted and paths.shard_path == second:
             raise KeyboardInterrupt("external stop after committed shard")
         storage = _ShardStorage(initialize_shard(config, paths, git_commit="test"), ())
@@ -132,6 +379,7 @@ def test_worker_boogu_persists_through_three_adapters_and_two_shards(
             git_commit="test",
             runner=runner,
             event_callback=events.append,
+            shard_inflight=shard_inflight,
         )
 
     if interrupted:
@@ -141,15 +389,18 @@ def test_worker_boogu_persists_through_three_adapters_and_two_shards(
     else:
         run()
     assert len(backends) == 1 and backends[0].starts == backends[0].closes == 1
-    assert calls == [
-        (shard.name, stage)
-        for shard in (c.shards[:1] if interrupted else c.shards)
-        for stage in ("remove", "reference_edit", "subject_attributes")
-    ]
+    assert sorted(calls) == sorted(
+        [
+            (shard.name, stage)
+            for shard in (c.shards[:1] if interrupted else c.shards)
+            for stage in ("remove", "reference_edit", "subject_attributes")
+        ]
+    )
     assert backends[0].config.temporary_root.is_relative_to(c.root / "runtime")
     assert events[-1]["boogu_start_count"] == 1 and events[-1]["boogu_call_count"] == (
         3 if interrupted else 6
     )
+    assert events[-1]["boogu_max_inflight_observed"] == 1
 
 
 def accepted(config):
@@ -1110,7 +1361,7 @@ def test_incomplete_shard_continues_later_shard_without_retry(case, monkeypatch)
             runner=runner,
             event_callback=events.append,
         )
-    assert attempted == [case[2], later]
+    assert sorted(attempted) == [case[2], later]
     assert api().completed_receipt(c, later) is not None
     assert events[-2]["event"] == "post_mask_worker_incomplete"
     assert events[-1]["event"] == "post_mask_worker_resource_summary"
