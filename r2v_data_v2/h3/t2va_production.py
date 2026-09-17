@@ -74,11 +74,11 @@ class ShardLockedError(RuntimeError):
 
 
 @contextmanager
-def file_lock(path: Path):
+def file_lock(path: Path, *, blocking=False):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a") as handle:
         try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(handle, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
         except BlockingIOError as exc:
             raise ShardLockedError(f"locked: {path}") from exc
         try:
@@ -105,15 +105,18 @@ def build_source_index(source: Path, root: Path) -> dict:
     if source.is_relative_to(root):
         raise ValueError("source must not be inside production output")
     path = root / "manifests/source_index.json"
-    with file_lock(root / "manifests/source_index.lock"):
+    with file_lock(root / "manifests/source_index.lock", blocking=True):
         identity = _source_identity(source)
         if path.exists():
             index = json.loads(path.read_text())
-            if (
+            if index["shard_size"] != SHARD_SIZE or (
                 index["source_identity"] != identity
-                or index["shard_size"] != SHARD_SIZE
+                and _sha(source) != index["source_sha256"]
             ):
                 raise ValueError("source changed; use a fresh production root")
+            # Device/inode/stat identity can differ across mounts. Content is
+            # authoritative; retain the current host's fast stat check in memory.
+            index["source_identity"] = identity
             return index
         digest = hashlib.sha256()
         shards, count = [], 0
@@ -150,8 +153,12 @@ def build_source_index(source: Path, root: Path) -> dict:
 
 def materialize_shard(index: dict, shard_id: int, root: Path) -> Path:
     source = Path(index["source_identity"]["path"])
-    if _source_identity(source) != index["source_identity"]:
+    if (
+        _source_identity(source) != index["source_identity"]
+        and _sha(source) != index["source_sha256"]
+    ):
         raise ValueError("source changed after indexing")
+    identity = _source_identity(source)
     if not 0 <= shard_id < len(index["shards"]):
         raise ValueError("shard outside source population")
     shard = index["shards"][shard_id]
@@ -168,7 +175,7 @@ def materialize_shard(index: dict, shard_id: int, root: Path) -> Path:
                     output.write(handle.readline())
                 output.flush()
                 os.fsync(output.fileno())
-            if _source_identity(source) != index["source_identity"]:
+            if _source_identity(source) != identity:
                 raise ValueError("source changed during shard extraction")
             os.replace(temporary, path)
             _sync_directory(path.parent)
@@ -179,6 +186,18 @@ def materialize_shard(index: dict, shard_id: int, root: Path) -> Path:
 
 class EndpointUnavailable(RuntimeError):
     """Infrastructure outage: stop scheduling, do not label remaining samples."""
+
+    def __init__(self, message, result=None):
+        super().__init__(message)
+        self.result = result
+
+
+class PartialStageFailure(ValueError):
+    """A failed variant must not discard independent ready variants."""
+
+    def __init__(self, message, result):
+        super().__init__(message)
+        self.result = result
 
 
 def complete_rows(path: Path):
@@ -322,7 +341,6 @@ def process_shard(
                 states[state["clip_uid"]] = dict(state)
 
         def process(row):
-            nonlocal processed
             uid = row["clip_uid"]
             if Path(uid).name != uid or uid in {".", ".."}:
                 raise ValueError("unsafe clip identity")
@@ -340,7 +358,14 @@ def process_shard(
                 }
             )
             if state["identity"] != identity:
-                raise ValueError("production source/config identity changed")
+                if (
+                    state.get("preparation_failed")
+                    and not (shard / "artifacts" / uid / "t2va").exists()
+                ):
+                    state["identity"] = identity
+                else:
+                    raise ValueError("production source/config identity changed")
+            state["preparation_failed"] = bool(row.get("preparation_error"))
             if state["t2va_status"] == "skipped":
                 return
             if row.get("upstream_failure"):
@@ -356,6 +381,10 @@ def process_shard(
                 if stopped.is_set():
                     return
                 destination = shard / "artifacts" / uid / stage
+                failed_destination = destination.with_name(f"{stage}_failed")
+                previous_partial = _recover_stage(failed_destination, identity)
+                if previous_partial is not None:
+                    publish_exports(previous_partial)
                 result = _recover_stage(destination, identity)
                 if result is None:
                     temporary = destination.with_name(
@@ -367,10 +396,32 @@ def process_shard(
                             result = processor.process(
                                 stage, row, temporary, destination
                             )
-                        except EndpointUnavailable:
+                        except EndpointUnavailable as exc:
                             stopped.set()
+                            if exc.result is not None:
+                                if failed_destination.exists():
+                                    shutil.rmtree(failed_destination)
+                                _publish_stage(
+                                    temporary, failed_destination, identity, exc.result
+                                )
+                                publish_exports(exc.result)
+                                state.update(
+                                    {
+                                        f"{stage}_status": "failed",
+                                        "failure_stage": stage,
+                                        "failure_reason": f"{type(exc).__name__}: {exc}",
+                                    }
+                                )
+                                save(state)
                             raise
                         except Exception as exc:  # noqa: BLE001 - sample isolation boundary.
+                            if isinstance(exc, PartialStageFailure):
+                                if failed_destination.exists():
+                                    shutil.rmtree(failed_destination)
+                                _publish_stage(
+                                    temporary, failed_destination, identity, exc.result
+                                )
+                                publish_exports(exc.result)
                             state.update(
                                 {
                                     f"{stage}_status": "failed",
@@ -387,6 +438,8 @@ def process_shard(
                         if temporary.exists():
                             shutil.rmtree(temporary)
                 publish_exports(result)
+                if state[f"{stage}_status"] == "ready":
+                    continue
                 state.update(
                     {
                         f"{stage}_status": "ready",
@@ -395,18 +448,26 @@ def process_shard(
                     }
                 )
                 save(state)
-            with writer:
-                processed += 1
-                if progress_every and processed % progress_every == 0:
-                    counts = {
-                        f"{s}_{v}": sum(x[f"{s}_status"] == v for x in states.values())
-                        for s in ("t2va", "ta2va")
-                        for v in ("ready", "failed")
-                    }
-                    print(
-                        f"shard={shard_id} processed={processed}/{len(rows)} {counts}",
-                        flush=True,
-                    )
+
+        def process_and_report(row):
+            nonlocal processed
+            try:
+                process(row)
+            finally:
+                with writer:
+                    processed += 1
+                    if progress_every and processed % progress_every == 0:
+                        counts = {
+                            f"{s}_{v}": sum(
+                                x[f"{s}_status"] == v for x in states.values()
+                            )
+                            for s in ("t2va", "ta2va")
+                            for v in ("ready", "failed")
+                        }
+                        print(
+                            f"shard={shard_id} processed={processed}/{len(rows)} {counts}",
+                            flush=True,
+                        )
 
         pool = ThreadPoolExecutor(max_workers=request_workers)
         pending = set()
@@ -417,7 +478,7 @@ def process_shard(
                     row = next(iterator, None)
                     if row is None:
                         break
-                    pending.add(pool.submit(process, row))
+                    pending.add(pool.submit(process_and_report, row))
                 if not pending:
                     break
                 done, pending = wait(pending, return_when=FIRST_COMPLETED)
@@ -443,7 +504,7 @@ def process_shard(
         return states
 
 
-def _endpoint_error(error):
+def _endpoint_error(error, result=None):
     if error and any(
         token in str(error).lower()
         for token in (
@@ -453,7 +514,7 @@ def _endpoint_error(error):
             "failed to establish a new connection",
         )
     ):
-        raise EndpointUnavailable(str(error))
+        raise EndpointUnavailable(str(error), result)
 
 
 def training_row(video, caption, audios=()):
@@ -515,6 +576,7 @@ def ta2va_stage(
     destination: Path,
     *,
     allow_unverified=False,
+    source_hashes=None,
 ):
     """Production writer around frozen TA2VA waveform and rendering operations."""
     import numpy as np
@@ -522,6 +584,15 @@ def ta2va_stage(
     from r2v_data_v2.h3 import ta2va_shadow as ta
 
     evidence = job.audio_evidence
+    hashes = {
+        **(source_hashes or {}),
+        job.target_video_path: job.target_video_sha256,
+        **{
+            getattr(evidence, f"{kind}_path"): getattr(evidence, f"{kind}_sha256")
+            for kind in ("full_audio", "speech", "music", "sfx")
+        },
+    }
+    ta._verify(hashes)
     frames = ta.probe_canonical_target_frames(
         Path(evidence.full_audio_path), evidence.full_audio_sha256
     )
@@ -547,6 +618,27 @@ def ta2va_stage(
         product = ta.TA2VAProduct(**fields, record_fingerprint=ta.fingerprint(fields))
         products.append(product)
         (temporary / f"{variant}.txt").write_text(product.prompt, encoding="utf-8")
+
+    def finish(failed_calls=0):
+        ta._verify(hashes)
+        (temporary / "records.jsonl").write_text(
+            "".join(p.model_dump_json() + "\n" for p in products), encoding="utf-8"
+        )
+        return {
+            "model_call_count": failed_calls
+            + sum(p.model_call_count for p in products),
+            "reuse_exclusions": exclusions,
+            "exports": {
+                "ta2va_full_audio"
+                if p.variant == "full_audio_reuse"
+                else "ta2va_speech_bgm": training_row(
+                    job.target_video_path,
+                    p.prompt,
+                    [a.path for a in p.audio_references],
+                )
+                for p in products
+            },
+        }
 
     full = ta.RecaptionAudioContract(
         audio_index=1,
@@ -646,8 +738,16 @@ def ta2va_stage(
             try:
                 profiles, raw = backend.profile(targets, snippets)
             except Exception as exc:
-                _endpoint_error(exc)
-                raise
+                atomic_json(
+                    temporary / "raw_profile.json",
+                    {
+                        "model_call_count": 0,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    },
+                )
+                partial = finish()
+                _endpoint_error(exc, partial)
+                raise PartialStageFailure(str(exc), partial) from exc
             raw["snippets"] = [
                 {
                     "label": label,
@@ -658,8 +758,9 @@ def ta2va_stage(
             ]
             atomic_json(temporary / "raw_profile.json", raw)
             if raw["error"]:
-                _endpoint_error(raw["error"])
-                raise ValueError(raw["error"])
+                partial = finish(raw["model_call_count"])
+                _endpoint_error(raw["error"], partial)
+                raise PartialStageFailure(raw["error"], partial)
             if include_music:
                 music = ta._check_stem(
                     stem.stem("music"),
@@ -695,21 +796,7 @@ def ta2va_stage(
                 [*exclusions, *warnings],
                 raw["model_call_count"],
             )
-    (temporary / "records.jsonl").write_text(
-        "".join(p.model_dump_json() + "\n" for p in products), encoding="utf-8"
-    )
-    return {
-        "model_call_count": sum(p.model_call_count for p in products),
-        "reuse_exclusions": exclusions,
-        "exports": {
-            "ta2va_full_audio"
-            if p.variant == "full_audio_reuse"
-            else "ta2va_speech_bgm": training_row(
-                job.target_video_path, p.prompt, [a.path for a in p.audio_references]
-            )
-            for p in products
-        },
-    }
+    return finish()
 
 
 def build_snapshot(root: Path, snapshot_id: str) -> Path:
@@ -742,8 +829,8 @@ def build_snapshot(root: Path, snapshot_id: str) -> Path:
                 sources = sorted(
                     json.loads(source_path.read_text()), key=lambda r: r["source_index"]
                 )
-                by_video = {r["video"]: r for r in sources}
-                if len(by_video) != len(sources):
+                by_video = {r["video"]: r for r in sources if r["video"]}
+                if len(by_video) != sum(bool(r["video"]) for r in sources):
                     raise ValueError("conflicting video identity in shard")
                 # Bound caption memory to one 10k shard. Global dedup stores hashes only.
                 rows_by_task = {}
@@ -753,6 +840,9 @@ def build_snapshot(root: Path, snapshot_id: str) -> Path:
                         shard / "exports" / f"{task}.jsonl",
                         shard / "exports" / f"{task}.jsonl.partial",
                     ]
+                    # Final may appear after the first check but before partial
+                    # is opened. Re-read final to close that rename window.
+                    paths.append(paths[0])
                     for path in paths:
                         try:
                             items = list(complete_rows(path))
@@ -830,3 +920,218 @@ def build_snapshot(root: Path, snapshot_id: str) -> Path:
             if temporary.exists():
                 shutil.rmtree(temporary)
     return destination
+
+
+def prepare_shard(
+    root,
+    index,
+    shard_id,
+    *,
+    audio_production_root,
+    audio_shadow_run_id,
+    clips_root,
+    source_videos_root,
+    backend,
+):
+    """Bound selection to one fixed shard and reuse the frozen inventory builder."""
+    from r2v_data_v2.h3.t2va_shadow import build_t2va_inventory, write_json
+    from r2v_data_v2.naming import parse_clip_identity
+    from r2v_data_v2.v3.production_source import JeaVideoMotionAdapter, _path_below_root
+
+    manifest = materialize_shard(index, shard_id, root)
+    prepared = root / "shards" / shard_name(shard_id) / "prepared"
+    prepared.mkdir(parents=True, exist_ok=True)
+    adapter = JeaVideoMotionAdapter(
+        clips_root=clips_root, source_videos_root=source_videos_root
+    )
+    rows, raw_by_uid, contexts, seen = [], {}, {}, set()
+    with manifest.open("rb") as handle:
+        for offset, line in enumerate(handle):
+            source_index = shard_id * SHARD_SIZE + offset
+            row = {
+                "source_index": source_index,
+                "clip_uid": f"invalid-source-{source_index}",
+                "video": "",
+                "source_row_sha256": hashlib.sha256(line).hexdigest(),
+            }
+            try:
+                raw = json.loads(line)
+                if not isinstance(raw, dict):
+                    raise TypeError("shot manifest row must be a JSON object")
+                # Preserve the ingestion identity across transient missing-media
+                # failures. Eligibility still goes through the full adapter.
+                candidate, _ = _path_below_root(
+                    raw.get("video_path"),
+                    root=clips_root,
+                    field_name="video_path",
+                    require_file=False,
+                )
+                uid = parse_clip_identity(candidate).clip_uid
+                if uid in seen:
+                    raise ValueError("duplicate JEA clip identity")
+                seen.add(uid)
+                row.update(clip_uid=uid, video=str(candidate))
+                item = adapter.parse(raw, source_index=source_index)
+                uid = item["clip_uid"]
+                row.update(clip_uid=uid, video=item["video_path"])
+                raw_by_uid[uid] = raw
+            except (ValueError, TypeError, KeyError, OSError) as exc:
+                row["preparation_error"] = f"{type(exc).__name__}: {exc}"
+            rows.append(row)
+
+    def build(path):
+        return build_t2va_inventory(
+            shot_manifest=path,
+            clips_root=clips_root,
+            source_videos_root=source_videos_root,
+            audio_production_root=audio_production_root,
+            audio_shadow_run_id=audio_shadow_run_id,
+            t2va_run_id="production",
+            backend=backend,
+        )
+
+    try:
+        inventory = build(manifest)
+    except (ValueError, TypeError, KeyError, OSError):
+        inventory = None
+    if inventory is not None:
+        write_json(prepared / "inventory.json", inventory)
+        contexts = {job.clip_uid: (job, inventory) for job in inventory.jobs}
+    for row in rows:
+        uid = row["clip_uid"]
+        if row.get("preparation_error"):
+            continue
+        if uid not in contexts:
+            # Exceptional path isolates one broken media/ASR row from its neighbors.
+            # Normal preparation loads the upstream inventory only once per shard.
+            path = prepared / f"{uid}.jsonl"
+            path.write_text(json.dumps(raw_by_uid[uid]) + "\n", encoding="utf-8")
+            try:
+                single = build(path)
+                if len(single.jobs) != 1 or single.jobs[0].clip_uid != uid:
+                    raise ValueError("source row is not a valid T2VA shot")
+                write_json(prepared / f"{uid}.inventory.json", single)
+                contexts[uid] = (single.jobs[0], single)
+            except (ValueError, TypeError, KeyError, OSError) as exc:
+                row["preparation_error"] = f"{type(exc).__name__}: {exc}"
+                continue
+        job, _ = contexts[uid]
+        if job.upstream_failure:
+            row["upstream_failure"] = job.upstream_failure
+    return rows, contexts
+
+
+class FrozenProductionProcessor:
+    def __init__(self, contexts, backend, profile_backend, *, allow_unverified=False):
+        self.contexts = contexts
+        self.backend = backend
+        self.profile_backend = profile_backend
+        self.allow_unverified = allow_unverified
+        self._sources = {}
+        # Load immutable source records once, never once per clip.
+        from r2v_data_v2.h3 import t2va_shadow as t
+
+        for _, inventory in contexts.values():
+            root = t.stem_shadow_root(
+                Path(inventory.audio_production_root), inventory.audio_shadow_run_id
+            )
+            if root in self._sources or not (root / "asr").exists():
+                continue
+            _, stems, _ = t.load_resolved_stems(root / "resolved_stems_v1")
+            raw = t.read_rows(
+                root / "diarization/raw_segments.jsonl", t.RawDiarizationSegment
+            )
+            asr = t.read_rows(root / "asr/segments.jsonl", t.Qwen3ASRSegment)
+            self._sources[root] = (
+                {s.clip_uid: s for s in stems},
+                {(s.target_clip_uid, s.segment_id): s for s in raw},
+                {(s.clip_uid, s.segment_id): s for s in asr},
+            )
+
+    def identity(self, row):
+        from r2v_data_v2.h3.t2va_shadow import fingerprint
+
+        context = self.contexts.get(row["clip_uid"])
+        hashes = {}
+        if context:
+            inventory = context[1]
+            local_selection = {
+                inventory.shot_selection.shot_manifest_path,
+                inventory.shot_selection.case_manifest_path,
+            }
+            hashes = {
+                p: h
+                for p, h in inventory.source_hashes.items()
+                if p not in local_selection
+            }
+        return fingerprint(
+            {
+                "source": {
+                    k: v
+                    for k, v in row.items()
+                    if k not in {"preparation_error", "upstream_failure"}
+                },
+                "job": context[0].model_dump(mode="json") if context else None,
+                "source_hashes": hashes,
+                "backend": self.backend.provenance().model_dump(mode="json"),
+                "profile_backend": self.profile_backend.provenance(),
+                "allow_unverified": self.allow_unverified,
+            }
+        )
+
+    def process(self, stage, row, temporary, destination):
+        from r2v_data_v2.h3 import t2va_shadow as t
+        from r2v_data_v2.h3.ta2va_shadow import _verify
+
+        if row.get("preparation_error"):
+            raise ValueError(row["preparation_error"])
+        job, inventory = self.contexts[row["clip_uid"]]
+        if stage == "t2va":
+            _verify(inventory.source_hashes)
+            result = t2va_stage(job, self.backend, temporary)
+            _verify(inventory.source_hashes)
+            return result
+        core_path = destination.parent / "t2va/core.json"
+        core = t.H3NoReferenceAVCore.model_validate_json(core_path.read_text())
+        t.validate_t2va_draft(job, core)
+        t.check_audio_files(job.audio_evidence)
+        root = t.stem_shadow_root(
+            Path(inventory.audio_production_root), inventory.audio_shadow_run_id
+        )
+        stems, raw, asr = self._sources[root]
+        segments = []
+        for fact in job.speech_facts:
+            key = (job.clip_uid, fact.segment_id)
+            r, a = raw[key], asr[key]
+            if (r.speaker_cluster_id, r.start_time, r.end_time) != (
+                fact.source_speaker_cluster,
+                fact.start_time,
+                fact.end_time,
+            ) or (a.text, a.language) != (fact.text, fact.language):
+                raise ValueError("TA2VA frozen speech identity differs")
+            for name in (
+                "speaker_cluster_id",
+                "source_audio_path",
+                "source_start_sample",
+                "source_end_sample",
+                "source_sample_rate_hz",
+                "source_channels",
+                "start_time",
+                "end_time",
+            ):
+                if getattr(r, name) != getattr(a, name):
+                    raise ValueError("TA2VA raw/ASR sample identity differs")
+            segments.append(r)
+        return ta2va_stage(
+            job,
+            core,
+            segments,
+            stems[job.clip_uid],
+            inventory.inventory_fingerprint,
+            _sha(core_path),
+            self.profile_backend,
+            temporary,
+            destination,
+            allow_unverified=self.allow_unverified,
+            source_hashes=inventory.source_hashes,
+        )

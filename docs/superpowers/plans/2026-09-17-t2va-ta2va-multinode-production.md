@@ -43,85 +43,85 @@ Pydantic Audio/H3 contracts, Bash and the accepted SGLang command.
 
 ## Task 1: Fixed Source Shards
 
-- [ ] Add failing tests for shard 59 bounds, deterministic shuffle/rank union,
+- [x] Add failing tests for shard 59 bounds, deterministic shuffle/rank union,
   explicit schedule, direct byte seeking and source identity changes.
-- [ ] Implement shard_name(id), shard_order(...), build_source_index(source, root)
+- [x] Implement shard_name(id), shard_order(...), build_source_index(source, root)
   and materialize_shard(index, id, root). Index raw JSONL rows, including malformed
   rows, so eligibility cannot move shard boundaries. Store only one offset/10k.
-- [ ] Publish index and raw shard manifests with temporary file + rename under a
+- [x] Publish index and raw shard manifests with temporary file + rename under a
   short index lock. Hash source while building; verify stat identity on reuse.
   Never rebuild an existing production population silently on source change.
-- [ ] Run new tests and commit Task 1.
+- [x] Run new tests and commit Task 1.
 
 ## Task 2: Stage Resume
 
-- [ ] Red tests: A ready/B fails/C ready; TA-only retry; interrupt after three;
+- [x] Red tests: A ready/B fails/C ready; TA-only retry; interrupt after three;
   artifact rename before state append; locked shard; endpoint outage.
-- [ ] Implement process_shard(rows, processor, ...) with a bounded worker pool,
+- [x] Implement process_shard(rows, processor, ...) with a bounded worker pool,
   serialized journal writer, one attempt per stage per invocation, no persisted
   running state. Processor writes under a stage temporary directory and returns
   a result; publication writes a completion envelope before rename.
-- [ ] On resume load last newline-terminated state, recover complete stage
+- [x] On resume load last newline-terminated state, recover complete stage
   envelopes, and repair incomplete append tails before further appends.
-- [ ] EndpointUnavailable stops new scheduling; active work may finish and
+- [x] EndpointUnavailable stops new scheduling; active work may finish and
   publish. KeyboardInterrupt never becomes a sample failure.
-- [ ] Run tests and commit Task 2.
+- [x] Run tests and commit Task 2.
 
 ## Task 3: Frozen T2VA Adapter
 
-- [ ] Add shadow-vs-production test with the same deterministic fake backend.
-- [ ] Implement T2VA stage using request_fingerprint, annotate,
+- [x] Add shadow-vs-production test with the same deterministic fake backend.
+- [x] Implement T2VA stage using request_fingerprint, annotate,
   parse_t2va_semantic, frozen audio draft parser, validate_t2va_draft and
   render_t2va_prompt. Keep raw diagnostics and validated core.
-- [ ] Use existing build_t2va_inventory on owned shard manifests; keep original
+- [x] Use existing build_t2va_inventory on owned shard manifests; keep original
   source index/hash in the production manifest. Isolate inventory errors to
   individual source rows if bulk preparation fails.
-- [ ] Bind resume identity to job/backend/source provenance; no old shadow-root
+- [x] Bind resume identity to job/backend/source provenance; no old shadow-root
   redirection or monkeypatching production globals.
-- [ ] Run focused equivalence tests and commit Task 3.
+- [x] Run focused equivalence tests and commit Task 3.
 
 ## Task 4: Frozen TA2VA Adapter
 
-- [ ] Add old-vs-new variant/prompt/PCM tests and TA-only retry coverage.
-- [ ] Load matching resolved stems/raw segments read-only; validate frozen T2VA
+- [x] Add old-vs-new variant/prompt/PCM tests and TA-only retry coverage.
+- [x] Load matching resolved stems/raw segments read-only; validate frozen T2VA
   facts against raw/ASR data. Call existing probe/_check_stem/sample_ranges/
   select_speakers/speech_track/profile/render_product and TA2VAProduct schema.
-- [ ] Keep full audio eligible with no speech; retain exclusion provenance.
+- [x] Keep full audio eligible with no speech; retain exclusion provenance.
   Write asset paths for their final atomic directory, not temporary paths.
-- [ ] Treat profile failure as TA failure, retain T2VA, do not rerun successful
+- [x] Treat profile failure as TA failure, retain T2VA, do not rerun successful
   T2VA. Never introduce alternative eligibility.
-- [ ] Run reuse/equivalence regressions and commit Task 4.
+- [x] Run reuse/equivalence regressions and commit Task 4.
 
 ## Task 5: Incremental Exports
 
-- [ ] Red tests assert immediate publication and exactly four training keys.
-- [ ] Append each ready stage's task rows with flush/fsync. Production manifest
+- [x] Red tests assert immediate publication and exactly four training keys.
+- [x] Append each ready stage's task rows with flush/fsync. Production manifest
   maps video to clip_uid for dedup without adding internal keys to training rows.
   Replay on recovery may append identical rows; snapshots deduplicate.
-- [ ] Only terminal ready/skipped shards receive COMPLETE and atomic export
+- [x] Only terminal ready/skipped shards receive COMPLETE and atomic export
   rename; failed stages remain resumable and snapshot-visible.
-- [ ] Run tests and commit Task 5.
+- [x] Run tests and commit Task 5.
 
 ## Task 6: Immutable Snapshots
 
-- [ ] Red tests: 327 rows in incomplete shard, truncated tail, duplicate
+- [x] Red tests: 327 rows in incomplete shard, truncated tail, duplicate
   equality/conflict, later TA completion, immutable existing snapshot.
-- [ ] Merge complete lines from final/partial task exports in stable shard and
+- [x] Merge complete lines from final/partial task exports in stable shard and
   source order; key by clip_uid/task using manifest identity. Reject conflicts.
   Regenerate videos.jsonl tasks, write summary, atomically publish directory,
   then atomically update plain-text LATEST. No database.
-- [ ] Add snapshot CLI, run tests and commit Task 6.
+- [x] Add snapshot CLI, run tests and commit Task 6.
 
 ## Task 7: Launcher and Documentation
 
-- [ ] Add CLI/dry-run tests and shell syntax/lifecycle tests with fake binaries.
-- [ ] Implement CLI inputs, default eight workers, progress, writable preflight,
+- [x] Add CLI/dry-run tests and shell syntax/lifecycle tests with fake binaries.
+- [x] Implement CLI inputs, default eight workers, progress, writable preflight,
   no Visual flags. Bash sources existing environments, unsets PYTHONPATH,
   starts exact accepted MiMo command, waits for readiness, logs per hostname,
   kills only owned PID on exit/signals. Dry-run starts no model.
-- [ ] Document fresh roots, fixed shards, upstream prerequisites, retries,
+- [x] Document fresh roots, fixed shards, upstream prerequisites, retries,
   snapshots, default skipped behavior and missing target-side T2V contract.
-- [ ] Run focused/new/related tests, Ruff, Python 3.12 compile and diff-check.
+- [x] Run focused/new/related tests, Ruff, Python 3.12 compile and diff-check.
   Commit Task 7.
 
 ## Task 8: Server Acceptance (Not Executable on This Mac)

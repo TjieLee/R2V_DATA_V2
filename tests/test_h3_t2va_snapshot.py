@@ -59,3 +59,22 @@ def test_t2va_ready_survives_ta_failure_in_snapshot(tmp_path):
         {"video": "/video/0.mp4", "tasks": ["t2va"]}
     ]
     assert json.loads((output / "summary.json").read_text())["counts"]["t2va"] == 1
+
+
+def test_snapshot_during_partial_rename(tmp_path, monkeypatch):
+    processor = FakeProcessor()
+    processor.fail.add(("clip0", "ta2va"))
+    production.process_shard(tmp_path, 0, sample_rows(1), processor)
+    original = production.complete_rows
+    renamed = False
+
+    def interleaved(path):
+        nonlocal renamed
+        yield from original(path)
+        if path.name == "t2va.jsonl" and not renamed:
+            path.with_suffix(".jsonl.partial").rename(path)
+            renamed = True
+
+    monkeypatch.setattr(production, "complete_rows", interleaved)
+    output = production.build_snapshot(tmp_path, "rename")
+    assert len(list(original(output / "t2va.jsonl"))) == 1
