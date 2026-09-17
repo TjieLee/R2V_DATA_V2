@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 import uuid
+from collections import deque
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -177,6 +178,17 @@ def reconcile_failed_worker(config, stats_path, log_path):
     return False
 
 
+def report_worker_log(log_path):
+    path = Path(log_path).resolve()
+    print(f"H3 worker log: {path}\n--- last 80 lines ---", file=sys.stderr, flush=True)
+    try:
+        with path.open(encoding="utf-8", errors="replace") as handle:
+            tail = "".join(deque(handle, maxlen=80))
+        print(tail, file=sys.stderr, end="" if tail.endswith("\n") else "\n", flush=True)
+    except OSError as exc:
+        print(f"Unable to read worker log: {exc}", file=sys.stderr, flush=True)
+
+
 def execute_phases(config, root, devices, lock_fd, *, prepare_only=False):
     pair = visible_pair(devices)
     session = uuid.uuid4().hex
@@ -211,10 +223,12 @@ def execute_phases(config, root, devices, lock_fd, *, prepare_only=False):
         if restart_requested:
             after = sum(failure_count(c,"generate") for c in config["cases"])
             if after <= before:
+                report_worker_log(specs[0]["log"])
                 raise RuntimeError("Worker restart made no durable failure progress")
             restart += 1  # bounded by the invocation's finite per-case retry budgets
             continue
         if any(codes):
+            report_worker_log(specs[0]["log"])
             raise RuntimeError("H3 infrastructure failed; rerun --resume after addressing worker log")
         break
     return inventory(config["cases"],config["limits"])

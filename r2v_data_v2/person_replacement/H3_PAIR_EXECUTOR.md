@@ -123,6 +123,22 @@ HF_HOME/HF_HUB_CACHE, Torch, Triton, Inductor, XDG and TMPDIR. Read-only model,
 vendor and dataset directories are never cache destinations. No dependency/model
 downloads. The parent must be the Qwen environment; H3 runs in its own Python.
 
+Import-only smoke in the isolated H3 environment (from the repository root;
+no model loading or GPU work):
+
+```bash
+"$H3_PYTHON" - <<'PY'
+from r2v_data_v2.person_replacement.h3_pair_generation import generate_loop
+from r2v_data_v2.person_replacement.h3_pdd_distributed import *
+print("H3 worker imports OK")
+PY
+```
+
+Shard selection imports the parent manifest parser only when invoked by the
+parent. Do not install `ijson` into the isolated H3 environment. On a torchrun
+infrastructure failure, the executor prints the absolute worker log path and
+its last 80 lines before raising; a missing/unreadable log does not mask the error.
+
 Read-only scan/status (no model, child, lock, plan or artifact writes):
 
 ```bash

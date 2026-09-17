@@ -1,5 +1,30 @@
+import subprocess
 import sys
+from pathlib import Path
 from types import SimpleNamespace
+
+
+def test_worker_imports_do_not_require_parent_manifest_dependencies():
+    script = '''
+import importlib.abc
+import sys
+class BlockParentDependencies(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "r2v_data_v2.manifest" or fullname.split(".")[0] == "ijson":
+            raise ModuleNotFoundError(f"Parent-only dependency imported: {fullname}")
+sys.meta_path.insert(0, BlockParentDependencies())
+from r2v_data_v2.person_replacement.h3_pair_generation import generate_loop
+from r2v_data_v2.person_replacement.h3_pdd_distributed import *
+import tools.person_replacement.h3_pdd_fsdp_worker
+assert "r2v_data_v2.manifest" not in sys.modules
+assert "ijson" not in sys.modules
+print("H3 worker imports OK")
+'''
+    result = subprocess.run([sys.executable, "-c", script],
+                            cwd=Path(__file__).resolve().parents[2],
+                            capture_output=True, text=True, timeout=30, check=False)
+    assert result.returncode == 0, result.stderr
+    assert "H3 worker imports OK" in result.stdout
 
 
 def test_pdd_is_applied_and_validated_before_sharding_without_offload(tmp_path, monkeypatch):

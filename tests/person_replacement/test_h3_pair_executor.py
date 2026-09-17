@@ -9,6 +9,34 @@ from pathlib import Path
 import pytest
 
 
+@pytest.mark.parametrize("log_exists", [True, False])
+def test_infrastructure_failure_reports_worker_log_tail(tmp_path, monkeypatch, capsys, log_exists):
+    from r2v_data_v2.person_replacement import h3_pair_executor as module
+    from r2v_data_v2.person_replacement.h3_pair_state import atomic_json
+
+    case = {"case_id":"case", "directory":str(tmp_path/"case")}
+    atomic_json(Path(case["directory"])/"preparation/prepared.json", {})
+    config = {"cases":[case], "limits":{"case":{"prepare":2,"generate":2}},
+              "h3_python":sys.executable}
+    logs = []
+    def failed_worker(specs, lock_fd):
+        log = Path(specs[0]["log"])
+        logs.append(log)
+        if log_exists:
+            log.write_text("".join(f"worker-line-{i:03d}\n" for i in range(120)))
+        return [1]
+    monkeypatch.setattr(module, "run_children", failed_worker)
+    with pytest.raises(RuntimeError, match="H3 infrastructure failed"):
+        module.execute_phases(config, tmp_path/"shard", "0,1", 123)
+    stderr = capsys.readouterr().err
+    assert str(logs[0].resolve()) in stderr
+    if log_exists:
+        assert [line for line in stderr.splitlines() if line.startswith("worker-line-")] == [
+            f"worker-line-{i:03d}" for i in range(40,120)]
+    else:
+        assert "Unable to read worker log" in stderr
+
+
 def test_two_prepare_children_then_one_torchrun_resume_skips_done(tmp_path, monkeypatch):
     from r2v_data_v2.person_replacement import h3_pair_executor as module
     from r2v_data_v2.person_replacement.h3_pair_state import atomic_json

@@ -8,8 +8,6 @@ from datetime import UTC, datetime
 from itertools import islice
 from pathlib import Path
 
-from r2v_data_v2.manifest import iter_source_records
-
 
 def now():
     return datetime.now(UTC).isoformat()
@@ -46,6 +44,9 @@ def read_json(path):
 
 
 def select_shard(source, output, pair_id, pair_size):
+    # Parent-only dependency: isolated H3 ranks never select input shards.
+    from r2v_data_v2.manifest import iter_source_records
+
     if pair_id < 0 or pair_size < 1:
         raise ValueError("pair-id >= 0 and pair-size >= 1 required")
     start = pair_id * pair_size
