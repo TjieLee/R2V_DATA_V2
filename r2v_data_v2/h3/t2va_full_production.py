@@ -115,15 +115,15 @@ def bootstrap_audio(shard: Path, selection: T2VAShotSelection, backend):
         )
         for c in clips
     ]
-    values = dict(
-        source_pairs_sha256=None,
-        source_asr_inventory_fingerprint=None,
-        mode="production",
-        targets=targets,
-        source_inventory_kind="jea_shot_manifest",
-        source_shot_manifest_sha256=selection.shot_manifest_sha256,
-        source_canonical_audio_manifest_sha256=sha256_file(canonical),
-    )
+    values = {
+        "source_pairs_sha256": None,
+        "source_asr_inventory_fingerprint": None,
+        "mode": "production",
+        "targets": targets,
+        "source_inventory_kind": "jea_shot_manifest",
+        "source_shot_manifest_sha256": selection.shot_manifest_sha256,
+        "source_canonical_audio_manifest_sha256": sha256_file(canonical),
+    }
     inventory = DiarizationInventory(
         schema_version="r2v.h3.diarization_inventory.5",
         mode="production",

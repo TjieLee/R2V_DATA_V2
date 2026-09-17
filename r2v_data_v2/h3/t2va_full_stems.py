@@ -1,0 +1,169 @@
+"""Production adapters for frozen SAM and AuK stem producers."""
+
+from __future__ import annotations
+
+import os
+import shutil
+import tempfile
+from collections import Counter
+from pathlib import Path
+
+from r2v_data_v2.h3 import sam_audio_stem_shadow as sam
+from r2v_data_v2.h3.audio_backends import FFmpegAudioMediaBackend
+from r2v_data_v2.h3.t2va_production import atomic_json
+
+
+def link_or_copy(source, destination):
+    try:
+        os.link(source, destination)
+    except OSError:
+        shutil.copyfile(source, destination)
+    return str(destination)
+
+
+class SAMWorker:
+    def __init__(self, configuration):
+        self.inventory = sam.SAMAudioStemInventory.model_validate_json(
+            Path(configuration["inventory_path"]).read_text()
+        )
+        self.backend = sam.OfficialSAMAudioBackend(self.inventory.model_configuration)
+        self.ffmpeg = configuration.get("ffmpeg", "ffmpeg")
+        self.ffprobe = configuration.get("ffprobe", "ffprobe")
+
+    def __enter__(self):
+        self.backend._load()
+        return self
+
+    def __exit__(self, *args):
+        self.backend = None
+
+    def process(self, job, output_dir):
+        from r2v_data_v2.h3.t2va_full_workers import SampleJobFailure
+
+        try:
+            record = sam._separate_one_route(
+                inventory=self.inventory,
+                job=sam.SAMAudioStemJob.model_validate(job["source"]),
+                route="music_first",
+                output_root=output_dir,
+                backend=self.backend,
+                canonicalizer=sam.FFmpegStemCanonicalizer(
+                    ffmpeg=self.ffmpeg, ffprobe=self.ffprobe
+                ),
+                raw_probe_backend=FFmpegAudioMediaBackend(
+                    ffmpeg=self.ffmpeg, ffprobe=self.ffprobe
+                ),
+            )
+        except sam._SAMAudioRouteFailure as exc:
+            if "out of memory" in str(exc).lower():
+                raise SystemExit(str(exc)) from exc
+            raise SampleJobFailure(
+                str(exc),
+                {
+                    "calls": [c.model_dump(mode="json") for c in exc.calls],
+                    "model_call_count": exc.model_call_count,
+                },
+            ) from exc
+        return {
+            "record": record.model_dump(mode="json"),
+            "output_root": str(output_dir),
+        }
+
+
+def run_sam(
+    inventory,
+    destination,
+    state_root,
+    gpu_ids,
+    *,
+    ffmpeg="ffmpeg",
+    ffprobe="ffprobe",
+    execute=None,
+):
+    if execute is None:
+        from r2v_data_v2.h3.t2va_full_workers import execute_stage
+
+        execute = execute_stage
+    if inventory.route != "music_first" or inventory.run_both_routes:
+        raise ValueError("full production requires frozen music_first route")
+    inventory_path = state_root / "inventory.json"
+    atomic_json(inventory_path, inventory.model_dump(mode="json"))
+    results = execute(
+        state_root,
+        [
+            {"job_id": j.clip_uid, "source": j.model_dump(mode="json")}
+            for j in inventory.jobs
+        ],
+        gpu_ids=gpu_ids,
+        factory=__name__ + ":SAMWorker",
+        configuration={
+            "inventory_path": str(inventory_path),
+            "model": inventory.model_configuration.model_dump(mode="json"),
+            "ffmpeg": ffmpeg,
+            "ffprobe": ffprobe,
+        },
+        environment={"PYTHONPATH": os.environ.get("SAM_AUDIO_RUNTIME_PYTHONPATH", "")},
+    )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(
+        tempfile.mkdtemp(prefix=".separation-publish-", dir=destination.parent)
+    )
+    records = []
+    try:
+        for job in inventory.jobs:
+            result = results[job.clip_uid]
+            if result["status"] == "ready":
+                record = sam.SAMAudioStemRecord.model_validate(
+                    result["result"]["record"]
+                )
+                source = Path(result["result"]["output_root"])
+                relative = Path("clips") / job.clip_uid
+                shutil.copytree(
+                    source, temporary / relative, copy_function=link_or_copy
+                )
+                record = sam._published_record_paths(
+                    record,
+                    temporary_root=source,
+                    destination_root=destination / relative,
+                )
+                values = record.model_dump(mode="json", exclude={"record_fingerprint"})
+                values["inventory_fingerprint"] = inventory.inventory_fingerprint
+            else:
+                detail = result.get("result") or {}
+                values = {
+                    "schema_version": sam.SAM_AUDIO_STEM_RECORD_VERSION,
+                    "clip_uid": job.clip_uid,
+                    "route": "music_first",
+                    "inventory_fingerprint": inventory.inventory_fingerprint,
+                    "model_configuration_fingerprint": inventory.model_configuration.configuration_fingerprint,
+                    "separation_state": "failure",
+                    "model_call_count": detail.get("model_call_count", 0),
+                    "calls": detail.get("calls", []),
+                    "stems": [],
+                    "failure_reason": result.get("failure_reason", "worker job failed"),
+                }
+            records.append(
+                sam.SAMAudioStemRecord(
+                    **values,
+                    record_fingerprint=sam._sha256_text(sam._compact_json(values)),
+                )
+            )
+        summary = sam.SAMAudioStemSummary(
+            inventory_fingerprint=inventory.inventory_fingerprint,
+            clip_count=len(inventory.jobs),
+            record_count=len(records),
+            route_counts={"music_first": len(records)},
+            verification_state_counts=dict(
+                sorted(Counter(r.separation_state for r in records).items())
+            ),
+            model_call_count=sum(r.model_call_count for r in records),
+        )
+        sam._write_json(temporary / "inventory.json", inventory)
+        sam._write_jsonl(temporary / "records.jsonl", records)
+        sam._write_json(temporary / "summary.json", summary)
+        sam._publish_directory(temporary, destination, overwrite=destination.exists())
+    finally:
+        if temporary.exists():
+            shutil.rmtree(temporary)
+    sam.load_stem_shadow(destination)
+    return summary
