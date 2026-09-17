@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import uuid
 from collections import Counter
 from dataclasses import asdict, dataclass, replace
@@ -29,7 +30,7 @@ from r2v_data_v2.v3.schemas import (
 from r2v_data_v2.v3.storage import RunStorage
 
 _COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
-_SHARD = re.compile(r"shard-[0-9]+\.jsonl")
+_SHARD = re.compile(r"shard-[0-9]{9}-[0-9]{9}\.jsonl")
 _PROVENANCE = ".post_mask_hydration.json"
 
 
@@ -319,6 +320,20 @@ def _validate_input(
     return clip_dir, provenance
 
 
+def _make_staging_writable(root: Path) -> None:
+    """Restore owner permissions only on our independent copied staging tree."""
+    for directory, directories, files in os.walk(root, followlinks=False):
+        parent = Path(directory)
+        if parent.is_symlink() or any(
+            (parent / name).is_symlink() for name in (*directories, *files)
+        ):
+            raise ValueError("owned hydration staging contains a symlink")
+        parent.chmod(parent.stat().st_mode | stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+        for name in files:
+            path = parent / name
+            path.chmod(path.stat().st_mode | stat.S_IRUSR | stat.S_IWUSR)
+
+
 def hydrate_shard(
     storage: RunStorage, *, entity_mask_root: Path, shard_path: Path, paths: ShardPaths
 ) -> HydrationResult:
@@ -402,9 +417,11 @@ def hydrate_shard(
             else:
                 staging = _beneath(paths.staging_root, uid)
                 if staging.exists():
+                    _make_staging_writable(staging)
                     shutil.rmtree(staging)
                 staging.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copytree(source, staging)
+                _make_staging_writable(staging)
                 write_json_atomic(staging / _PROVENANCE, provenance)
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 staging.replace(destination)

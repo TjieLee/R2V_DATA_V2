@@ -30,7 +30,7 @@ from tests.test_v3_storage import (
 def case(tmp_path, monkeypatch):
     config = _config(tmp_path, monkeypatch)
     root = config.dataset_json.parent / "entity_mask"
-    shard = root / "parts" / "shard-00000.jsonl"
+    shard = root / "parts" / "shard-000000000-000000099.jsonl"
     shard.parent.mkdir(parents=True)
     return config, root, shard
 
@@ -285,8 +285,9 @@ def test_historical_commit_and_physical_remap_keep_identity(case):
     restarted = api.initialize_shard(moved, paths, git_commit="new-code")
     assert restarted.read_run() == storage.read_run()
     assert restarted.read_run().git_commit == "first"
-    assert "r2v_v3_runs/production/jea_motion_v1/campaign/shard-00000" in str(
-        paths.run_root
+    assert (
+        "r2v_v3_runs/production/jea_motion_v1/campaign/shard-000000000-000000099"
+        in str(paths.run_root)
     )
 
 
@@ -323,13 +324,43 @@ def test_restart_identity_mismatch_fails_closed(case, change):
 
 def test_enumeration_is_canonical_sorted_and_excludes_nonparts(case):
     _write_rows(case, [])
-    (case[2].parent / "shard-00002.jsonl").write_text("")
-    (case[1] / "shard-00001.jsonl").write_text("")
+    (case[2].parent / "shard-000000200-000000299.jsonl").write_text("")
+    (case[1] / "shard-000000100-000000199.jsonl").write_text("")
     api, _, _ = _start(case)
     assert [path.name for path in api.enumerate_shards(case[1])] == [
-        "shard-00000.jsonl",
-        "shard-00002.jsonl",
+        "shard-000000000-000000099.jsonl",
+        "shard-000000200-000000299.jsonl",
     ]
+
+
+def test_readonly_frozen_tree_hydrates_writable_independent_destination(case):
+    import stat
+
+    row = _ready(case)
+    _write_rows(case, [row])
+    source = case[1] / row["artifact_root"] / "run/clips/clip-0"
+    original = {path: path.read_bytes() for path in source.rglob("*") if path.is_file()}
+    original_modes = {
+        path: path.stat().st_mode for path in (source, *source.rglob("*"))
+    }
+    try:
+        for path in original_modes:
+            path.chmod(0o555 if path.is_dir() else 0o444)
+        api, paths, storage = _start(case)
+        result = _hydrate(case, api, paths, storage)
+        assert result.ready == 1 and result.corrupt == 0
+        destination = storage.clip_dir("clip-0")
+        assert all(
+            path.stat().st_mode & stat.S_IWUSR
+            for path in (destination, *destination.rglob("*"))
+        )
+        (destination / "candidates/new.png").write_bytes(b"downstream")
+        (destination / "clip.json").write_bytes(b"independent")
+        assert all(path.read_bytes() == value for path, value in original.items())
+        assert all(not path.stat().st_mode & stat.S_IWUSR for path in original_modes)
+    finally:
+        for path, mode in original_modes.items():
+            path.chmod(mode)
 
 
 def test_destination_symlink_never_grants_hydration_access_to_frozen_source(case):
