@@ -2316,14 +2316,14 @@ def test_owner_exception_diagnostic_omits_payloads(message):
 def test_owner_metrics_diagnostic_exposes_fixed_validator_error_without_payload():
     with pytest.raises(ValidationError) as raised:
         OwnerEnrichmentMetrics(
-            attribute_bbox_reviews_attempted=1,
+            gme_candidates_screened=1,
             completion_attempts_by_type={"SECRET PAYLOAD": 0},
         )
     diagnostic = subject_attributes._owner_exception_message(raised.value)
     assert "OwnerEnrichmentMetrics" in diagnostic
     assert '"loc": []' in diagnostic
     assert '"type": "value_error"' in diagnostic
-    assert '"msg": "Value error, attribute bbox review outcomes exceed materialized variants"' in diagnostic
+    assert '"msg": "Value error, GME screened count must equal passed plus rejected"' in diagnostic
     assert "SECRET" not in diagnostic
     assert '"input"' not in diagnostic
     assert '"ctx"' not in diagnostic
@@ -4211,6 +4211,36 @@ def test_two_insufficient_candidates_reject_without_boogu_or_bbox(
     assert judge.calls == 0
     assert artifact.metrics.attribute_bbox_fallback_attempts == 0
     assert artifact.metrics.attribute_bbox_fallback_accepted == 0
+
+
+def test_nonface_rejected_bbox_fallback_has_review_without_published_variant(
+    tmp_path: Path,
+) -> None:
+    artifact, review, backend, judge = _run_two_candidate_routing_case(
+        tmp_path,
+        raw_kinds=("unusable_no_repair", "unusable_no_repair"),
+        attribute_type="glasses",
+        bbox_accepts=False,
+    )
+
+    assert review.candidate_calls == [["candidate_1"], ["candidate_2"]]
+    assert review.bbox_calls == 1
+    assert backend.calls == [] and judge.calls == 0
+    record = artifact.records[0]
+    assert record.attribute_type == "glasses"
+    assert record.review.matches_attribute and record.review.owner_binding_correct
+    assert record.status == "rejected"
+    assert record.reason.startswith("attribute_bbox_fallback_rejected:")
+    assert record.image_path is None and record.variants is None
+    assert artifact.metrics.attribute_bbox_fallback_attempts == 1
+    assert artifact.metrics.attribute_bbox_fallback_accepted == 0
+    assert artifact.metrics.attribute_bbox_reviews_attempted == 1
+    assert artifact.metrics.attribute_bbox_variants_materialized == 0
+    assert artifact.metrics.failures == 0
+    assert not list((tmp_path / "output").rglob("bbox.png"))
+    assert OwnerEnrichmentArtifact.model_validate_json(
+        artifact.model_dump_json()
+    ) == artifact
 
 
 def test_noncompletion_type_uses_candidate2_without_boogu(

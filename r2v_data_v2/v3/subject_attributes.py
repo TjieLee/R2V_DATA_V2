@@ -736,12 +736,8 @@ class OwnerEnrichmentMetrics(_SchemaModel):
             > self.attribute_background_variants_attempted
         ):
             raise ValueError("accepted attribute backgrounds exceed attempts")
-        if (
-            self.attribute_bbox_reviews_attempted
-            + self.attribute_bbox_reviews_skipped_background_accepted
-            > self.attribute_bbox_variants_materialized
-        ):
-            raise ValueError("attribute bbox review outcomes exceed materialized variants")
+        # Rejected last-resort bbox reviews publish no variant, so review
+        # attempts are not bounded by the number of materialized variants.
         for value in (
             self.qwen_model_call_time_seconds,
             self.sam3_model_call_time_seconds,
