@@ -76,7 +76,9 @@ def test_pdd_official_head_loader_and_video_reference(tmp_path, monkeypatch):
         scheduler = SimpleNamespace(shift=12.)
         audio_scheduler = SimpleNamespace(shift=3.)
         def load_components(self, **kwargs):
-            assert kwargs["workflow"] == "ref2va"
+            assert "workflow" not in kwargs
+            assert kwargs["dtype"] == "bf16"
+            assert kwargs["pretrained_model_name_or_path"] == str(tmp_path)
         def __call__(self, **kwargs):
             assert kwargs["references"] == ["whole video"]
             assert kwargs["num_inference_steps"] == 9
@@ -85,6 +87,11 @@ def test_pdd_official_head_loader_and_video_reference(tmp_path, monkeypatch):
     class Manager:
         def enable_auto_cpu_offload(self, **kwargs):
             assert kwargs["device"] == "cuda"
+    def from_pretrained(path, **kwargs):
+        assert path == str(tmp_path)
+        assert kwargs["workflow"] == "ref2va"
+        assert isinstance(kwargs["components_manager"], Manager)
+        return Pipe()
     def apply(model, path, video_shift, audio_shift):
         calls.append((model,path,video_shift,audio_shift))
         model._pdd_step_arm = SimpleNamespace(nfe=8, block_size=4)
@@ -92,7 +99,7 @@ def test_pdd_official_head_loader_and_video_reference(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules,"torch", SimpleNamespace(bfloat16="bf16", Generator=lambda:
         SimpleNamespace(manual_seed=lambda seed: "generator")))
     monkeypatch.setitem(sys.modules,"diffusers", SimpleNamespace(ComponentsManager=Manager,
-        ModularPipeline=SimpleNamespace(from_pretrained=lambda *a, **k: Pipe())))
+        ModularPipeline=SimpleNamespace(from_pretrained=from_pretrained)))
     monkeypatch.setitem(sys.modules,"diffusers.modular_pipelines.minimax_h3", SimpleNamespace(
         MiniMaxH3VideoReference=SimpleNamespace(from_file=lambda p: "whole video")))
     monkeypatch.setitem(sys.modules,"diffusers.utils.export_utils", SimpleNamespace(

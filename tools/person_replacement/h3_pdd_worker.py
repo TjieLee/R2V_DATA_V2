@@ -61,7 +61,7 @@ def generate(*, model_root, checkpoint, source, prompt, frames, width, height, o
     manager = ComponentsManager()
     manager.enable_auto_cpu_offload(device="cuda", memory_reserve_margin="12GB")
     pipeline = ModularPipeline.from_pretrained(str(model_root), workflow="ref2va", components_manager=manager)
-    pipeline.load_components(workflow="ref2va", dtype=torch.bfloat16, pretrained_model_name_or_path=str(model_root))
+    pipeline.load_components(dtype=torch.bfloat16, pretrained_model_name_or_path=str(model_root))
     video_shift, audio_shift = float(pipeline.scheduler.shift), float(pipeline.audio_scheduler.shift)
     if (video_shift, audio_shift) != (12., 3.):
         raise ValueError("PDD base scheduler must retain official 12/3 shifts")
