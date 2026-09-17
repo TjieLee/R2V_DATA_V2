@@ -18,6 +18,7 @@ SHARD_SIZE = 10_000
 DEFAULT_ROOT = Path(
     "/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/T2VA"
 )
+TASKS = ("t2va", "ta2va_full_audio", "ta2va_speech_bgm")
 
 
 def shard_bounds(shard_id: int) -> tuple[int, int]:
@@ -268,12 +269,52 @@ def process_shard(
         raise ValueError("request_workers must be positive")
     shard = root / "shards" / shard_name(shard_id)
     with file_lock(shard / "shard.lock"):
+        sources = [
+            {k: r[k] for k in ("source_index", "clip_uid", "video")} for r in rows
+        ]
+        if len({r["clip_uid"] for r in sources}) != len(sources):
+            raise ValueError("duplicate source clip identity within shard")
+        source_path = shard / "sources.json"
+        if source_path.exists() and json.loads(source_path.read_text()) != sources:
+            raise ValueError("shard source population changed")
+        if not source_path.exists():
+            atomic_json(source_path, sources)
         journal = shard / "state.jsonl.partial"
         _repair_tail(journal)
         states = load_states(shard)
         writer = threading.Lock()
         stopped = threading.Event()
         processed = 0
+        exported = {}
+        for task in TASKS:
+            for path in (
+                shard / "exports" / f"{task}.jsonl",
+                shard / "exports" / f"{task}.jsonl.partial",
+            ):
+                _repair_tail(path)
+                for item in complete_rows(path):
+                    key = (task, item["video"])
+                    if key in exported and exported[key] != item:
+                        raise ValueError("conflicting published training rows")
+                    exported[key] = item
+
+        def publish_exports(result):
+            with writer:
+                for task, item in result.get("exports", {}).items():
+                    if task not in TASKS or set(item) != {
+                        "video",
+                        "images",
+                        "audios",
+                        "caption",
+                    }:
+                        raise ValueError("invalid training row")
+                    key = (task, item["video"])
+                    if key in exported:
+                        if exported[key] != item:
+                            raise ValueError("conflicting published training rows")
+                        continue
+                    append_row(shard / "exports" / f"{task}.jsonl.partial", item)
+                    exported[key] = item
 
         def save(state):
             with writer:
@@ -345,6 +386,7 @@ def process_shard(
                     finally:
                         if temporary.exists():
                             shutil.rmtree(temporary)
+                publish_exports(result)
                 state.update(
                     {
                         f"{stage}_status": "ready",
@@ -388,6 +430,16 @@ def process_shard(
             pool.shutdown(wait=True, cancel_futures=True)
         if stopped.is_set():
             raise EndpointUnavailable("endpoint unavailable; resume after recovery")
+        if len(states) == len(rows) and all(
+            s["t2va_status"] == "skipped"
+            or (s["t2va_status"] == "ready" and s["ta2va_status"] == "ready")
+            for s in states.values()
+        ):
+            for task in TASKS:
+                partial = shard / "exports" / f"{task}.jsonl.partial"
+                if partial.exists():
+                    os.replace(partial, partial.with_suffix(""))
+            atomic_json(shard / "COMPLETE", {"source_count": len(rows)})
         return states
 
 

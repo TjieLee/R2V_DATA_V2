@@ -75,7 +75,11 @@ class FakeProcessor:
         if key in self.fail:
             raise ValueError("synthetic sample failure")
         (temporary / "result.txt").write_text(str(key))
-        return {"exports": {}, "model_call_count": 1}
+        task = "t2va" if stage == "t2va" else "ta2va_full_audio"
+        return {
+            "exports": {task: production.training_row(row["video"], str(key))},
+            "model_call_count": 1,
+        }
 
 
 def sample_rows(n=3):
@@ -143,6 +147,33 @@ def test_endpoint_outage_stops_scheduling(tmp_path):
             tmp_path, 0, sample_rows(100), Offline(), request_workers=1
         )
     assert not production.load_states(tmp_path / "shards" / production.shard_name(0))
+
+
+def test_incremental_exports_and_complete(tmp_path):
+    processor = FakeProcessor()
+    processor.fail.add(("clip1", "ta2va"))
+    production.process_shard(tmp_path, 0, sample_rows(), processor, request_workers=1)
+    shard = tmp_path / "shards" / production.shard_name(0)
+    assert not (shard / "COMPLETE").exists()
+    rows = list(production.complete_rows(shard / "exports/t2va.jsonl.partial"))
+    assert len(rows) == 3
+    assert all(set(r) == {"video", "images", "audios", "caption"} for r in rows)
+    assert (
+        len(
+            list(
+                production.complete_rows(
+                    shard / "exports/ta2va_full_audio.jsonl.partial"
+                )
+            )
+        )
+        == 2
+    )
+    processor.fail.clear()
+    production.process_shard(tmp_path, 0, sample_rows(), processor, request_workers=1)
+    assert (shard / "COMPLETE").exists()
+    assert (shard / "exports/t2va.jsonl").exists()
+    assert not (shard / "exports/t2va.jsonl.partial").exists()
+    assert len(list(production.complete_rows(shard / "exports/t2va.jsonl"))) == 3
 
 
 def test_t2va_shadow_equivalence(tmp_path, finalized):
