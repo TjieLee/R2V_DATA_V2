@@ -12,6 +12,9 @@ def test_full_launcher_sets_shared_sam_defaults():
     for expected in (
         'SAM_DEPS_ROOT="${SAM_DEPS_ROOT:-/mnt/workspace/litengjie/data/audio_deps}"',
         'export SAM_AUDIO_CODE_ROOT="${SAM_AUDIO_CODE_ROOT:-$SAM_DEPS_ROOT/sam-audio-src}"',
+        'PERCEPTION_MODELS_ROOT="${PERCEPTION_MODELS_ROOT:-$SAM_DEPS_ROOT/perception-models-src}"',
+        'DACVAE_ROOT="${DACVAE_ROOT:-$SAM_DEPS_ROOT/dacvae-src}"',
+        'SAM_AUDIO_PYDEPS="${SAM_AUDIO_PYDEPS:-$SAM_DEPS_ROOT/sam-audio-pydeps}"',
         'export SAM_AUDIO_MODEL_PATH="${SAM_AUDIO_MODEL_PATH:-/mnt/workspace/public/pretrained/Facebook/sam-audio-large-tv}"',
         'export SAM_AUDIO_MODEL_NAME="${SAM_AUDIO_MODEL_NAME:-facebook/sam-audio-large-tv}"',
         'export SAM_AUDIO_T5_BASE_PATH="${SAM_AUDIO_T5_BASE_PATH:-/mnt/workspace/public/pretrained/google/t5-base}"',
@@ -20,19 +23,8 @@ def test_full_launcher_sets_shared_sam_defaults():
         assert expected in text
 
 
-def test_full_launcher_preflights_sam_dependencies_before_mimo():
+def test_full_launcher_keeps_sam_runtime_path_before_pythonpath_clear():
     text = LAUNCHER.read_text()
-    preflight = text.index('command -v setsid')
-    mimo_start = text.index('setsid "${serve[@]}"')
-    assert preflight < mimo_start
-    for variable in (
-        "SAM_AUDIO_CODE_ROOT",
-        "SAM_AUDIO_MODEL_PATH",
-        "SAM_AUDIO_T5_BASE_PATH",
-        "PERCEPTION_MODELS_ROOT",
-        "DACVAE_ROOT",
-        "SAM_AUDIO_PYDEPS",
-    ):
-        marker = f'Missing {variable}:'
-        assert marker in text
-        assert text.index(marker) < mimo_start
+    runtime_default = text.index("export SAM_AUDIO_RUNTIME_PYTHONPATH=")
+    pythonpath_clear = text.index("unset PYTHONPATH")
+    assert runtime_default < pythonpath_clear
