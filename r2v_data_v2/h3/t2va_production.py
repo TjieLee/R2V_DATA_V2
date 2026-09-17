@@ -710,3 +710,123 @@ def ta2va_stage(
             for p in products
         },
     }
+
+
+def build_snapshot(root: Path, snapshot_id: str) -> Path:
+    if (
+        not snapshot_id
+        or Path(snapshot_id).name != snapshot_id
+        or snapshot_id in {".", "..", "LATEST"}
+    ):
+        raise ValueError("invalid snapshot ID")
+    root = root.resolve()
+    snapshots = root / "snapshots"
+    destination = snapshots / snapshot_id
+    with file_lock(snapshots / "snapshot.lock"):
+        if destination.exists():
+            raise FileExistsError(destination)
+        temporary = snapshots / f".{snapshot_id}.tmp-{uuid.uuid4().hex}"
+        temporary.mkdir()
+        handles = {}
+        try:
+            handles = {
+                task: (temporary / f"{task}.jsonl").open("w", encoding="utf-8")
+                for task in TASKS
+            }
+            seen, videos = {}, {}
+            counts = dict.fromkeys(TASKS, 0)
+            for shard in sorted((root / "shards").glob("shard-*")):
+                source_path = shard / "sources.json"
+                if not source_path.exists():
+                    continue
+                sources = sorted(
+                    json.loads(source_path.read_text()), key=lambda r: r["source_index"]
+                )
+                by_video = {r["video"]: r for r in sources}
+                if len(by_video) != len(sources):
+                    raise ValueError("conflicting video identity in shard")
+                # Bound caption memory to one 10k shard. Global dedup stores hashes only.
+                rows_by_task = {}
+                for task in TASKS:
+                    rows = {}
+                    paths = [
+                        shard / "exports" / f"{task}.jsonl",
+                        shard / "exports" / f"{task}.jsonl.partial",
+                    ]
+                    for path in paths:
+                        try:
+                            items = list(complete_rows(path))
+                        except FileNotFoundError:
+                            # A writer may have just renamed partial to final.
+                            items = list(complete_rows(paths[0]))
+                        for item in items:
+                            if set(item) != {"video", "images", "audios", "caption"}:
+                                raise ValueError("invalid loader-facing row")
+                            source = by_video.get(item["video"])
+                            if source is None:
+                                raise ValueError("export has no source clip identity")
+                            uid = source["clip_uid"]
+                            if uid in rows and rows[uid] != item:
+                                raise ValueError(
+                                    f"conflicting snapshot key: {uid}/{task}"
+                                )
+                            rows[uid] = item
+                    rows_by_task[task] = rows
+                for source in sources:
+                    uid = source["clip_uid"]
+                    for task in TASKS:
+                        item = rows_by_task[task].get(uid)
+                        if item is None:
+                            continue
+                        encoded = json.dumps(item, ensure_ascii=False, sort_keys=True)
+                        digest = hashlib.sha256(encoded.encode()).hexdigest()
+                        key = (uid, task)
+                        if key in seen:
+                            if seen[key] != digest:
+                                raise ValueError(
+                                    f"conflicting snapshot key: {uid}/{task}"
+                                )
+                            continue
+                        seen[key] = digest
+                        handles[task].write(encoded + "\n")
+                        counts[task] += 1
+                        video = videos.setdefault(
+                            uid, {"video": item["video"], "tasks": []}
+                        )
+                        if video["video"] != item["video"]:
+                            raise ValueError(f"conflicting clip video: {uid}")
+                        video["tasks"].append(task)
+            for handle in handles.values():
+                handle.flush()
+                os.fsync(handle.fileno())
+                handle.close()
+            with (temporary / "videos.jsonl").open("w", encoding="utf-8") as handle:
+                for video in videos.values():
+                    video["tasks"].sort(key=TASKS.index)
+                    handle.write(json.dumps(video, ensure_ascii=False) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            atomic_json(
+                temporary / "summary.json",
+                {
+                    "snapshot_id": snapshot_id,
+                    "counts": counts,
+                    "video_count": len(videos),
+                    "production_root": str(root),
+                },
+            )
+            temporary.rename(destination)
+            _sync_directory(snapshots)
+            latest = snapshots / f".LATEST.tmp-{uuid.uuid4().hex}"
+            with latest.open("w") as handle:
+                handle.write(snapshot_id + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(latest, snapshots / "LATEST")
+            _sync_directory(snapshots)
+        finally:
+            for handle in handles.values():
+                handle.close()
+            if temporary.exists():
+                shutil.rmtree(temporary)
+    return destination
