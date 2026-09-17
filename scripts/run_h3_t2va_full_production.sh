@@ -74,7 +74,7 @@ serve=("$SGLANG_ENV/bin/sglang" serve
   --tp 8 --dp 2 --enable-dp-attention --enable-dp-lm-head
   --mm-enable-dp-encoder --dtype bfloat16
   --attention-backend fa3 --mm-attention-backend fa3
-  --context-length 131072 --mem-fraction-static 0.65
+  --context-length 131072 --mem-fraction-static 0.50
   --chunked-prefill-size 16384 --max-running-requests 8
   --reasoning-parser mimo --tool-call-parser mimo
   --constrained-json-disable-any-whitespace --enable-deterministic-inference)
