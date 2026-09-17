@@ -10,6 +10,17 @@ cd "$REPO_ROOT"
 if ! "$dry_run"; then
   source "$REPO_ROOT/.venv/bin/activate"
   source "$REPO_ROOT/server_env.sh"
+
+  SAM_DEPS_ROOT="${SAM_DEPS_ROOT:-/mnt/workspace/litengjie/data/audio_deps}"
+  export SAM_AUDIO_CODE_ROOT="${SAM_AUDIO_CODE_ROOT:-$SAM_DEPS_ROOT/sam-audio-src}"
+  PERCEPTION_MODELS_ROOT="${PERCEPTION_MODELS_ROOT:-$SAM_DEPS_ROOT/perception-models-src}"
+  DACVAE_ROOT="${DACVAE_ROOT:-$SAM_DEPS_ROOT/dacvae-src}"
+  SAM_AUDIO_PYDEPS="${SAM_AUDIO_PYDEPS:-$SAM_DEPS_ROOT/sam-audio-pydeps}"
+  export SAM_AUDIO_RUNTIME_PYTHONPATH="${SAM_AUDIO_RUNTIME_PYTHONPATH:-$SAM_AUDIO_CODE_ROOT:$PERCEPTION_MODELS_ROOT:$DACVAE_ROOT:$SAM_AUDIO_PYDEPS}"
+  export SAM_AUDIO_MODEL_PATH="${SAM_AUDIO_MODEL_PATH:-/mnt/workspace/public/pretrained/Facebook/sam-audio-large-tv}"
+  export SAM_AUDIO_MODEL_NAME="${SAM_AUDIO_MODEL_NAME:-facebook/sam-audio-large-tv}"
+  export SAM_AUDIO_T5_BASE_PATH="${SAM_AUDIO_T5_BASE_PATH:-/mnt/workspace/public/pretrained/google/t5-base}"
+
   AUK_ROOT="${AUK_ROOT:-/mnt/workspace/litengjie/data/audio_deps/auk}"
   export AUK_PYTHON="${AUK_PYTHON:-$AUK_ROOT/auk-venv/bin/python}"
   export AUK_CODE_ROOT="${AUK_CODE_ROOT:-$AUK_ROOT/AuK-src}"
@@ -104,6 +115,30 @@ fi
 
 command -v setsid >/dev/null 2>&1 || {
   echo "setsid is required for full-production process isolation" >&2
+  exit 2
+}
+test -d "$SAM_AUDIO_CODE_ROOT" || {
+  echo "Missing SAM_AUDIO_CODE_ROOT: $SAM_AUDIO_CODE_ROOT" >&2
+  exit 2
+}
+test -d "$SAM_AUDIO_MODEL_PATH" || {
+  echo "Missing SAM_AUDIO_MODEL_PATH: $SAM_AUDIO_MODEL_PATH" >&2
+  exit 2
+}
+test -d "$SAM_AUDIO_T5_BASE_PATH" || {
+  echo "Missing SAM_AUDIO_T5_BASE_PATH: $SAM_AUDIO_T5_BASE_PATH" >&2
+  exit 2
+}
+test -d "$PERCEPTION_MODELS_ROOT" || {
+  echo "Missing PERCEPTION_MODELS_ROOT: $PERCEPTION_MODELS_ROOT" >&2
+  exit 2
+}
+test -d "$DACVAE_ROOT" || {
+  echo "Missing DACVAE_ROOT: $DACVAE_ROOT" >&2
+  exit 2
+}
+test -d "$SAM_AUDIO_PYDEPS" || {
+  echo "Missing SAM_AUDIO_PYDEPS: $SAM_AUDIO_PYDEPS" >&2
   exit 2
 }
 test -x "$AUK_PYTHON" || {
