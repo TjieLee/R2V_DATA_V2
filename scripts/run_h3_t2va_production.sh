@@ -10,6 +10,8 @@ cd "$REPO_ROOT"
 if ! "$dry_run"; then
   source "$REPO_ROOT/.venv/bin/activate"
   source "$REPO_ROOT/server_env.sh"
+  export NO_PROXY="127.0.0.1,localhost,::1${NO_PROXY:+,$NO_PROXY}"
+  export no_proxy="$NO_PROXY"
   unset PYTHONPATH
   export R2V_PYTHON="$(command -v python)"
 fi

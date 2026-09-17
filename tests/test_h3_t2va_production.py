@@ -478,9 +478,13 @@ def test_launcher_owned_lifecycle_without_server(tmp_path):
     binary.mkdir()
     (tmp_path / ".venv/bin").mkdir(parents=True)
     (tmp_path / ".venv/bin/activate").write_text(f'export PATH="{binary}:$PATH"\n')
-    (tmp_path / "server_env.sh").write_text("# synthetic environment\n")
+    (tmp_path / "server_env.sh").write_text(
+        'export http_proxy=http://proxy.invalid:3128\n'
+        'export NO_PROXY=existing.internal\n'
+        'export no_proxy=stale.invalid\n'
+    )
     programs = {
-        "python": '#!/bin/bash\nif [[ "$1" == "-c" ]]; then exit 0; fi\nexit 7\n',
+        "python": '#!/bin/bash\n[[ "$NO_PROXY" == "127.0.0.1,localhost,::1,existing.internal" ]] || exit 91\n[[ "$no_proxy" == "$NO_PROXY" ]] || exit 92\n[[ "$http_proxy" == "http://proxy.invalid:3128" ]] || exit 93\nif [[ "$1" == "-c" ]]; then exit 0; fi\nexit 7\n',
         "curl": '#!/bin/bash\nwhile [[ ! -f "$PID_FILE" ]]; do sleep 0.01; done\nexit 0\n',
         "sglang": '#!/bin/bash\necho $$ > "$PID_FILE"\ntrap "exit 0" TERM\nwhile :; do sleep 0.05; done\n',
     }
