@@ -53,8 +53,6 @@ def match_aspect_ratio(source: VideoTimeline) -> str:
         w, h = map(int, label.split(":"))
         return abs(ratio / (w/h) - 1)
     selected = min(supported, key=distance)
-    if distance(selected) > 0.01:
-        raise ValueError("Source aspect ratio differs from supported H3 ratios by >1%; no crop")
     return selected
 
 

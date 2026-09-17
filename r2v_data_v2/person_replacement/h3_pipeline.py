@@ -79,6 +79,8 @@ def run_cases(cases, *, qwen, backends, seed, descriptions_from=None):
                     raise ValueError("H3 generated duration does not match native timeline")
                 if (output.width, output.height) != output_size(aspect):
                     raise ValueError("H3 output resolution differs from shared 1.0 MP contract")
+                source_ratio = plan.source.width / plan.source.height
+                aspect_width, aspect_height = map(int, aspect.split(":"))
                 manifest = {
                     **metadata, "case_id":case["case_id"], "backend":backend.name,
                     "target_video_path":str(video), "reference_image_path":str(reference),
@@ -88,6 +90,9 @@ def run_cases(cases, *, qwen, backends, seed, descriptions_from=None):
                     "h3_model_path":str(backend.model_root), "acceleration_checkpoint_path":str(backend.lora),
                     "seed":seed, "requested_duration":plan.requested_duration,
                     "aspect_ratio":aspect, "megapixels":1.0,
+                    "source_aspect_ratio":source_ratio,
+                    "selected_output_aspect_ratio":aspect,
+                    "aspect_ratio_relative_error":abs(source_ratio / (aspect_width / aspect_height) - 1),
                     **{f"source_{k}":v for k,v in asdict(plan.source).items()},
                     **{f"output_{k}":v for k,v in asdict(output).items()},
                     "h3_native_frame_count":plan.native_frame_count, "h3_native_fps":24,

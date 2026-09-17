@@ -62,8 +62,13 @@ benchmark; both execution modes are reported.
 
 ## Timeline and framing
 
-Source must be one whole processed MP4, 2–15 s, with a supported aspect ratio
-within 1% (`21:9`, `16:9`, `4:3`, `1:1`, or transposes). No source crop/truncation.
+Source must be one whole processed MP4, 2–15 s. Select the nearest supported
+output aspect ratio (`21:9`, `16:9`, `4:3`, `1:1`, or transposes) by relative
+distance, without a rejection threshold. Reference geometry is independent:
+pass the original processed clip upstream without source crop, resize, or transcode.
+Candidate manifests record `source_aspect_ratio`, `selected_output_aspect_ratio`,
+and `aspect_ratio_relative_error` (`abs(source_ratio / selected_ratio - 1)`)
+for QA. No source truncation.
 Use the existing read-only timeline inspector (its CFR-cadence validation applies).
 
 ModelTC computes `N=max(5, round(duration*24)); N += (5-N%17)%17`.

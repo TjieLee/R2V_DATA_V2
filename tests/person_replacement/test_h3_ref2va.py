@@ -30,10 +30,12 @@ def test_duration_outside_reference_or_aligned_runtime_range_fails(seconds):
         plan_h3_timeline(replace(source(), duration_seconds=seconds))
 
 
-def test_aspect_ratio_no_crop():
-    assert match_aspect_ratio(source()) == "16:9"
-    with pytest.raises(ValueError):
-        match_aspect_ratio(replace(source(), width=1500, height=1000))
+@pytest.mark.parametrize("width,height,expected", [
+    (1920, 1080, "16:9"), (1500, 1000, "4:3"),
+    (1600, 1000, "16:9"), (1700, 1000, "16:9"),
+])
+def test_aspect_ratio_no_crop(width, height, expected):
+    assert match_aspect_ratio(replace(source(), width=width, height=height)) == expected
 
 
 @pytest.mark.parametrize("failed", ["lightx2v", "pdd", "preflight_lightx2v", "preflight_pdd",
@@ -75,7 +77,8 @@ def test_shared_preparation_and_backend_specific_manifest_gate(tmp_path, monkeyp
         native = replace(native, fps=25., fps_num=25)
     elif failed == "bad_size":
         native = replace(native, width=1344)
-    monkeypatch.setattr(h3_pipeline, "inspect_video_timeline", lambda p: source() if p == video else native)
+    nonstandard_source = replace(source(), width=1600, height=1000)
+    monkeypatch.setattr(h3_pipeline, "inspect_video_timeline", lambda p: nonstandard_source if p == video else native)
     previous = tmp_path/"bernini_manifest.json"
     previous.write_text(json.dumps({"target_video_path":str(video), "source_person_description":"source",
                                    "replacement_person_description":"replacement"}))
@@ -96,8 +99,15 @@ def test_shared_preparation_and_backend_specific_manifest_gate(tmp_path, monkeyp
             assert manifest["production_timeline_compatible"] is False
             assert manifest["target_video_path"] == str(video)
             assert manifest["output_frame_count"] == 141
+            assert manifest["source_aspect_ratio"] == 1.6
+            assert manifest["selected_output_aspect_ratio"] == "16:9"
+            assert manifest["aspect_ratio_relative_error"] == pytest.approx(0.1)
     assert len(report["failures"]) == (2 if str(failed).startswith("bad_") else int(bool(failed)))
     assert (output / "reference_frame0.jpg").read_bytes() == b"original"
+    assert video.read_bytes() == b"original"
+    assert sorted(p.relative_to(output).as_posix() for p in output.rglob("*.mp4")) == [
+        f"{name}/raw.mp4" for name in ("lightx2v", "pdd") if failed != f"preflight_{name}"
+    ]
 
 
 def test_dry_run_no_models_workers_or_directories(tmp_path, monkeypatch, capsys):
