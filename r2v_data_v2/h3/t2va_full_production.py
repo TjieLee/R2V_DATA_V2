@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 from r2v_data_v2.h3 import t2va_production as production
@@ -29,10 +31,21 @@ RUN_ID = "production"
 STAGES = ("canonical", "sam", "auk", "resolve", "diarizen", "asr", "mimo")
 
 
+@dataclass(frozen=True)
+class PreparedShard:
+    audio_root: Path
+    summary: dict
+
+
 def run_assigned_shards(root, shard_ids, pipeline):
     """One node owns a shard through all barriers, including downstream writes."""
     results = {}
-    for shard_id in shard_ids:
+    for position, shard_id in enumerate(shard_ids):
+        if hasattr(pipeline, "prepare_ahead"):
+            pipeline.prepare_ahead(
+                shard_id,
+                shard_ids[position + 1] if position + 1 < len(shard_ids) else None,
+            )
         shard = root / "shards" / production.shard_name(shard_id)
         try:
             with production.file_lock(shard / "invocation.lock"):
@@ -44,6 +57,7 @@ def run_assigned_shards(root, shard_ids, pipeline):
                     }.get(name, name)
                     log_path = shard / "logs" / f"{log_name}.log"
                     log_path.parent.mkdir(parents=True, exist_ok=True)
+                    started = time.monotonic()
                     try:
                         result = pipeline.stage(name, shard_id)
                     except BaseException:
@@ -60,7 +74,8 @@ def run_assigned_shards(root, shard_ids, pipeline):
                     counters = {k: v for k, v in result.items() if k != "clip_uids"}
                     results[shard_id][name] = counters
                     print(
-                        f"shard={shard_id} stage={name} {json.dumps(counters, sort_keys=True)}",
+                        f"shard={shard_id} stage={name} elapsed_seconds={time.monotonic() - started:.3f} "
+                        f"{json.dumps(counters, sort_keys=True)}",
                         flush=True,
                     )
         except production.ShardLockedError:
@@ -100,8 +115,41 @@ class FullPipeline:
         if canonical_workers < 1:
             raise ValueError("canonical workers must be positive")
         self.canonical_workers = canonical_workers
-        self.audio_root = None
+        self.prepared = {}
+        self.prefetch = None
         self.pools = None
+
+    @contextmanager
+    def node(self, shard_ids):
+        from r2v_data_v2.h3.t2va_full_prefetch import CanonicalPrefetch
+
+        with CanonicalPrefetch(
+            root=self.root,
+            index=self.index,
+            clips_root=self.clips_root,
+            source_videos_root=self.source_videos_root,
+            canonical_workers=self.canonical_workers,
+            ffmpeg=self.ffmpeg,
+            ffprobe=self.ffprobe,
+        ) as prefetch:
+            self.prefetch = prefetch
+            try:
+                if shard_ids:
+                    prefetch.start(shard_ids[0])
+                with self:
+                    yield self
+            finally:
+                self.prefetch = None
+
+    def prepare_ahead(self, shard_id, next_shard_id):
+        if self.prefetch is None:
+            return
+        result = self.prefetch.wait(shard_id)
+        self.prepared[shard_id] = PreparedShard(
+            Path(result["audio_root"]), result["summary"]
+        )
+        if next_shard_id is not None:
+            self.prefetch.start(next_shard_id)
 
     def __enter__(self):
         from r2v_data_v2.h3 import t2va_full_speech as speech
@@ -175,36 +223,43 @@ class FullPipeline:
         state = shard / "stage_state"
         execution = {"execute": self.pools.execute_stage} if self.pools else {}
         if name == "canonical":
-            selection = shard_selection(
-                self.root,
-                self.index,
-                shard_id,
-                self.clips_root,
-                self.source_videos_root,
-            )
-            self.audio_root = bootstrap_audio(
-                shard,
-                selection,
-                FFmpegAudioMediaBackend(ffmpeg=self.ffmpeg, ffprobe=self.ffprobe),
-                canonical_workers=self.canonical_workers,
-            )
-            rows = list(
-                production.complete_rows(
-                    self.audio_root / "audio/canonical_clips.jsonl"
+            if self.prefetch is not None and shard_id in self.prepared:
+                return self.prepared[shard_id].summary
+            with production.file_lock(shard / "canonical.lock", blocking=True):
+                selection = shard_selection(
+                    self.root,
+                    self.index,
+                    shard_id,
+                    self.clips_root,
+                    self.source_videos_root,
                 )
-            )
-            self.has_audio = bool(rows)
-            return {
-                "ready": len(rows),
-                "failed": len(selection.shots) - len(rows),
-                "skipped": len(selection.excluded_rows),
-            }
-        if not self.has_audio and name != "mimo":
+                audio_root = bootstrap_audio(
+                    shard,
+                    selection,
+                    FFmpegAudioMediaBackend(ffmpeg=self.ffmpeg, ffprobe=self.ffprobe),
+                    canonical_workers=self.canonical_workers,
+                )
+                count = sum(
+                    1
+                    for _ in production.complete_rows(
+                        audio_root / "audio/canonical_clips.jsonl"
+                    )
+                )
+                summary = {
+                    "ready": count,
+                    "failed": len(selection.shots) - count,
+                    "skipped": len(selection.excluded_rows),
+                }
+                self.prepared[shard_id] = PreparedShard(audio_root, summary)
+                return summary
+        prepared = self.prepared[shard_id]
+        audio_root = prepared.audio_root
+        if not prepared.summary["ready"] and name != "mimo":
             return {"ready": 0, "skipped": "no canonical audio"}
-        shadow = sam.stem_shadow_root(self.audio_root, RUN_ID)
+        shadow = sam.stem_shadow_root(audio_root, RUN_ID)
         if name == "sam":
             inventory = sam.build_sam_audio_stem_inventory(
-                canonical_audio_manifest_path=self.audio_root
+                canonical_audio_manifest_path=audio_root
                 / "audio/canonical_clips.jsonl",
                 model_configuration=self.sam_configuration,
                 route="music_first",
@@ -222,9 +277,9 @@ class FullPipeline:
             _, records, _ = sam.load_stem_shadow(shadow / "separation")
             eligible = {r.clip_uid for r in records if r.separation_state != "failure"}
             inventory = auk.build_auk_inventory(
-                audio_production_root=self.audio_root,
+                audio_production_root=audio_root,
                 shadow_run_id=RUN_ID,
-                case_manifest_path=self.audio_root / "case_manifest.json",
+                case_manifest_path=audio_root / "case_manifest.json",
                 configuration=self.auk_configuration,
             )
             return stems.run_auk(
@@ -237,7 +292,7 @@ class FullPipeline:
             )
         if name == "resolve":
             return resolve_audio_stems(
-                audio_production_root=self.audio_root,
+                audio_production_root=audio_root,
                 shadow_run_id=RUN_ID,
                 overwrite=(shadow / "resolved_stems_v1").exists(),
             )
@@ -245,7 +300,7 @@ class FullPipeline:
             from r2v_data_v2.h3.t2va_full_speech import run_asr, run_diarizen
 
             result = (run_diarizen if name == "diarizen" else run_asr)(
-                self.audio_root,
+                audio_root,
                 RUN_ID,
                 state / name,
                 self.gpu_ids,
@@ -268,7 +323,7 @@ class FullPipeline:
                 self.root,
                 self.index,
                 shard_id,
-                self.audio_root,
+                audio_root,
                 self.clips_root,
                 self.source_videos_root,
                 self.backend,
