@@ -2,10 +2,96 @@
 
 This orchestration is independent of Visual and writes only its owned production
 root. It calls the frozen T2VA v7/backend .7/core .6 and TA2VA .2/profile v2
-implementations; the reused audio finalizer remains v6. It does not preprocess
-Audio, migrate legacy outputs, or change semantic eligibility.
+implementations; the reused audio finalizer remains v6. The standalone downstream
+runner does not preprocess Audio. The optional full launcher below adds upstream
+stage orchestration without migrating legacy outputs or changing eligibility.
 
-## Prerequisites and Population
+## Full Raw-Video Production
+
+Use scripts/run_h3_t2va_full_production.sh for a fresh, shard-owned Audio
+workspace. One node owns one fixed shard through these barriers:
+
+    canonical -> SAM music_first -> AuK -> resolve -> DiariZen -> ASR -> MiMo
+
+MiMo starts once per launcher invocation and stays alive across stages/shards.
+The serving arguments are unchanged. Client REQUEST_WORKERS defaults to 1.
+Upstream stages use GPU_IDS=0,1,2,3,4,5,6,7 by default, one model instance per
+nonempty worker partition. Each child sees its physical GPU through
+CUDA_VISIBLE_DEVICES and uses cuda:0; the parent environment is unchanged.
+Workers exit at the barrier. There is no automatic GPU memory manager or restart.
+
+The full runner needs the existing server_env.sh dependency settings:
+SAM_AUDIO_CODE_ROOT, SAM_AUDIO_MODEL_PATH, SAM_AUDIO_T5_BASE_PATH,
+SAM_AUDIO_RUNTIME_PYTHONPATH, AUK_PYTHON, AUK_CODE_ROOT, AUK_CHECKPOINT,
+AUK_QWEN_PATH, DIARIZEN_PYTHON, DIARIZEN_CODE_ROOT, DIARIZEN_MODEL_PATH,
+QWEN3_ASR_ENV and QWEN3_ASR_MODEL_PATH. No dependency is downloaded. The launcher
+does not edit server_env.sh. It adds localhost to NO_PROXY/no_proxy without
+removing external proxies. Readiness checks owned PID, /v1/models and /model_info.
+
+```bash
+RANK=0 WORLD_SIZE=4 SHARD_SEED=20260917 GPU_IDS=0,1,2,3,4,5,6,7 \
+  bash scripts/run_h3_t2va_full_production.sh --dry-run
+
+# Inspect commands first. Explicit opt-in is required for unverified SAM output.
+RANK=0 WORLD_SIZE=4 SHARD_SEED=20260917 GPU_IDS=0,1,2,3,4,5,6,7 \
+ALLOW_UNVERIFIED=1 bash scripts/run_h3_t2va_full_production.sh
+
+SHARDS=59,12,87 ALLOW_UNVERIFIED=1 \
+  bash scripts/run_h3_t2va_full_production.sh
+```
+
+Do not supply an existing Audio cache to the full runner. It owns
+shards/<shard>/audio_production, including canonical_items, audio manifests and
+sam_audio_stem_shadow_v1/runs/production/{separation,auk_speech_v1,
+resolved_stems_v1,diarization,asr}. The JEA bootstrap has no Visual references or
+binding sidecars. It uses the same default target-side loader path as the frozen
+T2VA fixtures, not the RA2VA binding_evidence_mode=none Visual adapter. The name
+of that default mode does not introduce LR-ASD execution or evidence.
+
+Each stage has durable job receipts beneath stage_state/<stage>/jobs and
+worker-private request directories. Per-GPU logs append beneath the shard's
+logs/<stage>-gpu<ID>.log; stage summaries and exceptions have separate logs.
+Node logs are logs/<hostname>/{mimo,supervisor}-<timestamp>-<pid>.log.
+Only the parent publishes full ordered
+inventories. Worker outputs never race on canonical records.jsonl. Successful
+receipt/media hashes are checked before reuse; failed jobs retry once on the
+next invocation. A worker crash waits for other workers, stops the supervisor,
+and leaves unattempted jobs pending. Ctrl-C/TERM terminates owned worker trees.
+Never delete ready receipts merely to rerun the stage.
+
+stage_state/<stage>/invocation.json records scheduled_job_count,
+reused_ready_count and worker_count for the latest invocation. Zero scheduled
+jobs means no worker/model is started for that stage. Frozen publication model
+counts still describe the cached artifacts, not new calls in this invocation.
+Keep interpreters and dependency environments pinned for a resumed run; use a
+fresh production root when upgrading runtimes rather than adopting old caches.
+
+Upstream aggregate manifests can expand after failed clips recover. The full
+downstream adapter binds ready outputs to validated per-clip dependencies;
+unrelated aggregate hash changes cannot trigger repeat inference. Previously
+upstream-skipped clips can reopen when their own inputs become available.
+Published data remains available to the existing snapshot builder.
+
+### Raw-Video Server Acceptance
+
+No real inference was performed during local development. Before 10k production:
+
+1. Create a new five-row shot JSONL containing the original five target video
+   rows, preserving paths and order; do not copy a prior Audio cache.
+2. Point SHOT_MANIFEST at that file and PRODUCTION_ROOT at a fresh smoke root.
+3. Run SHARDS=0 with the full launcher and ALLOW_UNVERIFIED=1. Verify canonical,
+   SAM, AuK, resolved, DiariZen and ASR inventories with their existing loaders.
+4. Build a snapshot using tools/build_h3_t2va_snapshot.py. Check the stage and
+   downstream ready/failure counters rather than assuming every source is usable.
+5. Rerun the identical command. Confirm ready worker receipts were reused and
+   ready T2VA/TA2VA artifacts made zero additional model calls.
+6. In another fresh smoke root, interrupt during ASR, rerun, and verify only
+   unfinished/failed ASR jobs ran. Confirm one MiMo PID per invocation and no
+   surviving upstream child processes after each stage.
+7. Only after the five-clip checks pass, try a roughly 100-row bounded manifest,
+   then one actual 10k shard. Do not start the entire source population first.
+
+## Standalone Downstream Prerequisites
 
 The population authority is the original ordered JEA shot JSONL, not an Audio
 or Visual inventory. Each physical source row belongs permanently to a 10,000-row

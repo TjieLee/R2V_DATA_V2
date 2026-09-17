@@ -53,11 +53,12 @@ def run_assigned_shards(root, shard_ids, pipeline):
                     production.atomic_json(
                         shard / "stage_state" / f"{name}.json", result
                     )
-                    results[shard_id][name] = result
                     with log_path.open("a") as handle:
                         handle.write(json.dumps(result, sort_keys=True) + "\n")
+                    counters = {k: v for k, v in result.items() if k != "clip_uids"}
+                    results[shard_id][name] = counters
                     print(
-                        f"shard={shard_id} stage={name} {json.dumps(result, sort_keys=True)}",
+                        f"shard={shard_id} stage={name} {json.dumps(counters, sort_keys=True)}",
                         flush=True,
                     )
         except production.ShardLockedError:

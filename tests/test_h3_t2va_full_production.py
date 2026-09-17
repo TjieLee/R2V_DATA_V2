@@ -184,15 +184,17 @@ def test_raw_video_to_snapshot_and_retry_without_repeat_models(
     assert len(list(production.complete_rows(snapshot / "ta2va_full_audio.jsonl"))) == 3
 
 
-def test_full_supervisor_stage_order(tmp_path):
+def test_full_supervisor_stage_order(tmp_path, capsys):
     events = []
 
     class Pipeline:
         def stage(self, name, shard_id):
             events.append((shard_id, name))
-            return {"ready": 2, "failed": 1}
+            return {"ready": 2, "failed": 1, "clip_uids": ["inventory-only"]}
 
-    full.run_assigned_shards(tmp_path, [59, 12], Pipeline())
+    result = full.run_assigned_shards(tmp_path, [59, 12], Pipeline())
+    assert "inventory-only" not in capsys.readouterr().out
+    assert "inventory-only" not in json.dumps(result)
     assert events == [(shard, stage) for shard in (59, 12) for stage in full.STAGES]
     assert full.STAGES == (
         "canonical",
