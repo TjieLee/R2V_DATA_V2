@@ -449,3 +449,212 @@ def t2va_stage(job, backend, temporary: Path):
         "exports": {"t2va": training_row(job.target_video_path, prompt)},
         "warnings": [*raw.warnings, *raw.audio_finalize.warnings, *core.warnings],
     }
+
+
+def ta2va_stage(
+    job,
+    core,
+    segments,
+    stem,
+    source_fingerprint,
+    core_hash,
+    backend,
+    temporary: Path,
+    destination: Path,
+    *,
+    allow_unverified=False,
+):
+    """Production writer around frozen TA2VA waveform and rendering operations."""
+    import numpy as np
+
+    from r2v_data_v2.h3 import ta2va_shadow as ta
+
+    evidence = job.audio_evidence
+    frames = ta.probe_canonical_target_frames(
+        Path(evidence.full_audio_path), evidence.full_audio_sha256
+    )
+    products, exclusions = [], []
+
+    def publish(variant, refs, assets, profiles, warnings, calls):
+        fields = {
+            "schema_version": ta.VERSION,
+            "clip_uid": job.clip_uid,
+            "source_inventory_fingerprint": source_fingerprint,
+            "source_core_sha256": core_hash,
+            "source_resolved_record_fingerprint": stem.record_fingerprint,
+            "variant": variant,
+            "status": "ready",
+            "failure_reason": None,
+            "audio_references": [r.model_dump(mode="json") for r in refs],
+            "assets": [a.model_dump(mode="json") for a in assets],
+            "speaker_profiles": [p.model_dump(mode="json") for p in profiles],
+            "prompt": ta.render_product(core, variant, refs),
+            "warnings": warnings,
+            "model_call_count": calls,
+        }
+        product = ta.TA2VAProduct(**fields, record_fingerprint=ta.fingerprint(fields))
+        products.append(product)
+        (temporary / f"{variant}.txt").write_text(product.prompt, encoding="utf-8")
+
+    full = ta.RecaptionAudioContract(
+        audio_index=1,
+        audio_label="<Audio 1>",
+        kind="full_audio_reuse",
+        path=evidence.full_audio_path,
+        sha256=evidence.full_audio_sha256,
+        retention_marker="fully_copy",
+    )
+    publish("full_audio_reuse", [full], [], [], [], 0)
+    if any(f.text is not None for f in core.speech_facts):
+        if stem.separation_state != "success" and not allow_unverified:
+            raise ValueError(
+                "TA2VA unverified stems require explicit --allow-unverified"
+            )
+        speech_pcm = ta._check_stem(
+            stem.stem("speech"),
+            Path(evidence.full_audio_path),
+            evidence.full_audio_sha256,
+            frames,
+        )
+        groups, exclusions = ta.sample_ranges(
+            job, core, segments, frames, len(speech_pcm)
+        )
+        selected, include_music, warnings = ta.select_speakers(
+            groups, ta._music_present(core.non_diegetic_music)
+        )
+        if selected:
+            directory = temporary / "assets"
+            directory.mkdir()
+            assets, snippets, targets = [], [], []
+
+            def write_asset(
+                name, pcm, kind, sx=None, ranges=None, source_kind="speech"
+            ):
+                digest = ta._write_verified(directory / name, pcm)
+                source_stem = stem.stem(source_kind)
+                copied = min(frames, source_stem.canonical_frame_count)
+                tail = frames - copied
+                if ranges:
+                    copied, previous_end = 0, 0
+                    for r in ranges:
+                        copied += max(
+                            0,
+                            r.target_end_sample
+                            - max(previous_end, r.target_start_sample),
+                        )
+                        previous_end = max(previous_end, r.target_end_sample)
+                    tail = frames - previous_end
+                return ta.TA2VAAsset(
+                    kind=kind,
+                    speaker_id=sx,
+                    ranges=ranges or [],
+                    source_path=source_stem.canonical_stem_path,
+                    source_sha256=source_stem.canonical_stem_sha256,
+                    source_frame_count=source_stem.canonical_frame_count,
+                    output_path=str(destination / "assets" / name),
+                    output_sha256=digest,
+                    frame_count=frames,
+                    copied_frame_count=copied,
+                    silence_tail_frame_count=tail,
+                )
+
+            for sx in selected:
+                for r in groups[sx]:
+                    name = f"{sx}.{r.segment_id}.snippet.flac"
+                    ta._write_verified(
+                        directory / name,
+                        speech_pcm[r.target_start_sample : r.target_end_sample],
+                    )
+                    snippets.append(
+                        (
+                            {
+                                "speaker_group": sx,
+                                "speaker_id": sx,
+                                **r.model_dump(mode="json"),
+                            },
+                            directory / name,
+                        )
+                    )
+                assets.append(
+                    write_asset(
+                        f"{sx}.flac",
+                        ta.speech_track(speech_pcm, frames, groups[sx]),
+                        "speaker_speech_reuse",
+                        sx,
+                        groups[sx],
+                    )
+                )
+                targets.append(
+                    {
+                        "speaker_group": sx,
+                        "speaker_id": sx,
+                        "segments": [r.model_dump(mode="json") for r in groups[sx]],
+                    }
+                )
+            try:
+                profiles, raw = backend.profile(targets, snippets)
+            except Exception as exc:
+                _endpoint_error(exc)
+                raise
+            raw["snippets"] = [
+                {
+                    "label": label,
+                    "path": str(destination / "assets" / p.name),
+                    "sha256": _sha(p),
+                }
+                for label, p in snippets
+            ]
+            atomic_json(temporary / "raw_profile.json", raw)
+            if raw["error"]:
+                _endpoint_error(raw["error"])
+                raise ValueError(raw["error"])
+            if include_music:
+                music = ta._check_stem(
+                    stem.stem("music"),
+                    Path(evidence.full_audio_path),
+                    evidence.full_audio_sha256,
+                    frames,
+                )
+                pcm = np.zeros((frames, 2), dtype=np.int16)
+                copied = min(frames, len(music))
+                pcm[:copied] = music[:copied]
+                assets.append(
+                    write_asset("music.flac", pcm, "music_reuse", source_kind="music")
+                )
+            profile_by_sx = {p.speaker_group: p.voice_characteristics for p in profiles}
+            refs = [
+                ta.RecaptionAudioContract(
+                    audio_index=i,
+                    audio_label=f"<Audio {i}>",
+                    kind=a.kind,
+                    path=a.output_path,
+                    sha256=a.output_sha256,
+                    speaker_id=a.speaker_id,
+                    voice_characteristics=profile_by_sx.get(a.speaker_id),
+                    retention_marker="partially_copy",
+                )
+                for i, a in enumerate(assets, 1)
+            ]
+            publish(
+                "target_speech_reuse",
+                refs,
+                assets,
+                profiles,
+                [*exclusions, *warnings],
+                raw["model_call_count"],
+            )
+    (temporary / "records.jsonl").write_text(
+        "".join(p.model_dump_json() + "\n" for p in products), encoding="utf-8"
+    )
+    return {
+        "model_call_count": sum(p.model_call_count for p in products),
+        "reuse_exclusions": exclusions,
+        "exports": {
+            "ta2va_full_audio"
+            if p.variant == "full_audio_reuse"
+            else "ta2va_speech_bgm": training_row(
+                job.target_video_path, p.prompt, [a.path for a in p.audio_references]
+            )
+            for p in products
+        },
+    }

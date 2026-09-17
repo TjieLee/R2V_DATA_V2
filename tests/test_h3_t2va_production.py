@@ -176,3 +176,55 @@ def test_t2va_shadow_equivalence(tmp_path, finalized):
             == (old_root / "prompts" / f"{job.clip_uid}.txt").read_text()
         )
         assert result["model_call_count"] == 2
+
+
+def test_ta2va_shadow_equivalence(tmp_path, finalized):
+    from r2v_data_v2.h3 import ta2va_shadow as ta
+    from tests.test_h3_ta2va_shadow import ProfileClient
+
+    inventory = shared.build(finalized, tmp_path)
+    drafts = [
+        shared.draft_for(j).model_dump_json()
+        for j in inventory.jobs
+        if not j.upstream_failure
+    ]
+    shared.t2va.run_t2va_shadow(
+        inventory,
+        shared.T2VAMimoBackend(shared.config(tmp_path), client=shared.Client(drafts)),
+    )
+    root = shared.t2va.t2va_root(finalized[0], "t2va-test")
+    old = ta.run_ta2va_shadow(
+        root,
+        "old-ta",
+        ta.TA2VAProfileBackend(shared.config(tmp_path), client=ProfileClient()),
+        allow_unverified=True,
+    )
+    expected = ta.read_rows(old / "records.jsonl", ta.TA2VAProduct)
+    source, clips, stems, _ = ta.load_source(root)
+    for job, core, segments, core_hash in clips:
+        destination = tmp_path / "production-ta" / job.clip_uid
+        destination.mkdir(parents=True)
+        result = production.ta2va_stage(
+            job,
+            core,
+            segments,
+            stems[job.clip_uid],
+            source.inventory_fingerprint,
+            core_hash,
+            ta.TA2VAProfileBackend(shared.config(tmp_path), client=ProfileClient()),
+            destination,
+            destination,
+            allow_unverified=True,
+        )
+        actual = ta.read_rows(destination / "records.jsonl", ta.TA2VAProduct)
+        old_products = [p for p in expected if p.clip_uid == job.clip_uid]
+        assert [(p.variant, p.prompt, p.warnings) for p in actual] == [
+            (p.variant, p.prompt, p.warnings) for p in old_products
+        ]
+        assert result["model_call_count"] == sum(
+            p.model_call_count for p in old_products
+        )
+        for new, previous in zip(actual, old_products, strict=True):
+            assert [a.output_sha256 for a in new.assets] == [
+                a.output_sha256 for a in previous.assets
+            ]
