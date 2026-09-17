@@ -725,8 +725,16 @@ def run_post_mask_shard(
             results: list[tuple[str | None, dict[str, Any], Exception | None]] = []
             if todo:
                 emit("post_mask_stage_started", stage=stage, scheduled=len(todo))
+                phase_storage = selected
+                if stage == "pair":
+                    # Both pair passes enumerate this view. Keep completed
+                    # eligible donors, but never advance a predecessor failure.
+                    phase_storage = _ShardStorage(
+                        storage,
+                        tuple(uid for uid in hydrated.clip_uids if uid not in pending),
+                    )
                 try:
-                    with adapter_factory(stage, selected, execution) as adapter:
+                    with adapter_factory(stage, phase_storage, execution) as adapter:
 
                         def invoke(
                             uid: str | None,

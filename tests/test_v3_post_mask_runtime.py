@@ -126,6 +126,78 @@ def test_clip_exception_blocks_export_but_not_neighbour(case):
     )
 
 
+@pytest.mark.parametrize("failure_mode", ["exception", "pending"])
+def test_pair_excludes_predecessor_pending_clip_and_restores_it_on_resume(
+    case, failure_mode
+):
+    from r2v_data_v2.v3.storage import RunStorage
+
+    _write_rows(
+        case,
+        [_ready(case, "bad", 0, "pending_remove"), _ready(case, "good", 1)],
+    )
+    api, paths, execution = _setup(case)
+    blocked = True
+    pairing_targets, donor_views = [], []
+
+    @contextmanager
+    def factory(stage, storage, settings):
+        with _accepted_factory([])(stage, storage, settings) as ordinary:
+
+            class Phase:
+                def run(self, uid=None):
+                    if stage == "remove" and uid == "bad" and blocked:
+                        if failure_mode == "exception":
+                            raise RuntimeError("remove failed before publication")
+                        return {"retryable_pending": 1}
+                    if stage == "pair":
+                        pairing_targets.append(
+                            tuple(
+                                clip.clip_uid
+                                for clip in storage.iter_clips()
+                                if clip.pairing is None
+                            )
+                        )
+                    result = ordinary.run(uid)
+                    if stage == "pair":
+                        # The existing pair fallback builds its donor index from
+                        # this same phase storage after publishing first-pass refs.
+                        donor_views.append(
+                            tuple(
+                                clip.clip_uid
+                                for clip in storage.iter_clips()
+                                if clip.pairing is not None
+                                and clip.pairing.status == "ready"
+                            )
+                        )
+                    return result
+
+            yield Phase()
+
+    args = {
+        "entity_mask_root": case[1],
+        "paths": paths,
+        "git_commit": "test",
+        "execution": execution,
+        "adapter_factory": factory,
+    }
+    first = api.run_post_mask_shard(case[0], **args)
+    assert not first.completed and first.retryable_clip_uids == ("bad",)
+    assert pairing_targets == [("good",)]
+    assert donor_views == [("good",)]
+    from r2v_data_v2.v3.post_mask_production import prepare_shard_config
+
+    stored = RunStorage(prepare_shard_config(case[0], paths))
+    assert stored.read_clip("bad").pairing is None
+    assert stored.read_clip("good").instruction.status == "ready"
+
+    blocked = False
+    second = api.run_post_mask_shard(case[0], **args)
+    assert second.completed and second.sample_count == 2
+    assert pairing_targets == [("good",), ("bad",)]
+    assert donor_views == [("good",), ("bad", "good")]
+
+
 def test_hydration_corruption_never_enters_phases(case):
     row = _ready(case)
     _write_rows(case, [dict(row, artifact_root="missing")])
