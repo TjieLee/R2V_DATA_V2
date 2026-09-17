@@ -164,12 +164,19 @@ def _digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _identity(config: V3Config, paths: ShardPaths) -> dict[str, Any]:
+def _semantic_identity(config: V3Config, paths: ShardPaths) -> dict[str, Any]:
+    """Cheap campaign identity; canonical bytes are bound only on shard entry."""
     return {
         "canonical_shard": str(paths.shard_path),
-        "shard_sha256": _digest(paths.shard_path),
         "config_hash": config.fingerprint(),
         "subject_attributes": json.loads(json.dumps(asdict(config.subject_attributes))),
+    }
+
+
+def _identity(config: V3Config, paths: ShardPaths) -> dict[str, Any]:
+    return {
+        **_semantic_identity(config, paths),
+        "shard_sha256": _digest(paths.shard_path),
     }
 
 
@@ -234,7 +241,7 @@ def _reference_paths(value: object):
 
 def _validate_input(
     root: Path, shard: Path, row: dict[str, Any]
-) -> tuple[Path, dict[str, Any]]:
+) -> tuple[Path, dict[str, Any], tuple[Path, ...]]:
     uid = _component(row.get("clip_uid"))
     index = row.get("source_index")
     if not isinstance(index, int) or isinstance(index, bool) or index < 0:
@@ -248,15 +255,13 @@ def _validate_input(
     clip_dir = _beneath(workspace, f"run/clips/{uid}")
     if not clip_dir.is_dir():
         raise ValueError("missing Stage2 clip directory")
-    # Refuse links (including directory links) rather than share mutable inodes.
-    for path in clip_dir.rglob("*"):
-        if path.is_symlink() or not (path.is_file() or path.is_dir()):
-            raise ValueError("non-regular Stage2 artifact")
     manifest_paths = [
-        clip_dir / "clip.json",
-        clip_dir / "frames/frames.json",
-        clip_dir / "masks.rle.json",
+        _beneath(clip_dir, relative)
+        for relative in ("clip.json", "frames/frames.json", "masks.rle.json")
     ]
+    if any(not path.is_file() for path in manifest_paths):
+        raise ValueError("missing or non-regular Stage2 manifest")
+    required = set(manifest_paths)
     clip = ClipRecord.model_validate_json(manifest_paths[0].read_text())
     frames = SampledFramesArtifact.model_validate_json(manifest_paths[1].read_text())
     masks = TrackedMasksArtifact.model_validate_json(manifest_paths[2].read_text())
@@ -299,8 +304,10 @@ def _validate_input(
     if set(masks.entities) != {entity.entity_id for entity in clip.annotation.entities}:
         raise ValueError("annotation/masks entity identity mismatch")
     for frame in frames.frames:
-        if not _beneath(clip_dir, frame.image_path).is_file():
+        path = _beneath(clip_dir, frame.image_path)
+        if not path.is_file():
             raise ValueError("missing sampled frame")
+        required.add(path)
     for relative in _reference_paths(clip.references.model_dump(mode="json")):
         # Existing schemas use both clip-relative frame and run-relative paths.
         if relative.startswith("clips/"):
@@ -308,8 +315,10 @@ def _validate_input(
             if not relative.startswith(prefix):
                 raise ValueError("reference escapes source clip")
             relative = relative[len(prefix) :]
-        if not _beneath(clip_dir, relative).is_file():
+        path = _beneath(clip_dir, relative)
+        if not path.is_file():
             raise ValueError("missing reference asset")
+        required.add(path)
     provenance = {
         "row": row,
         "artifact_root": str(workspace),
@@ -317,7 +326,7 @@ def _validate_input(
             str(path.relative_to(clip_dir)): _digest(path) for path in manifest_paths
         },
     }
-    return clip_dir, provenance
+    return clip_dir, provenance, tuple(sorted(required))
 
 
 def _make_staging_writable(root: Path) -> None:
@@ -401,7 +410,7 @@ def hydrate_shard(
                 or indices[index] > 1
             ):
                 raise ValueError("invalid or duplicate Stage2 row identity")
-            source, provenance = _validate_input(root, shard, row)
+            source, provenance, required = _validate_input(root, shard, row)
             provenance["canonical_shard"] = str(shard)
             destination = _beneath(storage.root, f"clips/{uid}")
             marker = destination / _PROVENANCE
@@ -419,8 +428,11 @@ def hydrate_shard(
                 if staging.exists():
                     _make_staging_writable(staging)
                     shutil.rmtree(staging)
-                staging.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copytree(source, staging)
+                staging.mkdir(parents=True)
+                for path in required:
+                    target = staging / path.relative_to(source)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(path, target)
                 _make_staging_writable(staging)
                 write_json_atomic(staging / _PROVENANCE, provenance)
                 destination.parent.mkdir(parents=True, exist_ok=True)

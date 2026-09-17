@@ -28,7 +28,7 @@ from r2v_data_v2.reconciliation import write_json_atomic
 from r2v_data_v2.v3.config import BOOGU_REMOVE_BACKEND, load_config
 from r2v_data_v2.v3.post_mask_production import (
     ShardPaths,
-    _identity,
+    _semantic_identity,
     enumerate_shards,
     prepare_shard_config,
 )
@@ -99,6 +99,11 @@ def validate_production_config(config):
         )
     if config.subject_attribute_gme.enabled:
         raise ValueError("accepted production base must disable GME")
+    for section in ("pair", "reference_edit", "reference_integrity", "instruction"):
+        if not getattr(config, section).enabled:
+            raise ValueError(
+                f"accepted production base requires {section}.enabled=true"
+            )
     config.validate()
 
 
@@ -140,6 +145,8 @@ def prepare_campaign(
     frozen = Path(entity_mask_root).resolve(strict=True)
     writable = config_module.ALLOWED_WRITABLE_ROOT.resolve()
     source = Path(source_jsonl).resolve(strict=True)
+    if config.dataset_json.resolve() != source:
+        raise ValueError("config.dataset_json must match campaign source_jsonl")
     clips = Path(clips_root).resolve(strict=True)
     dataset = config_module.ALLOWED_DATASET_ROOT.resolve()
     if (
@@ -176,7 +183,9 @@ def prepare_campaign(
         paths = ShardPaths.for_shard(
             root, shard, runs_root=runs, exports_root=exports / "shards"
         )
-        identities[shard.stem] = _identity(prepare_shard_config(config, paths), paths)
+        identities[shard.stem] = _semantic_identity(
+            prepare_shard_config(config, paths), paths
+        )
     identity = {
         "entity_mask_root": str(frozen),
         "source_jsonl": str(source),
@@ -189,15 +198,28 @@ def prepare_campaign(
     # same tag from independently claiming the same run/export destination.
     with exclusive_lock(source_yaml.with_suffix(".lock")):
         receipt = root / "campaign.json"
-        if receipt.exists() and json.loads(receipt.read_text()) != identity:
-            raise ValueError("Post-Mask campaign identity mismatch")
+        if receipt.exists():
+            saved = json.loads(receipt.read_text())
+            # Retain legacy campaign bindings (and global markers) without
+            # re-reading source bodies. Per-shard resume still checks bytes.
+            semantic = {**saved, "shards": {}}
+            for name, item in saved["shards"].items():
+                if "shard_sha256" in item and not re.fullmatch(
+                    r"[a-f0-9]{64}", str(item["shard_sha256"])
+                ):
+                    raise ValueError("Post-Mask campaign shard identity mismatch")
+                semantic["shards"][name] = {
+                    k: v for k, v in item.items() if k != "shard_sha256"
+                }
+            if semantic != identity:
+                raise ValueError("Post-Mask campaign identity mismatch")
+            identity = saved
         binding = {
             "campaign_sha256": digest(identity),
             "post_mask_root": str(root),
             "source_adapter": JEA_VIDEO_MOTION_ADAPTER,
             "source_jsonl": str(source),
             "clips_root": str(clips),
-            "base_config_fingerprint": identities[shards[0].stem]["config_hash"],
         }
         if source_yaml.exists():
             import yaml
@@ -214,6 +236,9 @@ def prepare_campaign(
                     **binding,
                     "base_config_path": str(Path(base_config_path).resolve()),
                     "base_config_sha256": file_digest(base_config_path),
+                    "base_config_fingerprint": load_config(
+                        base_config_path
+                    ).fingerprint(),
                 },
             )
         write_json_atomic(receipt, identity)
@@ -228,7 +253,15 @@ def completed_receipt(campaign, shard):
         return None
     value = json.loads(marker.read_text())
     identity = value.get("identity", {})
-    if identity.get("shard_identity") != campaign.identity["shards"][shard.stem]:
+    shard_identity = identity.get("shard_identity", {})
+    expected = campaign.identity["shards"][shard.stem]
+    if (
+        not isinstance(shard_identity, dict)
+        or not re.fullmatch(r"[a-f0-9]{64}", str(shard_identity.get("shard_sha256")))
+        or {k: v for k, v in shard_identity.items() if k != "shard_sha256"}
+        != {k: v for k, v in expected.items() if k != "shard_sha256"}
+        or ("shard_sha256" in expected and shard_identity != expected)
+    ):
         raise ValueError("completed shard identity mismatch")
     if not isinstance(identity.get("clip_count"), int) or not re.fullmatch(
         r"[a-f0-9]{64}", str(identity.get("clip_sources_sha256"))
@@ -304,6 +337,7 @@ def run_worker(
         "current_stage": None,
     }
     previous_counts = {key: 0 for key in ("ready", "excluded", "corrupt")}
+    unresolved_shards = []
 
     def event(value):
         if "stage" in value:
@@ -330,6 +364,11 @@ def run_worker(
             with exclusive_lock(paths.state_root / "shard.lock"):
                 receipt = completed_receipt(campaign, shard)
                 if receipt is None:
+                    legacy_hash = campaign.identity["shards"][shard.stem].get(
+                        "shard_sha256"
+                    )
+                    if legacy_hash is not None and file_digest(shard) != legacy_hash:
+                        raise ValueError("Post-Mask legacy shard identity mismatch")
                     state["current_stage"] = "hydrate"
                     result = runner(
                         config,
@@ -342,9 +381,15 @@ def run_worker(
                     for key in ("ready", "excluded", "corrupt"):
                         state[key] = previous_counts[key] + getattr(result, key)
                     if not result.completed:
-                        raise RuntimeError(
-                            f"Post-Mask shard has retryable work: {shard.stem}"
+                        unresolved_shards.append(shard.stem)
+                        event(
+                            {
+                                "event": "post_mask_shard_incomplete",
+                                "shard": shard.stem,
+                                "retryable_clip_uids": list(result.retryable_clip_uids),
+                            }
                         )
+                        continue
                     if completed_receipt(campaign, shard) is None:
                         raise RuntimeError(
                             "worker returned without durable shard completion"
@@ -366,6 +411,16 @@ def run_worker(
                     )
                 state["completed_shards"] += 1
         state.update(current_shard=None, current_stage=None)
+        if unresolved_shards:
+            event(
+                {
+                    "event": "post_mask_worker_incomplete",
+                    "unresolved_shards": unresolved_shards,
+                }
+            )
+            raise RuntimeError(
+                f"Post-Mask shards have retryable work: {', '.join(unresolved_shards)}"
+            )
         event({"event": "post_mask_worker_completed"})
 
 
@@ -541,11 +596,11 @@ def supervise_children(children, *, poll_seconds=1):
         while True:
             codes = [child.poll() for child in children]
             failures = [code for code in codes if code not in (None, 0)]
-            if failures:
-                raise RuntimeError(
-                    f"Post-Mask worker failed with exit code {failures[0]}"
-                )
-            if all(code == 0 for code in codes):
+            if all(code is not None for code in codes):
+                if failures:
+                    raise RuntimeError(
+                        f"Post-Mask workers failed with exit codes {codes}"
+                    )
                 return
             time.sleep(poll_seconds)
     finally:

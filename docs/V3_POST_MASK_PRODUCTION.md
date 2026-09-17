@@ -54,12 +54,21 @@ remove:
   enabled: true
   backend: boogu_image_0_1_edit_turbo
   inference_profile: boogu_4step_v1
+pair:
+  enabled: true
+reference_edit:
+  enabled: true
+reference_integrity:
+  enabled: true
+instruction:
+  enabled: true
 subject_attribute_gme:
   enabled: false
 ```
 
-All ordinary V3 validation still applies. Reference-edit/integrity and attribute
-completion enablement, prompts, thresholds, seeds, endpoint configuration and
+The resolved `dataset_json` must equal the supplied `--source-jsonl`.
+All ordinary V3 validation still applies. Attribute completion enablement,
+prompts, thresholds, seeds, endpoint configuration and
 Subject Attribute policy remain exactly the supplied configuration. Instruct
 uses the normal deterministic annotation-template route, not a new Qwen call.
 Face remains bbox-first/raw fallback and never gains Boogu completion.
@@ -92,8 +101,15 @@ All sorted canonical shards are enumerated automatically (the frozen campaign
 has 384). No manual list, limit, source regeneration, recovery scheduler or
 full-image audit is performed. Ready rows hydrate through independent writable
 copies. Missing/corrupt ready input is recorded model-free and isolated.
-Canonical shard JSONL bytes are hashed at startup for immutable source identity;
-this is not a per-JPEG/PIL hydration audit.
+Campaign startup enumerates paths and semantic config identity without reading
+canonical JSONL bodies. Only the claimed shard is SHA256-bound on initialization
+and hydration/resume. Completed barriers validate small matching receipts and
+their stored SHA256, without reopening canonical bodies.
+Hydration copies only `clip.json`, `frames/frames.json`, `masks.rle.json`, listed
+sampled frames and assets referenced by the clip's references (including source
+masks). Required paths are checked for ownership/ordinary-file safety; unused
+candidate/debug trees are neither walked nor copied. Copies have independent
+inodes and writable permissions. No JPEG decoding or per-frame hashing is added.
 `coverage_rejected`, `skipped_*` and `failed_*` preserve source identity in
 `exclusions.jsonl`; corrupt ready rows go to `input_failures.jsonl`. Neither
 class enters downstream models or silently becomes an accepted Visual sample.
@@ -180,14 +196,22 @@ Restart the same command and roots after interruption. Rank/world size, GPU
 mapping and node can change. Semantic config/model/source changes are rejected;
 historical `run.json.git_commit` is retained when orchestration HEAD advances.
 Changing only physical placement or runtime concurrency does not change identity.
-The original source.yaml base path/byte hash remain historical provenance;
+New `source.yaml` records the exact base YAML path, raw-byte SHA256 and
+`load_config(base_config_path).fingerprint()` before execution overrides, not
+the prepared shard's config hash. These fields remain historical provenance;
 resume validates semantic identity, not raw YAML bytes or the latest git HEAD.
+Legacy campaign bindings/receipts remain readable without rehashing every source
+shard or rewriting their historical source descriptor.
 
 Completed shard markers are small, export-bound receipts. They skip the shard
 without Stage2 hydration or model construction. A crash after shard export but
 before its marker reuses validated publication rather than overwriting it.
 Transient/incomplete per-clip work prevents that shard's marker and makes its
-worker return nonzero; unaffected clips keep their committed progress.
+worker record `post_mask_shard_incomplete` and continue later assigned shards
+once, without retrying the incomplete shard in a loop. After all assigned shards
+are attempted, unresolved work emits `post_mask_worker_incomplete` and returns
+nonzero; unaffected clips keep their committed progress. Restart is the retry
+mechanism; unresolved shards cannot pass the global completion barrier.
 
 Existing durable terminal quality outcomes, including pairing rejection,
 `reference_edit.failed` and cached owner failure artifacts, remain terminal
@@ -197,9 +221,11 @@ the corresponding diagnostics remain. Missing owner output after an exception
 or another retryable predecessor still blocks shard publication. Do not confuse
 a terminal exclusion with recovered model success.
 
-A nonzero local worker immediately makes the node launcher fail; it terminates
-only its own worker process groups and their Boogu children, never a Qwen
-service or another job's workers. INT/TERM preserve committed progress. A
+A nonzero local worker does not kill a healthy sibling: the launcher waits for
+all already-started local workers and then reports all exit codes/nonzero failure.
+External INT/TERM or launcher abort still terminates only owned worker process
+groups and Boogu descendants, never Qwen or another job's workers, preserving
+committed progress. A
 remote node failure is normally handled by the platform; absent that, other
 ranks wait until their configurable global deadline and fail nonzero. There
 are no stale rank-failure files to poison a later topology restart.

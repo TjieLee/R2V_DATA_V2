@@ -4,7 +4,7 @@ import importlib
 import json
 import subprocess
 import sys
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import pytest
@@ -33,9 +33,16 @@ def accepted(config):
         ),
         reference_edit=replace(
             config.reference_edit,
+            enabled=True,
             python_executable=config.run_root.parent / "python",
             code_root=config.run_root.parent / "boogu",
             model_path=config.run_root.parent.parent / "models/boogu",
+        ),
+        reference_integrity=replace(config.reference_integrity, enabled=True),
+        qwen=replace(
+            config.qwen,
+            reference_edit_judge=config.qwen.candidate_judge,
+            reference_integrity_judge=config.qwen.candidate_judge,
         ),
         subject_attribute_gme=replace(config.subject_attribute_gme, enabled=False),
     )
@@ -46,7 +53,7 @@ def campaign(case):
     config = accepted(config)
     base = config.run_root.parent / "accepted.yaml"
     base.parent.mkdir(parents=True, exist_ok=True)
-    base.write_text("original accepted config provenance")
+    base.write_text(json.dumps(asdict(config), default=str))
     clips = config.dataset_json.parent / "videos"
     clips.mkdir(exist_ok=True)
     return api().prepare_campaign(
@@ -105,6 +112,11 @@ def test_campaign_resume_ignores_runtime_devices_and_new_base_bytes(case):
     _write_rows(case, [_ready(case)])
     first = campaign(case)
     descriptor = first.source_yaml.read_bytes()
+    metadata = json.loads(descriptor)
+    assert (
+        metadata["base_config_fingerprint"]
+        == api().load_config(Path(metadata["base_config_path"])).fingerprint()
+    )
     config = accepted(case[0])
     config = replace(
         config,
@@ -118,6 +130,112 @@ def test_campaign_resume_ignores_runtime_devices_and_new_base_bytes(case):
     changed = replace(config, pair=replace(config.pair, max_candidates_per_entity=2))
     with pytest.raises(ValueError, match="identity"):
         campaign((changed, *case[1:]))
+
+
+@pytest.mark.parametrize(
+    "section", ["pair", "reference_edit", "reference_integrity", "instruction"]
+)
+def test_required_production_stages_reject_disabled(case, section):
+    config = accepted(case[0])
+    config = replace(
+        config, **{section: replace(getattr(config, section), enabled=False)}
+    )
+    with pytest.raises(ValueError, match=section):
+        api().validate_production_config(config)
+
+
+def test_campaign_rejects_source_mismatch_before_writing(case):
+    config = accepted(case[0])
+    other = config.dataset_json.parent / "other.jsonl"
+    other.write_text("")
+    clips = config.dataset_json.parent / "videos"
+    clips.mkdir(exist_ok=True)
+    output = config.run_root.parent / "campaign"
+    with pytest.raises(ValueError, match="dataset_json"):
+        api().prepare_campaign(
+            config,
+            base_config_path=Path("unused.yaml"),
+            entity_mask_root=case[1],
+            post_mask_root=output,
+            source_jsonl=other,
+            clips_root=clips,
+        )
+    assert not output.exists()
+
+
+def test_campaign_and_completed_poll_never_read_canonical_contents(case, monkeypatch):
+    _write_rows(case, [])
+    second = case[2].with_name("shard-000000100-000000199.jsonl")
+    second.write_text("")
+    canonical = {case[2], second}
+    original = Path.open
+
+    def guarded(path, *args, **kwargs):
+        assert path not in canonical, "canonical body read at campaign/barrier"
+        return original(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "open", guarded)
+        c = campaign(case)
+    for shard in c.shards:
+        _completed(c, shard, count=0)
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "open", guarded)
+        assert campaign(case).identity == c.identity
+        assert all(api().completed_receipt(c, shard) for shard in c.shards)
+
+
+def test_only_claimed_shard_hashes_and_mutation_fails_resume(case, monkeypatch):
+    from r2v_data_v2.v3 import post_mask_production as production
+
+    _write_rows(case, [])
+    second = case[2].with_name("shard-000000100-000000199.jsonl")
+    second.write_text("")
+    c = campaign(case)
+    reads = []
+    original = production._digest
+
+    def observe(path):
+        if path in c.shards:
+            reads.append(path)
+        return original(path)
+
+    monkeypatch.setattr(production, "_digest", observe)
+    paths = c.paths(case[2])
+    config = accepted(case[0])
+    production.initialize_shard(config, paths, git_commit="test")
+    assert reads == [case[2]]
+    case[2].write_text("\n")
+    with pytest.raises(ValueError, match="identity mismatch"):
+        production.initialize_shard(config, paths, git_commit="test")
+    assert set(reads) == {case[2]}
+
+
+def test_legacy_campaign_receipts_resume_without_rehash_or_provenance_rewrite(
+    case, monkeypatch
+):
+    _write_rows(case, [])
+    c = campaign(case)
+    legacy = json.loads(json.dumps(c.identity))
+    legacy["shards"][case[2].stem]["shard_sha256"] = api().file_digest(case[2])
+    receipt = c.root / "campaign.json"
+    receipt.write_text(json.dumps(legacy))
+    descriptor = json.loads(c.source_yaml.read_text())
+    descriptor["campaign_sha256"] = api().digest(legacy)
+    c.source_yaml.write_text(json.dumps(descriptor))
+    historical = c.source_yaml.read_bytes()
+    _completed(c, case[2], count=0)
+    original = Path.open
+
+    def guarded(path, *args, **kwargs):
+        assert path != case[2], "legacy resume read canonical body"
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", guarded)
+    resumed = campaign(case)
+    assert resumed.identity == legacy
+    assert resumed.source_yaml.read_bytes() == historical
+    assert api().completed_receipt(resumed, case[2])
 
 
 def test_shared_shard_lock_prevents_other_process_mutation(tmp_path):
@@ -139,6 +257,28 @@ def test_shared_shard_lock_prevents_other_process_mutation(tmp_path):
         assert result.returncode != 0
     with api().exclusive_lock(lock):
         pass
+
+
+def test_unclaimed_legacy_shard_mutation_fails_before_runner(case, monkeypatch):
+    _write_rows(case, [])
+    c = campaign(case)
+    c.identity["shards"][case[2].stem]["shard_sha256"] = api().file_digest(case[2])
+    case[2].write_text("\n")
+    assert not c.paths(case[2]).identity_path.exists()
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "4")
+    with pytest.raises(ValueError, match="identity mismatch"):
+        api().run_worker(
+            c,
+            accepted(case[0]),
+            runtime=case[0].runtime,
+            rank=0,
+            world_size=1,
+            slot=0,
+            groups=(("4", "5"),),
+            git_commit="new",
+            event_callback=lambda e: None,
+            runner=lambda *a, **kw: pytest.fail("untrusted canonical reached runner"),
+        )
 
 
 def test_worker_skip_completed_and_actual_runtime_passthrough(case, monkeypatch):
@@ -204,16 +344,45 @@ def test_rank_zero_waits_for_all_markers_and_nonzero_rank_never_compacts(case):
     assert not c.compact_marker.exists()
 
 
-def test_nonzero_child_failure_propagates_and_cleans_owned_children():
+def test_nonzero_child_waits_for_healthy_sibling_before_reporting_failure(tmp_path):
+    finished = tmp_path / "healthy-finished"
     failed = subprocess.Popen(
         [sys.executable, "-c", "raise SystemExit(17)"], start_new_session=True
     )
     waiting = subprocess.Popen(
-        [sys.executable, "-c", "import time;time.sleep(60)"], start_new_session=True
+        [
+            sys.executable,
+            "-c",
+            "import time,pathlib,sys;time.sleep(.15);pathlib.Path(sys.argv[1]).write_text('done')",
+            str(finished),
+        ],
+        start_new_session=True,
     )
     with pytest.raises(RuntimeError, match="17"):
         api().supervise_children([failed, waiting], poll_seconds=0.01)
-    assert waiting.poll() is not None
+    assert waiting.returncode == 0
+    assert finished.read_text() == "done"
+
+
+def test_external_abort_still_cleans_owned_children(monkeypatch):
+    from types import SimpleNamespace
+
+    children = [
+        subprocess.Popen(
+            [sys.executable, "-c", "import time;time.sleep(60)"], start_new_session=True
+        )
+        for _ in range(2)
+    ]
+
+    def abort(_seconds):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        api(), "time", SimpleNamespace(sleep=abort, monotonic=api().time.monotonic)
+    )
+    with pytest.raises(KeyboardInterrupt):
+        api().supervise_children(children)
+    assert all(child.poll() is not None for child in children)
 
 
 def test_one_click_script_executes_repo_python_and_preserves_exit_status(tmp_path):
@@ -262,7 +431,10 @@ def _completed(c, shard, count=1):
 
     paths = c.paths(shard)
     identity = {
-        "shard_identity": c.identity["shards"][shard.stem],
+        "shard_identity": {
+            **c.identity["shards"][shard.stem],
+            "shard_sha256": api().file_digest(shard),
+        },
         "git_commit": "historical",
         "clip_count": count,
         "clip_sources_sha256": "a" * 64,
@@ -541,6 +713,10 @@ def test_launch_requires_explicit_base_and_uses_actual_runtime_overrides(
     )
     config, _campaign, groups = api().load_launch(args)
     assert config.runtime.qwen_max_inflight == 7 and config.runtime.cpu_workers == 3
+    assert (
+        json.loads(_campaign.source_yaml.read_text())["base_config_fingerprint"]
+        == accepted(case[0]).fingerprint()
+    )
     assert groups == (("4", "5"), ("6", "7"))
 
 
@@ -686,6 +862,56 @@ def test_worker_retryable_result_is_nonzero_and_never_worker_complete(
         )
     assert "post_mask_worker_completed" not in [e["event"] for e in events]
     assert not c.compact_marker.exists()
+
+
+def test_incomplete_shard_continues_later_shard_without_retry(case, monkeypatch):
+    from r2v_data_v2.v3.post_mask_runtime import ShardResult, run_post_mask_shard
+
+    _write_rows(case, [])
+    later = case[2].with_name("shard-000000100-000000199.jsonl")
+    later.write_text("")
+    c = campaign(case)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "4")
+    attempted, events = [], []
+
+    def runner(config, **kwargs):
+        shard = kwargs["paths"].shard_path
+        attempted.append(shard)
+        if shard == case[2]:
+            return ShardResult(False, 1, 0, 0, 0, ("retryable-clip",), {})
+        return run_post_mask_shard(
+            config, **kwargs, adapter_factory=_accepted_factory([])
+        )
+
+    with pytest.raises(RuntimeError, match="retryable"):
+        api().run_worker(
+            c,
+            accepted(case[0]),
+            runtime=case[0].runtime,
+            rank=0,
+            world_size=1,
+            slot=0,
+            groups=(("4", "5"),),
+            git_commit="test",
+            runner=runner,
+            event_callback=events.append,
+        )
+    assert attempted == [case[2], later]
+    assert api().completed_receipt(c, later) is not None
+    assert events[-1]["event"] == "post_mask_worker_incomplete"
+    assert events[-1]["unresolved_shards"] == [case[2].stem]
+    assert events[-1]["completed_shards"] == 1
+    assert not any(e["event"] == "post_mask_worker_completed" for e in events)
+    with pytest.raises(TimeoutError):
+        api().wait_for_global(
+            c,
+            rank=0,
+            timeout_seconds=0.01,
+            poll_seconds=0.005,
+            compactor=lambda **kwargs: pytest.fail("unresolved compaction"),
+            event_callback=events.append,
+        )
+    assert not any(e["event"] == "post_mask_global_completed" for e in events)
 
 
 def test_worker_hydration_counts_visible_during_blocking_phase(case, monkeypatch):

@@ -155,8 +155,9 @@ def test_ready_hydration_preserves_facts_and_assets_without_image_audit(
         0,
     )
     source = case[1] / row["artifact_root"] / "run" / "clips" / "clip-0"
+    assert not (storage.clip_dir("clip-0") / "candidates/candidate.png").exists()
     for path in source.rglob("*"):
-        if path.is_file():
+        if path.is_file() and path.parent.name != "candidates":
             copied = storage.clip_dir("clip-0") / path.relative_to(source)
             assert copied.read_bytes() == path.read_bytes()
             assert copied.stat().st_ino != path.stat().st_ino
@@ -354,6 +355,7 @@ def test_readonly_frozen_tree_hydrates_writable_independent_destination(case):
             path.stat().st_mode & stat.S_IWUSR
             for path in (destination, *destination.rglob("*"))
         )
+        (destination / "candidates").mkdir()
         (destination / "candidates/new.png").write_bytes(b"downstream")
         (destination / "clip.json").write_bytes(b"independent")
         assert all(path.read_bytes() == value for path, value in original.items())
@@ -485,3 +487,48 @@ def test_boolean_source_index_does_not_exclude_integer_neighbor(case):
     assert (result.clip_uids, result.corrupt) == (("clip-1",), 1)
     assert not storage.clip_path("clip-0").exists()
     assert storage.read_clip("clip-1").source.source_index == 1
+
+
+def test_minimal_hydration_never_walks_or_copies_unused_source_tree(case, monkeypatch):
+    row = _ready(case, background="pending_remove")
+    _write_rows(case, [row])
+    source = case[1] / row["artifact_root"] / "run/clips/clip-0"
+    (source / "debug").mkdir()
+    (source / "debug/unrelated-link").symlink_to(case[0].dataset_json)
+    api, paths, storage = _start(case)
+    original_rglob = Path.rglob
+
+    def forbid_source_walk(path, *args, **kwargs):
+        assert path != source, "whole source subtree walked"
+        return original_rglob(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "rglob", forbid_source_walk)
+    monkeypatch.setattr(
+        api.shutil, "copytree", lambda *a, **kw: pytest.fail("whole clip copy")
+    )
+    result = _hydrate(case, api, paths, storage)
+    assert result.ready == 1 and result.corrupt == 0
+    destination = storage.clip_dir("clip-0")
+    assert not (destination / "debug").exists()
+    assert not (destination / "candidates").exists()
+    bg = storage.read_clip("clip-0").references.background
+    assert (storage.root / bg.source_mask_path).read_bytes() == b"source mask"
+    assert len(list((destination / "frames").glob("*.jpg"))) == 10
+    assert _hydrate(case, api, paths, storage).ready == 1
+
+
+@pytest.mark.parametrize(
+    "relative", ["clip.json", "masks.rle.json", "frames/frames.json"]
+)
+def test_minimal_hydration_rejects_required_manifest_symlink(case, relative):
+    row = _ready(case)
+    _write_rows(case, [row])
+    source = case[1] / row["artifact_root"] / "run/clips/clip-0"
+    manifest = source / relative
+    target = case[0].run_root.parent / "borrowed-manifest"
+    target.write_bytes(manifest.read_bytes())
+    manifest.unlink()
+    manifest.symlink_to(target)
+    api, paths, storage = _start(case)
+    assert _hydrate(case, api, paths, storage).corrupt == 1
+    assert not storage.clip_path("clip-0").exists()
