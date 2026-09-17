@@ -415,14 +415,42 @@ def hydrate_shard(
             destination = _beneath(storage.root, f"clips/{uid}")
             marker = destination / _PROVENANCE
             if destination.exists():
+                marker = _beneath(destination, _PROVENANCE)
                 if not marker.is_file() or json.loads(marker.read_text()) != provenance:
                     raise ValueError("published clip hydration provenance mismatch")
+                if not _beneath(destination, "clip.json").is_file():
+                    raise ValueError("missing durable Post-Mask clip.json")
                 current = storage.read_clip(uid)
                 original = ClipRecord.model_validate_json(
                     (source / "clip.json").read_text()
                 )
                 if current.clip_uid != uid or current.source != original.source:
                     raise ValueError("published clip source identity mismatch")
+                for path in required:
+                    relative = path.relative_to(source).as_posix()
+                    if relative == "clip.json":
+                        continue  # Mutable downstream state is never rehydrated.
+                    target = _beneath(destination, relative)
+                    if target.exists() and not target.is_file():
+                        raise ValueError("non-regular hydrated input")
+                    corrupt_manifest = (
+                        relative in ("frames/frames.json", "masks.rle.json")
+                        and target.is_file()
+                        and _digest(target) != provenance["manifests"][relative]
+                    )
+                    if not target.exists() or corrupt_manifest:
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        temporary = target.with_name(
+                            f".{target.name}.post-mask-{uuid.uuid4().hex}.tmp"
+                        )
+                        try:
+                            shutil.copy2(path, temporary)
+                            temporary.chmod(
+                                temporary.stat().st_mode | stat.S_IRUSR | stat.S_IWUSR
+                            )
+                            temporary.replace(target)
+                        finally:
+                            temporary.unlink(missing_ok=True)
             else:
                 staging = _beneath(paths.staging_root, uid)
                 if staging.exists():

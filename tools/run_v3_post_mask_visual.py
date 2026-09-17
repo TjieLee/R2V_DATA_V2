@@ -35,6 +35,7 @@ from r2v_data_v2.v3.post_mask_production import (
 from r2v_data_v2.v3.production_source import JEA_VIDEO_MOTION_ADAPTER
 
 SOURCE_ROOT = Path("/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed")
+EXPECTED_PRODUCTION_SHARDS = 384
 
 
 def emit(event):
@@ -170,8 +171,18 @@ def prepare_campaign(
     ):
         raise ValueError("source JSONL and clips root must be public dataset inputs")
     shards = enumerate_shards(frozen)
-    if not shards:
-        raise ValueError("no canonical Stage2 shards")
+    stage1 = {p.name for p in enumerate_shards(frozen.parent / "entity_annotations")}
+    stage2 = {p.name for p in shards}
+    if (
+        len(stage1) != EXPECTED_PRODUCTION_SHARDS
+        or len(stage2) != EXPECTED_PRODUCTION_SHARDS
+        or stage1 != stage2
+    ):
+        raise ValueError(
+            f"expected Stage1/Stage2 canonical shard closure {EXPECTED_PRODUCTION_SHARDS}/{EXPECTED_PRODUCTION_SHARDS}; "
+            f"stage1={len(stage1)}, stage2={len(stage2)}, "
+            f"missing={sorted(stage1 - stage2)[:5]}, extra={sorted(stage2 - stage1)[:5]}"
+        )
     tag = root.name
     runs = writable / "r2v_v3_runs/production/jea_motion_v1" / tag
     exports = writable / "r2v_v3_exports/production/jea_motion_v1" / tag
@@ -573,6 +584,8 @@ def terminate_owned_children(children):
     # Each child starts its own session; its Boogu descendants inherit that
     # owned process group. Never inspect/kill unrelated GPU or serving processes.
     for child in children:
+        if child.poll() is not None:
+            continue
         try:
             os.killpg(child.pid, signal.SIGTERM)
         except ProcessLookupError:
@@ -584,6 +597,8 @@ def terminate_owned_children(children):
         except subprocess.TimeoutExpired:
             pass
     for child in children:
+        if child.poll() is not None:
+            continue
         try:
             os.killpg(child.pid, signal.SIGKILL)
         except ProcessLookupError:
@@ -597,14 +612,13 @@ def supervise_children(children, *, poll_seconds=1):
             codes = [child.poll() for child in children]
             failures = [code for code in codes if code not in (None, 0)]
             if all(code is not None for code in codes):
-                if failures:
-                    raise RuntimeError(
-                        f"Post-Mask workers failed with exit codes {codes}"
-                    )
-                return
+                break
             time.sleep(poll_seconds)
-    finally:
+    except BaseException:
         terminate_owned_children(children)
+        raise
+    if failures:
+        raise RuntimeError(f"Post-Mask workers failed with exit codes {codes}")
 
 
 def parser():

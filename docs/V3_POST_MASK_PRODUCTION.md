@@ -98,7 +98,11 @@ clips:  /mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/clips_
 ```
 
 All sorted canonical shards are enumerated automatically (the frozen campaign
-has 384). No manual list, limit, source regeneration, recovery scheduler or
+has 384). Before publishing any campaign/source descriptor, the launcher requires
+exactly 384 canonical filenames in both Stage2 `parts/` and the sibling
+`entity_annotations/parts/`, with identical name sets. Missing/replaced names
+fail with counts and bounded previews. This check reads directory metadata only,
+not JSONL bodies or artifacts. No manual list, limit, source regeneration, recovery scheduler or
 full-image audit is performed. Ready rows hydrate through independent writable
 copies. Missing/corrupt ready input is recorded model-free and isolated.
 Campaign startup enumerates paths and semantic config identity without reading
@@ -110,6 +114,16 @@ sampled frames and assets referenced by the clip's references (including source
 masks). Required paths are checked for ownership/ordinary-file safety; unused
 candidate/debug trees are neither walked nor copied. Copies have independent
 inodes and writable permissions. No JPEG decoding or per-frame hashing is added.
+On hydration resume, provenance and the current downstream `clip.json` must
+validate first. Missing immutable mirror files are restored from frozen Stage2;
+the small frames/masks JSON manifests are also restored if their provenance
+hash differs. Existing regular image payloads and generated downstream assets
+are left alone. Unsafe destinations are isolated, never followed/overwritten.
+Restored files are copied to a unique same-directory temporary file and atomically
+published, so an interrupted copy never becomes a seemingly complete payload.
+Missing/corrupt downstream `clip.json` or hydration provenance is not repaired:
+the original Stage2 clip state must never replace downstream durable progress.
+Mirror restoration is model-free and invokes no Stage2 recovery.
 `coverage_rejected`, `skipped_*` and `failed_*` preserve source identity in
 `exclusions.jsonl`; corrupt ready rows go to `input_failures.jsonl`. Neither
 class enters downstream models or silently becomes an accepted Visual sample.
@@ -223,7 +237,8 @@ a terminal exclusion with recovered model success.
 
 A nonzero local worker does not kill a healthy sibling: the launcher waits for
 all already-started local workers and then reports all exit codes/nonzero failure.
-External INT/TERM or launcher abort still terminates only owned worker process
+Normal all-exited success or failure sends no process-group signals.
+External INT/TERM or launcher abort still terminates only live owned worker process
 groups and Boogu descendants, never Qwen or another job's workers, preserving
 committed progress. A
 remote node failure is normally handled by the platform; absent that, other

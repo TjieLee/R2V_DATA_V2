@@ -6,6 +6,7 @@ import subprocess
 import sys
 from dataclasses import asdict, replace
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -48,7 +49,7 @@ def accepted(config):
     )
 
 
-def campaign(case):
+def campaign(case, *, strict_closure=False):
     config, root, _shard = case
     config = accepted(config)
     base = config.run_root.parent / "accepted.yaml"
@@ -56,14 +57,84 @@ def campaign(case):
     base.write_text(json.dumps(asdict(config), default=str))
     clips = config.dataset_json.parent / "videos"
     clips.mkdir(exist_ok=True)
-    return api().prepare_campaign(
-        config,
-        base_config_path=base,
-        entity_mask_root=root,
-        post_mask_root=config.run_root.parent / "campaign",
-        source_jsonl=config.dataset_json,
-        clips_root=clips,
+    names = [p.name for p in (root / "parts").glob("shard-*.jsonl")]
+    if not strict_closure:
+        annotations = root.parent / "entity_annotations/parts"
+        annotations.mkdir(parents=True, exist_ok=True)
+        for name in names:
+            (annotations / name).touch()
+    with patch.object(
+        api(),
+        "EXPECTED_PRODUCTION_SHARDS",
+        384 if strict_closure else len(names),
+        create=True,
+    ):
+        return api().prepare_campaign(
+            config,
+            base_config_path=base,
+            entity_mask_root=root,
+            post_mask_root=config.run_root.parent / "campaign",
+            source_jsonl=config.dataset_json,
+            clips_root=clips,
+        )
+
+
+@pytest.mark.parametrize(
+    "problem", [None, "stage2_missing", "stage1_missing", "replaced"]
+)
+def test_first_campaign_requires_exact_filename_closure(case, monkeypatch, problem):
+    annotations = case[1].parent / "entity_annotations/parts"
+    annotations.mkdir(parents=True)
+    for i in range(384):
+        name = f"shard-{i * 100:09d}-{i * 100 + 99:09d}.jsonl"
+        (annotations / name).touch()
+        (case[2].parent / name).touch()
+    last = "shard-000038300-000038399.jsonl"
+    if problem == "stage1_missing":
+        (annotations / last).unlink()
+    elif problem == "stage2_missing":
+        (case[2].parent / last).unlink()
+    elif problem == "replaced":
+        (case[2].parent / last).rename(
+            case[2].parent / "shard-000038400-000038499.jsonl"
+        )
+    original = Path.open
+
+    def no_body(path, *args, **kwargs):
+        assert path.parent not in (annotations, case[2].parent), (
+            "canonical content read"
+        )
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", no_body)
+    if problem is None:
+        assert len(campaign(case, strict_closure=True).shards) == 384
+    else:
+        with pytest.raises(ValueError, match="closure 384/384"):
+            campaign(case, strict_closure=True)
+        assert not (case[0].run_root.parent / "campaign").exists()
+        assert not list(case[0].run_root.parent.parent.rglob("source.yaml"))
+
+
+@pytest.mark.parametrize("codes", [(0, 0), (17, 0)])
+def test_naturally_exited_children_never_signalled(monkeypatch, codes):
+    children = [
+        subprocess.Popen(
+            [sys.executable, "-c", f"raise SystemExit({code})"], start_new_session=True
+        )
+        for code in codes
+    ]
+    for child in children:
+        child.wait()
+    monkeypatch.setattr(
+        api().os, "killpg", lambda *a: pytest.fail("signalled exited process")
     )
+    if codes[0]:
+        with pytest.raises(RuntimeError, match="17"):
+            api().supervise_children(children, poll_seconds=0.01)
+    else:
+        api().supervise_children(children, poll_seconds=0.01)
+    api().terminate_owned_children(children)
 
 
 def test_384_shards_assignment_complete_disjoint_and_balanced():
@@ -344,7 +415,9 @@ def test_rank_zero_waits_for_all_markers_and_nonzero_rank_never_compacts(case):
     assert not c.compact_marker.exists()
 
 
-def test_nonzero_child_waits_for_healthy_sibling_before_reporting_failure(tmp_path):
+def test_nonzero_child_waits_for_healthy_sibling_before_reporting_failure(
+    tmp_path, monkeypatch
+):
     finished = tmp_path / "healthy-finished"
     failed = subprocess.Popen(
         [sys.executable, "-c", "raise SystemExit(17)"], start_new_session=True
@@ -357,6 +430,9 @@ def test_nonzero_child_waits_for_healthy_sibling_before_reporting_failure(tmp_pa
             str(finished),
         ],
         start_new_session=True,
+    )
+    monkeypatch.setattr(
+        api().os, "killpg", lambda *a: pytest.fail("normal completion signalled")
     )
     with pytest.raises(RuntimeError, match="17"):
         api().supervise_children([failed, waiting], poll_seconds=0.01)
@@ -711,6 +787,12 @@ def test_launch_requires_explicit_base_and_uses_actual_runtime_overrides(
             ]
         )
     )
+    annotations = case[1].parent / "entity_annotations/parts"
+    annotations.mkdir(parents=True)
+    for i in range(384):
+        name = f"shard-{i * 100:09d}-{i * 100 + 99:09d}.jsonl"
+        (annotations / name).touch()
+        (case[2].parent / name).touch()
     config, _campaign, groups = api().load_launch(args)
     assert config.runtime.qwen_max_inflight == 7 and config.runtime.cpu_workers == 3
     assert (

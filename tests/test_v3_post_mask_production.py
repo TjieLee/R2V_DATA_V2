@@ -532,3 +532,131 @@ def test_minimal_hydration_rejects_required_manifest_symlink(case, relative):
     api, paths, storage = _start(case)
     assert _hydrate(case, api, paths, storage).corrupt == 1
     assert not storage.clip_path("clip-0").exists()
+
+
+@pytest.mark.parametrize(
+    "asset", ["frames/00.jpg", "frames/frames.json", "masks.rle.json", "source_mask"]
+)
+def test_resume_restores_immutable_inputs_without_resetting_durable_state(
+    case, asset, monkeypatch
+):
+    row = _ready(case, background="pending_remove")
+    _write_rows(case, [row])
+    api, paths, storage = _start(case)
+    assert _hydrate(case, api, paths, storage).ready == 1
+    destination = storage.clip_dir("clip-0")
+    frozen = case[1] / row["artifact_root"] / "run/clips/clip-0"
+    before = {
+        p.relative_to(frozen): p.read_bytes() for p in frozen.rglob("*") if p.is_file()
+    }
+    clip = storage.clip_path("clip-0")
+    payload = json.loads(clip.read_text())
+    payload["pairing"] = {"status": "rejected", "reason": "durable quality rejection"}
+    clip.write_text(json.dumps(payload))
+    durable = clip.read_bytes()
+    generated = destination / "generated/reference.png"
+    generated.parent.mkdir()
+    generated.write_bytes(b"keep generated output")
+    if asset == "source_mask":
+        target = (
+            storage.root
+            / storage.read_clip("clip-0").references.background.source_mask_path
+        )
+    else:
+        target = destination / asset
+    expected = target.read_bytes()
+    target.unlink()
+    original_digest = api._digest
+
+    def no_image_hash(path):
+        assert path.suffix not in (".jpg", ".png")
+        return original_digest(path)
+
+    monkeypatch.setattr(api, "_digest", no_image_hash)
+    for module, function in (
+        ("frames", "sample_frames"),
+        ("segment", "segment_clips"),
+        ("background", "build_background_candidates"),
+    ):
+        module_api = importlib.import_module(f"r2v_data_v2.v3.{module}")
+        monkeypatch.setattr(
+            module_api,
+            function,
+            lambda *a, **kw: pytest.fail("Stage2 regeneration during mirror restore"),
+        )
+    assert _hydrate(case, api, paths, storage).ready == 1
+    assert target.read_bytes() == expected
+    assert clip.read_bytes() == durable
+    assert generated.read_bytes() == b"keep generated output"
+    assert not (destination / "candidates").exists()
+    assert before == {
+        p.relative_to(frozen): p.read_bytes() for p in frozen.rglob("*") if p.is_file()
+    }
+
+
+@pytest.mark.parametrize("asset", ["frames/frames.json", "masks.rle.json"])
+def test_resume_repairs_corrupt_small_manifest(case, asset):
+    _write_rows(case, [_ready(case)])
+    api, paths, storage = _start(case)
+    _hydrate(case, api, paths, storage)
+    target = storage.clip_dir("clip-0") / asset
+    expected = target.read_bytes()
+    target.write_text("broken JSON")
+    assert _hydrate(case, api, paths, storage).ready == 1
+    assert target.read_bytes() == expected
+
+
+def test_interrupted_mirror_restore_never_leaves_partial_published_image(
+    case, monkeypatch
+):
+    _write_rows(case, [_ready(case)])
+    api, paths, storage = _start(case)
+    _hydrate(case, api, paths, storage)
+    target = storage.frame_path("clip-0", 0)
+    expected = target.read_bytes()
+    clip_bytes = storage.clip_path("clip-0").read_bytes()
+    target.unlink()
+
+    def interrupted(source, destination):
+        Path(destination).write_bytes(b"partial")
+        raise OSError("interrupted copy")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(api.shutil, "copy2", interrupted)
+        assert _hydrate(case, api, paths, storage).corrupt == 1
+    assert not target.exists()
+    assert not list(target.parent.glob("*.tmp"))
+    assert storage.clip_path("clip-0").read_bytes() == clip_bytes
+    assert _hydrate(case, api, paths, storage).ready == 1
+    assert target.read_bytes() == expected
+
+
+@pytest.mark.parametrize(
+    "damage",
+    ["missing_clip", "corrupt_clip", "symlink", "directory", "missing_provenance"],
+)
+def test_resume_never_resets_mutable_or_unsafe_destination(case, damage):
+    _write_rows(case, [_ready(case)])
+    api, paths, storage = _start(case)
+    _hydrate(case, api, paths, storage)
+    clip = storage.clip_path("clip-0")
+    frame = storage.frame_path("clip-0", 0)
+    if damage == "missing_clip":
+        clip.unlink()
+    elif damage == "corrupt_clip":
+        clip.write_text("broken")
+    elif damage == "missing_provenance":
+        (clip.parent / ".post_mask_hydration.json").unlink()
+    else:
+        frame.unlink()
+        if damage == "symlink":
+            frame.symlink_to(case[0].dataset_json)
+        else:
+            frame.mkdir()
+    assert _hydrate(case, api, paths, storage).corrupt == 1
+    if damage == "missing_clip":
+        assert not clip.exists()
+    elif damage == "corrupt_clip":
+        assert clip.read_text() == "broken"
+    elif damage == "symlink":
+        assert frame.is_symlink()
