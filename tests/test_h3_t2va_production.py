@@ -1,4 +1,5 @@
 import json
+from collections import Counter
 
 import pytest
 
@@ -50,3 +51,90 @@ def test_invalid_rows_do_not_shift_shards(tmp_path):
     assert (
         production.materialize_shard(index, 1, root).read_bytes() == b'{"last":true}\n'
     )
+
+
+class FakeProcessor:
+    def __init__(self):
+        self.calls = Counter()
+        self.fail = set()
+        self.interrupt = None
+
+    def identity(self, row):
+        return str(row["clip_uid"])
+
+    def process(self, stage, row, temporary, destination):
+        key = (row["clip_uid"], stage)
+        self.calls[key] += 1
+        if key == self.interrupt:
+            raise KeyboardInterrupt()
+        if key in self.fail:
+            raise ValueError("synthetic sample failure")
+        (temporary / "result.txt").write_text(str(key))
+        return {"exports": {}, "model_call_count": 1}
+
+
+def sample_rows(n=3):
+    return [
+        {"source_index": i, "clip_uid": f"clip{i}", "video": f"/video/{i}.mp4"}
+        for i in range(n)
+    ]
+
+
+def test_failure_isolation_and_stage_resume(tmp_path):
+    processor = FakeProcessor()
+    processor.fail = {("clip1", "t2va"), ("clip2", "ta2va")}
+    production.process_shard(tmp_path, 0, sample_rows(), processor, request_workers=1)
+    states = production.load_states(tmp_path / "shards" / production.shard_name(0))
+    assert states["clip0"]["ta2va_status"] == "ready"
+    assert states["clip1"]["t2va_status"] == "failed"
+    assert states["clip1"]["ta2va_status"] == "skipped"
+    assert states["clip2"]["t2va_status"] == "ready"
+    assert states["clip2"]["ta2va_status"] == "failed"
+    processor.fail.clear()
+    production.process_shard(tmp_path, 0, sample_rows(), processor, request_workers=1)
+    assert processor.calls["clip0", "t2va"] == 1
+    assert processor.calls["clip1", "t2va"] == 2
+    assert processor.calls["clip2", "t2va"] == 1
+    assert processor.calls["clip2", "ta2va"] == 2
+
+
+def test_interrupt_and_artifact_recovery(tmp_path):
+    processor = FakeProcessor()
+    processor.interrupt = ("clip3", "t2va")
+    with pytest.raises(KeyboardInterrupt):
+        production.process_shard(
+            tmp_path, 0, sample_rows(5), processor, request_workers=1
+        )
+    shard = tmp_path / "shards" / production.shard_name(0)
+    (shard / "state.jsonl.partial").write_bytes(b'{"partial":')
+    processor.interrupt = None
+    production.process_shard(tmp_path, 0, sample_rows(5), processor, request_workers=1)
+    assert all(processor.calls[f"clip{i}", "t2va"] == 1 for i in range(3))
+    assert processor.calls["clip4", "ta2va"] == 1
+
+
+def test_skipped_and_lock(tmp_path):
+    processor = FakeProcessor()
+    rows = sample_rows(1)
+    rows[0]["upstream_failure"] = "audio_preprocessing_required"
+    production.process_shard(tmp_path, 0, rows, processor)
+    production.process_shard(tmp_path, 0, rows, processor)
+    assert not processor.calls
+    with (
+        production.file_lock(tmp_path / "lock"),
+        pytest.raises(production.ShardLockedError),
+        production.file_lock(tmp_path / "lock"),
+    ):
+        pass
+
+
+def test_endpoint_outage_stops_scheduling(tmp_path):
+    class Offline(FakeProcessor):
+        def process(self, *args):
+            raise production.EndpointUnavailable("connection refused")
+
+    with pytest.raises(production.EndpointUnavailable):
+        production.process_shard(
+            tmp_path, 0, sample_rows(100), Offline(), request_workers=1
+        )
+    assert not production.load_states(tmp_path / "shards" / production.shard_name(0))
