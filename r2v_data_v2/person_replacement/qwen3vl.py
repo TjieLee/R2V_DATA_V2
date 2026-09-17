@@ -2,6 +2,46 @@
 
 from pathlib import Path
 
+TWO_SOURCE_PROMPT = """Watch this whole single-shot video. Identify the two main physical performers.
+Give stable anchors using clothing, hair, visible appearance and stable role/action cues.
+Initial left/right location is only an initial locator: each Subject label must follow the same
+physical performer throughout crossings, overlap, occlusion and screen-order changes.
+In SHOT_DESCRIPTION describe only the actual single-shot progression: starting positions,
+each subject's actions, hand-body/hand-object/person-person contact, props, occlusions,
+crossings and camera movement/framing changes. Do not invent actions or infer race/ethnicity.
+Use English and Subject 1 / Subject 2 consistently. No shot headers, markdown or explanation.
+Return exactly three nonempty single-line labelled fields:
+SOURCE_SUBJECT_1: ...
+SOURCE_SUBJECT_2: ...
+SHOT_DESCRIPTION: ..."""
+
+TWO_REPLACEMENT_PROMPT = """Invent two ordinary realistic replacement people.
+Source Subject 1: {subject1}
+Source Subject 2: {subject2}
+Replacement 1 must look clearly different from Source 1; Replacement 2 from Source 2.
+The two replacements must also be clearly distinguishable from each other through hair,
+clothing and visible appearance. No celebrities, fantasy characters or exaggerated bodies.
+Describe appearance only, never change pose/action. Do not infer race or ethnicity.
+Return English, exactly two nonempty single-line labelled fields, no markdown/explanation:
+REPLACEMENT_SUBJECT_1: ...
+REPLACEMENT_SUBJECT_2: ..."""
+
+
+def _labelled_fields(text: str, labels: tuple[str, ...]) -> tuple[str, ...]:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(lines) != len(labels):
+        raise ValueError("Qwen must return exactly the requested labelled fields")
+    values = []
+    for line, label in zip(lines, labels, strict=True):
+        prefix = label + ":"
+        if not line.startswith(prefix):
+            raise ValueError(f"Missing or out-of-order Qwen field: {label}")
+        value = line[len(prefix):].strip()
+        if not value or "[shot" in value.lower():
+            raise ValueError(f"Empty or shot-header-containing Qwen field: {label}")
+        values.append(value)
+    return tuple(values)
+
 SOURCE_PROMPT = """Watch this video and briefly describe the single main person so that a video-editing model can unambiguously identify which person should be replaced.
 Use stable visible characteristics such as clothing, hair, overall appearance, and approximate location in the frame.
 Also include any stable pose or action and any hand-body or hand-object contact that is clearly visible and useful for preserving the original performance, for example both hands inside trouser pockets, holding an object, or resting a hand on the body.
@@ -95,3 +135,14 @@ class LocalQwen:
         gc.collect()
         if hasattr(torch, "cuda") and torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    def describe_two(self, video: Path) -> tuple[str, str, str]:
+        return _labelled_fields(self._text([
+            {"type":"video", "path":str(video.resolve(strict=True))},
+            {"type":"text", "text":TWO_SOURCE_PROMPT},
+        ]), ("SOURCE_SUBJECT_1", "SOURCE_SUBJECT_2", "SHOT_DESCRIPTION"))
+
+    def invent_two(self, subject1: str, subject2: str) -> tuple[str, str]:
+        return _labelled_fields(self._text([{
+            "type":"text", "text":TWO_REPLACEMENT_PROMPT.format(subject1=subject1, subject2=subject2),
+        }]), ("REPLACEMENT_SUBJECT_1", "REPLACEMENT_SUBJECT_2"))

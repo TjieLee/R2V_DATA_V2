@@ -59,7 +59,8 @@ def test_lightx2v_original_video_job_and_exact_command(tmp_path, monkeypatch, fs
     assert metadata["inference_nfe"] == 8
 
 
-def test_pdd_official_head_loader_and_video_reference(tmp_path, monkeypatch):
+@pytest.mark.parametrize("with_image", [False, True])
+def test_pdd_official_head_loader_and_video_reference(tmp_path, monkeypatch, with_image):
     from tools.person_replacement.h3_pdd_worker import generate
 
     calls = []
@@ -80,7 +81,7 @@ def test_pdd_official_head_loader_and_video_reference(tmp_path, monkeypatch):
             assert kwargs["dtype"] == "bf16"
             assert kwargs["pretrained_model_name_or_path"] == str(tmp_path)
         def __call__(self, **kwargs):
-            assert kwargs["references"] == ["whole video"]
+            assert kwargs["references"] == ["whole video"] + (["edited frame"] if with_image else [])
             assert kwargs["num_inference_steps"] == 9
             assert kwargs["num_frames"] == 141
             return {"videos":["video"], "audio":["audio"], "sampling_rate":32000}
@@ -101,13 +102,15 @@ def test_pdd_official_head_loader_and_video_reference(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules,"diffusers", SimpleNamespace(ComponentsManager=Manager,
         ModularPipeline=SimpleNamespace(from_pretrained=from_pretrained)))
     monkeypatch.setitem(sys.modules,"diffusers.modular_pipelines.minimax_h3", SimpleNamespace(
-        MiniMaxH3VideoReference=SimpleNamespace(from_file=lambda p: "whole video")))
+        MiniMaxH3VideoReference=SimpleNamespace(from_file=lambda p: "whole video"),
+        MiniMaxH3ImageReference=SimpleNamespace(from_file=lambda p: "edited frame")))
     monkeypatch.setitem(sys.modules,"diffusers.utils.export_utils", SimpleNamespace(
         encode_video=lambda *a, **k: Path(k["output_path"]).write_bytes(b"raw")))
     monkeypatch.setitem(sys.modules,"minimax_h3_pdd", SimpleNamespace(apply_pdd_lora=apply))
     metadata = generate(model_root=tmp_path, checkpoint=tmp_path/PDD_CHECKPOINT,
         source=tmp_path/"original.mp4", prompt="shared", frames=141, width=1376, height=768,
-        output=tmp_path/"raw.mp4", seed=42)
+        output=tmp_path/"raw.mp4", seed=42,
+        **({"reference_image":tmp_path/"repainted.png"} if with_image else {}))
     assert calls == [(transformer,str(tmp_path/PDD_CHECKPOINT),12.,3.)]
     assert metadata["pdd_num_steps"] == 32 and metadata["pdd_block_size"] == 4
     assert metadata["inference_nfe"] == 8
@@ -118,6 +121,27 @@ def test_pdd_adapter_uses_own_worker_not_generic_lora(tmp_path):
     cmd = backend.command(tmp_path/"job.json")
     assert "h3_pdd_worker.py" in cmd[1]
     assert "--pdd-code-root" in cmd
+
+
+@pytest.mark.parametrize("with_image", [False, True])
+def test_pdd_adapter_optional_image_job(tmp_path, monkeypatch, with_image):
+    from r2v_data_v2.person_replacement.h3_ref2va import PDD_REVISION
+
+    backend = h3_pdd.PDDBackend(sys.executable,tmp_path,tmp_path,tmp_path/PDD_CHECKPOINT)
+    image = tmp_path/"edited.png"
+    image.write_bytes(b"image")
+    def run(command, **kwargs):
+        (tmp_path/"pdd_metadata.json").write_text(json.dumps({"inference_nfe":8,"code_revision":PDD_REVISION}))
+    monkeypatch.setattr(h3_pdd.subprocess,"run",run)
+    plan = plan_h3_timeline(VideoTimeline(138,25,25,1,1920,1080,5.52))
+    backend.run(tmp_path/"original.mp4", "prompt", plan, "16:9", tmp_path, 42,
+                **({"reference_image":image} if with_image else {}))
+    job = json.loads((tmp_path/"job.json").read_text())
+    assert job["source"] == str(tmp_path/"original.mp4")
+    assert ("reference_image" in job) == with_image
+    if with_image:
+        assert job["reference_image"] == str(image)
+    assert job["frames"] == 141 and (job["width"],job["height"]) == (1376,768)
 
 
 def test_pdd_worker_rejects_ordinary_lora_even_with_correct_filename(tmp_path, monkeypatch):

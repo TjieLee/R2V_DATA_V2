@@ -34,12 +34,15 @@ class PDDBackend:
         worker = Path(__file__).resolve().parents[2]/"tools/person_replacement/h3_pdd_worker.py"
         return [str(self.python), str(worker), "--job",str(job), "--pdd-code-root",str(self.code_root)]
 
-    def run(self, video, prompt, plan, aspect, directory, seed):
+    def run(self, video, prompt, plan, aspect, directory, seed, *, reference_image=None):
         width, height = output_size(aspect)
         job = directory/"job.json"
-        job.write_text(json.dumps({"source":str(video), "prompt":prompt, "frames":plan.native_frame_count,
+        payload = {"source":str(video), "prompt":prompt, "frames":plan.native_frame_count,
             "width":width, "height":height, "seed":seed, "model_root":str(self.model_root),
-            "checkpoint":str(self.lora), "output":str(directory/"raw.mp4")}, ensure_ascii=False), encoding="utf-8")
+            "checkpoint":str(self.lora), "output":str(directory/"raw.mp4")}
+        if reference_image is not None:
+            payload["reference_image"] = str(require_local(reference_image, "reference image"))
+        job.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         command = self.command(job)
         with (directory/"log.txt").open("w") as log:
             log.write(json.dumps(command)+"\n")

@@ -49,7 +49,8 @@ def validate_loaded_pdd_weights(checkpoint, transformer):
                 raise ValueError(f"Incomplete/incompatible PDD tensor shape: {name}")
 
 
-def generate(*, model_root, checkpoint, source, prompt, frames, width, height, output, seed):
+def generate(*, model_root, checkpoint, source, prompt, frames, width, height, output, seed,
+             reference_image=None):
     # Same construction / schedule / head injection as pinned predict_ref2v.py.
     # Only reference modality, requested geometry/timeline and output are supplied by our job.
     import torch
@@ -72,7 +73,12 @@ def generate(*, model_root, checkpoint, source, prompt, frames, width, height, o
     if (nfe != 8 or arm.nfe != nfe or steps != nfe*arm.block_size
             or pipeline.transformer_ref.audio_proj_out.num_steps != steps):
         raise ValueError("PDD checkpoint/head plan is not the requested 8-NFE contract")
-    result = pipeline(prompt=prompt, references=[MiniMaxH3VideoReference.from_file(str(source))],
+    references = [MiniMaxH3VideoReference.from_file(str(source))]
+    if reference_image is not None:
+        from diffusers.modular_pipelines.minimax_h3 import MiniMaxH3ImageReference
+
+        references.append(MiniMaxH3ImageReference.from_file(str(reference_image)))
+    result = pipeline(prompt=prompt, references=references,
         height=height, width=width, num_frames=frames, num_inference_steps=nfe+1,
         generator=torch.Generator().manual_seed(seed), output_type="np", output=["videos","audio","sampling_rate"])
     encode_video(result["videos"][0], fps=24, output_path=str(output),
@@ -95,6 +101,8 @@ def main(argv=None):
     validate_pdd_weights(job["checkpoint"])
     require_local(job["model_root"], "H3 base", directory=True)
     require_local(job["source"], "original processed source")
+    if job.get("reference_image") is not None:
+        require_local(job["reference_image"], "edited first-frame reference")
     output = Path(job["output"])
     if output.resolve().parent != args.job.resolve().parent or output.exists():
         raise ValueError("PDD output must be a new case-local file")

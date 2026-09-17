@@ -52,8 +52,9 @@ def validate_output_root(path: Path) -> Path:
     return output
 
 
-def select_cases(input_jsonl: Path, clips_root: Path, output_root: Path, *, limit: int) -> list[dict]:
-    if input_jsonl.name == "collected_face_2.jsonl":
+def select_cases(input_jsonl: Path, clips_root: Path, output_root: Path, *, limit: int,
+                 allow_two_person: bool = False) -> list[dict]:
+    if input_jsonl.name == "collected_face_2.jsonl" and not allow_two_person:
         raise ValueError("collected_face_2.jsonl is not enabled for this pilot")
     if input_jsonl.suffix.lower() != ".jsonl" or limit < 1:
         raise ValueError("require JSONL input and a positive --limit")
