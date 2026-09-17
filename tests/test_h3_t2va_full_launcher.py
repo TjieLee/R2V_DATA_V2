@@ -169,6 +169,7 @@ sys.exit(int(os.environ.get("RUN_STATUS", "0")))
             "SHARDS",
             "SHARD_END",
             "REQUEST_WORKERS",
+            "CANONICAL_WORKERS",
             "CUDA_VISIBLE_DEVICES",
         }
     }
@@ -291,6 +292,7 @@ def test_dry_run_exact_accepted_server_and_full_cli(sandbox):
     assert serve == shlex.split(original.stdout.splitlines()[0])
     assert run[1] == "tools/run_h3_t2va_full_production.py"
     assert run[run.index("--request-workers") + 1] == "1"
+    assert run[run.index("--canonical-workers") + 1] == "16"
     assert run[run.index("--gpu-ids") + 1] == "0,1,2,3,4,5,6,7"
     assert run[run.index("--shards") + 1] == "59,12,87"
     assert "--audio-production-root" not in run
@@ -322,6 +324,7 @@ def test_range_and_optional_arguments(sandbox):
         FFMPEG="/custom/ffmpeg",
         ALLOW_UNVERIFIED="1",
         REQUEST_WORKERS="3",
+        CANONICAL_WORKERS="5",
     )
     result = invoke(script, env, "--dry-run")
     assert result.returncode == 0, result.stderr
@@ -335,6 +338,7 @@ def test_range_and_optional_arguments(sandbox):
         "gpu-ids": "7",
         "ffmpeg": "/custom/ffmpeg",
         "request-workers": "3",
+        "canonical-workers": "5",
     }.items():
         assert run[run.index("--" + flag) + 1] == value
     assert "--shards" not in run

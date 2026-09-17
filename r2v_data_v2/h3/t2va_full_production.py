@@ -6,6 +6,7 @@ import json
 import os
 import traceback
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from pathlib import Path
 
@@ -82,6 +83,7 @@ class FullPipeline:
         profiles,
         allow_unverified=False,
         request_workers=1,
+        canonical_workers=16,
         ffmpeg="ffmpeg",
         ffprobe="ffprobe",
     ):
@@ -95,6 +97,9 @@ class FullPipeline:
         self.backend, self.profiles = backend, profiles
         self.allow_unverified, self.request_workers = allow_unverified, request_workers
         self.ffmpeg, self.ffprobe = ffmpeg, ffprobe
+        if canonical_workers < 1:
+            raise ValueError("canonical workers must be positive")
+        self.canonical_workers = canonical_workers
         self.audio_root = None
         self.pools = None
 
@@ -181,6 +186,7 @@ class FullPipeline:
                 shard,
                 selection,
                 FFmpegAudioMediaBackend(ffmpeg=self.ffmpeg, ffprobe=self.ffprobe),
+                canonical_workers=self.canonical_workers,
             )
             rows = list(
                 production.complete_rows(
@@ -358,12 +364,16 @@ def shard_selection(root, index, shard_id, clips_root, source_videos_root):
     return selection
 
 
-def bootstrap_audio(shard: Path, selection: T2VAShotSelection, backend):
+def bootstrap_audio(
+    shard: Path, selection: T2VAShotSelection, backend, *, canonical_workers=16
+):
     """Reuse the frozen bootstrap per clip, then publish an ordered shard inventory."""
+    if canonical_workers < 1:
+        raise ValueError("canonical workers must be positive")
     audio = shard / "audio_production"
     items = audio / "canonical_items"
-    clips, states = [], []
-    for shot in selection.shots:
+
+    def prepare(shot):
         destination = items / shot.clip_uid
         try:
             if not destination.exists():
@@ -383,14 +393,21 @@ def bootstrap_audio(shard: Path, selection: T2VAShotSelection, backend):
                 != clip.target_full_audio_sha256
             ):
                 raise ValueError("canonical audio changed")
-            clips.append(clip)
-            states.append({"clip_uid": shot.clip_uid, "status": "ready"})
+            return clip, {"clip_uid": shot.clip_uid, "status": "ready"}
         except (ValueError, OSError, RuntimeError) as exc:
-            states.append(
-                {"clip_uid": shot.clip_uid, "status": "failed", "reason": str(exc)}
-            )
+            return None, {
+                "clip_uid": shot.clip_uid,
+                "status": "failed",
+                "reason": str(exc),
+            }
+
+    # map consumes results in source order, independently of completion order.
+    with ThreadPoolExecutor(max_workers=canonical_workers) as executor:
+        prepared = list(executor.map(prepare, selection.shots))
+    clips = [clip for clip, _ in prepared if clip is not None]
+    states = [state for _, state in prepared]
     # Per-clip canonical directories are already atomically durable. The summary
-    # is derived once per barrier, rather than rewriting 10k growing snapshots.
+    # is derived once per barrier, rather than rewriting growing snapshots.
     production.atomic_json(shard / "stage_state/canonical_audio.json", states)
     canonical = audio / "audio/canonical_clips.jsonl"
     write_rows(canonical, clips)

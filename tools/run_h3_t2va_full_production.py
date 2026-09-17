@@ -29,6 +29,7 @@ def main(argv=None):
     parser.add_argument("--production-root", type=Path, default=production.DEFAULT_ROOT)
     parser.add_argument("--gpu-ids", default="0,1,2,3,4,5,6,7")
     parser.add_argument("--request-workers", type=int, default=1)
+    parser.add_argument("--canonical-workers", type=int, default=16)
     parser.add_argument("--shards")
     parser.add_argument("--shard-start", type=int, default=0)
     parser.add_argument("--shard-end", type=int)
@@ -52,6 +53,8 @@ def main(argv=None):
         raise ValueError("GPU IDs must be unique nonnegative physical indices")
     if args.request_workers < 1:
         raise ValueError("request workers must be positive")
+    if args.canonical_workers < 1:
+        raise ValueError("canonical workers must be positive")
     root = args.production_root.expanduser().resolve()
     for source in (args.shot_manifest, args.clips_root, args.source_videos_root):
         if source.resolve().is_relative_to(root):
@@ -76,6 +79,7 @@ def main(argv=None):
             "shards": order,
             "gpu_ids": gpu_ids,
             "request_workers": args.request_workers,
+            "canonical_workers": args.canonical_workers,
             "model_call_count": 0,
         }
     from r2v_data_v2.h3.auk_speech_shadow import auk_configuration
@@ -121,6 +125,7 @@ def main(argv=None):
         profiles=TA2VAProfileBackend(config),
         allow_unverified=args.allow_unverified,
         request_workers=args.request_workers,
+        canonical_workers=args.canonical_workers,
         ffmpeg=args.ffmpeg,
         ffprobe=args.ffprobe,
     )

@@ -55,10 +55,11 @@ for gpu in "${gpu_ids[@]}"; do
   seen+="$gpu,"
 done
 REQUEST_WORKERS="${REQUEST_WORKERS:-1}"
+CANONICAL_WORKERS="${CANONICAL_WORKERS:-16}"
 MIMO_STARTUP_POLLS="${MIMO_STARTUP_POLLS:-360}"
 MIMO_POLL_INTERVAL="${MIMO_POLL_INTERVAL:-5}"
 CLEANUP_GRACE_SECONDS="${CLEANUP_GRACE_SECONDS:-30}"
-for setting in REQUEST_WORKERS MIMO_STARTUP_POLLS CLEANUP_GRACE_SECONDS; do
+for setting in REQUEST_WORKERS CANONICAL_WORKERS MIMO_STARTUP_POLLS CLEANUP_GRACE_SECONDS; do
   if [[ ! "${!setting}" =~ ^[1-9][0-9]*$ ]]; then
     echo "$setting must be a positive integer" >&2; exit 2
   fi
@@ -84,6 +85,7 @@ run=("$R2V_PYTHON" tools/run_h3_t2va_full_production.py
   --production-root "$PRODUCTION_ROOT"
   --base-url http://127.0.0.1:8092/v1 --media-root "${MEDIA_ROOT:-/mnt/workspace}"
   --request-workers "$REQUEST_WORKERS" --gpu-ids "$GPU_IDS"
+  --canonical-workers "$CANONICAL_WORKERS"
   --ffmpeg "${FFMPEG:-ffmpeg}")
 if [[ -n "${SHARDS:-}" ]]; then
   run+=(--shards "$SHARDS")

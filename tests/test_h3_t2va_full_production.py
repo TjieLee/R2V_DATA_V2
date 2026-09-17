@@ -285,6 +285,7 @@ def test_full_cli_dry_run_does_not_require_models(tmp_path):
     )
     assert result["shards"] == [0]
     assert result["request_workers"] == 1
+    assert result["canonical_workers"] == 16
     assert result["gpu_ids"] == [str(i) for i in range(8)]
     assert result["model_call_count"] == 0
 
@@ -430,3 +431,51 @@ def test_bootstrap_isolates_failures_and_retries(tmp_path):
     assert (
         len(list(production.complete_rows(audio / "audio/canonical_clips.jsonl"))) == 3
     )
+
+
+def test_parallel_canonical_is_bounded_ordered_and_failure_isolated(tmp_path):
+    import threading
+    import time
+
+    manifest = shot_manifest(tmp_path)
+    root = tmp_path / "out"
+    selection = full.shard_selection(
+        root, production.build_source_index(manifest, root), 0, tmp_path, tmp_path
+    )
+    lock = threading.Lock()
+    active = maximum = 0
+    finished = []
+    ids = [s.clip_uid for s in selection.shots]
+
+    class Media(Audio):
+        def materialize_full_audio(self, **kwargs):
+            nonlocal active, maximum
+            uid = kwargs["clip_uid"]
+            with lock:
+                active += 1
+                maximum = max(active, maximum)
+            try:
+                time.sleep(0.1 if uid == ids[0] else 0.01)
+                if uid == ids[2]:
+                    raise ValueError("bad one")
+                super().materialize_full_audio(**kwargs)
+                finished.append(uid)
+            finally:
+                with lock:
+                    active -= 1
+
+    audio = full.bootstrap_audio(
+        root / "shards" / production.shard_name(0),
+        selection,
+        Media(),
+        canonical_workers=2,
+    )
+    assert 1 < maximum <= 2
+    assert finished == [ids[1], ids[0]]
+    rows = list(production.complete_rows(audio / "audio/canonical_clips.jsonl"))
+    assert [r["clip_uid"] for r in rows] == ids[:2]
+
+
+def test_canonical_workers_must_be_positive(tmp_path):
+    with pytest.raises(ValueError, match="canonical workers"):
+        full.bootstrap_audio(tmp_path, None, None, canonical_workers=0)
