@@ -20,8 +20,10 @@ full-population run at a random20-only cache and expect Audio to be generated.
 Skipped clips are not automatically retried; use a new production root when
 changing the source/config/upstream population.
 
-This checkout has no tools/export_h3_training_manifests.py or independent
-target-side T2V producer. The existing Visual t2v_caption field is not a separate
+The existing tools/export_h3_training_manifests.py exports completed shadow
+products. The production snapshot writer independently supports incremental
+publication using the same four loader-facing fields. There is no independent
+target-side T2V producer: the existing Visual t2v_caption field is not a separate
 no-reference target-side contract. No new T2V dataset or call is invented.
 
 ## Preflight
