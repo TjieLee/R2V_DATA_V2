@@ -1,4 +1,11 @@
-# Text-only H3-PDD two-GPU pair executor
+# Text-only H3-PDD 2/4/8-GPU executor
+
+`pair` is the historical file/API name. Execution groups support
+`--group-size {2,4,8}` (default 2); all sizes use the same worker and durable state.
+The visible GPU count must equal group-size before any worker is launched.
+Group size is execution-only, excluded from input/case identity; the existing
+`text_two_person_pdd_fsdp2_pair_v1` identity contract is unchanged. Prepared and
+DONE artifacts from a two-GPU run remain reusable with four/eight GPUs.
 
 This is a new independent path based on `fdca08616314562e637b622359b45f6ad6817ac7`.
 The A/B pilot, single-GPU PDD worker, Bernini, JoyAI, Visual and Audio/H3 production
@@ -46,7 +53,7 @@ the executor never upgrades dependencies or switches algorithms automatically.
 ## State and lifetime
 
 `pair_id * pair_size : (pair_id + 1) * pair_size` is the fixed input row range.
-Local indices modulo two assign independent Qwen workers to the two physical
+Local indices modulo group-size assign independent Qwen workers to the group's
 GPUs. Each lazily loads Qwen once, publishes every successful preparation
 immediately and exits after scanning its partition, even with exhausted cases.
 Then one torchrun session initializes NCCL/model/PDD once per rank and processes
@@ -157,11 +164,40 @@ CUDA_VISIBLE_DEVICES=0,1 "$PAIR_PYTHON" "$PAIR_CLI" "${COMMON[@]}" --pair-id 0 -
   --gpus 0,1,2,3,4,5,6,7 --pair-start 0
 ```
 
-The node command starts four independent pairs, fixed non-overlapping ranges.
+The node command defaults to four independent pairs, fixed non-overlapping ranges.
+With eight GPUs, `--group-size 4` creates two groups (0–3, 4–7), while
+`--group-size 8` creates one. Any distinct GPU list divisible by group-size is
+allowed; each group keeps its original pair-id-based fixed input range.
 The same node command resumes them. `--dry-run` or `--status` is forwarded
 read-only to every pair. No cross-node work stealing or dynamic GPU selection.
 
 ## Mandatory acceptance sequence (operator only)
+
+### Four-GPU resume of the existing failed case_05
+
+Use the **existing** CASE05_ROOT/CASE05_ARGS defined for the failed two-GPU run.
+Do not change its input, seed, prompt, checkpoint, pair-id or pair-size. Inspect
+the existing prepared.json: 311 frames, 1568x672, seed 42. Then:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+"$PAIR_PYTHON" "$PAIR_CLI" "${CASE05_ARGS[@]}" \
+  --resume --group-size 4 --retry-failed --max-generate-attempts 1
+```
+
+This must skip Qwen, reuse prepared.json, and launch one four-rank torchrun.
+Record wall_seconds, rank_memory for all four ranks, model_load_count,
+pdd_apply_count and distributed_init_count. The latter three must remain 1 per
+session (one initialization per rank). Four-GPU success/performance is **not yet
+verified**; compare against two GPUs only after a valid output and manifest.
+After successful acceptance, the node command with `--group-size 4` runs two
+independent persistent groups on eight GPUs, each with four Qwen prepare workers.
+
+Worker environments default `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`;
+an explicitly supplied operator value is preserved. No dependency, PDD, prompt,
+timeline, canvas, reference or FSDP wrapping policy changes accompany group sizing.
+
+### Initial acceptance and interruption checks
 
 1. Dry-run above.
 2. Use a separate new acceptance root and the known one-row fixture:

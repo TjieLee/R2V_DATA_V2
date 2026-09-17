@@ -59,10 +59,10 @@ def select_shard(source, output, pair_id, pair_size):
     return cases
 
 
-def partition(cases, worker):
-    if worker not in (0,1):
-        raise ValueError("Exactly two Qwen partitions")
-    return cases[worker::2]
+def partition(cases, worker, worker_count=2):
+    if worker_count not in (2,4,8) or not 0 <= worker < worker_count:
+        raise ValueError("Qwen worker must belong to a supported 2/4/8 GPU group")
+    return cases[worker::worker_count]
 
 
 def phase(case):

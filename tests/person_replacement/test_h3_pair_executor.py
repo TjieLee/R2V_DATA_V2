@@ -9,6 +9,46 @@ from pathlib import Path
 import pytest
 
 
+def test_old_prepared_and_done_survive_group_change(tmp_path, monkeypatch):
+    from r2v_data_v2.person_replacement import h3_pair_executor as module
+    from r2v_data_v2.person_replacement.h3_pair_state import (
+        atomic_json,
+        begin_attempt,
+        fail_attempt,
+    )
+    from tools.person_replacement.run_h3_pdd_pair_executor import arguments
+
+    clips = tmp_path/"clips"
+    clips.mkdir()
+    source = tmp_path/"source.jsonl"
+    source.write_text('{"video_path":"a.mp4"}\n{"video_path":"b.mp4"}\n')
+    argv = ["--input-jsonl",str(source),"--clips-root",str(clips),"--output-root",str(tmp_path/"out")]
+    root,old = module.make_config(arguments(argv))
+    module.validate_identity(root,old)
+    done,pending = old["cases"]
+    done_path = Path(done["directory"])/"generation/manifest.json"
+    prepared = Path(pending["directory"])/"preparation/prepared.json"
+    atomic_json(done_path,{"original":True})
+    atomic_json(prepared,{"identity":old["identity"],"prompt":"unchanged"})
+    for _ in range(2):
+        fail_attempt(pending,begin_attempt(pending,"generate",{}),RuntimeError("OOM"))
+    original = prepared.read_bytes(),done_path.read_bytes()
+    _,new = module.make_config(arguments(argv+["--group-size","4","--retry-failed","--max-generate-attempts","1"]))
+    assert new["identity"] == old["identity"]
+    module.validate_identity(root,new)
+    assert new["limits"][pending["case_id"]]["generate"] == 3
+    calls = []
+    def children(specs, fd):
+        calls.extend(specs)
+        assert len(specs) == 1 and "--nproc_per_node=4" in specs[0]["command"]
+        atomic_json(Path(pending["directory"])/"generation/manifest.json",{})
+        return [0]
+    monkeypatch.setattr(module,"run_children",children)
+    module.execute_phases(new,root,"0,1,2,3",123)
+    assert len(calls) == 1
+    assert (prepared.read_bytes(),done_path.read_bytes()) == original
+
+
 @pytest.mark.parametrize("log_exists", [True, False])
 def test_infrastructure_failure_reports_worker_log_tail(tmp_path, monkeypatch, capsys, log_exists):
     from r2v_data_v2.person_replacement import h3_pair_executor as module
@@ -37,26 +77,28 @@ def test_infrastructure_failure_reports_worker_log_tail(tmp_path, monkeypatch, c
         assert "Unable to read worker log" in stderr
 
 
-def test_two_prepare_children_then_one_torchrun_resume_skips_done(tmp_path, monkeypatch):
+@pytest.mark.parametrize("group_size", [2,4,8])
+def test_two_prepare_children_then_one_torchrun_resume_skips_done(tmp_path, monkeypatch, group_size):
     from r2v_data_v2.person_replacement import h3_pair_executor as module
     from r2v_data_v2.person_replacement.h3_pair_state import atomic_json
 
     case = {"case_id":"case","directory":str(tmp_path/"shard-000000/case"),"row_sha256":"row"}
     config = {"cases":[case],"limits":{"case":{"prepare":2,"generate":2}},"pair_id":0,
-              "identity":"identity","h3_python":sys.executable}
+              "identity":"identity","h3_python":sys.executable,"group_size":group_size}
     calls = []
     def children(specs, lock_fd, **kwargs):
         calls.append(specs)
-        atomic_json(Path(case["directory"])/("preparation/prepared.json" if len(specs)==2 else "generation/manifest.json"),{})
+        atomic_json(Path(case["directory"])/("preparation/prepared.json" if len(specs)==group_size else "generation/manifest.json"),{})
         return [0]*len(specs)
     monkeypatch.setattr(module,"run_children",children)
-    module.execute_phases(config,tmp_path/"shard-000000","2,5",123)
-    assert len(calls) == 2 and len(calls[0]) == 2 and len(calls[1]) == 1
-    assert [spec["env"]["CUDA_VISIBLE_DEVICES"] for spec in calls[0]] == ["2","5"]
-    assert calls[1][0]["env"]["CUDA_VISIBLE_DEVICES"] == "2,5"
-    assert "--nproc_per_node=2" in calls[1][0]["command"]
+    devices = ",".join(str(i) for i in range(group_size))
+    module.execute_phases(config,tmp_path/"shard-000000",devices,123)
+    assert len(calls) == 2 and len(calls[0]) == group_size and len(calls[1]) == 1
+    assert [spec["env"]["CUDA_VISIBLE_DEVICES"] for spec in calls[0]] == devices.split(",")
+    assert calls[1][0]["env"]["CUDA_VISIBLE_DEVICES"] == devices
+    assert f"--nproc_per_node={group_size}" in calls[1][0]["command"]
     calls.clear()
-    module.execute_phases(config,tmp_path/"shard-000000","2,5",123)
+    module.execute_phases(config,tmp_path/"shard-000000",devices,123)
     assert calls == []
 
 
@@ -90,15 +132,36 @@ def test_shard_lock_excludes_second_executor_and_identity_mismatch(tmp_path):
         validate_identity(tmp_path,{"identity":"b"})
 
 
-def test_node_maps_four_nonoverlapping_pairs_without_barrier(tmp_path, monkeypatch):
+@pytest.mark.parametrize("group_size", [2,4,8])
+def test_node_maps_four_nonoverlapping_pairs_without_barrier(tmp_path, monkeypatch, group_size):
     from tools.person_replacement import run_h3_pdd_node as cli
 
     calls = []
     monkeypatch.setattr(cli,"run_children",lambda specs,*a,**k:calls.extend(specs) or [0]*4)
     assert cli.main(["--gpus","0,1,2,3,4,5,6,7","--pair-start","4",
-                     "--output-root",str(tmp_path),"--pair-size","1000","--resume"]) == 0
-    assert [x["env"]["CUDA_VISIBLE_DEVICES"] for x in calls] == ["0,1","2,3","4,5","6,7"]
-    assert [x["command"][x["command"].index("--pair-id")+1] for x in calls] == ["4","5","6","7"]
+                     "--output-root",str(tmp_path),"--pair-size","1000","--resume",
+                     "--group-size",str(group_size)]) == 0
+    expected = {2:["0,1","2,3","4,5","6,7"],4:["0,1,2,3","4,5,6,7"],8:["0,1,2,3,4,5,6,7"]}
+    assert [x["env"]["CUDA_VISIBLE_DEVICES"] for x in calls] == expected[group_size]
+    assert [x["command"][x["command"].index("--pair-id")+1] for x in calls] == [str(4+i) for i in range(8//group_size)]
+    assert all(x["command"][x["command"].index("--group-size")+1] == str(group_size) for x in calls)
+
+
+def test_group_validation_before_launch_and_allocator_override(tmp_path, monkeypatch):
+    from r2v_data_v2.person_replacement import h3_pair_executor as module
+    from tools.person_replacement.run_h3_pdd_node import main
+
+    monkeypatch.setattr(module,"run_children",lambda *a,**k:pytest.fail("launched"))
+    with pytest.raises(ValueError,match="CUDA_VISIBLE_DEVICES"):
+        module.execute_phases({"group_size":4},tmp_path/"unused","0,1",123)
+    assert not (tmp_path/"unused").exists()
+    for gpus in ("0,1,2", "0,0,1,2"):
+        with pytest.raises(SystemExit):
+            main(["--gpus",gpus,"--group-size","4","--output-root",str(tmp_path)])
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF",raising=False)
+    assert module.worker_environment(tmp_path,"0,1")["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF","expandable_segments:False")
+    assert module.worker_environment(tmp_path,"0,1")["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:False"
 
 
 def test_shutdown_kills_descendant_after_leader_exits(tmp_path):

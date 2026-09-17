@@ -79,3 +79,12 @@ def test_pair_shards_are_disjoint_and_partition_is_deterministic(tmp_path):
     assert {x["case_id"] for x in left}.isdisjoint(x["case_id"] for x in right)
     assert [x["source_index"] for x in state.partition(left,0)] == [0,2]
     assert [x["source_index"] for x in state.partition(left,1)] == [1,3]
+def test_supported_group_partitions_are_disjoint_and_complete():
+    from r2v_data_v2.person_replacement.h3_pair_state import partition
+
+    cases = list(range(19))
+    for size in (2,4,8):
+        parts = [partition(cases,worker,size) for worker in range(size)]
+        assert sorted(item for part in parts for item in part) == cases
+        for worker,part in enumerate(parts):
+            assert all(item % size == worker for item in part)

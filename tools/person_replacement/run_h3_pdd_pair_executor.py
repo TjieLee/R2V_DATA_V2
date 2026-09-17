@@ -1,4 +1,4 @@
-"""Restartable fixed two-GPU, text-only person replacement shard executor."""
+"""Restartable 2/4/8-GPU, text-only person replacement shard executor."""
 
 import argparse
 import json
@@ -35,6 +35,7 @@ def arguments(argv=None):
                         help="Existing exact server checkpoint; no guessed path or downloads")
     parser.add_argument("--pair-id",type=int,default=0)
     parser.add_argument("--pair-size",type=int,default=1000)
+    parser.add_argument("--group-size",type=int,choices=(2,4,8),default=2)
     parser.add_argument("--seed",type=int,default=42)
     parser.add_argument("--max-prepare-attempts",type=int,default=2)
     parser.add_argument("--max-generate-attempts",type=int,default=2)

@@ -3,6 +3,44 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
+
+@pytest.mark.parametrize("size", [2,4,8])
+def test_channel_group_mesh_validation_and_gather(size, monkeypatch):
+    from r2v_data_v2.person_replacement.h3_pdd_distributed import DistributedChannel
+
+    events = []
+    dist = SimpleNamespace(init_process_group=lambda *a,**k:events.append("init"))
+    def gather(result, payload):
+        assert len(result) == size
+        result[:] = [payload] * size
+    dist.all_gather_object = gather
+    cuda = SimpleNamespace(is_available=lambda:True,device_count=lambda:size,set_device=lambda _:None)
+    torch = SimpleNamespace(cuda=cuda,device=lambda *a:a,distributed=dist)
+    def mesh(kind, shape, **kwargs):
+        assert kind == "cuda" and shape == (size,) and kwargs == {"mesh_dim_names":("fsdp",)}
+        return shape
+    monkeypatch.setitem(sys.modules,"torch",torch)
+    monkeypatch.setitem(sys.modules,"torch.distributed",dist)
+    monkeypatch.setitem(sys.modules,"torch.distributed.device_mesh",SimpleNamespace(init_device_mesh=mesh))
+    monkeypatch.setitem(sys.modules,"torch.distributed.fsdp",SimpleNamespace(fully_shard=None))
+    monkeypatch.setenv("WORLD_SIZE",str(size))
+    monkeypatch.setenv("RANK","0")
+    monkeypatch.setenv("LOCAL_RANK","0")
+    channel = DistributedChannel(group_size=size)
+    assert channel.mesh == (size,)
+    assert channel.gather("ready") == ["ready"] * size
+    assert events == ["init"]
+    monkeypatch.setenv("WORLD_SIZE","1")
+    with pytest.raises(ValueError,match="torchrun ranks"):
+        DistributedChannel(group_size=size)
+    monkeypatch.setenv("WORLD_SIZE",str(size))
+    cuda.device_count = lambda:1
+    with pytest.raises(RuntimeError,match="visible CUDA"):
+        DistributedChannel(group_size=size)
+    assert events == ["init"]
+
 
 def test_worker_imports_do_not_require_parent_manifest_dependencies():
     script = '''

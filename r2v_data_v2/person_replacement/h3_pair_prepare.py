@@ -19,7 +19,7 @@ from .timeline import inspect_video_timeline
 
 
 def prepare_partition(config, worker, qwen_factory=None):
-    cases = partition(config["cases"],worker)
+    cases = partition(config["cases"],worker,config.get("group_size",2))
     limits = config["limits"]
     if not any(eligible(case,"prepare",limits[case["case_id"]]["prepare"]) for case in cases):
         return

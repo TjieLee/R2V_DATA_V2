@@ -29,10 +29,10 @@ from .pipeline import validate_output_root
 TOOLS = Path(__file__).resolve().parents[2]/"tools/person_replacement"
 
 
-def visible_pair(value):
-    devices = value.split(",")
-    if len(devices) != 2 or len(set(devices)) != 2 or any(not x.strip() for x in devices):
-        raise ValueError("CUDA_VISIBLE_DEVICES must identify exactly two distinct GPUs")
+def visible_pair(value, group_size=2):
+    devices = [device.strip() for device in value.split(",")]
+    if group_size not in (2,4,8) or len(devices) != group_size or len(set(devices)) != group_size or not all(devices):
+        raise ValueError(f"CUDA_VISIBLE_DEVICES must identify exactly {group_size} distinct GPUs (supported: 2/4/8)")
     return devices
 
 
@@ -50,7 +50,7 @@ def make_config(args):
                 "rows":[(case["source_index"],case["row_sha256"]) for case in cases],
                 "contract":"text_two_person_pdd_fsdp2_pair_v1"}
     digest = hashlib.sha256(json.dumps(identity,sort_keys=True).encode()).hexdigest()
-    config = {**values,"identity":digest,"identity_details":identity,"cases":cases,
+    config = {**values,"identity":digest,"identity_details":identity,"cases":cases,"group_size":args.group_size,
               "clips_root":str(clips),"seed":args.seed,"pair_id":args.pair_id,
               "limits":{case["case_id"]:{stage:retry_limit(case,stage,maximum,retry_failed=args.retry_failed)
                         for stage,maximum in (("prepare",args.max_prepare_attempts),("generate",args.max_generate_attempts))}
@@ -82,6 +82,7 @@ def validate_identity(root, config, *, read_only=False):
 
 def worker_environment(directory, devices):
     env = dict(os.environ)
+    env.setdefault("PYTORCH_CUDA_ALLOC_CONF","expandable_segments:True")
     for key in ("PYTHONPATH","PYTHONHOME","VIRTUAL_ENV","TRANSFORMERS_CACHE"):
         env.pop(key,None)
     env.update(CUDA_VISIBLE_DEVICES=devices,HF_HUB_OFFLINE="1",TRANSFORMERS_OFFLINE="1",
@@ -190,7 +191,8 @@ def report_worker_log(log_path):
 
 
 def execute_phases(config, root, devices, lock_fd, *, prepare_only=False):
-    pair = visible_pair(devices)
+    group_size = config.get("group_size",2)
+    pair = visible_pair(devices,group_size)
     session = uuid.uuid4().hex
     session_root = root/"sessions"/session
     session_root.mkdir(parents=True)
@@ -210,7 +212,7 @@ def execute_phases(config, root, devices, lock_fd, *, prepare_only=False):
         before = sum(failure_count(c,"generate") for c in config["cases"])
         stats = session_root/f"h3-{restart}.json"
         specs = [{"command":[config["h3_python"],"-m","torch.distributed.run","--standalone",
-                              "--nproc_per_node=2","--max-restarts=0",str(TOOLS/"h3_pdd_fsdp_worker.py"),
+                              f"--nproc_per_node={group_size}","--max-restarts=0",str(TOOLS/"h3_pdd_fsdp_worker.py"),
                               "--config",str(config_path),"--stats",str(stats)],
                   "env":worker_environment(session_root/f"h3-{restart}",devices),
                   "log":session_root/f"h3-{restart}.log"}]
@@ -235,6 +237,7 @@ def execute_phases(config, root, devices, lock_fd, *, prepare_only=False):
 
 
 def run_pair(root, config, args):
+    visible_pair(os.environ.get("CUDA_VISIBLE_DEVICES",""),config.get("group_size",2))
     if root.exists() and not args.resume:
         raise FileExistsError("Existing shard requires --resume; never overwrite")
     with pair_lock(root) as fd:

@@ -84,7 +84,7 @@ def load_pipeline(model_root, checkpoint, mesh, device):
 
 
 class DistributedChannel:
-    def __init__(self, timeout_seconds=600):
+    def __init__(self, timeout_seconds=600, *, group_size=2):
         import torch
         import torch.distributed as dist
         from torch.distributed.device_mesh import init_device_mesh
@@ -92,16 +92,17 @@ class DistributedChannel:
             fully_shard,  # noqa: F401 -- preflight before loading weights
         )
 
-        if int(os.environ["WORLD_SIZE"]) != 2:
-            raise ValueError("Pair executor requires exactly two torchrun ranks")
+        if group_size not in (2,4,8) or int(os.environ["WORLD_SIZE"]) != group_size:
+            raise ValueError(f"Executor requires exactly {group_size} torchrun ranks (supported: 2/4/8)")
+        self.world_size = group_size
         self.rank = int(os.environ["RANK"])
         local = int(os.environ["LOCAL_RANK"])
-        if not torch.cuda.is_available() or torch.cuda.device_count() != 2:
-            raise RuntimeError("Exactly two visible CUDA GPUs required")
+        if not torch.cuda.is_available() or torch.cuda.device_count() != group_size:
+            raise RuntimeError(f"Exactly {group_size} visible CUDA GPUs required")
         torch.cuda.set_device(local)
         self.device = torch.device("cuda",local)
         dist.init_process_group("nccl",device_id=self.device,timeout=timedelta(seconds=timeout_seconds))
-        self.mesh = init_device_mesh("cuda",(2,),mesh_dim_names=("fsdp",))
+        self.mesh = init_device_mesh("cuda",(group_size,),mesh_dim_names=("fsdp",))
 
     def broadcast(self, payload):
         import torch.distributed as dist
@@ -111,7 +112,7 @@ class DistributedChannel:
 
     def gather(self, payload):
         import torch.distributed as dist
-        objects = [None,None]
+        objects = [None] * self.world_size
         dist.all_gather_object(objects,payload)
         return objects
 

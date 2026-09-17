@@ -1,4 +1,4 @@
-"""One GPU, one resident Qwen, deterministic half-shard preparation."""
+"""One GPU, one resident Qwen, deterministic group partition preparation."""
 
 import argparse
 import sys
@@ -14,7 +14,7 @@ from r2v_data_v2.person_replacement.h3_pair_state import read_json
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config",type=Path,required=True)
-    parser.add_argument("--worker",type=int,choices=(0,1),required=True)
+    parser.add_argument("--worker",type=int,required=True)
     args = parser.parse_args(argv)
     prepare_partition(read_json(args.config),args.worker)
     return 0
