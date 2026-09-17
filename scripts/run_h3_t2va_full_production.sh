@@ -10,6 +10,24 @@ cd "$REPO_ROOT"
 if ! "$dry_run"; then
   source "$REPO_ROOT/.venv/bin/activate"
   source "$REPO_ROOT/server_env.sh"
+  AUK_ROOT="${AUK_ROOT:-/mnt/workspace/litengjie/data/audio_deps/auk}"
+  export AUK_PYTHON="${AUK_PYTHON:-$AUK_ROOT/auk-venv/bin/python}"
+  export AUK_CODE_ROOT="${AUK_CODE_ROOT:-$AUK_ROOT/AuK-src}"
+  export AUK_CHECKPOINT="${AUK_CHECKPOINT:-$AUK_ROOT/AuK/auk_base.safetensors}"
+  export AUK_QWEN_PATH="${AUK_QWEN_PATH:-$AUK_ROOT/Qwen2.5-Omni-3B}"
+
+  export DIARIZEN_PYTHON="${DIARIZEN_PYTHON:-/mnt/workspace/litengjie/data/audio_deps/diarizen-venv/bin/python}"
+  export DIARIZEN_CODE_ROOT="${DIARIZEN_CODE_ROOT:-/mnt/workspace/litengjie/data/audio_deps/DiariZen}"
+  export DIARIZEN_MODEL_PATH="${DIARIZEN_MODEL_PATH:-/mnt/workspace/litengjie/data/audio_deps/diarizen-model-cache}"
+  export DIARIZEN_MODEL_IDENTIFIER="${DIARIZEN_MODEL_IDENTIFIER:-BUT-FIT/diarizen-wavlm-large-s80-md-v2}"
+  export DIARIZEN_DEVICE="${DIARIZEN_DEVICE:-cuda:0}"
+  export DIARIZEN_TIMEOUT_SECONDS="${DIARIZEN_TIMEOUT_SECONDS:-900}"
+
+  export QWEN3_ASR_ENV="${QWEN3_ASR_ENV:-/mnt/workspace/litengjie/data/audio_deps/qwen3-asr-venv}"
+  export QWEN3_ASR_MODEL_PATH="${QWEN3_ASR_MODEL_PATH:-/mnt/workspace/public/pretrained/Qwen/Qwen3-ASR-1.7B}"
+  export QWEN3_ASR_DEVICE="${QWEN3_ASR_DEVICE:-cuda:0}"
+  export QWEN3_ASR_DTYPE="${QWEN3_ASR_DTYPE:-bfloat16}"
+  export QWEN3_ASR_MAX_INFERENCE_BATCH_SIZE="${QWEN3_ASR_MAX_INFERENCE_BATCH_SIZE:-1}"
   export NO_PROXY="${NO_PROXY:+$NO_PROXY,}${no_proxy:+$no_proxy,}localhost,127.0.0.1,::1"
   export no_proxy="$NO_PROXY"
   unset PYTHONPATH
@@ -84,6 +102,42 @@ fi
 
 command -v setsid >/dev/null 2>&1 || {
   echo "setsid is required for full-production process isolation" >&2
+  exit 2
+}
+test -x "$AUK_PYTHON" || {
+  echo "Missing AUK_PYTHON: $AUK_PYTHON" >&2
+  exit 2
+}
+test -d "$AUK_CODE_ROOT" || {
+  echo "Missing AUK_CODE_ROOT: $AUK_CODE_ROOT" >&2
+  exit 2
+}
+test -f "$AUK_CHECKPOINT" || {
+  echo "Missing AUK_CHECKPOINT: $AUK_CHECKPOINT" >&2
+  exit 2
+}
+test -d "$AUK_QWEN_PATH" || {
+  echo "Missing AUK_QWEN_PATH: $AUK_QWEN_PATH" >&2
+  exit 2
+}
+test -x "$DIARIZEN_PYTHON" || {
+  echo "Missing DIARIZEN_PYTHON: $DIARIZEN_PYTHON" >&2
+  exit 2
+}
+test -d "$DIARIZEN_CODE_ROOT" || {
+  echo "Missing DIARIZEN_CODE_ROOT: $DIARIZEN_CODE_ROOT" >&2
+  exit 2
+}
+test -d "$DIARIZEN_MODEL_PATH" || {
+  echo "Missing DIARIZEN_MODEL_PATH: $DIARIZEN_MODEL_PATH" >&2
+  exit 2
+}
+test -x "$QWEN3_ASR_ENV/bin/python" || {
+  echo "Missing Qwen3-ASR Python: $QWEN3_ASR_ENV/bin/python" >&2
+  exit 2
+}
+test -d "$QWEN3_ASR_MODEL_PATH" || {
+  echo "Missing QWEN3_ASR_MODEL_PATH: $QWEN3_ASR_MODEL_PATH" >&2
   exit 2
 }
 mkdir -p "$PRODUCTION_ROOT"

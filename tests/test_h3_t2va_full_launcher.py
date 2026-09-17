@@ -14,6 +14,35 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[1]
 NAME = "run_h3_t2va_full_production.sh"
+DEPS = "/mnt/workspace/litengjie/data/audio_deps"
+DEFAULT_DEPENDENCIES = {
+    "AUK_PYTHON": f"{DEPS}/auk/auk-venv/bin/python",
+    "AUK_CODE_ROOT": f"{DEPS}/auk/AuK-src",
+    "AUK_CHECKPOINT": f"{DEPS}/auk/AuK/auk_base.safetensors",
+    "AUK_QWEN_PATH": f"{DEPS}/auk/Qwen2.5-Omni-3B",
+    "DIARIZEN_PYTHON": f"{DEPS}/diarizen-venv/bin/python",
+    "DIARIZEN_CODE_ROOT": f"{DEPS}/DiariZen",
+    "DIARIZEN_MODEL_PATH": f"{DEPS}/diarizen-model-cache",
+    "DIARIZEN_MODEL_IDENTIFIER": "BUT-FIT/diarizen-wavlm-large-s80-md-v2",
+    "DIARIZEN_DEVICE": "cuda:0",
+    "DIARIZEN_TIMEOUT_SECONDS": "900",
+    "QWEN3_ASR_ENV": f"{DEPS}/qwen3-asr-venv",
+    "QWEN3_ASR_MODEL_PATH": "/mnt/workspace/public/pretrained/Qwen/Qwen3-ASR-1.7B",
+    "QWEN3_ASR_DEVICE": "cuda:0",
+    "QWEN3_ASR_DTYPE": "bfloat16",
+    "QWEN3_ASR_MAX_INFERENCE_BATCH_SIZE": "1",
+}
+REQUIRED_PATHS = {
+    "AUK_PYTHON": "executable",
+    "AUK_CODE_ROOT": "directory",
+    "AUK_CHECKPOINT": "file",
+    "AUK_QWEN_PATH": "directory",
+    "DIARIZEN_PYTHON": "executable",
+    "DIARIZEN_CODE_ROOT": "directory",
+    "DIARIZEN_MODEL_PATH": "directory",
+    "QWEN3_ASR_ENV": "venv",
+    "QWEN3_ASR_MODEL_PATH": "directory",
+}
 
 
 def invoke(script, env, *args):
@@ -132,7 +161,9 @@ sys.exit(int(os.environ.get("RUN_STATUS", "0")))
     env = {
         k: v
         for k, v in os.environ.items()
-        if k
+        if k not in DEFAULT_DEPENDENCIES
+        and k != "AUK_ROOT"
+        and k
         not in {
             "GPU_IDS",
             "SHARDS",
@@ -141,6 +172,19 @@ sys.exit(int(os.environ.get("RUN_STATUS", "0")))
             "CUDA_VISIBLE_DEVICES",
         }
     }
+    for name, kind in REQUIRED_PATHS.items():
+        path = tmp_path / "dependencies" / name
+        if kind in {"directory", "venv"}:
+            path.mkdir(parents=True)
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("synthetic local dependency")
+            if kind == "executable":
+                path.chmod(0o755)
+        if kind == "venv":
+            (path / "bin").mkdir()
+            (path / "bin/python").symlink_to(sys.executable)
+        env[name] = str(path)
     env.update(
         FAKE_ROOT=str(tmp_path),
         SGLANG_ENV=str(tmp_path),
@@ -166,6 +210,61 @@ def events(root):
 
 def test_no_shell_job_control():
     assert "set -m" not in (REPO / "scripts" / NAME).read_text()
+
+
+@pytest.mark.parametrize("auk_root", [None, "/custom/auk"])
+def test_dependency_defaults_without_server_files(sandbox, auk_root):
+    script, env, root = sandbox
+    env = {k: v for k, v in env.items() if k not in DEFAULT_DEPENDENCIES}
+    if auk_root is not None:
+        env["AUK_ROOT"] = auk_root
+    # Execute the real setup, stopping before preflight; no /mnt paths are created.
+    probe = script.with_name("probe.sh")
+    probe.write_text(
+        script.read_text().split("command -v setsid")[0]
+        + f"\n{shlex.quote(sys.executable)} -c 'import os,json; print(json.dumps(dict(os.environ)))'\n"
+    )
+    result = invoke(probe, env)
+    assert result.returncode == 0, result.stderr
+    actual = json.loads(result.stdout)
+    expected = {
+        k: v.replace(f"{DEPS}/auk", auk_root)
+        if auk_root and k.startswith("AUK_")
+        else v
+        for k, v in DEFAULT_DEPENDENCIES.items()
+    }
+    assert {k: actual.get(k) for k in expected} == expected
+    assert not (root / "events").exists()
+
+
+def test_dependency_overrides_reach_supervisor(sandbox):
+    script, env, root = sandbox
+    env.update(
+        DIARIZEN_DEVICE="cuda:5",
+        DIARIZEN_TIMEOUT_SECONDS="123",
+        DIARIZEN_MODEL_IDENTIFIER="custom/diar",
+        QWEN3_ASR_DEVICE="cuda:6",
+        QWEN3_ASR_DTYPE="float32",
+        QWEN3_ASR_MAX_INFERENCE_BATCH_SIZE="2",
+    )
+    result = invoke(script, env)
+    assert result.returncode == 0, result.stderr
+    actual = json.loads((root / "invocation.json").read_text())["env"]
+    for name in DEFAULT_DEPENDENCIES:
+        assert actual[name] == env[name]
+
+
+@pytest.mark.parametrize("name", REQUIRED_PATHS)
+def test_missing_dependency_fails_before_mimo_but_not_dry_run(sandbox, name):
+    script, env, root = sandbox
+    env[name] = str(root / "missing" / name)
+    assert invoke(script, env, "--dry-run").returncode == 0
+    result = invoke(script, env)
+    assert result.returncode == 2
+    label = "Qwen3-ASR Python" if name == "QWEN3_ASR_ENV" else name
+    assert f"Missing {label}:" in result.stderr
+    assert env[name] in result.stderr
+    assert not (root / "events").exists()
 
 
 def test_missing_setsid_only_blocks_execution(sandbox):
