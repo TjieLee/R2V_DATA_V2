@@ -20,7 +20,7 @@ from typing import Any
 
 import r2v_data_v2.v3.config as config_module
 from r2v_data_v2.reconciliation import write_json_atomic
-from r2v_data_v2.v3.config import RuntimeGpuWorkersConfig, V3Config
+from r2v_data_v2.v3.config import RuntimeConfig, V3Config
 from r2v_data_v2.v3.schemas import (
     ClipRecord,
     SampledFramesArtifact,
@@ -138,10 +138,12 @@ class HydrationResult:
 
 
 def prepare_shard_config(base_config: V3Config, paths: ShardPaths) -> V3Config:
-    """Preserve Visual policy/models; replace output roots and physical devices.
+    """Preserve Visual policy/models; replace roots and execution-only settings.
 
-    Local execution adapters receive actual devices separately. Neutral cuda/0
-    are logical placeholders; normal RunStorage validation remains unchanged.
+    Local execution adapters receive actual devices, concurrency and timeouts
+    separately from the accepted base config/launcher. RuntimeConfig defaults
+    and neutral cuda/0 are stable placeholders, not execution requests. Normal
+    V3 config/fingerprint validation remains unchanged.
     """
     config = replace(
         base_config,
@@ -150,11 +152,7 @@ def prepare_shard_config(base_config: V3Config, paths: ShardPaths) -> V3Config:
         sam3=replace(base_config.sam3, device="cuda"),
         remove=replace(base_config.remove, device="cuda"),
         reference_edit=replace(base_config.reference_edit, cuda_visible_devices="0"),
-        runtime=replace(
-            base_config.runtime,
-            gpu_workers=RuntimeGpuWorkersConfig(),
-            stage_workers=replace(base_config.runtime.stage_workers, segment=1),
-        ),
+        runtime=RuntimeConfig(),
     )
     config.validate()
     return config
@@ -233,7 +231,9 @@ def _reference_paths(value: object):
             yield from _reference_paths(item)
 
 
-def _validate_input(root: Path, row: dict[str, Any]) -> tuple[Path, dict[str, Any]]:
+def _validate_input(
+    root: Path, shard: Path, row: dict[str, Any]
+) -> tuple[Path, dict[str, Any]]:
     uid = _component(row.get("clip_uid"))
     index = row.get("source_index")
     if not isinstance(index, int) or isinstance(index, bool) or index < 0:
@@ -241,6 +241,8 @@ def _validate_input(root: Path, row: dict[str, Any]) -> tuple[Path, dict[str, An
     artifact = row.get("artifact_root")
     if not isinstance(artifact, str):
         raise TypeError("ready row requires artifact_root")
+    if artifact != f"artifacts/{shard.stem}/{uid}":
+        raise ValueError("artifact_root does not match canonical shard/clip layout")
     workspace = _beneath(root, artifact)
     clip_dir = _beneath(workspace, f"run/clips/{uid}")
     if not clip_dir.is_dir():
@@ -355,6 +357,7 @@ def hydrate_shard(
         row.get("source_index")
         for row in rows
         if isinstance(row.get("source_index"), int)
+        and not isinstance(row.get("source_index"), bool)
     )
     excluded, failures, ready = [], [], []
     for row in rows:
@@ -376,9 +379,14 @@ def hydrate_shard(
                 raise ValueError("invalid Stage2 row status")
             uid = _component(row.get("clip_uid"))
             index = row.get("source_index")
-            if not isinstance(index, int) or uids[uid] > 1 or indices[index] > 1:
+            if (
+                not isinstance(index, int)
+                or isinstance(index, bool)
+                or uids[uid] > 1
+                or indices[index] > 1
+            ):
                 raise ValueError("invalid or duplicate Stage2 row identity")
-            source, provenance = _validate_input(root, row)
+            source, provenance = _validate_input(root, shard, row)
             provenance["canonical_shard"] = str(shard)
             destination = _beneath(storage.root, f"clips/{uid}")
             marker = destination / _PROVENANCE

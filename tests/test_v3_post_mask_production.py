@@ -398,3 +398,59 @@ def test_initializer_rejects_frozen_input_destination_before_any_write(
         api.initialize_shard(case[0], paths, git_commit="first")
     assert not paths.run_root.exists()
     assert not paths.state_root.exists()
+
+
+def test_ready_row_cannot_borrow_matching_identity_from_another_shard(case):
+    row = _ready(case)
+    source = case[1] / row["artifact_root"]
+    other = case[1] / "artifacts/shard-99999/clip-0"
+    other.parent.mkdir(parents=True)
+    source.rename(other)
+    row["artifact_root"] = "artifacts/shard-99999/clip-0"
+    _write_rows(case, [row])
+    api, paths, storage = _start(case)
+    result = _hydrate(case, api, paths, storage)
+    assert (result.ready, result.corrupt) == (0, 1)
+    assert not storage.clip_path("clip-0").exists()
+    assert (
+        "canonical shard"
+        in json.loads(paths.input_failures_path.read_text())["failure_reason"]
+    )
+
+
+@pytest.mark.parametrize(
+    "change", ["cpu", "qwen", "timeout", "stage_workers", "mode", "compile", "deferred"]
+)
+def test_execution_setting_remaps_preserve_shard_identity(case, change):
+    _write_rows(case, [_ready(case)])
+    api, paths, storage = _start(case)
+    cfg = case[0]
+    values = {
+        "cpu": {"cpu_workers": 16},
+        "qwen": {"qwen_max_inflight": 8},
+        "timeout": {"worker_timeout_seconds": 7200},
+        "stage_workers": {
+            "stage_workers": replace(
+                cfg.runtime.stage_workers, frames=7, pair=6, instruct=9
+            )
+        },
+        "mode": {"mode": "streaming_v1"},
+        "compile": {"sam3_compile_enabled": True},
+        "deferred": {"subject_attributes_deferred": True},
+    }
+    remapped = replace(cfg, runtime=replace(cfg.runtime, **values[change]))
+    restarted = api.initialize_shard(remapped, paths, git_commit="new-code")
+    assert restarted.read_run() == storage.read_run()
+    assert restarted.config.runtime == storage.config.runtime
+
+
+def test_boolean_source_index_does_not_exclude_integer_neighbor(case):
+    malformed = _ready(case)
+    malformed["source_index"] = True
+    good = _ready(case, uid="clip-1", index=1)
+    _write_rows(case, [malformed, good])
+    api, paths, storage = _start(case)
+    result = _hydrate(case, api, paths, storage)
+    assert (result.clip_uids, result.corrupt) == (("clip-1",), 1)
+    assert not storage.clip_path("clip-0").exists()
+    assert storage.read_clip("clip-1").source.source_index == 1
