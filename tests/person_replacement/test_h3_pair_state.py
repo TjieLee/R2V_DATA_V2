@@ -1,0 +1,81 @@
+import json
+
+import pytest
+
+
+def case(tmp_path):
+    return {"case_id":"case", "directory":str(tmp_path/"case"), "source_index":0, "row":{"video_path":"a.mp4"}}
+
+
+def test_markers_not_partial_artifacts_control_resume(tmp_path):
+    from r2v_data_v2.person_replacement import h3_pair_state as state
+
+    item = case(tmp_path)
+    directory = tmp_path/"case"
+    (directory/"preparation").mkdir(parents=True)
+    (directory/"generation").mkdir()
+    (directory/"preparation"/"h3_prompt.txt").write_text("partial")
+    (directory/"generation"/"raw.mp4").write_bytes(b"partial")
+    assert state.phase(item) == "prepare"
+    state.atomic_json(directory/"preparation"/"prepared.json", {"case_id":"case"})
+    assert state.phase(item) == "generate"
+    state.atomic_json(directory/"generation"/"manifest.json", {})
+    assert state.phase(item) == "done"
+
+
+def test_failure_history_retry_budget_and_interruption(tmp_path):
+    from r2v_data_v2.person_replacement import h3_pair_state as state
+
+    item = case(tmp_path)
+    # A killed attempt is not a failed case and remains retryable.
+    state.begin_attempt(item,"prepare",{"pair_id":0})
+    assert state.failure_count(item,"prepare") == 0
+    for _ in range(2):
+        attempt = state.begin_attempt(item,"prepare",{"pair_id":0})
+        state.fail_attempt(item,attempt,ValueError("bad clip"))
+    assert state.failure_count(item,"prepare") == 2
+    assert not state.eligible(item,"prepare",2)
+    assert state.retry_limit(item,"prepare",2,retry_failed=True) == 4
+    assert state.eligible(item,"prepare",4)
+    records = list((tmp_path/"case"/"failures").glob("*.json"))
+    assert len(records) == 2
+    assert [json.loads(p.read_text())["attempt"] for p in sorted(records)] == [2,3]
+
+
+def test_publication_markers_last_and_done_never_overwritten(tmp_path, monkeypatch):
+    from r2v_data_v2.person_replacement import h3_pair_state as state
+
+    item = case(tmp_path)
+    events = []
+    real = state.atomic_json
+    def write(path, payload):
+        if path.name == "prepared.json":
+            assert (path.parent/"h3_prompt.txt").read_text() == "prompt\n"
+        if path.name == "manifest.json":
+            assert (path.parent/"raw.mp4").read_bytes() == b"valid"
+        events.append(path.name)
+        real(path,payload)
+    monkeypatch.setattr(state,"atomic_json",write)
+    state.publish_prepared(item,{"case_id":"case","prompt":"prompt"},{"h3_prompt":"prompt"})
+    assert events[-1] == "prepared.json"
+    temporary = tmp_path/"case"/"tmp"/"video.mp4"
+    temporary.parent.mkdir()
+    temporary.write_bytes(b"valid")
+    state.publish_generated(item,temporary,{"case_id":"case"},lambda p: events.append("validated"))
+    assert events[-2:] == ["validated","manifest.json"]
+    with pytest.raises(FileExistsError):
+        state.publish_generated(item,temporary,{},lambda p: None)
+
+
+def test_pair_shards_are_disjoint_and_partition_is_deterministic(tmp_path):
+    from r2v_data_v2.person_replacement import h3_pair_state as state
+
+    source = tmp_path/"data.jsonl"
+    source.write_text("".join(json.dumps({"video_path":f"{i}.mp4"})+"\n" for i in range(7)))
+    left = state.select_shard(source,tmp_path/"out",0,4)
+    right = state.select_shard(source,tmp_path/"out",1,4)
+    assert [x["source_index"] for x in left] == [0,1,2,3]
+    assert [x["source_index"] for x in right] == [4,5,6]
+    assert {x["case_id"] for x in left}.isdisjoint(x["case_id"] for x in right)
+    assert [x["source_index"] for x in state.partition(left,0)] == [0,2]
+    assert [x["source_index"] for x in state.partition(left,1)] == [1,3]
