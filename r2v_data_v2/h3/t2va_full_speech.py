@@ -317,6 +317,7 @@ def run_diarizen(
         jobs=jobs,
         gpu_ids=list(gpu_ids),
         factory=f"{__name__}:diarizen_worker",
+        log_root=Path(stage_state).parent.parent / "logs",
         configuration=configuration,
         environment=configuration["environment"],
     )
@@ -388,6 +389,7 @@ def run_asr(
         jobs=jobs,
         gpu_ids=list(gpu_ids),
         factory=f"{__name__}:asr_worker",
+        log_root=Path(stage_state).parent.parent / "logs",
         configuration=configuration,
         environment=configuration["environment"],
     )

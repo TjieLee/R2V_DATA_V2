@@ -94,6 +94,7 @@ def run_auk(inventory, state_root, gpu_ids, *, eligible, ffmpeg="ffmpeg", execut
         ],
         gpu_ids=gpu_ids,
         factory=__name__ + ":AukWorker",
+        log_root=state_root.parent.parent / "logs",
         configuration={
             "model": inventory.model_configuration.model_dump(mode="json"),
             "ffmpeg": ffmpeg,
@@ -211,6 +212,7 @@ def run_sam(
         ],
         gpu_ids=gpu_ids,
         factory=__name__ + ":SAMWorker",
+        log_root=state_root.parent.parent / "logs",
         configuration={
             "inventory_path": str(inventory_path),
             "model": inventory.model_configuration.model_dump(mode="json"),

@@ -187,6 +187,7 @@ def execute_stage(
     configuration: dict,
     python_path: str | Path | None = None,
     environment: dict[str, str] | None = None,
+    log_root: str | Path | None = None,
 ) -> dict[str, dict]:
     """Run pending[rank::len(gpu_ids)] in one fresh child per nonempty slice.
 
@@ -259,6 +260,15 @@ def execute_stage(
             results[item["job"]["job_id"]] = cached
         else:
             pending.append(item)
+    _atomic_json(
+        root / "invocation.json",
+        {
+            "job_count": len(items),
+            "scheduled_job_count": len(pending),
+            "reused_ready_count": len(results),
+            "worker_count": min(len(pending), len(gpu_ids)),
+        },
+    )
     if not pending:
         return {item["job"]["job_id"]: results[item["job"]["job_id"]] for item in items}
 
@@ -290,7 +300,11 @@ def execute_stage(
             )
             manifests.append(manifest)
             try:
-                with manifest.with_name("worker.log").open("wb") as log:
+                log_path = manifest.with_name("worker.log")
+                if log_root is not None:
+                    log_path = Path(log_root) / f"{root.name}-gpu{gpu}.log"
+                    log_path.parent.mkdir(parents=True, exist_ok=True)
+                with log_path.open("ab") as log:
                     # Defer signals until the newly owned process is registered.
                     mask = signal.pthread_sigmask(signal.SIG_BLOCK, previous)
                     try:

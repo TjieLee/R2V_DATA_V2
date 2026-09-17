@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import traceback
 import uuid
 from pathlib import Path
 
@@ -16,13 +17,200 @@ from r2v_data_v2.h3.diarization_binding import (
 from r2v_data_v2.h3.jea_audio_production import CanonicalAudioClip
 from r2v_data_v2.h3.sam_audio_stem_shadow import sha256_file
 from r2v_data_v2.h3.t2va_source import (
+    T2VAShot,
     T2VAShotSelection,
     prepare_t2va_audio,
-    select_t2va_shots,
     validate_cached_target,
 )
 
 RUN_ID = "production"
+STAGES = ("canonical", "sam", "auk", "resolve", "diarizen", "asr", "mimo")
+
+
+def run_assigned_shards(root, shard_ids, pipeline):
+    """One node owns a shard through all barriers, including downstream writes."""
+    results = {}
+    for shard_id in shard_ids:
+        shard = root / "shards" / production.shard_name(shard_id)
+        try:
+            with production.file_lock(shard / "invocation.lock"):
+                results[shard_id] = {}
+                for name in STAGES:
+                    log_name = {
+                        "canonical": "canonical_audio",
+                        "mimo": "mimo-downstream",
+                    }.get(name, name)
+                    log_path = shard / "logs" / f"{log_name}.log"
+                    log_path.parent.mkdir(parents=True, exist_ok=True)
+                    try:
+                        result = pipeline.stage(name, shard_id)
+                    except BaseException:
+                        with log_path.open("a") as handle:
+                            traceback.print_exc(file=handle)
+                        raise
+                    if hasattr(result, "model_dump"):
+                        result = result.model_dump(mode="json")
+                    production.atomic_json(
+                        shard / "stage_state" / f"{name}.json", result
+                    )
+                    results[shard_id][name] = result
+                    with log_path.open("a") as handle:
+                        handle.write(json.dumps(result, sort_keys=True) + "\n")
+                    print(
+                        f"shard={shard_id} stage={name} {json.dumps(result, sort_keys=True)}",
+                        flush=True,
+                    )
+        except production.ShardLockedError:
+            print(f"shard={shard_id} locked; skipped", flush=True)
+    return results
+
+
+class FullPipeline:
+    def __init__(
+        self,
+        *,
+        root,
+        index,
+        clips_root,
+        source_videos_root,
+        gpu_ids,
+        sam_configuration,
+        auk_configuration,
+        backend,
+        profiles,
+        allow_unverified=False,
+        request_workers=1,
+        ffmpeg="ffmpeg",
+        ffprobe="ffprobe",
+    ):
+        self.root, self.index = root, index
+        self.clips_root, self.source_videos_root = clips_root, source_videos_root
+        self.gpu_ids = gpu_ids
+        self.sam_configuration, self.auk_configuration = (
+            sam_configuration,
+            auk_configuration,
+        )
+        self.backend, self.profiles = backend, profiles
+        self.allow_unverified, self.request_workers = allow_unverified, request_workers
+        self.ffmpeg, self.ffprobe = ffmpeg, ffprobe
+        self.audio_root = None
+
+    def stage(self, name, shard_id):
+        from r2v_data_v2.h3 import auk_speech_shadow as auk
+        from r2v_data_v2.h3 import sam_audio_stem_shadow as sam
+        from r2v_data_v2.h3 import t2va_full_stems as stems
+        from r2v_data_v2.h3.audio_backends import FFmpegAudioMediaBackend
+        from r2v_data_v2.h3.resolved_audio_stems import resolve_audio_stems
+
+        shard = self.root / "shards" / production.shard_name(shard_id)
+        state = shard / "stage_state"
+        if name == "canonical":
+            selection = shard_selection(
+                self.root,
+                self.index,
+                shard_id,
+                self.clips_root,
+                self.source_videos_root,
+            )
+            self.audio_root = bootstrap_audio(
+                shard,
+                selection,
+                FFmpegAudioMediaBackend(ffmpeg=self.ffmpeg, ffprobe=self.ffprobe),
+            )
+            rows = list(
+                production.complete_rows(
+                    self.audio_root / "audio/canonical_clips.jsonl"
+                )
+            )
+            self.has_audio = bool(rows)
+            return {
+                "ready": len(rows),
+                "failed": len(selection.shots) - len(rows),
+                "skipped": len(selection.excluded_rows),
+            }
+        if not self.has_audio and name != "mimo":
+            return {"ready": 0, "skipped": "no canonical audio"}
+        shadow = sam.stem_shadow_root(self.audio_root, RUN_ID)
+        if name == "sam":
+            inventory = sam.build_sam_audio_stem_inventory(
+                canonical_audio_manifest_path=self.audio_root
+                / "audio/canonical_clips.jsonl",
+                model_configuration=self.sam_configuration,
+                route="music_first",
+            )
+            return stems.run_sam(
+                inventory,
+                shadow / "separation",
+                state / "sam",
+                self.gpu_ids,
+                ffmpeg=self.ffmpeg,
+                ffprobe=self.ffprobe,
+            )
+        if name == "auk":
+            _, records, _ = sam.load_stem_shadow(shadow / "separation")
+            eligible = {r.clip_uid for r in records if r.separation_state != "failure"}
+            inventory = auk.build_auk_inventory(
+                audio_production_root=self.audio_root,
+                shadow_run_id=RUN_ID,
+                case_manifest_path=self.audio_root / "case_manifest.json",
+                configuration=self.auk_configuration,
+            )
+            return stems.run_auk(
+                inventory,
+                state / "auk",
+                self.gpu_ids,
+                eligible=eligible,
+                ffmpeg=self.ffmpeg,
+            )
+        if name == "resolve":
+            return resolve_audio_stems(
+                audio_production_root=self.audio_root,
+                shadow_run_id=RUN_ID,
+                overwrite=(shadow / "resolved_stems_v1").exists(),
+            )
+        if name in {"diarizen", "asr"}:
+            from r2v_data_v2.h3.t2va_full_speech import run_asr, run_diarizen
+
+            result = (run_diarizen if name == "diarizen" else run_asr)(
+                self.audio_root,
+                RUN_ID,
+                state / name,
+                self.gpu_ids,
+                self.allow_unverified,
+                ffmpeg=self.ffmpeg,
+            )
+            provenance = result["provenance"]
+            return {
+                "job_count": result["job_count"],
+                "ready": len(
+                    provenance.get("ready_clip_uids", provenance.get("clip_uids", []))
+                ),
+                "failed": len(provenance.get("failed_clip_uids", [])),
+            }
+        if name == "mimo":
+            from r2v_data_v2.h3.t2va_full_downstream import run_downstream
+
+            states = run_downstream(
+                self.root,
+                self.index,
+                shard_id,
+                self.audio_root,
+                self.clips_root,
+                self.source_videos_root,
+                self.backend,
+                self.profiles,
+                allow_unverified=self.allow_unverified,
+                request_workers=self.request_workers,
+                run_id=RUN_ID,
+            )
+            return {
+                f"{stage}_{status}": sum(
+                    row[f"{stage}_status"] == status for row in states.values()
+                )
+                for stage in ("t2va", "ta2va")
+                for status in ("ready", "failed", "skipped", "pending")
+            }
+        raise ValueError(f"unknown stage {name}")
 
 
 def write_rows(path, rows):
@@ -42,22 +230,56 @@ def write_rows(path, rows):
 
 
 def shard_selection(root, index, shard_id, clips_root, source_videos_root):
+    from r2v_data_v2.h3.t2va_shadow import fingerprint
+    from r2v_data_v2.v3.production_source import JeaVideoMotionAdapter
+
     manifest = production.materialize_shard(index, shard_id, root)
-    selection = select_t2va_shots(
-        manifest, clips_root=clips_root, source_videos_root=source_videos_root
-    )
     start = shard_id * production.SHARD_SIZE
-    selection = selection.model_copy(
-        update={
-            "shots": [
-                s.model_copy(update={"source_index": s.source_index + start})
-                for s in selection.shots
-            ],
-            "excluded_rows": [
-                {**r, "source_index": r["source_index"] + start}
-                for r in selection.excluded_rows
-            ],
-        }
+    adapter = JeaVideoMotionAdapter(
+        clips_root=clips_root, source_videos_root=source_videos_root
+    )
+    shots, excluded, seen = [], [], set()
+    with manifest.open("rb") as handle:
+        for offset, line in enumerate(handle):
+            source_index = start + offset
+            try:
+                raw = json.loads(line)
+                if not isinstance(raw, dict):
+                    raise TypeError("shot row must be an object")
+                item = adapter.parse(raw, source_index=source_index)
+                if item["clip_uid"] in seen:
+                    raise ValueError("duplicate clip identity")
+                shot = T2VAShot(
+                    clip_uid=item["clip_uid"],
+                    source_index=source_index,
+                    source_row_sha256=fingerprint(raw),
+                    source_video_id=item["parent_video_id"],
+                    shot_index=raw["shot_index"],
+                    clip_display_path=str(
+                        Path(
+                            item["metadata"]["source_relative_video_path"]
+                        ).with_suffix("")
+                    ),
+                    video_path=item["video_path"],
+                    video_sha256=sha256_file(Path(item["video_path"])),
+                    duration_seconds=float(raw["duration"]),
+                )
+                shots.append(shot)
+                seen.add(shot.clip_uid)
+            except (ValueError, TypeError, KeyError, OSError) as exc:
+                excluded.append({"source_index": source_index, "reason": str(exc)})
+    selection = T2VAShotSelection(
+        shot_manifest_path=str(manifest),
+        shot_manifest_sha256=sha256_file(manifest),
+        clips_root=str(clips_root),
+        source_videos_root=str(source_videos_root),
+        selection_mode="all",
+        sample_seed=None,
+        case_manifest_path=None,
+        case_manifest_sha256=None,
+        valid_row_count=len(shots),
+        excluded_rows=excluded,
+        shots=shots,
     )
     source = root / "shards" / production.shard_name(shard_id) / "source"
     production.atomic_json(source / "selection.json", selection.model_dump(mode="json"))
@@ -99,7 +321,9 @@ def bootstrap_audio(shard: Path, selection: T2VAShotSelection, backend):
             states.append(
                 {"clip_uid": shot.clip_uid, "status": "failed", "reason": str(exc)}
             )
-        production.atomic_json(shard / "stage_state/canonical_audio.json", states)
+    # Per-clip canonical directories are already atomically durable. The summary
+    # is derived once per barrier, rather than rewriting 10k growing snapshots.
+    production.atomic_json(shard / "stage_state/canonical_audio.json", states)
     canonical = audio / "audio/canonical_clips.jsonl"
     write_rows(canonical, clips)
     targets = [

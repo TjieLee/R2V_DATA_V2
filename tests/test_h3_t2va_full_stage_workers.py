@@ -102,6 +102,7 @@ def receipt(setup, job_id):
 
 
 def test_partition_10000_load_once_gpu_mapping_and_order(setup):
+    setup["gpu_ids"] = [str(i) for i in range(8)]
     before = dict(os.environ)
     jobs = [{"job_id": f"job-{i}"} for i in range(10000)]
     result = api().execute_stage(jobs=jobs, **setup)
@@ -110,7 +111,7 @@ def test_partition_10000_load_once_gpu_mapping_and_order(setup):
     assert "device" not in setup["configuration"]
     records = events(setup)
     for rank, gpu in enumerate(setup["gpu_ids"]):
-        partition = jobs[rank::3]
+        partition = jobs[rank::8]
         pid = result[partition[0]["job_id"]]["result"]["pid"]
         assert [
             e["job_id"] for e in records if e["kind"] == "process" and e["pid"] == pid
@@ -123,16 +124,18 @@ def test_partition_10000_load_once_gpu_mapping_and_order(setup):
             assert row["result"]["marker"] == "child"
             assert Path(row["result"]["path"]).is_file()
     for kind in ("load", "enter", "close"):
-        assert sum(e["kind"] == kind for e in records) == 3
+        assert sum(e["kind"] == kind for e in records) == 8
     requests = list(Path(setup["stage_root"]).glob("workers/*/worker-*/request.json"))
-    assert len(requests) == 3
+    assert len(requests) == 8
     assert all(p.with_name("worker.log").is_file() for p in requests)
 
 
 def test_failure_continues_retries_once_and_ready_skips(setup):
     setup["gpu_ids"] = ["4"]
+    setup["log_root"] = Path(setup["stage_root"]).parent / "logs"
     jobs = [{"job_id": "../bad", "fail": True}, {"job_id": "good"}]
     first = api().execute_stage(jobs=jobs, **setup)
+    assert (setup["log_root"] / "stage-gpu4.log").is_file()
     assert first["../bad"]["status"] == "failed"
     assert "sample failure" in first["../bad"]["failure_reason"]
     assert first["../bad"]["result"] is None
@@ -152,6 +155,12 @@ def test_failure_continues_retries_once_and_ready_skips(setup):
     count = len(events(setup))
     assert api().execute_stage(jobs=jobs, **setup) == third
     assert len(events(setup)) == count
+    assert json.loads((Path(setup["stage_root"]) / "invocation.json").read_text()) == {
+        "job_count": 2,
+        "scheduled_job_count": 0,
+        "reused_ready_count": 2,
+        "worker_count": 0,
+    }
     assert len(list(Path(setup["stage_root"]).glob("jobs/*"))) == 2
 
 

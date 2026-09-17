@@ -391,3 +391,61 @@ def test_real_executor_retries_semantic_failures(speech, finalized, tmp_path, ff
         jobs[0]["job_id"]: 2,
         jobs[1]["job_id"]: 1,
     }
+
+
+def test_all_upstream_speech_failures_publish_empty_stages(
+    speech, setup, tmp_path, ffmpeg, monkeypatch
+):
+    from r2v_data_v2.h3 import t2va_full_workers as workers
+
+    production = fixtures.prepare_t2va_audio(
+        fixtures.select_t2va_shots(fixtures.shot_manifest(tmp_path)),
+        output_root=tmp_path / "all-failed-audio",
+        audio_backend=fixtures.Audio(),
+    )
+    inventory = fixtures.auk_tests.auk.build_auk_inventory(
+        audio_production_root=production,
+        shadow_run_id=setup.shadow_run_id,
+        case_manifest_path=production / "case_manifest.json",
+        configuration=setup.model_configuration,
+    )
+    monkeypatch.setattr(
+        fixtures.auk_tests.FakeBackend,
+        "generate",
+        lambda *args: {
+            "status": "failed",
+            "reason": "all upstream speech inference failed",
+            "model_runtime_seconds": 0.1,
+        },
+    )
+    root, (_, records, _) = fixtures._resolve(inventory, tmp_path, ffmpeg)
+    assert len(records) == 3
+    assert all(record.status == "failed" for record in records)
+    calls = []
+
+    def empty_execute(*, jobs, factory, **kwargs):
+        assert jobs == []
+        calls.append(factory)
+        return {}
+
+    monkeypatch.setattr(workers, "execute_stage", empty_execute)
+    args = (production, setup.shadow_run_id, tmp_path / "workers", ["2", "7"], True)
+    diar_result = speech.run_diarizen(*args, ffmpeg=ffmpeg)
+    asr_result = speech.run_asr(*args, ffmpeg=ffmpeg)
+    assert diar_result["job_count"] == asr_result["job_count"] == 0
+    assert asr_result["summary"]["segment_count"] == 0
+    asr_provenance, diar_provenance = frozen.validate_stem_asr_lineage(
+        root.parent / "asr", expected_shadow_root=root.parent
+    )
+    assert diar_provenance.usable_clip_uids == []
+    assert asr_provenance.clip_uids == []
+    assert len(diar_provenance.skipped_clips) == 3
+    assert len(asr_provenance.skipped_clips) == 3
+    for relative in (
+        "diarization/raw_segments.jsonl",
+        "diarization/readable_targets.jsonl",
+        "diarization/readable_segments.jsonl",
+        "asr/segments.jsonl",
+    ):
+        assert (root.parent / relative).read_bytes() == b""
+    assert calls == [f"{speech.__name__}:diarizen_worker", f"{speech.__name__}:asr_worker"]
