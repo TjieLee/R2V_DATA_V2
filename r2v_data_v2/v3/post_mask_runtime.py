@@ -540,14 +540,19 @@ class DownstreamPhaseAdapter:
                 }
             )
             root = self.storage.root / "subject_attributes"
-            counts = process_subject_attribute_clip(
+            result = process_subject_attribute_clip(
                 self.config,
                 storage=self.storage,
                 output_root=root,
                 clip=accepted,
                 overwrite=False,
                 **self.kwargs,
-            ).to_counts()
+            )
+            counts: dict[str, Any] = dict(result.to_counts())
+            if result.totals.owner_processing_failures:
+                counts["subject_attribute_owner_failures"] = (
+                    result.totals.owner_processing_failures
+                )
             # Owner artifacts (including fail-closed failures) are the existing
             # durable policy. Exceptions that left no artifact remain retryable.
             durable_failures = 0
@@ -750,6 +755,12 @@ def _record_phase_result(
                 if stage == "subject_attributes"
                 else {}
             )
+            if stage == "subject_attributes" and values.get(
+                "subject_attribute_owner_failures"
+            ):
+                diagnostics["subject_attribute_owner_failures"] = values[
+                    "subject_attribute_owner_failures"
+                ]
             storage.append_failure(
                 stage=stage,
                 clip_uid=uid,

@@ -23,6 +23,7 @@ from pydantic import (
     ConfigDict,
     Field,
     StrictBool,
+    ValidationError,
     model_validator,
 )
 
@@ -1037,6 +1038,10 @@ class EnrichmentTotals:
     attribute_bbox_fallback_accepted: int = 0
     failures: int = 0
     failure_reasons: Counter[str] = field(default_factory=Counter)
+    # In-memory diagnostics only: not owner artifacts, counters or public schema.
+    owner_processing_failures: list[dict[str, str]] = field(
+        default_factory=list, repr=False
+    )
 
     def add_owner_metrics(self, metrics: OwnerEnrichmentMetrics) -> None:
         self.discovery_calls += metrics.discovery_calls
@@ -4871,6 +4876,25 @@ def _clear_clip_enrichment_artifacts(output_root: Path, clip_uid: str) -> None:
     )
 
 
+def _owner_exception_message(exc: Exception) -> str:
+    """Bound owner diagnostics without exposing model/input payloads."""
+    message = str(exc)
+    if isinstance(exc, ValidationError):
+        # Pydantic renders input values and custom-validator context below its
+        # summary; neither belongs in diagnostic events.
+        message = message.split("\n", 1)[0] + " [validation details omitted]"
+    else:
+        payload = re.search(
+            r"[{\[]|(?<![a-z0-9])(?:prompt|messages|input_value|response|body|image|base64|"
+            r"authorization|api[_ -]?key)(?![a-z0-9])|\bb['\"]|[A-Za-z0-9+/_-]{64,}={0,2}",
+            message,
+            flags=re.IGNORECASE,
+        )
+        if payload is not None:
+            message = message[:payload.start()] + "[payload omitted]"
+    return message.replace("\r", " ").replace("\n", " ")[:512]
+
+
 def process_subject_attribute_clip(
     config: V3Config,
     *,
@@ -5010,6 +5034,13 @@ def process_subject_attribute_clip(
                 totals.failure_reasons[
                     f"owner_processing_failed:{type(exc).__name__}"
                 ] += 1
+                totals.owner_processing_failures.append(
+                    {
+                        "owner_entity_id": owner.entity_id,
+                        "exception_type": type(exc).__name__,
+                        "exception_message": _owner_exception_message(exc),
+                    }
+                )
                 continue
             artifact_path.parent.mkdir(parents=True, exist_ok=True)
             write_json_atomic(artifact_path, artifact.model_dump(mode="json"))

@@ -1284,7 +1284,8 @@ def test_real_adapter_persistent_resources_placement_and_exception_close(
         if len(calls) == 2 and fail_second:
             raise RuntimeError("injected algorithm failure")
         return SimpleNamespace(
-            to_dict=lambda: {"processed": 1}, to_counts=lambda: {"failures": 0}
+            to_dict=lambda: {"processed": 1}, to_counts=lambda: {"failures": 0},
+            totals=subject_attributes.EnrichmentTotals(),
         )
 
     module_name, function_name = {
@@ -1630,7 +1631,10 @@ def test_attribute_failed_owner_durable_policy_versus_retryable_gap(
     monkeypatch.setattr(
         subject_attributes,
         "process_subject_attribute_clip",
-        lambda *args, **kwargs: SimpleNamespace(to_counts=lambda: {"failures": 1}),
+        lambda *args, **kwargs: SimpleNamespace(
+            to_counts=lambda: {"failures": 1},
+            totals=subject_attributes.EnrichmentTotals(failures=1),
+        ),
     )
     adapter = api.DownstreamPhaseAdapter("subject_attributes", storage, execution)
     adapter.kwargs = {
@@ -1644,3 +1648,46 @@ def test_attribute_failed_owner_durable_policy_versus_retryable_gap(
         api.phase_needed(storage, storage.read_clip("clip-0"), "subject_attributes")
         is not durable
     )
+
+
+@pytest.mark.parametrize("mode", ["legacy_serial", "wavefront_v2", "parallel_review_v21"])
+def test_swallowed_owner_exception_reaches_post_mask_event_without_receipt(
+    case, monkeypatch, mode
+):
+    from r2v_data_v2.v3 import subject_attributes
+    from tests.test_v3_subject_attributes import _candidate
+
+    case = _all_phases_case(case)
+    _write_rows(case, [_ready(case)])
+    api, paths, execution = _setup(case)
+    calls = []
+    monkeypatch.setattr(
+        subject_attributes, "build_entity_reference_candidates",
+        lambda *args, **kwargs: [_candidate("candidate_1", slot=1, source_frame_index=10)],
+    )
+    def fail_owner(**kwargs):
+        calls.append(kwargs["owner"].entity_id)
+        raise ValueError("synthetic owner failure")
+    monkeypatch.setattr(subject_attributes, "_process_owner", fail_owner)
+    events = []
+    result = api.run_post_mask_shard(
+        case[0], entity_mask_root=case[1], paths=paths, git_commit="test",
+        execution=replace(execution, scheduler_mode=mode),
+        adapter_factory=_accepted_factory([]), event_callback=events.append,
+    )
+    assert calls == ["e1"]
+    assert not result.completed and result.retryable_clip_uids == ("clip-0",)
+    assert not (paths.run_root / "subject_attributes" / "owners").exists()
+    assert not (paths.run_root / "clips/clip-0/.post_mask_attributes.json").exists()
+    event = next(e for e in events if e["event"] == "post_mask_clip_failed")
+    assert event["failures"] == event["retryable_pending"] == 1
+    assert event["retryable"] is True
+    assert event["subject_attribute_owner_failures"] == [{
+        "owner_entity_id": "e1", "exception_type": "ValueError",
+        "exception_message": "synthetic owner failure",
+    }]
+    failure = json.loads((paths.run_root / "failures.jsonl").read_text().splitlines()[-1])
+    assert failure["details"] == {
+        "retryable": True, "failures": 1, "retryable_pending": 1,
+        "subject_attribute_owner_failures": event["subject_attribute_owner_failures"],
+    }
