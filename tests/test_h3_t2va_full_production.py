@@ -207,6 +207,49 @@ def test_full_supervisor_stage_order(tmp_path, capsys):
     )
 
 
+def test_node_lifetime_starts_all_pools_once(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from r2v_data_v2.h3 import t2va_full_speech as speech
+    from r2v_data_v2.h3 import t2va_full_worker_pool as pools
+
+    events = []
+
+    class Manager:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            events.append("enter")
+            return self
+
+        def start(self, name, **kwargs):
+            events.append((name, kwargs))
+
+        def __exit__(self, *args):
+            events.append("close")
+
+    monkeypatch.setattr(pools, "PersistentPoolManager", Manager)
+    monkeypatch.setattr(speech, "_diar_configuration", lambda: {"environment": {}})
+    monkeypatch.setattr(speech, "_asr_configuration", lambda: {"environment": {}})
+    config = SimpleNamespace(model_dump=lambda **kw: {"model": "frozen"})
+    pipeline = full.FullPipeline(
+        root=tmp_path,
+        index={},
+        clips_root=tmp_path,
+        source_videos_root=tmp_path,
+        gpu_ids=["0", "5"],
+        sam_configuration=config,
+        auk_configuration=config,
+        backend=None,
+        profiles=None,
+    )
+    with pipeline:
+        assert [e[0] for e in events[1:]] == ["sam", "auk", "diarizen", "asr"]
+        assert events[1][1]["request_keys"] == ("inventory_path",)
+    assert events[-1] == "close"
+
+
 def test_shard_selection_preserves_bad_row_positions(tmp_path):
     manifest = shot_manifest(tmp_path)
     lines = manifest.read_bytes().splitlines(keepends=True)

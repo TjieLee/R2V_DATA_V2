@@ -6,6 +6,7 @@ import json
 import os
 import traceback
 import uuid
+from contextlib import ExitStack
 from pathlib import Path
 
 from r2v_data_v2.h3 import t2va_production as production
@@ -95,6 +96,68 @@ class FullPipeline:
         self.allow_unverified, self.request_workers = allow_unverified, request_workers
         self.ffmpeg, self.ffprobe = ffmpeg, ffprobe
         self.audio_root = None
+        self.pools = None
+
+    def __enter__(self):
+        from r2v_data_v2.h3 import t2va_full_speech as speech
+        from r2v_data_v2.h3 import t2va_full_stems as stems
+        from r2v_data_v2.h3.t2va_full_worker_pool import PersistentPoolManager
+
+        self._lifetime = ExitStack()
+        try:
+            self.pools = self._lifetime.enter_context(
+                PersistentPoolManager(self.root / "workers", self.gpu_ids)
+            )
+            self.pools.start(
+                "sam",
+                factory=stems.__name__ + ":SAMWorker",
+                configuration={
+                    "model": self.sam_configuration.model_dump(mode="json"),
+                    "ffmpeg": self.ffmpeg,
+                    "ffprobe": self.ffprobe,
+                },
+                request_keys=("inventory_path",),
+                environment={
+                    "PYTHONPATH": os.environ.get("SAM_AUDIO_RUNTIME_PYTHONPATH", "")
+                },
+            )
+            self.pools.start(
+                "auk",
+                factory=stems.__name__ + ":AukWorker",
+                configuration={
+                    "model": self.auk_configuration.model_dump(mode="json"),
+                    "ffmpeg": self.ffmpeg,
+                },
+            )
+            for name, factory, configuration in (
+                (
+                    "diarizen",
+                    speech.__name__ + ":diarizen_worker",
+                    speech._diar_configuration(),
+                ),
+                (
+                    "asr",
+                    speech.__name__ + ":asr_worker",
+                    {**speech._asr_configuration(), "ffmpeg": self.ffmpeg},
+                ),
+            ):
+                self.pools.start(
+                    name,
+                    factory=factory,
+                    configuration=configuration,
+                    environment=configuration["environment"],
+                )
+            return self
+        except BaseException:
+            self._lifetime.close()
+            self.pools = None
+            raise
+
+    def __exit__(self, *args):
+        try:
+            return self._lifetime.__exit__(*args)
+        finally:
+            self.pools = None
 
     def stage(self, name, shard_id):
         from r2v_data_v2.h3 import auk_speech_shadow as auk
@@ -105,6 +168,7 @@ class FullPipeline:
 
         shard = self.root / "shards" / production.shard_name(shard_id)
         state = shard / "stage_state"
+        execution = {"execute": self.pools.execute_stage} if self.pools else {}
         if name == "canonical":
             selection = shard_selection(
                 self.root,
@@ -146,6 +210,7 @@ class FullPipeline:
                 self.gpu_ids,
                 ffmpeg=self.ffmpeg,
                 ffprobe=self.ffprobe,
+                **execution,
             )
         if name == "auk":
             _, records, _ = sam.load_stem_shadow(shadow / "separation")
@@ -162,6 +227,7 @@ class FullPipeline:
                 self.gpu_ids,
                 eligible=eligible,
                 ffmpeg=self.ffmpeg,
+                **execution,
             )
         if name == "resolve":
             return resolve_audio_stems(
@@ -179,6 +245,7 @@ class FullPipeline:
                 self.gpu_ids,
                 self.allow_unverified,
                 ffmpeg=self.ffmpeg,
+                **execution,
             )
             provenance = result["provenance"]
             return {

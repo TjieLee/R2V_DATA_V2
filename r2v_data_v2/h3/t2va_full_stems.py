@@ -139,12 +139,21 @@ def run_auk(inventory, state_root, gpu_ids, *, eligible, ffmpeg="ffmpeg", execut
 
 class SAMWorker:
     def __init__(self, configuration):
-        self.inventory = sam.SAMAudioStemInventory.model_validate_json(
-            Path(configuration["inventory_path"]).read_text()
-        )
-        self.backend = sam.OfficialSAMAudioBackend(self.inventory.model_configuration)
+        model = sam.SAMAudioModelConfiguration.model_validate(configuration["model"])
+        self.backend = sam.OfficialSAMAudioBackend(model)
+        self.inventory = None
         self.ffmpeg = configuration.get("ffmpeg", "ffmpeg")
         self.ffprobe = configuration.get("ffprobe", "ffprobe")
+        if "inventory_path" in configuration:
+            self.bind_request(configuration)
+
+    def bind_request(self, configuration):
+        inventory = sam.SAMAudioStemInventory.model_validate_json(
+            Path(configuration["inventory_path"]).read_text()
+        )
+        if inventory.model_configuration != self.backend.configuration:
+            raise ValueError("SAM pool model configuration changed")
+        self.inventory = inventory
 
     def __enter__(self):
         self.backend._load()

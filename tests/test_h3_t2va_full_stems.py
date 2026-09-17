@@ -6,6 +6,38 @@ ffmpeg = fixtures.ffmpeg
 setup = fixtures.setup
 
 
+def test_sam_model_loaded_once_and_inventory_bound_per_request(tmp_path, monkeypatch):
+    from r2v_data_v2.h3 import sam_audio_stem_shadow as sam
+    from r2v_data_v2.h3 import t2va_full_stems as stems
+    from tests.test_h3_sam_audio_stem_shadow import _canonical_fixture, _configuration
+
+    manifest, _, _ = _canonical_fixture(tmp_path)
+    config = _configuration(tmp_path)
+    inventory = sam.build_sam_audio_stem_inventory(
+        canonical_audio_manifest_path=manifest, model_configuration=config
+    )
+    loads = []
+
+    class Backend:
+        def __init__(self, configuration):
+            self.configuration = configuration
+
+        def _load(self):
+            loads.append(self.configuration)
+
+    monkeypatch.setattr(sam, "OfficialSAMAudioBackend", Backend)
+    configuration = {"model": config.model_dump(mode="json")}
+    with stems.SAMWorker(configuration) as worker:
+        backend = worker.backend
+        for name in ("a", "b", "c"):
+            path = tmp_path / f"{name}.json"
+            path.write_text(inventory.model_dump_json())
+            worker.bind_request({**configuration, "inventory_path": str(path)})
+            assert worker.inventory == inventory
+            assert worker.backend is backend
+        assert loads == [config]
+
+
 def test_auk_replay_publishes_full_inventory(setup, tmp_path, ffmpeg):
     from r2v_data_v2.h3 import auk_speech_shadow as auk
     from r2v_data_v2.h3 import t2va_full_stems as stems

@@ -131,7 +131,8 @@ def main(argv=None):
 
     signal.signal(signal.SIGTERM, stop)
     try:
-        return full.run_assigned_shards(root, order, pipeline)
+        with pipeline:
+            return full.run_assigned_shards(root, order, pipeline)
     finally:
         signal.signal(signal.SIGTERM, previous)
 
