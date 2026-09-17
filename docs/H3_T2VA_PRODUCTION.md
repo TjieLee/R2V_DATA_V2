@@ -8,20 +8,30 @@ stage orchestration without migrating legacy outputs or changing eligibility.
 
 ## Full Raw-Video Production
 
-Use scripts/run_h3_t2va_full_production.sh for a fresh, shard-owned Audio
-workspace. One node owns one fixed shard through these barriers:
+Use scripts/run_h3_t2va_full_production.sh for the production path from original
+JEA video through finalized T2VA/TA2VA. Production shard size is 2,000 source
+rows. One node owns one shard at a time through these barriers:
 
     canonical -> SAM music_first -> AuK -> resolve -> DiariZen -> ASR -> MiMo
 
+Automatic multi-node scheduling shuffles shard IDs with SHARD_SEED and takes
+ordered_shards[RANK::WORLD_SIZE]. RANK/WORLD_SIZE are node-level scheduling
+coordinates: different nodes receive different shard sequences. Inside a node,
+the eight GPUs do not take eight different shards. They cooperatively process
+the current shard: persistent stage workers partition pending jobs across GPUs,
+while MiMo uses the full eight-GPU serving topology.
+
 MiMo starts once per launcher invocation and stays alive across stages/shards.
-The serving arguments are unchanged. Client REQUEST_WORKERS defaults to 1.
-Upstream stages use GPU_IDS=0,1,2,3,4,5,6,7 by default. SAM, AuK, DiariZen and
-Qwen3-ASR each have eight node-lifetime resident workers (32 upstream workers,
-in addition to MiMo). Every worker loads once before its READY handshake,
-processes requests across shards and closes only at node shutdown. Stage barriers
-remain sequential; residency does not mean concurrent GPU stages. Each child sees
-its physical GPU through CUDA_VISIBLE_DEVICES and uses cuda:0; the parent
-environment is unchanged. There is no automatic GPU memory manager or restart.
+The accepted full-production launcher uses TP=8, DP=2 and
+--mem-fraction-static 0.50; the previous 0.65 setting OOMed AuK when all resident
+upstream workers were present. Client REQUEST_WORKERS defaults to 1. Upstream
+stages use GPU_IDS=0,1,2,3,4,5,6,7 by default. SAM, AuK, DiariZen and Qwen3-ASR
+each have eight node-lifetime resident workers (32 upstream workers, in addition
+to MiMo). Every worker loads once before its READY handshake, processes requests
+across shards and closes only at node shutdown. Stage barriers remain sequential;
+residency does not mean concurrent GPU stages. Each child sees its physical GPU
+through CUDA_VISIBLE_DEVICES and uses cuda:0; the parent environment is unchanged.
+There is no automatic GPU memory manager or model restart daemon.
 
 Canonical preparation uses CANONICAL_WORKERS=16 (Python --canonical-workers),
 configurable to any positive integer. Per-clip publication and hash checks are
@@ -39,25 +49,101 @@ Within each ASR worker, a single CPU thread prefetches the next waveform.
 Transcription remains serial (one GPU inference at a time). Loader failures are
 attributed to their own segment. SAM/AuK postprocessing is not pipelined.
 
-The full runner needs the existing server_env.sh dependency settings:
-SAM_AUDIO_CODE_ROOT, SAM_AUDIO_MODEL_PATH, SAM_AUDIO_T5_BASE_PATH,
-SAM_AUDIO_RUNTIME_PYTHONPATH, AUK_PYTHON, AUK_CODE_ROOT, AUK_CHECKPOINT,
-AUK_QWEN_PATH, DIARIZEN_PYTHON, DIARIZEN_CODE_ROOT, DIARIZEN_MODEL_PATH,
-QWEN3_ASR_ENV and QWEN3_ASR_MODEL_PATH. No dependency is downloaded. The launcher
-does not edit server_env.sh. It adds localhost to NO_PROXY/no_proxy without
-removing external proxies. Readiness checks owned PID, /v1/models and /model_info.
+The launcher sources the repo .venv and server_env.sh. server_env.sh remains the
+local authority for the SAM runtime settings. The full launcher supplies the
+standard production defaults for AuK, DiariZen, Qwen3-ASR, SGLang and MiMo paths,
+while still allowing explicit environment overrides. No dependency is downloaded.
+The launcher does not edit server_env.sh. It adds localhost to NO_PROXY/no_proxy
+without removing external proxies. Readiness checks owned PID, /v1/models and
+/model_info.
+
+### Cluster launch: current production form
+
+The formal production root is:
+
+    /mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/T2VA
+
+Use the existing cluster job wrapper. Do not hard-code a node count into the
+wrapper. The scheduler supplies a unique RANK and a common WORLD_SIZE for each
+allocation, so the same file works when a resumed allocation has a different
+number of nodes. Keep the fallbacks only for single-node/manual use:
 
 ```bash
-RANK=0 WORLD_SIZE=4 SHARD_SEED=20260917 GPU_IDS=0,1,2,3,4,5,6,7 \
-  bash scripts/run_h3_t2va_full_production.sh --dry-run
+export RANK=${RANK:-0}
+export WORLD_SIZE=${WORLD_SIZE:-1}
 
-# Inspect commands first. Explicit opt-in is required for unverified SAM output.
-RANK=0 WORLD_SIZE=4 SHARD_SEED=20260917 GPU_IDS=0,1,2,3,4,5,6,7 \
-ALLOW_UNVERIFIED=1 bash scripts/run_h3_t2va_full_production.sh
+export PRODUCTION_ROOT=/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/T2VA
+export SHARD_SEED=20260918
+export ALLOW_UNVERIFIED=1
 
+cd /mnt/workspace/litengjie/data/R2V_DATA_V2
+bash scripts/run_h3_t2va_full_production.sh
+```
+
+Each allocated node is expected to have eight GPUs. The full launcher already
+defaults GPU_IDS=0,1,2,3,4,5,6,7, CANONICAL_WORKERS=16 and REQUEST_WORKERS=1,
+so the cluster wrapper should not repeat those values unless deliberately
+overriding them. Likewise, do not copy the long AuK/DiariZen/ASR path export list
+into the cluster wrapper; the launcher owns those standard defaults.
+
+All nodes in one allocation must see the same shared PRODUCTION_ROOT, source
+manifest, clips root and source-video root, and must receive unique RANK values
+within the same WORLD_SIZE. Keep SHARD_SEED=20260918 fixed for this production
+population so scheduling is reproducible. The number of nodes may change after an
+interruption: restart with the new scheduler-provided WORLD_SIZE and the same
+production root/seed. The new rank slicing still partitions the full shard list;
+already-ready receipts are reused, and shard/invocation locks protect the shared
+root. Do not change shard size or source identity in-place.
+
+For manual debugging only, explicit SHARDS bypasses rank/world allocation:
+
+```bash
 SHARDS=59,12,87 ALLOW_UNVERIFIED=1 \
   bash scripts/run_h3_t2va_full_production.sh
 ```
+
+### Cluster filesystem / Python runtime prerequisite
+
+/mnt/workspace is shared, but a venv executable may still be a symlink to a
+node-local path. This caused the cluster launcher to fail immediately with:
+
+    Missing AUK_PYTHON: /mnt/workspace/litengjie/data/audio_deps/auk/auk-venv/bin/python
+
+The AuK venv path itself existed on shared storage, but bin/python originally
+resolved through /opt/uv/python/... on the notebook. Ephemeral compute nodes did
+not provide that notebook-local /opt/uv target. Do not try to repair /opt/uv on
+each temporary node. Make the venv resolve to a shared runtime (or to a Python
+provided by the common base image) once on shared storage.
+
+The accepted AuK layout resolves to the shared runtime alias:
+
+    /mnt/workspace/litengjie/data/shared_uv_runtime/python/cpython-3.10-linux-x86_64-gnu/bin/python3.10
+
+DiariZen already uses a shared audio_deps/uv-python runtime. Qwen3-ASR and the
+SGLang environment currently resolve to /usr/bin/python3.12 and therefore rely on
+the common cluster base image providing that interpreter.
+
+Before changing or recreating any environment, inspect resolution without exiting
+the current shell:
+
+```bash
+for py in \
+  /mnt/workspace/litengjie/data/R2V_DATA_V2/.venv/bin/python \
+  /mnt/workspace/litengjie/data/audio_deps/auk/auk-venv/bin/python \
+  /mnt/workspace/litengjie/data/audio_deps/diarizen-venv/bin/python \
+  /mnt/workspace/litengjie/data/audio_deps/qwen3-asr-venv/bin/python \
+  /mnt/workspace/litengjie/data/audio_deps/qwen38-sglang-env/bin/python
+do
+  echo "===== $py ====="
+  readlink "$py" 2>/dev/null || true
+  readlink -f "$py" 2>/dev/null || true
+done
+```
+
+A shared path that ultimately resolves back to notebook-local /opt/uv is not
+cluster-portable even though ls shows the venv under /mnt/workspace. Prefer
+shared, versioned Python runtime directories with relative aliases; avoid
+absolute aliases back into /opt/uv.
 
 Do not supply an existing Audio cache to the full runner. It owns
 shards/<shard>/audio_production, including canonical_items, audio manifests and
@@ -74,20 +160,20 @@ exceptions remain under shard logs. Canonical subprocess logs are
 logs/canonical-prefetch.log within the shard. Pool startup and stage wall seconds,
 plus canonical prefetch start/completion, are printed in the supervisor log.
 Node logs are logs/<hostname>/{mimo,supervisor}-<timestamp>-<pid>.log.
-Only the parent publishes full ordered
-inventories. Worker outputs never race on canonical records.jsonl. Successful
-receipt/media hashes are checked before reuse; failed jobs retry once on the
-next invocation. A worker crash waits for other workers, stops the supervisor,
-and leaves unattempted jobs pending. Ctrl-C/TERM terminates owned worker trees.
-Never delete ready receipts merely to rerun the stage.
+Only the parent publishes full ordered inventories. Worker outputs never race on
+canonical records.jsonl. Successful receipt/media hashes are checked before
+reuse; failed jobs retry once on the next invocation. A worker crash waits for
+other workers, stops the supervisor, and leaves unattempted jobs pending.
+Ctrl-C/TERM terminates owned worker trees. Never delete ready receipts merely to
+rerun the stage.
 
 stage_state/<stage>/invocation.json records scheduled_job_count,
 reused_ready_count and worker_count for the latest invocation. Zero scheduled
 jobs means no inference request is sent; already-resident workers remain idle.
-Frozen publication model
-counts still describe the cached artifacts, not new calls in this invocation.
-Keep interpreters and dependency environments pinned for a resumed run; use a
-fresh production root when upgrading runtimes rather than adopting old caches.
+Frozen publication model counts still describe the cached artifacts, not new
+calls in this invocation. Keep interpreters and dependency environments pinned
+for a resumed run; use a fresh production root when changing source identity,
+shard size or incompatible runtime semantics rather than adopting old caches.
 
 Upstream aggregate manifests can expand after failed clips recover. The full
 downstream adapter binds ready outputs to validated per-clip dependencies;
@@ -95,40 +181,39 @@ unrelated aggregate hash changes cannot trigger repeat inference. Previously
 upstream-skipped clips can reopen when their own inputs become available.
 Published data remains available to the existing snapshot builder.
 
-### Raw-Video Server Acceptance
+### Raw-video server acceptance (2026-09-18)
 
-The pre-performance raw-5 run passed on the server as reported by the operator.
-No real inference was performed for this performance refactor locally. Before
-2k production, validate the new lifecycle using fresh roots:
+The performance-v2 raw-5 server run passed with the resident upstream pools and
+MiMo --mem-fraction-static 0.50. The final stage summary was:
 
-1. Create a new five-row shot JSONL containing the original five target video
-   rows, preserving paths and order; do not copy a prior Audio cache.
-2. Point SHOT_MANIFEST at that file and PRODUCTION_ROOT at a fresh smoke root.
-3. Run SHARDS=0 with the full launcher and ALLOW_UNVERIFIED=1. Verify canonical,
-   SAM, AuK, resolved, DiariZen and ASR inventories with their existing loaders.
-4. Build a snapshot using tools/build_h3_t2va_snapshot.py. Check the stage and
-   downstream ready/failure counters rather than assuming every source is usable.
-5. Rerun the identical command. Confirm ready worker receipts were reused and
-   ready T2VA/TA2VA artifacts made zero additional model calls.
-6. In another fresh smoke root, interrupt during ASR, rerun, and verify only
-   unfinished/failed ASR jobs ran. Confirm one MiMo PID per invocation and no
-   surviving owned child processes after node shutdown. After each stage, the
-   corresponding upstream workers MUST still exist; inspect their PIDs and GPUs.
-7. Only after the five-clip checks pass, try a roughly 100-row bounded manifest,
-   then one actual 2,000-row shard. Record canonical/SAM/AuK/resolve/DiariZen/
-   ASR/MiMo and total wall time.
-8. Finally run SHARDS=0,1 on two real 2,000-row shards. Verify identical worker
-   PIDs across both shards and exactly one model load per worker. Confirm that
-   shard 1 canonical preparation overlaps shard 0 GPU processing. Do not start
-   the entire source population before these checks pass.
+    canonical  ready=5 failed=0
+    SAM        records=5 model_call_count=10
+    AuK        ready=5 failed=0 model_call_count=5
+    resolve    ready=5 failed=0
+    DiariZen   jobs=5 ready=5 failed=0
+    ASR        jobs=6 ready clips=5 failed=0
+    MiMo       t2va_ready=5 ta2va_ready=5, all failed/pending/skipped=0
+
+ASR job_count can exceed ready clip count because ASR jobs are speech segments.
+The accepted run exited with no owned worker processes left behind. A prior run
+with MiMo mem-fraction-static 0.65 OOMed AuK during inference because MiMo held
+about 92 GiB per GPU while the resident audio models were also present; 0.50 is
+the current production setting. Full-population cluster production was started
+only after this acceptance and the shared-Python runtime issue above was fixed.
+
+For future runtime/architecture changes, repeat a small raw-video smoke before
+resuming large production. Use a fresh smoke root for changes that alter source
+index identity or incompatible runtime semantics; do not reuse the historical
+10k-shard smoke root.
 
 ## Standalone Downstream Prerequisites
 
 The population authority is the original ordered JEA shot JSONL, not an Audio
-or Visual inventory. Production shard size is 2,000. Each physical source row belongs permanently to a 2,000-row
-shard, including malformed/unavailable rows. Shard 59 is source indexes
-118000 through 119999. Shards 0 and 1 cover 0..1999 and 2000..3999.
-The last shard can be shorter; shard count is derived from the actual source.
+or Visual inventory. Production shard size is 2,000. Each physical source row
+belongs permanently to a 2,000-row shard, including malformed/unavailable rows.
+Shard 59 is source indexes 118000 through 119999. Shards 0 and 1 cover 0..1999
+and 2000..3999. The last shard can be shorter; shard count is derived from the
+actual source.
 
 An old 10,000-row-shard root is incompatible and raises
 "source index shard size mismatch". Use a fresh root, including for raw-5 smoke;
@@ -277,23 +362,23 @@ identities, schemas and statuses are never added to these rows. videos.jsonl
 contains only video and the currently available task list. Future snapshots
 gain later TA2VA products without modifying earlier snapshots.
 
-## Acceptance Before Large Production
+## Acceptance Before Semantic Changes
 
 CPU tests cover frozen-vs-production core/prompt equivalence, TA2VA PCM hashes,
 resume without repeat calls, concurrent writes, interruption recovery,
-incremental snapshots and launcher lifecycle with synthetic executables.
-They are not evidence of a real MiMo run.
+incremental snapshots and launcher lifecycle with synthetic executables. The
+full raw-video path additionally has the real raw-5 server acceptance documented
+above.
 
-Before operating the full population, create a separate smoke output root and
-a small ordered shot-manifest fixture containing 2-5 rows from the already
-validated random20 population, with original video paths unchanged. Use its
-matching frozen Audio root/run. Run Python dry-run, then shard 0 with a real
-endpoint. Compare:
+If frozen T2VA/TA2VA semantics, upstream model versions, shard identity or
+serving/runtime architecture changes, create a separate smoke output root and
+repeat a small real endpoint validation before resuming large production. Compare:
 
 1. production artifacts/<uid>/t2va/core.json to frozen core semantic payload;
 2. T2VA prompt and exact dialogue;
 3. TA2VA variant set, six-section prompts and reuse PCM hashes.
 
-Only after confirming no drift, test a bounded small complete shard fixture.
-Do not start the full 3.8M source until those server checks pass. This local
-development task has not executed real server/model inference.
+Do not treat a CPU-only test pass as evidence for a changed real-model runtime.
+For ordinary cluster interruptions with unchanged code/config/source identity,
+resume the same shared production root and let durable receipts/locks recover the
+remaining work.
