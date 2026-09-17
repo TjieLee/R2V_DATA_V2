@@ -4880,9 +4880,28 @@ def _owner_exception_message(exc: Exception) -> str:
     """Bound owner diagnostics without exposing model/input payloads."""
     message = str(exc)
     if isinstance(exc, ValidationError):
-        # Pydantic renders input values and custom-validator context below its
-        # summary; neither belongs in diagnostic events.
-        message = message.split("\n", 1)[0] + " [validation details omitted]"
+        summary = message.split("\n", 1)[0]
+        if exc.title == "OwnerEnrichmentMetrics":
+            # This model's validators have fixed messages. Never render their
+            # input metrics or context, nor expand details for other models.
+            errors = [
+                {
+                    "loc": [
+                        part
+                        if index == 0 and part in OwnerEnrichmentMetrics.model_fields
+                        else "<key omitted>"
+                        for index, part in enumerate(error["loc"])
+                    ],
+                    "type": error["type"],
+                    "msg": error["msg"],
+                }
+                for error in exc.errors(
+                    include_input=False, include_context=False, include_url=False
+                )
+            ]
+            message = summary + ": " + json.dumps(errors, ensure_ascii=False)
+        else:
+            message = summary + " [validation details omitted]"
     else:
         payload = re.search(
             r"[{\[]|(?<![a-z0-9])(?:prompt|messages|input_value|response|body|image|base64|"

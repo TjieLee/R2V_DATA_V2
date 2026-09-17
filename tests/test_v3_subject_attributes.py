@@ -2313,6 +2313,62 @@ def test_owner_exception_diagnostic_omits_payloads(message):
     assert len(diagnostic) <= 512
 
 
+def test_owner_metrics_diagnostic_exposes_fixed_validator_error_without_payload():
+    with pytest.raises(ValidationError) as raised:
+        OwnerEnrichmentMetrics(
+            attribute_bbox_reviews_attempted=1,
+            completion_attempts_by_type={"SECRET PAYLOAD": 0},
+        )
+    diagnostic = subject_attributes._owner_exception_message(raised.value)
+    assert "OwnerEnrichmentMetrics" in diagnostic
+    assert '"loc": []' in diagnostic
+    assert '"type": "value_error"' in diagnostic
+    assert '"msg": "Value error, attribute bbox review outcomes exceed materialized variants"' in diagnostic
+    assert "SECRET" not in diagnostic
+    assert '"input"' not in diagnostic
+    assert '"ctx"' not in diagnostic
+    assert '"url"' not in diagnostic
+    assert len(diagnostic) <= 512
+
+
+def test_owner_metrics_diagnostic_exposes_field_location_without_input():
+    with pytest.raises(ValidationError) as raised:
+        OwnerEnrichmentMetrics(failures="SECRET MODEL RESPONSE")
+    diagnostic = subject_attributes._owner_exception_message(raised.value)
+    assert '"loc": ["failures"]' in diagnostic
+    assert '"type": "int_parsing"' in diagnostic
+    assert "Input should be a valid integer" in diagnostic
+    assert "SECRET" not in diagnostic
+    assert '"input"' not in diagnostic and '"ctx"' not in diagnostic
+
+
+@pytest.mark.parametrize("payload", [
+    {"completion_attempts_by_type": {"SECRET MODEL RESPONSE": "not an integer"}},
+    {"SECRET EXTRA FIELD": 1},
+])
+def test_owner_metrics_diagnostic_omits_input_derived_locations(payload):
+    with pytest.raises(ValidationError) as raised:
+        OwnerEnrichmentMetrics.model_validate(payload)
+    diagnostic = subject_attributes._owner_exception_message(raised.value)
+    assert "SECRET" not in diagnostic
+    assert "<key omitted>" in diagnostic
+    if "completion_attempts_by_type" in payload:
+        assert '"loc": ["completion_attempts_by_type", "<key omitted>"]' in diagnostic
+        assert '"type": "int_parsing"' in diagnostic
+
+
+def test_owner_metrics_diagnostic_still_caps_many_errors():
+    with pytest.raises(ValidationError) as raised:
+        OwnerEnrichmentMetrics(
+            discovery_calls=-1, review_calls=-1, sam3_attempts=-1,
+            failures=-1, completion_attempts=-1,
+        )
+    diagnostic = subject_attributes._owner_exception_message(raised.value)
+    assert '"loc"' in diagnostic
+    assert len(diagnostic) == 512
+    assert "\r" not in diagnostic and "\n" not in diagnostic
+
+
 def test_owner_exception_diagnostic_does_not_render_validation_inputs():
     from pydantic import BaseModel
 
