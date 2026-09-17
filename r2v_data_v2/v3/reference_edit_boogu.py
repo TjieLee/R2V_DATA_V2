@@ -18,8 +18,13 @@ import selectors
 import subprocess
 import tempfile
 import uuid
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
+from contextvars import copy_context
 from dataclasses import dataclass, field
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Literal, Protocol, TextIO
 
 import numpy as np
@@ -1416,11 +1421,15 @@ def run_boogu_reference_edit(
     completion_source_frame_index: int | None = None,
     publish_final: bool = True,
     overwrite: bool = False,
+    review_execution: Literal["sequential", "parallel_independent"] = "sequential",
+    review_observer: Callable[[dict[str, int | float]], None] | None = None,
 ) -> BooguReferenceEditResult:
     """Generate, review, and publish one native Boogu reference artifact."""
 
     if operation not in {"complete_entity", "add_entity_background"}:
         raise ValueError(f"unsupported Boogu edit operation: {operation}")
+    if review_execution not in {"sequential", "parallel_independent"}:
+        raise ValueError(f"unsupported review execution: {review_execution}")
     if operation == "complete_entity":
         completion_attempt_index = completion_attempt_index or 1
         if completion_attempt_index not in {1, 2}:
@@ -1656,8 +1665,48 @@ def run_boogu_reference_edit(
             if qwen_review_skipped_reason is None:
                 qwen_review = run_qwen_review()
         else:
-            qwen_review = run_qwen_review()
-            sam_review = run_sam_review()
+            if review_execution == "parallel_independent":
+                review_metrics: dict[str, int | float] = {
+                    "reference_complete_parallel_attempts": 1,
+                    "reference_complete_parallel_both_success": 0,
+                }
+
+                def timed_review(name: str, call: Callable[[], Any]) -> Any:
+                    started = perf_counter()
+                    try:
+                        return call()
+                    finally:
+                        review_metrics[f"reference_complete_parallel_{name}_seconds"] = (
+                            perf_counter() - started
+                        )
+
+                wall_started = perf_counter()
+                try:
+                    # Separate contexts propagate the existing gate/profiler without
+                    # entering one Context concurrently. Exit drains both reviews.
+                    with ThreadPoolExecutor(max_workers=2) as reviews:
+                        qwen_future = reviews.submit(
+                            copy_context().run, timed_review, "qwen", run_qwen_review
+                        )
+                        sam_future = reviews.submit(
+                            copy_context().run, timed_review, "sam", run_sam_review
+                        )
+                        # Keep legacy failure provenance: a Qwen exception leaves
+                        # both fields unset; a SAM exception retains Qwen's result.
+                        qwen_review = qwen_future.result()
+                        sam_review = sam_future.result()
+                        review_metrics["reference_complete_parallel_both_success"] = 1
+                finally:
+                    review_metrics["reference_complete_parallel_wall_seconds"] = (
+                        perf_counter() - wall_started
+                    )
+                    if review_observer is not None:
+                        # Execution-only telemetry must not change publication.
+                        with suppress(Exception):
+                            review_observer(review_metrics)
+            else:
+                qwen_review = run_qwen_review()
+                sam_review = run_sam_review()
             geometry_metadata = _sam_geometry_metadata(sam_review)
 
         qwen_accepted = qwen_review is not None and qwen_review.verdict == "accept"

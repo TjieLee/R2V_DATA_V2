@@ -566,3 +566,115 @@ def test_shared_qwen_gate_observes_parallel_acquisitions_without_double_gate(
     assert len(set(slots)) == 2
     assert resources.summary()["qwen_max_inflight_observed"] == 2
     assert resources.summary()["qwen_queue_wait_seconds"] >= 0
+
+
+@pytest.mark.parametrize("resource_name", ["boogu", "sam"])
+def test_service_occupancy_excludes_startup_and_counts_failure_time(
+    tmp_path, monkeypatch, resource_name
+):
+    from r2v_data_v2.v3 import post_mask_resources, reference_edit_boogu
+
+    clock = [10.0]
+    monkeypatch.setattr(post_mask_resources.time, "perf_counter", lambda: clock[0])
+
+    class TimedBackend(_HealthyBackend):
+        def start(self, **kwargs):
+            clock[0] += 50
+            super().start(**kwargs)
+
+        def edit(self, **kwargs):
+            return inference(**kwargs)
+
+    def inference(*, fail=False):
+        clock[0] += 2
+        if fail:
+            raise RuntimeError("failed inference")
+        return "ok"
+
+    monkeypatch.setattr(reference_edit_boogu, "BooguSubprocessBackend", TimedBackend)
+    resources = post_mask_resources.PostMaskWorkerResources(
+        _config(tmp_path), _settings(tmp_path, monkeypatch),
+        runtime_root=tmp_path / "runtime",
+    )
+    initial = resources.summary()
+    assert initial[f"{resource_name}_first_service_started_at"] is None
+    assert initial[f"{resource_name}_last_service_finished_at"] is None
+    assert initial[f"{resource_name}_utilization_over_active_span"] == 0
+    call = resources.edit if resource_name == "boogu" else (
+        lambda **kwargs: resources.sam_call(inference, **kwargs)
+    )
+    with resources:
+        assert call() == "ok"
+        clock[0] += 3
+        with pytest.raises(RuntimeError, match="failed inference"):
+            call(fail=True)
+        clock[0] += 1
+        assert call() == "ok"
+        clock[0] += 100  # Worker lifetime is not the occupancy denominator.
+    summary = resources.summary()
+    expected_start = 60.0 if resource_name == "boogu" else 10.0
+    assert summary[f"{resource_name}_first_service_started_at"] == expected_start
+    assert summary[f"{resource_name}_last_service_finished_at"] == expected_start + 10
+    assert summary[f"{resource_name}_service_seconds"] == 6
+    assert summary[f"{resource_name}_idle_seconds_between_calls"] == 4
+    assert summary[f"{resource_name}_longest_idle_gap_seconds"] == 3
+    assert summary[f"{resource_name}_utilization_over_active_span"] == 0.6
+
+
+def test_qwen_occupancy_is_union_not_sum_of_acquired_intervals(tmp_path, monkeypatch):
+    from r2v_data_v2.v3 import post_mask_resources
+
+    clock = [10.0]
+    monkeypatch.setattr(post_mask_resources.time, "perf_counter", lambda: clock[0])
+    resources = post_mask_resources.PostMaskWorkerResources(
+        _config(tmp_path), _settings(tmp_path, monkeypatch),
+        runtime_root=tmp_path / "runtime",
+    )
+    assert resources.summary()["qwen_call_count"] == 0
+    assert resources.summary()["qwen_active_seconds"] == 0
+    with resources:
+        with resources.qwen_gate.acquire():
+            clock[0] = 12
+            with resources.qwen_gate.acquire():
+                clock[0] = 15
+                assert resources.summary()["qwen_active_seconds"] == 5
+            clock[0] = 17
+        clock[0] = 20
+        with (
+            pytest.raises(RuntimeError, match="qwen failure"),
+            resources.qwen_gate.acquire(),
+        ):
+            clock[0] = 21
+            raise RuntimeError("qwen failure")
+    summary = resources.summary()
+    assert summary["qwen_call_count"] == 3
+    assert summary["qwen_active_seconds"] == 8
+    assert summary["qwen_max_inflight_observed"] == 2
+    assert summary["qwen_active_seconds_scope"] == "worker_local_gate_interval_union"
+
+
+def test_parallel_review_metrics_are_additive_execution_only(tmp_path, monkeypatch):
+    from r2v_data_v2.v3.post_mask_resources import PostMaskWorkerResources
+
+    with PostMaskWorkerResources(
+        _config(tmp_path), _settings(tmp_path, monkeypatch),
+        runtime_root=tmp_path / "runtime",
+    ) as resources:
+        prefix = "reference_complete_parallel_"
+        resources.record_parallel_review({
+            prefix + "attempts": 1, prefix + "both_success": 1,
+            prefix + "qwen_seconds": 3.0, prefix + "sam_seconds": 2.0,
+            prefix + "wall_seconds": 3.0,
+        })
+        resources.record_parallel_review({
+            prefix + "attempts": 1, prefix + "both_success": 0,
+            prefix + "qwen_seconds": 1.0, prefix + "sam_seconds": 4.0,
+            prefix + "wall_seconds": 4.0,
+        })
+    summary = resources.summary()
+    assert summary[prefix + "attempts"] == 2
+    assert summary[prefix + "both_success"] == 1
+    assert summary[prefix + "qwen_seconds"] == 4.0
+    assert summary[prefix + "sam_seconds"] == 6.0
+    assert summary[prefix + "wall_seconds"] == 7.0
+    assert summary["scheduler_mode"] == "wavefront_v2"

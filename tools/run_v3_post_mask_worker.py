@@ -56,6 +56,7 @@ def main(argv=None):
             git_commit=commit,
             clip_inflight=args.clip_inflight,
             shard_inflight=args.shard_inflight,
+            scheduler_mode=args.scheduler_mode,
         )
         return 0
     except (Exception, KeyboardInterrupt) as exc:  # noqa: BLE001 - CLI failure boundary

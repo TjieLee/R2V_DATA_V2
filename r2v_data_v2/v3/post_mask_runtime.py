@@ -42,6 +42,8 @@ PHASES = (
     "subject_attributes",
 )
 
+SCHEDULER_MODES = ("legacy_serial", "wavefront_v2", "parallel_review_v21")
+
 
 @dataclass(frozen=True)
 class ExecutionSettings:
@@ -51,6 +53,7 @@ class ExecutionSettings:
     qwen_lock_directory: Path
     clip_inflight: int = 8
     shard_inflight: int = 2
+    scheduler_mode: str = "wavefront_v2"
 
     def __post_init__(self) -> None:
         from r2v_data_v2.v3 import config as config_module
@@ -59,6 +62,10 @@ class ExecutionSettings:
             raise ValueError("clip_inflight must be a positive integer")
         if type(self.shard_inflight) is not int or self.shard_inflight <= 0:
             raise ValueError("shard_inflight must be a positive integer")
+        if self.scheduler_mode not in SCHEDULER_MODES:
+            raise ValueError(
+                f"unsupported Post-Mask scheduler mode: {self.scheduler_mode}"
+            )
 
         if not self.sam_gpu.isdigit() or not self.boogu_gpu.isdigit():
             raise ValueError("Post-Mask requires physical numeric GPU IDs")
@@ -73,7 +80,7 @@ class ExecutionSettings:
 
     def workers_for(self, stage: str) -> int:
         if stage in {"remove", "reference_edit", "subject_attributes"}:
-            return self.clip_inflight
+            return 1 if self.scheduler_mode == "legacy_serial" else self.clip_inflight
         # Pair retains one complete donor view; existing CPU concurrency stays.
         if stage not in {"reference_integrity", "instruct"}:
             return 1
@@ -455,6 +462,11 @@ class DownstreamPhaseAdapter:
                 "scale_collapse_judge": scale_judge,
                 "manage_backend_lifecycle": False,
             }
+            if self.execution.scheduler_mode == "parallel_review_v21":
+                self.kwargs.update(
+                    review_execution="parallel_independent",
+                    review_observer=self.resources.record_parallel_review,
+                )
         elif stage == "reference_integrity":
             from r2v_data_v2.v3.reference_integrity import (
                 QwenReferenceIntegrityJudge,
@@ -730,11 +742,19 @@ def _record_phase_result(
             and clip.reference_edit.status == "failed"
         ):
             reason = str(error) if error else "phase has no durable successful outcome"
+            diagnostics = (
+                {
+                    "failures": values.get("failures", 0),
+                    "retryable_pending": values.get("retryable_pending", 0),
+                }
+                if stage == "subject_attributes"
+                else {}
+            )
             storage.append_failure(
                 stage=stage,
                 clip_uid=uid,
                 reason=reason,
-                details={"retryable": retryable},
+                details={"retryable": retryable, **diagnostics},
             )
             counts["clip_failures"] = counts.get("clip_failures", 0) + 1
             emit(
@@ -743,6 +763,7 @@ def _record_phase_result(
                 clip_uid=uid,
                 reason=reason,
                 retryable=retryable,
+                **diagnostics,
             )
 
 
@@ -873,7 +894,10 @@ def _run_post_mask_shard(
     pending: set[str] = set()
     gate = resources.qwen_gate
     if not paths.export_root.exists():
-        for stage in PHASES[:2]:
+        # 61fc7a7 legacy keeps every logical stage as a whole-shard barrier,
+        # including its existing CPU concurrency inside integrity/instruct.
+        legacy_serial = execution.scheduler_mode == "legacy_serial"
+        for stage in PHASES if legacy_serial else PHASES[:2]:
             todo = [
                 uid
                 for uid in hydrated.clip_uids
@@ -951,16 +975,17 @@ def _run_post_mask_shard(
                 {key: value for key, value in counts.items() if isinstance(value, int)},
             )
             emit("post_mask_stage_completed", stage=stage, counters=counts)
-        _post_pair_wavefront(
-            selected,
-            execution,
-            resources,
-            gate,
-            pending,
-            emit,
-            stage_counts,
-            adapter_factory,
-        )
+        if not legacy_serial:
+            _post_pair_wavefront(
+                selected,
+                execution,
+                resources,
+                gate,
+                pending,
+                emit,
+                stage_counts,
+                adapter_factory,
+            )
         if pending:
             emit("post_mask_shard_incomplete", retryable_clip_uids=sorted(pending))
             return ShardResult(

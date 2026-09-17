@@ -1174,8 +1174,9 @@ def test_abandoned_export_staging_only_owned_shard_is_cleaned(case):
 
 @pytest.mark.parametrize("stage", ["remove", "reference_edit", "subject_attributes"])
 @pytest.mark.parametrize("fail_second", [False, True])
+@pytest.mark.parametrize("scheduler_mode", ["legacy_serial", "wavefront_v2", "parallel_review_v21"])
 def test_real_adapter_persistent_resources_placement_and_exception_close(
-    case, monkeypatch, stage, fail_second
+    case, monkeypatch, stage, fail_second, scheduler_mode
 ):
     from types import SimpleNamespace
 
@@ -1200,7 +1201,8 @@ def test_real_adapter_persistent_resources_placement_and_exception_close(
     _write_rows(case, [_ready(case, "one", 0), _ready(case, "two", 1)])
     api, paths, execution = _setup(case)
     execution = replace(
-        execution, runtime=replace(execution.runtime, worker_timeout_seconds=73)
+        execution, runtime=replace(execution.runtime, worker_timeout_seconds=73),
+        scheduler_mode=scheduler_mode,
     )
     storage = initialize_shard(config, paths, git_commit="test")
     hydrate_shard(storage, entity_mask_root=root, shard_path=shard, paths=paths)
@@ -1264,6 +1266,13 @@ def test_real_adapter_persistent_resources_placement_and_exception_close(
             kwargs["completion_backend"].backend.edit()
         if stage == "reference_edit":
             assert not restart_sam.exists()
+            assert kwargs.get("review_execution", "sequential") == (
+                "parallel_independent" if scheduler_mode == "parallel_review_v21"
+                else "sequential"
+            )
+            assert callable(kwargs.get("review_observer")) == (
+                scheduler_mode == "parallel_review_v21"
+            )
             assert kwargs["manage_backend_lifecycle"] is False
             assert (
                 kwargs["sam_reviewer"].max_area_growth_ratio

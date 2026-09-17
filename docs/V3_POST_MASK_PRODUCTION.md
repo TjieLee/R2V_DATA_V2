@@ -392,5 +392,73 @@ enforces the configured node-wide limit across workers. Clip-pipeline maxima are
 with two active shards and eight chains per shard the bound is sixteen.
 Logical stage counters remain per shard, with one completion event per stage
 after that shard's chains resolve. Events from different shards may interleave;
-they do not represent a global stage barrier. V2 has no measured server speedup
-yet; rerun the same 20-clip selection before judging throughput.
+they do not represent a global stage barrier.
+
+## Execution modes and V2.1 validation
+
+`--scheduler-mode` (environment `POST_MASK_SCHEDULER_MODE`) selects:
+
+| Mode | Shard/stage scheduling | Completion reviews |
+| --- | --- | --- |
+| `legacy_serial` | One shard; whole-stage barriers | Qwen then SAM |
+| `wavefront_v2` (default) | Existing bounded cross-shard/per-clip wavefront | Qwen then SAM |
+| `parallel_review_v21` (opt-in) | Same V2 wavefront | Independent Qwen and SAM concurrently |
+
+Without the option/environment override, existing commands retain V2 behavior.
+Legacy ordering follows commit `61fc7a7`: hydrate → all remove → pair whole
+shard → all reference edit → all integrity → all instruct → all attributes →
+export. Heavy stages use one task; existing integrity/instruct CPU concurrency
+remains. Static shard ownership and compaction are unchanged in every mode.
+Modes are execution-only: no config hash, source fingerprint, campaign/shard
+identity, export schema or H3 identity change. Completed receipts can resume
+under another mode without rerunning successful model work.
+
+For example, append `--scheduler-mode parallel_review_v21` to the existing
+worker/cluster command, or set `POST_MASK_SCHEDULER_MODE=parallel_review_v21`.
+V2.1 overlaps only `complete_entity` reviews after candidate validation, with
+the same final AND gate, prompts, inputs, seeds and publication. Both started
+tasks drain on failure; no automatic retry occurs. Consequently, a Qwen exception
+can still leave one already-started SAM call in V2.1, unlike sequential early
+failure; successful/rejected review pairs retain one call each.
+`add_entity_background` remains SAM → conditional Qwen, including skipped
+Qwen calls on SAM hard failure. Existing node-wide Qwen gate and worker FIFO
+SAM/Boogu serialization/persistent models remain authoritative.
+
+The real V2 observation was 20 clips / four 5-clip shards / two workers:
+377 seconds, **190.98 clips/hour and 2.695× trend** relative to 1016 seconds.
+One shard remained incomplete due a retryable Subject Attribute clip, so this
+is **not a clean final throughput benchmark**.
+
+| Worker | Boogu service / queue seconds | SAM service / queue seconds | Qwen peak |
+| --- | --- | --- | --- |
+| 0 | 45.6 / 87.9 | 76.1 / 149.6 | 4 |
+| 1 | 56.3 / 141.7 | 93.5 / 175.1 | 4 |
+
+Steady-state server test candidates (not new defaults):
+
+| Case | shard_inflight | clip_inflight | qwen_max_inflight |
+| --- | ---: | ---: | ---: |
+| A | 2 | 8 | 4 |
+| B | 4 | 16 | 8 |
+| C | 4 | 16 | 12 |
+
+Defaults remain 2/8 and existing Qwen runtime configuration. Formal local-Qwen
+tests retain GPU0–3 Qwen, GPU4/5 SAM/Boogu worker0, GPU6/7 SAM/Boogu worker1.
+No dynamic role switching or attribute job queues are introduced.
+
+Resource summaries add monotonic `first_service_started_at`,
+`last_service_finished_at`, `idle_seconds_between_calls`,
+`longest_idle_gap_seconds`, and `utilization_over_active_span`, prefixed by
+`boogu_` or `sam_`. Utilization divides service seconds by last finish minus
+first start, not worker lifetime; unused resources report zero utilization.
+Qwen call count and active seconds observe this worker's acquired-gate intervals
+(union, not sum); they are not measured GPU utilization.
+`reference_complete_parallel_*` reports attempts, both_success, qwen_seconds,
+sam_seconds and wall_seconds. Both_success means both reviews returned without
+exception, not both accepted. Timings include their resource waits; compare
+parallel wall against max(review times), not their sum.
+
+Subject Attribute failure events now include `failures` and
+`retryable_pending` counters. No prompts/responses are logged. Missing durable
+outcomes remain retryable, without suppression, auto-retry or conversion to
+terminal outcomes. This patch claims no real GPU V2.1 throughput result.

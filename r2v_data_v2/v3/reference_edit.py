@@ -3,9 +3,10 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 
 from PIL import Image
 
@@ -509,6 +510,8 @@ def reference_edit_clips(
     bbox_route_judge: object | None = None,
     scale_collapse_judge: object | None = None,
     manage_backend_lifecycle: bool = True,
+    review_execution: Literal["sequential", "parallel_independent"] = "sequential",
+    review_observer: Callable[[dict[str, int | float]], None] | None = None,
 ) -> ReferenceEditStats:
     config.validate()
     if storage.root != config.resolved_run_root:
@@ -858,6 +861,8 @@ def reference_edit_clips(
                             backend=operation_backend,
                             judge=operation_judge,
                             sam_reviewer=operation_sam,
+                            review_execution=review_execution,
+                            review_observer=review_observer,
                             instruction_rewrite_enabled=_instruction_rewrite_enabled(
                                 config,
                                 "complete_entity",

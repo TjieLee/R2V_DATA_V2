@@ -344,6 +344,7 @@ def run_worker(
     heartbeat_seconds=45,
     clip_inflight=8,
     shard_inflight=2,
+    scheduler_mode="wavefront_v2",
 ):
     sam_gpu, boogu_gpu = groups[slot]
     if os.environ.get("CUDA_VISIBLE_DEVICES") != sam_gpu:
@@ -361,6 +362,7 @@ def run_worker(
         campaign.root / "qwen-gates" / node,
         clip_inflight,
         shard_inflight,
+        scheduler_mode,
     )
     state = {
         "worker_id": rank * len(groups) + slot,
@@ -546,7 +548,9 @@ def run_worker(
         for _ in bounded_results(
             run_shard,
             assigned,
-            execution.shard_inflight,
+            1
+            if execution.scheduler_mode == "legacy_serial"
+            else execution.shard_inflight,
             on_interrupt=resources.stop_accepting,
         ):
             pass
@@ -761,8 +765,21 @@ def _positive_int(value):
     return number
 
 
+def _scheduler_mode(value):
+    from r2v_data_v2.v3.post_mask_runtime import SCHEDULER_MODES
+
+    if value not in SCHEDULER_MODES:
+        raise argparse.ArgumentTypeError(f"must be one of {', '.join(SCHEDULER_MODES)}")
+    return value
+
+
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument(
+        "--scheduler-mode",
+        type=_scheduler_mode,
+        default=os.environ.get("POST_MASK_SCHEDULER_MODE", "wavefront_v2"),
+    )
     p.add_argument(
         "--base-config", type=Path, default=os.environ.get("POST_MASK_BASE_CONFIG")
     )

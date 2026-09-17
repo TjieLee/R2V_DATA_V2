@@ -5,8 +5,9 @@ from __future__ import annotations
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager, suppress
+from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, Self, TypeVar
@@ -18,6 +19,44 @@ if TYPE_CHECKING:
 
 
 _T = TypeVar("_T")
+
+
+@dataclass
+class _ServiceOccupancy:
+    """Monotonic perf_counter timestamps, never wall-clock/UTC timestamps.
+
+    Owner holds its metrics lock. Callers already serialize actual service.
+    """
+
+    first_service_started_at: float | None = None
+    last_service_finished_at: float | None = None
+    idle_seconds_between_calls: float = 0.0
+    longest_idle_gap_seconds: float = 0.0
+
+    def started(self, now: float) -> None:
+        if self.first_service_started_at is None:
+            self.first_service_started_at = now
+        if self.last_service_finished_at is not None:
+            gap = max(0.0, now - self.last_service_finished_at)
+            self.idle_seconds_between_calls += gap
+            self.longest_idle_gap_seconds = max(self.longest_idle_gap_seconds, gap)
+
+    def summary(self, prefix: str, service_seconds: float) -> dict[str, float | None]:
+        span = (
+            self.last_service_finished_at - self.first_service_started_at
+            if self.last_service_finished_at is not None
+            and self.first_service_started_at is not None
+            else 0.0
+        )
+        return {
+            f"{prefix}_first_service_started_at": self.first_service_started_at,
+            f"{prefix}_last_service_finished_at": self.last_service_finished_at,
+            f"{prefix}_idle_seconds_between_calls": self.idle_seconds_between_calls,
+            f"{prefix}_longest_idle_gap_seconds": self.longest_idle_gap_seconds,
+            f"{prefix}_utilization_over_active_span": (
+                service_seconds / span if span > 0 else 0.0
+            ),
+        }
 
 
 class _FifoLock:
@@ -63,6 +102,9 @@ class _ObservedQwenGate:
         with self._gate.acquire() as observation:
             self._owner._require_open()
             with self._owner._metrics_lock:
+                if self._owner._qwen_inflight == 0:
+                    self._owner._qwen_active_started_at = time.perf_counter()
+                self._owner._qwen_call_count += 1
                 self._owner._qwen_queue_wait_seconds += observation.queue_wait_seconds
                 self._owner._qwen_inflight += 1
                 self._owner._qwen_max_inflight_observed = max(
@@ -74,6 +116,10 @@ class _ObservedQwenGate:
             finally:
                 with self._owner._metrics_lock:
                     self._owner._qwen_inflight -= 1
+                    if self._owner._qwen_inflight == 0:
+                        self._owner._qwen_active_seconds += (
+                            time.perf_counter() - self._owner._qwen_active_started_at
+                        )
 
 
 class PostMaskWorkerResources:
@@ -127,6 +173,18 @@ class PostMaskWorkerResources:
         self._qwen_inflight = 0
         self._qwen_max_inflight_observed = 0
         self._qwen_queue_wait_seconds = 0.0
+        self._qwen_call_count = 0
+        self._qwen_active_seconds = 0.0
+        self._qwen_active_started_at = 0.0
+        self._parallel_review_metrics: dict[str, int | float] = {
+            "reference_complete_parallel_attempts": 0,
+            "reference_complete_parallel_both_success": 0,
+            "reference_complete_parallel_qwen_seconds": 0.0,
+            "reference_complete_parallel_sam_seconds": 0.0,
+            "reference_complete_parallel_wall_seconds": 0.0,
+        }
+        self._boogu_occupancy = _ServiceOccupancy()
+        self._sam_occupancy = _ServiceOccupancy()
 
         self._boogu_start_count = 0
         self._boogu_restart_count = 0
@@ -273,6 +331,7 @@ class PostMaskWorkerResources:
             backend = self._backend_for_request()
             service_started = time.perf_counter()
             with self._metrics_lock:
+                self._boogu_occupancy.started(service_started)
                 self._boogu_call_count += 1
                 self._boogu_inflight += 1
                 self._boogu_max_inflight_observed = max(
@@ -282,8 +341,10 @@ class PostMaskWorkerResources:
             try:
                 return backend.edit(**kwargs)
             finally:
-                elapsed = time.perf_counter() - service_started
+                service_finished = time.perf_counter()
+                elapsed = service_finished - service_started
                 with self._metrics_lock:
+                    self._boogu_occupancy.last_service_finished_at = service_finished
                     self._boogu_inflight -= 1
                     self._boogu_service_seconds += elapsed
 
@@ -308,19 +369,38 @@ class PostMaskWorkerResources:
                     self._sam_inflight,
                 )
             service_started = time.perf_counter()
+            with self._metrics_lock:
+                self._sam_occupancy.started(service_started)
             try:
                 return function(*args, **kwargs)
             finally:
-                elapsed = time.perf_counter() - service_started
+                service_finished = time.perf_counter()
+                elapsed = service_finished - service_started
                 with self._metrics_lock:
+                    self._sam_occupancy.last_service_finished_at = service_finished
                     self._sam_inflight -= 1
                     self._sam_service_seconds += elapsed
 
-    def summary(self) -> dict[str, int | float]:
-        """Return a thread-safe snapshot of worker resource measurements."""
+    def record_parallel_review(self, metrics: Mapping[str, int | float]) -> None:
+        """Aggregate execution-only review measurements, never model payloads."""
+        with self._metrics_lock:
+            for name in self._parallel_review_metrics:
+                self._parallel_review_metrics[name] += metrics.get(name, 0)
+
+    def summary(self) -> dict[str, int | float | str | None]:
+        """Snapshot worker measurements; service timestamps use perf_counter.
+
+        Qwen active seconds measure the union of this worker's acquired-gate
+        intervals, including client/network overhead, not remote GPU occupancy.
+        Boogu service and occupancy exclude its initial backend startup.
+        """
 
         with self._metrics_lock:
             return {
+                "scheduler_mode": getattr(self.execution, "scheduler_mode", "wavefront_v2"),
+                **self._parallel_review_metrics,
+                **self._boogu_occupancy.summary("boogu", self._boogu_service_seconds),
+                **self._sam_occupancy.summary("sam", self._sam_service_seconds),
                 "clip_inflight": self.execution.clip_inflight,
                 "shard_inflight": self.execution.shard_inflight,
                 "max_active_shards_observed": self._max_active["shards"],
@@ -349,6 +429,12 @@ class PostMaskWorkerResources:
                 ),
                 "qwen_max_inflight_observed": self._qwen_max_inflight_observed,
                 "qwen_queue_wait_seconds": self._qwen_queue_wait_seconds,
+                "qwen_call_count": self._qwen_call_count,
+                "qwen_active_seconds": self._qwen_active_seconds + (
+                    time.perf_counter() - self._qwen_active_started_at
+                    if self._qwen_inflight else 0.0
+                ),
+                "qwen_active_seconds_scope": "worker_local_gate_interval_union",
             }
 
     def close(self) -> None:
