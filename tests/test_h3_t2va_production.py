@@ -4,6 +4,11 @@ from collections import Counter
 import pytest
 
 from r2v_data_v2.h3 import t2va_production as production
+from tests import test_h3_t2va_shadow as shared
+
+finalized = shared.finalized
+setup = shared.setup
+ffmpeg = shared.ffmpeg
 
 
 def test_shard_59_and_schedule():
@@ -138,3 +143,36 @@ def test_endpoint_outage_stops_scheduling(tmp_path):
             tmp_path, 0, sample_rows(100), Offline(), request_workers=1
         )
     assert not production.load_states(tmp_path / "shards" / production.shard_name(0))
+
+
+def test_t2va_shadow_equivalence(tmp_path, finalized):
+    from tests import test_h3_t2va_shadow as shared
+
+    inventory = shared.build(finalized, tmp_path)
+    drafts = [
+        shared.draft_for(j).model_dump_json()
+        for j in inventory.jobs
+        if not j.upstream_failure
+    ]
+    old_backend = shared.T2VAMimoBackend(
+        shared.config(tmp_path), client=shared.Client(drafts)
+    )
+    shared.t2va.run_t2va_shadow(inventory, old_backend)
+    old_root = shared.t2va.t2va_root(finalized[0], "t2va-test")
+    new_backend = shared.T2VAMimoBackend(
+        shared.config(tmp_path), client=shared.Client(drafts)
+    )
+    for job in inventory.jobs:
+        if job.upstream_failure:
+            continue
+        temporary = tmp_path / "new" / job.clip_uid
+        temporary.mkdir(parents=True)
+        result = production.t2va_stage(job, new_backend, temporary)
+        assert json.loads((temporary / "core.json").read_text()) == json.loads(
+            (old_root / "core" / f"{job.clip_uid}.json").read_text()
+        )
+        assert (
+            result["exports"]["t2va"]["caption"]
+            == (old_root / "prompts" / f"{job.clip_uid}.txt").read_text()
+        )
+        assert result["model_call_count"] == 2

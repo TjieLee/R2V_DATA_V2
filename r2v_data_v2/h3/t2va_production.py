@@ -389,3 +389,63 @@ def process_shard(
         if stopped.is_set():
             raise EndpointUnavailable("endpoint unavailable; resume after recovery")
         return states
+
+
+def _endpoint_error(error):
+    if error and any(
+        token in str(error).lower()
+        for token in (
+            "apiconnectionerror",
+            "connection refused",
+            "connecterror",
+            "failed to establish a new connection",
+        )
+    ):
+        raise EndpointUnavailable(str(error))
+
+
+def training_row(video, caption, audios=()):
+    return {"video": video, "images": [], "audios": list(audios), "caption": caption}
+
+
+def t2va_stage(job, backend, temporary: Path):
+    """Mirror shadow orchestration using the frozen parser/validator/renderer."""
+    from r2v_data_v2.h3 import t2va_shadow as frozen
+    from r2v_data_v2.structured_output import parse_structured_json_response
+
+    identity = frozen.request_fingerprint(job, backend.provenance())
+    if _sha(Path(job.target_video_path)) != job.target_video_sha256:
+        raise ValueError("original target video hash differs")
+    try:
+        raw = backend.annotate(job, identity)
+    except Exception as exc:
+        _endpoint_error(exc)
+        raise
+    frozen.write_json(temporary / "raw.json", raw)
+    if raw.clip_uid != job.clip_uid or raw.request_fingerprint != identity:
+        raise ValueError("T2VA raw response ownership differs")
+    if raw.error:
+        _endpoint_error(raw.error)
+        raise ValueError(raw.error)
+    draft, corrections = frozen.parse_t2va_semantic(job, raw.response or "")
+    if (
+        corrections != raw.deterministic_corrections
+        or raw.audio_finalize is None
+        or raw.audio_finalize.error
+    ):
+        raise ValueError("T2VA audio-finalize/correction provenance differs")
+    audio = parse_structured_json_response(
+        raw.audio_finalize.response or "", frozen.MimoAudioFinalizeDraft
+    )
+    core = frozen.validate_t2va_draft(job, draft, audio)
+    if _sha(Path(job.target_video_path)) != job.target_video_sha256:
+        raise ValueError("original target video changed during annotation")
+    frozen.write_json(temporary / "job.json", job)
+    frozen.write_json(temporary / "core.json", core)
+    prompt = frozen.render_t2va_prompt(core)
+    (temporary / "prompt.txt").write_text(prompt, encoding="utf-8")
+    return {
+        "model_call_count": raw.model_call_count,
+        "exports": {"t2va": training_row(job.target_video_path, prompt)},
+        "warnings": [*raw.warnings, *raw.audio_finalize.warnings, *core.warnings],
+    }
