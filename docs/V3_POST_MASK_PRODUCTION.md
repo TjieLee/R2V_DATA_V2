@@ -173,6 +173,7 @@ phases, export and completed-marker publication. No work stealing is used.
 | `POST_MASK_TAG` | `--tag` | Default `post-mask-v1` when no explicit root |
 | `POST_MASK_ROOT` | `--post-mask-root` | Writable campaign state root; basename determines tag |
 | `POST_MASK_QWEN_MAX_INFLIGHT` | `--qwen-max-inflight` | Per-node capacity; otherwise actual base `runtime.qwen_max_inflight` |
+| `POST_MASK_CLIP_INFLIGHT` | `--clip-inflight` | Positive per-heavy-stage clip concurrency; default 8; execution-only |
 | `RANK`, `WORLD_SIZE` | `--rank`, `--world-size` | Platform topology; default `0`, `1` |
 | — | `--cpu-workers` | Override actual base runtime CPU workers |
 | — | `--worker-timeout-seconds` | Override actual base runtime worker timeout |
@@ -202,9 +203,32 @@ hydrate -> remove -> pair -> reference_edit -> reference_integrity
 
 Existing algorithms and durable owner artifacts decide missing work. Pairing
 uses the full eligible shard, retaining completed donors while excluding clips
-with pending predecessor work. GPU resources are phase-owned, reused across
-clips and closed before the next expensive phase. Integrity/instruct concurrency
-is bounded by actual CPU/stage settings; all Qwen calls share the node gate.
+with pending predecessor work. Remove, reference_edit and subject_attributes each
+run up to `clip_inflight` clip tasks through one shared phase adapter. All remove
+tasks finish before the single whole-shard pair pass; no donor view is clipped
+per task. Integrity/instruct concurrency retains actual CPU/stage settings.
+
+One lazy Boogu subprocess belongs to the worker, not the phase or shard. Healthy
+operation starts it once and reuses it across all three heavy stages and all
+assigned shards. Actual Boogu edits remain serialized (one request per process).
+SAM models remain phase-owned, with a worker-shared lock around actual inference
+entrypoints only. Different clips can overlap Boogu, SAM and Qwen; neither
+resource lock covers an entire clip or its subsequent judge call. Shard storage
+mutations share one write lock, released before model calls.
+
+Each executor thread explicitly enters the existing Qwen ContextVar; the existing
+profiler acquires the node-wide gate only around the actual HTTP request, without
+double acquisition. Smoke tests may use a remote Qwen endpoint. Formal production
+requires a local endpoint, normally `http://127.0.0.1:8000/v1`, with GPUs 0–3
+genuinely serving traffic. This change does not supply a vLLM launcher.
+
+Worker scratch/logs live under `<state>/runtime/<node>/worker-<id>-<unique>/`,
+outside shard semantic identity. Final generation paths, prompts, seeds, and
+publication remain unchanged. A failed Boogu request is not automatically retried;
+existing per-clip policy decides retryable versus terminal state. If the process
+dies, a later independent request may start a replacement. Healthy quality
+rejection does not restart it. Worker exit closes its own resident process;
+external launcher interruption retains existing owned-process-group cleanup.
 
 Restart the same command and roots after interruption. Rank/world size, GPU
 mapping and node can change. Semantic config/model/source changes are rejected;
@@ -311,5 +335,33 @@ Do not prune those clip records. This task does not launch Audio/H3 jobs.
 Local regression entry:
 
 ```bash
-.venv/bin/python -m pytest -q tests/test_v3_post_mask_production.py tests/test_v3_post_mask_runtime.py tests/test_v3_post_mask_cluster.py tests/test_v3_runtime.py tests/test_h3_visual_clip_contract.py tests/test_h3_jea_qwen3_production.py tests/test_v3_profiling.py
+.venv/bin/python -m pytest -q tests/test_v3_post_mask_production.py tests/test_v3_post_mask_runtime.py tests/test_v3_post_mask_resources.py tests/test_v3_post_mask_cluster.py tests/test_v3_runtime.py tests/test_h3_visual_clip_contract.py tests/test_h3_jea_qwen3_production.py tests/test_v3_profiling.py
 ```
+
+## Throughput validation baseline (server A/B pending)
+
+The measured clean baseline is 20 real clips, two workers × 10 clips, GPU groups
+`4:5,6:7`, remote Qwen: **1016 seconds / 70.87 clips per hour**. Both workers
+finished without retryable failures; each exported 9/10, for 18/20 total.
+Subject Attribute model times were approximately:
+
+| Worker | Qwen seconds | SAM3 seconds | Boogu completion seconds |
+| --- | ---: | ---: | ---: |
+| 0 | 97.16 | 85.92 | 23.82 |
+| 1 | 118.53 | 110.32 | 15.43 |
+
+After deployment, compare the same selection against this baseline. Minimum useful
+improvement is 1.5× throughput; target is 2× if remote Qwen is not the bottleneck.
+These are **unmeasured targets**, not results inferred from fake-resource tests.
+No real GPU benchmark is run during local development.
+
+Worker completion/incompletion also emits `post_mask_worker_resource_summary`:
+`clip_inflight`, `boogu_start_count`, `boogu_restart_count`,
+`boogu_call_count`, `boogu_queue_wait_seconds`, `boogu_service_seconds`,
+`boogu_max_inflight_observed`, `sam_call_count`, `sam_queue_wait_seconds`,
+`sam_service_seconds`, `sam_max_inflight_observed`, and
+`qwen_max_inflight_configured`. A healthy worker using Boogu should start once;
+actual Boogu/SAM peak inflight must each stay at 1 (0 if unused). Boogu service
+time measures edits, excluding initial model startup. Existing stage/profile
+events remain the detailed timing source; no prompts or payloads are added to
+resource summaries.

@@ -54,6 +54,7 @@ def main(argv=None):
             slot=placement.worker_slot,
             groups=groups,
             git_commit=commit,
+            clip_inflight=args.clip_inflight,
         )
         return 0
     except (Exception, KeyboardInterrupt) as exc:  # noqa: BLE001 - CLI failure boundary

@@ -14,6 +14,7 @@ import re
 import shutil
 import threading
 import time
+import uuid
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
@@ -49,9 +50,13 @@ class ExecutionSettings:
     sam_gpu: str
     boogu_gpu: str
     qwen_lock_directory: Path
+    clip_inflight: int = 8
 
     def __post_init__(self) -> None:
         from r2v_data_v2.v3 import config as config_module
+
+        if type(self.clip_inflight) is not int or self.clip_inflight <= 0:
+            raise ValueError("clip_inflight must be a positive integer")
 
         if not self.sam_gpu.isdigit() or not self.boogu_gpu.isdigit():
             raise ValueError("Post-Mask requires physical numeric GPU IDs")
@@ -65,8 +70,9 @@ class ExecutionSettings:
             )
 
     def workers_for(self, stage: str) -> int:
-        # A full-shard pair pass preserves its two-pass donor semantics; each
-        # local GPU resource is serial, not concurrently driven by many clips.
+        if stage in {"remove", "reference_edit", "subject_attributes"}:
+            return self.clip_inflight
+        # Pair retains one complete donor view; existing CPU concurrency stays.
         if stage not in {"reference_integrity", "instruct"}:
             return 1
         return min(self.runtime.cpu_workers, getattr(self.runtime.stage_workers, stage))
@@ -92,12 +98,25 @@ class ShardResult:
 class _ShardStorage:
     """Exclude corrupt/stale destinations while keeping all admitted donors."""
 
-    def __init__(self, storage: RunStorage, clip_uids: tuple[str, ...]):
+    def __init__(
+        self, storage: RunStorage, clip_uids: tuple[str, ...], write_lock=None
+    ):
         self._storage = storage
         self.clip_uids = clip_uids
+        self.write_lock = write_lock if write_lock is not None else threading.RLock()
 
     def __getattr__(self, name: str) -> Any:
-        return getattr(self._storage, name)
+        value = getattr(self._storage, name)
+        if callable(value) and name.startswith(
+            ("write_", "append_", "update_", "create_")
+        ):
+
+            def write(*args, **kwargs):
+                with self.write_lock:
+                    return value(*args, **kwargs)
+
+            return write
+        return value
 
     def iter_clips(self) -> Iterator[ClipRecord]:
         for uid in self.clip_uids:
@@ -292,14 +311,38 @@ class _AttributeCompletion:
         }
 
 
+class _SerializedSam:
+    """Serialize only model entrypoints, not the surrounding clip algorithm."""
+
+    def __init__(self, backend, resources):
+        self.backend, self.resources = backend, resources
+
+    def track(self, **kwargs):
+        return self.resources.sam_call(self.backend.track, **kwargs)
+
+    def segment_frame(self, **kwargs):
+        return self.resources.sam_call(self.backend.segment_frame, **kwargs)
+
+    def segment_generated_frame(self, **kwargs):
+        return self.resources.sam_call(self.backend.segment_generated_frame, **kwargs)
+
+
 class DownstreamPhaseAdapter:
     """One lazy phase resource owner; existing functions own all model policy."""
 
-    def __init__(self, stage: str, storage: RunStorage, execution: ExecutionSettings):
+    def __init__(
+        self,
+        stage: str,
+        storage: RunStorage,
+        execution: ExecutionSettings,
+        *,
+        resources=None,
+    ):
         self.stage, self.storage, self.execution = stage, storage, execution
         self.config = storage.config
         self.stack = ExitStack()
-        self.lock = threading.Lock()
+        self.lock = getattr(storage, "write_lock", threading.RLock())
+        self.resources = resources
         self.kwargs: dict[str, Any] = {}
 
     def _own(self, resource: Any) -> Any:
@@ -309,41 +352,22 @@ class DownstreamPhaseAdapter:
         return resource
 
     def _boogu(self) -> Any:
-        from r2v_data_v2.v3 import config as config_module
-        from r2v_data_v2.v3.reference_edit_boogu import (
-            BooguSubprocessBackend,
-            BooguWorkerConfig,
-        )
-
-        config = self.config.reference_edit
-        scratch = _prepare_scratch(self.storage.root, self.stage)
-        # Cleanup is registered before close so ExitStack closes first.
-        self.stack.callback(cleanup_phase_scratch, self.storage.root, self.stage)
-        backend = self._own(
-            BooguSubprocessBackend(
-                BooguWorkerConfig(
-                    python_executable=config.python_executable,
-                    code_root=config.code_root,
-                    model_path=config.model_path,
-                    model_revision=config.model_revision,
-                    device="cuda:0",
-                    cuda_visible_devices=self.execution.boogu_gpu,
-                    timeout_seconds=min(
-                        config.timeout_seconds,
-                        self.execution.runtime.worker_timeout_seconds,
-                    ),
-                    temporary_root=scratch,
-                    allowed_server_root=config_module.ALLOWED_WRITABLE_ROOT,
-                )
-            )
-        )
-        backend.start(
-            stderr_log_path=self.storage.root / f"post_mask_{self.stage}_boogu.log"
-        )
-        return backend
+        return self.resources
 
     def __enter__(self) -> Self:
         try:
+            if self.resources is None:
+                from r2v_data_v2.v3.post_mask_resources import PostMaskWorkerResources
+
+                self.resources = self.stack.enter_context(
+                    PostMaskWorkerResources(
+                        self.config,
+                        self.execution,
+                        runtime_root=self.execution.qwen_lock_directory.parent
+                        / "post-mask-runtime"
+                        / uuid.uuid4().hex,
+                    )
+                )
             self._initialize()
         except BaseException:
             self.stack.close()
@@ -401,14 +425,16 @@ class DownstreamPhaseAdapter:
             )
 
             self.function = reference_edit_clips
+            scratch = _prepare_scratch(self.storage.root, stage)
+            self.stack.callback(cleanup_phase_scratch, self.storage.root, stage)
             backend = self._boogu()
             judge = self._own(
                 QwenBooguReferenceEditJudge(config.qwen.reference_edit_judge)
             )
             segmenter = self._own(Sam3SegmentationBackend(config.sam3))
             reviewer = Sam3BooguReferenceReviewer(
-                segmenter,
-                temporary_root=_scratch_root(self.storage.root, stage),
+                _SerializedSam(segmenter, self.resources),
+                temporary_root=scratch,
                 max_area_growth_ratio=config.reference_edit.sam_max_area_growth_ratio,
                 max_significant_components=config.reference_edit.sam_max_significant_components,
                 min_candidate_scale_ratio=config.reference_edit.min_candidate_scale_ratio,
@@ -460,8 +486,8 @@ class DownstreamPhaseAdapter:
             self.kwargs = {
                 "discovery_client": client,
                 "review_client": client,
-                "segmentation_backend": self._own(
-                    Sam3AttributeFrameSegmenter(config.sam3)
+                "segmentation_backend": _SerializedSam(
+                    self._own(Sam3AttributeFrameSegmenter(config.sam3)), self.resources
                 ),
             }
             if config.subject_attributes.completion.enabled:
@@ -675,7 +701,7 @@ def _cleanup_export_staging(storage: RunStorage, paths: ShardPaths) -> None:
             shutil.rmtree(path)
 
 
-def run_post_mask_shard(
+def _run_post_mask_shard(
     base_config: V3Config,
     *,
     entity_mask_root: Path,
@@ -684,6 +710,7 @@ def run_post_mask_shard(
     execution: ExecutionSettings,
     event_callback: Callable[[dict[str, Any]], None] | None = None,
     adapter_factory: Callable[..., Any] = DownstreamPhaseAdapter,
+    resources=None,
 ) -> ShardResult:
     """Execute one locked shard; false completion means retryable work remains.
 
@@ -736,9 +763,17 @@ def run_post_mask_shard(
                     phase_storage = _ShardStorage(
                         storage,
                         tuple(uid for uid in hydrated.clip_uids if uid not in pending),
+                        selected.write_lock,
                     )
                 try:
-                    with adapter_factory(stage, phase_storage, execution) as adapter:
+                    extra = (
+                        {"resources": resources}
+                        if adapter_factory is DownstreamPhaseAdapter
+                        else {}
+                    )
+                    with adapter_factory(
+                        stage, phase_storage, execution, **extra
+                    ) as adapter:
 
                         def invoke(
                             uid: str | None,
@@ -757,7 +792,13 @@ def run_post_mask_shard(
                             with ThreadPoolExecutor(
                                 max_workers=execution.workers_for(stage)
                             ) as pool:
-                                results = list(pool.map(invoke, todo))
+                                try:
+                                    results = list(pool.map(invoke, todo))
+                                except BaseException:
+                                    # Wake resource waiters only to fail; do not
+                                    # restart models while executor tasks drain.
+                                    resources.stop_accepting()
+                                    raise
                 except Exception as exc:  # noqa: BLE001 - close resources, preserve shard progress
                     results.append((None, {}, exc))
                 for uid, values, error in results:
@@ -863,3 +904,37 @@ def run_post_mask_shard(
         (),
         stage_counts,
     )
+
+
+def run_post_mask_shard(
+    base_config: V3Config,
+    *,
+    entity_mask_root: Path,
+    paths: ShardPaths,
+    git_commit: str,
+    execution: ExecutionSettings,
+    event_callback=None,
+    adapter_factory=DownstreamPhaseAdapter,
+    resources=None,
+) -> ShardResult:
+    from r2v_data_v2.v3.post_mask_resources import PostMaskWorkerResources
+
+    with ExitStack() as stack:
+        if resources is None:
+            resources = stack.enter_context(
+                PostMaskWorkerResources(
+                    base_config,
+                    execution,
+                    runtime_root=paths.state_root / "runtime" / uuid.uuid4().hex,
+                )
+            )
+        return _run_post_mask_shard(
+            base_config,
+            entity_mask_root=entity_mask_root,
+            paths=paths,
+            git_commit=git_commit,
+            execution=execution,
+            event_callback=event_callback,
+            adapter_factory=adapter_factory,
+            resources=resources,
+        )

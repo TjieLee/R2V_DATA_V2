@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -311,6 +312,18 @@ def heartbeat(state, callback, seconds=45):
         thread.join()
 
 
+@contextmanager
+def _worker_model_resources(config, execution, root, event):
+    from r2v_data_v2.v3.post_mask_resources import PostMaskWorkerResources
+
+    resources = PostMaskWorkerResources(config, execution, runtime_root=root)
+    try:
+        with resources:
+            yield resources
+    finally:
+        event({"event": "post_mask_worker_resource_summary", **resources.summary()})
+
+
 def run_worker(
     campaign,
     config,
@@ -324,6 +337,7 @@ def run_worker(
     runner=None,
     event_callback=emit,
     heartbeat_seconds=45,
+    clip_inflight=8,
 ):
     sam_gpu, boogu_gpu = groups[slot]
     if os.environ.get("CUDA_VISIBLE_DEVICES") != sam_gpu:
@@ -334,7 +348,7 @@ def run_worker(
     assigned = assigned_shards(campaign.shards, rank, world_size, slot, len(groups))
     node = hashlib.sha256(socket.gethostname().encode()).hexdigest()[:24]
     execution = ExecutionSettings(
-        runtime, sam_gpu, boogu_gpu, campaign.root / "qwen-gates" / node
+        runtime, sam_gpu, boogu_gpu, campaign.root / "qwen-gates" / node, clip_inflight
     )
     state = {
         "worker_id": rank * len(groups) + slot,
@@ -365,7 +379,16 @@ def run_worker(
             "boogu_gpu": boogu_gpu,
         }
     )
-    with heartbeat(state, event_callback, heartbeat_seconds):
+    runtime_root = (
+        campaign.root
+        / "runtime"
+        / node
+        / f"worker-{rank * len(groups) + slot}-{uuid.uuid4().hex}"
+    )
+    with (
+        _worker_model_resources(config, execution, runtime_root, event) as resources,
+        heartbeat(state, event_callback, heartbeat_seconds),
+    ):
         for shard in assigned:
             paths = campaign.paths(shard)
             previous_counts = {key: state[key] for key in previous_counts}
@@ -388,6 +411,7 @@ def run_worker(
                         git_commit=git_commit,
                         execution=execution,
                         event_callback=event,
+                        resources=resources,
                     )
                     for key in ("ready", "excluded", "corrupt"):
                         state[key] = previous_counts[key] + getattr(result, key)
@@ -621,6 +645,13 @@ def supervise_children(children, *, poll_seconds=1):
         raise RuntimeError(f"Post-Mask workers failed with exit codes {codes}")
 
 
+def _positive_int(value):
+    number = int(value)
+    if number <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
+
+
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
@@ -650,6 +681,11 @@ def parser():
         default=os.environ.get("POST_MASK_QWEN_MAX_INFLIGHT"),
     )
     p.add_argument("--cpu-workers", type=int)
+    p.add_argument(
+        "--clip-inflight",
+        type=_positive_int,
+        default=os.environ.get("POST_MASK_CLIP_INFLIGHT", "8"),
+    )
     p.add_argument("--worker-timeout-seconds", type=int)
     p.add_argument("--global-wait-timeout-seconds", type=float, default=604800)
     return p

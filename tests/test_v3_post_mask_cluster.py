@@ -21,6 +21,137 @@ def api():
     return importlib.import_module("tools.run_v3_post_mask_visual")
 
 
+def test_clip_inflight_cli_env_and_validation(monkeypatch):
+    monkeypatch.delenv("POST_MASK_CLIP_INFLIGHT", raising=False)
+    assert api().parser().parse_args([]).clip_inflight == 8
+    monkeypatch.setenv("POST_MASK_CLIP_INFLIGHT", "3")
+    assert api().parser().parse_args([]).clip_inflight == 3
+    assert api().parser().parse_args(["--clip-inflight", "5"]).clip_inflight == 5
+    for value in ("0", "-1"):
+        with pytest.raises(SystemExit):
+            api().parser().parse_args(["--clip-inflight", value])
+
+
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_worker_boogu_persists_through_three_adapters_and_two_shards(
+    case, monkeypatch, interrupted
+):
+    from r2v_data_v2.v3 import (
+        reference_edit_boogu,
+        removal_judge,
+        sam3_backend,
+        subject_attributes,
+    )
+    from r2v_data_v2.v3.post_mask_production import initialize_shard
+    from r2v_data_v2.v3.post_mask_runtime import (
+        DownstreamPhaseAdapter,
+        ShardResult,
+        _ShardStorage,
+    )
+
+    config = accepted(case[0])
+    config = replace(
+        config,
+        subject_attributes=replace(
+            config.subject_attributes,
+            completion=replace(config.subject_attributes.completion, enabled=True),
+        ),
+    )
+    case = config, case[1], case[2]
+    _write_rows(case, [])
+    second = case[2].with_name("shard-000000100-000000199.jsonl")
+    second.write_text("")
+    c = campaign(case)
+    backends, calls, events = [], [], []
+
+    class Client:
+        def __init__(self, *a, **kw):
+            pass
+
+        def close(self):
+            pass
+
+    class Backend(Client):
+        started = False
+
+        def __init__(self, config):
+            self.config, self.starts, self.closes = config, 0, 0
+            backends.append(self)
+
+        def start(self, **kw):
+            self.started = True
+            self.starts += 1
+
+        def edit(self, **kw):
+            calls.append(kw["label"])
+
+        def close(self):
+            self.started = False
+            self.closes += 1
+
+    monkeypatch.setattr(reference_edit_boogu, "BooguSubprocessBackend", Backend)
+    monkeypatch.setattr(reference_edit_boogu, "QwenBooguReferenceEditJudge", Client)
+    monkeypatch.setattr(sam3_backend, "Sam3SegmentationBackend", Client)
+    monkeypatch.setattr(subject_attributes, "Sam3AttributeFrameSegmenter", Client)
+    monkeypatch.setattr(subject_attributes, "QwenSubjectAttributeClient", Client)
+    monkeypatch.setattr(
+        subject_attributes, "QwenSubjectAttributeCompletionJudge", Client
+    )
+    monkeypatch.setattr(removal_judge, "QwenBackgroundRemovalJudge", Client)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "4")
+
+    def runner(config, *, paths, execution, resources, **kwargs):
+        if interrupted and paths.shard_path == second:
+            raise KeyboardInterrupt("external stop after committed shard")
+        storage = _ShardStorage(initialize_shard(config, paths, git_commit="test"), ())
+        for stage in ("remove", "reference_edit", "subject_attributes"):
+            with DownstreamPhaseAdapter(
+                stage, storage, execution, resources=resources
+            ) as adapter:
+                if stage == "remove":
+                    handle = adapter.kwargs["backend"].backend
+                elif stage == "reference_edit":
+                    handle = adapter.kwargs["backend"]
+                else:
+                    handle = adapter.kwargs["completion_backend"].backend
+                assert handle is resources
+                handle.edit(label=(paths.shard_path.name, stage))
+            assert backends[0].closes == 0
+        _completed(c, paths.shard_path, count=0)
+        return ShardResult(True, 0, 0, 0, 0, (), {})
+
+    def run():
+        api().run_worker(
+            c,
+            config,
+            runtime=config.runtime,
+            rank=0,
+            world_size=1,
+            slot=0,
+            groups=(("4", "5"),),
+            git_commit="test",
+            runner=runner,
+            event_callback=events.append,
+        )
+
+    if interrupted:
+        with pytest.raises(KeyboardInterrupt):
+            run()
+        assert api().completed_receipt(c, c.shards[0]) is not None
+    else:
+        run()
+    assert len(backends) == 1 and backends[0].starts == backends[0].closes == 1
+    assert calls == [
+        (shard.name, stage)
+        for shard in (c.shards[:1] if interrupted else c.shards)
+        for stage in ("remove", "reference_edit", "subject_attributes")
+    ]
+    assert backends[0].config.temporary_root.is_relative_to(c.root / "runtime")
+    assert events[-1]["boogu_start_count"] == 1 and events[-1]["boogu_call_count"] == (
+        3 if interrupted else 6
+    )
+
+
 def accepted(config):
     from r2v_data_v2.v3.config import BOOGU_REMOVE_BACKEND
 
@@ -394,7 +525,8 @@ def test_worker_skip_completed_and_actual_runtime_passthrough(case, monkeypatch)
         event_callback=events.append,
     )
     assert len(execution_seen) == 1
-    assert events[-1]["event"] == "post_mask_worker_completed"
+    assert events[-2]["event"] == "post_mask_worker_completed"
+    assert events[-1]["event"] == "post_mask_worker_resource_summary"
 
 
 def test_rank_zero_waits_for_all_markers_and_nonzero_rank_never_compacts(case):
@@ -980,8 +1112,9 @@ def test_incomplete_shard_continues_later_shard_without_retry(case, monkeypatch)
         )
     assert attempted == [case[2], later]
     assert api().completed_receipt(c, later) is not None
-    assert events[-1]["event"] == "post_mask_worker_incomplete"
-    assert events[-1]["unresolved_shards"] == [case[2].stem]
+    assert events[-2]["event"] == "post_mask_worker_incomplete"
+    assert events[-1]["event"] == "post_mask_worker_resource_summary"
+    assert events[-2]["unresolved_shards"] == [case[2].stem]
     assert events[-1]["completed_shards"] == 1
     assert not any(e["event"] == "post_mask_worker_completed" for e in events)
     with pytest.raises(TimeoutError):

@@ -89,6 +89,244 @@ def _run(case, log, *, fail=None, events=None):
     return result, paths
 
 
+@pytest.mark.parametrize("stage", ["remove", "reference_edit", "subject_attributes"])
+def test_heavy_stage_clip_tasks_overlap(case, monkeypatch, stage):
+    from threading import Barrier
+    from types import SimpleNamespace
+
+    config, root, shard = _all_phases_case(case)
+    case = config, root, shard
+    _write_rows(case, [_ready(case, "one", 0), _ready(case, "two", 1)])
+    api, paths, execution = _setup(case)
+    barrier = Barrier(2, timeout=2)
+    entered = []
+    overlapped = []
+    monkeypatch.setattr(
+        api, "phase_needed", lambda storage, clip, current: current == stage
+    )
+
+    @contextmanager
+    def factory(current, storage, execution):
+        def run(uid):
+            entered.append(uid)
+            barrier.wait()
+            overlapped.append(uid)
+            return {}
+
+        yield SimpleNamespace(run=run)
+
+    result = api.run_post_mask_shard(
+        config,
+        entity_mask_root=root,
+        paths=paths,
+        git_commit="test",
+        execution=execution,
+        adapter_factory=factory,
+    )
+    assert not result.completed
+    assert sorted(entered) == ["one", "two"]
+    assert result.stage_counts[stage].get("clip_failures") == 2
+    assert sorted(overlapped) == ["one", "two"]
+
+
+@pytest.mark.parametrize("value", [0, -1, True])
+def test_clip_inflight_rejects_invalid_execution_value(case, value):
+    _, _, execution = _setup(case)
+    with pytest.raises(ValueError, match="clip_inflight"):
+        replace(execution, clip_inflight=value)
+
+
+@pytest.mark.parametrize("stage", ["remove", "reference_edit", "subject_attributes"])
+def test_clip_b_boogu_overlaps_clip_a_qwen(case, monkeypatch, stage):
+    from threading import Event
+    from types import SimpleNamespace
+
+    from r2v_data_v2.v3 import reference_edit_boogu
+    from r2v_data_v2.v3.post_mask_resources import PostMaskWorkerResources
+    from r2v_data_v2.v3.profiling import profiled_openai_call
+
+    a_qwen, b_boogu = Event(), Event()
+    calls = []
+
+    class Backend:
+        started = False
+
+        def __init__(self, config):
+            pass
+
+        def start(self, **kw):
+            self.started = True
+
+        def edit(self, **kw):
+            calls.append(kw["uid"])
+
+        def close(self):
+            self.started = False
+
+    monkeypatch.setattr(reference_edit_boogu, "BooguSubprocessBackend", Backend)
+    config, root, shard = _all_phases_case(case)
+    _write_rows((config, root, shard), [_ready(case, "a", 0), _ready(case, "b", 1)])
+    api, paths, execution = _setup((config, root, shard))
+    monkeypatch.setattr(
+        api, "phase_needed", lambda storage, clip, current: current == stage
+    )
+    with PostMaskWorkerResources(
+        config, execution, runtime_root=paths.state_root / "runtime"
+    ) as resources:
+
+        @contextmanager
+        def factory(current, storage, settings):
+            def run(uid):
+                if uid == "b":
+                    assert a_qwen.wait(3)
+                    resources.edit(uid=uid)
+                    b_boogu.set()
+                else:
+                    resources.edit(uid=uid)
+
+                    def qwen():
+                        a_qwen.set()
+                        assert b_boogu.wait(3)
+
+                    profiled_openai_call(
+                        qwen,
+                        component="test",
+                        operation="test",
+                        retry_index=0,
+                        model="fake",
+                        messages=[],
+                    )
+                return {}
+
+            yield SimpleNamespace(run=run)
+
+        result = api.run_post_mask_shard(
+            config,
+            entity_mask_root=root,
+            paths=paths,
+            git_commit="test",
+            execution=execution,
+            adapter_factory=factory,
+            resources=resources,
+        )
+        assert not result.completed and b_boogu.is_set()
+        assert calls == ["a", "b"]
+        assert resources.summary()["boogu_start_count"] == 1
+
+
+def test_heavy_threads_qwen_gate_allows_two_actual_requests(case, monkeypatch):
+    from threading import Barrier
+    from types import SimpleNamespace
+
+    from r2v_data_v2.v3.profiling import _QWEN_CONCURRENCY_GATE, profiled_openai_call
+
+    _write_rows(case, [_ready(case, "a", 0), _ready(case, "b", 1)])
+    api, paths, execution = _setup(case)
+    execution = replace(
+        execution, runtime=replace(execution.runtime, qwen_max_inflight=2)
+    )
+    monkeypatch.setattr(
+        api, "phase_needed", lambda storage, clip, stage: stage == "remove"
+    )
+    barrier, completed = Barrier(2, timeout=3), []
+
+    @contextmanager
+    def factory(stage, storage, settings):
+        def run(uid):
+            assert _QWEN_CONCURRENCY_GATE.get().maximum == 2
+
+            def request():
+                barrier.wait()
+                completed.append(uid)
+
+            profiled_openai_call(
+                request,
+                component="test",
+                operation="test",
+                retry_index=0,
+                model="fake",
+                messages=[],
+            )
+            return {}
+
+        yield SimpleNamespace(run=run)
+
+    api.run_post_mask_shard(
+        case[0],
+        entity_mask_root=case[1],
+        paths=paths,
+        git_commit="test",
+        execution=execution,
+        adapter_factory=factory,
+    )
+    assert sorted(completed) == ["a", "b"]
+
+
+def test_clip_inflight_change_reuses_durable_shard(case):
+    _write_rows(case, [_ready(case)])
+    result, paths = _run(case, [])
+    assert result.completed
+    original = paths.identity_path.read_bytes()
+    export = (paths.export_root / "samples.jsonl").read_bytes()
+    api, _, execution = _setup(case)
+    result = api.run_post_mask_shard(
+        case[0],
+        entity_mask_root=case[1],
+        paths=paths,
+        git_commit="later",
+        execution=replace(execution, clip_inflight=2),
+        adapter_factory=lambda *a: pytest.fail("durable stage recomputed"),
+    )
+    assert result.completed and paths.identity_path.read_bytes() == original
+    assert (paths.export_root / "samples.jsonl").read_bytes() == export
+
+
+def test_shared_shard_write_lock_serializes_clip_storage_mutations(case, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event, Lock
+
+    from r2v_data_v2.v3.post_mask_production import initialize_shard
+    from r2v_data_v2.v3.runtime import ClipScopedStorage
+
+    api, paths, _ = _setup(case)
+    _write_rows(case, [])
+    storage = initialize_shard(case[0], paths, git_commit="test")
+    shared = api._ShardStorage(storage, ("a", "b"))
+    a = ClipScopedStorage(shared, "a", shared_write_lock=shared.write_lock)
+    b = ClipScopedStorage(shared, "b", shared_write_lock=shared.write_lock)
+    inside, second_attempt = Event(), Event()
+    guard, active, peak = Lock(), 0, 0
+    original = storage.append_failure
+
+    def append(**kwargs):
+        nonlocal active, peak
+        with guard:
+            active += 1
+            peak = max(peak, active)
+        if kwargs["clip_uid"] == "a":
+            inside.set()
+            assert second_attempt.wait(3)
+        result = original(**kwargs)
+        with guard:
+            active -= 1
+        return result
+
+    monkeypatch.setattr(storage, "append_failure", append)
+
+    def second():
+        assert inside.wait(3)
+        second_attempt.set()
+        b.append_failure(stage="remove", clip_uid="b", reason="test")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        one = pool.submit(a.append_failure, stage="remove", clip_uid="a", reason="test")
+        two = pool.submit(second)
+        one.result()
+        two.result()
+    assert peak == 1
+    assert len(storage.failures_path.read_text().splitlines()) == 2
+
+
 def test_quality_rejection_exports_once_and_restart_loads_publication(case):
     _write_rows(case, [_ready(case)])
     log, events = [], []
@@ -104,6 +342,131 @@ def test_quality_rejection_exports_once_and_restart_loads_publication(case):
     assert second.completed and not log
     assert paths.export_root.joinpath("dataset.json").read_bytes() == before
     assert events[-1]["event"] == "post_mask_shard_completed"
+
+
+def test_pair_waits_for_all_concurrent_remove_tasks(case):
+    from threading import Barrier
+
+    case = _all_phases_case(case)
+    _write_rows(
+        case,
+        [
+            _ready(case, "a", 0, "pending_remove"),
+            _ready(case, "b", 1, "pending_remove"),
+        ],
+    )
+    api, paths, execution = _setup(case)
+    barrier = Barrier(2, timeout=2)
+    removed, paired = [], []
+
+    @contextmanager
+    def factory(stage, storage, execution):
+        with _accepted_factory([])(stage, storage, execution) as inner:
+
+            class Phase:
+                def run(self, uid=None):
+                    if stage == "remove":
+                        barrier.wait()
+                        result = inner.run(uid)
+                        removed.append(uid)
+                        return result
+                    if stage == "pair":
+                        assert sorted(removed) == ["a", "b"]
+                        assert uid is None
+                        paired.append(tuple(c.clip_uid for c in storage.iter_clips()))
+                    return inner.run(uid)
+
+            yield Phase()
+
+    result = api.run_post_mask_shard(
+        case[0],
+        entity_mask_root=case[1],
+        paths=paths,
+        git_commit="test",
+        execution=execution,
+        adapter_factory=factory,
+    )
+    assert result.completed
+    assert paired == [("a", "b")]
+
+
+def test_boogu_crash_keeps_clip_retryable_and_other_clip_continues(case, monkeypatch):
+    from threading import Event
+
+    from r2v_data_v2.v3 import reference_edit_boogu
+    from r2v_data_v2.v3.post_mask_resources import PostMaskWorkerResources
+
+    case = _all_phases_case(case)
+    _write_rows(
+        case,
+        [
+            _ready(case, "a", 0, "pending_remove"),
+            _ready(case, "b", 1, "pending_remove"),
+        ],
+    )
+    api, paths, execution = _setup(case)
+    failed = Event()
+    calls, downstream = [], []
+
+    class Backend:
+        started = False
+
+        def __init__(self, config):
+            pass
+
+        def start(self, **kw):
+            self.started = True
+
+        def close(self):
+            self.started = False
+
+        def edit(self, *, uid):
+            calls.append(uid)
+            if uid == "a":
+                self.started = False
+                failed.set()
+                raise RuntimeError("Boogu transport died")
+
+    monkeypatch.setattr(reference_edit_boogu, "BooguSubprocessBackend", Backend)
+    with PostMaskWorkerResources(
+        case[0], execution, runtime_root=paths.state_root / "runtime"
+    ) as resources:
+
+        @contextmanager
+        def factory(stage, storage, execution):
+            with _accepted_factory([])(stage, storage, execution) as inner:
+
+                class Phase:
+                    def run(self, uid=None):
+                        if stage == "remove":
+                            if uid == "b":
+                                assert failed.wait(2)
+                            resources.edit(uid=uid)
+                        else:
+                            downstream.extend(
+                                (stage, c.clip_uid)
+                                for c in storage.iter_clips()
+                                if uid is None or c.clip_uid == uid
+                            )
+                        return inner.run(uid)
+
+                yield Phase()
+
+        result = api.run_post_mask_shard(
+            case[0],
+            entity_mask_root=case[1],
+            paths=paths,
+            git_commit="test",
+            execution=execution,
+            adapter_factory=factory,
+            resources=resources,
+        )
+        assert resources.summary()["boogu_restart_count"] == 1
+        assert resources.summary()["boogu_call_count"] == 2
+    assert calls == ["a", "b"]
+    assert not result.completed and result.retryable_clip_uids == ("a",)
+    assert all(uid == "b" for _, uid in downstream)
+    assert ("subject_attributes", "b") in downstream
 
 
 def test_clip_exception_blocks_export_but_not_neighbour(case):
@@ -224,7 +587,7 @@ def test_execution_runtime_not_semantic_placeholders(case):
     )
     execution = replace(execution, runtime=runtime)
     assert execution.workers_for("instruct") == 2
-    assert execution.workers_for("remove") == 1
+    assert execution.workers_for("remove") == 8
     assert execution.qwen_gate().maximum == 7
     assert (
         api.ExecutionSettings(
@@ -623,13 +986,19 @@ def test_real_adapter_persistent_resources_placement_and_exception_close(
     class Resource:
         def __init__(self, config, **kwargs):
             self.config, self.kwargs, self.starts, self.closes = config, kwargs, 0, 0
+            self.started = False
             resources.append(self)
 
         def start(self, **kwargs):
             self.starts += 1
+            self.started = True
+
+        def edit(self, **kwargs):
+            return None
 
         def close(self):
             self.closes += 1
+            self.started = False
 
     monkeypatch.setattr(reference_edit_boogu, "BooguSubprocessBackend", Resource)
     monkeypatch.setattr(reference_edit_boogu, "QwenBooguReferenceEditJudge", Resource)
@@ -646,6 +1015,12 @@ def test_real_adapter_persistent_resources_placement_and_exception_close(
         assert config is storage.config
         assert kwargs["overwrite"] is False
         calls.append(kwargs)
+        if stage == "remove":
+            kwargs["backend"].backend.edit()
+        elif stage == "reference_edit":
+            kwargs["backend"].edit()
+        else:
+            kwargs["completion_backend"].backend.edit()
         if stage == "reference_edit":
             assert not restart_sam.exists()
             assert kwargs["manage_backend_lifecycle"] is False
@@ -717,6 +1092,7 @@ def test_adapter_closes_boogu_when_start_raises(case, monkeypatch):
     class Backend:
         def __init__(self, config):
             self.config = config
+            self.started = False
 
         def start(self, **kwargs):
             raise RuntimeError("worker startup failed")
@@ -727,9 +1103,9 @@ def test_adapter_closes_boogu_when_start_raises(case, monkeypatch):
     monkeypatch.setattr(reference_edit_boogu, "BooguSubprocessBackend", Backend)
     with (
         pytest.raises(RuntimeError, match="startup"),
-        api.DownstreamPhaseAdapter("remove", storage, execution),
+        api.DownstreamPhaseAdapter("remove", storage, execution) as adapter,
     ):
-        pass
+        adapter._boogu().edit()
     assert closed == [True]
 
 
