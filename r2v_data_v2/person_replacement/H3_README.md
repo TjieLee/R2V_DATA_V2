@@ -1,5 +1,9 @@
 # Independent accelerated H3 Ref2VA replacement candidates
 
+For the new, separate persistent two-GPU **text-only** pair executor, see
+[H3_PAIR_EXECUTOR.md](H3_PAIR_EXECUTOR.md). Its FSDP2 route is not yet H200-validated;
+the single-GPU and A/B paths described below remain unchanged.
+
 This experiment does not replace Bernini or write production training tuples.
 It only adds a separate CLI, deterministic prompt, subprocess adapters and tests.
 No existing Audio/H3, Visual, Bernini, JoyAI, Qwen or shared dependency file changes.
