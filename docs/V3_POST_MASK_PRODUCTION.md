@@ -228,7 +228,7 @@ not a fake H3-ready production.
 | Hydrated Stage2 frame/mask/source mirrors | Keep; no proven pruning path; never remove whole hydrated clips |
 | Exclusion/input-failure inventories, provenance, small logs and receipts | Keep |
 | Owned abandoned hydration staging | Safely rebuilt model-free under shard lock |
-| Owned Boogu per-request scratch after backend closes | Remove only matching owner-proven scratch; never completion candidates |
+| Owned Boogu and reference-edit SAM review per-request scratch after backends close | Remove only matching owner-proven scratch; never completion candidates |
 | Owned abandoned exporter `.<shard>.tmp-<32hex>` | Remove only matching shard/export intent under shard lock |
 | Compactor atomic-manifest temp files and `.production-sample-ids-<8chars>.sqlite3` sidecars | Remove only exact known file patterns under global lock after validated publication |
 | Frozen Stage2 input, unrelated temp/debug files, symlinks | Never delete or mutate |

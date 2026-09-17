@@ -114,7 +114,7 @@ def _scratch_root(run_root: Path, stage: str) -> Path:
 
 
 def cleanup_phase_scratch(run_root: Path, stage: str) -> None:
-    """Only remove proven run-owned abandoned Boogu request directories.
+    """Only remove proven run-owned abandoned request directories.
 
     Call only while holding the shard lock and after the backend has closed.
     Generated references, candidates, attribute sidecars and logs are retained.
@@ -130,11 +130,15 @@ def cleanup_phase_scratch(run_root: Path, stage: str) -> None:
         or json.loads(owner.read_text()) != expected
     ):
         raise ValueError("scratch directory has no matching owner")
-    for request in root.glob("r2v-boogu-*"):
-        if request.is_symlink():
-            raise ValueError("owned scratch request cannot be a symlink")
-        if request.is_dir():
-            shutil.rmtree(request)
+    patterns = ["r2v-boogu-*"]
+    if stage == "reference_edit":
+        patterns.append("sam3-review-*")
+    for pattern in patterns:
+        for request in root.glob(pattern):
+            if request.is_symlink():
+                raise ValueError("owned scratch request cannot be a symlink")
+            if request.is_dir():
+                shutil.rmtree(request)
 
 
 def _prepare_scratch(run_root: Path, stage: str) -> Path:

@@ -251,32 +251,61 @@ def test_pair_view_retains_done_donors(case):
     assert ("pair", ("first", "second")) in log
 
 
-def test_owned_scratch_cleanup_preserves_generated_assets(case):
+def test_owned_scratch_cleanup_removes_reference_edit_requests_only(case):
     api, paths, _ = _setup(case)
-    scratch = paths.run_root / ".post_mask_scratch" / "remove"
+    scratch = paths.run_root / ".post_mask_scratch" / "reference_edit"
     scratch.mkdir(parents=True)
     (scratch / ".owner.json").write_text(
-        json.dumps({"run_root": str(paths.run_root), "stage": "remove"})
+        json.dumps({"run_root": str(paths.run_root), "stage": "reference_edit"})
     )
-    stale = scratch / "r2v-boogu-dead"
-    stale.mkdir()
-    (stale / "request.png").write_bytes(b"scratch")
+    boogu = scratch / "r2v-boogu-dead"
+    boogu.mkdir()
+    (boogu / "request.png").write_bytes(b"scratch")
+    sam = scratch / "sam3-review-dead"
+    sam.mkdir()
+    for slot in range(10):
+        (sam / f"{slot:02d}.jpg").write_bytes(b"scratch")
+    unrelated = scratch / "debug-capture"
+    unrelated.mkdir()
+    (unrelated / "keep.jpg").write_bytes(b"debug")
+    note = scratch / "keep.log"
+    note.write_text("keep")
     kept = paths.run_root / "subject_attributes" / "completion_candidates" / "keep.png"
     kept.parent.mkdir(parents=True)
     kept.write_bytes(b"resume")
-    api.cleanup_phase_scratch(paths.run_root, "remove")
-    assert not stale.exists() and kept.read_bytes() == b"resume"
+    api.cleanup_phase_scratch(paths.run_root, "reference_edit")
+    assert not boogu.exists() and not sam.exists()
+    assert unrelated.joinpath("keep.jpg").read_bytes() == b"debug"
+    assert note.read_text() == "keep" and kept.read_bytes() == b"resume"
 
 
 def test_unowned_scratch_is_never_removed(case):
     api, paths, _ = _setup(case)
-    scratch = paths.run_root / ".post_mask_scratch" / "remove"
+    scratch = paths.run_root / ".post_mask_scratch" / "reference_edit"
     scratch.mkdir(parents=True)
-    stale = scratch / "r2v-boogu-dead"
-    stale.mkdir()
+    boogu = scratch / "r2v-boogu-dead"
+    boogu.mkdir()
+    sam = scratch / "sam3-review-dead"
+    sam.mkdir()
     with pytest.raises(ValueError, match="owned|owner"):
-        api.cleanup_phase_scratch(paths.run_root, "remove")
-    assert stale.exists()
+        api.cleanup_phase_scratch(paths.run_root, "reference_edit")
+    assert boogu.exists() and sam.exists()
+
+
+def test_owned_sam_review_scratch_symlink_fails_closed(case):
+    api, paths, _ = _setup(case)
+    scratch = paths.run_root / ".post_mask_scratch" / "reference_edit"
+    scratch.mkdir(parents=True)
+    (scratch / ".owner.json").write_text(
+        json.dumps({"run_root": str(paths.run_root), "stage": "reference_edit"})
+    )
+    target = paths.run_root / "unowned-sam-review"
+    target.mkdir()
+    (target / "keep.jpg").write_bytes(b"unowned")
+    (scratch / "sam3-review-redirected").symlink_to(target, target_is_directory=True)
+    with pytest.raises(ValueError, match="symlink"):
+        api.cleanup_phase_scratch(paths.run_root, "reference_edit")
+    assert target.joinpath("keep.jpg").read_bytes() == b"unowned"
 
 
 def _accepted_factory(log, *, terminal_edit_uid=None, retry_stage=None):
@@ -578,6 +607,18 @@ def test_real_adapter_persistent_resources_placement_and_exception_close(
     hydrate_shard(storage, entity_mask_root=root, shard_path=shard, paths=paths)
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "4")
     resources, calls = [], []
+    scratch = storage.root / ".post_mask_scratch" / stage
+    restart_sam = scratch / "sam3-review-restart"
+    unrelated_scratch = scratch / "debug-capture"
+    if stage == "reference_edit":
+        scratch.mkdir(parents=True)
+        (scratch / ".owner.json").write_text(
+            json.dumps({"run_root": str(storage.root), "stage": stage})
+        )
+        restart_sam.mkdir()
+        (restart_sam / "00.jpg").write_bytes(b"abandoned")
+        unrelated_scratch.mkdir()
+        (unrelated_scratch / "keep.jpg").write_bytes(b"debug")
 
     class Resource:
         def __init__(self, config, **kwargs):
@@ -606,11 +647,15 @@ def test_real_adapter_persistent_resources_placement_and_exception_close(
         assert kwargs["overwrite"] is False
         calls.append(kwargs)
         if stage == "reference_edit":
+            assert not restart_sam.exists()
             assert kwargs["manage_backend_lifecycle"] is False
             assert (
                 kwargs["sam_reviewer"].max_area_growth_ratio
                 == config.reference_edit.sam_max_area_growth_ratio
             )
+            final_sam = scratch / "sam3-review-final"
+            final_sam.mkdir(exist_ok=True)
+            (final_sam / "00.jpg").write_bytes(b"abandoned")
         if len(calls) == 2 and fail_second:
             raise RuntimeError("injected algorithm failure")
         return SimpleNamespace(
@@ -642,6 +687,9 @@ def test_real_adapter_persistent_resources_placement_and_exception_close(
     sam = [r for r in resources if r.config is storage.config.sam3]
     if stage != "remove":
         assert len(sam) == 1 and sam[0].config.device == "cuda"
+    if stage == "reference_edit":
+        assert not restart_sam.exists() and not (scratch / "sam3-review-final").exists()
+        assert unrelated_scratch.joinpath("keep.jpg").read_bytes() == b"debug"
     assert storage.config.runtime.worker_timeout_seconds == 3600
 
 
