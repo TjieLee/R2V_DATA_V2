@@ -117,30 +117,6 @@ command -v setsid >/dev/null 2>&1 || {
   echo "setsid is required for full-production process isolation" >&2
   exit 2
 }
-test -d "$SAM_AUDIO_CODE_ROOT" || {
-  echo "Missing SAM_AUDIO_CODE_ROOT: $SAM_AUDIO_CODE_ROOT" >&2
-  exit 2
-}
-test -d "$SAM_AUDIO_MODEL_PATH" || {
-  echo "Missing SAM_AUDIO_MODEL_PATH: $SAM_AUDIO_MODEL_PATH" >&2
-  exit 2
-}
-test -d "$SAM_AUDIO_T5_BASE_PATH" || {
-  echo "Missing SAM_AUDIO_T5_BASE_PATH: $SAM_AUDIO_T5_BASE_PATH" >&2
-  exit 2
-}
-test -d "$PERCEPTION_MODELS_ROOT" || {
-  echo "Missing PERCEPTION_MODELS_ROOT: $PERCEPTION_MODELS_ROOT" >&2
-  exit 2
-}
-test -d "$DACVAE_ROOT" || {
-  echo "Missing DACVAE_ROOT: $DACVAE_ROOT" >&2
-  exit 2
-}
-test -d "$SAM_AUDIO_PYDEPS" || {
-  echo "Missing SAM_AUDIO_PYDEPS: $SAM_AUDIO_PYDEPS" >&2
-  exit 2
-}
 test -x "$AUK_PYTHON" || {
   echo "Missing AUK_PYTHON: $AUK_PYTHON" >&2
   exit 2
