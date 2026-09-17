@@ -1,0 +1,251 @@
+"""Parallel inference with publication owned entirely by the frozen stem runners."""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import tempfile
+from contextlib import contextmanager
+from pathlib import Path
+
+from r2v_data_v2.h3 import diarization_binding as diar
+from r2v_data_v2.h3 import sam_audio_stem_shadow as frozen
+from r2v_data_v2.h3.audio_backends import fingerprint_local_model_path
+from r2v_data_v2.h3.resolved_audio_stems import RESOLVED_STAGE, load_stem_source
+
+
+def execute_stage(*args, **kwargs):
+    # Keep CPU imports usable while the independently owned executor is absent.
+    from r2v_data_v2.h3.t2va_full_workers import execute_stage as execute
+
+    return execute(*args, **kwargs)
+
+
+def _environment(prefix):
+    names = {
+        "DIARIZEN": (
+            "PYTHON",
+            "CODE_ROOT",
+            "MODEL_PATH",
+            "MODEL_IDENTIFIER",
+            "TIMEOUT_SECONDS",
+        ),
+    }[prefix]
+    return {
+        **{
+            f"{prefix}_{name}": os.environ[f"{prefix}_{name}"]
+            for name in names
+            if f"{prefix}_{name}" in os.environ
+        },
+        f"{prefix}_DEVICE": "cuda:0",
+        "HF_HUB_OFFLINE": "1",
+        "TRANSFORMERS_OFFLINE": "1",
+    }
+
+
+def _diar_configuration():
+    from tools.run_h3_diarization_binding import _configuration_fingerprint
+
+    environment = _environment("DIARIZEN")
+    model = fingerprint_local_model_path(Path(environment["DIARIZEN_MODEL_PATH"]))
+    identifier = environment.get(
+        "DIARIZEN_MODEL_IDENTIFIER", diar.DEFAULT_DIARIZEN_MODEL_IDENTIFIER
+    )
+    provenance = diar.DiarizationBackendProvenance(
+        backend="diarizen_official_pipeline",
+        model_identifier=identifier,
+        model_fingerprint=model,
+        configuration_fingerprint=_configuration_fingerprint(
+            model_identifier=identifier,
+            model_fingerprint=model,
+            requested_device="cuda:0",
+            input_profile="canonical_32k_stereo",
+        ),
+        input_profile="canonical_32k_stereo",
+        input_preprocessing=diar.DIARIZATION_CANONICAL_PREPROCESSING_VERSION,
+        source_sample_rate_hz=32000,
+        source_channels=2,
+    )
+    return {
+        "adapter_version": 1,
+        "environment": environment,
+        "provenance": provenance.model_dump(mode="json"),
+    }
+
+
+def _inference(backend, call):
+    """Do not let a dead persistent child become a durable sample failure."""
+    process = getattr(backend, "_process", None)
+    if process is None or process.poll() is not None:
+        raise SystemExit("speech inference worker is not running")
+    try:
+        result = call()
+    except Exception as exc:
+        process = getattr(backend, "_process", None)
+        if (
+            isinstance(
+                exc,
+                (TimeoutError, subprocess.TimeoutExpired, BrokenPipeError, EOFError),
+            )
+            or process is None
+            or process.poll() is not None
+            or "worker exited" in str(exc).lower()
+            or "out of memory" in str(exc).lower()
+        ):
+            raise SystemExit(f"speech inference worker failed: {exc}") from exc
+        raise
+    process = getattr(backend, "_process", None)
+    if process is None or process.poll() is not None:
+        raise SystemExit("speech inference worker exited after response")
+    return result
+
+
+def _diar_result(result, target, provenance):
+    if not isinstance(result, dict) or not isinstance(result.get("segments"), list):
+        raise TypeError("invalid DiariZen result")
+    segments = [
+        diar.DiarizationBackendSegment.model_validate(row) for row in result["segments"]
+    ]
+    # Validate cache eligibility with the same canonical boundary rules as replay.
+    diar._normalize_segments(target=target, segments=segments, provenance=provenance)
+    return segments
+
+
+class _DiarWorker:
+    def __init__(self, backend):
+        self.backend = backend
+
+    def process(self, job, output_dir):
+        del output_dir
+        target = diar.DiarizationTargetClip.model_validate(job["target"])
+        path = Path(target.source_audio_path)
+        if frozen.sha256_file(path) != target.source_audio_sha256:
+            raise ValueError("DiariZen source audio changed")
+        segments = _inference(
+            self.backend,
+            lambda: self.backend.diarize(
+                clip_uid=target.target_clip_uid,
+                audio_path=path,
+            ),
+        )
+        result = {"segments": [item.model_dump(mode="json") for item in segments]}
+        _diar_result(result, target, self.backend.provenance)
+        return result
+
+
+@contextmanager
+def diarizen_worker(configuration):
+    from tools.run_h3_diarization_binding import _runtime_backend
+
+    backend = None
+    with tempfile.TemporaryDirectory(prefix="t2va-diarizen-") as temporary:
+        try:
+            os.environ.update(configuration["environment"])
+            os.environ["DIARIZEN_DEVICE"] = "cuda:0"
+            backend, _ = _runtime_backend(
+                output_root=Path(temporary) / "stage",
+                input_profile="canonical_32k_stereo",
+            )
+            # The CLI helper normally remaps a physical device. Here the outer
+            # executor already selected it, and the nested child must retain it.
+            backend.environment["CUDA_VISIBLE_DEVICES"] = os.environ[
+                "CUDA_VISIBLE_DEVICES"
+            ]
+            if (
+                backend.provenance.model_dump(mode="json")
+                != configuration["provenance"]
+            ):
+                raise ValueError("DiariZen worker configuration changed")
+            backend.__enter__()
+        except Exception as exc:
+            if backend is not None:
+                backend.close()
+            raise SystemExit(f"DiariZen initialization failed: {exc}") from exc
+        try:
+            yield _DiarWorker(backend)
+        finally:
+            backend.close()
+
+
+def _ready(results, job_id):
+    record = results[job_id]
+    if record["status"] != "ready":
+        raise RuntimeError(record.get("failure_reason") or "speech inference failed")
+    return record["result"]
+
+
+def run_diarizen(
+    audio_root,
+    run_id,
+    stage_state,
+    gpu_ids,
+    allow_unverified,
+    ffmpeg="ffmpeg",
+    execute=execute_stage,
+):
+    del ffmpeg  # DiariZen owns its canonical preprocessing.
+    audio_root = Path(audio_root)
+    shadow = frozen.stem_shadow_root(audio_root, run_id)
+    stem_root = shadow / RESOLVED_STAGE
+    stems, records, _ = load_stem_source(stem_root)
+    source_root = audio_root / "diarization"
+    source = diar.DiarizationInventory.model_validate_json(
+        (source_root / "inventory.json").read_text()
+    )
+    if source.source_inventory_kind != "jea_shot_manifest" or any(
+        target.visual_references
+        or target.target_audio_binding_path is not None
+        or target.target_audio_binding_sha256 is not None
+        for target in source.targets
+    ):
+        raise ValueError(
+            "T2VA speech requires target-only JEA inventory without bindings"
+        )
+    inventory = frozen.build_stem_diarization_inventory(
+        stem_inventory=stems,
+        stem_records=records,
+        production_diarization_inventory=source,
+        route="resolved",
+        allow_unverified=allow_unverified,
+    )
+    configuration = _diar_configuration()
+    provenance = diar.DiarizationBackendProvenance.model_validate(
+        configuration["provenance"]
+    )
+    jobs = [
+        {
+            "job_id": target.target_clip_uid,
+            "target": target.model_dump(mode="json"),
+            "inventory_fingerprint": inventory.inventory_fingerprint,
+        }
+        for target in inventory.targets
+    ]
+    results = execute(
+        stage_root=Path(stage_state),
+        jobs=jobs,
+        gpu_ids=list(gpu_ids),
+        factory=f"{__name__}:diarizen_worker",
+        configuration=configuration,
+        environment=configuration["environment"],
+    )
+    by_id = {target.target_clip_uid: target for target in inventory.targets}
+
+    class Replay:
+        def diarize(self, *, clip_uid, audio_path):
+            target = by_id[clip_uid]
+            if Path(target.source_audio_path) != audio_path:
+                raise ValueError("DiariZen replay source differs")
+            return _diar_result(_ready(results, clip_uid), target, provenance)
+
+    replay = Replay()
+    replay.provenance = provenance
+    published = frozen.run_stem_diarization_shadow(
+        stem_root=stem_root,
+        production_diarization_root=source_root,
+        backend=replay,
+        route="resolved",
+        output_root=shadow / "diarization",
+        allow_unverified=allow_unverified,
+        overwrite=True,
+    )
+    return {"provenance": published.model_dump(mode="json"), "job_count": len(jobs)}

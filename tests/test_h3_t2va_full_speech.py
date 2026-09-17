@@ -1,0 +1,300 @@
+from __future__ import annotations
+
+import importlib
+import json
+import os
+from collections import Counter
+from contextlib import contextmanager
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from r2v_data_v2.h3 import sam_audio_stem_shadow as frozen
+from tests import test_h3_t2va_shadow as fixtures
+from tests.test_h3_sam_audio_stem_shadow import _Diarization
+
+finalized = fixtures.finalized
+ffmpeg = fixtures.ffmpeg
+setup = fixtures.setup
+
+
+@pytest.fixture
+def speech(monkeypatch):
+    module = importlib.import_module("r2v_data_v2.h3.t2va_full_speech")
+    # Factories normally run in child processes; direct tests must restore env.
+    monkeypatch.setenv("DIARIZEN_DEVICE", "cuda:5")
+    monkeypatch.setattr(
+        module,
+        "_diar_configuration",
+        lambda: {
+            "provenance": _Diarization.provenance.model_dump(mode="json"),
+            "environment": {},
+        },
+    )
+    return module
+
+
+class Executor:
+    """CPU worker/cache substitute; only ready process results are retained."""
+
+    def __init__(self):
+        self.cache = {}
+        self.calls = Counter()
+        self.fail = set()
+        self.batches = []
+
+    def __call__(self, *, stage_root, jobs, gpu_ids, factory, configuration, **kwargs):
+        self.batches.append((factory, jobs, configuration, kwargs))
+        assert gpu_ids == ["2", "7"]
+        results = {}
+        for job in jobs:
+            key = json.dumps([factory, configuration, job], sort_keys=True)
+            if key not in self.cache:
+                self.calls[job["job_id"]] += 1
+                if job["job_id"] in self.fail:
+                    results[job["job_id"]] = {
+                        "status": "failed",
+                        "result": None,
+                        "failure_reason": "sample failure",
+                    }
+                    continue
+                assert factory.endswith(":diarizen_worker")
+                result = {
+                    "segments": [
+                        {
+                            "start_time": 0.0,
+                            "end_time": 1.02,
+                            "speaker_label": "A",
+                        }
+                    ]
+                }
+                self.cache[key] = {
+                    "status": "ready",
+                    "result": result,
+                    "failure_reason": None,
+                }
+            results[job["job_id"]] = self.cache[key]
+        return results
+
+
+def test_frozen_lineage_partial_failure_resume(speech, finalized, tmp_path, ffmpeg):
+    audio, run_id = finalized
+    shadow = frozen.stem_shadow_root(audio, run_id)
+    source_before = (audio / "diarization/inventory.json").read_bytes()
+    executor = Executor()
+    args = (audio, run_id, tmp_path / "workers", ["2", "7"], True)
+    speech.run_diarizen(*args, ffmpeg=ffmpeg, execute=executor)
+    jobs = executor.batches[-1][1]
+    assert len(jobs) == 2  # The frozen fixture has one failed upstream separation.
+    assert all(not j["target"]["visual_references"] for j in jobs)
+    assert all(j["target"]["target_audio_binding_path"] is None for j in jobs)
+    executor.fail.add(jobs[1]["job_id"])
+    executor.cache.clear()
+    speech.run_diarizen(*args, ffmpeg=ffmpeg, execute=executor)
+    provenance, _, _ = frozen.validate_stem_diarization_lineage(
+        shadow / "diarization",
+        expected_shadow_root=shadow,
+    )
+    assert provenance.failed_clip_uids == [jobs[1]["job_id"]]
+    assert provenance.binding_evidence_mode == "legacy_lr_asd"
+    assert provenance.schema_version.endswith(".5")
+    before = executor.calls.copy()
+    executor.fail.clear()
+    speech.run_diarizen(*args, ffmpeg=ffmpeg, execute=executor)
+    assert executor.calls - before == Counter({jobs[1]["job_id"]: 1})
+    assert executor.batches[0][1] == executor.batches[-1][1]
+    raw = [
+        json.loads(line)
+        for line in (shadow / "diarization/raw_segments.jsonl").read_text().splitlines()
+    ]
+    assert all(row["end_time"] == 1.0 for row in raw)
+    assert all(row["boundary_reconciliation"]["end_clamped"] for row in raw)
+    assert (audio / "diarization/inventory.json").read_bytes() == source_before
+
+
+@pytest.mark.parametrize(
+    "error,process",
+    [
+        (TimeoutError("timeout"), SimpleNamespace(poll=lambda: None)),
+        (RuntimeError("exited"), SimpleNamespace(poll=lambda: 9)),
+        (RuntimeError("gone"), None),
+        (BrokenPipeError("pipe"), SimpleNamespace(poll=lambda: None)),
+        (RuntimeError("CUDA out of memory"), SimpleNamespace(poll=lambda: None)),
+        (RuntimeError("CUDA OUT OF MEMORY"), SimpleNamespace(poll=lambda: None)),
+    ],
+)
+def test_nested_worker_failure_is_fatal(speech, error, process):
+    backend = SimpleNamespace(_process=process)
+
+    def fail():
+        raise error
+
+    with pytest.raises(SystemExit):
+        speech._inference(backend, fail)
+
+
+def test_live_worker_sample_failure_is_retryable(speech):
+    backend = SimpleNamespace(_process=SimpleNamespace(poll=lambda: None))
+
+    def fail():
+        raise ValueError("bad sample")
+
+    with pytest.raises(ValueError, match="bad sample"):
+        speech._inference(backend, fail)
+
+
+def test_factories_load_once_and_use_frozen_crops(
+    speech, finalized, tmp_path, ffmpeg, monkeypatch
+):
+    from tools import run_h3_diarization_binding as diar_cli
+
+    audio, run_id = finalized
+    executor = Executor()
+    args = (audio, run_id, tmp_path / "workers", ["2", "7"], True)
+    parent_environment = dict(os.environ)
+    speech.run_diarizen(*args, ffmpeg=ffmpeg, execute=executor)
+    diar_jobs = executor.batches[-1][1]
+    assert dict(os.environ) == parent_environment
+
+    class DiarBackend(_Diarization):
+        starts = 0
+        closes = 0
+
+        def __init__(self):
+            super().__init__()
+            self.environment = {"CUDA_VISIBLE_DEVICES": "0"}
+
+        def __enter__(self):
+            self.starts += 1
+            self._process = SimpleNamespace(poll=lambda: None)
+            return self
+
+        def close(self):
+            self.closes += 1
+
+    db = DiarBackend()
+
+    def runtime(*, output_root, input_profile):
+        assert input_profile == "canonical_32k_stereo"
+        assert os.environ["DIARIZEN_DEVICE"] == "cuda:0"
+        return db, output_root
+
+    monkeypatch.setattr(diar_cli, "_runtime_backend", runtime)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "7")
+    with speech.diarizen_worker(speech._diar_configuration()) as worker:
+        for job in diar_jobs:
+            assert worker.process(job, tmp_path)["segments"]
+        assert db.environment["CUDA_VISIBLE_DEVICES"] == "7"
+    assert (db.starts, db.closes, len(db.paths)) == (1, 1, 2)
+
+
+def test_invalid_diarization_not_cacheable(speech, finalized, tmp_path, ffmpeg):
+    audio, run_id = finalized
+    executor = Executor()
+    speech.run_diarizen(
+        audio,
+        run_id,
+        tmp_path / "workers",
+        ["2", "7"],
+        True,
+        ffmpeg=ffmpeg,
+        execute=executor,
+    )
+    job = executor.batches[-1][1][0]
+    backend = _Diarization()
+    backend._process = SimpleNamespace(poll=lambda: None)
+    backend.diarize = lambda **kwargs: [
+        speech.diar.DiarizationBackendSegment(
+            start_time=2.0,
+            end_time=3.0,
+            speaker_label="A",
+        )
+    ]
+    with pytest.raises(speech.diar.DiarizationBackendFailure, match="EOF"):
+        speech._DiarWorker(backend).process(job, tmp_path)
+
+
+def test_model_configuration_changes_cache_identity(monkeypatch, tmp_path):
+    speech = importlib.import_module("r2v_data_v2.h3.t2va_full_speech")
+    monkeypatch.setattr(speech, "fingerprint_local_model_path", lambda path: "a" * 64)
+    monkeypatch.setenv("DIARIZEN_MODEL_PATH", str(tmp_path))
+    monkeypatch.setenv("DIARIZEN_DEVICE", "cuda:5")
+    before = dict(os.environ)
+    dc = speech._diar_configuration()
+    assert dc == speech._diar_configuration()
+    assert dc["environment"]["DIARIZEN_DEVICE"] == "cuda:0"
+    assert dict(os.environ) == before
+    monkeypatch.setattr(speech, "fingerprint_local_model_path", lambda path: "b" * 64)
+    assert dc != speech._diar_configuration()
+
+
+@contextmanager
+def cpu_diar_worker(configuration):
+    """Importable fake model for exercising the real executor's receipt cache."""
+    speech = importlib.import_module("r2v_data_v2.h3.t2va_full_speech")
+
+    class Backend(_Diarization):
+        def diarize(self, *, clip_uid, audio_path):
+            with Path(configuration["calls"]).open("a") as handle:
+                handle.write(clip_uid + "\n")
+            if (
+                clip_uid == configuration["fail"]
+                and not Path(configuration["recover"]).exists()
+            ):
+                return [
+                    speech.diar.DiarizationBackendSegment(
+                        start_time=9.0,
+                        end_time=10.0,
+                        speaker_label="invalid",
+                    )
+                ]
+            return super().diarize(clip_uid=clip_uid, audio_path=audio_path)
+
+    backend = Backend()
+    backend._process = SimpleNamespace(poll=lambda: None)
+    yield speech._DiarWorker(backend)
+
+
+def test_real_executor_retries_semantic_failures(speech, finalized, tmp_path, ffmpeg):
+    from r2v_data_v2.h3.t2va_full_workers import execute_stage
+
+    audio, run_id = finalized
+    executor = Executor()
+    speech.run_diarizen(
+        audio,
+        run_id,
+        tmp_path / "plan",
+        ["2", "7"],
+        True,
+        ffmpeg=ffmpeg,
+        execute=executor,
+    )
+    jobs = executor.batches[-1][1]
+    calls, recover = tmp_path / "calls", tmp_path / "recover"
+    arguments = {
+        "stage_root": tmp_path / "real-workers",
+        "jobs": jobs,
+        "gpu_ids": ["2", "7"],
+        "factory": f"{__name__}:cpu_diar_worker",
+        "configuration": {
+            "fail": jobs[0]["job_id"],
+            "calls": str(calls),
+            "recover": str(recover),
+        },
+        "environment": {
+            "PYTHONPATH": str(Path(__file__).resolve().parents[1])
+            + os.pathsep
+            + os.environ.get("PYTHONPATH", "")
+        },
+    }
+    first = execute_stage(**arguments)
+    assert first[jobs[0]["job_id"]]["status"] == "failed"
+    assert first[jobs[1]["job_id"]]["status"] == "ready"
+    recover.touch()
+    second = execute_stage(**arguments)
+    assert all(row["status"] == "ready" for row in second.values())
+    assert Counter(calls.read_text().splitlines()) == {
+        jobs[0]["job_id"]: 2,
+        jobs[1]["job_id"]: 1,
+    }
