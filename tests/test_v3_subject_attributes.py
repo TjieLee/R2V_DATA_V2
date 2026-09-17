@@ -2253,6 +2253,87 @@ def test_attribute_png_validation_accepts_cleaned_rgba_and_legacy_completed_rgb(
     )
 
 
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("synthetic owner failure", "synthetic owner failure"),
+        ("first\r\nsecond\nthird", "first  second third"),
+        ("long failure " * 100, ("long failure " * 100)[:512]),
+    ],
+)
+def test_owner_processing_failure_diagnostic_is_runtime_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, message: str, expected: str
+) -> None:
+    clip = _clip()
+    calls = []
+    storage = SimpleNamespace(
+        read_clip=lambda uid: clip,
+        read_frames=lambda uid: SimpleNamespace(),
+        read_masks=lambda uid: SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        subject_attributes, "build_entity_reference_candidates",
+        lambda *args, **kwargs: [_candidate("candidate_1", slot=1, source_frame_index=10)],
+    )
+    def fail_owner(**kwargs):
+        calls.append(kwargs["owner"].entity_id)
+        raise ValueError(message)
+    monkeypatch.setattr(subject_attributes, "_process_owner", fail_owner)
+    root = tmp_path / "attributes"
+    result = subject_attributes.process_subject_attribute_clip(
+        SimpleNamespace(), storage=storage, output_root=root, clip=clip,
+        discovery_client=object(), review_client=object(), segmentation_backend=object(),
+    )
+    assert calls == ["e1"]
+    assert result.totals.failures == 1
+    assert result.totals.failure_reasons == {"owner_processing_failed:ValueError": 1}
+    assert result.enriched_sample is None
+    assert not list(root.rglob("*.json"))
+    assert result.totals.owner_processing_failures == [{
+        "owner_entity_id": "e1", "exception_type": "ValueError",
+        "exception_message": expected,
+    }]
+    assert "owner_processing_failures" not in result.to_counts()
+    assert all(isinstance(value, (int, float)) for value in result.to_counts().values())
+
+
+@pytest.mark.parametrize("message", [
+    'request failed: prompt="SECRET PROMPT"',
+    'response body: SECRET MODEL RESPONSE',
+    'invalid input_value="SECRET INPUT"',
+    'image data:image/png;base64,SECRETIMAGE',
+    'Error code: 400 - {"error": "SECRET RESPONSE"}',
+    "invalid bytes b'SECRET IMAGE'",
+    'response_body=SECRET MODEL RESPONSE',
+    'prompt_payload=SECRET PROMPT',
+])
+def test_owner_exception_diagnostic_omits_payloads(message):
+    diagnostic = subject_attributes._owner_exception_message(ValueError(message))
+    assert "SECRET" not in diagnostic
+    assert len(diagnostic) <= 512
+
+
+def test_owner_exception_diagnostic_does_not_render_validation_inputs():
+    from pydantic import BaseModel
+
+    class ExpectedCount(BaseModel):
+        count: int
+
+    with pytest.raises(ValidationError) as raised:
+        ExpectedCount.model_validate({"count": "SECRET MODEL RESPONSE"})
+    assert subject_attributes._owner_exception_message(raised.value) == (
+        "1 validation error for ExpectedCount [validation details omitted]"
+    )
+    encoded = "QUJD" * 100
+    assert encoded[:80] not in subject_attributes._owner_exception_message(
+        ValueError("invalid encoded input: " + encoded)
+    )
+    wrapped = ("QUJD" * 19 + "\r\n") * 3
+    assert "QUJD" not in subject_attributes._owner_exception_message(
+        ValueError("invalid encoded input: " + wrapped)
+    )
+
+
 def test_clip_primitive_uses_cached_owner_without_touching_visual_clip(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2335,6 +2416,7 @@ def test_clip_primitive_uses_cached_owner_without_touching_visual_clip(
     )
 
     assert result.totals.skipped_existing_owners == 1
+    assert result.totals.owner_processing_failures == []
     assert forbidden.calls == 0
     assert clip_path.read_bytes() == visual_bytes
     assert (output_root / "samples" / f"{clip.clip_uid}.json").is_file()

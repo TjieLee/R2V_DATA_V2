@@ -4554,6 +4554,96 @@ def test_recovery_real_clip_corruption_cases(
     assert storage.read_clip("clip-0").references.background is not None
 
 
+def test_recovery_missing_run_identity_rebuilds_without_reusing_stale_subtree(
+    tmp_path, monkeypatch,
+):
+    fixture, shard, chunk = _recovery_fixture(tmp_path, monkeypatch, rows=2)
+    final = execution_chunk_path(fixture.output_root, shard, chunk)
+    lines = final.read_bytes().splitlines(keepends=True)
+    prefix = b"  " + lines[0]
+    final.write_bytes(prefix + lines[1])
+    workspace = fixture.output_root / "artifacts" / shard.path.stem / "clip-1"
+    run = workspace / "run"
+    (run / "run.json").unlink()
+    stale = run / "stale-descendant"
+    stale.write_bytes(b"must not survive")
+    outside = workspace / "keep-outside-run"
+    outside.write_bytes(b"keep")
+    backend, decoder = FakeBackend(), FakeDecoder()
+    stages = []
+    original = production._write_checkpoint
+
+    def checkpoint(*args, **kwargs):
+        stages.append(kwargs["stage"])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(production, "_write_checkpoint", checkpoint)
+    result = process_execution_chunk(
+        shard, chunk, output_root=fixture.output_root,
+        config_identity=fixture.identity, backend=backend, decoder=decoder,
+        recover_incomplete_artifacts=True,
+    )
+    assert result["rows"] == 2
+    assert final.read_bytes().startswith(prefix)
+    assert backend.calls == ["e1"]
+    assert decoder.calls  # retained valid frames must be rebuilt, not reused
+    assert stages[0] == "annotation_ready"
+    assert (run / "run.json").is_file()
+    assert not stale.exists()
+    assert outside.read_bytes() == b"keep"
+
+
+@pytest.mark.parametrize("damage", [
+    "malformed_run", "mismatching_run", "checkpoint", "frame_hash", "source",
+    "non_recovery", "run_directory", "run_symlink",
+])
+def test_recovery_run_identity_fail_closed_without_mutation(tmp_path, monkeypatch, damage):
+    fixture, shard, chunk = _recovery_fixture(tmp_path, monkeypatch)
+    workspace = fixture.output_root / "artifacts" / shard.path.stem / "clip-0"
+    run = workspace / "run"
+    run_json = run / "run.json"
+    if damage == "malformed_run":
+        run_json.write_text("{")
+    elif damage == "mismatching_run":
+        payload = json.loads(run_json.read_text())
+        payload["config_hash"] = "0" * 64
+        run_json.write_text(json.dumps(payload))
+    else:
+        run_json.unlink()
+        if damage == "checkpoint":
+            path = workspace / "state.json"
+            payload = json.loads(path.read_text())
+            payload["input_row_sha256"] = "0" * 64
+            path.write_text(json.dumps(payload))
+        elif damage == "frame_hash":
+            (run / "clips/clip-0/frames/00.jpg").write_bytes(b"corrupt")
+        elif damage == "source":
+            path = run / "clips/clip-0/clip.json"
+            payload = json.loads(path.read_text())
+            payload["source"]["source_index"] = 99
+            path.write_text(json.dumps(payload))
+        elif damage == "run_directory":
+            run_json.mkdir()
+        elif damage == "run_symlink":
+            run_json.symlink_to(run / "missing-identity")
+    before = {p: p.read_bytes() for p in fixture.output_root.rglob("*") if p.is_file()}
+    backend, decoder = FakeBackend(), FakeDecoder()
+    def run_chunk():
+        return process_execution_chunk(
+            shard, chunk, output_root=fixture.output_root,
+            config_identity=fixture.identity, backend=backend, decoder=decoder,
+            recover_incomplete_artifacts=damage != "non_recovery",
+        )
+    if damage == "non_recovery":
+        assert run_chunk()["skipped"]
+        assert not run_json.exists()
+    else:
+        with pytest.raises((ValueError, FileNotFoundError)):
+            run_chunk()
+    assert {p: p.read_bytes() for p in before} == before
+    assert backend.calls == decoder.calls == []
+
+
 @pytest.mark.parametrize("partial", [False, True])
 def test_recovery_preserves_exact_chunk_prefix_and_resumes_first_broken_row(
     tmp_path: Path,
@@ -4616,6 +4706,157 @@ def test_recovery_preserves_exact_chunk_prefix_and_resumes_first_broken_row(
     assert visited == [1, 1, 2]
     assert final.read_bytes().startswith(prefix)
     assert backend.calls == decoder.calls == []
+
+
+@pytest.mark.parametrize("damage", ["masks", "background"])
+@pytest.mark.parametrize("recovery", [False, True])
+def test_recovery_batch_stages_target_exact_clip_without_global_discovery(
+    tmp_path, monkeypatch, damage, recovery,
+):
+    fixture, shard, _ = _recovery_fixture(tmp_path, monkeypatch)
+    workspace = fixture.output_root / "artifacts" / shard.path.stem / "clip-0"
+    _, storage = production._stage2_workspace_storage(
+        fixture.config, workspace, output_root=fixture.output_root
+    )
+    frames = {p: p.read_bytes() for p in storage.frames_dir("clip-0").iterdir()}
+    if damage == "masks":
+        storage.prepare_masks_publication("clip-0")
+        stage = "frames_ready"
+    else:
+        storage.write_references("clip-0", production.ReferencesState())
+        stage = "coverage_ready"
+    production._write_checkpoint(
+        workspace, stage=stage, row=shard.rows[0],
+        shard_sha256=shard.sha256, config_identity=fixture.identity,
+    )
+    # Simulate the real failure: batch discovery misses the target entirely.
+    monkeypatch.setattr(production.RunStorage, "iter_clips", lambda self: iter(()))
+    backend, decoder = FakeBackend(), FakeDecoder()
+
+    def process():
+        return process_ready_clip(
+            row=shard.rows[0], shard=shard, output_root=fixture.output_root,
+            workspace=workspace, config_identity=fixture.identity,
+            backend=backend, decoder=decoder, recover_incomplete_artifacts=recovery,
+        )
+
+    if recovery:
+        assert process().status.startswith("ready_")
+        assert storage.read_clip("clip-0").references.background is not None
+        assert backend.calls == (["e1"] if damage == "masks" else [])
+    else:
+        with pytest.raises((FileNotFoundError, ValueError)):
+            process()
+        assert backend.calls == []
+    assert decoder.calls == []
+    assert {p: p.read_bytes() for p in frames} == frames
+
+
+@pytest.mark.parametrize("stage", ["sam3", "background"])
+def test_recovery_no_checkpoint_promotion_when_success_stats_have_no_target(
+    tmp_path, monkeypatch, stage,
+):
+    from types import SimpleNamespace
+
+    fixture, shard, chunk = _recovery_fixture(tmp_path, monkeypatch)
+    workspace = fixture.output_root / "artifacts" / shard.path.stem / "clip-0"
+    _, storage = production._stage2_workspace_storage(
+        fixture.config, workspace, output_root=fixture.output_root
+    )
+    if stage == "sam3":
+        storage.masks_path("clip-0").unlink()
+        function = "segment_clips"
+        expected = "frames_ready"
+    else:
+        storage.write_references("clip-0", production.ReferencesState())
+        function = "build_background_candidates"
+        expected = "coverage_ready"
+    monkeypatch.setattr(
+        production, function, lambda *a, **kw: SimpleNamespace(failed=0)
+    )
+    result = process_execution_chunk(
+        shard, chunk, output_root=fixture.output_root,
+        config_identity=fixture.identity, backend=FakeBackend(), decoder=FakeDecoder(),
+        recover_incomplete_artifacts=True,
+    )
+    assert result["retryable"] and result["stage"] == stage
+    assert production._read_checkpoint(workspace).stage == expected
+    assert not execution_chunk_path(fixture.output_root, shard, chunk).exists()
+
+
+@pytest.mark.parametrize("damage", ["clip", "masks", "background", "frame_hash", "identity"])
+@pytest.mark.parametrize("persistent", [False, True])
+def test_recovery_reconciles_newly_processed_suffix_before_publication(
+    tmp_path, monkeypatch, damage, persistent,
+):
+    fixture, shard, chunk = _recovery_fixture(tmp_path, monkeypatch, rows=3)
+    final = execution_chunk_path(fixture.output_root, shard, chunk)
+    partial = final.with_name(final.name + ".partial")
+    prefix = b"  " + final.read_bytes().splitlines(keepends=True)[0]
+    final.rename(partial)
+    partial.write_bytes(prefix)
+    final.with_name(f"{chunk.stem}.meta.json").unlink()
+    workspace = fixture.output_root / "artifacts" / shard.path.stem / "clip-1"
+    _, storage = production._stage2_workspace_storage(
+        fixture.config, workspace, output_root=fixture.output_root
+    )
+    clip_path = storage.clip_path("clip-1")
+    mask_path = storage.masks_path("clip-1")
+    visits = []
+    original = production.process_ready_clip
+    losses = 0
+
+    def process(**kwargs):
+        nonlocal losses
+        index = kwargs["row"]["source_index"]
+        visits.append(index)
+        result = original(**kwargs)
+        # Artifact loss AFTER processing, behind a valid appended materialized row.
+        if index == 2 and (persistent or losses == 0):
+            losses += 1
+            if damage == "clip":
+                clip_path.unlink()
+            elif damage == "masks":
+                mask_path.unlink()
+            elif damage == "background":
+                storage.write_references("clip-1", production.ReferencesState())
+            elif damage == "frame_hash":
+                (storage.frames_dir("clip-1") / "00.jpg").write_bytes(b"corrupt")
+            else:
+                path = workspace / "state.json"
+                payload = json.loads(path.read_text())
+                payload["input_row_sha256"] = "0" * 64
+                path.write_text(json.dumps(payload))
+        return result
+
+    monkeypatch.setattr(production, "process_ready_clip", process)
+    backend, decoder = FakeBackend(), FakeDecoder()
+
+    def run():
+        return process_execution_chunk(
+            shard, chunk, output_root=fixture.output_root,
+            config_identity=fixture.identity, backend=backend, decoder=decoder,
+            recover_incomplete_artifacts=True,
+        )
+
+    if damage in {"frame_hash", "identity"}:
+        with pytest.raises(ValueError, match="hash|provenance"):
+            run()
+        assert visits == [1, 2]
+        assert len(partial.read_bytes().splitlines()) == 3  # no truncation on corruption
+    else:
+        result = run()
+        assert visits == [1, 2, 1, 2]
+        assert backend.calls == (["e1"] if damage == "masks" else [])
+        if persistent:
+            assert result["retryable"] and result["stage"] == "finalization"
+            assert partial.read_bytes() == prefix
+            assert not final.exists()
+            assert not final.with_name(f"{chunk.stem}.meta.json").exists()
+        else:
+            assert result["rows"] == 3
+            assert final.read_bytes().startswith(prefix)
+    assert decoder.calls == []
 
 
 def test_recovery_disabled_keeps_strict_failure(

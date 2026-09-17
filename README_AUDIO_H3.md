@@ -2,11 +2,29 @@
 
 This top-level README is the current high-level source of truth for the Audio/H3 path after Visual/reference extraction. The root `README.md` still contains substantial legacy V2/MVP material; do not infer the current Audio/H3 product path from those legacy sections.
 
+The accepted freeze checkpoint is `docs/H3_AUDIO_FREEZE_20260916.md`. Historical development sections in older runbooks may retain earlier pilot/version snapshots; when they conflict with the freeze note, use the freeze note.
+
 Detailed operational documentation lives in:
 
+- `docs/H3_AUDIO_FREEZE_20260916.md`
+- `docs/H3_TRAINING_MANIFEST_EXPORT.md`
 - `docs/H3_AUDIO_SERVER_RUNBOOK.md`
 - `docs/H3_AUDIO_REUSE_ASSETS.md`
+- `docs/H3_T2VA_TA2VA_SERVER_RUNBOOK.md`
+- `docs/H3_RA2VA_BINDING_AB_REVIEW.md`
 - `docs/V3_VISUAL_AUDIO_INTEGRATION.md`
+
+## Frozen product state
+
+Target-side T2VA v7 + TA2VA .2 are complete and frozen. The accepted reference-side/no-LR-ASD path is also frozen at MiMo backend `.66`, speech prompt `v49`, authority policy `v18`, materializer `v29`, reference selection `v2`, 4 FPS, and binding mode `none`. Persistent target video/reference images/music/SFX media use HTTP transport to SGLang; short request-specific speaker snippets remain base64.
+
+For dataset loading, prefer final publication manifests rather than traversing internal stage folders:
+
+- R(A)2VA Audio-reuse products: `<shadow-run>/h3_audio_reuse_products_v1/records.jsonl`.
+- derived first/last-frame products: `<shadow-run>/h3_frame_conditioned_products_v1/records.jsonl`.
+- TA2VA products: `<ta2va-run>/records.jsonl`.
+
+The flattening level differs by family. TA2VA and the derived first/last-frame products are already close to direct single-manifest consumption. R(A)2VA Audio-reuse rows contain final prompt, speech and Audio contracts but still need the frozen source H3/Visual contract to resolve reference Pictures; T2VA `records.jsonl` is only an index/provenance manifest and its semantic core remains under `core/<clip_uid>.json`. The model-free flat exporter in `tools/export_h3_training_manifests.py` resolves these differences into one summary JSONL plus fine-grained task JSONL files using only `video`, `images`, `audios`, and `caption`. Formal production export is currently deferred; see `docs/H3_TRAINING_MANIFEST_EXPORT.md` for the task split and later-use command.
 
 ## Pipeline overview
 
