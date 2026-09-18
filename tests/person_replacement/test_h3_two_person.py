@@ -269,8 +269,8 @@ def test_two_person_appearance_and_temporal_prompt_contract():
     assert "<Subject 1> lifts the blue-and-white cup" not in detailed
 
     # Retention uses the official-style relationship markers and shot scope.
-    assert "<Subject 1> (appears in [Shot 1]): partially_preserved" in prompt
-    assert "<Subject 2> (appears in [Shot 1]): partially_preserved" in prompt
+    assert "<Subject 1> (appears in [Shot 1]): attribute_transfer" in prompt
+    assert "<Subject 2> (appears in [Shot 1]): attribute_transfer" in prompt
     assert "<Subject 3> (appears in [Shot 1]): fully_preserved" in prompt
     assert "<Subject 4> (appears in [Shot 1]): fully_preserved" in prompt
     assert "<Video 1> (source video editing): fully_preserved" in prompt
@@ -297,6 +297,21 @@ def test_two_person_video_sampling_only_and_short_motion_prompt(tmp_path, monkey
     assert "<Subject 1>" in prompt and "<Subject 2>" in prompt
     assert 'Never write bare "Subject 1" or "Subject 2"' in prompt
     assert "Do not use person pronouns" in prompt
+
+
+def test_shot_pronouns_follow_nearest_explicit_subject():
+    from r2v_data_v2.person_replacement.h3_two_person import build_prompt
+
+    shot = (
+        "<Subject 1> is seated, his mouth moving. He raises his right hand. "
+        "<Subject 2> remains behind her chair while she stays still."
+    )
+    prompt = build_prompt("source one", "source two", shot, "target one", "target two")
+    detailed = prompt.split("detailed_description:\n",1)[1].split("\n\noverall_soundscape:",1)[0]
+    assert "<Subject 3>'s mouth" in detailed
+    assert "<Subject 3> raises <Subject 3>'s right hand" in detailed
+    assert "<Subject 4> remains behind <Subject 4>'s chair while <Subject 4> stays still" in detailed
+    assert re.search(r"\b(he|she|his|her|him|hers)\b", detailed, re.IGNORECASE) is None
 
 
 @pytest.mark.parametrize("shot", [
