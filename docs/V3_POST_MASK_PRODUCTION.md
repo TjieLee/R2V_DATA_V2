@@ -462,3 +462,86 @@ Subject Attribute failure events now include `failures` and
 `retryable_pending` counters. No prompts/responses are logged. Missing durable
 outcomes remain retryable, without suppression, auto-retry or conversion to
 terminal outcomes. This patch claims no real GPU V2.1 throughput result.
+
+## Resource epoch execution mode (`resource_epoch_v3`, opt-in, unvalidated)
+
+Status: **development only**. No real GPU run, no throughput result and no
+production acceptance is claimed. The formal launcher remains
+`scripts/run_v3_post_mask_visual_cluster.sh`; this mode is never its default and
+existing `legacy_serial`, `wavefront_v2` and `parallel_review_v21` behaviour is
+unchanged.
+
+Existing production keeps long-lived fixed GPU roles (GPU0-3 Qwen, GPU4/6
+SAM/main, GPU5/7 Boogu). clean20 profiling showed long SAM/Boogu idle gaps, so
+`resource_epoch_v3` instead schedules by **resource type**: a group of 8
+canonical shards is processed by one node using all 8 GPUs, and the node loads
+one model class at a time.
+
+| Epoch | Layout |
+| --- | --- |
+| Qwen | one managed vLLM server, TP1 x DP8, GPU0-7, `127.0.0.1:8000/v1` |
+| Boogu | 8 persistent workers, one per GPU, loaded once per epoch |
+| SAM | 8 persistent SAM3 workers, one per GPU, loaded once per epoch |
+
+### Modules
+
+| Module | Responsibility |
+| --- | --- |
+| `post_mask_epoch_jobs.py` | deterministic model-job identity |
+| `post_mask_epoch_state.py` | immutable plans, append-only receipts, resume |
+| `post_mask_epoch_groups.py` | 8-shard group identity, static ownership, lock |
+| `post_mask_epoch_resources.py` | owned Qwen/Boogu/SAM lifecycles |
+| `post_mask_epoch_scheduler.py` | fixed-point ready-job orchestration |
+
+### Invariants
+
+* **No speculative model calls.** A job enters the ready set only when an
+  earlier CPU finalizer creates it, so conditional second attempts (background
+  candidate2, reference completion candidate2, attribute completion/source
+  candidate2) cannot be executed before policy unlocks them.
+* **Execution-free identity.** Job and group identities bind schema version,
+  job type, resource, canonical shard, clip, owner/entity/attribute target,
+  attempt index, seed, semantic input digest, dependency digests, model
+  identity, ordered canonical shards, campaign semantic identity and group
+  size. They never contain hostname, `RANK`, `WORLD_SIZE`, physical GPU id, PID
+  or concurrency, so a campaign may resume under a different topology.
+* **Durable commit.** model call -> unique same-directory tmp -> fsync -> atomic
+  rename -> validate -> append receipt -> flush + fsync. Resume classifies each
+  job as completed (skip), terminal reject (never pay again),
+  artifact-without-receipt (rerun) or digest mismatch (fail closed). Only a torn
+  final JSONL line is truncated; diagnostics are append-only.
+* **Owned processes only.** Resource switches terminate only PIDs/process
+  groups this launcher created. A pre-flight port check makes an unmanaged
+  server on `8000` fail fast instead of being adopted or killed.
+* **No work stealing.** Ownership is `group_index % WORLD_SIZE == RANK`, one
+  shared `flock` per group. An incomplete group does not block later assigned
+  groups on the same rank; the global shard-receipt barrier is unchanged.
+* **Internal only.** Resource groups never enter the public
+  `r2v.v3.production_sample.1` schema; export, compaction and H3 consumption
+  are untouched.
+
+### Running it
+
+```bash
+POST_MASK_BASE_CONFIG=/mnt/workspace/litengjie/data/r2v_v3_configs/<accepted>.local.yaml \
+bash scripts/run_v3_post_mask_resource_epoch.sh
+```
+
+Without `POST_MASK_JOB_RUNNER` the launcher runs `--dry-run`: it enumerates
+shards, builds and locks groups, publishes immutable descriptors and reports the
+plan, without any model call. Real phase semantics must be supplied as
+`package.module:callable` receiving `(group, ledger, emit)`; that runner owns
+every prompt, seed, threshold and accept/reject rule, reusing the existing
+semantic modules rather than duplicating them.
+
+Diagnostics are emitted as `post_mask_resource_epoch_summary` and written to
+`<state>/resource_epochs/summary-rank<N>.json`, including per-resource planned /
+skipped / executed / terminal-rejected / retryable-failed counts, epoch wall
+seconds, GPU slot job counts, resource switches and conditional-attempt counts.
+
+### Not yet done
+
+The semantic split of `remove.py`, `reference_edit*.py` and
+`subject_attributes.py` into prepare -> model job -> durable result -> CPU
+finalize is **not** implemented, so no real model job runner exists yet and no
+equivalence run has been performed. Do not infer throughput from unit tests.
