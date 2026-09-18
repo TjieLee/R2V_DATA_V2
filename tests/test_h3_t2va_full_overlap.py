@@ -5,11 +5,7 @@ from types import SimpleNamespace
 from r2v_data_v2.h3 import t2va_full_production as full
 
 
-def test_first_canonical_starts_before_pools_and_closes_on_startup_failure(
-    tmp_path, monkeypatch
-):
-    import pytest
-
+def test_node_prefetch_does_not_start_persistent_gpu_pools(tmp_path, monkeypatch):
     from r2v_data_v2.h3 import t2va_full_prefetch as prefetch_module
     from r2v_data_v2.h3 import t2va_full_worker_pool as pools
 
@@ -28,22 +24,12 @@ def test_first_canonical_starts_before_pools_and_closes_on_startup_failure(
         def __exit__(self, *args):
             events.append("canonical_close")
 
-    class Manager:
+    class ForbiddenManager:
         def __init__(self, *args, **kwargs):
-            pass
-
-        def __enter__(self):
-            events.append("pools")
-            return self
-
-        def start(self, *args, **kwargs):
-            raise RuntimeError("startup failed")
-
-        def __exit__(self, *args):
-            events.append("pools_close")
+            raise AssertionError("persistent upstream pool must not be constructed")
 
     monkeypatch.setattr(prefetch_module, "CanonicalPrefetch", Prefetch)
-    monkeypatch.setattr(pools, "PersistentPoolManager", Manager)
+    monkeypatch.setattr(pools, "PersistentPoolManager", ForbiddenManager)
     config = SimpleNamespace(model_dump=lambda **kw: {})
     pipeline = full.FullPipeline(
         root=tmp_path,
@@ -56,9 +42,10 @@ def test_first_canonical_starts_before_pools_and_closes_on_startup_failure(
         backend=None,
         profiles=None,
     )
-    with pytest.raises(RuntimeError, match="startup failed"), pipeline.node([3, 1]):
-        raise AssertionError("startup should fail")
-    assert events == [("canonical", 3), "pools", "pools_close", "canonical_close"]
+    with pipeline.node([3, 1]):
+        events.append("body")
+        assert pipeline.pools is None
+    assert events == [("canonical", 3), "body", "canonical_close"]
     assert pipeline.prefetch is None
     assert pipeline.pools is None
 
