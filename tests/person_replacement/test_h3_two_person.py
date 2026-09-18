@@ -25,13 +25,14 @@ def test_six_section_two_person_prompt(frame0):
         "subject_definitions", "summary", "retention_analysis", "detailed_description",
         "overall_soundscape", "non_diegetic_music"]
     assert "[Shot 1]" in prompt and "[Shot 2]" not in prompt
-    assert re.search(r"(?<!<)\bSubject [12]\b(?!>)", prompt) is None
     assert ("<Picture 1>" in prompt) == frame0
     for value in (*DESCRIPTIONS[:2], *REPLACEMENTS, "<Subject 1>", "<Subject 2>",
                   "<Subject 3>", "<Subject 4>", "attribute_transfer", "fully_preserved",
                   "<Video 1>"):
         assert value in prompt
-    assert "<Subject 3> passes behind <Subject 4> while both hold a box" in prompt
+    assert "pose-driven" in prompt
+    assert "motion driver" in prompt
+    assert DESCRIPTIONS[2] not in prompt
     if frame0:
         assert "where visible" in prompt and "first-frame" in prompt
 
@@ -229,21 +230,13 @@ def test_runtime_caches_are_case_local_and_environment_restored(tmp_path, monkey
 
 def test_two_person_appearance_and_temporal_prompt_contract():
     from r2v_data_v2.person_replacement.h3_two_person import build_prompt
-    from r2v_data_v2.person_replacement.qwen3vl import (
-        TWO_REPLACEMENT_PROMPT,
-        TWO_SOURCE_PROMPT,
-    )
+    from r2v_data_v2.person_replacement.qwen3vl import TWO_REPLACEMENT_PROMPT, TWO_SOURCE_PROMPT
 
-    # Keep these tests on semantic invariants, not exact prompt prose.
     assert "SHOT_DESCRIPTION" in TWO_SOURCE_PROMPT
-    assert "<Subject 1>" in TWO_SOURCE_PROMPT and "<Subject 2>" in TWO_SOURCE_PROMPT
-    assert "Do not use person pronouns" in TWO_SOURCE_PROMPT
-    assert "source-video timestamps" in TWO_SOURCE_PROMPT
-    assert "00:04.000" in TWO_SOURCE_PROMPT
     assert "clearly different from Source 1" in TWO_REPLACEMENT_PROMPT
     assert "clearly different from Source 2" in TWO_REPLACEMENT_PROMPT
 
-    shot = "<Subject 1> lifts the blue-and-white cup, drinks, then lowers it while <Subject 2> watches."
+    shot = "<Subject 1> lifts the blue-and-white cup while <Subject 2> watches."
     source1 = "a bald man with a mustache in a dark blue robe seated in the foreground"
     source2 = "a shaved-head man in a light gray robe standing in the background"
     replacement1 = "A middle-aged woman with auburn hair in an olive-green jacket."
@@ -253,35 +246,29 @@ def test_two_person_appearance_and_temporal_prompt_contract():
     definitions = prompt.split("\n\nsummary:",1)[0]
     detailed = prompt.split("detailed_description:\n",1)[1].split("\n\noverall_soundscape:",1)[0]
 
-    # Source performers remain separately defined.
-    assert source1 in definitions and "<Subject 1>" in definitions
-    assert source2 in definitions and "<Subject 2>" in definitions
-
-    # Target identities are separate subjects bound to the two source performers.
+    assert source1 in definitions and source2 in definitions
     assert "<Subject 3> is a middle-aged woman with auburn hair in an olive-green jacket." in definitions
     assert "<Subject 4> is an adult man with short black hair in a cream linen shirt." in definitions
-    assert "<Subject 3> replaces only <Subject 1>'s visible human appearance" in definitions
-    assert "<Subject 4> replaces only <Subject 2>'s visible human appearance" in definitions
-    assert "Everything else about <Subject 1>'s performance in <Video 1> stays unchanged" in definitions
-    assert "Everything else about <Subject 2>'s performance in <Video 1> stays unchanged" in definitions
+    assert "<Subject 3> replaces only <Subject 1>'s visible human identity and appearance" in definitions
+    assert "<Subject 4> replaces only <Subject 2>'s visible human identity and appearance" in definitions
+    assert "<Subject 3> is pose-driven and motion-driven by <Subject 1>" in definitions
+    assert "<Subject 4> is pose-driven and motion-driven by <Subject 2>" in definitions
 
-    # Source action labels are remapped to the target subjects in the final shot.
-    assert "<Subject 3> lifts the blue-and-white cup, drinks, then lowers it while <Subject 4> watches." in detailed
-    assert "<Subject 1> lifts the blue-and-white cup" not in detailed
+    assert "pose-driven and motion-driven human appearance replacement" in detailed
+    assert "Use <Video 1> as the pose and motion driver for the entire shot." in detailed
+    assert "A video of <Subject 3> and <Subject 4> performing the same specific actions" in detailed
+    assert "Copy the source performance from <Video 1>" in detailed
+    assert "Only the visible human identity, appearance and clothing" in detailed
+    assert shot not in prompt
 
-    # Retention uses the official-style relationship markers and shot scope.
     assert "<Subject 1> (appears in [Shot 1]): attribute_transfer" in prompt
     assert "<Subject 2> (appears in [Shot 1]): attribute_transfer" in prompt
     assert "<Subject 3> (appears in [Shot 1]): fully_preserved" in prompt
     assert "<Subject 4> (appears in [Shot 1]): fully_preserved" in prompt
-    assert "<Video 1> (source video editing): fully_preserved" in prompt
-    assert "(throughout [Shot 1])" not in prompt
-
-    for forbidden in ("Replacement 1", "Replacement 2", "->"):
-        assert forbidden not in prompt
+    assert "<Video 1> (pose, motion, timing and source video editing): fully_preserved" in prompt
 
 
-def test_source_timestamps_survive_target_subject_remap():
+def test_qwen_shot_text_is_provenance_not_h3_motion_instruction():
     from r2v_data_v2.person_replacement.h3_two_person import build_prompt
 
     shot = (
@@ -289,29 +276,10 @@ def test_source_timestamps_survive_target_subject_remap():
         "At 00:04.000, <Subject 1> raises <Subject 1>'s right hand toward the cup."
     )
     prompt = build_prompt("source one", "source two", shot, "target one", "target two")
-    detailed = prompt.split("detailed_description:\n",1)[1].split("\n\noverall_soundscape:",1)[0]
-    assert "00:04.000" in detailed
-    assert "<Subject 3> remains seated without the cup until 00:04.000." in detailed
-    assert "At 00:04.000, <Subject 3> raises <Subject 3>'s right hand" in detailed
-    assert "frame-by-frame template" in detailed
-    assert "Do not change when an action starts or ends" in detailed
-    assert "If the following text summary conflicts with <Video 1>, follow <Video 1>." in detailed
-
-
-def test_prompt_states_only_human_appearance_may_change():
-    from r2v_data_v2.person_replacement.h3_two_person import build_prompt
-
-    prompt = build_prompt(
-        "source one", "source two",
-        "<Subject 1> raises a cup while <Subject 2> remains still.",
-        "target one", "target two",
-    )
-    detailed = prompt.split("detailed_description:\n",1)[1].split("\n\noverall_soundscape:",1)[0]
-    assert "Change only the visible human appearance of the two performers." in detailed
-    assert "In every corresponding frame, <Subject 3> must do exactly what <Subject 1> does" in detailed
-    assert "<Subject 4> must do exactly what <Subject 2> does" in detailed
-    assert "the only intended difference" in detailed
-    assert "source track" not in detailed
+    assert shot not in prompt
+    assert "00:04.000" not in prompt
+    assert "pose and motion driver" in prompt
+    assert "follow <Video 1>" in prompt
 
 
 def test_two_person_video_sampling_only_and_short_motion_prompt(tmp_path, monkeypatch):
@@ -327,37 +295,3 @@ def test_two_person_video_sampling_only_and_short_motion_prompt(tmp_path, monkey
     client.describe(video)
     assert calls[0][0] == {"type":"video","path":str(video.resolve()),"fps":4.0}
     assert "fps" not in calls[1][0]
-    prompt = calls[0][1]["text"]
-    assert "<Subject 1>" in prompt and "<Subject 2>" in prompt
-    assert 'Never write bare "Subject 1" or "Subject 2"' in prompt
-    assert "Do not use person pronouns" in prompt
-
-
-def test_shot_pronouns_follow_nearest_explicit_subject():
-    from r2v_data_v2.person_replacement.h3_two_person import build_prompt
-
-    shot = (
-        "<Subject 1> is seated, his mouth moving. He raises his right hand. "
-        "<Subject 2> remains behind her chair while she stays still."
-    )
-    prompt = build_prompt("source one", "source two", shot, "target one", "target two")
-    detailed = prompt.split("detailed_description:\n",1)[1].split("\n\noverall_soundscape:",1)[0]
-    assert "<Subject 3>'s mouth" in detailed
-    assert "<Subject 3> raises <Subject 3>'s right hand" in detailed
-    assert "<Subject 4> remains behind <Subject 4>'s chair while <Subject 4> stays still" in detailed
-    assert re.search(r"\b(he|she|his|her|him|hers)\b", detailed, re.IGNORECASE) is None
-
-
-@pytest.mark.parametrize("shot", [
-    "Subject 1 raises a cup while Subject 2 remains behind.",
-    "<Subject 1> raises a cup while <Subject 2> remains behind.",
-    "Subject 1 raises a cup while <Subject 2> remains behind.",
-])
-def test_shot_label_normalization_without_double_brackets(shot):
-    from r2v_data_v2.person_replacement.h3_two_person import build_prompt
-
-    prompt = build_prompt("gray hair","red coat",shot,"dark coat","short hair")
-    detailed = prompt.split("detailed_description:\n",1)[1].split("\n\noverall_soundscape:",1)[0]
-    assert "<Subject 3> raises a cup while <Subject 4> remains behind." in detailed
-    assert "<<Subject" not in detailed
-    assert "Subject 12" in build_prompt("a","b","Subject 12 stays.","c","d")
