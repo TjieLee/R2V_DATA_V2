@@ -25,6 +25,9 @@ def test_six_section_two_person_prompt(frame0):
         "subject_definitions", "summary", "retention_analysis", "detailed_description",
         "overall_soundscape", "non_diegetic_music"]
     assert prompt.count("[Shot 1]") == 1 and "[Shot 2]" not in prompt
+    for index in (1,2):
+        assert f"<Subject {index}> remains Replacement {index}" in prompt
+    assert re.search(r"(?<!<)\bSubject [12]\b(?!>)", prompt) is None
     assert ("<Picture 1>" in prompt) == frame0
     for value in (*DESCRIPTIONS, *REPLACEMENTS, "<Subject 1>", "<Subject 2>", "Replacement 1",
                   "Replacement 2", "never cross-bind", "partially_preserved", "<Video 1>"):

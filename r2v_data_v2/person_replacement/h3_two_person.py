@@ -52,8 +52,8 @@ def build_prompt(source1, source2, shot, replacement1, replacement2, *, frame0=F
         "replacement descriptions must never replace, add or alter source props. "
         "Preserve the original hand-object contact and object motion throughout, as well as hand-body "
         "and person-person contact. "
-        "During crossing, overlap or exchanged screen order, Subject 1 remains Replacement 1 and "
-        "Subject 2 remains Replacement 2: never cross-bind. Keep camera motion, crop, framing, background, "
+        "During crossing, overlap or exchanged screen order, <Subject 1> remains Replacement 1 and "
+        "<Subject 2> remains Replacement 2: never cross-bind. Keep camera motion, crop, framing, background, "
         "objects, lighting and composition unchanged. Follow the complete single-shot source timeline "
         "without adding cuts or new dialogue; preserve source synchronized sound.",
         ("overall_soundscape:\nPreserve source synchronized sound, ambience and physical sounds; "
