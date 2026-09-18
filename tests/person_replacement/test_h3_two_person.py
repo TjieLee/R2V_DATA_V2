@@ -242,18 +242,19 @@ def test_two_person_appearance_and_temporal_prompt_contract():
     assert "Do not infer race, ethnicity or nationality" in source_prompt
     assert "complete visible single-shot progression in playback order" in source_prompt
     assert "Do not omit, merge, reorder or invent actions" in source_prompt
-    assert "substantial visual distance" in TWO_REPLACEMENT_PROMPT
-    assert "at least five" in TWO_REPLACEMENT_PROMPT
-    assert "Do not merely change hair and clothing" in TWO_REPLACEMENT_PROMPT
+    replacement_prompt = " ".join(TWO_REPLACEMENT_PROMPT.split())
+    assert "substantial visual distance" in replacement_prompt
+    assert "at least five" in replacement_prompt
+    assert "Do not merely change hair and clothing" in replacement_prompt
     for term in ("apparent age range", "visible skin tone", "face shape", "facial-hair state",
                  "hair length/style/texture/color", "overall build impression",
                  "clothing style/color/silhouette", "bald/shaved hairstyle"):
-        assert term in TWO_REPLACEMENT_PROMPT
-    assert "Describe only intrinsic human appearance and clothing" in TWO_REPLACEMENT_PROMPT
-    assert "Never add, replace or describe" in TWO_REPLACEMENT_PROMPT
+        assert term in replacement_prompt
+    assert "Describe only intrinsic human appearance and clothing" in replacement_prompt
+    assert "Never add, replace or describe" in replacement_prompt
     for term in ("held/carried/touched objects", "standing/sitting state", "hand position/state", "action or motion"):
-        assert term in TWO_REPLACEMENT_PROMPT
-    assert "do not infer or assign race, ethnicity or nationality" in TWO_REPLACEMENT_PROMPT
+        assert term in replacement_prompt
+    assert "do not infer or assign race, ethnicity or nationality" in replacement_prompt
     shot = "<Subject 1> lifts the blue-and-white cup, drinks, then lowers it."
     source1, source2 = "UNIQUE_SOURCE_BALD_MUSTACHE_BLUE_ROBE", "UNIQUE_SOURCE_SHAVED_HEAD_GRAY_ROBE"
     prompt = build_prompt(source1, source2, shot, "  burgundy coat.. ", "curly hair.")
