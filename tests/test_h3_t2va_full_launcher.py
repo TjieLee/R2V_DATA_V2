@@ -298,7 +298,7 @@ def test_dry_run_exact_accepted_server_and_full_cli(sandbox):
         return args[:index] + args[index + 2 :]
 
     assert without_mem_fraction(serve) == without_mem_fraction(standalone)
-    assert run[1] == "tools/run_h3_t2va_full_production.py"
+    assert run[1] == str(script.parent.parent / "tools/run_h3_t2va_full_production.py")
     assert run[run.index("--request-workers") + 1] == "1"
     assert run[run.index("--canonical-workers") + 1] == "16"
     assert run[run.index("--gpu-ids") + 1] == "0,1,2,3,4,5,6,7"
