@@ -3,21 +3,25 @@
 import re
 
 
-def _appearance_fragment(text):
-    return text.strip().rstrip(".").rstrip()
+def _person_fragment(text):
+    value = text.strip().rstrip(".").rstrip()
+    for article in ("A ", "An ", "The "):
+        if value.startswith(article):
+            return article.lower() + value[len(article):]
+    return value
 
 
 def build_prompt(source1, source2, shot, replacement1, replacement2, *, frame0=False):
-    # Source anchors remain preparation provenance; never inject them into H3.
     shot = re.sub(r"(?<!<)\bSubject ([12])\b(?!>)", r"<Subject \1>", shot)
-    replacement1, replacement2 = map(_appearance_fragment, (replacement1, replacement2))
+    source1, source2, replacement1, replacement2 = map(
+        _person_fragment, (source1, source2, replacement1, replacement2)
+    )
     definitions = []
-    for index, appearance in ((1, replacement1), (2, replacement2)):
+    for index, source, appearance in ((1, source1, replacement1), (2, source2, replacement2)):
         definitions.append(
-            f"<Subject {index}> is the edited version of the source performer whose actions are tracked "
-            f"as <Subject {index}> in [Shot 1] of <Video 1>. In the target video, <Subject {index}> "
-            f"appears as {appearance}. The corresponding source performer in <Video 1> provides "
-            f"<Subject {index}>'s motion, pose, expression, hand state, object interactions, position and timing."
+            f"<Subject {index}> is {appearance}. In <Video 1>, <Subject {index}> replaces {source}. "
+            f"<Subject {index}> follows that source performer's original motion, pose, facial expression, "
+            "gaze, mouth state, hand movements, object interactions, position and timing."
             + (" <Picture 1> additionally supplies an edited first-frame visual anchor where visible." if frame0 else "")
         )
     definitions.append("<Video 1> is the source video for the target video edit and provides the original "

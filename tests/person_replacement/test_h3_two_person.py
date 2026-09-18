@@ -233,40 +233,42 @@ def test_two_person_appearance_and_temporal_prompt_contract():
     )
 
     source_prompt = " ".join(TWO_SOURCE_PROMPT.split())
-    assert "Do not include" in source_prompt
-    for term in ("apparent age range", "visible skin tone", "face shape", "facial-hair state",
-                 "hair length/style/texture/color", "overall build impression", "clothing"):
-        assert term in source_prompt
-    for term in ("held/carried/touched objects", "pose", "action", "hand state", "expression", "gaze", "mouth state"):
-        assert term in source_prompt
-    assert "Do not infer race, ethnicity or nationality" in source_prompt
+    assert "one concise natural description" in source_prompt
+    assert "who the person is, not what the person does" in source_prompt
+    assert "Put actions, poses, held objects" in source_prompt
     assert "complete visible single-shot progression in playback order" in source_prompt
     assert "Do not omit, merge, reorder or invent actions" in source_prompt
+
     replacement_prompt = " ".join(TWO_REPLACEMENT_PROMPT.split())
-    assert "substantial visual distance" in replacement_prompt
-    assert "at least five" in replacement_prompt
-    assert "Do not merely change hair and clothing" in replacement_prompt
-    for term in ("apparent age range", "visible skin tone", "face shape", "facial-hair state",
-                 "hair length/style/texture/color", "overall build impression",
-                 "clothing style/color/silhouette", "bald/shaved hairstyle"):
-        assert term in replacement_prompt
-    assert "Describe only intrinsic human appearance and clothing" in replacement_prompt
-    assert "Never add, replace or describe" in replacement_prompt
-    for term in ("held/carried/touched objects", "standing/sitting state", "hand position/state", "action or motion"):
-        assert term in replacement_prompt
-    assert "do not infer or assign race, ethnicity or nationality" in replacement_prompt
+    assert "clearly different from Source 1" in replacement_prompt
+    assert "clearly different from Source 2" in replacement_prompt
+    assert "Change several visible identity characteristics" in replacement_prompt
+    assert "coherent realistic combination rather than forcing every category to differ" in replacement_prompt
+    assert "concise and natural" in replacement_prompt
+    assert "Describe only the replacement person's appearance and clothing" in replacement_prompt
+
     shot = "<Subject 1> lifts the blue-and-white cup, drinks, then lowers it."
-    source1, source2 = "UNIQUE_SOURCE_BALD_MUSTACHE_BLUE_ROBE", "UNIQUE_SOURCE_SHAVED_HEAD_GRAY_ROBE"
-    prompt = build_prompt(source1, source2, shot, "  burgundy coat.. ", "curly hair.")
+    source1 = "a bald man with a mustache in a dark blue robe seated in the foreground"
+    source2 = "a shaved-head man in a light gray robe standing in the background"
+    replacement1 = "A middle-aged woman with auburn hair in an olive-green jacket."
+    replacement2 = "An adult man with short black hair in a cream linen shirt."
+    prompt = build_prompt(source1, source2, shot, replacement1, replacement2)
+
     assert shot in prompt
-    for forbidden in (source1, source2, "Replacement 1", "Replacement 2", "->", "..",
-                      "The edit has two simultaneous requirements", "full visible edited human appearance",
-                      "These replacement traits must visibly override"):
-        assert forbidden not in prompt
     definitions = prompt.split("\n\nsummary:",1)[0]
     detailed = prompt.split("detailed_description:\n",1)[1].split("\n\noverall_soundscape:",1)[0]
-    for appearance in ("burgundy coat", "curly hair"):
-        assert appearance in definitions and appearance in detailed
+    assert "<Subject 1> is a middle-aged woman with auburn hair in an olive-green jacket." in definitions
+    assert f"In <Video 1>, <Subject 1> replaces {source1}." in definitions
+    assert "<Subject 2> is an adult man with short black hair in a cream linen shirt." in definitions
+    assert f"In <Video 1>, <Subject 2> replaces {source2}." in definitions
+    assert "<Subject 1> follows that source performer's original motion, pose, facial expression" in definitions
+    assert "<Subject 2> follows that source performer's original motion, pose, facial expression" in definitions
+    for appearance in ("middle-aged woman with auburn hair", "adult man with short black hair"):
+        assert appearance in detailed
+
+    for forbidden in ("Replacement 1", "Replacement 2", "->", "..",
+                      "The edit has two simultaneous requirements", "full visible edited human appearance"):
+        assert forbidden not in prompt
     for index in (1,2):
         assert f"<Subject {index}> (throughout [Shot 1]): partially_preserved" in prompt
     assert "<Video 1> (motion, interaction, camera and scene structure): fully_preserved" in prompt
