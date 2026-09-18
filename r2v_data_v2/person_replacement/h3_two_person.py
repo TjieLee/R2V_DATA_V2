@@ -12,7 +12,7 @@ def _person_fragment(text):
 
 
 def build_prompt(source1, source2, shot, replacement1, replacement2, *, frame0=False):
-    shot = re.sub(r"(?<!<)\\bSubject ([12])\\b(?!>)", r"<Subject \\1>", shot)
+    shot = re.sub(r"(?<!<)\bSubject ([12])\b(?!>)", r"<Subject \1>", shot)
     shot = re.sub(
         r"<Subject ([12])>",
         lambda match: f"<Subject {int(match.group(1)) + 2}>",
