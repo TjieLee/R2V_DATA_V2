@@ -15,6 +15,7 @@ from r2v_data_v2.person_replacement.h3_pair_executor import (
     validate_identity,
 )
 from r2v_data_v2.person_replacement.h3_pair_state import inventory
+from r2v_data_v2.person_replacement.h3_pdd_distributed import parallel_layout
 
 
 def arguments(argv=None):
@@ -36,6 +37,7 @@ def arguments(argv=None):
     parser.add_argument("--pair-id",type=int,default=0)
     parser.add_argument("--pair-size",type=int,default=1000)
     parser.add_argument("--group-size",type=int,choices=(2,4,8),default=2)
+    parser.add_argument("--ulysses-degree",type=int,choices=(1,2,4,8),default=1)
     parser.add_argument("--seed",type=int,default=42)
     parser.add_argument("--max-prepare-attempts",type=int,default=2)
     parser.add_argument("--max-generate-attempts",type=int,default=2)
@@ -45,6 +47,10 @@ def arguments(argv=None):
     parser.add_argument("--dry-run",action="store_true")
     parser.add_argument("--status",action="store_true")
     args = parser.parse_args(argv)
+    try:
+        parallel_layout(args.group_size,args.ulysses_degree)
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.seed < 0 or min(args.max_prepare_attempts,args.max_generate_attempts) < 1:
         parser.error("seed >= 0 and positive attempt budgets required")
     return args

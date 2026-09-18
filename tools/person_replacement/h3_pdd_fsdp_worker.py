@@ -38,7 +38,7 @@ def main(argv=None):
     validate_code(code,PDD_REVISION,("minimax_h3_pdd.py","predict_ref2v.py"))
     validate_checkpoint(require_local(config["pdd_lora"],"PDD weights"),PDD_CHECKPOINT)
     sys.path.insert(0,str(code))
-    channel = DistributedChannel(group_size=config.get("group_size",2))
+    channel = DistributedChannel(group_size=config.get("group_size",2),ulysses_degree=config.get("ulysses_degree",1))
     try:
         stats = generate_loop(config,channel,lambda:PersistentPDD(config,channel),args.stats)
         return 75 if stats["restart_required"] else 0

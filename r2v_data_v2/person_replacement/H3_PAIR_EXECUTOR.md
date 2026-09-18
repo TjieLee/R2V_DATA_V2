@@ -7,14 +7,118 @@ Group size is execution-only, excluded from input/case identity; the existing
 `text_two_person_pdd_fsdp2_pair_v1` identity contract is unchanged. Prepared and
 DONE artifacts from a two-GPU run remain reusable with four/eight GPUs.
 
+## Optional hybrid context parallelism
+
+`--ulysses-degree {1,2,4,8}` defaults to 1 (unchanged pure FSDP path).
+It must divide group-size and cannot exceed it. Neither degree changes durable
+identity. Qwen workers/partitions still depend only on group-size. The node
+launcher forwards `--ulysses-degree` unchanged; no new scheduler is introduced.
+
+| Group | Ulysses | FSDP | Mesh |
+|---|---|---|---|
+| 4 | 1 | 4 | `(4,)`, `fsdp` (baseline unchanged) |
+| 4 | 2 | 2 | `(1,2,2)`, `ring,ulysses,fsdp` |
+| 4 | 4 | 1 | `(1,4,1)` |
+| 8 | 2 / 4 / 8 | 4 / 2 / 1 | `(1,CP,FSDP)` |
+
+Pinned Diffusers `d035dcd7cc7c88e0a154609b62887d50bba9fdc2` was re-inspected:
+H3's `_cp_plan` splits packed hidden states, RoPE, adaln/timestep indices and
+gathers the PDD-replaced proj_out/audio_proj_out outputs. The official PDD head
+retains three-dimensional output shape. The worker passes **no custom cp_plan**
+and does not rewrite attention. Ordering is **apply/validate PDD → enable built-in
+CP on transformer_ref → FSDP2 on mesh['fsdp'] only**. CP gets the complete custom
+mesh with ring_degree=1 and ulysses_anything=True. Text encoder has no CP and
+uses only the same FSDP submesh. At FSDP degree 1, transformer/conditioner stay
+replicated without FSDP or offload; loading OOM is not worked around.
+
+No attention-backend option/download is added in this patch. The first test
+uses the current default attention backend. CPU structural tests cover call
+ordering/submesh/step-arm preservation, not real collective/hook compatibility.
+
+### Safe case05 benchmark preparation (never overwrite DONE)
+
+User-reported FSDP4 baseline: **1573.101990563795 s (26.2184 min)**,
+311 frames, 1568x672, seed 42, 8 NFE; all four ranks allocated 95.92 GiB /
+reserved 115.36 GiB; one successful job and one model/PDD/distributed init.
+This is server-provided evidence, not a local measurement.
+
+Do not rerun over its successful root. Using the existing CASE05_ARGS shell
+array (including its exact resource paths), set a **new nonexistent** root:
+
+```bash
+export CP_ROOT=/mnt/workspace/litengjie/data/person_replacement/h3_case05_cp2_fsdp2_v1
+"$PAIR_PYTHON" - "${CASE05_ARGS[@]}" <<'PY'
+import copy
+import os
+import sys
+from pathlib import Path
+from tools.person_replacement.run_h3_pdd_pair_executor import arguments
+from r2v_data_v2.person_replacement.h3_pair_executor import make_config, validate_identity
+from r2v_data_v2.person_replacement.h3_pair_state import atomic_bytes, read_json
+
+old_args = arguments(sys.argv[1:])
+old_root, old = make_config(old_args)
+validate_identity(old_root, old, read_only=True)
+new_args = copy.copy(old_args)
+new_args.output_root = Path(os.environ['CP_ROOT'])
+new_args.group_size, new_args.ulysses_degree = 4, 2
+new_root, new = make_config(new_args)
+if new_args.output_root.exists() or old['identity'] != new['identity'] or len(old['cases']) != 1:
+    raise RuntimeError('Need a new root and the identical single-case input/config identity')
+source_case, target_case = old['cases'][0], new['cases'][0]
+prep = Path(source_case['directory'])/'preparation'
+payload = read_json(prep/'prepared.json')
+expected = dict(case_id=target_case['case_id'], row_sha256=target_case['row_sha256'],
+                identity=new['identity'], frames=311, width=1568, height=672, seed=42)
+if any(payload.get(k) != v for k, v in expected.items()):
+    raise RuntimeError('Preparation identity/geometry mismatch')
+original = Path(source_case['directory'])/'original.mp4'
+if original.resolve(strict=True) != Path(payload['source']).resolve(strict=True):
+    raise RuntimeError('Source mismatch')
+names = ['source_subject_1','source_subject_2','shot_description',
+         'replacement_subject_1','replacement_subject_2','h3_prompt']
+files = {name+'.txt': (prep/(name+'.txt')).read_bytes() for name in names}
+if files['h3_prompt.txt'] != (payload['prompt']+'\n').encode('utf-8'):
+    raise RuntimeError('Prompt bytes mismatch')
+files['prepared.json'] = (prep/'prepared.json').read_bytes()
+validate_identity(new_root, new)
+target = Path(target_case['directory'])
+for name, data in files.items():  # prepared marker LAST, exact bytes, no generation/history
+    atomic_bytes(target/'preparation'/name, data)
+    if (target/'preparation'/name).read_bytes() != data:
+        raise RuntimeError('Copy verification failed')
+(target/'original.mp4').symlink_to(payload['source'])
+print('Exact preparation copied; no generation/attempts/failures/sessions copied')
+PY
+
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+"$PAIR_PYTHON" "$PAIR_CLI" "${CASE05_ARGS[@]}" \
+  --output-root "$CP_ROOT" --resume --group-size 4 --ulysses-degree 2
+```
+
+The last output-root option selects the new root; the original DONE output is
+untouched. Verify no Qwen run and byte-identical prompt/preparation. First accept
+CP2×FSDP2 before any CP4×FSDP1 experiment (use another new root for CP4).
+
+Manifest/stats include model_load_wall_seconds, pdd_apply_wall_seconds,
+parallel_setup_wall_seconds, reference_prepare_wall_seconds,
+pipeline_infer_wall_seconds, encode_wall_seconds, total_case_wall_seconds and
+parallel_setup_count. Inference timing synchronizes CUDA before/after pipeline;
+total case includes preparation, inference, encode, collectives and validation,
+excluding one-time model setup and final durable publication. Stats timing fields
+describe the last successful case. Existing wall_seconds is retained unchanged.
+Compare pipeline_infer_wall_seconds with 1573.101990563795; report all rank_memory
+entries and speedup only after actual success. **No hybrid GPU benchmark has been
+run by Codex; speedup and real PDD/CP/FSDP hook compatibility remain unverified.**
+
 This is a new independent path based on `fdca08616314562e637b622359b45f6ad6817ac7`.
 The A/B pilot, single-GPU PDD worker, Bernini, JoyAI, Visual and Audio/H3 production
 code are unchanged. Only Video 1 is supplied; no Boogu, SAM, tracking, frame
 selection, quality classifier, truncation or single-GPU fallback.
 
-**Not yet GPU-validated or production-ready.** CPU tests do not prove that two
-H200s fit the 311-frame case. Do not start a full shard/four pairs until the
-acceptance sequence below passes. Codex has not run these server commands.
+**Hybrid CP is not yet GPU-validated or production-ready.** The user confirmed
+pure FSDP4 case05 success above; this does not validate CP, multi-job stability or
+full-shard operation. Codex has not run these server commands.
 
 ## Source inspection and FSDP strategy
 
@@ -43,7 +147,7 @@ H3's conditioner `text_encoder.model` and its decoder layers are also sharded.
 Its unused outer LM head stays on CPU. The conditioner root explicitly reshards
 after encoding. VAE/audio VAE and other non-sharded modules are replicated on each
 local GPU. **No ComponentsManager CPU offload**, and no independent mover owns
-`transformer_ref`. Activations are not sequence-parallel; two GPUs do not guarantee
+`transformer_ref`. In the default pure FSDP mode activations are not sequence-parallel; two GPUs do not guarantee
 every workload will fit.
 
 Requires the inspected Diffusers 0.40.0 and an existing Torch stack providing
@@ -174,6 +278,9 @@ read-only to every pair. No cross-node work stealing or dynamic GPU selection.
 ## Mandatory acceptance sequence (operator only)
 
 ### Four-GPU resume of the existing failed case_05
+
+Historical recipe for the formerly failed root. **The now-successful case05 is
+DONE and must be skipped**; use the new-root hybrid benchmark recipe above for CP.
 
 Use the **existing** CASE05_ROOT/CASE05_ARGS defined for the failed two-GPU run.
 Do not change its input, seed, prompt, checkpoint, pair-id or pair-size. Inspect

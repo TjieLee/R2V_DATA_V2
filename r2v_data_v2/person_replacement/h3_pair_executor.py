@@ -51,6 +51,7 @@ def make_config(args):
                 "contract":"text_two_person_pdd_fsdp2_pair_v1"}
     digest = hashlib.sha256(json.dumps(identity,sort_keys=True).encode()).hexdigest()
     config = {**values,"identity":digest,"identity_details":identity,"cases":cases,"group_size":args.group_size,
+              "ulysses_degree":args.ulysses_degree,
               "clips_root":str(clips),"seed":args.seed,"pair_id":args.pair_id,
               "limits":{case["case_id"]:{stage:retry_limit(case,stage,maximum,retry_failed=args.retry_failed)
                         for stage,maximum in (("prepare",args.max_prepare_attempts),("generate",args.max_generate_attempts))}

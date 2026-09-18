@@ -56,19 +56,25 @@ def generate_loop(config, channel, backend_factory, stats_path):
             stats.update(backend.metadata)
         started = time.monotonic()
         stats["jobs_attempted"] += 1
+        timings = {"reference_prepare_wall_seconds":0.,"pipeline_infer_wall_seconds":0.,"encode_wall_seconds":0.}
         result, reference, error = None, None, None
         try:
             reference = backend.prepare(message["job"])
         except Exception as exc:  # noqa: BLE001 -- decode errors have not touched FSDP state
             error = {"error_type":type(exc).__name__,"error":str(exc)}
         prepared = channel.gather({"error":error})
+        timings["reference_prepare_wall_seconds"] = time.monotonic()-started
         prepare_failed = any(r["error"] is not None for r in prepared)
         if not prepare_failed:
             if channel.rank == 0:
                 atomic_json(stats_path,{**stats,"phase":"inference",
                     "active_case":message["case"],"active_attempt":message["attempt"]})
             try:
+                getattr(backend,"synchronize",lambda:None)()
+                infer_started = time.monotonic()
                 result = backend.infer(message["job"],reference)
+                getattr(backend,"synchronize",lambda:None)()
+                timings["pipeline_infer_wall_seconds"] = time.monotonic()-infer_started
             except Exception as exc:  # noqa: BLE001 -- FSDP forward state may be partially advanced
                 error = {"error_type":type(exc).__name__,"error":str(exc)}
                 # Out-of-band receipt survives a rank-asymmetric OOM that also
@@ -91,15 +97,20 @@ def generate_loop(config, channel, backend_factory, stats_path):
             else:
                 try:
                     temporary = Path(message["temporary"])
+                    encode_started = time.monotonic()
                     backend.encode(result,temporary)
-                    manifest = {**message["job"],**backend.metadata,"variant":"text_two_person",
+                    timings["encode_wall_seconds"] = time.monotonic()-encode_started
+                    manifest = {**message["job"],**backend.metadata,**timings,"variant":"text_two_person",
                                 "references":[{"type":"video","path":message["job"]["source"]}],
                                 "attempt":message["attempt"],"rank_memory":[r["memory"] for r in reports],
                                 "wall_seconds":time.monotonic()-started,
                                 "worker_started_at":stats["worker_started_at"],
                                 "production_timeline_compatible":False}
-                    publish_generated(message["case"],temporary,manifest,
-                                      lambda path,job=message["job"]:validate_output(path,job))
+                    def validate_and_time(path, job=message["job"], output=manifest, case_started=started):
+                        validate_output(path,job)
+                        output["total_case_wall_seconds"] = time.monotonic()-case_started
+                    publish_generated(message["case"],temporary,manifest,validate_and_time)
+                    stats.update(timings,total_case_wall_seconds=manifest["total_case_wall_seconds"])
                     stats["jobs_succeeded"] += 1
                 except Exception as exc:  # noqa: BLE001 -- codec/validation failures do not poison model
                     fail_attempt(message["case"],message["attempt"],exc)

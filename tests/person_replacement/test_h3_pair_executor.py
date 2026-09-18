@@ -33,8 +33,9 @@ def test_old_prepared_and_done_survive_group_change(tmp_path, monkeypatch):
     for _ in range(2):
         fail_attempt(pending,begin_attempt(pending,"generate",{}),RuntimeError("OOM"))
     original = prepared.read_bytes(),done_path.read_bytes()
-    _,new = module.make_config(arguments(argv+["--group-size","4","--retry-failed","--max-generate-attempts","1"]))
+    _,new = module.make_config(arguments(argv+["--group-size","4","--ulysses-degree","2","--retry-failed","--max-generate-attempts","1"]))
     assert new["identity"] == old["identity"]
+    assert new["ulysses_degree"] == 2 and old["ulysses_degree"] == 1
     module.validate_identity(root,new)
     assert new["limits"][pending["case_id"]]["generate"] == 3
     calls = []
@@ -140,11 +141,12 @@ def test_node_maps_four_nonoverlapping_pairs_without_barrier(tmp_path, monkeypat
     monkeypatch.setattr(cli,"run_children",lambda specs,*a,**k:calls.extend(specs) or [0]*4)
     assert cli.main(["--gpus","0,1,2,3,4,5,6,7","--pair-start","4",
                      "--output-root",str(tmp_path),"--pair-size","1000","--resume",
-                     "--group-size",str(group_size)]) == 0
+                     "--group-size",str(group_size),"--ulysses-degree","2"]) == 0
     expected = {2:["0,1","2,3","4,5","6,7"],4:["0,1,2,3","4,5,6,7"],8:["0,1,2,3,4,5,6,7"]}
     assert [x["env"]["CUDA_VISIBLE_DEVICES"] for x in calls] == expected[group_size]
     assert [x["command"][x["command"].index("--pair-id")+1] for x in calls] == [str(4+i) for i in range(8//group_size)]
     assert all(x["command"][x["command"].index("--group-size")+1] == str(group_size) for x in calls)
+    assert all(x["command"][x["command"].index("--ulysses-degree")+1] == "2" for x in calls)
 
 
 def test_group_validation_before_launch_and_allocator_override(tmp_path, monkeypatch):

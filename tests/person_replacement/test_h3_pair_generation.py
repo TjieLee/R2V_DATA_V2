@@ -33,10 +33,13 @@ def test_persistent_model_once_three_jobs_publish_failure_isolation(tmp_path, mo
     from r2v_data_v2.person_replacement import h3_pair_generation as module
 
     config = prepared_cases(tmp_path)
+    config.update(group_size=4,ulysses_degree=2)
     channel = RootChannel()
+    channel.gather = lambda value:[value] * 4
     events = []
     class Backend:
-        metadata: ClassVar = {"model_load_count":1,"pdd_apply_count":1}
+        metadata: ClassVar = {"model_load_count":1,"pdd_apply_count":1,
+                             "distributed_init_count":1,"parallel_setup_count":1}
         def __init__(self):
             events.append("model_and_pdd_init")
         def prepare(self, job):
@@ -55,6 +58,11 @@ def test_persistent_model_once_three_jobs_publish_failure_isolation(tmp_path, mo
     assert events == ["model_and_pdd_init",311,124,226]
     assert report["jobs_succeeded"] == 2 and report["jobs_failed"] == 1
     assert report["model_load_count"] == report["pdd_apply_count"] == 1
+    assert report["distributed_init_count"] == report["parallel_setup_count"] == 1
+    manifest = read_json(tmp_path/"0/generation/manifest.json")
+    assert len(manifest["rank_memory"]) == 4
+    for key in ("reference_prepare_wall_seconds","pipeline_infer_wall_seconds","encode_wall_seconds","total_case_wall_seconds"):
+        assert manifest[key] >= 0 and report[key] >= 0
     assert phase(config["cases"][0]) == phase(config["cases"][2]) == "done"
     assert phase(config["cases"][1]) == "generate"
     assert [x["kind"] for x in channel.sent].count("job") == 3
