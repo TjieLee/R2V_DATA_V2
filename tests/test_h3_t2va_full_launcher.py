@@ -292,9 +292,11 @@ def test_dry_run_exact_accepted_server_and_full_cli(sandbox):
     standalone = shlex.split(original.stdout.splitlines()[0])
     assert serve[serve.index("--mem-fraction-static") + 1] == "0.60"
     assert standalone[standalone.index("--mem-fraction-static") + 1] == "0.65"
+
     def without_mem_fraction(args):
         index = args.index("--mem-fraction-static")
         return args[:index] + args[index + 2 :]
+
     assert without_mem_fraction(serve) == without_mem_fraction(standalone)
     assert run[1] == "tools/run_h3_t2va_full_production.py"
     assert run[run.index("--request-workers") + 1] == "1"
