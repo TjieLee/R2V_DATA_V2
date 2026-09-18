@@ -3,12 +3,19 @@
 from pathlib import Path
 
 TWO_SOURCE_PROMPT = """Watch this whole single-shot video. Identify the two main physical performers.
-Give stable anchors using clothing, hair, visible appearance and stable role/action cues.
+SOURCE_SUBJECT_1/2 are identification/appearance anchors only: clothing, hair,
+stable visible human appearance and approximate initial foreground/background location.
+Do not include held/carried/touched objects, props, pose, gesture, action, hand state,
+expression, gaze, mouth state or interaction in SOURCE_SUBJECT fields.
 Initial left/right location is only an initial locator: each Subject label must follow the same
 physical performer throughout crossings, overlap, occlusion and screen-order changes.
-In SHOT_DESCRIPTION describe only the actual single-shot progression: starting positions,
-each subject's actions, hand-body/hand-object/person-person contact, props, occlusions,
-crossings and camera movement/framing changes. Do not invent actions or infer race/ethnicity.
+Put all actions, poses, held objects and interactions in SHOT_DESCRIPTION.
+Describe the complete visible single-shot progression in playback order.
+Preserve every visible action/state transition and important hand-object interaction.
+Do not omit, merge, reorder or invent actions. Track held/touched props through the sequence
+and state when they remain in the person's hand/contact. Include starting positions,
+hand-body/person-person contact, occlusions, crossings and camera movement/framing changes.
+Do not infer race/ethnicity.
 Use English and Subject 1 / Subject 2 consistently. No shot headers, markdown or explanation.
 Return exactly three nonempty single-line labelled fields:
 SOURCE_SUBJECT_1: ...
@@ -21,7 +28,12 @@ Source Subject 2: {subject2}
 Replacement 1 must look clearly different from Source 1; Replacement 2 from Source 2.
 The two replacements must also be clearly distinguishable from each other through hair,
 clothing and visible appearance. No celebrities, fantasy characters or exaggerated bodies.
-Describe appearance only, never change pose/action. Do not infer race or ethnicity.
+Describe only intrinsic human appearance and clothing.
+Never add, replace or describe held/carried/touched objects or props, pose or gesture,
+standing/sitting state, hand position/state, action or motion, expression, gaze,
+mouth state, screen position or person-object/person-person interaction.
+If the source description contains any of these, ignore them when inventing the replacement.
+They come exclusively from <Video 1>. Do not infer race or ethnicity.
 Return English, exactly two nonempty single-line labelled fields, no markdown/explanation:
 REPLACEMENT_SUBJECT_1: ...
 REPLACEMENT_SUBJECT_2: ..."""

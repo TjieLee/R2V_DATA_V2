@@ -222,3 +222,31 @@ def test_runtime_caches_are_case_local_and_environment_restored(tmp_path, monkey
         assert os.environ["HF_HUB_OFFLINE"] == "1" and "PYTHONPATH" not in os.environ
         raise RuntimeError("model failed")
     assert os.environ == original
+
+
+def test_two_person_appearance_and_temporal_prompt_contract():
+    from r2v_data_v2.person_replacement.h3_two_person import build_prompt
+    from r2v_data_v2.person_replacement.qwen3vl import (
+        TWO_REPLACEMENT_PROMPT,
+        TWO_SOURCE_PROMPT,
+    )
+
+    assert "Do not include" in TWO_SOURCE_PROMPT
+    for term in ("held/carried/touched objects", "pose", "action", "hand state", "expression", "gaze", "mouth state"):
+        assert term in TWO_SOURCE_PROMPT
+    assert "complete visible single-shot progression in playback order" in TWO_SOURCE_PROMPT
+    assert "Do not omit, merge, reorder or invent actions" in TWO_SOURCE_PROMPT
+    assert "Describe only intrinsic human appearance and clothing" in TWO_REPLACEMENT_PROMPT
+    assert "Never add, replace or describe" in TWO_REPLACEMENT_PROMPT
+    for term in ("held/carried/touched objects", "standing/sitting state", "hand position/state", "action or motion"):
+        assert term in TWO_REPLACEMENT_PROMPT
+    shot = "Subject 1 lifts the blue-and-white cup, drinks, then lowers it."
+    prompt = build_prompt("gray hair", "dark coat", shot, "burgundy coat", "curly hair")
+    assert shot in prompt
+    for index in (1,2):
+        assert f"Replacement {index} defines human appearance only" in prompt
+        assert f"<Subject {index}> (throughout its source performance): partially_preserved" in prompt
+    assert "<Video 1> is the temporal authority" in prompt
+    assert "Do not add, omit, reorder, merge, replace or extend actions or interactions" in prompt
+    assert "replacement descriptions must never replace, add or alter source props" in prompt
+    assert "<Video 1> (source temporal, scene and interaction structure): fully_preserved" in prompt
