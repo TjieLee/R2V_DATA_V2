@@ -18,7 +18,7 @@ _SUBJECT_OR_PRONOUN = re.compile(
 _HER_POSSESSIVE_NEXT = re.compile(
     r"\s+(?:right|left|own|head|face|mouth|eye|eyes|gaze|hair|hand|hands|arm|arms|"
     r"shoulder|shoulders|body|torso|leg|legs|foot|feet|clothing|shirt|jacket|robe|"
-    r"tunic|trousers|pants|cup|object)\b",
+    r"tunic|trousers|pants|cup|chair|object)\b",
     re.IGNORECASE,
 )
 
