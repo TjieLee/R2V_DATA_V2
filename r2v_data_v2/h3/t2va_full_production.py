@@ -8,7 +8,7 @@ import time
 import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack, contextmanager
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -152,65 +152,16 @@ class FullPipeline:
             self.prefetch.start(next_shard_id)
 
     def __enter__(self):
-        from r2v_data_v2.h3 import t2va_full_speech as speech
-        from r2v_data_v2.h3 import t2va_full_stems as stems
-        from r2v_data_v2.h3.t2va_full_worker_pool import PersistentPoolManager
+        # MiMo is owned by the outer launcher and remains resident. Upstream
+        # SAM/AuK/DiariZen/ASR workers are intentionally stage-local: stage()
+        # leaves execution unset so the existing ephemeral executor loads one
+        # worker per GPU for the active stage and releases it at the barrier.
+        self.pools = None
+        return self
 
-        self._lifetime = ExitStack()
-        try:
-            self.pools = self._lifetime.enter_context(
-                PersistentPoolManager(self.root / "workers", self.gpu_ids)
-            )
-            self.pools.start(
-                "sam",
-                factory=stems.__name__ + ":SAMWorker",
-                configuration={
-                    "model": self.sam_configuration.model_dump(mode="json"),
-                    "ffmpeg": self.ffmpeg,
-                    "ffprobe": self.ffprobe,
-                },
-                request_keys=("inventory_path",),
-                environment={
-                    "PYTHONPATH": os.environ.get("SAM_AUDIO_RUNTIME_PYTHONPATH", "")
-                },
-            )
-            self.pools.start(
-                "auk",
-                factory=stems.__name__ + ":AukWorker",
-                configuration={
-                    "model": self.auk_configuration.model_dump(mode="json"),
-                    "ffmpeg": self.ffmpeg,
-                },
-            )
-            for name, factory, configuration in (
-                (
-                    "diarizen",
-                    speech.__name__ + ":diarizen_worker",
-                    speech._diar_configuration(),
-                ),
-                (
-                    "asr",
-                    speech.__name__ + ":asr_worker",
-                    {**speech._asr_configuration(), "ffmpeg": self.ffmpeg},
-                ),
-            ):
-                self.pools.start(
-                    name,
-                    factory=factory,
-                    configuration=configuration,
-                    environment=configuration["environment"],
-                )
-            return self
-        except BaseException:
-            self._lifetime.close()
-            self.pools = None
-            raise
-
-    def __exit__(self, *args):
-        try:
-            return self._lifetime.__exit__(*args)
-        finally:
-            self.pools = None
+    def __exit__(self, *_args):
+        self.pools = None
+        return False
 
     def stage(self, name, shard_id):
         from r2v_data_v2.h3 import auk_speech_shadow as auk
