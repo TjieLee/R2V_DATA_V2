@@ -172,7 +172,7 @@ class FullPipeline:
 
         shard = self.root / "shards" / production.shard_name(shard_id)
         state = shard / "stage_state"
-        execution = {"execute": self.pools.execute_stage} if self.pools else {}
+        execution = {}
         if name == "canonical":
             if self.prefetch is not None and shard_id in self.prepared:
                 # Re-read after taking invocation ownership: another node may
