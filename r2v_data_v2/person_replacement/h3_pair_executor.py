@@ -48,7 +48,7 @@ def make_config(args):
     identity = {"input":str(source),"clips_root":str(clips),"pair_id":args.pair_id,
                 "pair_size":args.pair_size,"seed":args.seed,"resources":values,
                 "rows":[(case["source_index"],case["row_sha256"]) for case in cases],
-                "contract":"text_two_person_pdd_fsdp2_pair_v11"}
+                "contract":"text_two_person_pdd_fsdp2_pair_v12"}
     digest = hashlib.sha256(json.dumps(identity,sort_keys=True).encode()).hexdigest()
     config = {**values,"identity":digest,"identity_details":identity,"cases":cases,"group_size":args.group_size,
               "ulysses_degree":args.ulysses_degree,

@@ -61,17 +61,19 @@ def build_prompt(source1, source2, shot, replacement1, replacement2, *, frame0=F
         f"<Subject 1> is {source1} in <Video 1>.",
         f"<Subject 2> is {source2} in <Video 1>.",
         (
-            f"<Subject 3> is {replacement1}. In the target video, <Subject 3> replaces "
-            "<Subject 1>'s visible appearance and follows <Subject 1>'s original performance "
-            "from <Video 1>, including motion, pose, facial expression, gaze, mouth state, "
-            "hand movements, object interactions, position and timing."
+            f"<Subject 3> is {replacement1}. In the target video, <Subject 3> replaces only "
+            "<Subject 1>'s visible human appearance. Everything else about <Subject 1>'s "
+            "performance in <Video 1> stays unchanged and is performed by <Subject 3>, including "
+            "the same motion, pose, facial expression, gaze, mouth state, hand movements, "
+            "object interactions, position and timing."
             + (" <Picture 1> additionally supplies an edited first-frame visual anchor where visible." if frame0 else "")
         ),
         (
-            f"<Subject 4> is {replacement2}. In the target video, <Subject 4> replaces "
-            "<Subject 2>'s visible appearance and follows <Subject 2>'s original performance "
-            "from <Video 1>, including motion, pose, facial expression, gaze, mouth state, "
-            "hand movements, object interactions, position and timing."
+            f"<Subject 4> is {replacement2}. In the target video, <Subject 4> replaces only "
+            "<Subject 2>'s visible human appearance. Everything else about <Subject 2>'s "
+            "performance in <Video 1> stays unchanged and is performed by <Subject 4>, including "
+            "the same motion, pose, facial expression, gaze, mouth state, hand movements, "
+            "object interactions, position and timing."
             + (" <Picture 1> additionally supplies an edited first-frame visual anchor where visible." if frame0 else "")
         ),
         "<Video 1> is the source video for the target video edit.",
@@ -94,9 +96,10 @@ def build_prompt(source1, source2, shot, replacement1, replacement2, *, frame0=F
         "appearance is retained while <Subject 3> follows <Subject 1>'s original performance.",
         "<Subject 4> (appears in [Shot 1]): fully_preserved - the defined replacement "
         "appearance is retained while <Subject 4> follows <Subject 2>'s original performance.",
-        "<Video 1> (source video editing): fully_preserved - retain the original action start "
-        "times, durations and order, poses, hand-object contacts, non-person props, camera, background, "
-        "lighting and composition.",
+        "<Video 1> (source video editing): fully_preserved - use <Video 1> as the 1:1 frame-by-frame "
+        "template for motion and timing. Retain the original action start times, durations and order, "
+        "poses, expressions, gaze, mouth states, hand-object contacts, positions, scale, orientation, "
+        "occlusion, non-person props, camera, background, lighting and composition.",
     ]
     if frame0:
         retention.append(
@@ -110,26 +113,25 @@ def build_prompt(source1, source2, shot, replacement1, replacement2, *, frame0=F
         "subject_definitions:\n" + "\n".join(definitions),
         (
             f"summary:\n[{task}] The target video is an edited version of <Video 1>. "
-            "<Subject 3> replaces the visible appearance of <Subject 1>, and <Subject 4> "
-            "replaces the visible appearance of <Subject 2>. <Subject 3> and <Subject 4> "
-            "follow the original performances of <Subject 1> and <Subject 2> from <Video 1>. "
-            "Preserve the original action start times, durations and order, non-person props, camera and scene."
+            "The only edit is the visible human appearance of the two performers: <Subject 3> "
+            "replaces only <Subject 1>'s appearance, and <Subject 4> replaces only <Subject 2>'s "
+            "appearance. Every action, pose, expression, gaze, hand and object interaction, "
+            "position, timing, non-person prop, camera state and scene element stays as in <Video 1>."
         ),
         "retention_analysis:\n" + "\n".join(retention),
         (
             "detailed_description:\nKeep the visual style and lighting of <Video 1>.\n\n"
             "[Shot 1] " + anchor +
-            "<Subject 3> appears in place of <Subject 1> and follows <Subject 1>'s original "
-            "performance from <Video 1>. <Subject 4> appears in place of <Subject 2> and follows "
-            "<Subject 2>'s original performance from <Video 1>. Treat source-video timestamps "
-            "in the following performance description as timing anchors and do not move actions "
-            "earlier or later. " + shot +
-            " These actions and interactions reproduce the corresponding source performances "
-            "from <Video 1> with the same start times, durations and order. Keep all non-person props unchanged, "
-            "including held or touched objects, and preserve the original hand-object contact, "
-            "camera, background, lighting and composition. Keep <Subject 3> on <Subject 1>'s "
-            "source track and <Subject 4> on <Subject 2>'s source track throughout crossings, "
-            "overlap or occlusion; do not swap the two target subjects."
+            "Use <Video 1> as the frame-by-frame template. Change only the visible human "
+            "appearance of the two performers. In every corresponding frame, <Subject 3> must do "
+            "exactly what <Subject 1> does in <Video 1>, and <Subject 4> must do exactly what "
+            "<Subject 2> does in <Video 1>. Do not change when an action starts or ends, how long "
+            "it lasts, body pose or motion, facial expression, gaze, mouth state, hand state, "
+            "hand-object contact, position, scale, orientation or occlusion. Do not change the "
+            "camera, background, lighting or any non-person object. If the following text summary "
+            "conflicts with <Video 1>, follow <Video 1>. " + shot +
+            " Preserve the source action sequence and timing exactly; the only intended difference "
+            "is that <Subject 3> and <Subject 4> have the replacement appearances defined above."
         ),
         (
             "overall_soundscape:\nPreserve source synchronized sound, ambience and physical "

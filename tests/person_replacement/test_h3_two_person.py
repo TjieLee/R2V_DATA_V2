@@ -261,8 +261,8 @@ def test_two_person_appearance_and_temporal_prompt_contract():
     # Target identities are separate subjects bound to the two source performers.
     assert "<Subject 3> is a middle-aged woman with auburn hair in an olive-green jacket." in definitions
     assert "<Subject 4> is an adult man with short black hair in a cream linen shirt." in definitions
-    assert "<Subject 3> replaces <Subject 1>'s visible appearance" in definitions
-    assert "<Subject 4> replaces <Subject 2>'s visible appearance" in definitions
+    assert "<Subject 3> replaces only <Subject 1>'s visible human appearance" in definitions
+    assert "<Subject 4> replaces only <Subject 2>'s visible human appearance" in definitions
     assert "<Subject 1>'s original performance" in definitions
     assert "<Subject 2>'s original performance" in definitions
 
@@ -294,8 +294,25 @@ def test_source_timestamps_survive_target_subject_remap():
     assert "00:04.000" in detailed
     assert "<Subject 3> remains seated without the cup until 00:04.000." in detailed
     assert "At 00:04.000, <Subject 3> raises <Subject 3>'s right hand" in detailed
-    assert "timing anchors" in detailed
-    assert "same start times, durations and order" in detailed
+    assert "frame-by-frame template" in detailed
+    assert "Do not change when an action starts or ends" in detailed
+    assert "If the following text summary conflicts with <Video 1>, follow <Video 1>." in detailed
+
+
+def test_prompt_states_only_human_appearance_may_change():
+    from r2v_data_v2.person_replacement.h3_two_person import build_prompt
+
+    prompt = build_prompt(
+        "source one", "source two",
+        "<Subject 1> raises a cup while <Subject 2> remains still.",
+        "target one", "target two",
+    )
+    detailed = prompt.split("detailed_description:\n",1)[1].split("\n\noverall_soundscape:",1)[0]
+    assert "Change only the visible human appearance of the two performers." in detailed
+    assert "In every corresponding frame, <Subject 3> must do exactly what <Subject 1> does" in detailed
+    assert "<Subject 4> must do exactly what <Subject 2> does" in detailed
+    assert "the only intended difference" in detailed
+    assert "source track" not in detailed
 
 
 def test_two_person_video_sampling_only_and_short_motion_prompt(tmp_path, monkeypatch):
