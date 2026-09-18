@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+TWO_PERSON_VIDEO_FPS = 4.0
+
 TWO_SOURCE_PROMPT = """Watch this whole single-shot video. Identify the two main physical performers.
 SOURCE_SUBJECT_1/2 are identification/appearance anchors only: clothing, hair,
 stable visible human appearance and approximate initial foreground/background location.
@@ -15,8 +17,14 @@ Preserve every visible action/state transition and important hand-object interac
 Do not omit, merge, reorder or invent actions. Track held/touched props through the sequence
 and state when they remain in the person's hand/contact. Include starting positions,
 hand-body/person-person contact, occlusions, crossings and camera movement/framing changes.
+Pay particular attention to brief hand, arm, head and object movements.
+Describe every visible motion/state transition, including small movements that occur over a short interval.
+Do not replace a sequence of visible actions with a static summary such as "remains still throughout"
+unless the performer is genuinely motionless for the entire source sequence.
+For an interacted prop, preserve the visible progression of its state/contact/motion in playback order.
 Do not infer race/ethnicity.
-Use English and Subject 1 / Subject 2 consistently. No shot headers, markdown or explanation.
+Use English and the exact reference labels <Subject 1> and <Subject 2> in SHOT_DESCRIPTION.
+Never write bare "Subject 1" or "Subject 2" there. No shot headers, markdown or explanation.
 Return exactly three nonempty single-line labelled fields:
 SOURCE_SUBJECT_1: ...
 SOURCE_SUBJECT_2: ...
@@ -150,7 +158,7 @@ class LocalQwen:
 
     def describe_two(self, video: Path) -> tuple[str, str, str]:
         return _labelled_fields(self._text([
-            {"type":"video", "path":str(video.resolve(strict=True))},
+            {"type":"video", "path":str(video.resolve(strict=True)), "fps":TWO_PERSON_VIDEO_FPS},
             {"type":"text", "text":TWO_SOURCE_PROMPT},
         ]), ("SOURCE_SUBJECT_1", "SOURCE_SUBJECT_2", "SHOT_DESCRIPTION"))
 

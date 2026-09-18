@@ -1,7 +1,10 @@
 """Deterministic paired two-person prompts following MiniMax's Ref2VA guide."""
 
+import re
+
 
 def build_prompt(source1, source2, shot, replacement1, replacement2, *, frame0=False):
+    shot = re.sub(r"(?<!<)\bSubject ([12])\b(?!>)", r"<Subject \1>", shot)
     definitions = []
     for index, source, replacement in ((1, source1, replacement1), (2, source2, replacement2)):
         definitions.append(

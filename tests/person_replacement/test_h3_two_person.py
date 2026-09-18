@@ -12,7 +12,7 @@ from PIL import Image
 from r2v_data_v2.person_replacement import qwen3vl
 
 DESCRIPTIONS = ("short hair and blue coat, initially left", "long hair and red coat, initially right",
-                "Subject 1 passes behind Subject 2 while both hold a box; the camera pans right.")
+                "<Subject 1> passes behind <Subject 2> while both hold a box; the camera pans right.")
 REPLACEMENTS = ("older adult with curly hair and green jacket", "young adult with bob and tan shirt")
 
 
@@ -56,7 +56,7 @@ def test_two_person_qwen_calls_and_parser(tmp_path, monkeypatch):
     monkeypatch.setattr(qwen, "_text", text)
     assert qwen.describe_two(video) == ("blue coat", "red coat", "They cross.")
     assert qwen.invent_two("blue coat", "red coat") == ("green coat", "tan shirt")
-    assert calls[0][0] == {"type":"video", "path":str(video)}
+    assert calls[0][0] == {"type":"video", "path":str(video), "fps":4.0}
     assert "physical performer" in calls[0][1]["text"]
 
 
@@ -240,7 +240,7 @@ def test_two_person_appearance_and_temporal_prompt_contract():
     assert "Never add, replace or describe" in TWO_REPLACEMENT_PROMPT
     for term in ("held/carried/touched objects", "standing/sitting state", "hand position/state", "action or motion"):
         assert term in TWO_REPLACEMENT_PROMPT
-    shot = "Subject 1 lifts the blue-and-white cup, drinks, then lowers it."
+    shot = "<Subject 1> lifts the blue-and-white cup, drinks, then lowers it."
     prompt = build_prompt("gray hair", "dark coat", shot, "burgundy coat", "curly hair")
     assert shot in prompt
     for index in (1,2):
@@ -250,3 +250,38 @@ def test_two_person_appearance_and_temporal_prompt_contract():
     assert "Do not add, omit, reorder, merge, replace or extend actions or interactions" in prompt
     assert "replacement descriptions must never replace, add or alter source props" in prompt
     assert "<Video 1> (source temporal, scene and interaction structure): fully_preserved" in prompt
+
+
+def test_two_person_video_sampling_only_and_short_motion_prompt(tmp_path, monkeypatch):
+    video = tmp_path/"source.mp4"
+    video.touch()
+    client = qwen3vl.LocalQwen(tmp_path)
+    calls = []
+    def text(content):
+        calls.append(content)
+        return "SOURCE_SUBJECT_1: gray hair\nSOURCE_SUBJECT_2: red coat\nSHOT_DESCRIPTION: <Subject 1> raises a cup."
+    monkeypatch.setattr(client,"_text",text)
+    client.describe_two(video)
+    client.describe(video)
+    assert calls[0][0] == {"type":"video","path":str(video.resolve()),"fps":4.0}
+    assert "fps" not in calls[1][0]
+    prompt = calls[0][1]["text"]
+    for phrase in ('<Subject 1>', '<Subject 2>', 'Never write bare "Subject 1" or "Subject 2"',
+                   'brief hand, arm, head and object movements', 'every visible motion/state transition',
+                   'genuinely motionless for the entire source sequence'):
+        assert phrase in prompt
+
+
+@pytest.mark.parametrize("shot", [
+    "Subject 1 raises a cup while Subject 2 remains behind.",
+    "<Subject 1> raises a cup while <Subject 2> remains behind.",
+    "Subject 1 raises a cup while <Subject 2> remains behind.",
+])
+def test_shot_label_normalization_without_double_brackets(shot):
+    from r2v_data_v2.person_replacement.h3_two_person import build_prompt
+
+    prompt = build_prompt("gray hair","red coat",shot,"dark coat","short hair")
+    detailed = prompt.split("detailed_description:\n",1)[1].split("\n\noverall_soundscape:",1)[0]
+    assert "<Subject 1> raises a cup while <Subject 2> remains behind." in detailed
+    assert "<<Subject" not in detailed
+    assert "Subject 12" in build_prompt("a","b","Subject 12 stays.","c","d")
