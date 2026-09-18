@@ -28,7 +28,7 @@ def test_six_section_two_person_prompt(frame0):
     assert re.search(r"(?<!<)\bSubject [12]\b(?!>)", prompt) is None
     assert ("<Picture 1>" in prompt) == frame0
     for value in (*DESCRIPTIONS[:2], *REPLACEMENTS, "<Subject 1>", "<Subject 2>",
-                  "<Subject 3>", "<Subject 4>", "partially_preserved", "fully_preserved",
+                  "<Subject 3>", "<Subject 4>", "attribute_transfer", "fully_preserved",
                   "<Video 1>"):
         assert value in prompt
     assert "<Subject 3> passes behind <Subject 4> while both hold a box" in prompt
