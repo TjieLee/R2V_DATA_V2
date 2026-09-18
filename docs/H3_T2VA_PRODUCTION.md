@@ -23,7 +23,7 @@ while MiMo uses the full eight-GPU serving topology.
 
 MiMo starts once per launcher invocation and stays alive across stages/shards.
 The current full-production launcher uses TP=8, DP=2 and
---mem-fraction-static 0.60. SAM, AuK, DiariZen and Qwen3-ASR are no longer
+--mem-fraction-static 0.55. SAM, AuK, DiariZen and Qwen3-ASR are no longer
 node-lifetime resident. Each upstream stage uses the existing ephemeral executor:
 it starts at most one worker per physical GPU for that stage, waits for the stage
 barrier, then terminates the workers and their owned child processes before the
@@ -197,7 +197,7 @@ ASR job_count can exceed ready clip count because ASR jobs are speech segments.
 The accepted run exited with no owned worker processes left behind. Subsequent
 real 2k-shard runs showed that keeping all upstream models resident still caused
 SAM/AuK OOMs even after lowering MiMo to 0.45. Production therefore switched to
-stage-local upstream workers and MiMo 0.60: MiMo remains resident, while only the
+stage-local upstream workers and MiMo 0.55: MiMo remains resident, while only the
 currently active SAM/AuK/DiariZen/ASR model is loaded on each GPU. This lifecycle
 change preserves the frozen stage semantics and durable receipts but must be
 validated by real production continuation rather than inferred from the older
