@@ -8,13 +8,19 @@ TWO_SOURCE_PROMPT = """Watch this whole single-shot video. Identify the two main
 For SOURCE_SUBJECT_1 and SOURCE_SUBJECT_2, write one concise natural description of each
 source performer so that the person is easy to identify in <Video 1>. Include the person's
 visible appearance, clothing, and a simple locator such as foreground/background or initial
-left/right position when useful. A stable held object or pose may also be mentioned when it
-helps identify the performer. Keep the descriptions natural rather than filling a checklist.
+left/right position when useful. Keep these source descriptions about the person's identity
+and stable visual role; put temporary actions and held/touched props in SHOT_DESCRIPTION.
+Keep the descriptions natural rather than filling a checklist.
 Each Subject label must follow the same physical performer throughout crossings, overlap,
 occlusion and screen-order changes.
 Put the complete action sequence in SHOT_DESCRIPTION. Describe the visible progression in
 playback order and preserve every important action/state transition and hand-object interaction.
-Do not omit, merge, reorder or invent actions. Track held/touched props through the sequence
+Use source-video timestamps for significant action/state transitions, especially when an
+action starts after a period of stillness. State the preceding interval explicitly when useful,
+for example: "<Subject 1> remains seated without the cup until 00:04.000. At 00:04.000,
+<Subject 1> raises <Subject 1>'s right hand toward the cup." Keep these timestamps tied to the
+source video; do not shift an action earlier or later. Do not omit, merge, reorder or invent
+actions. Track held/touched props through the sequence
 and state when they remain in the person's hand/contact. Include relevant starting positions,
 hand-body/person-person contact, occlusions, crossings and camera movement/framing changes.
 Pay particular attention to brief hand, arm, head and object movements.

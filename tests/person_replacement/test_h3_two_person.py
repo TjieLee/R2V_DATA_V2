@@ -239,6 +239,8 @@ def test_two_person_appearance_and_temporal_prompt_contract():
     assert "SHOT_DESCRIPTION" in TWO_SOURCE_PROMPT
     assert "<Subject 1>" in TWO_SOURCE_PROMPT and "<Subject 2>" in TWO_SOURCE_PROMPT
     assert "Do not use person pronouns" in TWO_SOURCE_PROMPT
+    assert "source-video timestamps" in TWO_SOURCE_PROMPT
+    assert "00:04.000" in TWO_SOURCE_PROMPT
     assert "clearly different from Source 1" in TWO_REPLACEMENT_PROMPT
     assert "clearly different from Source 2" in TWO_REPLACEMENT_PROMPT
 
@@ -278,6 +280,22 @@ def test_two_person_appearance_and_temporal_prompt_contract():
 
     for forbidden in ("Replacement 1", "Replacement 2", "->"):
         assert forbidden not in prompt
+
+
+def test_source_timestamps_survive_target_subject_remap():
+    from r2v_data_v2.person_replacement.h3_two_person import build_prompt
+
+    shot = (
+        "<Subject 1> remains seated without the cup until 00:04.000. "
+        "At 00:04.000, <Subject 1> raises <Subject 1>'s right hand toward the cup."
+    )
+    prompt = build_prompt("source one", "source two", shot, "target one", "target two")
+    detailed = prompt.split("detailed_description:\n",1)[1].split("\n\noverall_soundscape:",1)[0]
+    assert "00:04.000" in detailed
+    assert "<Subject 3> remains seated without the cup until 00:04.000." in detailed
+    assert "At 00:04.000, <Subject 3> raises <Subject 3>'s right hand" in detailed
+    assert "timing anchors" in detailed
+    assert "same start times, durations and order" in detailed
 
 
 def test_two_person_video_sampling_only_and_short_motion_prompt(tmp_path, monkeypatch):

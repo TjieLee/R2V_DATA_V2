@@ -94,8 +94,8 @@ def build_prompt(source1, source2, shot, replacement1, replacement2, *, frame0=F
         "appearance is retained while <Subject 3> follows <Subject 1>'s original performance.",
         "<Subject 4> (appears in [Shot 1]): fully_preserved - the defined replacement "
         "appearance is retained while <Subject 4> follows <Subject 2>'s original performance.",
-        "<Video 1> (source video editing): fully_preserved - retain the original action order "
-        "and timing, poses, hand-object contacts, non-person props, camera, background, "
+        "<Video 1> (source video editing): fully_preserved - retain the original action start "
+        "times, durations and order, poses, hand-object contacts, non-person props, camera, background, "
         "lighting and composition.",
     ]
     if frame0:
@@ -113,7 +113,7 @@ def build_prompt(source1, source2, shot, replacement1, replacement2, *, frame0=F
             "<Subject 3> replaces the visible appearance of <Subject 1>, and <Subject 4> "
             "replaces the visible appearance of <Subject 2>. <Subject 3> and <Subject 4> "
             "follow the original performances of <Subject 1> and <Subject 2> from <Video 1>. "
-            "Preserve the original action order and timing, non-person props, camera and scene."
+            "Preserve the original action start times, durations and order, non-person props, camera and scene."
         ),
         "retention_analysis:\n" + "\n".join(retention),
         (
@@ -121,9 +121,11 @@ def build_prompt(source1, source2, shot, replacement1, replacement2, *, frame0=F
             "[Shot 1] " + anchor +
             "<Subject 3> appears in place of <Subject 1> and follows <Subject 1>'s original "
             "performance from <Video 1>. <Subject 4> appears in place of <Subject 2> and follows "
-            "<Subject 2>'s original performance from <Video 1>. " + shot +
+            "<Subject 2>'s original performance from <Video 1>. Treat source-video timestamps "
+            "in the following performance description as timing anchors and do not move actions "
+            "earlier or later. " + shot +
             " These actions and interactions reproduce the corresponding source performances "
-            "from <Video 1> in the same order and timing. Keep all non-person props unchanged, "
+            "from <Video 1> with the same start times, durations and order. Keep all non-person props unchanged, "
             "including held or touched objects, and preserve the original hand-object contact, "
             "camera, background, lighting and composition. Keep <Subject 3> on <Subject 1>'s "
             "source track and <Subject 4> on <Subject 2>'s source track throughout crossings, "
