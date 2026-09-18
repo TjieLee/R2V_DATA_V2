@@ -233,14 +233,26 @@ def test_two_person_appearance_and_temporal_prompt_contract():
     )
 
     assert "Do not include" in TWO_SOURCE_PROMPT
+    for term in ("apparent age range", "visible skin tone", "face shape", "facial-hair state",
+                 "hair length/style/texture/color", "overall build impression", "clothing"):
+        assert term in TWO_SOURCE_PROMPT
     for term in ("held/carried/touched objects", "pose", "action", "hand state", "expression", "gaze", "mouth state"):
         assert term in TWO_SOURCE_PROMPT
+    assert "Do not infer race, ethnicity or nationality" in TWO_SOURCE_PROMPT
     assert "complete visible single-shot progression in playback order" in TWO_SOURCE_PROMPT
     assert "Do not omit, merge, reorder or invent actions" in TWO_SOURCE_PROMPT
+    assert "substantial visual distance" in TWO_REPLACEMENT_PROMPT
+    assert "at least five" in TWO_REPLACEMENT_PROMPT
+    assert "Do not merely change hair and clothing" in TWO_REPLACEMENT_PROMPT
+    for term in ("apparent age range", "visible skin tone", "face shape", "facial-hair state",
+                 "hair length/style/texture/color", "overall build impression",
+                 "clothing style/color/silhouette", "bald/shaved hairstyle"):
+        assert term in TWO_REPLACEMENT_PROMPT
     assert "Describe only intrinsic human appearance and clothing" in TWO_REPLACEMENT_PROMPT
     assert "Never add, replace or describe" in TWO_REPLACEMENT_PROMPT
     for term in ("held/carried/touched objects", "standing/sitting state", "hand position/state", "action or motion"):
         assert term in TWO_REPLACEMENT_PROMPT
+    assert "do not infer or assign race, ethnicity or nationality" in TWO_REPLACEMENT_PROMPT
     shot = "<Subject 1> lifts the blue-and-white cup, drinks, then lowers it."
     source1, source2 = "UNIQUE_SOURCE_BALD_MUSTACHE_BLUE_ROBE", "UNIQUE_SOURCE_SHAVED_HEAD_GRAY_ROBE"
     prompt = build_prompt(source1, source2, shot, "  burgundy coat.. ", "curly hair.")

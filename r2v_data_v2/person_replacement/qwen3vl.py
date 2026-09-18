@@ -5,10 +5,13 @@ from pathlib import Path
 TWO_PERSON_VIDEO_FPS = 4.0
 
 TWO_SOURCE_PROMPT = """Watch this whole single-shot video. Identify the two main physical performers.
-SOURCE_SUBJECT_1/2 are identification/appearance anchors only: clothing, hair,
-stable visible human appearance and approximate initial foreground/background location.
-Do not include held/carried/touched objects, props, pose, gesture, action, hand state,
-expression, gaze, mouth state or interaction in SOURCE_SUBJECT fields.
+SOURCE_SUBJECT_1/2 are identification/appearance anchors only. When visible, describe
+identity-defining appearance such as apparent age range, visible skin tone, face shape,
+facial-hair state, hair length/style/texture/color, overall build impression, clothing
+style/color/silhouette, and approximate initial foreground/background location.
+Do not infer race, ethnicity or nationality from appearance. Do not include held/carried/touched
+objects, props, pose, gesture, action, hand state, expression, gaze, mouth state or interaction
+in SOURCE_SUBJECT fields.
 Initial left/right location is only an initial locator: each Subject label must follow the same
 physical performer throughout crossings, overlap, occlusion and screen-order changes.
 Put all actions, poses, held objects and interactions in SHOT_DESCRIPTION.
@@ -36,15 +39,22 @@ SHOT_DESCRIPTION: ..."""
 TWO_REPLACEMENT_PROMPT = """Invent two ordinary realistic replacement people.
 Source Subject 1: {subject1}
 Source Subject 2: {subject2}
-Replacement 1 must look clearly different from Source 1; Replacement 2 from Source 2.
-The two replacements must also be clearly distinguishable from each other through hair,
-clothing and visible appearance. No celebrities, fantasy characters or exaggerated bodies.
-Describe only intrinsic human appearance and clothing.
-Never add, replace or describe held/carried/touched objects or props, pose or gesture,
-standing/sitting state, hand position/state, action or motion, expression, gaze,
-mouth state, screen position or person-object/person-person interaction.
-If the source description contains any of these, ignore them when inventing the replacement.
-They come exclusively from <Video 1>. Do not infer race or ethnicity.
+Choose two plausible replacement identities with substantial visual distance from their
+corresponding source people. For each replacement, differ clearly on at least five
+identity-defining visible traits among apparent age range, visible skin tone, face shape,
+facial-hair state, hair length/style/texture/color, overall build impression, and clothing
+style/color/silhouette. Do not merely change hair and clothing. When the source has a
+distinctive bald/shaved hairstyle, facial hair, face shape, age appearance or wardrobe,
+prefer a clearly contrasting but realistic target state. The two replacements must also
+remain clearly distinguishable from each other across several of these traits.
+Keep each replacement internally coherent and ordinary/realistic; no celebrities, fantasy
+characters, costume characters or exaggerated bodies. Describe only intrinsic human
+appearance and clothing. Never add, replace or describe held/carried/touched objects or
+props, pose or gesture, standing/sitting state, hand position/state, action or motion,
+expression, gaze, mouth state, screen position or person-object/person-person interaction.
+If the source description contains any of these, ignore them when inventing the replacement;
+they come exclusively from <Video 1>. Use visible skin tone only as an appearance descriptor;
+do not infer or assign race, ethnicity or nationality.
 Return English, exactly two nonempty single-line labelled fields, no markdown/explanation:
 REPLACEMENT_SUBJECT_1: ...
 REPLACEMENT_SUBJECT_2: ..."""
