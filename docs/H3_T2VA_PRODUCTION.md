@@ -18,27 +18,26 @@ Automatic multi-node scheduling shuffles shard IDs with SHARD_SEED and takes
 ordered_shards[RANK::WORLD_SIZE]. RANK/WORLD_SIZE are node-level scheduling
 coordinates: different nodes receive different shard sequences. Inside a node,
 the eight GPUs do not take eight different shards. They cooperatively process
-the current shard: persistent stage workers partition pending jobs across GPUs,
+the current shard: the active upstream stage partitions pending jobs across GPUs,
 while MiMo uses the full eight-GPU serving topology.
 
 MiMo starts once per launcher invocation and stays alive across stages/shards.
-The accepted full-production launcher uses TP=8, DP=2 and
---mem-fraction-static 0.50; the previous 0.65 setting OOMed AuK when all resident
-upstream workers were present. Client REQUEST_WORKERS defaults to 1. Upstream
-stages use GPU_IDS=0,1,2,3,4,5,6,7 by default. SAM, AuK, DiariZen and Qwen3-ASR
-each have eight node-lifetime resident workers (32 upstream workers, in addition
-to MiMo). Every worker loads once before its READY handshake, processes requests
-across shards and closes only at node shutdown. Stage barriers remain sequential;
-residency does not mean concurrent GPU stages. Each child sees its physical GPU
-through CUDA_VISIBLE_DEVICES and uses cuda:0; the parent environment is unchanged.
-There is no automatic GPU memory manager or model restart daemon.
+The current full-production launcher uses TP=8, DP=2 and
+--mem-fraction-static 0.60. SAM, AuK, DiariZen and Qwen3-ASR are no longer
+node-lifetime resident. Each upstream stage uses the existing ephemeral executor:
+it starts at most one worker per physical GPU for that stage, waits for the stage
+barrier, then terminates the workers and their owned child processes before the
+next GPU stage begins. Thus upstream models do not coexist across stage barriers.
+Client REQUEST_WORKERS defaults to 1 and GPU_IDS defaults to
+0,1,2,3,4,5,6,7. Each child sees its physical GPU through CUDA_VISIBLE_DEVICES
+and uses cuda:0; the parent environment is unchanged. There is no automatic model
+restart daemon.
 
 Canonical preparation uses CANONICAL_WORKERS=16 (Python --canonical-workers),
 configurable to any positive integer. Per-clip publication and hash checks are
 unchanged; the final manifest is always in source order. An owned CPU subprocess
 prepares at most one next shard while the current shard runs its GPU stages.
-First-shard canonical preparation starts before pool initialization, so CPU work
-can overlap model startup. Every canonical path takes blocking canonical.lock;
+Every canonical path takes blocking canonical.lock;
 invocation.lock still prevents duplicate GPU-stage writers. Background canonical
 also waits for that lock before canonical.lock, so another node cannot republish
 the same shard's input manifest during active GPU consumption. Termination cleans
@@ -154,11 +153,11 @@ T2VA fixtures, not the RA2VA binding_evidence_mode=none Visual adapter. The name
 of that default mode does not introduce LR-ASD execution or evidence.
 
 Each stage has durable job receipts beneath stage_state/<stage>/jobs.
-Persistent worker control uses owned request files, never model stdout.
-Per-GPU logs append beneath workers/<stage>-gpu<ID>.log; stage summaries and
-exceptions remain under shard logs. Canonical subprocess logs are
-logs/canonical-prefetch.log within the shard. Pool startup and stage wall seconds,
-plus canonical prefetch start/completion, are printed in the supervisor log.
+Stage-local worker control uses owned request files, never model stdout.
+Per-GPU upstream logs are written beneath the shard logs for the active stage;
+stage summaries and exceptions remain under shard logs. Canonical subprocess logs
+are logs/canonical-prefetch.log within the shard. Stage wall seconds plus
+canonical prefetch start/completion are printed in the supervisor log.
 Node logs are logs/<hostname>/{mimo,supervisor}-<timestamp>-<pid>.log.
 Only the parent publishes full ordered inventories. Worker outputs never race on
 canonical records.jsonl. Successful receipt/media hashes are checked before
@@ -183,8 +182,8 @@ Published data remains available to the existing snapshot builder.
 
 ### Raw-video server acceptance (2026-09-18)
 
-The performance-v2 raw-5 server run passed with the resident upstream pools and
-MiMo --mem-fraction-static 0.50. The final stage summary was:
+The earlier performance-v2 raw-5 server run passed with resident upstream pools
+and MiMo --mem-fraction-static 0.50. The final stage summary was:
 
     canonical  ready=5 failed=0
     SAM        records=5 model_call_count=10
@@ -195,11 +194,14 @@ MiMo --mem-fraction-static 0.50. The final stage summary was:
     MiMo       t2va_ready=5 ta2va_ready=5, all failed/pending/skipped=0
 
 ASR job_count can exceed ready clip count because ASR jobs are speech segments.
-The accepted run exited with no owned worker processes left behind. A prior run
-with MiMo mem-fraction-static 0.65 OOMed AuK during inference because MiMo held
-about 92 GiB per GPU while the resident audio models were also present; 0.50 is
-the current production setting. Full-population cluster production was started
-only after this acceptance and the shared-Python runtime issue above was fixed.
+The accepted run exited with no owned worker processes left behind. Subsequent
+real 2k-shard runs showed that keeping all upstream models resident still caused
+SAM/AuK OOMs even after lowering MiMo to 0.45. Production therefore switched to
+stage-local upstream workers and MiMo 0.60: MiMo remains resident, while only the
+currently active SAM/AuK/DiariZen/ASR model is loaded on each GPU. This lifecycle
+change preserves the frozen stage semantics and durable receipts but must be
+validated by real production continuation rather than inferred from the older
+resident-pool raw-5 result.
 
 For future runtime/architecture changes, repeat a small raw-video smoke before
 resuming large production. Use a fresh smoke root for changes that alter source
