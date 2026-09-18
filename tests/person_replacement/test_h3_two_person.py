@@ -232,15 +232,16 @@ def test_two_person_appearance_and_temporal_prompt_contract():
         TWO_SOURCE_PROMPT,
     )
 
-    assert "Do not include" in TWO_SOURCE_PROMPT
+    source_prompt = " ".join(TWO_SOURCE_PROMPT.split())
+    assert "Do not include" in source_prompt
     for term in ("apparent age range", "visible skin tone", "face shape", "facial-hair state",
                  "hair length/style/texture/color", "overall build impression", "clothing"):
-        assert term in TWO_SOURCE_PROMPT
+        assert term in source_prompt
     for term in ("held/carried/touched objects", "pose", "action", "hand state", "expression", "gaze", "mouth state"):
-        assert term in TWO_SOURCE_PROMPT
-    assert "Do not infer race, ethnicity or nationality" in TWO_SOURCE_PROMPT
-    assert "complete visible single-shot progression in playback order" in TWO_SOURCE_PROMPT
-    assert "Do not omit, merge, reorder or invent actions" in TWO_SOURCE_PROMPT
+        assert term in source_prompt
+    assert "Do not infer race, ethnicity or nationality" in source_prompt
+    assert "complete visible single-shot progression in playback order" in source_prompt
+    assert "Do not omit, merge, reorder or invent actions" in source_prompt
     assert "substantial visual distance" in TWO_REPLACEMENT_PROMPT
     assert "at least five" in TWO_REPLACEMENT_PROMPT
     assert "Do not merely change hair and clothing" in TWO_REPLACEMENT_PROMPT
