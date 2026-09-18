@@ -27,9 +27,12 @@ def test_six_section_two_person_prompt(frame0):
     assert "[Shot 1]" in prompt and "[Shot 2]" not in prompt
     assert re.search(r"(?<!<)\bSubject [12]\b(?!>)", prompt) is None
     assert ("<Picture 1>" in prompt) == frame0
-    for value in (DESCRIPTIONS[2], *REPLACEMENTS, "<Subject 1>", "<Subject 2>",
-                  "do not swap the two subjects", "partially_preserved", "<Video 1>"):
+    for value in (*DESCRIPTIONS[:2], *REPLACEMENTS, "<Subject 1>", "<Subject 2>",
+                  "<Subject 3>", "<Subject 4>", "partially_preserved", "fully_preserved",
+                  "<Video 1>"):
         assert value in prompt
+    assert "<Subject 3> passes behind <Subject 4> while both hold a box" in prompt
+    assert "do not swap the two target subjects" in prompt
     if frame0:
         assert "where visible" in prompt and "first-frame" in prompt
 
@@ -234,10 +237,11 @@ def test_two_person_appearance_and_temporal_prompt_contract():
 
     source_prompt = " ".join(TWO_SOURCE_PROMPT.split())
     assert "one concise natural description" in source_prompt
-    assert "who the person is, not what the person does" in source_prompt
-    assert "Put actions, poses, held objects" in source_prompt
-    assert "complete visible single-shot progression in playback order" in source_prompt
+    assert "stable held object or pose may also be mentioned" in source_prompt
+    assert "complete action sequence in SHOT_DESCRIPTION" in source_prompt
     assert "Do not omit, merge, reorder or invent actions" in source_prompt
+    assert "Do not use person pronouns such as he, she" in source_prompt
+    assert '"<Subject 1> raises <Subject 1>\'s right hand."' in source_prompt
 
     replacement_prompt = " ".join(TWO_REPLACEMENT_PROMPT.split())
     assert "clearly different from Source 1" in replacement_prompt
@@ -245,40 +249,44 @@ def test_two_person_appearance_and_temporal_prompt_contract():
     assert "Change several visible identity characteristics" in replacement_prompt
     assert "coherent realistic combination rather than forcing every category to differ" in replacement_prompt
     assert "concise and natural" in replacement_prompt
-    assert "Describe only the replacement person's appearance and clothing" in replacement_prompt
 
-    shot = "<Subject 1> lifts the blue-and-white cup, drinks, then lowers it."
+    shot = "<Subject 1> lifts the blue-and-white cup, drinks, then lowers it while <Subject 2> watches."
     source1 = "a bald man with a mustache in a dark blue robe seated in the foreground"
     source2 = "a shaved-head man in a light gray robe standing in the background"
     replacement1 = "A middle-aged woman with auburn hair in an olive-green jacket."
     replacement2 = "An adult man with short black hair in a cream linen shirt."
     prompt = build_prompt(source1, source2, shot, replacement1, replacement2)
 
-    assert shot in prompt
     definitions = prompt.split("\n\nsummary:",1)[0]
     detailed = prompt.split("detailed_description:\n",1)[1].split("\n\noverall_soundscape:",1)[0]
-    assert "<Subject 1> is a middle-aged woman with auburn hair in an olive-green jacket." in definitions
-    assert f"In <Video 1>, <Subject 1> replaces {source1}." in definitions
-    assert "<Subject 2> is an adult man with short black hair in a cream linen shirt." in definitions
-    assert f"In <Video 1>, <Subject 2> replaces {source2}." in definitions
-    assert "<Subject 1> follows that source performer's original motion, pose, facial expression" in definitions
-    assert "<Subject 2> follows that source performer's original motion, pose, facial expression" in definitions
-    for appearance in ("middle-aged woman with auburn hair", "adult man with short black hair"):
-        assert appearance in detailed
+    assert f"<Subject 1> is {source1} in <Video 1>." in definitions
+    assert f"<Subject 2> is {source2} in <Video 1>." in definitions
+    assert "<Subject 3> is a middle-aged woman with auburn hair in an olive-green jacket." in definitions
+    assert "<Subject 4> is an adult man with short black hair in a cream linen shirt." in definitions
+    assert "<Subject 3> replaces <Subject 1>'s visible appearance" in definitions
+    assert "<Subject 4> replaces <Subject 2>'s visible appearance" in definitions
+    assert "<Subject 3> follows <Subject 1>'s original performance" in definitions
+    assert "<Subject 4> follows <Subject 2>'s original performance" in definitions
+
+    assert "<Subject 3> lifts the blue-and-white cup, drinks, then lowers it while <Subject 4> watches." in detailed
+    assert "<Subject 1> lifts the blue-and-white cup" not in detailed
+    assert "<Subject 1> (appears in [Shot 1]): partially_preserved" in prompt
+    assert "<Subject 2> (appears in [Shot 1]): partially_preserved" in prompt
+    assert "<Subject 3> (appears in [Shot 1]): fully_preserved" in prompt
+    assert "<Subject 4> (appears in [Shot 1]): fully_preserved" in prompt
+    assert "<Video 1> (source video editing): fully_preserved" in prompt
+    assert "(throughout [Shot 1])" not in prompt
+    assert "The target video is an edited version of <Video 1>" in prompt
 
     for forbidden in ("Replacement 1", "Replacement 2", "->", "..",
                       "The edit has two simultaneous requirements", "full visible edited human appearance"):
         assert forbidden not in prompt
-    for index in (1,2):
-        assert f"<Subject {index}> (throughout [Shot 1]): partially_preserved" in prompt
-    assert "<Video 1> (motion, interaction, camera and scene structure): fully_preserved" in prompt
-    assert "The target video is an edited version of <Video 1>" in prompt
     for phrase in ("same order and timing", "non-person props", "held or touched objects",
                    "hand-object contact", "camera, background, lighting and composition",
-                   "source performers' original clothing is replaced", "crossings, overlap or occlusion",
-                   "do not swap the two subjects", "Preserve source synchronized sound"):
+                   "crossings, overlap or occlusion", "do not swap the two target subjects",
+                   "Preserve source synchronized sound"):
         assert phrase in prompt
-    assert "rather than gendered pronouns such as he, she, his or her" in TWO_SOURCE_PROMPT
+    assert "rather than forcing every category to differ" in TWO_REPLACEMENT_PROMPT
 
 
 def test_two_person_video_sampling_only_and_short_motion_prompt(tmp_path, monkeypatch):
@@ -311,6 +319,6 @@ def test_shot_label_normalization_without_double_brackets(shot):
 
     prompt = build_prompt("gray hair","red coat",shot,"dark coat","short hair")
     detailed = prompt.split("detailed_description:\n",1)[1].split("\n\noverall_soundscape:",1)[0]
-    assert "<Subject 1> raises a cup while <Subject 2> remains behind." in detailed
+    assert "<Subject 3> raises a cup while <Subject 4> remains behind." in detailed
     assert "<<Subject" not in detailed
     assert "Subject 12" in build_prompt("a","b","Subject 12 stays.","c","d")
