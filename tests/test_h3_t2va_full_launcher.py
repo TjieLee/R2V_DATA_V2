@@ -290,7 +290,7 @@ def test_dry_run_exact_accepted_server_and_full_cli(sandbox):
     serve, run = map(shlex.split, result.stdout.splitlines())
     original = invoke(REPO / "scripts/run_h3_t2va_production.sh", env, "--dry-run")
     standalone = shlex.split(original.stdout.splitlines()[0])
-    assert serve[serve.index("--mem-fraction-static") + 1] == "0.60"
+    assert serve[serve.index("--mem-fraction-static") + 1] == "0.55"
     assert standalone[standalone.index("--mem-fraction-static") + 1] == "0.65"
 
     def without_mem_fraction(args):
