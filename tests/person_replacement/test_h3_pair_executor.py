@@ -25,10 +25,10 @@ def test_old_prepared_and_done_survive_group_change(tmp_path, monkeypatch):
     source.write_text('{"video_path":"a.mp4"}\n{"video_path":"b.mp4"}\n')
     argv = ["--input-jsonl",str(source),"--clips-root",str(clips),"--output-root",str(tmp_path/"out")]
     root,old = module.make_config(arguments(argv))
-    assert old["identity_details"]["contract"] == "text_two_person_pdd_fsdp2_pair_v5"
-    legacy_details = {**old["identity_details"],"contract":"text_two_person_pdd_fsdp2_pair_v4"}
+    assert old["identity_details"]["contract"] == "text_two_person_pdd_fsdp2_pair_v6"
+    legacy_details = {**old["identity_details"],"contract":"text_two_person_pdd_fsdp2_pair_v5"}
     legacy_identity = hashlib.sha256(json.dumps(legacy_details,sort_keys=True).encode()).hexdigest()
-    legacy_root = tmp_path/"legacy-v4"
+    legacy_root = tmp_path/"legacy-v5"
     atomic_json(legacy_root/"identity.json",{"identity":legacy_identity})
     with pytest.raises(ValueError,match="identity mismatch"):
         module.validate_identity(legacy_root,old)

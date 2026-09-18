@@ -3,72 +3,58 @@
 import re
 
 
+def _appearance_fragment(text):
+    return text.strip().rstrip(".").rstrip()
+
+
 def build_prompt(source1, source2, shot, replacement1, replacement2, *, frame0=False):
+    # Source anchors remain preparation provenance; never inject them into H3.
     shot = re.sub(r"(?<!<)\bSubject ([12])\b(?!>)", r"<Subject \1>", shot)
+    replacement1, replacement2 = map(_appearance_fragment, (replacement1, replacement2))
     definitions = []
-    for index, source, replacement in ((1, source1, replacement1), (2, source2, replacement2)):
+    for index, appearance in ((1, replacement1), (2, replacement2)):
         definitions.append(
-            f"<Subject {index}> is the physical performer in <Video 1> identified by {source}. "
-            f"Its intended target appearance is Replacement {index}: {replacement}. "
-            f"Replacement {index} defines the subject's full visible edited human appearance, "
-            "including facial identity impression, hairstyle/hair volume, gender presentation, "
-            "skin appearance, and wardrobe style/color/silhouette. "
-            "These replacement traits must visibly override the source subject's original identity and clothing throughout the clip. "
-            "<Video 1> remains authoritative for pose, motion, action, hand state, held/touched objects and interactions. "
-            "The label follows that same physical performer, not current screen position; "
-            "<Video 1> supplies its complete temporal motion/performance track."
-            + (" <Picture 1> additionally supplies a concrete edited first-frame visual anchor "
-               "where visible; replacement text defines the intended target identity." if frame0 else "")
+            f"<Subject {index}> is the edited version of the source performer whose actions are tracked "
+            f"as <Subject {index}> in [Shot 1] of <Video 1>. In the target video, <Subject {index}> "
+            f"appears as {appearance}. The corresponding source performer in <Video 1> provides "
+            f"<Subject {index}>'s motion, pose, expression, hand state, object interactions, position and timing."
+            + (" <Picture 1> additionally supplies an edited first-frame visual anchor where visible." if frame0 else "")
         )
-    definitions.append("<Video 1> is the source video for the target video edit and is authoritative "
-                       "for the complete action sequence, timing, pose, hand state, source objects, "
-                       "interactions, camera, scene and composition.")
+    definitions.append("<Video 1> is the source video for the target video edit and provides the original "
+                       "action sequence, interactions, camera, background, lighting and composition.")
     if frame0:
         definitions.append("<Picture 1> is the edited first-frame target appearance and composition anchor, "
                            "not the sole identity source and not evidence that both people are visible.")
-    retention = [f"<Subject {i}> (throughout its source performance): partially_preserved - "
-                 "identity/appearance replaced; exact source performance retained." for i in (1, 2)]
-    retention.append("<Video 1> (source temporal, scene and interaction structure): fully_preserved - "
-                     "preserve the complete source action order and timing, all non-target objects and held/touched props, "
-                     "hand-object contacts, camera, background, lighting and composition; only the explicitly defined "
-                     "facial identity, hair and wardrobe appearance of <Subject 1> and <Subject 2> may change.")
+    retention = [f"<Subject {i}> (throughout [Shot 1]): partially_preserved - the corresponding source "
+                 "performer's motion, pose, expression, hand state, object interactions, position and timing "
+                 "are retained from <Video 1>, while the visible identity, hair and clothing follow the "
+                 "target appearance defined above." for i in (1, 2)]
+    retention.append("<Video 1> (motion, interaction, camera and scene structure): fully_preserved - "
+                     "retain the original action order and timing, poses, hand-object contacts, non-person "
+                     "props, camera, background, lighting and composition.")
     if frame0:
         retention.append("<Picture 1> (first-frame anchor): fully_preserved - retain its edited "
                          "visible target appearances and composition at the start of the shot.")
-    # Preservation is prompt intent, not a claim of byte-copied audio: retain
-    # the existing PDD video-reference/audio-generation behavior unchanged.
+    # Preservation is prompt intent, not a claim of byte-copied audio.
     task = "video editing + keyframe completion" if frame0 else "video editing"
     anchor = "The shot begins from the edited first-frame anchor <Picture 1>. " if frame0 else ""
     return "\n\n".join([
         "subject_definitions:\n" + "\n".join(definitions),
         (f"summary:\n[{task}] The target video is an edited version of <Video 1>. "
-        "<Subject 1> -> Replacement 1; <Subject 2> -> Replacement 2. "
-        "Change the two people's identities and wardrobes so both clearly read as their assigned replacements, "
-        "while preserving all source actions, timing, poses, interactions, non-person props/objects, camera and background."),
+         "The two tracked performers keep their original performances and interactions from <Video 1>, "
+         "while their visible identities and clothing are changed to the target appearances defined for "
+         "<Subject 1> and <Subject 2>. Preserve the original action order and timing, non-person props, camera and scene."),
         "retention_analysis:\n" + "\n".join(retention),
-        "detailed_description:\nKeep the source visual style and lighting unchanged.\n[Shot 1] " + anchor + shot +
-        " The edit has two simultaneous requirements: "
-        "(1) both target subjects must clearly and consistently read as their assigned replacements, including visibly changed face, hair and clothing; "
-        "(2) the source performance, action order, timing, props, interactions, camera and scene must remain unchanged. "
-        "Do not preserve the source subject's original facial identity, hairstyle, or source wardrobe when those conflict with the assigned replacement appearance. "
-        "Even when <Subject 2> is in the background, partially blurred, or less salient, "
-        "its replacement identity, hairstyle and wardrobe must remain visibly consistent and distinguishable from the source subject. "
-        "<Video 1> is the temporal authority. Reproduce the visible source actions in the same order and timing. "
-        "Do not add, omit, reorder, merge, replace or extend actions or interactions. "
-        "Each subject follows its own original trajectory/performance. Preserve body pose/orientation, "
-        "limbs, hands, head pose, expression, gaze, mouth state, position, scale, depth, occlusion and timing. "
-        "Preserve every non-person object from the source, especially held or touched props; "
-        "however, the target subjects' source clothing is part of the edited human appearance and is not protected. "
-        "It must change to match the assigned replacement wardrobe; "
-        "replacement descriptions must never replace, add or alter source props. "
-        "Preserve the original hand-object contact and object motion throughout, as well as hand-body "
-        "and person-person contact. "
-        "During crossing, overlap or exchanged screen order, <Subject 1> remains Replacement 1 and "
-        "<Subject 2> remains Replacement 2: never cross-bind. Keep camera motion, crop, framing, background, "
-        "objects, lighting and composition unchanged. Follow the complete single-shot source timeline "
-        "without adding cuts or new dialogue; preserve source synchronized sound.",
+        "detailed_description:\nKeep the visual style and lighting of <Video 1>.\n\n[Shot 1] " + anchor +
+        f"In the target video, <Subject 1> appears as {replacement1}, while <Subject 2> appears as {replacement2}. " + shot +
+        " These actions and interactions follow <Video 1> in the same order and timing. "
+        "Keep all non-person props unchanged, including held or touched objects, and preserve the original "
+        "hand-object contact, camera, background, lighting and composition. The source performers' original "
+        "clothing is replaced by the clothing described for <Subject 1> and <Subject 2>. "
+        "Keep each subject on its corresponding source performer's track throughout crossings, overlap or "
+        "occlusion; do not swap the two subjects.",
         ("overall_soundscape:\nPreserve source synchronized sound, ambience and physical sounds; "
-        "do not invent new effects or voices because the appearances change."),
+         "do not invent new effects or voices because the appearances change."),
         "non_diegetic_music:\nPreserve existing source music; do not add new music.",
     ])
 

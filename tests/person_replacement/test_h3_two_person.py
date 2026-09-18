@@ -24,13 +24,11 @@ def test_six_section_two_person_prompt(frame0):
     assert re.findall(r"^([a-z_]+):", prompt, re.MULTILINE) == [
         "subject_definitions", "summary", "retention_analysis", "detailed_description",
         "overall_soundscape", "non_diegetic_music"]
-    assert prompt.count("[Shot 1]") == 1 and "[Shot 2]" not in prompt
-    for index in (1,2):
-        assert f"<Subject {index}> remains Replacement {index}" in prompt
+    assert "[Shot 1]" in prompt and "[Shot 2]" not in prompt
     assert re.search(r"(?<!<)\bSubject [12]\b(?!>)", prompt) is None
     assert ("<Picture 1>" in prompt) == frame0
-    for value in (*DESCRIPTIONS, *REPLACEMENTS, "<Subject 1>", "<Subject 2>", "Replacement 1",
-                  "Replacement 2", "never cross-bind", "partially_preserved", "<Video 1>"):
+    for value in (DESCRIPTIONS[2], *REPLACEMENTS, "<Subject 1>", "<Subject 2>",
+                  "do not swap the two subjects", "partially_preserved", "<Video 1>"):
         assert value in prompt
     if frame0:
         assert "where visible" in prompt and "first-frame" in prompt
@@ -244,30 +242,27 @@ def test_two_person_appearance_and_temporal_prompt_contract():
     for term in ("held/carried/touched objects", "standing/sitting state", "hand position/state", "action or motion"):
         assert term in TWO_REPLACEMENT_PROMPT
     shot = "<Subject 1> lifts the blue-and-white cup, drinks, then lowers it."
-    prompt = build_prompt("gray hair", "dark coat", shot, "burgundy coat", "curly hair")
+    source1, source2 = "UNIQUE_SOURCE_BALD_MUSTACHE_BLUE_ROBE", "UNIQUE_SOURCE_SHAVED_HEAD_GRAY_ROBE"
+    prompt = build_prompt(source1, source2, shot, "  burgundy coat.. ", "curly hair.")
     assert shot in prompt
+    for forbidden in (source1, source2, "Replacement 1", "Replacement 2", "->", "..",
+                      "The edit has two simultaneous requirements", "full visible edited human appearance",
+                      "These replacement traits must visibly override"):
+        assert forbidden not in prompt
+    definitions = prompt.split("\n\nsummary:",1)[0]
+    detailed = prompt.split("detailed_description:\n",1)[1].split("\n\noverall_soundscape:",1)[0]
+    for appearance in ("burgundy coat", "curly hair"):
+        assert appearance in definitions and appearance in detailed
     for index in (1,2):
-        assert f"Replacement {index} defines the subject's full visible edited human appearance" in prompt
-        assert f"<Subject {index}> (throughout its source performance): partially_preserved" in prompt
-    assert "<Video 1> is the temporal authority" in prompt
-    assert "Do not add, omit, reorder, merge, replace or extend actions or interactions" in prompt
-    assert "replacement descriptions must never replace, add or alter source props" in prompt
-    assert "<Video 1> (source temporal, scene and interaction structure): fully_preserved" in prompt
-    for phrase in (
-        "facial identity impression, hairstyle/hair volume, gender presentation",
-        "skin appearance, and wardrobe style/color/silhouette",
-        "These replacement traits must visibly override the source subject's original identity and clothing throughout the clip",
-        "The edit has two simultaneous requirements",
-        "including visibly changed face, hair and clothing",
-        "the target subjects' source clothing is part of the edited human appearance and is not protected",
-        "It must change to match the assigned replacement wardrobe",
-        "Do not preserve the source subject's original facial identity, hairstyle, or source wardrobe",
-        "Even when <Subject 2> is in the background, partially blurred, or less salient",
-        "its replacement identity, hairstyle and wardrobe must remain visibly consistent and distinguishable from the source subject",
-        "Preserve the original hand-object contact and object motion throughout",
-        "same order and timing",
-    ):
+        assert f"<Subject {index}> (throughout [Shot 1]): partially_preserved" in prompt
+    assert "<Video 1> (motion, interaction, camera and scene structure): fully_preserved" in prompt
+    assert "The target video is an edited version of <Video 1>" in prompt
+    for phrase in ("same order and timing", "non-person props", "held or touched objects",
+                   "hand-object contact", "camera, background, lighting and composition",
+                   "source performers' original clothing is replaced", "crossings, overlap or occlusion",
+                   "do not swap the two subjects", "Preserve source synchronized sound"):
         assert phrase in prompt
+    assert "rather than gendered pronouns such as he, she, his or her" in TWO_SOURCE_PROMPT
 
 
 def test_two_person_video_sampling_only_and_short_motion_prompt(tmp_path, monkeypatch):

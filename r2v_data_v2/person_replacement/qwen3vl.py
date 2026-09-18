@@ -25,6 +25,9 @@ For an interacted prop, preserve the visible progression of its state/contact/mo
 Do not infer race/ethnicity.
 Use English and the exact reference labels <Subject 1> and <Subject 2> in SHOT_DESCRIPTION.
 Never write bare "Subject 1" or "Subject 2" there. No shot headers, markdown or explanation.
+In SHOT_DESCRIPTION, refer to the two performers with <Subject 1> and <Subject 2>
+rather than gendered pronouns such as he, she, his or her, so the source action
+description stays independent of the target appearance.
 Return exactly three nonempty single-line labelled fields:
 SOURCE_SUBJECT_1: ...
 SOURCE_SUBJECT_2: ...
