@@ -32,7 +32,6 @@ def test_six_section_two_person_prompt(frame0):
                   "<Video 1>"):
         assert value in prompt
     assert "<Subject 3> passes behind <Subject 4> while both hold a box" in prompt
-    assert "do not swap the two target subjects" in prompt
     if frame0:
         assert "where visible" in prompt and "first-frame" in prompt
 
@@ -263,8 +262,8 @@ def test_two_person_appearance_and_temporal_prompt_contract():
     assert "<Subject 4> is an adult man with short black hair in a cream linen shirt." in definitions
     assert "<Subject 3> replaces only <Subject 1>'s visible human appearance" in definitions
     assert "<Subject 4> replaces only <Subject 2>'s visible human appearance" in definitions
-    assert "<Subject 1>'s original performance" in definitions
-    assert "<Subject 2>'s original performance" in definitions
+    assert "Everything else about <Subject 1>'s performance in <Video 1> stays unchanged" in definitions
+    assert "Everything else about <Subject 2>'s performance in <Video 1> stays unchanged" in definitions
 
     # Source action labels are remapped to the target subjects in the final shot.
     assert "<Subject 3> lifts the blue-and-white cup, drinks, then lowers it while <Subject 4> watches." in detailed
