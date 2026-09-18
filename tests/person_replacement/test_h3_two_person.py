@@ -247,12 +247,27 @@ def test_two_person_appearance_and_temporal_prompt_contract():
     prompt = build_prompt("gray hair", "dark coat", shot, "burgundy coat", "curly hair")
     assert shot in prompt
     for index in (1,2):
-        assert f"Replacement {index} defines human appearance only" in prompt
+        assert f"Replacement {index} defines the subject's full visible edited human appearance" in prompt
         assert f"<Subject {index}> (throughout its source performance): partially_preserved" in prompt
     assert "<Video 1> is the temporal authority" in prompt
     assert "Do not add, omit, reorder, merge, replace or extend actions or interactions" in prompt
     assert "replacement descriptions must never replace, add or alter source props" in prompt
     assert "<Video 1> (source temporal, scene and interaction structure): fully_preserved" in prompt
+    for phrase in (
+        "facial identity impression, hairstyle/hair volume, gender presentation",
+        "skin appearance, and wardrobe style/color/silhouette",
+        "These replacement traits must visibly override the source subject's original identity and clothing throughout the clip",
+        "The edit has two simultaneous requirements",
+        "including visibly changed face, hair and clothing",
+        "the target subjects' source clothing is part of the edited human appearance and is not protected",
+        "It must change to match the assigned replacement wardrobe",
+        "Do not preserve the source subject's original facial identity, hairstyle, or source wardrobe",
+        "Even when <Subject 2> is in the background, partially blurred, or less salient",
+        "its replacement identity, hairstyle and wardrobe must remain visibly consistent and distinguishable from the source subject",
+        "Preserve the original hand-object contact and object motion throughout",
+        "same order and timing",
+    ):
+        assert phrase in prompt
 
 
 def test_two_person_video_sampling_only_and_short_motion_prompt(tmp_path, monkeypatch):

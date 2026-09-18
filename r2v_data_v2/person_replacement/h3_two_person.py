@@ -10,7 +10,10 @@ def build_prompt(source1, source2, shot, replacement1, replacement2, *, frame0=F
         definitions.append(
             f"<Subject {index}> is the physical performer in <Video 1> identified by {source}. "
             f"Its intended target appearance is Replacement {index}: {replacement}. "
-            f"Replacement {index} defines human appearance only. "
+            f"Replacement {index} defines the subject's full visible edited human appearance, "
+            "including facial identity impression, hairstyle/hair volume, gender presentation, "
+            "skin appearance, and wardrobe style/color/silhouette. "
+            "These replacement traits must visibly override the source subject's original identity and clothing throughout the clip. "
             "<Video 1> remains authoritative for pose, motion, action, hand state, held/touched objects and interactions. "
             "The label follows that same physical performer, not current screen position; "
             "<Video 1> supplies its complete temporal motion/performance track."
@@ -28,7 +31,7 @@ def build_prompt(source1, source2, shot, replacement1, replacement2, *, frame0=F
     retention.append("<Video 1> (source temporal, scene and interaction structure): fully_preserved - "
                      "preserve the complete source action order and timing, all non-target objects and held/touched props, "
                      "hand-object contacts, camera, background, lighting and composition; only the explicitly defined "
-                     "human appearance attributes of <Subject 1> and <Subject 2> may change.")
+                     "facial identity, hair and wardrobe appearance of <Subject 1> and <Subject 2> may change.")
     if frame0:
         retention.append("<Picture 1> (first-frame anchor): fully_preserved - retain its edited "
                          "visible target appearances and composition at the start of the shot.")
@@ -40,15 +43,23 @@ def build_prompt(source1, source2, shot, replacement1, replacement2, *, frame0=F
         "subject_definitions:\n" + "\n".join(definitions),
         (f"summary:\n[{task}] The target video is an edited version of <Video 1>. "
         "<Subject 1> -> Replacement 1; <Subject 2> -> Replacement 2. "
-        "Change only the two people's identities/visible human appearances. "
-        "Preserve all source actions, timing, poses, interactions, props/objects, camera and background."),
+        "Change the two people's identities and wardrobes so both clearly read as their assigned replacements, "
+        "while preserving all source actions, timing, poses, interactions, non-person props/objects, camera and background."),
         "retention_analysis:\n" + "\n".join(retention),
         "detailed_description:\nKeep the source visual style and lighting unchanged.\n[Shot 1] " + anchor + shot +
-        " <Video 1> is the temporal authority. Reproduce the visible source actions in the same order and timing. "
+        " The edit has two simultaneous requirements: "
+        "(1) both target subjects must clearly and consistently read as their assigned replacements, including visibly changed face, hair and clothing; "
+        "(2) the source performance, action order, timing, props, interactions, camera and scene must remain unchanged. "
+        "Do not preserve the source subject's original facial identity, hairstyle, or source wardrobe when those conflict with the assigned replacement appearance. "
+        "Even when <Subject 2> is in the background, partially blurred, or less salient, "
+        "its replacement identity, hairstyle and wardrobe must remain visibly consistent and distinguishable from the source subject. "
+        "<Video 1> is the temporal authority. Reproduce the visible source actions in the same order and timing. "
         "Do not add, omit, reorder, merge, replace or extend actions or interactions. "
         "Each subject follows its own original trajectory/performance. Preserve body pose/orientation, "
         "limbs, hands, head pose, expression, gaze, mouth state, position, scale, depth, occlusion and timing. "
         "Preserve every non-person object from the source, especially held or touched props; "
+        "however, the target subjects' source clothing is part of the edited human appearance and is not protected. "
+        "It must change to match the assigned replacement wardrobe; "
         "replacement descriptions must never replace, add or alter source props. "
         "Preserve the original hand-object contact and object motion throughout, as well as hand-body "
         "and person-person contact. "
