@@ -90,7 +90,7 @@ serve=("$SGLANG_ENV/bin/sglang" serve
   --reasoning-parser mimo --tool-call-parser mimo
   --constrained-json-disable-any-whitespace --enable-deterministic-inference)
 
-run=("$R2V_PYTHON" tools/run_h3_t2va_full_production.py
+run=("$R2V_PYTHON" "$REPO_ROOT/tools/run_h3_t2va_full_production.py"
   --shot-manifest "$SHOT_MANIFEST" --clips-root "$JEA_CLIPS_ROOT"
   --source-videos-root "$JEA_SOURCE_VIDEOS_ROOT"
   --production-root "$PRODUCTION_ROOT"
