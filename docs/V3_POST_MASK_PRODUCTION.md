@@ -510,6 +510,23 @@ one model class at a time.
   job as completed (skip), terminal reject (never pay again),
   artifact-without-receipt (rerun) or digest mismatch (fail closed). Only a torn
   final JSONL line is truncated; diagnostics are append-only.
+* **Monotonic phase plan, immutable per-job record.** A phase's ready set can
+  grow across a restart, so the plan's job set only ever grows and is never
+  rejected for being a superset or subset. The invariant is per job: a job's
+  ``plan_record`` may never change once written.
+* **Every committed outcome is fully validated.** ``completed`` and
+  ``terminal_reject`` run the identical check: job identity, outcome, internal
+  artifact digests, ``result.json`` presence, its SHA256 against
+  ``result_digest``, JSON parseability, outcome agreement between result and
+  receipt, and external-artifact agreement. ``result.json`` is mandatory; a
+  receipt without a durable result fails closed instead of being treated as
+  legacy state. External artifacts are verified (absolute path, existence, size,
+  chunked streaming SHA256) rather than merely recorded —
+  ``ArtifactReference.path`` is an internal ledger-facing absolute path, and
+  public relative paths belong in ``JobResult.payload``.
+* **Schema version.** ``JOB_SCHEMA_VERSION`` is ``post_mask_resource_epoch_v3/2``.
+  There is deliberately no migration for pre-v2 development receipts; start the
+  campaign under a new tag/root.
 * **Skip model call never skips the finalizer.** A downstream job exists only
   because some finalizer ran, so a crash between receipt and finalize would
   otherwise strand every dependent job. Committed jobs persist a small
@@ -529,8 +546,18 @@ one model class at a time.
   finalizers and pending-map mutation stay on the scheduler thread in
   deterministic order, so durable state never races.
 * **Owned processes only.** Resource switches terminate only PIDs/process
-  groups this launcher created. A pre-flight port check makes an unmanaged
-  server on `8000` fail fast instead of being adopted or killed.
+  groups this launcher created, and only while that child is owned and alive;
+  an unowned PID is never signalled and an already-exited child is only reaped.
+  A pre-flight port check makes an unmanaged server on `8000` fail fast instead
+  of being adopted or killed.
+* **The semantic layer never sees GPU topology.** Runners receive a live backend
+  handle (`BooguSubprocessBackend`, `Sam3SegmentationBackend`, or the Qwen
+  endpoint), never a GPU slot id. Worker slots are loaded concurrently and
+  re-ordered by slot, so a Boogu epoch's model load is not serialised eight
+  times; any startup failure closes every already-created worker before raising.
+* **Lifecycle diagnostics survive unload.** Startup, shutdown and per-slot
+  counters are accumulated per resource and reported separately from model-job
+  counters. A resource entered twice reports both epochs.
 * **No work stealing.** Ownership is `group_index % WORLD_SIZE == RANK`, one
   shared `flock` per group. An incomplete group does not block later assigned
   groups on the same rank; the global shard-receipt barrier is unchanged.
@@ -576,6 +603,14 @@ taken from the R2V `.venv`. This server advertises the **full model path**, not
 its basename, so health checking matches the served id against
 `--served-model-name` (or `str(model_path)`) across every `/v1/models` entry,
 and `--served-model-name` can be overridden explicitly.
+
+Startup health polling uses `health_poll_interval_seconds`, default **1.0s**
+(execution-only, not part of semantic identity): a DP8 cold start can take many
+minutes and `/v1/models` must not be hit ~20 times a second.
+
+Resource lifecycle counters (start/stop counts, startup/shutdown/service wall
+seconds, per-slot job counts) are reported under `resource_lifecycle`, separate
+from the model-job `resources` counters.
 
 ### Not yet done
 
