@@ -12,8 +12,8 @@ Three epochs are supported:
     Boogu  eight persistent Boogu worker processes, one per GPU
     SAM    eight persistent SAM3 workers, one per GPU
 
-Each epoch loads once and shuts down once. ``start_count`` / ``stop_count`` are
-exposed so the launcher can assert healthy single-load behaviour.
+Exactly one heavy GPU resource is loaded at a time. :class:`ResourceEpochManager`
+owns that invariant: entering a resource fully exits the previous one.
 """
 
 from __future__ import annotations
@@ -23,10 +23,12 @@ import os
 import shutil
 import socket
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -35,9 +37,13 @@ from r2v_data_v2.v3.post_mask_epoch_jobs import (
     RESOURCE_BOOGU,
     RESOURCE_QWEN,
     RESOURCE_SAM,
-    ModelJob,
+    job_order_key,
 )
-from r2v_data_v2.v3.post_mask_epoch_scheduler import JobResult
+from r2v_data_v2.v3.post_mask_epoch_scheduler import (
+    BatchJobExecutor,
+    JobExecution,
+    JobResult,
+)
 
 
 class EpochResourceError(RuntimeError):
@@ -71,7 +77,20 @@ class EpochProcessManager(Protocol):
 
 
 class SubprocessEpochProcessManager:
-    """Spawn each resource in its own process group and stop only that group."""
+    """Spawn each resource in its own process group and stop only that group.
+
+    The ``Popen`` handle is retained so the child is always waited on and
+    reaped: after a normal stop, after a startup failure, and after a SIGTERM
+    timeout escalates to SIGKILL.
+    """
+
+    def __init__(self) -> None:
+        self._children: dict[int, subprocess.Popen] = {}
+        self.reaped: list[int] = []
+
+    @property
+    def open_children(self) -> tuple[int, ...]:
+        return tuple(sorted(self._children))
 
     def spawn(
         self,
@@ -98,32 +117,65 @@ class SubprocessEpochProcessManager:
         finally:
             if handle is not None:
                 handle.close()
-        try:
-            pgid = os.getpgid(child.pid)
-        except OSError:  # pragma: no cover - race with immediate exit
-            pgid = child.pid
-        return OwnedProcess(pid=child.pid, pgid=pgid, argv=tuple(argv), log_path=log_path)
+        self._children[child.pid] = child
+        pgid = child.pid
+        getpgid = getattr(os, "getpgid", None)
+        if getpgid is not None:
+            try:
+                pgid = getpgid(child.pid)
+            except OSError:  # pragma: no cover - race with immediate exit
+                pgid = child.pid
+        return OwnedProcess(
+            pid=child.pid, pgid=pgid, argv=tuple(argv), log_path=log_path
+        )
 
     def alive(self, process: OwnedProcess) -> bool:
+        child = self._children.get(process.pid)
+        if child is not None:
+            return child.poll() is None
         try:
             os.kill(process.pid, 0)
         except OSError:
             return False
         return True
 
-    def stop(self, process: OwnedProcess, *, grace_seconds: float) -> bool:
-        import signal
+    def _signal_group(self, process: OwnedProcess, signal_number: int) -> bool:
+        """Signal only the process group this manager created."""
+        killpg = getattr(os, "killpg", None)
+        if killpg is None:
+            return False
+        try:
+            killpg(process.pgid, signal_number)
+        except (OSError, ValueError):
+            return False
+        return True
 
-        for sig in (signal.SIGTERM, signal.SIGKILL):
+    def stop(self, process: OwnedProcess, *, grace_seconds: float) -> bool:
+        import signal as signal_module
+
+        child = self._children.get(process.pid)
+        self._signal_group(process, signal_module.SIGTERM)
+        deadline = time.monotonic() + grace_seconds
+        while time.monotonic() < deadline:
+            if not self.alive(process):
+                break
+            time.sleep(0.05)
+        if self.alive(process):
+            # SIGKILL is POSIX-only; fall back to TERM where it is absent.
+            fatal = getattr(signal_module, "SIGKILL", signal_module.SIGTERM)
+            self._signal_group(process, fatal)
+        # Always reap, even if the child ignored both signals.
+        if child is not None:
             try:
-                os.killpg(process.pgid, sig)
-            except OSError:
-                return not self.alive(process)
-            deadline = time.monotonic() + grace_seconds
-            while time.monotonic() < deadline:
-                if not self.alive(process):
-                    return True
-                time.sleep(0.2)
+                child.wait(timeout=max(grace_seconds, 1.0))
+            except subprocess.TimeoutExpired:  # pragma: no cover - hostile child
+                child.kill()
+                child.wait()
+            finally:
+                self._children.pop(process.pid, None)
+                self.reaped.append(process.pid)
+        elif not self.alive(process):
+            self.reaped.append(process.pid)
         return not self.alive(process)
 
 
@@ -217,14 +269,17 @@ class QwenEpochConfig:
     startup_timeout_seconds: float = 1800.0
     shutdown_grace_seconds: float = 30.0
     health_path: str = "/v1/models"
+    #: Explicit served model id. vLLM reports the model path on this server,
+    #: not just its basename, so callers should pass the absolute path.
+    served_model_name: str | None = None
 
     @property
     def base_url(self) -> str:
         return f"http://{self.host}:{self.port}/v1"
 
     @property
-    def served_model_id(self) -> str:
-        return Path(self.model_path).name
+    def expected_served_model_id(self) -> str:
+        return self.served_model_name or str(self.model_path)
 
     def argv(self) -> tuple[str, ...]:
         argv = [
@@ -245,6 +300,8 @@ class QwenEpochConfig:
             str(self.gpu_memory_utilization),
             "--dtype",
             self.dtype,
+            "--served-model-name",
+            self.expected_served_model_id,
         ]
         if self.allowed_local_media_path is not None:
             argv += [
@@ -270,11 +327,21 @@ def port_in_use(host: str, port: int) -> bool:
 
 
 def default_health_probe(base_url: str, *, timeout_seconds: float = 5.0) -> dict[str, Any]:
-    request = urllib.request.Request(
-        f"{base_url}/models".replace("/v1/v1/", "/v1/"), method="GET"
-    )
+    request = urllib.request.Request(f"{base_url}/models", method="GET")
     with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+def served_model_ids(payload: Mapping[str, Any]) -> tuple[str, ...]:
+    """Every model id advertised by /v1/models, not just the first one."""
+    data = payload.get("data")
+    if not isinstance(data, list):
+        return ()
+    return tuple(
+        str(item.get("id"))
+        for item in data
+        if isinstance(item, dict) and item.get("id") is not None
+    )
 
 
 class QwenEpochResource(EpochResource):
@@ -322,6 +389,7 @@ class QwenEpochResource(EpochResource):
     def _await_ready(self) -> None:
         deadline = time.monotonic() + self.config.startup_timeout_seconds
         last_error: Exception | None = None
+        expected = self.config.expected_served_model_id
         while time.monotonic() < deadline:
             if self.process is not None and not self.process_manager.alive(self.process):
                 raise EpochResourceError(
@@ -331,16 +399,14 @@ class QwenEpochResource(EpochResource):
                 payload = self.health_probe(self.config.base_url)
             except (urllib.error.URLError, OSError, ValueError) as exc:
                 last_error = exc
-                time.sleep(1.0)
+                time.sleep(0.05)
                 continue
-            served = (payload.get("data") or [{}])[0].get("id")
-            if served == self.config.served_model_id:
+            if expected in served_model_ids(payload):
                 return
             last_error = EpochResourceError(
-                f"served model {served!r} != expected "
-                f"{self.config.served_model_id!r}"
+                f"served models {served_model_ids(payload)} do not include {expected!r}"
             )
-            time.sleep(1.0)
+            time.sleep(0.05)
         raise EpochResourceError("managed Qwen startup timed out") from last_error
 
     def _stop(self) -> None:
@@ -357,8 +423,8 @@ class QwenEpochResource(EpochResource):
 # ---------------------------------------------------------------------------
 
 
-def deterministic_slot(job: ModelJob, slot_count: int) -> int:
-    """Static round-robin slot for a job; no stealing, no dynamic balancing."""
+def deterministic_slot(job: Any, slot_count: int) -> int:
+    """Static hash slot for single-job dispatch; no stealing, no balancing."""
     if slot_count <= 0:
         raise ValueError("slot_count must be positive")
     return int(job.job_id(), 16) % slot_count
@@ -406,7 +472,7 @@ class WorkerEpochResource(EpochResource):
                 close()
         self.workers = []
 
-    def handle_for(self, job: ModelJob) -> Any:
+    def handle_for(self, job: Any) -> Any:
         if not self._open:
             raise EpochResourceError(f"{self.name} epoch is not started")
         slot = deterministic_slot(job, self.slot_count)
@@ -446,26 +512,35 @@ def boogu_worker_factory(
             allowed_server_root=allowed_server_root,
         )
         backend = BooguSubprocessBackend(worker_config)
-        backend.start(stderr_log_path=Path(temporary_root) / f"boogu-slot-{slot}.log")
+        backend.start(
+            stderr_log_path=Path(temporary_root) / f"boogu-slot-{slot}.log"
+        )
         return backend
 
     return factory
 
 
-def sam_worker_factory(*, config: Any, pool: WorkerPoolConfig) -> Callable[[int, int], Any]:
-    """Build one persistent SAM3 worker bound to ``cuda:<slot>``.
+def sam_worker_factory(
+    *,
+    config: Any,
+    pool: WorkerPoolConfig,
+    backend_builder: Callable[[Any], Any] | None = None,
+) -> Callable[[int, int], Any]:
+    """Build one persistent SAM3 worker bound to the *physical* GPU id.
 
-    All eight GPUs are visible inside the epoch, so the logical device selects
-    the physical GPU. SAM prompts, mask semantics, thresholds and review
-    behaviour are inherited unchanged from the frozen backend.
+    ``gpu_ids`` may be non-contiguous, so the logical device must follow
+    ``gpu_id`` rather than the slot index. SAM prompts, mask semantics,
+    thresholds and review behaviour are inherited unchanged.
     """
 
     def factory(slot: int, gpu_id: int) -> Any:
         from dataclasses import replace
 
+        if backend_builder is not None:
+            return backend_builder(replace(config, device=f"cuda:{gpu_id}"))
         from r2v_data_v2.v3.sam3_backend import Sam3SegmentationBackend
 
-        return Sam3SegmentationBackend(replace(config, device=f"cuda:{slot}"))
+        return Sam3SegmentationBackend(replace(config, device=f"cuda:{gpu_id}"))
 
     return factory
 
@@ -499,40 +574,202 @@ def build_sam_epoch(
     pool: WorkerPoolConfig,
     process_manager: EpochProcessManager,
     log_root: Path | None = None,
+    backend_builder: Callable[[Any], Any] | None = None,
 ) -> WorkerEpochResource:
     return WorkerEpochResource(
         RESOURCE_SAM,
         pool,
         process_manager=process_manager,
-        worker_factory=sam_worker_factory(config=config, pool=pool),
+        worker_factory=sam_worker_factory(config=config, pool=pool, backend_builder=backend_builder),
         log_root=log_root,
     )
 
 
 # ---------------------------------------------------------------------------
-# Scheduler bridge
+# Batch executors
 # ---------------------------------------------------------------------------
 
 
-class HandleExecutor:
-    """Hand the semantic runner a live resource handle, nothing more.
+class SerialBatchExecutor:
+    """Run a batch one job at a time. Useful for tests and CPU-only paths."""
 
-    The runner owns prompts, inputs, seeds and accept/reject policy. This class
-    exists so the scheduler never learns what a model call means.
+    def __init__(self, runner: Callable[[Any, Any], JobResult], handle: Any = None):
+        self.runner = runner
+        self.handle = handle
+
+    def execute_batch(
+        self, jobs: Sequence[Any]
+    ) -> Mapping[str, JobExecution]:
+        results: dict[str, JobExecution] = {}
+        for job in sorted(jobs, key=job_order_key):
+            try:
+                results[job.job_id()] = JobExecution(
+                    job, self.runner(job, self.handle), None
+                )
+            except BaseException as exc:  # noqa: BLE001 - isolate per job
+                results[job.job_id()] = JobExecution(job, None, exc)
+        return results
+
+
+class QwenConcurrentExecutor:
+    """Send many requests at once to the single TP1 x DP8 vLLM endpoint."""
+
+    def __init__(
+        self,
+        runner: Callable[[Any, Any], JobResult],
+        *,
+        endpoint: Any = None,
+        max_inflight: int = 8,
+    ):
+        if max_inflight <= 0:
+            raise ValueError("max_inflight must be positive")
+        self.runner = runner
+        self.endpoint = endpoint
+        self.max_inflight = max_inflight
+
+    def execute_batch(self, jobs: Sequence[Any]) -> Mapping[str, JobExecution]:
+        ordered = sorted(jobs, key=job_order_key)
+        results: dict[str, JobExecution] = {}
+        if not ordered:
+            return results
+        workers = min(self.max_inflight, len(ordered))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(self.runner, job, self.endpoint): job for job in ordered
+            }
+            for future, job in futures.items():
+                try:
+                    results[job.job_id()] = JobExecution(job, future.result(), None)
+                except BaseException as exc:  # noqa: BLE001 - isolate per job
+                    results[job.job_id()] = JobExecution(job, None, exc)
+        return results
+
+
+class WorkerSlotExecutor:
+    """Run one sequential queue per GPU slot, with all slots concurrent.
+
+    Placement is execution-only: jobs are round-robined across slots in
+    deterministic order, so a batch never skews onto one GPU, and a slot is
+    never asked to run two jobs at once.
     """
 
     def __init__(
         self,
-        resource: EpochResource,
-        runner: Callable[[ModelJob, Any], JobResult],
-    ) -> None:
-        self.resource = resource
+        runner: Callable[[Any, Any], JobResult],
+        *,
+        slot_count: int = 8,
+        resource: Any = None,
+    ):
+        if slot_count <= 0:
+            raise ValueError("slot_count must be positive")
         self.runner = runner
+        self.slot_count = slot_count
+        self.resource = resource
 
-    def _handle(self, job: ModelJob) -> Any:
-        if isinstance(self.resource, WorkerEpochResource):
-            return self.resource.handle_for(job)
-        return self.resource
+    def execute_batch(self, jobs: Sequence[Any]) -> Mapping[str, JobExecution]:
+        ordered = sorted(jobs, key=job_order_key)
+        slots: list[list[Any]] = [[] for _ in range(self.slot_count)]
+        for index, job in enumerate(ordered):
+            slots[index % self.slot_count].append(job)
+        results: dict[str, JobExecution] = {}
+        lock = threading.Lock()
 
-    def execute(self, job: ModelJob) -> JobResult:
-        return self.runner(job, self._handle(job))
+        def run_slot(slot_id: int, queued: list[Any]) -> None:
+            for job in queued:
+                try:
+                    result = self.runner(job, slot_id)
+                except BaseException as exc:  # noqa: BLE001 - isolate per job
+                    with lock:
+                        results[job.job_id()] = JobExecution(job, None, exc)
+                else:
+                    with lock:
+                        results[job.job_id()] = JobExecution(job, result, None)
+                if self.resource is not None:
+                    counts = self.resource.slot_job_counts
+                    counts[slot_id] = counts.get(slot_id, 0) + 1
+
+        threads = [
+            threading.Thread(target=run_slot, args=(slot_id, queued), daemon=True)
+            for slot_id, queued in enumerate(slots)
+            if queued
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        return results
+
+
+# ---------------------------------------------------------------------------
+# Resource epoch manager
+# ---------------------------------------------------------------------------
+
+
+class ResourceEpochManager:
+    """Own at most one heavy GPU resource at a time for the scheduler.
+
+    The scheduler decides *when* to enter and exit; the manager owns loading,
+    unloading and the invariant that Qwen, Boogu and SAM are never resident
+    together.
+    """
+
+    def __init__(
+        self,
+        factories: Mapping[str, Callable[[], tuple[EpochResource, BatchJobExecutor]]],
+    ) -> None:
+        unknown = set(factories) - {RESOURCE_QWEN, RESOURCE_BOOGU, RESOURCE_SAM}
+        if unknown:
+            raise ValueError(f"unknown resource factories: {sorted(unknown)}")
+        self._factories = dict(factories)
+        self.timeline: list[tuple[str, str]] = []
+        self.max_open_observed = 0
+        self._open: str | None = None
+        self._resource: EpochResource | None = None
+        self._executor: BatchJobExecutor | None = None
+
+    @property
+    def open_resource(self) -> str | None:
+        return self._open
+
+    @property
+    def open_count(self) -> int:
+        return 1 if self._open is not None else 0
+
+    def enter(self, resource: str) -> BatchJobExecutor:
+        if self._open == resource and self._executor is not None:
+            return self._executor
+        self.exit_current()
+        factory = self._factories.get(resource)
+        if factory is None:
+            raise EpochResourceError(f"no resource factory for {resource!r}")
+        built_resource, executor = factory()
+        built_resource.start()
+        self._resource = built_resource
+        self._executor = executor
+        self._open = resource
+        self.timeline.append(("start", resource))
+        self.max_open_observed = max(self.max_open_observed, 1)
+        return executor
+
+    def exit_current(self) -> None:
+        if self._open is None:
+            return
+        resource = self._open
+        self._open = None
+        try:
+            if self._resource is not None:
+                self._resource.stop()
+        finally:
+            self.timeline.append(("stop", resource))
+            self._resource = None
+            self._executor = None
+
+    def close(self) -> None:
+        self.exit_current()
+
+    def counters(self) -> dict[str, Any]:
+        return {
+            "timeline": [f"{action}:{name}" for action, name in self.timeline],
+            "max_open_observed": self.max_open_observed,
+            "open_resource": self._open,
+        }
