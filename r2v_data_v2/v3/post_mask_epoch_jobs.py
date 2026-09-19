@@ -161,10 +161,101 @@ class ModelJob:
         ).hexdigest()
 
     def job_id(self) -> str:
-        return self.identity()[:16]
+        """Full identity digest.
+
+        This value is used as the pending-map key, the artifact directory name,
+        the receipt key and the dependency address, so it must not be truncated:
+        a 64-bit prefix would be a plausible collision surface across the tens
+        of thousands of model jobs a campaign can produce.
+        """
+        return self.identity()
 
     def plan_record(self) -> dict[str, Any]:
         payload = self.identity_payload()
         payload["job_id"] = self.job_id()
         payload["job_identity"] = self.identity()
         return payload
+
+
+def job_order_key(job: ModelJob) -> tuple[str, str, int, str]:
+    """Deterministic execution order. Execution-only, never part of identity."""
+    return (job.clip_uid, job.job_type, job.attempt_index, job.job_id())
+
+
+@dataclass(frozen=True)
+class ArtifactReference:
+    """A durable artifact that lives *outside* the epoch ledger.
+
+    Production images (Boogu candidates, completion candidates) stay in the
+    existing RunStorage / completion-candidate paths. The ledger records their
+    path and digest for receipt validation instead of copying every generated
+    PNG a second time.
+    """
+
+    path: str
+    sha256: str
+    size: int | None = None
+
+    def record(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {"path": self.path, "sha256": self.sha256}
+        if self.size is not None:
+            payload["size"] = self.size
+        return payload
+
+    @classmethod
+    def from_record(cls, value: Mapping[str, Any]) -> ArtifactReference:
+        return cls(
+            path=str(value["path"]),
+            sha256=str(value["sha256"]),
+            size=None if value.get("size") is None else int(value["size"]),
+        )
+
+
+@dataclass(frozen=True)
+class JobResult:
+    """Outcome of one model call.
+
+    ``payload`` is the small semantic result the CPU finalizer needs in order to
+    be replayable after a crash. It is persisted as ``result.json``; it must
+    never carry large media or base64 blobs. Binary outputs are published as
+    ordinary ledger artifacts, and artifacts that legitimately live in the
+    production tree are referenced, not copied.
+    """
+
+    outcome: str
+    artifacts: Mapping[str, bytes] = field(default_factory=dict)
+    external_artifacts: tuple[ArtifactReference, ...] = ()
+    payload: Mapping[str, Any] = field(default_factory=dict)
+    detail: str = ""
+
+    @property
+    def committed(self) -> bool:
+        return self.outcome in (OUTCOME_COMPLETED, OUTCOME_TERMINAL_REJECT)
+
+    def durable(self) -> dict[str, Any]:
+        return {
+            "outcome": self.outcome,
+            "detail": self.detail,
+            "result_payload": dict(self.payload),
+            "external_artifacts": [ref.record() for ref in self.external_artifacts],
+        }
+
+    @classmethod
+    def from_durable(
+        cls, value: Mapping[str, Any], *, artifacts: Mapping[str, str] | None = None
+    ) -> JobResult:
+        """Rebuild a result for finalizer replay.
+
+        Byte artifacts are not reloaded: the finalizer only needs the small
+        semantic payload, and the receipt already binds their digests.
+        """
+        return cls(
+            outcome=str(value["outcome"]),
+            artifacts={} if artifacts is None else artifacts,
+            external_artifacts=tuple(
+                ArtifactReference.from_record(item)
+                for item in value.get("external_artifacts", [])
+            ),
+            payload=dict(value.get("result_payload") or {}),
+            detail=str(value.get("detail", "")),
+        )

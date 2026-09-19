@@ -7,7 +7,8 @@ Layout below the existing Post-Mask campaign state root:
         phases/<phase-id>/
             plan.json
             receipts.jsonl
-            artifacts/<...>
+            artifacts/<job-id>/<...>
+            artifacts/<job-id>/result.json
 
 The commit protocol is deliberately strict so that an interruption at any point
 can only ever lose *one* job's worth of work, never corrupt a finished one:
@@ -20,14 +21,22 @@ can only ever lose *one* job's worth of work, never corrupt a finished one:
     -> append durable receipt
     -> flush + fsync
 
-Consequences used by :meth:`PhaseLedger.classify`:
+Consequences used by :meth:`GroupLedger.classify`:
 
-* valid receipt whose artifacts still match -> completed, skip the model call;
-* ``terminal_reject`` receipt -> durable quality outcome, never paid for again;
+* valid receipt whose artifacts still match -> completed, skip the model call
+  but still replay the CPU finalizer;
+* ``terminal_reject`` receipt -> durable quality outcome, never paid for again,
+  finalizer still replayed;
 * artifact present but no valid receipt -> the job did not commit, rerun it;
 * receipt/artifact digest mismatch -> fail closed with a diagnostic, never
   silently accept;
 * absent receipt and absent artifact -> ordinary pending job.
+
+Skipping a model call is **not** the same as skipping the finalizer. A
+downstream job only exists because some finalizer created it, so a crash
+between the receipt and the finalizer would otherwise strand every dependent
+job forever. Committed results are therefore persisted as ``result.json`` and
+replayed on resume.
 
 History is append-only. Diagnostics are never deleted. The only mutation ever
 performed on ``receipts.jsonl`` is truncating a single torn **final** line left
@@ -49,12 +58,15 @@ from typing import Any
 from r2v_data_v2.v3.post_mask_epoch_jobs import (
     COMMITTED_OUTCOMES,
     OUTCOME_COMPLETED,
+    ArtifactReference,
+    JobResult,
     canonical_json,
 )
 
 _PLAN_NAME = "plan.json"
 _RECEIPTS_NAME = "receipts.jsonl"
 _ARTIFACTS_NAME = "artifacts"
+_RESULT_NAME = "result.json"
 
 # Resume classification results.
 STATE_PENDING = "pending"
@@ -147,6 +159,7 @@ class JobState:
     state: str
     receipt: dict[str, Any] | None = None
     detail: str = ""
+    phase_id: str | None = None
 
     @property
     def skippable(self) -> bool:
@@ -161,6 +174,8 @@ class Receipt:
     outcome: str
     artifact_digests: Mapping[str, str]
     model_identity: str
+    result_digest: str = ""
+    external_artifacts: tuple[ArtifactReference, ...] = ()
 
     def record(self) -> dict[str, Any]:
         return {
@@ -170,7 +185,25 @@ class Receipt:
             "outcome": self.outcome,
             "artifact_digests": dict(sorted(self.artifact_digests.items())),
             "model_identity": self.model_identity,
+            "result_digest": self.result_digest,
+            "external_artifacts": [ref.record() for ref in self.external_artifacts],
         }
+
+    @classmethod
+    def from_record(cls, value: Mapping[str, Any]) -> Receipt:
+        return cls(
+            job_id=str(value.get("job_id", "")),
+            job_identity=str(value.get("job_identity", "")),
+            resource=str(value.get("resource", "")),
+            outcome=str(value.get("outcome", "")),
+            artifact_digests=dict(value.get("artifact_digests") or {}),
+            model_identity=str(value.get("model_identity", "")),
+            result_digest=str(value.get("result_digest", "")),
+            external_artifacts=tuple(
+                ArtifactReference.from_record(item)
+                for item in value.get("external_artifacts", [])
+            ),
+        )
 
 
 class PhaseLedger:
@@ -217,10 +250,14 @@ class PhaseLedger:
         return jobs
 
     # -- receipts ---------------------------------------------------------
-    def receipts(self) -> dict[str, dict[str, Any]]:
+    def load_receipts(self) -> tuple[list[dict[str, Any]], bool]:
         records, repaired = _load_jsonl(self.receipts_path)
         if repaired:
             self.torn_receipts_repaired += 1
+        return records, repaired
+
+    def receipts(self) -> dict[str, dict[str, Any]]:
+        records, _ = self.load_receipts()
         latest: dict[str, dict[str, Any]] = {}
         for record in records:
             key = record.get("job_id")
@@ -277,7 +314,75 @@ class PhaseLedger:
                 ).hexdigest()
         return result
 
+    # -- durable result ---------------------------------------------------
+    def publish_result(self, job: Any, result: JobResult) -> str:
+        """Persist the small semantic result so the finalizer can be replayed."""
+        payload = (canonical_json(result.durable()) + "\n").encode("utf-8")
+        atomic_write_bytes(self.artifact_path(job.job_id(), _RESULT_NAME), payload)
+        return hashlib.sha256(payload).hexdigest()
+
+    def load_result(self, job: Any) -> JobResult | None:
+        path = self.artifact_path(job.job_id(), _RESULT_NAME)
+        if not path.is_file():
+            return None
+        try:
+            payload = json.loads(path.read_text())
+        except ValueError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return JobResult.from_durable(payload)
+
     # -- resume -----------------------------------------------------------
+    def verify_committed(self, job: Any, receipt: Mapping[str, Any]) -> JobState:
+        """Validate a receipt already held in memory.
+
+        Separate from :meth:`classify` so the group ledger can resolve resume
+        decisions from its index without re-parsing ``receipts.jsonl`` for every
+        job. Only this job's own artifact directory is touched.
+        """
+        if receipt.get("job_identity") != job.identity():
+            return JobState(
+                STATE_MISMATCH,
+                dict(receipt),
+                "receipt job identity does not match the planned job",
+                phase_id=self.root.name,
+            )
+        outcome = receipt.get("outcome")
+        if outcome not in COMMITTED_OUTCOMES:
+            return JobState(
+                STATE_PENDING,
+                dict(receipt),
+                "receipt is not a committed outcome",
+                phase_id=self.root.name,
+            )
+        if outcome == OUTCOME_COMPLETED:
+            expected = receipt.get("artifact_digests") or {}
+            if expected != self.artifact_digests(job.job_id()):
+                return JobState(
+                    STATE_MISMATCH,
+                    dict(receipt),
+                    "receipt artifact digests do not match artifacts on disk",
+                    phase_id=self.root.name,
+                )
+            expected_result = str(receipt.get("result_digest", ""))
+            result_path = self.artifact_path(job.job_id(), _RESULT_NAME)
+            if expected_result and (
+                not result_path.is_file()
+                or hashlib.sha256(result_path.read_bytes()).hexdigest()
+                != expected_result
+            ):
+                return JobState(
+                    STATE_MISMATCH,
+                    dict(receipt),
+                    "durable result is missing or does not match its receipt",
+                    phase_id=self.root.name,
+                )
+            return JobState(STATE_COMPLETED, dict(receipt), phase_id=self.root.name)
+        return JobState(
+            STATE_TERMINAL_REJECT, dict(receipt), phase_id=self.root.name
+        )
+
     def classify(self, job: Any) -> JobState:
         receipt = self.receipts().get(job.job_id())
         if receipt is None:
@@ -288,16 +393,23 @@ class PhaseLedger:
                 detail="artifact without receipt"
                 if self.artifact_digests(job.job_id())
                 else "",
+                phase_id=self.root.name,
             )
         if receipt.get("job_identity") != job.identity():
             return JobState(
                 STATE_MISMATCH,
                 receipt,
                 "receipt job identity does not match the planned job",
+                phase_id=self.root.name,
             )
         outcome = receipt.get("outcome")
         if outcome not in COMMITTED_OUTCOMES:
-            return JobState(STATE_PENDING, receipt, "receipt is not a committed outcome")
+            return JobState(
+                STATE_PENDING,
+                receipt,
+                "receipt is not a committed outcome",
+                phase_id=self.root.name,
+            )
         if outcome == OUTCOME_COMPLETED:
             expected = receipt.get("artifact_digests") or {}
             actual = self.artifact_digests(job.job_id())
@@ -306,9 +418,25 @@ class PhaseLedger:
                     STATE_MISMATCH,
                     receipt,
                     "receipt artifact digests do not match artifacts on disk",
+                    phase_id=self.root.name,
                 )
-            return JobState(STATE_COMPLETED, receipt)
-        return JobState(STATE_TERMINAL_REJECT, receipt)
+            result_path = self.artifact_path(job.job_id(), _RESULT_NAME)
+            expected_result = str(receipt.get("result_digest", ""))
+            if expected_result and (
+                not result_path.is_file()
+                or hashlib.sha256(result_path.read_bytes()).hexdigest()
+                != expected_result
+            ):
+                return JobState(
+                    STATE_MISMATCH,
+                    receipt,
+                    "durable result is missing or does not match its receipt",
+                    phase_id=self.root.name,
+                )
+            return JobState(
+                STATE_COMPLETED, receipt, phase_id=self.root.name
+            )
+        return JobState(STATE_TERMINAL_REJECT, receipt, phase_id=self.root.name)
 
     def commit(
         self,
@@ -316,6 +444,8 @@ class PhaseLedger:
         *,
         outcome: str,
         artifact_digests: Mapping[str, str],
+        result_digest: str = "",
+        external_artifacts: tuple[ArtifactReference, ...] = (),
     ) -> Receipt:
         receipt = Receipt(
             job_id=job.job_id(),
@@ -324,6 +454,8 @@ class PhaseLedger:
             outcome=outcome,
             artifact_digests=dict(artifact_digests),
             model_identity=job.model_identity,
+            result_digest=result_digest,
+            external_artifacts=external_artifacts,
         )
         self.append_receipt(receipt)
         return receipt
@@ -334,14 +466,25 @@ class GroupLedger:
 
     A conditional second attempt is planned in a later phase than the job that
     unlocked it, so resume has to locate a receipt without knowing in advance
-    which phase produced it. Phases are scanned in lexical order and the newest
-    matching receipt wins; an artifact/receipt mismatch is still evaluated
-    against the phase that owns the artifact.
+    which phase produced it.
+
+    A group can contain tens of thousands of model jobs, so the expensive part
+    (walking phases and parsing ``receipts.jsonl``) happens **once** during
+    :meth:`refresh`. Afterwards :meth:`classify` is an in-memory lookup plus an
+    artifact check scoped to that one job. Commits update the index
+    incrementally, so a long run never re-scans.
     """
 
     def __init__(self, root: Path) -> None:
         self.root = Path(root)
+        self.jsonl_load_calls = 0
+        self.refresh_calls = 0
+        self._receipt_index: dict[str, dict[str, Any]] = {}
+        self._job_phase_index: dict[str, str] = {}
+        self._artifact_owners: dict[str, str] = {}
+        self._dirty = True
 
+    # -- indexing ---------------------------------------------------------
     @property
     def phases_root(self) -> Path:
         return self.root / "phases"
@@ -356,27 +499,85 @@ class GroupLedger:
             sorted(path.name for path in self.phases_root.iterdir() if path.is_dir())
         )
 
-    def _index(self) -> dict[str, tuple[str, dict[str, Any]]]:
-        index: dict[str, tuple[str, dict[str, Any]]] = {}
+    def refresh(self, *, force: bool = False) -> None:
+        """Rebuild the in-memory indexes. Cheap when nothing changed."""
+        if not self._dirty and not force:
+            return
+        self.refresh_calls += 1
+        receipt_index: dict[str, dict[str, Any]] = {}
+        job_phase: dict[str, str] = {}
+        artifact_owners: dict[str, str] = {}
         for phase_id in self.phase_ids():
-            for job_id, receipt in self.phase(phase_id).receipts().items():
-                index[job_id] = (phase_id, receipt)
-        return index
+            ledger = self.phase(phase_id)
+            records, _repaired = ledger.load_receipts()
+            self.jsonl_load_calls += 1
+            for record in records:
+                job_id = record.get("job_id")
+                if isinstance(job_id, str):
+                    receipt_index[job_id] = record
+                    job_phase[job_id] = phase_id
+            artifacts_root = ledger.artifacts_root
+            if artifacts_root.is_dir():
+                for entry in artifacts_root.iterdir():
+                    if entry.is_dir():
+                        artifact_owners[entry.name] = phase_id
+        self._receipt_index = receipt_index
+        self._job_phase_index = job_phase
+        self._artifact_owners = artifact_owners
+        self._dirty = False
+
+    def _rebuild_artifact_owners(self) -> None:
+        owners: dict[str, str] = {}
+        for phase_id in self.phase_ids():
+            artifacts_root = self.phase(phase_id).artifacts_root
+            if artifacts_root.is_dir():
+                for entry in artifacts_root.iterdir():
+                    if entry.is_dir():
+                        owners[entry.name] = phase_id
+        self._artifact_owners = owners
+
+    def note_commit(self, phase_id: str, receipt: Receipt) -> None:
+        """Keep the index current without re-reading every phase."""
+        self._receipt_index[receipt.job_id] = receipt.record()
+        self._job_phase_index[receipt.job_id] = phase_id
+        self._artifact_owners[receipt.job_id] = phase_id
+
+    def note_artifact(self, phase_id: str, job_id: str) -> None:
+        self._artifact_owners[job_id] = phase_id
+
+    # -- lookup -----------------------------------------------------------
+    def phase_for(self, job: Any) -> str | None:
+        self.refresh()
+        return self._job_phase_index.get(job.job_id())
 
     def classify(self, job: Any) -> JobState:
-        entry = self._index().get(job.job_id())
-        if entry is None:
-            for phase_id in self.phase_ids():
-                if self.phase(phase_id).artifact_digests(job.job_id()):
-                    return JobState(
-                        STATE_RERUN_NO_RECEIPT, detail="artifact without receipt"
-                    )
-            return JobState(STATE_PENDING)
-        phase_id, receipt = entry
-        state = self.phase(phase_id).classify(job)
-        if state.state == STATE_PENDING and not state.detail:
-            return JobState(STATE_PENDING, receipt, f"located in {phase_id}")
-        return state
+        self.refresh()
+        job_id = job.job_id()
+        receipt = self._receipt_index.get(job_id)
+        if receipt is None:
+            owner = self._artifact_owners.get(job_id)
+            if owner is None:
+                # An artifact directory may have been created by a run that
+                # never wrote a receipt and refreshed no index yet.
+                self._rebuild_artifact_owners()
+                owner = self._artifact_owners.get(job_id)
+            if owner is None:
+                return JobState(STATE_PENDING)
+            return JobState(
+                STATE_RERUN_NO_RECEIPT,
+                detail="artifact without receipt",
+                phase_id=owner,
+            )
+        phase_id = self._job_phase_index.get(job_id) or ""
+        return self.phase(phase_id).verify_committed(job, receipt)
+
+    def load_committed_result(self, job: Any) -> JobResult | None:
+        """Rebuild the result of an already-committed job for finalizer replay."""
+        self.refresh()
+        phase_id = self._job_phase_index.get(job.job_id())
+        if phase_id is None:
+            return None
+        return self.phase(phase_id).load_result(job)
 
     @property
     def torn_receipts_repaired(self) -> int:

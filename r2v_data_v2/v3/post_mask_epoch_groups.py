@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -195,6 +196,9 @@ def record_group_outcome(
     with path.open("a", encoding="utf-8") as handle:
         handle.write(payload + "\n")
         handle.flush()
+        # Shared filesystems make an un-fsynced append lose the outcome when
+        # the node dies; history stays append-only either way.
+        os.fsync(handle.fileno())
     return path
 
 

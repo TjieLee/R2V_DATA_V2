@@ -1,6 +1,6 @@
 """Resource-epoch execution substrate: identity, durability and scheduling.
 
-These tests cover the new ``resource_epoch_v3`` substrate only. They never
+These tests cover the ``resource_epoch_v3`` substrate only. They never
 construct a real model, GPU or endpoint, and they do not touch the frozen
 semantic modules. Semantic equivalence against the existing scheduler is a
 separate, server-side validation and is explicitly *not* claimed here.
@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -32,11 +33,13 @@ from r2v_data_v2.v3.post_mask_epoch_jobs import (
     RESOURCE_BOOGU,
     RESOURCE_QWEN,
     RESOURCE_SAM,
+    JobResult,
     ModelJob,
 )
 from r2v_data_v2.v3.post_mask_epoch_scheduler import (
+    DEFAULT_WINDOW_SIZE,
     EpochDiagnostics,
-    JobResult,
+    JobExecution,
     ResourceEpochScheduler,
     SchedulerError,
 )
@@ -66,7 +69,7 @@ def _job(
     clip_uid: str = "clip-000001",
     attempt_index: int = 0,
     seed: int | None = None,
-    semantic: object = None,
+    semantic: Any = None,
     shard: str = "shard-000000000-000000999",
     model: str = "boogu-image-0.1",
     target: dict | None = None,
@@ -84,17 +87,48 @@ def _job(
     )
 
 
-class _FakeExecutor:
-    """Deterministic fake resource; records every call it is asked to make."""
+class _FakeBatchExecutor:
+    """Deterministic fake resource; records every batch it is asked to run."""
 
-    def __init__(self, resource: str, outcomes: dict[str, JobResult] | None = None):
-        self.resource = resource
+    def __init__(self, outcomes: dict[str, JobResult] | None = None):
         self.calls: list[ModelJob] = []
+        self.batch_sizes: list[int] = []
         self.outcomes = outcomes or {}
 
-    def execute(self, job: ModelJob) -> JobResult:
-        self.calls.append(job)
-        return self.outcomes.get(job.job_id(), JobResult(OUTCOME_COMPLETED, {"out.png": b"ok"}))
+    def execute_batch(self, jobs):
+        self.batch_sizes.append(len(jobs))
+        results = {}
+        for index, job in enumerate(jobs):
+            self.calls.append(job)
+            outcome = self.outcomes.get(
+                job.job_id(),
+                JobResult(
+                    OUTCOME_COMPLETED,
+                    {"out.png": b"ok"},
+                    payload={"index": index},
+                ),
+            )
+            results[job.job_id()] = JobExecution(job, outcome, None)
+        return results
+
+    def call_ids(self) -> list[str]:
+        return [job.job_id() for job in self.calls]
+
+
+def _scheduler(
+    tmp_path: Path,
+    executors: dict,
+    finalize,
+    *,
+    window_size: int = DEFAULT_WINDOW_SIZE,
+    ledger: GroupLedger | None = None,
+) -> ResourceEpochScheduler:
+    return ResourceEpochScheduler(
+        ledger=ledger if ledger is not None else GroupLedger(tmp_path / "group"),
+        executors=executors,
+        finalize=finalize,
+        window_size=window_size,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -120,7 +154,6 @@ def test_group_identity_excludes_rank_world_host_gpu_and_pid():
     blob = json.dumps(groups[0].identity_payload()).lower()
     for forbidden in ("rank", "world", "host", "gpu", "pid", "cuda"):
         assert forbidden not in blob
-    # Static ownership must not leak into identity either.
     for rank, world in ((0, 1), (1, 4), (3, 7)):
         owned = assigned_groups(groups, rank=rank, world_size=world)
         for group in owned:
@@ -160,6 +193,13 @@ def test_assignment_rejects_invalid_topology():
 # --------------------------------------------------------------------------
 # 2. job identity
 # --------------------------------------------------------------------------
+
+
+def test_job_id_is_the_full_identity_digest():
+    job = _job()
+    assert job.job_id() == job.identity()
+    assert len(job.job_id()) == 64
+    assert set(job.job_id()) <= set("0123456789abcdef")
 
 
 def test_job_identity_is_stable_and_seed_aware():
@@ -206,8 +246,13 @@ def test_job_rejects_unknown_resource():
         _job(resource="flux")
 
 
+def test_many_jobs_have_unique_ids():
+    jobs = [_job(clip_uid=f"clip-{index:06d}") for index in range(2000)]
+    assert len({job.job_id() for job in jobs}) == 2000
+
+
 # --------------------------------------------------------------------------
-# 3. durable ledger: crash injection and resume
+# 3. durable ledger
 # --------------------------------------------------------------------------
 
 
@@ -226,8 +271,7 @@ def test_missing_plan_fails_closed(tmp_path: Path):
 
 
 def test_pending_job_has_no_receipt(tmp_path: Path):
-    ledger = PhaseLedger(tmp_path / "phase")
-    assert ledger.classify(_job()).state == STATE_PENDING
+    assert PhaseLedger(tmp_path / "phase").classify(_job()).state == STATE_PENDING
 
 
 def test_completed_receipt_with_matching_artifacts_skips_model_call(tmp_path: Path):
@@ -244,7 +288,6 @@ def test_artifact_without_receipt_is_treated_as_incomplete(tmp_path: Path):
     ledger = PhaseLedger(tmp_path / "phase")
     job = _job()
     ledger.publish_artifact(job.job_id(), "out.png", b"payload")
-    # Crash between artifact rename and receipt append.
     assert ledger.classify(job).state == STATE_RERUN_NO_RECEIPT
     assert not ledger.classify(job).skippable
 
@@ -258,13 +301,6 @@ def test_terminal_reject_is_durable_and_never_paid_again(tmp_path: Path):
     assert state.skippable
 
 
-def test_retryable_failure_leaves_no_successful_receipt(tmp_path: Path):
-    ledger = PhaseLedger(tmp_path / "phase")
-    job = _job()
-    # A retryable exception must not append a receipt at all.
-    assert ledger.classify(job).state == STATE_PENDING
-
-
 def test_digest_mismatch_fails_closed(tmp_path: Path):
     ledger = PhaseLedger(tmp_path / "phase")
     job = _job()
@@ -276,25 +312,43 @@ def test_digest_mismatch_fails_closed(tmp_path: Path):
     assert not state.skippable
 
 
+def test_missing_durable_result_fails_closed(tmp_path: Path):
+    ledger = PhaseLedger(tmp_path / "phase")
+    job = _job()
+    digest = ledger.publish_artifact(job.job_id(), "out.png", b"payload")
+    ledger.commit(
+        job,
+        outcome=OUTCOME_COMPLETED,
+        artifact_digests={"out.png": digest},
+        result_digest="deadbeef",
+    )
+    assert ledger.classify(job).state == STATE_MISMATCH
+
+
+def test_durable_result_round_trips(tmp_path: Path):
+    ledger = PhaseLedger(tmp_path / "phase")
+    job = _job()
+    result = JobResult(OUTCOME_COMPLETED, payload={"accepted": True, "score": 0.5})
+    digest = ledger.publish_result(job, result)
+    assert digest
+    loaded = ledger.load_result(job)
+    assert loaded is not None
+    assert loaded.outcome == OUTCOME_COMPLETED
+    assert loaded.payload == {"accepted": True, "score": 0.5}
+
+
 def test_torn_final_receipt_line_is_repaired_and_earlier_lines_kept(tmp_path: Path):
+    from r2v_data_v2.v3.post_mask_epoch_state import _load_jsonl
+
     ledger = PhaseLedger(tmp_path / "phase")
     first = _job(clip_uid="clip-000001")
     ledger.commit(first, outcome=OUTCOME_COMPLETED, artifact_digests={})
-    ledger.receipts_path.write_bytes(
-        ledger.receipts_path.read_bytes()
-        + b'{"job_id":"torn","job_ide'
-    )
-    loaded, was_repaired = _load_with_repair(ledger)
+    with ledger.receipts_path.open("ab") as handle:
+        handle.write(b'{"job_id":"torn","job_ide')
+    loaded, was_repaired = _load_jsonl(ledger.receipts_path)
     assert was_repaired is True
     assert [r["job_id"] for r in loaded] == [first.job_id()]
-    # The surviving receipt is still usable after repair.
     assert ledger.classify(first).state == STATE_COMPLETED
-
-
-def _load_with_repair(ledger: PhaseLedger):
-    from r2v_data_v2.v3.post_mask_epoch_state import _load_jsonl
-
-    return _load_jsonl(ledger.receipts_path)
 
 
 def test_receipts_are_append_only_across_resume(tmp_path: Path):
@@ -311,11 +365,10 @@ def test_receipts_are_append_only_across_resume(tmp_path: Path):
 def test_group_ledger_locates_receipt_across_phases(tmp_path: Path):
     group = GroupLedger(tmp_path / "group")
     job = _job()
-    group.phase("r000-booqu").commit(
+    group.phase("r000-boogu").commit(
         job, outcome=OUTCOME_TERMINAL_REJECT, artifact_digests={}
     )
-    state = group.classify(job)
-    assert state.state == STATE_TERMINAL_REJECT
+    assert group.classify(job).state == STATE_TERMINAL_REJECT
 
 
 def test_group_ledger_reports_artifact_without_receipt(tmp_path: Path):
@@ -323,6 +376,44 @@ def test_group_ledger_reports_artifact_without_receipt(tmp_path: Path):
     job = _job()
     group.phase("r000-boogu").publish_artifact(job.job_id(), "out.png", b"x")
     assert group.classify(job).state == STATE_RERUN_NO_RECEIPT
+
+
+def test_group_ledger_classify_does_not_rescan_jsonl_per_job(tmp_path, monkeypatch):
+    """200 committed jobs must not cause 200 JSONL parses."""
+    import r2v_data_v2.v3.post_mask_epoch_state as state_module
+
+    root = tmp_path / "group"
+    ledger = GroupLedger(root)
+    jobs = [_job(clip_uid=f"clip-{index:06d}") for index in range(200)]
+    phase = ledger.phase("r000-boogu")
+    phase.write_plan(jobs)
+    for job in jobs:
+        artifact = phase.publish_artifact(job.job_id(), "out.png", b"x")
+        result = phase.publish_result(
+            job, JobResult(OUTCOME_COMPLETED, payload={"ok": True})
+        )
+        receipt = phase.commit(
+            job,
+            outcome=OUTCOME_COMPLETED,
+            artifact_digests={"out.png": artifact, "result.json": result},
+            result_digest=result,
+        )
+        ledger.note_commit("r000-boogu", receipt)
+
+    calls = {"count": 0}
+    real = state_module._load_jsonl
+
+    def counting(path):
+        calls["count"] += 1
+        return real(path)
+
+    monkeypatch.setattr(state_module, "_load_jsonl", counting)
+    fresh = GroupLedger(root)
+    for job in jobs:
+        assert fresh.classify(job).state == STATE_COMPLETED
+    # One refresh over one phase, not one parse per job.
+    assert calls["count"] <= 2
+    assert fresh.jsonl_load_calls <= 2
 
 
 # --------------------------------------------------------------------------
@@ -359,31 +450,23 @@ def test_campaign_identity_is_semantic_only():
 
 
 # --------------------------------------------------------------------------
-# 5. scheduler: no speculative calls, fixed point, deterministic switching
+# 5. scheduler
 # --------------------------------------------------------------------------
 
 
-def _scheduler(tmp_path: Path, executors: dict, finalize):
-    return ResourceEpochScheduler(
-        ledger=GroupLedger(tmp_path / "group"),
-        executors=executors,
-        finalize=finalize,
-    )
-
-
 def test_scheduler_runs_ready_jobs_and_commits_receipts(tmp_path: Path):
-    boogu = _FakeExecutor(RESOURCE_BOOGU)
-    scheduler = _scheduler(tmp_path, {RESOURCE_BOOGU: boogu}, lambda job, result: ())
+    executor = _FakeBatchExecutor()
+    scheduler = _scheduler(tmp_path, {RESOURCE_BOOGU: executor}, lambda job, result: ())
     job = _job()
     outcome = scheduler.run([job])
     assert outcome["completed"] is True
-    assert [j.job_id() for j in boogu.calls] == [job.job_id()]
+    assert executor.call_ids() == [job.job_id()]
     assert GroupLedger(tmp_path / "group").classify(job).state == STATE_COMPLETED
 
 
 def test_scheduler_never_creates_conditional_second_attempt_speculatively(tmp_path: Path):
-    boogu = _FakeExecutor(RESOURCE_BOOGU)
-    qwen = _FakeExecutor(RESOURCE_QWEN)
+    boogu = _FakeBatchExecutor()
+    qwen = _FakeBatchExecutor()
     second = _job(job_type="background_removal_candidate2", attempt_index=1, seed=2)
 
     def finalize(job: ModelJob, result: JobResult) -> tuple[ModelJob, ...]:
@@ -394,27 +477,27 @@ def test_scheduler_never_creates_conditional_second_attempt_speculatively(tmp_pa
         tmp_path, {RESOURCE_BOOGU: boogu, RESOURCE_QWEN: qwen}, finalize
     )
     scheduler.run([_job()])
-    assert [j.job_id() for j in boogu.calls] == [_job().job_id()]
+    assert boogu.call_ids() == [_job().job_id()]
     assert qwen.calls == []
-    assert second.job_id() not in {j.job_id() for j in boogu.calls}
+    assert second.job_id() not in boogu.call_ids()
 
 
 def test_conditional_second_attempt_runs_only_when_policy_unlocks_it(tmp_path: Path):
-    boogu = _FakeExecutor(RESOURCE_BOOGU)
+    executor = _FakeBatchExecutor()
     second = _job(job_type="background_removal_candidate2", attempt_index=1, seed=2)
 
     def finalize(job: ModelJob, result: JobResult) -> tuple[ModelJob, ...]:
         return (second,) if job.attempt_index == 0 else ()
 
-    scheduler = _scheduler(tmp_path, {RESOURCE_BOOGU: boogu}, finalize)
+    scheduler = _scheduler(tmp_path, {RESOURCE_BOOGU: executor}, finalize)
     scheduler.run([_job()])
-    assert len(boogu.calls) == 2
-    assert boogu.calls[1].job_id() == second.job_id()
+    assert len(executor.calls) == 2
+    assert executor.calls[1].job_id() == second.job_id()
 
 
 def test_fixed_point_keeps_same_resource_before_switching(tmp_path: Path):
-    qwen = _FakeExecutor(RESOURCE_QWEN)
-    boogu = _FakeExecutor(RESOURCE_BOOGU)
+    qwen = _FakeBatchExecutor()
+    boogu = _FakeBatchExecutor()
     second_qwen = _job(job_type="removal_judge2", resource=RESOURCE_QWEN, attempt_index=1)
 
     def finalize(job: ModelJob, result: JobResult) -> tuple[ModelJob, ...]:
@@ -425,7 +508,6 @@ def test_fixed_point_keeps_same_resource_before_switching(tmp_path: Path):
     )
     outcome = scheduler.run([_job(resource=RESOURCE_BOOGU)])
     assert outcome["completed"] is True
-    # Boogu first (only ready work), then both Qwen jobs in one epoch.
     assert len(boogu.calls) == 1
     assert len(qwen.calls) == 1
     assert scheduler.diagnostics.resource_switches == 1
@@ -433,7 +515,10 @@ def test_fixed_point_keeps_same_resource_before_switching(tmp_path: Path):
 
 def test_resource_selection_is_deterministic_across_runs(tmp_path: Path):
     def run(root: Path) -> list[str]:
-        executors = {r: _FakeExecutor(r) for r in (RESOURCE_QWEN, RESOURCE_BOOGU, RESOURCE_SAM)}
+        executors = {
+            name: _FakeBatchExecutor()
+            for name in (RESOURCE_QWEN, RESOURCE_BOOGU, RESOURCE_SAM)
+        }
         jobs = [
             _job(resource=RESOURCE_SAM, job_type="sam_review", clip_uid="clip-000001"),
             _job(resource=RESOURCE_QWEN, job_type="qwen_judge", clip_uid="clip-000002"),
@@ -441,67 +526,38 @@ def test_resource_selection_is_deterministic_across_runs(tmp_path: Path):
         ]
         scheduler = _scheduler(root, executors, lambda job, result: ())
         scheduler.run(jobs)
-        return [phase for phase in GroupLedger(root / "group").phase_ids()]
+        return list(GroupLedger(root / "group").phase_ids())
 
     assert run(tmp_path / "a") == run(tmp_path / "b")
 
 
 def test_completed_jobs_are_skipped_on_second_run(tmp_path: Path):
-    executors = {RESOURCE_BOOGU: _FakeExecutor(RESOURCE_BOOGU)}
+    executor = _FakeBatchExecutor()
     job = _job()
-    first = _scheduler(tmp_path, executors, lambda job_, result: ())
-    first.run([job])
-    second = _scheduler(tmp_path, executors, lambda job_, result: ())
+    _scheduler(tmp_path, {RESOURCE_BOOGU: executor}, lambda j, r: ()).run([job])
+    second = _scheduler(tmp_path, {RESOURCE_BOOGU: executor}, lambda j, r: ())
     outcome = second.run([job])
     assert outcome["completed"] is True
-    assert len(executors[RESOURCE_BOOGU].calls) == 1
+    assert len(executor.calls) == 1
     assert second.diagnostics.resume["receipts_reused"] >= 1
 
 
-def test_retryable_job_is_retried_on_next_run(tmp_path: Path):
-    job = _job()
-    executors = {
-        RESOURCE_BOOGU: _FakeExecutor(
-            RESOURCE_BOOGU, {job.job_id(): JobResult(OUTCOME_RETRYABLE_FAILED)}
-        )
-    }
-    outcome = _scheduler(tmp_path, executors, lambda j, r: ()).run([job])
-    assert outcome["completed"] is False
-    assert outcome["unresolved_job_ids"] == [job.job_id()]
-    # No receipt was written, so resume must pay for the call again.
-    assert GroupLedger(tmp_path / "group").classify(job).state == STATE_PENDING
-
-
-def test_scheduler_fails_closed_on_receipt_mismatch(tmp_path: Path):
-    job = _job()
-    ledger = GroupLedger(tmp_path / "group")
-    executors = {RESOURCE_BOOGU: _FakeExecutor(RESOURCE_BOOGU)}
-    _scheduler(tmp_path, executors, lambda j, r: ()).run([job])
-    # Simulate a tampered artifact after a durable commit.
-    ledger.phase(ledger.phase_ids()[0]).publish_artifact(
-        job.job_id(), "out.png", b"tampered"
+def test_execution_uses_bounded_windows(tmp_path: Path):
+    jobs = [_job(clip_uid=f"clip-{index:03d}") for index in range(10)]
+    executor = _FakeBatchExecutor()
+    scheduler = _scheduler(
+        tmp_path, {RESOURCE_BOOGU: executor}, lambda j, r: (), window_size=4
     )
-    with pytest.raises(SchedulerError):
-        _scheduler(tmp_path, executors, lambda j, r: ()).run([job])
-
-
-def test_terminal_reject_is_not_paid_again_on_resume(tmp_path: Path):
-    job = _job(job_type="removal_judge", resource=RESOURCE_QWEN)
-    executors = {
-        RESOURCE_QWEN: _FakeExecutor(
-            RESOURCE_QWEN, {job.job_id(): JobResult(OUTCOME_TERMINAL_REJECT)}
-        )
-    }
-    _scheduler(tmp_path, executors, lambda j, r: ()).run([job])
-    again = _scheduler(tmp_path, executors, lambda j, r: ())
-    outcome = again.run([job])
+    outcome = scheduler.run(jobs)
     assert outcome["completed"] is True
-    assert len(executors[RESOURCE_QWEN].calls) == 1
+    assert max(executor.batch_sizes) <= 4
+    assert sum(executor.batch_sizes) == 10
+    assert scheduler.diagnostics.window_count == 3
 
 
 def test_diagnostics_report_required_counters(tmp_path: Path):
-    executors = {RESOURCE_BOOGU: _FakeExecutor(RESOURCE_BOOGU)}
-    scheduler = _scheduler(tmp_path, executors, lambda j, r: ())
+    executor = _FakeBatchExecutor()
+    scheduler = _scheduler(tmp_path, {RESOURCE_BOOGU: executor}, lambda j, r: ())
     scheduler.diagnostics.group_count = 48
     outcome = scheduler.run([_job()])
     summary = outcome["diagnostics"]
@@ -510,6 +566,7 @@ def test_diagnostics_report_required_counters(tmp_path: Path):
         "group_completed",
         "group_incomplete",
         "phase_count",
+        "window_count",
         "resource_switches",
         "conditional_attempts",
         "resume",
@@ -540,7 +597,7 @@ def test_scheduler_rejects_unknown_executor(tmp_path: Path):
     with pytest.raises(ValueError):
         ResourceEpochScheduler(
             ledger=GroupLedger(tmp_path / "g"),
-            executors={"flux": _FakeExecutor("flux")},
+            executors={"flux": _FakeBatchExecutor()},
             finalize=lambda j, r: (),
         )
 
@@ -548,8 +605,205 @@ def test_scheduler_rejects_unknown_executor(tmp_path: Path):
 def test_scheduler_fails_clearly_when_a_ready_resource_has_no_executor(tmp_path: Path):
     scheduler = ResourceEpochScheduler(
         ledger=GroupLedger(tmp_path / "g"),
-        executors={RESOURCE_QWEN: _FakeExecutor(RESOURCE_QWEN)},
+        executors={RESOURCE_QWEN: _FakeBatchExecutor()},
         finalize=lambda j, r: (),
     )
     with pytest.raises(SchedulerError, match="no executor configured"):
         scheduler.run([_job(resource=RESOURCE_SAM)])
+
+
+def test_scheduler_fails_closed_on_receipt_mismatch(tmp_path: Path):
+    job = _job()
+    ledger = GroupLedger(tmp_path / "group")
+    executor = _FakeBatchExecutor()
+    _scheduler(tmp_path, {RESOURCE_BOOGU: executor}, lambda j, r: ()).run([job])
+    ledger.phase(ledger.phase_ids()[0]).publish_artifact(
+        job.job_id(), "out.png", b"tampered"
+    )
+    with pytest.raises(SchedulerError):
+        _scheduler(tmp_path, {RESOURCE_BOOGU: executor}, lambda j, r: ()).run([job])
+
+
+# --------------------------------------------------------------------------
+# 6. resume: skip model call != skip finalizer
+# --------------------------------------------------------------------------
+
+
+def test_receipt_before_finalize_crash_replays_finalizer(tmp_path: Path):
+    """Case A: crash after receipt, before finalize, must not strand children."""
+    first = _job(job_type="removal")
+    second = _job(job_type="removal_candidate2", attempt_index=1, seed=2)
+    state = {"fail": True, "finalized": []}
+    executor = _FakeBatchExecutor()
+
+    def finalize(job: ModelJob, result: JobResult) -> tuple[ModelJob, ...]:
+        if state["fail"]:
+            raise RuntimeError("simulated crash before finalize")
+        state["finalized"].append(job.job_id())
+        return (second,) if job.job_id() == first.job_id() else ()
+
+    broken = _scheduler(tmp_path, {RESOURCE_BOOGU: executor}, finalize)
+    outcome = broken.run([first])
+    assert outcome["completed"] is False
+    assert executor.call_ids() == [first.job_id()]
+
+    state["fail"] = False
+    resumed = _scheduler(tmp_path, {RESOURCE_BOOGU: executor}, finalize)
+    outcome = resumed.run([first])
+    assert outcome["completed"] is True
+    # The model was called once for `first`; only `second` is new work.
+    assert executor.call_ids() == [first.job_id(), second.job_id()]
+    assert state["finalized"] == [first.job_id(), second.job_id()]
+    assert resumed.diagnostics.resume["finalizers_replayed"] >= 1
+
+
+def test_terminal_reject_replays_finalizer_without_repeat_call(tmp_path: Path):
+    """Case B: terminal reject is durable and its finalizer is replayed."""
+    job = _job(job_type="removal_judge", resource=RESOURCE_QWEN)
+    executor = _FakeBatchExecutor(
+        {job.job_id(): JobResult(OUTCOME_TERMINAL_REJECT, payload={"rejected": True})}
+    )
+    state = {"fail": True, "seen": []}
+
+    def finalize(job: ModelJob, result: JobResult) -> tuple[ModelJob, ...]:
+        if state["fail"]:
+            raise RuntimeError("simulated crash before finalize")
+        state["seen"].append((job.job_id(), result.outcome, dict(result.payload)))
+        return ()
+
+    _scheduler(tmp_path, {RESOURCE_QWEN: executor}, finalize).run([job])
+    assert len(executor.calls) == 1
+    state["fail"] = False
+    outcome = _scheduler(tmp_path, {RESOURCE_QWEN: executor}, finalize).run([job])
+    assert outcome["completed"] is True
+    assert len(executor.calls) == 1
+    assert state["seen"] == [
+        (job.job_id(), OUTCOME_TERMINAL_REJECT, {"rejected": True})
+    ]
+
+
+def test_finalizer_failure_is_retried_on_restart_not_replayed_model(tmp_path: Path):
+    """Case C: a finalizer crash must not cost another model call."""
+    job = _job()
+    executor = _FakeBatchExecutor()
+    state = {"fail": True, "finalized": 0}
+
+    def finalize(job: ModelJob, result: JobResult) -> tuple[ModelJob, ...]:
+        if state["fail"]:
+            raise RuntimeError("finalizer boom")
+        state["finalized"] += 1
+        return ()
+
+    failed = _scheduler(tmp_path, {RESOURCE_BOOGU: executor}, finalize)
+    outcome = failed.run([job])
+    assert outcome["completed"] is False
+    assert failed.diagnostics.resume["finalizer_failures"] == 1
+
+    state["fail"] = False
+    resumed = _scheduler(tmp_path, {RESOURCE_BOOGU: executor}, finalize)
+    outcome = resumed.run([job])
+    assert outcome["completed"] is True
+    assert executor.call_ids() == [job.job_id()]
+    assert state["finalized"] == 1
+
+
+def test_finalizer_replay_is_idempotent(tmp_path: Path):
+    job = _job()
+    executor = _FakeBatchExecutor()
+    counter = {"calls": 0}
+
+    def finalize(job: ModelJob, result: JobResult) -> tuple[ModelJob, ...]:
+        counter["calls"] += 1
+        return (_job(job_type="downstream", clip_uid="clip-000009"),)
+
+    for _ in range(3):
+        outcome = _scheduler(tmp_path, {RESOURCE_BOOGU: executor}, finalize).run([job])
+        assert outcome["completed"] is True
+    # One model call, one downstream job, replays do not duplicate either.
+    assert executor.call_ids() == [job.job_id(), _job(
+        job_type="downstream", clip_uid="clip-000009"
+    ).job_id()]
+
+
+# --------------------------------------------------------------------------
+# 7. retryable: once per invocation, retry on restart
+# --------------------------------------------------------------------------
+
+
+def test_retryable_job_runs_once_per_invocation(tmp_path: Path):
+    retryable = _job()
+    healthy = _job(clip_uid="clip-000002")
+    executor = _FakeBatchExecutor(
+        {retryable.job_id(): JobResult(OUTCOME_RETRYABLE_FAILED)}
+    )
+    outcome = _scheduler(
+        tmp_path, {RESOURCE_BOOGU: executor}, lambda j, r: ()
+    ).run([retryable, healthy])
+    calls = executor.call_ids()
+    assert calls.count(retryable.job_id()) == 1
+    assert calls.count(healthy.job_id()) == 1
+    assert outcome["completed"] is False
+    assert outcome["unresolved_job_ids"] == [retryable.job_id()]
+    # No receipt was written, so resume must pay for the call again.
+    assert GroupLedger(tmp_path / "group").classify(retryable).state == STATE_PENDING
+
+
+def test_retryable_job_is_retried_after_restart(tmp_path: Path):
+    retryable = _job()
+    healthy = _job(clip_uid="clip-000002")
+    executor = _FakeBatchExecutor(
+        {retryable.job_id(): JobResult(OUTCOME_RETRYABLE_FAILED)}
+    )
+    _scheduler(tmp_path, {RESOURCE_BOOGU: executor}, lambda j, r: ()).run(
+        [retryable, healthy]
+    )
+    outcome = _scheduler(tmp_path, {RESOURCE_BOOGU: executor}, lambda j, r: ()).run(
+        [retryable, healthy]
+    )
+    calls = executor.call_ids()
+    assert calls.count(retryable.job_id()) == 2
+    # The healthy sibling stays committed and is never re-paid.
+    assert calls.count(healthy.job_id()) == 1
+    assert outcome["completed"] is False
+
+
+def test_terminal_reject_is_not_paid_again_on_resume(tmp_path: Path):
+    job = _job(job_type="removal_judge", resource=RESOURCE_QWEN)
+    executor = _FakeBatchExecutor(
+        {job.job_id(): JobResult(OUTCOME_TERMINAL_REJECT)}
+    )
+    _scheduler(tmp_path, {RESOURCE_QWEN: executor}, lambda j, r: ()).run([job])
+    outcome = _scheduler(tmp_path, {RESOURCE_QWEN: executor}, lambda j, r: ()).run([job])
+    assert outcome["completed"] is True
+    assert len(executor.calls) == 1
+
+
+def test_model_exception_does_not_abort_sibling_jobs(tmp_path: Path):
+    boom = _job()
+    healthy = _job(clip_uid="clip-000002")
+
+    class _FlakyExecutor:
+        def __init__(self):
+            self.calls: list[ModelJob] = []
+
+        def execute_batch(self, jobs):
+            results = {}
+            for job in jobs:
+                self.calls.append(job)
+                if job.job_id() == boom.job_id():
+                    results[job.job_id()] = JobExecution(
+                        job, None, RuntimeError("model infra failure")
+                    )
+                else:
+                    results[job.job_id()] = JobExecution(
+                        job, JobResult(OUTCOME_COMPLETED, {"out.png": b"ok"}), None
+                    )
+            return results
+
+    executor = _FlakyExecutor()
+    outcome = _scheduler(tmp_path, {RESOURCE_BOOGU: executor}, lambda j, r: ()).run(
+        [boom, healthy]
+    )
+    assert len(executor.calls) == 2
+    assert outcome["unresolved_job_ids"] == [boom.job_id()]
+    assert GroupLedger(tmp_path / "group").classify(healthy).state == STATE_COMPLETED
