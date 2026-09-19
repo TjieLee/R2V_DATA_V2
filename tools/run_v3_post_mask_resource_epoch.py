@@ -26,9 +26,10 @@ live in the frozen semantic modules and must be reused, never duplicated.
 
 Background removal now has a real runner:
 ``r2v_data_v2.v3.post_mask_epoch_removal:run_removal_epoch``. It reuses the
-shared ``remove.py`` semantics and drains only the remove stage; reference edit
-and subject attributes still have no runner, so a campaign that needs them
-still reports its groups incomplete. Use ``--dry-run`` to plan only.
+shared ``remove.py`` semantics and always returns ``completed=False``, because
+the downstream phases (pair, reference edit, reference integrity, instruction,
+subject attributes, export) are not wired yet; a group is therefore recorded
+incomplete even when the remove stage finished. Use ``--dry-run`` to plan only.
 """
 
 from __future__ import annotations

@@ -588,6 +588,17 @@ publication helpers, so there is still exactly one implementation of the prompt,
 the candidate preparation, the judge call, the attempt record and the
 accept/reject rule.
 
+v1 supports one topology only and refuses anything else:
+
+```
+BOOGU epoch   GPU0-7, eight persistent Boogu workers      -> generation
+QWEN epoch    one managed Qwen3-VL server, TP1 x DP8      -> judging
+```
+
+`config.remove.backend` must be `boogu_image_0_1_edit_turbo`. The legacy
+`remove_backgrounds()` still supports the Qwen Image Edit remover unchanged;
+the epoch adapter raises instead of loading a second heavy remover.
+
 The split is three-sided:
 
 | Side | Owner | Runs where |
@@ -596,41 +607,61 @@ The split is three-sided:
 | model job | `RemovalEpochRunner.run` | inside a resource epoch |
 | finalize | `RemovalEpochRunner.finalize` | CPU, scheduler thread |
 
-Job graph for one clip with `candidate_seeds = (s0, s1)`:
+Job graph for one clip with two configured candidate seeds:
 
 ```
-generate(s0) -> judge(s0) -> accepted -> publish ready_removed
-                          \-> rejected -> generate(s1) -> judge(s1) -> ...
-all candidates rejected -> publish rejected
+generate(c0) -> judge(c0) -> accepted -> publish ready_removed
+                          \-> rejected -> generate(c1) -> judge(c1) -> ...
+                          \-> failed   -> generate(c1) -> ...
+
+exhausted, all rejected -> publish rejected (this cycle's attempts only)
+exhausted, any failed   -> publish retryable (carried-over attempts), clip stays pending_remove
 ```
 
-* Only candidate 0 is seeded. A later candidate is a *different* job type
-  (`background_removal_candidate2`) and only exists because a judge committed a
-  rejection, so a conditional second attempt can never be speculated.
-* Generation runs on the Boogu worker epoch when `remove.backend` is Boogu and
-  on the Qwen epoch otherwise; the judge always runs on the Qwen epoch. A Boogu
-  worker handle is wrapped by `BooguBackgroundRemovalBackend`, so the shared
-  prompt and generation-size rules apply unchanged.
-* A generation or judge failure is **retryable**, never terminal: the job stays
-  unresolved, the group is reported incomplete, and the next launch retries it.
-  A rejected candidate is a **terminal reject** for that candidate: its verdict
-  is durable and is never paid for again.
+Attempt semantics are legacy-equivalent, not "retry on restart":
+
+* **Boogu seeds are random and durable-once.** The first plan of an attempt draws
+  `new_boogu_seed()` once and writes it to
+  `<group>/semantic/background_remove/<shard>/<clip>/attempt-<n>.json`; a restart
+  reads the same seed instead of re-randomising, so job identity is stable.
+  `candidate_seeds` only decides how many candidates a cycle has.
+* **A semantic failure is a committed attempt.** A generation or judge exception
+  produces a durable `BackgroundRemovalAttempt(status="failed")` with
+  `OUTCOME_COMPLETED`, and the finalizer walks to the next candidate. Only the
+  inability to form a legal semantic result -- missing artifact, digest mismatch,
+  unreadable committed result -- is `retryable_failed` at the scheduler level.
+* **`attempt_index` is global and monotonic**
+  (`len(state.removal_attempts) + cycle_index`), so a second launch plans new jobs
+  instead of colliding with the previous cycle's receipts. `cycle_index` (0/1)
+  alone decides `background_removal_generate` vs `background_removal_candidate2`.
+* **Finalizers are idempotent** and reconstruction is ledger-only: a restart
+  rebuilds the current cycle's attempts from committed `JobResult`s and the seed
+  plan, never from in-memory state.
+* **Every model job re-validates its own identity before calling a model.** The
+  semantic inputs are recomputed and compared with `job.input_digest`; the judge
+  additionally compares the job's `candidate_sha256`, the generation result's
+  digest and the actual artifact bytes. Any disagreement makes the job
+  retryable **without** a model call.
 * The candidate PNG is published as a ledger artifact
   (`artifacts/<job-id>/candidate.png`), never into the production run tree, so
-  production cleanup can never invalidate a receipt.
-* Finalizers are idempotent: replaying one against a clip that is already
-  `ready_removed` or `rejected` unlocks nothing and does not raise, so a crash
-  immediately after publication cannot strand a group.
+  production cleanup can never invalidate a receipt. Candidate retention is a
+  future disk optimisation, not a correctness issue.
+* Before seeding, each canonical shard is initialized and hydrated through the
+  existing production helpers (`initialize_shard`, `hydrate_shard`) under the
+  production shard lock, so a fresh run root produces real Stage2 clips instead
+  of silently planning zero removal jobs.
 
-Two intentional differences from the legacy serial loop:
+The only intentional metric difference: per-attempt `runtime_seconds` measures
+generation active seconds plus judge active seconds, while the legacy loop
+measured one wall interval spanning both plus candidate preparation. Queue wait,
+resource-switch and epoch wait were never included and still are not.
 
-* the Boogu seed is derived deterministically from
-  `(clip_uid, candidate index, configured seed)` instead of being drawn at
-  random, because a random seed cannot be part of a resumable job identity;
-* per-attempt `runtime_seconds` measures generation active seconds plus judge
-  active seconds. The legacy loop measured one wall interval spanning both plus
-  candidate preparation; queue wait, resource-switch and epoch wait were never
-  included and still are not.
+**The remove stage can complete; a group cannot.** Downstream phases (pair,
+reference edit, reference integrity, instruction, subject attributes, export) are
+not wired, so the runner always returns `completed=False` with
+`remove_completed=True` and a reason; the generic launcher therefore never
+records `GROUP_COMPLETED`. The remove stage emits
+`post_mask_removal_epoch_completed` as a stage event instead.
 
 Run it as the launcher's job runner:
 
@@ -640,9 +671,10 @@ POST_MASK_JOB_RUNNER=r2v_data_v2.v3.post_mask_epoch_removal:run_removal_epoch \
 bash scripts/run_v3_post_mask_resource_epoch.sh
 ```
 
-Reference edit and subject attributes still have no epoch runner; until they do,
-that command only drains the remove stage, and the launcher reports the group
-incomplete whenever another phase has pending work.
+The managed Qwen server is the foundation `QwenEpochResource` (`TP1`, `DP8`,
+port 8000) with `served_model_name == config.qwen.background_remove_judge.model`,
+so `/v1/models` and the judge request agree on one model identity. No image-edit
+remover is ever loaded by the epoch.
 
 ### Running it
 
