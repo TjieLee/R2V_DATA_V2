@@ -24,10 +24,11 @@ live in the frozen semantic modules and must be reused, never duplicated.
 
     --job-runner package.module:callable
 
-The callable receives ``(group, ledger, emit)`` and returns a mapping with at
-least ``{"completed": bool}``. It owns executors, job seeding and CPU
-finalizers, and therefore owns every prompt, seed, threshold and accept/reject
-rule. Until that runner exists for the real phases, run with ``--dry-run``.
+Background removal now has a real runner:
+``r2v_data_v2.v3.post_mask_epoch_removal:run_removal_epoch``. It reuses the
+shared ``remove.py`` semantics and drains only the remove stage; reference edit
+and subject attributes still have no runner, so a campaign that needs them
+still reports its groups incomplete. Use ``--dry-run`` to plan only.
 """
 
 from __future__ import annotations
