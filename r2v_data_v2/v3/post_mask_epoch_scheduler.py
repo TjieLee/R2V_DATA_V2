@@ -61,7 +61,7 @@ CONDITIONAL_JOB_TYPES = (
 class JobExecutor(Protocol):
     """One model resource. Owns its own lifecycle; the scheduler only calls it."""
 
-    def execute(self, job: ModelJob) -> JobResult:  # noqa: D102 - protocol
+    def execute(self, job: ModelJob) -> JobResult:
         ...
 
 

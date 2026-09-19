@@ -81,7 +81,7 @@ def _load_runner(spec: str):
     module = import_module(module_name)
     runner = getattr(module, attribute)
     if not callable(runner):
-        raise ValueError(f"--job-runner {spec} is not callable")
+        raise TypeError(f"--job-runner {spec} is not callable")
     return runner
 
 

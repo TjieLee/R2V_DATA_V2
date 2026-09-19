@@ -461,9 +461,9 @@ def sam_worker_factory(*, config: Any, pool: WorkerPoolConfig) -> Callable[[int,
     """
 
     def factory(slot: int, gpu_id: int) -> Any:
-        from r2v_data_v2.v3.sam3_backend import Sam3SegmentationBackend
-
         from dataclasses import replace
+
+        from r2v_data_v2.v3.sam3_backend import Sam3SegmentationBackend
 
         return Sam3SegmentationBackend(replace(config, device=f"cuda:{slot}"))
 
