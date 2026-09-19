@@ -152,6 +152,33 @@ def _load_jsonl(path: Path) -> tuple[list[dict[str, Any]], bool]:
     return records, repaired
 
 
+def verify_external_artifact(
+    reference: ArtifactReference, *, chunk_size: int = 1 << 20
+) -> bool:
+    """Validate a referenced production artifact without copying it.
+
+    ``ArtifactReference.path`` is an internal ledger-facing absolute filesystem
+    path, never a public schema path; public relative paths belong in
+    ``JobResult.payload``. Reads are chunked so a large generated PNG is never
+    pulled into memory in one go.
+    """
+    path = Path(reference.path)
+    if not path.is_absolute():
+        return False
+    if not path.is_file():
+        return False
+    if reference.size is not None and path.stat().st_size != reference.size:
+        return False
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(chunk_size), b""):
+                digest.update(chunk)
+    except OSError:
+        return False
+    return digest.hexdigest() == reference.sha256
+
+
 @dataclass(frozen=True)
 class JobState:
     """Resume decision for one planned job."""
@@ -222,23 +249,52 @@ class PhaseLedger:
         return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
 
     def write_plan(self, jobs: Sequence[Any]) -> str:
-        """Create or validate the immutable phase plan; never overwrite."""
-        digest = self.plan_hash(jobs)
-        payload = {
-            "plan_hash": digest,
-            "job_count": len(jobs),
-            "jobs": [job.plan_record() for job in jobs],
-        }
-        if self.plan_path.is_file():
-            existing = json.loads(self.plan_path.read_text())
-            if existing != payload:
+        """Create or grow the phase plan. Never shrink it, never rewrite a job.
+
+        A phase's ready set can grow across a restart: a retryable sibling that
+        succeeds on the second run unlocks jobs that did not exist the first
+        time. Treating the batch as an immutable whole therefore produced a
+        false ``PlanMismatchError``. The invariant that actually matters is
+        per-job: a job's ``plan_record`` may never change once written.
+
+        So the plan's job set is monotonic and each record is immutable.
+        """
+        current = {job.job_id(): job.plan_record() for job in jobs}
+        if not self.plan_path.is_file():
+            ordered = [current[key] for key in sorted(current)]
+            payload = {
+                "plan_hash": hashlib.sha256(
+                    canonical_json(ordered).encode("utf-8")
+                ).hexdigest(),
+                "job_count": len(ordered),
+                "jobs": ordered,
+            }
+            self.root.mkdir(parents=True, exist_ok=True)
+            atomic_write_json(self.plan_path, payload)
+            return payload["plan_hash"]
+
+        existing = json.loads(self.plan_path.read_text())
+        merged: dict[str, dict[str, Any]] = {}
+        for record in existing.get("jobs", []):
+            job_id = record.get("job_id")
+            if isinstance(job_id, str):
+                merged[job_id] = record
+        for job_id, record in current.items():
+            known = merged.get(job_id)
+            if known is not None and known != record:
                 raise PlanMismatchError(
-                    f"immutable phase plan changed at {self.plan_path}"
+                    f"immutable job plan changed for {job_id} at {self.plan_path}"
                 )
-            return digest
-        self.root.mkdir(parents=True, exist_ok=True)
-        atomic_write_json(self.plan_path, payload)
-        return digest
+            merged[job_id] = record
+        ordered = [merged[key] for key in sorted(merged)]
+        payload = {
+            "plan_hash": hashlib.sha256(canonical_json(ordered).encode("utf-8")).hexdigest(),
+            "job_count": len(ordered),
+            "jobs": ordered,
+        }
+        if payload != existing:
+            atomic_write_json(self.plan_path, payload)
+        return payload["plan_hash"]
 
     def read_plan(self) -> list[dict[str, Any]]:
         if not self.plan_path.is_file():
@@ -365,25 +421,86 @@ class PhaseLedger:
                     "receipt artifact digests do not match artifacts on disk",
                     phase_id=self.root.name,
                 )
-            expected_result = str(receipt.get("result_digest", ""))
-            result_path = self.artifact_path(job.job_id(), _RESULT_NAME)
-            if expected_result and (
-                not result_path.is_file()
-                or hashlib.sha256(result_path.read_bytes()).hexdigest()
-                != expected_result
-            ):
+        # From here on every committed outcome is validated identically.
+        # result.json is mandatory: a receipt without a durable result cannot
+        # be replayed, and replaying nothing would silently drop downstream
+        # jobs, so it fails closed rather than being treated as legacy state.
+        result_path = self.artifact_path(job.job_id(), _RESULT_NAME)
+        expected_result = str(receipt.get("result_digest", ""))
+        if not expected_result:
+            return JobState(
+                STATE_MISMATCH,
+                dict(receipt),
+                "receipt has no durable result digest",
+                phase_id=self.root.name,
+            )
+        if not result_path.is_file():
+            return JobState(
+                STATE_MISMATCH,
+                dict(receipt),
+                "durable result is missing",
+                phase_id=self.root.name,
+            )
+        if (
+            hashlib.sha256(result_path.read_bytes()).hexdigest()
+            != expected_result
+        ):
+            return JobState(
+                STATE_MISMATCH,
+                dict(receipt),
+                "durable result does not match its receipt",
+                phase_id=self.root.name,
+            )
+        try:
+            payload = json.loads(result_path.read_text())
+        except ValueError:
+            return JobState(
+                STATE_MISMATCH,
+                dict(receipt),
+                "durable result is not parseable",
+                phase_id=self.root.name,
+            )
+        if not isinstance(payload, dict):
+            return JobState(
+                STATE_MISMATCH,
+                dict(receipt),
+                "durable result is not an object",
+                phase_id=self.root.name,
+            )
+        if payload.get("outcome") != receipt.get("outcome"):
+            return JobState(
+                STATE_MISMATCH,
+                dict(receipt),
+                "durable result outcome disagrees with its receipt",
+                phase_id=self.root.name,
+            )
+        receipt_externals = [
+            item for item in receipt.get("external_artifacts", [])
+        ]
+        if receipt_externals != list(payload.get("external_artifacts", [])):
+            return JobState(
+                STATE_MISMATCH,
+                dict(receipt),
+                "durable result external artifacts disagree with the receipt",
+                phase_id=self.root.name,
+            )
+        for item in receipt_externals:
+            reference = ArtifactReference.from_record(item)
+            if not verify_external_artifact(reference):
                 return JobState(
                     STATE_MISMATCH,
                     dict(receipt),
-                    "durable result is missing or does not match its receipt",
+                    f"external artifact failed validation: {reference.path}",
                     phase_id=self.root.name,
                 )
+        if outcome == OUTCOME_COMPLETED:
             return JobState(STATE_COMPLETED, dict(receipt), phase_id=self.root.name)
         return JobState(
             STATE_TERMINAL_REJECT, dict(receipt), phase_id=self.root.name
         )
 
     def classify(self, job: Any) -> JobState:
+        """Resolve one job's resume state against this phase."""
         receipt = self.receipts().get(job.job_id())
         if receipt is None:
             return JobState(
@@ -395,48 +512,7 @@ class PhaseLedger:
                 else "",
                 phase_id=self.root.name,
             )
-        if receipt.get("job_identity") != job.identity():
-            return JobState(
-                STATE_MISMATCH,
-                receipt,
-                "receipt job identity does not match the planned job",
-                phase_id=self.root.name,
-            )
-        outcome = receipt.get("outcome")
-        if outcome not in COMMITTED_OUTCOMES:
-            return JobState(
-                STATE_PENDING,
-                receipt,
-                "receipt is not a committed outcome",
-                phase_id=self.root.name,
-            )
-        if outcome == OUTCOME_COMPLETED:
-            expected = receipt.get("artifact_digests") or {}
-            actual = self.artifact_digests(job.job_id())
-            if expected != actual:
-                return JobState(
-                    STATE_MISMATCH,
-                    receipt,
-                    "receipt artifact digests do not match artifacts on disk",
-                    phase_id=self.root.name,
-                )
-            result_path = self.artifact_path(job.job_id(), _RESULT_NAME)
-            expected_result = str(receipt.get("result_digest", ""))
-            if expected_result and (
-                not result_path.is_file()
-                or hashlib.sha256(result_path.read_bytes()).hexdigest()
-                != expected_result
-            ):
-                return JobState(
-                    STATE_MISMATCH,
-                    receipt,
-                    "durable result is missing or does not match its receipt",
-                    phase_id=self.root.name,
-                )
-            return JobState(
-                STATE_COMPLETED, receipt, phase_id=self.root.name
-            )
-        return JobState(STATE_TERMINAL_REJECT, receipt, phase_id=self.root.name)
+        return self.verify_committed(job, receipt)
 
     def commit(
         self,
@@ -479,6 +555,7 @@ class GroupLedger:
         self.root = Path(root)
         self.jsonl_load_calls = 0
         self.refresh_calls = 0
+        self._torn_receipts_repaired = 0
         self._receipt_index: dict[str, dict[str, Any]] = {}
         self._job_phase_index: dict[str, str] = {}
         self._artifact_owners: dict[str, str] = {}
@@ -509,8 +586,10 @@ class GroupLedger:
         artifact_owners: dict[str, str] = {}
         for phase_id in self.phase_ids():
             ledger = self.phase(phase_id)
-            records, _repaired = ledger.load_receipts()
+            records, repaired = ledger.load_receipts()
             self.jsonl_load_calls += 1
+            if repaired:
+                self._torn_receipts_repaired += 1
             for record in records:
                 job_id = record.get("job_id")
                 if isinstance(job_id, str):
@@ -525,16 +604,6 @@ class GroupLedger:
         self._job_phase_index = job_phase
         self._artifact_owners = artifact_owners
         self._dirty = False
-
-    def _rebuild_artifact_owners(self) -> None:
-        owners: dict[str, str] = {}
-        for phase_id in self.phase_ids():
-            artifacts_root = self.phase(phase_id).artifacts_root
-            if artifacts_root.is_dir():
-                for entry in artifacts_root.iterdir():
-                    if entry.is_dir():
-                        owners[entry.name] = phase_id
-        self._artifact_owners = owners
 
     def note_commit(self, phase_id: str, receipt: Receipt) -> None:
         """Keep the index current without re-reading every phase."""
@@ -556,11 +625,13 @@ class GroupLedger:
         receipt = self._receipt_index.get(job_id)
         if receipt is None:
             owner = self._artifact_owners.get(job_id)
-            if owner is None:
-                # An artifact directory may have been created by a run that
-                # never wrote a receipt and refreshed no index yet.
-                self._rebuild_artifact_owners()
-                owner = self._artifact_owners.get(job_id)
+            # No rebuild here on purpose. During a run the scheduler registers
+            # every artifact via note_artifact(), so after refresh() an unknown
+            # job genuinely has no artifact yet: it is simply pending. A crash
+            # between an artifact rename and note_artifact() also kills the
+            # process, so the next restart's refresh() picks it up anyway.
+            # Rebuilding per miss would rescan every phase dir for every new
+            # pending job, which is O(N^2) on an 80k-row group.
             if owner is None:
                 return JobState(STATE_PENDING)
             return JobState(
@@ -581,7 +652,12 @@ class GroupLedger:
 
     @property
     def torn_receipts_repaired(self) -> int:
-        return sum(self.phase(pid).torn_receipts_repaired for pid in self.phase_ids())
+        """Repairs observed by *this* ledger, not re-derived per call.
+
+        Recreating a PhaseLedger to read its counter would always report zero,
+        so the count is accumulated during refresh.
+        """
+        return self._torn_receipts_repaired
 
 
 @contextmanager

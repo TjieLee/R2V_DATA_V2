@@ -102,6 +102,9 @@ class EpochDiagnostics:
     conditional_attempts: dict[str, int] = field(default_factory=dict)
     resume: dict[str, int] = field(default_factory=dict)
     resources: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: Owned-resource lifecycle counters (start/stop/load times per resource).
+    #: Kept out of ``resources`` because that dict holds model-job counters.
+    resource_lifecycle: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         for name in CONDITIONAL_JOB_TYPES:
@@ -145,6 +148,7 @@ class EpochDiagnostics:
             "conditional_attempts": dict(sorted(self.conditional_attempts.items())),
             "resume": dict(sorted(self.resume.items())),
             "resources": {k: self.resources[k] for k in sorted(self.resources)},
+            "resource_lifecycle": self.resource_lifecycle,
         }
 
 
@@ -267,7 +271,7 @@ class ResourceEpochScheduler:
             if self.resource_manager is not None:
                 # Close first so the final exit is part of the recorded timeline.
                 self.resource_manager.close()
-                self.diagnostics.resources["_manager"] = (
+                self.diagnostics.resource_lifecycle = (
                     self.resource_manager.counters()
                 )
 
@@ -281,6 +285,7 @@ class ResourceEpochScheduler:
             "job_count": len(pending),
             "resolved_job_count": len(resolved),
             "attempted_job_count": len(attempted),
+            "resource_lifecycle": self.diagnostics.resource_lifecycle,
             "wall_seconds": time.perf_counter() - started,
             "diagnostics": self.diagnostics.summary(),
         }

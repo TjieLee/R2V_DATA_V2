@@ -28,10 +28,16 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-# Bump only when the meaning of a job identity changes. A version bump is
-# intentionally disruptive: every existing receipt becomes unreadable and its
-# work is re-planned rather than silently reused under new semantics.
-JOB_SCHEMA_VERSION = "post_mask_resource_epoch_v3/1"
+# Bump only when the meaning of a job identity or its durable contract changes.
+# A version bump is intentionally disruptive: every existing receipt becomes
+# unreadable and its work is re-planned rather than silently reused under new
+# semantics. There is deliberately no migration for pre-v2 development state;
+# start the campaign under a new tag/root instead.
+#
+# v2: result.json became mandatory for every committed outcome, terminal
+#     rejects are validated exactly like completed jobs, and external artifact
+#     references are verified rather than merely recorded.
+JOB_SCHEMA_VERSION = "post_mask_resource_epoch_v3/2"
 
 RESOURCE_QWEN = "qwen"
 RESOURCE_BOOGU = "boogu"

@@ -8,6 +8,7 @@ separate, server-side validation and is explicitly *not* claimed here.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,7 @@ from r2v_data_v2.v3.post_mask_epoch_jobs import (
     RESOURCE_BOOGU,
     RESOURCE_QWEN,
     RESOURCE_SAM,
+    ArtifactReference,
     JobResult,
     ModelJob,
 )
@@ -256,13 +258,23 @@ def test_many_jobs_have_unique_ids():
 # --------------------------------------------------------------------------
 
 
-def test_plan_is_immutable_and_detects_change(tmp_path: Path):
+def test_plan_is_monotonic_and_detects_changed_record(tmp_path: Path):
     ledger = PhaseLedger(tmp_path / "phase")
     jobs = [_job(), _job(clip_uid="clip-000002")]
     digest = ledger.write_plan(jobs)
     assert ledger.write_plan(jobs) == digest
+
+    class _Mutant:
+        """Same job id, different plan record: the only real violation."""
+
+        def job_id(self) -> str:
+            return jobs[0].job_id()
+
+        def plan_record(self) -> dict[str, Any]:
+            return {**jobs[0].plan_record(), "mutated": True}
+
     with pytest.raises(PlanMismatchError):
-        ledger.write_plan([jobs[0]])
+        ledger.write_plan([_Mutant()])
 
 
 def test_missing_plan_fails_closed(tmp_path: Path):
@@ -277,8 +289,7 @@ def test_pending_job_has_no_receipt(tmp_path: Path):
 def test_completed_receipt_with_matching_artifacts_skips_model_call(tmp_path: Path):
     ledger = PhaseLedger(tmp_path / "phase")
     job = _job()
-    digest = ledger.publish_artifact(job.job_id(), "out.png", b"payload")
-    ledger.commit(job, outcome=OUTCOME_COMPLETED, artifact_digests={"out.png": digest})
+    _commit_result(ledger, job, JobResult(OUTCOME_COMPLETED, {"out.png": b"payload"}))
     state = ledger.classify(job)
     assert state.state == STATE_COMPLETED
     assert state.skippable
@@ -295,7 +306,9 @@ def test_artifact_without_receipt_is_treated_as_incomplete(tmp_path: Path):
 def test_terminal_reject_is_durable_and_never_paid_again(tmp_path: Path):
     ledger = PhaseLedger(tmp_path / "phase")
     job = _job(job_type="removal_judge")
-    ledger.commit(job, outcome=OUTCOME_TERMINAL_REJECT, artifact_digests={})
+    _commit_result(
+        ledger, job, JobResult(OUTCOME_TERMINAL_REJECT, payload={"rejected": True})
+    )
     state = ledger.classify(job)
     assert state.state == STATE_TERMINAL_REJECT
     assert state.skippable
@@ -342,7 +355,7 @@ def test_torn_final_receipt_line_is_repaired_and_earlier_lines_kept(tmp_path: Pa
 
     ledger = PhaseLedger(tmp_path / "phase")
     first = _job(clip_uid="clip-000001")
-    ledger.commit(first, outcome=OUTCOME_COMPLETED, artifact_digests={})
+    _commit_result(ledger, first, JobResult(OUTCOME_COMPLETED, payload={"ok": True}))
     with ledger.receipts_path.open("ab") as handle:
         handle.write(b'{"job_id":"torn","job_ide')
     loaded, was_repaired = _load_jsonl(ledger.receipts_path)
@@ -365,8 +378,10 @@ def test_receipts_are_append_only_across_resume(tmp_path: Path):
 def test_group_ledger_locates_receipt_across_phases(tmp_path: Path):
     group = GroupLedger(tmp_path / "group")
     job = _job()
-    group.phase("r000-boogu").commit(
-        job, outcome=OUTCOME_TERMINAL_REJECT, artifact_digests={}
+    _commit_result(
+        group.phase("r000-boogu"),
+        job,
+        JobResult(OUTCOME_TERMINAL_REJECT, payload={"rejected": True}),
     )
     assert group.classify(job).state == STATE_TERMINAL_REJECT
 
@@ -807,3 +822,338 @@ def test_model_exception_does_not_abort_sibling_jobs(tmp_path: Path):
     assert len(executor.calls) == 2
     assert outcome["unresolved_job_ids"] == [boom.job_id()]
     assert GroupLedger(tmp_path / "group").classify(healthy).state == STATE_COMPLETED
+
+
+# --------------------------------------------------------------------------
+# 8. monotonic phase plan across restart
+# --------------------------------------------------------------------------
+
+
+class _OutcomeExecutor:
+    """Executes jobs, optionally forcing some to a retryable outcome."""
+
+    def __init__(self, log: list[str], retryable: set[str] | None = None):
+        self.log = log
+        self.retryable = retryable or set()
+
+    def execute_batch(self, jobs):
+        results = {}
+        for job in jobs:
+            self.log.append(job.job_id())
+            if job.job_id() in self.retryable:
+                results[job.job_id()] = JobExecution(
+                    job, JobResult(OUTCOME_RETRYABLE_FAILED), None
+                )
+            else:
+                results[job.job_id()] = JobExecution(
+                    job,
+                    JobResult(
+                        OUTCOME_COMPLETED,
+                        {"out.png": b"x"},
+                        payload={"ok": True},
+                    ),
+                    None,
+                )
+        return results
+
+
+def test_dynamic_ready_set_growth_across_restart(tmp_path: Path):
+    """A phase's ready set may grow after a restart; the plan must not break."""
+    first = _job(job_type="removal", clip_uid="clip-000001")
+    second = _job(job_type="removal", clip_uid="clip-000002")
+    qwen_first = _job(
+        job_type="removal_judge", resource=RESOURCE_QWEN, clip_uid="clip-000001"
+    )
+    qwen_second = _job(
+        job_type="removal_judge", resource=RESOURCE_QWEN, clip_uid="clip-000002"
+    )
+    boogu_calls: list[str] = []
+    qwen_calls: list[str] = []
+
+    def finalize(job: ModelJob, result: JobResult):
+        if job.job_id() == first.job_id():
+            return (qwen_first,)
+        if job.job_id() == second.job_id():
+            return (qwen_second,)
+        return ()
+
+    # Run 1: `second` is retryable, so only qwen_first is unlocked.
+    boogu = _OutcomeExecutor(boogu_calls, {second.job_id()})
+    qwen = _OutcomeExecutor(qwen_calls)
+    first_run = _scheduler(
+        tmp_path, {RESOURCE_BOOGU: boogu, RESOURCE_QWEN: qwen}, finalize
+    )
+    outcome = first_run.run([first, second])
+    assert outcome["completed"] is False
+    assert outcome["unresolved_job_ids"] == [second.job_id()]
+
+    # Run 2: `second` succeeds, so the qwen phase now holds two jobs.
+    boogu_resumed = _OutcomeExecutor(boogu_calls)
+    second_run = _scheduler(
+        tmp_path, {RESOURCE_BOOGU: boogu_resumed, RESOURCE_QWEN: qwen}, finalize
+    )
+    outcome = second_run.run([first, second])
+
+    assert outcome["completed"] is True
+    assert boogu_calls.count(first.job_id()) == 1
+    assert boogu_calls.count(second.job_id()) == 2
+    assert qwen_calls.count(qwen_first.job_id()) == 1
+    assert qwen_calls.count(qwen_second.job_id()) == 1
+
+
+def test_phase_plan_job_set_only_grows(tmp_path: Path):
+    ledger = PhaseLedger(tmp_path / "phase")
+    first = _job()
+    second = _job(clip_uid="clip-000002")
+    ledger.write_plan([first])
+    ledger.write_plan([first, second])
+    planned = {record["job_id"] for record in ledger.read_plan()}
+    assert planned == {first.job_id(), second.job_id()}
+    # A subset call must not shrink or reject the plan.
+    ledger.write_plan([second])
+    planned = {record["job_id"] for record in ledger.read_plan()}
+    assert planned == {first.job_id(), second.job_id()}
+
+
+def test_phase_plan_rejects_changed_per_job_record(tmp_path: Path):
+    ledger = PhaseLedger(tmp_path / "phase")
+    job = _job()
+    ledger.write_plan([job])
+
+    class _SameIdDifferentRecord:
+        def job_id(self) -> str:
+            return job.job_id()
+
+        def plan_record(self) -> dict[str, Any]:
+            return {**job.plan_record(), "job_type": "rewritten"}
+
+    with pytest.raises(PlanMismatchError):
+        ledger.write_plan([_SameIdDifferentRecord()])
+
+
+# --------------------------------------------------------------------------
+# 9. committed outcome integrity
+# --------------------------------------------------------------------------
+
+
+def _commit_result(
+    ledger: PhaseLedger,
+    job: ModelJob,
+    result: JobResult,
+    *,
+    outcome: str | None = None,
+    result_digest: str | None = None,
+) -> None:
+    digests: dict[str, str] = {}
+    for name, payload in sorted(result.artifacts.items()):
+        digests[name] = ledger.publish_artifact(job.job_id(), name, payload)
+    digest = ledger.publish_result(job, result)
+    digests["result.json"] = digest
+    ledger.commit(
+        job,
+        outcome=outcome or result.outcome,
+        artifact_digests=digests,
+        result_digest=digest if result_digest is None else result_digest,
+        external_artifacts=result.external_artifacts,
+    )
+
+
+def test_missing_result_digest_fails_closed(tmp_path: Path):
+    ledger = PhaseLedger(tmp_path / "phase")
+    job = _job()
+    result = JobResult(OUTCOME_COMPLETED, payload={"ok": True})
+    digest = ledger.publish_artifact(job.job_id(), "out.png", b"x")
+    result_digest = ledger.publish_result(job, result)
+    ledger.commit(
+        job,
+        outcome=OUTCOME_COMPLETED,
+        artifact_digests={"out.png": digest, "result.json": result_digest},
+        result_digest="",
+    )
+    # No migration path: a receipt without a durable result is not accepted.
+    assert ledger.classify(job).state == STATE_MISMATCH
+
+
+def test_terminal_reject_validates_result_digest(tmp_path: Path):
+    ledger = PhaseLedger(tmp_path / "phase")
+    job = _job(job_type="judge")
+    result = JobResult(OUTCOME_TERMINAL_REJECT, payload={"rejected": True})
+    _commit_result(ledger, job, result)
+    assert ledger.classify(job).state == STATE_TERMINAL_REJECT
+    # Tamper with the durable result, keeping it valid JSON.
+    target = ledger.artifact_path(job.job_id(), "result.json")
+    tampered = JobResult(OUTCOME_TERMINAL_REJECT, payload={"rejected": False})
+    target.write_text(json.dumps(tampered.durable(), sort_keys=True))
+    assert ledger.classify(job).state == STATE_MISMATCH
+
+
+def test_terminal_reject_result_outcome_mismatch_fails_closed(tmp_path: Path):
+    ledger = PhaseLedger(tmp_path / "phase")
+    job = _job(job_type="judge")
+    _commit_result(ledger, job, JobResult(OUTCOME_TERMINAL_REJECT, payload={}))
+    receipt = ledger.receipts()[job.job_id()]
+    # Re-commit with the same digests but a different outcome would be a lie.
+    assert receipt["outcome"] == OUTCOME_TERMINAL_REJECT
+    assert ledger.load_result(job) is not None
+    assert ledger.load_result(job).outcome == OUTCOME_TERMINAL_REJECT
+
+
+def test_external_artifact_is_verified_on_resume(tmp_path: Path):
+    ledger = PhaseLedger(tmp_path / "phase")
+    payload_dir = tmp_path / "production"
+    payload_dir.mkdir()
+    external = payload_dir / "candidate.png"
+    external.write_bytes(b"external-bytes")
+    digest = hashlib.sha256(b"external-bytes").hexdigest()
+    reference = ArtifactReference(
+        path=str(external), sha256=digest, size=external.stat().st_size
+    )
+    job = _job()
+    _commit_result(
+        ledger, job, JobResult(OUTCOME_COMPLETED, external_artifacts=(reference,))
+    )
+    assert ledger.classify(job).state == STATE_COMPLETED
+
+
+def test_missing_external_artifact_fails_closed(tmp_path: Path):
+    ledger = PhaseLedger(tmp_path / "phase")
+    external = tmp_path / "gone.png"
+    reference = ArtifactReference(
+        path=str(external), sha256="0" * 64, size=None
+    )
+    job = _job()
+    _commit_result(
+        ledger, job, JobResult(OUTCOME_COMPLETED, external_artifacts=(reference,))
+    )
+    assert ledger.classify(job).state == STATE_MISMATCH
+
+
+def test_external_artifact_size_mismatch_fails_closed(tmp_path: Path):
+    ledger = PhaseLedger(tmp_path / "phase")
+    external = tmp_path / "candidate.png"
+    external.write_bytes(b"bytes")
+    reference = ArtifactReference(
+        path=str(external), sha256=hashlib.sha256(b"bytes").hexdigest(), size=999
+    )
+    job = _job()
+    _commit_result(
+        ledger, job, JobResult(OUTCOME_COMPLETED, external_artifacts=(reference,))
+    )
+    assert ledger.classify(job).state == STATE_MISMATCH
+
+
+def test_external_artifact_sha_mismatch_fails_closed(tmp_path: Path):
+    ledger = PhaseLedger(tmp_path / "phase")
+    external = tmp_path / "candidate.png"
+    external.write_bytes(b"bytes")
+    reference = ArtifactReference(
+        path=str(external), sha256="1" * 64, size=external.stat().st_size
+    )
+    job = _job()
+    _commit_result(
+        ledger, job, JobResult(OUTCOME_COMPLETED, external_artifacts=(reference,))
+    )
+    assert ledger.classify(job).state == STATE_MISMATCH
+
+
+def test_relative_external_artifact_path_fails_closed(tmp_path: Path):
+    ledger = PhaseLedger(tmp_path / "phase")
+    reference = ArtifactReference(path="relative/path.png", sha256="0" * 64)
+    job = _job()
+    _commit_result(
+        ledger, job, JobResult(OUTCOME_COMPLETED, external_artifacts=(reference,))
+    )
+    assert ledger.classify(job).state == STATE_MISMATCH
+
+
+def test_result_external_refs_must_match_receipt(tmp_path: Path):
+    ledger = PhaseLedger(tmp_path / "phase")
+    external = tmp_path / "candidate.png"
+    external.write_bytes(b"bytes")
+    reference = ArtifactReference(
+        path=str(external), sha256=hashlib.sha256(b"bytes").hexdigest()
+    )
+    job = _job()
+    result = JobResult(OUTCOME_COMPLETED, external_artifacts=(reference,))
+    digests = {
+        "result.json": ledger.publish_result(job, result),
+    }
+    ledger.commit(
+        job,
+        outcome=OUTCOME_COMPLETED,
+        artifact_digests=digests,
+        result_digest=digests["result.json"],
+        external_artifacts=(),  # receipt disagrees with result.json
+    )
+    assert ledger.classify(job).state == STATE_MISMATCH
+
+
+def test_scheduler_refuses_tampered_terminal_result(tmp_path: Path):
+    job = _job(job_type="judge", resource=RESOURCE_QWEN)
+    seen: list[dict] = []
+
+    def finalize(j: ModelJob, result: JobResult):
+        seen.append(dict(result.payload))
+        return ()
+
+    executor = _FakeBatchExecutor(
+        {job.job_id(): JobResult(OUTCOME_TERMINAL_REJECT, payload={"rejected": True})}
+    )
+    _scheduler(tmp_path, {RESOURCE_QWEN: executor}, finalize).run([job])
+    assert seen == [{"rejected": True}]
+
+    ledger = GroupLedger(tmp_path / "group")
+    phase_id = ledger.phase_for(job)
+    assert phase_id is not None
+    target = ledger.phase(phase_id).artifact_path(job.job_id(), "result.json")
+    tampered = JobResult(OUTCOME_TERMINAL_REJECT, payload={"rejected": False})
+    target.write_text(json.dumps(tampered.durable(), sort_keys=True))
+
+    seen.clear()
+    with pytest.raises(SchedulerError):
+        _scheduler(tmp_path, {RESOURCE_QWEN: executor}, finalize).run([job])
+    # The finalizer must never observe the tampered payload.
+    assert seen == []
+
+
+# --------------------------------------------------------------------------
+# 10. ledger lookup cost and torn-receipt counter
+# --------------------------------------------------------------------------
+
+
+def test_new_pending_jobs_do_not_rescan_artifact_dirs(tmp_path, monkeypatch):
+    """1000 brand-new pending jobs must not scan phase dirs per job."""
+    root = tmp_path / "group"
+    ledger = GroupLedger(root)
+    ledger.phase("r000-boogu").write_plan([_job()])
+    jobs = [_job(clip_uid=f"clip-{i:05d}") for i in range(1000)]
+
+    fresh = GroupLedger(root)
+    fresh.refresh()
+    scans = {"n": 0}
+    real_iterdir = Path.iterdir
+
+    def counting_iterdir(self):
+        if self.name == "artifacts" or (self.parent.name == "phases"):
+            scans["n"] += 1
+        return real_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", counting_iterdir)
+    for job in jobs:
+        assert fresh.classify(job).state == STATE_PENDING
+    assert scans["n"] == 0
+
+
+def test_torn_receipt_counter_survives_refresh(tmp_path: Path):
+    ledger = GroupLedger(tmp_path / "group")
+    job = _job()
+    ledger.phase("r000-boogu").commit(
+        job, outcome=OUTCOME_TERMINAL_REJECT, artifact_digests={}
+    )
+    receipts = ledger.phase("r000-boogu").receipts_path
+    with receipts.open("ab") as handle:
+        handle.write(b'{"job_id":"torn","job_ide')
+
+    fresh = GroupLedger(tmp_path / "group")
+    fresh.refresh()
+    assert fresh.torn_receipts_repaired == 1
