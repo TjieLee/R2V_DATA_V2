@@ -87,6 +87,7 @@ class SubprocessEpochProcessManager:
     def __init__(self) -> None:
         self._children: dict[int, subprocess.Popen] = {}
         self.reaped: list[int] = []
+        self._reap_timeout_seconds = 30.0
 
     @property
     def open_children(self) -> tuple[int, ...]:
@@ -154,29 +155,38 @@ class SubprocessEpochProcessManager:
         import signal as signal_module
 
         child = self._children.get(process.pid)
+        if child is None:
+            # Never signal a PID we did not spawn. A misrouted killpg could
+            # take down an unrelated job sharing the node.
+            return False
+        if child.poll() is not None:
+            # Already exited (for example a failed health check). Reap only:
+            # signalling a dead process group risks hitting a recycled PGID.
+            self._reap(process, child)
+            return True
         self._signal_group(process, signal_module.SIGTERM)
         deadline = time.monotonic() + grace_seconds
         while time.monotonic() < deadline:
-            if not self.alive(process):
+            if child.poll() is not None:
                 break
             time.sleep(0.05)
-        if self.alive(process):
+        if child.poll() is None:
             # SIGKILL is POSIX-only; fall back to TERM where it is absent.
             fatal = getattr(signal_module, "SIGKILL", signal_module.SIGTERM)
             self._signal_group(process, fatal)
-        # Always reap, even if the child ignored both signals.
-        if child is not None:
-            try:
-                child.wait(timeout=max(grace_seconds, 1.0))
-            except subprocess.TimeoutExpired:  # pragma: no cover - hostile child
-                child.kill()
-                child.wait()
-            finally:
-                self._children.pop(process.pid, None)
-                self.reaped.append(process.pid)
-        elif not self.alive(process):
+        self._reap(process, child)
+        return child.poll() is not None
+
+    def _reap(self, process: OwnedProcess, child: Any) -> None:
+        """Always wait on an owned child so it cannot linger as a zombie."""
+        try:
+            child.wait(timeout=max(self._reap_timeout_seconds, 1.0))
+        except subprocess.TimeoutExpired:  # pragma: no cover - hostile child
+            child.kill()
+            child.wait()
+        finally:
+            self._children.pop(process.pid, None)
             self.reaped.append(process.pid)
-        return not self.alive(process)
 
 
 @dataclass
@@ -269,6 +279,9 @@ class QwenEpochConfig:
     startup_timeout_seconds: float = 1800.0
     shutdown_grace_seconds: float = 30.0
     health_path: str = "/v1/models"
+    #: Startup polling interval. A DP8 cold start can take a long time, so the
+    #: default is 1s rather than hammering /v1/models at 20 QPS. Execution-only.
+    health_poll_interval_seconds: float = 1.0
     #: Explicit served model id. vLLM reports the model path on this server,
     #: not just its basename, so callers should pass the absolute path.
     served_model_name: str | None = None
@@ -399,14 +412,14 @@ class QwenEpochResource(EpochResource):
                 payload = self.health_probe(self.config.base_url)
             except (urllib.error.URLError, OSError, ValueError) as exc:
                 last_error = exc
-                time.sleep(0.05)
+                time.sleep(self.config.health_poll_interval_seconds)
                 continue
             if expected in served_model_ids(payload):
                 return
             last_error = EpochResourceError(
                 f"served models {served_model_ids(payload)} do not include {expected!r}"
             )
-            time.sleep(0.05)
+            time.sleep(self.config.health_poll_interval_seconds)
         raise EpochResourceError("managed Qwen startup timed out") from last_error
 
     def _stop(self) -> None:
@@ -462,8 +475,38 @@ class WorkerEpochResource(EpochResource):
         return len(self.pool.gpu_ids)
 
     def _start(self) -> None:
-        for slot, gpu_id in enumerate(self.pool.gpu_ids):
-            self.workers.append(self.worker_factory(slot, gpu_id))
+        """Load every GPU's worker concurrently, then restore slot order.
+
+        Serial construction would multiply a Boogu epoch's model-load latency
+        by the slot count. Results are re-ordered by slot, so completion order
+        never changes slot mapping.
+        """
+        slots = list(enumerate(self.pool.gpu_ids))
+        if not slots:
+            return
+        built: dict[int, Any] = {}
+        failures: dict[int, BaseException] = {}
+        with ThreadPoolExecutor(max_workers=len(slots)) as pool:
+            futures = {
+                pool.submit(self.worker_factory, slot, gpu_id): slot
+                for slot, gpu_id in slots
+            }
+            for future, slot in futures.items():
+                try:
+                    built[slot] = future.result()
+                except BaseException as exc:  # noqa: BLE001 - rollback below
+                    failures[slot] = exc
+        if failures:
+            # Never leave a partial set of GPU models resident.
+            for slot in sorted(built):
+                close = getattr(built[slot], "close", None)
+                if callable(close):
+                    close()
+            first = min(failures)
+            raise EpochResourceError(
+                f"{self.name} worker slot {first} failed to start: {failures[first]}"
+            )
+        self.workers = [built[slot] for slot in sorted(built)]
 
     def _stop(self) -> None:
         for worker in self.workers:
@@ -472,12 +515,21 @@ class WorkerEpochResource(EpochResource):
                 close()
         self.workers = []
 
-    def handle_for(self, job: Any) -> Any:
+    def handle_for_slot(self, slot_id: int) -> Any:
+        """Return the live worker backend for a slot, never the slot id.
+
+        The semantic runner must not learn about GPU slots or indices; it only
+        ever receives the backend handle it should call.
+        """
         if not self._open:
             raise EpochResourceError(f"{self.name} epoch is not started")
-        slot = deterministic_slot(job, self.slot_count)
-        self.slot_job_counts[slot] = self.slot_job_counts.get(slot, 0) + 1
-        return self.workers[slot]
+        if not 0 <= slot_id < self.slot_count:
+            raise EpochResourceError(f"invalid {self.name} slot: {slot_id}")
+        self.slot_job_counts[slot_id] = self.slot_job_counts.get(slot_id, 0) + 1
+        return self.workers[slot_id]
+
+    def handle_for(self, job: Any) -> Any:
+        return self.handle_for_slot(deterministic_slot(job, self.slot_count))
 
     def counters(self) -> dict[str, float]:
         payload = super().counters()
@@ -676,17 +728,20 @@ class WorkerSlotExecutor:
 
         def run_slot(slot_id: int, queued: list[Any]) -> None:
             for job in queued:
+                # The runner receives the live backend, never a GPU slot id.
+                handle = (
+                    self.resource.handle_for_slot(slot_id)
+                    if self.resource is not None
+                    else slot_id
+                )
                 try:
-                    result = self.runner(job, slot_id)
+                    result = self.runner(job, handle)
                 except BaseException as exc:  # noqa: BLE001 - isolate per job
                     with lock:
                         results[job.job_id()] = JobExecution(job, None, exc)
                 else:
                     with lock:
                         results[job.job_id()] = JobExecution(job, result, None)
-                if self.resource is not None:
-                    counts = self.resource.slot_job_counts
-                    counts[slot_id] = counts.get(slot_id, 0) + 1
 
         threads = [
             threading.Thread(target=run_slot, args=(slot_id, queued), daemon=True)
@@ -726,6 +781,10 @@ class ResourceEpochManager:
         self._open: str | None = None
         self._resource: EpochResource | None = None
         self._executor: BatchJobExecutor | None = None
+        #: Aggregated per-resource lifecycle counters. Unloading a resource
+        #: must not discard its startup/shutdown/load measurements, and a
+        #: resource entered twice (qwen -> boogu -> qwen) accumulates both.
+        self._resource_counters: dict[str, dict[str, Any]] = {}
 
     @property
     def open_resource(self) -> str | None:
@@ -759,10 +818,32 @@ class ResourceEpochManager:
         try:
             if self._resource is not None:
                 self._resource.stop()
+                # Snapshot after the stop so shutdown time and stop_count are
+                # included; unloading must not discard the measurements.
+                self._accumulate(resource, self._resource.counters())
         finally:
             self.timeline.append(("stop", resource))
             self._resource = None
             self._executor = None
+
+    _ACCUMULATED = (
+        "start_count",
+        "stop_count",
+        "startup_wall_seconds",
+        "shutdown_wall_seconds",
+        "service_seconds",
+    )
+
+    def _accumulate(self, name: str, snapshot: Mapping[str, Any]) -> None:
+        bucket = self._resource_counters.setdefault(
+            name,
+            {key: 0 for key in self._ACCUMULATED} | {"gpu_slot_job_counts": {}},
+        )
+        for key in self._ACCUMULATED:
+            bucket[key] = bucket.get(key, 0) + snapshot.get(key, 0)
+        slots = bucket.setdefault("gpu_slot_job_counts", {})
+        for slot, count in (snapshot.get("gpu_slot_job_counts") or {}).items():
+            slots[slot] = slots.get(slot, 0) + count
 
     def close(self) -> None:
         self.exit_current()
@@ -772,4 +853,8 @@ class ResourceEpochManager:
             "timeline": [f"{action}:{name}" for action, name in self.timeline],
             "max_open_observed": self.max_open_observed,
             "open_resource": self._open,
+            "resources": {
+                name: dict(sorted(bucket.items()))
+                for name, bucket in sorted(self._resource_counters.items())
+            },
         }

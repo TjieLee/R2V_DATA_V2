@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import threading
 from dataclasses import dataclass
@@ -710,6 +711,221 @@ def test_scheduler_records_manager_counters(tmp_path: Path):
         resource_manager=manager,
     )
     outcome = scheduler.run([_boogu_job("clip-001")])
-    manager_counters = outcome["diagnostics"]["resources"]["_manager"]
-    assert manager_counters["timeline"] == ["start:boogu", "stop:boogu"]
-    assert manager_counters["max_open_observed"] == 1
+    lifecycle = outcome["resource_lifecycle"]
+    assert lifecycle["timeline"] == ["start:boogu", "stop:boogu"]
+    assert lifecycle["max_open_observed"] == 1
+    # Lifecycle counters are separate from model-job counters.
+    assert "_manager" not in outcome["diagnostics"]["resources"]
+    assert outcome["diagnostics"]["resource_lifecycle"]["timeline"] == [
+        "start:boogu",
+        "stop:boogu",
+    ]
+
+
+def test_lifecycle_counters_survive_unload_and_accumulate(tmp_path: Path):
+    manager = ResourceEpochManager(
+        {
+            RESOURCE_BOOGU: _factory(
+                RESOURCE_BOOGU,
+                SerialBatchExecutor(lambda j, h: JobResult(OUTCOME_COMPLETED)),
+                [],
+            ),
+            RESOURCE_QWEN: _factory(
+                RESOURCE_QWEN,
+                SerialBatchExecutor(lambda j, h: JobResult(OUTCOME_COMPLETED)),
+                [],
+            ),
+        }
+    )
+    manager.enter(RESOURCE_QWEN)
+    manager.enter(RESOURCE_BOOGU)
+    manager.enter(RESOURCE_QWEN)
+    manager.close()
+    counters = manager.counters()
+    # Qwen was entered twice; its counters must aggregate both epochs.
+    assert counters["resources"][RESOURCE_QWEN]["start_count"] == 2
+    assert counters["resources"][RESOURCE_QWEN]["stop_count"] == 2
+    assert counters["resources"][RESOURCE_BOOGU]["start_count"] == 1
+    assert counters["resources"][RESOURCE_BOOGU]["stop_count"] == 1
+    assert counters["timeline"] == [
+        "start:qwen",
+        "stop:qwen",
+        "start:boogu",
+        "stop:boogu",
+        "start:qwen",
+        "stop:qwen",
+    ]
+
+
+# --------------------------------------------------------------------------
+# Process ownership safety
+# --------------------------------------------------------------------------
+
+
+class _RecordingKillpg:
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, int]] = []
+
+    def __call__(self, pgid: int, signal_number: int) -> None:
+        self.calls.append((pgid, signal_number))
+        raise ProcessLookupError("no such process group")
+
+
+def test_stop_never_signals_an_unowned_process(monkeypatch):
+    recorder = _RecordingKillpg()
+    monkeypatch.setattr(os, "killpg", recorder, raising=False)
+    manager = SubprocessEpochProcessManager()
+    stranger = OwnedProcess(pid=9999, pgid=9999, argv=("someone-elses-service",))
+    assert manager.stop(stranger, grace_seconds=0.1) is False
+    assert recorder.calls == []
+    assert manager.reaped == []
+
+
+def test_stop_reaps_already_exited_child_without_signalling(monkeypatch):
+    _FakePopen.instances = []
+    monkeypatch.setattr(subprocess, "Popen", _FakePopen)
+    recorder = _RecordingKillpg()
+    monkeypatch.setattr(os, "killpg", recorder, raising=False)
+
+    manager = SubprocessEpochProcessManager()
+    process = manager.spawn(["/bin/true"], env={})
+    # The child already exited (for example a failed health check).
+    _FakePopen.instances[0]._alive = False
+
+    assert manager.stop(process, grace_seconds=0.1) is True
+    assert recorder.calls == []
+    assert process.pid in manager.reaped
+    assert manager.open_children == ()
+
+
+def test_stop_signals_only_a_live_owned_child(monkeypatch):
+    _FakePopen.instances = []
+    monkeypatch.setattr(subprocess, "Popen", _FakePopen)
+    recorder = _RecordingKillpg()
+    monkeypatch.setattr(os, "killpg", recorder, raising=False)
+
+    manager = SubprocessEpochProcessManager()
+    process = manager.spawn(["/usr/local/bin/vllm", "serve"], env={})
+    assert manager.stop(process, grace_seconds=0.1) is True
+    # Every signal targets the owned pgid: TERM first, then KILL only because
+    # the fake child ignores signals and stays alive.
+    assert recorder.calls
+    assert {call[0] for call in recorder.calls} == {process.pgid}
+    assert len(recorder.calls) <= 2
+    assert process.pid in manager.reaped
+
+
+# --------------------------------------------------------------------------
+# Worker handle API and parallel startup
+# --------------------------------------------------------------------------
+
+
+def test_worker_slot_executor_hands_backend_to_runner(tmp_path: Path):
+    resource = WorkerEpochResource(
+        RESOURCE_BOOGU,
+        WorkerPoolConfig(),
+        process_manager=_FakeProcessManager(),
+        worker_factory=_FakeWorker,
+        log_root=tmp_path,
+    )
+    resource.start()
+    seen: list[Any] = []
+
+    def runner(job: ModelJob, handle: Any) -> JobResult:
+        seen.append(handle)
+        return JobResult(OUTCOME_COMPLETED, payload={})
+
+    jobs = [_boogu_job(f"clip-{i:03d}") for i in range(8)]
+    WorkerSlotExecutor(runner, slot_count=8, resource=resource).execute_batch(jobs)
+    # The semantic runner sees backend handles, never GPU slot ids.
+    assert all(isinstance(handle, _FakeWorker) for handle in seen)
+    assert sorted(handle.gpu_id for handle in seen) == list(range(8))
+
+
+def test_worker_slot_executor_keeps_one_job_per_handle_at_a_time(tmp_path: Path):
+    resource = WorkerEpochResource(
+        RESOURCE_BOOGU,
+        WorkerPoolConfig(),
+        process_manager=_FakeProcessManager(),
+        worker_factory=_FakeWorker,
+        log_root=tmp_path,
+    )
+    resource.start()
+    tracker = _Tracker(parties=8)
+
+    def runner(job: ModelJob, handle: Any) -> JobResult:
+        slot = handle.slot
+        tracker.enter(slot)
+        try:
+            tracker.barrier.wait()
+            return JobResult(OUTCOME_COMPLETED, payload={})
+        finally:
+            tracker.exit(slot)
+
+    jobs = [_boogu_job(f"clip-{i:03d}") for i in range(16)]
+    WorkerSlotExecutor(runner, slot_count=8, resource=resource).execute_batch(jobs)
+    assert tracker.max_active == 8
+    assert len(tracker.slot_max) == 8
+    assert all(value == 1 for value in tracker.slot_max.values())
+
+
+def test_worker_startup_loads_all_slots_concurrently(tmp_path: Path):
+    tracker = _Tracker(parties=8)
+
+    def factory(slot: int, gpu_id: int) -> _FakeWorker:
+        tracker.enter(slot)
+        try:
+            tracker.barrier.wait()
+            return _FakeWorker(slot, gpu_id)
+        finally:
+            tracker.exit(slot)
+
+    resource = WorkerEpochResource(
+        RESOURCE_BOOGU,
+        WorkerPoolConfig(),
+        process_manager=_FakeProcessManager(),
+        worker_factory=factory,
+        log_root=tmp_path,
+    )
+    resource.start()
+    assert tracker.max_active == 8
+    # Completion order must not change slot mapping.
+    assert [worker.gpu_id for worker in resource.workers] == list(range(8))
+
+
+def test_worker_startup_failure_rolls_back_created_workers(tmp_path: Path):
+    created: list[_FakeWorker] = []
+
+    def factory(slot: int, gpu_id: int) -> _FakeWorker:
+        if slot == 3:
+            raise RuntimeError("boom")
+        worker = _FakeWorker(slot, gpu_id)
+        created.append(worker)
+        return worker
+
+    resource = WorkerEpochResource(
+        RESOURCE_BOOGU,
+        WorkerPoolConfig(gpu_ids=(0, 1, 2, 3, 4, 5, 6, 7)),
+        process_manager=_FakeProcessManager(),
+        worker_factory=factory,
+        log_root=tmp_path,
+    )
+    with pytest.raises(EpochResourceError, match="slot 3"):
+        resource.start()
+    assert created
+    assert all(worker.closed for worker in created)
+    assert resource.workers == []
+    assert resource.open is False
+
+
+def test_handle_for_slot_rejects_out_of_range(tmp_path: Path):
+    resource = WorkerEpochResource(
+        RESOURCE_BOOGU,
+        WorkerPoolConfig(gpu_ids=(0, 1)),
+        process_manager=_FakeProcessManager(),
+        worker_factory=_FakeWorker,
+        log_root=tmp_path,
+    )
+    resource.start()
+    with pytest.raises(EpochResourceError):
+        resource.handle_for_slot(5)
