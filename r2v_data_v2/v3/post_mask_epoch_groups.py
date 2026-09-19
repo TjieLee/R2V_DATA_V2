@@ -33,7 +33,11 @@ from pathlib import Path
 from typing import Any
 
 from r2v_data_v2.v3.post_mask_epoch_jobs import canonical_json
-from r2v_data_v2.v3.post_mask_epoch_state import atomic_write_json, file_lock
+from r2v_data_v2.v3.post_mask_epoch_state import (
+    _fsync_directory,
+    atomic_write_json,
+    file_lock,
+)
 
 #: Default number of canonical shards per resource epoch group.
 DEFAULT_GROUP_SIZE = 8
@@ -193,12 +197,16 @@ def record_group_outcome(
             "reason": reason,
         }
     )
+    was_new = not path.exists()
     with path.open("a", encoding="utf-8") as handle:
         handle.write(payload + "\n")
         handle.flush()
         # Shared filesystems make an un-fsynced append lose the outcome when
         # the node dies; history stays append-only either way.
         os.fsync(handle.fileno())
+    if was_new:
+        # A newly created outcomes file needs its directory entry durable too.
+        _fsync_directory(path.parent)
     return path
 
 

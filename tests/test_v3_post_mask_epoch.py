@@ -55,6 +55,7 @@ from r2v_data_v2.v3.post_mask_epoch_state import (
     LedgerError,
     PhaseLedger,
     PlanMismatchError,
+    verify_external_artifact,
 )
 
 CAMPAIGN = {"config_hash": "cfg-1", "dataset": "jea-motion-v1"}
@@ -1157,3 +1158,181 @@ def test_torn_receipt_counter_survives_refresh(tmp_path: Path):
     fresh = GroupLedger(tmp_path / "group")
     fresh.refresh()
     assert fresh.torn_receipts_repaired == 1
+
+
+# --------------------------------------------------------------------------
+# 11. shared committed validation
+# --------------------------------------------------------------------------
+
+
+def test_terminal_reject_internal_artifact_tamper_fails_closed(tmp_path: Path):
+    ledger = PhaseLedger(tmp_path / "phase")
+    job = _job(job_type="judge")
+    result = JobResult(
+        OUTCOME_TERMINAL_REJECT,
+        {"diagnostic.json": b"original", "out.bin": b"bytes"},
+        payload={"rejected": True},
+    )
+    _commit_result(ledger, job, result)
+    assert ledger.classify(job).state == STATE_TERMINAL_REJECT
+    # Tamper an internal artifact, leaving result.json untouched.
+    ledger.publish_artifact(job.job_id(), "diagnostic.json", b"tampered")
+    assert ledger.classify(job).state == STATE_MISMATCH
+
+
+def test_terminal_reject_missing_internal_artifact_fails_closed(tmp_path: Path):
+    ledger = PhaseLedger(tmp_path / "phase")
+    job = _job(job_type="judge")
+    result = JobResult(
+        OUTCOME_TERMINAL_REJECT,
+        {"diagnostic.json": b"original"},
+        payload={"rejected": True},
+    )
+    _commit_result(ledger, job, result)
+    assert ledger.classify(job).state == STATE_TERMINAL_REJECT
+    (ledger.artifacts_root / job.job_id() / "diagnostic.json").unlink()
+    assert ledger.classify(job).state == STATE_MISMATCH
+
+
+def test_external_artifact_filesystem_error_fails_closed(tmp_path, monkeypatch):
+    """A filesystem race must fail closed, not be reported as a valid artifact."""
+    external = tmp_path / "candidate.png"
+    external.write_bytes(b"bytes")
+    reference = ArtifactReference(
+        path=str(external), sha256=hashlib.sha256(b"bytes").hexdigest()
+    )
+    assert verify_external_artifact(reference) is True
+
+    def exploding_is_file(self):
+        raise OSError("transient filesystem error")
+
+    monkeypatch.setattr(Path, "is_file", exploding_is_file)
+    assert verify_external_artifact(reference) is False
+
+
+# --------------------------------------------------------------------------
+# 12. finalizer once per invocation
+# --------------------------------------------------------------------------
+
+
+def test_failed_finalizer_runs_once_even_when_a_sibling_progresses(tmp_path: Path):
+    """A finalizer failure is retried on restart, not inside the same run."""
+    failing = _job(job_type="removal", clip_uid="clip-000001")
+    healthy = _job(job_type="removal", clip_uid="clip-000002")
+    executor = _FakeBatchExecutor()
+    counts: dict[str, int] = {failing.job_id(): 0, healthy.job_id(): 0}
+
+    def finalize(job: ModelJob, result: JobResult) -> tuple[ModelJob, ...]:
+        counts[job.job_id()] += 1
+        if job.job_id() == failing.job_id():
+            raise RuntimeError("finalizer boom")
+        return ()
+
+    # Commit both jobs with a finalizer that always succeeds.
+    def ok_finalize(job: ModelJob, result: JobResult) -> tuple[ModelJob, ...]:
+        return ()
+
+    _scheduler(tmp_path, {RESOURCE_BOOGU: executor}, ok_finalize).run(
+        [failing, healthy]
+    )
+    assert executor.call_ids() == [failing.job_id(), healthy.job_id()]
+
+    counts[failing.job_id()] = 0
+    counts[healthy.job_id()] = 0
+    outcome = _scheduler(tmp_path, {RESOURCE_BOOGU: executor}, finalize).run(
+        [failing, healthy]
+    )
+    # The healthy sibling resolved, so the scheduler had further rounds; the
+    # failing finalizer must still be attempted exactly once.
+    assert counts[failing.job_id()] == 1
+    assert counts[healthy.job_id()] == 1
+    assert outcome["completed"] is False
+    assert outcome["unresolved_job_ids"] == [failing.job_id()]
+    # No model call was repeated for the committed jobs.
+    assert executor.call_ids() == [failing.job_id(), healthy.job_id()]
+
+    counts[failing.job_id()] = 0
+    counts[healthy.job_id()] = 0
+    restarted = _scheduler(tmp_path, {RESOURCE_BOOGU: executor}, finalize).run(
+        [failing, healthy]
+    )
+    # Restart gives the failing finalizer exactly one new attempt. The healthy
+    # sibling is committed too, so its finalizer is also replayed once; the
+    # point is that neither is retried more than once per invocation.
+    assert counts[failing.job_id()] == 1
+    assert counts[healthy.job_id()] == 1
+    assert restarted["completed"] is False
+    assert executor.call_ids() == [failing.job_id(), healthy.job_id()]
+
+
+# --------------------------------------------------------------------------
+# 13. malformed existing phase plans fail closed
+# --------------------------------------------------------------------------
+
+
+def _write_plan_payload(ledger: PhaseLedger, payload: Any) -> None:
+    ledger.root.mkdir(parents=True, exist_ok=True)
+    ledger.plan_path.write_text(json.dumps(payload, sort_keys=True))
+
+
+def _valid_plan_payload(job: ModelJob) -> dict[str, Any]:
+    jobs = [job.plan_record()]
+    return {
+        "plan_hash": hashlib.sha256(
+            json.dumps(jobs, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest(),
+        "job_count": len(jobs),
+        "jobs": jobs,
+    }
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "bad_hash",
+        "bad_count",
+        "jobs_not_list",
+        "duplicate_job_id",
+        "non_dict_record",
+        "missing_job_id",
+    ],
+)
+def test_malformed_existing_plan_fails_closed(tmp_path: Path, mutation: str):
+    ledger = PhaseLedger(tmp_path / "phase")
+    job = _job()
+    payload = _valid_plan_payload(job)
+    if mutation == "bad_hash":
+        payload["plan_hash"] = "0" * 64
+    elif mutation == "bad_count":
+        payload["job_count"] = 99
+    elif mutation == "jobs_not_list":
+        payload["jobs"] = {"not": "a list"}
+    elif mutation == "duplicate_job_id":
+        payload["jobs"] = [job.plan_record(), job.plan_record()]
+        payload["job_count"] = 2
+        payload["plan_hash"] = hashlib.sha256(
+            json.dumps(
+                payload["jobs"], sort_keys=True, separators=(",", ":")
+            ).encode()
+        ).hexdigest()
+    elif mutation == "non_dict_record":
+        payload["jobs"] = ["not-a-dict"]
+        payload["job_count"] = 1
+    elif mutation == "missing_job_id":
+        broken = dict(job.plan_record())
+        broken.pop("job_id")
+        payload["jobs"] = [broken]
+        payload["job_count"] = 1
+    _write_plan_payload(ledger, payload)
+    with pytest.raises((PlanMismatchError, LedgerError)):
+        ledger.write_plan([_job(clip_uid="clip-000002")])
+
+
+def test_valid_plan_growth_still_passes(tmp_path: Path):
+    ledger = PhaseLedger(tmp_path / "phase")
+    job = _job()
+    _write_plan_payload(ledger, _valid_plan_payload(job))
+    other = _job(clip_uid="clip-000002")
+    ledger.write_plan([other])
+    planned = {record["job_id"] for record in ledger.read_plan()}
+    assert planned == {job.job_id(), other.job_id()}

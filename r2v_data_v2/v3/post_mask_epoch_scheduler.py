@@ -212,13 +212,18 @@ class ResourceEpochScheduler:
         #: Jobs already given one real model attempt in *this* invocation.
         #: Post-Mask has no in-launch automatic retry; restart is the retry.
         attempted: set[str] = set()
+        #: Jobs whose CPU finalizer was already attempted in *this* invocation.
+        #: A finalizer failure is also retried on restart, never in-launch, so
+        #: a successful sibling must not cause a second attempt here. This is
+        #: invocation-local execution state: never persisted, never in identity.
+        finalize_attempted: set[str] = set()
         current: str | None = None
         round_index = 0
         started = time.perf_counter()
 
         try:
             while round_index < self.max_rounds:
-                ready = self._ready(pending, resolved, attempted)
+                ready = self._ready(pending, resolved, attempted, finalize_attempted)
                 if not ready:
                     break
                 resource = self._pick_resource(ready, current)
@@ -236,7 +241,7 @@ class ResourceEpochScheduler:
                     batch = sorted(
                         (
                             job
-                            for job in self._ready(pending, resolved, attempted)
+                            for job in self._ready(pending, resolved, attempted, finalize_attempted)
                             if job.resource == resource
                         ),
                         key=job_order_key,
@@ -257,6 +262,7 @@ class ResourceEpochScheduler:
                         pending,
                         resolved,
                         attempted,
+                        finalize_attempted,
                     )
                     after = (len(resolved), len(attempted), len(pending))
                     round_index += 1
@@ -295,11 +301,14 @@ class ResourceEpochScheduler:
         pending: Mapping[str, ModelJob],
         resolved: set[str],
         attempted: set[str],
+        finalize_attempted: set[str],
     ) -> list[ModelJob]:
         return [
             job
             for key, job in sorted(pending.items())
-            if key not in resolved and key not in attempted
+            if key not in resolved
+            and key not in attempted
+            and key not in finalize_attempted
         ]
 
     def _drain_phase(
@@ -312,6 +321,7 @@ class ResourceEpochScheduler:
         pending: dict[str, ModelJob],
         resolved: set[str],
         attempted: set[str],
+        finalize_attempted: set[str],
     ) -> None:
         for start in range(0, len(batch), self.window_size):
             chunk = batch[start : start + self.window_size]
@@ -331,7 +341,7 @@ class ResourceEpochScheduler:
                     self.diagnostics.resume["receipts_reused"] += 1
                     if state.state == "rerun_no_receipt":
                         self.diagnostics.resume["jobs_rerun_after_incomplete_commit"] += 1
-                    self._replay_committed(job, pending, resolved)
+                    self._replay_committed(job, pending, resolved, finalize_attempted)
                     continue
                 if state.state == "rerun_no_receipt":
                     self.diagnostics.resume["jobs_rerun_after_incomplete_commit"] += 1
@@ -380,13 +390,16 @@ class ResourceEpochScheduler:
                 else:
                     counters["jobs_retryable_failed"] += 1
                 if result.committed:
-                    self._finalize(job, result, pending, resolved)
+                    self._finalize(
+                        job, result, pending, resolved, finalize_attempted
+                    )
 
     def _replay_committed(
         self,
         job: ModelJob,
         pending: dict[str, ModelJob],
         resolved: set[str],
+        finalize_attempted: set[str],
     ) -> None:
         """Re-run the CPU finalizer for an already-committed job.
 
@@ -400,7 +413,7 @@ class ResourceEpochScheduler:
                 f"{job.job_id()}: committed job has no replayable durable result"
             )
         self.diagnostics.resume["finalizers_replayed"] += 1
-        self._finalize(job, result, pending, resolved)
+        self._finalize(job, result, pending, resolved, finalize_attempted)
 
     def _finalize(
         self,
@@ -408,7 +421,11 @@ class ResourceEpochScheduler:
         result: JobResult,
         pending: dict[str, ModelJob],
         resolved: set[str],
+        finalize_attempted: set[str],
     ) -> None:
+        # Marked before the call so a raising finalizer still counts as this
+        # invocation's single attempt.
+        finalize_attempted.add(job.job_id())
         try:
             unlocked = self.finalize(job, result) or ()
         except Exception:  # noqa: BLE001 - finalizer failure must not be silent

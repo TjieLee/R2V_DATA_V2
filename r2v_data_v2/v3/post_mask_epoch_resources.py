@@ -494,7 +494,7 @@ class WorkerEpochResource(EpochResource):
             for future, slot in futures.items():
                 try:
                     built[slot] = future.result()
-                except BaseException as exc:  # noqa: BLE001 - rollback below
+                except Exception as exc:  # noqa: BLE001 - rollback below
                     failures[slot] = exc
         if failures:
             # Never leave a partial set of GPU models resident.
@@ -509,11 +509,21 @@ class WorkerEpochResource(EpochResource):
         self.workers = [built[slot] for slot in sorted(built)]
 
     def _stop(self) -> None:
-        for worker in self.workers:
+        """Close every worker, then report. One failure must not leak the rest."""
+        workers, self.workers = self.workers, []
+        errors: list[str] = []
+        for slot, worker in enumerate(workers):
             close = getattr(worker, "close", None)
-            if callable(close):
+            if not callable(close):
+                continue
+            try:
                 close()
-        self.workers = []
+            except Exception as exc:  # noqa: BLE001 - best-effort shutdown
+                errors.append(f"slot {slot}: {exc}")
+        if errors:
+            raise EpochResourceError(
+                f"{self.name} shutdown incomplete: {'; '.join(errors)}"
+            )
 
     def handle_for_slot(self, slot_id: int) -> Any:
         """Return the live worker backend for a slot, never the slot id.
@@ -658,7 +668,7 @@ class SerialBatchExecutor:
                 results[job.job_id()] = JobExecution(
                     job, self.runner(job, self.handle), None
                 )
-            except BaseException as exc:  # noqa: BLE001 - isolate per job
+            except Exception as exc:  # noqa: BLE001 - isolate per job
                 results[job.job_id()] = JobExecution(job, None, exc)
         return results
 
@@ -692,7 +702,7 @@ class QwenConcurrentExecutor:
             for future, job in futures.items():
                 try:
                     results[job.job_id()] = JobExecution(job, future.result(), None)
-                except BaseException as exc:  # noqa: BLE001 - isolate per job
+                except Exception as exc:  # noqa: BLE001 - isolate per job
                     results[job.job_id()] = JobExecution(job, None, exc)
         return results
 
@@ -725,23 +735,32 @@ class WorkerSlotExecutor:
             slots[index % self.slot_count].append(job)
         results: dict[str, JobExecution] = {}
         lock = threading.Lock()
+        #: Control-flow exceptions (SystemExit, KeyboardInterrupt) are never
+        #: recorded as a per-job failure; they are re-raised on the caller's
+        #: thread once every slot has settled.
+        fatal: list[BaseException] = []
 
         def run_slot(slot_id: int, queued: list[Any]) -> None:
-            for job in queued:
-                # The runner receives the live backend, never a GPU slot id.
-                handle = (
-                    self.resource.handle_for_slot(slot_id)
-                    if self.resource is not None
-                    else slot_id
-                )
-                try:
-                    result = self.runner(job, handle)
-                except BaseException as exc:  # noqa: BLE001 - isolate per job
-                    with lock:
-                        results[job.job_id()] = JobExecution(job, None, exc)
-                else:
-                    with lock:
-                        results[job.job_id()] = JobExecution(job, result, None)
+            try:
+                for job in queued:
+                    # The runner receives the live backend, never a GPU slot id.
+                    handle = (
+                        self.resource.handle_for_slot(slot_id)
+                        if self.resource is not None
+                        else slot_id
+                    )
+                    try:
+                        result = self.runner(job, handle)
+                    except Exception as exc:  # noqa: BLE001 - isolate per job
+                        with lock:
+                            results[job.job_id()] = JobExecution(job, None, exc)
+                    else:
+                        with lock:
+                            results[job.job_id()] = JobExecution(job, result, None)
+            except BaseException as exc:  # re-raised on the caller's thread
+                with lock:
+                    fatal.append(exc)
+                raise
 
         threads = [
             threading.Thread(target=run_slot, args=(slot_id, queued), daemon=True)
@@ -752,6 +771,8 @@ class WorkerSlotExecutor:
             thread.start()
         for thread in threads:
             thread.join()
+        if fatal:
+            raise fatal[0]
         return results
 
 
@@ -801,6 +822,8 @@ class ResourceEpochManager:
         factory = self._factories.get(resource)
         if factory is None:
             raise EpochResourceError(f"no resource factory for {resource!r}")
+        # exit_current() raises on a failed unload, so a broken resource can
+        # never be left half-unloaded while the next one loads.
         built_resource, executor = factory()
         built_resource.start()
         self._resource = built_resource

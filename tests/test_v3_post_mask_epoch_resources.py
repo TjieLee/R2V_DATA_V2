@@ -929,3 +929,109 @@ def test_handle_for_slot_rejects_out_of_range(tmp_path: Path):
     resource.start()
     with pytest.raises(EpochResourceError):
         resource.handle_for_slot(5)
+
+
+# --------------------------------------------------------------------------
+# Shutdown safety
+# --------------------------------------------------------------------------
+
+
+class _ClosableWorker:
+    def __init__(self, slot: int, gpu_id: int, *, fail: bool = False):
+        self.slot, self.gpu_id = slot, gpu_id
+        self.closed = False
+        self.close_calls = 0
+        self.fail = fail
+
+    def close(self) -> None:
+        self.close_calls += 1
+        if self.fail:
+            raise RuntimeError(f"close failed for slot {self.slot}")
+        self.closed = True
+
+
+def test_worker_shutdown_closes_every_worker_even_on_failure(tmp_path: Path):
+    created: list[_ClosableWorker] = []
+
+    def factory(slot: int, gpu_id: int) -> _ClosableWorker:
+        worker = _ClosableWorker(slot, gpu_id, fail=(slot == 2))
+        created.append(worker)
+        return worker
+
+    resource = WorkerEpochResource(
+        RESOURCE_BOOGU,
+        WorkerPoolConfig(),
+        process_manager=_FakeProcessManager(),
+        worker_factory=factory,
+        log_root=tmp_path,
+    )
+    resource.start()
+    assert len(created) == 8
+    with pytest.raises(EpochResourceError, match="slot 2"):
+        resource.stop()
+    # Every worker was asked to close, not just the ones before the failure.
+    assert all(worker.close_calls == 1 for worker in created)
+    assert resource.workers == []
+
+
+def test_failed_resource_stop_blocks_the_next_resource():
+    started: list[str] = []
+
+    class _BadResource(EpochResource):
+        def _start(self) -> None:
+            started.append(self.name)
+
+        def _stop(self) -> None:
+            raise RuntimeError("stop failed")
+
+    def bad_factory():
+        return _BadResource(RESOURCE_QWEN, process_manager=_FakeProcessManager()), SerialBatchExecutor(
+            lambda j, h: JobResult(OUTCOME_COMPLETED)
+        )
+
+    def next_factory():
+        started.append(RESOURCE_BOOGU)
+        return _TrackedResource(
+            RESOURCE_BOOGU, process_manager=_FakeProcessManager()
+        ), SerialBatchExecutor(lambda j, h: JobResult(OUTCOME_COMPLETED))
+
+    manager = ResourceEpochManager(
+        {RESOURCE_QWEN: bad_factory, RESOURCE_BOOGU: next_factory}
+    )
+    manager.enter(RESOURCE_QWEN)
+    with pytest.raises(RuntimeError, match="stop failed"):
+        manager.enter(RESOURCE_BOOGU)
+    # Boogu must never be loaded after a failed Qwen unload.
+    assert RESOURCE_BOOGU not in started
+    assert manager.open_count == 0
+
+
+# --------------------------------------------------------------------------
+# Control-flow exceptions must propagate
+# --------------------------------------------------------------------------
+
+
+def _system_exit_runner(job: ModelJob, handle: Any) -> JobResult:
+    raise SystemExit("interrupted")
+
+
+def test_serial_executor_propagates_system_exit():
+    with pytest.raises(SystemExit):
+        SerialBatchExecutor(_system_exit_runner).execute_batch([_boogu_job("clip-1")])
+
+
+def test_qwen_executor_propagates_system_exit():
+    executor = QwenConcurrentExecutor(_system_exit_runner, max_inflight=2)
+    with pytest.raises(SystemExit):
+        executor.execute_batch([_qwen_job("clip-1"), _qwen_job("clip-2")])
+
+
+@pytest.mark.filterwarnings(
+    "ignore::pytest.PytestUnhandledThreadExceptionWarning"
+)
+def test_worker_slot_executor_propagates_system_exit():
+    # SystemExit is raised inside the slot thread (proving it is not swallowed
+    # into a JobExecution) and re-raised on the caller's thread after join.
+    executor = WorkerSlotExecutor(_system_exit_runner, slot_count=2)
+    with pytest.raises(SystemExit):
+        executor.execute_batch([_boogu_job("clip-1")])

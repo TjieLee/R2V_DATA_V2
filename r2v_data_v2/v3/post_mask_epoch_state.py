@@ -162,19 +162,21 @@ def verify_external_artifact(
     ``JobResult.payload``. Reads are chunked so a large generated PNG is never
     pulled into memory in one go.
     """
-    path = Path(reference.path)
-    if not path.is_absolute():
-        return False
-    if not path.is_file():
-        return False
-    if reference.size is not None and path.stat().st_size != reference.size:
-        return False
     digest = hashlib.sha256()
     try:
+        path = Path(reference.path)
+        if not path.is_absolute():
+            return False
+        if not path.is_file():
+            return False
+        if reference.size is not None and path.stat().st_size != reference.size:
+            return False
         with path.open("rb") as handle:
             for chunk in iter(lambda: handle.read(chunk_size), b""):
                 digest.update(chunk)
     except OSError:
+        # Any filesystem race (disappeared file, permission change, stale NFS
+        # handle) fails closed instead of being reported as a valid artifact.
         return False
     return digest.hexdigest() == reference.sha256
 
@@ -248,6 +250,44 @@ class PhaseLedger:
         payload = [job.plan_record() for job in jobs]
         return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
 
+    @staticmethod
+    def _validate_existing_plan(payload: Any) -> dict[str, dict[str, Any]]:
+        """Validate a plan already on disk before it is extended.
+
+        A malformed plan must fail closed. It is never silently repaired or
+        overwritten, because that would hide durable-state corruption and
+        could resurrect a job under different semantics.
+        """
+        if not isinstance(payload, dict):
+            raise LedgerError("phase plan is not an object")
+        jobs = payload.get("jobs")
+        if not isinstance(jobs, list):
+            raise LedgerError("phase plan jobs is not a list")
+        count = payload.get("job_count")
+        if not isinstance(count, int) or isinstance(count, bool) or count != len(jobs):
+            raise LedgerError("phase plan job_count does not match its jobs")
+        plan_hash = payload.get("plan_hash")
+        if not isinstance(plan_hash, str) or not plan_hash:
+            raise LedgerError("phase plan has no plan_hash")
+        if (
+            hashlib.sha256(canonical_json(jobs).encode("utf-8")).hexdigest()
+            != plan_hash
+        ):
+            raise LedgerError("phase plan hash does not match its jobs")
+        indexed: dict[str, dict[str, Any]] = {}
+        for record in jobs:
+            if not isinstance(record, dict):
+                raise LedgerError("phase plan job record is not an object")
+            job_id = record.get("job_id")
+            if not isinstance(job_id, str) or not job_id:
+                raise LedgerError("phase plan job record has no job_id")
+            if job_id in indexed:
+                raise LedgerError(f"phase plan has duplicate job_id {job_id}")
+            if not isinstance(record.get("job_identity"), str):
+                raise LedgerError(f"phase plan job {job_id} has no job_identity")
+            indexed[job_id] = record
+        return indexed
+
     def write_plan(self, jobs: Sequence[Any]) -> str:
         """Create or grow the phase plan. Never shrink it, never rewrite a job.
 
@@ -274,11 +314,7 @@ class PhaseLedger:
             return payload["plan_hash"]
 
         existing = json.loads(self.plan_path.read_text())
-        merged: dict[str, dict[str, Any]] = {}
-        for record in existing.get("jobs", []):
-            job_id = record.get("job_id")
-            if isinstance(job_id, str):
-                merged[job_id] = record
+        merged = self._validate_existing_plan(existing)
         for job_id, record in current.items():
             known = merged.get(job_id)
             if known is not None and known != record:
@@ -323,11 +359,16 @@ class PhaseLedger:
 
     def append_receipt(self, receipt: Receipt) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
+        was_new = not self.receipts_path.exists()
         line = canonical_json(receipt.record()) + "\n"
         with self.receipts_path.open("a", encoding="utf-8") as handle:
             handle.write(line)
             handle.flush()
             os.fsync(handle.fileno())
+        if was_new:
+            # A newly created file needs its directory entry durable too,
+            # otherwise a crash can lose the file itself, not just its tail.
+            _fsync_directory(self.receipts_path.parent)
 
     # -- artifacts --------------------------------------------------------
     def artifact_path(self, job_id: str, name: str) -> Path:
@@ -412,15 +453,17 @@ class PhaseLedger:
                 "receipt is not a committed outcome",
                 phase_id=self.root.name,
             )
-        if outcome == OUTCOME_COMPLETED:
-            expected = receipt.get("artifact_digests") or {}
-            if expected != self.artifact_digests(job.job_id()):
-                return JobState(
-                    STATE_MISMATCH,
-                    dict(receipt),
-                    "receipt artifact digests do not match artifacts on disk",
-                    phase_id=self.root.name,
-                )
+        # Shared committed validation. A terminal reject is as committed as a
+        # completed job, so its internal artifacts are validated identically
+        # rather than being exempted.
+        expected = receipt.get("artifact_digests") or {}
+        if expected != self.artifact_digests(job.job_id()):
+            return JobState(
+                STATE_MISMATCH,
+                dict(receipt),
+                "receipt artifact digests do not match artifacts on disk",
+                phase_id=self.root.name,
+            )
         # From here on every committed outcome is validated identically.
         # result.json is mandatory: a receipt without a durable result cannot
         # be replayed, and replaying nothing would silently drop downstream
