@@ -515,10 +515,12 @@ one model class at a time.
   rejected for being a superset or subset. The invariant is per job: a job's
   ``plan_record`` may never change once written.
 * **Every committed outcome is fully validated.** ``completed`` and
-  ``terminal_reject`` run the identical check: job identity, outcome, internal
-  artifact digests, ``result.json`` presence, its SHA256 against
-  ``result_digest``, JSON parseability, outcome agreement between result and
-  receipt, and external-artifact agreement. ``result.json`` is mandatory; a
+  ``terminal_reject`` run the identical check, with no exemption: job identity,
+  outcome, all internal artifact digests, ``result.json`` presence, its SHA256
+  against ``result_digest``, JSON parseability, outcome agreement between result
+  and receipt, and external-artifact agreement. A malformed existing plan
+  (bad hash, wrong job_count, non-list jobs, non-dict or duplicate records,
+  missing job_id) fails closed and is never repaired or overwritten. ``result.json`` is mandatory; a
   receipt without a durable result fails closed instead of being treated as
   legacy state. External artifacts are verified (absolute path, existence, size,
   chunked streaming SHA256) rather than merely recorded —
@@ -535,6 +537,17 @@ one model class at a time.
 * **No in-launch automatic retry.** Restart is the retry. A job gets at most
   one real model attempt per invocation; a retryable outcome leaves the group
   incomplete rather than being retried inside the same run.
+* **No in-launch retry, for models or finalizers.** Restart is the retry. A job
+  gets at most one real model attempt per invocation, and a committed job's CPU
+  finalizer is replayed at most once per invocation: a successful sibling must
+  not cause a second attempt on a job whose finalizer already failed.
+* **Shutdown is best-effort and all-or-nothing.** Every worker is asked to
+  close even if an earlier close raises, and the failure is reported
+  afterwards; a failed unload also blocks the next resource from loading, so
+  two heavy resources can never be resident because a stop half-succeeded.
+* **Control-flow exceptions propagate.** Model executors catch `Exception`, so
+  `KeyboardInterrupt`, `SystemExit` and `GeneratorExit` are never turned into a
+  per-job failure record.
 * **One heavy resource at a time.** The scheduler loads Qwen, Boogu or SAM,
   drains that resource to a fixed point, then unloads it completely. Enter/exit
   is guarded by `try/finally`, so an executor exception or interrupt still
