@@ -510,6 +510,24 @@ one model class at a time.
   job as completed (skip), terminal reject (never pay again),
   artifact-without-receipt (rerun) or digest mismatch (fail closed). Only a torn
   final JSONL line is truncated; diagnostics are append-only.
+* **Skip model call never skips the finalizer.** A downstream job exists only
+  because some finalizer ran, so a crash between receipt and finalize would
+  otherwise strand every dependent job. Committed jobs persist a small
+  `result.json`; resume reloads it and replays the CPU finalizer. Finalizers
+  must be model-free, deterministic and idempotent.
+* **No in-launch automatic retry.** Restart is the retry. A job gets at most
+  one real model attempt per invocation; a retryable outcome leaves the group
+  incomplete rather than being retried inside the same run.
+* **One heavy resource at a time.** The scheduler loads Qwen, Boogu or SAM,
+  drains that resource to a fixed point, then unloads it completely. Enter/exit
+  is guarded by `try/finally`, so an executor exception or interrupt still
+  unloads. Resource switches never reload a resource that still has ready work.
+* **Concurrency is confined to model calls.** Same-resource jobs run through a
+  bounded window with all GPU slots busy: Boogu/SAM keep one sequential queue
+  per slot (a slot never overlaps itself), Qwen sends many requests at once to
+  the single TP1 x DP8 endpoint. Receipt appends, artifact publication,
+  finalizers and pending-map mutation stay on the scheduler thread in
+  deterministic order, so durable state never races.
 * **Owned processes only.** Resource switches terminate only PIDs/process
   groups this launcher created. A pre-flight port check makes an unmanaged
   server on `8000` fail fast instead of being adopted or killed.
@@ -537,7 +555,27 @@ semantic modules rather than duplicating them.
 Diagnostics are emitted as `post_mask_resource_epoch_summary` and written to
 `<state>/resource_epochs/summary-rank<N>.json`, including per-resource planned /
 skipped / executed / terminal-rejected / retryable-failed counts, epoch wall
-seconds, GPU slot job counts, resource switches and conditional-attempt counts.
+seconds, GPU slot job counts, resource switches, window count,
+conditional-attempt counts and resume counters (receipts reused, finalizers
+replayed, finalizer failures, jobs rerun after an incomplete commit).
+
+The managed Qwen server is started as:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+vllm serve /mnt/workspace/public/pretrained/Qwen/Qwen3-VL-32B-Instruct \
+  --host 127.0.0.1 --port 8000 \
+  --tensor-parallel-size 1 --data-parallel-size 8 \
+  --max-model-len 49152 --gpu-memory-utilization 0.90 --dtype bfloat16 \
+  --allowed-local-media-path /mnt/workspace/public/dataset \
+  --served-model-name /mnt/workspace/public/pretrained/Qwen/Qwen3-VL-32B-Instruct
+```
+
+The executable resolves through `PATH` (`shutil.which("vllm")`) and is never
+taken from the R2V `.venv`. This server advertises the **full model path**, not
+its basename, so health checking matches the served id against
+`--served-model-name` (or `str(model_path)`) across every `/v1/models` entry,
+and `--served-model-name` can be overridden explicitly.
 
 ### Not yet done
 
@@ -545,3 +583,8 @@ The semantic split of `remove.py`, `reference_edit*.py` and
 `subject_attributes.py` into prepare -> model job -> durable result -> CPU
 finalize is **not** implemented, so no real model job runner exists yet and no
 equivalence run has been performed. Do not infer throughput from unit tests.
+
+The foundation API is ready for that runner: seed jobs, `BatchJobExecutor`
+implementations, a CPU finalizer contract, `ResourceEpochManager` and resume are
+all exercised by fake tests, but no code has been pointed at real Visual
+semantics yet.
