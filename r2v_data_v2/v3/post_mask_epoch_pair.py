@@ -1375,30 +1375,40 @@ class PairEpochRunner:
                 and current.reference_scope == "full"
             ):
                 continue
-            candidates = build_entity_reference_candidates(
-                self.config,
-                storage,
-                clip_uid=clip_uid,
-                entity=entity,
-                frames=frames,
-                masks=masks,
-            )
-            donors = _donors_for_target(
-                self.config, index, target_clip=target_clip, target_entity=entity
-            )
-            if not donors:
-                # Frozen ordering: no donor means no evidence materialization.
-                continue
-            evidence = prepare_cross_pair_target_evidence(
-                self.config,
-                storage,
-                clip_uid=clip_uid,
-                entity=entity,
-                frames=frames,
-                target_candidates=candidates,
-            )
+            try:
+                candidates = build_entity_reference_candidates(
+                    self.config,
+                    storage,
+                    clip_uid=clip_uid,
+                    entity=entity,
+                    frames=frames,
+                    masks=masks,
+                )
+                donors = _donors_for_target(
+                    self.config, index, target_clip=target_clip, target_entity=entity
+                )
+                if not donors:
+                    # Frozen ordering: no donor means no evidence materialization.
+                    continue
+                evidence = prepare_cross_pair_target_evidence(
+                    self.config,
+                    storage,
+                    clip_uid=clip_uid,
+                    entity=entity,
+                    frames=frames,
+                    target_candidates=candidates,
+                )
+            except PairEpochError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - legacy target isolation
+                return self._finish_cross_cpu_failure(shard, clip_uid, exc)
             for rank, donor in enumerate(donors):
-                prepared = prepare_cross_pair_attempt(evidence, donor)
+                try:
+                    prepared = prepare_cross_pair_attempt(evidence, donor)
+                except PairEpochError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - legacy target isolation
+                    return self._finish_cross_cpu_failure(shard, clip_uid, exc)
                 job = self._cross_job(
                     shard,
                     clip_uid,
@@ -1417,13 +1427,18 @@ class PairEpochRunner:
                     return self._finish_cross_failure(
                         shard, clip_uid, target_clip, entity, evidence, donor, result
                     )
-                outcome = finalize_cross_pair_judge(
-                    storage,
-                    target_clip=target_clip,
-                    prepared=prepared,
-                    attempt=_cross_payload_attempt(result),
-                    counters=self._scratch(shard),
-                )
+                try:
+                    outcome = finalize_cross_pair_judge(
+                        storage,
+                        target_clip=target_clip,
+                        prepared=prepared,
+                        attempt=_cross_payload_attempt(result),
+                        counters=self._scratch(shard),
+                    )
+                except PairEpochError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - legacy target isolation
+                    return self._finish_cross_cpu_failure(shard, clip_uid, exc)
                 if outcome.verdict != "accepted":
                     continue
                 states_by_id[entity.entity_id] = outcome.state
@@ -1444,9 +1459,14 @@ class PairEpochRunner:
                 reason="fallback completed without an accepted donor",
             )
             return None
-        pairing = _pairing_from_references(
-            target_clip, entity_states, bind_ready_background=False
-        )
+        try:
+            pairing = _pairing_from_references(
+                target_clip, entity_states, bind_ready_background=False
+            )
+        except PairEpochError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - legacy target isolation
+            return self._finish_cross_cpu_failure(shard, clip_uid, exc)
         if pairing.status == "ready":
             token, pending = self._background_token(
                 shard, clip_uid, frames, CALL_SITE_CROSS_PAIR
@@ -1538,6 +1558,38 @@ class PairEpochRunner:
                     f"clip {clip_uid} entity {entity_id} cross-published PNG differs "
                     "from the frozen donor reference"
                 )
+
+    def _finish_cross_cpu_failure(
+        self, shard: str, clip_uid: str, exc: BaseException
+    ) -> None:
+        """Legacy target-block failure for an ordinary fallback CPU exception.
+
+        Only called for real fallback execution failures. Frozen-state drift
+        (snapshot mismatch, donor PNG mismatch, job digest mismatch,
+        already-published mismatch) never reaches here: those stay fail closed
+        so a corrupted durable state is never recorded as a Pair terminal.
+        """
+        from r2v_data_v2.v3.pair import _failure_details
+
+        storage = self._storage_for(shard)
+        try:
+            storage.cleanup_pair_artifacts(clip_uid)
+        except Exception as cleanup_error:  # noqa: BLE001
+            self.emit("cross cleanup skipped", cleanup_error)
+        storage.append_failure(
+            stage="pair",
+            clip_uid=clip_uid,
+            reason=str(exc),
+            details=_failure_details(exc),
+        )
+        self.stats[shard]["failed"] += 1
+        self._mark_cross_terminal(
+            shard,
+            clip_uid,
+            status=CROSS_TERMINAL_FAILED,
+            reason_kind="cross_pair_cpu_failure",
+            reason=f"{type(exc).__name__}: {exc}",
+        )
 
     def _finish_cross_failure(
         self,

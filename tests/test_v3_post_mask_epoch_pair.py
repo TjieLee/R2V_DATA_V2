@@ -2636,7 +2636,14 @@ def test_cross_context_only_evidence_uses_sampled_frames(
     expected_slots = [frame.slot for frame in frames.frames]
     assert judge.calls[0]["target_evidence_mode"] == "sampled_frames"
     assert judge.calls[0]["crop_mode"] is None
-    assert len(expected_slots) == len(frames.frames)
+
+    # The rebuilt evidence is what the job identity and the judge really see.
+    _prepared, evidence, _donor, _rank, _clip = runner._cross_position(
+        SHARD, "target-b", dict(job.target)
+    )
+    assert list(evidence.frame_slots) == expected_slots
+    assert evidence.evidence_mode == "sampled_frames"
+    assert evidence.entity_crop is None
 
 
 def test_cross_publication_is_idempotent_after_marker_loss(
@@ -2715,3 +2722,45 @@ def test_tampered_cross_published_png_fails_closed(
     )
     with pytest.raises(PairEpochError, match="cross-published PNG differs"):
         restarted.freeze_cross_pair_after_primary_quiescence()
+
+
+def test_cross_cpu_failure_is_durable_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ordinary fallback CPU failure terminates the target like legacy."""
+    import r2v_data_v2.v3.post_mask_epoch_pair as pm
+
+    _config, storage, runner = _cross_fixture(tmp_path, monkeypatch)
+    runner.freeze_donor_snapshot(SHARD)
+    before = storage.read_clip("target-b").pairing
+
+    def explode(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("evidence construction failed")
+
+    monkeypatch.setattr(pm, "prepare_cross_pair_target_evidence", explode)
+    judge = _CrossJudge([True])
+    jobs = [
+        item
+        for item in runner.freeze_cross_pair_after_primary_quiescence()
+        if item.clip_uid == "target-b"
+    ]
+    assert jobs == [], "no cross job after a CPU terminal failure"
+    assert judge.calls == [], "Qwen is never called"
+
+    terminal = runner._cross_terminal(SHARD, "target-b")
+    assert terminal is not None
+    assert terminal["status"] == "failed"
+    assert terminal["reason_kind"] == "cross_pair_cpu_failure"
+    assert storage.read_clip("target-b").pairing == before, "primary survives"
+
+    restarted = _runner(
+        tmp_path,
+        _config,
+        storage,
+        clip_uids=("clip-1", "donor", "target-b", "target-c"),
+    )
+    assert [
+        item.clip_uid
+        for item in restarted.freeze_cross_pair_after_primary_quiescence()
+        if item.clip_uid == "target-b"
+    ] == []
