@@ -5,8 +5,10 @@ import json
 import math
 import re
 import shutil
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 from PIL import Image, ImageDraw
@@ -16,6 +18,7 @@ from r2v_data_v2.v3.background import validate_background_reference
 from r2v_data_v2.v3.background_final_guard import (
     FinalBackgroundJudge,
     FinalBackgroundJudgeFailure,
+    FinalBackgroundReviewAttempt,
     QwenFinalBackgroundJudge,
     load_final_background_image,
 )
@@ -158,6 +161,44 @@ class PairStats:
         return asdict(self)
 
 
+class _GuardFailClosed(Exception):
+    """Internal: a background-guard step failed and must close the binding.
+
+    Carries the raw response because ``FinalBackgroundJudgeFailure`` is the only
+    failure class whose raw response reaches the debug artifact.
+    """
+
+    def __init__(self, error: Exception, *, raw_response: str | None = None) -> None:
+        super().__init__(str(error))
+        self.error = error
+        self.raw_response = raw_response
+
+
+@dataclass(frozen=True)
+class BackgroundFinalGuardPreparation:
+    """Deterministic inputs of one final-background guard model call."""
+
+    clip: ClipRecord
+    background: BackgroundReferenceState
+    image: Image.Image
+    phrase: str
+    grounding_prompt: str
+    background_status: str
+
+
+@dataclass(frozen=True)
+class BackgroundGuardStep:
+    """Result of the deterministic guard step.
+
+    ``token`` is set when the guard resolved without a model call (not
+    eligible, or mode ``off``); ``preparation`` is set when a model call is
+    required.
+    """
+
+    token: str | None = None
+    preparation: BackgroundFinalGuardPreparation | None = None
+
+
 class _BackgroundFinalGuardRuntime:
     def __init__(
         self,
@@ -234,30 +275,54 @@ class _BackgroundFinalGuardRuntime:
         except Exception:  # noqa: BLE001,S110 - diagnostics cannot reject a sample
             pass
 
-    def token_for_ready_pairing(
+    def _fail_closed(
+        self,
+        *,
+        clip: ClipRecord,
+        background: BackgroundReferenceState,
+        raw_response: str | None,
+        error: Exception,
+    ) -> None:
+        self.counters["background_final_guard_failed_closed"] += 1
+        self._write_debug(
+            clip=clip,
+            background=background,
+            review=None,
+            raw_response=raw_response,
+            error=error,
+            bound_after_guard=False,
+        )
+
+    def prepare_background_final_guard(
         self,
         *,
         clip: ClipRecord,
         frames: SampledFramesArtifact,
-    ) -> str | None:
+    ) -> BackgroundGuardStep:
+        """Deterministic part of the guard: eligibility, validation, image load.
+
+        Raises ``_GuardFailClosed`` for every deterministic failure, exactly as
+        the original single ``try`` block did -- those failures close the
+        background binding without touching the entity pairing.
+        """
         background = clip.references.background
         if background is None or background.status not in {
             "clean_raw",
             "ready_removed",
         }:
-            return None
+            return BackgroundGuardStep(token=None)
         if self.config.pair.background_final_guard_mode == "off":
+            # Never wrapped: a broken background propagates to the caller.
             validate_background_reference(
                 self.storage,
                 clip.clip_uid,
                 background,
                 frames=frames,
             )
-            return "<ref_bg_1>"
+            return BackgroundGuardStep(token="<ref_bg_1>")
 
         self.evaluated_clip_uids.add(clip.clip_uid)
         self.counters["background_final_guard_attempted"] += 1
-        raw_response: str | None = None
         try:
             validate_background_reference(
                 self.storage,
@@ -275,29 +340,44 @@ class _BackgroundFinalGuardRuntime:
                 clip_uid=clip.clip_uid,
                 background=background,
             )
-            attempt = self._judge().review(
-                image=image,
-                background_phrase=annotation_background.phrase,
-                background_grounding_prompt=(
-                    annotation_background.grounding_prompt
-                ),
-                background_status=background.status,
-            )
-            raw_response = attempt.raw_response
-        except Exception as exc:  # noqa: BLE001 - background-only fail closed
-            if isinstance(exc, FinalBackgroundJudgeFailure):
-                raw_response = exc.raw_response
-            self.counters["background_final_guard_failed_closed"] += 1
-            self._write_debug(
+        except FinalBackgroundJudgeFailure as exc:
+            raise _GuardFailClosed(exc, raw_response=exc.raw_response) from exc
+        except Exception as exc:
+            raise _GuardFailClosed(exc) from exc
+        return BackgroundGuardStep(
+            preparation=BackgroundFinalGuardPreparation(
                 clip=clip,
                 background=background,
-                review=None,
-                raw_response=raw_response,
-                error=exc,
-                bound_after_guard=False,
+                image=image,
+                phrase=annotation_background.phrase,
+                grounding_prompt=annotation_background.grounding_prompt,
+                background_status=background.status,
             )
-            return None
+        )
 
+    def run_background_final_guard_judge(
+        self,
+        preparation: BackgroundFinalGuardPreparation,
+    ) -> FinalBackgroundReviewAttempt:
+        """MODEL CALL. The judge keeps its own prompt, service and flow."""
+        try:
+            return self._judge().review(
+                image=preparation.image,
+                background_phrase=preparation.phrase,
+                background_grounding_prompt=preparation.grounding_prompt,
+                background_status=preparation.background_status,
+            )
+        except FinalBackgroundJudgeFailure as exc:
+            raise _GuardFailClosed(exc, raw_response=exc.raw_response) from exc
+        except Exception as exc:
+            raise _GuardFailClosed(exc) from exc
+
+    def finalize_background_final_guard(
+        self,
+        preparation: BackgroundFinalGuardPreparation,
+        attempt: FinalBackgroundReviewAttempt,
+    ) -> str | None:
+        """CPU policy: counter, debug and token decision."""
         accepted = attempt.review.verdict == "accept"
         self.counters[
             "background_final_guard_accepted"
@@ -305,14 +385,37 @@ class _BackgroundFinalGuardRuntime:
             else "background_final_guard_rejected"
         ] += 1
         self._write_debug(
-            clip=clip,
-            background=background,
+            clip=preparation.clip,
+            background=preparation.background,
             review=attempt.review,
-            raw_response=raw_response,
+            raw_response=attempt.raw_response,
             error=None,
             bound_after_guard=accepted,
         )
         return "<ref_bg_1>" if accepted else None
+
+    def token_for_ready_pairing(
+        self,
+        *,
+        clip: ClipRecord,
+        frames: SampledFramesArtifact,
+    ) -> str | None:
+        try:
+            step = self.prepare_background_final_guard(clip=clip, frames=frames)
+            if step.preparation is None:
+                return step.token
+            attempt = self.run_background_final_guard_judge(step.preparation)
+        except _GuardFailClosed as closed:
+            background = clip.references.background
+            assert background is not None
+            self._fail_closed(
+                clip=clip,
+                background=background,
+                raw_response=closed.raw_response,
+                error=closed.error,
+            )
+            return None
+        return self.finalize_background_final_guard(step.preparation, attempt)
 
     def close(self) -> None:
         if self.owned_judge is not None:
@@ -1648,6 +1751,461 @@ def _publish_cross_pair_result(
         storage.cleanup_pair_artifacts(clip_uid)
 
 
+# ---------------------------------------------------------------------------
+# Reusable Pair semantic boundaries
+#
+# These split the frozen Pair policy into
+#
+#     deterministic CPU prepare -> MODEL CALL -> CPU policy/finalize
+#
+# so the future resource-epoch Pair adapter can own the model call without
+# owning a second copy of the candidate, prefilter, donor or guard policy.
+# ``pair_clips()`` is the first consumer: it still drives all three boundaries
+# synchronously, in the original order, with the original counters.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PreparedEntityReferenceDecision:
+    """Judge inputs for one primary entity reference decision."""
+
+    clip_uid: str
+    entity: AnnotationEntity
+    candidates: tuple[EntityReferenceCandidate, ...]
+    source_images: Mapping[str, Image.Image]
+
+
+@dataclass(frozen=True)
+class EntityReferenceFinalization:
+    """CPU outcome of one primary entity reference decision."""
+
+    state: EntityReferenceState
+    #: ``(temporary path, image)`` only when the entity became ready. The caller
+    #: still publishes everything at once, so this stays a temporary file.
+    temporary: tuple[Path, Image.Image] | None = None
+
+
+def prepare_entity_reference(
+    config: V3Config,
+    storage: RunStorage,
+    *,
+    clip_uid: str,
+    entity: AnnotationEntity,
+    frames: SampledFramesArtifact,
+    masks: TrackedMasksArtifact,
+    counters: dict[str, int],
+) -> EntityReferenceState | PreparedEntityReferenceDecision:
+    """Deterministic routing for one annotated entity.
+
+    Returns a terminal ``EntityReferenceState`` when no Qwen call is needed
+    (tracking not ready, no valid candidate, prefiltered away), otherwise the
+    prepared judge inputs. Counter ownership stays with the caller.
+    """
+    tracked: TrackedEntityMasks = masks.entities[entity.entity_id]
+    if tracked.status != "ready":
+        return _rejected_reference(
+            entity.entity_id,
+            f"tracking_not_ready:{tracked.status}",
+        )
+    (
+        candidates,
+        all_candidates_tiny,
+        all_candidates_fragmented,
+    ) = _build_entity_reference_candidates(
+        config,
+        storage,
+        clip_uid=clip_uid,
+        entity=entity,
+        frames=frames,
+        masks=masks,
+    )
+    if not candidates:
+        return _rejected_reference(
+            entity.entity_id,
+            (
+                "tiny_reference_candidates"
+                if all_candidates_tiny
+                else "fragmented_reference_candidates"
+                if all_candidates_fragmented
+                else "no_valid_reference_candidate"
+            ),
+        )
+    source_images = _load_source_images(storage, candidates)
+    judged_candidates = candidates
+    if config.pair.reference_prefilter_mode == "conservative_v1":
+        try:
+            prefilter_result = prefilter_entity_reference_candidates(
+                entity,
+                candidates,
+                source_images,
+            )
+        except Exception as exc:  # noqa: BLE001 - required fail-open
+            counters["prefilter_candidates_examined"] += len(candidates)
+            counters["prefilter_fail_open_entities"] += 1
+            _write_prefilter_debug(
+                storage,
+                clip_uid=clip_uid,
+                entity=entity,
+                original_candidates=candidates,
+                result=None,
+                error=exc,
+            )
+        else:
+            _record_prefilter_stats(counters, prefilter_result)
+            _write_prefilter_debug(
+                storage,
+                clip_uid=clip_uid,
+                entity=entity,
+                original_candidates=candidates,
+                result=prefilter_result,
+            )
+            judged_candidates = list(prefilter_result.retained_candidates)
+            if not judged_candidates:
+                return _rejected_reference(
+                    entity.entity_id,
+                    "reference_prefilter_all_candidates_filtered",
+                )
+    return PreparedEntityReferenceDecision(
+        clip_uid=clip_uid,
+        entity=entity,
+        candidates=tuple(judged_candidates),
+        source_images=source_images,
+    )
+
+
+def run_entity_reference_judge(
+    prepared: PreparedEntityReferenceDecision,
+    judge: Any,
+) -> EntityReferenceDecisionAttempt:
+    """MODEL CALL. Thin on purpose: repair retries stay inside the judge."""
+    return judge.decide(
+        entity=prepared.entity,
+        candidates=list(prepared.candidates),
+        source_images=prepared.source_images,
+    )
+
+
+def finalize_entity_reference(
+    config: V3Config,
+    storage: RunStorage,
+    *,
+    prepared: PreparedEntityReferenceDecision,
+    attempt: EntityReferenceDecisionAttempt,
+) -> EntityReferenceFinalization:
+    """CPU policy after the Qwen call: debug, validation, scope policy, crop.
+
+    Returns the entity state plus a temporary reference image. Clip-level
+    publication stays with ``pair_clips()``.
+    """
+    _write_debug_attempt(
+        storage,
+        clip_uid=prepared.clip_uid,
+        entity=prepared.entity,
+        candidates=list(prepared.candidates),
+        attempt=attempt,
+    )
+    decision = attempt.decision
+    decision_issues = validate_entity_reference_decision(
+        decision,
+        candidate_ids={item.candidate_id for item in prepared.candidates},
+        reference_type=prepared.entity.reference_type,
+        candidate_by_id={item.candidate_id: item for item in prepared.candidates},
+    )
+    if decision_issues:
+        messages = "; ".join(issue.message for issue in decision_issues)
+        raise ValueError(f"invalid judge decision: {messages}")
+    if decision.reference_scope == "reject":
+        return EntityReferenceFinalization(
+            state=EntityReferenceState(
+                entity_id=prepared.entity.entity_id,
+                status="rejected",
+                reference_scope="reject",
+                visible_region="custom",
+                whole_entity_recognizable=False,
+                identity_features_visible=False,
+                scope_reason=decision.scope_reason,
+                image_quality=decision.image_quality,
+                completeness=decision.completeness,
+                viewpoint=decision.viewpoint,
+                independent_reference_value=(decision.independent_reference_value),
+                requires_substantial_invention=(
+                    decision.requires_substantial_invention
+                ),
+                primary_identity_region_visible=(
+                    decision.primary_identity_region_visible
+                ),
+                major_structure_visible=(decision.major_structure_visible),
+                truncation_severity=decision.truncation_severity,
+                discrete_foreground_instance=(decision.discrete_foreground_instance),
+                mask_matches_target=decision.mask_matches_target,
+                completion_needed_for_reference_use=(
+                    decision.completion_needed_for_reference_use
+                ),
+                detached_target_fragments_present=(
+                    decision.detached_target_fragments_present
+                ),
+                synthetic=False,
+            )
+        )
+    if decision.reference_scope == "local" and not config.reference_scope.allow_local:
+        return EntityReferenceFinalization(
+            state=_rejected_reference(
+                prepared.entity.entity_id,
+                "local_reference_disabled",
+                decision=decision,
+            )
+        )
+    selected = next(
+        candidate
+        for candidate in prepared.candidates
+        if candidate.candidate_id == decision.selected_candidate_id
+    )
+    source = prepared.source_images[selected.image_path]
+    reference_image, _ = build_reference_crop(
+        source,
+        selected.mask,
+        crop_padding_ratio=config.pair.crop_padding_ratio,
+    )
+    temporary = storage.pair_output_temporary_path(
+        prepared.clip_uid,
+        prepared.entity.entity_id,
+    )
+    reference_image.save(temporary, format="PNG")
+    return EntityReferenceFinalization(
+        state=EntityReferenceState(
+            entity_id=prepared.entity.entity_id,
+            status="ready",
+            reference_scope=decision.reference_scope,
+            visible_region=decision.visible_region,
+            whole_entity_recognizable=(decision.whole_entity_recognizable),
+            identity_features_visible=(decision.identity_features_visible),
+            scope_reason=decision.scope_reason,
+            image_path=storage.relative_artifact_path(
+                storage.selected_entity_path(
+                    prepared.clip_uid,
+                    prepared.entity.entity_id,
+                )
+            ),
+            source_frame_index=selected.source_frame_index,
+            synthetic=False,
+            source_clip_uid=prepared.clip_uid,
+            source_entity_id=prepared.entity.entity_id,
+            image_quality=decision.image_quality,
+            completeness=decision.completeness,
+            viewpoint=decision.viewpoint,
+            independent_reference_value=(decision.independent_reference_value),
+            requires_substantial_invention=(
+                decision.requires_substantial_invention
+            ),
+            primary_identity_region_visible=(
+                decision.primary_identity_region_visible
+            ),
+            major_structure_visible=decision.major_structure_visible,
+            truncation_severity=decision.truncation_severity,
+            discrete_foreground_instance=decision.discrete_foreground_instance,
+            mask_matches_target=decision.mask_matches_target,
+            completion_needed_for_reference_use=(
+                decision.completion_needed_for_reference_use
+            ),
+            detached_target_fragments_present=(
+                decision.detached_target_fragments_present
+            ),
+        ),
+        temporary=(temporary, reference_image),
+    )
+
+
+@dataclass(frozen=True)
+class CrossPairTargetEvidence:
+    """Target-side evidence for one cross-pair entity, built once per entity."""
+
+    clip_uid: str
+    entity: AnnotationEntity
+    evidence_mode: CrossPairTargetEvidenceMode
+    frame_slots: tuple[int, ...]
+    context_image: Image.Image
+    entity_crop: Image.Image | None
+
+
+@dataclass(frozen=True)
+class PreparedCrossPairDecision:
+    """Judge inputs for one target/donor cross-pair attempt."""
+
+    evidence: CrossPairTargetEvidence
+    donor: _CrossPairDonor
+    donor_reference_image: Image.Image
+
+
+@dataclass(frozen=True)
+class CrossPairDonorOutcome:
+    """CPU outcome of one donor attempt.
+
+    ``verdict`` is ``"continue"`` for a rejection (the donor chain proceeds) and
+    ``"accepted"`` for an accept. Nothing is published here.
+    """
+
+    verdict: str
+    state: EntityReferenceState | None = None
+    donor_path: Path | None = None
+
+
+def prepare_cross_pair_target_evidence(
+    config: V3Config,
+    storage: RunStorage,
+    *,
+    clip_uid: str,
+    entity: AnnotationEntity,
+    frames: SampledFramesArtifact,
+    masks: TrackedMasksArtifact,
+) -> CrossPairTargetEvidence:
+    """Target evidence for one entity, independent of any donor."""
+    target_candidates = build_entity_reference_candidates(
+        config,
+        storage,
+        clip_uid=clip_uid,
+        entity=entity,
+        frames=frames,
+        masks=masks,
+    )
+    if target_candidates:
+        target_candidate = target_candidates[0]
+        target_frame_slots = (target_candidate.frame_slot,)
+        target_sources = _load_source_images(storage, [target_candidate])
+        target_source = target_sources[target_candidate.image_path]
+        target_context = build_candidate_context_image(
+            target_source,
+            target_candidate.mask,
+        )
+        target_crop, _ = build_reference_crop(
+            target_source,
+            target_candidate.mask,
+            crop_padding_ratio=config.pair.crop_padding_ratio,
+        )
+        return CrossPairTargetEvidence(
+            clip_uid=clip_uid,
+            entity=entity,
+            evidence_mode="masked_candidate",
+            frame_slots=target_frame_slots,
+            context_image=target_context,
+            entity_crop=target_crop,
+        )
+    target_frame_images = _load_cross_pair_target_frame_images(
+        storage,
+        clip_uid=clip_uid,
+        frames=frames,
+    )
+    target_frame_slots = tuple(slot for slot, _ in target_frame_images)
+    return CrossPairTargetEvidence(
+        clip_uid=clip_uid,
+        entity=entity,
+        evidence_mode="sampled_frames",
+        frame_slots=target_frame_slots,
+        context_image=build_cross_pair_target_contact_sheet(target_frame_images),
+        entity_crop=None,
+    )
+
+
+def prepare_cross_pair_attempt(
+    evidence: CrossPairTargetEvidence,
+    donor: _CrossPairDonor,
+) -> PreparedCrossPairDecision:
+    """Load the donor reference image for one attempt."""
+    with Image.open(donor.image_path) as opened:
+        donor_image = opened.convert("RGBA")
+        donor_image.load()
+    return PreparedCrossPairDecision(
+        evidence=evidence,
+        donor=donor,
+        donor_reference_image=donor_image,
+    )
+
+
+def run_cross_pair_judge(
+    prepared: PreparedCrossPairDecision,
+    judge: Any,
+) -> CrossPairDecisionAttempt:
+    """MODEL CALL. ``CrossPairJudgeFailure`` propagates unchanged."""
+    return judge.decide(
+        target_clip_uid=prepared.evidence.clip_uid,
+        target_entity=prepared.evidence.entity,
+        target_evidence_mode=prepared.evidence.evidence_mode,
+        target_context_image=prepared.evidence.context_image,
+        target_entity_crop=prepared.evidence.entity_crop,
+        donor_clip_uid=prepared.donor.clip.clip_uid,
+        donor_entity=prepared.donor.entity,
+        donor_reference_image=prepared.donor_reference_image,
+    )
+
+
+def finalize_cross_pair_judge(
+    storage: RunStorage,
+    *,
+    target_clip: ClipRecord,
+    prepared: PreparedCrossPairDecision,
+    attempt: CrossPairDecisionAttempt,
+    counters: dict[str, int],
+) -> CrossPairDonorOutcome:
+    """CPU policy for one donor attempt: debug, repair counter, verdict."""
+    _write_cross_pair_debug(
+        storage,
+        target_clip=target_clip,
+        target_entity=prepared.evidence.entity,
+        target_evidence_mode=prepared.evidence.evidence_mode,
+        target_frame_slots=prepared.evidence.frame_slots,
+        target_context_image=prepared.evidence.context_image,
+        donor=prepared.donor,
+        attempt=attempt,
+    )
+    counters["cross_pair_repaired"] += int(attempt.repair_attempts > 0)
+    if attempt.decision.verdict != "accept":
+        return CrossPairDonorOutcome(verdict="continue")
+    donor_state = prepared.donor.reference
+    state = EntityReferenceState(
+        entity_id=prepared.evidence.entity.entity_id,
+        status="ready",
+        reference_scope=donor_state.reference_scope,
+        visible_region=donor_state.visible_region,
+        whole_entity_recognizable=(donor_state.whole_entity_recognizable),
+        identity_features_visible=(donor_state.identity_features_visible),
+        scope_reason=donor_state.scope_reason,
+        viewpoint=donor_state.viewpoint,
+        independent_reference_value=(donor_state.independent_reference_value),
+        requires_substantial_invention=(
+            donor_state.requires_substantial_invention
+        ),
+        primary_identity_region_visible=(
+            donor_state.primary_identity_region_visible
+        ),
+        major_structure_visible=donor_state.major_structure_visible,
+        truncation_severity=donor_state.truncation_severity,
+        discrete_foreground_instance=(donor_state.discrete_foreground_instance),
+        mask_matches_target=donor_state.mask_matches_target,
+        completion_needed_for_reference_use=(
+            donor_state.completion_needed_for_reference_use
+        ),
+        detached_target_fragments_present=(
+            donor_state.detached_target_fragments_present
+        ),
+        image_path=storage.relative_artifact_path(
+            storage.selected_entity_path(
+                target_clip.clip_uid,
+                prepared.evidence.entity.entity_id,
+            )
+        ),
+        source_frame_index=(donor_state.source_frame_index),
+        synthetic=False,
+        source_clip_uid=prepared.donor.clip.clip_uid,
+        source_entity_id=prepared.donor.entity.entity_id,
+        image_quality=(donor_state.image_quality or "high"),
+        completeness="complete",
+    )
+    return CrossPairDonorOutcome(
+        verdict="accepted",
+        state=state,
+        donor_path=prepared.donor.image_path,
+    )
+
+
 def _run_same_parent_cross_pair_fallback(
     config: V3Config,
     storage: RunStorage,
@@ -1695,7 +2253,10 @@ def _run_same_parent_cross_pair_fallback(
                         and current_state.reference_scope == "full"
                     ):
                         continue
-                    target_candidates = build_entity_reference_candidates(
+                    # Target evidence is deterministic and donor-independent,
+                    # so it is prepared once per entity, exactly like the
+                    # original single pass, and reused for every donor.
+                    evidence = prepare_cross_pair_target_evidence(
                         config,
                         storage,
                         clip_uid=target_clip.clip_uid,
@@ -1711,40 +2272,6 @@ def _run_same_parent_cross_pair_fallback(
                     )
                     if not donors:
                         continue
-                    if target_candidates:
-                        target_evidence_mode: CrossPairTargetEvidenceMode = (
-                            "masked_candidate"
-                        )
-                        target_candidate = target_candidates[0]
-                        target_frame_slots = (target_candidate.frame_slot,)
-                        target_sources = _load_source_images(
-                            storage,
-                            [target_candidate],
-                        )
-                        target_source = target_sources[target_candidate.image_path]
-                        target_context = build_candidate_context_image(
-                            target_source,
-                            target_candidate.mask,
-                        )
-                        target_crop, _ = build_reference_crop(
-                            target_source,
-                            target_candidate.mask,
-                            crop_padding_ratio=config.pair.crop_padding_ratio,
-                        )
-                    else:
-                        target_evidence_mode = "sampled_frames"
-                        target_frame_images = _load_cross_pair_target_frame_images(
-                            storage,
-                            clip_uid=target_clip.clip_uid,
-                            frames=target_frames,
-                        )
-                        target_frame_slots = tuple(
-                            slot for slot, _ in target_frame_images
-                        )
-                        target_context = build_cross_pair_target_contact_sheet(
-                            target_frame_images
-                        )
-                        target_crop = None
                     for donor in donors:
                         if active_judge is None:
                             judge_config = config.qwen.cross_pair_judge
@@ -1755,99 +2282,34 @@ def _run_same_parent_cross_pair_fallback(
                                 repair_retries=config.pair.repair_retries,
                             )
                             active_judge = owned_judge
-                        with Image.open(donor.image_path) as opened:
-                            donor_image = opened.convert("RGBA")
-                            donor_image.load()
                         counters["cross_pair_attempted"] += 1
+                        prepared = prepare_cross_pair_attempt(evidence, donor)
                         try:
-                            attempt = active_judge.decide(
-                                target_clip_uid=target_clip.clip_uid,
-                                target_entity=target_entity,
-                                target_evidence_mode=target_evidence_mode,
-                                target_context_image=target_context,
-                                target_entity_crop=target_crop,
-                                donor_clip_uid=donor.clip.clip_uid,
-                                donor_entity=donor.entity,
-                                donor_reference_image=donor_image,
-                            )
+                            attempt = run_cross_pair_judge(prepared, active_judge)
                         except CrossPairJudgeFailure as exc:
                             _write_cross_pair_debug(
                                 storage,
                                 target_clip=target_clip,
                                 target_entity=target_entity,
-                                target_evidence_mode=target_evidence_mode,
-                                target_frame_slots=target_frame_slots,
-                                target_context_image=target_context,
+                                target_evidence_mode=evidence.evidence_mode,
+                                target_frame_slots=evidence.frame_slots,
+                                target_context_image=evidence.context_image,
                                 donor=donor,
                                 failure=exc,
                             )
                             raise
-                        _write_cross_pair_debug(
+                        outcome = finalize_cross_pair_judge(
                             storage,
                             target_clip=target_clip,
-                            target_entity=target_entity,
-                            target_evidence_mode=target_evidence_mode,
-                            target_frame_slots=target_frame_slots,
-                            target_context_image=target_context,
-                            donor=donor,
+                            prepared=prepared,
                             attempt=attempt,
+                            counters=counters,
                         )
-                        counters["cross_pair_repaired"] += int(
-                            attempt.repair_attempts > 0
-                        )
-                        if attempt.decision.verdict != "accept":
+                        if outcome.verdict != "accepted":
                             continue
-                        donor_state = donor.reference
-                        states_by_id[target_entity.entity_id] = EntityReferenceState(
-                            entity_id=target_entity.entity_id,
-                            status="ready",
-                            reference_scope=donor_state.reference_scope,
-                            visible_region=donor_state.visible_region,
-                            whole_entity_recognizable=(
-                                donor_state.whole_entity_recognizable
-                            ),
-                            identity_features_visible=(
-                                donor_state.identity_features_visible
-                            ),
-                            scope_reason=donor_state.scope_reason,
-                            viewpoint=donor_state.viewpoint,
-                            independent_reference_value=(
-                                donor_state.independent_reference_value
-                            ),
-                            requires_substantial_invention=(
-                                donor_state.requires_substantial_invention
-                            ),
-                            primary_identity_region_visible=(
-                                donor_state.primary_identity_region_visible
-                            ),
-                            major_structure_visible=(
-                                donor_state.major_structure_visible
-                            ),
-                            truncation_severity=donor_state.truncation_severity,
-                            discrete_foreground_instance=(
-                                donor_state.discrete_foreground_instance
-                            ),
-                            mask_matches_target=donor_state.mask_matches_target,
-                            completion_needed_for_reference_use=(
-                                donor_state.completion_needed_for_reference_use
-                            ),
-                            detached_target_fragments_present=(
-                                donor_state.detached_target_fragments_present
-                            ),
-                            image_path=storage.relative_artifact_path(
-                                storage.selected_entity_path(
-                                    target_clip.clip_uid,
-                                    target_entity.entity_id,
-                                )
-                            ),
-                            source_frame_index=(donor_state.source_frame_index),
-                            synthetic=False,
-                            source_clip_uid=donor.clip.clip_uid,
-                            source_entity_id=donor.entity.entity_id,
-                            image_quality=(donor_state.image_quality or "high"),
-                            completeness="complete",
-                        )
-                        temporary_donors[target_entity.entity_id] = donor.image_path
+                        assert outcome.state is not None
+                        states_by_id[target_entity.entity_id] = outcome.state
+                        temporary_donors[target_entity.entity_id] = outcome.donor_path
                         break
                 if not temporary_donors:
                     continue
@@ -2044,83 +2506,19 @@ def pair_clips(
                 entity_states: list[EntityReferenceState] = []
                 assert clip.annotation is not None
                 for entity in clip.annotation.entities:
-                    tracked: TrackedEntityMasks = masks.entities[entity.entity_id]
-                    if tracked.status != "ready":
-                        entity_states.append(
-                            _rejected_reference(
-                                entity.entity_id,
-                                f"tracking_not_ready:{tracked.status}",
-                            )
-                        )
-                        continue
-                    (
-                        candidates,
-                        all_candidates_tiny,
-                        all_candidates_fragmented,
-                    ) = _build_entity_reference_candidates(
+                    prepared = prepare_entity_reference(
                         config,
                         storage,
                         clip_uid=clip.clip_uid,
                         entity=entity,
                         frames=frames,
                         masks=masks,
+                        counters=counters,
                     )
-                    if not candidates:
-                        entity_states.append(
-                            _rejected_reference(
-                                entity.entity_id,
-                                (
-                                    "tiny_reference_candidates"
-                                    if all_candidates_tiny
-                                    else "fragmented_reference_candidates"
-                                    if all_candidates_fragmented
-                                    else "no_valid_reference_candidate"
-                                ),
-                            )
-                        )
+                    if isinstance(prepared, EntityReferenceState):
+                        # Deterministic terminal outcome: no Qwen call.
+                        entity_states.append(prepared)
                         continue
-                    source_images = _load_source_images(storage, candidates)
-                    judged_candidates = candidates
-                    if config.pair.reference_prefilter_mode == "conservative_v1":
-                        try:
-                            prefilter_result = prefilter_entity_reference_candidates(
-                                entity,
-                                candidates,
-                                source_images,
-                            )
-                        except Exception as exc:  # noqa: BLE001 - required fail-open
-                            counters["prefilter_candidates_examined"] += len(
-                                candidates
-                            )
-                            counters["prefilter_fail_open_entities"] += 1
-                            _write_prefilter_debug(
-                                storage,
-                                clip_uid=clip.clip_uid,
-                                entity=entity,
-                                original_candidates=candidates,
-                                result=None,
-                                error=exc,
-                            )
-                        else:
-                            _record_prefilter_stats(counters, prefilter_result)
-                            _write_prefilter_debug(
-                                storage,
-                                clip_uid=clip.clip_uid,
-                                entity=entity,
-                                original_candidates=candidates,
-                                result=prefilter_result,
-                            )
-                            judged_candidates = list(
-                                prefilter_result.retained_candidates
-                            )
-                            if not judged_candidates:
-                                entity_states.append(
-                                    _rejected_reference(
-                                        entity.entity_id,
-                                        "reference_prefilter_all_candidates_filtered",
-                                    )
-                                )
-                                continue
                     if active_judge is None:
                         judge_config = config.qwen.candidate_judge
                         if judge_config is None:
@@ -2131,156 +2529,17 @@ def pair_clips(
                             crop_padding_ratio=config.pair.crop_padding_ratio,
                         )
                         active_judge = owned_judge
-                    attempt = active_judge.decide(
-                        entity=entity,
-                        candidates=judged_candidates,
-                        source_images=source_images,
-                    )
+                    attempt = run_entity_reference_judge(prepared, active_judge)
                     counters["repaired"] += int(attempt.repair_attempts > 0)
-                    _write_debug_attempt(
+                    finalization = finalize_entity_reference(
+                        config,
                         storage,
-                        clip_uid=clip.clip_uid,
-                        entity=entity,
-                        candidates=judged_candidates,
+                        prepared=prepared,
                         attempt=attempt,
                     )
-                    decision = attempt.decision
-                    decision_issues = validate_entity_reference_decision(
-                        decision,
-                        candidate_ids={
-                            item.candidate_id for item in judged_candidates
-                        },
-                        reference_type=entity.reference_type,
-                        candidate_by_id={
-                            item.candidate_id: item for item in judged_candidates
-                        },
-                    )
-                    if decision_issues:
-                        messages = "; ".join(issue.message for issue in decision_issues)
-                        raise ValueError(f"invalid judge decision: {messages}")
-                    if decision.reference_scope == "reject":
-                        entity_states.append(
-                            EntityReferenceState(
-                                entity_id=entity.entity_id,
-                                status="rejected",
-                                reference_scope="reject",
-                                visible_region="custom",
-                                whole_entity_recognizable=False,
-                                identity_features_visible=False,
-                                scope_reason=decision.scope_reason,
-                                image_quality=decision.image_quality,
-                                completeness=decision.completeness,
-                                viewpoint=decision.viewpoint,
-                                independent_reference_value=(
-                                    decision.independent_reference_value
-                                ),
-                                requires_substantial_invention=(
-                                    decision.requires_substantial_invention
-                                ),
-                                primary_identity_region_visible=(
-                                    decision.primary_identity_region_visible
-                                ),
-                                major_structure_visible=(
-                                    decision.major_structure_visible
-                                ),
-                                truncation_severity=decision.truncation_severity,
-                                discrete_foreground_instance=(
-                                    decision.discrete_foreground_instance
-                                ),
-                                mask_matches_target=decision.mask_matches_target,
-                                completion_needed_for_reference_use=(
-                                    decision.completion_needed_for_reference_use
-                                ),
-                                detached_target_fragments_present=(
-                                    decision.detached_target_fragments_present
-                                ),
-                                synthetic=False,
-                            )
-                        )
-                        continue
-                    if (
-                        decision.reference_scope == "local"
-                        and not config.reference_scope.allow_local
-                    ):
-                        entity_states.append(
-                            _rejected_reference(
-                                entity.entity_id,
-                                "local_reference_disabled",
-                                decision=decision,
-                            )
-                        )
-                        continue
-                    selected = next(
-                        candidate
-                        for candidate in judged_candidates
-                        if candidate.candidate_id == decision.selected_candidate_id
-                    )
-                    source = source_images[selected.image_path]
-                    reference_image, _ = build_reference_crop(
-                        source,
-                        selected.mask,
-                        crop_padding_ratio=config.pair.crop_padding_ratio,
-                    )
-                    temporary = storage.pair_output_temporary_path(
-                        clip.clip_uid,
-                        entity.entity_id,
-                    )
-                    reference_image.save(temporary, format="PNG")
-                    temporary_images[entity.entity_id] = (
-                        temporary,
-                        reference_image,
-                    )
-                    entity_states.append(
-                        EntityReferenceState(
-                            entity_id=entity.entity_id,
-                            status="ready",
-                            reference_scope=decision.reference_scope,
-                            visible_region=decision.visible_region,
-                            whole_entity_recognizable=(
-                                decision.whole_entity_recognizable
-                            ),
-                            identity_features_visible=(
-                                decision.identity_features_visible
-                            ),
-                            scope_reason=decision.scope_reason,
-                            image_path=storage.relative_artifact_path(
-                                storage.selected_entity_path(
-                                    clip.clip_uid,
-                                    entity.entity_id,
-                                )
-                            ),
-                            source_frame_index=selected.source_frame_index,
-                            synthetic=False,
-                            source_clip_uid=clip.clip_uid,
-                            source_entity_id=entity.entity_id,
-                            image_quality=decision.image_quality,
-                            completeness=decision.completeness,
-                            viewpoint=decision.viewpoint,
-                            independent_reference_value=(
-                                decision.independent_reference_value
-                            ),
-                            requires_substantial_invention=(
-                                decision.requires_substantial_invention
-                            ),
-                            primary_identity_region_visible=(
-                                decision.primary_identity_region_visible
-                            ),
-                            major_structure_visible=(
-                                decision.major_structure_visible
-                            ),
-                            truncation_severity=decision.truncation_severity,
-                            discrete_foreground_instance=(
-                                decision.discrete_foreground_instance
-                            ),
-                            mask_matches_target=decision.mask_matches_target,
-                            completion_needed_for_reference_use=(
-                                decision.completion_needed_for_reference_use
-                            ),
-                            detached_target_fragments_present=(
-                                decision.detached_target_fragments_present
-                            ),
-                        )
-                    )
+                    entity_states.append(finalization.state)
+                    if finalization.temporary is not None:
+                        temporary_images[entity.entity_id] = finalization.temporary
                 retained = [
                     state.entity_id
                     for state in entity_states

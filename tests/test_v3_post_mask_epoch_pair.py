@@ -35,6 +35,7 @@ from r2v_data_v2.v3.reference_judge import (
 from r2v_data_v2.v3.schemas import (
     BackgroundAnnotation,
     BackgroundReferenceState,
+    EntityReferenceState,
     PairingState,
     ReferencesState,
 )
@@ -856,3 +857,120 @@ def test_characterize_runtime_rejected_pairing_is_terminal(
         lambda *args, **kwargs: None,
     )
     assert "target" not in pending
+
+
+# ---------------------------------------------------------------------------
+# L. Direct helper-boundary tests (guards against Commit 3 misuse)
+# ---------------------------------------------------------------------------
+
+
+def test_helper_prepare_entity_reference_matches_legacy_judge_inputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """prepare() must yield exactly the candidates the legacy judge saw."""
+    from r2v_data_v2.v3.frames import validate_sampled_frames
+    from r2v_data_v2.v3.pair import (
+        PairStats,
+        finalize_entity_reference,
+        prepare_entity_reference,
+        run_entity_reference_judge,
+    )
+
+    config = _config(tmp_path, monkeypatch)
+    storage = _storage(config, entity_types=("subject",))
+    capturing = _Judge()
+    pair_clips(config, storage, judge=capturing)
+    legacy_candidates = [candidates for _, candidates in capturing.calls]
+
+    # A second run root, so "publication stays with pair_clips" is observable.
+    helper_config = replace(config, run_root=config.run_root.parent / "helper")
+    helper_storage = _storage(helper_config, entity_types=("subject",))
+    frames = validate_sampled_frames(helper_storage, "clip-1")
+    masks = helper_storage.read_masks("clip-1")
+    counters = {field: 0 for field in PairStats.__dataclass_fields__}
+    entity = helper_storage.read_clip("clip-1").annotation.entities[0]
+    prepared = prepare_entity_reference(
+        helper_config,
+        helper_storage,
+        clip_uid="clip-1",
+        entity=entity,
+        frames=frames,
+        masks=masks,
+        counters=counters,
+    )
+
+    assert not isinstance(prepared, EntityReferenceState), "e1 needs a judge"
+    assert [item.candidate_id for item in prepared.candidates] == legacy_candidates[0]
+
+    attempt = run_entity_reference_judge(prepared, _Judge())
+    finalization = finalize_entity_reference(
+        helper_config, helper_storage, prepared=prepared, attempt=attempt
+    )
+    assert finalization.state.status == "ready"
+    assert finalization.temporary is not None
+    assert finalization.temporary[0].is_file()
+    assert not helper_storage.selected_entity_path("clip-1", "e1").is_file()
+
+
+def test_helper_prepare_cross_pair_evidence_matches_legacy_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from r2v_data_v2.v3.frames import validate_sampled_frames
+    from r2v_data_v2.v3.pair import prepare_cross_pair_target_evidence
+
+    config = _config(
+        tmp_path, monkeypatch, pair=PairConfig(same_parent_fallback_enabled=True)
+    )
+    storage = _two_entity_target_storage(config)
+    target = storage.read_clip("target")
+
+    evidence = prepare_cross_pair_target_evidence(
+        config,
+        storage,
+        clip_uid="target",
+        entity=target.annotation.entities[0],
+        frames=validate_sampled_frames(storage, "target"),
+        masks=storage.read_masks("target"),
+    )
+
+    # The legacy fake cross judge recorded this exact mode.
+    assert evidence.evidence_mode == "masked_candidate"
+    assert evidence.entity_crop is not None
+    assert evidence.frame_slots == (evidence.frame_slots[0],)
+
+
+def test_helper_guard_boundary_matches_the_synchronous_wrapper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from r2v_data_v2.v3.frames import validate_sampled_frames
+    from r2v_data_v2.v3.pair import (
+        PairStats,
+        _BackgroundFinalGuardRuntime,
+    )
+    from tests.test_v3_pair import _FinalBackgroundJudge
+
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        pair=PairConfig(background_final_guard_mode="qwen_v1"),
+        debug=True,
+    )
+    storage = _storage(config, entity_types=("subject",))
+    _install_background_on(storage, "clip-1")
+    counters = {field: 0 for field in PairStats.__dataclass_fields__}
+    runtime = _BackgroundFinalGuardRuntime(
+        config, storage, counters, _FinalBackgroundJudge(accepted=True)
+    )
+    clip = storage.read_clip("clip-1")
+    frames = validate_sampled_frames(storage, "clip-1")
+
+    synchronous = runtime.token_for_ready_pairing(clip=clip, frames=frames)
+    step = runtime.prepare_background_final_guard(clip=clip, frames=frames)
+    assert step.preparation is not None
+    attempt = runtime.run_background_final_guard_judge(step.preparation)
+    manual = runtime.finalize_background_final_guard(step.preparation, attempt)
+
+    assert synchronous == manual == "<ref_bg_1>"
+    # No de-duplication: each pass through the boundary is paid for.
+    assert counters["background_final_guard_attempted"] == 2
+    assert counters["background_final_guard_accepted"] == 2
