@@ -52,9 +52,8 @@ def resume_first_assigned_shards(root, shard_ids):
             complete.append(shard_id)
             continue
         state = shard / "stage_state"
-        started = (shard / "state.jsonl.partial").is_file() or (
-            state / "canonical_audio.json"
-        ).is_file() or any((state / f"{name}.json").is_file() for name in STAGES)
+        has_stage_summary = state.is_dir() and next(state.glob("*.json"), None) is not None
+        started = (shard / "state.jsonl.partial").is_file() or has_stage_summary
         (unfinished if started else fresh).append(shard_id)
     return unfinished + fresh, {
         "unfinished": len(unfinished),
