@@ -1590,28 +1590,50 @@ def test_guard_job_identity_includes_image_geometry(
 
 
 class _PairExecutor:
-    """Pair-aware fake Qwen executor driving runner.run() per job."""
+    """Pair-aware fake Qwen executor driving runner.run() per job.
 
-    def __init__(self, runner: Any, entity_judge: Any, guard_judge: Any = None) -> None:
+    Three-way dispatch: a cross job must never be handed to the guard judge.
+    """
+
+    def __init__(
+        self,
+        runner: Any,
+        entity_judge: Any = None,
+        guard_judge: Any = None,
+        cross_judge: Any = None,
+    ) -> None:
         self.runner = runner
         self.entity_judge = entity_judge
         self.guard_judge = guard_judge
-        self.calls: list[str] = []
+        self.cross_judge = cross_judge
+        self.calls: list[dict[str, str]] = []
+
+    @property
+    def job_types(self) -> list[str]:
+        return [call["job_type"] for call in self.calls]
 
     def execute_batch(self, jobs: Sequence[Any]) -> dict[str, Any]:
         from r2v_data_v2.v3.post_mask_epoch_pair import (
+            PAIR_CROSS_JUDGE_JOB,
             PAIR_ENTITY_JUDGE_JOB,
         )
         from r2v_data_v2.v3.post_mask_epoch_scheduler import JobExecution
 
         outcomes: dict[str, Any] = {}
         for job in jobs:
-            self.calls.append(job.job_type)
-            judge = (
-                self.entity_judge
-                if job.job_type == PAIR_ENTITY_JUDGE_JOB
-                else self.guard_judge
+            self.calls.append(
+                {
+                    "job_type": job.job_type,
+                    "clip_uid": job.clip_uid,
+                    "job_id": job.job_id(),
+                }
             )
+            if job.job_type == PAIR_ENTITY_JUDGE_JOB:
+                judge = self.entity_judge
+            elif job.job_type == PAIR_CROSS_JUDGE_JOB:
+                judge = self.cross_judge
+            else:
+                judge = self.guard_judge
             try:
                 result = self.runner.run(job, judge)
             except Exception as exc:  # noqa: BLE001
@@ -1680,7 +1702,7 @@ def test_scheduler_resumes_after_publication_crash_on_last_entity_receipt(
     except RuntimeError:
         pass
 
-    assert executor.calls == ["pair_entity_reference_judge"]
+    assert executor.job_types == ["pair_entity_reference_judge"]
     assert state["calls"] == 1, "publication was attempted exactly once"
     assert storage.read_clip("clip-1").pairing is None
     assert not storage.selected_entity_path("clip-1", "e1").is_file()
@@ -1692,7 +1714,7 @@ def test_scheduler_resumes_after_publication_crash_on_last_entity_receipt(
     restarted_scheduler = _scheduler(restarted.ledger, restarted, restarted_executor)
     outcome = restarted_scheduler.run(restarted.seed_primary_jobs())
 
-    assert restarted_executor.calls == [], "no extra Qwen: the receipt was reused"
+    assert restarted_executor.job_types == [], "no extra Qwen: receipt reused"
     assert judge.calls and len(judge.calls) == 1
     assert outcome["completed"] is True
     clip = storage.read_clip("clip-1")
@@ -1725,7 +1747,7 @@ def test_scheduler_resumes_after_publication_crash_on_guard_receipt(
     except RuntimeError:
         pass
 
-    assert sorted(executor.calls) == [
+    assert sorted(executor.job_types) == [
         "pair_background_final_guard",
         "pair_entity_reference_judge",
     ]
@@ -1739,7 +1761,7 @@ def test_scheduler_resumes_after_publication_crash_on_guard_receipt(
     restarted_scheduler = _scheduler(restarted.ledger, restarted, restarted_executor)
     outcome = restarted_scheduler.run(restarted.seed_primary_jobs())
 
-    assert restarted_executor.calls == [], "no extra Qwen for entity or guard"
+    assert restarted_executor.job_types == [], "no extra Qwen for entity/guard"
     assert len(judge.calls) == 1
     assert len(guard.calls) == 1
     assert outcome["completed"] is True
