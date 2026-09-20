@@ -19,19 +19,22 @@ ordered_shards[RANK::WORLD_SIZE]. RANK/WORLD_SIZE are node-level scheduling
 coordinates: different nodes receive different shard sequences. Inside a node,
 the eight GPUs do not take eight different shards. They cooperatively process
 the current shard: the active upstream stage partitions pending jobs across GPUs,
-while MiMo uses the full eight-GPU serving topology.
+while the downstream MiMo stage uses the full eight-GPU serving topology.
 
-MiMo starts once per launcher invocation and stays alive across stages/shards.
-The current full-production launcher uses TP=8, DP=2 and
---mem-fraction-static 0.55. SAM, AuK, DiariZen and Qwen3-ASR are no longer
-node-lifetime resident. Each upstream stage uses the existing ephemeral executor:
-it starts at most one worker per physical GPU for that stage, waits for the stage
-barrier, then terminates the workers and their owned child processes before the
-next GPU stage begins. Thus upstream models do not coexist across stage barriers.
+No large GPU model is node-lifetime resident. SAM, AuK, DiariZen and Qwen3-ASR
+use the existing ephemeral executor: each stage starts at most one worker per
+physical GPU, waits for its barrier, then terminates those workers before the next
+GPU stage. MiMo is also shard-local and lazy. Entering the downstream stage does
+not load MiMo; the first actual T2VA/TA2VA API request starts SGLang with TP=8,
+DP=2 and --mem-fraction-static 0.65, and leaving that shard's downstream stage
+stops it. A fully cached downstream shard therefore never starts MiMo. This keeps
+MiMo completely absent while SAM/AuK/DiariZen/ASR run and prevents their memory
+peaks from overlapping.
+
 Client REQUEST_WORKERS defaults to 1 and GPU_IDS defaults to
-0,1,2,3,4,5,6,7. Each child sees its physical GPU through CUDA_VISIBLE_DEVICES
-and uses cuda:0; the parent environment is unchanged. There is no automatic model
-restart daemon.
+0,1,2,3,4,5,6,7. Each upstream child sees its physical GPU through
+CUDA_VISIBLE_DEVICES and uses cuda:0; the parent environment is unchanged.
+There is no automatic model retry or restart daemon within a shard.
 
 Canonical preparation uses CANONICAL_WORKERS=16 (Python --canonical-workers),
 configurable to any positive integer. Per-clip publication and hash checks are
@@ -53,8 +56,10 @@ local authority for the SAM runtime settings. The full launcher supplies the
 standard production defaults for AuK, DiariZen, Qwen3-ASR, SGLang and MiMo paths,
 while still allowing explicit environment overrides. No dependency is downloaded.
 The launcher does not edit server_env.sh. It adds localhost to NO_PROXY/no_proxy
-without removing external proxies. Readiness checks owned PID, /v1/models and
-/model_info.
+without removing external proxies. The shell launches only the Python supervisor.
+For each shard that needs a real downstream request, the Python MiMo lifecycle
+checks that 127.0.0.1:8092 is free, starts its owned SGLang child, waits for both
+/v1/models and /model_info, and tears the server down at the downstream barrier.
 
 ### Cluster launch: current production form
 
@@ -156,8 +161,10 @@ Each stage has durable job receipts beneath stage_state/<stage>/jobs.
 Stage-local worker control uses owned request files, never model stdout.
 Per-GPU upstream logs are written beneath the shard logs for the active stage;
 stage summaries and exceptions remain under shard logs. Canonical subprocess logs
-are logs/canonical-prefetch.log within the shard. Stage wall seconds plus
-canonical prefetch start/completion are printed in the supervisor log.
+are logs/canonical-prefetch.log within the shard. Lazy MiMo server logs are
+logs/<hostname>/mimo-shard-<shard>-<timestamp>-<supervisor-pid>.log. Stage wall
+seconds, canonical prefetch start/completion, and MiMo server start/ready/stop
+events are printed in the supervisor log.
 Node logs are logs/<hostname>/{mimo,supervisor}-<timestamp>-<pid>.log.
 Only the parent publishes full ordered inventories. Worker outputs never race on
 canonical records.jsonl. Successful receipt/media hashes are checked before
@@ -194,14 +201,16 @@ and MiMo --mem-fraction-static 0.50. The final stage summary was:
     MiMo       t2va_ready=5 ta2va_ready=5, all failed/pending/skipped=0
 
 ASR job_count can exceed ready clip count because ASR jobs are speech segments.
-The accepted run exited with no owned worker processes left behind. Subsequent
-real 2k-shard runs showed that keeping all upstream models resident still caused
-SAM/AuK OOMs even after lowering MiMo to 0.45. Production therefore switched to
-stage-local upstream workers and MiMo 0.55: MiMo remains resident, while only the
-currently active SAM/AuK/DiariZen/ASR model is loaded on each GPU. This lifecycle
-change preserves the frozen stage semantics and durable receipts but must be
-validated by real production continuation rather than inferred from the older
-resident-pool raw-5 result.
+The accepted run exited with no owned worker processes left behind. Subsequent real 2k-shard runs showed that keeping all upstream models resident
+caused SAM/AuK OOMs even after lowering MiMo. A later stage-local-upstream run
+still produced repeated SAM OOMs while MiMo 0.55 remained resident: SGLang
+processes occupied roughly 90-114 GiB per GPU while SAM itself used roughly
+25-40 GiB and requested additional 4-12 GiB transient allocations. Production
+therefore removed the final overlap as well. MiMo is now lazy per shard and runs
+only inside the downstream stage at mem-fraction-static 0.65; it is stopped
+before the next shard returns to SAM. This lifecycle preserves the frozen stage
+semantics and durable receipts. It is the current production candidate and still
+requires server smoke / resumed real-shard validation.
 
 For future runtime/architecture changes, repeat a small raw-video smoke before
 resuming large production. Use a fresh smoke root for changes that alter source
