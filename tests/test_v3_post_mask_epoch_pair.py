@@ -2863,3 +2863,106 @@ def test_cross_background_drift_is_not_terminal(
     with pytest.raises(PairEpochError, match="background durable drift"):
         runner.finalize(job, result)
     assert runner._cross_terminal(SHARD, "target-b") is None
+
+
+def _run_until_quiescent(
+    runner: Any, jobs: Sequence[Any], entity_judge: Any, guard_judge: Any, cross_judge: Any
+) -> list[Any]:
+    """Drive jobs with the right judge per job type, committing each result.
+
+    Returns the background guard jobs it drove, in call order.
+    """
+    from r2v_data_v2.v3.post_mask_epoch_pair import (
+        PAIR_BACKGROUND_GUARD_JOB,
+        PAIR_CROSS_JUDGE_JOB,
+        PAIR_ENTITY_JUDGE_JOB,
+    )
+
+    guard_jobs: list[Any] = []
+    pending = list(jobs)
+    while pending:
+        job = pending.pop(0)
+        if job.job_type == PAIR_ENTITY_JUDGE_JOB:
+            judge = entity_judge
+        elif job.job_type == PAIR_CROSS_JUDGE_JOB:
+            judge = cross_judge
+        else:
+            judge = guard_judge
+        if job.job_type == PAIR_BACKGROUND_GUARD_JOB:
+            guard_jobs.append(job)
+        result = runner.run(job, judge)
+        if not result.committed:
+            continue
+        _commit(runner, job, result)
+        pending.extend(runner.finalize(job, result))
+    return guard_jobs
+
+
+def test_primary_and_cross_background_guard_are_two_distinct_paid_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same clip, same background: primary then cross, two separate Qwen calls."""
+    from r2v_data_v2.v3.post_mask_epoch_pair import (
+        CALL_SITE_CROSS_PAIR,
+        CALL_SITE_PRIMARY,
+    )
+    from tests.test_v3_pair import _FinalBackgroundJudge
+
+    config = _pair_config(
+        tmp_path,
+        monkeypatch,
+        same_parent_fallback_enabled=True,
+        background_final_guard_mode="qwen_v1",
+    )
+    storage = _storage(config, entity_types=("subject", "subject"))
+    _add_ready_clip(
+        config, storage, clip_uid="donor", clip_suffix="2", entity_types=("subject",)
+    )
+    _install_clean_background(storage)
+    runner = _runner(tmp_path, config, storage, clip_uids=("clip-1", "donor"))
+
+    entity_judge = _ScopedJudge({("clip-1", "e2"): "reject"})
+    guard_judge = _FinalBackgroundJudge(accepted=True)
+    cross_judge = _CrossJudge([True])
+
+    # Primary: e1 full, e2 rejected -> ready pairing -> primary guard.
+    primary_guard_jobs = _run_until_quiescent(
+        runner, runner.seed_primary_jobs(), entity_judge, guard_judge, cross_judge
+    )
+    clip = storage.read_clip("clip-1")
+    assert clip.pairing is not None and clip.pairing.status == "ready"
+    assert clip.pairing.background_token == "<ref_bg_1>"
+    assert len(guard_judge.calls) == 1, "primary guard ran exactly once"
+
+    # Cross: e1 baseline is already full -> skipped; e2 accepts a frozen donor.
+    cross_jobs = runner.freeze_cross_pair_after_primary_quiescence()
+    assert [job.clip_uid for job in cross_jobs] == ["clip-1"]
+    cross_guard_jobs = _run_until_quiescent(
+        runner, cross_jobs, entity_judge, guard_judge, cross_judge
+    )
+
+    assert len(cross_judge.calls) == 1
+    assert len(guard_judge.calls) == 2, "cross guard is a second paid call"
+    counters = runner._guard_counters[SHARD]
+    assert counters["background_final_guard_attempted"] == 2
+    assert counters["background_final_guard_accepted"] == 2
+    assert counters["background_final_guard_failed_closed"] == 0
+
+    final = storage.read_clip("clip-1")
+    assert final.pairing.status == "ready"
+    assert final.pairing.background_token == "<ref_bg_1>"
+    state = next(
+        item for item in final.references.entities if item.entity_id == "e2"
+    )
+    assert state.status == "ready"
+    assert state.source_clip_uid == "donor"
+
+    terminal = runner._cross_terminal(SHARD, "clip-1")
+    assert terminal is not None and terminal["status"] == "completed"
+
+    # Distinct identities even with identical background image and text.
+    (primary_guard_job,) = primary_guard_jobs
+    (cross_guard_job,) = cross_guard_jobs
+    assert dict(primary_guard_job.target)["call_site"] == CALL_SITE_PRIMARY
+    assert dict(cross_guard_job.target)["call_site"] == CALL_SITE_CROSS_PAIR
+    assert primary_guard_job.job_id() != cross_guard_job.job_id()
