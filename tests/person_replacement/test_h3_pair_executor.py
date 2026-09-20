@@ -25,7 +25,7 @@ def test_old_prepared_and_done_survive_group_change(tmp_path, monkeypatch):
     source.write_text('{"video_path":"a.mp4"}\n{"video_path":"b.mp4"}\n')
     argv = ["--input-jsonl",str(source),"--clips-root",str(clips),"--output-root",str(tmp_path/"out")]
     root,old = module.make_config(arguments(argv))
-    assert old["identity_details"]["contract"] == "text_two_person_pdd_fsdp2_pair_v19"
+    assert old["identity_details"]["contract"] == "text_two_person_pdd_fsdp2_pair_v20"
     legacy_details = {**old["identity_details"],"contract":"text_two_person_pdd_fsdp2_pair_v12"}
     legacy_identity = hashlib.sha256(json.dumps(legacy_details,sort_keys=True).encode()).hexdigest()
     legacy_root = tmp_path/"legacy-v12"
@@ -237,10 +237,48 @@ def test_text_identity_uses_prompt_writer_and_frame0_keeps_8b(tmp_path):
     base = ["--input-jsonl",str(source),"--clips-root",str(clips),"--output-root",str(tmp_path/"out")]
     _,text = module.make_config(arguments(base))
     _,frame0 = module.make_config(arguments(base+["--variant","frame0"]))
+    assert "prompt_writer_python" in text["identity_details"]["resources"]
     assert "prompt_writer_model" in text["identity_details"]["resources"]
     assert "qwen_model" not in text["identity_details"]["resources"]
     assert "qwen_model" in frame0["identity_details"]["resources"]
+    assert "prompt_writer_python" not in frame0["identity_details"]["resources"]
     assert "prompt_writer_model" not in frame0["identity_details"]["resources"]
     assert text["identity"] != frame0["identity"]
+    assert arguments(base).prompt_writer_python == Path(
+        "/mnt/workspace/litengjie/data/audio_deps/qwen38-sglang-env/bin/python")
     assert arguments(base).prompt_writer_model == Path(
         "/mnt/workspace/public/pretrained/Qwen/Qwen3.8-27B-FP8")
+
+
+def test_prepare_python_runtime_is_variant_scoped(tmp_path, monkeypatch):
+    from r2v_data_v2.person_replacement import h3_pair_executor as module
+    from r2v_data_v2.person_replacement.h3_pair_state import atomic_json
+
+    def run_variant(variant, root):
+        case = {"case_id":"case","directory":str(root/"case"),"row_sha256":"row"}
+        config = {
+            "cases":[case],
+            "limits":{"case":{"prepare":1,"generate":1}},
+            "pair_id":0,
+            "identity":"identity",
+            "variant":variant,
+            "group_size":2,
+        }
+        if variant == "text":
+            config["prompt_writer_python"] = "/isolated/qwen38/bin/python"
+        calls = []
+        def children(specs, lock_fd, **kwargs):
+            calls.extend(specs)
+            atomic_json(Path(case["directory"])/"preparation/prepared.json", {"prompt":"ok"})
+            return [0]*len(specs)
+        monkeypatch.setattr(module, "run_children", children)
+        module.execute_phases(config, root, "0,1", 123, prepare_only=True)
+        return calls
+
+    text_calls = run_variant("text", tmp_path/"text-shard")
+    assert len(text_calls) == 2
+    assert all(spec["command"][0] == "/isolated/qwen38/bin/python" for spec in text_calls)
+
+    frame0_calls = run_variant("frame0", tmp_path/"frame0-shard")
+    assert len(frame0_calls) == 2
+    assert all(spec["command"][0] == sys.executable for spec in frame0_calls)

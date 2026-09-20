@@ -30,9 +30,9 @@ from .pipeline import validate_output_root
 TOOLS = Path(__file__).resolve().parents[2]/"tools/person_replacement"
 
 # text V19 dropped the 8B writer, so frame0 keeps its own v18 contract.
-VARIANTS = {"text":"text_two_person_pdd_fsdp2_pair_v19", "frame0":"frame0_two_person_pdd_fsdp2_pair_v18"}
+VARIANTS = {"text":"text_two_person_pdd_fsdp2_pair_v20", "frame0":"frame0_two_person_pdd_fsdp2_pair_v18"}
 BASE_RESOURCE_KEYS = ("h3_python","h3_model_root","pdd_code_root","pdd_lora")
-TEXT_RESOURCE_KEYS = ("prompt_writer_model",)
+TEXT_RESOURCE_KEYS = ("prompt_writer_python","prompt_writer_model")
 FRAME0_RESOURCE_KEYS = ("qwen_model","boogu_python","boogu_code_root","boogu_model_root")
 RESOURCE_KEYS = (*BASE_RESOURCE_KEYS,*TEXT_RESOURCE_KEYS)
 
@@ -220,7 +220,10 @@ def execute_phases(config, root, devices, lock_fd, *, prepare_only=False):
     def pending(stage):
         return any(eligible(c,stage,config["limits"][c["case_id"]][stage]) for c in config["cases"])
     if pending("prepare"):
-        specs = [{"command":[sys.executable,str(TOOLS/"h3_pair_prepare_worker.py"),"--config",str(config_path),
+        # Text V20 runs Qwen3.8 in its validated isolated runtime. Frame0 keeps
+        # the parent interpreter because that legacy path still owns Qwen3-VL-8B.
+        prepare_python = config["prompt_writer_python"] if config.get("variant") == "text" else sys.executable
+        specs = [{"command":[prepare_python,str(TOOLS/"h3_pair_prepare_worker.py"),"--config",str(config_path),
                              "--worker",str(i)],
                   "env":worker_environment(session_root/f"qwen-{i}",gpu),
                   "log":session_root/f"qwen-{i}.log"} for i,gpu in enumerate(pair)]
