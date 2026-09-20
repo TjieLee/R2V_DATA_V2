@@ -648,18 +648,35 @@ def test_missing_video_keeps_source_identity_for_resume(tmp_path, finalized):
     assert rows[1]["video"] == repaired[1]["video"]
 
 
-def test_cross_mount_source_identity_and_changed_content(tmp_path):
+def test_cross_mount_source_identity_and_changed_content(tmp_path, monkeypatch):
     source = tmp_path / "input.jsonl"
     source.write_bytes(b"{}\n")
     root = tmp_path / "out"
     index = production.build_source_index(source, root)
     index["source_identity"]["device"] = -1
+    index["source_identity"]["inode"] = -1
+    index["source_identity"]["ctime_ns"] = -1
     production.atomic_json(root / "manifests/source_index.json", index)
-    assert (
-        production.build_source_index(source, root)["source_sha256"]
-        == index["source_sha256"]
-    )
-    production.materialize_shard(index, 0, root)
+
+    original_sha = production._sha
+    calls = []
+
+    def counted_sha(path):
+        calls.append(path)
+        return original_sha(path)
+
+    monkeypatch.setattr(production, "_sha", counted_sha)
+    loaded = production.build_source_index(source, root)
+    assert loaded["source_sha256"] == index["source_sha256"]
+    assert calls == []
+
+    production.materialize_shard(loaded, 0, root)
+    assert calls == []
+
+    source.write_bytes(b"{\"changed\":true}\n")
+    with pytest.raises(ValueError, match="source"):
+        production.build_source_index(source, root)
+    assert calls
 
 
 def test_runner_end_to_end_cpu(tmp_path, finalized, monkeypatch):
