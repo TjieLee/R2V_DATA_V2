@@ -3221,3 +3221,59 @@ def test_scheduler_stops_after_cross_pair_judge_failure(
     assert jobs == [], "later donor and later entity are never planned"
     assert len(_ExplodingCrossJudge.calls) == 1, "no extra cross Qwen"
     assert storage.read_clip("target-b").pairing == primary_before
+
+
+def test_newly_cross_paired_target_never_becomes_another_donor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cross-produced full reference must not enter another target's donors.
+
+    Proven with the actual resource chain call log, not by re-scanning the
+    live donor builder: the frozen snapshot is the only donor source.
+    """
+    _config, storage, runner = _cross_fixture(tmp_path, monkeypatch)
+    runner.freeze_donor_snapshot(SHARD)
+
+    frozen_index = runner.frozen_donor_index(SHARD)
+    frozen_donor_uids = {
+        donor.clip.clip_uid for donors in frozen_index.values() for donor in donors
+    }
+    assert "target-b" not in frozen_donor_uids, "B starts as a target, not a donor"
+
+    cross_judge = _CrossJudge([True, True])
+
+    # B accepts a frozen donor and becomes ready/full with cross provenance.
+    (b_job,) = [
+        item
+        for item in runner.freeze_cross_pair_after_primary_quiescence()
+        if item.clip_uid == "target-b"
+    ]
+    _chain(runner, b_job, cross_judge)
+    live_b = storage.read_clip("target-b")
+    b_state = next(item for item in live_b.references.entities if item.entity_id == "e1")
+    assert b_state.status == "ready"
+    assert b_state.reference_scope == "full"
+    assert b_state.source_clip_uid in frozen_donor_uids
+
+    # Now run C's fallback. B must never appear as a donor for C.
+    c_jobs = [
+        item
+        for item in runner.freeze_cross_pair_after_primary_quiescence()
+        if item.clip_uid == "target-c"
+    ]
+    assert c_jobs, "C still has frozen donors to try"
+    pending = c_jobs
+    while pending:
+        job = pending.pop(0)
+        result, unlocked = _chain(runner, job, cross_judge)
+        assert result.committed
+        pending.extend(unlocked)
+
+    c_calls = [
+        call for call in cross_judge.calls if call["target_clip_uid"] == "target-c"
+    ]
+    assert c_calls, "C's fallback really ran"
+    assert all(
+        call["donor_clip_uid"] != "target-b" for call in c_calls
+    ), "the cross-produced B never became a donor for C"
+    assert {call["donor_clip_uid"] for call in c_calls} <= frozen_donor_uids
