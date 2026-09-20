@@ -2966,3 +2966,102 @@ def test_primary_and_cross_background_guard_are_two_distinct_paid_calls(
     assert dict(primary_guard_job.target)["call_site"] == CALL_SITE_PRIMARY
     assert dict(cross_guard_job.target)["call_site"] == CALL_SITE_CROSS_PAIR
     assert primary_guard_job.job_id() != cross_guard_job.job_id()
+
+
+def _guard_fixture(root: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
+    """clip-1 (two subject entities) + a frozen full donor + qwen_v1 guard."""
+    from tests.test_v3_pair import _FinalBackgroundJudge
+
+    config = _pair_config(
+        root,
+        monkeypatch,
+        same_parent_fallback_enabled=True,
+        background_final_guard_mode="qwen_v1",
+    )
+    storage = _storage(config, entity_types=("subject", "subject"))
+    _add_ready_clip(
+        config, storage, clip_uid="donor", clip_suffix="2", entity_types=("subject",)
+    )
+    _install_clean_background(storage)
+    runner = _runner(root / "ledger", config, storage, clip_uids=("clip-1", "donor"))
+    judges = {
+        "entity": _ScopedJudge({("clip-1", "e2"): "reject"}),
+        "guard": _FinalBackgroundJudge(accepted=True),
+        "cross": _CrossJudge([True]),
+    }
+    return config, storage, runner, judges
+
+
+def test_scheduler_recovers_when_cross_publication_crashes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Real scheduler: cross + guard receipts survive a publication crash."""
+    # _advance_cross_pair_target imports _publish_cross_pair_result inside the
+    # function, so the patch target is the pair module symbol.
+    import r2v_data_v2.v3.pair as pm
+
+    root = tmp_path / "run"
+    root.mkdir()
+    config, storage, runner, judges = _guard_fixture(root, monkeypatch)
+
+    # Primary fully done, then freeze snapshot + cross baselines.
+    _run_until_quiescent(
+        runner, runner.seed_primary_jobs(),
+        judges["entity"], judges["guard"], judges["cross"],
+    )
+    runner.freeze_donor_snapshot(SHARD)
+    baseline = runner.cross_baseline(SHARD, "clip-1")
+    donor_png = storage.selected_entity_path("donor", "e1").read_bytes()
+
+    real_publish = pm._publish_cross_pair_result
+    publish_calls: list[int] = []
+
+    def explode(*args: Any, **kwargs: Any) -> Any:
+        publish_calls.append(1)
+        raise RuntimeError("simulated cross publication crash")
+
+    pm._publish_cross_pair_result = explode
+    executor = _PairExecutor(
+        runner, entity_judge=judges["entity"], guard_judge=judges["guard"],
+        cross_judge=judges["cross"],
+    )
+    scheduler = _scheduler(runner.ledger, runner, executor)
+    try:
+        outcome = scheduler.run(runner.freeze_cross_pair_after_primary_quiescence())
+    finally:
+        pm._publish_cross_pair_result = real_publish
+
+    cross_first = len(judges["cross"].calls)
+    guard_first = len(judges["guard"].calls)
+    assert cross_first == 1, "one paid cross call"
+    assert guard_first == 2, "primary guard plus cross guard"
+    assert publish_calls == [1], "publication attempted once"
+    assert outcome["completed"] is False
+    assert runner._cross_terminal(SHARD, "clip-1") is None
+    assert runner._live_matches_cross_baseline(storage.read_clip("clip-1"), baseline)
+
+    # Real restart: new ledger, new runner, new executor, new scheduler.
+    restarted = _runner(root / "ledger", config, storage, clip_uids=("clip-1", "donor"))
+    restarted_executor = _PairExecutor(
+        restarted, entity_judge=judges["entity"], guard_judge=judges["guard"],
+        cross_judge=judges["cross"],
+    )
+    restarted_scheduler = _scheduler(restarted.ledger, restarted, restarted_executor)
+    restarted_scheduler.run(restarted.freeze_cross_pair_after_primary_quiescence())
+
+    assert len(judges["cross"].calls) == cross_first, "no extra cross Qwen"
+    assert len(judges["guard"].calls) == guard_first, "no extra guard Qwen"
+    assert restarted_executor.job_types == [], "no restart model job ran"
+
+    final = storage.read_clip("clip-1")
+    assert final.pairing.status == "ready"
+    assert final.pairing.background_token == "<ref_bg_1>"
+    states = {item.entity_id: item for item in final.references.entities}
+    assert states["e2"].status == "ready"
+    assert states["e2"].source_clip_uid == "donor"
+    assert states["e2"].source_entity_id == "e1"
+    assert _png_sha(
+        storage.selected_entity_path("clip-1", "e2").read_bytes()
+    ) == _png_sha(donor_png)
+    terminal = restarted._cross_terminal(SHARD, "clip-1")
+    assert terminal is not None and terminal["status"] == "completed"
