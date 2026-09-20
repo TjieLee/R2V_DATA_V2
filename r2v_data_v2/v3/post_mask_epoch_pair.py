@@ -1005,6 +1005,58 @@ class PairEpochRunner:
             targets.append(clip_uid)
         return tuple(targets)
 
+    # -- cross target primary baseline ------------------------------------
+    #
+    # Cross replay must start from the PRIMARY PairingState / ReferencesState
+    # that existed when the donor snapshot was frozen, not from whatever the
+    # live clip currently holds: after a successful cross publication the live
+    # state already contains the cross upgrade, and replaying from it would
+    # treat an upgraded e2 as a pre-existing full self reference and skip it.
+
+    def _cross_baseline_path(self, shard: str, clip_uid: str) -> Path:
+        return (
+            _semantic_root(self.ledger)
+            / "cross_baselines"
+            / shard
+            / f"{clip_uid}.json"
+        )
+
+    def _freeze_cross_baseline(self, shard: str, clip_uid: str) -> dict[str, Any]:
+        storage = self._storage_for(shard)
+        clip = storage.read_clip(clip_uid)
+        payload = {
+            "schema": PAIR_CROSS_BASELINE_SCHEMA,
+            "canonical_shard": shard,
+            "clip_uid": clip_uid,
+            "primary_pairing": (
+                clip.pairing.model_dump(mode="json") if clip.pairing is not None else None
+            ),
+            "primary_entity_references": [
+                state.model_dump(mode="json")
+                for state in (
+                    clip.references.entities if clip.references is not None else ()
+                )
+            ],
+        }
+        _write_json_once(self._cross_baseline_path(shard, clip_uid), payload)
+        return payload
+
+    def cross_baseline(self, shard: str, clip_uid: str) -> dict[str, Any]:
+        payload = _read_json(self._cross_baseline_path(shard, clip_uid))
+        if payload is None:
+            raise PairEpochError(
+                f"no frozen cross baseline for {clip_uid!r} in {shard!r}"
+            )
+        if payload.get("schema") != PAIR_CROSS_BASELINE_SCHEMA:
+            raise PairEpochError(f"unsupported cross baseline schema for {clip_uid!r}")
+        if payload.get("canonical_shard") != shard or payload.get("clip_uid") != clip_uid:
+            raise PairEpochError(f"cross baseline identity mismatch for {clip_uid!r}")
+        return payload
+
+    def _freeze_cross_baselines(self, shard: str, targets: Sequence[str]) -> None:
+        for clip_uid in targets:
+            self._freeze_cross_baseline(shard, clip_uid)
+
     def _snapshot_path(self, shard: str) -> Path:
         return _semantic_root(self.ledger) / "donor_snapshots" / f"{shard}.json"
 
@@ -1055,6 +1107,9 @@ class PairEpochRunner:
             "groups": groups,
         }
         _write_json_once(self._snapshot_path(shard), payload)
+        # Baseline the cross targets against their frozen primary state before
+        # any cross-pair work can mutate it.
+        self._freeze_cross_baselines(shard, targets)
         return payload
 
     def donor_snapshot(self, shard: str) -> dict[str, Any]:
@@ -1249,6 +1304,7 @@ PAIR_CROSS_JUDGE_JOB = "pair_cross_pair_judge"
 CALL_SITE_CROSS_PAIR = "cross_pair"
 
 PAIR_DONOR_SNAPSHOT_SCHEMA = "post_mask_epoch_pair_donor_snapshot/2"
+PAIR_CROSS_BASELINE_SCHEMA = "post_mask_epoch_pair_cross_baseline/1"
 
 
 def _donor_projection(donor: Any, storage: RunStorage) -> dict[str, Any]:

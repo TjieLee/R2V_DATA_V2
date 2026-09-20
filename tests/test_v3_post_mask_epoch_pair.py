@@ -2224,3 +2224,38 @@ def _drain_primary_shard(runner: Any, shard: str, storage: RunStorage) -> None:
             for job in runner.finalize(job, result)
             if job.canonical_shard == shard
         )
+
+
+def test_cross_baseline_freezes_the_primary_state_before_cross_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Replay must start from the frozen PRIMARY state, not the live one."""
+    config = _pair_config(
+        tmp_path, monkeypatch, same_parent_fallback_enabled=True
+    )
+    storage = _storage(config, entity_types=("subject",))
+    _three_donor_shard(config, storage)
+    uid_list = ("clip-1", "donor", "target-b", "target-c")
+    runner = _runner(tmp_path, config, storage, clip_uids=uid_list)
+    _drain_primary(
+        runner,
+        _ScopedJudge({("target-b", "e1"): "reject", ("target-c", "e1"): "reject"}),
+    )
+    snapshot = runner.freeze_donor_snapshot(SHARD)
+    assert "target-b" in snapshot["cross_pair_target_clip_uids"]
+
+    baseline = runner.cross_baseline(SHARD, "target-b")
+    live = storage.read_clip("target-b")
+    assert baseline["primary_pairing"] == live.pairing.model_dump(mode="json")
+    assert baseline["primary_entity_references"] == [
+        state.model_dump(mode="json") for state in live.references.entities
+    ]
+    # The rejected primary outcome is what replay must see, not an upgrade.
+    assert baseline["primary_entity_references"][0]["status"] == "rejected"
+
+    # Durable and create-or-validate: a restart reads the same primary
+    # baseline, so cross replay always starts from the pre-cross state.
+    restarted = _runner(tmp_path, config, storage, clip_uids=uid_list)
+    assert restarted.cross_baseline(SHARD, "target-b") == baseline
+    restarted.freeze_donor_snapshot(SHARD)
+    assert restarted.cross_baseline(SHARD, "target-b") == baseline
