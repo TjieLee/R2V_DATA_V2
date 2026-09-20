@@ -419,3 +419,86 @@ def test_restart_after_pair_primary_receipt_does_not_repeat_pair_qwen(
     # CPU replay recovers the receipt chain; no extra Pair Qwen is paid.
     assert pair_calls == paid
     assert second["pair_completed"] is True
+
+
+def test_pre_launch_existing_pairing_donates_but_is_not_a_cross_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A clip that already had a pairing before launch can donate, not fall back.
+
+    Proven at the composition level by reading the frozen donor snapshot the
+    pipeline produced: the pre-launch clip appears in the frozen donor set and
+    is absent from the frozen cross target list.
+    """
+    import json
+
+    from tests.test_v3_pair import _add_ready_clip, pair_clips
+    from tests.test_v3_post_mask_epoch_pair import _ScopedJudge
+
+    config, storages, eligible, _, log = _fixture(tmp_path, monkeypatch)
+    pair_storage = storages[PAIR_SHARD]
+    pair_config = _config(tmp_path, monkeypatch, "run-b")
+
+    # clip-1 gets a pairing BEFORE this launch: it is an existing donor.
+    pair_clips(pair_config, pair_storage, judge=_EntityJudge())
+    assert pair_storage.read_clip("clip-1").pairing is not None
+    # target-x is a fresh clip that will need the fallback.
+    _add_ready_clip(
+        pair_config,
+        pair_storage,
+        clip_uid="target-x",
+        clip_suffix="20",
+        entity_types=("subject",),
+    )
+    eligible = {
+        SHARD: tuple(eligible[SHARD]),
+        PAIR_SHARD: ("clip-1", "target-x"),
+    }
+    storages = {SHARD: storages[SHARD], PAIR_SHARD: pair_storage}
+    ledger = GroupLedger(tmp_path / "ledger")
+
+    def removal_factory(runner: Any) -> Any:
+        return ResourceEpochScheduler(
+            ledger=ledger,
+            finalize=runner.finalize,
+            executors=_removal_executors(runner, log),
+        )
+
+    def pair_factory(runner: Any) -> Any:
+        return ResourceEpochScheduler(
+            ledger=ledger,
+            finalize=runner.finalize,
+            executors={
+                RESOURCE_QWEN: _RecordingExecutor(
+                    runner,
+                    _ScopedJudge({("target-x", "e1"): "reject"}),
+                    "pair",
+                    log,
+                )
+            },
+        )
+
+    outcome = run_removal_pair_epochs(
+        config=config,
+        storages=storages,
+        eligible_clip_uids_by_shard=eligible,
+        ledger=ledger,
+        removal_scheduler_factory=removal_factory,
+        pair_scheduler_factory=pair_factory,
+    )
+    assert outcome["remove_completed"] is True
+
+    snapshot_path = (
+        Path(ledger.root) / "semantic" / "pair" / "donor_snapshots" / f"{PAIR_SHARD}.json"
+    )
+    assert snapshot_path.is_file(), "the pipeline froze a donor snapshot"
+    snapshot = json.loads(snapshot_path.read_text())
+
+    targets = list(snapshot["cross_pair_target_clip_uids"])
+    donors = {
+        entry["clip_uid"] for group in snapshot["groups"] for entry in group["donors"]
+    }
+    assert "clip-1" not in targets, "a pre-launch pairing never becomes a cross target"
+    assert "target-x" in targets, "the fresh clip is the cross target"
+    assert "clip-1" in donors, "the pre-launch pairing is a valid frozen donor"
+    assert "target-x" not in donors
