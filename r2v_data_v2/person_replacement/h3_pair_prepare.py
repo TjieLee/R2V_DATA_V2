@@ -5,6 +5,7 @@ from pathlib import Path
 
 from r2v_data_v2.v3.production_source import JeaVideoMotionAdapter
 
+from .h3_pair_diversity import diversity_cues
 from .h3_pair_state import (
     begin_attempt,
     eligible,
@@ -86,7 +87,9 @@ def prepare_partition(config, worker, qwen_factory=None):
                         qwen._load()  # infrastructure failure is fatal, unlike bad inputs/parses
                     (subject1, subject2, performance1, performance2,
                      shot) = qwen.describe_two_with_performance(video)
-                    replacement1, replacement2 = qwen.invent_two(subject1,subject2)
+                    cue1, cue2 = diversity_cues(config["seed"],case["row_sha256"])
+                    replacement1, replacement2 = qwen.invent_two_with_diversity(
+                        subject1,subject2,cue1,cue2)
                     texts = {"source_subject_1":subject1,"source_subject_2":subject2,
                              "source_performance_1":performance1,"source_performance_2":performance2,
                              "shot_description":shot,
@@ -101,6 +104,7 @@ def prepare_partition(config, worker, qwen_factory=None):
                     payload = {"case_id":case["case_id"],"row_sha256":case["row_sha256"],
                         "identity":config["identity"],"source":str(video),"seed":config["seed"],
                         "h3_reference_source":str(reference),
+                        "replacement_diversity_1":cue1,"replacement_diversity_2":cue2,
                         "frames":plan.native_frame_count,"width":width,"height":height,
                         "timeline":asdict(plan),"aspect_ratio":aspect,**audio,**texts}
                     if config.get("variant") == "frame0":

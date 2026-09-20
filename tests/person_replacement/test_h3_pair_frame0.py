@@ -67,6 +67,10 @@ class QwenSpy:
     def invent_two(self, *args):
         return TEXTS["replacement_subject_1"],TEXTS["replacement_subject_2"]
 
+    def invent_two_with_diversity(self, subject1, subject2, cue1, cue2):
+        QwenSpy.calls.append("invent")
+        return TEXTS["replacement_subject_1"],TEXTS["replacement_subject_2"]
+
     def close(self):
         QwenSpy.calls.append("close")
 
@@ -166,8 +170,8 @@ def test_variant_contracts_are_distinct_and_group_size_is_not_semantic(tmp_path)
     _,text = module.make_config(arguments(base+["--variant","text"]))
     _,frame0 = module.make_config(arguments(base+["--variant","frame0"]))
     assert text["identity"] != frame0["identity"]
-    assert text["identity_details"]["contract"] == "text_two_person_pdd_fsdp2_pair_v15"
-    assert frame0["identity_details"]["contract"] == "frame0_two_person_pdd_fsdp2_pair_v15"
+    assert text["identity_details"]["contract"] == "text_two_person_pdd_fsdp2_pair_v16"
+    assert frame0["identity_details"]["contract"] == "frame0_two_person_pdd_fsdp2_pair_v16"
     for key in ("boogu_python","boogu_code_root","boogu_model_root"):
         assert key in frame0["identity_details"]["resources"] and key not in text["identity_details"]["resources"]
     _,bigger = module.make_config(arguments(base+["--variant","frame0","--group-size","4","--ulysses-degree","2"]))

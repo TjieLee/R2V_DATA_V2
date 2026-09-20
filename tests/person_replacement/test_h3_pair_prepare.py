@@ -49,6 +49,9 @@ class Qwen:
     def invent_two(self, *args):
         return "replacement 1","replacement 2"
 
+    def invent_two_with_diversity(self, subject1, subject2, cue1, cue2):
+        return "replacement 1","replacement 2"
+
     def close(self):
         CALLS.append("close")
 

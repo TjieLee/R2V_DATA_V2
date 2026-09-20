@@ -54,7 +54,13 @@ def test_performance_prompt_requests_non_temporal_object_anchors():
     assert "then, before, after, initially or later" in prompt
     assert "holding a black clipboard with both hands" in prompt
     assert "throughout" in prompt  # explicitly forbids false whole-shot claims
-    assert "<Video 1> alone decides timing" in prompt
+    assert "output exactly NONE and nothing else" in prompt  # no-object sentinel
+    for banned in ("standing","sitting","standing still","walking","facial expression","gaze",
+                   "emotion","mouth state","clothing","uniform","hair","background","camera"):
+        assert banned in prompt  # present only inside the explicit prohibition list
+    assert "You may add one simple" not in prompt  # general-state allowance removed
+    assert "object-only non-temporal anchors" in prompt
+    assert "SHOT_DESCRIPTION still keeps the complete temporal sequence" in prompt
 
 
 def test_performance_prompt_disambiguates_props_against_shot_description():
@@ -81,21 +87,82 @@ def test_malformed_responses_fail_closed(tmp_path, broken):
         qwen(broken).describe_two_with_performance(video)
 
 
-def test_performance_anchors_reach_detailed_description_but_shot_does_not():
+def detailed(prompt):
+    return prompt.split("detailed_description:")[1]
+
+
+def test_performance_anchors_are_object_only_and_target_centric():
     from r2v_data_v2.person_replacement.h3_two_person import build_prompt
 
     shot = "UNIQUE_SHOT_MARKER_1234"
     prompt = build_prompt("a man","a woman",shot,"an old man","a young woman",
                           performance1="holding and handling a hockey stick",
                           performance2="holding a black clipboard with both hands")
-    assert "<Subject 3> preserves <Subject 1>'s source performance and object interactions " \
-           "from <Video 1>: holding and handling a hockey stick." in prompt
-    assert "<Subject 4> preserves <Subject 2>'s source performance and object interactions " \
-           "from <Video 1>: holding a black clipboard with both hands." in prompt
-    assert "Any object held, carried, touched, or otherwise interacted with by <Subject 1> " \
-           "or <Subject 2> in <Video 1> must remain the same source object" in prompt
+    section = detailed(prompt)
+    assert "<Subject 3> must preserve this source object interaction: " \
+           "holding and handling a hockey stick." in section
+    assert "<Subject 4> must preserve this source object interaction: " \
+           "holding a black clipboard with both hands." in section
+    assert "Any source object held, carried, touched" in section
     assert shot not in prompt  # SHOT_DESCRIPTION stays provenance only
-    assert prompt.index("holding and handling a hockey stick") > prompt.index("detailed_description")
+
+
+@pytest.mark.parametrize("value", ["holding a clipboard.","holding a clipboard..",
+                                   "holding a clipboard...","holding a clipboard"])
+def test_dynamic_anchor_never_doubles_sentence_punctuation(value):
+    from r2v_data_v2.person_replacement.h3_two_person import build_prompt
+
+    section = detailed(build_prompt("a man","a woman","shot","an old man","a young woman",
+                                    performance1=value))
+    assert "holding a clipboard." in section
+    assert "clipboard.." not in section
+    assert ".." not in section
+
+
+def test_none_anchor_produces_no_target_sentence_and_no_sentinel():
+    from r2v_data_v2.person_replacement.h3_two_person import build_prompt
+
+    section = detailed(build_prompt("a man","a woman","shot","an old man","a young woman",
+                                    performance1="NONE",performance2="none"))
+    assert "NONE" not in section and "none " not in section.lower().replace("non-person","")
+    assert "must preserve this source object interaction" not in section
+    assert "Any source object held, carried, touched" in section  # generic rule stays
+
+
+def test_detailed_section_never_reactivates_source_labels():
+    from r2v_data_v2.person_replacement.h3_two_person import build_prompt
+
+    for frame0 in (False,True):
+        section = detailed(build_prompt("a man","a woman","shot","an old man","a young woman",
+                                        frame0=frame0,
+                                        performance1="holding a black clipboard with both hands",
+                                        performance2="NONE"))
+        assert "<Subject 3>" in section and "<Subject 4>" in section
+        assert "<Subject 1>" not in section
+        assert "<Subject 2>" not in section
+        for phrase in ("Edit <Video 1> in place","Do not add any new person",
+                       "duplicate either replacement","keep a source identity as an additional person",
+                       "same visible-person count and occupancy as <Video 1>",
+                       "facial expression, gaze, mouth movement","directly from <Video 1>"):
+            assert phrase in section
+        assert "exactly two visible people" not in section
+
+
+def test_definitions_declare_source_only_and_in_place_replacement():
+    from r2v_data_v2.person_replacement.h3_two_person import build_prompt
+
+    definitions = build_prompt("a man","a woman","shot","an old man","a young woman").split(
+        "subject_definitions:")[1].split("summary:")[0]
+    assert definitions.count("source-only performer identity") == 2
+    assert definitions.count("must not appear as an additional person") == 2
+    assert definitions.count("replaces <Subject 1> in place") == 1
+    assert definitions.count("replaces <Subject 2> in place") == 1
+    assert definitions.count("must never coexist as separate people") == 2
+    summary = build_prompt("a man","a woman","shot","an old man","a young woman").split(
+        "summary:")[1].split("retention_analysis:")[0]
+    assert "The replacement happens in place." in summary
+    assert "Do not retain a source performer beside its replacement" in summary
+    assert "duplicate a replacement, or add any new person" in summary
 
 
 def test_without_performance_arguments_prompt_is_unchanged():

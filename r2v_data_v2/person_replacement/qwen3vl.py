@@ -39,6 +39,16 @@ SOURCE_SUBJECT_2: ...
 SHOT_DESCRIPTION: ..."""
 
 TWO_SOURCE_WITH_PERFORMANCE_PROMPT = TWO_SOURCE_BODY + """
+
+For the two extra performance fields, write object-only non-temporal anchors.
+They may name only the visible held, carried, touched or clearly interacted object and
+the hand-object relation, for example: holding a black clipboard with both hands, carrying
+a bag in the right hand, holding and handling a hockey stick, touching the table with the
+left hand. They must never describe standing, sitting, standing still, walking, facing
+direction, general pose, facial expression, gaze, emotion, mouth state, clothing, uniform,
+hair, body appearance, background, camera or a temporal action sequence; <Video 1> alone is
+the authority for pose, motion, facial performance and action timing. If the performer has
+no object that needs protection, output exactly NONE and nothing else.
 The three field families have different jobs, and they are not in conflict:
 SOURCE_SUBJECT_1 and SOURCE_SUBJECT_2 stay about identity and stable visual role and
 must not contain temporary props or temporary actions. SOURCE_PERFORMANCE_1 and
@@ -48,17 +58,13 @@ inherit them. SHOT_DESCRIPTION still keeps the complete temporal sequence in pla
 order. The same prop may therefore be named as a non-temporal anchor in
 SOURCE_PERFORMANCE and also described with its timing in SHOT_DESCRIPTION; that is
 intentional, not a contradiction.
-Now write SOURCE_PERFORMANCE_1 and SOURCE_PERFORMANCE_2 as one short non-temporal
-anchor per performer describing the source performance facts a replacement
-performer must inherit. Name the visible held, carried, touched or interacted objects and
-the hand-object relation, for example: holding a black clipboard with both hands, carrying
-a bag in the right hand, touching the table with the left hand. You may add one simple
-stable body or action state when it helps preservation. Never write timestamps, ordering
-words such as then, before, after, initially or later, a full action sequence, background,
-camera, replacement appearance, race, ethnicity or nationality, and never repeat the Subject
-labels inside the value. If an object is handled during only part of the shot, do not claim
-it is held throughout; write it as interacting with that object, as in: interacting with the
-same black clipboard, holding it with both hands when handled. <Video 1> alone decides timing.
+Keep each anchor limited to the object and its hand-object relation. Never write timestamps
+or ordering words such as then, before, after, initially or later, never write a full action
+sequence, background, camera, replacement appearance, race, ethnicity or nationality, and
+never repeat the Subject labels inside the value. If an object is handled during only part
+of the shot, do not claim it is held throughout; write it as interacting with that object,
+as in: interacting with the same black clipboard, holding it with both hands when handled.
+When there is no object to protect, write exactly NONE.
 Return exactly five nonempty single-line labelled fields:
 SOURCE_SUBJECT_1: ...
 SOURCE_SUBJECT_2: ...
@@ -66,7 +72,7 @@ SOURCE_PERFORMANCE_1: ...
 SOURCE_PERFORMANCE_2: ...
 SHOT_DESCRIPTION: ..."""
 
-TWO_REPLACEMENT_PROMPT = """Invent two ordinary realistic replacement people.
+TWO_REPLACEMENT_BODY = """Invent two ordinary realistic replacement people.
 Source Subject 1: {subject1}
 Source Subject 2: {subject2}
 Replacement 1 should look clearly different from Source 1, and Replacement 2 should look
@@ -80,10 +86,28 @@ characters or exaggerated bodies. Describe only the replacement person's appeara
 clothing. Do not invent held/carried/touched objects or props, pose or gesture,
 standing/sitting state, hand state, action or motion, expression, gaze, mouth state,
 screen position or interactions; those come from <Video 1>. Do not assign race, ethnicity
-or nationality.
+or nationality."""
+
+TWO_REPLACEMENT_TAIL = """
 Return English, exactly two nonempty single-line labelled fields, no markdown/explanation:
 REPLACEMENT_SUBJECT_1: ...
 REPLACEMENT_SUBJECT_2: ..."""
+
+TWO_REPLACEMENT_PROMPT = TWO_REPLACEMENT_BODY + TWO_REPLACEMENT_TAIL
+
+TWO_REPLACEMENT_WITH_DIVERSITY_PROMPT = TWO_REPLACEMENT_BODY + """
+Replacement 1 diversity cue: {cue1}
+Replacement 2 diversity cue: {cue2}
+Each cue is an appearance-only style hint. Use it only through clothing, hairstyle,
+grooming, colour palette and general visual styling. A generic cue means ordinary
+everyday clothing with no particular role. A profession cue means that profession's
+clothing and grooming only. A period or distinctive-attire cue means that historical or
+stylistic clothing and hairstyle only. Never introduce any object, prop, tool, equipment,
+weapon, accessory or item that would be held, worn as an interactive device or interacted
+with, and never introduce an action, pose, gesture, hand state or interaction implied by
+the occupation or historical style. Clothing and grooming alone must express the cue.
+The two replacements must remain clearly distinguishable from each other and from their
+own source performer.""" + TWO_REPLACEMENT_TAIL
 
 
 def _labelled_fields(text: str, labels: tuple[str, ...]) -> tuple[str, ...]:
@@ -212,4 +236,13 @@ class LocalQwen:
     def invent_two(self, subject1: str, subject2: str) -> tuple[str, str]:
         return _labelled_fields(self._text([{
             "type":"text", "text":TWO_REPLACEMENT_PROMPT.format(subject1=subject1, subject2=subject2),
+        }]), ("REPLACEMENT_SUBJECT_1", "REPLACEMENT_SUBJECT_2"))
+
+    def invent_two_with_diversity(self, subject1: str, subject2: str,
+                                  cue1: str, cue2: str) -> tuple[str, str]:
+        """Pair-executor replacement call with deterministic appearance-only cues."""
+        return _labelled_fields(self._text([{
+            "type":"text",
+            "text":TWO_REPLACEMENT_WITH_DIVERSITY_PROMPT.format(subject1=subject1, subject2=subject2,
+                                                                cue1=cue1, cue2=cue2),
         }]), ("REPLACEMENT_SUBJECT_1", "REPLACEMENT_SUBJECT_2"))

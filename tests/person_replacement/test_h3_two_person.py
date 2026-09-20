@@ -31,7 +31,7 @@ def test_six_section_two_person_prompt(frame0):
                   "<Video 1>"):
         assert value in prompt
     assert "pose-driven" in prompt
-    assert "motion driver" in prompt
+    assert "directly from <Video 1>" in prompt
     assert DESCRIPTIONS[2] not in prompt
     if frame0:
         assert "where visible" in prompt and "first-frame" in prompt
@@ -249,16 +249,18 @@ def test_two_person_appearance_and_temporal_prompt_contract():
     assert source1 in definitions and source2 in definitions
     assert "<Subject 3> is a middle-aged woman with auburn hair in an olive-green jacket." in definitions
     assert "<Subject 4> is an adult man with short black hair in a cream linen shirt." in definitions
-    assert "<Subject 3> replaces only <Subject 1>'s visible human identity and appearance" in definitions
-    assert "<Subject 4> replaces only <Subject 2>'s visible human identity and appearance" in definitions
-    assert "<Subject 3> is pose-driven and motion-driven by <Subject 1>" in definitions
-    assert "<Subject 4> is pose-driven and motion-driven by <Subject 2>" in definitions
+    assert "<Subject 3> replaces <Subject 1> in place" in definitions
+    assert "<Subject 4> replaces <Subject 2> in place" in definitions
+    assert "<Subject 3> is pose-driven and motion-driven by <Video 1>" in definitions
+    assert "<Subject 4> is pose-driven and motion-driven by <Video 1>" in definitions
+    assert "must never coexist as separate people" in definitions
 
-    assert "pose-driven and motion-driven human appearance replacement" in detailed
-    assert "Use <Video 1> as the pose and motion driver for the entire shot." in detailed
-    assert "A video of <Subject 3> and <Subject 4> performing the same specific actions" in detailed
-    assert "Copy the source performance from <Video 1>" in detailed
-    assert "Only the visible human identity, appearance and clothing" in detailed
+    assert "Edit <Video 1> in place." in detailed
+    assert "Do not add any new person" in detailed
+    assert "same visible-person count and occupancy as <Video 1>" in detailed
+    assert "<Subject 3> and <Subject 4> inherit their corresponding source performers'" in detailed
+    assert "Only human identity, appearance and clothing may change" in detailed
+    assert "<Subject 1>" not in detailed and "<Subject 2>" not in detailed
     assert shot not in prompt
 
     assert "<Subject 1> (appears in [Shot 1]): attribute_transfer" in prompt
@@ -278,7 +280,7 @@ def test_qwen_shot_text_is_provenance_not_h3_motion_instruction():
     prompt = build_prompt("source one", "source two", shot, "target one", "target two")
     assert shot not in prompt
     assert "00:04.000" not in prompt
-    assert "pose and motion driver" in prompt
+    assert "directly from <Video 1>" in prompt
     assert "follow <Video 1>" in prompt
 
 
