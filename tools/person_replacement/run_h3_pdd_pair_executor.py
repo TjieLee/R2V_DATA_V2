@@ -31,7 +31,11 @@ def arguments(argv=None):
         "/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/clips_clean_cropped"))
     parser.add_argument("--output-root",type=Path,required=True)
     parser.add_argument("--qwen-model",type=Path,
-                        default=Path("/mnt/workspace/public/pretrained/Qwen/Qwen3-VL-8B-Instruct"))
+                        default=Path("/mnt/workspace/public/pretrained/Qwen/Qwen3-VL-8B-Instruct"),
+                        help="Legacy 8B writer; frame0 experiment only, text never loads it")
+    parser.add_argument("--prompt-writer-model",type=Path,
+                        default=Path("/mnt/workspace/public/pretrained/Qwen/Qwen3.8-27B-FP8"),
+                        help="Text V19 writer: one resident 27B instance per GPU worker")
     parser.add_argument("--h3-python",type=Path,default=Path(
         "/mnt/workspace/litengjie/data/person_replacement_deps/minimax-h3-env/bin/python"))
     parser.add_argument("--h3-model-root",type=Path,default=Path("/mnt/workspace/public/pretrained/MiniMaxAI/MiniMax-H3"))

@@ -29,9 +29,12 @@ from .pipeline import validate_output_root
 
 TOOLS = Path(__file__).resolve().parents[2]/"tools/person_replacement"
 
-VARIANTS = {"text":"text_two_person_pdd_fsdp2_pair_v18", "frame0":"frame0_two_person_pdd_fsdp2_pair_v18"}
-RESOURCE_KEYS = ("qwen_model","h3_python","h3_model_root","pdd_code_root","pdd_lora")
-BOOGU_KEYS = ("boogu_python","boogu_code_root","boogu_model_root")
+# text V19 dropped the 8B writer, so frame0 keeps its own v18 contract.
+VARIANTS = {"text":"text_two_person_pdd_fsdp2_pair_v19", "frame0":"frame0_two_person_pdd_fsdp2_pair_v18"}
+BASE_RESOURCE_KEYS = ("h3_python","h3_model_root","pdd_code_root","pdd_lora")
+TEXT_RESOURCE_KEYS = ("prompt_writer_model",)
+FRAME0_RESOURCE_KEYS = ("qwen_model","boogu_python","boogu_code_root","boogu_model_root")
+RESOURCE_KEYS = (*BASE_RESOURCE_KEYS,*TEXT_RESOURCE_KEYS)
 
 
 def visible_pair(value, group_size=2):
@@ -52,14 +55,13 @@ def make_config(args):
     if variant not in VARIANTS:
         raise ValueError(f"variant must be one of {sorted(VARIANTS)}")
     values = {key:str(getattr(args,key).expanduser().absolute()) if getattr(args,key) is not None else None
-              for key in RESOURCE_KEYS}
-    if variant == "frame0":
+              for key in BASE_RESOURCE_KEYS}
+    for key in (FRAME0_RESOURCE_KEYS if variant == "frame0" else TEXT_RESOURCE_KEYS):
         # Server defaults only; never validated at argparse/import time.
-        for key in BOOGU_KEYS:
-            value = getattr(args,key,None)
-            if value is None:
-                raise ValueError(f"{key} is required for the frame0 variant")
-            values[key] = str(Path(value).expanduser().absolute())
+        value = getattr(args,key,None)
+        if value is None:
+            raise ValueError(f"{key} is required for the {variant} variant")
+        values[key] = str(Path(value).expanduser().absolute())
     identity = {"input":str(source),"clips_root":str(clips),"pair_id":args.pair_id,
                 "pair_size":args.pair_size,"seed":args.seed,"variant":variant,"resources":values,
                 "rows":[(case["source_index"],case["row_sha256"]) for case in cases],

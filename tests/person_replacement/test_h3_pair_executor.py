@@ -25,7 +25,7 @@ def test_old_prepared_and_done_survive_group_change(tmp_path, monkeypatch):
     source.write_text('{"video_path":"a.mp4"}\n{"video_path":"b.mp4"}\n')
     argv = ["--input-jsonl",str(source),"--clips-root",str(clips),"--output-root",str(tmp_path/"out")]
     root,old = module.make_config(arguments(argv))
-    assert old["identity_details"]["contract"] == "text_two_person_pdd_fsdp2_pair_v18"
+    assert old["identity_details"]["contract"] == "text_two_person_pdd_fsdp2_pair_v19"
     legacy_details = {**old["identity_details"],"contract":"text_two_person_pdd_fsdp2_pair_v12"}
     legacy_identity = hashlib.sha256(json.dumps(legacy_details,sort_keys=True).encode()).hexdigest()
     legacy_root = tmp_path/"legacy-v12"
@@ -224,3 +224,23 @@ def test_sigterm_parent_cleans_children(tmp_path):
         if parent.poll() is None:
             parent.kill()
             parent.wait()
+
+
+def test_text_identity_uses_prompt_writer_and_frame0_keeps_8b(tmp_path):
+    from r2v_data_v2.person_replacement import h3_pair_executor as module
+    from tools.person_replacement.run_h3_pdd_pair_executor import arguments
+
+    clips = tmp_path/"clips"
+    clips.mkdir()
+    source = tmp_path/"source.jsonl"
+    source.write_text('{"video_path":"a.mp4"}\n')
+    base = ["--input-jsonl",str(source),"--clips-root",str(clips),"--output-root",str(tmp_path/"out")]
+    _,text = module.make_config(arguments(base))
+    _,frame0 = module.make_config(arguments(base+["--variant","frame0"]))
+    assert "prompt_writer_model" in text["identity_details"]["resources"]
+    assert "qwen_model" not in text["identity_details"]["resources"]
+    assert "qwen_model" in frame0["identity_details"]["resources"]
+    assert "prompt_writer_model" not in frame0["identity_details"]["resources"]
+    assert text["identity"] != frame0["identity"]
+    assert arguments(base).prompt_writer_model == Path(
+        "/mnt/workspace/public/pretrained/Qwen/Qwen3.8-27B-FP8")

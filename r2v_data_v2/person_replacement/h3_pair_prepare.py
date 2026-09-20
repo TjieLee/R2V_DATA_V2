@@ -1,4 +1,8 @@
-"""One Qwen instance per partition; per-case durable preparation commits."""
+"""One model instance per partition; per-case durable preparation commits.
+
+The text V19 path uses one resident Qwen3.8-27B writer for two calls per case.
+The frame0 experiment keeps the older 8B + Boogu path.
+"""
 
 from dataclasses import asdict
 from pathlib import Path
@@ -7,6 +11,7 @@ from r2v_data_v2.v3.production_source import JeaVideoMotionAdapter
 
 from .h3_pair_diversity import diversity_cues
 from .h3_pair_state import (
+    atomic_bytes,
     begin_attempt,
     eligible,
     fail_attempt,
@@ -20,6 +25,13 @@ from .h3_ref2va import match_aspect_ratio, output_size, plan_h3_timeline
 from .h3_reference_audio import ensure_h3_reference
 from .h3_two_person import build_prompt
 from .qwen3vl import LocalQwen
+from .qwen38_h3_prompt_writer import (
+    PROMPT_MAX_NEW_TOKENS,
+    REPLACEMENT_MAX_NEW_TOKENS,
+    VIDEO_FPS,
+    LocalQwen38H3PromptWriter,
+    validate_h3_prompt_writer_output,
+)
 from .timeline import inspect_video_timeline
 
 # H3 pads any shorter clip up to 124 frames @24fps, so the tail would carry no
@@ -28,6 +40,8 @@ MINIMUM_SOURCE_DURATION_SECONDS = 5.0
 SOURCE_SUBJECT_FIELDS = ("source_subject_1","source_subject_2")
 PERFORMANCE_FIELDS = ("source_performance_1","source_performance_2")
 QWEN_FIELDS = (*SOURCE_SUBJECT_FIELDS,*PERFORMANCE_FIELDS,"shot_description")
+PROMPT_WRITER_CONTRACT = "qwen38_two_call_full_video_h3_prompt_v1"
+PROMPT_SOURCE = "qwen38_full_video"
 
 
 def skip_payload(case, config, video, reason, *, detail="", timeline=None):
@@ -120,3 +134,83 @@ def prepare_partition(config, worker, qwen_factory=None):
     finally:
         if qwen is not None:
             qwen.close()
+
+
+def prepare_text_partition_v19(config, worker, writer_factory=None):
+    """Text V19: one resident 27B writer, Call 1 then Call 2 per case."""
+    cases = partition(config["cases"],worker,config.get("group_size",2))
+    limits = config["limits"]
+    if not any(eligible(case,"prepare",limits[case["case_id"]]["prepare"]) for case in cases):
+        return
+    factory = writer_factory or (lambda path:LocalQwen38H3PromptWriter(path))
+    writer = None  # loaded lazily and exactly once per worker partition
+    root = Path(config["clips_root"])
+    resolver = JeaVideoMotionAdapter(clips_root=root,source_videos_root=root)
+    try:
+        for case in cases:
+            while eligible(case,"prepare",limits[case["case_id"]]["prepare"]):
+                attempt = begin_attempt(case,"prepare",{"pair_id":config["pair_id"],"text_worker":worker})
+                try:
+                    video, _ = resolver.resolve_clip_path(case["row"])
+                    if video.suffix.lower() != ".mp4":
+                        raise ValueError("Processed clip must be MP4")
+                    plan = skip_or_plan(case,config,video)
+                    if plan is None:
+                        break
+                    source = plan.source
+                    aspect = match_aspect_ratio(source)
+                    reference, audio = ensure_h3_reference(video,Path(case["directory"])/"preparation")
+                    width,height = output_size(aspect)
+                    base = {"case_id":case["case_id"],"row_sha256":case["row_sha256"],
+                            "identity":config["identity"],"source":str(video),"seed":config["seed"],
+                            "h3_reference_source":str(reference),
+                            "frames":plan.native_frame_count,"width":width,"height":height,
+                            "timeline":asdict(plan),"aspect_ratio":aspect,**audio}
+                    marker = qwen_prepared(case)
+                    if marker is None:
+                        if writer is None:
+                            writer = factory(config["prompt_writer_model"])
+                            writer._load()
+                        cue1, cue2 = diversity_cues(config["seed"],case["row_sha256"])
+                        (performer1, performer2,
+                         replacement1, replacement2) = writer.invent_replacements(video,cue1,cue2)
+                        texts = {"source_performer_1":performer1,"source_performer_2":performer2,
+                                 "replacement_subject_1":replacement1,
+                                 "replacement_subject_2":replacement2}
+                        publish_qwen(case,{**base,"replacement_diversity_1":cue1,
+                                           "replacement_diversity_2":cue2,**texts},texts)
+                        marker = qwen_prepared(case)
+                    if writer is None:
+                        writer = factory(config["prompt_writer_model"])
+                        writer._load()
+                    prompt = writer.write_h3_prompt(
+                        video,marker["source_performer_1"],marker["source_performer_2"],
+                        marker["replacement_subject_1"],marker["replacement_subject_2"])
+                    validate_h3_prompt_writer_output(prompt)  # fail closed, no fallback
+                    directory = Path(case["directory"])/"preparation"
+                    atomic_bytes(directory/"prompt_writer_request.txt",
+                                 _writer_request(marker).encode())
+                    publish_prepared(case,{**marker,"variant":"text_two_person","prompt":prompt,
+                        "prompt_writer_model":str(config["prompt_writer_model"]),
+                        "prompt_writer_contract":PROMPT_WRITER_CONTRACT,
+                        "prompt_writer_video_fps":VIDEO_FPS,
+                        "prompt_writer_replacement_max_new_tokens":REPLACEMENT_MAX_NEW_TOKENS,
+                        "prompt_writer_prompt_max_new_tokens":PROMPT_MAX_NEW_TOKENS,
+                        "prompt_writer_thinking":writer.thinking_disabled,
+                        "prompt_source":PROMPT_SOURCE},
+                        {"h3_prompt":prompt})
+                except Exception as exc:  # noqa: BLE001 -- failure is case-local and durable
+                    fail_attempt(case,attempt,exc)
+    finally:
+        if writer is not None:
+            writer.close()
+
+
+def _writer_request(marker):
+    from .qwen38_h3_prompt_writer import H3_PROMPT_USER_TEMPLATE
+
+    return H3_PROMPT_USER_TEMPLATE.format(
+        source_performer_1=marker["source_performer_1"],
+        replacement_subject_1=marker["replacement_subject_1"],
+        source_performer_2=marker["source_performer_2"],
+        replacement_subject_2=marker["replacement_subject_2"])
