@@ -2290,3 +2290,88 @@ def test_barrier_seeds_exactly_one_donor1_job_per_frozen_target(
         assert dict(job.target)["donor_clip_uid"] in {"donor", "clip-1"}
     # A second barrier call must not create donor2 out of nothing.
     assert runner.freeze_cross_pair_after_primary_quiescence() == tuple(jobs)
+
+
+def _cross_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
+    config = _pair_config(
+        tmp_path, monkeypatch, same_parent_fallback_enabled=True
+    )
+    storage = _storage(config, entity_types=("subject",))
+    _three_donor_shard(config, storage)
+    runner = _runner(
+        tmp_path,
+        config,
+        storage,
+        clip_uids=("clip-1", "donor", "target-b", "target-c"),
+    )
+    _drain_primary(
+        runner,
+        _ScopedJudge({("target-b", "e1"): "reject", ("target-c", "e1"): "reject"}),
+    )
+    return config, storage, runner
+
+
+def test_cross_pair_judge_failure_is_durable_and_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The structured failure carrier survives and never becomes retryable."""
+    import json
+
+    from r2v_data_v2.structured_output import ValidationIssue
+    from r2v_data_v2.v3.cross_pair_judge import CrossPairJudgeFailure
+
+    _config, storage, runner = _cross_fixture(tmp_path, monkeypatch)
+    (job,) = [
+        item
+        for item in runner.freeze_cross_pair_after_primary_quiescence()
+        if item.clip_uid == "target-b"
+    ]
+    failure = CrossPairJudgeFailure(
+        raw_responses=["bad"],
+        issues=[
+            ValidationIssue(
+                code="schema_invalid", field="verdict", message="missing verdict"
+            )
+        ],
+        attempt_count=1,
+    )
+
+    class _ExplodingJudge:
+        def decide(self, **kwargs: Any) -> Any:
+            raise failure
+
+    result = runner.run(job, _ExplodingJudge())
+    assert result.committed, "a judge failure is committed, not retried"
+    assert result.payload["status"] == "cross_pair_failed"
+    assert result.payload["failure"]["attempt_count"] == 1
+    assert result.payload["failure"]["raw_responses"] == ["bad"]
+
+    primary_before = storage.read_clip("target-b").pairing
+    _run_one(runner, job, _ExplodingJudge())
+    assert runner.finalize(job, result) == ()
+
+    terminal = runner._cross_terminal(SHARD, "target-b")
+    assert terminal is not None and terminal["status"] == "failed"
+    assert storage.read_clip("target-b").pairing == primary_before, "primary survives"
+    # target-b is terminal and is never seeded again; target-c is unaffected.
+    remaining = [
+        item.clip_uid for item in runner.freeze_cross_pair_after_primary_quiescence()
+    ]
+    assert "target-b" not in remaining
+    assert "target-c" in remaining
+
+    records: list[dict[str, Any]] = []
+    for path in sorted(storage.root.rglob("*.jsonl")):
+        for line in path.read_text().splitlines():
+            if not line.strip():
+                continue
+            try:
+                records.append(json.loads(line))
+            except ValueError:
+                continue
+    failures = [item for item in records if item.get("stage") == "pair"]
+    assert failures, "a Pair failure diagnostic exists"
+    details = failures[-1]["details"]
+    assert details["attempt_count"] == 1
+    assert details["raw_responses"] == ["bad"]
+    assert details["issues"][0]["code"] == "schema_invalid"

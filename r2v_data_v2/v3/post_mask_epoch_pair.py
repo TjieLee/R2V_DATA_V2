@@ -1333,10 +1333,11 @@ class PairEpochRunner:
         the rest of the shard: a target whose primary is unresolved is simply
         absent from the frozen target list.
         """
-        del unresolved_job_ids
         jobs: list[ModelJob] = []
         for shard in sorted(self.storages):
-            snapshot = self.freeze_donor_snapshot(shard)
+            snapshot = self.freeze_donor_snapshot(
+                shard, unresolved_job_ids=unresolved_job_ids
+            )
             for clip_uid in snapshot.get("cross_pair_target_clip_uids", ()):
                 if self._cross_terminal(shard, clip_uid) is not None:
                     continue
@@ -1483,11 +1484,10 @@ class PairEpochRunner:
         result: JobResult,
     ) -> None:
         """Legacy target-block failure: debug, diagnostic, then the marker."""
-        from r2v_data_v2.v3.cross_pair_judge import CrossPairJudgeFailure
-        from r2v_data_v2.v3.pair import _write_cross_pair_debug
+        from r2v_data_v2.v3.pair import _failure_details, _write_cross_pair_debug
 
         storage = self._storage_for(shard)
-        failure = CrossPairJudgeFailure(str(result.payload.get("error") or "cross-pair judge failed"))
+        failure = _cross_failure_from_payload(result.payload)
         _write_cross_pair_debug(
             storage,
             target_clip=target_clip,
@@ -1499,7 +1499,10 @@ class PairEpochRunner:
             failure=failure,
         )
         storage.append_failure(
-            stage="pair", clip_uid=clip_uid, reason=str(failure), details={}
+            stage="pair",
+            clip_uid=clip_uid,
+            reason=str(failure),
+            details=_failure_details(failure),
         )
         self.stats[shard]["failed"] += 1
         self._mark_cross_terminal(
@@ -1571,8 +1574,8 @@ class PairEpochRunner:
                 OUTCOME_COMPLETED,
                 payload={
                     "status": "cross_pair_failed",
+                    "failure": exc.to_dict(),
                     "error": str(exc),
-                    "raw_responses": list(getattr(exc, "raw_responses", ()) or ()),
                 },
             )
         except Exception as exc:  # noqa: BLE001 - infrastructure, not semantic
@@ -1858,6 +1861,27 @@ PAIR_CROSS_TERMINAL_SCHEMA = "post_mask_epoch_pair_cross_terminal/1"
 
 CROSS_TERMINAL_COMPLETED = "completed"
 CROSS_TERMINAL_FAILED = "failed"
+
+
+def _cross_failure_from_payload(payload: Mapping[str, Any]) -> Any:
+    """Rebuild a real CrossPairJudgeFailure from the durable payload.
+
+    Its constructor is keyword-only and carries raw_responses, issues and
+    attempt_count, so the payload has to keep all three; `error` is only a
+    human-readable hint and is not the authority.
+    """
+    from r2v_data_v2.structured_output import ValidationIssue
+    from r2v_data_v2.v3.cross_pair_judge import CrossPairJudgeFailure
+
+    failure_payload = dict(payload.get("failure") or {})
+    issues = [
+        ValidationIssue(**issue) for issue in failure_payload.get("issues", ())
+    ]
+    return CrossPairJudgeFailure(
+        raw_responses=list(failure_payload.get("raw_responses", ())),
+        issues=issues,
+        attempt_count=failure_payload.get("attempt_count"),
+    )
 
 
 def _cross_payload_attempt(result: JobResult) -> Any:
