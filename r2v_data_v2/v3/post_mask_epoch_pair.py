@@ -1019,6 +1019,12 @@ class PairEpochRunner:
         The donor view excludes clips whose primary work has not settled, so
         a half-finished primary can never contribute a stale donor.
         """
+        if self._snapshot_path(shard).is_file():
+            # Already frozen: return it as-is. Donor membership is never
+            # re-derived from live storage, so a full reference produced later
+            # by cross-pair can neither expand nor invalidate the snapshot.
+            return self.donor_snapshot(shard)
+
         blocked = self._unresolved_primary_clip_uids(shard, unresolved_job_ids)
         targets = self._cross_pair_targets(shard, blocked=blocked)
         view = self._shard_view(shard, exclude=blocked)
@@ -1041,6 +1047,9 @@ class PairEpochRunner:
             "schema": PAIR_DONOR_SNAPSHOT_SCHEMA,
             "canonical_shard": shard,
             "eligible_view": list(self._eligible_for(shard)),
+            "primary_plan_digest": semantic_input_digest(
+                self._primary_plan(shard)
+            ),
             "blocked_primary_clip_uids": list(blocked),
             "cross_pair_target_clip_uids": list(targets),
             "groups": groups,
@@ -1055,7 +1064,11 @@ class PairEpochRunner:
             raise PairEpochError(f"no frozen donor snapshot for shard {shard!r}")
         if payload.get("schema") != PAIR_DONOR_SNAPSHOT_SCHEMA:
             raise PairEpochError(f"unsupported donor snapshot schema for {shard!r}")
-        expected = {"canonical_shard": shard, "eligible_view": list(self._eligible_for(shard))}
+        expected = {
+            "canonical_shard": shard,
+            "eligible_view": list(self._eligible_for(shard)),
+            "primary_plan_digest": semantic_input_digest(self._primary_plan(shard)),
+        }
         for key, value in expected.items():
             if payload.get(key) != value:
                 raise PairEpochError(f"frozen donor snapshot {key} drifted for {shard!r}")
@@ -1235,7 +1248,7 @@ class PairEpochRunner:
 PAIR_CROSS_JUDGE_JOB = "pair_cross_pair_judge"
 CALL_SITE_CROSS_PAIR = "cross_pair"
 
-PAIR_DONOR_SNAPSHOT_SCHEMA = "post_mask_epoch_pair_donor_snapshot/1"
+PAIR_DONOR_SNAPSHOT_SCHEMA = "post_mask_epoch_pair_donor_snapshot/2"
 
 
 def _donor_projection(donor: Any, storage: RunStorage) -> dict[str, Any]:
@@ -1301,11 +1314,25 @@ def load_frozen_donor_index(
     Nothing is re-sorted and eligibility is never re-derived: the result is
     fed straight to pair.py's _donors_for_target.
     """
+    groups = snapshot.get("groups")
+    if not isinstance(groups, list):
+        raise PairEpochError("frozen donor snapshot has a malformed groups list")
     index: dict[tuple[str, str], list[Any]] = {}
-    for group in snapshot.get("groups", ()):
+    for group in groups:
         key = (group["parent_video_id"], group["reference_type"])
+        if key in index:
+            raise PairEpochError(f"frozen donor snapshot has duplicate group {key!r}")
+        entries = group.get("donors")
+        if not isinstance(entries, list):
+            raise PairEpochError("frozen donor group has a malformed donors list")
         donors: list[Any] = []
-        for entry in group["donors"]:
+        # The ordinal is the frozen order itself: it is verified, never sorted.
+        for expected_ordinal, entry in enumerate(entries):
+            if entry.get("ordinal") != expected_ordinal:
+                raise PairEpochError(
+                    f"frozen donor ordinal mismatch at {expected_ordinal} "
+                    f"for group {key!r}"
+                )
             donors.append(_restore_donor(storage, group["parent_video_id"], entry))
         index[key] = donors
     return {key: tuple(items) for key, items in index.items()}

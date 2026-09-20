@@ -2064,53 +2064,163 @@ def test_donor_snapshot_tamper_fails_closed(
         restarted.frozen_donor_index(SHARD)
 
 
-def test_donor_snapshot_does_not_expand_after_new_full_reference(
+def test_second_freeze_never_rebuilds_the_live_donor_index(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """After the first freeze, donor membership is never re-derived.
+
+    A spy on the live builder is the direct proof: if it is not called again,
+    a full reference produced later by cross-pair can neither expand the
+    snapshot nor make it mismatch.
+    """
+    import r2v_data_v2.v3.post_mask_epoch_pair as pm
+
     config = _pair_config(
         tmp_path, monkeypatch, same_parent_fallback_enabled=True
     )
     storage = _storage(config, entity_types=("subject",))
     _three_donor_shard(config, storage)
-    runner = _runner(
-        tmp_path,
-        config,
-        storage,
-        clip_uids=("clip-1", "donor", "target-b", "target-c"),
+    uid_list = ("clip-1", "donor", "target-b", "target-c")
+    runner = _runner(tmp_path, config, storage, clip_uids=uid_list)
+    _drain_primary(
+        runner,
+        _ScopedJudge({("target-b", "e1"): "reject", ("target-c", "e1"): "reject"}),
     )
-    _drain_primary(runner)
-    first = runner.freeze_donor_snapshot(SHARD)
-    before = [
-        (g["parent_video_id"], [d["clip_uid"] for d in g["donors"]])
-        for g in first["groups"]
-    ]
 
-    # target-b becomes a full reference: the frozen snapshot must not grow.
-    again = runner.freeze_donor_snapshot(SHARD)
-    after = [
-        (g["parent_video_id"], [d["clip_uid"] for d in g["donors"]])
-        for g in again["groups"]
-    ]
-    assert after == before
-    assert first == again, "an existing snapshot is reused, never rewritten"
+    real_builder = pm._build_same_parent_donor_index
+    live_calls: list[int] = []
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        live_calls.append(1)
+        return real_builder(*args, **kwargs)
+
+    pm._build_same_parent_donor_index = spy
+    try:
+        first = runner.freeze_donor_snapshot(SHARD)
+        again = runner.freeze_donor_snapshot(SHARD)
+        restarted = _runner(tmp_path, config, storage, clip_uids=uid_list)
+        third = restarted.freeze_donor_snapshot(SHARD)
+    finally:
+        pm._build_same_parent_donor_index = real_builder
+
+    assert len(live_calls) == 1, "the live donor index is built exactly once"
+    assert again == first, "a second freeze returns the frozen snapshot"
+    assert third == first, "a restart reuses the same frozen snapshot"
+    donors = [d["clip_uid"] for g in first["groups"] for d in g["donors"]]
+    assert "target-b" not in donors and "target-c" not in donors
 
 
-def test_existing_donor_is_not_a_cross_target(
+def test_unresolved_primary_is_excluded_from_snapshot_and_targets(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """One unresolved clip is excluded; the rest of the shard is not blocked."""
     config = _pair_config(
         tmp_path, monkeypatch, same_parent_fallback_enabled=True
     )
     storage = _storage(config, entity_types=("subject",))
-    pair_clips(config, storage, judge=_Judge())
     _add_ready_clip(
-        config, storage, clip_uid="target", clip_suffix="20", entity_types=("subject",)
+        config, storage, clip_uid="clip-b", clip_suffix="20", entity_types=("subject",)
     )
-    runner = _runner(tmp_path, config, storage, clip_uids=("clip-1", "target"))
-    _drain_primary(runner)
-    snapshot = runner.freeze_donor_snapshot(SHARD)
+    _add_ready_clip(
+        config, storage, clip_uid="clip-c", clip_suffix="21", entity_types=("subject",)
+    )
+    runner = _runner(
+        tmp_path, config, storage, clip_uids=("clip-1", "clip-b", "clip-c")
+    )
 
-    assert "clip-1" not in snapshot["cross_pair_target_clip_uids"]
-    assert "target" in snapshot["cross_pair_target_clip_uids"]
+    # clip-b raises on its entity judge and stays unresolved.
+    pending = runner.seed_primary_jobs()
+    while pending:
+        job = pending.pop(0)
+        if job.clip_uid == "clip-b":
+            result = runner.run(job, _FailingEntityJudge(fail_on="e1"))
+            assert not result.committed
+            continue
+        result = _run_one(runner, job, _Judge())
+        if result.committed:
+            pending.extend(runner.finalize(job, result))
+
+    blocked = runner._unresolved_primary_clip_uids(SHARD, ())
+    snapshot = runner.freeze_donor_snapshot(SHARD, unresolved_job_ids=())
     donors = [d["clip_uid"] for g in snapshot["groups"] for d in g["donors"]]
-    assert "clip-1" in donors, "the pre-launch pairing stays a valid donor"
+
+    assert "clip-b" in blocked
+    assert "clip-b" not in snapshot["cross_pair_target_clip_uids"]
+    assert "clip-b" not in donors
+    # The rest of the shard still participates.
+    assert "clip-1" in snapshot["cross_pair_target_clip_uids"]
+    assert "clip-c" in snapshot["cross_pair_target_clip_uids"]
+
+
+def test_donor_domain_is_scoped_to_one_canonical_shard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A shard-A snapshot never sees a shard-B donor, same parent/type."""
+    from dataclasses import replace
+
+    from r2v_data_v2.v3.post_mask_epoch_pair import PairEpochRunner
+    from r2v_data_v2.v3.post_mask_epoch_state import GroupLedger
+
+    config = _pair_config(
+        tmp_path, monkeypatch, same_parent_fallback_enabled=True
+    )
+    shard_a = _storage(config, entity_types=("subject",))
+    _add_ready_clip(
+        config,
+        shard_a,
+        clip_uid="donor-a",
+        clip_suffix="2",
+        entity_types=("subject",),
+    )
+    _add_ready_clip(
+        config,
+        shard_a,
+        clip_uid="target-a",
+        clip_suffix="20",
+        entity_types=("subject",),
+    )
+    shard_b_config = replace(
+        config, run_root=config.run_root.parent / "shard-b-run"
+    )
+    shard_b = RunStorage(shard_b_config)
+    shard_b.initialize(git_commit="shard-b")
+    _add_ready_clip(
+        config,
+        shard_b,
+        clip_uid="donor-b",
+        clip_suffix="3",
+        entity_types=("subject",),
+    )
+    assert shard_b.read_clip("donor-b").source.parent_video_id == "parent"
+
+    runner = PairEpochRunner(
+        config,
+        {"shard-a": shard_a, "shard-b": shard_b},
+        GroupLedger(tmp_path / "ledger"),
+        eligible_clip_uids_by_shard={
+            "shard-a": ["clip-1", "donor-a", "target-a"],
+            "shard-b": ["donor-b"],
+        },
+    )
+    _drain_primary_shard(runner, "shard-a", shard_a)
+    _drain_primary_shard(runner, "shard-b", shard_b)
+    snapshot = runner.freeze_donor_snapshot("shard-a")
+    donors = [d["clip_uid"] for g in snapshot["groups"] for d in g["donors"]]
+
+    assert "donor-a" in donors
+    assert "donor-b" not in donors
+
+
+def _drain_primary_shard(runner: Any, shard: str, storage: RunStorage) -> None:
+    pending = list(runner.seed_primary_jobs())
+    pending = [job for job in pending if job.canonical_shard == shard]
+    while pending:
+        job = pending.pop(0)
+        result = _run_one(runner, job, _Judge())
+        if not result.committed:
+            break
+        pending.extend(
+            job
+            for job in runner.finalize(job, result)
+            if job.canonical_shard == shard
+        )
