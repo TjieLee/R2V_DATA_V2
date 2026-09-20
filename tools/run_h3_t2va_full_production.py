@@ -102,6 +102,10 @@ def main(argv=None):
             "canonical_workers": args.canonical_workers,
             "model_call_count": 0,
         }
+    if not args.mimo_sglang.is_file() or not os.access(args.mimo_sglang, os.X_OK):
+        raise ValueError(f"MiMo SGLang executable unavailable: {args.mimo_sglang}")
+    if not args.mimo_checkpoint.is_dir():
+        raise ValueError(f"MiMo checkpoint unavailable: {args.mimo_checkpoint}")
     from r2v_data_v2.h3.auk_speech_shadow import auk_configuration
     from r2v_data_v2.h3.mimo25_backend import MimoMediaResolver
     from r2v_data_v2.h3.sam_audio_stem_shadow import sam_audio_configuration
