@@ -189,24 +189,29 @@ except ordinary non-interactive parts of clothing.
 GLOBAL DETAILED-DESCRIPTION PREFACE
 
 Immediately after the `detailed_description:` heading and before `[Shot 1]`,
-write a short global preface of one or two sentences.
+write exactly one source-grounded dynamic overview sentence.
 
-This preface is very important. It must state that the target video is a direct
-edit of <Video 1> and must prioritize the source video's motion, action timing,
-camera framing, camera movement, cuts, scene geometry, depth relationships,
-object interactions and event progression, while changing only the visible
-human identity and appearance of <Subject 1> and <Subject 2>.
+This sentence is especially important. It must summarize the dominant visible
+motion of <Subject 1> and <Subject 2>, their relative movement or most important
+interaction when one is visible, and the dominant camera behavior across the
+source clip.
 
-Do not use this preface for static appearance description.
-Do not begin with style-only or lighting-only wording.
-Do not write a generic preservation checklist.
-Use it as a high-level dynamic anchor for the whole edited video.
+Write concrete target-video content, not editing instructions. Describe what
+visibly happens rather than saying to preserve it.
 
-A good global preface should read like:
-"The target video is a direct edit of <Video 1>. Preserve the complete source
-motion, action timing, camera behavior, scene geometry, depth, and object
-interactions, while changing only the visible human identity and appearance of
-<Subject 1> and <Subject 2>."
+Prioritize concrete dynamic information such as subject trajectories,
+body/head/hand movement, interaction progression, camera tracking, panning,
+tilting, zooming, reframing, handheld movement, or cuts when those are actually
+visible. If the source camera is genuinely static, say that the framing remains
+static instead of inventing camera movement.
+
+Do not use generic wording such as:
+"The target video is a direct edit of <Video 1>."
+or
+"Preserve the complete source motion."
+
+Do not use this sentence for static appearance, clothing, background, lighting,
+or style description.
 
 FIRST-SENTENCE PRIORITY
 

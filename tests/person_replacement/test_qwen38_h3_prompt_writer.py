@@ -375,18 +375,19 @@ def test_system_prompt_adds_global_preface_and_first_sentence_priority():
     prompt = H3_PROMPT_SYSTEM_PROMPT
     assert "GLOBAL DETAILED-DESCRIPTION PREFACE" in prompt
     assert "Immediately after the `detailed_description:` heading and before `[Shot 1]`" in prompt
-    assert "short global preface of one or two sentences" in prompt
-    assert "a direct\nedit of <Video 1>" in prompt
-    assert "motion, action timing," in prompt
-    assert "camera framing, camera movement, cuts, scene geometry, depth relationships," in prompt
-    assert "object interactions and event progression" in prompt
-    assert ("while changing only the visible\nhuman identity and appearance of "
-            "<Subject 1> and <Subject 2>." in prompt)
-    assert "Do not use this preface for static appearance description." in prompt
-    assert "Do not begin with style-only or lighting-only wording." in prompt
-    assert "Do not write a generic preservation checklist." in prompt
-    assert "high-level dynamic anchor" in prompt
-    assert 'A good global preface should read like:' in prompt
+    assert "exactly one source-grounded dynamic overview sentence" in prompt
+    assert "dominant visible\nmotion of <Subject 1> and <Subject 2>" in prompt
+    assert "their relative movement or most important\ninteraction" in prompt
+    assert "dominant camera behavior across the\nsource clip" in prompt
+    assert "Write concrete target-video content, not editing instructions." in prompt
+    assert "Describe what\nvisibly happens rather than saying to preserve it." in prompt
+    assert "subject trajectories" in prompt
+    assert "body/head/hand movement" in prompt
+    assert "camera tracking, panning," in prompt
+    assert "If the source camera is genuinely static" in prompt
+    assert '"The target video is a direct edit of <Video 1>."' in prompt
+    assert '"Preserve the complete source motion."' in prompt
+    assert "Do not use this sentence for static appearance, clothing, background, lighting," in prompt
     assert "FIRST-SENTENCE PRIORITY" in prompt
     assert "The first sentence inside [Shot 1] is especially important." in prompt
     assert "dominant visible motion and the dominant camera\nbehavior" in prompt
