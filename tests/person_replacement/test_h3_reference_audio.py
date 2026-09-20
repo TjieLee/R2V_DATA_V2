@@ -1,6 +1,8 @@
 """H3 reference audio: >2ch sources get a stereo copy; everything else passes through."""
 
 import json
+import shutil
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -49,6 +51,35 @@ def test_command_copies_video_and_downmixes_audio_only():
     assert command[command.index("-c:a")+1] == "aac"
     assert "0:v:0" in command and "0:a:0?" in command
     assert str(Path("/out/b.mp4")) == command[-1]
+
+
+def test_temporary_output_keeps_the_mp4_extension(tmp_path):
+    """ffmpeg infers the container from the final extension."""
+    assert module.TEMPORARY_NAME.endswith(".mp4")
+    command = module.stereo_reference_command(tmp_path/"a.mp4",tmp_path/module.TEMPORARY_NAME)
+    assert command[-1].endswith(".mp4")
+    assert not command[-1].endswith(".partial")
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
+                    reason="ffmpeg/ffprobe unavailable")
+def test_real_ffmpeg_downmixes_six_channels_to_stereo(tmp_path):
+    source = tmp_path/"source.mp4"
+    subprocess.run(["ffmpeg","-nostdin","-v","error","-y",
+                    "-f","lavfi","-i","color=c=blue:s=320x240:r=24:d=1",
+                    "-f","lavfi","-i","sine=frequency=440:duration=1",
+                    "-c:v","libx264","-pix_fmt","yuv420p","-c:a","aac","-ac","6",
+                    "-shortest",str(source)],check=True,capture_output=True)
+    assert module.probe_audio_channels(source) == 6
+    before = source.read_bytes()
+    reference, provenance = module.ensure_h3_reference(source,tmp_path/"preparation")
+    assert reference == tmp_path/"preparation"/module.REFERENCE_NAME
+    assert provenance["reference_audio_source_channels"] == 6
+    assert provenance["reference_audio_target_channels"] == 2
+    assert module.probe_audio_channels(reference) == 2
+    assert module.validate_reference(reference) is True
+    assert source.read_bytes() == before  # original dataset file untouched
+    assert not (tmp_path/"preparation"/module.TEMPORARY_NAME).exists()
 
 
 @pytest.mark.parametrize("channels", [None,1,2])

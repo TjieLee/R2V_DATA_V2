@@ -13,7 +13,10 @@ import subprocess
 from pathlib import Path
 
 REFERENCE_NAME = "h3_reference_stereo.mp4"
-TEMPORARY_NAME = ".h3_reference_stereo.mp4.partial"
+# ffmpeg infers the container from the final extension, so the temporary must
+# still end in .mp4; ".mp4.partial" would fail with "Unable to find a suitable
+# output format".
+TEMPORARY_NAME = ".h3_reference_stereo.partial.mp4"
 TARGET_CHANNELS = 2
 FFMPEG = "ffmpeg"
 FFPROBE = "ffprobe"

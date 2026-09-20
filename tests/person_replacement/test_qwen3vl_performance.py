@@ -57,6 +57,18 @@ def test_performance_prompt_requests_non_temporal_object_anchors():
     assert "<Video 1> alone decides timing" in prompt
 
 
+def test_performance_prompt_disambiguates_props_against_shot_description():
+    prompt = TWO_SOURCE_WITH_PERFORMANCE_PROMPT
+    # Subjects must not carry temporary props, performance fields must carry them,
+    # and the same prop may legitimately appear in both anchor and timed sequence.
+    assert "must not contain temporary props or temporary actions" in prompt
+    assert "non-temporal record of the visible held, carried, touched" in prompt
+    assert "SHOT_DESCRIPTION still keeps the complete temporal sequence" in prompt
+    assert "not a contradiction" in prompt
+    assert "temporary actions and held/touched props in SHOT_DESCRIPTION" in TWO_SOURCE_PROMPT
+    assert "not in conflict" in prompt
+
+
 @pytest.mark.parametrize("broken", [
     RESPONSE.replace("SOURCE_PERFORMANCE_2:","BAD_LABEL:"),
     "\n".join(RESPONSE.splitlines()[:4]),

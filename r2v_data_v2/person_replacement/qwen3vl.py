@@ -39,8 +39,17 @@ SOURCE_SUBJECT_2: ...
 SHOT_DESCRIPTION: ..."""
 
 TWO_SOURCE_WITH_PERFORMANCE_PROMPT = TWO_SOURCE_BODY + """
-Additionally, for SOURCE_PERFORMANCE_1 and SOURCE_PERFORMANCE_2, write one short
-non-temporal anchor per performer describing the source performance facts a replacement
+The three field families have different jobs, and they are not in conflict:
+SOURCE_SUBJECT_1 and SOURCE_SUBJECT_2 stay about identity and stable visual role and
+must not contain temporary props or temporary actions. SOURCE_PERFORMANCE_1 and
+SOURCE_PERFORMANCE_2 are the non-temporal record of the visible held, carried, touched
+and interacted objects and their hand-object relation, so a replacement performer can
+inherit them. SHOT_DESCRIPTION still keeps the complete temporal sequence in playback
+order. The same prop may therefore be named as a non-temporal anchor in
+SOURCE_PERFORMANCE and also described with its timing in SHOT_DESCRIPTION; that is
+intentional, not a contradiction.
+Now write SOURCE_PERFORMANCE_1 and SOURCE_PERFORMANCE_2 as one short non-temporal
+anchor per performer describing the source performance facts a replacement
 performer must inherit. Name the visible held, carried, touched or interacted objects and
 the hand-object relation, for example: holding a black clipboard with both hands, carrying
 a bag in the right hand, touching the table with the left hand. You may add one simple
