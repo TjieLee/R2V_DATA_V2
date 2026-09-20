@@ -443,6 +443,14 @@ class LocalQwen38H3PromptWriter:
         self.processor = AutoProcessor.from_pretrained(
             str(self.model_path), local_files_only=True,
         )
+        # Qwen video processors carry a default fps (commonly 2). Transformers
+        # treats that default as an active sampling argument, so passing our
+        # explicit num_frames at chat-template time otherwise triggers the
+        # mutually-exclusive num_frames+fps guard. Disable only the processor
+        # default; num_frames remains the sole bounded sampling control.
+        video_processor = getattr(self.processor, "video_processor", None)
+        if video_processor is not None and hasattr(video_processor, "fps"):
+            video_processor.fps = None
         self.model = AutoModelForMultimodalLM.from_pretrained(
             str(self.model_path), local_files_only=True, device_map="auto",
         ).eval()

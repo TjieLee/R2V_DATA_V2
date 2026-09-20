@@ -47,6 +47,9 @@ class FakeProcessor:
 
     def __init__(self):
         self.calls = []
+        # Match the real Qwen video processor, whose default fps would conflict
+        # with an explicit num_frames unless the writer disables it after load.
+        self.video_processor = SimpleNamespace(fps=2)
 
     @classmethod
     def from_pretrained(cls, path, **kwargs):
@@ -140,6 +143,7 @@ def test_lazy_single_load_uses_local_files_only(tmp_path, monkeypatch):
     assert instance.model.kwargs["device_map"] == "auto"
     assert "dtype" not in instance.model.kwargs  # FP8 checkpoint keeps its dtype
     assert instance.processor.kwargs["local_files_only"] is True
+    assert instance.processor.video_processor.fps is None
 
 
 def test_missing_transformers_fails_loudly(tmp_path, monkeypatch):
