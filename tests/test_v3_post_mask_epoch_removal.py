@@ -17,7 +17,8 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
-from collections.abc import Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from io import BytesIO
 from pathlib import Path
@@ -28,6 +29,7 @@ import pytest
 from PIL import Image
 
 import r2v_data_v2.v3.config as config_module
+import r2v_data_v2.v3.post_mask_epoch_removal as epoch_removal_module
 import r2v_data_v2.v3.remove as remove_module
 from r2v_data_v2.reconciliation import write_json_atomic
 from r2v_data_v2.v3.background import build_background_candidates
@@ -43,6 +45,7 @@ from r2v_data_v2.v3.config import (
     V3Config,
 )
 from r2v_data_v2.v3.mask_codec import encode_binary_mask
+from r2v_data_v2.v3.post_mask_epoch_groups import resource_epoch_root
 from r2v_data_v2.v3.post_mask_epoch_jobs import (
     OUTCOME_COMPLETED,
     OUTCOME_RETRYABLE_FAILED,
@@ -62,6 +65,7 @@ from r2v_data_v2.v3.post_mask_epoch_removal import (
     REMOVAL_GENERATE_JOB,
     REMOVAL_JUDGE_JOB,
     SEMANTIC_MISMATCH,
+    PreparedRemovalShard,
     RemovalEpochError,
     RemovalEpochRunner,
     build_qwen_epoch_config,
@@ -72,7 +76,11 @@ from r2v_data_v2.v3.post_mask_epoch_removal import (
     prepare_shard_storage,
     removal_generation_resource,
     removal_seed_anchor_inputs,
+    removal_shard_paths,
+    resolve_removal_judge,
     seed_plan_path,
+    shard_lock_path,
+    validate_removal_roots,
 )
 from r2v_data_v2.v3.post_mask_epoch_resources import (
     QwenConcurrentExecutor,
@@ -220,6 +228,7 @@ def _base_config(
     max_generation_ratio: float = 1.0,
     dilation: int = 0,
     run_name: str = "run",
+    save_rejected_candidates: bool = False,
 ) -> V3Config:
     writable = (tmp_path / "workspace" / "data").resolve()
     dataset_root = (tmp_path / "public" / "dataset").resolve()
@@ -253,6 +262,7 @@ def _base_config(
             candidate_seeds=seeds,
             generation_mask_dilation_pixels=dilation,
             max_generation_mask_area_ratio=max_generation_ratio,
+            save_rejected_candidates=save_rejected_candidates,
         ),
         debug=DebugConfig(save_diagnostics=False),
     )
@@ -283,9 +293,22 @@ def _boogu_config(config: V3Config) -> V3Config:
 
 
 def _fixture_config(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, run_name: str = "run", **kwargs: Any
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    run_name: str = "run",
+    **kwargs: Any,
 ) -> V3Config:
-    return _boogu_config(_base_config(tmp_path, monkeypatch, run_name=run_name, **kwargs))
+    return _boogu_config(
+        _base_config(tmp_path, monkeypatch, run_name=run_name, **kwargs)
+    )
+
+
+def _group_with(*shards: str) -> Any:
+    class _Group:
+        group_id = "group-000000"
+        canonical_shards = tuple(shards)
+
+    return _Group()
 
 
 def _mask() -> np.ndarray:
@@ -373,11 +396,15 @@ def _write_frames(storage: RunStorage, clip_uid: str) -> None:
 
 
 def _pending_storage(
-    config: V3Config, *, clip_uids: tuple[str, ...] = ("clip-1",)
+    config: V3Config,
+    *,
+    clip_uids: tuple[str, ...] = ("clip-1",),
+    source_index_start: int = 0,
 ) -> RunStorage:
     storage = RunStorage(config)
     storage.initialize(git_commit="abc123")
-    for clip_uid in clip_uids:
+    for offset, clip_uid in enumerate(clip_uids):
+        index = source_index_start + offset
         video = config.dataset_json.parent / f"{clip_uid}.mp4"
         video.parent.mkdir(parents=True, exist_ok=True)
         video.write_bytes(b"target")
@@ -386,8 +413,8 @@ def _pending_storage(
             source=ClipSource(
                 video_path=str(video),
                 parent_video_id="parent",
-                clip_suffix="1_0",
-                source_index=0,
+                clip_suffix=f"{index}_0",
+                source_index=index,
                 caption_raw="",
                 metadata={},
             ),
@@ -425,18 +452,36 @@ def _state(storage: RunStorage, clip_uid: str = "clip-1") -> BackgroundReference
     return background
 
 
+def _eligible(storage: RunStorage, clip_uids: Sequence[str] | None = None) -> tuple[str, ...]:
+    """The epoch eligibility view: explicit, never ``iter_clips``-derived."""
+    if clip_uids is not None:
+        return tuple(clip_uids)
+    return tuple(clip.clip_uid for clip in storage.iter_clips())
+
+
 def _runner(
     config: V3Config,
     storage: RunStorage,
     ledger: GroupLedger,
     *,
     seed_allocator: Any = None,
+    eligible_clip_uids: Sequence[str] | None = None,
 ) -> RemovalEpochRunner:
+    eligible = {SHARD: _eligible(storage, eligible_clip_uids)}
     if seed_allocator is not None:
         return RemovalEpochRunner(
-            config, {SHARD: storage}, ledger, seed_allocator=seed_allocator
+            config,
+            {SHARD: storage},
+            ledger,
+            seed_allocator=seed_allocator,
+            eligible_clip_uids_by_shard=eligible,
         )
-    return RemovalEpochRunner(config, {SHARD: storage}, ledger)
+    return RemovalEpochRunner(
+        config,
+        {SHARD: storage},
+        ledger,
+        eligible_clip_uids_by_shard=eligible,
+    )
 
 
 def _scheduler(
@@ -559,7 +604,12 @@ def test_non_boogu_backend_is_refused(
     storage = _pending_storage(config)
 
     with pytest.raises(RemovalEpochError, match="requires Boogu"):
-        RemovalEpochRunner(config, {SHARD: storage}, GroupLedger(tmp_path / "group"))
+        RemovalEpochRunner(
+            config,
+            {SHARD: storage},
+            GroupLedger(tmp_path / "group"),
+            eligible_clip_uids_by_shard={SHARD: _eligible(storage)},
+        )
 
 
 def test_seed_jobs_rejects_an_oversized_generation_mask(
@@ -960,9 +1010,22 @@ def test_removal_only_runner_never_reports_group_completed(
 ) -> None:
     config = _fixture_config(tmp_path, monkeypatch)
     storage = _pending_storage(config)
+    post_mask_root = tmp_path / "workspace" / "data" / "campaign"
     monkeypatch.setattr(
         "r2v_data_v2.v3.post_mask_epoch_removal.prepare_shard_storage",
-        lambda *args, **kwargs: storage,
+        lambda *args, **kwargs: PreparedRemovalShard(
+            shard=kwargs["shard"],
+            paths=removal_shard_paths(
+                post_mask_root=kwargs["post_mask_root"],
+                entity_mask_root=kwargs["entity_mask_root"],
+                shard=kwargs["shard"],
+            ),
+            storage=storage,
+            clip_uids=_eligible(storage),
+            ready=1,
+            excluded=0,
+            corrupt=0,
+        ),
     )
 
     class _Group:
@@ -999,7 +1062,7 @@ def test_removal_only_runner_never_reports_group_completed(
     )
     runner_callable = build_removal_epoch_runner(
         config,
-        post_mask_root=tmp_path / "campaign",
+        post_mask_root=post_mask_root,
         entity_mask_root=tmp_path / "entity_mask",
         process_manager=_fake_process_manager(),
         temporary_root=tmp_path / "tmp",
@@ -1007,7 +1070,11 @@ def test_removal_only_runner_never_reports_group_completed(
         qwen_epoch_config=build_qwen_epoch_config(config),
     )
 
-    outcome = runner_callable(_Group(), GroupLedger(tmp_path / "group"), lambda *a, **k: None)
+    outcome = runner_callable(
+        _Group(),
+        GroupLedger(resource_epoch_root(post_mask_root) / "group-000000"),
+        lambda *a, **k: None,
+    )
 
     assert outcome["remove_completed"] is True
     assert outcome["completed"] is False
@@ -1059,21 +1126,28 @@ def test_fresh_run_root_is_hydrated_before_seeding(
     config = _fixture_config(tmp_path, monkeypatch, run_name="epoch")
     post_mask_root = tmp_path / "workspace" / "data" / "campaign"
 
-    storage = prepare_shard_storage(
+    prepared = prepare_shard_storage(
         config,
         post_mask_root=post_mask_root,
         entity_mask_root=entity_mask_root,
         shard=shard,
         git_commit="test",
     )
-
+    storage = prepared.storage
     clips = list(storage.iter_clips())
     assert [clip.clip_uid for clip in clips] == [clip_uid]
     assert clips[0].references.background is not None
     assert clips[0].references.background.status == "pending_remove"
+    assert prepared.clip_uids == (clip_uid,)
+    assert prepared.ready == 1
+    assert prepared.excluded == 0
+    assert prepared.corrupt == 0
 
     runner = RemovalEpochRunner(
-        config, {shard: storage}, GroupLedger(tmp_path / "group")
+        config,
+        {shard: storage},
+        GroupLedger(tmp_path / "group"),
+        eligible_clip_uids_by_shard={shard: prepared.clip_uids},
     )
     assert len(runner.seed_jobs()) == 1
 
@@ -1085,14 +1159,15 @@ def test_hydrated_root_is_reused_without_duplicating_clips(
     config = _fixture_config(tmp_path, monkeypatch, run_name="epoch")
     post_mask_root = tmp_path / "workspace" / "data" / "campaign"
 
-    storage = prepare_shard_storage(
+    prepared = prepare_shard_storage(
         config,
         post_mask_root=post_mask_root,
         entity_mask_root=entity_mask_root,
         shard=shard,
         git_commit="test",
     )
-    assert [clip.clip_uid for clip in storage.iter_clips()] == [clip_uid]
+    assert prepared.clip_uids == (clip_uid,)
+    assert [clip.clip_uid for clip in prepared.storage.iter_clips()] == [clip_uid]
 
     # Re-entering an initialized shard keeps the historical commit and every
     # hydrated clip instead of duplicating or resetting them.
@@ -1189,7 +1264,11 @@ def _epoch_run(
 ) -> tuple[Any, Any, list[str]]:
     ledger = GroupLedger(tmp_path / "epoch-group")
     runner = RemovalEpochRunner(
-        config, {SHARD: storage}, ledger, seed_allocator=allocator
+        config,
+        {SHARD: storage},
+        ledger,
+        seed_allocator=allocator,
+        eligible_clip_uids_by_shard={SHARD: _eligible(storage)},
     )
     worker = _BooguWorker(scenario.generation)
     judge = _Judge(scenario.judge)
@@ -1347,3 +1426,712 @@ def test_retry_cycle_matches_legacy_after_a_restart(
         201,
     ]
     assert _normalized(_state(legacy_storage)) == _normalized(_state(epoch_storage))
+
+
+# ---------------------------------------------------------------------------
+# Shard lock lifetime
+# ---------------------------------------------------------------------------
+
+
+SHARD_A = "shard-000000000-000000000"
+SHARD_B = "shard-000000001-000000999"
+
+
+class _LockRecorder:
+    """Stand-in for ``file_lock`` that records the whole lock lifetime.
+
+    The legacy Post-Mask worker holds ``state_root/shard.lock`` from hydration
+    through publication. The resource-epoch runner must do the same for every
+    canonical shard of the group, so this records when each lock is taken, what
+    is still held while a model runs, and when everything is released.
+    """
+
+    def __init__(self, *, fail_on: Sequence[str] = ()) -> None:
+        self.events: list[str] = []
+        self.fail_on = set(fail_on)
+        self.held: list[str] = []
+        self.held_during_model: list[list[str]] = []
+
+    def __call__(self, path: Path, *, blocking: bool = True) -> Any:
+        recorder = self
+        name = path.parent.name
+
+        @contextmanager
+        def lock() -> Iterator[bool]:
+            if name in recorder.fail_on:
+                recorder.events.append(f"lock-unavailable {name}")
+                yield False
+                return
+            recorder.events.append(f"acquire {name}")
+            recorder.held.append(name)
+            try:
+                yield True
+            finally:
+                recorder.held.remove(name)
+                recorder.events.append(f"release {name}")
+
+        return lock()
+
+
+class _TracingWorker:
+    """Boogu worker that snapshots the lock state on every model call."""
+
+    def __init__(
+        self, recorder: _LockRecorder, responses: Sequence[Any] = ()
+    ) -> None:
+        self.recorder = recorder
+        self.inner = _BooguWorker(responses)
+
+    @property
+    def calls(self) -> list[dict[str, Any]]:
+        return self.inner.calls
+
+    def edit(self, **kwargs: Any) -> BooguEditOutput:
+        self.recorder.events.append("boogu")
+        self.recorder.held_during_model.append(list(self.recorder.held))
+        return self.inner.edit(**kwargs)
+
+    def close(self) -> None:
+        self.inner.close()
+
+
+class _TracingJudge:
+    def __init__(
+        self, recorder: _LockRecorder, responses: Sequence[Any] = ()
+    ) -> None:
+        self.recorder = recorder
+        self.inner = _Judge(responses)
+
+    @property
+    def calls(self) -> int:
+        return self.inner.calls
+
+    def review(self, **kwargs: Any) -> BackgroundRemovalReview:
+        self.recorder.events.append("qwen")
+        self.recorder.held_during_model.append(list(self.recorder.held))
+        return self.inner.review(**kwargs)
+
+
+class _FakeEpochResource:
+    def start(self) -> None:
+        self.started = True
+
+    def stop(self) -> None:
+        self.started = False
+
+    def counters(self) -> dict[str, Any]:
+        return {}
+
+
+def _install_fake_factories(
+    monkeypatch: pytest.MonkeyPatch, worker: Any, judge: Any
+) -> None:
+    monkeypatch.setattr(
+        "r2v_data_v2.v3.post_mask_epoch_removal.build_removal_epoch_factories",
+        lambda config, runner, **kwargs: {
+            RESOURCE_BOOGU: lambda: (
+                _FakeEpochResource(),
+                SerialBatchExecutor(runner.run, worker),
+            ),
+            RESOURCE_QWEN: lambda: (
+                _FakeEpochResource(),
+                SerialBatchExecutor(runner.run, judge),
+            ),
+        },
+    )
+
+
+def _install_prepared_shards(
+    monkeypatch: pytest.MonkeyPatch,
+    storages: Mapping[str, RunStorage],
+    recorder: _LockRecorder,
+    *,
+    clip_uids_by_shard: Mapping[str, Sequence[str]] | None = None,
+) -> None:
+    def fake_prepare(
+        config: V3Config,
+        *,
+        post_mask_root: Path,
+        entity_mask_root: Path,
+        shard: str,
+        git_commit: str,
+    ) -> PreparedRemovalShard:
+        recorder.events.append(f"hydrate {shard}")
+        storage = storages[shard]
+        wanted = (clip_uids_by_shard or {}).get(shard)
+        return PreparedRemovalShard(
+            shard=shard,
+            paths=removal_shard_paths(
+                post_mask_root=post_mask_root,
+                entity_mask_root=entity_mask_root,
+                shard=shard,
+            ),
+            storage=storage,
+            clip_uids=_eligible(storage, wanted),
+            ready=1,
+            excluded=0,
+            corrupt=0,
+        )
+
+    monkeypatch.setattr(
+        "r2v_data_v2.v3.post_mask_epoch_removal.prepare_shard_storage", fake_prepare
+    )
+
+
+def _trace_mutations(monkeypatch: pytest.MonkeyPatch, recorder: _LockRecorder) -> None:
+    real_publish = epoch_removal_module._publish_ready
+
+    def traced_publish(*args: Any, **kwargs: Any) -> Any:
+        recorder.events.append("publish")
+        return real_publish(*args, **kwargs)
+
+    monkeypatch.setattr(epoch_removal_module, "_publish_ready", traced_publish)
+
+    real_counts = RunStorage.update_stage_counts
+
+    def traced_counts(self: RunStorage, stage: str, counts: dict[str, int]) -> Any:
+        recorder.events.append("stage_counts")
+        return real_counts(self, stage, counts)
+
+    monkeypatch.setattr(RunStorage, "update_stage_counts", traced_counts)
+
+
+def _two_shard_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    recorder: _LockRecorder,
+    fail: bool = False,
+) -> tuple[dict[str, Any], _TracingWorker, _TracingJudge, RunStorage]:
+    writable = tmp_path / "workspace" / "data"
+    post_mask_root = writable / "campaign"
+    config = _fixture_config(tmp_path, monkeypatch, run_name="shard-a")
+    other = _fixture_config(tmp_path, monkeypatch, run_name="shard-b")
+    storages = {
+        SHARD_A: _pending_storage(config, clip_uids=("clip-1",)),
+        SHARD_B: _pending_storage(other, clip_uids=("clip-1",)),
+    }
+    worker = _TracingWorker(recorder)
+    judge = _TracingJudge(recorder, [_accept(), _accept()])
+    _install_prepared_shards(monkeypatch, storages, recorder)
+    _install_fake_factories(monkeypatch, worker, judge)
+    _trace_mutations(monkeypatch, recorder)
+    monkeypatch.setattr(
+        "r2v_data_v2.v3.post_mask_epoch_removal.file_lock", recorder
+    )
+    runner_callable = build_removal_epoch_runner(
+        config,
+        post_mask_root=post_mask_root,
+        entity_mask_root=tmp_path / "entity_mask",
+        process_manager=_fake_process_manager(),
+        temporary_root=tmp_path / "tmp",
+        allowed_server_root=writable,
+        qwen_epoch_config=build_qwen_epoch_config(config),
+    )
+    ledger = GroupLedger(resource_epoch_root(post_mask_root) / "group-000000")
+    outcome = runner_callable(
+        _group_with(SHARD_A, SHARD_B), ledger, lambda *a, **k: None
+    )
+    del fail
+    return outcome, worker, judge, storages[SHARD_A]
+
+
+def test_removal_epoch_holds_every_shard_lock_across_the_whole_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorder = _LockRecorder()
+    outcome, worker, judge, storage = _two_shard_run(
+        tmp_path, monkeypatch, recorder=recorder
+    )
+
+    assert outcome["remove_completed"] is True
+    trace = recorder.events
+    # Phase 1: every canonical shard lock, in lexical shard order, before any
+    # shard is touched.
+    assert trace[0] == f"acquire {SHARD_A}"
+    assert trace[1] == f"acquire {SHARD_B}"
+    assert trace.index(f"hydrate {SHARD_A}") > trace.index(f"acquire {SHARD_B}")
+    # Model calls, publication and the stage-count update all happen while the
+    # locks are still held.
+    assert trace.index("boogu") > trace.index(f"hydrate {SHARD_B}")
+    assert trace.index("qwen") > trace.index("boogu")
+    assert trace.index("publish") > trace.index("qwen")
+    assert trace.index("stage_counts") > trace.index("publish")
+    assert trace[-2] == f"release {SHARD_B}"
+    assert trace[-1] == f"release {SHARD_A}"
+    assert recorder.held_during_model, "no model call was observed"
+    assert all(
+        held == [SHARD_A, SHARD_B] for held in recorder.held_during_model
+    ), "a model call ran without every shard lock held"
+    assert len(worker.calls) == 2
+    assert judge.calls == 2
+    assert _state(storage).status == "ready_removed"
+
+
+def test_second_shard_lock_unavailable_mutates_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorder = _LockRecorder(fail_on=(SHARD_B,))
+    config = _fixture_config(tmp_path, monkeypatch, run_name="shard-a")
+    other = _fixture_config(tmp_path, monkeypatch, run_name="shard-b")
+    writable = tmp_path / "workspace" / "data"
+    post_mask_root = writable / "campaign"
+    storages = {
+        SHARD_A: _pending_storage(config, clip_uids=("clip-1",)),
+        SHARD_B: _pending_storage(other, clip_uids=("clip-1",)),
+    }
+    worker = _TracingWorker(recorder)
+    judge = _TracingJudge(recorder, [_accept()])
+    _install_prepared_shards(monkeypatch, storages, recorder)
+    _install_fake_factories(monkeypatch, worker, judge)
+    _trace_mutations(monkeypatch, recorder)
+    monkeypatch.setattr(
+        "r2v_data_v2.v3.post_mask_epoch_removal.file_lock", recorder
+    )
+    runner_callable = build_removal_epoch_runner(
+        config,
+        post_mask_root=post_mask_root,
+        entity_mask_root=tmp_path / "entity_mask",
+        process_manager=_fake_process_manager(),
+        temporary_root=tmp_path / "tmp",
+        allowed_server_root=writable,
+        qwen_epoch_config=build_qwen_epoch_config(config),
+    )
+
+    with pytest.raises(RemovalEpochError, match="locked elsewhere"):
+        runner_callable(
+            _group_with(SHARD_A, SHARD_B),
+            GroupLedger(resource_epoch_root(post_mask_root) / "group-000000"),
+            lambda *a, **k: None,
+        )
+
+    assert recorder.events == [
+        f"acquire {SHARD_A}",
+        f"lock-unavailable {SHARD_B}",
+        f"release {SHARD_A}",
+    ]
+    assert not any("hydrate" in event for event in recorder.events)
+    assert worker.calls == [], "no generation may run without every shard lock"
+    assert judge.calls == 0, "no judge may run without every shard lock"
+    assert "publish" not in recorder.events
+    assert "stage_counts" not in recorder.events
+    assert recorder.held == [], "the acquired lock must be released again"
+    assert _state(storages[SHARD_A]).status == "pending_remove"
+
+
+def test_epoch_shard_lock_is_the_legacy_worker_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _fixture_config(tmp_path, monkeypatch)
+    writable = tmp_path / "workspace" / "data"
+    post_mask_root = writable / "campaign"
+    entity_mask_root = writable / "stage2" / "entity_mask"
+    legacy_paths = ShardPaths.for_shard(
+        post_mask_root, entity_mask_root / "parts" / f"{SHARD}.jsonl"
+    )
+    epoch_paths = removal_shard_paths(
+        post_mask_root=post_mask_root,
+        entity_mask_root=entity_mask_root,
+        shard=SHARD,
+    )
+
+    assert shard_lock_path(epoch_paths) == legacy_paths.state_root / "shard.lock"
+    assert shard_lock_path(epoch_paths) == epoch_paths.state_root / "shard.lock"
+    assert "resource_epoch" not in str(shard_lock_path(epoch_paths))
+    assert config is not None
+
+
+# ---------------------------------------------------------------------------
+# Eligible clip view
+# ---------------------------------------------------------------------------
+
+
+def test_seed_jobs_only_reads_the_explicit_eligible_view(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _fixture_config(tmp_path, monkeypatch)
+    storage = _pending_storage(config, clip_uids=("clip-A", "clip-B"))
+    runner = _runner(
+        config,
+        storage,
+        GroupLedger(tmp_path / "group"),
+        eligible_clip_uids=("clip-A",),
+    )
+
+    jobs = runner.seed_jobs()
+
+    assert {job.clip_uid for job in jobs} == {"clip-A"}
+    assert {clip.clip_uid for clip in storage.iter_clips()} == {"clip-A", "clip-B"}
+    assert _state(storage, "clip-B").status == "pending_remove"
+
+
+def test_corrupt_historical_clip_is_never_seeded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if sys.platform == "win32":  # pragma: no cover - known production module bug
+        pytest.skip("hydrate_shard re-entry is not Windows-safe")
+    entity_mask_root, shard = _stage2_two_clip_fixture(tmp_path, monkeypatch)
+    config = _fixture_config(tmp_path, monkeypatch, run_name="epoch")
+    post_mask_root = tmp_path / "workspace" / "data" / "campaign"
+
+    first = prepare_shard_storage(
+        config,
+        post_mask_root=post_mask_root,
+        entity_mask_root=entity_mask_root,
+        shard=shard,
+        git_commit="test",
+    )
+    assert first.clip_uids == ("clip-A", "clip-B"), (
+        first.paths.input_failures_path.read_text()
+    )
+    assert first.corrupt == 0
+
+    # The second launch sees clip-B as corrupt: its frozen Stage2 manifest is
+    # gone, so hydration admits only clip-A this time.
+    corrupt_source = (
+        entity_mask_root
+        / "artifacts"
+        / shard
+        / "clip-B"
+        / "run"
+        / "clips"
+        / "clip-B"
+        / "frames"
+        / "frames.json"
+    )
+    corrupt_source.unlink()
+
+    second = prepare_shard_storage(
+        config,
+        post_mask_root=post_mask_root,
+        entity_mask_root=entity_mask_root,
+        shard=shard,
+        git_commit="test",
+    )
+
+    assert second.clip_uids == ("clip-A",)
+    assert second.corrupt == 1
+    # clip-B is still on disk from the first launch ...
+    assert (second.storage.root / "clips" / "clip-B").is_dir()
+    assert {clip.clip_uid for clip in second.storage.iter_clips()} == {
+        "clip-A",
+        "clip-B",
+    }
+    # ... but this launch's hydration result is the only eligibility source.
+    runner = RemovalEpochRunner(
+        config,
+        {shard: second.storage},
+        GroupLedger(tmp_path / "group"),
+        eligible_clip_uids_by_shard={shard: second.clip_uids},
+    )
+    jobs = runner.seed_jobs()
+    assert {job.clip_uid for job in jobs} == {"clip-A"}
+
+
+def _stage2_two_clip_fixture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    shard: str = SHARD,
+    clip_uids: tuple[str, ...] = ("clip-A", "clip-B"),
+) -> tuple[Path, str]:
+    """One canonical Stage2 shard whose parts list two ready clips."""
+    entity_mask_root = tmp_path / "public" / "entity_mask"
+    parts = entity_mask_root / "parts"
+    parts.mkdir(parents=True, exist_ok=True)
+    for index, uid in enumerate(clip_uids):
+        source_config = _fixture_config(tmp_path, monkeypatch, run_name=f"stage2-{uid}")
+        storage = _pending_storage(
+            source_config, clip_uids=(uid,), source_index_start=index
+        )
+        destination = entity_mask_root / "artifacts" / shard / uid / "run"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        storage.root.rename(destination)
+    rows = [
+        json.dumps(
+            {
+                "schema_version": "r2v.v3.pre_qwen_stage2.1",
+                "source_index": index,
+                "clip_uid": uid,
+                "status": "ready_background_pending_remove",
+                "coverage_passed": True,
+                "background_status": "pending_remove",
+                "reason": None,
+                "artifact_root": f"artifacts/{shard}/{uid}",
+            }
+        )
+        for index, uid in enumerate(clip_uids)
+    ]
+    (parts / f"{shard}.jsonl").write_text("\n".join(rows) + "\n")
+    return entity_mask_root, shard
+
+
+# ---------------------------------------------------------------------------
+# Qwen judge client ownership
+# ---------------------------------------------------------------------------
+
+
+class _SharedJudge:
+    """A judge handle the runner does not own, even though it can be closed."""
+
+    def __init__(self, response: Any = None) -> None:
+        self.response = response
+        self.review_calls = 0
+        self.close_calls = 0
+
+    def review(self, **kwargs: Any) -> BackgroundRemovalReview:
+        self.review_calls += 1
+        if isinstance(self.response, Exception):
+            raise self.response
+        return _accept()
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+def _install_endpoint_judge(monkeypatch: pytest.MonkeyPatch, response: Any) -> list[Any]:
+    created: list[Any] = []
+
+    class _FakeEndpointJudge:
+        def __init__(self, service: Any) -> None:
+            self.service = service
+            self.review_calls = 0
+            self.close_calls = 0
+            created.append(self)
+
+        def review(self, **kwargs: Any) -> BackgroundRemovalReview:
+            self.review_calls += 1
+            if isinstance(response, Exception):
+                raise response
+            return _accept()
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    monkeypatch.setattr(
+        epoch_removal_module, "QwenBackgroundRemovalJudge", _FakeEndpointJudge
+    )
+    return created
+
+
+def _judge_job_for(
+    config: V3Config,
+    storage: RunStorage,
+    ledger: GroupLedger,
+) -> tuple[RemovalEpochRunner, ModelJob]:
+    runner = _runner(config, storage, ledger)
+    (generate_job,) = runner.seed_jobs()
+    worker = _BooguWorker()
+    generation = runner.run(generate_job, worker)
+    phase = ledger.phase("manual")
+    digest = phase.publish_artifact(
+        generate_job.job_id(),
+        CANDIDATE_ARTIFACT,
+        generation.artifacts[CANDIDATE_ARTIFACT],
+    )
+    result_digest = phase.publish_result(generate_job, generation)
+    receipt = phase.commit(
+        generate_job,
+        outcome=generation.outcome,
+        artifact_digests={CANDIDATE_ARTIFACT: digest, "result.json": result_digest},
+        result_digest=result_digest,
+    )
+    ledger.note_commit("manual", receipt)
+    (judge_job,) = runner.finalize(generate_job, generation)
+    return runner, judge_job
+
+
+def test_endpoint_judge_client_is_closed_after_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _fixture_config(tmp_path, monkeypatch)
+    storage = _pending_storage(config)
+    ledger = GroupLedger(tmp_path / "group")
+    created = _install_endpoint_judge(monkeypatch, None)
+    runner, judge_job = _judge_job_for(config, storage, ledger)
+
+    result = runner.run(judge_job, "http://127.0.0.1:8000/v1")
+
+    assert result.outcome == OUTCOME_COMPLETED
+    assert len(created) == 1
+    assert created[0].review_calls == 1
+    assert created[0].close_calls == 1, "an endpoint client must always be closed"
+
+
+def test_endpoint_judge_client_is_closed_when_review_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _fixture_config(tmp_path, monkeypatch)
+    storage = _pending_storage(config)
+    ledger = GroupLedger(tmp_path / "group")
+    created = _install_endpoint_judge(monkeypatch, RuntimeError("judge down"))
+    runner, judge_job = _judge_job_for(config, storage, ledger)
+
+    result = runner.run(judge_job, "http://127.0.0.1:8000/v1")
+
+    assert result.outcome == OUTCOME_COMPLETED
+    assert len(created) == 1
+    assert created[0].review_calls == 1
+    assert created[0].close_calls == 1, "close must survive a review exception"
+
+
+def test_shared_judge_handle_is_never_closed_by_the_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _fixture_config(tmp_path, monkeypatch)
+    storage = _pending_storage(config)
+    ledger = GroupLedger(tmp_path / "group")
+    _install_endpoint_judge(monkeypatch, None)
+    runner, judge_job = _judge_job_for(config, storage, ledger)
+    shared = _SharedJudge()
+
+    runner.run(judge_job, shared)
+
+    assert shared.review_calls == 1
+    assert shared.close_calls == 0, "a shared handle belongs to its owner"
+    resolved = resolve_removal_judge(shared, config)
+    assert resolved.judge is shared
+    assert resolved.owned is False
+
+
+# ---------------------------------------------------------------------------
+# Launcher / runner root consistency
+# ---------------------------------------------------------------------------
+
+
+def test_runner_refuses_a_ledger_root_outside_the_launcher_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _fixture_config(tmp_path, monkeypatch)
+    storage = _pending_storage(config)
+    writable = tmp_path / "workspace" / "data"
+    campaign_a = writable / "campaign-A"
+    campaign_b = writable / "campaign-B"
+    recorder = _LockRecorder()
+    _install_prepared_shards(monkeypatch, {SHARD: storage}, recorder)
+    _install_fake_factories(monkeypatch, _BooguWorker(), _Judge([_accept()]))
+    monkeypatch.setattr(
+        "r2v_data_v2.v3.post_mask_epoch_removal.file_lock", recorder
+    )
+    runner_callable = build_removal_epoch_runner(
+        config,
+        post_mask_root=campaign_b,
+        entity_mask_root=tmp_path / "entity_mask",
+        process_manager=_fake_process_manager(),
+        temporary_root=tmp_path / "tmp",
+        allowed_server_root=writable,
+        qwen_epoch_config=build_qwen_epoch_config(config),
+    )
+
+    with pytest.raises(RemovalEpochError, match="Post-Mask root"):
+        runner_callable(
+            _group_with(SHARD),
+            GroupLedger(resource_epoch_root(campaign_a) / "group-X"),
+            lambda *a, **k: None,
+        )
+
+    assert not any("hydrate" in event for event in recorder.events)
+    assert recorder.events == [], "root validation runs before any lock"
+    assert _state(storage).status == "pending_remove"
+
+
+def test_runner_refuses_an_entity_mask_root_that_is_not_the_campaign(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "campaign-A"
+    ledger = GroupLedger(resource_epoch_root(root) / "group-X")
+
+    with pytest.raises(RemovalEpochError, match="entity mask root"):
+        validate_removal_roots(
+            ledger,
+            group_id="group-X",
+            post_mask_root=root,
+            entity_mask_root=tmp_path / "stage2-A",
+            campaign={"entity_mask_root": str(tmp_path / "stage2-B")},
+        )
+
+
+def test_matching_roots_validate(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "campaign-A"
+    ledger = GroupLedger(resource_epoch_root(root) / "group-X")
+    entity_mask_root = tmp_path / "stage2-A"
+
+    validate_removal_roots(
+        ledger,
+        group_id="group-X",
+        post_mask_root=root,
+        entity_mask_root=entity_mask_root,
+        campaign={"entity_mask_root": str(entity_mask_root)},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Debug semantic equivalence
+# ---------------------------------------------------------------------------
+
+
+def _debug_tree(storage: RunStorage, clip_uid: str) -> dict[str, Any]:
+    directory = storage.remove_debug_dir(clip_uid)
+    payload: dict[str, Any] = {}
+    for path in sorted(directory.iterdir()):
+        if path.suffix == ".json":
+            payload[path.name] = json.loads(path.read_text())
+        else:
+            payload[path.name] = path.read_bytes()
+    return payload
+
+
+def test_rejected_candidate_debug_artifacts_match_legacy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scenario = _Scenario(
+        "B-reject-accept",
+        (),
+        (_reject("seam"), _accept("clean")),
+        (101, 202),
+        "ready_removed",
+        None,
+        2,
+        2,
+        True,
+    )
+    legacy_config = _fixture_config(
+        tmp_path,
+        monkeypatch,
+        run_name="legacy",
+        save_rejected_candidates=True,
+    )
+    epoch_config = _fixture_config(
+        tmp_path,
+        monkeypatch,
+        run_name="epoch",
+        save_rejected_candidates=True,
+    )
+    legacy_storage = _pending_storage(legacy_config)
+    epoch_storage = _pending_storage(epoch_config)
+
+    _legacy_run(
+        legacy_config,
+        legacy_storage,
+        monkeypatch,
+        scenario,
+        _SeedAllocator(scenario.seeds),
+    )
+    _epoch_run(
+        epoch_config,
+        epoch_storage,
+        tmp_path,
+        scenario,
+        _SeedAllocator(scenario.seeds),
+    )
+
+    legacy_debug = _debug_tree(legacy_storage, "clip-1")
+    epoch_debug = _debug_tree(epoch_storage, "clip-1")
+
+    assert set(legacy_debug) == set(epoch_debug)
+    assert "candidate_seed_101.png" in legacy_debug, "the rejected candidate debug"
+    assert "candidate_seed_202.png" not in legacy_debug, "accepted candidates do not"
+    for name in sorted(legacy_debug):
+        assert legacy_debug[name] == epoch_debug[name], f"debug mismatch: {name}"
