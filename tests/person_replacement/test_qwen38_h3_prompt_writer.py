@@ -161,7 +161,10 @@ def test_video_input_num_frames_and_generation_settings(tmp_path, monkeypatch):
     messages, kwargs = instance.processor.calls[-1]
     assert "fps" not in kwargs  # no vLLM-only fps sampling parameter
     assert kwargs["num_frames"] == 40 and kwargs["enable_thinking"] is False
-    assert messages[0]["content"][0] == {"type":"video","video":str(video.resolve())}
+    # Local files use the `path` locator; `video` is for decoded media objects.
+    assert messages[0]["content"][0] == {"type":"video","path":str(video.resolve())}
+    assert "video" not in messages[0]["content"][0]  # no decoded-object key
+    assert str(video.resolve()).startswith("/")  # local path, never a URL
     assert instance.model.generate_calls[-1]["do_sample"] is False
     assert instance.model.generate_calls[-1]["max_new_tokens"] == 512
     instance.write_h3_prompt(video,"p1","p2","r1","r2",num_frames=40)
@@ -297,3 +300,21 @@ def test_validator_rejects_leading_prose_and_thinking():
             validate_h3_prompt_writer_output(broken)
     assert validate_h3_prompt_writer_output("\n\n" + LEGAL_PROMPT + "\n").startswith(
         "subject_definitions:")
+
+
+def test_both_calls_use_the_same_path_style_video_part(tmp_path, monkeypatch):
+    instance = writer(tmp_path,monkeypatch)
+    instance.processor.text = CALL1_RESPONSE
+    video = tmp_path/"source.mp4"
+    video.touch()
+    instance.invent_replacements(video,"doctor","generic",num_frames=40)
+    instance.write_h3_prompt(video,"p1","p2","r1","r2",num_frames=40)
+    parts = []
+    for messages, _ in instance.processor.calls:
+        for message in messages:
+            content = message["content"]
+            if isinstance(content,list):
+                parts.extend(item for item in content if item.get("type") == "video")
+    assert parts == [{"type":"video","path":str(video.resolve())}]*2
+    assert all(not part.keys() - {"type","path"} for part in parts)
+    assert [kwargs["num_frames"] for _, kwargs in instance.processor.calls] == [40,40]

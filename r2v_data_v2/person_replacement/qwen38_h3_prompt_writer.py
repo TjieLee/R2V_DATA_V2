@@ -425,7 +425,6 @@ class LocalQwen38H3PromptWriter:
         self.prompt_max_new_tokens = prompt_max_new_tokens
         self.model = self.processor = None
         self.thinking_disabled = True  # flipped when the template cannot disable it
-        self.fps_parameter_applied = True
 
     def _load(self):
         if self.model is not None:
@@ -484,7 +483,9 @@ class LocalQwen38H3PromptWriter:
         return text
 
     def _video(self, video):
-        return {"type":"video", "video":str(Path(video).resolve(strict=True))}
+        # Transformers multimodal chat templates take a local file in `path`;
+        # `video` is reserved for an already decoded video object/array.
+        return {"type":"video", "path":str(Path(video).resolve(strict=True))}
 
     def invent_replacements(self, video, cue1, cue2, *, num_frames):
         """Call 1: bind the two performers and plan replacement identities."""
