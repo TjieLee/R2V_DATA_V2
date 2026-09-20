@@ -234,6 +234,52 @@ def test_node_lifetime_does_not_start_persistent_upstream_pools(tmp_path, monkey
     assert pipeline.pools is None
 
 
+def test_mimo_stage_is_wrapped_by_per_shard_lifecycle(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    from r2v_data_v2.h3 import t2va_full_downstream
+
+    events = []
+
+    class Lifecycle:
+        @contextmanager
+        def stage(self, shard_id):
+            events.append(("enter", shard_id))
+            try:
+                yield
+            finally:
+                events.append(("exit", shard_id))
+
+    def run_downstream(*args, **kwargs):
+        events.append(("run", args[2]))
+        return {
+            "clip": {
+                "t2va_status": "ready",
+                "ta2va_status": "ready",
+            }
+        }
+
+    monkeypatch.setattr(t2va_full_downstream, "run_downstream", run_downstream)
+    config = SimpleNamespace(model_dump=lambda **kw: {})
+    pipeline = full.FullPipeline(
+        root=tmp_path,
+        index={},
+        clips_root=tmp_path,
+        source_videos_root=tmp_path,
+        gpu_ids=["0"],
+        sam_configuration=config,
+        auk_configuration=config,
+        backend=None,
+        profiles=None,
+        mimo_lifecycle=Lifecycle(),
+    )
+    pipeline.prepared[7] = full.PreparedShard(tmp_path / "audio", {"ready": 1})
+    result = pipeline.stage("mimo", 7)
+    assert events == [("enter", 7), ("run", 7), ("exit", 7)]
+    assert result["t2va_ready"] == result["ta2va_ready"] == 1
+
+
 def test_shard_selection_preserves_bad_row_positions(tmp_path):
     manifest = shot_manifest(tmp_path)
     lines = manifest.read_bytes().splitlines(keepends=True)
