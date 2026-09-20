@@ -184,6 +184,66 @@ def test_raw_video_to_snapshot_and_retry_without_repeat_models(
     assert len(list(production.complete_rows(snapshot / "ta2va_full_audio.jsonl"))) == 3
 
 
+def test_resume_first_schedule_uses_only_cheap_markers(tmp_path):
+    assigned = [7, 2, 9, 4, 1, 6]
+
+    complete = tmp_path / "shards" / production.shard_name(2)
+    complete.mkdir(parents=True)
+    (complete / "COMPLETE").write_text("not-json")
+
+    canonical = tmp_path / "shards" / production.shard_name(9) / "stage_state"
+    canonical.mkdir(parents=True)
+    (canonical / "canonical.json").write_text("not-json")
+
+    downstream = tmp_path / "shards" / production.shard_name(1)
+    downstream.mkdir(parents=True)
+    (downstream / "state.jsonl.partial").write_text("not-json")
+
+    audio_summary = tmp_path / "shards" / production.shard_name(6) / "stage_state"
+    audio_summary.mkdir(parents=True)
+    (audio_summary / "canonical_audio.json").write_text("not-json")
+
+    order, summary = full.resume_first_assigned_shards(tmp_path, assigned)
+
+    # Relative order is stable inside each class. No marker content is parsed.
+    assert order == [9, 1, 6, 7, 4]
+    assert summary == {
+        "unfinished": 3,
+        "fresh": 2,
+        "complete_skipped": 1,
+    }
+
+
+def test_resume_first_happens_after_rank_partition(tmp_path):
+    assigned = [
+        production.shard_order(start=0, end=19, seed=42, rank=rank, world_size=3)
+        for rank in range(3)
+    ]
+    assert set(assigned[0]).isdisjoint(assigned[1])
+    assert set(assigned[0]).isdisjoint(assigned[2])
+    assert set(assigned[1]).isdisjoint(assigned[2])
+
+    # Mark one shard in each already-owned slice unfinished. Reordering cannot
+    # move a shard across rank ownership.
+    for shard_ids in assigned:
+        state = (
+            tmp_path
+            / "shards"
+            / production.shard_name(shard_ids[-1])
+            / "stage_state"
+        )
+        state.mkdir(parents=True)
+        (state / "asr.json").touch()
+
+    prioritized = [
+        full.resume_first_assigned_shards(tmp_path, shard_ids)[0]
+        for shard_ids in assigned
+    ]
+    for before, after in zip(assigned, prioritized, strict=True):
+        assert after[0] == before[-1]
+        assert set(after) == set(before)
+
+
 def test_full_supervisor_stage_order(tmp_path, capsys):
     events = []
 
