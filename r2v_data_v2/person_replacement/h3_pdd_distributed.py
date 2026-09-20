@@ -9,6 +9,7 @@ from tools.person_replacement.h3_pdd_worker import (
     validate_pdd_weights,
 )
 
+from .h3_pair_generation import h3_reference_source
 from .h3_ref2va import PDD_REVISION
 
 
@@ -184,8 +185,9 @@ class PersistentPDD:
     def prepare(self, job):
         from diffusers.modular_pipelines.minimax_h3 import MiniMaxH3VideoReference
 
-        # Fixed order: Video 1 first, Picture 1 second.
-        references = [MiniMaxH3VideoReference.from_file(job["source"])]
+        # Fixed order: Video 1 first, Picture 1 second. Video 1 is the actual
+        # H3 reference path, a stereo-normalized copy when the source is >2ch.
+        references = [MiniMaxH3VideoReference.from_file(h3_reference_source(job))]
         if job.get("reference_image"):
             from diffusers.modular_pipelines.minimax_h3 import MiniMaxH3ImageReference
 

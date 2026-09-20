@@ -78,13 +78,36 @@ def partition(cases, worker, worker_count=2):
     return cases[worker::worker_count]
 
 
+SKIP_MARKER = "skipped.json"
+
+
 def phase(case):
     directory = Path(case["directory"])
     if (directory/"generation/manifest.json").is_file():
         return "done"
     if (directory/"preparation/prepared.json").is_file():
         return "generate"
+    if (directory/"preparation"/SKIP_MARKER).is_file():
+        return "skipped"
     return "prepare"
+
+
+def skipped(case):
+    """Durable ineligibility marker: input is unsuitable for H3, not a failure."""
+    path = Path(case["directory"])/"preparation"/SKIP_MARKER
+    return read_json(path) if path.is_file() else None
+
+
+def publish_skipped(case, payload):
+    directory = Path(case["directory"])/"preparation"
+    marker = directory/SKIP_MARKER
+    if marker.is_file():
+        raise FileExistsError("Case is already skipped")
+    if phase(case) != "prepare":
+        raise FileExistsError("Case is already prepared/done")
+    if not payload.get("reason"):
+        raise ValueError("Skip requires a reason")
+    atomic_json(marker,payload)  # commits the case; no retry budget is consumed
 
 
 def failure_count(case, stage):
@@ -159,10 +182,19 @@ def publish_generated(case, temporary, manifest, validate):
 
 
 def inventory(cases, limits):
-    result = {"done":0, "prepared":0, "unprepared":0, "exhausted_prepare":0, "exhausted_generate":0}
+    result = {"done":0, "prepared":0, "unprepared":0, "skipped":0,
+              "exhausted_prepare":0, "exhausted_generate":0}
     for case in cases:
         stage = phase(case)
+        if stage == "skipped":  # committed ineligibility, never exhausted
+            result["skipped"] += 1
+            continue
         result[{"done":"done","prepare":"unprepared","generate":"prepared"}[stage]] += 1
         if stage != "done" and not eligible(case,stage,limits[case["case_id"]][stage]):
             result[f"exhausted_{stage}"] += 1
     return result
+
+
+def finished(counts, total):
+    """Skipped cases are settled but must stay distinguishable from done."""
+    return counts["done"] + counts["skipped"] == total

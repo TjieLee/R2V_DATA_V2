@@ -4,7 +4,7 @@ from pathlib import Path
 
 TWO_PERSON_VIDEO_FPS = 4.0
 
-TWO_SOURCE_PROMPT = """Watch this whole single-shot video. Identify the two main physical performers.
+TWO_SOURCE_BODY = """Watch this whole single-shot video. Identify the two main physical performers.
 For SOURCE_SUBJECT_1 and SOURCE_SUBJECT_2, write one concise natural description of each
 source performer so that the person is easy to identify in <Video 1>. Include the person's
 visible appearance, clothing, and a simple locator such as foreground/background or initial
@@ -30,10 +30,31 @@ Use English and the exact reference labels <Subject 1> and <Subject 2> in SHOT_D
 Never write bare "Subject 1" or "Subject 2" there. Do not use person pronouns such as he, she,
 him, her, his or hers in SHOT_DESCRIPTION. Repeat the exact Subject label instead, including
 possessives, for example: "<Subject 1> raises <Subject 1>'s right hand."
-No shot headers, markdown or explanation. Do not infer race, ethnicity or nationality.
+No shot headers, markdown or explanation. Do not infer race, ethnicity or nationality."""
+
+TWO_SOURCE_PROMPT = TWO_SOURCE_BODY + """
 Return exactly three nonempty single-line labelled fields:
 SOURCE_SUBJECT_1: ...
 SOURCE_SUBJECT_2: ...
+SHOT_DESCRIPTION: ..."""
+
+TWO_SOURCE_WITH_PERFORMANCE_PROMPT = TWO_SOURCE_BODY + """
+Additionally, for SOURCE_PERFORMANCE_1 and SOURCE_PERFORMANCE_2, write one short
+non-temporal anchor per performer describing the source performance facts a replacement
+performer must inherit. Name the visible held, carried, touched or interacted objects and
+the hand-object relation, for example: holding a black clipboard with both hands, carrying
+a bag in the right hand, touching the table with the left hand. You may add one simple
+stable body or action state when it helps preservation. Never write timestamps, ordering
+words such as then, before, after, initially or later, a full action sequence, background,
+camera, replacement appearance, race, ethnicity or nationality, and never repeat the Subject
+labels inside the value. If an object is handled during only part of the shot, do not claim
+it is held throughout; write it as interacting with that object, as in: interacting with the
+same black clipboard, holding it with both hands when handled. <Video 1> alone decides timing.
+Return exactly five nonempty single-line labelled fields:
+SOURCE_SUBJECT_1: ...
+SOURCE_SUBJECT_2: ...
+SOURCE_PERFORMANCE_1: ...
+SOURCE_PERFORMANCE_2: ...
 SHOT_DESCRIPTION: ..."""
 
 TWO_REPLACEMENT_PROMPT = """Invent two ordinary realistic replacement people.
@@ -170,6 +191,14 @@ class LocalQwen:
             {"type":"video", "path":str(video.resolve(strict=True)), "fps":TWO_PERSON_VIDEO_FPS},
             {"type":"text", "text":TWO_SOURCE_PROMPT},
         ]), ("SOURCE_SUBJECT_1", "SOURCE_SUBJECT_2", "SHOT_DESCRIPTION"))
+
+    def describe_two_with_performance(self, video: Path) -> tuple[str, str, str, str, str]:
+        """Pair-executor source call: two subjects, two non-temporal performance anchors, shot."""
+        return _labelled_fields(self._text([
+            {"type":"video", "path":str(video.resolve(strict=True)), "fps":TWO_PERSON_VIDEO_FPS},
+            {"type":"text", "text":TWO_SOURCE_WITH_PERFORMANCE_PROMPT},
+        ]), ("SOURCE_SUBJECT_1", "SOURCE_SUBJECT_2", "SOURCE_PERFORMANCE_1",
+             "SOURCE_PERFORMANCE_2", "SHOT_DESCRIPTION"))
 
     def invent_two(self, subject1: str, subject2: str) -> tuple[str, str]:
         return _labelled_fields(self._text([{

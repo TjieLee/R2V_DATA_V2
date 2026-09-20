@@ -18,6 +18,7 @@ from .h3_pair_state import (
     eligible,
     fail_attempt,
     failure_count,
+    finished,
     inventory,
     read_json,
     retry_limit,
@@ -28,7 +29,7 @@ from .pipeline import validate_output_root
 
 TOOLS = Path(__file__).resolve().parents[2]/"tools/person_replacement"
 
-VARIANTS = {"text":"text_two_person_pdd_fsdp2_pair_v14", "frame0":"frame0_two_person_pdd_fsdp2_pair_v14"}
+VARIANTS = {"text":"text_two_person_pdd_fsdp2_pair_v15", "frame0":"frame0_two_person_pdd_fsdp2_pair_v15"}
 RESOURCE_KEYS = ("qwen_model","h3_python","h3_model_root","pdd_code_root","pdd_lora")
 BOOGU_KEYS = ("boogu_python","boogu_code_root","boogu_model_root")
 
@@ -268,7 +269,7 @@ def run_pair(root, config, args):
     with pair_lock(root) as fd:
         validate_identity(root,config)
         counts = inventory(config["cases"],config["limits"])
-        if counts["done"] == len(config["cases"]):
+        if finished(counts,len(config["cases"])):
             return counts
         # Validate existing resources without importing any GPU framework.
         PDDBackend(config["h3_python"],config["h3_model_root"],config["pdd_code_root"],config["pdd_lora"]).validate()

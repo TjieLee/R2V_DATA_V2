@@ -19,6 +19,8 @@ from r2v_data_v2.person_replacement.h3_pair_state import (
 from r2v_data_v2.person_replacement.timeline import VideoTimeline
 
 TEXTS = {"source_subject_1":"a man in a blue jacket","source_subject_2":"a woman with a cup",
+         "source_performance_1":"holding and handling a hockey stick",
+         "source_performance_2":"holding a black clipboard with both hands",
          "shot_description":"They talk at a table.","replacement_subject_1":"an old man",
          "replacement_subject_2":"a young woman"}
 BOOGU_ROOT = "/mnt/workspace/litengjie/data"
@@ -56,6 +58,11 @@ class QwenSpy:
     def describe_two(self, video):
         QwenSpy.calls.append("describe")
         return TEXTS["source_subject_1"],TEXTS["source_subject_2"],TEXTS["shot_description"]
+
+    def describe_two_with_performance(self, video):
+        QwenSpy.calls.append("describe")
+        return (TEXTS["source_subject_1"],TEXTS["source_subject_2"],TEXTS["source_performance_1"],
+                TEXTS["source_performance_2"],TEXTS["shot_description"])
 
     def invent_two(self, *args):
         return TEXTS["replacement_subject_1"],TEXTS["replacement_subject_2"]
@@ -115,7 +122,14 @@ def decode_stub(video, directory, width, height):
 
 
 @pytest.fixture(autouse=True)
-def reset_spies():
+def reset_spies(monkeypatch):
+    """No ffmpeg/GPU here: mono/stereo passthrough, audio tests live in their own file."""
+    from r2v_data_v2.person_replacement import h3_pair_prepare
+
+    monkeypatch.setattr(h3_pair_prepare,"ensure_h3_reference",
+                        lambda source,directory:(source,{"reference_audio_normalized":False,
+                                                         "reference_audio_source_channels":None,
+                                                         "reference_audio_target_channels":None}))
     QwenSpy.calls.clear()
     FakeBoogu.instances.clear()
     yield
@@ -152,8 +166,8 @@ def test_variant_contracts_are_distinct_and_group_size_is_not_semantic(tmp_path)
     _,text = module.make_config(arguments(base+["--variant","text"]))
     _,frame0 = module.make_config(arguments(base+["--variant","frame0"]))
     assert text["identity"] != frame0["identity"]
-    assert text["identity_details"]["contract"] == "text_two_person_pdd_fsdp2_pair_v14"
-    assert frame0["identity_details"]["contract"] == "frame0_two_person_pdd_fsdp2_pair_v14"
+    assert text["identity_details"]["contract"] == "text_two_person_pdd_fsdp2_pair_v15"
+    assert frame0["identity_details"]["contract"] == "frame0_two_person_pdd_fsdp2_pair_v15"
     for key in ("boogu_python","boogu_code_root","boogu_model_root"):
         assert key in frame0["identity_details"]["resources"] and key not in text["identity_details"]["resources"]
     _,bigger = module.make_config(arguments(base+["--variant","frame0","--group-size","4","--ulysses-degree","2"]))

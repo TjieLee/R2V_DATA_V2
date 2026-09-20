@@ -9,7 +9,15 @@ def _person_fragment(text):
     return value
 
 
-def build_prompt(source1, source2, shot, replacement1, replacement2, *, frame0=False):
+PERFORMANCE_OBJECT_RULE = (
+    "Any object held, carried, touched, or otherwise interacted with by <Subject 1> or "
+    "<Subject 2> in <Video 1> must remain the same source object, with the same hand-object "
+    "contact and source timing, for the corresponding replacement."
+)
+
+
+def build_prompt(source1, source2, shot, replacement1, replacement2, *, frame0=False,
+                 performance1=None, performance2=None):
     # Qwen's shot description remains preparation provenance. H3 motion is
     # driven directly by <Video 1> so a text re-description cannot retime it.
     source1, source2, replacement1, replacement2 = map(
@@ -113,7 +121,12 @@ def build_prompt(source1, source2, shot, replacement1, replacement2, *, frame0=F
             "<Subject 4> follows the corresponding source performance of <Subject 2>. Copy the source "
             "performance from <Video 1> rather than generating or reinterpreting a new performance. "
             "Only the visible human identity, appearance and clothing of the two performers may change. "
-            "Do not retime, invent, omit, merge or reinterpret actions. Preserve the camera, background, "
+            + (f" <Subject 3> preserves <Subject 1>'s source performance and object interactions "
+               f"from <Video 1>: {performance1}." if performance1 else "")
+            + (f" <Subject 4> preserves <Subject 2>'s source performance and object interactions "
+               f"from <Video 1>: {performance2}." if performance2 else "")
+            + (f" {PERFORMANCE_OBJECT_RULE}" if performance1 or performance2 else "")
+            + " Do not retime, invent, omit, merge or reinterpret actions. Preserve the camera, background, "
             "lighting and every non-person object. If any text description conflicts with <Video 1>, "
             "follow <Video 1>."
         ),

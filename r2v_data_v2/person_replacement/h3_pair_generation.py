@@ -19,12 +19,17 @@ from .timeline import inspect_video_timeline
 VARIANTS = {"text_two_person", "frame0_two_person"}
 
 
+def h3_reference_source(job):
+    """The path H3 actually conditions on; the original source stays provenance."""
+    return job.get("h3_reference_source") or job["source"]
+
+
 def reference_manifest(job):
     """Fail closed: frame0 must carry a real Boogu reference image, no text fallback."""
     variant = job.get("variant")
     if variant not in VARIANTS:
         raise ValueError(f"Prepared job has missing/unknown variant: {variant}")
-    references = [{"type":"video","label":"Video 1","path":job["source"]}]
+    references = [{"type":"video","label":"Video 1","path":h3_reference_source(job)}]
     if variant == "frame0_two_person":
         if job.get("reference_mode") != "frame0_boogu":
             raise ValueError("frame0 variant requires reference_mode=frame0_boogu")
