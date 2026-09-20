@@ -37,6 +37,32 @@ class PreparedShard:
     summary: dict
 
 
+def resume_first_assigned_shards(root, shard_ids):
+    """Prioritize cheap resume markers within an already rank-partitioned schedule.
+
+    This deliberately performs only filesystem metadata checks. It never opens
+    stage JSON, receipts, media, or hashes. Cross-node ownership must already be
+    fixed by shard_order(..., rank=..., world_size=...) before calling this.
+    """
+    root = Path(root)
+    unfinished, fresh, complete = [], [], []
+    for shard_id in shard_ids:
+        shard = root / "shards" / production.shard_name(shard_id)
+        if (shard / "COMPLETE").is_file():
+            complete.append(shard_id)
+            continue
+        state = shard / "stage_state"
+        started = (shard / "state.jsonl.partial").is_file() or (
+            state / "canonical_audio.json"
+        ).is_file() or any((state / f"{name}.json").is_file() for name in STAGES)
+        (unfinished if started else fresh).append(shard_id)
+    return unfinished + fresh, {
+        "unfinished": len(unfinished),
+        "fresh": len(fresh),
+        "complete_skipped": len(complete),
+    }
+
+
 def run_assigned_shards(root, shard_ids, pipeline):
     """One node owns a shard through all barriers, including downstream writes."""
     results = {}
