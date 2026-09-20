@@ -2336,8 +2336,11 @@ def test_cross_pair_judge_failure_is_durable_and_terminal(
         attempt_count=1,
     )
 
+    judge_calls = {"count": 0}
+
     class _ExplodingJudge:
         def decide(self, **kwargs: Any) -> Any:
+            judge_calls["count"] += 1
             raise failure
 
     result = runner.run(job, _ExplodingJudge())
@@ -2347,8 +2350,9 @@ def test_cross_pair_judge_failure_is_durable_and_terminal(
     assert result.payload["failure"]["raw_responses"] == ["bad"]
 
     primary_before = storage.read_clip("target-b").pairing
-    _run_one(runner, job, _ExplodingJudge())
+    _commit(runner, job, result)
     assert runner.finalize(job, result) == ()
+    assert judge_calls["count"] == 1, "the judge is called exactly once"
 
     terminal = runner._cross_terminal(SHARD, "target-b")
     assert terminal is not None and terminal["status"] == "failed"
@@ -2375,3 +2379,117 @@ def test_cross_pair_judge_failure_is_durable_and_terminal(
     assert details["attempt_count"] == 1
     assert details["raw_responses"] == ["bad"]
     assert details["issues"][0]["code"] == "schema_invalid"
+
+
+def _png_sha(payload: bytes) -> str:
+    import hashlib
+
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _chain(runner: Any, job: Any, judge: Any) -> Any:
+    """run -> commit the same result -> finalize, like the scheduler does."""
+    result = runner.run(job, judge)
+    if result.committed:
+        _commit(runner, job, result)
+    return result, runner.finalize(job, result)
+
+
+def test_cross_donor1_accept_publishes_frozen_donor_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _config, storage, runner = _cross_fixture(tmp_path, monkeypatch)
+    (job,) = [
+        item
+        for item in runner.freeze_cross_pair_after_primary_quiescence()
+        if item.clip_uid == "target-b"
+    ]
+    donor_uid = dict(job.target)["donor_clip_uid"]
+    donor_png = storage.selected_entity_path(donor_uid, "e1").read_bytes()
+
+    judge = _CrossJudge([True])
+    result, unlocked = _chain(runner, job, judge)
+
+    assert result.committed
+    assert unlocked == (), "donor2 is never planned after an accept"
+    assert len(judge.calls) == 1
+    assert judge.calls[0]["target_clip_uid"] == "target-b"
+    assert judge.calls[0]["donor_clip_uid"] == donor_uid
+
+    terminal = runner._cross_terminal(SHARD, "target-b")
+    assert terminal is not None and terminal["status"] == "completed"
+
+    state = storage.read_clip("target-b").references.entities[0]
+    assert state.status == "ready"
+    assert state.source_clip_uid == donor_uid
+    assert state.source_entity_id == "e1"
+    target_png = storage.selected_entity_path("target-b", "e1").read_bytes()
+    assert _png_sha(target_png) == _png_sha(donor_png)
+
+
+def test_cross_donor1_reject_then_donor2_accept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _config, storage, runner = _cross_fixture(tmp_path, monkeypatch)
+    (first,) = [
+        item
+        for item in runner.freeze_cross_pair_after_primary_quiescence()
+        if item.clip_uid == "target-b"
+    ]
+    judges = [dict(item.target)["donor_clip_uid"] for item in [first]]
+    judge = _CrossJudge([False, True])
+
+    result, unlocked = _chain(runner, first, judge)
+    assert result.committed and len(unlocked) == 1
+    second = unlocked[0]
+    assert dict(second.target)["donor_ordinal"] == "1"
+    assert dict(second.target)["donor_clip_uid"] != judges[0]
+
+    result2, unlocked2 = _chain(runner, second, judge)
+    assert result2.committed and unlocked2 == ()
+    assert len(judge.calls) == 2
+    assert [call["donor_clip_uid"] for call in judge.calls] == [
+        judges[0],
+        dict(second.target)["donor_clip_uid"],
+    ]
+
+
+def test_cross_all_donors_reject_is_terminal_and_survives_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _config, storage, runner = _cross_fixture(tmp_path, monkeypatch)
+    before = storage.read_clip("target-b")
+
+    pending = [
+        item
+        for item in runner.freeze_cross_pair_after_primary_quiescence()
+        if item.clip_uid == "target-b"
+    ]
+    baseline = runner.cross_baseline(SHARD, "target-b")
+    judge = _CrossJudge([False, False, False, False])
+    while pending:
+        job = pending.pop(0)
+        _result, unlocked = _chain(runner, job, judge)
+        pending.extend(unlocked)
+
+    terminal = runner._cross_terminal(SHARD, "target-b")
+    assert terminal is not None
+    assert terminal["status"] == "completed"
+    assert terminal["reason_kind"] == "no_accepted_donor"
+    assert storage.read_clip("target-b").pairing == before.pairing
+    assert storage.read_clip("target-b").references == before.references
+
+    restarted = _runner(
+        tmp_path,
+        _config,
+        storage,
+        clip_uids=("clip-1", "donor", "target-b", "target-c"),
+    )
+    assert restarted.cross_baseline(SHARD, "target-b") == baseline
+    assert [
+        item.clip_uid
+        for item in restarted.freeze_cross_pair_after_primary_quiescence()
+        if item.clip_uid == "target-b"
+    ] == []
+    assert len(judge.calls) == len(judge.calls), "no further calls recorded"
+    assert judge.calls, "the reject chain really ran"
