@@ -2764,3 +2764,80 @@ def test_cross_cpu_failure_is_durable_terminal(
         for item in restarted.freeze_cross_pair_after_primary_quiescence()
         if item.clip_uid == "target-b"
     ] == []
+
+
+def _committed_cross_accept(runner: Any, clip_uid: str) -> Any:
+    """Run the donor1 cross job and commit its accept receipt.
+
+    Returns (job, result) with the receipt durable but not yet finalized, so a
+    test can patch the next CPU step before the finalizer replays.
+    """
+    (job,) = [
+        item
+        for item in runner.freeze_cross_pair_after_primary_quiescence()
+        if item.clip_uid == clip_uid
+    ]
+    result = runner.run(job, _CrossJudge([True]))
+    assert result.committed
+    _commit(runner, job, result)
+    return job, result
+
+
+def test_cross_background_cpu_failure_is_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ordinary cross background CPU failure terminates the target."""
+    from r2v_data_v2.v3.post_mask_epoch_pair import CALL_SITE_CROSS_PAIR
+
+    _config, storage, runner = _cross_fixture(tmp_path, monkeypatch)
+    job, result = _committed_cross_accept(runner, "target-b")
+    before = storage.read_clip("target-b").pairing
+
+    real_background_token = runner._background_token
+
+    def explode(shard: Any, clip: str, frames: Any, call_site: str) -> Any:
+        if call_site == CALL_SITE_CROSS_PAIR:
+            raise RuntimeError("cross background preparation failed")
+        return real_background_token(shard, clip, frames, call_site)
+
+    runner._background_token = explode
+    try:
+        assert runner.finalize(job, result) == ()
+    finally:
+        runner._background_token = real_background_token
+
+    terminal = runner._cross_terminal(SHARD, "target-b")
+    assert terminal is not None
+    assert terminal["status"] == "failed"
+    assert terminal["reason_kind"] == "cross_pair_cpu_failure"
+    assert storage.read_clip("target-b").pairing == before, "primary survives"
+
+    restarted = _runner(
+        tmp_path,
+        _config,
+        storage,
+        clip_uids=("clip-1", "donor", "target-b", "target-c"),
+    )
+    assert [
+        item.clip_uid
+        for item in restarted.freeze_cross_pair_after_primary_quiescence()
+        if item.clip_uid == "target-b"
+    ] == []
+
+
+def test_cross_background_drift_is_not_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Frozen-state drift from _background_token must never become terminal."""
+    from r2v_data_v2.v3.post_mask_epoch_pair import PairEpochError
+
+    _config, storage, runner = _cross_fixture(tmp_path, monkeypatch)
+    job, result = _committed_cross_accept(runner, "target-b")
+
+    def drift(*args: Any, **kwargs: Any) -> Any:
+        raise PairEpochError("background durable drift")
+
+    runner._background_token = drift
+    with pytest.raises(PairEpochError, match="background durable drift"):
+        runner.finalize(job, result)
+    assert runner._cross_terminal(SHARD, "target-b") is None

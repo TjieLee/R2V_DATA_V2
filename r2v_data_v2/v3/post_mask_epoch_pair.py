@@ -1468,9 +1468,20 @@ class PairEpochRunner:
         except Exception as exc:  # noqa: BLE001 - legacy target isolation
             return self._finish_cross_cpu_failure(shard, clip_uid, exc)
         if pairing.status == "ready":
-            token, pending = self._background_token(
-                shard, clip_uid, frames, CALL_SITE_CROSS_PAIR
-            )
+            # Part of the frozen legacy cross target outer try: an ordinary
+            # CPU failure here (background artifact validation, deterministic
+            # preparation, mode-off validation) terminates the target, while a
+            # pending guard ModelJob is a normal unlock and guard semantic
+            # drift stays retryable inside run(). PairEpochError is frozen
+            # durable-state drift and must keep propagating.
+            try:
+                token, pending = self._background_token(
+                    shard, clip_uid, frames, CALL_SITE_CROSS_PAIR
+                )
+            except PairEpochError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - legacy target isolation
+                return self._finish_cross_cpu_failure(shard, clip_uid, exc)
             if pending is not None:
                 return pending
             pairing = pairing.model_copy(update={"background_token": token})
