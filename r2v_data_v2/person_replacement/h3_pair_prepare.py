@@ -136,6 +136,14 @@ def prepare_partition(config, worker, qwen_factory=None):
             qwen.close()
 
 
+MAX_WRITER_FRAMES = 60
+
+
+def writer_frames(duration_seconds):
+    """Bounded 4fps sampling budget; the processor does the actual sampling."""
+    return max(1,min(MAX_WRITER_FRAMES,round(float(duration_seconds)*VIDEO_FPS)))
+
+
 def prepare_text_partition_v19(config, worker, writer_factory=None):
     """Text V19: one resident 27B writer, Call 1 then Call 2 per case."""
     cases = partition(config["cases"],worker,config.get("group_size",2))
@@ -166,6 +174,8 @@ def prepare_text_partition_v19(config, worker, writer_factory=None):
                             "h3_reference_source":str(reference),
                             "frames":plan.native_frame_count,"width":width,"height":height,
                             "timeline":asdict(plan),"aspect_ratio":aspect,**audio}
+                    # Bounded 4fps sampling for both calls of this case.
+                    num_frames = writer_frames(plan.source.duration_seconds)
                     marker = qwen_prepared(case)
                     if marker is None:
                         if writer is None:
@@ -173,7 +183,8 @@ def prepare_text_partition_v19(config, worker, writer_factory=None):
                             writer._load()
                         cue1, cue2 = diversity_cues(config["seed"],case["row_sha256"])
                         (performer1, performer2,
-                         replacement1, replacement2) = writer.invent_replacements(video,cue1,cue2)
+                         replacement1, replacement2) = writer.invent_replacements(
+                            video,cue1,cue2,num_frames=num_frames)
                         texts = {"source_performer_1":performer1,"source_performer_2":performer2,
                                  "replacement_subject_1":replacement1,
                                  "replacement_subject_2":replacement2}
@@ -185,7 +196,8 @@ def prepare_text_partition_v19(config, worker, writer_factory=None):
                         writer._load()
                     prompt = writer.write_h3_prompt(
                         video,marker["source_performer_1"],marker["source_performer_2"],
-                        marker["replacement_subject_1"],marker["replacement_subject_2"])
+                        marker["replacement_subject_1"],marker["replacement_subject_2"],
+                        num_frames=num_frames)
                     validate_h3_prompt_writer_output(prompt)  # fail closed, no fallback
                     directory = Path(case["directory"])/"preparation"
                     atomic_bytes(directory/"prompt_writer_request.txt",
@@ -197,6 +209,7 @@ def prepare_text_partition_v19(config, worker, writer_factory=None):
                         "prompt_writer_replacement_max_new_tokens":REPLACEMENT_MAX_NEW_TOKENS,
                         "prompt_writer_prompt_max_new_tokens":PROMPT_MAX_NEW_TOKENS,
                         "prompt_writer_thinking":writer.thinking_disabled,
+                        "prompt_writer_num_frames":num_frames,
                         "prompt_source":PROMPT_SOURCE},
                         {"h3_prompt":prompt})
                 except Exception as exc:  # noqa: BLE001 -- failure is case-local and durable

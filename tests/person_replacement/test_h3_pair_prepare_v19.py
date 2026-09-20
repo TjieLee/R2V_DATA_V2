@@ -19,6 +19,7 @@ CALL1_FIELDS = {"source_performer_1":"a younger woman in a yellow shirt",
                 "replacement_subject_2":"a young man in denim"}
 
 EVENTS = []
+FRAMES = []
 
 
 class FakeWriter:
@@ -31,13 +32,16 @@ class FakeWriter:
     def _load(self):
         pass
 
-    def invent_replacements(self, video, cue1, cue2):
+    def invent_replacements(self, video, cue1, cue2, *, num_frames):
         EVENTS.append(f"{video.stem}_call1")
+        FRAMES.append(num_frames)
         return (CALL1_FIELDS["source_performer_1"],CALL1_FIELDS["source_performer_2"],
                 CALL1_FIELDS["replacement_subject_1"],CALL1_FIELDS["replacement_subject_2"])
 
-    def write_h3_prompt(self, video, performer1, performer2, replacement1, replacement2):
+    def write_h3_prompt(self, video, performer1, performer2, replacement1, replacement2,
+                        *, num_frames):
         EVENTS.append(f"{video.stem}_call2")
+        FRAMES.append(num_frames)
         assert (performer1,performer2,replacement1,replacement2) == (
             CALL1_FIELDS["source_performer_1"],CALL1_FIELDS["source_performer_2"],
             CALL1_FIELDS["replacement_subject_1"],CALL1_FIELDS["replacement_subject_2"])
@@ -50,6 +54,7 @@ class FakeWriter:
 @pytest.fixture(autouse=True)
 def clear_events():
     EVENTS.clear()
+    FRAMES.clear()
     yield
 
 
@@ -119,7 +124,7 @@ def test_resume_after_call1_does_not_repeat_call1(tmp_path, monkeypatch):
                                        "seed":42,"h3_reference_source":str(clips/"0.mp4")})
 
     class NoCall1(FakeWriter):
-        def invent_replacements(self, video, cue1, cue2):
+        def invent_replacements(self, video, cue1, cue2, *, num_frames):
             pytest.fail("Call 1 must not repeat when qwen.json exists")
 
     prepare(tmp_path,monkeypatch,cases,clips,writer_factory=lambda path:NoCall1(path))
@@ -134,11 +139,11 @@ def test_call2_failure_keeps_marker_and_retries_only_call2(tmp_path, monkeypatch
     attempts = {"count":0}
 
     class FailingCall2(FakeWriter):
-        def write_h3_prompt(self, *args):
+        def write_h3_prompt(self, *args, **kwargs):
             attempts["count"] += 1
             if attempts["count"] == 1:
                 raise RuntimeError("writer failed")
-            return super().write_h3_prompt(*args)
+            return super().write_h3_prompt(*args, **kwargs)
 
     prepare(tmp_path,monkeypatch,cases,clips,writer_factory=lambda path:FailingCall2(path))
     assert failure_count(cases[0],"prepare") == 1
@@ -153,7 +158,7 @@ def test_invalid_writer_output_is_a_case_failure(tmp_path, monkeypatch):
     cases = make_cases(tmp_path,1,clips)
 
     class BadPrompt(FakeWriter):
-        def write_h3_prompt(self, *args):
+        def write_h3_prompt(self, *args, **kwargs):
             return "subject_definitions:\nonly one section"
 
     prepare(tmp_path,monkeypatch,cases,clips,writer_factory=lambda path:BadPrompt(path))
@@ -233,3 +238,29 @@ def test_frame0_never_instantiates_the_27b(tmp_path, monkeypatch):
     prepared = read_json((tmp_path/"case0")/"preparation"/"prepared.json")
     assert "prompt_writer_model" not in prepared
     assert prepared["source_subject_1"] == "s1"
+
+
+@pytest.mark.parametrize("duration,expected", [(5.0,20),(10.0,40),(15.0,60),(20.0,60),(0.1,1)])
+def test_writer_frames_budget(duration, expected):
+    from r2v_data_v2.person_replacement.h3_pair_prepare import writer_frames
+
+    assert writer_frames(duration) == expected
+
+
+def test_both_calls_share_one_num_frames_and_no_fps(tmp_path, monkeypatch):
+    clips = tmp_path/"clips"
+    clips.mkdir()
+    cases = make_cases(tmp_path,1,clips)
+    from r2v_data_v2.person_replacement import h3_pair_prepare as module
+
+    monkeypatch.setattr(module,"ensure_h3_reference",
+                        lambda source,directory:(source,{"reference_audio_normalized":False,
+                                                         "reference_audio_source_channels":None,
+                                                         "reference_audio_target_channels":None}))
+    monkeypatch.setattr(module,"inspect_video_timeline",
+                        lambda _:VideoTimeline(240,25,25,1,1920,1080,10.0))
+    module.prepare_text_partition_v19(config_for(cases,clips),0,lambda path:FakeWriter(path))
+    assert FRAMES == [40,40]  # Call 1 and Call 2 use exactly the same budget
+    prepared = read_json((tmp_path/"case0")/"preparation"/"prepared.json")
+    assert prepared["prompt_writer_num_frames"] == 40
+    assert prepared["prompt_writer_video_fps"] == 4.0

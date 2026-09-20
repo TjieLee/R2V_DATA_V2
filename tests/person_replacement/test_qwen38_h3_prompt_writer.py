@@ -57,10 +57,9 @@ class FakeProcessor:
 
     def apply_chat_template(self, messages, **kwargs):
         self.calls.append((messages,dict(kwargs)))
-        if kwargs.get("enable_thinking") is False and getattr(self,"reject_thinking",False):
-            raise TypeError("unexpected keyword")
-        if kwargs.get("fps") is not None and getattr(self,"reject_fps",False):
-            raise TypeError("unexpected keyword")
+        for key, flag in (("enable_thinking","reject_thinking"),("num_frames","reject_num_frames")):
+            if key in kwargs and getattr(self,flag,False):
+                raise TypeError(f"unexpected keyword argument {key}")
         return FakeInputs({"input_ids":[[1,2,3]]})
 
     def batch_decode(self, trimmed, **kwargs):
@@ -153,19 +152,21 @@ def test_missing_transformers_fails_loudly(tmp_path, monkeypatch):
         LocalQwen38H3PromptWriter(tmp_path)._load()
 
 
-def test_video_input_fps_and_generation_settings(tmp_path, monkeypatch):
+def test_video_input_num_frames_and_generation_settings(tmp_path, monkeypatch):
     instance = writer(tmp_path,monkeypatch)
     instance.processor.text = CALL1_RESPONSE
     video = tmp_path/"source.mp4"
     video.touch()
-    instance.invent_replacements(video,"doctor","generic")
+    instance.invent_replacements(video,"doctor","generic",num_frames=40)
     messages, kwargs = instance.processor.calls[-1]
-    assert kwargs["fps"] == 4.0 and kwargs["enable_thinking"] is False
+    assert "fps" not in kwargs  # no vLLM-only fps sampling parameter
+    assert kwargs["num_frames"] == 40 and kwargs["enable_thinking"] is False
     assert messages[0]["content"][0] == {"type":"video","video":str(video.resolve())}
     assert instance.model.generate_calls[-1]["do_sample"] is False
     assert instance.model.generate_calls[-1]["max_new_tokens"] == 512
-    instance.write_h3_prompt(video,"p1","p2","r1","r2")
+    instance.write_h3_prompt(video,"p1","p2","r1","r2",num_frames=40)
     assert instance.model.generate_calls[-1]["max_new_tokens"] == 4096
+    assert [kwargs["num_frames"] for _, kwargs in instance.processor.calls] == [40,40]
     assert len(instance.processor.calls) == 2  # one model instance, two calls
 
 
@@ -183,8 +184,9 @@ def test_template_without_thinking_support_is_reported(tmp_path, monkeypatch):
     instance.processor.text = CALL1_RESPONSE
     video = tmp_path/"source.mp4"
     video.touch()
-    instance.invent_replacements(video,"generic","generic")
+    instance.invent_replacements(video,"generic","generic",num_frames=20)
     assert instance.thinking_disabled is False  # honest, not silently assumed
+    assert instance.processor.calls[-1][1]["num_frames"] == 20
 
 
 def test_close_releases_model_and_processor(tmp_path, monkeypatch):
@@ -192,7 +194,7 @@ def test_close_releases_model_and_processor(tmp_path, monkeypatch):
     instance.processor.text = CALL1_RESPONSE
     video = tmp_path/"source.mp4"
     video.touch()
-    instance.invent_replacements(video,"generic","generic")
+    instance.invent_replacements(video,"generic","generic",num_frames=20)
     instance.close()
     assert instance.model is None and instance.processor is None
 
@@ -212,7 +214,7 @@ def test_call1_parser_is_strict(tmp_path, monkeypatch, text):
     video = tmp_path/"source.mp4"
     video.touch()
     with pytest.raises(ValueError):
-        instance.invent_replacements(video,"generic","generic")
+        instance.invent_replacements(video,"generic","generic",num_frames=20)
 
 
 def test_call1_parser_accepts_four_ordered_fields(tmp_path, monkeypatch):
@@ -223,7 +225,7 @@ def test_call1_parser_accepts_four_ordered_fields(tmp_path, monkeypatch):
                                "REPLACEMENT_SUBJECT_2: a young man in denim")
     video = tmp_path/"source.mp4"
     video.touch()
-    assert instance.invent_replacements(video,"doctor","generic") == (
+    assert instance.invent_replacements(video,"doctor","generic",num_frames=20) == (
         "a younger woman in a yellow shirt","an older woman in a light shirt",
         "a middle-aged man","a young man in denim")
 
@@ -263,3 +265,35 @@ def test_validator_requires_subjects_in_detailed_description():
     with pytest.raises(ValueError,match="detailed_description"):
         validate_h3_prompt_writer_output(
             LEGAL_PROMPT.replace("[Shot 1] <Subject 1> stands","[Shot 1] the performer stands"))
+
+
+def test_num_frames_is_never_dropped(tmp_path, monkeypatch):
+    processor = FakeProcessor()
+    processor.reject_num_frames = True
+    processor.text = LEGAL_PROMPT
+    install(monkeypatch,processor=processor)
+    from r2v_data_v2.person_replacement.qwen38_h3_prompt_writer import (
+        LocalQwen38H3PromptWriter,
+    )
+
+    instance = LocalQwen38H3PromptWriter(tmp_path)
+    instance._load()
+    video = tmp_path/"source.mp4"
+    video.touch()
+    with pytest.raises(TypeError,match="num_frames"):
+        instance.invent_replacements(video,"generic","generic",num_frames=40)
+
+
+def test_validator_rejects_leading_prose_and_thinking():
+    from r2v_data_v2.person_replacement.qwen38_h3_prompt_writer import (
+        validate_h3_prompt_writer_output,
+    )
+
+    for broken in ("Here is the prompt you asked for.\n\n" + LEGAL_PROMPT,
+                   "subject definitions first\n" + LEGAL_PROMPT,
+                   "<think>plan the sections</think>\n" + LEGAL_PROMPT,
+                   LEGAL_PROMPT + "\n</think>"):
+        with pytest.raises(ValueError):
+            validate_h3_prompt_writer_output(broken)
+    assert validate_h3_prompt_writer_output("\n\n" + LEGAL_PROMPT + "\n").startswith(
+        "subject_definitions:")

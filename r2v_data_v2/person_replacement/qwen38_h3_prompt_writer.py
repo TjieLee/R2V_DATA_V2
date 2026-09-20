@@ -376,6 +376,12 @@ def validate_h3_prompt_writer_output(text):
     """Fail-closed structural check; never a semantic parser."""
     if not isinstance(text,str) or not text.strip():
         raise ValueError("H3 prompt writer returned no text")
+    text = text.strip()
+    # A reasoning prefix must never reach H3; fail closed instead.
+    if "<think>" in text or "</think>" in text:
+        raise ValueError("H3 prompt contains thinking markers; enable_thinking must be off")
+    if not text.startswith("subject_definitions:"):
+        raise ValueError("H3 prompt must start with subject_definitions:, got leading prose")
     sections = split_sections(text)
     headings = [heading for heading,_ in sections]
     if headings != list(SECTION_HEADINGS):
@@ -442,29 +448,28 @@ class LocalQwen38H3PromptWriter:
             str(self.model_path), local_files_only=True, device_map="auto",
         ).eval()
 
-    def _apply_template(self, messages):
-        """Non-thinking + fps=4 sampling when the processor accepts them."""
+    def _apply_template(self, messages, *, num_frames):
+        """num_frames sampling is mandatory; only enable_thinking may be dropped."""
         kwargs = {"tokenize":True, "add_generation_prompt":True,
                   "return_dict":True, "return_tensors":"pt"}
-        optional = {"fps":self.video_fps, "enable_thinking":False}
-        while True:
-            try:
-                return self.processor.apply_chat_template(messages, **kwargs, **optional)
-            except TypeError:
-                if not optional:
-                    raise
-                dropped = next(iter(optional))
-                if dropped == "enable_thinking":
-                    self.thinking_disabled = False
-                else:
-                    self.fps_parameter_applied = False
-                optional.pop(dropped)
+        try:
+            return self.processor.apply_chat_template(
+                messages, **kwargs, num_frames=num_frames, enable_thinking=False)
+        except TypeError as exc:
+            if "num_frames" in str(exc):
+                # Never silently decode the whole video.
+                raise TypeError(
+                    "Qwen3.8 processor does not support num_frames video sampling; "
+                    "refusing to run without bounded frame sampling"
+                ) from exc
+            self.thinking_disabled = False  # honest; the validator then guards output
+            return self.processor.apply_chat_template(messages, **kwargs, num_frames=num_frames)
 
-    def _generate(self, messages, max_new_tokens):
+    def _generate(self, messages, max_new_tokens, *, num_frames):
         self._load()
         import torch
 
-        inputs = self._apply_template(messages).to(self.model.device)
+        inputs = self._apply_template(messages, num_frames=num_frames).to(self.model.device)
         inputs.pop("token_type_ids", None)
         with torch.inference_mode():
             generated = self.model.generate(
@@ -481,18 +486,18 @@ class LocalQwen38H3PromptWriter:
     def _video(self, video):
         return {"type":"video", "video":str(Path(video).resolve(strict=True))}
 
-    def invent_replacements(self, video, cue1, cue2):
+    def invent_replacements(self, video, cue1, cue2, *, num_frames):
         """Call 1: bind the two performers and plan replacement identities."""
         text = self._generate([
             {"role":"user", "content":[
                 self._video(video),
                 {"type":"text", "text":REPLACEMENT_PLANNING_PROMPT.format(cue1=cue1, cue2=cue2)},
             ]},
-        ], self.replacement_max_new_tokens)
+        ], self.replacement_max_new_tokens, num_frames=num_frames)
         return _labelled_fields(text, CALL1_LABELS)
 
     def write_h3_prompt(self, video, source_performer_1, source_performer_2,
-                        replacement_subject_1, replacement_subject_2):
+                        replacement_subject_1, replacement_subject_2, *, num_frames):
         """Call 2: watch <Video 1> again and write the whole six-section prompt."""
         return self._generate([
             {"role":"system", "content":H3_PROMPT_SYSTEM_PROMPT},
@@ -504,7 +509,7 @@ class LocalQwen38H3PromptWriter:
                     source_performer_2=source_performer_2,
                     replacement_subject_2=replacement_subject_2)},
             ]},
-        ], self.prompt_max_new_tokens)
+        ], self.prompt_max_new_tokens, num_frames=num_frames)
 
     def close(self):
         """Release the 27B before the H3 launcher consumes GPU memory."""
