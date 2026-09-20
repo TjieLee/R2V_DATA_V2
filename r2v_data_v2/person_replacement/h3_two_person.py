@@ -10,98 +10,117 @@ def _person_fragment(text):
 
 
 def build_prompt(source1, source2, shot, replacement1, replacement2, *, frame0=False):
-    # Qwen's shot description remains preparation provenance. H3 motion is
-    # driven directly by <Video 1> so a text re-description cannot retime it.
+    """Two-subject in-place appearance edit of <Video 1>.
+
+    <Subject 1> and <Subject 2> are the same source performers seen in
+    <Video 1>; replacement1/replacement2 are appearance-only modification
+    descriptions for those same subjects, never additional entities. There is
+    deliberately no <Subject 3> / <Subject 4> and no attribute_transfer.
+    """
+    # Qwen's shot description remains preparation provenance. <Video 1> is the
+    # only authority for motion, events, camera and scene structure.
     source1, source2, replacement1, replacement2 = map(
         _person_fragment, (source1, source2, replacement1, replacement2)
     )
 
     definitions = [
         (
-            f"<Subject 1> is the source performer in <Video 1> identified by {source1}. "
-            "This description is only for identifying the performer; <Video 1> determines "
-            "<Subject 1>'s action, pose, held-object state and timing."
+            f"<Subject 1> is the target performer in <Video 1> identified by {source1}. "
+            "This description identifies the performer to edit. <Video 1> remains the "
+            "authority for this performer's pose, motion, facial performance, interactions, "
+            "position and timing."
         ),
         (
-            f"<Subject 2> is the source performer in <Video 1> identified by {source2}. "
-            "This description is only for identifying the performer; <Video 1> determines "
-            "<Subject 2>'s action, pose, held-object state and timing."
+            f"<Subject 2> is the target performer in <Video 1> identified by {source2}. "
+            "This description identifies the performer to edit. <Video 1> remains the "
+            "authority for this performer's pose, motion, facial performance, interactions, "
+            "position and timing."
         ),
         (
-            f"<Subject 3> is {replacement1}. In the target video, <Subject 3> replaces only "
-            "<Subject 1>'s visible human identity and appearance. <Subject 3> is pose-driven "
-            "and motion-driven by <Subject 1> in <Video 1> and performs the same source "
-            "performance with the same timing."
-            + (" <Picture 1> additionally supplies an edited first-frame visual anchor where visible." if frame0 else "")
+            "<Video 1> is the source video being directly edited. Its original shot, events, "
+            "camera behavior, scene content and all non-target people remain the source for "
+            "the target video."
         ),
-        (
-            f"<Subject 4> is {replacement2}. In the target video, <Subject 4> replaces only "
-            "<Subject 2>'s visible human identity and appearance. <Subject 4> is pose-driven "
-            "and motion-driven by <Subject 2> in <Video 1> and performs the same source "
-            "performance with the same timing."
-            + (" <Picture 1> additionally supplies an edited first-frame visual anchor where visible." if frame0 else "")
-        ),
-        "<Video 1> is the source video for the target video edit and the pose, motion and timing driver for the entire shot.",
     ]
     if frame0:
         definitions.append(
-            "<Picture 1> is the edited first-frame target appearance and composition anchor."
+            "<Picture 1> is the edited first-frame appearance anchor for <Subject 1> and "
+            "<Subject 2>. It does not replace <Video 1> as the authority for motion, events, "
+            "camera or scene geometry."
         )
 
     retention = [
-        "<Subject 1> (appears in [Shot 1]): attribute_transfer - <Subject 1>'s pose, motion, "
-        "facial performance, hand and object interactions, position and timing from <Video 1> "
-        "are transferred to <Subject 3>; <Subject 1>'s visible identity and appearance are not retained.",
-        "<Subject 2> (appears in [Shot 1]): attribute_transfer - <Subject 2>'s pose, motion, "
-        "facial performance, hand and object interactions, position and timing from <Video 1> "
-        "are transferred to <Subject 4>; <Subject 2>'s visible identity and appearance are not retained.",
-        "<Subject 3> (appears in [Shot 1]): fully_preserved - the defined replacement appearance "
-        "is retained while pose and motion are driven by <Subject 1> in <Video 1>.",
-        "<Subject 4> (appears in [Shot 1]): fully_preserved - the defined replacement appearance "
-        "is retained while pose and motion are driven by <Subject 2> in <Video 1>.",
-        "<Video 1> (pose, motion, timing and source video editing): fully_preserved - use <Video 1> "
-        "as the motion source for the complete performance and preserve its action timing, body and "
-        "head pose, facial expression, gaze, mouth movement, hand pose, object contacts, positions, "
-        "scale, orientation, occlusion, camera, background, lighting and non-person objects.",
+        (
+            "<Subject 1> (appears in [Shot 1]): partially_preserved - preserve the performer's "
+            "original pose, body motion, head motion, facial performance, gaze, mouth movement, "
+            "hand motion, object interactions, position, scale, orientation, occlusion and timing "
+            f"from <Video 1>; modify only the visible human identity, facial appearance, hair and "
+            f"clothing to match {replacement1}."
+        ),
+        (
+            "<Subject 2> (appears in [Shot 1]): partially_preserved - preserve the performer's "
+            "original pose, body motion, head motion, facial performance, gaze, mouth movement, "
+            "hand motion, object interactions, position, scale, orientation, occlusion and timing "
+            f"from <Video 1>; modify only the visible human identity, facial appearance, hair and "
+            f"clothing to match {replacement2}."
+        ),
+        (
+            "<Video 1> (source video editing): fully_preserved - preserve the original shot "
+            "structure, camera framing, camera motion, scene geometry, depth relationships, "
+            "background, lighting, all non-target people, all non-person objects, actions, "
+            "interactions and event timing. Only the specified appearance edits to <Subject 1> "
+            "and <Subject 2> are made."
+        ),
     ]
     if frame0:
         retention.append(
-            "<Picture 1> ([Shot 1] first frame): fully_preserved - retain its edited target "
-            "appearances and composition at the start of the shot."
+            "<Picture 1> ([Shot 1] first frame): fully_preserved - its edited first-frame "
+            "appearance and composition anchor the two target performers' edited appearance only."
         )
 
     task = "video editing + keyframe completion" if frame0 else "video editing"
-    anchor = "The shot begins from the edited first-frame anchor <Picture 1>. " if frame0 else ""
+    picture = (
+        "<Picture 1> supplies the edited first-frame appearance anchor; <Video 1> still defines "
+        "motion, events, camera and scene. " if frame0 else ""
+    )
     return "\n\n".join([
         "subject_definitions:\n" + "\n".join(definitions),
         (
             f"summary:\n[{task}] The target video is an edited version of <Video 1>. "
-            "This is a pose-driven human appearance replacement. <Subject 3> replaces only "
-            "<Subject 1>'s visible identity and appearance, and <Subject 4> replaces only "
-            "<Subject 2>'s visible identity and appearance. Their pose, motion, actions and "
-            "timing come directly from <Video 1>; the camera, scene and non-person objects remain unchanged."
+            + picture
+            + "Only the visible human identity and appearance of <Subject 1> and <Subject 2> "
+            "are modified. Their original performance remains from <Video 1>. Preserve the "
+            "original events, camera behavior, scene, all non-target people and all "
+            "non-person objects."
         ),
         "retention_analysis:\n" + "\n".join(retention),
         (
-            "detailed_description:\nKeep the visual style and lighting of <Video 1>.\n\n"
-            "[Shot 1] " + anchor +
-            "This is a pose-driven and motion-driven human appearance replacement. Use <Video 1> "
-            "as the pose and motion driver for the entire shot. A video of <Subject 3> and <Subject 4> "
-            "performing the same specific actions as <Subject 1> and <Subject 2> in <Video 1>. "
-            "<Subject 3> follows <Subject 1>'s source pose, body motion, head motion, facial expression, "
-            "gaze, mouth movement, hand pose, limb motion, object interactions, position and timing. "
-            "<Subject 4> follows the corresponding source performance of <Subject 2>. Copy the source "
-            "performance from <Video 1> rather than generating or reinterpreting a new performance. "
-            "Only the visible human identity, appearance and clothing of the two performers may change. "
-            "Do not retime, invent, omit, merge or reinterpret actions. Preserve the camera, background, "
-            "lighting and every non-person object. If any text description conflicts with <Video 1>, "
-            "follow <Video 1>."
+            "detailed_description:\nThe target video preserves the original visual content and "
+            "complete event sequence of <Video 1>. Preserve the original camera framing and "
+            "camera motion, scene geometry and depth relationships, background, lighting, all "
+            "non-target people, all non-person objects, actions, interactions, positions, "
+            "occlusions and timing. Only the visible human identity and appearance of "
+            "<Subject 1> and <Subject 2> are modified.\n\n"
+            "[Shot 1] Use <Video 1> directly as the source video.\n\n"
+            "Keep <Subject 1>'s original pose, body motion, head motion, facial expression, gaze, "
+            "mouth movement, hand motion, object interactions, position, scale, orientation, "
+            f"occlusion and timing exactly as shown in <Video 1>. Modify only <Subject 1>'s "
+            f"visible human identity, facial appearance, hair and clothing to match: "
+            f"{replacement1}.\n\n"
+            "Keep <Subject 2>'s original pose, body motion, head motion, facial expression, gaze, "
+            "mouth movement, hand motion, object interactions, position, scale, orientation, "
+            f"occlusion and timing exactly as shown in <Video 1>. Modify only <Subject 2>'s "
+            f"visible human identity, facial appearance, hair and clothing to match: "
+            f"{replacement2}.\n\n"
+            "All other visible people and all other scene content remain those of <Video 1>. "
+            "Do not create replacement people as additional subjects. Do not reinterpret or "
+            "regenerate the shot as a new scene.\n\n"
+            "If any appearance description conflicts with the source performance or scene "
+            "structure in <Video 1>, preserve <Video 1> and apply only the compatible "
+            "appearance change."
         ),
-        (
-            "overall_soundscape:\nPreserve source synchronized sound, ambience and physical "
-            "sounds; do not invent new effects or voices because the appearances change."
-        ),
-        "non_diegetic_music:\nPreserve existing source music; do not add new music.",
+        "overall_soundscape:\nN/A",
+        "non_diegetic_music:\nN/A",
     ])
 
 

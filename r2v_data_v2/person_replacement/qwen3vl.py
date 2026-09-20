@@ -4,12 +4,24 @@ from pathlib import Path
 
 TWO_PERSON_VIDEO_FPS = 4.0
 
-TWO_SOURCE_BODY = """Watch this whole single-shot video. Identify the two main physical performers.
-For SOURCE_SUBJECT_1 and SOURCE_SUBJECT_2, write one concise natural description of each
-source performer so that the person is easy to identify in <Video 1>. Include the person's
-visible appearance, clothing, and a simple locator such as foreground/background or initial
-left/right position when useful. Keep these source descriptions about the person's identity
-and stable visual role; put temporary actions and held/touched props in SHOT_DESCRIPTION.
+TWO_SOURCE_BODY = """Watch this whole single-shot video. Select the two main physical performers to edit.
+For SOURCE_SUBJECT_1 and SOURCE_SUBJECT_2, write one concise STATIC IDENTIFICATION PHRASE
+per performer so that the person is easy to identify in <Video 1>.
+A static identification phrase may include only: apparent age, gender presentation, hair,
+facial appearance, body build, clothing, other stable visible characteristics, and an
+approximate initial location such as foreground/background or initial left/right when useful.
+A static identification phrase must NEVER contain an action, motion, pose progression, gaze
+behavior, expression or emotion, speaking, mouth state, held-object action, or any temporal
+sequence, and must never use words such as then, later, at first, turning, looking, smiling
+or speaking. All of that belongs in SHOT_DESCRIPTION only.
+BAD: "a woman in a yellow shirt looking down then turning around"
+GOOD: "a younger woman in a yellow graphic T-shirt with dark hair in a high ponytail and
+bangs, initially in the foreground"
+BAD: "an older woman smiling and then speaking seriously"
+GOOD: "an older woman in a light-colored button-up shirt with dark hair tied back"
+The video may contain other visible people. Do not assume the two selected performers are the
+only people in the shot. Describe only the two main performers selected for replacement; other
+visible people are non-target scene content and must not be folded into either target identity.
 Keep the descriptions natural rather than filling a checklist.
 Each Subject label must follow the same physical performer throughout crossings, overlap,
 occlusion and screen-order changes.
@@ -106,6 +118,9 @@ stylistic clothing and hairstyle only. Never introduce any object, prop, tool, e
 weapon, accessory or item that would be held, worn as an interactive device or interacted
 with, and never introduce an action, pose, gesture, hand state or interaction implied by
 the occupation or historical style. Clothing and grooming alone must express the cue.
+Do not request a substantially different height, extreme body build, or exaggerated body
+silhouette. Keep each replacement person's overall body scale and silhouette compatible with
+that performer's source body so the source pose and spatial occupancy can be preserved.
 The two replacements must remain clearly distinguishable from each other and from their
 own source performer.""" + TWO_REPLACEMENT_TAIL
 

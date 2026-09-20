@@ -27,14 +27,16 @@ def test_six_section_two_person_prompt(frame0):
     assert "[Shot 1]" in prompt and "[Shot 2]" not in prompt
     assert ("<Picture 1>" in prompt) == frame0
     for value in (*DESCRIPTIONS[:2], *REPLACEMENTS, "<Subject 1>", "<Subject 2>",
-                  "<Subject 3>", "<Subject 4>", "attribute_transfer", "fully_preserved",
-                  "<Video 1>"):
+                  "partially_preserved", "fully_preserved", "<Video 1>"):
         assert value in prompt
-    assert "pose-driven" in prompt
-    assert "motion driver" in prompt
+    # Replacement descriptions modify the same subjects, never new subjects.
+    assert "<Subject 3>" not in prompt and "<Subject 4>" not in prompt
+    assert "attribute_transfer" not in prompt
+    assert "Use <Video 1> directly as the source video" in prompt
     assert DESCRIPTIONS[2] not in prompt
     if frame0:
-        assert "where visible" in prompt and "first-frame" in prompt
+        assert "first-frame" in prompt
+        assert "<Picture 1> is the edited first-frame appearance anchor" in prompt
 
 
 def test_boogu_prompt_both_bindings():
@@ -228,15 +230,18 @@ def test_runtime_caches_are_case_local_and_environment_restored(tmp_path, monkey
     assert os.environ == original
 
 
-def test_two_person_appearance_and_temporal_prompt_contract():
+def test_two_subject_appearance_edit_contract():
     from r2v_data_v2.person_replacement.h3_two_person import build_prompt
-    from r2v_data_v2.person_replacement.qwen3vl import TWO_REPLACEMENT_PROMPT, TWO_SOURCE_PROMPT
+    from r2v_data_v2.person_replacement.qwen3vl import (
+        TWO_REPLACEMENT_PROMPT,
+        TWO_SOURCE_PROMPT,
+    )
 
     assert "SHOT_DESCRIPTION" in TWO_SOURCE_PROMPT
     assert "clearly different from Source 1" in TWO_REPLACEMENT_PROMPT
     assert "clearly different from Source 2" in TWO_REPLACEMENT_PROMPT
 
-    shot = "<Subject 1> lifts the blue-and-white cup while <Subject 2> watches."
+    shot = "UNIQUE_TEMPORAL_MARKER_1234"
     source1 = "a bald man with a mustache in a dark blue robe seated in the foreground"
     source2 = "a shaved-head man in a light gray robe standing in the background"
     replacement1 = "A middle-aged woman with auburn hair in an olive-green jacket."
@@ -244,28 +249,26 @@ def test_two_person_appearance_and_temporal_prompt_contract():
     prompt = build_prompt(source1, source2, shot, replacement1, replacement2)
 
     definitions = prompt.split("\n\nsummary:",1)[0]
+    retention = prompt.split("retention_analysis:\n",1)[1].split("\n\ndetailed_description:",1)[0]
     detailed = prompt.split("detailed_description:\n",1)[1].split("\n\noverall_soundscape:",1)[0]
 
     assert source1 in definitions and source2 in definitions
-    assert "<Subject 3> is a middle-aged woman with auburn hair in an olive-green jacket." in definitions
-    assert "<Subject 4> is an adult man with short black hair in a cream linen shirt." in definitions
-    assert "<Subject 3> replaces only <Subject 1>'s visible human identity and appearance" in definitions
-    assert "<Subject 4> replaces only <Subject 2>'s visible human identity and appearance" in definitions
-    assert "<Subject 3> is pose-driven and motion-driven by <Subject 1>" in definitions
-    assert "<Subject 4> is pose-driven and motion-driven by <Subject 2>" in definitions
+    assert "<Subject 1> is the target performer in <Video 1>" in definitions
+    assert "<Subject 2> is the target performer in <Video 1>" in definitions
+    assert "<Subject 3>" not in prompt and "<Subject 4>" not in prompt
 
-    assert "pose-driven and motion-driven human appearance replacement" in detailed
-    assert "Use <Video 1> as the pose and motion driver for the entire shot." in detailed
-    assert "A video of <Subject 3> and <Subject 4> performing the same specific actions" in detailed
-    assert "Copy the source performance from <Video 1>" in detailed
-    assert "Only the visible human identity, appearance and clothing" in detailed
+    assert "<Subject 1> (appears in [Shot 1]): partially_preserved" in retention
+    assert "<Subject 2> (appears in [Shot 1]): partially_preserved" in retention
+    assert "<Video 1> (source video editing): fully_preserved" in retention
+    assert "attribute_transfer" not in prompt
+    assert retention.count("fully_preserved") == 1  # only <Video 1>
+    assert "to match a middle-aged woman with auburn hair in an olive-green jacket." in retention
+    assert "to match an adult man with short black hair in a cream linen shirt." in retention
+
+    assert "Modify only <Subject 1>'s" in detailed
+    assert "Modify only <Subject 2>'s" in detailed
+    assert "All other visible people" in detailed
     assert shot not in prompt
-
-    assert "<Subject 1> (appears in [Shot 1]): attribute_transfer" in prompt
-    assert "<Subject 2> (appears in [Shot 1]): attribute_transfer" in prompt
-    assert "<Subject 3> (appears in [Shot 1]): fully_preserved" in prompt
-    assert "<Subject 4> (appears in [Shot 1]): fully_preserved" in prompt
-    assert "<Video 1> (pose, motion, timing and source video editing): fully_preserved" in prompt
 
 
 def test_qwen_shot_text_is_provenance_not_h3_motion_instruction():
@@ -278,8 +281,8 @@ def test_qwen_shot_text_is_provenance_not_h3_motion_instruction():
     prompt = build_prompt("source one", "source two", shot, "target one", "target two")
     assert shot not in prompt
     assert "00:04.000" not in prompt
-    assert "pose and motion driver" in prompt
-    assert "follow <Video 1>" in prompt
+    assert "Use <Video 1> directly as the source video" in prompt
+    assert "preserve <Video 1> and apply only the compatible appearance change" in prompt
 
 
 def test_two_person_video_sampling_only_and_short_motion_prompt(tmp_path, monkeypatch):
@@ -297,46 +300,41 @@ def test_two_person_video_sampling_only_and_short_motion_prompt(tmp_path, monkey
     assert "fps" not in calls[1][0]
 
 
-def test_v13_prompt_regression_after_v15_v16_revert():
-    """The H3 prompt must match the V13 text-only contract that ran best."""
+def test_two_subject_v18_prompt_regression():
+    """Whole-prompt invariants for the 2-subject in-place appearance edit."""
     from r2v_data_v2.person_replacement.h3_two_person import build_prompt
 
-    shot = "UNIQUE_SHOT_MARKER_7788"
+    shot = "UNIQUE_TEMPORAL_MARKER_7788"
     prompt = build_prompt("a man","a woman",shot,"an old man","a young woman")
-    definitions = prompt.split("\n\nsummary:",1)[0]
-    detailed = prompt.split("detailed_description:\n",1)[1].split("\n\noverall_soundscape:",1)[0]
+
+    assert "<Subject 1>" in prompt and "<Subject 2>" in prompt and "<Video 1>" in prompt
+    assert "<Subject 3>" not in prompt
+    assert "<Subject 4>" not in prompt
+    assert "attribute_transfer" not in prompt
 
     for phrase in (
-        "<Subject 1> is the source performer in <Video 1> identified by a man.",
-        "<Subject 2> is the source performer in <Video 1> identified by a woman.",
-        "<Subject 3> is an old man. In the target video, <Subject 3> replaces only",
-        "<Subject 4> is a young woman. In the target video, <Subject 4> replaces only",
-        "<Subject 3> is pose-driven and motion-driven by <Subject 1> in <Video 1>",
-        "<Subject 4> is pose-driven and motion-driven by <Subject 2> in <Video 1>",
-        "This is a pose-driven and motion-driven human appearance replacement.",
-        "Use <Video 1> as the pose and motion driver for the entire shot.",
-        "performing the same specific actions as <Subject 1> and <Subject 2> in <Video 1>",
-        ("<Subject 3> follows <Subject 1>'s source pose, body motion, head motion, facial "
-         "expression, gaze, mouth movement, hand pose, limb motion, object interactions, "
-         "position and timing."),
-        "<Subject 4> follows the corresponding source performance of <Subject 2>.",
-        ("Copy the source performance from <Video 1> rather than generating or reinterpreting "
-         "a new performance."),
-        "Only the visible human identity, appearance and clothing of the two performers may change.",
-        "Do not retime, invent, omit, merge or reinterpret actions.",
-        "Preserve the camera, background, lighting and every non-person object.",
-        "If any text description conflicts with <Video 1>, follow <Video 1>.",
-        "<Subject 1> (appears in [Shot 1]): attribute_transfer",
-        "<Subject 2> (appears in [Shot 1]): attribute_transfer",
-        "<Subject 3> (appears in [Shot 1]): fully_preserved",
-        "<Subject 4> (appears in [Shot 1]): fully_preserved",
-        "<Video 1> (pose, motion, timing and source video editing): fully_preserved",
-        "This is a pose-driven human appearance replacement.",
+        "<Subject 1> (appears in [Shot 1]): partially_preserved",
+        "<Subject 2> (appears in [Shot 1]): partially_preserved",
+        "<Video 1> (source video editing): fully_preserved",
+        "The target video preserves the original visual content and complete event sequence",
+        "camera framing and camera motion",
+        "scene geometry and depth relationships",
+        "all non-target people",
+        "all non-person objects",
+        "positions, occlusions and timing",
+        "Only the visible human identity and appearance of <Subject 1> and <Subject 2>",
+        ("Modify only <Subject 1>'s visible human identity, facial appearance, hair and "
+         "clothing to match: an old man."),
+        ("Modify only <Subject 2>'s visible human identity, facial appearance, hair and "
+         "clothing to match: a young woman."),
+        "Do not create replacement people as additional subjects",
+        "Do not reinterpret or regenerate the shot as a new scene",
     ):
         assert phrase in prompt, phrase
-    assert "<Subject 1>" in definitions and "<Subject 1>" in detailed
-    assert shot not in prompt  # SHOT_DESCRIPTION stays provenance only
-    assert "source_performance" not in prompt
+    assert "Keep the visual style and lighting of <Video 1>." not in prompt
+    assert shot not in prompt
+    assert "overall_soundscape:\nN/A" in prompt
+    assert "non_diegetic_music:\nN/A" in prompt
 
 
 def test_v15_v16_experimental_wording_is_absent():

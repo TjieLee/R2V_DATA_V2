@@ -166,8 +166,8 @@ def test_variant_contracts_are_distinct_and_group_size_is_not_semantic(tmp_path)
     _,text = module.make_config(arguments(base+["--variant","text"]))
     _,frame0 = module.make_config(arguments(base+["--variant","frame0"]))
     assert text["identity"] != frame0["identity"]
-    assert text["identity_details"]["contract"] == "text_two_person_pdd_fsdp2_pair_v17"
-    assert frame0["identity_details"]["contract"] == "frame0_two_person_pdd_fsdp2_pair_v17"
+    assert text["identity_details"]["contract"] == "text_two_person_pdd_fsdp2_pair_v18"
+    assert frame0["identity_details"]["contract"] == "frame0_two_person_pdd_fsdp2_pair_v18"
     for key in ("boogu_python","boogu_code_root","boogu_model_root"):
         assert key in frame0["identity_details"]["resources"] and key not in text["identity_details"]["resources"]
     _,bigger = module.make_config(arguments(base+["--variant","frame0","--group-size","4","--ulysses-degree","2"]))
@@ -600,14 +600,16 @@ def test_frame0_prompt_semantics_and_no_shot_description():
     shot = "They raise the cups in exactly this order."
     prompt = build_prompt(TEXTS["source_subject_1"],TEXTS["source_subject_2"],shot,
                           TEXTS["replacement_subject_1"],TEXTS["replacement_subject_2"],frame0=True)
-    assert "<Picture 1>" in prompt  # frame0 keeps its original Picture 1 anchor
-    assert "<Picture 1> is the edited first-frame target appearance and composition anchor." in prompt
-    assert "<Picture 1> additionally supplies an edited first-frame visual anchor" in prompt
+    assert "<Picture 1>" in prompt  # frame0 adds an appearance anchor only
+    assert "<Picture 1> is the edited first-frame appearance anchor for <Subject 1>" in prompt
+    assert "It does not replace <Video 1> as the authority" in prompt
     assert "<Video 1>" in prompt
-    assert "attribute_transfer" in prompt and "fully_preserved" in prompt
+    assert "<Subject 3>" not in prompt and "<Subject 4>" not in prompt
+    assert "partially_preserved" in prompt and "fully_preserved" in prompt
+    assert "attribute_transfer" not in prompt
     assert shot not in prompt  # Qwen shot description is provenance only
     assert "[video editing + keyframe completion]" in prompt
-    assert "Do not retime, invent, omit, merge or reinterpret actions" in prompt
+    assert "Use <Video 1> directly as the source video" in prompt
     text = build_prompt(TEXTS["source_subject_1"],TEXTS["source_subject_2"],shot,
                         TEXTS["replacement_subject_1"],TEXTS["replacement_subject_2"])
     assert "<Picture 1>" not in text

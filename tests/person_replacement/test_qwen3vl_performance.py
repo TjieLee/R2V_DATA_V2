@@ -71,7 +71,7 @@ def test_performance_prompt_disambiguates_props_against_shot_description():
     assert "non-temporal record of the visible held, carried, touched" in prompt
     assert "SHOT_DESCRIPTION still keeps the complete temporal sequence" in prompt
     assert "not a contradiction" in prompt
-    assert "temporary actions and held/touched props in SHOT_DESCRIPTION" in TWO_SOURCE_PROMPT
+    assert "All of that belongs in SHOT_DESCRIPTION only." in TWO_SOURCE_PROMPT
     assert "not in conflict" in prompt
 
 
@@ -105,5 +105,40 @@ def test_frame0_prompt_keeps_its_original_picture_anchor():
     from r2v_data_v2.person_replacement.h3_two_person import build_prompt
 
     prompt = build_prompt("a man","a woman","shot","an old man","a young woman",frame0=True)
-    assert "<Picture 1> is the edited first-frame target appearance and composition anchor." in prompt
-    assert "<Picture 1> additionally supplies an edited first-frame visual anchor" in prompt
+    assert "<Picture 1> is the edited first-frame appearance anchor for <Subject 1>" in prompt
+    assert "<Picture 1> ([Shot 1] first frame): fully_preserved" in prompt
+    assert "<Subject 3>" not in prompt and "<Subject 4>" not in prompt
+
+
+def test_source_prompt_forces_static_identification_phrases():
+    """Real Qwen leaked actions/expressions into SOURCE_SUBJECT_*; contract now forbids it."""
+    from r2v_data_v2.person_replacement.qwen3vl import TWO_SOURCE_PROMPT
+
+    assert "STATIC IDENTIFICATION PHRASE" in TWO_SOURCE_PROMPT
+    assert "must NEVER contain an action, motion, pose progression, gaze" in TWO_SOURCE_PROMPT
+    assert "All of that belongs in SHOT_DESCRIPTION only." in TWO_SOURCE_PROMPT
+    for banned in ("then","later","at first","turning","looking","smiling","speaking"):
+        assert banned in TWO_SOURCE_PROMPT  # named only as forbidden words
+    assert 'BAD: "a woman in a yellow shirt looking down then turning around"' in TWO_SOURCE_PROMPT
+    assert 'BAD: "an older woman smiling and then speaking seriously"' in TWO_SOURCE_PROMPT
+    assert "GOOD:" in TWO_SOURCE_PROMPT
+    assert "The video may contain other visible people." in TWO_SOURCE_PROMPT
+    assert "Do not assume the two selected performers are the" in TWO_SOURCE_PROMPT
+    assert "only people in the shot" in TWO_SOURCE_PROMPT
+    assert "non-target scene content and must not be folded into either" in TWO_SOURCE_PROMPT
+    assert "SHOT_DESCRIPTION" in TWO_SOURCE_PROMPT
+
+
+def test_replacement_prompt_limits_body_geometry_drift():
+    from r2v_data_v2.person_replacement.qwen3vl import (
+        TWO_REPLACEMENT_WITH_DIVERSITY_PROMPT,
+    )
+
+    prompt = TWO_REPLACEMENT_WITH_DIVERSITY_PROMPT
+    assert "Do not request a substantially different height" in prompt
+    assert "extreme body build" in prompt
+    assert "overall body scale and silhouette compatible" in prompt
+    for forbidden in ("object, prop, tool, equipment,", "action, pose, gesture, hand state"):
+        assert forbidden in prompt
+    assert "Replacement 1 diversity cue: {cue1}" in prompt
+    assert "Replacement 2 diversity cue: {cue2}" in prompt
