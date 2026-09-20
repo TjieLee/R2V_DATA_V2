@@ -14,12 +14,21 @@ rows. One node owns one shard at a time through these barriers:
 
     canonical -> SAM music_first -> AuK -> resolve -> DiariZen -> ASR -> MiMo
 
-Automatic multi-node scheduling shuffles shard IDs with SHARD_SEED and takes
-ordered_shards[RANK::WORLD_SIZE]. RANK/WORLD_SIZE are node-level scheduling
-coordinates: different nodes receive different shard sequences. Inside a node,
-the eight GPUs do not take eight different shards. They cooperatively process
-the current shard: the active upstream stage partitions pending jobs across GPUs,
-while the downstream MiMo stage uses the full eight-GPU serving topology.
+Automatic multi-node scheduling first shuffles shard IDs with SHARD_SEED and
+takes ordered_shards[RANK::WORLD_SIZE], fixing cross-node ownership before any
+resume inspection. Each node then reorders only its own assigned shards:
+unfinished shards first, never-started shards second, and shards with COMPLETE
+are omitted from automatic scheduling. Resume classification is intentionally
+metadata-only: it checks COMPLETE, state.jsonl.partial, and whether stage_state/
+contains any top-level *.json file. It never opens stage JSON, receipts, media,
+or hashes during scheduling. Explicit SHARDS preserves the caller's exact order
+and bypasses this automatic resume-first filtering.
+
+RANK/WORLD_SIZE are node-level scheduling coordinates: different nodes receive
+different shard sequences. Inside a node, the eight GPUs do not take eight
+different shards. They cooperatively process the current shard: the active
+upstream stage partitions pending jobs across GPUs, while the downstream MiMo
+stage uses the full eight-GPU serving topology.
 
 No large GPU model is node-lifetime resident. SAM, AuK, DiariZen and Qwen3-ASR
 use the existing ephemeral executor: each stage starts at most one worker per
@@ -95,9 +104,11 @@ manifest, clips root and source-video root, and must receive unique RANK values
 within the same WORLD_SIZE. Keep SHARD_SEED=20260918 fixed for this production
 population so scheduling is reproducible. The number of nodes may change after an
 interruption: restart with the new scheduler-provided WORLD_SIZE and the same
-production root/seed. The new rank slicing still partitions the full shard list;
-already-ready receipts are reused, and shard/invocation locks protect the shared
-root. Do not change shard size or source identity in-place.
+production root/seed. A changed WORLD_SIZE can move shard ownership to a
+different rank, but the new owner still prioritizes that unfinished shard within
+its own fixed slice. Already-ready receipts are reused, and shard/invocation
+locks protect the shared root. Do not change shard size or source identity
+in-place.
 
 For manual debugging only, explicit SHARDS bypasses rank/world allocation:
 
