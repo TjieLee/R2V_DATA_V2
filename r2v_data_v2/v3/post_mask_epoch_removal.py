@@ -47,7 +47,8 @@ import hashlib
 import json
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import replace
+from contextlib import ExitStack
+from dataclasses import dataclass, replace
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -59,6 +60,7 @@ from r2v_data_v2.v3.background import validate_background_reference
 from r2v_data_v2.v3.boogu_remove_backend import BooguBackgroundRemovalBackend
 from r2v_data_v2.v3.boogu_seed import new_boogu_seed
 from r2v_data_v2.v3.config import BOOGU_REMOVE_BACKEND, V3Config
+from r2v_data_v2.v3.post_mask_epoch_groups import resource_epoch_root
 from r2v_data_v2.v3.post_mask_epoch_jobs import (
     OUTCOME_COMPLETED,
     OUTCOME_RETRYABLE_FAILED,
@@ -554,26 +556,52 @@ def resolve_removal_backend(handle: Any, config: V3Config) -> Any:
     )
 
 
-def resolve_removal_judge(handle: Any, config: V3Config) -> Any:
+@dataclass(frozen=True)
+class ResolvedRemovalJudge:
+    """A judge handle plus whether *this* job created it.
+
+    A shared handle (an injected fake, or a client someone else owns) must never
+    be closed by the runner. An endpoint string makes the runner build -- and
+    therefore own -- a fresh OpenAI client, which has to be closed or tens of
+    thousands of judge calls accumulate HTTP connections and sockets.
+    """
+
+    judge: Any
+    owned: bool
+
+
+def resolve_removal_judge(handle: Any, config: V3Config) -> ResolvedRemovalJudge:
     """Return a ``BackgroundRemovalJudge`` for one judge job.
 
     The Qwen epoch hands the runner its endpoint, so the judge is rebuilt
     against that endpoint and nothing else about the service changes.
+
+    ``owned`` is True exactly when this call constructed the handle, so the
+    caller can close it and leave an injected/shared handle alone.
     """
     if handle is None:
         raise RemovalEpochError("judge epoch supplied no handle")
     if hasattr(handle, "judge"):
         return resolve_removal_judge(handle.judge, config)
     if hasattr(handle, "review"):
-        return handle
+        return ResolvedRemovalJudge(handle, False)
     service = config.qwen.background_remove_judge
     if isinstance(handle, str):
         if service is None:
             raise RemovalEpochError("no configured background remove judge")
-        return QwenBackgroundRemovalJudge(replace(service, base_url=handle))
+        return ResolvedRemovalJudge(
+            QwenBackgroundRemovalJudge(replace(service, base_url=handle)), True
+        )
     if service is not None and hasattr(handle, "base_url") and hasattr(handle, "model"):
-        return QwenBackgroundRemovalJudge(handle)
+        return ResolvedRemovalJudge(QwenBackgroundRemovalJudge(handle), True)
     raise RemovalEpochError("judge epoch handle implements no review()")
+
+
+def close_removal_judge(judge: Any) -> None:
+    """Best-effort close of a runner-owned judge client."""
+    close = getattr(judge, "close", None)
+    if callable(close):
+        close()
 
 
 # ---------------------------------------------------------------------------
@@ -596,6 +624,7 @@ class RemovalEpochRunner:
         storages: Mapping[str, RunStorage],
         ledger: GroupLedger,
         *,
+        eligible_clip_uids_by_shard: Mapping[str, Sequence[str]],
         emit: Callable[..., None] | None = None,
         seed_allocator: Callable[[], int] = new_boogu_seed,
     ) -> None:
@@ -603,6 +632,18 @@ class RemovalEpochRunner:
         self.config = config
         self.storages: dict[str, RunStorage] = dict(storages)
         self.ledger = ledger
+        #: The epoch's only source of clip eligibility. It is the hydration
+        #: result of this launch -- never ``storage.iter_clips()``, which would
+        #: also enumerate clips a previous run hydrated but this run excluded.
+        self.eligible_clip_uids_by_shard: dict[str, tuple[str, ...]] = {
+            str(shard): tuple(str(uid) for uid in uids)
+            for shard, uids in eligible_clip_uids_by_shard.items()
+        }
+        for shard in self.storages:
+            if shard not in self.eligible_clip_uids_by_shard:
+                raise RemovalEpochError(
+                    f"canonical shard {shard!r} has no eligible clip view"
+                )
         self.emit = emit or (lambda *args, **kwargs: None)
         self.seed_allocator = seed_allocator
         self.stats: dict[str, dict[str, int]] = {
@@ -616,13 +657,18 @@ class RemovalEpochRunner:
         Only cycle 0 is seeded. A later candidate exists solely because a judge
         rejected its sibling or an attempt failed, so it can never be
         speculated here.
+
+        Eligibility comes from this launch's hydration result, in the order
+        hydration admitted the clips. ``storage.iter_clips()`` is deliberately
+        not used: it also lists historically hydrated clips that the current
+        hydration excluded or judged corrupt, and those must not enter a model.
         """
         jobs: list[ModelJob] = []
         for shard in sorted(self.storages):
             storage = self.storages[shard]
             counters = self.stats[shard]
-            for listed in storage.iter_clips():
-                clip_uid = listed.clip_uid
+            for clip_uid in self.eligible_clip_uids_by_shard[shard]:
+                listed = storage.read_clip(clip_uid)
                 state = listed.references.background
                 if state is None or state.status in _TERMINAL_STATUSES:
                     counters["skipped_not_pending"] += 1
@@ -812,19 +858,25 @@ class RemovalEpochRunner:
                 payload=payload,
                 detail=SEMANTIC_MISMATCH,
             )
-        judge = resolve_removal_judge(handle, self.config)
+        resolved = resolve_removal_judge(handle, self.config)
         generation_seconds = float(
             generation.payload.get(PAYLOAD_GENERATION_SECONDS, 0.0)
         )
-        outcome = review_removal_candidate(
-            context=context,
-            candidate=self._candidate_image(candidate_bytes),
-            candidate_bytes=candidate_bytes,
-            candidate_sha256=actual_sha,
-            judge=judge,
-            seed=seed,
-            generation_seconds=generation_seconds,
-        )
+        try:
+            outcome = review_removal_candidate(
+                context=context,
+                candidate=self._candidate_image(candidate_bytes),
+                candidate_bytes=candidate_bytes,
+                candidate_sha256=actual_sha,
+                judge=resolved.judge,
+                seed=seed,
+                generation_seconds=generation_seconds,
+            )
+        finally:
+            # An endpoint-created OpenAI client is owned by this job; a shared
+            # or injected handle belongs to its caller and must stay open.
+            if resolved.owned:
+                close_removal_judge(resolved.judge)
         payload[PAYLOAD_JUDGE_SECONDS] = outcome.judge_seconds
         payload[PAYLOAD_GENERATION_SECONDS] = generation_seconds
         payload[PAYLOAD_ATTEMPT] = outcome.attempt.model_dump(mode="json")
@@ -1296,6 +1348,44 @@ def build_removal_epoch_factories(
     return {RESOURCE_BOOGU: boogu_factory, RESOURCE_QWEN: qwen_factory}
 
 
+@dataclass(frozen=True)
+class PreparedRemovalShard:
+    """One initialized, hydrated canonical shard plus its admission result.
+
+    ``clip_uids`` is the *only* eligibility source for the removal epoch: it is
+    what this launch's ``hydrate_shard`` admitted, not what a previous run
+    happened to leave in the run root. ``ready``/``excluded``/``corrupt`` are
+    kept as diagnostics for the group summary; they are not semantic identity.
+    """
+
+    shard: str
+    paths: ShardPaths
+    storage: RunStorage
+    clip_uids: tuple[str, ...]
+    ready: int
+    excluded: int
+    corrupt: int
+
+
+def removal_shard_paths(
+    *, post_mask_root: Path, entity_mask_root: Path, shard: str
+) -> ShardPaths:
+    """Stable Post-Mask paths for one canonical shard. Touches nothing."""
+    shard_path = Path(entity_mask_root) / "parts" / f"{shard}.jsonl"
+    return ShardPaths.for_shard(Path(post_mask_root), shard_path)
+
+
+def shard_lock_path(paths: ShardPaths) -> Path:
+    """The production shard mutation lock.
+
+    This is the *same* file the legacy Post-Mask worker holds across hydrate,
+    remove, pair, reference edit and export. A resource-epoch runner must use
+    this exact path: a second ``resource_epoch/shard.lock`` would not exclude
+    the legacy worker and would therefore not protect the clip.
+    """
+    return paths.state_root / "shard.lock"
+
+
 def prepare_shard_storage(
     config: V3Config,
     *,
@@ -1303,26 +1393,70 @@ def prepare_shard_storage(
     entity_mask_root: Path,
     shard: str,
     git_commit: str,
-) -> RunStorage:
-    """Initialize and hydrate one canonical shard under the production lock.
+) -> PreparedRemovalShard:
+    """Initialize and hydrate one canonical shard.
 
     Hydration is reused from the existing Post-Mask production flow, never
     reimplemented: a fresh run root must produce real Stage2 clips instead of
     silently planning zero removal jobs.
+
+    Caller must hold ``paths.state_root / "shard.lock"`` for the whole removal
+    epoch, exactly like the legacy worker. Lock ownership belongs to the group
+    runner, not to this per-shard helper: it must be possible to acquire every
+    shard lock *before* any shard is mutated.
     """
-    shard_path = Path(entity_mask_root) / "parts" / f"{shard}.jsonl"
-    paths = ShardPaths.for_shard(Path(post_mask_root), shard_path)
-    with file_lock(paths.state_root / "shard.lock", blocking=False) as held:
-        if not held:
-            raise RemovalEpochError(f"canonical shard {shard} is locked elsewhere")
-        storage = initialize_shard(config, paths, git_commit=git_commit)
-        hydrate_shard(
-            storage,
-            entity_mask_root=Path(entity_mask_root),
-            shard_path=shard_path,
-            paths=paths,
+    paths = removal_shard_paths(
+        post_mask_root=post_mask_root, entity_mask_root=entity_mask_root, shard=shard
+    )
+    storage = initialize_shard(config, paths, git_commit=git_commit)
+    hydrated = hydrate_shard(
+        storage,
+        entity_mask_root=Path(entity_mask_root),
+        shard_path=paths.shard_path,
+        paths=paths,
+    )
+    return PreparedRemovalShard(
+        shard=shard,
+        paths=paths,
+        storage=storage,
+        clip_uids=tuple(hydrated.clip_uids),
+        ready=hydrated.ready,
+        excluded=hydrated.excluded,
+        corrupt=hydrated.corrupt,
+    )
+
+
+def validate_removal_roots(
+    ledger: GroupLedger,
+    *,
+    group_id: str,
+    post_mask_root: Path,
+    entity_mask_root: Path | None = None,
+    campaign: Mapping[str, Any] | None = None,
+) -> None:
+    """Fail closed when the launcher's roots and the runner's roots disagree.
+
+    The generic launcher builds the ledger from its own ``--post-mask-root`` /
+    ``--tag``, while ``run_removal_epoch`` resolves its roots from the
+    environment. If those two disagree the group identity would be established
+    under one campaign while hydration and every clip mutation happened under
+    another. This runs before any lock, hydrate or model call.
+    """
+    expected = (resource_epoch_root(Path(post_mask_root)) / group_id).resolve()
+    actual = Path(ledger.root).resolve()
+    if expected != actual:
+        raise RemovalEpochError(
+            f"removal epoch ledger {actual} is not {expected}; the launcher and "
+            "the runner disagree on the Post-Mask root"
         )
-    return storage
+    if entity_mask_root is not None and campaign is not None:
+        expected_entity = str(Path(entity_mask_root).resolve())
+        actual_entity = str(campaign.get("entity_mask_root", ""))
+        if actual_entity and Path(actual_entity).resolve() != Path(expected_entity):
+            raise RemovalEpochError(
+                f"removal epoch entity mask root {expected_entity} does not match "
+                f"the launcher campaign identity {actual_entity}"
+            )
 
 
 def _current_git_commit(repo: Path) -> str:
@@ -1348,12 +1482,22 @@ def build_removal_epoch_runner(
     qwen_max_inflight: int = 8,
     log_root: Path | None = None,
     repo_root: Path | None = None,
+    campaign: Mapping[str, Any] | None = None,
 ) -> Callable[[Any, GroupLedger, Any], dict[str, Any]]:
     """Build the ``--job-runner`` callable for one removal resource epoch.
 
     The returned callable hydrates each canonical shard, seeds the unconditional
     candidate jobs and drains them through the resource-epoch scheduler. It
     never touches a prompt, a threshold or an accept/reject rule.
+
+    Locking is all-or-nothing at group scope: every canonical shard's
+    ``state_root/shard.lock`` -- the exact file the legacy Post-Mask worker
+    holds -- is acquired in lexical shard order *before* any shard is
+    initialized, hydrated or handed to a model. If one shard is locked
+    elsewhere, every already-acquired lock is released and nothing is mutated,
+    so a partially mutated group is impossible. The locks are then held across
+    seeding, every model call, publication and the stage-count update, exactly
+    like the legacy worker's single-shard lock scope.
 
     It also never reports a completed *group*: the downstream DAG is not wired,
     so ``completed`` stays False even when the remove stage finished.
@@ -1362,46 +1506,92 @@ def build_removal_epoch_runner(
     worker_pool = pool or WorkerPoolConfig()
 
     def runner(group: Any, ledger: GroupLedger, emit: Any) -> dict[str, Any]:
-        storages: dict[str, RunStorage] = {}
+        validate_removal_roots(
+            ledger,
+            group_id=str(getattr(group, "group_id", "")),
+            post_mask_root=post_mask_root,
+            entity_mask_root=entity_mask_root,
+            campaign=campaign,
+        )
         git_commit = _current_git_commit(repo_root or Path.cwd())
-        for shard in sorted(group.canonical_shards):
-            storages[shard] = prepare_shard_storage(
-                config,
+        # Deterministic lock order. Every resource-epoch node sorts the same
+        # way, so two groups can never deadlock on overlapping shards.
+        ordered_shards = sorted(str(shard) for shard in group.canonical_shards)
+        paths_by_shard = {
+            shard: removal_shard_paths(
                 post_mask_root=post_mask_root,
                 entity_mask_root=entity_mask_root,
                 shard=shard,
-                git_commit=git_commit,
             )
-        removal = RemovalEpochRunner(config, storages, ledger, emit=emit)
-        seed_jobs = removal.seed_jobs()
-        emit(
-            "post_mask_removal_epoch_planned",
-            group_id=getattr(group, "group_id", ""),
-            seeded_jobs=len(seed_jobs),
-        )
-        manager = ResourceEpochManager(
-            factories=build_removal_epoch_factories(
+            for shard in ordered_shards
+        }
+        prepared: dict[str, PreparedRemovalShard] = {}
+        hydration: dict[str, dict[str, int]] = {}
+        with ExitStack() as shard_locks:
+            for shard in ordered_shards:
+                held = shard_locks.enter_context(
+                    file_lock(shard_lock_path(paths_by_shard[shard]), blocking=False)
+                )
+                if not held:
+                    raise RemovalEpochError(
+                        f"canonical shard {shard} is locked elsewhere"
+                    )
+            # Only now, with every shard lock held, may anything be mutated.
+            for shard in ordered_shards:
+                prepared_shard = prepare_shard_storage(
+                    config,
+                    post_mask_root=post_mask_root,
+                    entity_mask_root=entity_mask_root,
+                    shard=shard,
+                    git_commit=git_commit,
+                )
+                prepared[shard] = prepared_shard
+                hydration[shard] = {
+                    "hydrated_ready": prepared_shard.ready,
+                    "hydrated_excluded": prepared_shard.excluded,
+                    "hydrated_corrupt": prepared_shard.corrupt,
+                }
+            storages = {shard: item.storage for shard, item in prepared.items()}
+            eligible = {shard: item.clip_uids for shard, item in prepared.items()}
+            removal = RemovalEpochRunner(
                 config,
-                removal,
-                qwen_epoch_config=qwen_epoch_config,
-                pool=worker_pool,
-                process_manager=process_manager,
-                temporary_root=temporary_root,
-                allowed_server_root=allowed_server_root,
-                qwen_max_inflight=qwen_max_inflight,
-                log_root=log_root,
+                storages,
+                ledger,
+                emit=emit,
+                eligible_clip_uids_by_shard=eligible,
             )
-        )
-        scheduler = ResourceEpochScheduler(
-            ledger=ledger,
-            finalize=removal.finalize,
-            resource_manager=manager,
-            window_size=window_size,
-        )
-        try:
-            outcome = scheduler.run(seed_jobs)
-        finally:
-            removal.close()
+            seed_jobs = removal.seed_jobs()
+            emit(
+                "post_mask_removal_epoch_planned",
+                group_id=getattr(group, "group_id", ""),
+                seeded_jobs=len(seed_jobs),
+                hydration=hydration,
+            )
+            manager = ResourceEpochManager(
+                factories=build_removal_epoch_factories(
+                    config,
+                    removal,
+                    qwen_epoch_config=qwen_epoch_config,
+                    pool=worker_pool,
+                    process_manager=process_manager,
+                    temporary_root=temporary_root,
+                    allowed_server_root=allowed_server_root,
+                    qwen_max_inflight=qwen_max_inflight,
+                    log_root=log_root,
+                )
+            )
+            scheduler = ResourceEpochScheduler(
+                ledger=ledger,
+                finalize=removal.finalize,
+                resource_manager=manager,
+                window_size=window_size,
+            )
+            try:
+                outcome = scheduler.run(seed_jobs)
+            finally:
+                removal.close()
+            # Locks are released only when this block exits, i.e. after
+            # publication and the stage-count update.
         remove_completed = bool(outcome.get("completed"))
         summary = {
             shard: {
@@ -1410,6 +1600,7 @@ def build_removal_epoch_runner(
                 "retryable_pending": counters["retryable_pending"],
                 "failed": counters["failed"],
                 "candidates_generated": counters["candidates_generated"],
+                **hydration.get(shard, {}),
             }
             for shard, counters in sorted(removal.stats.items())
         }
