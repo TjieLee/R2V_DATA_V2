@@ -35,10 +35,10 @@ def arguments(argv=None):
                         help="Legacy 8B writer; frame0 experiment only, text never loads it")
     parser.add_argument("--prompt-writer-python",type=Path,
                         default=Path("/mnt/workspace/litengjie/data/audio_deps/qwen38-sglang-env/bin/python"),
-                        help="Text V21 isolated prompt-writer runtime; frame0 never uses it")
+                        help="Text V22 isolated prompt-writer runtime; frame0 never uses it")
     parser.add_argument("--prompt-writer-model",type=Path,
-                        default=Path("/mnt/workspace/public/pretrained/Qwen/Qwen3.6-27B"),
-                        help="Text V21 writer: one resident Qwen3.6-27B instance per GPU worker")
+                        default=Path("/mnt/workspace/public/pretrained/Qwen/Qwen3.5-27B"),
+                        help="Text V22 writer: one resident Qwen3.5-27B instance per GPU worker")
     parser.add_argument("--h3-python",type=Path,default=Path(
         "/mnt/workspace/litengjie/data/person_replacement_deps/minimax-h3-env/bin/python"))
     parser.add_argument("--h3-model-root",type=Path,default=Path("/mnt/workspace/public/pretrained/MiniMaxAI/MiniMax-H3"))

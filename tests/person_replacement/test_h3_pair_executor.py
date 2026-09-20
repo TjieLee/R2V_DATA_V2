@@ -25,7 +25,7 @@ def test_old_prepared_and_done_survive_group_change(tmp_path, monkeypatch):
     source.write_text('{"video_path":"a.mp4"}\n{"video_path":"b.mp4"}\n')
     argv = ["--input-jsonl",str(source),"--clips-root",str(clips),"--output-root",str(tmp_path/"out")]
     root,old = module.make_config(arguments(argv))
-    assert old["identity_details"]["contract"] == "text_two_person_pdd_fsdp2_pair_v21"
+    assert old["identity_details"]["contract"] == "text_two_person_pdd_fsdp2_pair_v22"
     legacy_details = {**old["identity_details"],"contract":"text_two_person_pdd_fsdp2_pair_v12"}
     legacy_identity = hashlib.sha256(json.dumps(legacy_details,sort_keys=True).encode()).hexdigest()
     legacy_root = tmp_path/"legacy-v12"
@@ -247,7 +247,7 @@ def test_text_identity_uses_prompt_writer_and_frame0_keeps_8b(tmp_path):
     assert arguments(base).prompt_writer_python == Path(
         "/mnt/workspace/litengjie/data/audio_deps/qwen38-sglang-env/bin/python")
     assert arguments(base).prompt_writer_model == Path(
-        "/mnt/workspace/public/pretrained/Qwen/Qwen3.6-27B")
+        "/mnt/workspace/public/pretrained/Qwen/Qwen3.5-27B")
 
 
 def test_prepare_python_runtime_is_variant_scoped(tmp_path, monkeypatch):
