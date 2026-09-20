@@ -39,12 +39,14 @@ class Qwen:
     def _load(self):
         CALLS.append("load")
 
-    def describe_two_with_performance(self, video):
+    def describe_two(self, video):
         CALLS.append(video.name)
         if getattr(self,"fail_on",None) == video.name:
             raise ValueError("bad case")
-        return ("source 1","source 2","holding and handling a hockey stick",
-                "holding a black clipboard with both hands","They cross.")
+        return "source 1","source 2","They cross."
+
+    def describe_two_with_performance(self, video):
+        pytest.fail("production pair path must not use the 5-field source call")
 
     def invent_two(self, *args):
         return "replacement 1","replacement 2"
@@ -103,11 +105,11 @@ def test_interrupted_prepare_resumes_without_repeating_committed_qwen(tmp_path, 
     seen = []
 
     class Interrupting(Qwen):
-        def describe_two_with_performance(self, video):
+        def describe_two(self, video):
             seen.append(video.name)
             if interrupted and video.name == "2.mp4":
                 raise KeyboardInterrupt
-            return super().describe_two_with_performance(video)
+            return super().describe_two(video)
 
     with pytest.raises(KeyboardInterrupt):
         module.prepare_partition(config,0,lambda _:Interrupting())
@@ -161,12 +163,15 @@ def test_five_second_source_enters_preparation(tmp_path, monkeypatch):
     assert CALLS[0] == "load"
     assert phase(cases[0]) == "generate"
     prepared = read_json(Path(cases[0]["directory"])/"preparation/prepared.json")
-    assert prepared["source_performance_1"] == "holding and handling a hockey stick"
-    assert prepared["source_performance_2"] == "holding a black clipboard with both hands"
     directory = Path(cases[0]["directory"])/"preparation"
-    assert (directory/"source_performance_1.txt").read_text().strip() == prepared["source_performance_1"]
-    assert (directory/"source_performance_2.txt").read_text().strip() == prepared["source_performance_2"]
+    for name in ("source_subject_1","source_subject_2","shot_description",
+                 "replacement_subject_1","replacement_subject_2"):
+        assert prepared[name]
+        assert (directory/f"{name}.txt").read_text().strip() == prepared[name]
+    assert "source_performance_1" not in prepared and "source_performance_2" not in prepared
+    assert not (directory/"source_performance_1.txt").exists()
     assert prepared["h3_reference_source"] == prepared["source"]  # stereo passthrough
+    assert "replacement_diversity_1" in prepared and "replacement_diversity_2" in prepared
 
 
 def test_planner_ineligible_source_is_skipped_not_failed(tmp_path, monkeypatch):
@@ -233,3 +238,27 @@ def test_multichannel_reference_is_recorded_for_h3(tmp_path, monkeypatch):
     assert prepared["reference_audio_normalized"] is True
     assert prepared["reference_audio_source_channels"] == 6
     assert prepared["reference_audio_target_channels"] == 2
+
+
+def test_production_pair_path_uses_the_three_field_source_call(tmp_path, monkeypatch):
+    """describe_two_with_performance() stays available but is not used in production."""
+    from r2v_data_v2.person_replacement import h3_pair_prepare as module
+
+    clips = tmp_path/"clips"
+    clips.mkdir()
+    cases = make_cases(tmp_path,1,clips)
+    config = {"cases":cases,"clips_root":str(clips),"qwen_model":str(tmp_path),"seed":42,"pair_id":0,
+              "identity":"identity","limits":{"0":{"prepare":2,"generate":2}}}
+    passthrough_audio(module,monkeypatch)
+    monkeypatch.setattr(module,"inspect_video_timeline",lambda _:VideoTimeline(138,25,25,1,1920,1080,5.52))
+
+    class Strict(Qwen):
+        def describe_two_with_performance(self, video):
+            pytest.fail("production pair path must not use the 5-field source call")
+
+    module.prepare_partition(config,0,lambda _:Strict())
+    assert phase(cases[0]) == "generate"
+    prepared = read_json((tmp_path/"case0")/"preparation"/"prepared.json")
+    assert {"source_subject_1","source_subject_2","shot_description",
+            "replacement_subject_1","replacement_subject_2"} <= set(prepared)
+    assert "source_performance_1" not in prepared

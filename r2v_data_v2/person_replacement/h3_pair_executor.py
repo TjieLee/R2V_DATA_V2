@@ -29,7 +29,7 @@ from .pipeline import validate_output_root
 
 TOOLS = Path(__file__).resolve().parents[2]/"tools/person_replacement"
 
-VARIANTS = {"text":"text_two_person_pdd_fsdp2_pair_v16", "frame0":"frame0_two_person_pdd_fsdp2_pair_v16"}
+VARIANTS = {"text":"text_two_person_pdd_fsdp2_pair_v17", "frame0":"frame0_two_person_pdd_fsdp2_pair_v17"}
 RESOURCE_KEYS = ("qwen_model","h3_python","h3_model_root","pdd_code_root","pdd_lora")
 BOOGU_KEYS = ("boogu_python","boogu_code_root","boogu_model_root")
 

@@ -208,8 +208,8 @@ def prepare_case(case, config, session):
     directory = Path(case["directory"])/"preparation"
     video = Path(marker["source"])
     width, height = int(marker["width"]), int(marker["height"])
-    names = ("source_subject_1","source_subject_2","source_performance_1","source_performance_2",
-             "shot_description","replacement_subject_1","replacement_subject_2")
+    names = ("source_subject_1","source_subject_2","shot_description",
+             "replacement_subject_1","replacement_subject_2")
     texts = {name:marker[name] for name in names}
     for name, value in texts.items():
         if not isinstance(value,str) or not value.strip():
@@ -218,9 +218,7 @@ def prepare_case(case, config, session):
     if not reference.is_file() or reference.stat().st_size == 0:
         raise ValueError("Boogu did not produce a usable repainted first frame")
     prompt = build_prompt(texts["source_subject_1"],texts["source_subject_2"],texts["shot_description"],
-                          texts["replacement_subject_1"],texts["replacement_subject_2"],frame0=True,
-                          performance1=texts["source_performance_1"],
-                          performance2=texts["source_performance_2"])
+                          texts["replacement_subject_1"],texts["replacement_subject_2"],frame0=True)
     publish_prepared(case,{**marker,"prompt":prompt,"variant":VARIANT,"reference_mode":REFERENCE_MODE,
                            "reference_image":str(reference),"boogu":job},
                      {**texts,"h3_prompt":prompt})

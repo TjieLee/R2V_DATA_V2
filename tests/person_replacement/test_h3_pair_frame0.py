@@ -19,8 +19,6 @@ from r2v_data_v2.person_replacement.h3_pair_state import (
 from r2v_data_v2.person_replacement.timeline import VideoTimeline
 
 TEXTS = {"source_subject_1":"a man in a blue jacket","source_subject_2":"a woman with a cup",
-         "source_performance_1":"holding and handling a hockey stick",
-         "source_performance_2":"holding a black clipboard with both hands",
          "shot_description":"They talk at a table.","replacement_subject_1":"an old man",
          "replacement_subject_2":"a young woman"}
 BOOGU_ROOT = "/mnt/workspace/litengjie/data"
@@ -60,9 +58,7 @@ class QwenSpy:
         return TEXTS["source_subject_1"],TEXTS["source_subject_2"],TEXTS["shot_description"]
 
     def describe_two_with_performance(self, video):
-        QwenSpy.calls.append("describe")
-        return (TEXTS["source_subject_1"],TEXTS["source_subject_2"],TEXTS["source_performance_1"],
-                TEXTS["source_performance_2"],TEXTS["shot_description"])
+        pytest.fail("production pair path must not use the 5-field source call")
 
     def invent_two(self, *args):
         return TEXTS["replacement_subject_1"],TEXTS["replacement_subject_2"]
@@ -170,8 +166,8 @@ def test_variant_contracts_are_distinct_and_group_size_is_not_semantic(tmp_path)
     _,text = module.make_config(arguments(base+["--variant","text"]))
     _,frame0 = module.make_config(arguments(base+["--variant","frame0"]))
     assert text["identity"] != frame0["identity"]
-    assert text["identity_details"]["contract"] == "text_two_person_pdd_fsdp2_pair_v16"
-    assert frame0["identity_details"]["contract"] == "frame0_two_person_pdd_fsdp2_pair_v16"
+    assert text["identity_details"]["contract"] == "text_two_person_pdd_fsdp2_pair_v17"
+    assert frame0["identity_details"]["contract"] == "frame0_two_person_pdd_fsdp2_pair_v17"
     for key in ("boogu_python","boogu_code_root","boogu_model_root"):
         assert key in frame0["identity_details"]["resources"] and key not in text["identity_details"]["resources"]
     _,bigger = module.make_config(arguments(base+["--variant","frame0","--group-size","4","--ulysses-degree","2"]))
@@ -604,13 +600,14 @@ def test_frame0_prompt_semantics_and_no_shot_description():
     shot = "They raise the cups in exactly this order."
     prompt = build_prompt(TEXTS["source_subject_1"],TEXTS["source_subject_2"],shot,
                           TEXTS["replacement_subject_1"],TEXTS["replacement_subject_2"],frame0=True)
-    assert "<Picture 1>" in prompt
-    assert "appearance from <Picture 1>" in prompt
-    assert "pose, motion and timing driver" in prompt
+    assert "<Picture 1>" in prompt  # frame0 keeps its original Picture 1 anchor
+    assert "<Picture 1> is the edited first-frame target appearance and composition anchor." in prompt
+    assert "<Picture 1> additionally supplies an edited first-frame visual anchor" in prompt
     assert "<Video 1>" in prompt
     assert "attribute_transfer" in prompt and "fully_preserved" in prompt
     assert shot not in prompt  # Qwen shot description is provenance only
     assert "[video editing + keyframe completion]" in prompt
+    assert "Do not retime, invent, omit, merge or reinterpret actions" in prompt
     text = build_prompt(TEXTS["source_subject_1"],TEXTS["source_subject_2"],shot,
                         TEXTS["replacement_subject_1"],TEXTS["replacement_subject_2"])
     assert "<Picture 1>" not in text

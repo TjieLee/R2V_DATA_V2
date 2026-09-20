@@ -31,7 +31,7 @@ def test_six_section_two_person_prompt(frame0):
                   "<Video 1>"):
         assert value in prompt
     assert "pose-driven" in prompt
-    assert "directly from <Video 1>" in prompt
+    assert "motion driver" in prompt
     assert DESCRIPTIONS[2] not in prompt
     if frame0:
         assert "where visible" in prompt and "first-frame" in prompt
@@ -249,18 +249,16 @@ def test_two_person_appearance_and_temporal_prompt_contract():
     assert source1 in definitions and source2 in definitions
     assert "<Subject 3> is a middle-aged woman with auburn hair in an olive-green jacket." in definitions
     assert "<Subject 4> is an adult man with short black hair in a cream linen shirt." in definitions
-    assert "<Subject 3> replaces <Subject 1> in place" in definitions
-    assert "<Subject 4> replaces <Subject 2> in place" in definitions
-    assert "<Subject 3> is pose-driven and motion-driven by <Video 1>" in definitions
-    assert "<Subject 4> is pose-driven and motion-driven by <Video 1>" in definitions
-    assert "must never coexist as separate people" in definitions
+    assert "<Subject 3> replaces only <Subject 1>'s visible human identity and appearance" in definitions
+    assert "<Subject 4> replaces only <Subject 2>'s visible human identity and appearance" in definitions
+    assert "<Subject 3> is pose-driven and motion-driven by <Subject 1>" in definitions
+    assert "<Subject 4> is pose-driven and motion-driven by <Subject 2>" in definitions
 
-    assert "Edit <Video 1> in place." in detailed
-    assert "Do not add any new person" in detailed
-    assert "same visible-person count and occupancy as <Video 1>" in detailed
-    assert "<Subject 3> and <Subject 4> inherit their corresponding source performers'" in detailed
-    assert "Only human identity, appearance and clothing may change" in detailed
-    assert "<Subject 1>" not in detailed and "<Subject 2>" not in detailed
+    assert "pose-driven and motion-driven human appearance replacement" in detailed
+    assert "Use <Video 1> as the pose and motion driver for the entire shot." in detailed
+    assert "A video of <Subject 3> and <Subject 4> performing the same specific actions" in detailed
+    assert "Copy the source performance from <Video 1>" in detailed
+    assert "Only the visible human identity, appearance and clothing" in detailed
     assert shot not in prompt
 
     assert "<Subject 1> (appears in [Shot 1]): attribute_transfer" in prompt
@@ -280,7 +278,7 @@ def test_qwen_shot_text_is_provenance_not_h3_motion_instruction():
     prompt = build_prompt("source one", "source two", shot, "target one", "target two")
     assert shot not in prompt
     assert "00:04.000" not in prompt
-    assert "directly from <Video 1>" in prompt
+    assert "pose and motion driver" in prompt
     assert "follow <Video 1>" in prompt
 
 
@@ -297,3 +295,61 @@ def test_two_person_video_sampling_only_and_short_motion_prompt(tmp_path, monkey
     client.describe(video)
     assert calls[0][0] == {"type":"video","path":str(video.resolve()),"fps":4.0}
     assert "fps" not in calls[1][0]
+
+
+def test_v13_prompt_regression_after_v15_v16_revert():
+    """The H3 prompt must match the V13 text-only contract that ran best."""
+    from r2v_data_v2.person_replacement.h3_two_person import build_prompt
+
+    shot = "UNIQUE_SHOT_MARKER_7788"
+    prompt = build_prompt("a man","a woman",shot,"an old man","a young woman")
+    definitions = prompt.split("\n\nsummary:",1)[0]
+    detailed = prompt.split("detailed_description:\n",1)[1].split("\n\noverall_soundscape:",1)[0]
+
+    for phrase in (
+        "<Subject 1> is the source performer in <Video 1> identified by a man.",
+        "<Subject 2> is the source performer in <Video 1> identified by a woman.",
+        "<Subject 3> is an old man. In the target video, <Subject 3> replaces only",
+        "<Subject 4> is a young woman. In the target video, <Subject 4> replaces only",
+        "<Subject 3> is pose-driven and motion-driven by <Subject 1> in <Video 1>",
+        "<Subject 4> is pose-driven and motion-driven by <Subject 2> in <Video 1>",
+        "This is a pose-driven and motion-driven human appearance replacement.",
+        "Use <Video 1> as the pose and motion driver for the entire shot.",
+        "performing the same specific actions as <Subject 1> and <Subject 2> in <Video 1>",
+        ("<Subject 3> follows <Subject 1>'s source pose, body motion, head motion, facial "
+         "expression, gaze, mouth movement, hand pose, limb motion, object interactions, "
+         "position and timing."),
+        "<Subject 4> follows the corresponding source performance of <Subject 2>.",
+        ("Copy the source performance from <Video 1> rather than generating or reinterpreting "
+         "a new performance."),
+        "Only the visible human identity, appearance and clothing of the two performers may change.",
+        "Do not retime, invent, omit, merge or reinterpret actions.",
+        "Preserve the camera, background, lighting and every non-person object.",
+        "If any text description conflicts with <Video 1>, follow <Video 1>.",
+        "<Subject 1> (appears in [Shot 1]): attribute_transfer",
+        "<Subject 2> (appears in [Shot 1]): attribute_transfer",
+        "<Subject 3> (appears in [Shot 1]): fully_preserved",
+        "<Subject 4> (appears in [Shot 1]): fully_preserved",
+        "<Video 1> (pose, motion, timing and source video editing): fully_preserved",
+        "This is a pose-driven human appearance replacement.",
+    ):
+        assert phrase in prompt, phrase
+    assert "<Subject 1>" in definitions and "<Subject 1>" in detailed
+    assert shot not in prompt  # SHOT_DESCRIPTION stays provenance only
+    assert "source_performance" not in prompt
+
+
+def test_v15_v16_experimental_wording_is_absent():
+    from r2v_data_v2.person_replacement.h3_two_person import build_prompt
+
+    for frame0 in (False,True):
+        prompt = build_prompt("a man","a woman","shot","an old man","a young woman",frame0=frame0)
+        for removed in ("source-only performer identity","must not appear as an additional person",
+                        "replaces <Subject 1> in place","replaces <Subject 2> in place",
+                        "must never coexist","Edit <Video 1> in place",
+                        "same visible-person count and occupancy","Do not add any new person",
+                        "duplicate either replacement","must preserve this source object interaction",
+                        "Any source object held, carried, touched",
+                        "Do not reinterpret facial emotion","The replacement happens in place"):
+            assert removed not in prompt, removed
+        assert ".." not in prompt

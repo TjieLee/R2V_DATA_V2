@@ -91,93 +91,19 @@ def detailed(prompt):
     return prompt.split("detailed_description:")[1]
 
 
-def test_performance_anchors_are_object_only_and_target_centric():
-    from r2v_data_v2.person_replacement.h3_two_person import build_prompt
-
-    shot = "UNIQUE_SHOT_MARKER_1234"
-    prompt = build_prompt("a man","a woman",shot,"an old man","a young woman",
-                          performance1="holding and handling a hockey stick",
-                          performance2="holding a black clipboard with both hands")
-    section = detailed(prompt)
-    assert "<Subject 3> must preserve this source object interaction: " \
-           "holding and handling a hockey stick." in section
-    assert "<Subject 4> must preserve this source object interaction: " \
-           "holding a black clipboard with both hands." in section
-    assert "Any source object held, carried, touched" in section
-    assert shot not in prompt  # SHOT_DESCRIPTION stays provenance only
-
-
-@pytest.mark.parametrize("value", ["holding a clipboard.","holding a clipboard..",
-                                   "holding a clipboard...","holding a clipboard"])
-def test_dynamic_anchor_never_doubles_sentence_punctuation(value):
-    from r2v_data_v2.person_replacement.h3_two_person import build_prompt
-
-    section = detailed(build_prompt("a man","a woman","shot","an old man","a young woman",
-                                    performance1=value))
-    assert "holding a clipboard." in section
-    assert "clipboard.." not in section
-    assert ".." not in section
-
-
-def test_none_anchor_produces_no_target_sentence_and_no_sentinel():
-    from r2v_data_v2.person_replacement.h3_two_person import build_prompt
-
-    section = detailed(build_prompt("a man","a woman","shot","an old man","a young woman",
-                                    performance1="NONE",performance2="none"))
-    assert "NONE" not in section and "none " not in section.lower().replace("non-person","")
-    assert "must preserve this source object interaction" not in section
-    assert "Any source object held, carried, touched" in section  # generic rule stays
-
-
-def test_detailed_section_never_reactivates_source_labels():
-    from r2v_data_v2.person_replacement.h3_two_person import build_prompt
-
-    for frame0 in (False,True):
-        section = detailed(build_prompt("a man","a woman","shot","an old man","a young woman",
-                                        frame0=frame0,
-                                        performance1="holding a black clipboard with both hands",
-                                        performance2="NONE"))
-        assert "<Subject 3>" in section and "<Subject 4>" in section
-        assert "<Subject 1>" not in section
-        assert "<Subject 2>" not in section
-        for phrase in ("Edit <Video 1> in place","Do not add any new person",
-                       "duplicate either replacement","keep a source identity as an additional person",
-                       "same visible-person count and occupancy as <Video 1>",
-                       "facial expression, gaze, mouth movement","directly from <Video 1>"):
-            assert phrase in section
-        assert "exactly two visible people" not in section
-
-
-def test_definitions_declare_source_only_and_in_place_replacement():
-    from r2v_data_v2.person_replacement.h3_two_person import build_prompt
-
-    definitions = build_prompt("a man","a woman","shot","an old man","a young woman").split(
-        "subject_definitions:")[1].split("summary:")[0]
-    assert definitions.count("source-only performer identity") == 2
-    assert definitions.count("must not appear as an additional person") == 2
-    assert definitions.count("replaces <Subject 1> in place") == 1
-    assert definitions.count("replaces <Subject 2> in place") == 1
-    assert definitions.count("must never coexist as separate people") == 2
-    summary = build_prompt("a man","a woman","shot","an old man","a young woman").split(
-        "summary:")[1].split("retention_analysis:")[0]
-    assert "The replacement happens in place." in summary
-    assert "Do not retain a source performer beside its replacement" in summary
-    assert "duplicate a replacement, or add any new person" in summary
-
-
-def test_without_performance_arguments_prompt_is_unchanged():
+def test_h3_prompt_takes_no_performance_arguments():
+    """The production H3 prompt is the reverted V13 contract: no anchors at all."""
     from r2v_data_v2.person_replacement.h3_two_person import build_prompt
 
     base = build_prompt("a man","a woman","shot","an old man","a young woman")
-    assert "preserves <Subject 1>'s source performance" not in base
-    assert "Any object held, carried, touched" not in base
+    assert "source performance and object interactions" not in base
+    assert "Any source object held, carried, touched" not in base
     assert base == build_prompt("a man","a woman","shot","an old man","a young woman")
 
 
-def test_performance_anchor_also_applies_to_frame0():
+def test_frame0_prompt_keeps_its_original_picture_anchor():
     from r2v_data_v2.person_replacement.h3_two_person import build_prompt
 
-    prompt = build_prompt("a man","a woman","shot","an old man","a young woman",frame0=True,
-                          performance1="holding a black clipboard with both hands")
-    assert "appearance from <Picture 1>" in prompt
-    assert "holding a black clipboard with both hands" in prompt
+    prompt = build_prompt("a man","a woman","shot","an old man","a young woman",frame0=True)
+    assert "<Picture 1> is the edited first-frame target appearance and composition anchor." in prompt
+    assert "<Picture 1> additionally supplies an edited first-frame visual anchor" in prompt

@@ -85,13 +85,11 @@ def prepare_partition(config, worker, qwen_factory=None):
                     if qwen is None:
                         qwen = factory(config["qwen_model"])
                         qwen._load()  # infrastructure failure is fatal, unlike bad inputs/parses
-                    (subject1, subject2, performance1, performance2,
-                     shot) = qwen.describe_two_with_performance(video)
+                    subject1, subject2, shot = qwen.describe_two(video)
                     cue1, cue2 = diversity_cues(config["seed"],case["row_sha256"])
                     replacement1, replacement2 = qwen.invent_two_with_diversity(
                         subject1,subject2,cue1,cue2)
                     texts = {"source_subject_1":subject1,"source_subject_2":subject2,
-                             "source_performance_1":performance1,"source_performance_2":performance2,
                              "shot_description":shot,
                              "replacement_subject_1":replacement1,"replacement_subject_2":replacement2}
                     original = Path(case["directory"])/"original.mp4"
@@ -114,8 +112,7 @@ def prepare_partition(config, worker, qwen_factory=None):
                         publish_qwen(case,payload,texts)
                         break
                     else:
-                        prompt = build_prompt(subject1,subject2,shot,replacement1,replacement2,
-                                              performance1=performance1,performance2=performance2)
+                        prompt = build_prompt(subject1,subject2,shot,replacement1,replacement2)
                         publish_prepared(case,{**payload,"prompt":prompt,"variant":"text_two_person"},
                                          {**texts,"h3_prompt":prompt})
                 except Exception as exc:  # noqa: BLE001 -- failure is case-local and durable
