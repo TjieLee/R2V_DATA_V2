@@ -1,6 +1,6 @@
 """One model instance per partition; per-case durable preparation commits.
 
-The text V19 path uses one resident Qwen3.8-27B writer for two calls per case.
+The text V21 path uses one resident Qwen3.6-27B writer for two calls per case.
 The frame0 experiment keeps the older 8B + Boogu path.
 """
 
@@ -40,8 +40,8 @@ MINIMUM_SOURCE_DURATION_SECONDS = 5.0
 SOURCE_SUBJECT_FIELDS = ("source_subject_1","source_subject_2")
 PERFORMANCE_FIELDS = ("source_performance_1","source_performance_2")
 QWEN_FIELDS = (*SOURCE_SUBJECT_FIELDS,*PERFORMANCE_FIELDS,"shot_description")
-PROMPT_WRITER_CONTRACT = "qwen38_two_call_full_video_h3_prompt_v1"
-PROMPT_SOURCE = "qwen38_full_video"
+PROMPT_WRITER_CONTRACT = "qwen36_two_call_full_video_h3_prompt_v1"
+PROMPT_SOURCE = "qwen36_full_video"
 
 
 def skip_payload(case, config, video, reason, *, detail="", timeline=None):
@@ -145,7 +145,7 @@ def writer_frames(duration_seconds):
 
 
 def prepare_text_partition_v19(config, worker, writer_factory=None):
-    """Text V19: one resident 27B writer, Call 1 then Call 2 per case."""
+    """Text V21: one resident Qwen3.6-27B writer, Call 1 then Call 2 per case."""
     cases = partition(config["cases"],worker,config.get("group_size",2))
     limits = config["limits"]
     if not any(eligible(case,"prepare",limits[case["case_id"]]["prepare"]) for case in cases):
