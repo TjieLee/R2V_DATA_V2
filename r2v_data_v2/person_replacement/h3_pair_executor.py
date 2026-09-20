@@ -28,6 +28,10 @@ from .pipeline import validate_output_root
 
 TOOLS = Path(__file__).resolve().parents[2]/"tools/person_replacement"
 
+VARIANTS = {"text":"text_two_person_pdd_fsdp2_pair_v14", "frame0":"frame0_two_person_pdd_fsdp2_pair_v14"}
+RESOURCE_KEYS = ("qwen_model","h3_python","h3_model_root","pdd_code_root","pdd_lora")
+BOOGU_KEYS = ("boogu_python","boogu_code_root","boogu_model_root")
+
 
 def visible_pair(value, group_size=2):
     devices = [device.strip() for device in value.split(",")]
@@ -43,14 +47,25 @@ def make_config(args):
     if not clips.is_dir() or root == clips or clips in root.parents or root in clips.parents or root in source.parents:
         raise ValueError("Output must not overlap inputs")
     cases = select_shard(source,root,args.pair_id,args.pair_size)
+    variant = getattr(args,"variant","text")
+    if variant not in VARIANTS:
+        raise ValueError(f"variant must be one of {sorted(VARIANTS)}")
     values = {key:str(getattr(args,key).expanduser().absolute()) if getattr(args,key) is not None else None
-              for key in ("qwen_model","h3_python","h3_model_root","pdd_code_root","pdd_lora")}
+              for key in RESOURCE_KEYS}
+    if variant == "frame0":
+        # Server defaults only; never validated at argparse/import time.
+        for key in BOOGU_KEYS:
+            value = getattr(args,key,None)
+            if value is None:
+                raise ValueError(f"{key} is required for the frame0 variant")
+            values[key] = str(Path(value).expanduser().absolute())
     identity = {"input":str(source),"clips_root":str(clips),"pair_id":args.pair_id,
-                "pair_size":args.pair_size,"seed":args.seed,"resources":values,
+                "pair_size":args.pair_size,"seed":args.seed,"variant":variant,"resources":values,
                 "rows":[(case["source_index"],case["row_sha256"]) for case in cases],
-                "contract":"text_two_person_pdd_fsdp2_pair_v13"}
+                "contract":VARIANTS[variant]}
     digest = hashlib.sha256(json.dumps(identity,sort_keys=True).encode()).hexdigest()
-    config = {**values,"identity":digest,"identity_details":identity,"cases":cases,"group_size":args.group_size,
+    config = {**values,"variant":variant,"identity":digest,"identity_details":identity,"cases":cases,
+              "group_size":args.group_size,
               "ulysses_degree":args.ulysses_degree,
               "clips_root":str(clips),"seed":args.seed,"pair_id":args.pair_id,
               "limits":{case["case_id"]:{stage:retry_limit(case,stage,maximum,retry_failed=args.retry_failed)
@@ -208,6 +223,15 @@ def execute_phases(config, root, devices, lock_fd, *, prepare_only=False):
                   "log":session_root/f"qwen-{i}.log"} for i,gpu in enumerate(pair)]
         if any(run_children(specs,lock_fd)):
             raise RuntimeError("Qwen preparation infrastructure failed; completed preparations remain resumable")
+    # Phase B starts only after every Qwen child has exited: Qwen and Boogu
+    # never share a GPU. Same fixed partition, one Boogu worker per GPU.
+    if config.get("variant") == "frame0" and pending("prepare"):
+        specs = [{"command":[sys.executable,str(TOOLS/"h3_pair_frame0_worker.py"),"--config",str(config_path),
+                             "--worker",str(i)],
+                  "env":worker_environment(session_root/f"frame0-{i}",gpu),
+                  "log":session_root/f"frame0-{i}.log"} for i,gpu in enumerate(pair)]
+        if any(run_children(specs,lock_fd)):
+            raise RuntimeError("Boogu frame0 preparation infrastructure failed; completed preparations remain resumable")
     restart = 0
     while not prepare_only and pending("generate"):
         before = sum(failure_count(c,"generate") for c in config["cases"])

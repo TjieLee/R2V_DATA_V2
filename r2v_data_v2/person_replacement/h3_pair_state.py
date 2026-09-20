@@ -43,6 +43,19 @@ def read_json(path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+QWEN_MARKER = "qwen.json"
+
+
+def preparation_marker(case, name):
+    return Path(case["directory"])/"preparation"/name
+
+
+def qwen_prepared(case):
+    """Intermediate Qwen marker for the frame0 variant; never a preparation commit."""
+    path = preparation_marker(case,QWEN_MARKER)
+    return read_json(path) if path.is_file() else None
+
+
 def select_shard(source, output, pair_id, pair_size):
     # Parent-only dependency: isolated H3 ranks never select input shards.
     from r2v_data_v2.manifest import iter_source_records
@@ -117,6 +130,19 @@ def publish_prepared(case, payload, texts):
             raise ValueError(f"Missing preparation field: {name}")
         atomic_bytes(directory/f"{name}.txt",(value+"\n").encode())
     atomic_json(marker,payload)  # commit marker LAST
+
+
+def publish_qwen(case, payload, texts):
+    """Durable Qwen-only marker. The frame0 Boogu phase still owns prepared.json."""
+    directory = Path(case["directory"])/"preparation"
+    marker = directory/QWEN_MARKER
+    if phase(case) != "prepare" or marker.is_file():
+        raise FileExistsError("Case is already Qwen-marked or prepared")
+    for name, value in texts.items():
+        if not isinstance(value,str) or not value.strip():
+            raise ValueError(f"Missing preparation field: {name}")
+        atomic_bytes(directory/f"{name}.txt",(value+"\n").encode())
+    atomic_json(marker,payload)  # Qwen marker LAST, still before the preparation commit
 
 
 def publish_generated(case, temporary, manifest, validate):

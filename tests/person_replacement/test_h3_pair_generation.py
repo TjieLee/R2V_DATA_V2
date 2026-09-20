@@ -12,7 +12,8 @@ def prepared_cases(tmp_path, count=3):
         case = {"case_id":str(i),"directory":str(tmp_path/str(i)),"row_sha256":str(i)}
         atomic_json(Path(case["directory"])/"preparation/prepared.json",{
             "case_id":str(i),"row_sha256":str(i),"identity":"same","source":str(tmp_path/f"{i}.mp4"),
-            "prompt":"six sections","frames":[311,124,226][i],"width":1568,"height":672,"seed":42})
+            "variant":"text_two_person","prompt":"six sections","frames":[311,124,226][i],
+            "width":1568,"height":672,"seed":42})
         cases.append(case)
     return {"cases":cases,"pair_id":0,"identity":"same",
             "limits":{str(i):{"prepare":2,"generate":1} for i in range(count)}}

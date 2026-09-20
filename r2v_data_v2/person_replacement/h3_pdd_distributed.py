@@ -183,9 +183,16 @@ class PersistentPDD:
 
     def prepare(self, job):
         from diffusers.modular_pipelines.minimax_h3 import MiniMaxH3VideoReference
-        return MiniMaxH3VideoReference.from_file(job["source"])
 
-    def infer(self, job, reference):
+        # Fixed order: Video 1 first, Picture 1 second.
+        references = [MiniMaxH3VideoReference.from_file(job["source"])]
+        if job.get("reference_image"):
+            from diffusers.modular_pipelines.minimax_h3 import MiniMaxH3ImageReference
+
+            references.append(MiniMaxH3ImageReference.from_file(job["reference_image"]))
+        return references
+
+    def infer(self, job, references):
         import torch
 
         torch.cuda.reset_peak_memory_stats(self.device)
@@ -196,7 +203,7 @@ class PersistentPDD:
         arm.arm(0)
         with torch.no_grad():
             return self.pipeline(prompt=job["prompt"],
-                references=[reference],
+                references=references,
                 num_frames=job["frames"],width=job["width"],height=job["height"],
                 num_inference_steps=9,generator=torch.Generator().manual_seed(job["seed"]),
                 output_type="np",output=["videos","audio","sampling_rate"])

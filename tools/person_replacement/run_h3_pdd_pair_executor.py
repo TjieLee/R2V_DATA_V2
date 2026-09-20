@@ -16,6 +16,11 @@ from r2v_data_v2.person_replacement.h3_pair_executor import (
 )
 from r2v_data_v2.person_replacement.h3_pair_state import inventory
 from r2v_data_v2.person_replacement.h3_pdd_distributed import parallel_layout
+from r2v_data_v2.v3.reference_edit_boogu import (
+    DEFAULT_BOOGU_CODE_ROOT,
+    DEFAULT_BOOGU_MODEL_PATH,
+    DEFAULT_BOOGU_PYTHON,
+)
 
 
 def arguments(argv=None):
@@ -34,6 +39,13 @@ def arguments(argv=None):
                         default=Path("/mnt/workspace/litengjie/data/vendor/MiniMax-H3-Acc-LoRAs"))
     parser.add_argument("--pdd-lora",type=Path,default=os.environ.get("H3_PDD_LORA"),
                         help="Existing exact server checkpoint; no guessed path or downloads")
+    parser.add_argument("--variant",choices=("text","frame0"),default="text",
+                        help="text keeps the text-only Ref2VA baseline; frame0 adds a Boogu-edited "
+                             "first-frame <Picture 1> next to the source <Video 1>")
+    # Server defaults. Never validated here; only frame0 runtime resolves them.
+    parser.add_argument("--boogu-python",type=Path,default=DEFAULT_BOOGU_PYTHON)
+    parser.add_argument("--boogu-code-root",type=Path,default=DEFAULT_BOOGU_CODE_ROOT)
+    parser.add_argument("--boogu-model-root",type=Path,default=DEFAULT_BOOGU_MODEL_PATH)
     parser.add_argument("--pair-id",type=int,default=0)
     parser.add_argument("--pair-size",type=int,default=1000)
     parser.add_argument("--group-size",type=int,choices=(2,4,8),default=2)

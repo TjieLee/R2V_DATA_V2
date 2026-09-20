@@ -32,20 +32,32 @@ def build_prompt(source1, source2, shot, replacement1, replacement2, *, frame0=F
             "<Subject 1>'s visible human identity and appearance. <Subject 3> is pose-driven "
             "and motion-driven by <Subject 1> in <Video 1> and performs the same source "
             "performance with the same timing."
-            + (" <Picture 1> additionally supplies an edited first-frame visual anchor where visible." if frame0 else "")
+            if not frame0 else
+            f"<Subject 3> is {replacement1}. <Subject 3> is the edited target counterpart of "
+            "<Subject 1> and replaces only <Subject 1>'s visible human identity and appearance. "
+            "<Subject 3> takes its visible appearance from <Picture 1>, while its pose, body motion, "
+            "facial performance, hand-object interactions, position and timing come from "
+            "<Subject 1> in <Video 1>."
         ),
         (
             f"<Subject 4> is {replacement2}. In the target video, <Subject 4> replaces only "
             "<Subject 2>'s visible human identity and appearance. <Subject 4> is pose-driven "
             "and motion-driven by <Subject 2> in <Video 1> and performs the same source "
             "performance with the same timing."
-            + (" <Picture 1> additionally supplies an edited first-frame visual anchor where visible." if frame0 else "")
+            if not frame0 else
+            f"<Subject 4> is {replacement2}. <Subject 4> is the edited target counterpart of "
+            "<Subject 2> and replaces only <Subject 2>'s visible human identity and appearance. "
+            "<Subject 4> takes its visible appearance from <Picture 1>, while its pose, body motion, "
+            "facial performance, hand-object interactions, position and timing come from "
+            "<Subject 2> in <Video 1>."
         ),
         "<Video 1> is the source video for the target video edit and the pose, motion and timing driver for the entire shot.",
     ]
     if frame0:
         definitions.append(
-            "<Picture 1> is the edited first-frame target appearance and composition anchor."
+            "<Picture 1> is the edited first frame of [Shot 1] and the appearance and composition "
+            "anchor of the target video. <Picture 1> controls the two target people's visible "
+            "appearance; it never defines pose, motion or timing."
         )
 
     retention = [
@@ -71,12 +83,20 @@ def build_prompt(source1, source2, shot, replacement1, replacement2, *, frame0=F
         )
 
     task = "video editing + keyframe completion" if frame0 else "video editing"
-    anchor = "The shot begins from the edited first-frame anchor <Picture 1>. " if frame0 else ""
+    anchor = (
+        "Use <Picture 1> as the first-frame appearance authority. Use <Video 1> as the pose, motion "
+        "and timing driver. The shot begins from the edited first-frame anchor <Picture 1>. "
+        "Only human appearance changes; no action, object state or timing may change. "
+        if frame0 else ""
+    )
     return "\n\n".join([
         "subject_definitions:\n" + "\n".join(definitions),
         (
             f"summary:\n[{task}] The target video is an edited version of <Video 1>. "
-            "This is a pose-driven human appearance replacement. <Subject 3> replaces only "
+            + ("<Picture 1> is the edited first frame of [Shot 1] and defines the edited first-frame "
+               "appearance of <Subject 3> and <Subject 4> where visible; <Video 1> provides the "
+               "complete source performance, including every pose, motion and timing. " if frame0 else "")
+            + "This is a pose-driven human appearance replacement. <Subject 3> replaces only "
             "<Subject 1>'s visible identity and appearance, and <Subject 4> replaces only "
             "<Subject 2>'s visible identity and appearance. Their pose, motion, actions and "
             "timing come directly from <Video 1>; the camera, scene and non-person objects remain unchanged."
@@ -103,6 +123,21 @@ def build_prompt(source1, source2, shot, replacement1, replacement2, *, frame0=F
         ),
         "non_diegetic_music:\nPreserve existing source music; do not add new music.",
     ])
+
+
+def boogu_frame0_prompt(source1, source2, replacement1, replacement2):
+    """Still-image first-frame edit instruction; no video timing or new people."""
+    return (
+        "Edit only the two visible people in this frame.\n\n"
+        f"Replace the visible appearance of the person matching {source1} with {replacement1}.\n\n"
+        f"Replace the visible appearance of the person matching {source2} with {replacement2}.\n\n"
+        "Preserve each person's exact pose, body orientation, facial expression, gaze, mouth state, "
+        "hand pose, held or touched objects, hand-object contacts, position, scale and occlusion.\n\n"
+        "Preserve every non-person object, the background, framing, lighting and composition.\n\n"
+        "Do not add a person who is not visible in the source frame. Do not change any action or "
+        "object state. Only the two target people's visible identity, hair, body appearance and "
+        "clothing may change."
+    )
 
 
 def boogu_prompt(source1, source2, replacement1, replacement2):

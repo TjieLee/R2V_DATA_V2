@@ -16,6 +16,25 @@ from .h3_pair_state import (
 )
 from .timeline import inspect_video_timeline
 
+VARIANTS = {"text_two_person", "frame0_two_person"}
+
+
+def reference_manifest(job):
+    """Fail closed: frame0 must carry a real Boogu reference image, no text fallback."""
+    variant = job.get("variant")
+    if variant not in VARIANTS:
+        raise ValueError(f"Prepared job has missing/unknown variant: {variant}")
+    references = [{"type":"video","label":"Video 1","path":job["source"]}]
+    if variant == "frame0_two_person":
+        if job.get("reference_mode") != "frame0_boogu":
+            raise ValueError("frame0 variant requires reference_mode=frame0_boogu")
+        image = job.get("reference_image")
+        if not image or not Path(image).is_file():
+            raise ValueError("frame0 variant requires an existing repainted reference image; "
+                             "no silent text-only fallback")
+        references.append({"type":"image","label":"Picture 1","path":str(image)})
+    return variant, references
+
 
 def validate_output(path, job):
     actual = inspect_video_timeline(path)
@@ -34,10 +53,12 @@ def _next_job(config):
                               ("identity",config["identity"])):
             if job.get(key) != expected:
                 raise ValueError(f"Prepared case {key} mismatch")
+        variant, references = reference_manifest(job)  # validated before any GPU work
         attempt = begin_attempt(case,"generate",{"pair_id":config["pair_id"],"rank":0})
         temporary = Path(case["directory"])/"tmp"/f"generate-{attempt['attempt']:03d}"/"raw.mp4"
         temporary.parent.mkdir(parents=True,exist_ok=False)
-        return {"kind":"job","case":case,"job":job,"attempt":attempt,"temporary":str(temporary)}
+        return {"kind":"job","case":case,"job":job,"attempt":attempt,"temporary":str(temporary),
+                "variant":variant,"references":references}
     return {"kind":"stop"}
 
 
@@ -100,8 +121,8 @@ def generate_loop(config, channel, backend_factory, stats_path):
                     encode_started = time.monotonic()
                     backend.encode(result,temporary)
                     timings["encode_wall_seconds"] = time.monotonic()-encode_started
-                    manifest = {**message["job"],**backend.metadata,**timings,"variant":"text_two_person",
-                                "references":[{"type":"video","path":message["job"]["source"]}],
+                    manifest = {**message["job"],**backend.metadata,**timings,
+                                "variant":message["variant"],"references":message["references"],
                                 "attempt":message["attempt"],"rank_memory":[r["memory"] for r in reports],
                                 "wall_seconds":time.monotonic()-started,
                                 "worker_started_at":stats["worker_started_at"],
