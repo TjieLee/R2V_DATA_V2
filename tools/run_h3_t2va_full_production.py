@@ -82,7 +82,13 @@ def main(argv=None):
     root.mkdir(parents=True, exist_ok=True)
     if not os.access(root, os.W_OK):
         raise PermissionError(f"production root is not writable: {root}")
+    print("source_index_start", flush=True)
     index = production.build_source_index(args.shot_manifest, root)
+    print(
+        f"source_index_ready shards={len(index['shards'])} "
+        f"records={index['source_record_count']}",
+        flush=True,
+    )
     explicit = [int(x) for x in args.shards.split(",")] if args.shards else None
     assigned = production.shard_order(
         explicit=explicit,
@@ -95,6 +101,7 @@ def main(argv=None):
     if any(s >= len(index["shards"]) for s in assigned):
         raise ValueError("shard outside source inventory")
     if explicit is None:
+        print(f"resume_scan_start assigned={len(assigned)}", flush=True)
         order, resume_schedule = full.resume_first_assigned_shards(root, assigned)
     else:
         order = assigned
