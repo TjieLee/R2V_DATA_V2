@@ -96,6 +96,36 @@ The diversity cue must not be satisfied only by a clothing change.
 The replacement should also differ in facial appearance and overall styling
 from the source performer.
 
+Each REPLACEMENT_SUBJECT line should be compact but identity-bearing. When
+visually plausible, include:
+- an apparent age band,
+- a hair/head appearance,
+- a face-shape or grooming detail,
+- and a clothing/style detail with at least one useful colour or material cue.
+
+Do not use empty identity phrases such as "a generic man", "a generic woman",
+"a generic person", or "an ordinary person" as the replacement description.
+The replacement must read like a specific new casting choice, not a vague
+placeholder.
+
+FEW-SHOT IDENTITY EXAMPLES
+
+These examples demonstrate the desired identity distance and description
+density only. Do not copy their attributes unless the current video and
+diversity cue support them.
+
+Example A:
+SOURCE_PERFORMER_1: a young adult man with short black hair and a light grey hoodie, initially on the left
+SOURCE_PERFORMER_2: a young adult woman with long straight dark hair and a pale blouse, initially on the right
+REPLACEMENT_SUBJECT_1: a middle-aged man with cropped salt-and-pepper hair, a broad angular face, light stubble, and a dark green crew-neck t-shirt
+REPLACEMENT_SUBJECT_2: a woman in her thirties with a short wavy auburn bob, a narrow oval face, subtle makeup, and a burgundy retro blouse with restrained sequined trim
+
+Example B:
+SOURCE_PERFORMER_1: an older man with thinning grey hair and a dark jacket, initially nearer the camera
+SOURCE_PERFORMER_2: a young woman with shoulder-length dark hair and a plain top, initially farther back
+REPLACEMENT_SUBJECT_1: a younger adult man with thick curly brown hair, a clean-shaven round face, and a fitted navy casual shirt
+REPLACEMENT_SUBJECT_2: a middle-aged woman with a neat short black bob, a defined square jaw, thin rectangular glasses, and a muted blue professional blouse
+
 Keep the replacement person's overall height/body scale and silhouette broadly
 compatible with the corresponding source performer so source pose and spatial
 occupancy can be preserved.
@@ -229,6 +259,45 @@ Whenever supported by <Video 1>, the first sentence should jointly state:
 
 Do not begin [Shot 1] with static clothing, static background description,
 or generic wording such as "preserve the original motion".
+
+OBSERVATION-ONLY LANGUAGE
+
+Describe visible motion, pose, facial configuration, gaze, mouth movement,
+interaction, spatial relations and camera behavior. Do not infer invisible
+causes, intentions, powers, hidden objects or psychological explanations.
+
+Avoid speculative phrases such as:
+- "as if"
+- "seems to"
+- "appears to be trying to"
+- "suggesting that"
+
+For example, if a hand extends into empty space, describe the hand extension and
+finger configuration. Do not invent an invisible force, unseen object or motive.
+Prefer visible facial facts such as a smile, lowered gaze, tightened lips or
+furrowed brows over inferred inner states.
+
+FEW-SHOT DETAILED-DESCRIPTION STYLE EXAMPLES
+
+These examples demonstrate structure and emphasis only. Never copy their
+motion, camera behavior, scene or interaction unless it is actually visible in
+the current <Video 1>.
+
+Example A — static camera:
+
+detailed_description:
+<Subject 1> reaches his right hand toward the mostly stationary <Subject 2> and then draws it back while keeping his body oriented toward her, with the camera holding a static medium two-shot throughout.
+
+[Shot 1]
+<Subject 1> sits on the left facing slightly toward <Subject 2> and extends his right arm forward with an open palm and partially curled fingers, while <Subject 2> remains nearly still on the right with her head slightly lowered; the camera stays fixed in a medium composition. <Subject 1> then gradually retracts his hand toward his torso without changing seats, while <Subject 2> maintains her position and the framing remains static.
+
+Example B — moving camera:
+
+detailed_description:
+<Subject 1> and <Subject 2> walk forward side by side while briefly turning toward each other and exchanging hand gestures, as the camera tracks backward with them and gradually tightens the two-shot.
+
+[Shot 1]
+<Subject 1> and <Subject 2> advance together from the mid-ground toward the foreground while the camera tracks backward at their pace, keeping both subjects centered. <Subject 1> turns his head toward <Subject 2> and lifts one hand during the exchange; <Subject 2> responds with a small hand motion while continuing forward, and the camera slowly reframes them more tightly without introducing a cut.
 
 DETAILED DESCRIPTION
 
@@ -482,6 +551,25 @@ def validate_h3_prompt_writer_output(text):
     for token in ("<Subject 1>","<Subject 2>"):
         if token not in detailed:
             raise ValueError(f"detailed_description is missing {token}")
+    if "[Shot 1]" not in detailed:
+        raise ValueError("detailed_description must contain [Shot 1]")
+    preface = detailed.split("[Shot 1]",1)[0].strip()
+    if not preface:
+        raise ValueError("detailed_description must contain a dynamic preface before [Shot 1]")
+    for token in ("<Subject 1>","<Subject 2>"):
+        if token not in preface:
+            raise ValueError(f"dynamic preface is missing {token}")
+    if not re.search(r"\b(?:camera|framing|shot|view)\b",preface,re.IGNORECASE):
+        raise ValueError("dynamic preface must describe camera or framing behavior")
+    speculative = re.search(
+        r"\b(?:as if|seems to|appears to be trying to|suggesting that|invisible force)\b",
+        detailed,
+        re.IGNORECASE,
+    )
+    if speculative:
+        raise ValueError(
+            f"detailed_description uses speculative language: {speculative.group(0)!r}"
+        )
     return text.strip()
 
 

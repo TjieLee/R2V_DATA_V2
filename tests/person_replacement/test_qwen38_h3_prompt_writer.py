@@ -26,7 +26,9 @@ retention_analysis:
 <Video 1>: preserve - preserve the complete action sequence and shot structure.
 
 detailed_description:
-[Shot 1] <Subject 1> stands at the left of frame facing <Subject 2> in <Video 1> and lifts a hand.
+<Subject 1> raises one hand toward <Subject 2> while <Subject 2> remains in place, with the camera holding a static wide framing throughout.
+
+[Shot 1] <Subject 1> stands at the left of frame facing <Subject 2> in <Video 1> and lifts a hand while the camera remains static.
 The camera holds a static wide framing throughout.
 
 overall_soundscape:
@@ -397,6 +399,59 @@ def test_system_prompt_adds_global_preface_and_first_sentence_priority():
     assert ("Do not begin [Shot 1] with static clothing, static background description,"
             in prompt)
     assert 'generic wording such as "preserve the original motion".' in prompt
+
+
+def test_prompt_includes_identity_and_motion_icl_examples():
+    from r2v_data_v2.person_replacement.qwen38_h3_prompt_writer import (
+        H3_PROMPT_SYSTEM_PROMPT,
+        REPLACEMENT_PLANNING_PROMPT,
+    )
+
+    replacement = REPLACEMENT_PLANNING_PROMPT
+    assert "FEW-SHOT IDENTITY EXAMPLES" in replacement
+    assert "Do not use empty identity phrases" in replacement
+    assert '"a generic man"' in replacement and '"a generic woman"' in replacement
+    assert "cropped salt-and-pepper hair" in replacement
+    assert "short wavy auburn bob" in replacement
+    assert "a face-shape or grooming detail" in replacement
+
+    system = H3_PROMPT_SYSTEM_PROMPT
+    assert "OBSERVATION-ONLY LANGUAGE" in system
+    assert "FEW-SHOT DETAILED-DESCRIPTION STYLE EXAMPLES" in system
+    assert "Example A — static camera:" in system
+    assert "Example B — moving camera:" in system
+    assert "camera holding a static medium two-shot" in system
+    assert "camera tracks backward with them" in system
+    assert "Do not invent an invisible force" in system
+
+
+def test_validator_requires_dynamic_preface_and_rejects_speculation():
+    from r2v_data_v2.person_replacement.qwen38_h3_prompt_writer import (
+        validate_h3_prompt_writer_output,
+    )
+
+    missing_preface = LEGAL_PROMPT.replace(
+        "<Subject 1> raises one hand toward <Subject 2> while <Subject 2> remains in place, "
+        "with the camera holding a static wide framing throughout.\n\n",
+        "",
+    )
+    with pytest.raises(ValueError,match="dynamic preface"):
+        validate_h3_prompt_writer_output(missing_preface)
+
+    missing_camera = LEGAL_PROMPT.replace(
+        "with the camera holding a static wide framing throughout.",
+        "and both remain visible throughout.",
+        1,
+    )
+    with pytest.raises(ValueError,match="camera or framing"):
+        validate_h3_prompt_writer_output(missing_camera)
+
+    speculative = LEGAL_PROMPT.replace(
+        "and lifts a hand while the camera remains static.",
+        "and lifts a hand as if controlling an invisible force while the camera remains static.",
+    )
+    with pytest.raises(ValueError,match="speculative language"):
+        validate_h3_prompt_writer_output(speculative)
 
 
 def test_system_prompt_still_enforces_the_six_section_contract():
