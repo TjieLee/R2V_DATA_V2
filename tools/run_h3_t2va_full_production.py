@@ -83,16 +83,27 @@ def main(argv=None):
     if not os.access(root, os.W_OK):
         raise PermissionError(f"production root is not writable: {root}")
     index = production.build_source_index(args.shot_manifest, root)
-    order = production.shard_order(
-        explicit=[int(x) for x in args.shards.split(",")] if args.shards else None,
+    explicit = [int(x) for x in args.shards.split(",")] if args.shards else None
+    assigned = production.shard_order(
+        explicit=explicit,
         start=args.shard_start,
         end=args.shard_end if args.shard_end is not None else len(index["shards"]) - 1,
         seed=args.shard_seed,
         rank=args.rank,
         world_size=args.world_size,
     )
-    if any(s >= len(index["shards"]) for s in order):
+    if any(s >= len(index["shards"]) for s in assigned):
         raise ValueError("shard outside source inventory")
+    if explicit is None:
+        order, resume_schedule = full.resume_first_assigned_shards(root, assigned)
+    else:
+        order = assigned
+        resume_schedule = {
+            "unfinished": 0,
+            "fresh": len(order),
+            "complete_skipped": 0,
+            "explicit": True,
+        }
     if args.dry_run:
         return {
             "dry_run": True,
@@ -100,8 +111,22 @@ def main(argv=None):
             "gpu_ids": gpu_ids,
             "request_workers": args.request_workers,
             "canonical_workers": args.canonical_workers,
+            "resume_schedule": resume_schedule,
             "model_call_count": 0,
         }
+    print(
+        "schedule "
+        + json.dumps(
+            {
+                "rank": args.rank,
+                "world_size": args.world_size,
+                **resume_schedule,
+                "scheduled": len(order),
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
     if not args.mimo_sglang.is_file() or not os.access(args.mimo_sglang, os.X_OK):
         raise ValueError(f"MiMo SGLang executable unavailable: {args.mimo_sglang}")
     if not args.mimo_checkpoint.is_dir():
