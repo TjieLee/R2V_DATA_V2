@@ -37,6 +37,7 @@ from r2v_data_v2.v3.pair import (
     EntityReferenceState,
     PreparedEntityReferenceDecision,
     _BackgroundFinalGuardRuntime,
+    _build_same_parent_donor_index,
     _GuardFailClosed,
     _publish_pair_result,
     finalize_entity_reference,
@@ -934,6 +935,136 @@ class PairEpochRunner:
                     unresolved.append(pending.job_id())
         return tuple(unresolved)
 
+    # -- frozen donor snapshot --------------------------------------------
+
+    def _clip_job_ids(self, shard: str, clip_uid: str) -> set[str]:
+        """Job ids currently planned for one clip, for barrier bookkeeping."""
+        return {
+            str(record.get("job_id", ""))
+            for record in self.phase.read_plan()
+            if record.get("clip_uid") == clip_uid
+            and record.get("canonical_shard") == shard
+        }
+
+
+    def _shard_view(self, shard: str, *, exclude: Sequence[str] = ()) -> Any:
+        """Storage view limited to this shard's current eligible Pair view."""
+        from r2v_data_v2.v3.post_mask_runtime import _ShardStorage
+
+        blocked = set(exclude)
+        storage = self._storage_for(shard)
+        return _ShardStorage(
+            storage, tuple(uid for uid in self._eligible_for(shard) if uid not in blocked)
+        )
+
+    def _unresolved_primary_clip_uids(
+        self, shard: str, unresolved_job_ids: Sequence[str]
+    ) -> tuple[str, ...]:
+        """Fresh targets whose primary work has not settled."""
+        plan = self._primary_plan(shard)
+        storage = self._storage_for(shard)
+        blocked: list[str] = []
+        for clip_uid in plan["eligible_clip_uids"]:
+            if plan["clips"][clip_uid]["classification"] != CLIP_FRESH_TARGET:
+                continue
+            context = self._primary_context(storage, clip_uid)
+            if context is None:
+                continue
+            _, temporary, pending = self._replay_primary_clip(
+                shard, storage, clip_uid, context, stop_at_unresolved=True
+            )
+            self._discard_temporary(temporary)
+            known = self._clip_job_ids(shard, clip_uid)
+            if pending is not None and (
+                not unresolved_job_ids or not known & set(unresolved_job_ids)
+            ) or known & set(unresolved_job_ids):
+                blocked.append(clip_uid)
+        return tuple(sorted(blocked))
+
+    def _cross_pair_targets(
+        self, shard: str, *, blocked: Sequence[str]
+    ) -> tuple[str, ...]:
+        """Cross targets: fresh in the durable plan, published, not blocked.
+
+        A clip that already had a pairing before this launch is
+        ``existing_pairing`` and can only ever be a donor, never a target --
+        even though a fresh target that has since published looks identical
+        if you only look at clip.pairing.
+        """
+        plan = self._primary_plan(shard)
+        storage = self._storage_for(shard)
+        skip = set(blocked)
+        targets: list[str] = []
+        for clip_uid in plan["eligible_clip_uids"]:
+            if plan["clips"][clip_uid]["classification"] != CLIP_FRESH_TARGET:
+                continue
+            if clip_uid in skip:
+                continue
+            if storage.read_clip(clip_uid).pairing is None:
+                continue
+            targets.append(clip_uid)
+        return tuple(targets)
+
+    def _snapshot_path(self, shard: str) -> Path:
+        return _semantic_root(self.ledger) / "donor_snapshots" / f"{shard}.json"
+
+    def _snapshot_identity(self, payload: Mapping[str, Any]) -> str:
+        return semantic_input_digest(payload)
+
+    def freeze_donor_snapshot(
+        self, shard: str, *, unresolved_job_ids: Sequence[str] = ()
+    ) -> dict[str, Any]:
+        """Freeze this shard's donor index once. Create-or-validate.
+
+        The donor view excludes clips whose primary work has not settled, so
+        a half-finished primary can never contribute a stale donor.
+        """
+        blocked = self._unresolved_primary_clip_uids(shard, unresolved_job_ids)
+        targets = self._cross_pair_targets(shard, blocked=blocked)
+        view = self._shard_view(shard, exclude=blocked)
+        live = _build_same_parent_donor_index(self.config, view)
+        storage = self._storage_for(shard)
+        groups = []
+        for key in sorted(live, key=lambda item: (str(item[0]), str(item[1]))):
+            parent, reference_type = key
+            groups.append(
+                {
+                    "parent_video_id": parent,
+                    "reference_type": str(reference_type),
+                    "donors": [
+                        dict(ordinal=ordinal, **_donor_projection(donor, storage))
+                        for ordinal, donor in enumerate(live[key])
+                    ],
+                }
+            )
+        payload = {
+            "schema": PAIR_DONOR_SNAPSHOT_SCHEMA,
+            "canonical_shard": shard,
+            "eligible_view": list(self._eligible_for(shard)),
+            "blocked_primary_clip_uids": list(blocked),
+            "cross_pair_target_clip_uids": list(targets),
+            "groups": groups,
+        }
+        _write_json_once(self._snapshot_path(shard), payload)
+        return payload
+
+    def donor_snapshot(self, shard: str) -> dict[str, Any]:
+        """Load the frozen snapshot. Never rebuilt, never expanded."""
+        payload = _read_json(self._snapshot_path(shard))
+        if payload is None:
+            raise PairEpochError(f"no frozen donor snapshot for shard {shard!r}")
+        if payload.get("schema") != PAIR_DONOR_SNAPSHOT_SCHEMA:
+            raise PairEpochError(f"unsupported donor snapshot schema for {shard!r}")
+        expected = {"canonical_shard": shard, "eligible_view": list(self._eligible_for(shard))}
+        for key, value in expected.items():
+            if payload.get(key) != value:
+                raise PairEpochError(f"frozen donor snapshot {key} drifted for {shard!r}")
+        return payload
+
+    def frozen_donor_index(self, shard: str) -> dict[tuple[str, str], tuple[Any, ...]]:
+        """Restore the frozen index for _donors_for_target."""
+        return load_frozen_donor_index(self._storage_for(shard), self.donor_snapshot(shard))
+
     # -- model calls -------------------------------------------------------
 
     def run(self, job: ModelJob, handle: Any) -> JobResult:
@@ -1090,3 +1221,91 @@ class PairEpochRunner:
             shard, storage, job.clip_uid, context[1], states, temporary
         )
         return (guard,) if guard is not None else ()
+
+
+# ---------------------------------------------------------------------------
+# Frozen per-shard donor snapshot (Commit 3b)
+#
+# Donor eligibility, natural ordering, self exclusion and the donor cap all
+# stay in pair.py. This module only freezes the ordered index that
+# _build_same_parent_donor_index() returned and restores it later. It never
+# re-filters, re-sorts, re-caps or re-derives eligibility.
+# ---------------------------------------------------------------------------
+
+PAIR_CROSS_JUDGE_JOB = "pair_cross_pair_judge"
+CALL_SITE_CROSS_PAIR = "cross_pair"
+
+PAIR_DONOR_SNAPSHOT_SCHEMA = "post_mask_epoch_pair_donor_snapshot/1"
+
+
+def _donor_projection(donor: Any, storage: RunStorage) -> dict[str, Any]:
+    path = Path(donor.image_path)
+    payload = path.read_bytes() if path.is_file() else b""
+    return {
+        "clip_uid": donor.clip.clip_uid,
+        "clip_suffix": donor.clip.source.clip_suffix,
+        "entity_id": donor.entity.entity_id,
+        "entity": donor.entity.model_dump(mode="json"),
+        "reference": donor.reference.model_dump(mode="json"),
+        "image_sha256": _sha256_bytes(payload),
+        "image_size": len(payload),
+    }
+
+
+def _restore_donor(
+    storage: RunStorage, parent: str, entry: Mapping[str, Any]
+) -> Any:
+    """Validate one frozen donor projection and rebuild its carrier."""
+    from r2v_data_v2.v3.pair import _CrossPairDonor
+
+    clip_uid = entry["clip_uid"]
+    clip = storage.read_clip(clip_uid)
+    if clip.source.parent_video_id != parent:
+        raise PairEpochError(f"frozen donor {clip_uid} parent drifted")
+    if clip.source.clip_suffix != entry["clip_suffix"]:
+        raise PairEpochError(f"frozen donor {clip_uid} clip_suffix drifted")
+    if clip.pairing is None or clip.pairing.status != "ready":
+        raise PairEpochError(f"frozen donor {clip_uid} pairing is not ready")
+
+    entities = tuple(clip.annotation.entities) if clip.annotation is not None else ()
+    entity = next((item for item in entities if item.entity_id == entry["entity_id"]), None)
+    if entity is None:
+        raise PairEpochError(f"frozen donor {clip_uid} lost entity {entry['entity_id']}")
+    if entity.model_dump(mode="json") != entry["entity"]:
+        raise PairEpochError(f"frozen donor {clip_uid} entity projection drifted")
+    if entry["entity_id"] not in (clip.pairing.retained_entity_ids or ()):
+        raise PairEpochError(f"frozen donor {clip_uid} no longer retains {entry['entity_id']}")
+
+    states = tuple(clip.references.entities) if clip.references is not None else ()
+    state = next((item for item in states if item.entity_id == entry["entity_id"]), None)
+    if state is None:
+        raise PairEpochError(f"frozen donor {clip_uid} lost reference {entry['entity_id']}")
+    if state.model_dump(mode="json") != entry["reference"]:
+        raise PairEpochError(f"frozen donor {clip_uid} reference projection drifted")
+
+    path = storage.selected_entity_path(clip_uid, entry["entity_id"])
+    if not path.is_file():
+        raise PairEpochError(f"frozen donor {clip_uid} lost its selected PNG")
+    payload = path.read_bytes()
+    if len(payload) != entry["image_size"] or _sha256_bytes(payload) != entry["image_sha256"]:
+        raise PairEpochError(f"frozen donor {clip_uid} selected PNG changed")
+
+    return _CrossPairDonor(clip=clip, entity=entity, reference=state, image_path=path)
+
+
+def load_frozen_donor_index(
+    storage: RunStorage, snapshot: Mapping[str, Any]
+) -> dict[tuple[str, str], tuple[Any, ...]]:
+    """Reconstruct the frozen index, keeping the exact snapshot order.
+
+    Nothing is re-sorted and eligibility is never re-derived: the result is
+    fed straight to pair.py's _donors_for_target.
+    """
+    index: dict[tuple[str, str], list[Any]] = {}
+    for group in snapshot.get("groups", ()):
+        key = (group["parent_video_id"], group["reference_type"])
+        donors: list[Any] = []
+        for entry in group["donors"]:
+            donors.append(_restore_donor(storage, group["parent_video_id"], entry))
+        index[key] = donors
+    return {key: tuple(items) for key, items in index.items()}

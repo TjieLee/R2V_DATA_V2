@@ -1935,3 +1935,182 @@ def test_existing_pairing_failure_diagnostic_does_not_grow_unbounded(
     restarted = _runner(root, config, storage)
     restarted._primary_plan(SHARD)
     assert restarted.stats[SHARD]["failed"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Q. Frozen per-shard donor snapshot (3b)
+# ---------------------------------------------------------------------------
+
+
+def _three_donor_shard(config: V3Config, storage: RunStorage) -> None:
+    """One ready full donor plus two rejected targets, same parent."""
+    for uid, suffix in (("donor", "2"),):
+        _add_ready_clip(
+            config, storage, clip_uid=uid, clip_suffix=suffix, entity_types=("subject",)
+        )
+    for uid, suffix in (("target-b", "20"), ("target-c", "21")):
+        _add_ready_clip(
+            config, storage, clip_uid=uid, clip_suffix=suffix, entity_types=("subject",)
+        )
+
+
+def _drain_primary(runner: Any, judge: Any = None) -> None:
+    """Run every primary job to its terminal state."""
+    judge = judge if judge is not None else _Judge()
+    pending = list(runner.seed_primary_jobs())
+    guard: Any = None
+    while pending:
+        job = pending.pop(0)
+        result = _run_one(runner, job, judge if guard is None else guard)
+        if not result.committed:
+            break
+        pending.extend(runner.finalize(job, result))
+
+
+def test_donor_snapshot_order_matches_the_live_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from r2v_data_v2.v3.pair import _build_same_parent_donor_index
+    from r2v_data_v2.v3.post_mask_runtime import _ShardStorage
+
+    config = _pair_config(
+        tmp_path, monkeypatch, same_parent_fallback_enabled=True
+    )
+    storage = _storage(config, entity_types=("subject",))
+    _three_donor_shard(config, storage)
+    runner = _runner(
+        tmp_path,
+        config,
+        storage,
+        clip_uids=("clip-1", "donor", "target-b", "target-c"),
+    )
+    runner.seed_primary_jobs()
+
+    snapshot = runner.freeze_donor_snapshot(SHARD)
+    live = _build_same_parent_donor_index(
+        config,
+        _ShardStorage(
+            storage, ("clip-1", "donor", "target-b", "target-c")
+        ),
+    )
+    for group in snapshot["groups"]:
+        key = (group["parent_video_id"], group["reference_type"])
+        expected = [d.clip.clip_uid for d in live.get(key, ())]
+        assert [d["clip_uid"] for d in group["donors"]] == expected
+        assert [d["ordinal"] for d in group["donors"]] == list(range(len(expected)))
+
+
+def test_donor_snapshot_restore_feeds_donors_for_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from r2v_data_v2.v3.pair import _donors_for_target
+
+    config = _pair_config(
+        tmp_path, monkeypatch, same_parent_fallback_enabled=True
+    )
+    storage = _storage(config, entity_types=("subject",))
+    _three_donor_shard(config, storage)
+    runner = _runner(
+        tmp_path,
+        config,
+        storage,
+        clip_uids=("clip-1", "donor", "target-b", "target-c"),
+    )
+    # Only clip-1 and donor publish a full reference, so they are the donors.
+    _drain_primary(
+        runner,
+        _ScopedJudge({("target-b", "e1"): "reject", ("target-c", "e1"): "reject"}),
+    )
+    runner.freeze_donor_snapshot(SHARD)
+
+    index = runner.frozen_donor_index(SHARD)
+    target = storage.read_clip("target-b")
+    donors = _donors_for_target(
+        config, index, target_clip=target, target_entity=target.annotation.entities[0]
+    )
+    # clip-1 also published a full reference, so it is a donor too; target-b
+    # itself is excluded by pair.py's self exclusion.
+    assert [d.clip.clip_uid for d in donors] == ["donor", "clip-1"]
+    assert "target-b" not in [d.clip.clip_uid for d in donors]
+
+
+def test_donor_snapshot_tamper_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from r2v_data_v2.v3.post_mask_epoch_pair import PairEpochError
+
+    config = _pair_config(
+        tmp_path, monkeypatch, same_parent_fallback_enabled=True
+    )
+    storage = _storage(config, entity_types=("subject",))
+    _three_donor_shard(config, storage)
+    runner = _runner(
+        tmp_path,
+        config,
+        storage,
+        clip_uids=("clip-1", "donor", "target-b", "target-c"),
+    )
+    _drain_primary(runner)
+    runner.freeze_donor_snapshot(SHARD)
+
+    storage.selected_entity_path("donor", "e1").write_bytes(b"tampered")
+    restarted = _runner(
+        tmp_path,
+        config,
+        storage,
+        clip_uids=("clip-1", "donor", "target-b", "target-c"),
+    )
+    with pytest.raises(PairEpochError, match="selected PNG changed"):
+        restarted.frozen_donor_index(SHARD)
+
+
+def test_donor_snapshot_does_not_expand_after_new_full_reference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _pair_config(
+        tmp_path, monkeypatch, same_parent_fallback_enabled=True
+    )
+    storage = _storage(config, entity_types=("subject",))
+    _three_donor_shard(config, storage)
+    runner = _runner(
+        tmp_path,
+        config,
+        storage,
+        clip_uids=("clip-1", "donor", "target-b", "target-c"),
+    )
+    _drain_primary(runner)
+    first = runner.freeze_donor_snapshot(SHARD)
+    before = [
+        (g["parent_video_id"], [d["clip_uid"] for d in g["donors"]])
+        for g in first["groups"]
+    ]
+
+    # target-b becomes a full reference: the frozen snapshot must not grow.
+    again = runner.freeze_donor_snapshot(SHARD)
+    after = [
+        (g["parent_video_id"], [d["clip_uid"] for d in g["donors"]])
+        for g in again["groups"]
+    ]
+    assert after == before
+    assert first == again, "an existing snapshot is reused, never rewritten"
+
+
+def test_existing_donor_is_not_a_cross_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _pair_config(
+        tmp_path, monkeypatch, same_parent_fallback_enabled=True
+    )
+    storage = _storage(config, entity_types=("subject",))
+    pair_clips(config, storage, judge=_Judge())
+    _add_ready_clip(
+        config, storage, clip_uid="target", clip_suffix="20", entity_types=("subject",)
+    )
+    runner = _runner(tmp_path, config, storage, clip_uids=("clip-1", "target"))
+    _drain_primary(runner)
+    snapshot = runner.freeze_donor_snapshot(SHARD)
+
+    assert "clip-1" not in snapshot["cross_pair_target_clip_uids"]
+    assert "target" in snapshot["cross_pair_target_clip_uids"]
+    donors = [d["clip_uid"] for g in snapshot["groups"] for d in g["donors"]]
+    assert "clip-1" in donors, "the pre-launch pairing stays a valid donor"
