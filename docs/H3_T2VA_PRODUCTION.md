@@ -19,10 +19,11 @@ takes ordered_shards[RANK::WORLD_SIZE], fixing cross-node ownership before any
 resume inspection. Each node then reorders only its own assigned shards:
 unfinished shards first, never-started shards second, and shards with COMPLETE
 are omitted from automatic scheduling. Resume classification is intentionally
-metadata-only: it checks COMPLETE, state.jsonl.partial, and whether stage_state/
-contains any top-level *.json file. It never opens stage JSON, receipts, media,
-or hashes during scheduling. Explicit SHARDS preserves the caller's exact order
-and bypasses this automatic resume-first filtering.
+metadata-only and batched: it enumerates shards/ once, treats any existing shard
+directory without a top-level COMPLETE file as unfinished, and treats absent
+shard directories as fresh. It never opens stage JSON, receipts, media, or hashes
+during scheduling. Explicit SHARDS preserves the caller's exact order and
+bypasses this automatic resume-first filtering.
 
 RANK/WORLD_SIZE are node-level scheduling coordinates: different nodes receive
 different shard sequences. Inside a node, the eight GPUs do not take eight
