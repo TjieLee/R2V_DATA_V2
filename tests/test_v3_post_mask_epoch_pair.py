@@ -32,7 +32,12 @@ from r2v_data_v2.v3.reference_judge import (
     EntityReferenceDecisionAttempt,
     EntityReferenceJudgeFailure,
 )
-from r2v_data_v2.v3.schemas import PairingState
+from r2v_data_v2.v3.schemas import (
+    BackgroundAnnotation,
+    BackgroundReferenceState,
+    PairingState,
+    ReferencesState,
+)
 from r2v_data_v2.v3.storage import RunStorage
 from tests.test_v3_pair import (
     _add_ready_clip,
@@ -542,3 +547,312 @@ def test_characterize_reference_edit_enabled_bypairs_completion(
     assert stats.completion_ready == 0
     assert stats.completion_rejected == 0
     assert stats.ready == 1
+
+
+# ---------------------------------------------------------------------------
+# H. Cross-pair failure stops later target entities
+# ---------------------------------------------------------------------------
+
+
+class _ScopedJudge:
+    """Per-clip scopes, plus an explicit "this clip must never be judged" set."""
+
+    def __init__(
+        self,
+        scopes: dict[tuple[str, str], str] | None = None,
+        *,
+        forbidden: tuple[str, ...] = (),
+    ) -> None:
+        self.scopes = scopes or {}
+        self.forbidden = set(forbidden)
+        self.calls: list[tuple[str, str]] = []
+        self.close_calls = 0
+
+    def decide(self, *, entity, candidates, source_images):
+        clip_uid = Path(candidates[0].image_path).parts[1]
+        self.calls.append((clip_uid, entity.entity_id))
+        if clip_uid in self.forbidden:
+            raise AssertionError(f"{clip_uid} must not be judged again")
+        return EntityReferenceDecisionAttempt(
+            decision=_decision(
+                self.scopes.get((clip_uid, entity.entity_id), "full"),
+                entity.reference_type,
+            ),
+            raw_responses=("{}",),
+            repair_attempts=0,
+        )
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+def _two_entity_target_storage(config: V3Config) -> RunStorage:
+    """One ready full donor plus a two-entity same-parent target."""
+    storage = RunStorage(config)
+    storage.initialize(git_commit="cross-two-entity-test")
+    _add_ready_clip(
+        config,
+        storage,
+        clip_uid="donor",
+        clip_suffix="2",
+        entity_types=("subject",),
+    )
+    _add_ready_clip(
+        config,
+        storage,
+        clip_uid="target",
+        clip_suffix="20",
+        entity_types=("subject", "subject"),
+    )
+    return storage
+
+
+def test_characterize_cross_pair_failure_stops_later_target_entities(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """target/e1 failing must not let target/e2 be cross-paired."""
+    config = _config(
+        tmp_path, monkeypatch, pair=PairConfig(same_parent_fallback_enabled=True)
+    )
+    storage = _two_entity_target_storage(config)
+    cross = _FailingCrossJudge(decisions=[True], fail_at=0)
+
+    stats = pair_clips(
+        config,
+        storage,
+        judge=_ScopedJudge(
+            {("target", "e1"): "reject", ("target", "e2"): "reject"}
+        ),
+        cross_pair_judge=cross,
+    )
+
+    observed = [
+        (call["target_entity_id"], call["donor_clip_uid"]) for call in cross.calls
+    ]
+    assert observed == [("e1", "donor")], "e2 must not be cross-paired after e1 failed"
+    target = storage.read_clip("target")
+    assert target.pairing is not None
+    assert target.pairing.status == "rejected"
+    assert stats.failed == 1
+    assert stats.cross_pair_ready == 0
+
+
+# ---------------------------------------------------------------------------
+# I. Existing completed Pair stays a valid same-shard donor
+# ---------------------------------------------------------------------------
+
+
+def test_characterize_existing_pairing_remains_a_valid_donor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An existing donor is reused without paying for its primary Qwen again."""
+    config = _config(
+        tmp_path, monkeypatch, pair=PairConfig(same_parent_fallback_enabled=True)
+    )
+    storage = RunStorage(config)
+    storage.initialize(git_commit="existing-donor-test")
+    _add_ready_clip(
+        config, storage, clip_uid="donor", clip_suffix="2", entity_types=("subject",)
+    )
+
+    first = pair_clips(config, storage, judge=_ScopedJudge())
+    assert first.ready == 1, "donor publishes a ready full self reference"
+
+    _add_ready_clip(
+        config, storage, clip_uid="target", clip_suffix="20", entity_types=("subject",)
+    )
+    judge = _ScopedJudge({("target", "e1"): "reject"}, forbidden=("donor",))
+
+    stats = pair_clips(
+        config, storage, judge=judge, cross_pair_judge=_CrossJudge([True])
+    )
+
+    assert ("donor", "e1") not in judge.calls, "existing donor must not be re-judged"
+    assert stats.skipped_existing == 1
+    assert stats.processed == 1
+    assert stats.cross_pair_attempted == 1
+    assert stats.cross_pair_ready == 1
+    target_state = storage.read_clip("target").references.entities[0]
+    assert target_state.source_clip_uid == "donor"
+    assert target_state.source_entity_id == "e1"
+
+
+# ---------------------------------------------------------------------------
+# J. Background guard: primary pass AND cross-pair pass
+# ---------------------------------------------------------------------------
+
+
+def _install_background_on(storage: RunStorage, clip_uid: str) -> None:
+    from r2v_data_v2.reconciliation import write_json_atomic
+
+    clip = storage.read_clip(clip_uid)
+    assert clip.annotation is not None
+    annotation = clip.annotation.model_copy(
+        update={
+            "background": BackgroundAnnotation(
+                phrase="a stone courtyard",
+                grounding_prompt="the stone courtyard and surrounding walls",
+            )
+        }
+    )
+    write_json_atomic(
+        storage.clip_path(clip_uid),
+        clip.model_copy(update={"annotation": annotation}).model_dump(mode="json"),
+    )
+    storage.write_references(
+        clip_uid,
+        ReferencesState(
+            background=BackgroundReferenceState(
+                status="clean_raw",
+                source_image_path=f"clips/{clip_uid}/frames/00.jpg",
+                output_image_path=f"clips/{clip_uid}/frames/00.jpg",
+                source_frame_slot=0,
+                source_frame_index=0,
+                source_foreground_area_pixels=0,
+                source_foreground_area_ratio=0.0,
+            )
+        ),
+    )
+
+
+def test_characterize_background_guard_runs_in_primary_and_again_in_cross_pair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No de-duplication: the guard is paid for in both passes."""
+    from tests.test_v3_pair import _FinalBackgroundJudge
+
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        pair=PairConfig(
+            same_parent_fallback_enabled=True, background_final_guard_mode="qwen_v1"
+        ),
+        debug=True,
+    )
+    storage = _two_entity_target_storage(config)
+    _install_background_on(storage, "target")
+    guard = _FinalBackgroundJudge(accepted=True)
+
+    stats = pair_clips(
+        config,
+        storage,
+        judge=_ScopedJudge(
+            {("target", "e1"): "full", ("target", "e2"): "reject"}
+        ),
+        cross_pair_judge=_CrossJudge([True]),
+        background_final_judge=guard,
+    )
+
+    # Primary: e1 is full so the pairing is ready -> guard call 1.
+    # Cross-pair upgrades e2 from the donor -> guard call 2. The trailing loop
+    # does not add a third because the clip is already in evaluated_clip_uids.
+    assert len(guard.calls) == 2
+    assert stats.background_final_guard_attempted == 2
+    assert stats.background_final_guard_accepted == 2
+    # Recorded, not assumed: the pair counter only increments once.
+    assert stats.backgrounds_bound == 1
+    target = storage.read_clip("target")
+    assert target.pairing is not None
+    assert target.pairing.status == "ready"
+    assert target.pairing.background_token == "<ref_bg_1>"
+
+
+# ---------------------------------------------------------------------------
+# K. Post-Mask runtime treatment of a cross-pair fallback failure
+# ---------------------------------------------------------------------------
+
+
+def _cross_pair_failure_storage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, target_e1: str
+) -> tuple[V3Config, RunStorage]:
+    config = _config(
+        tmp_path, monkeypatch, pair=PairConfig(same_parent_fallback_enabled=True)
+    )
+    storage = _two_entity_target_storage(config)
+    return config, storage
+
+
+def test_characterize_runtime_does_not_retry_pair_after_cross_pair_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Primary Pair success + cross-pair failure is a terminal Pair stage."""
+    from r2v_data_v2.v3.post_mask_runtime import (
+        _record_phase_result,
+        phase_needed,
+    )
+
+    config, storage = _cross_pair_failure_storage(tmp_path, monkeypatch, target_e1="full")
+    target_before = storage.read_clip("target")
+    assert phase_needed(storage, target_before, "pair") is True, "no pairing yet"
+
+    stats = pair_clips(
+        config,
+        storage,
+        # e1 is full so the primary pairing is ready; e2 needs the fallback,
+        # and the fallback judge fails on it.
+        judge=_ScopedJudge({("target", "e1"): "full", ("target", "e2"): "reject"}),
+        cross_pair_judge=_FailingCrossJudge(decisions=[True], fail_at=0),
+    )
+
+    target = storage.read_clip("target")
+    assert stats.failed == 1, "legacy records the failed fallback"
+    assert target.pairing is not None
+    assert target.pairing.status == "ready", "primary pairing survives the fallback"
+    assert phase_needed(storage, target, "pair") is False, (
+        "a published pairing ends the Pair stage even when the fallback failed"
+    )
+
+    pending: set[str] = set()
+    _record_phase_result(
+        storage,
+        "pair",
+        ["target"],
+        stats.to_dict(),
+        None,
+        {},
+        pending,
+        lambda *args, **kwargs: None,
+    )
+    assert "target" not in pending, (
+        "cross-pair fallback failure must not make the clip retryable"
+    )
+
+
+def test_characterize_runtime_rejected_pairing_is_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rejected content outcome is terminal, not retryable."""
+    from r2v_data_v2.v3.post_mask_runtime import (
+        _record_phase_result,
+        phase_needed,
+    )
+
+    config = _config(
+        tmp_path, monkeypatch, pair=PairConfig(same_parent_fallback_enabled=True)
+    )
+    storage = _two_entity_target_storage(config)
+
+    stats = pair_clips(
+        config,
+        storage,
+        judge=_ScopedJudge({("target", "e1"): "reject", ("target", "e2"): "reject"}),
+        cross_pair_judge=_FailingCrossJudge(decisions=[True], fail_at=0),
+    )
+
+    target = storage.read_clip("target")
+    assert target.pairing is not None
+    assert target.pairing.status == "rejected"
+    assert phase_needed(storage, target, "pair") is False
+
+    pending: set[str] = set()
+    _record_phase_result(
+        storage,
+        "pair",
+        ["target"],
+        stats.to_dict(),
+        None,
+        {},
+        pending,
+        lambda *args, **kwargs: None,
+    )
+    assert "target" not in pending
