@@ -17,17 +17,28 @@ cd "${REPO}"
 export OMP_NUM_THREADS=1
 export PYTHONPATH="/mnt/workspace/litengjie/data/vendor/sam3${PYTHONPATH:+:${PYTHONPATH}}"
 
+# The generic launcher builds group identity from these CLI values, while an
+# external job runner (for example run_removal_epoch) resolves the same roots
+# from the environment. Export *and* pass every root so the two can never drift
+# onto different campaigns.
+export POST_MASK_BASE_CONFIG="${BASE_CONFIG}"
+export POST_MASK_TAG="${POST_MASK_TAG:-post-mask-v1}"
+export POST_MASK_ENTITY_MASK_ROOT="${POST_MASK_ENTITY_MASK_ROOT:-/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/entity_mask}"
+
 OPTS=(
-  --base-config "${BASE_CONFIG}"
-  --tag "${POST_MASK_TAG:-post-mask-v1}"
+  --base-config "${POST_MASK_BASE_CONFIG}"
+  --tag "${POST_MASK_TAG}"
+  --entity-mask-root "${POST_MASK_ENTITY_MASK_ROOT}"
   --group-size "${POST_MASK_GROUP_SIZE:-8}"
   --rank "${RANK:-0}"
   --world-size "${WORLD_SIZE:-1}"
 )
-if [[ -n "${POST_MASK_ENTITY_MASK_ROOT:-}" ]]; then
-  OPTS+=(--entity-mask-root "${POST_MASK_ENTITY_MASK_ROOT}")
+if [[ -n "${POST_MASK_ROOT:-}" ]]; then
+  export POST_MASK_ROOT
+  OPTS+=(--post-mask-root "${POST_MASK_ROOT}")
 fi
 if [[ -n "${POST_MASK_JOB_RUNNER:-}" ]]; then
+  export POST_MASK_JOB_RUNNER
   OPTS+=(--job-runner "${POST_MASK_JOB_RUNNER}")
 else
   OPTS+=(--dry-run)
