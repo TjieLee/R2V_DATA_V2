@@ -656,6 +656,43 @@ generation active seconds plus judge active seconds, while the legacy loop
 measured one wall interval spanning both plus candidate preparation. Queue wait,
 resource-switch and epoch wait were never included and still are not.
 
+### Production wiring hardening (`post_mask_epoch_removal`)
+
+Four wiring properties the remove stage now guarantees.
+
+**Shard locks are held for the whole epoch.** The legacy worker acquires
+`<state>/shards/<shard>/shard.lock` and holds it across hydrate, remove, pair,
+reference edit and export. The resource-epoch runner uses that exact path and
+that exact scope: it acquires every canonical shard's lock, in lexical shard
+order, *before* initializing or hydrating anything, and releases them only after
+the scheduler drained, publication finished and the stage counts were updated.
+Acquisition is all-or-nothing: if one shard is locked elsewhere, every
+already-acquired lock is released and there are zero hydrate calls, zero model
+calls and zero clip mutations. Lexical ordering is mandatory on every node so
+two groups cannot deadlock. The group ownership lock is still taken as well; it
+protects group ownership, which the legacy worker knows nothing about, and does
+not replace the per-shard lock.
+
+**Eligibility is the hydration result, never the run root.** `prepare_shard_storage`
+returns a `PreparedRemovalShard` carrying `hydrate_shard`'s `clip_uids`, `ready`,
+`excluded` and `corrupt`. `RemovalEpochRunner.seed_jobs` seeds exactly that
+explicit view. `storage.iter_clips()` is not used, because it also lists clips a
+previous run hydrated but this run excluded or judged corrupt; those must not
+reach a model.
+
+**Endpoint judges are closed, shared judges are not.** `resolve_removal_judge`
+returns `(judge, owned)`. A handle that already implements `review()` is shared
+and is never closed by the runner. An endpoint string makes the runner build an
+`QwenBackgroundRemovalJudge`, which it then closes in a `finally`, so a review
+exception still releases the client.
+
+**Launcher and runner roots cannot drift.** The shell wrapper exports and passes
+`--base-config`, `--tag`, `--entity-mask-root` and `--post-mask-root`, and
+`validate_removal_roots` fails closed -- before any lock, hydrate or model call
+-- when the ledger the launcher handed over is not
+`resource_epoch_root(post_mask_root)/<group_id>`, or when the entity-mask root
+disagrees with the campaign identity.
+
 **The remove stage can complete; a group cannot.** Downstream phases (pair,
 reference edit, reference integrity, instruction, subject attributes, export) are
 not wired, so the runner always returns `completed=False` with
