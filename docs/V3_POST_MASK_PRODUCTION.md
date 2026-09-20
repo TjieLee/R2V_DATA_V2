@@ -545,6 +545,11 @@ one model class at a time.
   close even if an earlier close raises, and the failure is reported
   afterwards; a failed unload also blocks the next resource from loading, so
   two heavy resources can never be resident because a stop half-succeeded.
+  Partial *startup* rollback follows the same rule: when some of the eight
+  workers load and one fails, every successfully built worker is asked to
+  close, a cleanup exception never aborts the remaining closes, and the raised
+  error still names the slot whose startup failed, with the cleanup failures
+  appended as a chained diagnostic.
 * **Control-flow exceptions propagate.** Model executors catch `Exception`, so
   `KeyboardInterrupt`, `SystemExit` and `GeneratorExit` are never turned into a
   per-job failure record.
@@ -686,12 +691,34 @@ and is never closed by the runner. An endpoint string makes the runner build an
 `QwenBackgroundRemovalJudge`, which it then closes in a `finally`, so a review
 exception still releases the client.
 
-**Launcher and runner roots cannot drift.** The shell wrapper exports and passes
-`--base-config`, `--tag`, `--entity-mask-root` and `--post-mask-root`, and
-`validate_removal_roots` fails closed -- before any lock, hydrate or model call
--- when the ledger the launcher handed over is not
-`resource_epoch_root(post_mask_root)/<group_id>`, or when the entity-mask root
-disagrees with the campaign identity.
+**Launcher and runner roots cannot drift.** The shell wrapper only turns an
+environment value into a CLI option when that variable actually exists, so a
+CLI override is never shadowed. The Python parser is then the single authority:
+before it imports or calls an external job runner it mirrors its resolved
+`--base-config`, `--tag`, `--entity-mask-root`, `--post-mask-root` and
+`--job-runner` back into the environment the runner reads. Without an explicit
+Post-Mask root the variable is removed, so the launcher's tag-derived default
+and the runner's tag-derived default are the same directory instead of the
+runner inheriting a stale shell value. `validate_removal_roots` additionally
+fails closed, before any lock, hydrate or model call, when the ledger the
+launcher handed over is not `resource_epoch_root(post_mask_root)/<group_id>`.
+
+**The runner re-derives the campaign identity itself.** A job runner is called
+as `runner(group, ledger, emit)` and receives no campaign argument, so it
+rebuilds the launcher's campaign semantic payload from what it is actually
+about to read -- `config.fingerprint()`, `dataset_json`, `entity_mask_root` and
+the live canonical shard count from `enumerate_shards` -- and refuses to
+continue unless `campaign_identity(...)` equals `group.campaign_identity`. A
+drift in any one of those four fields fails before the first shard lock, before
+any initialize/hydrate and before any model call. `tools/run_v3_post_mask_resource_epoch.build_campaign`
+and the runner's reconstruction are the same payload; a test asserts the two
+agree so they cannot silently diverge.
+
+**`--dry-run` can never execute a job runner.** `--dry-run` and `--job-runner`
+are mutually exclusive at the parser, so the combination exits `2` before any
+import. `--dry-run` alone only plans groups; `--job-runner` alone executes;
+neither is a clear usage error. The shell adds `--dry-run` only when no runner
+came from the environment or the CLI.
 
 **The remove stage can complete; a group cannot.** Downstream phases (pair,
 reference edit, reference integrity, instruction, subject attributes, export) are

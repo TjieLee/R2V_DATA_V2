@@ -918,6 +918,90 @@ def test_worker_startup_failure_rolls_back_created_workers(tmp_path: Path):
     assert resource.open is False
 
 
+class _CloseCounterWorker:
+    """A worker whose ``close()`` may raise, counting every attempt."""
+
+    def __init__(self, slot: int, gpu_id: int, *, close_error: str | None = None):
+        self.slot, self.gpu_id = slot, gpu_id
+        self._close_error = close_error
+        self.close_calls = 0
+
+    def close(self) -> None:
+        self.close_calls += 1
+        if self._close_error is not None:
+            raise RuntimeError(self._close_error)
+
+
+def test_partial_startup_rollback_closes_every_built_worker(tmp_path: Path):
+    """A failing cleanup must not strand the remaining slots' GPU models."""
+    created: dict[int, _CloseCounterWorker] = {}
+
+    def factory(slot: int, gpu_id: int) -> _CloseCounterWorker:
+        if slot == 2:
+            raise RuntimeError("boom-slot-2")
+        worker = _CloseCounterWorker(
+            slot, gpu_id, close_error="close failed" if slot == 0 else None
+        )
+        created[slot] = worker
+        return worker
+
+    resource = WorkerEpochResource(
+        RESOURCE_BOOGU,
+        WorkerPoolConfig(gpu_ids=(0, 1, 2)),
+        process_manager=_FakeProcessManager(),
+        worker_factory=factory,
+        log_root=tmp_path,
+    )
+
+    with pytest.raises(EpochResourceError) as excinfo:
+        resource.start()
+
+    # slot0's close raised, but slot1 was still asked to close.
+    assert created[0].close_calls == 1
+    assert created[1].close_calls == 1
+    assert 2 not in created
+    # The original startup failure stays the primary error ...
+    message = str(excinfo.value)
+    assert "slot 2" in message
+    assert "boom-slot-2" in message
+    # ... and the cleanup failure is retained as a chained diagnostic.
+    assert "rollback incomplete" in message
+    assert "slot 0: close failed" in message
+    assert resource.workers == []
+    assert resource.open is False
+
+
+def test_partial_startup_rollback_attempts_every_close_even_when_all_fail(
+    tmp_path: Path,
+):
+    created: dict[int, _CloseCounterWorker] = {}
+
+    def factory(slot: int, gpu_id: int) -> _CloseCounterWorker:
+        if slot == 3:
+            raise RuntimeError("boom-slot-3")
+        worker = _CloseCounterWorker(slot, gpu_id, close_error=f"close-{slot}")
+        created[slot] = worker
+        return worker
+
+    resource = WorkerEpochResource(
+        RESOURCE_BOOGU,
+        WorkerPoolConfig(gpu_ids=(0, 1, 2, 3)),
+        process_manager=_FakeProcessManager(),
+        worker_factory=factory,
+        log_root=tmp_path,
+    )
+
+    with pytest.raises(EpochResourceError) as excinfo:
+        resource.start()
+
+    assert all(worker.close_calls == 1 for worker in created.values())
+    message = str(excinfo.value)
+    assert "slot 3" in message
+    for slot in sorted(created):
+        assert f"slot {slot}: close-{slot}" in message
+    assert resource.workers == []
+
+
 def test_handle_for_slot_rejects_out_of_range(tmp_path: Path):
     resource = WorkerEpochResource(
         RESOURCE_BOOGU,

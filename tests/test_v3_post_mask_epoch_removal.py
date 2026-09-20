@@ -45,7 +45,11 @@ from r2v_data_v2.v3.config import (
     V3Config,
 )
 from r2v_data_v2.v3.mask_codec import encode_binary_mask
-from r2v_data_v2.v3.post_mask_epoch_groups import resource_epoch_root
+from r2v_data_v2.v3.post_mask_epoch_groups import (
+    DEFAULT_GROUP_SIZE,
+    build_groups,
+    resource_epoch_root,
+)
 from r2v_data_v2.v3.post_mask_epoch_jobs import (
     OUTCOME_COMPLETED,
     OUTCOME_RETRYABLE_FAILED,
@@ -69,6 +73,7 @@ from r2v_data_v2.v3.post_mask_epoch_removal import (
     RemovalEpochError,
     RemovalEpochRunner,
     build_qwen_epoch_config,
+    build_removal_campaign,
     build_removal_epoch_factories,
     build_removal_epoch_runner,
     build_removal_generate_job,
@@ -303,12 +308,31 @@ def _fixture_config(
     )
 
 
-def _group_with(*shards: str) -> Any:
-    class _Group:
-        group_id = "group-000000"
-        canonical_shards = tuple(shards)
+def _group_with(
+    *shards: str, campaign: Mapping[str, Any] | None = None
+) -> Any:
+    """A real resource-epoch group, so ``campaign_identity`` is real too.
 
-    return _Group()
+    Hand-rolled stand-ins have no campaign identity at all, which would let a
+    test pass while the real production path never validated anything.
+    """
+    groups = build_groups(
+        list(shards),
+        campaign=dict(campaign or {}),
+        group_size=max(DEFAULT_GROUP_SIZE, len(shards)),
+    )
+    assert len(groups) == 1
+    return groups[0]
+
+
+def _parts_root(tmp_path: Path, shards: Sequence[str]) -> Path:
+    """A Stage2 entity-mask root whose parts/ lists exactly ``shards``."""
+    root = tmp_path / "public" / "entity_mask"
+    parts = root / "parts"
+    parts.mkdir(parents=True, exist_ok=True)
+    for shard in shards:
+        (parts / f"{shard}.jsonl").write_text("")
+    return root
 
 
 def _mask() -> np.ndarray:
@@ -1060,19 +1084,24 @@ def test_removal_only_runner_never_reports_group_completed(
             ),
         },
     )
+    entity_mask_root = _parts_root(tmp_path, (SHARD,))
     runner_callable = build_removal_epoch_runner(
         config,
         post_mask_root=post_mask_root,
-        entity_mask_root=tmp_path / "entity_mask",
+        entity_mask_root=entity_mask_root,
         process_manager=_fake_process_manager(),
         temporary_root=tmp_path / "tmp",
         allowed_server_root=tmp_path / "workspace" / "data",
         qwen_epoch_config=build_qwen_epoch_config(config),
     )
+    group = _group_with(
+        SHARD,
+        campaign=build_removal_campaign(config, entity_mask_root=entity_mask_root),
+    )
 
     outcome = runner_callable(
-        _Group(),
-        GroupLedger(resource_epoch_root(post_mask_root) / "group-000000"),
+        group,
+        GroupLedger(resource_epoch_root(post_mask_root) / group.group_id),
         lambda *a, **k: None,
     )
 
@@ -1619,19 +1648,20 @@ def _two_shard_run(
     monkeypatch.setattr(
         "r2v_data_v2.v3.post_mask_epoch_removal.file_lock", recorder
     )
+    entity_mask_root = _parts_root(tmp_path, (SHARD_A, SHARD_B))
+    campaign = build_removal_campaign(config, entity_mask_root=entity_mask_root)
     runner_callable = build_removal_epoch_runner(
         config,
         post_mask_root=post_mask_root,
-        entity_mask_root=tmp_path / "entity_mask",
+        entity_mask_root=entity_mask_root,
         process_manager=_fake_process_manager(),
         temporary_root=tmp_path / "tmp",
         allowed_server_root=writable,
         qwen_epoch_config=build_qwen_epoch_config(config),
     )
-    ledger = GroupLedger(resource_epoch_root(post_mask_root) / "group-000000")
-    outcome = runner_callable(
-        _group_with(SHARD_A, SHARD_B), ledger, lambda *a, **k: None
-    )
+    group = _group_with(SHARD_A, SHARD_B, campaign=campaign)
+    ledger = GroupLedger(resource_epoch_root(post_mask_root) / group.group_id)
+    outcome = runner_callable(group, ledger, lambda *a, **k: None)
     del fail
     return outcome, worker, judge, storages[SHARD_A]
 
@@ -1688,20 +1718,23 @@ def test_second_shard_lock_unavailable_mutates_nothing(
     monkeypatch.setattr(
         "r2v_data_v2.v3.post_mask_epoch_removal.file_lock", recorder
     )
+    entity_mask_root = _parts_root(tmp_path, (SHARD_A, SHARD_B))
+    campaign = build_removal_campaign(config, entity_mask_root=entity_mask_root)
     runner_callable = build_removal_epoch_runner(
         config,
         post_mask_root=post_mask_root,
-        entity_mask_root=tmp_path / "entity_mask",
+        entity_mask_root=entity_mask_root,
         process_manager=_fake_process_manager(),
         temporary_root=tmp_path / "tmp",
         allowed_server_root=writable,
         qwen_epoch_config=build_qwen_epoch_config(config),
     )
+    group = _group_with(SHARD_A, SHARD_B, campaign=campaign)
 
     with pytest.raises(RemovalEpochError, match="locked elsewhere"):
         runner_callable(
-            _group_with(SHARD_A, SHARD_B),
-            GroupLedger(resource_epoch_root(post_mask_root) / "group-000000"),
+            group,
+            GroupLedger(resource_epoch_root(post_mask_root) / group.group_id),
             lambda *a, **k: None,
         )
 
@@ -2007,6 +2040,7 @@ def test_runner_refuses_a_ledger_root_outside_the_launcher_root(
     writable = tmp_path / "workspace" / "data"
     campaign_a = writable / "campaign-A"
     campaign_b = writable / "campaign-B"
+    entity_mask_root = _parts_root(tmp_path, (SHARD,))
     recorder = _LockRecorder()
     _install_prepared_shards(monkeypatch, {SHARD: storage}, recorder)
     _install_fake_factories(monkeypatch, _BooguWorker(), _Judge([_accept()]))
@@ -2016,16 +2050,20 @@ def test_runner_refuses_a_ledger_root_outside_the_launcher_root(
     runner_callable = build_removal_epoch_runner(
         config,
         post_mask_root=campaign_b,
-        entity_mask_root=tmp_path / "entity_mask",
+        entity_mask_root=entity_mask_root,
         process_manager=_fake_process_manager(),
         temporary_root=tmp_path / "tmp",
         allowed_server_root=writable,
         qwen_epoch_config=build_qwen_epoch_config(config),
     )
+    # The campaign matches, so the ledger root is what must fail.
+    group = _group_with(
+        SHARD, campaign=build_removal_campaign(config, entity_mask_root=entity_mask_root)
+    )
 
     with pytest.raises(RemovalEpochError, match="Post-Mask root"):
         runner_callable(
-            _group_with(SHARD),
+            group,
             GroupLedger(resource_epoch_root(campaign_a) / "group-X"),
             lambda *a, **k: None,
         )
@@ -2065,6 +2103,209 @@ def test_matching_roots_validate(
         entity_mask_root=entity_mask_root,
         campaign={"entity_mask_root": str(entity_mask_root)},
     )
+
+
+# ---------------------------------------------------------------------------
+# Campaign identity (real runner path, not just the helper)
+# ---------------------------------------------------------------------------
+
+
+def _load_launcher_module() -> Any:
+    """Import tools/run_v3_post_mask_resource_epoch.py by path."""
+    import importlib.util
+
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "tools"
+        / "run_v3_post_mask_resource_epoch.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "run_v3_post_mask_resource_epoch", path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_runner_and_launcher_build_the_same_campaign_payload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _fixture_config(tmp_path, monkeypatch)
+    entity_mask_root = _parts_root(tmp_path, (SHARD_A, SHARD_B))
+    launcher = _load_launcher_module()
+
+    from_launcher = launcher.build_campaign(
+        config,
+        entity_mask_root=entity_mask_root,
+        canonical_shard_count=2,
+    )
+    from_runner = build_removal_campaign(config, entity_mask_root=entity_mask_root)
+
+    assert from_runner == from_launcher
+
+
+def _campaign_drift_case(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    group_config: V3Config | None = None,
+    group_entity_mask_root: Path | None = None,
+) -> tuple[_LockRecorder, _TracingWorker, _TracingJudge, Any]:
+    """Run the real group runner with a live campaign the group never saw."""
+    writable = tmp_path / "workspace" / "data"
+    post_mask_root = writable / "campaign"
+    config = _fixture_config(tmp_path, monkeypatch, run_name="runner")
+    entity_mask_root = _parts_root(tmp_path, (SHARD,))
+    storage = _pending_storage(config, clip_uids=("clip-1",))
+    recorder = _LockRecorder()
+    worker = _TracingWorker(recorder)
+    judge = _TracingJudge(recorder, [_accept()])
+    _install_prepared_shards(monkeypatch, {SHARD: storage}, recorder)
+    _install_fake_factories(monkeypatch, worker, judge)
+    _trace_mutations(monkeypatch, recorder)
+    monkeypatch.setattr(
+        "r2v_data_v2.v3.post_mask_epoch_removal.file_lock", recorder
+    )
+    runner_callable = build_removal_epoch_runner(
+        config,
+        post_mask_root=post_mask_root,
+        entity_mask_root=entity_mask_root,
+        process_manager=_fake_process_manager(),
+        temporary_root=tmp_path / "tmp",
+        allowed_server_root=writable,
+        qwen_epoch_config=build_qwen_epoch_config(config),
+    )
+    group = _group_with(
+        SHARD,
+        campaign=build_removal_campaign(
+            group_config or config,
+            entity_mask_root=group_entity_mask_root or entity_mask_root,
+        ),
+    )
+    with pytest.raises(RemovalEpochError, match="campaign identity"):
+        runner_callable(
+            group,
+            GroupLedger(resource_epoch_root(post_mask_root) / group.group_id),
+            lambda *a, **k: None,
+        )
+    return recorder, worker, judge, storage
+
+
+def test_runner_rejects_entity_mask_root_drift_before_any_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    other_root = _parts_root(tmp_path / "elsewhere", (SHARD,))
+    recorder, worker, judge, storage = _campaign_drift_case(
+        tmp_path, monkeypatch, group_entity_mask_root=other_root
+    )
+
+    assert recorder.events == [], "campaign validation runs before the first lock"
+    assert worker.calls == []
+    assert judge.calls == 0
+    assert _state(storage).status == "pending_remove"
+
+
+def test_runner_rejects_config_fingerprint_drift_before_any_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    drifted = _fixture_config(
+        tmp_path, monkeypatch, run_name="drifted", max_generation_ratio=0.5
+    )
+    recorder, worker, judge, storage = _campaign_drift_case(
+        tmp_path, monkeypatch, group_config=drifted
+    )
+
+    assert recorder.events == []
+    assert worker.calls == []
+    assert judge.calls == 0
+    assert _state(storage).status == "pending_remove"
+
+
+def test_runner_rejects_canonical_shard_count_drift_before_any_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _parts_root(tmp_path, (SHARD,))
+    config = _fixture_config(tmp_path, monkeypatch)
+    writable = tmp_path / "workspace" / "data"
+    post_mask_root = writable / "campaign"
+    storage = _pending_storage(config, clip_uids=("clip-1",))
+    recorder = _LockRecorder()
+    worker = _TracingWorker(recorder)
+    judge = _TracingJudge(recorder, [_accept()])
+    _install_prepared_shards(monkeypatch, {SHARD: storage}, recorder)
+    _install_fake_factories(monkeypatch, worker, judge)
+    _trace_mutations(monkeypatch, recorder)
+    monkeypatch.setattr(
+        "r2v_data_v2.v3.post_mask_epoch_removal.file_lock", recorder
+    )
+    runner_callable = build_removal_epoch_runner(
+        config,
+        post_mask_root=post_mask_root,
+        entity_mask_root=root,
+        process_manager=_fake_process_manager(),
+        temporary_root=tmp_path / "tmp",
+        allowed_server_root=writable,
+        qwen_epoch_config=build_qwen_epoch_config(config),
+    )
+    # The group was built when the campaign had exactly one canonical shard.
+    group = _group_with(
+        SHARD,
+        campaign=build_removal_campaign(config, entity_mask_root=root),
+    )
+    # A second canonical shard appears in the same Stage2 root afterwards.
+    (root / "parts" / f"{SHARD_B}.jsonl").write_text("")
+
+    with pytest.raises(RemovalEpochError, match="campaign identity"):
+        runner_callable(
+            group,
+            GroupLedger(resource_epoch_root(post_mask_root) / group.group_id),
+            lambda *a, **k: None,
+        )
+
+    assert recorder.events == []
+    assert worker.calls == []
+    assert judge.calls == 0
+
+
+def test_matching_campaign_reaches_the_first_shard_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _fixture_config(tmp_path, monkeypatch)
+    entity_mask_root = _parts_root(tmp_path, (SHARD,))
+    writable = tmp_path / "workspace" / "data"
+    post_mask_root = writable / "campaign"
+    storage = _pending_storage(config, clip_uids=("clip-1",))
+    recorder = _LockRecorder()
+    worker = _TracingWorker(recorder)
+    judge = _TracingJudge(recorder, [_accept()])
+    _install_prepared_shards(monkeypatch, {SHARD: storage}, recorder)
+    _install_fake_factories(monkeypatch, worker, judge)
+    _trace_mutations(monkeypatch, recorder)
+    monkeypatch.setattr(
+        "r2v_data_v2.v3.post_mask_epoch_removal.file_lock", recorder
+    )
+    runner_callable = build_removal_epoch_runner(
+        config,
+        post_mask_root=post_mask_root,
+        entity_mask_root=entity_mask_root,
+        process_manager=_fake_process_manager(),
+        temporary_root=tmp_path / "tmp",
+        allowed_server_root=writable,
+        qwen_epoch_config=build_qwen_epoch_config(config),
+    )
+    group = _group_with(
+        SHARD, campaign=build_removal_campaign(config, entity_mask_root=entity_mask_root)
+    )
+
+    outcome = runner_callable(
+        group,
+        GroupLedger(resource_epoch_root(post_mask_root) / group.group_id),
+        lambda *a, **k: None,
+    )
+
+    assert outcome["remove_completed"] is True
+    assert recorder.events[0] == f"acquire {SHARD}"
 
 
 # ---------------------------------------------------------------------------
