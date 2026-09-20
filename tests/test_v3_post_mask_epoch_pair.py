@@ -2259,3 +2259,34 @@ def test_cross_baseline_freezes_the_primary_state_before_cross_work(
     assert restarted.cross_baseline(SHARD, "target-b") == baseline
     restarted.freeze_donor_snapshot(SHARD)
     assert restarted.cross_baseline(SHARD, "target-b") == baseline
+
+
+def test_barrier_seeds_exactly_one_donor1_job_per_frozen_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One chain head per target, donor1 only, never donor2 in advance."""
+    from r2v_data_v2.v3.post_mask_epoch_pair import PAIR_CROSS_JUDGE_JOB
+
+    config = _pair_config(
+        tmp_path, monkeypatch, same_parent_fallback_enabled=True
+    )
+    storage = _storage(config, entity_types=("subject",))
+    _three_donor_shard(config, storage)
+    uid_list = ("clip-1", "donor", "target-b", "target-c")
+    runner = _runner(tmp_path, config, storage, clip_uids=uid_list)
+    _drain_primary(
+        runner,
+        _ScopedJudge({("target-b", "e1"): "reject", ("target-c", "e1"): "reject"}),
+    )
+
+    jobs = runner.freeze_cross_pair_after_primary_quiescence()
+
+    targets = sorted(job.clip_uid for job in jobs)
+    assert targets == ["target-b", "target-c"]
+    for job in jobs:
+        assert job.job_type == PAIR_CROSS_JUDGE_JOB
+        assert job.resource == "qwen"
+        assert dict(job.target)["donor_ordinal"] == "0"
+        assert dict(job.target)["donor_clip_uid"] in {"donor", "clip-1"}
+    # A second barrier call must not create donor2 out of nothing.
+    assert runner.freeze_cross_pair_after_primary_quiescence() == tuple(jobs)

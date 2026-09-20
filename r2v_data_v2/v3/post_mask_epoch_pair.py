@@ -38,10 +38,15 @@ from r2v_data_v2.v3.pair import (
     PreparedEntityReferenceDecision,
     _BackgroundFinalGuardRuntime,
     _build_same_parent_donor_index,
+    _donors_for_target,
     _GuardFailClosed,
     _publish_pair_result,
+    finalize_cross_pair_judge,
     finalize_entity_reference,
+    prepare_cross_pair_attempt,
+    prepare_cross_pair_target_evidence,
     prepare_entity_reference,
+    run_cross_pair_judge,
     run_entity_reference_judge,
 )
 from r2v_data_v2.v3.post_mask_epoch_jobs import (
@@ -1133,6 +1138,378 @@ class PairEpochRunner:
         """Restore the frozen index for _donors_for_target."""
         return load_frozen_donor_index(self._storage_for(shard), self.donor_snapshot(shard))
 
+    # -- cross terminal marker ---------------------------------------------
+
+    def _cross_terminal_path(self, shard: str, clip_uid: str) -> Path:
+        return (
+            _semantic_root(self.ledger) / "cross_terminal" / shard / f"{clip_uid}.json"
+        )
+
+    def _cross_terminal_identity(self, shard: str, clip_uid: str) -> tuple[str, str]:
+        return (
+            self._snapshot_identity(self.donor_snapshot(shard)),
+            semantic_input_digest(self.cross_baseline(shard, clip_uid)),
+        )
+
+    def _cross_terminal(self, shard: str, clip_uid: str) -> dict[str, Any] | None:
+        payload = _read_json(self._cross_terminal_path(shard, clip_uid))
+        if payload is None:
+            return None
+        if payload.get("schema") != PAIR_CROSS_TERMINAL_SCHEMA:
+            raise PairEpochError(f"unsupported cross terminal schema for {clip_uid!r}")
+        snapshot_identity, baseline_digest = self._cross_terminal_identity(shard, clip_uid)
+        if payload.get("snapshot_identity") != snapshot_identity:
+            raise PairEpochError(f"cross terminal snapshot drifted for {clip_uid!r}")
+        if payload.get("baseline_digest") != baseline_digest:
+            raise PairEpochError(f"cross terminal baseline drifted for {clip_uid!r}")
+        return payload
+
+    def _mark_cross_terminal(
+        self,
+        shard: str,
+        clip_uid: str,
+        *,
+        status: str,
+        reason_kind: str,
+        reason: str,
+    ) -> None:
+        """Record that this target's fallback pass is terminal.
+
+        Written only after the legacy side effects (debug, append_failure or
+        successful publication) have run, so a crash before it can duplicate a
+        diagnostic but can never drop one.
+        """
+        snapshot_identity, baseline_digest = self._cross_terminal_identity(shard, clip_uid)
+        _write_json_once(
+            self._cross_terminal_path(shard, clip_uid),
+            {
+                "schema": PAIR_CROSS_TERMINAL_SCHEMA,
+                "status": status,
+                "canonical_shard": shard,
+                "clip_uid": clip_uid,
+                "snapshot_identity": snapshot_identity,
+                "baseline_digest": baseline_digest,
+                "reason_kind": reason_kind,
+                "reason": reason,
+            },
+        )
+
+    # -- cross job identity -------------------------------------------------
+
+    def _cross_job(
+        self,
+        shard: str,
+        clip_uid: str,
+        entity: AnnotationEntity,
+        index: int,
+        evidence: Any,
+        donor: Any,
+        rank: int,
+        snapshot_identity: str,
+        donor_image: Any,
+    ) -> ModelJob:
+        from r2v_data_v2.v3.cross_pair_judge import build_cross_pair_request_payload
+
+        service = self.config.qwen.cross_pair_judge
+        if service is None:
+            raise PairEpochError("cross-pair judge is not configured")
+        semantic_inputs = {
+            "clip_uid": clip_uid,
+            "entity": _entity_semantics(entity, index),
+            "request": build_cross_pair_request_payload(
+                target_clip_uid=clip_uid,
+                target_entity=entity,
+                target_evidence_mode=evidence.evidence_mode,
+                donor_clip_uid=donor.clip.clip_uid,
+                donor_entity=donor.entity,
+            ),
+            "evidence_mode": str(evidence.evidence_mode),
+            "frame_slots": list(evidence.frame_slots),
+            "context_image": _image_identity(evidence.context_image),
+            "entity_crop": (
+                _image_identity(evidence.entity_crop)
+                if evidence.entity_crop is not None
+                else None
+            ),
+            "donor": {
+                "clip_uid": donor.clip.clip_uid,
+                "entity_id": donor.entity.entity_id,
+                "projection": donor.reference.model_dump(mode="json"),
+                "image": _image_identity(donor_image),
+            },
+            "donor_ordinal": rank,
+            "snapshot_identity": snapshot_identity,
+            "policy": _pair_policy_semantics(self.config),
+        }
+        return ModelJob.create(
+            job_type=PAIR_CROSS_JUDGE_JOB,
+            resource=RESOURCE_QWEN,
+            canonical_shard=shard,
+            clip_uid=clip_uid,
+            semantic_inputs=semantic_inputs,
+            model_identity=_model_identity(service),
+            target={
+                "target_entity_id": entity.entity_id,
+                "target_entity_index": str(index),
+                "donor_clip_uid": donor.clip.clip_uid,
+                "donor_entity_id": donor.entity.entity_id,
+                "donor_ordinal": str(rank),
+            },
+            attempt_index=rank,
+        )
+
+    # -- cross CPU replay ---------------------------------------------------
+
+    def _cross_context(self, shard: str, clip_uid: str) -> Any:
+        """Frozen snapshot, donor index, baseline states and target inputs."""
+        storage = self._storage_for(shard)
+        snapshot = self.donor_snapshot(shard)
+        baseline = self.cross_baseline(shard, clip_uid)
+        target_clip = storage.read_clip(clip_uid)
+        states = {
+            item["entity_id"]: EntityReferenceState.model_validate(item)
+            for item in baseline["primary_entity_references"]
+        }
+        frames = _validate_frames(storage, clip_uid)
+        masks = storage.read_masks(clip_uid)
+        return (storage, snapshot, baseline, target_clip, states, frames, masks)
+
+    def _cross_position(
+        self, shard: str, clip_uid: str, target: Mapping[str, str]
+    ) -> tuple[Any, Any, Any, int, Any]:
+        """Rebuild the exact entity/donor position a cross job points at."""
+        from r2v_data_v2.v3.pair import build_entity_reference_candidates
+
+        storage, _snapshot, _b, target_clip, _s, frames, masks = self._cross_context(
+            shard, clip_uid
+        )
+        index = int(target["target_entity_index"])
+        entity = target_clip.annotation.entities[index]
+        donors = _donors_for_target(
+            self.config,
+            self.frozen_donor_index(shard),
+            target_clip=target_clip,
+            target_entity=entity,
+        )
+        rank = int(target["donor_ordinal"])
+        donor = next(
+            (
+                item
+                for item in donors
+                if item.clip.clip_uid == target["donor_clip_uid"]
+                and item.entity.entity_id == target["donor_entity_id"]
+            ),
+            None,
+        )
+        if donor is None:
+            raise PairEpochError(
+                f"frozen donor {target['donor_clip_uid']} is no longer in the target list"
+            )
+        candidates = build_entity_reference_candidates(
+            self.config,
+            storage,
+            clip_uid=clip_uid,
+            entity=entity,
+            frames=frames,
+            masks=masks,
+        )
+        evidence = prepare_cross_pair_target_evidence(
+            self.config,
+            storage,
+            clip_uid=clip_uid,
+            entity=entity,
+            frames=frames,
+            target_candidates=candidates,
+        )
+        prepared = prepare_cross_pair_attempt(evidence, donor)
+        return prepared, evidence, donor, rank, target_clip
+
+    def freeze_cross_pair_after_primary_quiescence(
+        self, *, unresolved_job_ids: Sequence[str] = ()
+    ) -> Sequence[ModelJob]:
+        """Whole-shard barrier: seed one chain head per frozen cross target.
+
+        Called once the primary Qwen ready-set has quiesced. It never blocks
+        the rest of the shard: a target whose primary is unresolved is simply
+        absent from the frozen target list.
+        """
+        del unresolved_job_ids
+        jobs: list[ModelJob] = []
+        for shard in sorted(self.storages):
+            snapshot = self.freeze_donor_snapshot(shard)
+            for clip_uid in snapshot.get("cross_pair_target_clip_uids", ()):
+                if self._cross_terminal(shard, clip_uid) is not None:
+                    continue
+                pending = self._advance_cross_pair_target(shard, clip_uid)
+                if pending is not None:
+                    jobs.append(pending)
+        return tuple(jobs)
+
+    def _advance_cross_pair_target(self, shard: str, clip_uid: str) -> ModelJob | None:
+        """Replay one target's fallback from the frozen baseline.
+
+        Returns the single chain-head job, or None when the fallback pass is
+        terminal (accepted donors published, or nothing to do).
+        """
+        from r2v_data_v2.v3.pair import (
+            _pairing_from_references,
+            _publish_cross_pair_result,
+            build_entity_reference_candidates,
+        )
+
+        if self._cross_terminal(shard, clip_uid) is not None:
+            return None
+        storage, snapshot, _b, target_clip, states_by_id, frames, masks = (
+            self._cross_context(shard, clip_uid)
+        )
+        snapshot_identity = self._snapshot_identity(snapshot)
+        index = self.frozen_donor_index(shard)
+        accepted: dict[str, Any] = {}
+
+        for entity_index, entity in enumerate(target_clip.annotation.entities):
+            current = states_by_id.get(entity.entity_id)
+            if (
+                current is not None
+                and current.status == "ready"
+                and current.reference_scope == "full"
+            ):
+                continue
+            candidates = build_entity_reference_candidates(
+                self.config,
+                storage,
+                clip_uid=clip_uid,
+                entity=entity,
+                frames=frames,
+                masks=masks,
+            )
+            donors = _donors_for_target(
+                self.config, index, target_clip=target_clip, target_entity=entity
+            )
+            if not donors:
+                # Frozen ordering: no donor means no evidence materialization.
+                continue
+            evidence = prepare_cross_pair_target_evidence(
+                self.config,
+                storage,
+                clip_uid=clip_uid,
+                entity=entity,
+                frames=frames,
+                target_candidates=candidates,
+            )
+            for rank, donor in enumerate(donors):
+                prepared = prepare_cross_pair_attempt(evidence, donor)
+                job = self._cross_job(
+                    shard,
+                    clip_uid,
+                    entity,
+                    entity_index,
+                    evidence,
+                    donor,
+                    rank,
+                    snapshot_identity,
+                    prepared.donor_reference_image,
+                )
+                result = self._committed(job)
+                if result is None:
+                    return job
+                if str(result.payload.get("status")) == "cross_pair_failed":
+                    return self._finish_cross_failure(
+                        shard, clip_uid, target_clip, entity, evidence, donor, result
+                    )
+                outcome = finalize_cross_pair_judge(
+                    storage,
+                    target_clip=target_clip,
+                    prepared=prepared,
+                    attempt=_cross_payload_attempt(result),
+                    counters=self._scratch(shard),
+                )
+                if outcome.verdict != "accepted":
+                    continue
+                states_by_id[entity.entity_id] = outcome.state
+                accepted[entity.entity_id] = outcome.donor_path
+                break
+
+        entity_states = [
+            states_by_id[entity.entity_id]
+            for entity in target_clip.annotation.entities
+            if entity.entity_id in states_by_id
+        ]
+        if not accepted:
+            self._mark_cross_terminal(
+                shard,
+                clip_uid,
+                status=CROSS_TERMINAL_COMPLETED,
+                reason_kind="no_accepted_donor",
+                reason="fallback completed without an accepted donor",
+            )
+            return None
+        pairing = _pairing_from_references(
+            target_clip, entity_states, bind_ready_background=False
+        )
+        if pairing.status == "ready":
+            token, pending = self._background_token(
+                shard, clip_uid, frames, CALL_SITE_CROSS_PAIR
+            )
+            if pending is not None:
+                return pending
+            pairing = pairing.model_copy(update={"background_token": token})
+        references = ReferencesState(
+            entities=entity_states, background=target_clip.references.background
+        )
+        _publish_cross_pair_result(
+            storage,
+            clip_uid=clip_uid,
+            references=references,
+            pairing=pairing,
+            donor_paths=accepted,
+        )
+        self._mark_cross_terminal(
+            shard,
+            clip_uid,
+            status=CROSS_TERMINAL_COMPLETED,
+            reason_kind="published",
+            reason=f"accepted donors: {sorted(accepted)}",
+        )
+        return None
+
+    def _finish_cross_failure(
+        self,
+        shard: str,
+        clip_uid: str,
+        target_clip: Any,
+        entity: Any,
+        evidence: Any,
+        donor: Any,
+        result: JobResult,
+    ) -> None:
+        """Legacy target-block failure: debug, diagnostic, then the marker."""
+        from r2v_data_v2.v3.cross_pair_judge import CrossPairJudgeFailure
+        from r2v_data_v2.v3.pair import _write_cross_pair_debug
+
+        storage = self._storage_for(shard)
+        failure = CrossPairJudgeFailure(str(result.payload.get("error") or "cross-pair judge failed"))
+        _write_cross_pair_debug(
+            storage,
+            target_clip=target_clip,
+            target_entity=entity,
+            target_evidence_mode=evidence.evidence_mode,
+            target_frame_slots=evidence.frame_slots,
+            target_context_image=evidence.context_image,
+            donor=donor,
+            failure=failure,
+        )
+        storage.append_failure(
+            stage="pair", clip_uid=clip_uid, reason=str(failure), details={}
+        )
+        self.stats[shard]["failed"] += 1
+        self._mark_cross_terminal(
+            shard,
+            clip_uid,
+            status=CROSS_TERMINAL_FAILED,
+            reason_kind="cross_pair_judge_failure",
+            reason=str(result.payload.get("error") or ""),
+        )
+
     # -- model calls -------------------------------------------------------
 
     def run(self, job: ModelJob, handle: Any) -> JobResult:
@@ -1140,7 +1517,78 @@ class PairEpochRunner:
             return self._run_entity_job(job, handle)
         if job.job_type == PAIR_BACKGROUND_GUARD_JOB:
             return self._run_guard_job(job, handle)
+        if job.job_type == PAIR_CROSS_JUDGE_JOB:
+            return self._run_cross_job(job, handle)
         raise PairEpochError(f"unknown Pair job type: {job.job_type}")
+
+    def _run_cross_job(self, job: ModelJob, handle: Any) -> JobResult:
+        from r2v_data_v2.v3.cross_pair_judge import (
+            CrossPairJudgeFailure,
+            QwenCrossPairJudge,
+        )
+
+        shard = job.canonical_shard
+        clip_uid = job.clip_uid
+        try:
+            prepared, evidence, donor, rank, target_clip = self._cross_position(
+                shard, clip_uid, dict(job.target)
+            )
+        except PairEpochError as exc:
+            # Frozen durable-state drift must never be recorded as the legacy
+            # target-block terminal outcome.
+            return JobResult(OUTCOME_RETRYABLE_FAILED, detail=str(exc))
+        snapshot_identity = self._snapshot_identity(self.donor_snapshot(shard))
+        index = int(dict(job.target)["target_entity_index"])
+        entity = target_clip.annotation.entities[index]
+        rebuilt = self._cross_job(
+            shard,
+            clip_uid,
+            entity,
+            index,
+            evidence,
+            donor,
+            rank,
+            snapshot_identity,
+            prepared.donor_reference_image,
+        )
+        if rebuilt.input_digest != job.input_digest:
+            return JobResult(
+                OUTCOME_RETRYABLE_FAILED,
+                detail="cross-pair semantic inputs changed",
+            )
+        resolved = _resolve_qwen_judge(
+            handle,
+            self.config.qwen.cross_pair_judge,
+            lambda svc: QwenCrossPairJudge(
+                svc, repair_retries=self.config.pair.repair_retries
+            ),
+        )
+        try:
+            attempt = run_cross_pair_judge(prepared, resolved.judge)
+        except CrossPairJudgeFailure as exc:
+            # Legacy: the fallback aborts the whole target and is never retried.
+            return JobResult(
+                OUTCOME_COMPLETED,
+                payload={
+                    "status": "cross_pair_failed",
+                    "error": str(exc),
+                    "raw_responses": list(getattr(exc, "raw_responses", ()) or ()),
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - infrastructure, not semantic
+            return JobResult(OUTCOME_RETRYABLE_FAILED, detail=str(exc))
+        finally:
+            if resolved.owned:
+                resolved.judge.close()
+        return JobResult(
+            OUTCOME_COMPLETED,
+            payload={
+                "status": "decision",
+                "decision": attempt.decision.model_dump(mode="json"),
+                "raw_responses": list(attempt.raw_responses),
+                "repair_attempts": int(attempt.repair_attempts),
+            },
+        )
 
     def _run_entity_job(self, job: ModelJob, handle: Any) -> JobResult:
         storage = self._storage_for(job.canonical_shard)
@@ -1268,7 +1716,15 @@ class PairEpochRunner:
         if job.job_type == PAIR_ENTITY_JUDGE_JOB:
             return self._finalize_primary_clip(job)
         if job.job_type == PAIR_BACKGROUND_GUARD_JOB:
+            if dict(job.target).get("call_site") == CALL_SITE_CROSS_PAIR:
+                pending = self._advance_cross_pair_target(
+                    job.canonical_shard, job.clip_uid
+                )
+                return (pending,) if pending is not None else ()
             return self._finalize_primary_clip(job)
+        if job.job_type == PAIR_CROSS_JUDGE_JOB:
+            pending = self._advance_cross_pair_target(job.canonical_shard, job.clip_uid)
+            return (pending,) if pending is not None else ()
         raise PairEpochError(f"unknown Pair job type: {job.job_type}")
 
     def _finalize_primary_clip(self, job: ModelJob) -> Sequence[ModelJob]:
@@ -1392,3 +1848,24 @@ def load_frozen_donor_index(
             donors.append(_restore_donor(storage, group["parent_video_id"], entry))
         index[key] = donors
     return {key: tuple(items) for key, items in index.items()}
+
+
+# ---------------------------------------------------------------------------
+# Durable cross-pair chain (Commit 3b-2)
+# ---------------------------------------------------------------------------
+
+PAIR_CROSS_TERMINAL_SCHEMA = "post_mask_epoch_pair_cross_terminal/1"
+
+CROSS_TERMINAL_COMPLETED = "completed"
+CROSS_TERMINAL_FAILED = "failed"
+
+
+def _cross_payload_attempt(result: JobResult) -> Any:
+    from r2v_data_v2.v3.cross_pair_judge import CrossPairDecisionAttempt
+    from r2v_data_v2.v3.schemas import RawCrossPairDecision
+
+    return CrossPairDecisionAttempt(
+        decision=RawCrossPairDecision.model_validate(result.payload["decision"]),
+        raw_responses=tuple(result.payload.get("raw_responses", ())),
+        repair_attempts=int(result.payload.get("repair_attempts", 0)),
+    )
