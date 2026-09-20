@@ -38,25 +38,38 @@ class PreparedShard:
 
 
 def resume_first_assigned_shards(root, shard_ids):
-    """Prioritize cheap resume markers within an already rank-partitioned schedule.
+    """Prioritize existing incomplete shard directories without content reads.
 
-    This deliberately performs only filesystem metadata checks. It never opens
-    stage JSON, receipts, media, or hashes. Cross-node ownership must already be
-    fixed by shard_order(..., rank=..., world_size=...) before calling this.
+    Cross-node ownership is fixed before this call. Scheduling performs one
+    directory enumeration of shards/, then inspects only existing assigned shard
+    directories for a top-level COMPLETE marker. It never opens stage JSON,
+    receipts, media, or hashes.
     """
     root = Path(root)
-    unfinished, fresh, complete = [], [], []
-    for shard_id in shard_ids:
-        shard = root / "shards" / production.shard_name(shard_id)
-        if (shard / "COMPLETE").is_file():
-            complete.append(shard_id)
-            continue
-        state = shard / "stage_state"
-        has_stage_summary = (
-            state.is_dir() and next(state.glob("*.json"), None) is not None
-        )
-        started = (shard / "state.jsonl.partial").is_file() or has_stage_summary
-        (unfinished if started else fresh).append(shard_id)
+    assigned = list(shard_ids)
+    assigned_by_name = {production.shard_name(shard_id): shard_id for shard_id in assigned}
+    existing = {}
+    shards_root = root / "shards"
+    if shards_root.is_dir():
+        with os.scandir(shards_root) as entries:
+            for entry in entries:
+                shard_id = assigned_by_name.get(entry.name)
+                if shard_id is not None and entry.is_dir(follow_symlinks=False):
+                    existing[shard_id] = Path(entry.path)
+
+    complete = set()
+    for shard_id, shard in existing.items():
+        with os.scandir(shard) as entries:
+            if any(
+                entry.name == "COMPLETE" and entry.is_file(follow_symlinks=False)
+                for entry in entries
+            ):
+                complete.add(shard_id)
+
+    unfinished = [
+        shard_id for shard_id in assigned if shard_id in existing and shard_id not in complete
+    ]
+    fresh = [shard_id for shard_id in assigned if shard_id not in existing]
     return unfinished + fresh, {
         "unfinished": len(unfinished),
         "fresh": len(fresh),
