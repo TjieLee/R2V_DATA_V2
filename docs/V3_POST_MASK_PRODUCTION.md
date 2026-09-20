@@ -718,7 +718,9 @@ agree so they cannot silently diverge.
 are mutually exclusive at the parser, so the combination exits `2` before any
 import. `--dry-run` alone only plans groups; `--job-runner` alone executes;
 neither is a clear usage error. The shell adds `--dry-run` only when no runner
-came from the environment or the CLI.
+came from the environment or the CLI, and resolves the mode strictly CLI
+first, environment second, plan-only default last, so it never emits both and
+never overrides an explicit CLI choice.
 
 **The remove stage can complete; a group cannot.** Downstream phases (pair,
 reference edit, reference integrity, instruction, subject attributes, export) are

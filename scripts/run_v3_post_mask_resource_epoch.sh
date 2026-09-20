@@ -8,11 +8,14 @@ set -eu
 
 REPO="${POST_MASK_REPO:-/mnt/workspace/litengjie/data/R2V_DATA_V2}"
 
-# True when the extra CLI arguments already carry this option. The Python
-# parser stays the authority: this only decides whether the shell has to add a
-# default, so a CLI override is never shadowed by an environment default.
+# True when the *user* CLI arguments already carry this option. "$@" includes
+# the needle itself, so it has to be shifted off first; scanning it too would
+# make every check unconditionally true. The Python parser stays the authority:
+# this only decides whether the shell has to add a default, so a CLI value is
+# never shadowed by an environment default.
 _cli_has() {
   local needle="$1"
+  shift
   local arg
   for arg in "$@"; do
     if [[ "${arg}" == "${needle}" || "${arg}" == "${needle}"=* ]]; then
@@ -52,12 +55,17 @@ if [[ -n "${POST_MASK_GROUP_SIZE:-}" ]]; then
 fi
 OPTS+=(--rank "${RANK:-0}" --world-size "${WORLD_SIZE:-1}")
 
-# A job runner is the only thing that may execute model jobs. Add --dry-run
-# only when neither the environment nor the CLI supplied one: --dry-run and
-# --job-runner are mutually exclusive in the parser.
-if [[ -n "${POST_MASK_JOB_RUNNER:-}" ]]; then
+# A job runner is the only thing that may execute model jobs, and --dry-run
+# and --job-runner are mutually exclusive in the parser. Resolution is strictly
+# CLI first, environment second, plan-only default last, so the shell never
+# emits both and never overrides an explicit CLI choice.
+if _cli_has --dry-run "$@"; then
+  :
+elif _cli_has --job-runner "$@"; then
+  :
+elif [[ -n "${POST_MASK_JOB_RUNNER:-}" ]]; then
   OPTS+=(--job-runner "${POST_MASK_JOB_RUNNER}")
-elif ! _cli_has --job-runner "$@"; then
+else
   OPTS+=(--dry-run)
 fi
 
