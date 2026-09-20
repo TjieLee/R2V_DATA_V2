@@ -352,29 +352,28 @@ def test_range_and_optional_arguments(sandbox):
 
 
 @pytest.mark.parametrize("status", [0, 7])
-def test_one_server_for_all_shards_and_proxy_readiness(sandbox, status):
+def test_shell_launches_only_supervisor_and_passes_mimo_config(sandbox, status):
     script, env, root = sandbox
     result = invoke(script, {**env, "RUN_STATUS": str(status), "GPU_IDS": "3,7"})
     assert result.returncode == status, result.stderr
     log = events(root)
-    assert log.count("mimo-start") == log.count("mimo-stop") == 1
+    assert "mimo-start" not in log
+    assert "mimo-stop" not in log
     assert log.count("runner-start") == 1
-    assert log.index("runner-exit") < log.index("mimo-stop")
-    for name in ("mimo", "runner"):
-        session = json.loads((root / f"{name}.session.json").read_text())
-        assert session["pid"] == session["pgid"] == session["sid"]
-        assert session["sid"] != os.getsid(0)
-        assert session["stdin_is_devnull"]
-    calls = [json.loads(line[5:]) for line in log if line.startswith("curl:")]
-    assert sum(args[-1].endswith("/model_info") for args in calls) == 2
-    assert sum(args[-1].endswith("/v1/models") for args in calls) == 2
-    for args in calls:
-        assert args[args.index("--noproxy") + 1] == "*"
+    assert log.count("runner-exit") == 1
+    session = json.loads((root / "runner.session.json").read_text())
+    assert session["pid"] == session["pgid"] == session["sid"]
+    assert session["sid"] != os.getsid(0)
+    assert session["stdin_is_devnull"]
     record = json.loads((root / "invocation.json").read_text())
     for flag, value in {
         "gpu-ids": "3,7",
         "shards": "59,12,87",
         "request-workers": "1",
+        "mimo-mem-fraction-static": "0.65",
+        "mimo-startup-polls": "3",
+        "mimo-poll-interval": "0.01",
+        "mimo-cleanup-grace-seconds": "2",
     }.items():
         assert record["args"][record["args"].index("--" + flag) + 1] == value
     child_env = record["env"]
@@ -389,32 +388,12 @@ def test_one_server_for_all_shards_and_proxy_readiness(sandbox, status):
     assert child_env["http_proxy"] == "http://external.invalid:3128"
     assert child_env["HTTPS_PROXY"] == "http://secure.invalid:3128"
     assert "CUDA_VISIBLE_DEVICES" not in child_env
-    with pytest.raises(ProcessLookupError):
-        os.kill(int((root / "mimo.pid").read_text()), 0)
-
-
-@pytest.mark.parametrize("mode", ["timeout", "dead"])
-def test_readiness_failure_never_launches_supervisor(sandbox, mode):
-    script, env, root = sandbox
-    result = invoke(script, {**env, "READY_MODE": mode})
-    assert result.returncode != 0
-    assert "runner-start" not in events(root)
-    assert events(root).count("mimo-stop") == 1
-
-
-def test_busy_port_does_not_start_or_stop_foreign_server(sandbox):
-    script, env, root = sandbox
-    result = invoke(script, {**env, "PORT_BUSY": "1"})
-    assert result.returncode != 0
-    assert not (root / "events").exists()
 
 
 @pytest.mark.parametrize(
     "stop_signal, exit_status", [(signal.SIGTERM, 143), (signal.SIGINT, 130)]
 )
-def test_term_waits_for_supervisor_workers_before_mimo(
-    sandbox, stop_signal, exit_status
-):
+def test_term_waits_for_supervisor_workers(sandbox, stop_signal, exit_status):
     script, env, root = sandbox
     proc = subprocess.Popen(
         ["bash", str(script)],
@@ -433,12 +412,8 @@ def test_term_waits_for_supervisor_workers_before_mimo(
         _, err = proc.communicate(timeout=8)
         assert proc.returncode == exit_status, err
         log = events(root)
-        assert (
-            log.index("runner-term")
-            < log.index("workers-stopped")
-            < log.index("mimo-stop")
-        )
-        for name in ("runner", "worker", "mimo"):
+        assert log.index("runner-term") < log.index("workers-stopped")
+        for name in ("runner", "worker"):
             with pytest.raises(ProcessLookupError):
                 os.kill(int((root / f"{name}.pid").read_text()), 0)
     finally:
@@ -447,12 +422,9 @@ def test_term_waits_for_supervisor_workers_before_mimo(
         proc.communicate(timeout=5)
 
 
-@pytest.mark.parametrize("stage", ["runner", "mimo"])
-def test_forced_cleanup_kills_only_owned_process_groups(sandbox, stage):
+def test_forced_cleanup_kills_only_owned_supervisor_group(sandbox):
     script, env, root = sandbox
-    env = {**env, "FORCE_STAGE": stage, "CLEANUP_GRACE_SECONDS": "1"}
-    if stage == "mimo":
-        env["RUN_MODE"] = "wait"
+    env = {**env, "FORCE_STAGE": "runner", "CLEANUP_GRACE_SECONDS": "1"}
     foreign = subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True
     )
@@ -460,31 +432,22 @@ def test_forced_cleanup_kills_only_owned_process_groups(sandbox, stage):
         ["bash", str(script)], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE
     )
     try:
-        flags = (
-            ["worker-ready"]
-            if stage == "runner"
-            else ["runner-ready", "mimo-worker-ready"]
-        )
         deadline = time.monotonic() + 8
-        while (
-            not all((root / name).exists() for name in flags)
-            and time.monotonic() < deadline
-        ):
+        while not (root / "worker-ready").exists() and time.monotonic() < deadline:
             assert proc.poll() is None
             time.sleep(0.01)
-        assert all((root / name).exists() for name in flags)
+        assert (root / "worker-ready").exists()
         proc.terminate()
         _, stderr = proc.communicate(timeout=8)
         assert proc.returncode == 143, stderr
         assert foreign.poll() is None
-        for name in ("runner", "worker", "mimo", "mimo-worker"):
+        for name in ("runner", "worker"):
             path = root / f"{name}.pid"
             if not path.exists():
                 continue
             pid = int(path.read_text())
             deadline = time.monotonic() + 3
             while time.monotonic() < deadline:
-                # An orphan zombie is already dead; PID 1 owns its final reap.
                 state = subprocess.run(
                     ["ps", "-p", str(pid), "-o", "stat="],
                     capture_output=True,
