@@ -99,6 +99,11 @@ def _source_identity(path):
     }
 
 
+def _same_source_content_metadata(left, right):
+    """Cross-mount-stable fast identity; full SHA is the fallback on change."""
+    return all(left.get(key) == right.get(key) for key in ("path", "size", "mtime_ns"))
+
+
 def build_source_index(source: Path, root: Path) -> dict:
     source = source.resolve(strict=True)
     root = root.resolve()
@@ -112,12 +117,13 @@ def build_source_index(source: Path, root: Path) -> dict:
             if index["shard_size"] != SHARD_SIZE:
                 raise ValueError("source index shard size mismatch; use a fresh production root")
             if (
-                index["source_identity"] != identity
+                not _same_source_content_metadata(index["source_identity"], identity)
                 and _sha(source) != index["source_sha256"]
             ):
                 raise ValueError("source changed; use a fresh production root")
-            # Device/inode/stat identity can differ across mounts. Content is
-            # authoritative; retain the current host's fast stat check in memory.
+            # device/inode/ctime can differ across shared mounts. Stable path,
+            # size and mtime avoid a full-file SHA on every cluster node; SHA
+            # remains the fallback whenever those content-facing fields change.
             index["source_identity"] = identity
             return index
         digest = hashlib.sha256()
@@ -155,8 +161,9 @@ def build_source_index(source: Path, root: Path) -> dict:
 
 def materialize_shard(index: dict, shard_id: int, root: Path) -> Path:
     source = Path(index["source_identity"]["path"])
+    current_identity = _source_identity(source)
     if (
-        _source_identity(source) != index["source_identity"]
+        not _same_source_content_metadata(current_identity, index["source_identity"])
         and _sha(source) != index["source_sha256"]
     ):
         raise ValueError("source changed after indexing")
