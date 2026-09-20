@@ -54,12 +54,13 @@ def test_first_request_is_lazy_and_stage_cleanup_is_mandatory(tmp_path, monkeypa
     events = []
 
     def ensure():
-        events.append("start")
-        value._client = SimpleNamespace(
-            chat=SimpleNamespace(
-                completions=SimpleNamespace(create=lambda **kwargs: kwargs)
+        if value._client is None:
+            events.append("start")
+            value._client = SimpleNamespace(
+                chat=SimpleNamespace(
+                    completions=SimpleNamespace(create=lambda **kwargs: kwargs)
+                )
             )
-        )
 
     def stop():
         events.append("stop")
@@ -72,8 +73,8 @@ def test_first_request_is_lazy_and_stage_cleanup_is_mandatory(tmp_path, monkeypa
         assert events == []
         assert value.chat.completions.create(marker="one") == {"marker": "one"}
         assert value.chat.completions.create(marker="two") == {"marker": "two"}
-        assert events == ["start", "start"]
-    assert events == ["start", "start", "stop"]
+        assert events == ["start"]
+    assert events == ["start", "stop"]
 
 
 def test_busy_port_is_infrastructure_failure(tmp_path, monkeypatch):
