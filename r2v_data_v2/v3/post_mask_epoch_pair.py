@@ -1,0 +1,835 @@
+"""Durable primary Pair resource-epoch jobs.
+
+Scope: the primary Pair pass only -- the per-entity Qwen judge chain and the
+primary background final guard. Cross-pair, the donor snapshot and the
+whole-shard barrier are a later commit.
+
+This module owns the *durable* boundary: ModelJob identity, committed results,
+replayable CPU finalization and the conditional unlock of the next job. It owns
+no Pair policy. Every semantic decision still goes through the frozen helpers in
+:mod:`r2v_data_v2.v3.pair`:
+
+    prepare_entity_reference / run_entity_reference_judge /
+    finalize_entity_reference
+    _BackgroundFinalGuardRuntime.prepare / run / finalize
+
+and publication still goes through ``_publish_pair_result``, so PNG validation,
+backup, atomic replacement, clip write, rollback and cleanup stay exactly as
+legacy left them.
+
+Composing this with the removal runner is a later commit: nothing here touches
+the scheduler, the resource manager or the launcher.
+"""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+from PIL import Image
+
+from r2v_data_v2.v3.config import V3Config
+from r2v_data_v2.v3.pair import (
+    EntityReferenceState,
+    PreparedEntityReferenceDecision,
+    _BackgroundFinalGuardRuntime,
+    _GuardFailClosed,
+    _publish_pair_result,
+    finalize_entity_reference,
+    prepare_entity_reference,
+    run_entity_reference_judge,
+)
+from r2v_data_v2.v3.post_mask_epoch_jobs import (
+    OUTCOME_COMPLETED,
+    OUTCOME_RETRYABLE_FAILED,
+    RESOURCE_QWEN,
+    JobResult,
+    ModelJob,
+    semantic_input_digest,
+)
+from r2v_data_v2.v3.post_mask_epoch_state import GroupLedger
+from r2v_data_v2.v3.schemas import (
+    AnnotationEntity,
+    PairingState,
+    ReferencesState,
+)
+from r2v_data_v2.v3.storage import RunStorage
+
+PAIR_ENTITY_JUDGE_JOB = "pair_entity_reference_judge"
+PAIR_BACKGROUND_GUARD_JOB = "pair_background_final_guard"
+
+PAIR_PRIMARY_PLAN_SCHEMA = "post_mask_epoch_pair_primary/1"
+
+CALL_SITE_PRIMARY = "primary"
+
+PAIR_PHASE = "pair"
+
+CLIP_FRESH_TARGET = "fresh_pair_target"
+CLIP_EXISTING_PAIRING = "existing_pairing"
+CLIP_INELIGIBLE = "ineligible"
+
+
+class PairEpochError(RuntimeError):
+    """Raised when the Pair epoch cannot proceed without changing semantics."""
+
+
+# ---------------------------------------------------------------------------
+# Durable semantic files
+# ---------------------------------------------------------------------------
+
+
+def _semantic_root(ledger: GroupLedger) -> Path:
+    return Path(ledger.root) / "semantic" / "pair"
+
+
+def _read_json(path: Path) -> dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _write_json_once(path: Path, payload: Mapping[str, Any]) -> None:
+    """Create-or-validate. An existing frozen file is never rewritten."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_file():
+        if _read_json(path) != dict(payload):
+            raise PairEpochError(
+                f"{path.name} already exists with different semantics; "
+                "refusing to rewrite a frozen Pair plan"
+            )
+        return
+    path.write_text(json.dumps(payload, sort_keys=True, indent=2), encoding="utf-8")
+
+
+def _sha256_bytes(payload: bytes) -> str:
+    import hashlib
+
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _image_sha256(image: Image.Image) -> str:
+    return _sha256_bytes(image.tobytes())
+
+
+# ---------------------------------------------------------------------------
+# Semantic identity helpers
+# ---------------------------------------------------------------------------
+
+
+def _entity_semantics(entity: AnnotationEntity, index: int) -> dict[str, Any]:
+    return {
+        "entity_id": entity.entity_id,
+        "entity_index": index,
+        "reference_type": str(entity.reference_type),
+        "phrase": entity.phrase,
+        "grounding_prompt": entity.grounding_prompt,
+    }
+
+
+def _candidate_semantics(
+    storage: RunStorage, candidates: Sequence[Any]
+) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for candidate in candidates:
+        path = storage.root / candidate.image_path
+        mask = np.ascontiguousarray(candidate.mask)
+        items.append(
+            {
+                "candidate_id": candidate.candidate_id,
+                "frame_slot": candidate.frame_slot,
+                "source_frame_index": candidate.source_frame_index,
+                "image_path": candidate.image_path,
+                "image_sha256": (
+                    _sha256_bytes(path.read_bytes()) if path.is_file() else ""
+                ),
+                "mask_sha256": _sha256_bytes(mask.tobytes()),
+                "mask_shape": list(mask.shape),
+            }
+        )
+    return items
+
+
+def _pair_policy_semantics(config: V3Config) -> dict[str, Any]:
+    pair = config.pair
+    return {
+        "crop_padding_ratio": pair.crop_padding_ratio,
+        "repair_retries": pair.repair_retries,
+        "reference_prefilter_mode": pair.reference_prefilter_mode,
+        "background_final_guard_mode": pair.background_final_guard_mode,
+        "reference_scope_allow_local": config.reference_scope.allow_local,
+    }
+
+
+def _model_identity(service: Any) -> str:
+    return str(getattr(service, "model", "") or "")
+
+
+# ---------------------------------------------------------------------------
+# Judge handle resolution
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _ResolvedJudge:
+    judge: Any
+    owned: bool
+
+
+def _resolve_qwen_judge(handle: Any, service: Any, factory: Any) -> _ResolvedJudge:
+    """A shared injected judge is used as-is; an endpoint is owned and closed."""
+    if isinstance(handle, str):
+        return _ResolvedJudge(
+            factory(service.model_copy(update={"base_url": handle})), owned=True
+        )
+    if handle is not None:
+        return _ResolvedJudge(handle, owned=False)
+    return _ResolvedJudge(factory(service), owned=False)
+
+
+def _entity_judge_factory(service: Any, config: V3Config) -> Any:
+    from r2v_data_v2.v3.reference_judge import QwenEntityReferenceJudge
+
+    return QwenEntityReferenceJudge(
+        service,
+        repair_retries=config.pair.repair_retries,
+        crop_padding_ratio=config.pair.crop_padding_ratio,
+    )
+
+
+def _guard_judge_factory(service: Any) -> Any:
+    from r2v_data_v2.v3.background_final_guard import QwenFinalBackgroundJudge
+
+    return QwenFinalBackgroundJudge(service)
+
+
+# ---------------------------------------------------------------------------
+# Result shims
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _ReviewAttemptShim:
+    review: Any
+    raw_response: str | None = None
+
+
+def _attempt_from_result(result: JobResult) -> Any:
+    from r2v_data_v2.v3.reference_judge import (
+        EntityReferenceDecisionAttempt,
+        RawEntityReferenceDecision,
+    )
+
+    return EntityReferenceDecisionAttempt(
+        decision=RawEntityReferenceDecision.model_validate(result.payload["decision"]),
+        raw_responses=tuple(result.payload.get("raw_responses", ())),
+        repair_attempts=int(result.payload.get("repair_attempts", 0)),
+    )
+
+
+def _final_background_review(payload: Any) -> Any:
+    from r2v_data_v2.v3.background_final_guard import FinalBackgroundReview
+
+    return FinalBackgroundReview.model_validate(payload)
+
+
+def _validate_frames(storage: RunStorage, clip_uid: str) -> Any:
+    from r2v_data_v2.v3.frames import validate_sampled_frames
+
+    return validate_sampled_frames(storage, clip_uid)
+
+
+def _tokens_for_retained(retained: Sequence[str], entity_by_id: Any) -> dict[str, str]:
+    from r2v_data_v2.v3.pair import _tokens_for_retained as legacy_tokens
+
+    return legacy_tokens(list(retained), entity_by_id)
+
+
+# ---------------------------------------------------------------------------
+# Runner
+# ---------------------------------------------------------------------------
+
+
+class PairEpochRunner:
+    """Durable primary Pair jobs for one resource-epoch group.
+
+    One clip holds at most one outstanding Qwen job: the entity chain inside a
+    clip is a conditional chain, while different clips and different shards may
+    be seeded in parallel.
+    """
+
+    def __init__(
+        self,
+        config: V3Config,
+        storages: Mapping[str, RunStorage],
+        ledger: GroupLedger,
+        *,
+        eligible_clip_uids_by_shard: Mapping[str, Sequence[str]],
+        emit: Any = None,
+    ) -> None:
+        config.validate()
+        if not config.pair.enabled:
+            raise PairEpochError("V3 pair stage is disabled")
+        # Production Post-Mask runs with reference_edit enabled, so the legacy
+        # completion fallbacks stay bypassed: the epoch Pair path is Qwen + CPU
+        # only, never image-edit completion or SAM completion.
+        if not config.reference_edit.enabled:
+            raise PairEpochError(
+                "Pair resource epoch requires reference_edit.enabled: the legacy "
+                "completion fallbacks are not part of the epoch Pair path"
+            )
+        self.config = config
+        self.storages = dict(storages)
+        self.ledger = ledger
+        self.eligible = {
+            shard: tuple(uids) for shard, uids in eligible_clip_uids_by_shard.items()
+        }
+        self.emit = emit or (lambda *args, **kwargs: None)
+        self.phase = ledger.phase(PAIR_PHASE)
+        self.stats: dict[str, dict[str, int]] = {
+            shard: self._empty_stats() for shard in self.storages
+        }
+        self._guard_counters: dict[str, dict[str, int]] = {
+            shard: self._empty_stats() for shard in self.storages
+        }
+
+    @staticmethod
+    def _empty_stats() -> dict[str, int]:
+        from r2v_data_v2.v3.pair import PairStats
+
+        return {field: 0 for field in PairStats.__dataclass_fields__}
+
+    def _storage_for(self, shard: str) -> RunStorage:
+        storage = self.storages.get(shard)
+        if storage is None:
+            raise PairEpochError(f"no run storage for canonical shard {shard!r}")
+        return storage
+
+    def _eligible_for(self, shard: str) -> tuple[str, ...]:
+        return self.eligible.get(shard, ())
+
+    # -- durable primary plan -------------------------------------------
+
+    def _plan_path(self, shard: str) -> Path:
+        return _semantic_root(self.ledger) / "primary" / f"{shard}.json"
+
+    def _clip_classification(self, storage: RunStorage, clip_uid: str) -> str:
+        clip = storage.read_clip(clip_uid)
+        if clip.pairing is not None:
+            return CLIP_EXISTING_PAIRING
+        if (
+            clip.annotation is None
+            or clip.annotation.status != "ready"
+            or clip.coverage is None
+            or not clip.coverage.passed
+        ):
+            return CLIP_INELIGIBLE
+        return CLIP_FRESH_TARGET
+
+    def _write_primary_plan(self, shard: str) -> dict[str, Any]:
+        storage = self._storage_for(shard)
+        eligible = self._eligible_for(shard)
+        clips: dict[str, dict[str, Any]] = {}
+        for clip_uid in eligible:
+            classification = self._clip_classification(storage, clip_uid)
+            clip = storage.read_clip(clip_uid)
+            projection = {
+                "clip_uid": clip_uid,
+                "classification": classification,
+                "annotation": (
+                    clip.annotation.model_dump(mode="json")
+                    if clip.annotation is not None
+                    else None
+                ),
+                "coverage": (
+                    clip.coverage.model_dump(mode="json")
+                    if clip.coverage is not None
+                    else None
+                ),
+            }
+            clips[clip_uid] = {
+                "classification": classification,
+                "digest": semantic_input_digest(projection),
+            }
+        payload = {
+            "schema": PAIR_PRIMARY_PLAN_SCHEMA,
+            "canonical_shard": shard,
+            "config_fingerprint": self.config.fingerprint(),
+            "pair_policy": _pair_policy_semantics(self.config),
+            "eligible_clip_uids": list(eligible),
+            "clips": clips,
+        }
+        _write_json_once(self._plan_path(shard), payload)
+        return payload
+
+    def _require_primary_plan(self, shard: str) -> dict[str, Any]:
+        plan = _read_json(self._plan_path(shard))
+        if plan is None:
+            raise PairEpochError(f"no durable primary plan for shard {shard!r}")
+        if plan.get("schema") != PAIR_PRIMARY_PLAN_SCHEMA:
+            raise PairEpochError(f"unsupported primary plan schema for {shard!r}")
+        return plan
+
+    # -- primary job identity --------------------------------------------
+
+    def _entity_job(
+        self,
+        shard: str,
+        storage: RunStorage,
+        clip_uid: str,
+        entity: AnnotationEntity,
+        index: int,
+        prepared: PreparedEntityReferenceDecision,
+    ) -> ModelJob:
+        service = self.config.qwen.candidate_judge
+        if service is None:
+            raise PairEpochError("candidate judge is not configured")
+        semantic_inputs = {
+            "clip_uid": clip_uid,
+            "entity": _entity_semantics(entity, index),
+            "candidates": _candidate_semantics(storage, prepared.candidates),
+            "policy": _pair_policy_semantics(self.config),
+        }
+        return ModelJob.create(
+            job_type=PAIR_ENTITY_JUDGE_JOB,
+            resource=RESOURCE_QWEN,
+            canonical_shard=shard,
+            clip_uid=clip_uid,
+            semantic_inputs=semantic_inputs,
+            model_identity=_model_identity(service),
+            target={"entity_id": entity.entity_id, "entity_index": str(index)},
+        )
+
+    def _guard_job(
+        self, shard: str, clip_uid: str, call_site: str, preparation: Any
+    ) -> ModelJob:
+        service = self.config.qwen.background_final_judge
+        if service is None:
+            raise PairEpochError("final background judge is not configured")
+        semantic_inputs = {
+            "clip_uid": clip_uid,
+            "call_site": call_site,
+            "background_status": preparation.background_status,
+            "background_phrase": preparation.phrase,
+            "background_grounding_prompt": preparation.grounding_prompt,
+            "image_sha256": _image_sha256(preparation.image),
+        }
+        return ModelJob.create(
+            job_type=PAIR_BACKGROUND_GUARD_JOB,
+            resource=RESOURCE_QWEN,
+            canonical_shard=shard,
+            clip_uid=clip_uid,
+            semantic_inputs=semantic_inputs,
+            model_identity=_model_identity(service),
+            target={"call_site": call_site},
+        )
+
+    def _committed(self, job: ModelJob) -> JobResult | None:
+        state = self.ledger.classify(job)
+        if not state.skippable:
+            return None
+        return self.ledger.load_committed_result(job)
+
+    # -- primary replay ---------------------------------------------------
+
+    def _primary_context(self, storage: RunStorage, clip_uid: str) -> Any:
+        from r2v_data_v2.v3.pair import _validate_pair_inputs
+
+        clip = storage.read_clip(clip_uid)
+        try:
+            frames = _validate_frames(storage, clip_uid)
+            masks = storage.read_masks(clip_uid)
+            _validate_pair_inputs(clip, frames, masks)
+        except Exception:  # noqa: BLE001 - not eligible for Pair
+            return None
+        return (clip, frames, masks)
+
+    @staticmethod
+    def _discard_temporary(
+        temporary_images: Mapping[str, tuple[Path, Image.Image]]
+    ) -> None:
+        """Replay artifacts are not progress: only committed receipts are."""
+        for temporary, _ in temporary_images.values():
+            temporary.unlink(missing_ok=True)
+
+    def _replay_primary_clip(
+        self,
+        shard: str,
+        storage: RunStorage,
+        clip_uid: str,
+        context: Any,
+        *,
+        stop_at_unresolved: bool,
+    ) -> tuple[
+        list[EntityReferenceState], dict[str, tuple[Path, Image.Image]], ModelJob | None
+    ]:
+        """Rebuild a clip's primary prefix from committed results only.
+
+        Deterministic entities are recomputed; entity judge outcomes are read
+        back from their receipts. Nothing lives only in memory, so a crash
+        before publication costs zero extra Qwen calls.
+        """
+        clip, frames, masks = context
+        counters = self.stats[shard]
+        entity_states: list[EntityReferenceState] = []
+        temporary_images: dict[str, tuple[Path, Image.Image]] = {}
+        for index, entity in enumerate(clip.annotation.entities):
+            prepared = prepare_entity_reference(
+                self.config,
+                storage,
+                clip_uid=clip_uid,
+                entity=entity,
+                frames=frames,
+                masks=masks,
+                counters=counters,
+            )
+            if isinstance(prepared, EntityReferenceState):
+                entity_states.append(prepared)
+                continue
+            job = self._entity_job(shard, storage, clip_uid, entity, index, prepared)
+            result = self._committed(job)
+            if result is None:
+                if not stop_at_unresolved:
+                    raise PairEpochError(
+                        f"primary entity {entity.entity_id} has no committed result"
+                    )
+                self._discard_temporary(temporary_images)
+                return entity_states, {}, job
+            finalization = finalize_entity_reference(
+                self.config,
+                storage,
+                prepared=prepared,
+                attempt=_attempt_from_result(result),
+            )
+            entity_states.append(finalization.state)
+            if finalization.temporary is not None:
+                temporary_images[entity.entity_id] = finalization.temporary
+        return entity_states, temporary_images, None
+
+    # -- background guard -------------------------------------------------
+
+    def _guard_runtime(self, shard: str) -> Any:
+        return _BackgroundFinalGuardRuntime(
+            self.config, self._storage_for(shard), self._guard_counters[shard], None
+        )
+
+    def _background_token(
+        self,
+        shard: str,
+        clip_uid: str,
+        frames: Any,
+        call_site: str,
+        *,
+        stop_at_unresolved: bool,
+    ) -> tuple[str | None, ModelJob | None]:
+        """Return ``(token, pending_guard_job)`` for one guard call site.
+
+        ``mode == off`` and a non-ready background produce no Qwen job, and a
+        deterministic guard failure closes the background binding only.
+        """
+        runtime = self._guard_runtime(shard)
+        clip = self._storage_for(shard).read_clip(clip_uid)
+        try:
+            step = runtime.prepare_background_final_guard(clip=clip, frames=frames)
+        except _GuardFailClosed as closed:
+            background = clip.references.background
+            assert background is not None
+            runtime._fail_closed(
+                clip=clip,
+                background=background,
+                raw_response=closed.raw_response,
+                error=closed.error,
+            )
+            return None, None
+        if step.preparation is None:
+            return step.token, None
+        job = self._guard_job(shard, clip_uid, call_site, step.preparation)
+        result = self._committed(job)
+        if result is None:
+            if not stop_at_unresolved:
+                raise PairEpochError(f"background guard {clip_uid} has no result")
+            return None, job
+        return self._apply_guard_result(runtime, step.preparation, result), None
+
+    @staticmethod
+    def _apply_guard_result(runtime: Any, preparation: Any, result: JobResult) -> str | None:
+        if str(result.payload.get("status", "")) == "failed_closed":
+            runtime._fail_closed(
+                clip=preparation.clip,
+                background=preparation.background,
+                raw_response=result.payload.get("raw_response"),
+                error=RuntimeError(str(result.payload.get("error") or "guard failed")),
+            )
+            return None
+        return runtime.finalize_background_final_guard(
+            preparation,
+            _ReviewAttemptShim(
+                review=_final_background_review(result.payload.get("review")),
+                raw_response=result.payload.get("raw_response"),
+            ),
+        )
+
+    # -- primary publication ----------------------------------------------
+
+    def _publish_primary(
+        self,
+        shard: str,
+        storage: RunStorage,
+        clip_uid: str,
+        frames: Any,
+        entity_states: Sequence[EntityReferenceState],
+        temporary_images: Mapping[str, tuple[Path, Image.Image]],
+        *,
+        stop_at_unresolved: bool,
+    ) -> ModelJob | None:
+        clip = storage.read_clip(clip_uid)
+        counters = self.stats[shard]
+        retained = [state.entity_id for state in entity_states if state.status == "ready"]
+        if not set(retained).intersection(clip.coverage.qualifying_entity_ids):
+            pairing = PairingState(
+                status="rejected", reason="no_qualifying_ready_reference"
+            )
+            token: str | None = None
+        else:
+            token, pending = self._background_token(
+                shard,
+                clip_uid,
+                frames,
+                CALL_SITE_PRIMARY,
+                stop_at_unresolved=stop_at_unresolved,
+            )
+            if pending is not None:
+                self._discard_temporary(temporary_images)
+                return pending
+            pairing = PairingState(
+                status="ready",
+                retained_entity_ids=retained,
+                tokens=_tokens_for_retained(
+                    retained, {e.entity_id: e for e in clip.annotation.entities}
+                ),
+                background_token=token,
+            )
+        _publish_pair_result(
+            self.config,
+            storage,
+            clip_uid=clip_uid,
+            references=ReferencesState(
+                entities=list(entity_states),
+                background=clip.references.background,
+            ),
+            pairing=pairing,
+            temporary_images=dict(temporary_images),
+        )
+        ready_count = sum(state.status == "ready" for state in entity_states)
+        counters["entities_ready"] += ready_count
+        counters["entities_rejected"] += len(entity_states) - ready_count
+        counters[pairing.status] += 1
+        counters["backgrounds_bound"] += int(pairing.background_token is not None)
+        return None
+
+    # -- seeding and primary status ---------------------------------------
+
+    def seed_primary_jobs(self) -> list[ModelJob]:
+        """Seed the first unresolved primary job for every fresh Pair target."""
+        jobs: list[ModelJob] = []
+        for shard in sorted(self.storages):
+            plan = self._write_primary_plan(shard)
+            storage = self._storage_for(shard)
+            for clip_uid in plan["eligible_clip_uids"]:
+                if plan["clips"][clip_uid]["classification"] != CLIP_FRESH_TARGET:
+                    continue
+                context = self._primary_context(storage, clip_uid)
+                if context is None:
+                    continue
+                _, temporary, pending = self._replay_primary_clip(
+                    shard, storage, clip_uid, context, stop_at_unresolved=True
+                )
+                # Seeding never publishes: rebuilt temporaries are discarded.
+                self._discard_temporary(temporary)
+                if pending is not None:
+                    jobs.append(pending)
+        jobs.sort(key=lambda job: job.job_id())
+        self.phase.write_plan(jobs)
+        return jobs
+
+    def primary_unresolved_job_ids(self) -> tuple[str, ...]:
+        """Job ids of primary work that is still outstanding.
+
+        A later commit consumes this to decide which clips are settled before
+        the donor snapshot is frozen.
+        """
+        unresolved: list[str] = []
+        for shard in sorted(self.storages):
+            plan = self._require_primary_plan(shard)
+            storage = self._storage_for(shard)
+            for clip_uid in plan["eligible_clip_uids"]:
+                if plan["clips"][clip_uid]["classification"] != CLIP_FRESH_TARGET:
+                    continue
+                context = self._primary_context(storage, clip_uid)
+                if context is None:
+                    continue
+                _, temporary, pending = self._replay_primary_clip(
+                    shard, storage, clip_uid, context, stop_at_unresolved=True
+                )
+                self._discard_temporary(temporary)
+                if pending is not None:
+                    unresolved.append(pending.job_id())
+        return tuple(unresolved)
+
+    # -- model calls -------------------------------------------------------
+
+    def run(self, job: ModelJob, handle: Any) -> JobResult:
+        if job.job_type == PAIR_ENTITY_JUDGE_JOB:
+            return self._run_entity_job(job, handle)
+        if job.job_type == PAIR_BACKGROUND_GUARD_JOB:
+            return self._run_guard_job(job, handle)
+        raise PairEpochError(f"unknown Pair job type: {job.job_type}")
+
+    def _run_entity_job(self, job: ModelJob, handle: Any) -> JobResult:
+        storage = self._storage_for(job.canonical_shard)
+        clip = storage.read_clip(job.clip_uid)
+        frames = _validate_frames(storage, job.clip_uid)
+        masks = storage.read_masks(job.clip_uid)
+        index = int(dict(job.target)["entity_index"])
+        entity = clip.annotation.entities[index]
+        prepared = prepare_entity_reference(
+            self.config,
+            storage,
+            clip_uid=job.clip_uid,
+            entity=entity,
+            frames=frames,
+            masks=masks,
+            counters=self.stats[job.canonical_shard],
+        )
+        if not isinstance(prepared, PreparedEntityReferenceDecision):
+            return JobResult(
+                OUTCOME_RETRYABLE_FAILED,
+                detail=f"entity {entity.entity_id} became deterministic",
+            )
+        rebuilt = self._entity_job(
+            job.canonical_shard, storage, job.clip_uid, entity, index, prepared
+        )
+        if rebuilt.input_digest != job.input_digest:
+            return JobResult(
+                OUTCOME_RETRYABLE_FAILED,
+                detail="primary entity semantic inputs changed",
+            )
+        resolved = _resolve_qwen_judge(
+            handle,
+            self.config.qwen.candidate_judge,
+            lambda svc: _entity_judge_factory(svc, self.config),
+        )
+        try:
+            attempt = run_entity_reference_judge(prepared, resolved.judge)
+        except Exception as exc:  # noqa: BLE001 - retryable, no receipt
+            return JobResult(OUTCOME_RETRYABLE_FAILED, detail=str(exc))
+        finally:
+            if resolved.owned:
+                resolved.judge.close()
+        return JobResult(
+            OUTCOME_COMPLETED,
+            payload={
+                "decision": attempt.decision.model_dump(mode="json"),
+                "raw_responses": list(attempt.raw_responses),
+                "repair_attempts": int(attempt.repair_attempts),
+            },
+        )
+
+    def _run_guard_job(self, job: ModelJob, handle: Any) -> JobResult:
+        runtime = self._guard_runtime(job.canonical_shard)
+        storage = self._storage_for(job.canonical_shard)
+        clip = storage.read_clip(job.clip_uid)
+        frames = _validate_frames(storage, job.clip_uid)
+        call_site = dict(job.target)["call_site"]
+        try:
+            step = runtime.prepare_background_final_guard(clip=clip, frames=frames)
+        except _GuardFailClosed as closed:
+            # A guard failure closes the background binding only: durable, and
+            # never a scheduler retry.
+            return JobResult(
+                OUTCOME_COMPLETED,
+                payload={
+                    "status": "failed_closed",
+                    "raw_response": closed.raw_response,
+                    "error": str(closed.error),
+                },
+            )
+        if step.preparation is None:
+            return JobResult(
+                OUTCOME_COMPLETED,
+                payload={"status": "unbound", "token": step.token},
+            )
+        rebuilt = self._guard_job(
+            job.canonical_shard, job.clip_uid, call_site, step.preparation
+        )
+        if rebuilt.input_digest != job.input_digest:
+            return JobResult(
+                OUTCOME_RETRYABLE_FAILED,
+                detail="background guard semantic inputs changed",
+            )
+        resolved = _resolve_qwen_judge(
+            handle, self.config.qwen.background_final_judge, _guard_judge_factory
+        )
+        runtime.active_judge = resolved.judge
+        try:
+            attempt = runtime.run_background_final_guard_judge(step.preparation)
+        except _GuardFailClosed as closed:
+            return JobResult(
+                OUTCOME_COMPLETED,
+                payload={
+                    "status": "failed_closed",
+                    "raw_response": closed.raw_response,
+                    "error": str(closed.error),
+                },
+            )
+        finally:
+            if resolved.owned:
+                resolved.judge.close()
+        return JobResult(
+            OUTCOME_COMPLETED,
+            payload={
+                "status": (
+                    "accepted" if attempt.review.verdict == "accept" else "rejected"
+                ),
+                "review": attempt.review.model_dump(mode="json"),
+                "raw_response": attempt.raw_response,
+            },
+        )
+
+    # -- finalization -------------------------------------------------------
+
+    def finalize(self, job: ModelJob, result: JobResult) -> Sequence[ModelJob]:
+        del result  # the committed receipt is the authority, not this object
+        if job.job_type == PAIR_ENTITY_JUDGE_JOB:
+            return self._finalize_primary_clip(job)
+        if job.job_type == PAIR_BACKGROUND_GUARD_JOB:
+            return self._finalize_primary_clip(job)
+        raise PairEpochError(f"unknown Pair job type: {job.job_type}")
+
+    def _finalize_primary_clip(self, job: ModelJob) -> Sequence[ModelJob]:
+        shard = job.canonical_shard
+        storage = self._storage_for(shard)
+        # Crash resume: replay from a clean temporary state.
+        storage.cleanup_pair_artifacts(job.clip_uid)
+        context = self._primary_context(storage, job.clip_uid)
+        if context is None:
+            return ()
+        states, temporary, pending = self._replay_primary_clip(
+            shard, storage, job.clip_uid, context, stop_at_unresolved=True
+        )
+        if pending is not None:
+            # A later entity still needs Qwen: nothing is published yet.
+            return (pending,)
+        guard = self._publish_primary(
+            shard,
+            storage,
+            job.clip_uid,
+            context[1],
+            states,
+            temporary,
+            stop_at_unresolved=True,
+        )
+        return (guard,) if guard is not None else ()
