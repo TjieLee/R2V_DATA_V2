@@ -1,5 +1,6 @@
 """frame0 variant semantic invariants: Qwen -> Boogu -> H3(Video1 + Picture1)."""
 
+import os
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -81,6 +82,7 @@ class FakeBoogu:
     def start(self, stderr_log_path):
         self.started += 1
         self.log = Path(stderr_log_path)
+        self.env_tmpdir = os.environ.get("TMPDIR")  # proves the cache namespace
         if self.fail_start:
             raise RuntimeError("boogu worker failed to load")
 
@@ -319,6 +321,7 @@ def test_frame0_start_failure_records_attempt_and_resumes_with_budget(tmp_path, 
 
 
 def test_persistent_backend_starts_once_for_many_cases(tmp_path, monkeypatch):
+    """Worker 0 owns case0 and case2 and must load Boogu exactly once."""
     from r2v_data_v2.person_replacement import h3_pair_frame0 as module
 
     cases = case_fixture(tmp_path,count=4)
@@ -328,12 +331,75 @@ def test_persistent_backend_starts_once_for_many_cases(tmp_path, monkeypatch):
         qwen_marker(case,video)
     monkeypatch.setattr(module,"_decode_frame_zero",decode_stub)
     config = pair_config(cases,tmp_path)
-    config["group_size"] = 4
-    for worker in range(4):  # one GPU worker owns exactly one case here
+    config["group_size"] = 2  # worker 0 -> case0, case2; worker 1 -> case1, case3
+    module.prepare_frame0_partition(config,0,lambda settings:FakeBoogu(settings))
+    backend, = FakeBoogu.instances  # one subprocess, not one per case
+    assert backend.started == 1 and backend.edits == 2 and backend.closed == 1
+    assert phase(cases[0]) == "generate" and phase(cases[2]) == "generate"
+    assert phase(cases[1]) == phase(cases[3]) == "prepare"  # other partition untouched
+    for case in (cases[0],cases[2]):
+        assert (Path(case["directory"])/"preparation/repainted_frame0.png").is_file()
+
+
+def test_worker_directories_are_isolated(tmp_path, monkeypatch):
+    """Concurrent GPU workers must not share runtime, temp or log namespaces."""
+    from r2v_data_v2.person_replacement import h3_pair_frame0 as module
+
+    cases = case_fixture(tmp_path,count=4)
+    video = tmp_path/"video.mp4"
+    video.touch()
+    for case in cases:
+        qwen_marker(case,video)
+    monkeypatch.setattr(module,"_decode_frame_zero",decode_stub)
+    config = pair_config(cases,tmp_path)
+    config["group_size"] = 2
+    for worker in (0,1):
         module.prepare_frame0_partition(config,worker,lambda settings:FakeBoogu(settings))
-    assert len(FakeBoogu.instances) == 4  # one subprocess per worker, not per case
-    assert all(instance.started == 1 and instance.closed == 1 for instance in FakeBoogu.instances)
-    assert all((Path(case["directory"])/"preparation/prepared.json").is_file() for case in cases)
+    first, second = FakeBoogu.instances
+    assert first.log.name == "boogu_worker-0.log" and second.log.name == "boogu_worker-1.log"
+    assert first.log.parent != second.log.parent
+    assert first.settings.temporary_root != second.settings.temporary_root
+    assert first.env_tmpdir != second.env_tmpdir
+    for worker, backend in ((0,first),(1,second)):
+        root = tmp_path/f"frame0-worker-{worker}"
+        assert (root/"runtime").is_dir()
+        assert backend.settings.temporary_root == root/"boogu_tmp"
+    assert (tmp_path/"frame0-worker-0"/"runtime") != (tmp_path/"frame0-worker-1"/"runtime")
+    # case-level artifacts keep their original location
+    for case in cases:
+        directory = Path(case["directory"])/"preparation"
+        assert (directory/"source_frame0.png").is_file()
+        assert (directory/"repainted_frame0.png").is_file()
+        assert (directory/"boogu_job.json").is_file()
+        assert (directory/"prepared.json").is_file()
+
+
+def test_resume_reuses_the_same_worker_namespace(tmp_path, monkeypatch):
+    from r2v_data_v2.person_replacement import h3_pair_frame0 as module
+
+    cases = case_fixture(tmp_path,count=2)
+    video = tmp_path/"video.mp4"
+    video.touch()
+    for case in cases:
+        qwen_marker(case,video)
+    monkeypatch.setattr(module,"_decode_frame_zero",decode_stub)
+    config = pair_config(cases,tmp_path)
+    config["group_size"] = 2
+
+    class CrashingBoogu(FakeBoogu):
+        def edit(self, source_rgb, instruction, width, height, thinking_enabled,
+                 instruction_rewrite_enabled, seed):
+            raise KeyboardInterrupt("frame0 worker died mid-edit")
+
+    with pytest.raises(KeyboardInterrupt):
+        module.prepare_frame0_partition(config,0,CrashingBoogu)
+    first = tmp_path/"frame0-worker-0"/"runtime"
+    assert first.is_dir()
+    module.prepare_frame0_partition(config,0,lambda settings:FakeBoogu(settings))
+    assert first.is_dir()  # stable namespace, never a fresh random directory
+    assert [path.name for path in tmp_path.iterdir() if path.name.startswith("frame0-worker-")] == [
+        "frame0-worker-0"]
+    assert len(FakeBoogu.instances) == 2 and phase(cases[0]) == "generate"
 
 
 def test_backend_is_rebuilt_after_it_breaks_mid_partition(tmp_path, monkeypatch):

@@ -233,8 +233,11 @@ def prepare_frame0_partition(config, worker, backend_factory=None):
              and eligible(case,"prepare",limits[case["case_id"]]["prepare"])]
     if not cases:
         return
-    directory = shared_worker_directory(cases)
-    with boogu_runtime(directory/"frame0_runtime"):
+    # One namespace per GPU worker: concurrent Boogu subprocesses must not share
+    # HF/Triton/Inductor caches, TMPDIR or the Boogu temporary root. Stable
+    # across resumes; never part of the semantic identity.
+    directory = shared_worker_directory(cases)/f"frame0-worker-{worker}"
+    with boogu_runtime(directory/"runtime"):
         session = Frame0BooguSession(config,directory,worker=worker,backend_factory=backend_factory)
         try:
             for case in cases:
