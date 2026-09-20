@@ -141,6 +141,7 @@ def test_lazy_single_load_uses_local_files_only(tmp_path, monkeypatch):
     assert instance.model.path == str(tmp_path)
     assert instance.model.kwargs["local_files_only"] is True
     assert instance.model.kwargs["device_map"] == "auto"
+    assert instance.model.kwargs["trust_remote_code"] is True
     assert "dtype" not in instance.model.kwargs  # FP8 checkpoint keeps its dtype
     assert instance.processor.kwargs["local_files_only"] is True
     assert instance.processor.video_processor.fps is None

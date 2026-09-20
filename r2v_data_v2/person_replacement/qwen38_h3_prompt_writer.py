@@ -453,6 +453,10 @@ class LocalQwen38H3PromptWriter:
             video_processor.fps = None
         self.model = AutoModelForMultimodalLM.from_pretrained(
             str(self.model_path), local_files_only=True, device_map="auto",
+            # Fine-grained FP8 on Hopper may lazily load the official
+            # kernels-community/deep-gemm kernel package. Transformers gates
+            # that executable kernel code behind the remote-code trust flag.
+            trust_remote_code=True,
         ).eval()
 
     def _apply_template(self, messages, *, num_frames):
