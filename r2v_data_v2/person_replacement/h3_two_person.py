@@ -126,17 +126,13 @@ def build_prompt(source1, source2, shot, replacement1, replacement2, *, frame0=F
 
 
 def boogu_frame0_prompt(source1, source2, replacement1, replacement2):
-    """Still-image first-frame edit instruction; no video timing or new people."""
+    """Still-image first-frame edit instruction; no video timing or extra terms."""
     return (
-        "Edit only the two visible people in this frame.\n\n"
-        f"Replace the visible appearance of the person matching {source1} with {replacement1}.\n\n"
-        f"Replace the visible appearance of the person matching {source2} with {replacement2}.\n\n"
-        "Preserve each person's exact pose, body orientation, facial expression, gaze, mouth state, "
-        "hand pose, held or touched objects, hand-object contacts, position, scale and occlusion.\n\n"
-        "Preserve every non-person object, the background, framing, lighting and composition.\n\n"
-        "Do not add a person who is not visible in the source frame. Do not change any action or "
-        "object state. Only the two target people's visible identity, hair, body appearance and "
-        "clothing may change."
+        f"Replace the person matching {source1} with {replacement1}.\n"
+        f"Replace the person matching {source2} with {replacement2}.\n\n"
+        "Keep the original pose, expression, hands, object interactions, positions, "
+        "background and composition unchanged.\n"
+        "Do not add a person who is not visible in the image."
     )
 
 

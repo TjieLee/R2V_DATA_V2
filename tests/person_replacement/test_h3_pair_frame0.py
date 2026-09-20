@@ -1,5 +1,6 @@
 """frame0 variant semantic invariants: Qwen -> Boogu -> H3(Video1 + Picture1)."""
 
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import ClassVar
@@ -8,6 +9,7 @@ import pytest
 
 from r2v_data_v2.person_replacement.h3_pair_state import (
     atomic_json,
+    failure_count,
     phase,
     publish_qwen,
     qwen_prepared,
@@ -18,58 +20,88 @@ from r2v_data_v2.person_replacement.timeline import VideoTimeline
 TEXTS = {"source_subject_1":"a man in a blue jacket","source_subject_2":"a woman with a cup",
          "shot_description":"They talk at a table.","replacement_subject_1":"an old man",
          "replacement_subject_2":"a young woman"}
+BOOGU_ROOT = "/mnt/workspace/litengjie/data"
 
 
-def case_fixture(tmp_path, name="case0", count=4):
-    cases = []
-    for i in range(count):
-        cases.append({"case_id":f"case{i}","directory":str(tmp_path/f"case{i}"),
-                      "row":{"video_path":f"{i}.mp4"},"row_sha256":str(i),"source_index":i})
-    return cases
+def case_fixture(root, count=4):
+    return [{"case_id":f"case{i}","directory":str(root/f"case{i}"),"row":{"video_path":f"{i}.mp4"},
+             "row_sha256":str(i),"source_index":i} for i in range(count)]
 
 
-def qwen_config(cases, clips, variant="frame0"):
+def pair_config(cases, clips, variant="frame0", prepare_budget=2):
     return {"cases":cases,"clips_root":str(clips),"qwen_model":str(clips),"seed":42,"pair_id":0,
             "identity":"identity","variant":variant,
-            "limits":{case["case_id"]:{"prepare":2,"generate":2} for case in cases}}
+            "limits":{case["case_id"]:{"prepare":prepare_budget,"generate":2} for case in cases},
+            "boogu_python":f"{BOOGU_ROOT}/venvs/boogu-image/bin/python",
+            "boogu_code_root":f"{BOOGU_ROOT}/vendor/Boogu-Image",
+            "boogu_model_root":f"{BOOGU_ROOT}/models/Boogu"}
 
 
-class FakeQwen:
+def qwen_marker(case, video):
+    publish_qwen(case,{**TEXTS,"case_id":case["case_id"],"row_sha256":case["row_sha256"],
+                       "identity":"identity","source":str(video),"seed":42,"frames":124,
+                       "width":1376,"height":768,"timeline":{},"aspect_ratio":"16:9"},TEXTS)
+
+
+class QwenSpy:
+    calls: ClassVar = []
+
     def __init__(self, path):
-        self.calls = []
+        QwenSpy.calls.append("load")
+
     def _load(self):
         pass
+
     def describe_two(self, video):
+        QwenSpy.calls.append("describe")
         return TEXTS["source_subject_1"],TEXTS["source_subject_2"],TEXTS["shot_description"]
+
     def invent_two(self, *args):
         return TEXTS["replacement_subject_1"],TEXTS["replacement_subject_2"]
+
     def close(self):
-        pass
+        QwenSpy.calls.append("close")
 
 
 class FakeBoogu:
-    """Stands in for BooguSubprocessBackend; still exercises publish ordering."""
+    """Minimal stand-in for BooguSubprocessBackend with its real start/edit lifecycle."""
 
     instances: ClassVar = []
 
-    def __init__(self, config, directory=None):
-        self.config = config
-        self.directory = directory
-        self.started = False
+    def __init__(self, settings, *, fail_edit=(), fail_start=False, effective=None):
+        self.settings = settings
+        self.fail_edit = fail_edit
+        self.fail_start = fail_start
+        self.effective_instruction = effective
+        self.edits = 0
+        self.started = 0
+        self.closed = 0
         FakeBoogu.instances.append(self)
 
     def start(self, stderr_log_path):
-        self.started = True
-        self.log = stderr_log_path
+        self.started += 1
+        self.log = Path(stderr_log_path)
+        if self.fail_start:
+            raise RuntimeError("boogu worker failed to load")
 
     def edit(self, source_rgb, instruction, width, height, thinking_enabled,
              instruction_rewrite_enabled, seed):
-        self.instruction = instruction
-        self.width, self.height, self.seed = width, height, seed
-        return SimpleNamespace(png_bytes=b"\x89PNG-repainted", worker_metadata={"backend":"fake"})
+        self.edits += 1
+        if self.edits in self.fail_edit:
+            raise RuntimeError("boogu edit failed")
+        return SimpleNamespace(png_bytes=b"\x89PNG-repainted",
+                               original_instruction=instruction,
+                               rewritten_instruction=None,
+                               effective_instruction=self.effective_instruction or instruction,
+                               worker_metadata={"backend":"fake"})
 
     def close(self):
-        self.closed = True
+        self.closed += 1
+
+
+@contextmanager
+def nullcontext():
+    yield
 
 
 def decode_stub(video, directory, width, height):
@@ -79,6 +111,15 @@ def decode_stub(video, directory, width, height):
     path.write_bytes(b"\x89PNG-source")
     return SimpleNamespace(), path
 
+
+@pytest.fixture(autouse=True)
+def reset_spies():
+    QwenSpy.calls.clear()
+    FakeBoogu.instances.clear()
+    yield
+
+
+# ---------------------------------------------------------------- CLI / identity
 
 def test_cli_variant_choices_and_default(tmp_path):
     from tools.person_replacement.run_h3_pdd_pair_executor import arguments
@@ -117,6 +158,8 @@ def test_variant_contracts_are_distinct_and_group_size_is_not_semantic(tmp_path)
     assert bigger["identity"] == frame0["identity"]  # execution strategy is not semantic identity
 
 
+# ------------------------------------------------------------ text variant path
+
 def test_text_variant_still_publishes_prepared_without_picture(tmp_path, monkeypatch):
     from r2v_data_v2.person_replacement import h3_pair_prepare as module
 
@@ -124,10 +167,9 @@ def test_text_variant_still_publishes_prepared_without_picture(tmp_path, monkeyp
     clips.mkdir()
     (clips/"0.mp4").touch()
     cases = case_fixture(tmp_path,count=1)
-    config = qwen_config(cases,clips,variant="text")
     monkeypatch.setattr(module,"inspect_video_timeline",
                         lambda _:VideoTimeline(138,25,25,1,1920,1080,5.52))
-    module.prepare_partition(config,0,lambda _:FakeQwen("model"))
+    module.prepare_partition(pair_config(cases,clips,variant="text"),0,lambda _:QwenSpy("model"))
     directory = Path(cases[0]["directory"])/"preparation"
     prepared = read_json(directory/"prepared.json")
     assert prepared["variant"] == "text_two_person"
@@ -143,68 +185,71 @@ def test_frame0_qwen_phase_is_durable_but_not_prepared(tmp_path, monkeypatch):
     clips.mkdir()
     (clips/"0.mp4").touch()
     cases = case_fixture(tmp_path,count=1)
-    config = qwen_config(cases,clips,variant="frame0")
     monkeypatch.setattr(module,"inspect_video_timeline",
                         lambda _:VideoTimeline(138,25,25,1,1920,1080,5.52))
-    calls = []
-    def factory(path):
-        calls.append(path)
-        return FakeQwen(path)
-    module.prepare_partition(config,0,factory)
+    module.prepare_partition(pair_config(cases,clips),0,lambda _:QwenSpy("model"))
     directory = Path(cases[0]["directory"])/"preparation"
     assert not (directory/"prepared.json").exists()
     assert phase(cases[0]) == "prepare"
     marker = qwen_prepared(cases[0])
-    assert marker is not None
     for name, value in TEXTS.items():
         assert marker[name] == value
         assert (directory/f"{name}.txt").read_text(encoding="utf-8").strip() == value
     for key in ("source","width","height","frames","timeline","aspect_ratio","identity","seed"):
         assert key in marker
-    calls.clear()
-    module.prepare_partition(config,0,factory)  # resume must not repeat Qwen
-    assert calls == []
+    QwenSpy.calls.clear()
+    module.prepare_partition(pair_config(cases,clips),0,lambda _:QwenSpy("model"))
+    assert QwenSpy.calls == []  # resume must not repeat Qwen
 
 
-def test_frame0_boogu_phase_publishes_prepared_last(tmp_path, monkeypatch):
+# ------------------------------------------------------------ frame0 preparation
+
+def test_frame0_boogu_publishes_prepared_last_with_provenance(tmp_path, monkeypatch):
     from r2v_data_v2.person_replacement import h3_pair_frame0 as module
 
-    cases = case_fixture(tmp_path,count=4)
-    for case in cases:
-        publish_qwen(case,{**TEXTS,"case_id":case["case_id"],"row_sha256":case["row_sha256"],
-                           "identity":"identity","source":str(tmp_path/"video.mp4"),"seed":42,
-                           "frames":124,"width":1376,"height":768,"timeline":{},"aspect_ratio":"16:9"},TEXTS)
-    (tmp_path/"video.mp4").touch()
-    config = qwen_config(cases,tmp_path,variant="frame0")
-    config.update(group_size=4,
-                  boogu_python="/mnt/workspace/litengjie/data/venvs/boogu-image/bin/python",
-                  boogu_code_root="/mnt/workspace/litengjie/data/vendor/Boogu-Image",
-                  boogu_model_root="/mnt/workspace/litengjie/data/models/Boogu")
-    FakeBoogu.instances = []
+    cases = case_fixture(tmp_path,count=1)
+    video = tmp_path/"video.mp4"
+    video.touch()
+    qwen_marker(cases[0],video)
     monkeypatch.setattr(module,"_decode_frame_zero",decode_stub)
-    monkeypatch.setattr(module,"boogu_config",lambda config,directory:SimpleNamespace(
-        python_executable=Path(config["boogu_python"]),code_root=Path(config["boogu_code_root"]),
-        model_path=Path(config["boogu_model_root"]),cuda_visible_devices="0",
-        temporary_root=directory/"boogu_tmp"))
-    monkeypatch.setattr(module,"boogu_runtime",lambda directory:nullcontext())
-    for worker in range(4):  # one Boogu worker per GPU, fixed partition
-        module.prepare_frame0_partition(config,worker,
-                                        lambda settings,directory=None:FakeBoogu(settings,directory))
-    for case in cases:
-        directory = Path(case["directory"])/"preparation"
-        assert (directory/"source_frame0.png").exists()
-        repainted = directory/"repainted_frame0.png"
-        assert repainted.read_bytes() == b"\x89PNG-repainted"
-        prepared = read_json(directory/"prepared.json")
-        assert prepared["variant"] == "frame0_two_person"
-        assert prepared["reference_mode"] == "frame0_boogu"
-        assert prepared["reference_image"] == str(repainted)
-        assert prepared["boogu"]["num_inference_steps"] == 4
-        assert phase(case) == "generate"
-    assert len(FakeBoogu.instances) == 4
+    module.prepare_frame0_partition(pair_config(cases,tmp_path),0,lambda settings:FakeBoogu(settings))
+    directory = Path(cases[0]["directory"])/"preparation"
+    assert (directory/"source_frame0.png").read_bytes() == b"\x89PNG-source"
+    repainted = directory/"repainted_frame0.png"
+    assert repainted.read_bytes() == b"\x89PNG-repainted"
+    prepared = read_json(directory/"prepared.json")
+    assert prepared["variant"] == "frame0_two_person"
+    assert prepared["reference_mode"] == "frame0_boogu"
+    assert prepared["reference_image"] == str(repainted)
+    assert phase(cases[0]) == "generate"
+    job = prepared["boogu"]
+    assert job["model_name"] == "Boogu-Image-0.1-Edit-Turbo"
+    assert job["model_revision"]
+    assert job["python"] and job["code_root"] and job["model_path"]
+    assert job["instruction"] == job["original_instruction"] == job["effective_instruction"]
+    assert job["instruction_rewritten"] is False  # rewrite disabled, never silently rewritten
+    assert job["num_inference_steps"] == 4 and job["seed"] == 42
+    assert (directory/"boogu_prompt.txt").read_text(encoding="utf-8").strip() == job["instruction"]
 
 
-def test_frame0_resume_reruns_only_boogu_and_skips_prepared(tmp_path, monkeypatch):
+def test_frame0_provenance_records_effective_instruction(tmp_path, monkeypatch):
+    from r2v_data_v2.person_replacement import h3_pair_frame0 as module
+
+    cases = case_fixture(tmp_path,count=1)
+    video = tmp_path/"video.mp4"
+    video.touch()
+    qwen_marker(cases[0],video)
+    monkeypatch.setattr(module,"_decode_frame_zero",decode_stub)
+    module.prepare_frame0_partition(pair_config(cases,tmp_path),0,
+                                    lambda settings:FakeBoogu(settings,effective="rewritten by boogu"))
+    job = read_json(Path(cases[0]["directory"])/"preparation/prepared.json")["boogu"]
+    assert job["effective_instruction"] == "rewritten by boogu"
+    assert job["instruction"] != job["effective_instruction"]
+    assert job["instruction_rewritten"] is True
+
+
+def test_frame0_resume_after_boogu_crash_without_rerunning_qwen(tmp_path, monkeypatch):
+    """A Boogu crash leaves nothing committed; the relaunched worker resumes."""
     from r2v_data_v2.person_replacement import h3_pair_frame0 as frame0
     from r2v_data_v2.person_replacement import h3_pair_prepare as prepare
 
@@ -212,66 +257,191 @@ def test_frame0_resume_reruns_only_boogu_and_skips_prepared(tmp_path, monkeypatc
     clips.mkdir()
     (clips/"0.mp4").touch()
     cases = case_fixture(tmp_path,count=1)
-    config = qwen_config(cases,clips,variant="frame0")
-    config.update(boogu_python="/mnt/workspace/litengjie/data/venvs/boogu-image/bin/python",
-                  boogu_code_root="/mnt/workspace/litengjie/data/vendor/Boogu-Image",
-                  boogu_model_root="/mnt/workspace/litengjie/data/models/Boogu")
     monkeypatch.setattr(prepare,"inspect_video_timeline",
                         lambda _:VideoTimeline(138,25,25,1,1920,1080,5.52))
-    qwen_calls = []
+    prepare.prepare_partition(pair_config(cases,clips),0,lambda _:QwenSpy("model"))
+    assert qwen_prepared(cases[0]) is not None
     monkeypatch.setattr(frame0,"_decode_frame_zero",decode_stub)
-    monkeypatch.setattr(frame0,"boogu_config",lambda config,directory:SimpleNamespace(
-        python_executable=Path(config["boogu_python"]),code_root=Path(config["boogu_code_root"]),
-        model_path=Path(config["boogu_model_root"]),cuda_visible_devices="0",
-        temporary_root=directory/"boogu_tmp"))
-    monkeypatch.setattr(frame0,"boogu_runtime",lambda directory:nullcontext())
-    backend = lambda settings,directory=None:FakeBoogu(settings,directory)
-    prepare.prepare_partition(config,0,lambda _:FakeQwen("model"))  # Qwen succeeded
-    frame0.prepare_frame0_partition(config,0,backend)
-    assert phase(cases[0]) == "generate"
-    qwen_calls.clear()
-    prepare.prepare_partition(config,0,lambda _:FakeQwen("model"))
-    frame0.prepare_frame0_partition(config,0,backend)  # prepared: neither phase reruns
+    directory = Path(cases[0]["directory"])/"preparation"
+
+    class CrashingBoogu(FakeBoogu):
+        def edit(self, source_rgb, instruction, width, height, thinking_enabled,
+                 instruction_rewrite_enabled, seed):
+            raise KeyboardInterrupt("frame0 worker died mid-edit")
+
+    with pytest.raises(KeyboardInterrupt):
+        frame0.prepare_frame0_partition(pair_config(cases,tmp_path),0,CrashingBoogu)
+    assert not (directory/"prepared.json").exists()
+    assert not (directory/"repainted_frame0.png").exists()
+    assert qwen_prepared(cases[0]) is not None
+    QwenSpy.calls.clear()
+    frame0.prepare_frame0_partition(pair_config(cases,tmp_path),0,lambda settings:FakeBoogu(settings))
+    assert QwenSpy.calls == []  # Qwen never runs again
+    assert (directory/"repainted_frame0.png").read_bytes() == b"\x89PNG-repainted"
+    prepared = read_json(directory/"prepared.json")
+    assert prepared["variant"] == "frame0_two_person" and phase(cases[0]) == "generate"
+
+
+def test_frame0_case_failure_records_attempt_and_resumes_with_budget(tmp_path, monkeypatch):
+    """Real failures consume attempts durably; nothing is committed before Boogu succeeds."""
+    from r2v_data_v2.person_replacement import h3_pair_frame0 as module
+
+    cases = case_fixture(tmp_path,count=1)
+    video = tmp_path/"video.mp4"
+    video.touch()
+    qwen_marker(cases[0],video)
+    monkeypatch.setattr(module,"_decode_frame_zero",decode_stub)
+    directory = Path(cases[0]["directory"])/"preparation"
+    module.prepare_frame0_partition(pair_config(cases,tmp_path),0,
+                                    lambda settings:FakeBoogu(settings,fail_edit=(1,)))
+    assert failure_count(cases[0],"prepare") == 2
+    assert phase(cases[0]) == "prepare" and qwen_prepared(cases[0]) is not None
+    assert not (directory/"prepared.json").exists()
+    module.prepare_frame0_partition(pair_config(cases,tmp_path,prepare_budget=3),0,
+                                    lambda settings:FakeBoogu(settings))
+    assert (directory/"prepared.json").is_file() and phase(cases[0]) == "generate"
+
+
+def test_frame0_start_failure_records_attempt_and_resumes_with_budget(tmp_path, monkeypatch):
+    from r2v_data_v2.person_replacement import h3_pair_frame0 as module
+
+    cases = case_fixture(tmp_path,count=1)
+    video = tmp_path/"video.mp4"
+    video.touch()
+    qwen_marker(cases[0],video)
+    monkeypatch.setattr(module,"_decode_frame_zero",decode_stub)
+    config = pair_config(cases,tmp_path)
+    module.prepare_frame0_partition(config,0,lambda settings:FakeBoogu(settings,fail_start=True))
+    assert failure_count(cases[0],"prepare") == 2 and phase(cases[0]) == "prepare"
+    module.prepare_frame0_partition(pair_config(cases,tmp_path,prepare_budget=3),0,
+                                    lambda settings:FakeBoogu(settings))
     assert phase(cases[0]) == "generate"
 
 
-def test_frame0_worker_uses_fixed_partition_one_gpu_each(tmp_path, monkeypatch):
+def test_persistent_backend_starts_once_for_many_cases(tmp_path, monkeypatch):
     from r2v_data_v2.person_replacement import h3_pair_frame0 as module
 
     cases = case_fixture(tmp_path,count=4)
+    video = tmp_path/"video.mp4"
+    video.touch()
+    for case in cases:
+        qwen_marker(case,video)
+    monkeypatch.setattr(module,"_decode_frame_zero",decode_stub)
+    config = pair_config(cases,tmp_path)
+    config["group_size"] = 4
+    for worker in range(4):  # one GPU worker owns exactly one case here
+        module.prepare_frame0_partition(config,worker,lambda settings:FakeBoogu(settings))
+    assert len(FakeBoogu.instances) == 4  # one subprocess per worker, not per case
+    assert all(instance.started == 1 and instance.closed == 1 for instance in FakeBoogu.instances)
+    assert all((Path(case["directory"])/"preparation/prepared.json").is_file() for case in cases)
+
+
+def test_backend_is_rebuilt_after_it_breaks_mid_partition(tmp_path, monkeypatch):
+    """A dead subprocess must not permanently disable the rest of the partition."""
+    from r2v_data_v2.person_replacement import h3_pair_frame0 as module
+
+    cases = case_fixture(tmp_path,count=4)
+    video = tmp_path/"video.mp4"
+    video.touch()
+    for case in cases:
+        qwen_marker(case,video)
+    monkeypatch.setattr(module,"_decode_frame_zero",decode_stub)
+    config = pair_config(cases,tmp_path,prepare_budget=1)  # one attempt per case
+    config["group_size"] = 2  # worker 0 owns case0 and case2
+    backends = []
+
+    def factory(settings):
+        # The first backend breaks on its only edit, like a subprocess that died.
+        broken = not backends
+        backend = FakeBoogu(settings,fail_edit=(1,) if broken else ())
+        backends.append(backend)
+        return backend
+
+    module.prepare_frame0_partition(config,0,factory)
+    assert len(backends) == 2  # rebuilt for the next eligible case
+    assert phase(cases[0]) == "prepare"  # broken case stays case-local
+    assert phase(cases[2]) == "generate"
+    assert backends[0].closed == 1 and backends[1].edits == 1
+
+
+def test_frame0_worker_keeps_fixed_partition_and_loads_nothing_when_idle(tmp_path, monkeypatch):
+    from r2v_data_v2.person_replacement import h3_pair_frame0 as module
+
+    cases = case_fixture(tmp_path,count=4)
+    video = tmp_path/"video.mp4"
+    video.touch()
+    for case in cases:
+        qwen_marker(case,video)
     seen = []
-    def fake_prepare(case, config, backend_factory=None):
+
+    def fake_prepare(case, config, backend):
+        assert isinstance(backend,module.Frame0BooguSession)
         seen.append(case["case_id"])
         directory = Path(case["directory"])/"preparation"
         directory.mkdir(parents=True,exist_ok=True)
         atomic_json(directory/"prepared.json",{"variant":"frame0_two_person"})
-    monkeypatch.setattr(module,"prepare_case",fake_prepare)
-    monkeypatch.setattr(module,"qwen_prepared",lambda case:{"source":"v.mp4","width":1376,"height":768})
-    config = {"cases":cases,"group_size":4,"pair_id":0,
-              "limits":{case["case_id"]:{"prepare":1,"generate":2} for case in cases}}
-    for worker in range(4):
-        module.prepare_frame0_partition(config,worker)
-    assert seen == [f"case{i}" for i in range(4)]  # fixed partition, one case per GPU
 
+    monkeypatch.setattr(module,"prepare_case",fake_prepare)
+    config = pair_config(cases,tmp_path,prepare_budget=1)
+    config["group_size"] = 4
+    for worker in range(4):
+        module.prepare_frame0_partition(config,worker,lambda settings:FakeBoogu(settings))
+    assert seen == [f"case{i}" for i in range(4)]
+    assert FakeBoogu.instances == []  # nothing to edit means no Boogu subprocess
+
+
+def test_shared_worker_directory_and_log_are_partition_local():
+    from r2v_data_v2.person_replacement.h3_pair_frame0 import (
+        Frame0BooguSession,
+        shared_worker_directory,
+    )
+
+    cases = case_fixture(Path("/tmp/shard-000000"),count=2)
+    assert shared_worker_directory(cases) == Path("/tmp/shard-000000")
+    assert Frame0BooguSession({},Path("/tmp/shard-000000"),worker=2).log_path.name == "boogu_worker-2.log"
+
+
+def test_boogu_worker_keeps_partition_gpu_not_physical_zero(monkeypatch):
+    from r2v_data_v2.person_replacement import h3_pair_frame0 as module
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES","3")
+    settings = module.boogu_config({"boogu_python":"/a","boogu_code_root":"/b","boogu_model_root":"/c"},
+                                   Path("/tmp/frame0"))
+    assert settings.cuda_visible_devices == "3"  # never remap every worker onto GPU 0
+    assert settings.device == "cuda:0"  # subprocess-local index stays canonical
+
+
+def test_runtime_cache_namespace_is_retry_safe(tmp_path):
+    """The Boogu cache namespace is re-entered on every resume attempt."""
+    from r2v_data_v2.person_replacement.h3_pair_frame0 import (
+        boogu_runtime,
+        frame0_runtime_environment,
+    )
+
+    cache = tmp_path/"frame0_runtime"
+    frame0_runtime_environment(cache)
+    frame0_runtime_environment(cache)  # second attempt after a failed edit must not raise
+    with boogu_runtime(cache):
+        pass
+
+
+# -------------------------------------------------------------------- references
 
 def test_distributed_references_video_then_image(tmp_path, monkeypatch):
     from r2v_data_v2.person_replacement.h3_pdd_distributed import PersistentPDD
 
-    created = []
     video = tmp_path/"video.mp4"
     image = tmp_path/"frame0.png"
     video.touch()
     image.touch()
 
     def reference(kind):
-        def from_file(path):
-            created.append((kind,path))
-            return (kind,path)
-        return SimpleNamespace(from_file=from_file)
+        return SimpleNamespace(from_file=lambda path:(kind,path))
 
-    monkeypatch.setitem(__import__("sys").modules,"diffusers",SimpleNamespace())
-    monkeypatch.setitem(__import__("sys").modules,"diffusers.modular_pipelines",SimpleNamespace())
-    monkeypatch.setitem(__import__("sys").modules,"diffusers.modular_pipelines.minimax_h3",
+    modules = __import__("sys").modules
+    monkeypatch.setitem(modules,"diffusers",SimpleNamespace())
+    monkeypatch.setitem(modules,"diffusers.modular_pipelines",SimpleNamespace())
+    monkeypatch.setitem(modules,"diffusers.modular_pipelines.minimax_h3",
                         SimpleNamespace(MiniMaxH3VideoReference=reference("video"),
                                         MiniMaxH3ImageReference=reference("image")))
     backend = PersistentPDD.__new__(PersistentPDD)
@@ -283,7 +453,7 @@ def test_distributed_references_video_then_image(tmp_path, monkeypatch):
     arm = SimpleNamespace(index=1,arm=lambda value:None)
     backend.device = "cuda:0"
     backend.transformer_ref = SimpleNamespace(_pdd_step_arm=arm)
-    monkeypatch.setitem(__import__("sys").modules,"torch",SimpleNamespace(
+    monkeypatch.setitem(modules,"torch",SimpleNamespace(
         cuda=SimpleNamespace(reset_peak_memory_stats=lambda _:None),
         Generator=lambda:SimpleNamespace(manual_seed=lambda seed:seed),
         no_grad=nullcontext))
@@ -327,7 +497,7 @@ def test_generation_manifest_variant_and_fail_closed(tmp_path):
         reference_manifest({"source":str(video)})
 
 
-def test_frame0_generation_fails_closed_instead_of_text_fallback(tmp_path, monkeypatch):
+def test_frame0_generation_fails_closed_instead_of_text_fallback(tmp_path):
     from r2v_data_v2.person_replacement import h3_pair_generation as module
 
     case = {"case_id":"case0","directory":str(tmp_path/"case0"),"row_sha256":"0"}
@@ -342,11 +512,10 @@ def test_frame0_generation_fails_closed_instead_of_text_fallback(tmp_path, monke
     assert phase(case) == "generate"  # never silently downgraded to text-only
 
 
+# ------------------------------------------------------------------------ prompt
+
 def test_frame0_prompt_semantics_and_no_shot_description():
-    from r2v_data_v2.person_replacement.h3_two_person import (
-        boogu_frame0_prompt,
-        build_prompt,
-    )
+    from r2v_data_v2.person_replacement.h3_two_person import build_prompt
 
     shot = "They raise the cups in exactly this order."
     prompt = build_prompt(TEXTS["source_subject_1"],TEXTS["source_subject_2"],shot,
@@ -361,12 +530,28 @@ def test_frame0_prompt_semantics_and_no_shot_description():
     text = build_prompt(TEXTS["source_subject_1"],TEXTS["source_subject_2"],shot,
                         TEXTS["replacement_subject_1"],TEXTS["replacement_subject_2"])
     assert "<Picture 1>" not in text
+
+
+def test_boogu_frame0_prompt_is_short_and_binding_exact():
+    from r2v_data_v2.person_replacement.h3_two_person import boogu_frame0_prompt
+
     instruction = boogu_frame0_prompt(TEXTS["source_subject_1"],TEXTS["source_subject_2"],
                                       TEXTS["replacement_subject_1"],TEXTS["replacement_subject_2"])
-    assert "->" not in instruction  # natural language, not the sequential arrow form
-    assert "Do not add a person who is not visible in the source frame." in instruction
-    assert "timing" not in instruction.lower()  # still-image edit only
+    lines = [line for line in instruction.splitlines() if line.strip()]
+    assert lines[0] == f"Replace the person matching {TEXTS['source_subject_1']} " \
+                       f"with {TEXTS['replacement_subject_1']}."
+    assert lines[1] == f"Replace the person matching {TEXTS['source_subject_2']} " \
+                       f"with {TEXTS['replacement_subject_2']}."
+    assert "Do not add a person who is not visible in the image." in instruction
+    assert "two visible people" not in instruction
+    assert "->" not in instruction  # no sequential arrow form
+    for banned in ("body orientation","gaze","mouth state","scale","occlusion","lighting",
+                   "framing","object state","identity","hair","clothing"):
+        assert banned not in instruction.lower()
+    assert len(instruction.split()) <= 55  # do not re-inflate it later
 
+
+# --------------------------------------------------------------------- execution
 
 def test_execute_phases_runs_boogu_only_after_qwen_exits(tmp_path, monkeypatch):
     from r2v_data_v2.person_replacement import h3_pair_executor as module
@@ -375,40 +560,11 @@ def test_execute_phases_runs_boogu_only_after_qwen_exits(tmp_path, monkeypatch):
     config = {"cases":[case],"limits":{"case0":{"prepare":2,"generate":2}},"pair_id":0,
               "identity":"identity","h3_python":"python","variant":"frame0","group_size":4}
     calls = []
-    def children(specs, lock_fd, **kwargs):
-        commands = [spec["command"] for spec in specs]
-        calls.append(commands)
-        if len(calls) == 1:
-            for case_dir in (Path(case["directory"]),):
-                (case_dir/"preparation").mkdir(parents=True,exist_ok=True)
-        return [0]*len(specs)
-    monkeypatch.setattr(module,"run_children",children)
+    monkeypatch.setattr(module,"run_children",
+                        lambda specs,lock_fd,**kwargs:calls.append([spec["command"] for spec in specs])
+                              or [0]*len(specs))
     module.execute_phases(config,tmp_path/"shard-000000","0,1,2,3",123,prepare_only=True)
     assert len(calls) == 2 and len(calls[0]) == len(calls[1]) == 4
     assert all("h3_pair_prepare_worker.py" in command[1] for command in calls[0])
     assert all("h3_pair_frame0_worker.py" in command[1] for command in calls[1])
-    assert [spec_env for spec_env in []] == []
-    # Every Boogu worker gets exactly one GPU, same fixed set as Qwen.
     assert [command[command.index("--worker")+1] for command in calls[1]] == ["0","1","2","3"]
-
-
-def test_boogu_worker_keeps_partition_gpu_not_physical_zero(monkeypatch):
-    from r2v_data_v2.person_replacement import h3_pair_frame0 as module
-
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES","3")
-    captured = {}
-    class Config:
-        def __init__(self, **kwargs):
-            captured.update(kwargs)
-    monkeypatch.setitem(__import__("sys").modules,"r2v_data_v2.v3.reference_edit_boogu",
-                        SimpleNamespace(BooguWorkerConfig=Config))
-    module.boogu_config({"boogu_python":"/a","boogu_code_root":"/b","boogu_model_root":"/c"},
-                        Path("/tmp/frame0"))
-    assert captured["cuda_visible_devices"] == "3"  # never remap every worker onto GPU 0
-
-
-class nullcontext:
-    def __enter__(self):
-        return None
-    def __exit__(self, *args):
-        return False
