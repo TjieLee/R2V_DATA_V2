@@ -5,7 +5,7 @@ import json
 import math
 import re
 import shutil
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -2056,25 +2056,17 @@ def prepare_cross_pair_target_evidence(
     clip_uid: str,
     entity: AnnotationEntity,
     frames: SampledFramesArtifact,
-    masks: TrackedMasksArtifact,
-    target_candidates: list[EntityReferenceCandidate] | None = None,
+    target_candidates: Sequence[EntityReferenceCandidate],
 ) -> CrossPairTargetEvidence:
-    """Target evidence for one entity, independent of any donor.
+    """Materialize target evidence from already-built candidates.
 
-    Legacy built the candidates *before* looking up donors, but only loaded
-    source images, built the context/crop or built the contact sheet *after*
-    a non-empty donor list was known. Callers that follow that ordering pass
-    the already-built candidates here so they are not rebuilt.
+    The caller owns the frozen ordering: ``build_entity_reference_candidates``
+    first, then ``_donors_for_target``, then ``continue`` when there is no
+    donor, and only then this helper. Taking the candidates as a required
+    argument is what enforces that -- the helper cannot rebuild them, so a
+    caller cannot silently materialize a context-only target's ten frames
+    before knowing whether any donor exists.
     """
-    if target_candidates is None:
-        target_candidates = build_entity_reference_candidates(
-            config,
-            storage,
-            clip_uid=clip_uid,
-            entity=entity,
-            frames=frames,
-            masks=masks,
-        )
     if target_candidates:
         target_candidate = target_candidates[0]
         target_frame_slots = (target_candidate.frame_slot,)
@@ -2288,7 +2280,6 @@ def _run_same_parent_cross_pair_fallback(
                         clip_uid=target_clip.clip_uid,
                         entity=target_entity,
                         frames=target_frames,
-                        masks=target_masks,
                         target_candidates=target_candidates,
                     )
                     for donor in donors:

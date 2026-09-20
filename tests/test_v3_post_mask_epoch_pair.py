@@ -916,27 +916,41 @@ def test_helper_prepare_cross_pair_evidence_matches_legacy_mode(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from r2v_data_v2.v3.frames import validate_sampled_frames
-    from r2v_data_v2.v3.pair import prepare_cross_pair_target_evidence
+    from r2v_data_v2.v3.pair import (
+        build_entity_reference_candidates,
+        prepare_cross_pair_target_evidence,
+    )
 
     config = _config(
         tmp_path, monkeypatch, pair=PairConfig(same_parent_fallback_enabled=True)
     )
     storage = _two_entity_target_storage(config)
     target = storage.read_clip("target")
+    frames = validate_sampled_frames(storage, "target")
+    masks = storage.read_masks("target")
+    # The caller owns the ordering: candidates first, then donors, then this.
+    candidates = build_entity_reference_candidates(
+        config,
+        storage,
+        clip_uid="target",
+        entity=target.annotation.entities[0],
+        frames=frames,
+        masks=masks,
+    )
 
     evidence = prepare_cross_pair_target_evidence(
         config,
         storage,
         clip_uid="target",
         entity=target.annotation.entities[0],
-        frames=validate_sampled_frames(storage, "target"),
-        masks=storage.read_masks("target"),
+        frames=frames,
+        target_candidates=candidates,
     )
 
     # The legacy fake cross judge recorded this exact mode.
     assert evidence.evidence_mode == "masked_candidate"
     assert evidence.entity_crop is not None
-    assert evidence.frame_slots == (evidence.frame_slots[0],)
+    assert evidence.frame_slots == (candidates[0].frame_slot,)
 
 
 def test_helper_guard_boundary_matches_the_synchronous_wrapper(
@@ -1068,29 +1082,59 @@ def test_donor_image_load_failure_does_not_count_as_an_attempt(
 def test_unreadable_donor_reference_is_filtered_from_the_donor_index(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Characterization: the donor index validates before the loop."""
+    """Characterization: the donor index validates before the loop.
+
+    The storage starts with the donor only, so the second pass really has a
+    fresh target-new with no pairing; re-adding an existing clip_uid would
+    leave its durable pairing in place and make this vacuous.
+    """
     config = _config(
         tmp_path, monkeypatch, pair=PairConfig(same_parent_fallback_enabled=True)
     )
-    storage = _same_parent_storage(config)
-    pair_clips(config, storage, judge=_ScopedJudge())
+    storage = RunStorage(config)
+    storage.initialize(git_commit="corrupt-donor-test")
+    _add_ready_clip(
+        config, storage, clip_uid="donor", clip_suffix="2", entity_types=("subject",)
+    )
+
+    first = pair_clips(config, storage, judge=_ScopedJudge())
+    assert first.ready == 1, "donor publishes a ready full self reference"
     donor_path = storage.selected_entity_path("donor", "e1")
     assert donor_path.is_file()
     donor_path.write_bytes(b"not a png")
 
+    # A genuinely new target: same parent, same reference type, no pairing.
     _add_ready_clip(
-        config, storage, clip_uid="target", clip_suffix="20", entity_types=("subject",)
+        config,
+        storage,
+        clip_uid="target-new",
+        clip_suffix="20",
+        entity_types=("subject",),
     )
+    assert storage.read_clip("target-new").pairing is None
+
     cross = _CrossJudge([True])
-    judge = _ScopedJudge({("target", "e1"): "reject"}, forbidden=("donor",))
+    judge = _ScopedJudge({("target-new", "e1"): "reject"}, forbidden=("donor",))
 
     stats = pair_clips(config, storage, judge=judge, cross_pair_judge=cross)
 
+    # The donor keeps its existing pairing and is never re-judged.
+    assert ("donor", "e1") not in judge.calls
+    # target-new really went through the primary pass.
+    assert ("target-new", "e1") in judge.calls
+    assert stats.processed == 1
     # _build_same_parent_donor_index validates the donor artifact, so an
     # unreadable reference never reaches the donor loop at all.
     assert cross.calls == []
     assert stats.cross_pair_attempted == 0
     assert stats.cross_pair_ready == 0
+    assert storage.read_clip("target-new").pairing == PairingState(
+        status="rejected", reason="no_qualifying_ready_reference"
+    )
+    # Recorded, not assumed: the corrupt donor's own existing-pairing
+    # validation is what the current implementation reports as a failure.
+    assert stats.skipped_existing == 0
+    assert stats.failed == 1
 
 
 def test_helper_target_evidence_context_only_mode(
@@ -1111,7 +1155,6 @@ def test_helper_target_evidence_context_only_mode(
         clip_uid="target",
         entity=target.annotation.entities[0],
         frames=validate_sampled_frames(storage, "target"),
-        masks=storage.read_masks("target"),
         target_candidates=[],
     )
 
