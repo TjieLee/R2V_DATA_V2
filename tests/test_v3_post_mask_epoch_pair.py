@@ -2430,7 +2430,7 @@ def test_cross_donor1_accept_publishes_frozen_donor_bytes(
 def test_cross_donor1_reject_then_donor2_accept(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _config, storage, runner = _cross_fixture(tmp_path, monkeypatch)
+    _config, _storage, runner = _cross_fixture(tmp_path, monkeypatch)
     (first,) = [
         item
         for item in runner.freeze_cross_pair_after_primary_quiescence()
@@ -2493,3 +2493,106 @@ def test_cross_all_donors_reject_is_terminal_and_survives_restart(
     ] == []
     assert len(judge.calls) == len(judge.calls), "no further calls recorded"
     assert judge.calls, "the reject chain really ran"
+
+
+def test_frozen_donor_tamper_is_retryable_not_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Frozen-state corruption is drift, never a legacy target failure."""
+    from r2v_data_v2.v3.post_mask_epoch_jobs import OUTCOME_RETRYABLE_FAILED
+
+    _config, storage, runner = _cross_fixture(tmp_path, monkeypatch)
+    (job,) = [
+        item
+        for item in runner.freeze_cross_pair_after_primary_quiescence()
+        if item.clip_uid == "target-b"
+    ]
+    donor_uid = dict(job.target)["donor_clip_uid"]
+    storage.selected_entity_path(donor_uid, "e1").write_bytes(b"tampered")
+
+    judge = _CrossJudge([True])
+    result = runner.run(job, judge)
+
+    assert result.outcome == OUTCOME_RETRYABLE_FAILED
+    assert not result.committed, "drift must not commit under the old job identity"
+    assert judge.calls == [], "Qwen is never called on a frozen-state mismatch"
+    assert runner._cross_terminal(SHARD, "target-b") is None
+
+
+def test_no_frozen_donor_never_materializes_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """build candidates -> donor lookup -> empty donors -> no evidence."""
+    import r2v_data_v2.v3.post_mask_epoch_pair as pm
+
+    calls: list[int] = []
+
+    def explode(*args: Any, **kwargs: Any) -> Any:
+        calls.append(1)
+        raise AssertionError("evidence must not be materialized")
+
+    real_donors = pm._donors_for_target
+    pm.prepare_cross_pair_target_evidence = explode
+    pm._donors_for_target = lambda *args, **kwargs: ()
+    try:
+        _config, _storage, runner = _cross_fixture(tmp_path, monkeypatch)
+        jobs = runner.freeze_cross_pair_after_primary_quiescence()
+    finally:
+        pm.prepare_cross_pair_target_evidence = (
+            __import__(
+                "r2v_data_v2.v3.pair", fromlist=["prepare_cross_pair_target_evidence"]
+            ).prepare_cross_pair_target_evidence
+        )
+        pm._donors_for_target = real_donors
+
+    assert calls == [], "no evidence materialization when donors is empty"
+    assert [job.clip_uid for job in jobs if job.clip_uid == "target-b"] == []
+    terminal = runner._cross_terminal(SHARD, "target-b")
+    assert terminal is not None and terminal["status"] == "completed"
+
+
+def test_multi_entity_fallback_is_strictly_sequential(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """e1's donor chain must finish before e2's donor1 exists."""
+    config = _pair_config(
+        tmp_path, monkeypatch, same_parent_fallback_enabled=True
+    )
+    storage = _storage(config, entity_types=("subject",))
+    _add_ready_clip(
+        config, storage, clip_uid="donor", clip_suffix="2", entity_types=("subject",)
+    )
+    _add_ready_clip(
+        config,
+        storage,
+        clip_uid="target-m",
+        clip_suffix="20",
+        entity_types=("subject", "subject"),
+    )
+    runner = _runner(
+        tmp_path, config, storage, clip_uids=("clip-1", "donor", "target-m")
+    )
+    _drain_primary(
+        runner,
+        _ScopedJudge(
+            {("target-m", "e1"): "reject", ("target-m", "e2"): "reject"}
+        ),
+    )
+    judge = _CrossJudge([True, True])
+
+    (first,) = [
+        item
+        for item in runner.freeze_cross_pair_after_primary_quiescence()
+        if item.clip_uid == "target-m"
+    ]
+    assert dict(first.target)["target_entity_index"] == "0"
+
+    _result, unlocked = _chain(runner, first, judge)
+    assert len(unlocked) == 1
+    second = unlocked[0]
+    assert dict(second.target)["target_entity_index"] == "1"
+    assert dict(second.target)["donor_ordinal"] == "0"
+
+    _result2, unlocked2 = _chain(runner, second, judge)
+    assert unlocked2 == ()
+    assert [call["target_entity_id"] for call in judge.calls] == ["e1", "e2"]
