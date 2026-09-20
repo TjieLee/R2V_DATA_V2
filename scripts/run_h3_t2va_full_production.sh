@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One endpoint for the entire full-production supervisor, including all shards.
+# Full production: upstream stages run without MiMo; MiMo is lazy per shard.
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PRODUCTION_ROOT="${PRODUCTION_ROOT:-/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/T2VA}"
@@ -85,7 +85,7 @@ serve=("$SGLANG_ENV/bin/sglang" serve
   --tp 8 --dp 2 --enable-dp-attention --enable-dp-lm-head
   --mm-enable-dp-encoder --dtype bfloat16
   --attention-backend fa3 --mm-attention-backend fa3
-  --context-length 131072 --mem-fraction-static 0.55
+  --context-length 131072 --mem-fraction-static 0.65
   --chunked-prefill-size 16384 --max-running-requests 8
   --reasoning-parser mimo --tool-call-parser mimo
   --constrained-json-disable-any-whitespace --enable-deterministic-inference)
@@ -97,7 +97,13 @@ run=("$R2V_PYTHON" "$REPO_ROOT/tools/run_h3_t2va_full_production.py"
   --base-url http://127.0.0.1:8092/v1 --media-root "${MEDIA_ROOT:-/mnt/workspace}"
   --request-workers "$REQUEST_WORKERS" --gpu-ids "$GPU_IDS"
   --canonical-workers "$CANONICAL_WORKERS"
-  --ffmpeg "${FFMPEG:-ffmpeg}")
+  --ffmpeg "${FFMPEG:-ffmpeg}"
+  --mimo-sglang "$SGLANG_ENV/bin/sglang"
+  --mimo-checkpoint "$MIMO_CHECKPOINT"
+  --mimo-mem-fraction-static 0.65
+  --mimo-startup-polls "$MIMO_STARTUP_POLLS"
+  --mimo-poll-interval "$MIMO_POLL_INTERVAL"
+  --mimo-cleanup-grace-seconds "$CLEANUP_GRACE_SECONDS")
 if [[ -n "${SHARDS:-}" ]]; then
   run+=(--shards "$SHARDS")
 else
@@ -155,12 +161,9 @@ test -d "$QWEN3_ASR_MODEL_PATH" || {
 }
 mkdir -p "$PRODUCTION_ROOT"
 test -w "$PRODUCTION_ROOT" || { echo "Output not writable: $PRODUCTION_ROOT" >&2; exit 1; }
-# Never adopt an endpoint or discover processes by port/name for cleanup.
-"$R2V_PYTHON" -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",8092)); s.close()'
 stamp="$(date +%Y%m%d-%H%M%S)-$$"
 logs="$PRODUCTION_ROOT/logs/$(hostname)"
 mkdir -p "$logs"
-mimo_pid=""
 runner_pid=""
 
 wait_grace() {
@@ -173,40 +176,20 @@ wait_grace() {
 cleanup() {
   trap '' INT TERM
   if [[ -n "$runner_pid" ]]; then
-    # The supervisor handles TERM and reaps workers (including their sessions).
+    # The Python supervisor owns stage workers and the lazy per-shard MiMo child.
     kill -TERM "$runner_pid" 2>/dev/null || true
     if ! wait_grace "$runner_pid"; then
+      # MiMo inherits this supervisor process group, so forced cleanup covers it.
       kill -KILL -- "-$runner_pid" 2>/dev/null || true
     fi
     wait "$runner_pid" 2>/dev/null || true
     runner_pid=""
   fi
-  if [[ -n "$mimo_pid" ]]; then
-    kill -TERM "$mimo_pid" 2>/dev/null || true
-    if ! wait_grace "$mimo_pid"; then
-      kill -KILL -- "-$mimo_pid" 2>/dev/null || true
-    fi
-    wait "$mimo_pid" 2>/dev/null || true
-    mimo_pid=""
-  fi
 }
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-# Isolate owned sessions without enabling shell job-control.
-setsid "${serve[@]}" </dev/null >"$logs/mimo-$stamp.log" 2>&1 &
-mimo_pid=$!
-ready=false
-for ((i=0; i<MIMO_STARTUP_POLLS; i++)); do
-  kill -0 "$mimo_pid" 2>/dev/null || { echo "MiMo exited; see $logs/mimo-$stamp.log" >&2; exit 1; }
-  if curl --noproxy '*' -fsS --max-time 5 http://127.0.0.1:8092/v1/models >/dev/null &&
-     curl --noproxy '*' -fsS --max-time 5 http://127.0.0.1:8092/model_info >/dev/null &&
-     kill -0 "$mimo_pid" 2>/dev/null; then
-    ready=true; break
-  fi
-  if (( i + 1 < MIMO_STARTUP_POLLS )); then sleep "$MIMO_POLL_INTERVAL"; fi
-done
-"$ready" || { echo "MiMo readiness timeout" >&2; exit 1; }
+
 echo "Supervisor log: $logs/supervisor-$stamp.log"
 setsid "${run[@]}" </dev/null >"$logs/supervisor-$stamp.log" 2>&1 &
 runner_pid=$!
