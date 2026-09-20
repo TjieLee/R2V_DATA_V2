@@ -73,6 +73,29 @@ Do not introduce:
 - pose
 - interactions
 
+Each replacement should be noticeably different from its corresponding source
+performer, not just a lightly modified lookalike.
+
+When reasonable, create difference across at least two or three of the
+following aspects:
+- apparent age band,
+- hairstyle, hair texture or hair colour,
+- face shape or facial-structure impression,
+- grooming or facial hair,
+- clothing style,
+- overall colour palette,
+- general visual styling archetype.
+
+However, keep the result realistic and plausible.
+Do not make the replacement bizarre, caricatured or unnaturally extreme.
+Do not request a radically different body size or silhouette.
+Keep the replacement person broadly compatible with the source performer's body
+scale and spatial occupancy so the source motion can be preserved cleanly.
+
+The diversity cue must not be satisfied only by a clothing change.
+The replacement should also differ in facial appearance and overall styling
+from the source performer.
+
 Keep the replacement person's overall height/body scale and silhouette broadly
 compatible with the corresponding source performer so source pose and spatial
 occupancy can be preserved.
@@ -162,6 +185,45 @@ Do not create additional replacement people.
 
 Do not add props, tools or objects that are not already present in <Video 1>,
 except ordinary non-interactive parts of clothing.
+
+GLOBAL DETAILED-DESCRIPTION PREFACE
+
+Immediately after the `detailed_description:` heading and before `[Shot 1]`,
+write a short global preface of one or two sentences.
+
+This preface is very important. It must state that the target video is a direct
+edit of <Video 1> and must prioritize the source video's motion, action timing,
+camera framing, camera movement, cuts, scene geometry, depth relationships,
+object interactions and event progression, while changing only the visible
+human identity and appearance of <Subject 1> and <Subject 2>.
+
+Do not use this preface for static appearance description.
+Do not begin with style-only or lighting-only wording.
+Do not write a generic preservation checklist.
+Use it as a high-level dynamic anchor for the whole edited video.
+
+A good global preface should read like:
+"The target video is a direct edit of <Video 1>. Preserve the complete source
+motion, action timing, camera behavior, scene geometry, depth, and object
+interactions, while changing only the visible human identity and appearance of
+<Subject 1> and <Subject 2>."
+
+FIRST-SENTENCE PRIORITY
+
+The first sentence inside [Shot 1] is especially important.
+
+It must immediately describe the dominant visible motion and the dominant camera
+behavior at the start of the clip.
+
+Whenever supported by <Video 1>, the first sentence should jointly state:
+- what <Subject 1> and <Subject 2> are doing,
+- how they are moving relative to each other,
+- the most important interaction between them,
+- and the main camera behavior (static, panning, tracking, tilting, zooming,
+  reframing, handheld, or cutting).
+
+Do not begin [Shot 1] with static clothing, static background description,
+or generic wording such as "preserve the original motion".
 
 DETAILED DESCRIPTION
 

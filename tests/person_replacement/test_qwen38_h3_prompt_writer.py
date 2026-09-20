@@ -341,3 +341,71 @@ def test_both_calls_use_the_same_path_style_video_part(tmp_path, monkeypatch):
     assert parts == [{"type":"video","path":str(video.resolve())}]*2
     assert all(not part.keys() - {"type","path"} for part in parts)
     assert [kwargs["num_frames"] for _, kwargs in instance.processor.calls] == [40,40]
+
+
+def test_replacement_planning_prompt_pushes_real_identity_distance():
+    from r2v_data_v2.person_replacement.qwen38_h3_prompt_writer import (
+        REPLACEMENT_PLANNING_PROMPT,
+    )
+
+    prompt = REPLACEMENT_PLANNING_PROMPT
+    assert "noticeably different from its corresponding source" in prompt
+    assert "not just a lightly modified lookalike" in prompt
+    assert "at least two or three of the\nfollowing aspects" in prompt
+    assert "- apparent age band," in prompt
+    assert "- hairstyle, hair texture or hair colour," in prompt
+    assert "- face shape or facial-structure impression," in prompt
+    assert "- grooming or facial hair," in prompt
+    assert "- overall colour palette," in prompt
+    assert ("The diversity cue must not be satisfied only by a clothing change." in prompt)
+    assert "Do not make the replacement bizarre, caricatured or unnaturally extreme." in prompt
+    assert "Do not request a radically different body size or silhouette." in prompt
+    assert "broadly compatible with the source performer's body" in prompt
+    # Existing constraints must survive
+    assert "not be celebrities" in prompt
+    assert "- props" in prompt and "- weapons" in prompt
+    assert "{cue1}" in prompt and "{cue2}" in prompt
+
+
+def test_system_prompt_adds_global_preface_and_first_sentence_priority():
+    from r2v_data_v2.person_replacement.qwen38_h3_prompt_writer import (
+        H3_PROMPT_SYSTEM_PROMPT,
+    )
+
+    prompt = H3_PROMPT_SYSTEM_PROMPT
+    assert "GLOBAL DETAILED-DESCRIPTION PREFACE" in prompt
+    assert "Immediately after the `detailed_description:` heading and before `[Shot 1]`" in prompt
+    assert "short global preface of one or two sentences" in prompt
+    assert "a direct\nedit of <Video 1>" in prompt
+    assert "motion, action timing," in prompt
+    assert "camera framing, camera movement, cuts, scene geometry, depth relationships," in prompt
+    assert "object interactions and event progression" in prompt
+    assert ("while changing only the visible\nhuman identity and appearance of "
+            "<Subject 1> and <Subject 2>." in prompt)
+    assert "Do not use this preface for static appearance description." in prompt
+    assert "Do not begin with style-only or lighting-only wording." in prompt
+    assert "Do not write a generic preservation checklist." in prompt
+    assert "high-level dynamic anchor" in prompt
+    assert 'A good global preface should read like:' in prompt
+    assert "FIRST-SENTENCE PRIORITY" in prompt
+    assert "The first sentence inside [Shot 1] is especially important." in prompt
+    assert "dominant visible motion and the dominant camera\nbehavior" in prompt
+    assert "- how they are moving relative to each other," in prompt
+    assert ("- and the main camera behavior (static, panning, tracking, tilting, zooming,\n"
+            "  reframing, handheld, or cutting)." in prompt)
+    assert ("Do not begin [Shot 1] with static clothing, static background description,"
+            in prompt)
+    assert 'generic wording such as "preserve the original motion".' in prompt
+
+
+def test_system_prompt_still_enforces_the_six_section_contract():
+    from r2v_data_v2.person_replacement.qwen38_h3_prompt_writer import (
+        H3_PROMPT_SYSTEM_PROMPT,
+    )
+
+    prompt = H3_PROMPT_SYSTEM_PROMPT
+    for heading in ("subject_definitions:","summary:","retention_analysis:",
+                    "detailed_description:","overall_soundscape:","non_diegetic_music:"):
+        assert heading in prompt
+    assert "Never define <Subject 3> or <Subject 4>." in prompt
+    assert "N/A" in prompt

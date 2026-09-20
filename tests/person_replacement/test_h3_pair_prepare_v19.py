@@ -69,7 +69,7 @@ def make_cases(tmp_path, count, clips):
 
 def config_for(cases, clips, *, budget=2):
     return {"cases":cases,"clips_root":str(clips),"seed":42,"pair_id":0,"identity":"identity",
-            "prompt_writer_model":"/mnt/workspace/public/pretrained/Qwen/Qwen3.8-27B-FP8",
+            "prompt_writer_model":"/mnt/workspace/public/pretrained/Qwen/Qwen3.5-27B",
             "limits":{case["case_id"]:{"prepare":budget,"generate":2} for case in cases}}
 
 
@@ -108,7 +108,7 @@ def test_text_v19_never_loads_8b_or_build_prompt(tmp_path, monkeypatch):
     prepare(tmp_path,monkeypatch,cases,clips)
     prepared = read_json((tmp_path/"case0")/"preparation"/"prepared.json")
     assert prepared["prompt"] == LEGAL_PROMPT
-    assert prepared["prompt_source"] == "qwen38_full_video"
+    assert prepared["prompt_source"] == "qwen35_full_video"
     assert prepared["source_subject_1"] if False else True
     assert "shot_description" not in prepared and "source_subject_1" not in prepared
 
@@ -192,8 +192,8 @@ def test_prepared_provenance_and_artifacts(tmp_path, monkeypatch):
     prepare(tmp_path,monkeypatch,cases,clips)
     directory = tmp_path/"case0"/"preparation"
     prepared = read_json(directory/"prepared.json")
-    assert prepared["prompt_writer_model"] == "/mnt/workspace/public/pretrained/Qwen/Qwen3.8-27B-FP8"
-    assert prepared["prompt_writer_contract"] == "qwen38_two_call_full_video_h3_prompt_v1"
+    assert prepared["prompt_writer_model"] == "/mnt/workspace/public/pretrained/Qwen/Qwen3.5-27B"
+    assert prepared["prompt_writer_contract"] == "qwen35_two_call_full_video_h3_prompt_v1"
     assert prepared["prompt_writer_video_fps"] == 4.0
     assert prepared["prompt_writer_replacement_max_new_tokens"] == 512
     assert prepared["prompt_writer_prompt_max_new_tokens"] == 4096
@@ -213,7 +213,7 @@ def test_frame0_never_instantiates_the_27b(tmp_path, monkeypatch):
     from r2v_data_v2.person_replacement.h3_pair_executor import VARIANTS
 
     assert VARIANTS["frame0"] == "frame0_two_person_pdd_fsdp2_pair_v18"
-    assert VARIANTS["text"] == "text_two_person_pdd_fsdp2_pair_v19"
+    assert VARIANTS["text"] == "text_two_person_pdd_fsdp2_pair_v23"
 
     clips = tmp_path/"clips"
     clips.mkdir()
