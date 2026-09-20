@@ -497,15 +497,31 @@ class WorkerEpochResource(EpochResource):
                 except Exception as exc:  # noqa: BLE001 - rollback below
                     failures[slot] = exc
         if failures:
-            # Never leave a partial set of GPU models resident.
+            # Never leave a partial set of GPU models resident. Every
+            # successfully built worker is asked to close, and one failing
+            # close must not abort the rollback: stopping after the first
+            # cleanup exception would strand the remaining slots' models in
+            # GPU memory for the rest of the process.
+            cleanup_errors: list[str] = []
             for slot in sorted(built):
                 close = getattr(built[slot], "close", None)
-                if callable(close):
+                if not callable(close):
+                    continue
+                try:
                     close()
+                except Exception as exc:  # noqa: BLE001 - best-effort rollback
+                    cleanup_errors.append(f"slot {slot}: {exc}")
+            built.clear()
+            self.workers = []
             first = min(failures)
-            raise EpochResourceError(
+            # The original startup failure stays the primary error; cleanup
+            # failures are appended, never substituted for it.
+            message = (
                 f"{self.name} worker slot {first} failed to start: {failures[first]}"
             )
+            if cleanup_errors:
+                message += f" (rollback incomplete: {'; '.join(cleanup_errors)})"
+            raise EpochResourceError(message)
         self.workers = [built[slot] for slot in sorted(built)]
 
     def _stop(self) -> None:
