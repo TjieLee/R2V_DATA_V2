@@ -184,24 +184,18 @@ def test_raw_video_to_snapshot_and_retry_without_repeat_models(
     assert len(list(production.complete_rows(snapshot / "ta2va_full_audio.jsonl"))) == 3
 
 
-def test_resume_first_schedule_uses_only_cheap_markers(tmp_path):
+def test_resume_first_schedule_uses_only_shard_directory_metadata(tmp_path):
     assigned = [7, 2, 9, 4, 1, 6]
 
     complete = tmp_path / "shards" / production.shard_name(2)
     complete.mkdir(parents=True)
     (complete / "COMPLETE").write_text("not-json")
 
-    canonical = tmp_path / "shards" / production.shard_name(9) / "stage_state"
-    canonical.mkdir(parents=True)
-    (canonical / "canonical.json").write_text("not-json")
-
-    downstream = tmp_path / "shards" / production.shard_name(1)
-    downstream.mkdir(parents=True)
-    (downstream / "state.jsonl.partial").write_text("not-json")
-
-    audio_summary = tmp_path / "shards" / production.shard_name(6) / "stage_state"
-    audio_summary.mkdir(parents=True)
-    (audio_summary / "canonical_audio.json").write_text("not-json")
+    for shard_id in (9, 1, 6):
+        shard = tmp_path / "shards" / production.shard_name(shard_id)
+        shard.mkdir(parents=True)
+        # Existing content is deliberately irrelevant to scheduling.
+        (shard / "arbitrary.partial").write_text("not-json")
 
     order, summary = full.resume_first_assigned_shards(tmp_path, assigned)
 
