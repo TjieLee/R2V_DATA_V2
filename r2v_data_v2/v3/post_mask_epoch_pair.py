@@ -326,9 +326,15 @@ class PairEpochRunner:
         """
         return self._empty_stats()
 
+    def _marker_path(self, key: str) -> Path:
+        return _semantic_root(self.ledger) / "accounted" / f"{key}.json"
+
+    def _marker_exists(self, key: str) -> bool:
+        return self._marker_path(key).is_file()
+
     def _mark_once(self, key: str) -> bool:
         """Durable, idempotent 'account this exactly once' marker."""
-        path = _semantic_root(self.ledger) / "accounted" / f"{key}.json"
+        path = self._marker_path(key)
         if path.is_file():
             return False
         _write_json_once(path, {"key": key})
@@ -472,21 +478,34 @@ class PairEpochRunner:
             _validate_pair_inputs as legacy_inputs,
         )
 
+        # Validation itself is never gated by a marker: a clip that was valid
+        # when the plan was created can lose or corrupt its reference PNG
+        # later, and 3b must not inherit a donor that was never re-checked.
+        # Only the failure diagnostic is de-duplicated, and the marker for it
+        # is written after append_failure, so a crash between the two can
+        # duplicate one diagnostic but can never drop one.
         clip = storage.read_clip(clip_uid)
-        # Accounting marker: validated exactly once, so repeated status
-        # queries cannot grow the failure diagnostic.
-        if not self._mark_once(f"existing-validated-{shard}-{clip_uid}"):
-            return
         try:
             frames = _validate_frames(storage, clip_uid)
             masks = storage.read_masks(clip_uid)
             legacy_inputs(clip, frames, masks)
             legacy_validate(self.config, storage, clip, frames=frames, masks=masks)
         except Exception as exc:  # noqa: BLE001 - legacy failure semantics
-            storage.append_failure(
-                stage="pair", clip_uid=clip_uid, reason=str(exc), details={}
+            fingerprint = semantic_input_digest(
+                {
+                    "shard": shard,
+                    "clip_uid": clip_uid,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
             )
-            self.stats[shard]["failed"] += 1
+            accounted = self._marker_exists(f"existing-invalid-{fingerprint}")
+            if not accounted:
+                storage.append_failure(
+                    stage="pair", clip_uid=clip_uid, reason=str(exc), details={}
+                )
+                self.stats[shard]["failed"] += 1
+                # Written after the diagnostic, never before it.
+                self._mark_once(f"existing-invalid-{fingerprint}")
 
     # -- primary job identity --------------------------------------------
 

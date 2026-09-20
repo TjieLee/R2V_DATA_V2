@@ -1799,8 +1799,10 @@ def test_publication_retry_after_failed_first_attempt(
     assert state["calls"] == 1
     assert storage.read_clip("clip-1").pairing is None
     assert not storage.selected_entity_path("clip-1", "e1").is_file()
-    marker = runner.ledger.root / "semantic/pair/accounted/published-clip-1.json"
-    assert not marker.exists(), "no durable published marker after a failed publish"
+    accounted = runner.ledger.root / "semantic/pair/accounted"
+    assert not (
+        accounted / f"published-{SHARD}-clip-1.json"
+    ).exists(), "no durable published marker after a failed publish"
 
     restore_publish()
     resumed = _runner(tmp_path, config, storage)
@@ -1809,6 +1811,9 @@ def test_publication_retry_after_failed_first_attempt(
     assert clip.pairing is not None
     assert clip.pairing.status == "ready"
     assert storage.selected_entity_path("clip-1", "e1").is_file()
+    # The marker only follows a successful publication; it never decides
+    # whether publication runs.
+    assert (accounted / f"published-{SHARD}-clip-1.json").exists()
 
 
 def test_guard_counters_count_one_call_once(
@@ -1864,3 +1869,69 @@ def test_guard_failure_counters_count_one_failure_once(
     clip = storage.read_clip("clip-1")
     assert clip.pairing.status == "ready"
     assert clip.pairing.background_token is None
+
+
+def test_existing_pairing_is_revalidated_after_plan_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Validation must run every time; only the diagnostic is de-duplicated."""
+    import r2v_data_v2.v3.pair as pair_module
+
+    config = _pair_config(tmp_path, monkeypatch)
+    storage = _storage(config, entity_types=("subject",))
+    pair_clips(config, storage, judge=_Judge())
+    root = tmp_path / "ledger"
+
+    runner = _runner(root, config, storage)
+    plan = runner._primary_plan(SHARD)
+    assert plan["clips"]["clip-1"]["classification"] == "existing_pairing"
+    assert runner.stats[SHARD]["failed"] == 0
+
+    real_validate = pair_module._validate_existing_pairing
+    seen: list[str] = []
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs.get("clip", args[2] if len(args) > 2 else None).clip_uid)
+        return real_validate(*args, **kwargs)
+
+    monkeypatch.setattr(pair_module, "_validate_existing_pairing", spy)
+
+    # The clip is still healthy: validation runs and passes again.
+    revalidated = _runner(root, config, storage)
+    revalidated._primary_plan(SHARD)
+    assert seen == ["clip-1"], "existing pairing is validated on every load"
+    assert revalidated.stats[SHARD]["failed"] == 0
+
+    # Now corrupt the published reference after the plan already exists.
+    storage.selected_entity_path("clip-1", "e1").write_bytes(b"not a png")
+
+    after = _runner(root, config, storage)
+    after._primary_plan(SHARD)
+    assert len(seen) == 2, "validation is not skipped by any success marker"
+    assert after.stats[SHARD]["failed"] == 1
+    assert after.seed_primary_jobs() == [], "no primary Qwen for an existing pairing"
+
+
+def test_existing_pairing_failure_diagnostic_does_not_grow_unbounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same corruption is accounted once, not once per status query."""
+    config = _pair_config(tmp_path, monkeypatch)
+    storage = _storage(config, entity_types=("subject",))
+    pair_clips(config, storage, judge=_Judge())
+    storage.selected_entity_path("clip-1", "e1").write_bytes(b"not a png")
+    root = tmp_path / "ledger"
+
+    runner = _runner(root, config, storage)
+    runner._primary_plan(SHARD)
+    assert runner.stats[SHARD]["failed"] == 1
+
+    # Repeated loads still validate; only the accounting is de-duplicated.
+    runner._primary_plan(SHARD)
+    runner._primary_plan(SHARD)
+    assert runner.stats[SHARD]["failed"] == 1, "same failure is not counted again"
+
+    # A fresh runner keeps the already-recorded diagnostic from growing.
+    restarted = _runner(root, config, storage)
+    restarted._primary_plan(SHARD)
+    assert restarted.stats[SHARD]["failed"] == 0
