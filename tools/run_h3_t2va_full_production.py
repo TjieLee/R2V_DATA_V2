@@ -37,6 +37,20 @@ def main(argv=None):
     parser.add_argument("--rank", type=int, default=0)
     parser.add_argument("--world-size", type=int, default=1)
     parser.add_argument("--base-url", default="http://127.0.0.1:8092/v1")
+    parser.add_argument(
+        "--mimo-sglang",
+        type=Path,
+        default=Path("/mnt/workspace/litengjie/data/audio_deps/qwen38-sglang-env/bin/sglang"),
+    )
+    parser.add_argument(
+        "--mimo-checkpoint",
+        type=Path,
+        default=Path("/mnt/workspace/public/pretrained/MiMo/MiMo-V2.5"),
+    )
+    parser.add_argument("--mimo-mem-fraction-static", type=float, default=0.65)
+    parser.add_argument("--mimo-startup-polls", type=int, default=360)
+    parser.add_argument("--mimo-poll-interval", type=float, default=5.0)
+    parser.add_argument("--mimo-cleanup-grace-seconds", type=float, default=30.0)
     parser.add_argument("--media-mode", choices=["base64", "http"], default="base64")
     parser.add_argument("--media-base-url")
     parser.add_argument("--allow-unverified", action="store_true")
@@ -55,6 +69,12 @@ def main(argv=None):
         raise ValueError("request workers must be positive")
     if args.canonical_workers < 1:
         raise ValueError("canonical workers must be positive")
+    if args.mimo_startup_polls < 1:
+        raise ValueError("MiMo startup polls must be positive")
+    if args.mimo_poll_interval < 0 or args.mimo_cleanup_grace_seconds <= 0:
+        raise ValueError("invalid MiMo lifecycle timing")
+    if not 0 < args.mimo_mem_fraction_static <= 1:
+        raise ValueError("MiMo mem fraction must be in (0, 1]")
     root = args.production_root.expanduser().resolve()
     for source in (args.shot_manifest, args.clips_root, args.source_videos_root):
         if source.resolve().is_relative_to(root):
@@ -87,6 +107,10 @@ def main(argv=None):
     from r2v_data_v2.h3.sam_audio_stem_shadow import sam_audio_configuration
     from r2v_data_v2.h3.t2va_mimo_backend import T2VAMimoBackend, T2VAMimoConfig
     from r2v_data_v2.h3.ta2va_shadow import TA2VAProfileBackend
+    from r2v_data_v2.h3.t2va_mimo_stage_server import (
+        StageMimoClient,
+        build_mimo_serve_command,
+    )
 
     sam_config = sam_audio_configuration(
         implementation_root=required_path("SAM_AUDIO_CODE_ROOT"),
@@ -113,6 +137,20 @@ def main(argv=None):
         api_key=os.environ.get("MIMO_API_KEY", "local-no-key"),
         transport="sglang",
     )
+    mimo_client = StageMimoClient(
+        api_key=config.api_key,
+        base_url=config.base_url,
+        timeout_seconds=config.timeout_seconds,
+        serve_command=build_mimo_serve_command(
+            args.mimo_sglang,
+            args.mimo_checkpoint,
+            mem_fraction_static=args.mimo_mem_fraction_static,
+        ),
+        log_root=root / "logs" / os.uname().nodename,
+        startup_polls=args.mimo_startup_polls,
+        poll_interval=args.mimo_poll_interval,
+        cleanup_grace_seconds=args.mimo_cleanup_grace_seconds,
+    )
     pipeline = full.FullPipeline(
         root=root,
         index=index,
@@ -121,13 +159,14 @@ def main(argv=None):
         gpu_ids=gpu_ids,
         sam_configuration=sam_config,
         auk_configuration=auk_config,
-        backend=T2VAMimoBackend(config),
-        profiles=TA2VAProfileBackend(config),
+        backend=T2VAMimoBackend(config, client=mimo_client),
+        profiles=TA2VAProfileBackend(config, client=mimo_client),
         allow_unverified=args.allow_unverified,
         request_workers=args.request_workers,
         canonical_workers=args.canonical_workers,
         ffmpeg=args.ffmpeg,
         ffprobe=args.ffprobe,
+        mimo_lifecycle=mimo_client,
     )
     previous = signal.getsignal(signal.SIGTERM)
 
