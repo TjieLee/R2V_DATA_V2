@@ -290,18 +290,16 @@ def test_dry_run_exact_accepted_server_and_full_cli(sandbox):
     serve, run = map(shlex.split, result.stdout.splitlines())
     original = invoke(REPO / "scripts/run_h3_t2va_production.sh", env, "--dry-run")
     standalone = shlex.split(original.stdout.splitlines()[0])
-    assert serve[serve.index("--mem-fraction-static") + 1] == "0.55"
-    assert standalone[standalone.index("--mem-fraction-static") + 1] == "0.65"
-
-    def without_mem_fraction(args):
-        index = args.index("--mem-fraction-static")
-        return args[:index] + args[index + 2 :]
-
-    assert without_mem_fraction(serve) == without_mem_fraction(standalone)
+    assert serve == standalone
+    assert serve[serve.index("--mem-fraction-static") + 1] == "0.65"
     assert run[1] == str(script.parent.parent / "tools/run_h3_t2va_full_production.py")
     assert run[run.index("--request-workers") + 1] == "1"
     assert run[run.index("--canonical-workers") + 1] == "16"
     assert run[run.index("--gpu-ids") + 1] == "0,1,2,3,4,5,6,7"
+    assert run[run.index("--mimo-mem-fraction-static") + 1] == "0.65"
+    assert run[run.index("--mimo-startup-polls") + 1] == "3"
+    assert run[run.index("--mimo-poll-interval") + 1] == "0.01"
+    assert run[run.index("--mimo-cleanup-grace-seconds") + 1] == "2"
     assert run[run.index("--shards") + 1] == "59,12,87"
     assert "--audio-production-root" not in run
     assert "--audio-shadow-run-id" not in run
