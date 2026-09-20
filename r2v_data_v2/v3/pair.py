@@ -2057,16 +2057,24 @@ def prepare_cross_pair_target_evidence(
     entity: AnnotationEntity,
     frames: SampledFramesArtifact,
     masks: TrackedMasksArtifact,
+    target_candidates: list[EntityReferenceCandidate] | None = None,
 ) -> CrossPairTargetEvidence:
-    """Target evidence for one entity, independent of any donor."""
-    target_candidates = build_entity_reference_candidates(
-        config,
-        storage,
-        clip_uid=clip_uid,
-        entity=entity,
-        frames=frames,
-        masks=masks,
-    )
+    """Target evidence for one entity, independent of any donor.
+
+    Legacy built the candidates *before* looking up donors, but only loaded
+    source images, built the context/crop or built the contact sheet *after*
+    a non-empty donor list was known. Callers that follow that ordering pass
+    the already-built candidates here so they are not rebuilt.
+    """
+    if target_candidates is None:
+        target_candidates = build_entity_reference_candidates(
+            config,
+            storage,
+            clip_uid=clip_uid,
+            entity=entity,
+            frames=frames,
+            masks=masks,
+        )
     if target_candidates:
         target_candidate = target_candidates[0]
         target_frame_slots = (target_candidate.frame_slot,)
@@ -2253,10 +2261,10 @@ def _run_same_parent_cross_pair_fallback(
                         and current_state.reference_scope == "full"
                     ):
                         continue
-                    # Target evidence is deterministic and donor-independent,
-                    # so it is prepared once per entity, exactly like the
-                    # original single pass, and reused for every donor.
-                    evidence = prepare_cross_pair_target_evidence(
+                    # Legacy ordering: candidates are built before the donor
+                    # lookup, but no source image, context, crop or contact
+                    # sheet is materialized until a donor actually exists.
+                    target_candidates = build_entity_reference_candidates(
                         config,
                         storage,
                         clip_uid=target_clip.clip_uid,
@@ -2272,6 +2280,17 @@ def _run_same_parent_cross_pair_fallback(
                     )
                     if not donors:
                         continue
+                    # Target evidence is deterministic and donor-independent,
+                    # so it is prepared once per entity and reused by donors.
+                    evidence = prepare_cross_pair_target_evidence(
+                        config,
+                        storage,
+                        clip_uid=target_clip.clip_uid,
+                        entity=target_entity,
+                        frames=target_frames,
+                        masks=target_masks,
+                        target_candidates=target_candidates,
+                    )
                     for donor in donors:
                         if active_judge is None:
                             judge_config = config.qwen.cross_pair_judge
@@ -2282,8 +2301,11 @@ def _run_same_parent_cross_pair_fallback(
                                 repair_retries=config.pair.repair_retries,
                             )
                             active_judge = owned_judge
-                        counters["cross_pair_attempted"] += 1
+                        # Legacy timing: the donor image is loaded first, so
+                        # cross_pair_attempted means a donor reference was
+                        # successfully read and a judge call is about to run.
                         prepared = prepare_cross_pair_attempt(evidence, donor)
+                        counters["cross_pair_attempted"] += 1
                         try:
                             attempt = run_cross_pair_judge(prepared, active_judge)
                         except CrossPairJudgeFailure as exc:

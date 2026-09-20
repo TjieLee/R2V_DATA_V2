@@ -974,3 +974,148 @@ def test_helper_guard_boundary_matches_the_synchronous_wrapper(
     # No de-duplication: each pass through the boundary is paid for.
     assert counters["background_final_guard_attempted"] == 2
     assert counters["background_final_guard_accepted"] == 2
+
+
+# ---------------------------------------------------------------------------
+# M. Frozen cross-pair preparation ordering
+# ---------------------------------------------------------------------------
+
+
+def test_no_donor_means_target_evidence_is_never_materialized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Evidence materialization happens only after a non-empty donor list."""
+    import r2v_data_v2.v3.pair as pair_module_local
+
+    config = _config(
+        tmp_path, monkeypatch, pair=PairConfig(same_parent_fallback_enabled=True)
+    )
+    storage = RunStorage(config)
+    storage.initialize(git_commit="no-donor-order-test")
+    # Same reference_type, but a different parent, so no donor is eligible.
+    _add_ready_clip(
+        config,
+        storage,
+        clip_uid="donor",
+        clip_suffix="2",
+        parent_video_id="unrelated-parent",
+        entity_types=("subject",),
+    )
+    _add_ready_clip(
+        config,
+        storage,
+        clip_uid="target",
+        clip_suffix="20",
+        entity_types=("subject",),
+    )
+
+    recorded: list[str] = []
+    real = pair_module_local.prepare_cross_pair_target_evidence
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        recorded.append(kwargs.get("clip_uid", "?"))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(
+        pair_module_local, "prepare_cross_pair_target_evidence", spy
+    )
+
+    stats = pair_clips(
+        config,
+        storage,
+        judge=_ScopedJudge({("target", "e1"): "reject"}),
+        cross_pair_judge=_CrossJudge([True]),
+    )
+
+    assert recorded == [], "evidence must not be built when there is no donor"
+    assert stats.cross_pair_attempted == 0
+    assert stats.failed == 0, "a missing donor is not a Pair failure"
+
+
+def test_donor_image_load_failure_does_not_count_as_an_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """cross_pair_attempted means the donor image was actually loaded.
+
+    Legacy incremented the counter *after* ``Image.open(...).load()``, so a
+    donor whose reference image cannot be read is not an attempt.
+    """
+    import r2v_data_v2.v3.pair as pair_module_local
+
+    config = _config(
+        tmp_path, monkeypatch, pair=PairConfig(same_parent_fallback_enabled=True)
+    )
+    storage = _two_entity_target_storage(config)
+
+    def explode(evidence: Any, donor: Any) -> Any:
+        raise OSError("donor reference image is unreadable")
+
+    monkeypatch.setattr(pair_module_local, "prepare_cross_pair_attempt", explode)
+
+    cross = _CrossJudge([True])
+    stats = pair_clips(
+        config,
+        storage,
+        judge=_ScopedJudge({("target", "e1"): "reject", ("target", "e2"): "reject"}),
+        cross_pair_judge=cross,
+    )
+
+    assert cross.calls == [], "no Qwen call without a readable donor image"
+    assert stats.cross_pair_attempted == 0
+    assert stats.failed == 1
+
+
+def test_unreadable_donor_reference_is_filtered_from_the_donor_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Characterization: the donor index validates before the loop."""
+    config = _config(
+        tmp_path, monkeypatch, pair=PairConfig(same_parent_fallback_enabled=True)
+    )
+    storage = _same_parent_storage(config)
+    pair_clips(config, storage, judge=_ScopedJudge())
+    donor_path = storage.selected_entity_path("donor", "e1")
+    assert donor_path.is_file()
+    donor_path.write_bytes(b"not a png")
+
+    _add_ready_clip(
+        config, storage, clip_uid="target", clip_suffix="20", entity_types=("subject",)
+    )
+    cross = _CrossJudge([True])
+    judge = _ScopedJudge({("target", "e1"): "reject"}, forbidden=("donor",))
+
+    stats = pair_clips(config, storage, judge=judge, cross_pair_judge=cross)
+
+    # _build_same_parent_donor_index validates the donor artifact, so an
+    # unreadable reference never reaches the donor loop at all.
+    assert cross.calls == []
+    assert stats.cross_pair_attempted == 0
+    assert stats.cross_pair_ready == 0
+
+
+def test_helper_target_evidence_context_only_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """sampled_frames mode: ten frames, a contact sheet, no entity crop."""
+    from r2v_data_v2.v3.frames import validate_sampled_frames
+    from r2v_data_v2.v3.pair import prepare_cross_pair_target_evidence
+
+    config = _config(
+        tmp_path, monkeypatch, pair=PairConfig(same_parent_fallback_enabled=True)
+    )
+    storage = _two_entity_target_storage(config)
+    target = storage.read_clip("target")
+    evidence = prepare_cross_pair_target_evidence(
+        config,
+        storage,
+        clip_uid="target",
+        entity=target.annotation.entities[0],
+        frames=validate_sampled_frames(storage, "target"),
+        masks=storage.read_masks("target"),
+        target_candidates=[],
+    )
+
+    assert evidence.evidence_mode == "sampled_frames"
+    assert evidence.frame_slots == tuple(range(10))
+    assert evidence.entity_crop is None
+    assert evidence.context_image.size[0] > 0
