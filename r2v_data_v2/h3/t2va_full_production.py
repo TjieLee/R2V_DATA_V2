@@ -101,6 +101,7 @@ class FullPipeline:
         canonical_workers=16,
         ffmpeg="ffmpeg",
         ffprobe="ffprobe",
+        mimo_lifecycle=None,
     ):
         self.root, self.index = root, index
         self.clips_root, self.source_videos_root = clips_root, source_videos_root
@@ -112,6 +113,7 @@ class FullPipeline:
         self.backend, self.profiles = backend, profiles
         self.allow_unverified, self.request_workers = allow_unverified, request_workers
         self.ffmpeg, self.ffprobe = ffmpeg, ffprobe
+        self.mimo_lifecycle = mimo_lifecycle
         if canonical_workers < 1:
             raise ValueError("canonical workers must be positive")
         self.canonical_workers = canonical_workers
@@ -286,21 +288,29 @@ class FullPipeline:
                 "failed": len(provenance.get("failed_clip_uids", [])),
             }
         if name == "mimo":
+            from contextlib import nullcontext
+
             from r2v_data_v2.h3.t2va_full_downstream import run_downstream
 
-            states = run_downstream(
-                self.root,
-                self.index,
-                shard_id,
-                audio_root,
-                self.clips_root,
-                self.source_videos_root,
-                self.backend,
-                self.profiles,
-                allow_unverified=self.allow_unverified,
-                request_workers=self.request_workers,
-                run_id=RUN_ID,
+            lifecycle = (
+                self.mimo_lifecycle.stage(shard_id)
+                if self.mimo_lifecycle is not None
+                else nullcontext()
             )
+            with lifecycle:
+                states = run_downstream(
+                    self.root,
+                    self.index,
+                    shard_id,
+                    audio_root,
+                    self.clips_root,
+                    self.source_videos_root,
+                    self.backend,
+                    self.profiles,
+                    allow_unverified=self.allow_unverified,
+                    request_workers=self.request_workers,
+                    run_id=RUN_ID,
+                )
             return {
                 f"{stage}_{status}": sum(
                     row[f"{stage}_status"] == status for row in states.values()
