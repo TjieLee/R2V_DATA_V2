@@ -3065,3 +3065,159 @@ def test_scheduler_recovers_when_cross_publication_crashes(
     ) == _png_sha(donor_png)
     terminal = restarted._cross_terminal(SHARD, "clip-1")
     assert terminal is not None and terminal["status"] == "completed"
+
+
+def test_scheduler_recovers_when_terminal_marker_crashes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Publication succeeds, marker write fails: restart verifies, not republishes."""
+    import r2v_data_v2.v3.pair as pm
+
+    root = tmp_path / "run"
+    root.mkdir()
+    config, storage, runner, judges = _guard_fixture(root, monkeypatch)
+    _run_until_quiescent(
+        runner, runner.seed_primary_jobs(),
+        judges["entity"], judges["guard"], judges["cross"],
+    )
+    runner.freeze_donor_snapshot(SHARD)
+    donor_png = storage.selected_entity_path("donor", "e1").read_bytes()
+
+    real_publish = pm._publish_cross_pair_result
+    publish_calls: list[int] = []
+
+    def counting_publish(*args: Any, **kwargs: Any) -> Any:
+        publish_calls.append(1)
+        return real_publish(*args, **kwargs)
+
+    real_marker = runner._mark_cross_terminal
+    marker_calls: list[int] = []
+
+    def explode_marker(
+        shard: str, clip_uid: str, *, status: str, reason_kind: str, reason: str
+    ) -> None:
+        if clip_uid == "clip-1" and status == "completed" and reason_kind == "published":
+            marker_calls.append(1)
+            if len(marker_calls) == 1:
+                raise RuntimeError("simulated terminal marker crash")
+        return real_marker(
+            shard, clip_uid, status=status, reason_kind=reason_kind, reason=reason
+        )
+
+    pm._publish_cross_pair_result = counting_publish
+    runner._mark_cross_terminal = explode_marker
+    scheduler = _scheduler(
+        runner.ledger, runner,
+        _PairExecutor(runner, entity_judge=judges["entity"],
+                      guard_judge=judges["guard"], cross_judge=judges["cross"]),
+    )
+    try:
+        outcome = scheduler.run(runner.freeze_cross_pair_after_primary_quiescence())
+    finally:
+        pm._publish_cross_pair_result = real_publish
+
+    assert publish_calls == [1], "publication really succeeded"
+    assert marker_calls == [1], "the marker write was the thing that crashed"
+    assert outcome["completed"] is False
+    assert runner._cross_terminal(SHARD, "clip-1") is None, "marker absent"
+    # Live target is already cross-upgraded even though the marker is missing.
+    upgraded = storage.read_clip("clip-1")
+    states = {item.entity_id: item for item in upgraded.references.entities}
+    assert states["e2"].status == "ready"
+    assert _png_sha(
+        storage.selected_entity_path("clip-1", "e2").read_bytes()
+    ) == _png_sha(donor_png)
+    published_pairing = upgraded.pairing
+    published_references = upgraded.references
+
+    # Restart: Case B must verify the existing publication and rewrite the marker.
+    restarted = _runner(root / "ledger", config, storage, clip_uids=("clip-1", "donor"))
+    restart_publish_calls: list[int] = []
+
+    def spy_publish(*args: Any, **kwargs: Any) -> Any:
+        restart_publish_calls.append(1)
+        return real_publish(*args, **kwargs)
+
+    pm._publish_cross_pair_result = spy_publish
+    restarted_scheduler = _scheduler(
+        restarted.ledger, restarted,
+        _PairExecutor(restarted, entity_judge=judges["entity"],
+                      guard_judge=judges["guard"], cross_judge=judges["cross"]),
+    )
+    try:
+        restarted_scheduler.run(restarted.freeze_cross_pair_after_primary_quiescence())
+    finally:
+        pm._publish_cross_pair_result = real_publish
+
+    assert restart_publish_calls == [], "no republish"
+    assert len(judges["cross"].calls) == 1, "no extra cross Qwen"
+    assert len(judges["guard"].calls) == 2, "no extra guard Qwen"
+    final = storage.read_clip("clip-1")
+    assert final.pairing == published_pairing
+    assert final.references == published_references
+    assert _png_sha(
+        storage.selected_entity_path("clip-1", "e2").read_bytes()
+    ) == _png_sha(donor_png)
+    terminal = restarted._cross_terminal(SHARD, "clip-1")
+    assert terminal is not None and terminal["status"] == "completed"
+
+
+def test_scheduler_stops_after_cross_pair_judge_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CrossPairJudgeFailure is terminal for the target, across a restart."""
+    from r2v_data_v2.structured_output import ValidationIssue
+    from r2v_data_v2.v3.cross_pair_judge import CrossPairJudgeFailure
+
+    root = tmp_path / "run"
+    root.mkdir()
+    config, storage, runner = _cross_fixture(root, monkeypatch)
+    primary_before = storage.read_clip("target-b").pairing
+    failure = CrossPairJudgeFailure(
+        raw_responses=["bad"],
+        issues=[
+            ValidationIssue(
+                code="schema_invalid", field="verdict", message="missing verdict"
+            )
+        ],
+        attempt_count=1,
+    )
+
+    class _ExplodingCrossJudge:
+        calls: list[int] = []
+
+        def decide(self, **kwargs: Any) -> Any:
+            _ExplodingCrossJudge.calls.append(1)
+            raise failure
+
+    scheduler = _scheduler(
+        runner.ledger, runner,
+        _PairExecutor(runner, cross_judge=_ExplodingCrossJudge()),
+    )
+    seed = [
+        job
+        for job in runner.freeze_cross_pair_after_primary_quiescence()
+        if job.clip_uid == "target-b"
+    ]
+    outcome = scheduler.run(seed)
+
+    assert len(_ExplodingCrossJudge.calls) == 1, "one paid cross call"
+    # A judge failure is a committed terminal, so the scheduler itself is not
+    # left with failed work: the fallback is over for this target.
+    assert outcome["completed"] is True
+    terminal = runner._cross_terminal(SHARD, "target-b")
+    assert terminal is not None and terminal["status"] == "failed"
+    assert storage.read_clip("target-b").pairing == primary_before
+
+    restarted = _runner(
+        root / "ledger", config, storage,
+        clip_uids=("clip-1", "donor", "target-b", "target-c"),
+    )
+    jobs = [
+        item
+        for item in restarted.freeze_cross_pair_after_primary_quiescence()
+        if item.clip_uid == "target-b"
+    ]
+    assert jobs == [], "later donor and later entity are never planned"
+    assert len(_ExplodingCrossJudge.calls) == 1, "no extra cross Qwen"
+    assert storage.read_clip("target-b").pairing == primary_before
