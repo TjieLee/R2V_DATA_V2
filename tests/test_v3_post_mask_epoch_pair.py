@@ -1,0 +1,544 @@
+"""Characterization of the frozen ``pair_clips()`` Pair semantics.
+
+These tests run against the *current* production Pair implementation and must
+pass unchanged: they record behaviour, they do not propose any. The resource
+epoch Pair adapter has to reproduce exactly what is captured here, including
+the parts that look unattractive:
+
+* a per-entity judge failure aborts the whole clip, so later entities are
+  never called;
+* a cross-pair judge failure aborts that target clip's whole fallback, so
+  later donors *and* later entities are never called;
+* the background final guard is not de-duplicated across the primary pass,
+  the cross-pair pass and the trailing loop -- the call count is whatever
+  ``pair_clips()`` actually produces.
+
+Nothing here touches prompts, thresholds, ranking, prefilter, donor policy or
+reference tokens.
+"""
+
+from __future__ import annotations
+
+from dataclasses import replace
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from r2v_data_v2.v3.config import PairConfig, V3Config
+from r2v_data_v2.v3.cross_pair_judge import CrossPairJudgeFailure
+from r2v_data_v2.v3.pair import pair_clips
+from r2v_data_v2.v3.reference_judge import (
+    EntityReferenceDecisionAttempt,
+    EntityReferenceJudgeFailure,
+)
+from r2v_data_v2.v3.schemas import PairingState
+from r2v_data_v2.v3.storage import RunStorage
+from tests.test_v3_pair import (
+    _add_ready_clip,
+    _config,
+    _cross_decision,
+    _CrossJudge,
+    _decision,
+    _install_clean_background,
+    _Judge,
+    _same_parent_storage,
+    _storage,
+)
+
+
+def _judge_failure(message: str = "structured output invalid") -> Exception:
+    return EntityReferenceJudgeFailure(
+        raw_responses=["{not json}"],
+        issues=[],
+        attempt_count=1,
+    )
+
+
+def _cross_failure(message: str = "structured output invalid") -> Exception:
+    return CrossPairJudgeFailure(
+        raw_responses=["{not json}"],
+        issues=[],
+        attempt_count=1,
+    )
+
+
+class _FailingEntityJudge:
+    """``_Judge`` plus an explicit failure injection for one entity."""
+
+    def __init__(
+        self,
+        scopes: dict[str, str] | None = None,
+        *,
+        fail_on: str | None = None,
+    ) -> None:
+        self.scopes = scopes or {}
+        self.fail_on = fail_on
+        self.calls: list[tuple[str, list[str]]] = []
+        self.close_calls = 0
+
+    def decide(self, *, entity, candidates, source_images):
+        self.calls.append(
+            (entity.entity_id, [item.candidate_id for item in candidates])
+        )
+        if entity.entity_id == self.fail_on:
+            raise _judge_failure()
+        return EntityReferenceDecisionAttempt(
+            decision=_decision(
+                self.scopes.get(entity.entity_id, "full"),
+                entity.reference_type,
+            ),
+            raw_responses=("{}",),
+            repair_attempts=0,
+        )
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+class _FailingCrossJudge:
+    """``_CrossJudge`` plus a cross-pair failure at a chosen donor index."""
+
+    def __init__(
+        self,
+        decisions: list[bool] | None = None,
+        *,
+        fail_at: int | None = None,
+    ) -> None:
+        self.decisions = list(decisions or [])
+        self.fail_at = fail_at
+        self.calls: list[dict[str, Any]] = []
+
+    def decide(
+        self,
+        *,
+        target_clip_uid,
+        target_entity,
+        target_evidence_mode,
+        target_context_image,
+        target_entity_crop,
+        donor_clip_uid,
+        donor_entity,
+        donor_reference_image,
+    ):
+        index = len(self.calls)
+        self.calls.append(
+            {
+                "target_clip_uid": target_clip_uid,
+                "target_entity_id": target_entity.entity_id,
+                "target_evidence_mode": target_evidence_mode,
+                "donor_clip_uid": donor_clip_uid,
+                "donor_entity_id": donor_entity.entity_id,
+            }
+        )
+        if index == self.fail_at:
+            raise _cross_failure()
+        accept = self.decisions[index] if index < len(self.decisions) else True
+        from r2v_data_v2.v3.cross_pair_judge import CrossPairDecisionAttempt
+
+        return CrossPairDecisionAttempt(
+            decision=_cross_decision(accept=accept),
+            raw_responses=("{}",),
+            repair_attempts=0,
+        )
+
+
+class _NeverCalledJudge:
+    """Sentinel: any Pair Qwen call is a regression."""
+
+    def __init__(self, label: str = "judge") -> None:
+        self.label = label
+        self.calls: list[Any] = []
+
+    def decide(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        raise AssertionError(f"{self.label} must not be called")
+
+    def close(self) -> None:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# A. Primary entity judge failure
+# ---------------------------------------------------------------------------
+
+
+def test_characterize_entity_judge_failure_stops_the_entity_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """e2 raises: e3 must never be judged and the clip stays unpublished."""
+    config = _config(tmp_path, monkeypatch)
+    storage = _storage(config, entity_types=("subject", "object", "object"))
+    judge = _FailingEntityJudge(fail_on="e2")
+
+    stats = pair_clips(config, storage, judge=judge)
+
+    assert [entity_id for entity_id, _ in judge.calls] == ["e1", "e2"], (
+        "e3 must not be called after e2 failed"
+    )
+    clip = storage.read_clip("clip-1")
+    assert clip.pairing is None, "a failed entity leaves pairing unpublished"
+    assert stats.failed == 1
+    assert stats.processed == 1
+    assert stats.ready == 0
+    assert stats.rejected == 0
+    # e1's temporary reference image is rolled back with the clip.
+    assert not storage.selected_entity_path("clip-1", "e1").is_file()
+
+
+def test_characterize_failed_clip_never_enters_cross_pair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(
+        tmp_path, monkeypatch, pair=PairConfig(same_parent_fallback_enabled=True)
+    )
+    storage = _storage(config, entity_types=("subject", "object"))
+    cross = _FailingCrossJudge()
+
+    stats = pair_clips(
+        config, storage, judge=_FailingEntityJudge(fail_on="e2"), cross_pair_judge=cross
+    )
+
+    assert cross.calls == []
+    assert stats.cross_pair_attempted == 0
+    assert stats.failed == 1
+
+
+# ---------------------------------------------------------------------------
+# B. Cross-pair ordering and stop-first-accept
+# ---------------------------------------------------------------------------
+
+
+def _three_donor_storage(config: V3Config) -> RunStorage:
+    storage = RunStorage(config)
+    storage.initialize(git_commit="cross-order-test")
+    for uid, suffix in (("donor-10", "10"), ("donor-2", "2"), ("donor-1", "1")):
+        _add_ready_clip(
+            config, storage, clip_uid=uid, clip_suffix=suffix, entity_types=("subject",)
+        )
+    _add_ready_clip(
+        config, storage, clip_uid="target", clip_suffix="20", entity_types=("subject",)
+    )
+    return storage
+
+
+def test_characterize_cross_pair_donor_order_is_natural_suffix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(
+        tmp_path, monkeypatch, pair=PairConfig(same_parent_fallback_enabled=True)
+    )
+    storage = _three_donor_storage(config)
+    cross = _CrossJudge([False, False, False])
+    from tests.test_v3_pair import _ClipJudge
+
+    pair_clips(
+        config,
+        storage,
+        judge=_ClipJudge({("target", "e1"): "reject"}),
+        cross_pair_judge=cross,
+    )
+
+    assert [call["donor_clip_uid"] for call in cross.calls] == [
+        "donor-1",
+        "donor-2",
+        "donor-10",
+    ]
+
+
+def test_characterize_first_donor_accept_stops_the_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(
+        tmp_path, monkeypatch, pair=PairConfig(same_parent_fallback_enabled=True)
+    )
+    storage = _three_donor_storage(config)
+    cross = _CrossJudge([True, True, True])
+    from tests.test_v3_pair import _ClipJudge
+
+    stats = pair_clips(
+        config,
+        storage,
+        judge=_ClipJudge({("target", "e1"): "reject"}),
+        cross_pair_judge=cross,
+    )
+
+    assert [call["donor_clip_uid"] for call in cross.calls] == ["donor-1"]
+    assert stats.cross_pair_attempted == 1
+    assert stats.cross_pair_ready == 1
+
+
+def test_characterize_reject_then_accept_stops_the_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(
+        tmp_path, monkeypatch, pair=PairConfig(same_parent_fallback_enabled=True)
+    )
+    storage = _three_donor_storage(config)
+    cross = _CrossJudge([False, True, True])
+    from tests.test_v3_pair import _ClipJudge
+
+    stats = pair_clips(
+        config,
+        storage,
+        judge=_ClipJudge({("target", "e1"): "reject"}),
+        cross_pair_judge=cross,
+    )
+
+    assert [call["donor_clip_uid"] for call in cross.calls] == ["donor-1", "donor-2"]
+    assert stats.cross_pair_attempted == 2
+    assert stats.cross_pair_ready == 1
+
+
+def test_characterize_all_donors_reject_preserves_target_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(
+        tmp_path, monkeypatch, pair=PairConfig(same_parent_fallback_enabled=True)
+    )
+    storage = _three_donor_storage(config)
+    cross = _CrossJudge([False, False, False])
+    from tests.test_v3_pair import _ClipJudge
+
+    stats = pair_clips(
+        config,
+        storage,
+        judge=_ClipJudge({("target", "e1"): "reject"}),
+        cross_pair_judge=cross,
+    )
+
+    target = storage.read_clip("target")
+    assert target.pairing == PairingState(
+        status="rejected",
+        reason="no_qualifying_ready_reference",
+    )
+    assert stats.cross_pair_ready == 0
+    assert stats.rejected == 1
+
+
+# ---------------------------------------------------------------------------
+# C. Cross-pair judge failure
+# ---------------------------------------------------------------------------
+
+
+def test_characterize_cross_pair_failure_aborts_target_and_keeps_primary_pairing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(
+        tmp_path, monkeypatch, pair=PairConfig(same_parent_fallback_enabled=True)
+    )
+    storage = _same_parent_storage(config)
+    cross = _FailingCrossJudge(decisions=[True], fail_at=0)
+    from tests.test_v3_pair import _ClipJudge
+
+    stats = pair_clips(
+        config,
+        storage,
+        judge=_ClipJudge({("target", "e1"): "reject"}),
+        cross_pair_judge=cross,
+    )
+
+    assert len(cross.calls) == 1, "donor2 must not be called after donor1 failed"
+    target = storage.read_clip("target")
+    # The primary pairing survives: only the fallback block aborted.
+    assert target.pairing is not None
+    assert target.pairing.status == "rejected"
+    assert stats.failed == 1
+    assert stats.cross_pair_ready == 0
+
+
+def test_characterize_cross_pair_failure_is_not_retried_on_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A target with a durable pairing is skipped, so no re-cross-pair."""
+    config = _config(
+        tmp_path, monkeypatch, pair=PairConfig(same_parent_fallback_enabled=True)
+    )
+    storage = _same_parent_storage(config)
+    from tests.test_v3_pair import _ClipJudge
+
+    pair_clips(
+        config,
+        storage,
+        judge=_ClipJudge({("target", "e1"): "reject"}),
+        cross_pair_judge=_FailingCrossJudge(decisions=[True], fail_at=0),
+    )
+
+    stats = pair_clips(
+        config,
+        storage,
+        judge=_NeverCalledJudge("entity judge"),
+        cross_pair_judge=_NeverCalledJudge("cross judge"),
+    )
+
+    assert stats.skipped_existing == 2, "both clips already carry a durable pairing"
+    assert stats.processed == 0
+    assert stats.cross_pair_attempted == 0
+    assert stats.failed == 0
+
+
+# ---------------------------------------------------------------------------
+# D. Donor domain is one storage (one canonical shard)
+# ---------------------------------------------------------------------------
+
+
+def test_characterize_donor_domain_is_one_storage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A same-parent donor in another shard's storage is invisible."""
+    config = _config(
+        tmp_path, monkeypatch, pair=PairConfig(same_parent_fallback_enabled=True)
+    )
+    target_shard = RunStorage(config)
+    target_shard.initialize(git_commit="shard-a")
+    _add_ready_clip(
+        config,
+        target_shard,
+        clip_uid="target",
+        clip_suffix="20",
+        entity_types=("subject",),
+    )
+    # A perfect same-parent donor, but living in another shard's run root.
+    other_config = replace(config, run_root=config.run_root.parent / "shard-b")
+    other_shard = RunStorage(other_config)
+    other_shard.initialize(git_commit="shard-b")
+    _add_ready_clip(
+        config,
+        other_shard,
+        clip_uid="donor",
+        clip_suffix="2",
+        entity_types=("subject",),
+    )
+    cross = _CrossJudge([True])
+    from tests.test_v3_pair import _ClipJudge
+
+    stats = pair_clips(
+        config,
+        target_shard,
+        judge=_ClipJudge({("target", "e1"): "reject"}),
+        cross_pair_judge=cross,
+    )
+
+    assert cross.calls == [], "no cross-shard donor may be used"
+    assert stats.cross_pair_attempted == 0
+
+
+# ---------------------------------------------------------------------------
+# E. Existing pairing is retained and reused as a donor
+# ---------------------------------------------------------------------------
+
+
+def test_characterize_existing_pairing_is_not_rejudged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    storage = _storage(config, entity_types=("subject",))
+    first = pair_clips(config, storage, judge=_Judge())
+    assert first.ready == 1
+
+    stats = pair_clips(config, storage, judge=_NeverCalledJudge("entity judge"))
+
+    assert stats.skipped_existing == 1
+    assert stats.processed == 0
+    assert storage.read_clip("clip-1").pairing is not None
+
+
+# ---------------------------------------------------------------------------
+# F. Background final guard call count
+# ---------------------------------------------------------------------------
+
+
+def test_characterize_background_guard_called_once_for_primary_ready(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        pair=PairConfig(background_final_guard_mode="qwen_v1"),
+        debug=True,
+    )
+    storage = _storage(config, entity_types=("subject",))
+    _install_clean_background(storage)
+    from tests.test_v3_pair import _FinalBackgroundJudge
+
+    guard = _FinalBackgroundJudge(accepted=True)
+
+    stats = pair_clips(config, storage, judge=_Judge(), background_final_judge=guard)
+
+    # Primary publishes ready -> guard evaluated once in the primary pass, and
+    # the trailing loop skips it because it is already evaluated.
+    assert stats.background_final_guard_attempted == 1
+    assert stats.background_final_guard_accepted == 1
+    assert len(guard.calls) == 1
+    assert storage.read_clip("clip-1").pairing is not None
+    assert storage.read_clip("clip-1").pairing.background_token == "<ref_bg_1>"
+
+
+def test_characterize_background_guard_mode_off_makes_no_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(
+        tmp_path, monkeypatch, pair=PairConfig(background_final_guard_mode="off")
+    )
+    storage = _storage(config, entity_types=("subject",))
+    _install_clean_background(storage)
+    from tests.test_v3_pair import _FinalBackgroundJudge
+
+    guard = _FinalBackgroundJudge(accepted=True)
+
+    stats = pair_clips(config, storage, judge=_Judge(), background_final_judge=guard)
+
+    assert guard.calls == []
+    assert stats.background_final_guard_attempted == 0
+    assert storage.read_clip("clip-1").pairing.background_token == "<ref_bg_1>"
+
+
+def test_characterize_background_guard_failure_binds_nothing_but_publishes_pair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from r2v_data_v2.v3.background_final_guard import FinalBackgroundJudgeFailure
+    from tests.test_v3_pair import _FinalBackgroundJudge
+
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        pair=PairConfig(background_final_guard_mode="qwen_v1"),
+        debug=True,
+    )
+    storage = _storage(config, entity_types=("subject",))
+    background = _install_clean_background(storage)
+    guard = _FinalBackgroundJudge(
+        error=FinalBackgroundJudgeFailure(
+            "structured output invalid", raw_response="{bad json"
+        )
+    )
+
+    stats = pair_clips(config, storage, judge=_Judge(), background_final_judge=guard)
+
+    clip = storage.read_clip("clip-1")
+    assert clip.pairing is not None
+    assert clip.pairing.status == "ready"
+    assert clip.pairing.background_token is None, "guard failure closes background only"
+    assert stats.background_final_guard_failed_closed == 1
+    assert stats.failed == 0, "a guard failure is not a Pair infrastructure failure"
+    assert storage.read_clip("clip-1").references.background == background
+
+
+# ---------------------------------------------------------------------------
+# G. Completion bypass under the production Post-Mask configuration
+# ---------------------------------------------------------------------------
+
+
+def test_characterize_reference_edit_enabled_bypairs_completion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Production Post-Mask runs with reference_edit.enabled=True."""
+    config = _config(tmp_path, monkeypatch, reference_edit_enabled=True)
+    storage = _storage(config, entity_types=("subject",))
+
+    stats = pair_clips(config, storage, judge=_Judge())
+
+    assert stats.completion_attempted == 0
+    assert stats.completion_ready == 0
+    assert stats.completion_rejected == 0
+    assert stats.ready == 1
