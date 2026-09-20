@@ -1582,3 +1582,285 @@ def test_guard_job_identity_includes_image_geometry(
 
     assert flat_a.tobytes() == flat_b.tobytes(), "same raw bytes on purpose"
     assert _image_identity(flat_a) != _image_identity(flat_b)
+
+
+# ---------------------------------------------------------------------------
+# P. Real scheduler crash recovery
+# ---------------------------------------------------------------------------
+
+
+class _PairExecutor:
+    """Pair-aware fake Qwen executor driving runner.run() per job."""
+
+    def __init__(self, runner: Any, entity_judge: Any, guard_judge: Any = None) -> None:
+        self.runner = runner
+        self.entity_judge = entity_judge
+        self.guard_judge = guard_judge
+        self.calls: list[str] = []
+
+    def execute_batch(self, jobs: Sequence[Any]) -> dict[str, Any]:
+        from r2v_data_v2.v3.post_mask_epoch_pair import (
+            PAIR_ENTITY_JUDGE_JOB,
+        )
+        from r2v_data_v2.v3.post_mask_epoch_scheduler import JobExecution
+
+        outcomes: dict[str, Any] = {}
+        for job in jobs:
+            self.calls.append(job.job_type)
+            judge = (
+                self.entity_judge
+                if job.job_type == PAIR_ENTITY_JUDGE_JOB
+                else self.guard_judge
+            )
+            try:
+                result = self.runner.run(job, judge)
+            except Exception as exc:  # noqa: BLE001
+                outcomes[job.job_id()] = JobExecution(
+                    job=job, result=None, exception=exc
+                )
+            else:
+                outcomes[job.job_id()] = JobExecution(
+                    job=job, result=result, exception=None
+                )
+        return outcomes
+
+
+def _scheduler(ledger: Any, runner: Any, executor: Any) -> Any:
+    from r2v_data_v2.v3.post_mask_epoch_jobs import RESOURCE_QWEN
+    from r2v_data_v2.v3.post_mask_epoch_scheduler import ResourceEpochScheduler
+
+    return ResourceEpochScheduler(
+        ledger=ledger,
+        finalize=runner.finalize,
+        executors={RESOURCE_QWEN: executor},
+    )
+
+
+def _fail_publish_once(monkeypatch: pytest.MonkeyPatch, times: int = 1) -> Any:
+    """Fault-inject publication. Returns ``(state, restore)``.
+
+    Restoration is explicit rather than ``monkeypatch.undo()``, which would
+    also undo the config root patching the fixtures depend on.
+    """
+    import r2v_data_v2.v3.post_mask_epoch_pair as pm
+
+    real = pm._publish_pair_result
+    state = {"remaining": times, "calls": 0}
+
+    def flaky(*args: Any, **kwargs: Any) -> Any:
+        state["calls"] += 1
+        if state["remaining"] > 0:
+            state["remaining"] -= 1
+            raise RuntimeError("publication crashed")
+        return real(*args, **kwargs)
+
+    pm._publish_pair_result = flaky
+
+    def restore() -> None:
+        pm._publish_pair_result = real
+
+    return state, restore
+
+
+def test_scheduler_resumes_after_publication_crash_on_last_entity_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Entity receipt committed, finalizer crashed: restart reuses the receipt."""
+    config = _pair_config(tmp_path, monkeypatch)
+    storage = _storage(config, entity_types=("subject",))
+    root = tmp_path / "ledger"
+
+    runner = _runner(root, config, storage)
+    judge = _Judge()
+    executor = _PairExecutor(runner, judge)
+    state, restore_publish = _fail_publish_once(monkeypatch)
+    scheduler = _scheduler(runner.ledger, runner, executor)
+    try:
+        scheduler.run(runner.seed_primary_jobs())
+    except RuntimeError:
+        pass
+
+    assert executor.calls == ["pair_entity_reference_judge"]
+    assert state["calls"] == 1, "publication was attempted exactly once"
+    assert storage.read_clip("clip-1").pairing is None
+    assert not storage.selected_entity_path("clip-1", "e1").is_file()
+
+    # Real restart: new ledger, new runner, new scheduler, no memory reuse.
+    restore_publish()
+    restarted = _runner(root, config, storage)
+    restarted_executor = _PairExecutor(restarted, judge)
+    restarted_scheduler = _scheduler(restarted.ledger, restarted, restarted_executor)
+    outcome = restarted_scheduler.run(restarted.seed_primary_jobs())
+
+    assert restarted_executor.calls == [], "no extra Qwen: the receipt was reused"
+    assert judge.calls and len(judge.calls) == 1
+    assert outcome["completed"] is True
+    clip = storage.read_clip("clip-1")
+    assert clip.pairing is not None
+    assert clip.pairing.status == "ready"
+    assert storage.selected_entity_path("clip-1", "e1").is_file()
+
+
+def test_scheduler_resumes_after_publication_crash_on_guard_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Guard receipt committed, publication crashed: restart replays CPU only."""
+    from tests.test_v3_pair import _FinalBackgroundJudge
+
+    config = _pair_config(
+        tmp_path, monkeypatch, background_final_guard_mode="qwen_v1"
+    )
+    storage = _storage(config, entity_types=("subject",))
+    _install_clean_background(storage)
+    root = tmp_path / "ledger"
+
+    runner = _runner(root, config, storage)
+    judge = _Judge()
+    guard = _FinalBackgroundJudge(accepted=True)
+    executor = _PairExecutor(runner, judge, guard)
+    _, restore_publish = _fail_publish_once(monkeypatch)
+    scheduler = _scheduler(runner.ledger, runner, executor)
+    try:
+        scheduler.run(runner.seed_primary_jobs())
+    except RuntimeError:
+        pass
+
+    assert sorted(executor.calls) == [
+        "pair_background_final_guard",
+        "pair_entity_reference_judge",
+    ]
+    assert len(judge.calls) == 1
+    assert len(guard.calls) == 1
+    assert storage.read_clip("clip-1").pairing is None
+
+    restore_publish()
+    restarted = _runner(root, config, storage)
+    restarted_executor = _PairExecutor(restarted, judge, guard)
+    restarted_scheduler = _scheduler(restarted.ledger, restarted, restarted_executor)
+    outcome = restarted_scheduler.run(restarted.seed_primary_jobs())
+
+    assert restarted_executor.calls == [], "no extra Qwen for entity or guard"
+    assert len(judge.calls) == 1
+    assert len(guard.calls) == 1
+    assert outcome["completed"] is True
+    clip = storage.read_clip("clip-1")
+    assert clip.pairing is not None
+    assert clip.pairing.status == "ready"
+    assert clip.pairing.background_token == "<ref_bg_1>"
+    assert storage.selected_entity_path("clip-1", "e1").is_file()
+
+
+def test_frozen_plan_input_drift_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from r2v_data_v2.v3.post_mask_epoch_pair import PairEpochError
+
+    config = _pair_config(tmp_path, monkeypatch)
+    storage = _storage(config, entity_types=("subject",))
+    root = tmp_path / "ledger"
+    runner = _runner(root, config, storage)
+    runner.seed_primary_jobs()
+
+    # Mutate a frozen pre-Pair input: the annotation semantics.
+    clip = storage.read_clip("clip-1")
+    assert clip.annotation is not None
+    entity = clip.annotation.entities[0]
+    drifted = clip.annotation.model_copy(
+        update={
+            "entities": [
+                entity.model_copy(update={"phrase": "drifted phrase"}),
+                *clip.annotation.entities[1:],
+            ]
+        }
+    )
+    storage.write_annotation("clip-1", drifted)
+
+    restarted = _runner(root, config, storage)
+    judge = _Judge()
+    with pytest.raises(PairEpochError, match="frozen primary input drifted"):
+        restarted.seed_primary_jobs()
+    assert judge.calls == []
+
+
+def test_publication_retry_after_failed_first_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed publication must not leave anything durable behind."""
+    config = _pair_config(tmp_path, monkeypatch)
+    storage = _storage(config, entity_types=("subject",))
+    runner = _runner(tmp_path, config, storage)
+    (job,) = runner.seed_primary_jobs()
+    result = _run_one(runner, job, _Judge())
+
+    state, restore_publish = _fail_publish_once(monkeypatch)
+    with pytest.raises(RuntimeError, match="publication crashed"):
+        runner.finalize(job, result)
+
+    assert state["calls"] == 1
+    assert storage.read_clip("clip-1").pairing is None
+    assert not storage.selected_entity_path("clip-1", "e1").is_file()
+    marker = runner.ledger.root / "semantic/pair/accounted/published-clip-1.json"
+    assert not marker.exists(), "no durable published marker after a failed publish"
+
+    restore_publish()
+    resumed = _runner(tmp_path, config, storage)
+    assert resumed.seed_primary_jobs() == []
+    clip = storage.read_clip("clip-1")
+    assert clip.pairing is not None
+    assert clip.pairing.status == "ready"
+    assert storage.selected_entity_path("clip-1", "e1").is_file()
+
+
+def test_guard_counters_count_one_call_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.test_v3_pair import _FinalBackgroundJudge
+
+    config = _pair_config(
+        tmp_path, monkeypatch, background_final_guard_mode="qwen_v1"
+    )
+    storage = _storage(config, entity_types=("subject",))
+    _install_clean_background(storage)
+    runner = _runner(tmp_path, config, storage)
+    guard = _FinalBackgroundJudge(accepted=True)
+
+    (entity_job,) = runner.seed_primary_jobs()
+    entity_result = _run_one(runner, entity_job, _Judge())
+    (guard_job,) = runner.finalize(entity_job, entity_result)
+    guard_result = _run_one(runner, guard_job, guard)
+    runner.finalize(guard_job, guard_result)
+
+    counters = runner._guard_counters[SHARD]
+    assert counters["background_final_guard_attempted"] == 1
+    assert counters["background_final_guard_accepted"] == 1
+    assert counters["background_final_guard_failed_closed"] == 0
+    assert len(guard.calls) == 1
+
+
+def test_guard_failure_counters_count_one_failure_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from r2v_data_v2.v3.background_final_guard import FinalBackgroundJudgeFailure
+    from tests.test_v3_pair import _FinalBackgroundJudge
+
+    config = _pair_config(
+        tmp_path, monkeypatch, background_final_guard_mode="qwen_v1"
+    )
+    storage = _storage(config, entity_types=("subject",))
+    _install_clean_background(storage)
+    runner = _runner(tmp_path, config, storage)
+    guard = _FinalBackgroundJudge(error=FinalBackgroundJudgeFailure("bad json"))
+
+    (entity_job,) = runner.seed_primary_jobs()
+    entity_result = _run_one(runner, entity_job, _Judge())
+    (guard_job,) = runner.finalize(entity_job, entity_result)
+    guard_result = _run_one(runner, guard_job, guard)
+    runner.finalize(guard_job, guard_result)
+
+    counters = runner._guard_counters[SHARD]
+    assert counters["background_final_guard_attempted"] == 1
+    assert counters["background_final_guard_failed_closed"] == 1
+    assert counters["background_final_guard_accepted"] == 0
+    clip = storage.read_clip("clip-1")
+    assert clip.pairing.status == "ready"
+    assert clip.pairing.background_token is None

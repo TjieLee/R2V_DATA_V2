@@ -425,6 +425,17 @@ class PairEpochRunner:
                     raise PairEpochError(
                         f"frozen primary plan {key} drifted for {shard!r}"
                     )
+            # The stored per-clip input digests are the whole point of the
+            # plan: re-derive them and fail closed on any pre-Pair drift.
+            storage = self._storage_for(shard)
+            for clip_uid, entry in existing.get("clips", {}).items():
+                actual = self._frozen_input_digest(storage, clip_uid)
+                if actual != entry.get("digest"):
+                    raise PairEpochError(
+                        f"frozen primary input drifted for {clip_uid!r} in {shard!r}"
+                    )
+                if entry.get("classification") == CLIP_EXISTING_PAIRING:
+                    self._validate_existing_pairing(shard, storage, clip_uid)
             return existing
 
         storage = self._storage_for(shard)
@@ -462,6 +473,10 @@ class PairEpochRunner:
         )
 
         clip = storage.read_clip(clip_uid)
+        # Accounting marker: validated exactly once, so repeated status
+        # queries cannot grow the failure diagnostic.
+        if not self._mark_once(f"existing-validated-{shard}-{clip_uid}"):
+            return
         try:
             frames = _validate_frames(storage, clip_uid)
             masks = storage.read_masks(clip_uid)
@@ -617,9 +632,16 @@ class PairEpochRunner:
 
     # -- background guard -------------------------------------------------
 
-    def _guard_runtime(self, shard: str) -> Any:
+    def _guard_runtime(self, shard: str, *, scratch: bool = False) -> Any:
+        """A guard runtime.
+
+        Every use that merely re-derives semantic inputs uses ``scratch``, so
+        planning, digest verification and resume replay cannot move the stage
+        counters. Only :meth:`_apply_guard_result` accounts for real.
+        """
+        counters = self._scratch(shard) if scratch else self._guard_counters[shard]
         return _BackgroundFinalGuardRuntime(
-            self.config, self._storage_for(shard), self._guard_counters[shard], None
+            self.config, self._storage_for(shard), counters, None
         )
 
     def _background_token(
@@ -645,7 +667,7 @@ class PairEpochRunner:
             # broken background propagates so the primary Pair fails.
             validate_background_reference(storage, clip_uid, background, frames=frames)
             return "<ref_bg_1>", None
-        runtime = self._guard_runtime(shard)
+        runtime = self._guard_runtime(shard, scratch=True)
         deterministic_key = f"guard_deterministic-{shard}-{call_site}-{clip_uid}"
         try:
             validate_background_reference(storage, clip_uid, background, frames=frames)
@@ -658,16 +680,18 @@ class PairEpochRunner:
                 storage, clip_uid=clip_uid, background=background
             )
         except Exception as exc:  # noqa: BLE001 - background-only fail closed
+            raw_response = getattr(exc, "raw_response", None)
+            runtime._fail_closed(
+                clip=clip,
+                background=background,
+                raw_response=raw_response,
+                error=exc,
+            )
+            # Accounting only, and only after the semantic side effect.
             if self._mark_once(deterministic_key):
-                raw_response = getattr(exc, "raw_response", None)
-                self._guard_counters[shard]["background_final_guard_attempted"] += 1
-                self._guard_counters[shard]["background_final_guard_failed_closed"] += 1
-                runtime._fail_closed(
-                    clip=clip,
-                    background=background,
-                    raw_response=raw_response,
-                    error=exc,
-                )
+                counters = self._guard_counters[shard]
+                counters["background_final_guard_attempted"] += 1
+                counters["background_final_guard_failed_closed"] += 1
             return None, None
         preparation = BackgroundFinalGuardPreparation(
             clip=clip,
@@ -682,7 +706,9 @@ class PairEpochRunner:
         result = self._committed(job)
         if result is None:
             return None, job
-        return self._apply_guard_result(runtime, preparation, job, result), None
+        return self._apply_guard_result(
+            runtime, preparation, job, shard, result
+        ), None
 
     def _account_guard_attempt(self, shard: str, job: ModelJob) -> None:
         """One ``attempted`` per guard job, across restarts and replays."""
@@ -690,37 +716,34 @@ class PairEpochRunner:
             self._guard_counters[shard]["background_final_guard_attempted"] += 1
 
     def _apply_guard_result(
-        self, runtime: Any, preparation: Any, job: ModelJob, result: JobResult
+        self, runtime: Any, preparation: Any, job: ModelJob, shard: str, result: JobResult
     ) -> str | None:
-        if not self._mark_once(f"guard_applied-{job.job_id()}"):
-            # Already accounted: replay must not move the counters again.
-            status = str(result.payload.get("status", ""))
-            return None if status == "failed_closed" else self._guard_token(preparation, result)
+        """Apply one committed guard outcome. Accounting happens after it."""
         if str(result.payload.get("status", "")) == "failed_closed":
-            self._guard_counters[preparation.clip and job.canonical_shard][
-                "background_final_guard_failed_closed"
-            ] += 1
             runtime._fail_closed(
                 clip=preparation.clip,
                 background=preparation.background,
                 raw_response=result.payload.get("raw_response"),
                 error=RuntimeError(str(result.payload.get("error") or "guard failed")),
             )
+            if self._mark_once(f"guard_applied-{job.job_id()}"):
+                self._guard_counters[shard]["background_final_guard_failed_closed"] += 1
             return None
-        return runtime.finalize_background_final_guard(
+        token = runtime.finalize_background_final_guard(
             preparation,
             _ReviewAttemptShim(
                 review=_final_background_review(result.payload.get("review")),
                 raw_response=result.payload.get("raw_response"),
             ),
         )
-
-    @staticmethod
-    def _guard_token(preparation: Any, result: JobResult) -> str | None:
-        status = str(result.payload.get("status", ""))
-        if status == "accepted":
-            return "<ref_bg_1>"
-        return None
+        if self._mark_once(f"guard_applied-{job.job_id()}"):
+            key = (
+                "background_final_guard_accepted"
+                if token is not None
+                else "background_final_guard_rejected"
+            )
+            self._guard_counters[shard][key] += 1
+        return token
 
     # -- primary publication ----------------------------------------------
 
@@ -755,26 +778,69 @@ class PairEpochRunner:
                 ),
                 background_token=token,
             )
-        if not self._mark_once(f"published-{shard}-{clip_uid}"):
-            return None
-        counters = self.stats[shard]
-        _publish_pair_result(
-            self.config,
-            storage,
-            clip_uid=clip_uid,
-            references=ReferencesState(
-                entities=list(entity_states),
-                background=clip.references.background,
-            ),
-            pairing=pairing,
-            temporary_images=dict(temporary_images),
-        )
-        ready_count = sum(state.status == "ready" for state in entity_states)
-        counters["entities_ready"] += ready_count
-        counters["entities_rejected"] += len(entity_states) - ready_count
-        counters[pairing.status] += 1
-        counters["backgrounds_bound"] += int(pairing.background_token is not None)
+        # The publication transaction itself is the authority, not a marker: a
+        # marker written before it could outlive a failed publish and stop the
+        # restart from ever publishing again.
+        if clip.pairing is not None:
+            self._verify_existing_publication(
+                storage, clip, pairing, entity_states, temporary_images
+            )
+            self._discard_temporary(temporary_images)
+        else:
+            _publish_pair_result(
+                self.config,
+                storage,
+                clip_uid=clip_uid,
+                references=ReferencesState(
+                    entities=list(entity_states),
+                    background=clip.references.background,
+                ),
+                pairing=pairing,
+                temporary_images=dict(temporary_images),
+            )
+        if self._mark_once(f"published-{shard}-{clip_uid}"):
+            counters = self.stats[shard]
+            ready_count = sum(state.status == "ready" for state in entity_states)
+            counters["entities_ready"] += ready_count
+            counters["entities_rejected"] += len(entity_states) - ready_count
+            counters[pairing.status] += 1
+            counters["backgrounds_bound"] += int(pairing.background_token is not None)
         return None
+
+    @staticmethod
+    def _verify_existing_publication(
+        storage: RunStorage,
+        clip: Any,
+        pairing: PairingState,
+        entity_states: Sequence[EntityReferenceState],
+        temporary_images: Mapping[str, tuple[Path, Image.Image]],
+    ) -> None:
+        """Restart after a successful publish must reproduce it byte for byte."""
+        if clip.pairing != pairing:
+            raise PairEpochError(
+                f"clip {clip.clip_uid} pairing drifted from the reconstructed "
+                "primary outcome"
+            )
+        current = [state.model_dump(mode="json") for state in clip.references.entities]
+        expected = [state.model_dump(mode="json") for state in entity_states]
+        if current != expected:
+            raise PairEpochError(
+                f"clip {clip.clip_uid} references drifted from the reconstructed "
+                "primary outcome"
+            )
+        for entity_id, (temporary, _) in temporary_images.items():
+            published = storage.selected_entity_path(clip.clip_uid, entity_id)
+            if not published.is_file():
+                raise PairEpochError(
+                    f"clip {clip.clip_uid} entity {entity_id} lost its published PNG"
+                )
+            if _sha256_bytes(published.read_bytes()) != _sha256_bytes(
+                temporary.read_bytes()
+            ):
+                raise PairEpochError(
+                    f"clip {clip.clip_uid} entity {entity_id} published PNG differs "
+                    "from the reconstructed reference"
+                )
 
     # -- seeding and primary status ---------------------------------------
 
@@ -875,7 +941,7 @@ class PairEpochRunner:
             entity=entity,
             frames=frames,
             masks=masks,
-            counters=self.stats[job.canonical_shard],
+            counters=self._scratch(job.canonical_shard),
         )
         if not isinstance(prepared, PreparedEntityReferenceDecision):
             return JobResult(
@@ -912,7 +978,11 @@ class PairEpochRunner:
         )
 
     def _run_guard_job(self, job: ModelJob, handle: Any) -> JobResult:
+        # Re-derivation must never move stage counters, so the runtime here is
+        # scratch: `attempted` was already accounted once when the job was
+        # planned.
         runtime = self._guard_runtime(job.canonical_shard)
+        runtime.counters = self._scratch(job.canonical_shard)
         storage = self._storage_for(job.canonical_shard)
         clip = storage.read_clip(job.clip_uid)
         try:
