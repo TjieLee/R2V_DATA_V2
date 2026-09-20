@@ -60,7 +60,10 @@ from r2v_data_v2.v3.background import validate_background_reference
 from r2v_data_v2.v3.boogu_remove_backend import BooguBackgroundRemovalBackend
 from r2v_data_v2.v3.boogu_seed import new_boogu_seed
 from r2v_data_v2.v3.config import BOOGU_REMOVE_BACKEND, V3Config
-from r2v_data_v2.v3.post_mask_epoch_groups import resource_epoch_root
+from r2v_data_v2.v3.post_mask_epoch_groups import (
+    campaign_identity,
+    resource_epoch_root,
+)
 from r2v_data_v2.v3.post_mask_epoch_jobs import (
     OUTCOME_COMPLETED,
     OUTCOME_RETRYABLE_FAILED,
@@ -1426,6 +1429,53 @@ def prepare_shard_storage(
     )
 
 
+def build_removal_campaign(
+    config: V3Config, *, entity_mask_root: Path
+) -> dict[str, Any]:
+    """Rebuild the launcher's campaign semantic payload from live inputs.
+
+    This mirrors ``tools/run_v3_post_mask_resource_epoch.build_campaign``
+    exactly and deliberately does *not* trust a caller-supplied dict: the real
+    ``--job-runner`` path receives no campaign argument, so it has to derive
+    the same identity the launcher baked into ``group.campaign_identity`` from
+    the config, the dataset and the Stage2 root it is actually about to read.
+    """
+
+    from r2v_data_v2.v3.post_mask_production import enumerate_shards
+
+    root = Path(entity_mask_root)
+    return {
+        "config_hash": config.fingerprint(),
+        "dataset_json": str(getattr(config, "dataset_json", "")),
+        "entity_mask_root": str(root),
+        "canonical_shard_count": len(enumerate_shards(root)),
+    }
+
+
+def validate_removal_campaign(
+    group: Any, *, config: V3Config, entity_mask_root: Path
+) -> dict[str, Any]:
+    """Fail closed unless the group's campaign identity matches live inputs.
+
+    A drift in the base config fingerprint, the dataset JSON, the entity-mask
+    root or the canonical shard count means the group descriptor was built for
+    a different campaign than the one this runner would hydrate. That is a
+    correctness bug, not a warning, so it is raised before the first shard
+    lock, before any initialize/hydrate and before any model call.
+    """
+    expected = build_removal_campaign(config, entity_mask_root=entity_mask_root)
+    expected_identity = campaign_identity(expected)
+    actual_identity = str(getattr(group, "campaign_identity", ""))
+    if actual_identity != expected_identity:
+        raise RemovalEpochError(
+            f"removal epoch campaign identity {actual_identity} does not match "
+            f"the live campaign {expected_identity} "
+            f"({expected['canonical_shard_count']} canonical shards at "
+            f"{expected['entity_mask_root']}, config {expected['config_hash']})"
+        )
+    return expected
+
+
 def validate_removal_roots(
     ledger: GroupLedger,
     *,
@@ -1501,11 +1551,22 @@ def build_removal_epoch_runner(
 
     It also never reports a completed *group*: the downstream DAG is not wired,
     so ``completed`` stays False even when the remove stage finished.
+
+    Before any of that, it re-derives the launcher's campaign semantic identity
+    from ``config.fingerprint()``, ``dataset_json``, ``entity_mask_root`` and
+    the live canonical shard count, and refuses to continue unless it matches
+    ``group.campaign_identity``.
     """
     require_boogu_backend(config)
     worker_pool = pool or WorkerPoolConfig()
 
     def runner(group: Any, ledger: GroupLedger, emit: Any) -> dict[str, Any]:
+        # Campaign identity first: it is derived from the config, the dataset
+        # and the Stage2 root this runner is about to read, never from a
+        # caller-supplied dict, and it must fail before the first shard lock.
+        validate_removal_campaign(
+            group, config=config, entity_mask_root=entity_mask_root
+        )
         validate_removal_roots(
             ledger,
             group_id=str(getattr(group, "group_id", "")),

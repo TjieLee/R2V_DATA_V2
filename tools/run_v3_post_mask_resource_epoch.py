@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -52,6 +53,23 @@ def _emit(event: str, **details: Any) -> None:
     print(json.dumps({"event": event, **details}, sort_keys=True), flush=True)
 
 
+def build_campaign(
+    config: Any, *, entity_mask_root: Path, canonical_shard_count: int
+) -> dict[str, Any]:
+    """The campaign semantic identity the launcher bakes into every group.
+
+    A real job runner must be able to rebuild exactly this payload from its own
+    resolved inputs, so the key set and construction stay a single explicit
+    definition rather than an inline literal.
+    """
+    return {
+        "config_hash": config.fingerprint(),
+        "dataset_json": str(getattr(config, "dataset_json", "")),
+        "entity_mask_root": str(Path(entity_mask_root)),
+        "canonical_shard_count": int(canonical_shard_count),
+    }
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--base-config", required=True)
@@ -61,15 +79,18 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--group-size", type=int, default=8)
     parser.add_argument("--rank", type=int, default=0)
     parser.add_argument("--world-size", type=int, default=1)
-    parser.add_argument(
+    # A dry run must be structurally incapable of calling a model runner, so
+    # the two are mutually exclusive instead of "dry run wins silently".
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--job-runner",
         default=None,
         help="package.module:callable owning real phase semantics",
     )
-    parser.add_argument(
+    mode.add_argument(
         "--dry-run",
         action="store_true",
-        help="plan and report groups without executing model jobs",
+        help="plan and report groups without executing any job runner",
     )
     return parser
 
@@ -85,6 +106,31 @@ def _load_runner(spec: str):
     if not callable(runner):
         raise TypeError(f"--job-runner {spec} is not callable")
     return runner
+
+
+def _publish_resolved_environment(args: argparse.Namespace) -> None:
+    """Mirror the resolved CLI values into the runner's environment.
+
+    An external job runner such as ``run_removal_epoch`` resolves its roots
+    from the environment, while the launcher resolved the group identity from
+    parsed CLI values. Rewriting the environment from the *final* parsed values
+    makes parser output the single authority, so ``--base-config B`` overriding
+    an environment ``A`` cannot leave the runner writing under ``A``.
+    """
+    os.environ["POST_MASK_BASE_CONFIG"] = str(args.base_config)
+    os.environ["POST_MASK_TAG"] = str(args.tag)
+    os.environ["POST_MASK_ENTITY_MASK_ROOT"] = str(args.entity_mask_root)
+    if args.post_mask_root:
+        os.environ["POST_MASK_ROOT"] = str(args.post_mask_root)
+    else:
+        # No explicit root: the launcher derives the state root from the tag,
+        # and the runner must derive the same default instead of inheriting a
+        # stale POST_MASK_ROOT from the shell.
+        os.environ.pop("POST_MASK_ROOT", None)
+    if args.job_runner:
+        os.environ["POST_MASK_JOB_RUNNER"] = str(args.job_runner)
+    else:
+        os.environ.pop("POST_MASK_JOB_RUNNER", None)
 
 
 def main(argv=None) -> int:
@@ -122,24 +168,28 @@ def main(argv=None) -> int:
             / "jea_motion_v1"
             / args.tag
         )
-        campaign = {
-            "config_hash": config.fingerprint(),
-            "dataset_json": str(getattr(config, "dataset_json", "")),
-            "entity_mask_root": str(entity_mask_root),
-            "canonical_shard_count": len(shards),
-        }
+        campaign = build_campaign(
+            config,
+            entity_mask_root=entity_mask_root,
+            canonical_shard_count=len(shards),
+        )
         groups = build_groups(
             [shard.stem for shard in shards],
             campaign=campaign,
             group_size=args.group_size,
         )
         owned = assigned_groups(groups, rank=args.rank, world_size=args.world_size)
-        runner = _load_runner(args.job_runner) if args.job_runner else None
-        if runner is None and not args.dry_run:
+        # --dry-run and --job-runner are mutually exclusive at the parser, so
+        # reaching here with neither is a real usage error, not a silent plan.
+        if not args.job_runner and not args.dry_run:
             raise ValueError(
                 "resource_epoch_v3 needs --job-runner for real phase semantics; "
                 "use --dry-run to plan only"
             )
+        # The job runner reads its roots from the environment, so publish the
+        # resolved values before anything can import or call it.
+        _publish_resolved_environment(args)
+        runner = _load_runner(args.job_runner) if args.job_runner else None
 
         try:
             git_commit = subprocess.check_output(
@@ -156,7 +206,7 @@ def main(argv=None) -> int:
             assigned_groups=len(owned),
             group_size=args.group_size,
             git_commit=git_commit,
-            dry_run=bool(args.dry_run or runner is None),
+            dry_run=bool(args.dry_run),
         )
 
         planned, completed, incomplete, skipped = 0, 0, 0, 0
