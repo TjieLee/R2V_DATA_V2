@@ -80,7 +80,7 @@ export PRODUCTION_ROOT=/mnt/workspace/public/dataset/jea-video/moive-183t-0808_p
 export SHARD_SEED=20260918
 export ALLOW_UNVERIFIED=1
 
-cd /mnt/workspace/litengjie/data/R2V_DATA_V2
+cd /mnt/workspace/litengjie/data/R2V_DATA_V2_h3_prod
 bash scripts/run_h3_t2va_full_production.sh
 ```
 
