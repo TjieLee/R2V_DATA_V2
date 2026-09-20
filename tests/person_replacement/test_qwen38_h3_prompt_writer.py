@@ -275,6 +275,24 @@ def test_validator_requires_subjects_in_detailed_description():
             LEGAL_PROMPT.replace("[Shot 1] <Subject 1> stands","[Shot 1] the performer stands"))
 
 
+def test_validator_allows_detailed_description_without_literal_video_token():
+    from r2v_data_v2.person_replacement.qwen38_h3_prompt_writer import (
+        validate_h3_prompt_writer_output,
+    )
+
+    prompt = LEGAL_PROMPT.replace(
+        " stands at the left of frame facing <Subject 2> in <Video 1> and lifts a hand.",
+        " stands at the left of frame facing <Subject 2> and lifts a hand.",
+    )
+    assert "<Video 1>" not in dict(
+        __import__(
+            "r2v_data_v2.person_replacement.qwen38_h3_prompt_writer",
+            fromlist=["split_sections"],
+        ).split_sections(prompt)
+    )["detailed_description"]
+    assert validate_h3_prompt_writer_output(prompt) == prompt.strip()
+
+
 def test_num_frames_is_never_dropped(tmp_path, monkeypatch):
     processor = FakeProcessor()
     processor.reject_num_frames = True

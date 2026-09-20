@@ -407,7 +407,12 @@ def validate_h3_prompt_writer_output(text):
     if "(appears in [Shot" in text:
         raise ValueError("H3 prompt must not use '(appears in [Shot ...])' syntax")
     detailed = bodies["detailed_description"]
-    for token in ("<Subject 1>","<Subject 2>","<Video 1>"):
+    # The detailed description is target-video narration, so it must name both
+    # replacement subjects. A literal <Video 1> token is not required here:
+    # the source-video binding is already enforced globally by subject_definitions
+    # / summary / retention_analysis, and forcing the token into narration is a
+    # formatting preference rather than a semantic correctness condition.
+    for token in ("<Subject 1>","<Subject 2>"):
         if token not in detailed:
             raise ValueError(f"detailed_description is missing {token}")
     return text.strip()
