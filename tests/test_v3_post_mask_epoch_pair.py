@@ -1437,3 +1437,148 @@ def test_primary_guard_failure_is_committed_and_publishes_without_token(
     clip = storage.read_clip("clip-1")
     assert clip.pairing.status == "ready"
     assert clip.pairing.background_token is None
+
+
+# ---------------------------------------------------------------------------
+# O. Primary resume hardening regression
+# ---------------------------------------------------------------------------
+
+
+def test_frozen_plan_keeps_fresh_classification_after_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fresh target stays fresh even after this invocation published it."""
+    from r2v_data_v2.v3.post_mask_epoch_pair import CLIP_FRESH_TARGET
+
+    config = _pair_config(tmp_path, monkeypatch)
+    storage = _storage(config, entity_types=("subject",))
+    runner = _runner(tmp_path, config, storage)
+    (job,) = runner.seed_primary_jobs()
+    result = _run_one(runner, job, _Judge())
+    runner.finalize(job, result)
+    assert storage.read_clip("clip-1").pairing is not None
+
+    restarted = _runner(tmp_path, config, storage)
+    plan = restarted._primary_plan(SHARD)
+    assert plan["clips"]["clip-1"]["classification"] == CLIP_FRESH_TARGET
+    assert restarted.seed_primary_jobs() == []
+
+
+def test_deterministic_only_primary_publishes_rejected_with_zero_qwen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _pair_config(tmp_path, monkeypatch)
+    storage = _storage(config, entity_types=("subject",), tracking_status={"e1": "failed"})
+
+    runner = _runner(tmp_path, config, storage)
+    jobs = runner.seed_primary_jobs()
+
+    assert jobs == []
+    clip = storage.read_clip("clip-1")
+    assert clip.pairing is not None
+    assert clip.pairing.status == "rejected"
+
+
+def test_existing_pairing_is_validated_like_legacy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _pair_config(tmp_path, monkeypatch)
+    storage = _storage(config, entity_types=("subject",))
+    pair_clips(config, storage, judge=_Judge())
+    runner = _runner(tmp_path, config, storage)
+
+    plan = runner._primary_plan(SHARD)
+    assert plan["clips"]["clip-1"]["classification"] == "existing_pairing"
+    assert runner.stats[SHARD]["failed"] == 0
+    assert runner.seed_primary_jobs() == []
+
+
+def test_corrupt_existing_pairing_is_a_pair_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _pair_config(tmp_path, monkeypatch)
+    storage = _storage(config, entity_types=("subject",))
+    pair_clips(config, storage, judge=_Judge())
+    storage.selected_entity_path("clip-1", "e1").write_bytes(b"not a png")
+
+    runner = _runner(tmp_path, config, storage)
+    runner._primary_plan(SHARD)
+
+    assert runner.stats[SHARD]["failed"] == 1
+    assert runner.seed_primary_jobs() == []
+
+
+def test_guard_input_drift_is_not_committed_as_failed_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.test_v3_pair import _FinalBackgroundJudge
+
+    config = _pair_config(
+        tmp_path, monkeypatch, background_final_guard_mode="qwen_v1"
+    )
+    storage = _storage(config, entity_types=("subject",))
+    _install_clean_background(storage)
+    runner = _runner(tmp_path, config, storage)
+    guard = _FinalBackgroundJudge(accepted=True)
+
+    (entity_job,) = runner.seed_primary_jobs()
+    entity_result = _run_one(runner, entity_job, _Judge())
+    (guard_job,) = runner.finalize(entity_job, entity_result)
+    # The planned background input disappears before the job runs.
+    frame = storage.root / "clips/clip-1/frames/00.jpg"
+    frame.write_bytes(b"corrupted")
+
+    result = runner.run(guard_job, guard)
+
+    assert not result.committed, "drift must not commit under the old job identity"
+    assert len(guard.calls) == 0
+
+
+def test_primary_counts_do_not_multiply_across_seed_and_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _pair_config(tmp_path, monkeypatch)
+    storage = _storage(config, entity_types=("subject",))
+    runner = _runner(tmp_path, config, storage)
+    (job,) = runner.seed_primary_jobs()
+    result = _run_one(runner, job, _Judge())
+    runner.finalize(job, result)
+    first = dict(runner.stats[SHARD])
+
+    runner.seed_primary_jobs()
+    runner.primary_unresolved_job_ids()
+    restarted = _runner(tmp_path, config, storage)
+    restarted.seed_primary_jobs()
+
+    assert dict(runner.stats[SHARD]) == first
+    assert restarted.stats[SHARD]["entities_ready"] == 0
+    assert restarted.stats[SHARD]["ready"] == 0
+
+
+def test_entity_job_identity_follows_the_canonical_request_payload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _pair_config(tmp_path, monkeypatch)
+    storage = _storage(config, entity_types=("subject",))
+    runner = _runner(tmp_path, config, storage)
+    (job,) = runner.seed_primary_jobs()
+
+    assert job.job_id()
+    # Same inputs, different execution-only context -> same identity.
+    again_runner = _runner(tmp_path / "again", config, storage)
+    (same,) = again_runner.seed_primary_jobs()
+    assert same.job_id() == job.job_id()
+
+
+def test_guard_job_identity_includes_image_geometry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from PIL import Image
+
+    from r2v_data_v2.v3.post_mask_epoch_pair import _image_identity
+
+    flat_a = Image.new("RGB", (2, 2), (7, 7, 7))
+    flat_b = Image.new("RGB", (1, 4), (7, 7, 7))
+
+    assert flat_a.tobytes() == flat_b.tobytes(), "same raw bytes on purpose"
+    assert _image_identity(flat_a) != _image_identity(flat_b)

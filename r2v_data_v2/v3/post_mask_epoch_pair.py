@@ -51,7 +51,11 @@ from r2v_data_v2.v3.post_mask_epoch_jobs import (
     ModelJob,
     semantic_input_digest,
 )
-from r2v_data_v2.v3.post_mask_epoch_state import GroupLedger
+from r2v_data_v2.v3.post_mask_epoch_state import (
+    GroupLedger,
+    atomic_write_json,
+)
+from r2v_data_v2.v3.reference_judge import build_entity_reference_request_payload
 from r2v_data_v2.v3.schemas import (
     AnnotationEntity,
     PairingState,
@@ -102,7 +106,8 @@ def _write_json_once(path: Path, payload: Mapping[str, Any]) -> None:
                 "refusing to rewrite a frozen Pair plan"
             )
         return
-    path.write_text(json.dumps(payload, sort_keys=True, indent=2), encoding="utf-8")
+    # The epoch durable-state contract: tmp -> flush/fsync -> atomic rename.
+    atomic_write_json(path, dict(payload))
 
 
 def _sha256_bytes(payload: bytes) -> str:
@@ -111,8 +116,18 @@ def _sha256_bytes(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _image_sha256(image: Image.Image) -> str:
-    return _sha256_bytes(image.tobytes())
+def _image_identity(image: Image.Image) -> dict[str, Any]:
+    """Geometry plus pixel digest.
+
+    Raw ``tobytes()`` alone is ambiguous: a uniformly coloured 2x2 and a 1x4
+    image can share a byte sequence while the model receives different
+    geometry.
+    """
+    return {
+        "mode": image.mode,
+        "size": list(image.size),
+        "pixel_sha256": _sha256_bytes(image.tobytes()),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -181,13 +196,14 @@ class _ResolvedJudge:
 
 def _resolve_qwen_judge(handle: Any, service: Any, factory: Any) -> _ResolvedJudge:
     """A shared injected judge is used as-is; an endpoint is owned and closed."""
+    if handle is not None and not isinstance(handle, str):
+        return _ResolvedJudge(handle, owned=False)
     if isinstance(handle, str):
         return _ResolvedJudge(
             factory(service.model_copy(update={"base_url": handle})), owned=True
         )
-    if handle is not None:
-        return _ResolvedJudge(handle, owned=False)
-    return _ResolvedJudge(factory(service), owned=False)
+    # No endpoint and no injected judge: this call built a client, so it owns it.
+    return _ResolvedJudge(factory(service), owned=True)
 
 
 def _entity_judge_factory(service: Any, config: V3Config) -> Any:
@@ -302,6 +318,22 @@ class PairEpochRunner:
 
         return {field: 0 for field in PairStats.__dataclass_fields__}
 
+    def _scratch(self, shard: str) -> dict[str, int]:
+        """Counters for deterministic replay that must not touch stage stats.
+
+        Seeding, status queries and receipt replay all re-run the deterministic
+        prefix, so prefilter and repair counters would otherwise multiply.
+        """
+        return self._empty_stats()
+
+    def _mark_once(self, key: str) -> bool:
+        """Durable, idempotent 'account this exactly once' marker."""
+        path = _semantic_root(self.ledger) / "accounted" / f"{key}.json"
+        if path.is_file():
+            return False
+        _write_json_once(path, {"key": key})
+        return True
+
     def _storage_for(self, shard: str) -> RunStorage:
         storage = self.storages.get(shard)
         if storage is None:
@@ -329,31 +361,85 @@ class PairEpochRunner:
             return CLIP_INELIGIBLE
         return CLIP_FRESH_TARGET
 
-    def _write_primary_plan(self, shard: str) -> dict[str, Any]:
+    def _frozen_input_digest(self, storage: RunStorage, clip_uid: str) -> str:
+        """Digest of every pre-Pair input the primary pass depends on.
+
+        Pairing, Pair-produced entity states, instruction and reference_edit
+        are outputs of this invocation and are deliberately NOT bound: a fresh
+        target that has since published its pairing is legal, not a mismatch.
+        """
+        clip = storage.read_clip(clip_uid)
+        try:
+            frames = _validate_frames(storage, clip_uid)
+            frames_payload = frames.model_dump(mode="json")
+        except Exception:  # noqa: BLE001 - ineligible inputs are frozen as such
+            frames_payload = None
+        try:
+            masks_payload = storage.read_masks(clip_uid).model_dump(mode="json")
+        except Exception:  # noqa: BLE001
+            masks_payload = None
+        projection = {
+            "annotation": (
+                clip.annotation.model_dump(mode="json")
+                if clip.annotation is not None
+                else None
+            ),
+            "coverage": (
+                clip.coverage.model_dump(mode="json")
+                if clip.coverage is not None
+                else None
+            ),
+            "sampled_frames": frames_payload,
+            "tracked_masks": masks_payload,
+            "background": (
+                clip.references.background.model_dump(mode="json")
+                if clip.references.background is not None
+                else None
+            ),
+        }
+        return semantic_input_digest(projection)
+
+    def _primary_plan(self, shard: str) -> dict[str, Any]:
+        """Load the frozen plan, or create it once from the launch state.
+
+        An existing plan is never re-classified and never rewritten: a clip
+        marked ``fresh_pair_target`` stays fresh for the whole invocation even
+        after this invocation published its pairing. Re-classifying on restart
+        would turn it into ``existing_pairing`` and destroy the plan's whole
+        purpose.
+        """
+        existing = _read_json(self._plan_path(shard))
+        if existing is not None:
+            if existing.get("schema") != PAIR_PRIMARY_PLAN_SCHEMA:
+                raise PairEpochError(
+                    f"unsupported primary plan schema for {shard!r}"
+                )
+            expected = {
+                "canonical_shard": shard,
+                "config_fingerprint": self.config.fingerprint(),
+                "pair_policy": _pair_policy_semantics(self.config),
+                "eligible_clip_uids": list(self._eligible_for(shard)),
+            }
+            for key, value in expected.items():
+                if existing.get(key) != value:
+                    raise PairEpochError(
+                        f"frozen primary plan {key} drifted for {shard!r}"
+                    )
+            return existing
+
         storage = self._storage_for(shard)
         eligible = self._eligible_for(shard)
         clips: dict[str, dict[str, Any]] = {}
         for clip_uid in eligible:
             classification = self._clip_classification(storage, clip_uid)
-            clip = storage.read_clip(clip_uid)
-            projection = {
-                "clip_uid": clip_uid,
-                "classification": classification,
-                "annotation": (
-                    clip.annotation.model_dump(mode="json")
-                    if clip.annotation is not None
-                    else None
-                ),
-                "coverage": (
-                    clip.coverage.model_dump(mode="json")
-                    if clip.coverage is not None
-                    else None
-                ),
-            }
             clips[clip_uid] = {
                 "classification": classification,
-                "digest": semantic_input_digest(projection),
+                "digest": self._frozen_input_digest(storage, clip_uid),
             }
+            if classification == CLIP_EXISTING_PAIRING:
+                # Legacy validates an existing pairing instead of regenerating
+                # it; a corrupt reference is a Pair failure, not a silent skip.
+                self._validate_existing_pairing(shard, storage, clip_uid)
         payload = {
             "schema": PAIR_PRIMARY_PLAN_SCHEMA,
             "canonical_shard": shard,
@@ -365,13 +451,27 @@ class PairEpochRunner:
         _write_json_once(self._plan_path(shard), payload)
         return payload
 
-    def _require_primary_plan(self, shard: str) -> dict[str, Any]:
-        plan = _read_json(self._plan_path(shard))
-        if plan is None:
-            raise PairEpochError(f"no durable primary plan for shard {shard!r}")
-        if plan.get("schema") != PAIR_PRIMARY_PLAN_SCHEMA:
-            raise PairEpochError(f"unsupported primary plan schema for {shard!r}")
-        return plan
+    def _validate_existing_pairing(
+        self, shard: str, storage: RunStorage, clip_uid: str
+    ) -> None:
+        from r2v_data_v2.v3.pair import (
+            _validate_existing_pairing as legacy_validate,
+        )
+        from r2v_data_v2.v3.pair import (
+            _validate_pair_inputs as legacy_inputs,
+        )
+
+        clip = storage.read_clip(clip_uid)
+        try:
+            frames = _validate_frames(storage, clip_uid)
+            masks = storage.read_masks(clip_uid)
+            legacy_inputs(clip, frames, masks)
+            legacy_validate(self.config, storage, clip, frames=frames, masks=masks)
+        except Exception as exc:  # noqa: BLE001 - legacy failure semantics
+            storage.append_failure(
+                stage="pair", clip_uid=clip_uid, reason=str(exc), details={}
+            )
+            self.stats[shard]["failed"] += 1
 
     # -- primary job identity --------------------------------------------
 
@@ -387,10 +487,16 @@ class PairEpochRunner:
         service = self.config.qwen.candidate_judge
         if service is None:
             raise PairEpochError("candidate judge is not configured")
+        # The canonical request payload is the authority for which candidate
+        # fields the judge actually sees, so a future change in
+        # reference_judge.py cannot silently drop fields from job identity.
         semantic_inputs = {
             "clip_uid": clip_uid,
             "entity": _entity_semantics(entity, index),
             "candidates": _candidate_semantics(storage, prepared.candidates),
+            "request": build_entity_reference_request_payload(
+                entity, list(prepared.candidates)
+            ),
             "policy": _pair_policy_semantics(self.config),
         }
         return ModelJob.create(
@@ -415,7 +521,7 @@ class PairEpochRunner:
             "background_status": preparation.background_status,
             "background_phrase": preparation.phrase,
             "background_grounding_prompt": preparation.grounding_prompt,
-            "image_sha256": _image_sha256(preparation.image),
+            "image": _image_identity(preparation.image),
         }
         return ModelJob.create(
             job_type=PAIR_BACKGROUND_GUARD_JOB,
@@ -473,7 +579,7 @@ class PairEpochRunner:
         before publication costs zero extra Qwen calls.
         """
         clip, frames, masks = context
-        counters = self.stats[shard]
+        counters = self._scratch(shard)
         entity_states: list[EntityReferenceState] = []
         temporary_images: dict[str, tuple[Path, Image.Image]] = {}
         for index, entity in enumerate(clip.annotation.entities):
@@ -517,46 +623,83 @@ class PairEpochRunner:
         )
 
     def _background_token(
-        self,
-        shard: str,
-        clip_uid: str,
-        frames: Any,
-        call_site: str,
-        *,
-        stop_at_unresolved: bool,
+        self, shard: str, clip_uid: str, frames: Any, call_site: str
     ) -> tuple[str | None, ModelJob | None]:
         """Return ``(token, pending_guard_job)`` for one guard call site.
 
-        ``mode == off`` and a non-ready background produce no Qwen job, and a
-        deterministic guard failure closes the background binding only.
+        Preparation here never touches stage counters: the identity of a guard
+        job has to be derivable on every replay, and the ``attempted`` counter
+        is incremented exactly once per guard job by :meth:`_account_guard`.
         """
-        runtime = self._guard_runtime(shard)
-        clip = self._storage_for(shard).read_clip(clip_uid)
-        try:
-            step = runtime.prepare_background_final_guard(clip=clip, frames=frames)
-        except _GuardFailClosed as closed:
-            background = clip.references.background
-            assert background is not None
-            runtime._fail_closed(
-                clip=clip,
-                background=background,
-                raw_response=closed.raw_response,
-                error=closed.error,
-            )
+        from r2v_data_v2.v3.background import validate_background_reference
+        from r2v_data_v2.v3.background_final_guard import load_final_background_image
+        from r2v_data_v2.v3.pair import BackgroundFinalGuardPreparation
+
+        storage = self._storage_for(shard)
+        clip = storage.read_clip(clip_uid)
+        background = clip.references.background
+        if background is None or background.status not in {"clean_raw", "ready_removed"}:
             return None, None
-        if step.preparation is None:
-            return step.token, None
-        job = self._guard_job(shard, clip_uid, call_site, step.preparation)
+        if self.config.pair.background_final_guard_mode == "off":
+            # Legacy: mode off validates and binds without any Qwen call, and a
+            # broken background propagates so the primary Pair fails.
+            validate_background_reference(storage, clip_uid, background, frames=frames)
+            return "<ref_bg_1>", None
+        runtime = self._guard_runtime(shard)
+        deterministic_key = f"guard_deterministic-{shard}-{call_site}-{clip_uid}"
+        try:
+            validate_background_reference(storage, clip_uid, background, frames=frames)
+            annotation_background = (
+                clip.annotation.background if clip.annotation is not None else None
+            )
+            if annotation_background is None:
+                raise ValueError("ready background has no annotation semantics")
+            image = load_final_background_image(
+                storage, clip_uid=clip_uid, background=background
+            )
+        except Exception as exc:  # noqa: BLE001 - background-only fail closed
+            if self._mark_once(deterministic_key):
+                raw_response = getattr(exc, "raw_response", None)
+                self._guard_counters[shard]["background_final_guard_attempted"] += 1
+                self._guard_counters[shard]["background_final_guard_failed_closed"] += 1
+                runtime._fail_closed(
+                    clip=clip,
+                    background=background,
+                    raw_response=raw_response,
+                    error=exc,
+                )
+            return None, None
+        preparation = BackgroundFinalGuardPreparation(
+            clip=clip,
+            background=background,
+            image=image,
+            phrase=annotation_background.phrase,
+            grounding_prompt=annotation_background.grounding_prompt,
+            background_status=background.status,
+        )
+        job = self._guard_job(shard, clip_uid, call_site, preparation)
+        self._account_guard_attempt(shard, job)
         result = self._committed(job)
         if result is None:
-            if not stop_at_unresolved:
-                raise PairEpochError(f"background guard {clip_uid} has no result")
             return None, job
-        return self._apply_guard_result(runtime, step.preparation, result), None
+        return self._apply_guard_result(runtime, preparation, job, result), None
 
-    @staticmethod
-    def _apply_guard_result(runtime: Any, preparation: Any, result: JobResult) -> str | None:
+    def _account_guard_attempt(self, shard: str, job: ModelJob) -> None:
+        """One ``attempted`` per guard job, across restarts and replays."""
+        if self._mark_once(f"guard_attempted-{job.job_id()}"):
+            self._guard_counters[shard]["background_final_guard_attempted"] += 1
+
+    def _apply_guard_result(
+        self, runtime: Any, preparation: Any, job: ModelJob, result: JobResult
+    ) -> str | None:
+        if not self._mark_once(f"guard_applied-{job.job_id()}"):
+            # Already accounted: replay must not move the counters again.
+            status = str(result.payload.get("status", ""))
+            return None if status == "failed_closed" else self._guard_token(preparation, result)
         if str(result.payload.get("status", "")) == "failed_closed":
+            self._guard_counters[preparation.clip and job.canonical_shard][
+                "background_final_guard_failed_closed"
+            ] += 1
             runtime._fail_closed(
                 clip=preparation.clip,
                 background=preparation.background,
@@ -572,6 +715,13 @@ class PairEpochRunner:
             ),
         )
 
+    @staticmethod
+    def _guard_token(preparation: Any, result: JobResult) -> str | None:
+        status = str(result.payload.get("status", ""))
+        if status == "accepted":
+            return "<ref_bg_1>"
+        return None
+
     # -- primary publication ----------------------------------------------
 
     def _publish_primary(
@@ -582,11 +732,8 @@ class PairEpochRunner:
         frames: Any,
         entity_states: Sequence[EntityReferenceState],
         temporary_images: Mapping[str, tuple[Path, Image.Image]],
-        *,
-        stop_at_unresolved: bool,
     ) -> ModelJob | None:
         clip = storage.read_clip(clip_uid)
-        counters = self.stats[shard]
         retained = [state.entity_id for state in entity_states if state.status == "ready"]
         if not set(retained).intersection(clip.coverage.qualifying_entity_ids):
             pairing = PairingState(
@@ -595,11 +742,7 @@ class PairEpochRunner:
             token: str | None = None
         else:
             token, pending = self._background_token(
-                shard,
-                clip_uid,
-                frames,
-                CALL_SITE_PRIMARY,
-                stop_at_unresolved=stop_at_unresolved,
+                shard, clip_uid, frames, CALL_SITE_PRIMARY
             )
             if pending is not None:
                 self._discard_temporary(temporary_images)
@@ -612,6 +755,9 @@ class PairEpochRunner:
                 ),
                 background_token=token,
             )
+        if not self._mark_once(f"published-{shard}-{clip_uid}"):
+            return None
+        counters = self.stats[shard]
         _publish_pair_result(
             self.config,
             storage,
@@ -633,10 +779,17 @@ class PairEpochRunner:
     # -- seeding and primary status ---------------------------------------
 
     def seed_primary_jobs(self) -> list[ModelJob]:
-        """Seed the first unresolved primary job for every fresh Pair target."""
+        """Advance every fresh Pair target to its CPU fixed point.
+
+        CPU work does not stop just because this is the seeding call: a
+        deterministic terminal entity is recomputed, a clip whose entities are
+        all deterministic is published straight away, and a clip whose primary
+        pass is complete but whose guard needs Qwen seeds the guard job. Only
+        a genuinely unresolved model job is handed back.
+        """
         jobs: list[ModelJob] = []
         for shard in sorted(self.storages):
-            plan = self._write_primary_plan(shard)
+            plan = self._primary_plan(shard)
             storage = self._storage_for(shard)
             for clip_uid in plan["eligible_clip_uids"]:
                 if plan["clips"][clip_uid]["classification"] != CLIP_FRESH_TARGET:
@@ -644,16 +797,36 @@ class PairEpochRunner:
                 context = self._primary_context(storage, clip_uid)
                 if context is None:
                     continue
-                _, temporary, pending = self._replay_primary_clip(
-                    shard, storage, clip_uid, context, stop_at_unresolved=True
-                )
-                # Seeding never publishes: rebuilt temporaries are discarded.
-                self._discard_temporary(temporary)
+                pending = self._advance_primary_clip(shard, storage, clip_uid, context)
                 if pending is not None:
                     jobs.append(pending)
         jobs.sort(key=lambda job: job.job_id())
         self.phase.write_plan(jobs)
         return jobs
+
+    def _advance_primary_clip(
+        self,
+        shard: str,
+        storage: RunStorage,
+        clip_uid: str,
+        context: Any,
+    ) -> ModelJob | None:
+        """CPU -> MODEL -> CPU until a fixed point is reached.
+
+        Returns the single job the scheduler still has to run, or ``None`` when
+        the clip's primary Pair is terminal.
+        """
+        states, temporary, pending = self._replay_primary_clip(
+            shard, storage, clip_uid, context, stop_at_unresolved=True
+        )
+        if pending is not None:
+            # Rebuilt temporaries are not progress: only receipts are.
+            self._discard_temporary(temporary)
+            return pending
+        guard = self._publish_primary(
+            shard, storage, clip_uid, context[1], states, temporary
+        )
+        return guard
 
     def primary_unresolved_job_ids(self) -> tuple[str, ...]:
         """Job ids of primary work that is still outstanding.
@@ -663,7 +836,7 @@ class PairEpochRunner:
         """
         unresolved: list[str] = []
         for shard in sorted(self.storages):
-            plan = self._require_primary_plan(shard)
+            plan = self._primary_plan(shard)
             storage = self._storage_for(shard)
             for clip_uid in plan["eligible_clip_uids"]:
                 if plan["clips"][clip_uid]["classification"] != CLIP_FRESH_TARGET:
@@ -671,10 +844,7 @@ class PairEpochRunner:
                 context = self._primary_context(storage, clip_uid)
                 if context is None:
                     continue
-                _, temporary, pending = self._replay_primary_clip(
-                    shard, storage, clip_uid, context, stop_at_unresolved=True
-                )
-                self._discard_temporary(temporary)
+                pending = self._advance_primary_clip(shard, storage, clip_uid, context)
                 if pending is not None:
                     unresolved.append(pending.job_id())
         return tuple(unresolved)
@@ -691,8 +861,11 @@ class PairEpochRunner:
     def _run_entity_job(self, job: ModelJob, handle: Any) -> JobResult:
         storage = self._storage_for(job.canonical_shard)
         clip = storage.read_clip(job.clip_uid)
-        frames = _validate_frames(storage, job.clip_uid)
-        masks = storage.read_masks(job.clip_uid)
+        try:
+            frames = _validate_frames(storage, job.clip_uid)
+            masks = storage.read_masks(job.clip_uid)
+        except Exception as exc:  # noqa: BLE001 - drift, no receipt
+            return JobResult(OUTCOME_RETRYABLE_FAILED, detail=str(exc))
         index = int(dict(job.target)["entity_index"])
         entity = clip.annotation.entities[index]
         prepared = prepare_entity_reference(
@@ -742,25 +915,26 @@ class PairEpochRunner:
         runtime = self._guard_runtime(job.canonical_shard)
         storage = self._storage_for(job.canonical_shard)
         clip = storage.read_clip(job.clip_uid)
-        frames = _validate_frames(storage, job.clip_uid)
+        try:
+            frames = _validate_frames(storage, job.clip_uid)
+        except Exception as exc:  # noqa: BLE001 - drift, never a committed guard outcome
+            return JobResult(OUTCOME_RETRYABLE_FAILED, detail=str(exc))
         call_site = dict(job.target)["call_site"]
         try:
             step = runtime.prepare_background_final_guard(clip=clip, frames=frames)
-        except _GuardFailClosed as closed:
-            # A guard failure closes the background binding only: durable, and
-            # never a scheduler retry.
+        except _GuardFailClosed:
+            # The job was planned against earlier background semantics. If the
+            # planned inputs no longer exist this is drift, not the semantic
+            # failure that job was created to observe, so it must not be
+            # committed under the old job identity.
             return JobResult(
-                OUTCOME_COMPLETED,
-                payload={
-                    "status": "failed_closed",
-                    "raw_response": closed.raw_response,
-                    "error": str(closed.error),
-                },
+                OUTCOME_RETRYABLE_FAILED,
+                detail="background guard semantic inputs changed",
             )
         if step.preparation is None:
             return JobResult(
-                OUTCOME_COMPLETED,
-                payload={"status": "unbound", "token": step.token},
+                OUTCOME_RETRYABLE_FAILED,
+                detail="background guard no longer requires a model call",
             )
         rebuilt = self._guard_job(
             job.canonical_shard, job.clip_uid, call_site, step.preparation
@@ -824,12 +998,6 @@ class PairEpochRunner:
             # A later entity still needs Qwen: nothing is published yet.
             return (pending,)
         guard = self._publish_primary(
-            shard,
-            storage,
-            job.clip_uid,
-            context[1],
-            states,
-            temporary,
-            stop_at_unresolved=True,
+            shard, storage, job.clip_uid, context[1], states, temporary
         )
         return (guard,) if guard is not None else ()
