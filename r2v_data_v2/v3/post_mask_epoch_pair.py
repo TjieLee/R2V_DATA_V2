@@ -1457,13 +1457,30 @@ class PairEpochRunner:
         references = ReferencesState(
             entities=entity_states, background=target_clip.references.background
         )
-        _publish_cross_pair_result(
-            storage,
-            clip_uid=clip_uid,
-            references=references,
-            pairing=pairing,
-            donor_paths=accepted,
-        )
+        live = storage.read_clip(clip_uid)
+        baseline = self.cross_baseline(shard, clip_uid)
+        if self._live_matches_cross_baseline(live, baseline):
+            # Case A: still the frozen primary state -> publish once.
+            _publish_cross_pair_result(
+                storage,
+                clip_uid=clip_uid,
+                references=references,
+                pairing=pairing,
+                donor_paths=accepted,
+            )
+        elif live.pairing == pairing:
+            # Case B: already published -> verify, never republish. Marker
+            # state is not consulted: the publication transaction is the
+            # authority.
+            self._verify_existing_cross_publication(
+                storage, clip_uid, references, pairing, accepted
+            )
+        else:
+            # Case C: neither primary nor the reconstructed cross state.
+            raise PairEpochError(
+                f"clip {clip_uid} is neither the frozen primary state nor the "
+                "reconstructed cross outcome"
+            )
         self._mark_cross_terminal(
             shard,
             clip_uid,
@@ -1472,6 +1489,55 @@ class PairEpochRunner:
             reason=f"accepted donors: {sorted(accepted)}",
         )
         return None
+
+    def _live_matches_cross_baseline(self, clip: Any, baseline: Mapping[str, Any]) -> bool:
+        """True when the live clip is still exactly the frozen primary state."""
+        pairing = (
+            clip.pairing.model_dump(mode="json") if clip.pairing is not None else None
+        )
+        if pairing != baseline.get("primary_pairing"):
+            return False
+        entities = [
+            state.model_dump(mode="json")
+            for state in (clip.references.entities if clip.references is not None else ())
+        ]
+        return entities == baseline.get("primary_entity_references")
+
+    def _verify_existing_cross_publication(
+        self,
+        storage: RunStorage,
+        clip_uid: str,
+        expected_references: Any,
+        expected_pairing: Any,
+        accepted_donor_paths: Mapping[str, Any],
+    ) -> None:
+        """Verify an already-published cross result instead of republishing."""
+        clip = storage.read_clip(clip_uid)
+        if clip.pairing != expected_pairing:
+            raise PairEpochError(
+                f"clip {clip_uid} cross pairing drifted from the reconstructed outcome"
+            )
+        live = [
+            state.model_dump(mode="json")
+            for state in (clip.references.entities if clip.references is not None else ())
+        ]
+        if live != [state.model_dump(mode="json") for state in expected_references.entities]:
+            raise PairEpochError(
+                f"clip {clip_uid} cross references drifted from the reconstructed outcome"
+            )
+        for entity_id, donor_path in accepted_donor_paths.items():
+            published = storage.selected_entity_path(clip_uid, entity_id)
+            if not published.is_file():
+                raise PairEpochError(
+                    f"clip {clip_uid} entity {entity_id} lost its cross-published PNG"
+                )
+            if _sha256_bytes(published.read_bytes()) != _sha256_bytes(
+                Path(donor_path).read_bytes()
+            ):
+                raise PairEpochError(
+                    f"clip {clip_uid} entity {entity_id} cross-published PNG differs "
+                    "from the frozen donor reference"
+                )
 
     def _finish_cross_failure(
         self,

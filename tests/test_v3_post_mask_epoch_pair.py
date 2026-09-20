@@ -2479,6 +2479,8 @@ def test_cross_all_donors_reject_is_terminal_and_survives_restart(
     assert storage.read_clip("target-b").pairing == before.pairing
     assert storage.read_clip("target-b").references == before.references
 
+    calls_before_restart = len(judge.calls)
+    assert calls_before_restart > 0, "the reject chain really ran"
     restarted = _runner(
         tmp_path,
         _config,
@@ -2491,8 +2493,9 @@ def test_cross_all_donors_reject_is_terminal_and_survives_restart(
         for item in restarted.freeze_cross_pair_after_primary_quiescence()
         if item.clip_uid == "target-b"
     ] == []
-    assert len(judge.calls) == len(judge.calls), "no further calls recorded"
-    assert judge.calls, "the reject chain really ran"
+    assert len(judge.calls) == calls_before_restart
+    calls_before_restart = len(judge.calls)
+    assert calls_before_restart > 0, "the reject chain really ran"
 
 
 def test_frozen_donor_tamper_is_retryable_not_terminal(
@@ -2596,3 +2599,119 @@ def test_multi_entity_fallback_is_strictly_sequential(
     _result2, unlocked2 = _chain(runner, second, judge)
     assert unlocked2 == ()
     assert [call["target_entity_id"] for call in judge.calls] == ["e1", "e2"]
+
+
+def test_cross_context_only_evidence_uses_sampled_frames(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No target candidates -> sampled_frames evidence, no entity crop.
+
+    The donor snapshot must be frozen with the REAL candidate builder first:
+    patching it earlier would also break validate_entity_reference_artifact
+    inside the donor builder, leaving no frozen donors at all.
+    """
+    import r2v_data_v2.v3.pair as pair_module
+    from r2v_data_v2.v3.frames import validate_sampled_frames
+
+    _config, storage, runner = _cross_fixture(tmp_path, monkeypatch)
+    snapshot = runner.freeze_donor_snapshot(SHARD)
+    donor_count = sum(len(g["donors"]) for g in snapshot["groups"])
+    assert donor_count > 0, "donors are frozen with the real candidate builder"
+
+    monkeypatch.setattr(
+        pair_module,
+        "build_entity_reference_candidates",
+        lambda *args, **kwargs: [],
+    )
+    (job,) = [
+        item
+        for item in runner.freeze_cross_pair_after_primary_quiescence()
+        if item.clip_uid == "target-b"
+    ]
+    judge = _CrossJudge([True])
+    result, _unlocked = _chain(runner, job, judge)
+
+    assert result.committed
+    frames = validate_sampled_frames(storage, "target-b")
+    expected_slots = [frame.slot for frame in frames.frames]
+    assert judge.calls[0]["target_evidence_mode"] == "sampled_frames"
+    assert judge.calls[0]["crop_mode"] is None
+    assert len(expected_slots) == len(frames.frames)
+
+
+def test_cross_publication_is_idempotent_after_marker_loss(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Publication success then marker loss: restart verifies, never republishes."""
+    import r2v_data_v2.v3.pair as pair_module
+
+    _config, storage, runner = _cross_fixture(tmp_path, monkeypatch)
+    (job,) = [
+        item
+        for item in runner.freeze_cross_pair_after_primary_quiescence()
+        if item.clip_uid == "target-b"
+    ]
+    judge = _CrossJudge([True])
+    _chain(runner, job, judge)
+
+    published_pairing = storage.read_clip("target-b").pairing
+    published_references = storage.read_clip("target-b").references
+    target_png = storage.selected_entity_path("target-b", "e1").read_bytes()
+    assert _png_sha(target_png)
+
+    # Publication succeeded but the terminal marker never became durable.
+    runner._cross_terminal_path(SHARD, "target-b").unlink()
+
+    calls: list[int] = []
+
+    def explode(*args: Any, **kwargs: Any) -> Any:
+        calls.append(1)
+        raise AssertionError("must not republish an already-published cross result")
+
+    monkeypatch.setattr(pair_module, "_publish_cross_pair_result", explode)
+    restarted = _runner(
+        tmp_path,
+        _config,
+        storage,
+        clip_uids=("clip-1", "donor", "target-b", "target-c"),
+    )
+    assert [
+        item.clip_uid
+        for item in restarted.freeze_cross_pair_after_primary_quiescence()
+        if item.clip_uid == "target-b"
+    ] == []
+
+    assert calls == [], "no republish"
+    assert len(judge.calls) == 1, "no extra Qwen"
+    assert storage.read_clip("target-b").pairing == published_pairing
+    assert storage.read_clip("target-b").references == published_references
+    assert _png_sha(storage.selected_entity_path("target-b", "e1").read_bytes()) == _png_sha(
+        target_png
+    )
+    terminal = restarted._cross_terminal(SHARD, "target-b")
+    assert terminal is not None and terminal["status"] == "completed"
+
+
+def test_tampered_cross_published_png_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from r2v_data_v2.v3.post_mask_epoch_pair import PairEpochError
+
+    _config, storage, runner = _cross_fixture(tmp_path, monkeypatch)
+    (job,) = [
+        item
+        for item in runner.freeze_cross_pair_after_primary_quiescence()
+        if item.clip_uid == "target-b"
+    ]
+    _chain(runner, job, _CrossJudge([True]))
+    runner._cross_terminal_path(SHARD, "target-b").unlink()
+    storage.selected_entity_path("target-b", "e1").write_bytes(b"tampered")
+
+    restarted = _runner(
+        tmp_path,
+        _config,
+        storage,
+        clip_uids=("clip-1", "donor", "target-b", "target-c"),
+    )
+    with pytest.raises(PairEpochError, match="cross-published PNG differs"):
+        restarted.freeze_cross_pair_after_primary_quiescence()
