@@ -37,7 +37,7 @@ H3_PDD_LORA="${H3_PDD_LORA:-/mnt/workspace/litengjie/data/pretrained/alibaba-pai
 
 INPUT_JSONL="${PERSON_REPLACEMENT_INPUT_JSONL:-/mnt/workspace/liutao/X_human_data/collected_face_2.jsonl}"
 CLIPS_ROOT="${PERSON_REPLACEMENT_CLIPS_ROOT:-/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/clips_clean_cropped}"
-OUTPUT_ROOT="${PERSON_REPLACEMENT_OUTPUT_ROOT:-/mnt/workspace/litengjie/data/person_replacement/runs/v25-qwen35-icl-production}"
+OUTPUT_ROOT="${PERSON_REPLACEMENT_OUTPUT_ROOT:-/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/multi_person_replace}"
 
 GPUS="${PERSON_REPLACEMENT_GPUS:-0,1,2,3,4,5,6,7}"
 PAIR_SIZE="${PERSON_REPLACEMENT_PAIR_SIZE:-2000}"
