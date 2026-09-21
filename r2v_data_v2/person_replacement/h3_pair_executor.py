@@ -102,10 +102,12 @@ def validate_identity(root, config, *, read_only=False):
 def worker_environment(directory, devices):
     env = dict(os.environ)
     env.setdefault("PYTORCH_CUDA_ALLOC_CONF","expandable_segments:True")
-    for key in ("PYTHONPATH","PYTHONHOME","VIRTUAL_ENV","TRANSFORMERS_CACHE"):
+    for key in ("PYTHONPATH","PYTHONHOME","VIRTUAL_ENV","CONDA_PREFIX",
+                "CONDA_DEFAULT_ENV","PYTHONUSERBASE","TRANSFORMERS_CACHE"):
         env.pop(key,None)
     env.update(CUDA_VISIBLE_DEVICES=devices,HF_HUB_OFFLINE="1",TRANSFORMERS_OFFLINE="1",
-               HF_HUB_DISABLE_TELEMETRY="1",PYTHONDONTWRITEBYTECODE="1",OMP_NUM_THREADS="1",
+               HF_HUB_DISABLE_TELEMETRY="1",PYTHONDONTWRITEBYTECODE="1",
+               PYTHONNOUSERSITE="1",OMP_NUM_THREADS="1",
                TORCH_NCCL_ASYNC_ERROR_HANDLING="1")
     for key,folder in (("HF_HOME","hf"),("HF_HUB_CACHE","hf/hub"),("HUGGINGFACE_HUB_CACHE","hf/hub"),
                        ("TORCH_HOME","torch"),("XDG_CACHE_HOME","cache"),("TRITON_CACHE_DIR","triton"),

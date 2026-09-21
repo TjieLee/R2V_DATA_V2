@@ -11,8 +11,11 @@ set -euo pipefail
 #   RANK=1 -> pair 2,3 -> rows [4000,7999]
 #   ...
 
-REPO="${REPO:-/mnt/workspace/litengjie/data/R2V_DATA_V2}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+DEFAULT_REPO="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+REPO="${REPO:-$DEFAULT_REPO}"
 cd "$REPO"
+CODE_SHA="$(git rev-parse HEAD)"
 
 : "${RANK:?RANK must be injected by the cluster platform (zero-based node rank)}"
 : "${WORLD_SIZE:?WORLD_SIZE must be injected by the cluster platform}"
@@ -64,6 +67,8 @@ mkdir -p "$OUTPUT_ROOT/cluster_logs"
 NODE_LOG="$OUTPUT_ROOT/cluster_logs/node-rank-$(printf '%06d' "$RANK").log"
 
 echo "=== person-replacement H3/PDD cluster node ==="
+echo "repo=$REPO"
+echo "code_sha=$CODE_SHA"
 echo "rank=$RANK world_size=$WORLD_SIZE"
 echo "gpus=$GPUS group_size=$GROUP_SIZE ulysses_degree=$ULYSSES_DEGREE"
 echo "pairs_per_node=$PAIRS_PER_NODE pair_start=$PAIR_START pair_size=$PAIR_SIZE"
@@ -78,7 +83,15 @@ case "${PERSON_REPLACEMENT_RETRY_FAILED:-0}" in
   1|true|TRUE|yes|YES) EXTRA_ARGS+=(--retry-failed) ;;
 esac
 
-"$PAIR_PYTHON" tools/person_replacement/run_h3_pdd_node.py \
+env \
+  -u PYTHONPATH \
+  -u PYTHONHOME \
+  -u VIRTUAL_ENV \
+  -u CONDA_PREFIX \
+  -u CONDA_DEFAULT_ENV \
+  -u PYTHONUSERBASE \
+  PYTHONNOUSERSITE=1 \
+  "$PAIR_PYTHON" tools/person_replacement/run_h3_pdd_node.py \
   --gpus "$GPUS" \
   --pair-start "$PAIR_START" \
   --group-size "$GROUP_SIZE" \

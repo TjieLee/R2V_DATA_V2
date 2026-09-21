@@ -35,8 +35,15 @@ def main(argv=None):
         if "--status" in remaining or "--dry-run" in remaining:
             pair_main(options)  # strictly read-only, no log/lock/process creation
             continue
+        child_env = dict(os.environ)
+        for key in ("PYTHONPATH","PYTHONHOME","VIRTUAL_ENV","CONDA_PREFIX",
+                    "CONDA_DEFAULT_ENV","PYTHONUSERBASE"):
+            child_env.pop(key,None)
+        child_env.update(PYTHONNOUSERSITE="1",
+                         CUDA_VISIBLE_DEVICES=",".join(
+                             devices[args.group_size*i:args.group_size*(i+1)]))
         specs.append({"command":[sys.executable,str(Path(__file__).with_name("run_h3_pdd_pair_executor.py")),*options],
-                      "env":{**os.environ,"CUDA_VISIBLE_DEVICES":",".join(devices[args.group_size*i:args.group_size*(i+1)])},
+                      "env":child_env,
                       "log":root/"node_logs"/session/f"pair-{args.pair_start+i}.log"})
     return 1 if specs and any(run_children(specs,stop_on_error=False)) else 0
 

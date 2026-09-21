@@ -145,6 +145,9 @@ def test_shard_lock_excludes_second_executor_and_identity_mismatch(tmp_path):
 def test_node_maps_four_nonoverlapping_pairs_without_barrier(tmp_path, monkeypatch, group_size):
     from tools.person_replacement import run_h3_pdd_node as cli
 
+    for key in ("PYTHONPATH","PYTHONHOME","VIRTUAL_ENV","CONDA_PREFIX",
+                "CONDA_DEFAULT_ENV","PYTHONUSERBASE"):
+        monkeypatch.setenv(key,"/contaminated")
     calls = []
     monkeypatch.setattr(cli,"run_children",lambda specs,*a,**k:calls.extend(specs) or [0]*4)
     assert cli.main(["--gpus","0,1,2,3,4,5,6,7","--pair-start","4",
@@ -152,6 +155,11 @@ def test_node_maps_four_nonoverlapping_pairs_without_barrier(tmp_path, monkeypat
                      "--group-size",str(group_size),"--ulysses-degree","2"]) == 0
     expected = {2:["0,1","2,3","4,5","6,7"],4:["0,1,2,3","4,5,6,7"],8:["0,1,2,3,4,5,6,7"]}
     assert [x["env"]["CUDA_VISIBLE_DEVICES"] for x in calls] == expected[group_size]
+    for spec in calls:
+        for key in ("PYTHONPATH","PYTHONHOME","VIRTUAL_ENV","CONDA_PREFIX",
+                    "CONDA_DEFAULT_ENV","PYTHONUSERBASE"):
+            assert key not in spec["env"]
+        assert spec["env"]["PYTHONNOUSERSITE"] == "1"
     assert [x["command"][x["command"].index("--pair-id")+1] for x in calls] == [str(4+i) for i in range(8//group_size)]
     assert all(x["command"][x["command"].index("--group-size")+1] == str(group_size) for x in calls)
     assert all(x["command"][x["command"].index("--ulysses-degree")+1] == "2" for x in calls)
@@ -168,6 +176,14 @@ def test_group_validation_before_launch_and_allocator_override(tmp_path, monkeyp
     for gpus in ("0,1,2", "0,0,1,2"):
         with pytest.raises(SystemExit):
             main(["--gpus",gpus,"--group-size","4","--output-root",str(tmp_path)])
+    for key in ("PYTHONPATH","PYTHONHOME","VIRTUAL_ENV","CONDA_PREFIX",
+                "CONDA_DEFAULT_ENV","PYTHONUSERBASE"):
+        monkeypatch.setenv(key,"/contaminated")
+    clean = module.worker_environment(tmp_path,"0,1")
+    for key in ("PYTHONPATH","PYTHONHOME","VIRTUAL_ENV","CONDA_PREFIX",
+                "CONDA_DEFAULT_ENV","PYTHONUSERBASE"):
+        assert key not in clean
+    assert clean["PYTHONNOUSERSITE"] == "1"
     monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF",raising=False)
     assert module.worker_environment(tmp_path,"0,1")["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
     monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF","expandable_segments:False")
