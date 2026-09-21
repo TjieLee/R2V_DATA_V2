@@ -1183,15 +1183,16 @@ def test_production_wrapper_keeps_pair_incomplete_reason(
         tmp_path, monkeypatch, qwen=_FailingPairHandle()
     )
     assert outcome["remove_completed"] is True
-    if outcome["pair_primary_unresolved"]:
-        assert outcome["pair_completed"] is False
-        assert outcome["reason"] == "pair resource epoch incomplete", outcome["reason"]
-        assert outcome["completed"] is False
-        finished = [
-            event
-            for event in events
-            if event["event"] == "post_mask_removal_epoch_finished"
-        ]
-        assert finished[-1]["unresolved"] > 0
-    else:
-        pytest.skip("fixture produced no unresolved Pair work")
+    # Hard assertion: this regression must never silently skip.
+    assert outcome["pair_primary_unresolved"], (
+        "fixture must produce unresolved Pair primary work"
+    )
+    assert outcome["pair_completed"] is False
+    assert outcome["reason"] == "pair resource epoch incomplete", outcome["reason"]
+    assert outcome["completed"] is False
+    finished = [
+        event
+        for event in events
+        if event["event"] == "post_mask_removal_epoch_finished"
+    ]
+    assert finished[-1]["unresolved"] > 0

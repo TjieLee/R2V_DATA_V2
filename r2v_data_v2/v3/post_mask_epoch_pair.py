@@ -275,6 +275,25 @@ def _tokens_for_retained(retained: Sequence[str], entity_by_id: Any) -> dict[str
 # ---------------------------------------------------------------------------
 
 
+class _MutableStats:
+    """Attribute access over a plain counter dict while reconciling."""
+
+    def __init__(self, counts: dict[str, int]) -> None:
+        self._counts = counts
+
+    def __getattr__(self, name: str) -> int:
+        try:
+            return self._counts[name]
+        except KeyError as exc:  # pragma: no cover - guards typos
+            raise AttributeError(name) from exc
+
+    def __setattr__(self, name: str, value: int) -> None:
+        if name == "_counts":
+            object.__setattr__(self, name, value)
+            return
+        self._counts[name] = value
+
+
 class PairEpochRunner:
     """Durable primary Pair jobs for one resource-epoch group.
 
@@ -918,6 +937,173 @@ class PairEpochRunner:
             shard, storage, clip_uid, context[1], states, temporary
         )
         return guard
+
+    # -- durable primary PairStats reconciliation (4c1) -------------------
+
+
+
+    def _pair_inputs_valid(self, storage: RunStorage, clip_uid: str) -> bool:
+        """Read-only legacy input validation. Never mutates, never appends."""
+        from r2v_data_v2.v3.pair import _validate_pair_inputs as legacy_inputs
+
+        clip = storage.read_clip(clip_uid)
+        try:
+            frames = _validate_frames(storage, clip_uid)
+            masks = storage.read_masks(clip_uid)
+            legacy_inputs(clip, frames, masks)
+        except Exception:  # noqa: BLE001 - incomplete inputs are not eligible
+            return False
+        return True
+
+    def _existing_pairing_valid(self, storage: RunStorage, clip_uid: str) -> bool:
+        """Read-only legacy existing-pairing validation for reconciliation."""
+        from r2v_data_v2.v3.pair import _validate_existing_pairing as legacy_validate
+
+        clip = storage.read_clip(clip_uid)
+        try:
+            frames = _validate_frames(storage, clip_uid)
+            masks = storage.read_masks(clip_uid)
+            _ = frames, masks
+            legacy_validate(self.config, storage, clip, frames=frames, masks=masks)
+        except Exception:  # noqa: BLE001 - invalid existing pairing is a failure
+            return False
+        return True
+
+    def _planned_jobs(self, shard: str) -> tuple[dict[str, Any], ...]:
+        try:
+            records = self.phase.read_plan()
+        except Exception:  # noqa: BLE001 - no plan yet means no planned jobs
+            return ()
+        return tuple(
+            record
+            for record in records
+            if record.get("canonical_shard") == shard
+        )
+
+    def _committed_payload(self, job_id: str) -> dict[str, Any] | None:
+        """Result payload of a committed job, or None when it never committed."""
+        if job_id not in self.phase.receipts():
+            return None
+        path = self.phase.artifact_path(job_id, "result.json")
+        if not path.is_file():
+            return None
+        payload = json.loads(path.read_text())
+        return dict(payload.get("result_payload") or {})
+
+    def reconcile_primary_stats(self, shard: str) -> Any:
+        """Primary PairStats rebuilt from durable state only (4c1).
+
+        Authority is the frozen primary plan, durable committed receipts and
+        published Pair state -- never the invocation-local ``self.stats``. A
+        fresh runner with zero model calls must return identical stats, so this
+        is pure observation: no receipt, no Pair state and no failure
+        diagnostic is written.
+
+        Cross and prefilter fields are still 0: they are 4c2. Completion fields
+        stay 0 because the epoch Pair path requires reference_edit.enabled.
+        """
+        from r2v_data_v2.v3.pair import PairStats
+
+        storage = self._storage_for(shard)
+        plan = self._primary_plan(shard)
+        # PairStats is frozen, so reconciliation accumulates into a plain dict.
+        counts: dict[str, int] = {field: 0 for field in PairStats.__dataclass_fields__}
+        stats = _MutableStats(counts)
+        for clip_uid in sorted(plan.get("clips", {})):
+            classification = plan["clips"][clip_uid]["classification"]
+            if classification == CLIP_INELIGIBLE:
+                stats.skipped_not_ready += 1
+                continue
+            if classification == CLIP_EXISTING_PAIRING:
+                if self._existing_pairing_valid(storage, clip_uid):
+                    stats.skipped_existing += 1
+                else:
+                    stats.failed += 1
+                continue
+            if not self._pair_inputs_valid(storage, clip_uid):
+                stats.skipped_not_ready += 1
+                continue
+            stats.processed += 1
+            pairing = self._reconcile_primary_pairing(shard, storage, clip_uid)
+            if pairing is None:
+                continue
+            status = str(pairing.get("status", ""))
+            if status == "ready":
+                stats.ready += 1
+            elif status == "rejected":
+                stats.rejected += 1
+            if pairing.get("background_token") is not None:
+                stats.backgrounds_bound += 1
+            for state in self._reconcile_primary_entities(shard, storage, clip_uid):
+                if str(state.get("status", "")) == "ready":
+                    stats.entities_ready += 1
+                else:
+                    stats.entities_rejected += 1
+
+        # Repairs: one per committed primary entity decision, never the raw sum.
+        for record in self._planned_jobs(shard):
+            if record.get("job_type") != PAIR_ENTITY_JUDGE_JOB:
+                continue
+            payload = self._committed_payload(str(record.get("job_id", "")))
+            if payload is None:
+                continue
+            stats.repaired += int(int(payload.get("repair_attempts", 0)) > 0)
+
+        # Primary background guard counters, rebuilt from durable markers.
+        if self.config.pair.background_final_guard_mode != "off":
+            for record in self._planned_jobs(shard):
+                if record.get("job_type") != PAIR_BACKGROUND_GUARD_JOB:
+                    continue
+                if dict(record.get("target") or {}).get("call_site") != "primary":
+                    continue
+                job_id = str(record.get("job_id", ""))
+                if not self._marker_exists(f"guard_attempted-{job_id}"):
+                    continue
+                stats.background_final_guard_attempted += 1
+                if not self._marker_exists(f"guard_applied-{job_id}"):
+                    continue
+                status = str((self._committed_payload(job_id) or {}).get("status", ""))
+                if status == "failed_closed":
+                    stats.background_final_guard_failed_closed += 1
+                elif status == "accepted":
+                    stats.background_final_guard_accepted += 1
+                elif status == "rejected":
+                    stats.background_final_guard_rejected += 1
+                else:
+                    raise PairEpochError(
+                        f"committed primary guard result has no durable status: {job_id}"
+                    )
+            for clip_uid in sorted(plan.get("clips", {})):
+                key = f"guard_deterministic-{shard}-primary-{clip_uid}"
+                if self._marker_exists(key):
+                    stats.background_final_guard_attempted += 1
+                    stats.background_final_guard_failed_closed += 1
+        return PairStats(**counts)
+
+    def _reconcile_primary_pairing(
+        self, shard: str, storage: RunStorage, clip_uid: str
+    ) -> dict[str, Any] | None:
+        """Primary pairing as it was *before* any cross upgrade."""
+        baseline = _read_json(self._cross_baseline_path(shard, clip_uid))
+        if baseline is not None:
+            return dict(baseline.get("primary_pairing") or {}) or None
+        clip = storage.read_clip(clip_uid)
+        if clip.pairing is None:
+            return None
+        return clip.pairing.model_dump(mode="json")
+
+    def _reconcile_primary_entities(
+        self, shard: str, storage: RunStorage, clip_uid: str
+    ) -> tuple[dict[str, Any], ...]:
+        """Primary entity reference states as they were before any cross pass."""
+        baseline = _read_json(self._cross_baseline_path(shard, clip_uid))
+        if baseline is not None:
+            return tuple(baseline.get("primary_entity_references") or ())
+        clip = storage.read_clip(clip_uid)
+        return tuple(
+            state.model_dump(mode="json")
+            for state in (clip.references.entities if clip.references is not None else ())
+        )
 
     def primary_unresolved_job_ids(self) -> tuple[str, ...]:
         """Job ids of primary work that is still outstanding.
