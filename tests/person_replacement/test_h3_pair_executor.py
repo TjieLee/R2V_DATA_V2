@@ -184,6 +184,9 @@ def test_group_validation_before_launch_and_allocator_override(tmp_path, monkeyp
                 "CONDA_DEFAULT_ENV","PYTHONUSERBASE"):
         assert key not in clean
     assert clean["PYTHONNOUSERSITE"] == "1"
+    assert "127.0.0.1" in clean["NO_PROXY"].split(",")
+    assert "localhost" in clean["NO_PROXY"].split(",")
+    assert clean["no_proxy"] == clean["NO_PROXY"]
     monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF",raising=False)
     assert module.worker_environment(tmp_path,"0,1")["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
     monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF","expandable_segments:False")

@@ -112,10 +112,15 @@ def worker_environment(directory, devices):
     for key in ("PYTHONPATH","PYTHONHOME","VIRTUAL_ENV","CONDA_PREFIX",
                 "CONDA_DEFAULT_ENV","PYTHONUSERBASE","TRANSFORMERS_CACHE"):
         env.pop(key,None)
+    no_proxy = [item for item in env.get("NO_PROXY",env.get("no_proxy","")).split(",") if item]
+    for host in ("127.0.0.1","localhost","::1"):
+        if host not in no_proxy:
+            no_proxy.append(host)
     env.update(CUDA_VISIBLE_DEVICES=devices,HF_HUB_OFFLINE="1",TRANSFORMERS_OFFLINE="1",
                HF_HUB_DISABLE_TELEMETRY="1",PYTHONDONTWRITEBYTECODE="1",
                PYTHONNOUSERSITE="1",OMP_NUM_THREADS="1",
-               TORCH_NCCL_ASYNC_ERROR_HANDLING="1")
+               TORCH_NCCL_ASYNC_ERROR_HANDLING="1",
+               NO_PROXY=",".join(no_proxy),no_proxy=",".join(no_proxy))
     for key,folder in (("HF_HOME","hf"),("HF_HUB_CACHE","hf/hub"),("HUGGINGFACE_HUB_CACHE","hf/hub"),
                        ("TORCH_HOME","torch"),("XDG_CACHE_HOME","cache"),("TRITON_CACHE_DIR","triton"),
                        ("TORCHINDUCTOR_CACHE_DIR","inductor"),("TMPDIR","tmp")):

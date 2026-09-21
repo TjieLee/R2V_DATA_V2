@@ -852,6 +852,7 @@ class OpenAIQwen38H3PromptWriter:
             api_key=self.api_key,
             base_url=self.base_url,
             timeout=self.timeout_seconds,
+            max_retries=0,
         )
 
     @staticmethod
