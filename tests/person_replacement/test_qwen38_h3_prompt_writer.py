@@ -11,23 +11,23 @@ CALL1_RESPONSE = ("SOURCE_PERFORMER_1: a younger woman in a yellow shirt\n"
                "REPLACEMENT_SUBJECT_2: a young man in denim")
 
 LEGAL_PROMPT = """subject_definitions:
-<Subject 1>: The replacement principal subject corresponding to source performer 1. an older man
-<Subject 2>: The replacement principal subject corresponding to source performer 2. a young woman
-<Video 1>: The source video providing the complete motion, facial performance, camera, scene, object
-and temporal structure.
+<Subject 1>: an older man. This replacement applies only to the source person in <Video 1> identified by the static visual locator: a younger woman in a yellow shirt.
+<Subject 2>: a young woman. This replacement applies only to the source person in <Video 1> identified by the static visual locator: an older woman in a light shirt.
+<Video 1>: The source video providing the complete motion, facial performance, camera, scene, object and temporal structure.
 
 summary:
-[video editing + reference generation] Replace the two original performers throughout <Video 1> with
-<Subject 1> and <Subject 2>.
+[video editing + reference generation] <Subject 1> replaces only the source person identified by a younger woman in a yellow shirt. <Subject 2> replaces only the source person identified by an older woman in a light shirt. Keep both mappings fixed.
 
 retention_analysis:
-<Subject 1>: replace - use the replacement identity and appearance defined above throughout the clip.
-<Subject 2>: replace - use the replacement identity and appearance defined above throughout the clip.
-<Video 1>: preserve - preserve the complete action sequence and shot structure.
+<Subject 1>: replace - appearance first; replace only the source person identified by a younger woman in a yellow shirt.
+<Subject 2>: replace - appearance first; replace only the source person identified by an older woman in a light shirt.
+<Video 1>: preserve - preserve the complete action sequence and shot structure. Binding is fixed and must never swap.
 
 detailed_description:
 Only replace <Subject 1> and <Subject 2>'s identities and appearances; reproduce the source performers' motion and performance from <Video 1> exactly: body pose and action, head direction and motion, facial expression, gaze, mouth/lip/jaw motion, hand-object and person-person interaction, position, occlusion, and timing, with no added, removed, retimed, or reinterpreted movement.
 Keep <Video 1>'s camera motion, framing, scene geometry, background, lighting, and non-person objects unchanged.
+
+Binding is fixed throughout <Video 1>: <Subject 1> replaces only the source person identified by a younger woman in a yellow shirt; <Subject 2> replaces only the source person identified by an older woman in a light shirt. Never swap these mappings when the people move, cross, overlap, become occluded, or change screen order.
 
 <Subject 1> raises one hand toward <Subject 2> while <Subject 2> remains in place, with the camera holding a static wide framing throughout.
 
@@ -395,6 +395,9 @@ def test_system_prompt_adds_global_preface_and_first_sentence_priority():
     assert "The first sentence inside [Shot 1] is especially important." in prompt
     assert "dominant visible motion and the dominant camera\nbehavior" in prompt
     assert "Do not begin [Shot 1] with static clothing" in prompt
+    assert 'never refer to the bindings as "source performer 1"' in prompt
+    assert "Put the replacement appearance FIRST" in prompt
+    assert "Use the concrete locator itself." in prompt
 
 
 def test_prompt_includes_identity_and_motion_icl_examples():
@@ -445,6 +448,38 @@ def test_prompt_includes_identity_and_motion_icl_examples():
     assert "Do not invent an invisible force" in system
 
 
+def test_final_prompt_uses_appearance_first_and_explicit_source_bindings(tmp_path, monkeypatch):
+    instance = writer(tmp_path,monkeypatch)
+    instance.processor.text = LEGAL_PROMPT
+    video = tmp_path/"source.mp4"
+    video.touch()
+    prompt = instance.write_h3_prompt(
+        video,
+        "the younger woman in a yellow shirt initially on the left",
+        "the older woman in a light shirt initially on the right",
+        "a young South Asian woman with long dark wavy hair and an olive sweater",
+        "an older white man with short curly white hair and a navy shirt",
+        num_frames=40,
+    )
+    subject1 = next(
+        line for line in prompt.splitlines() if line.startswith("<Subject 1>:")
+    )
+    assert subject1.startswith(
+        "<Subject 1>: a young South Asian woman with long dark wavy hair and an olive sweater."
+    )
+    assert "identified by the static visual locator: the younger woman in a yellow shirt initially on the left." in subject1
+    assert "source performer 1" not in prompt.lower()
+    assert "source performer 2" not in prompt.lower()
+    assert (
+        "Binding is fixed throughout <Video 1>: <Subject 1> replaces only the source person "
+        "identified by the younger woman in a yellow shirt initially on the left"
+    ) in prompt
+    assert (
+        "<Video 1>: preserve -" in prompt
+        and "Never swap these mappings." in prompt
+    )
+
+
 def test_preservation_sentence_is_deterministically_prepended():
     from r2v_data_v2.person_replacement.qwen38_h3_prompt_writer import (
         DETAIL_PRESERVATION_PREFIX,
@@ -454,13 +489,15 @@ def test_preservation_sentence_is_deterministically_prepended():
     )
 
     without = LEGAL_PROMPT.replace(DETAIL_PRESERVATION_PREFIX + "\n\n","",1)
-    fixed = enforce_detail_preservation_preface(without)
+    fixed = enforce_detail_preservation_preface(
+        without,"a younger woman in a yellow shirt","an older woman in a light shirt")
     detailed = dict(split_sections(fixed))["detailed_description"].strip()
     assert detailed.startswith(DETAIL_PRESERVATION_PREFIX)
     assert detailed.count(DETAIL_PRESERVATION_PREFIX) == 1
     assert validate_h3_prompt_writer_output(fixed) == fixed.strip()
 
-    unchanged = enforce_detail_preservation_preface(LEGAL_PROMPT)
+    unchanged = enforce_detail_preservation_preface(
+        LEGAL_PROMPT,"a younger woman in a yellow shirt","an older woman in a light shirt")
     assert unchanged.count(DETAIL_PRESERVATION_PREFIX) == 1
 
 

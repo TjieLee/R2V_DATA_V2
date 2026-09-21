@@ -205,10 +205,10 @@ H3_PROMPT_SYSTEM_PROMPT = """You are a production prompt writer for MiniMax-H3 R
 
 You receive:
 1. the complete source video <Video 1>;
-2. a static locator for source performer 1;
-3. a static locator for source performer 2;
-4. the required replacement appearance for <Subject 1>;
-5. the required replacement appearance for <Subject 2>.
+2. the required replacement appearance for <Subject 1>;
+3. the static visual locator of the source person that <Subject 1> must replace;
+4. the required replacement appearance for <Subject 2>;
+5. the static visual locator of the source person that <Subject 2> must replace.
 
 The source video contains exactly two physical human performers.
 
@@ -217,26 +217,24 @@ production-ready MiniMax-H3 prompt.
 
 SUBJECT SEMANTICS
 
-<Subject 1> is the replacement person for source performer 1.
+<Subject 1> and <Subject 2> are the two replacement identities that must appear
+in the final generated video.
 
-<Subject 2> is the replacement person for source performer 2.
-
-<Subject 1> and <Subject 2> are the two human subjects that must appear in the
-final generated video.
-
-The original source performers are NOT additional Subject labels.
+Each Subject is bound to exactly one physical source person by the supplied
+static visual locator. The original source people are NOT additional Subject
+labels.
 
 Never define <Subject 3> or <Subject 4>.
 
 <Video 1> is the source video providing the complete motion, facial performance,
 camera, scene, object and temporal structure.
 
-Use the supplied source-performer locators only to bind each replacement to the
-correct physical source performer.
+In the final prompt, never refer to the bindings as "source performer 1" or
+"source performer 2". Use the actual supplied visual locator so the physical
+person being replaced is explicit.
 
-Keep this mapping fixed through crossings, occlusions and screen-order changes.
-
-Do not swap identities when the performers move left or right.
+Keep each mapping fixed through crossings, occlusions, overlap, and changes in
+screen order. Never swap the two replacement identities.
 
 APPEARANCE REPLACEMENT
 
@@ -547,36 +545,42 @@ N/A
 
 subject_definitions style:
 
-<Subject 1>: The replacement principal subject corresponding to source performer
-1. [replacement appearance]
+Put the replacement appearance FIRST because it is the primary generation
+condition. Put the source-person binding AFTER the appearance.
 
-<Subject 2>: The replacement principal subject corresponding to source performer
-2. [replacement appearance]
+<Subject 1>: [replacement appearance]. This replacement applies only to the
+source person in <Video 1> identified by the supplied static visual locator.
+
+<Subject 2>: [replacement appearance]. This replacement applies only to the
+source person in <Video 1> identified by the supplied static visual locator.
 
 <Video 1>: The source video providing the complete motion, facial performance,
 camera, scene, object and temporal structure.
 
+Do not write "source performer 1" or "source performer 2" in the final prompt.
+Use the concrete locator itself.
+
 summary style:
 
-[video editing + reference generation] Replace the two original performers
-throughout <Video 1> with <Subject 1> and <Subject 2>, beginning from their first
-visible frames and continuing through the final frame. Follow the complete
-source performance and shot structure while changing their identities and
-appearances.
+[video editing + reference generation] Explicitly state the two mappings using
+the concrete visual locators: <Subject 1> replaces only its identified source
+person and <Subject 2> replaces only its identified source person. Keep both
+mappings fixed throughout the complete source performance and shot structure.
 
 retention_analysis style:
 
-<Subject 1>: replace - use the replacement identity and appearance defined above
-throughout the clip while inheriting the corresponding source performer's
-performance and timing.
+<Subject 1>: replace - appearance first, then explicitly state the concrete
+source-person locator that only <Subject 1> replaces, while inheriting that
+person's complete performance and timing.
 
-<Subject 2>: replace - use the replacement identity and appearance defined above
-throughout the clip while inheriting the corresponding source performer's
-performance and timing.
+<Subject 2>: replace - appearance first, then explicitly state the concrete
+source-person locator that only <Subject 2> replaces, while inheriting that
+person's complete performance and timing.
 
 <Video 1>: preserve - preserve the complete action sequence, positions, object
 interactions, shot timing, camera movement, framing, background, lighting and
-scene structure.
+scene structure, and explicitly restate both fixed source-person mappings so
+they cannot swap.
 
 Do NOT use:
 <Subject 1> (appears in [Shot 1])
@@ -589,20 +593,20 @@ No explanation before or after the prompt."""
 
 H3_PROMPT_USER_TEMPLATE = """Generate the final MiniMax-H3 Ref2VA prompt for the attached <Video 1>.
 
-Source performer 1 locator:
-{source_performer_1}
-
 Required appearance for <Subject 1>:
 {replacement_subject_1}
 
-Source performer 2 locator:
-{source_performer_2}
+<Subject 1> must replace only the source person identified by this static visual locator:
+{source_performer_1}
 
 Required appearance for <Subject 2>:
 {replacement_subject_2}
 
-The locator descriptions are only for identifying and binding the corresponding
-physical source performer.
+<Subject 2> must replace only the source person identified by this static visual locator:
+{source_performer_2}
+
+These locator descriptions identify the physical source people whose motion and
+performance must be inherited. Keep each mapping fixed for the entire clip.
 
 Do not preserve source appearance attributes from the locator when they conflict
 with the required replacement appearance.
@@ -629,8 +633,81 @@ def split_sections(text):
     return sections
 
 
-def enforce_detail_preservation_preface(text):
-    """Guarantee the H3 detailed description starts with the canonical constraint."""
+def _clean_binding_text(value):
+    return " ".join(str(value).split()).strip().rstrip(".")
+
+
+def source_binding_sentence(source_performer_1, source_performer_2):
+    first = _clean_binding_text(source_performer_1)
+    second = _clean_binding_text(source_performer_2)
+    return (
+        "Binding is fixed throughout <Video 1>: <Subject 1> replaces only the source "
+        f"person identified by {first}; <Subject 2> replaces only the source person "
+        f"identified by {second}. Never swap these mappings when the people move, "
+        "cross, overlap, become occluded, or change screen order."
+    )
+
+
+def _rebuild_sections(text, replacements):
+    sections = split_sections(text)
+    if [heading for heading,_ in sections] != list(SECTION_HEADINGS):
+        return text
+    bodies = {heading: body.strip() for heading,body in sections}
+    bodies.update(replacements)
+    return "\n\n".join(
+        f"{heading}:\n{bodies[heading].strip()}" for heading in SECTION_HEADINGS
+    ).strip()
+
+
+def enforce_source_binding_sections(
+    text,
+    source_performer_1,
+    source_performer_2,
+    replacement_subject_1,
+    replacement_subject_2,
+):
+    """Make final Subject/source binding explicit and deterministic."""
+    locator1 = _clean_binding_text(source_performer_1)
+    locator2 = _clean_binding_text(source_performer_2)
+    appearance1 = _clean_binding_text(replacement_subject_1)
+    appearance2 = _clean_binding_text(replacement_subject_2)
+    subject_definitions = (
+        f"<Subject 1>: {appearance1}. This replacement applies only to the source "
+        f"person in <Video 1> identified by the static visual locator: {locator1}.\n"
+        f"<Subject 2>: {appearance2}. This replacement applies only to the source "
+        f"person in <Video 1> identified by the static visual locator: {locator2}.\n"
+        "<Video 1>: The source video providing the complete motion, facial performance, "
+        "camera, scene, object and temporal structure."
+    )
+    summary = (
+        "[video editing + reference generation] "
+        f"<Subject 1> replaces only the source person in <Video 1> identified by: {locator1}. "
+        f"<Subject 2> replaces only the source person identified by: {locator2}. "
+        "Keep both mappings fixed from each person's first visible frame through the "
+        "end of the clip while preserving the complete source performance and shot structure."
+    )
+    retention = (
+        f"<Subject 1>: replace - use the appearance defined above; it replaces only "
+        f"the source person in <Video 1> identified by: {locator1}. Inherit that "
+        "person's complete pose, motion, facial performance, interactions and timing.\n"
+        f"<Subject 2>: replace - use the appearance defined above; it replaces only "
+        f"the source person in <Video 1> identified by: {locator2}. Inherit that "
+        "person's complete pose, motion, facial performance, interactions and timing.\n"
+        "<Video 1>: preserve - preserve the complete action sequence, positions, object "
+        "interactions, shot timing, camera movement, framing, background, lighting and "
+        "scene structure. Binding is fixed: <Subject 1> replaces only the source person "
+        f"identified by {locator1}; <Subject 2> replaces only the source person identified "
+        f"by {locator2}. Never swap these mappings."
+    )
+    return _rebuild_sections(text,{
+        "subject_definitions":subject_definitions,
+        "summary":summary,
+        "retention_analysis":retention,
+    })
+
+
+def enforce_detail_preservation_preface(text, source_performer_1=None, source_performer_2=None):
+    """Guarantee preservation first, followed by one unambiguous source binding."""
     if not isinstance(text,str):
         return text
     match = re.search(r"(?m)^detailed_description:[ \t]*$",text)
@@ -643,10 +720,18 @@ def enforce_detail_preservation_preface(text):
     body_end = body_start + next_match.start()
     body = text[body_start:body_end].strip()
     if body.startswith(DETAIL_PRESERVATION_PREFIX):
-        return text.strip()
-    replacement = (
-        "\n" + DETAIL_PRESERVATION_PREFIX + "\n\n" + body + "\n\n"
-    )
+        tail = body[len(DETAIL_PRESERVATION_PREFIX):].strip()
+    else:
+        tail = body
+    pieces = [DETAIL_PRESERVATION_PREFIX]
+    if source_performer_1 is not None and source_performer_2 is not None:
+        binding = source_binding_sentence(source_performer_1,source_performer_2)
+        if tail.startswith(binding):
+            tail = tail[len(binding):].strip()
+        pieces.append(binding)
+    if tail:
+        pieces.append(tail)
+    replacement = "\n" + "\n\n".join(pieces) + "\n\n"
     return (text[:body_start] + replacement + text[body_end:]).strip()
 
 
@@ -698,10 +783,16 @@ def validate_h3_prompt_writer_output(text):
     preface = detailed.split("[Shot 1]",1)[0].strip()
     if not preface.startswith(DETAIL_PRESERVATION_PREFIX):
         raise ValueError("detailed_description must start with the canonical preservation prefix")
-    dynamic_preface = preface[len(DETAIL_PRESERVATION_PREFIX):].strip()
-    if not dynamic_preface:
-        raise ValueError("detailed_description must contain a dynamic overview after the preservation sentence")
+    after_prefix = preface[len(DETAIL_PRESERVATION_PREFIX):].strip()
+    if not after_prefix.startswith("Binding is fixed throughout <Video 1>:"):
+        raise ValueError("detailed_description must contain the fixed source-person binding after preservation")
+    paragraphs = [part.strip() for part in after_prefix.split("\n\n") if part.strip()]
+    if len(paragraphs) < 2:
+        raise ValueError("detailed_description must contain a dynamic overview after the source binding")
+    binding, dynamic_preface = paragraphs[0], "\n\n".join(paragraphs[1:])
     for token in ("<Subject 1>","<Subject 2>"):
+        if token not in binding:
+            raise ValueError(f"source-person binding is missing {token}")
         if token not in dynamic_preface:
             raise ValueError(f"dynamic overview is missing {token}")
     if not re.search(r"\b(?:camera|framing|shot|view)\b",dynamic_preface,re.IGNORECASE):
@@ -828,7 +919,11 @@ class LocalQwen38H3PromptWriter:
                     replacement_subject_2=replacement_subject_2)},
             ]},
         ], self.prompt_max_new_tokens, num_frames=num_frames)
-        return enforce_detail_preservation_preface(raw)
+        prompt = enforce_detail_preservation_preface(
+            raw,source_performer_1,source_performer_2)
+        return enforce_source_binding_sections(
+            prompt,source_performer_1,source_performer_2,
+            replacement_subject_1,replacement_subject_2)
 
     def close(self):
         """Release the 27B before the H3 launcher consumes GPU memory."""
