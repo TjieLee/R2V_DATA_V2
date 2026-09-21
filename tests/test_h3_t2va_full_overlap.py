@@ -50,6 +50,55 @@ def test_node_prefetch_does_not_start_persistent_gpu_pools(tmp_path, monkeypatch
     assert pipeline.pools is None
 
 
+def test_locked_prefetch_shard_is_skipped_and_next_shard_runs(tmp_path):
+    from r2v_data_v2.h3 import t2va_production as production
+
+    events = []
+
+    class Prefetch:
+        def __init__(self):
+            self.pending = None
+
+        def start(self, shard):
+            self.pending = shard
+            events.append(("start", shard))
+
+        def wait(self, shard):
+            assert self.pending == shard
+            self.pending = None
+            if shard == 0:
+                raise production.ShardLockedError("owned elsewhere")
+            return {
+                "audio_root": str(tmp_path / str(shard)),
+                "summary": {"ready": 1},
+            }
+
+    class Pipeline(full.FullPipeline):
+        def stage(self, name, shard):
+            events.append(("stage", shard, name))
+            return {}
+
+    config = SimpleNamespace(model_dump=lambda **kw: {})
+    pipeline = Pipeline(
+        root=tmp_path,
+        index={},
+        clips_root=tmp_path,
+        source_videos_root=tmp_path,
+        gpu_ids=["0"],
+        sam_configuration=config,
+        auk_configuration=config,
+        backend=None,
+        profiles=None,
+    )
+    pipeline.prefetch = Prefetch()
+    pipeline.prefetch.start(0)
+    full.run_assigned_shards(tmp_path, [0, 1], pipeline)
+
+    assert not any(event[:2] == ("stage", 0) for event in events)
+    assert ("start", 1) in events
+    assert any(event[:2] == ("stage", 1) for event in events)
+
+
 def test_one_canonical_lookahead_and_serial_gpu_barriers(tmp_path):
     events = []
     next_started = threading.Event()
