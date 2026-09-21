@@ -16,13 +16,17 @@ REPLACEMENT_MAX_NEW_TOKENS = 512
 PROMPT_MAX_NEW_TOKENS = 4096
 
 DETAIL_PRESERVATION_SENTENCE = (
-    "Keep <Subject 1> and <Subject 2>'s actions, body poses and motion, head "
-    "orientation and motion, facial expressions, gaze, mouth/lip/jaw movement, "
-    "hand-object and person-person interactions, positions, scale, occlusion, and "
-    "timing exactly the same as in <Video 1>, and keep the source camera movement, "
-    "framing, background, lighting, and scene structure unchanged; only their "
-    "identities and appearances are replaced."
+    "Only replace <Subject 1> and <Subject 2>'s identities and appearances; "
+    "reproduce the source performers' motion and performance from <Video 1> exactly: "
+    "body pose and action, head direction and motion, facial expression, gaze, "
+    "mouth/lip/jaw motion, hand-object and person-person interaction, position, "
+    "occlusion, and timing, with no added, removed, retimed, or reinterpreted movement."
 )
+DETAIL_CAMERA_SENTENCE = (
+    "Keep <Video 1>'s camera motion, framing, scene geometry, background, lighting, "
+    "and non-person objects unchanged."
+)
+DETAIL_PRESERVATION_PREFIX = DETAIL_PRESERVATION_SENTENCE + " " + DETAIL_CAMERA_SENTENCE
 
 CALL1_LABELS = ("SOURCE_PERFORMER_1","SOURCE_PERFORMER_2",
                 "REPLACEMENT_SUBJECT_1","REPLACEMENT_SUBJECT_2")
@@ -269,22 +273,23 @@ except ordinary non-interactive parts of clothing.
 
 GLOBAL DETAILED-DESCRIPTION PREFACE
 
-The first sentence immediately after the `detailed_description:` heading is a
-mandatory preservation statement. Write this exact sentence first:
+Immediately after the `detailed_description:` heading, write these two exact
+sentences before any source-specific narration:
 
-Keep <Subject 1> and <Subject 2>'s actions, body poses and motion, head orientation and motion, facial expressions, gaze, mouth/lip/jaw movement, hand-object and person-person interactions, positions, scale, occlusion, and timing exactly the same as in <Video 1>, and keep the source camera movement, framing, background, lighting, and scene structure unchanged; only their identities and appearances are replaced.
+Only replace <Subject 1> and <Subject 2>'s identities and appearances; reproduce the source performers' motion and performance from <Video 1> exactly: body pose and action, head direction and motion, facial expression, gaze, mouth/lip/jaw motion, hand-object and person-person interaction, position, occlusion, and timing, with no added, removed, retimed, or reinterpreted movement.
+Keep <Video 1>'s camera motion, framing, scene geometry, background, lighting, and non-person objects unchanged.
 
-After that fixed preservation sentence and before `[Shot 1]`, write exactly one
+After those two fixed sentences and before `[Shot 1]`, write exactly one
 source-grounded dynamic overview sentence.
 
 The dynamic overview must summarize the dominant visible motion of <Subject 1>
 and <Subject 2>, their relative movement or most important interaction when one
 is visible, and the dominant camera behavior across the source clip.
 
-The preservation sentence states the editing constraint. The following dynamic
-overview and [Shot] narration describe the observed source performance in
-concrete target-video terms. Do not reinterpret, embellish, intensify, simplify,
-or creatively restage that performance.
+The fixed prefix states the editing constraint. The following dynamic overview
+and [Shot] narration must describe the observed source performance, not a
+plausible rewrite of it. Do not reinterpret, embellish, intensify, simplify,
+smooth over, or creatively restage the performance.
 
 Prioritize concrete dynamic information such as subject trajectories,
 body/head/hand movement, interaction progression, camera tracking, panning,
@@ -368,16 +373,18 @@ the current <Video 1>.
 Example A — face-dominant static close-up:
 
 detailed_description:
-Keep <Subject 1> and <Subject 2>'s actions, body poses and motion, head orientation and motion, facial expressions, gaze, mouth/lip/jaw movement, hand-object and person-person interactions, positions, scale, occlusion, and timing exactly the same as in <Video 1>, and keep the source camera movement, framing, background, lighting, and scene structure unchanged; only their identities and appearances are replaced.
+Only replace <Subject 1> and <Subject 2>'s identities and appearances; reproduce the source performers' motion and performance from <Video 1> exactly: body pose and action, head direction and motion, facial expression, gaze, mouth/lip/jaw motion, hand-object and person-person interaction, position, occlusion, and timing, with no added, removed, retimed, or reinterpreted movement.
+Keep <Video 1>'s camera motion, framing, scene geometry, background, lighting, and non-person objects unchanged.
 <Subject 1> holds a three-quarter-right head orientation toward <Subject 2>, keeping her eyes on him as her initially parted lips gradually come together, while <Subject 2> remains in near left profile, briefly lowers his gaze and opens then closes his mouth; the camera holds a static tight two-shot throughout.
 
 [Shot 1]
-<Subject 1> sits on the left with her shoulders mostly forward and her head rotated to the right into a three-quarter view. Her chin begins slightly lowered, her eyes stay directed toward <Subject 2>, and her lips are initially separated with the lower jaw slightly dropped. She keeps the same head direction while the jaw rises gradually and the lips meet, with her gaze remaining on <Subject 2>. <Subject 2> sits on the right in near left profile, with his nose and chin pointing toward the left side of frame. His head position stays nearly fixed while his eyes shift slightly downward. His mouth begins closed, the lips part briefly as the lower jaw drops, and the mouth returns to a closed state. The camera remains completely static with no pan, tilt, zoom, reframing, or cut.
+The shot opens in a tight two-shot with <Subject 1> seated on the left and <Subject 2> on the right. <Subject 1>'s shoulders stay mostly forward while her head is already rotated right into a three-quarter view; her chin is slightly lowered, her eyes are fixed on <Subject 2>, and her lips begin separated with the lower jaw slightly dropped. Early in the shot she holds the same head angle and gaze while the jaw rises gradually. Her lower lip approaches the upper lip until the mouth closes, without a head turn or body shift. Through the middle of the shot her eyes remain directed toward <Subject 2>; her visible facial configuration stays stable rather than becoming a new expression. Near the end she continues holding the three-quarter-right head orientation with the mouth closed and the chin at nearly the same level. <Subject 2> begins in near left profile, his nose and chin pointing toward the left side of frame, with his head almost still and his mouth closed. Early in the shot his eyes shift slightly downward while the head remains fixed. He then parts his lips briefly as the lower jaw drops a small amount, holds that opening momentarily, and brings the jaw back up until the lips meet again. His gaze remains lower than at the opening and his profile orientation does not change. The camera holds the same tight framing throughout with no pan, tilt, zoom, reframing, or cut.
 
 Example B — subtle head, gaze and mouth transitions:
 
 detailed_description:
-Keep <Subject 1> and <Subject 2>'s actions, body poses and motion, head orientation and motion, facial expressions, gaze, mouth/lip/jaw movement, hand-object and person-person interactions, positions, scale, occlusion, and timing exactly the same as in <Video 1>, and keep the source camera movement, framing, background, lighting, and scene structure unchanged; only their identities and appearances are replaced.
+Only replace <Subject 1> and <Subject 2>'s identities and appearances; reproduce the source performers' motion and performance from <Video 1> exactly: body pose and action, head direction and motion, facial expression, gaze, mouth/lip/jaw motion, hand-object and person-person interaction, position, occlusion, and timing, with no added, removed, retimed, or reinterpreted movement.
+Keep <Video 1>'s camera motion, framing, scene geometry, background, lighting, and non-person objects unchanged.
 <Subject 1> starts nearly frontal, shifts her gaze toward <Subject 2> before turning her head slightly right and parting her lips, while <Subject 2> raises his chin and closes his previously open mouth; the camera remains static.
 
 [Shot 1]
@@ -386,7 +393,8 @@ Keep <Subject 1> and <Subject 2>'s actions, body poses and motion, head orientat
 Example C — body motion with a moving camera:
 
 detailed_description:
-Keep <Subject 1> and <Subject 2>'s actions, body poses and motion, head orientation and motion, facial expressions, gaze, mouth/lip/jaw movement, hand-object and person-person interactions, positions, scale, occlusion, and timing exactly the same as in <Video 1>, and keep the source camera movement, framing, background, lighting, and scene structure unchanged; only their identities and appearances are replaced.
+Only replace <Subject 1> and <Subject 2>'s identities and appearances; reproduce the source performers' motion and performance from <Video 1> exactly: body pose and action, head direction and motion, facial expression, gaze, mouth/lip/jaw motion, hand-object and person-person interaction, position, occlusion, and timing, with no added, removed, retimed, or reinterpreted movement.
+Keep <Video 1>'s camera motion, framing, scene geometry, background, lighting, and non-person objects unchanged.
 <Subject 1> and <Subject 2> walk forward side by side while briefly turning their heads toward each other and exchanging hand gestures, as the camera tracks backward with them and gradually tightens the two-shot.
 
 [Shot 1]
@@ -396,17 +404,37 @@ DETAILED DESCRIPTION
 
 The detailed_description is the most important section.
 
-It must be a COMPLETE POSITIVE DESCRIPTION OF THE TARGET VIDEO.
+It must be a COMPLETE, GENERATION-QUALITY VISUAL DESCRIPTION OF THE TARGET VIDEO,
+not a short caption and not merely a list of preservation constraints.
 
-It must NOT merely be a list of preservation constraints.
+Watch the complete <Video 1> and narrate the source performance from beginning
+to end using <Subject 1> and <Subject 2> in place of the original performers.
 
-Watch the complete <Video 1> and narrate what the final edited video visibly
-contains from beginning to end.
+For every shot, cover the meaningful early-to-middle-to-late progression. Start
+from the opening visual state, then describe each observable action/state change
+in playback order, and finish with the ending state. Continue through the end of
+the clip instead of stopping after the opening composition or first interaction.
 
-Use <Subject 1> and <Subject 2> in place of the original performers when
-describing the source performance.
+Emphasize spatial relations, body action, head motion, facial performance, gaze,
+mouth/lip/jaw motion, hand/object/person interaction, camera behavior, and
+temporal progression. When two events happen together, describe their
+simultaneity or relative order.
 
-Actually describe the visible action and event sequence.
+Treat a visible change as a micro-event: state its onset, direction/trajectory
+or transition, and resulting state when those are observable. In a face-dominant
+shot, explicitly track each subject's head orientation, gaze, expression and
+mouth/jaw state through the shot rather than compressing them into one emotion
+label.
+
+A continuous single shot can still require a substantial paragraph. Do not make
+[Shot 1] short merely because there is no cut. For a 5-15 second clip with
+visible motion or facial changes, one or two summary sentences are usually
+insufficient.
+
+After establishing the initial composition, spend description budget on new
+actions and state changes rather than repeatedly restating unchanged background,
+posture, gaze or atmosphere. No padding is needed; density should come from
+actual observed progression.
 
 When relevant, explicitly describe:
 - opening composition
@@ -614,10 +642,10 @@ def enforce_detail_preservation_preface(text):
         return text
     body_end = body_start + next_match.start()
     body = text[body_start:body_end].strip()
-    if body.startswith(DETAIL_PRESERVATION_SENTENCE):
+    if body.startswith(DETAIL_PRESERVATION_PREFIX):
         return text.strip()
     replacement = (
-        "\n" + DETAIL_PRESERVATION_SENTENCE + "\n\n" + body + "\n\n"
+        "\n" + DETAIL_PRESERVATION_PREFIX + "\n\n" + body + "\n\n"
     )
     return (text[:body_start] + replacement + text[body_end:]).strip()
 
@@ -668,9 +696,9 @@ def validate_h3_prompt_writer_output(text):
     if "[Shot 1]" not in detailed:
         raise ValueError("detailed_description must contain [Shot 1]")
     preface = detailed.split("[Shot 1]",1)[0].strip()
-    if not preface.startswith(DETAIL_PRESERVATION_SENTENCE):
-        raise ValueError("detailed_description must start with the canonical preservation sentence")
-    dynamic_preface = preface[len(DETAIL_PRESERVATION_SENTENCE):].strip()
+    if not preface.startswith(DETAIL_PRESERVATION_PREFIX):
+        raise ValueError("detailed_description must start with the canonical preservation prefix")
+    dynamic_preface = preface[len(DETAIL_PRESERVATION_PREFIX):].strip()
     if not dynamic_preface:
         raise ValueError("detailed_description must contain a dynamic overview after the preservation sentence")
     for token in ("<Subject 1>","<Subject 2>"):

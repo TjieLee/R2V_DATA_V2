@@ -26,7 +26,8 @@ retention_analysis:
 <Video 1>: preserve - preserve the complete action sequence and shot structure.
 
 detailed_description:
-Keep <Subject 1> and <Subject 2>'s actions, body poses and motion, head orientation and motion, facial expressions, gaze, mouth/lip/jaw movement, hand-object and person-person interactions, positions, scale, occlusion, and timing exactly the same as in <Video 1>, and keep the source camera movement, framing, background, lighting, and scene structure unchanged; only their identities and appearances are replaced.
+Only replace <Subject 1> and <Subject 2>'s identities and appearances; reproduce the source performers' motion and performance from <Video 1> exactly: body pose and action, head direction and motion, facial expression, gaze, mouth/lip/jaw motion, hand-object and person-person interaction, position, occlusion, and timing, with no added, removed, retimed, or reinterpreted movement.
+Keep <Video 1>'s camera motion, framing, scene geometry, background, lighting, and non-person objects unchanged.
 
 <Subject 1> raises one hand toward <Subject 2> while <Subject 2> remains in place, with the camera holding a static wide framing throughout.
 
@@ -385,33 +386,15 @@ def test_system_prompt_adds_global_preface_and_first_sentence_priority():
 
     prompt = H3_PROMPT_SYSTEM_PROMPT
     assert "GLOBAL DETAILED-DESCRIPTION PREFACE" in prompt
-    assert "mandatory preservation statement" in prompt
-    assert "actions, body poses and motion, head orientation and motion" in prompt
-    assert "facial expressions, gaze, mouth/lip/jaw movement" in prompt
-    assert "only their identities and appearances are replaced" in prompt
-    assert "Immediately after the `detailed_description:` heading and before `[Shot 1]`" in prompt
-    assert "exactly one source-grounded dynamic overview sentence" in prompt
-    assert "dominant visible\nmotion of <Subject 1> and <Subject 2>" in prompt
-    assert "their relative movement or most important\ninteraction" in prompt
-    assert "dominant camera behavior across the\nsource clip" in prompt
-    assert "Write concrete target-video content, not editing instructions." in prompt
-    assert "Describe what\nvisibly happens rather than saying to preserve it." in prompt
-    assert "subject trajectories" in prompt
-    assert "body/head/hand movement" in prompt
-    assert "camera tracking, panning," in prompt
-    assert "If the source camera is genuinely static" in prompt
-    assert '"The target video is a direct edit of <Video 1>."' in prompt
-    assert '"Preserve the complete source motion."' in prompt
-    assert "Do not use this sentence for static appearance, clothing, background, lighting," in prompt
+    assert "reproduce the source performers' motion and performance from <Video 1> exactly" in prompt
+    assert "no added, removed, retimed, or reinterpreted movement" in prompt
+    assert "camera motion, framing, scene geometry" in prompt
+    assert "After those two fixed sentences and before `[Shot 1]`" in prompt
+    assert "source-grounded dynamic overview sentence" in prompt
     assert "FIRST-SENTENCE PRIORITY" in prompt
     assert "The first sentence inside [Shot 1] is especially important." in prompt
     assert "dominant visible motion and the dominant camera\nbehavior" in prompt
-    assert "- how they are moving relative to each other," in prompt
-    assert ("- and the main camera behavior (static, panning, tracking, tilting, zooming,\n"
-            "  reframing, handheld, or cutting)." in prompt)
-    assert ("Do not begin [Shot 1] with static clothing, static background description,"
-            in prompt)
-    assert 'generic wording such as "preserve the original motion".' in prompt
+    assert "Do not begin [Shot 1] with static clothing" in prompt
 
 
 def test_prompt_includes_identity_and_motion_icl_examples():
@@ -447,6 +430,11 @@ def test_prompt_includes_identity_and_motion_icl_examples():
     assert "final visible head/gaze/mouth state" in system
     assert "Do not collapse these observations into only" in system
     assert "Do not infer spoken words or phoneme-level lip sync." in system
+    assert "COMPLETE, GENERATION-QUALITY VISUAL DESCRIPTION" in system
+    assert "early-to-middle-to-late progression" in system
+    assert "Treat a visible change as a micro-event" in system
+    assert "one or two summary sentences are usually" in system
+    assert "After establishing the initial composition" in system
     assert "FEW-SHOT DETAILED-DESCRIPTION STYLE EXAMPLES" in system
     assert "Example A — face-dominant static close-up:" in system
     assert "Example B — subtle head, gaze and mouth transitions:" in system
@@ -459,36 +447,36 @@ def test_prompt_includes_identity_and_motion_icl_examples():
 
 def test_preservation_sentence_is_deterministically_prepended():
     from r2v_data_v2.person_replacement.qwen38_h3_prompt_writer import (
-        DETAIL_PRESERVATION_SENTENCE,
+        DETAIL_PRESERVATION_PREFIX,
         enforce_detail_preservation_preface,
         split_sections,
         validate_h3_prompt_writer_output,
     )
 
-    without = LEGAL_PROMPT.replace(DETAIL_PRESERVATION_SENTENCE + "\n\n","",1)
+    without = LEGAL_PROMPT.replace(DETAIL_PRESERVATION_PREFIX + "\n\n","",1)
     fixed = enforce_detail_preservation_preface(without)
     detailed = dict(split_sections(fixed))["detailed_description"].strip()
-    assert detailed.startswith(DETAIL_PRESERVATION_SENTENCE)
-    assert detailed.count(DETAIL_PRESERVATION_SENTENCE) == 1
+    assert detailed.startswith(DETAIL_PRESERVATION_PREFIX)
+    assert detailed.count(DETAIL_PRESERVATION_PREFIX) == 1
     assert validate_h3_prompt_writer_output(fixed) == fixed.strip()
 
     unchanged = enforce_detail_preservation_preface(LEGAL_PROMPT)
-    assert unchanged.count(DETAIL_PRESERVATION_SENTENCE) == 1
+    assert unchanged.count(DETAIL_PRESERVATION_PREFIX) == 1
 
 
 def test_validator_requires_dynamic_preface_and_rejects_speculation():
     from r2v_data_v2.person_replacement.qwen38_h3_prompt_writer import (
-        DETAIL_PRESERVATION_SENTENCE,
+        DETAIL_PRESERVATION_PREFIX,
         validate_h3_prompt_writer_output,
     )
 
     missing_preface = LEGAL_PROMPT.replace(
-        DETAIL_PRESERVATION_SENTENCE + "\n\n"
+        DETAIL_PRESERVATION_PREFIX + "\n\n"
         "<Subject 1> raises one hand toward <Subject 2> while <Subject 2> remains in place, "
         "with the camera holding a static wide framing throughout.\n\n",
         "",
     )
-    with pytest.raises(ValueError,match="canonical preservation sentence"):
+    with pytest.raises(ValueError,match="canonical preservation prefix"):
         validate_h3_prompt_writer_output(missing_preface)
 
     missing_camera = LEGAL_PROMPT.replace(
