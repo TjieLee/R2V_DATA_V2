@@ -353,6 +353,13 @@ def test_replacement_planning_prompt_pushes_real_identity_distance():
     prompt = REPLACEMENT_PLANNING_PROMPT
     assert "noticeably different from its corresponding source" in prompt
     assert "not just a lightly modified lookalike" in prompt
+    assert "CASTING VARIATION" in prompt
+    assert "gender presentation and approximate age are\nidentification facts" in prompt
+    assert "Do not default to the same gender presentation or a nearby age band" in prompt
+    assert "at least one replacement whose apparent gender presentation differs" in prompt
+    assert "at least one replacement whose apparent adult age band differs clearly" in prompt
+    assert "do not introduce a child merely to\ncreate contrast" in prompt
+    assert "It does NOT mean preserving gender presentation, age, face," in prompt
     assert "at least two or three of the\nfollowing aspects" in prompt
     assert "- apparent age band," in prompt
     assert "- hairstyle, hair texture or hair colour," in prompt
@@ -411,8 +418,10 @@ def test_prompt_includes_identity_and_motion_icl_examples():
     assert "FEW-SHOT IDENTITY EXAMPLES" in replacement
     assert "Do not use empty identity phrases" in replacement
     assert '"a generic man"' in replacement and '"a generic woman"' in replacement
-    assert "cropped salt-and-pepper hair" in replacement
-    assert "short wavy auburn bob" in replacement
+    assert "woman in her forties with short textured auburn hair" in replacement
+    assert "older man in his sixties with swept-back silver hair" in replacement
+    assert "young adult woman with a cropped black pixie cut" in replacement
+    assert "middle-aged man with wavy dark-brown hair" in replacement
     assert "a face-shape or grooming detail" in replacement
 
     system = H3_PROMPT_SYSTEM_PROMPT

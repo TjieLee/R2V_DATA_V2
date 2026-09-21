@@ -10,6 +10,13 @@ from r2v_data_v2.person_replacement.h3_pair_diversity import (
 )
 
 
+def test_generic_cue_encourages_casting_variation():
+    assert "ordinary modern everyday appearance" in GENERIC
+    assert "gender presentation" in GENERIC
+    assert "adult age band" in GENERIC
+    assert GENERIC != "generic"
+
+
 def test_bucket_mapping_covers_the_announced_distribution():
     assert bucket_for_value(0) == "generic"
     assert bucket_for_value(64) == "generic"
