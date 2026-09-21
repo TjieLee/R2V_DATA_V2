@@ -342,6 +342,43 @@ finger configuration. Do not invent an invisible force, unseen object or motive.
 Prefer visible facial facts such as a smile, lowered gaze, tightened lips or
 furrowed brows over inferred inner states.
 
+TEMPORAL VERIFICATION BEFORE WRITING
+
+Before writing the dynamic overview or [Shot 1], silently compare the opening,
+early, middle, late, and final visible states of EACH subject. This is a temporal
+tracking task, not a single-frame captioning task.
+
+For each subject, explicitly check whether these change over the clip:
+- body orientation and pose,
+- head direction / head angle,
+- gaze direction,
+- eyelid state when salient,
+- facial configuration,
+- mouth/lip/jaw state,
+- hand position and interaction.
+
+If any state changes, the final description must narrate the transition in
+playback order: initial state -> visible transition -> later/final state.
+A brief turn, glance, blink, mouth closure/opening, lean, hand movement, or return
+movement still counts as a real motion event and must not be flattened away.
+
+Use words such as "throughout", "maintains", "remains", "stays fixed",
+"continues to face", or "keeps looking" only when the same state is actually
+supported at the opening, middle, AND end of the visible interval. Never infer a
+persistent head direction or gaze from one salient frame.
+
+In particular, if a subject begins in profile or three-quarter view and later
+turns toward or away from the camera or the other subject, describe that turn
+explicitly. Do not summarize the whole clip using only the opening orientation.
+
+Do not substitute social-role interpretations for visible motion. "speaks",
+"listens", "responds", or "looks attentive" are not enough by themselves.
+Describe the observable mouth/jaw, head, gaze, eyelid, hand and body changes that
+support the event.
+
+Do not output this temporal audit as a checklist. Use it only to make the final
+dynamic overview and [Shot] narration temporally complete.
+
 FACIAL AND HEAD MICRO-MOTION PRIORITY
 
 For close-up, medium-close, dialogue-like, reaction, or otherwise face-dominant
@@ -388,15 +425,15 @@ Keep <Video 1>'s camera motion, framing, scene geometry, background, lighting, a
 [Shot 1]
 The shot opens in a tight two-shot with <Subject 1> seated on the left and <Subject 2> on the right. <Subject 1>'s shoulders stay mostly forward while her head is already rotated right into a three-quarter view; her chin is slightly lowered, her eyes are fixed on <Subject 2>, and her lips begin separated with the lower jaw slightly dropped. Early in the shot she holds the same head angle and gaze while the jaw rises gradually. Her lower lip approaches the upper lip until the mouth closes, without a head turn or body shift. Through the middle of the shot her eyes remain directed toward <Subject 2>; her visible facial configuration stays stable rather than becoming a new expression. Near the end she continues holding the three-quarter-right head orientation with the mouth closed and the chin at nearly the same level. <Subject 2> begins in near left profile, his nose and chin pointing toward the left side of frame, with his head almost still and his mouth closed. Early in the shot his eyes shift slightly downward while the head remains fixed. He then parts his lips briefly as the lower jaw drops a small amount, holds that opening momentarily, and brings the jaw back up until the lips meet again. His gaze remains lower than at the opening and his profile orientation does not change. The camera holds the same tight framing throughout with no pan, tilt, zoom, reframing, or cut.
 
-Example B — subtle head, gaze and mouth transitions:
+Example B — head turn must not be flattened into a persistent pose:
 
 detailed_description:
 Only replace <Subject 1> and <Subject 2>'s identities and appearances; reproduce the source performers' motion and performance from <Video 1> exactly: body pose and action, head direction and motion, facial expression, gaze, mouth/lip/jaw motion, hand-object and person-person interaction, position, occlusion, and timing, with no added, removed, retimed, or reinterpreted movement.
 Keep <Video 1>'s camera motion, framing, scene geometry, background, lighting, and non-person objects unchanged.
-<Subject 1> starts nearly frontal, shifts her gaze toward <Subject 2> before turning her head slightly right and parting her lips, while <Subject 2> raises his chin and closes his previously open mouth; the camera remains static.
+<Subject 1> begins in right profile toward <Subject 2>, turns through a three-quarter angle to face more forward, and later holds the new orientation while her mouth moves; <Subject 2> briefly closes and reopens the eyes while shifting gaze forward, with the camera remaining static.
 
 [Shot 1]
-<Subject 1> begins with her face almost frontal and her mouth closed. Her eyes move first toward <Subject 2>; after the gaze shift, her head rotates slightly to the right into a shallow three-quarter view. Her lips then separate and the lower jaw lowers a little while the head holds the new angle. <Subject 2> begins facing slightly left with his chin lowered and mouth open. He gradually raises his chin, keeps his eyes on <Subject 1>, and brings the lower jaw upward until the lips meet. Neither subject changes seat or body position, and the camera keeps the same framing throughout.
+The shot opens with <Subject 1> on the left in a clear right-facing profile, her nose and chin directed toward <Subject 2>, and her gaze also directed right. Early in the shot she begins rotating her head leftward away from the profile orientation. The face passes through a three-quarter-right angle while the eyes shift forward. By the middle of the shot her face is much more frontal, and the mouth begins a sequence of visible openings and closures while the new head angle is held. Near the end she remains at this later, more forward-facing orientation rather than returning to the original profile. <Subject 2> begins angled slightly toward <Subject 1> with the eyes open. During <Subject 1>'s turn, <Subject 2> closes both eyes briefly, lowers the chin a small amount, then reopens the eyes and directs the gaze forward. The mouth remains mostly closed. The camera stays in the same static two-shot with no cut, pan, tilt, zoom, or reframing.
 
 Example C — body motion with a moving camera:
 
@@ -420,7 +457,9 @@ to end using <Subject 1> and <Subject 2> in place of the original performers.
 
 For every shot, cover the meaningful early-to-middle-to-late progression. Start
 from the opening visual state, then describe each observable action/state change
-in playback order, and finish with the ending state. Continue through the end of
+in playback order, and finish with the ending state. For each clearly visible
+subject, establish an opening state, at least one middle-state observation when
+the clip supports it, and the final visible state. Continue through the end of
 the clip instead of stopping after the opening composition or first interaction.
 
 Emphasize spatial relations, body action, head motion, facial performance, gaze,

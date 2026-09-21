@@ -461,6 +461,12 @@ def test_prompt_includes_identity_and_motion_icl_examples():
 
     system = H3_PROMPT_SYSTEM_PROMPT
     assert "OBSERVATION-ONLY LANGUAGE" in system
+    assert "TEMPORAL VERIFICATION BEFORE WRITING" in system
+    assert "opening, early, middle, late, and final visible states of EACH subject" in system
+    assert "initial state -> visible transition -> later/final state" in system
+    assert 'Use words such as "throughout", "maintains", "remains"' in system
+    assert "Never infer a\npersistent head direction or gaze from one salient frame." in system
+    assert "profile or three-quarter view and later\nturns" in system
     assert "FACIAL AND HEAD MICRO-MOTION PRIORITY" in system
     assert "initial head orientation: frontal, three-quarter left/right" in system
     assert "initial mouth state: closed, slightly parted, or open" in system
@@ -475,10 +481,10 @@ def test_prompt_includes_identity_and_motion_icl_examples():
     assert "After establishing the initial composition" in system
     assert "FEW-SHOT DETAILED-DESCRIPTION STYLE EXAMPLES" in system
     assert "Example A — face-dominant static close-up:" in system
-    assert "Example B — subtle head, gaze and mouth transitions:" in system
+    assert "Example B — head turn must not be flattened into a persistent pose:" in system
     assert "Example C — body motion with a moving camera:" in system
     assert "the lips meet" in system
-    assert "eyes move first toward <Subject 2>" in system
+    assert "The face passes through a three-quarter-right angle while the eyes shift forward." in system
     assert "camera tracks backward with them" in system
     assert "Do not invent an invisible force" in system
 
