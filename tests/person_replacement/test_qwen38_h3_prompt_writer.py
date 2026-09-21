@@ -24,10 +24,8 @@ retention_analysis:
 <Video 1>: preserve - preserve the complete action sequence and shot structure. Binding is fixed and must never swap.
 
 detailed_description:
-Only replace <Subject 1> and <Subject 2>'s identities and appearances; reproduce the source performers' motion and performance from <Video 1> exactly: body pose and action, head direction and motion, facial expression, gaze, mouth/lip/jaw motion, hand-object and person-person interaction, position, occlusion, and timing, with no added, removed, retimed, or reinterpreted movement.
-Keep <Video 1>'s camera motion, framing, scene geometry, background, lighting, and non-person objects unchanged.
-
-Binding is fixed throughout <Video 1>: <Subject 1> replaces only the source person identified by a younger woman in a yellow shirt; <Subject 2> replaces only the source person identified by an older woman in a light shirt. Never swap these mappings when the people move, cross, overlap, become occluded, or change screen order.
+Only replace <Subject 1> and <Subject 2>'s identities and appearances; keep <Video 1>'s motion, facial performance, interactions, and timing unchanged.
+Keep <Video 1>'s camera, framing, scene, lighting, and non-person objects unchanged.
 
 <Subject 1> raises one hand toward <Subject 2> while <Subject 2> remains in place, with the camera holding a static wide framing throughout.
 
@@ -423,142 +421,71 @@ def test_both_calls_use_the_same_path_style_video_part(tmp_path, monkeypatch):
     assert [kwargs["num_frames"] for _, kwargs in instance.processor.calls] == [40,40]
 
 
-def test_replacement_planning_prompt_pushes_real_identity_distance():
+def test_replacement_planning_prompt_keeps_identity_distance_without_prompt_bloat():
     from r2v_data_v2.person_replacement.qwen38_h3_prompt_writer import (
         REPLACEMENT_PLANNING_PROMPT,
     )
 
     prompt = REPLACEMENT_PLANNING_PROMPT
-    assert "noticeably different from its corresponding source" in prompt
-    assert "not just a lightly modified lookalike" in prompt
-    assert "CASTING VARIATION" in prompt
-    assert "gender presentation and approximate age are\nidentification facts" in prompt
-    assert "Do not default to the same gender presentation or a nearby age band" in prompt
-    assert "at least one replacement whose apparent gender presentation differs" in prompt
-    assert "at least one replacement whose apparent adult age band differs clearly" in prompt
-    assert "do not introduce a child merely to\ncreate contrast" in prompt
-    assert "It does NOT mean preserving gender presentation, age, face," in prompt
-    assert "at least two or three of the\nfollowing aspects" in prompt
-    assert "- apparent age band," in prompt
-    assert "- hairstyle, hair texture or hair colour," in prompt
-    assert "- face shape or facial-structure impression," in prompt
-    assert "- grooming or facial hair," in prompt
-    assert "- overall colour palette," in prompt
-    assert ("The diversity cue must not be satisfied only by a clothing change." in prompt)
-    assert "Do not make the replacement bizarre, caricatured or unnaturally extreme." in prompt
-    assert "Do not request a radically different body size or silhouette." in prompt
-    assert "broadly compatible with the source performer's body" in prompt
-    # Existing constraints must survive
-    assert "not be celebrities" in prompt
-    assert "- props" in prompt and "- weapons" in prompt
+    assert "clearly different from its source" in prompt
+    assert "at least one cross-gender replacement" in prompt
+    assert "at least one clearly different adult age band" in prompt
+    assert "face shape, hair, grooming, skin tone, clothing/style" in prompt
+    assert "Do not satisfy diversity only by\nchanging clothes." in prompt
+    assert "body scale and occupied silhouette broadly compatible" in prompt
+    assert "Do not add props, actions,\ngestures, pose, or interactions." in prompt
     assert "{cue1}" in prompt and "{cue2}" in prompt
+    assert len(prompt.split()) < 500
 
 
-def test_system_prompt_adds_global_preface_and_first_sentence_priority():
+def test_system_prompt_is_slim_and_prioritizes_salient_motion():
     from r2v_data_v2.person_replacement.qwen38_h3_prompt_writer import (
         H3_PROMPT_SYSTEM_PROMPT,
     )
 
     prompt = H3_PROMPT_SYSTEM_PROMPT
-    assert "GLOBAL DETAILED-DESCRIPTION PREFACE" in prompt
-    assert "reproduce the source performers' motion and performance from <Video 1> exactly" in prompt
-    assert "no added, removed, retimed, or reinterpreted movement" in prompt
-    assert "camera motion, framing, scene geometry" in prompt
-    assert "After those two fixed sentences and before `[Shot 1]`" in prompt
-    assert "source-grounded dynamic overview sentence" in prompt
-    assert "FIRST-SENTENCE PRIORITY" in prompt
-    assert "The first sentence inside [Shot 1] is especially important." in prompt
-    assert "dominant visible motion and the dominant camera\nbehavior" in prompt
-    assert "Do not begin [Shot 1] with static clothing" in prompt
-    assert 'never refer to the bindings as "source performer 1"' in prompt
-    assert "Put the replacement appearance FIRST" in prompt
-    assert "Use the concrete locator itself." in prompt
+    assert "Change who the two people are; do not change what happens." in prompt
+    assert "Do not repeat replacement\nappearance" in prompt
+    assert "Describe only meaningful visible action/state changes" in prompt
+    assert "Do not enumerate every blink" in prompt
+    assert 'Use words such\nas "throughout", "maintains", or "remains" only' in prompt
+    assert "If uncertain, stay conservative." in prompt
+    assert "TEMPORAL VERIFICATION BEFORE WRITING" not in prompt
+    assert "FACIAL AND HEAD MICRO-MOTION PRIORITY" not in prompt
+    assert "FEW-SHOT DETAILED-DESCRIPTION STYLE EXAMPLES" not in prompt
+    assert "early-to-middle-to-late progression" not in prompt
+    assert "Treat a visible change as a micro-event" not in prompt
+    assert len(prompt.split()) < 650
 
 
-def test_prompt_includes_identity_and_motion_icl_examples():
-    from r2v_data_v2.person_replacement.qwen38_h3_prompt_writer import (
-        H3_PROMPT_SYSTEM_PROMPT,
-        REPLACEMENT_PLANNING_PROMPT,
-    )
-
-    replacement = REPLACEMENT_PLANNING_PROMPT
-    assert "FEW-SHOT IDENTITY EXAMPLES" in replacement
-    assert "Do not use empty identity phrases" in replacement
-    assert '"a generic man"' in replacement and '"a generic woman"' in replacement
-    assert "woman in her forties with short textured auburn hair" in replacement
-    assert "older man in his sixties with swept-back silver hair" in replacement
-    assert "young adult woman with a cropped black pixie cut" in replacement
-    assert "middle-aged man with wavy dark-brown hair" in replacement
-    assert "a face-shape or grooming detail" in replacement
-    assert "Optional diversity dimensions may also include a broad country/region" in replacement
-    assert "skin tone" in replacement and "profession-inspired styling" in replacement
-    assert "Black British woman in her forties with deep brown skin" in replacement
-    assert "young South Asian woman with medium-brown skin" in replacement
-    assert "white Eastern European man with fair skin" in replacement
-    assert "young Southeast Asian man with warm tan skin" in replacement
-    assert "Latina woman in her fifties with medium olive skin" in replacement
-    assert "Do not force every replacement to mention every one" in replacement
-
-    system = H3_PROMPT_SYSTEM_PROMPT
-    assert "OBSERVATION-ONLY LANGUAGE" in system
-    assert "TEMPORAL VERIFICATION BEFORE WRITING" in system
-    assert "opening, early, middle, late, and final visible states of EACH subject" in system
-    assert "initial state -> visible transition -> later/final state" in system
-    assert 'Use words such as "throughout", "maintains", "remains"' in system
-    assert "Never infer a\npersistent head direction or gaze from one salient frame." in system
-    assert "profile or three-quarter view and later\nturns" in system
-    assert "FACIAL AND HEAD MICRO-MOTION PRIORITY" in system
-    assert "initial head orientation: frontal, three-quarter left/right" in system
-    assert "initial mouth state: closed, slightly parted, or open" in system
-    assert "visible lip and lower-jaw movement over time" in system
-    assert "final visible head/gaze/mouth state" in system
-    assert "Do not collapse these observations into only" in system
-    assert "Do not infer spoken words or phoneme-level lip sync." in system
-    assert "COMPLETE, GENERATION-QUALITY VISUAL DESCRIPTION" in system
-    assert "early-to-middle-to-late progression" in system
-    assert "Treat a visible change as a micro-event" in system
-    assert "one or two summary sentences are usually" in system
-    assert "After establishing the initial composition" in system
-    assert "FEW-SHOT DETAILED-DESCRIPTION STYLE EXAMPLES" in system
-    assert "Example A — face-dominant static close-up:" in system
-    assert "Example B — head turn must not be flattened into a persistent pose:" in system
-    assert "Example C — body motion with a moving camera:" in system
-    assert "the lips meet" in system
-    assert "The face passes through a three-quarter-right angle while the eyes shift forward." in system
-    assert "camera tracks backward with them" in system
-    assert "Do not invent an invisible force" in system
-
-
-def test_final_prompt_uses_appearance_first_and_explicit_source_bindings(tmp_path, monkeypatch):
+def test_final_prompt_uses_appearance_first_and_single_source_bindings(tmp_path, monkeypatch):
     instance = writer(tmp_path,monkeypatch)
     instance.processor.text = LEGAL_PROMPT
     video = tmp_path/"source.mp4"
     video.touch()
+    locator1 = "the younger woman in a yellow shirt initially on the left"
+    locator2 = "the older woman in a light shirt initially on the right"
     prompt = instance.write_h3_prompt(
         video,
-        "the younger woman in a yellow shirt initially on the left",
-        "the older woman in a light shirt initially on the right",
+        locator1,
+        locator2,
         "a young South Asian woman with long dark wavy hair and an olive sweater",
         "an older white man with short curly white hair and a navy shirt",
         num_frames=40,
     )
-    subject1 = next(
-        line for line in prompt.splitlines() if line.startswith("<Subject 1>:")
-    )
+    subject1 = next(line for line in prompt.splitlines() if line.startswith("<Subject 1>:"))
     assert subject1.startswith(
         "<Subject 1>: a young South Asian woman with long dark wavy hair and an olive sweater."
     )
-    assert "identified by the static visual locator: the younger woman in a yellow shirt initially on the left." in subject1
-    assert "source performer 1" not in prompt.lower()
-    assert "source performer 2" not in prompt.lower()
-    assert (
-        "Binding is fixed throughout <Video 1>: <Subject 1> replaces only the source person "
-        "identified by the younger woman in a yellow shirt initially on the left"
-    ) in prompt
-    assert (
-        "<Video 1>: preserve -" in prompt
-        and "Never swap these mappings." in prompt
-    )
+    assert f"Replaces only the source person identified by: {locator1}." in subject1
+    assert prompt.count(locator1) == 1
+    assert prompt.count(locator2) == 1
+    detailed = dict(__import__(
+        "r2v_data_v2.person_replacement.qwen38_h3_prompt_writer",
+        fromlist=["split_sections"],
+    ).split_sections(prompt))["detailed_description"]
+    assert "Binding is fixed throughout" not in detailed
+    assert "replace appearance only" in prompt
 
 
 def test_preservation_prefix_is_not_duplicated_when_model_uses_newline_between_fixed_sentences():
@@ -642,13 +569,10 @@ def test_prompt_explicitly_requires_the_fixed_audio_tail():
         H3_PROMPT_USER_TEMPLATE,
     )
 
-    assert "COMPLETION REQUIREMENT" in H3_PROMPT_SYSTEM_PROMPT
-    assert "Never stop the response after detailed_description" in H3_PROMPT_SYSTEM_PROMPT
-    assert "ALWAYS append these exact final two" in H3_PROMPT_SYSTEM_PROMPT
-    assert "all six top-level section headings appear exactly once" in H3_PROMPT_SYSTEM_PROMPT
     tail = "overall_soundscape:\nN/A\n\nnon_diegetic_music:\nN/A"
     assert tail in H3_PROMPT_SYSTEM_PROMPT
     assert tail in H3_PROMPT_USER_TEMPLATE
+    assert "The final response must end with the two exact N/A sections above." in H3_PROMPT_SYSTEM_PROMPT
 
 
 def test_system_prompt_still_enforces_the_six_section_contract():

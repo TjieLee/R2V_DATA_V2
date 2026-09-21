@@ -42,8 +42,8 @@ MINIMUM_SOURCE_DURATION_SECONDS = 5.0
 SOURCE_SUBJECT_FIELDS = ("source_subject_1","source_subject_2")
 PERFORMANCE_FIELDS = ("source_performance_1","source_performance_2")
 QWEN_FIELDS = (*SOURCE_SUBJECT_FIELDS,*PERFORMANCE_FIELDS,"shot_description")
-PROMPT_WRITER_CONTRACT = "mimo8_qwen38_or_qwen35_two_call_h3_prompt_v15"
-PROMPT_SOURCE = "qwen35_full_video"
+PROMPT_WRITER_CONTRACT = "slim_two_call_h3_prompt_v16"
+PROMPT_SOURCE = "qwen35_full_video_fps8_slim"
 
 
 def skip_payload(case, config, video, reason, *, detail="", timeline=None):
@@ -138,11 +138,11 @@ def prepare_partition(config, worker, qwen_factory=None):
             qwen.close()
 
 
-MAX_WRITER_FRAMES = 60
+MAX_WRITER_FRAMES = 120
 
 
 def writer_frames(duration_seconds):
-    """Bounded 4fps sampling budget; the processor does the actual sampling."""
+    """Bounded 8fps sampling budget; the processor does the actual sampling."""
     return max(1,min(MAX_WRITER_FRAMES,round(float(duration_seconds)*VIDEO_FPS)))
 
 
@@ -191,7 +191,7 @@ def prepare_text_partition_v19(config, worker, writer_factory=None):
                             "h3_reference_source":str(reference),
                             "frames":plan.native_frame_count,"width":width,"height":height,
                             "timeline":asdict(plan),"aspect_ratio":aspect,**audio}
-                    # Bounded 4fps sampling for both calls of this case.
+                    # Bounded 8fps sampling for both calls of this case.
                     num_frames = writer_frames(plan.source.duration_seconds)
                     marker = qwen_prepared(case)
                     if marker is None:
@@ -236,9 +236,9 @@ def prepare_text_partition_v19(config, worker, writer_factory=None):
                         "prompt_writer_num_frames":(
                             num_frames if getattr(writer,"uses_local_frame_sampling",True) else None),
                         "prompt_source":(
-                            "mimo25_sglang_full_video_fps8"
+                            "mimo25_sglang_full_video_fps8_slim"
                             if config.get("prompt_writer_backend") == "mimo"
-                            else ("qwen38_sglang_full_video"
+                            else ("qwen38_sglang_full_video_slim"
                                   if config.get("prompt_writer_backend") == "sglang"
                                   else PROMPT_SOURCE))},
                         {"h3_prompt":prompt})

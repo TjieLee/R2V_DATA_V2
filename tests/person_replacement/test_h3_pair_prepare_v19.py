@@ -111,7 +111,7 @@ def test_text_v19_never_loads_8b_or_build_prompt(tmp_path, monkeypatch):
     prepare(tmp_path,monkeypatch,cases,clips)
     prepared = read_json((tmp_path/"case0")/"preparation"/"prepared.json")
     assert prepared["prompt"] == LEGAL_PROMPT
-    assert prepared["prompt_source"] == "qwen35_full_video"
+    assert prepared["prompt_source"] == "qwen35_full_video_fps8_slim"
     assert prepared["source_subject_1"] if False else True
     assert "shot_description" not in prepared and "source_subject_1" not in prepared
 
@@ -196,8 +196,8 @@ def test_prepared_provenance_and_artifacts(tmp_path, monkeypatch):
     directory = tmp_path/"case0"/"preparation"
     prepared = read_json(directory/"prepared.json")
     assert prepared["prompt_writer_model"] == "/mnt/workspace/public/pretrained/Qwen/Qwen3.5-27B"
-    assert prepared["prompt_writer_contract"] == "mimo8_qwen38_or_qwen35_two_call_h3_prompt_v15"
-    assert prepared["prompt_writer_video_fps"] == 4.0
+    assert prepared["prompt_writer_contract"] == "slim_two_call_h3_prompt_v16"
+    assert prepared["prompt_writer_video_fps"] == 8.0
     assert prepared["prompt_writer_replacement_max_new_tokens"] == 512
     assert prepared["prompt_writer_prompt_max_new_tokens"] == 4096
     assert prepared["prompt_writer_thinking"] is False or prepared["prompt_writer_thinking"] is True
@@ -244,7 +244,7 @@ def test_mimo_backend_factory_and_provenance_use_fps8(tmp_path, monkeypatch):
     prepared = read_json(tmp_path/"case0"/"preparation"/"prepared.json")
     assert prepared["prompt_writer_backend"] == "mimo"
     assert prepared["prompt_writer_video_fps"] == 8.0
-    assert prepared["prompt_source"] == "mimo25_sglang_full_video_fps8"
+    assert prepared["prompt_source"] == "mimo25_sglang_full_video_fps8_slim"
 
 
 def test_frame0_never_instantiates_the_27b(tmp_path, monkeypatch):
@@ -253,7 +253,7 @@ def test_frame0_never_instantiates_the_27b(tmp_path, monkeypatch):
     from r2v_data_v2.person_replacement.h3_pair_executor import VARIANTS
 
     assert VARIANTS["frame0"] == "frame0_two_person_pdd_fsdp2_pair_v18"
-    assert VARIANTS["text"] == "text_two_person_pdd_fsdp2_pair_v37"
+    assert VARIANTS["text"] == "text_two_person_pdd_fsdp2_pair_v38"
 
     clips = tmp_path/"clips"
     clips.mkdir()
@@ -280,7 +280,7 @@ def test_frame0_never_instantiates_the_27b(tmp_path, monkeypatch):
     assert prepared["source_subject_1"] == "s1"
 
 
-@pytest.mark.parametrize("duration,expected", [(5.0,20),(10.0,40),(15.0,60),(20.0,60),(0.1,1)])
+@pytest.mark.parametrize("duration,expected", [(5.0,40),(10.0,80),(15.0,120),(20.0,120),(0.1,1)])
 def test_writer_frames_budget(duration, expected):
     from r2v_data_v2.person_replacement.h3_pair_prepare import writer_frames
 
@@ -300,7 +300,7 @@ def test_both_calls_share_one_num_frames_and_no_fps(tmp_path, monkeypatch):
     monkeypatch.setattr(module,"inspect_video_timeline",
                         lambda _:VideoTimeline(240,25,25,1,1920,1080,10.0))
     module.prepare_text_partition_v19(config_for(cases,clips),0,lambda path:FakeWriter(path))
-    assert FRAMES == [40,40]  # Call 1 and Call 2 use exactly the same budget
+    assert FRAMES == [80,80]  # Call 1 and Call 2 use exactly the same 8fps budget
     prepared = read_json((tmp_path/"case0")/"preparation"/"prepared.json")
-    assert prepared["prompt_writer_num_frames"] == 40
-    assert prepared["prompt_writer_video_fps"] == 4.0
+    assert prepared["prompt_writer_num_frames"] == 80
+    assert prepared["prompt_writer_video_fps"] == 8.0
