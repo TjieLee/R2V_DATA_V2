@@ -361,11 +361,18 @@ prevalidated path.
 
 Integrity checks that remain in the hot path are intentionally local:
 
-- pending T2VA/TA2VA work verifies the media actually used by that sample;
+- each pending full-production T2VA sample validates its target video and four
+  Audio inputs once before use; the backend/stage do not repeat the same hashes
+  before and after the request;
+- TA2VA does not repeat a whole-media start/end _verify pass in full production;
+  the full-audio/stem readers still validate the exact media they actually read;
 - published stage artifacts retain their recorded file hashes;
 - resume performs one authoritative artifact recovery/hash validation, not a
   duplicate preflight hash pass;
 - source/config/inventory fingerprints remain part of durable identity.
+
+Standalone/frozen paths keep their original stronger repeated verification by
+default. The reduced checks apply only to the full-production prevalidated path.
 
 The full downstream supervisor prints:
 
