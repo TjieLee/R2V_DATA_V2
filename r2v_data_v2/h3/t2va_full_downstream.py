@@ -43,6 +43,7 @@ class _Processor(production.FrozenProductionProcessor):
         }
         self.dependencies = {}
         checked, loaded, diarization = set(), {}, {}
+        segment_keys_by_shadow = {}
         for uid, (job, inventory) in contexts.items():
             if inventory.inventory_fingerprint not in checked:
                 frozen._check_sources(inventory)
@@ -83,8 +84,21 @@ class _Processor(production.FrozenProductionProcessor):
                 != auk_records[uid].record_fingerprint
             ):
                 raise ValueError("resolved per-clip dependency differs")
-            raw_keys = sorted(key for key in raw if key[0] == uid)
-            if raw_keys != sorted(key for key in asr if key[0] == uid):
+            if shadow not in segment_keys_by_shadow:
+                raw_keys_by_uid = {}
+                asr_keys_by_uid = {}
+                for key in raw:
+                    raw_keys_by_uid.setdefault(key[0], []).append(key)
+                for key in asr:
+                    asr_keys_by_uid.setdefault(key[0], []).append(key)
+                for keys in raw_keys_by_uid.values():
+                    keys.sort()
+                for keys in asr_keys_by_uid.values():
+                    keys.sort()
+                segment_keys_by_shadow[shadow] = (raw_keys_by_uid, asr_keys_by_uid)
+            raw_keys_by_uid, asr_keys_by_uid = segment_keys_by_shadow[shadow]
+            raw_keys = raw_keys_by_uid.get(uid, [])
+            if raw_keys != asr_keys_by_uid.get(uid, []):
                 raise ValueError("per-clip raw/ASR keys differ")
             # Full production already carries immutable upstream hashes in the
             # canonical/resolved records. Actual pending T2VA/TA2VA work verifies
@@ -327,9 +341,11 @@ def run_downstream(
         f"contexts={len(contexts)}",
         flush=True,
     )
+    print(f"shard={shard_id} downstream_processor_start", flush=True)
     processor = _Processor(
         contexts, backend, profiles, index, allow_unverified=allow_unverified
     )
+    print(f"shard={shard_id} downstream_processor_ready", flush=True)
     shard = root / "shards" / production.shard_name(shard_id)
     print(f"shard={shard_id} downstream_preflight_start", flush=True)
     with production.file_lock(shard / "shard.lock"):
