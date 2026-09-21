@@ -26,12 +26,14 @@ import hashlib
 import json
 import subprocess
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
 from PIL import Image
 
 from r2v_data_v2.v3.post_mask_epoch_jobs import (
+    JOB_SCHEMA_VERSION,
     OUTCOME_COMPLETED,
     OUTCOME_RETRYABLE_FAILED,
     RESOURCE_BOOGU,
@@ -44,6 +46,7 @@ from r2v_data_v2.v3.post_mask_epoch_jobs import (
 from r2v_data_v2.v3.post_mask_epoch_state import GroupLedger
 from r2v_data_v2.v3.reference_edit import (
     _alternate_completion_source,
+    _disabled_entity_background_variant,
     _instruction,
     _instruction_rewrite_enabled,
     _operations,
@@ -52,6 +55,8 @@ from r2v_data_v2.v3.reference_edit import (
     _route,
     _source_gate_reason,
     _tokens_for_retained,
+    _variant,
+    _variant_state,
     _write_source_selection_metadata,
 )
 from r2v_data_v2.v3.reference_edit_boogu import (
@@ -100,6 +105,60 @@ LEGACY_MODEL_EXCEPTIONS = (
 
 class ReferenceEditEpochError(RuntimeError):
     """Raised when durable Reference Edit state cannot be trusted."""
+
+
+class ReferenceEditDurableError(ReferenceEditEpochError):
+    """Durable corruption/drift: never semantic-failed, always fail closed."""
+
+
+class _JobIdRef:
+    """Minimal job reference: the GroupLedger index only needs ``job_id()``."""
+
+    __slots__ = ("_job_id",)
+
+    def __init__(self, job_id: str) -> None:
+        self._job_id = job_id
+
+    def job_id(self) -> str:
+        return self._job_id
+
+
+@dataclass(frozen=True)
+class ResolvedReferenceEditJudge:
+    """A judge handle plus whether *this* call created it."""
+
+    judge: Any
+    owned: bool
+
+
+def resolve_reference_edit_judge(
+    handle: Any, config: Any
+) -> ResolvedReferenceEditJudge:
+    """Resolve the shared Qwen executor's handle into a review judge.
+
+    Production passes the shared vLLM endpoint string; the judge is then built
+    against that endpoint with the configured model and is owned (closed) by
+    the caller. An injected judge object is reused as-is and never closed.
+    """
+    from r2v_data_v2.v3.reference_edit_boogu import QwenBooguReferenceEditJudge
+
+    if handle is None:
+        raise ReferenceEditEpochError("qwen review epoch supplied no handle")
+    if isinstance(handle, str):
+        service = config.qwen.reference_edit_judge
+        if service is None:
+            raise ReferenceEditEpochError(
+                "no configured reference edit judge for the endpoint handle"
+            )
+        from dataclasses import replace as _replace
+
+        return ResolvedReferenceEditJudge(
+            QwenBooguReferenceEditJudge(
+                _replace(service, base_url=handle)
+            ),
+            owned=True,
+        )
+    return ResolvedReferenceEditJudge(handle, owned=False)
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:
@@ -253,54 +312,13 @@ class ReferenceEditEpochRunner:
             "crop_padding_ratio": self.config.pair.crop_padding_ratio,
         }
 
-    def _plan(self, shard: str) -> dict[str, Any]:
-        existing = _read_json(self._plan_path(shard))
-        if existing is not None:
-            expected = {
-                "schema": REFERENCE_EDIT_PLAN_SCHEMA,
-                "canonical_shard": shard,
-                "eligible_clip_uids": list(self.eligible.get(shard, ())),
-                "policy": self._policy_identity(),
-            }
-            for key, value in expected.items():
-                if existing.get(key) != value:
-                    raise ReferenceEditEpochError(
-                        f"frozen Reference Edit plan {key} drifted for {shard!r}"
-                    )
-            storage = self._storage_for(shard)
-            for clip_uid, entry in existing.get("clips", {}).items():
-                actual = self._clip_digest(storage, storage.read_clip(clip_uid))
-                if actual != entry.get("digest"):
-                    raise ReferenceEditEpochError(
-                        f"frozen Reference Edit input drifted for {clip_uid!r}"
-                    )
-            return existing
-
-        storage = self._storage_for(shard)
-        clips: dict[str, dict[str, Any]] = {}
-        for clip_uid in self.eligible.get(shard, ()):
-            clip = storage.read_clip(clip_uid)
-            clips[clip_uid] = {
-                "classification": self._clip_classification(clip),
-                "digest": self._clip_digest(storage, clip),
-                "chain_entity_ids": (
-                    list(self._chain_entity_ids(clip))
-                    if self._clip_classification(clip) == CLIP_FRESH_TARGET
-                    else []
-                ),
-            }
-        payload = {
-            "schema": REFERENCE_EDIT_PLAN_SCHEMA,
-            "canonical_shard": shard,
-            "eligible_clip_uids": list(self.eligible.get(shard, ())),
-            "policy": self._policy_identity(),
-            "clips": clips,
-        }
-        _write_json_once(self._plan_path(shard), payload)
-        return payload
-
     def _clip_digest(self, storage: RunStorage, clip: Any) -> str:
-        """Digest of every pre-Reference-Edit input the stage depends on."""
+        """Digest of the publication-stable inputs (annotation/coverage/frames).
+
+        ``references`` and ``pairing`` are deliberately excluded: a successful
+        completion publication legitimately rewrites them, so restart must not
+        compare them here (see ``_verify_plan_entry``).
+        """
         projection = {
             "annotation": (
                 clip.annotation.model_dump(mode="json")
@@ -312,12 +330,6 @@ class ReferenceEditEpochRunner:
                 if clip.coverage is not None
                 else None
             ),
-            "pairing": (
-                clip.pairing.model_dump(mode="json")
-                if clip.pairing is not None
-                else None
-            ),
-            "references": clip.references.model_dump(mode="json"),
             "sampled_frames": storage
             .read_frames(clip.clip_uid)
             .model_dump(mode="json"),
@@ -325,6 +337,95 @@ class ReferenceEditEpochRunner:
             "policy": self._policy_identity(),
         }
         return semantic_input_digest(projection)
+
+    def _plan_entry(self, storage: RunStorage, clip: Any) -> dict[str, Any]:
+        classification = self._clip_classification(clip)
+        return {
+            "classification": classification,
+            "digest": self._clip_digest(storage, clip),
+            "chain_entity_ids": (
+                list(self._chain_entity_ids(clip))
+                if classification == CLIP_FRESH_TARGET
+                else []
+            ),
+            "pre_pairing": (
+                clip.pairing.model_dump(mode="json")
+                if clip.pairing is not None
+                else None
+            ),
+            "pre_references": clip.references.model_dump(mode="json"),
+        }
+
+    def _verify_plan_entry(
+        self, shard: str, storage: RunStorage, clip_uid: str, entry: dict[str, Any]
+    ) -> None:
+        """Validate one frozen plan entry against the live clip.
+
+        A clip that already published its Reference Edit result is verified
+        against its durable outcome instead of the pre-edit baseline: the
+        publication legitimately rewrites ``references``/``pairing``.
+        """
+        clip = storage.read_clip(clip_uid)
+        actual = self._clip_digest(storage, clip)
+        if actual != entry.get("digest"):
+            raise ReferenceEditDurableError(
+                f"frozen Reference Edit input drifted for {clip_uid!r}"
+            )
+        if entry.get("classification") != CLIP_FRESH_TARGET:
+            return
+        if clip.reference_edit is not None:
+            # Published: the durable outcome marker is the authority.
+            if self._clip_outcome_path(shard, clip_uid).is_file():
+                return
+            raise ReferenceEditDurableError(
+                f"clip {clip_uid!r} published Reference Edit state without a "
+                "durable outcome marker"
+            )
+        pre_pairing = (
+            clip.pairing.model_dump(mode="json") if clip.pairing is not None else None
+        )
+        if pre_pairing != entry.get("pre_pairing"):
+            raise ReferenceEditDurableError(
+                f"frozen Reference Edit pairing drifted for {clip_uid!r}"
+            )
+        if clip.references.model_dump(mode="json") != entry.get("pre_references"):
+            raise ReferenceEditDurableError(
+                f"frozen Reference Edit references drifted for {clip_uid!r}"
+            )
+
+    def _plan(self, shard: str) -> dict[str, Any]:
+        existing = _read_json(self._plan_path(shard))
+        if existing is not None:
+            expected = {
+                "schema": REFERENCE_EDIT_PLAN_SCHEMA,
+                "canonical_shard": shard,
+                "eligible_clip_uids": list(self.eligible.get(shard, ())),
+                "policy": self._policy_identity(),
+            }
+            for key, value in expected.items():
+                if existing.get(key) != value:
+                    raise ReferenceEditDurableError(
+                        f"frozen Reference Edit plan {key} drifted for {shard!r}"
+                    )
+            storage = self._storage_for(shard)
+            for clip_uid, entry in existing.get("clips", {}).items():
+                self._verify_plan_entry(shard, storage, clip_uid, entry)
+            return existing
+
+        storage = self._storage_for(shard)
+        clips: dict[str, dict[str, Any]] = {}
+        for clip_uid in self.eligible.get(shard, ()):
+            clip = storage.read_clip(clip_uid)
+            clips[clip_uid] = self._plan_entry(storage, clip)
+        payload = {
+            "schema": REFERENCE_EDIT_PLAN_SCHEMA,
+            "canonical_shard": shard,
+            "eligible_clip_uids": list(self.eligible.get(shard, ())),
+            "policy": self._policy_identity(),
+            "clips": clips,
+        }
+        _write_json_once(self._plan_path(shard), payload)
+        return payload
 
     def _existing_plan_for_reconcile(self, shard: str) -> dict[str, Any]:
         payload = _read_json(self._plan_path(shard))
@@ -340,12 +441,13 @@ class ReferenceEditEpochRunner:
         }
         for key, value in expected.items():
             if payload.get(key) != value:
-                raise ReferenceEditEpochError(
+                raise ReferenceEditDurableError(
                     f"frozen Reference Edit plan {key} drifted for {shard!r}"
                 )
+        storage = self._storage_for(shard)
+        for clip_uid, entry in payload.get("clips", {}).items():
+            self._verify_plan_entry(shard, storage, clip_uid, entry)
         return payload
-
-    # -- durable seed plan ---------------------------------------------------
 
     def _entity_anchor(
         self,
@@ -360,8 +462,15 @@ class ReferenceEditEpochRunner:
         canonical_sha256 = _sha256_bytes(
             _resolve_artifact(storage, reference.image_path).read_bytes()
         )
+        from dataclasses import asdict
+
         geometry_sha256 = _sha256_bytes(
-            _reference_content_geometry(storage, reference).model_dump_json().encode()
+            json.dumps(
+                asdict(
+                    _reference_content_geometry(storage, reference)
+                ),
+                sort_keys=True,
+            ).encode()
         )
         source_sha256 = canonical_sha256
         comparison_sha256 = None
@@ -373,7 +482,13 @@ class ReferenceEditEpochRunner:
             source_candidate_id = alternate.candidate.candidate_id
             source_frame_index = alternate.candidate.source_frame_index
         instruction = _instruction("complete_entity", entity)
-        width, height = self._resolved_size(source_sha256, storage, reference)
+        if alternate is not None:
+            with Image.open(alternate.image_path) as opened:
+                opened.load()
+                source_rgba = opened.convert("RGBA")
+            width, height = self._resolved_size_rgba(source_rgba)
+        else:
+            width, height = self._resolved_size(storage, reference)
         return {
             "clip_uid": clip_uid,
             "entity_id": entity.entity_id,
@@ -404,14 +519,15 @@ class ReferenceEditEpochRunner:
             "boogu_model_path": str(self.config.reference_edit.model_path),
         }
 
-    def _resolved_size(
-        self, _source_sha256: str, storage: RunStorage, reference: Any
-    ) -> tuple[int, int]:
-        from r2v_data_v2.v3.reference_edit_boogu import resolve_boogu_1k_size
-
+    def _resolved_size(self, storage: RunStorage, reference: Any) -> tuple[int, int]:
         with Image.open(_resolve_artifact(storage, reference.image_path)) as opened:
             opened.load()
             rgba = opened.convert("RGBA")
+        return self._resolved_size_rgba(rgba)
+
+    def _resolved_size_rgba(self, rgba: Image.Image) -> tuple[int, int]:
+        from r2v_data_v2.v3.reference_edit_boogu import resolve_boogu_1k_size
+
         return resolve_boogu_1k_size(
             rgba.width,
             rgba.height,
@@ -522,6 +638,7 @@ class ReferenceEditEpochRunner:
         attempt_index: int,
         *,
         alternate_image_path: Path | None,
+        alternate: Any = None,
     ) -> Any:
         comparison: Path | None = None
         source_path: Path | None = None
@@ -563,9 +680,15 @@ class ReferenceEditEpochRunner:
             comparison_source_image_path=comparison,
             completion_attempt_index=attempt_index,
             completion_source_candidate_id=(
-                "canonical_reference" if attempt_index == 1 else "candidate_1"
+                "canonical_reference"
+                if attempt_index == 1 or alternate is None
+                else alternate.candidate.candidate_id
             ),
-            completion_source_frame_index=reference.source_frame_index,
+            completion_source_frame_index=(
+                reference.source_frame_index
+                if attempt_index == 1 or alternate is None
+                else alternate.candidate.source_frame_index
+            ),
             publish_final=False,
             resume_existing_outputs=True,
         )
@@ -639,54 +762,138 @@ class ReferenceEditEpochRunner:
             },
         )
 
-    def _phase_for(self, job_id: str) -> str:
-        class _Ref:
-            def __init__(self, value: str) -> None:
-                self._value = value
+    def _plan_record_index(self) -> dict[str, dict[str, Any]]:
+        """Every planned Reference Edit job record of this group, by job_id."""
+        seen: dict[str, dict[str, Any]] = {}
+        for phase_id in self.ledger.phase_ids():
+            phase = self.ledger.phase(phase_id)
+            if not phase.plan_path.is_file():
+                continue
+            try:
+                records = phase.read_plan()
+            except Exception as exc:  # corruption is never empty
+                raise ReferenceEditDurableError(
+                    f"invalid Reference Edit phase plan in {phase_id}"
+                ) from exc
+            for record in records:
+                if record.get("job_type") not in (
+                    REFERENCE_EDIT_BOOGU_GENERATE_JOB,
+                    REFERENCE_EDIT_QWEN_REVIEW_JOB,
+                    REFERENCE_EDIT_SAM_REVIEW_JOB,
+                ):
+                    continue
+                job_id = record.get("job_id")
+                if not isinstance(job_id, str) or not job_id:
+                    continue
+                previous = seen.get(job_id)
+                if previous is not None and previous != record:
+                    raise ReferenceEditDurableError(
+                        f"Reference Edit job {job_id} has drifting plan records"
+                    )
+                seen.setdefault(job_id, record)
+        return seen
 
-            def job_id(self) -> str:
-                return self._value
+    def _job_from_plan_record(self, record: Mapping[str, Any]) -> ModelJob:
+        """Rebuild the ModelJob its immutable plan record describes."""
+        job = ModelJob(
+            job_type=str(record["job_type"]),
+            resource=str(record["resource"]),
+            canonical_shard=str(record["canonical_shard"]),
+            clip_uid=str(record["clip_uid"]),
+            input_digest=str(record["input_digest"]),
+            model_identity=str(record["model_identity"]),
+            target=tuple(
+                (str(key), str(value))
+                for key, value in (record.get("target") or [])
+            ),
+            attempt_index=int(record.get("attempt_index", 0)),
+            seed=record.get("seed"),
+            dependency_digests=tuple(
+                (str(key), str(value))
+                for key, value in (record.get("dependency_digests") or [])
+            ),
+            schema_version=str(record.get("schema_version", JOB_SCHEMA_VERSION)),
+        )
+        if job.job_id() != str(record.get("job_id", "")) or job.identity() != str(
+            record.get("job_identity", "")
+        ):
+            raise ReferenceEditDurableError(
+                "Reference Edit plan record does not rebuild: "
+                f"{record.get('job_id', '')}"
+            )
+        return job
 
-        phase_id = self.ledger.phase_for(_Ref(job_id))
-        if phase_id is None:
+    def _planned_record(self, job_id: str) -> dict[str, Any]:
+        record = self._plan_record_index().get(job_id)
+        if record is None:
+            raise ReferenceEditDurableError(
+                f"Reference Edit job {job_id} is not in any durable plan"
+            )
+        return record
+
+    def _validated_committed(
+        self, job_id: str
+    ) -> tuple[ModelJob, Any, dict[str, Any]]:
+        """Receipt-validated committed job: (job, result, payload).
+
+        ``ledger.classify`` re-validates the receipt identity, artifact
+        digests, result digest and outcome before anything is trusted.
+        """
+        from r2v_data_v2.v3.post_mask_epoch_state import STATE_MISMATCH
+
+        job = self._job_from_plan_record(self._planned_record(job_id))
+        state = self.ledger.classify(job)
+        if state.state == STATE_MISMATCH:
+            raise ReferenceEditDurableError(
+                f"Reference Edit job {job_id} receipt mismatch: "
+                f"{state.detail or ''}"
+            )
+        if not state.skippable:
             raise ReferenceEditEpochError(
-                f"pair-style dependency {job_id} has no committed phase"
+                f"Reference Edit job {job_id} is not terminal; the stage is "
+                "incomplete"
+            )
+        result = self.ledger.load_committed_result(job)
+        if result is None:
+            raise ReferenceEditDurableError(
+                f"committed Reference Edit job {job_id} has no replayable result"
+            )
+        return job, result, dict(result.payload)
+
+    def _phase_for(self, job_id: str) -> str:
+        phase_id = self.ledger.phase_for(_JobIdRef(job_id))
+        if phase_id is None:
+            raise ReferenceEditDurableError(
+                f"Reference Edit job {job_id} has no committed phase"
             )
         return phase_id
-
-    def _committed_result(self, job_id: str) -> Any:
-        from r2v_data_v2.v3.post_mask_epoch_jobs import JobResult as _JobResult
-
-        phase_id = self._phase_for(job_id)
-        path = self.ledger.phase(phase_id).artifact_path(job_id, "result.json")
-        if not path.is_file():
-            raise ReferenceEditEpochError(
-                f"committed job {job_id} has no durable result"
-            )
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        return _JobResult.from_durable(payload)
 
     def _committed_artifact(self, job_id: str, name: str) -> bytes:
         phase_id = self._phase_for(job_id)
         path = self.ledger.phase(phase_id).artifact_path(job_id, name)
         if not path.is_file():
-            raise ReferenceEditEpochError(
+            raise ReferenceEditDurableError(
                 f"committed job {job_id} has no artifact {name!r}"
             )
         return path.read_bytes()
 
-    def _validated_candidate(
+    def _committed_candidate_bytes(
         self, generation_job_id: str, expected_sha256: str
     ) -> bytes:
-        payload = self._committed_result(generation_job_id).payload
-        candidate = self._committed_artifact(generation_job_id, "candidate.png")
-        digest = _sha256_bytes(candidate)
+        """Receipt-validated candidate bytes for one committed generation."""
+        _generation_job, _result, payload = self._validated_committed(
+            generation_job_id
+        )
         if payload.get("status") != "generated":
-            raise ReferenceEditEpochError(
+            raise ReferenceEditDurableError(
                 f"generation {generation_job_id} did not commit a candidate"
             )
-        if digest != expected_sha256 or digest != payload.get("candidate_sha256"):
-            raise ReferenceEditEpochError(
+        candidate = self._committed_artifact(generation_job_id, "candidate.png")
+        digest = _sha256_bytes(candidate)
+        if digest != expected_sha256 or digest != str(
+            payload.get("candidate_sha256", "")
+        ):
+            raise ReferenceEditDurableError(
                 f"committed candidate artifact drifted for {generation_job_id}"
             )
         return candidate
@@ -918,31 +1125,46 @@ class ReferenceEditEpochRunner:
         )
         return shard, clip_uid, storage, entity, reference, attempt_index
 
-    def _rebuild_prepared(self, job: ModelJob, attempt_index: int) -> Any:
-        """Re-derive the frozen attempt anchor, then prepare with resume policy."""
+    def _rebuild_anchor(self, job: ModelJob, attempt_index: int) -> dict[str, Any]:
+        """Re-derive the attempt anchor from durable plans. Drift fails closed."""
         shard, clip_uid, storage, entity, reference, _ = self._attempt_context(job)
-        stored_anchor = dict(job.semantic_inputs["anchor"])
         alternate = None
         if attempt_index == 2:
             alternate = self.durable_alternate(
                 shard, storage, clip_uid, entity, reference
             )
             if alternate is None:
-                raise ReferenceEditEpochError(
+                raise ReferenceEditDurableError(
                     f"attempt 2 planned without a frozen alternate: "
                     f"{clip_uid}/{entity.entity_id}"
                 )
-        current = self._entity_anchor(
-            storage,
-            clip_uid,
-            entity,
-            reference,
-            attempt_index,
-            alternate=alternate,
+        return self._entity_anchor(
+            storage, clip_uid, entity, reference, attempt_index, alternate=alternate
         )
-        if semantic_input_digest(current) != semantic_input_digest(stored_anchor):
-            raise ReferenceEditEpochError(
-                f"generation anchor drifted for {clip_uid}/{entity.entity_id}"
+
+    def _rebuild_prepared(self, job: ModelJob, attempt_index: int) -> Any:
+        """CPU replay prepare.
+
+        The anchor is re-derived from durable state and validated against the
+        durable seed plan's own anchor digest (the job's ``input_digest``
+        belongs to this job's *own* semantic identity: generation binds
+        anchor+seed, reviews bind the review identity). Drift fails closed.
+        """
+        anchor = self._rebuild_anchor(job, attempt_index)
+        # durable_seed validates the frozen anchor digest (fail closed on
+        # drift); the seed value itself is only needed by the generation job.
+        self.durable_seed(
+            job.canonical_shard,
+            job.clip_uid,
+            dict(job.target)["entity_id"],
+            anchor,
+            attempt_index,
+        )
+        shard, clip_uid, storage, entity, reference, _ = self._attempt_context(job)
+        alternate = None
+        if attempt_index == 2:
+            alternate = self.durable_alternate(
+                shard, storage, clip_uid, entity, reference
             )
         return self._prepare_attempt(
             shard,
@@ -953,42 +1175,50 @@ class ReferenceEditEpochRunner:
             alternate_image_path=(
                 alternate.image_path if alternate is not None else None
             ),
+            alternate=alternate,
         )
 
     def _run_generation(self, job: ModelJob, handle: Any) -> JobResult:
-        shard = job.canonical_shard
-        clip_uid = job.clip_uid
-        storage = self._storage_for(shard)
-        clip = self._clip(storage, clip_uid)
-        target = dict(job.target)
-        entity_id = str(target["entity_id"])
-        attempt_index = int(target["attempt_index"])
-        entity = next(
-            item for item in clip.annotation.entities if item.entity_id == entity_id
+        """Rebuild anchor+seed from durable state and compare input digest."""
+        shard, clip_uid, storage, entity, reference, attempt_index = (
+            self._attempt_context(job)
         )
-        reference = next(
-            item for item in clip.references.entities if item.entity_id == entity_id
-        )
-        anchor = dict(job.semantic_inputs["anchor"])
-        seed = int(job.semantic_inputs["seed"])
         alternate = None
         if attempt_index == 2:
             alternate = self.durable_alternate(
                 shard, storage, clip_uid, entity, reference
             )
-        current = self._entity_anchor(
+        anchor = self._entity_anchor(
             storage, clip_uid, entity, reference, attempt_index, alternate=alternate
         )
-        if semantic_input_digest({**current, "seed": seed}) != semantic_input_digest(
-            {**anchor, "seed": seed}
+        seed_path = self._seed_path(shard, clip_uid, entity.entity_id, attempt_index)
+        existing_seed = _read_json(seed_path)
+        if existing_seed is None:
+            return JobResult(
+                OUTCOME_RETRYABLE_FAILED,
+                detail="Reference Edit generation has no durable seed plan yet",
+            )
+        if existing_seed.get("anchor_digest") != semantic_input_digest(
+            dict(anchor)
         ):
             return JobResult(
                 OUTCOME_RETRYABLE_FAILED,
                 detail="Reference Edit generation anchor drifted",
             )
+        seed = int(existing_seed["seed"])
+        inputs = {
+            "anchor": dict(anchor),
+            "seed": seed,
+            "attempt_index": attempt_index,
+        }
+        if semantic_input_digest(inputs) != job.input_digest:
+            return JobResult(
+                OUTCOME_RETRYABLE_FAILED,
+                detail="Reference Edit generation semantic identity drifted",
+            )
         prepared = self._prepare_attempt(
             shard,
-            job.clip_uid,
+            clip_uid,
             entity,
             reference,
             attempt_index,
@@ -1025,23 +1255,61 @@ class ReferenceEditEpochRunner:
             },
         )
 
+    def _review_identity(
+        self, job: ModelJob
+    ) -> tuple[str, str, dict[str, Any]]:
+        """(generation_job_id, candidate_sha256, rebuilt semantic inputs)."""
+        generation_job_id = str(dict(job.dependency_digests)["generation"])
+        _gen_job, _result, generation_payload = self._validated_committed(
+            generation_job_id
+        )
+        candidate_sha256 = str(generation_payload.get("candidate_sha256", ""))
+        target = dict(job.target)
+        attempt_index = int(target["attempt_index"])
+        clip = self._clip(self._storage_for(job.canonical_shard), job.clip_uid)
+        entity = next(
+            item
+            for item in clip.annotation.entities
+            if item.entity_id == str(target["entity_id"])
+        )
+        inputs = {
+            "entity_id": entity.entity_id,
+            "entity_phrase": entity.phrase,
+            "reference_type": entity.reference_type,
+            "operation": "complete_entity",
+            "attempt_index": attempt_index,
+            "generation_job_id": generation_job_id,
+            "candidate_sha256": candidate_sha256,
+            "model_identity": job.model_identity,
+        }
+        del clip
+        return generation_job_id, candidate_sha256, inputs
+
     def _run_qwen(self, job: ModelJob, handle: Any) -> JobResult:
-        generation_job_id = str(job.semantic_inputs["generation_job_id"])
-        candidate_sha256 = str(job.semantic_inputs["candidate_sha256"])
+        generation_job_id, candidate_sha256, inputs = self._review_identity(job)
+        if semantic_input_digest(inputs) != job.input_digest:
+            return JobResult(
+                OUTCOME_RETRYABLE_FAILED,
+                detail="Reference Edit qwen review semantic identity drifted",
+            )
+        candidate_bytes = self._committed_candidate_bytes(
+            generation_job_id, candidate_sha256
+        )
+        prepared = self._rebuild_prepared(job, int(dict(job.target)["attempt_index"]))
+        generation = _reconstructed_generation(
+            self, generation_job_id, candidate_bytes, candidate_sha256
+        )
+        resolved = resolve_reference_edit_judge(handle, self.config)
         try:
-            candidate_bytes = self._validated_candidate(
-                generation_job_id, candidate_sha256
-            )
-            prepared = self._rebuild_prepared(job, int(dict(job.target)["attempt_index"]))
-            generation = _reconstructed_generation(
-                self, generation_job_id, candidate_bytes, candidate_sha256
-            )
-            review = run_boogu_qwen_review(prepared, generation, handle)
+            review = run_boogu_qwen_review(prepared, generation, resolved.judge)
         except LEGACY_MODEL_EXCEPTIONS as exc:
             return JobResult(
                 OUTCOME_COMPLETED,
                 payload={"status": "qwen_failed", "error": str(exc)},
             )
+        finally:
+            if resolved.owned:
+                resolved.judge.close()
         return JobResult(
             OUTCOME_COMPLETED,
             payload={
@@ -1053,35 +1321,39 @@ class ReferenceEditEpochRunner:
     def _run_sam(self, job: ModelJob, handle: Any) -> JobResult:
         from r2v_data_v2.v3.reference_edit_boogu import Sam3BooguReferenceReviewer
 
-        generation_job_id = str(job.semantic_inputs["generation_job_id"])
-        candidate_sha256 = str(job.semantic_inputs["candidate_sha256"])
+        generation_job_id, candidate_sha256, inputs = self._review_identity(job)
+        if semantic_input_digest(inputs) != job.input_digest:
+            return JobResult(
+                OUTCOME_RETRYABLE_FAILED,
+                detail="Reference Edit sam review semantic identity drifted",
+            )
+        candidate_bytes = self._committed_candidate_bytes(
+            generation_job_id, candidate_sha256
+        )
+        prepared = self._rebuild_prepared(job, int(dict(job.target)["attempt_index"]))
+        generation = _reconstructed_generation(
+            self, generation_job_id, candidate_bytes, candidate_sha256
+        )
+        segmenter = handle
+        reviewer = Sam3BooguReferenceReviewer(
+            segmenter,
+            temporary_root=self._storage_for(
+                job.canonical_shard
+            ).reference_edit_temporary_dir(),
+            max_area_growth_ratio=(
+                self.config.reference_edit.sam_max_area_growth_ratio
+            ),
+            max_significant_components=(
+                self.config.reference_edit.sam_max_significant_components
+            ),
+            min_candidate_scale_ratio=(
+                self.config.reference_edit.min_candidate_scale_ratio
+            ),
+            max_candidate_center_shift=(
+                self.config.reference_edit.max_candidate_center_shift
+            ),
+        )
         try:
-            candidate_bytes = self._validated_candidate(
-                generation_job_id, candidate_sha256
-            )
-            prepared = self._rebuild_prepared(job, int(dict(job.target)["attempt_index"]))
-            generation = _reconstructed_generation(
-                self, generation_job_id, candidate_bytes, candidate_sha256
-            )
-            segmenter = handle
-            reviewer = Sam3BooguReferenceReviewer(
-                segmenter,
-                temporary_root=self._storage_for(
-                    job.canonical_shard
-                ).reference_edit_temporary_dir(),
-                max_area_growth_ratio=(
-                    self.config.reference_edit.sam_max_area_growth_ratio
-                ),
-                max_significant_components=(
-                    self.config.reference_edit.sam_max_significant_components
-                ),
-                min_candidate_scale_ratio=(
-                    self.config.reference_edit.min_candidate_scale_ratio
-                ),
-                max_candidate_center_shift=(
-                    self.config.reference_edit.max_candidate_center_shift
-                ),
-            )
             review = run_boogu_sam_review(prepared, generation, reviewer)
         except LEGACY_MODEL_EXCEPTIONS as exc:
             return JobResult(
@@ -1099,8 +1371,7 @@ class ReferenceEditEpochRunner:
         if job.job_type == REFERENCE_EDIT_QWEN_REVIEW_JOB:
             return self._finalize_qwen(job, result)
         if job.job_type == REFERENCE_EDIT_SAM_REVIEW_JOB:
-            self._finalize_attempt(job)
-            return ()
+            return self._finalize_sam(job)
         raise ReferenceEditEpochError(f"unsupported job type {job.job_type!r}")
 
     def _finalize_generation(
@@ -1111,8 +1382,10 @@ class ReferenceEditEpochRunner:
             self._generation_context(job)
         )
         judge = self.config.qwen.reference_edit_judge
-        assert judge is not None
+        if judge is None:
+            raise ReferenceEditEpochError("reference edit judge is not configured")
         if payload.get("status") == "generated":
+            candidate_sha256 = str(payload["candidate_sha256"])
             qwen_job = self._review_job(
                 shard,
                 job.clip_uid,
@@ -1122,7 +1395,7 @@ class ReferenceEditEpochRunner:
                 resource=RESOURCE_QWEN,
                 model_identity=f"qwen:{judge.model}",
                 generation_job_id=job.job_id(),
-                candidate_sha256=str(payload["candidate_sha256"]),
+                candidate_sha256=candidate_sha256,
             )
             unlocked: list[ModelJob] = [qwen_job]
             if self.review_execution == "parallel_independent":
@@ -1136,12 +1409,16 @@ class ReferenceEditEpochRunner:
                         resource=RESOURCE_SAM,
                         model_identity="sam3",
                         generation_job_id=job.job_id(),
-                        candidate_sha256=str(payload["candidate_sha256"]),
+                        candidate_sha256=candidate_sha256,
                     )
                 )
             return unlocked
         # generation_failed: legacy semantic rejection; no reviews are paid.
-        return self._complete_attempt_after_generation_failure(job, payload)
+        return self._complete_attempt(
+            job,
+            generation_job_id=job.job_id(),
+            failure_kind="generation_failed",
+        )
 
     def _generation_context(
         self, job: ModelJob
@@ -1166,71 +1443,235 @@ class ReferenceEditEpochRunner:
         payload = dict(result.payload)
         if payload.get("status") == "review":
             if self.review_execution == "parallel_independent":
-                # The SAM job was unlocked with the Qwen job at generation time.
-                return ()
+                # The SAM job was unlocked with the Qwen job at generation
+                # time; whichever review terminal arrives second finalizes.
+                return self._maybe_finalize_attempt(job)
             attempt_index = int(dict(job.target)["attempt_index"])
+            generation_job_id = str(dict(job.dependency_digests)["generation"])
+            _gen_job, _result, gen_payload = self._validated_committed(
+                generation_job_id
+            )
             sam_job = self._review_job(
                 job.canonical_shard,
                 job.clip_uid,
-                self._entity_of(job),
+                self._chain_entity(job),
                 attempt_index,
                 job_type=REFERENCE_EDIT_SAM_REVIEW_JOB,
                 resource=RESOURCE_SAM,
                 model_identity="sam3",
-                generation_job_id=str(job.semantic_inputs["generation_job_id"]),
-                candidate_sha256=str(job.semantic_inputs["candidate_sha256"]),
+                generation_job_id=generation_job_id,
+                candidate_sha256=str(gen_payload.get("candidate_sha256", "")),
             )
             return [sam_job]
-        return self._complete_attempt_after_review_failure(job, payload)
+        if self.review_execution == "parallel_independent":
+            # A Qwen exception must not skip SAM: keep the failure durable and
+            # let the SAM finalizer complete the attempt with both payloads.
+            return self._maybe_finalize_attempt(job)
+        return self._complete_attempt(
+            job, generation_job_id=str(dict(job.dependency_digests)["generation"]),
+            failure_kind="qwen_failed",
+        )
+
+    def _finalize_sam(self, job: ModelJob) -> Sequence[ModelJob]:
+        if self.review_execution == "parallel_independent":
+            return self._maybe_finalize_attempt(job)
+        return self._complete_attempt(
+            job, generation_job_id=str(dict(job.dependency_digests)["generation"]),
+            failure_kind="none",
+        )
+
+    def _chain_entity(self, job: ModelJob) -> Any:
+        _shard, _clip_uid, storage, _clip = (
+            job.canonical_shard,
+            job.clip_uid,
+            self._storage_for(job.canonical_shard),
+            self._clip(self._storage_for(job.canonical_shard), job.clip_uid),
+        )
+        target = dict(job.target)
+        return next(
+            item
+            for item in self._clip(storage, job.clip_uid).annotation.entities
+            if item.entity_id == str(target["entity_id"])
+        )
 
     # -- attempt completion -----------------------------------------------------
 
-    def _attempt_finalize(
+    def _attempt_finalized_marker(self, generation_job_id: str) -> Path:
+        return self._semantic(
+            "accounted", "attempt_finalized", f"{generation_job_id}.json"
+        )
+
+    def _attempt_outcome_path(
+        self, shard: str, clip_uid: str, entity_id: str, attempt_index: int
+    ) -> Path:
+        return self._semantic(
+            "attempt_outcomes",
+            shard,
+            clip_uid,
+            entity_id,
+            f"attempt-{attempt_index}.json",
+        )
+
+    def _review_job_for(
+        self, generation_job_id: str, job_type: str
+    ) -> ModelJob | None:
+        for record in self._plan_record_index().values():
+            if record.get("job_type") != job_type:
+                continue
+            dependencies = {
+                str(key): str(value)
+                for key, value in (record.get("dependency_digests") or [])
+            }
+            if dependencies.get("generation") == generation_job_id:
+                return self._job_from_plan_record(record)
+        return None
+
+    def _maybe_finalize_attempt(self, job: ModelJob) -> Sequence[ModelJob]:
+        """parallel_independent: finalize once BOTH reviews are terminal."""
+        generation_job_id = str(dict(job.dependency_digests)["generation"])
+        qwen_job = self._review_job_for(
+            generation_job_id, REFERENCE_EDIT_QWEN_REVIEW_JOB
+        )
+        sam_job = self._review_job_for(
+            generation_job_id, REFERENCE_EDIT_SAM_REVIEW_JOB
+        )
+        if qwen_job is None or sam_job is None:
+            raise ReferenceEditDurableError(
+                f"attempt {generation_job_id} is missing a planned review job"
+            )
+        qwen_state = self.ledger.classify(qwen_job)
+        sam_state = self.ledger.classify(sam_job)
+        if not qwen_state.skippable or not sam_state.skippable:
+            # The sibling review is still outstanding; it finalizes the attempt.
+            return ()
+        marker = self._attempt_finalized_marker(generation_job_id)
+        if marker.is_file():
+            return ()
+        _write_json_once(
+            marker,
+            {
+                "generation_job_id": generation_job_id,
+                "finalized_by": job.job_id(),
+            },
+        )
+        return self._complete_attempt(
+            job,
+            generation_job_id=generation_job_id,
+            failure_kind="none",
+        )
+
+    def _complete_attempt(
         self,
         job: ModelJob,
         *,
-        qwen_payload: Mapping[str, Any] | None,
-        sam_payload: Mapping[str, Any] | None,
-    ) -> BooguReferenceEditResult:
-        generation_job_id = str(job.semantic_inputs["generation_job_id"])
-        candidate_sha256 = str(job.semantic_inputs["candidate_sha256"])
-        candidate_bytes = self._validated_candidate(
-            generation_job_id, candidate_sha256
+        generation_job_id: str,
+        failure_kind: str,
+    ) -> Sequence[ModelJob]:
+        """Run the attempt CPU finalizer, then continue the clip chain."""
+        generation_job, _result, generation_payload = self._validated_committed(
+            generation_job_id
         )
-        attempt_index = int(dict(job.target)["attempt_index"])
-        prepared = self._rebuild_prepared(job, attempt_index)
-        generation = _reconstructed_generation(
-            self, generation_job_id, candidate_bytes, candidate_sha256
+        qwen_payload: dict[str, Any] | None = None
+        sam_payload: dict[str, Any] | None = None
+        qwen_job = self._review_job_for(
+            generation_job_id, REFERENCE_EDIT_QWEN_REVIEW_JOB
         )
-        self._materialize_candidate(prepared.candidate_path, candidate_bytes)
-        qwen_review = None
-        qwen_override: str | None = None
-        if qwen_payload is not None and qwen_payload.get("status") == "review":
-            qwen_review = _deserialize_qwen_review(
-                job.canonical_shard, qwen_payload["qwen_review"]
+        if qwen_job is not None:
+            _job, _result, qwen_payload = self._validated_committed(qwen_job.job_id())
+        sam_job = self._review_job_for(
+            generation_job_id, REFERENCE_EDIT_SAM_REVIEW_JOB
+        )
+        if sam_job is not None:
+            _job, _result, sam_payload = self._validated_committed(sam_job.job_id())
+        shard, storage, entity, reference, attempt_index = (
+            self._generation_context(generation_job)
+        )
+        if str(generation_payload.get("status", "")) == "generation_failed":
+            attempt_result = self._attempt_failed_result(generation_job)
+            failure_kind = "generation_failed"
+        else:
+            candidate_sha256 = str(generation_payload.get("candidate_sha256", ""))
+            candidate_bytes = self._committed_candidate_bytes(
+                generation_job_id, candidate_sha256
             )
-        elif qwen_payload is not None:
-            qwen_override = f"boogu_reference_edit_failed: {qwen_payload.get('error')}"
-        sam_review = None
-        sam_override: str | None = None
-        if sam_payload is not None and sam_payload.get("status") == "review":
-            sam_review = BooguSamReview.model_validate(sam_payload["sam_review"])
-        elif sam_payload is not None:
-            sam_override = f"boogu_reference_edit_failed: {sam_payload.get('error')}"
-        override = qwen_override or sam_override
-        return finalize_boogu_reference_edit_attempt(
-            prepared,
-            generation,
-            qwen_review=qwen_review,
-            qwen_review_skipped_reason=None,
-            sam_review=sam_review,
-            rejection_reason_override=override,
+            prepared = self._rebuild_prepared(generation_job, attempt_index)
+            generation = _reconstructed_generation(
+                self, generation_job_id, candidate_bytes, candidate_sha256
+            )
+            self._materialize_candidate(prepared.candidate_path, candidate_bytes)
+            qwen_review = None
+            override: str | None = None
+            if qwen_payload is not None and qwen_payload.get("status") == "review":
+                qwen_review = _deserialize_qwen_review(
+                    shard, qwen_payload["qwen_review"]
+                )
+            elif qwen_payload is not None:
+                override = (
+                    f"boogu_reference_edit_failed: {qwen_payload.get('error')}"
+                )
+                failure_kind = "qwen_failed"
+            sam_review = None
+            if sam_payload is not None and sam_payload.get("status") == "review":
+                sam_review = BooguSamReview.model_validate(sam_payload["sam_review"])
+            elif sam_payload is not None:
+                override = (
+                    f"boogu_reference_edit_failed: {sam_payload.get('error')}"
+                )
+                failure_kind = "sam_failed"
+            attempt_result = finalize_boogu_reference_edit_attempt(
+                prepared,
+                generation,
+                qwen_review=qwen_review,
+                qwen_review_skipped_reason=None,
+                sam_review=sam_review,
+                rejection_reason_override=override,
+            )
+        self._write_attempt_outcome(
+            shard, job.clip_uid, entity.entity_id, attempt_index,
+            attempt_result, failure_kind,
+        )
+        return self._after_attempt(
+            generation_job,
+            shard,
+            storage,
+            entity,
+            reference,
+            attempt_index,
+            attempt_result,
+            failure_kind=failure_kind,
+            failure_reason=_rejection_reason_of(attempt_result),
+        )
+
+    def _write_attempt_outcome(
+        self,
+        shard: str,
+        clip_uid: str,
+        entity_id: str,
+        attempt_index: int,
+        attempt_result: BooguReferenceEditResult,
+        failure_kind: str,
+    ) -> None:
+        _write_json_once(
+            self._attempt_outcome_path(
+                shard, clip_uid, entity_id, attempt_index
+            ),
+            {
+                "schema": "post_mask_epoch_reference_edit_attempt_outcome/1",
+                "attempt_index": attempt_index,
+                "status": (
+                    "accepted"
+                    if attempt_result.status == "accepted"
+                    else failure_kind if failure_kind != "none" else "rejected"
+                ),
+                "accepted": attempt_result.status == "accepted",
+                "rejection_reason": _rejection_reason_of(attempt_result),
+            },
         )
 
     def _materialize_candidate(self, destination: Path, payload: bytes) -> None:
         if destination.is_file():
             if _sha256_bytes(destination.read_bytes()) != _sha256_bytes(payload):
-                raise ReferenceEditEpochError(
+                raise ReferenceEditDurableError(
                     f"production candidate drifted: {destination}"
                 )
             return
@@ -1242,14 +1683,13 @@ class ReferenceEditEpochRunner:
         finally:
             temporary.unlink(missing_ok=True)
 
-    def _attempt_failed_result(self, job: ModelJob) -> BooguReferenceEditResult:
+    def _attempt_failed_result(self, generation_job: ModelJob) -> BooguReferenceEditResult:
         """Re-run the attempt finalizer for a generation_failed attempt."""
-        payload = dict(self._committed_result(job.job_id()).payload)
-        shard, _storage, _entity, _reference, _attempt_index = (
-            self._generation_context(job)
+        _job, result, payload = self._validated_committed(generation_job.job_id())
+        del result
+        prepared = self._rebuild_prepared(
+            generation_job, int(dict(generation_job.target)["attempt_index"])
         )
-        del shard
-        prepared = self._rebuild_prepared(job, int(dict(job.target)["attempt_index"]))
         return finalize_boogu_reference_edit_attempt(
             prepared,
             None,
@@ -1260,98 +1700,6 @@ class ReferenceEditEpochRunner:
                 f"boogu_reference_edit_failed: {payload.get('error')}"
             ),
         )
-
-    def _complete_attempt_after_generation_failure(
-        self, job: ModelJob, payload: Mapping[str, Any]
-    ) -> Sequence[ModelJob]:
-        shard = job.canonical_shard
-        _shard, storage, entity, reference, attempt_index = (
-            self._generation_context(job)
-        )
-        attempt_result = self._attempt_failed_result(job)
-        return self._after_attempt(
-            job,
-            shard,
-            storage,
-            entity,
-            reference,
-            attempt_index,
-            attempt_result,
-            failure_reason=_rejection_reason_of(attempt_result),
-        )
-
-    def _complete_attempt_after_review_failure(
-        self, job: ModelJob, payload: Mapping[str, Any]
-    ) -> Sequence[ModelJob]:
-        shard = job.canonical_shard
-        _shard, storage, entity, reference, attempt_index = (
-            self._generation_context(job)
-        )
-        generation_job_id = str(job.semantic_inputs["generation_job_id"])
-        generation_job = self._generation_job_by_id(generation_job_id)
-        attempt_result = self._attempt_finalize(
-            generation_job,
-            qwen_payload=payload if job.job_type == REFERENCE_EDIT_QWEN_REVIEW_JOB else None,
-            sam_payload=payload if job.job_type == REFERENCE_EDIT_SAM_REVIEW_JOB else None,
-        )
-        return self._after_attempt(
-            generation_job,
-            shard,
-            storage,
-            entity,
-            reference,
-            attempt_index,
-            attempt_result,
-            failure_reason=_rejection_reason_of(attempt_result),
-        )
-
-    def _generation_job_by_id(self, job_id: str) -> ModelJob:
-        for record in self._planned_records():
-            if record.get("job_id") == job_id:
-                return self._job_from_plan_record(record)
-        raise ReferenceEditEpochError(
-            f"generation job {job_id} is not in any durable plan"
-        )
-
-    def _planned_records(self) -> list[dict[str, Any]]:
-        records: list[dict[str, Any]] = []
-        for phase_id in self.ledger.phase_ids():
-            phase = self.ledger.phase(phase_id)
-            if not phase.plan_path.is_file():
-                continue
-            try:
-                records.extend(phase.read_plan())
-            except Exception as exc:
-                raise ReferenceEditEpochError(
-                    f"invalid Reference Edit phase plan in {phase_id}"
-                ) from exc
-        return records
-
-    def _job_from_plan_record(self, record: Mapping[str, Any]) -> ModelJob:
-        job = ModelJob(
-            job_type=str(record["job_type"]),
-            resource=str(record["resource"]),
-            canonical_shard=str(record["canonical_shard"]),
-            clip_uid=str(record["clip_uid"]),
-            input_digest=str(record["input_digest"]),
-            model_identity=str(record["model_identity"]),
-            target=tuple(
-                (str(key), str(value))
-                for key, value in (record.get("target") or [])
-            ),
-            attempt_index=int(record.get("attempt_index", 0)),
-            seed=record.get("seed"),
-            dependency_digests=tuple(
-                (str(key), str(value))
-                for key, value in (record.get("dependency_digests") or [])
-            ),
-            schema_version=str(record.get("schema_version", "post_mask_epoch_job/1")),
-        )
-        if job.job_id() != str(record.get("job_id", "")):
-            raise ReferenceEditEpochError(
-                f"Reference Edit plan record does not rebuild: {record.get('job_id')}"
-            )
-        return job
 
     def _routing_delta(self, shard: str, clip_uid: str, entity_id: str) -> dict[str, int]:
         routing = _read_json(self._routing_path(shard, clip_uid, entity_id)) or {}
@@ -1370,6 +1718,7 @@ class ReferenceEditEpochRunner:
         attempt_index: int,
         attempt_result: BooguReferenceEditResult,
         *,
+        failure_kind: str,
         failure_reason: str,
     ) -> Sequence[ModelJob]:
         clip_uid = generation_job.clip_uid
@@ -1386,15 +1735,6 @@ class ReferenceEditEpochRunner:
                     "delta": {
                         "entities_eligible": 1,
                         "entities_accepted": 1,
-                        **(
-                            {"completion_candidate1_accepted": 1}
-                            if attempt_index == 1
-                            else {
-                                "completion_candidate2_accepted": 1,
-                                "completion_candidate2_attempts": 1,
-                            }
-                        ),
-                        "completion_attempts": 1,
                         **routing_delta,
                     },
                 },
@@ -1428,30 +1768,23 @@ class ReferenceEditEpochRunner:
                         anchor=anchor,
                     )
                 ]
-        if attempt_index == 2:
-            # The candidate2 attempt was planned and paid; count it.
-            self._count_candidate2_attempt(shard, clip_uid, entity.entity_id)
-        _write_source_selection_metadata(
-            storage,
-            clip_uid=clip_uid,
-            reference=reference,
-            geometry=_reference_content_geometry(storage, reference),
-            source_gate_reason=None,
-            reason=(
-                "repairable_completion_rejected:"
-                f"{failure_reason or 'completion_unavailable'}"
-            ),
-            operation_metadata_path=attempt_result.metadata_path,
-        )
+        # Final fallback to the canonical source alpha. Legacy also counts
+        # entities_failed when the FINAL attempt failed through a model
+        # exception, with one idempotent failure diagnostic.
         delta = {
             "entities_eligible": 1,
             "entities_fallback": 1,
             "completion_fallback_to_alpha": 1,
-            "completion_attempts": 1,
             **routing_delta,
         }
-        if attempt_index == 2:
-            delta["completion_candidate2_attempts"] = 1
+        if failure_kind != "none":
+            delta["entities_failed"] = 1
+            self._account_failure_diagnostic(
+                shard,
+                clip_uid=clip_uid,
+                entity_id=entity.entity_id,
+                reason=failure_reason,
+            )
         self._write_entity_outcome(
             shard,
             clip_uid,
@@ -1470,24 +1803,49 @@ class ReferenceEditEpochRunner:
         self._publish_clip_if_terminal(shard, storage, clip_uid)
         return []
 
-    def _count_candidate2_attempt(
-        self, shard: str, clip_uid: str, entity_id: str
+    def _account_failure_diagnostic(
+        self,
+        shard: str,
+        *,
+        clip_uid: str,
+        entity_id: str,
+        reason: str,
     ) -> None:
-        outcome = self._entity_outcome(shard, clip_uid, entity_id)
-        if outcome is not None and outcome.get("candidate2_counted"):
-            return
-        # Counted inside the fallback delta below; marker kept for idempotence.
-        marker = self._semantic(
-            "accounted", "candidate2", shard, clip_uid, f"{entity_id}.json"
+        """Append the legacy failure diagnostic exactly once per entity."""
+        marker_path = self._semantic(
+            "failure_accounted", shard, clip_uid, f"{entity_id}.json"
         )
-        _write_json_once(marker, {"candidate2_counted": True, "entity_id": entity_id})
+        if marker_path.is_file():
+            return
+        storage = self._storage_for(shard)
+        storage.append_failure(
+            stage="reference_edit",
+            clip_uid=clip_uid,
+            reason=reason,
+            details={"entity_id": entity_id, "operation": "complete_entity"},
+        )
+        _write_json_once(
+            marker_path,
+            {
+                "clip_uid": clip_uid,
+                "entity_id": entity_id,
+                "reason": reason,
+            },
+        )
 
-    # -- clip publication --------------------------------------------------------
+    # -- clip publication ---    # -- clip publication --------------------------------------------------------
 
     def _publish_clip_if_terminal(
         self, shard: str, storage: RunStorage, clip_uid: str
     ) -> None:
-        plan = self._existing_plan_for_reconcile(shard)
+        # Read-only plan access: the strict publication verification runs in
+        # reconcile_stats AFTER the clip outcome marker exists, so calling it
+        # here (mid-publication) would fail against its own ordering.
+        plan = _read_json(self._plan_path(shard))
+        if plan is None:
+            raise ReferenceEditDurableError(
+                f"Reference Edit publication needs the frozen plan for {shard!r}"
+            )
         chain_ids = list(plan["clips"][clip_uid]["chain_entity_ids"])
         outcomes = {
             entity_id: self._entity_outcome(shard, clip_uid, entity_id)
@@ -1505,6 +1863,7 @@ class ReferenceEditEpochRunner:
         delta: dict[str, int] = {}
         for reference in clip.references.entities:
             entity_id = reference.entity_id
+            entity = entities.get(entity_id)
             if entity_id not in outcomes:
                 final_references.append(reference)
                 continue
@@ -1514,6 +1873,101 @@ class ReferenceEditEpochRunner:
             source_geometry, gate_reason, route = self._entity_route_context(
                 storage, clip, reference
             )
+            initial_route = route
+            if gate_reason is None:
+                route = _route(
+                    reference,
+                    source_touches_boundary=(
+                        source_geometry.touches_canvas_boundary
+                    ),
+                )
+            entity_variant_route = bool(
+                entity is not None
+                and entity.reference_type in {"subject", "object"}
+                and route in {"complete", "local_usable", "repairable"}
+            )
+            alpha_variant = (
+                _variant(
+                    image_path=reference.image_path,
+                    status="accepted",
+                    reviewed=True,
+                    review_status="accepted_pair_reference",
+                    reason="pair_accepted_source_alpha",
+                    synthetic=False,
+                    source_frame_index=reference.source_frame_index,
+                )
+                if entity_variant_route
+                else None
+            )
+            routing = _read_json(
+                self._routing_path(shard, clip_uid, entity_id)
+            )
+            bbox_paths = dict((routing or {}).get("bbox_paths") or {})
+            bbox_error = (routing or {}).get("bbox_error")
+            bbox_variant = (
+                _variant(
+                    image_path=bbox_paths.get("candidate_relative"),
+                    status=(
+                        "available"
+                        if bbox_paths.get("candidate_relative")
+                        else "unavailable"
+                    ),
+                    reviewed=False,
+                    review_status=(
+                        "not_reviewed"
+                        if bbox_paths.get("candidate_relative")
+                        else "materialization_failed"
+                    ),
+                    reason=(
+                        "source_bbox_materialized"
+                        if bbox_paths.get("candidate_relative")
+                        else bbox_error
+                        or "source_bbox_unavailable"
+                    ),
+                    synthetic=False,
+                    metadata_path=bbox_paths.get("metadata_relative"),
+                    source_frame_index=reference.source_frame_index,
+                )
+                if entity_variant_route
+                else None
+            )
+            generated_variant = (
+                _disabled_entity_background_variant(reference)
+                if entity_variant_route
+                else None
+            )
+            variants = (
+                _variant_state(
+                    alpha=alpha_variant,
+                    bbox=bbox_variant,
+                    generated_background=generated_variant,
+                )
+                if alpha_variant is not None
+                and bbox_variant is not None
+                and generated_variant is not None
+                else None
+            )
+            # Legacy special case: a non subject/object entity with a known
+            # completeness and no operation is not_required BEFORE the
+            # entities_eligible increment (no eligible/accepted delta).
+            if (
+                entity is not None
+                and entity.reference_type not in {"subject", "object"}
+                and reference.completeness is not None
+                and not _operations(_route(reference))
+            ):
+                final_references.append(reference)
+                edit_states.append(
+                    ReferenceEditEntityState(
+                        entity_id=entity_id,
+                        route=initial_route,
+                        status="not_required",
+                        source_reference=reference,
+                        source_image_path=reference.image_path,
+                        output_image_path=reference.image_path,
+                    )
+                )
+                continue
             if outcome["outcome"] == "fallback" and outcome.get("reason") == (
                 "tiny_source_entity"
             ):
@@ -1534,6 +1988,7 @@ class ReferenceEditEpochRunner:
                         source_reference=reference,
                         source_image_path=reference.image_path,
                         output_image_path=reference.image_path,
+                        variants=variants,
                         metadata_path=storage.relative_artifact_path(metadata_path),
                         fallback_policy="keep_source",
                         reason="tiny_source_entity",
@@ -1550,14 +2005,22 @@ class ReferenceEditEpochRunner:
                         source_reference=reference,
                         source_image_path=reference.image_path,
                         output_image_path=reference.image_path,
+                        variants=variants,
+                        default_variant="alpha" if entity_variant_route else None,
+                        default_image_path=(
+                            reference.image_path if entity_variant_route else None
+                        ),
+                        default_reason=(
+                            "source_alpha_preferred_by_policy"
+                            if entity_variant_route
+                            else None
+                        ),
                     )
                 )
                 continue
             if outcome["outcome"] == "accepted":
                 attempt_index = int(outcome.get("attempt_index", 1))
-                edit_dir = (
-                    storage.reference_edit_dir(clip_uid) / entity_id
-                )
+                edit_dir = storage.reference_edit_dir(clip_uid) / entity_id
                 candidate_name = (
                     "completion_candidate_1k.png"
                     if attempt_index == 1
@@ -1588,9 +2051,8 @@ class ReferenceEditEpochRunner:
                         source_reference=reference,
                         source_image_path=reference.image_path,
                         output_image_path=accepted.image_path,
-                        default_variant=(
-                            "accepted_base"
-                        ),
+                        variants=variants,
+                        default_variant="accepted_base",
                         default_image_path=accepted.image_path,
                         default_reason=(
                             "completion_candidate_"
@@ -1616,12 +2078,19 @@ class ReferenceEditEpochRunner:
                     source_reference=reference,
                     source_image_path=reference.image_path,
                     output_image_path=reference.image_path,
-                    default_variant="alpha",
-                    default_image_path=reference.image_path,
+                    variants=variants,
+                    default_variant="alpha" if entity_variant_route else None,
+                    default_image_path=(
+                        reference.image_path if entity_variant_route else None
+                    ),
                     default_reason=(
                         "completion_rejected_fallback_to_source_alpha"
+                        if entity_variant_route
+                        else None
                     ),
-                    accepted_base_image_path=reference.image_path,
+                    accepted_base_image_path=(
+                        reference.image_path if entity_variant_route else None
+                    ),
                     operation="complete_entity",
                     metadata_path=storage.relative_artifact_path(
                         storage.reference_edit_dir(clip_uid)
@@ -1629,6 +2098,19 @@ class ReferenceEditEpochRunner:
                         / "final_metadata.json"
                     ),
                     operations=["complete_entity"],
+                    completion_metadata_path=(
+                        storage.relative_artifact_path(
+                            storage.reference_edit_dir(clip_uid)
+                            / entity_id
+                            / (
+                                "completion_metadata.json"
+                                if int(outcome.get("attempt_index", 1)) == 1
+                                else "completion_metadata_2.json"
+                            )
+                        )
+                        if outcome.get("attempt_index")
+                        else None
+                    ),
                     fallback_policy="keep_source",
                     reason=str(outcome.get("reason", "")),
                 )
@@ -1697,8 +2179,24 @@ class ReferenceEditEpochRunner:
                 )
             for field, value in outcome.get("delta", {}).items():
                 counts[field] = counts.get(field, 0) + int(value)
+            # Completion stats come from the durable per-attempt markers.
+            for entity_id in entry.get("chain_entity_ids", []):
+                for attempt_index in (1, 2):
+                    marker = _read_json(
+                        self._attempt_outcome_path(
+                            shard, clip_uid, entity_id, attempt_index
+                        )
+                    )
+                    if marker is None:
+                        continue
+                    counts["completion_attempts"] += 1
+                    if attempt_index == 1 and marker.get("accepted"):
+                        counts["completion_candidate1_accepted"] += 1
+                    if attempt_index == 2:
+                        counts["completion_candidate2_attempts"] += 1
+                        if marker.get("accepted"):
+                            counts["completion_candidate2_accepted"] += 1
         return ReferenceEditStats(**counts)
-
 
 def publish_final_reference(
     *,
@@ -1761,11 +2259,19 @@ def _reconstructed_generation(
 ) -> Any:
     from types import SimpleNamespace
 
-    payload = dict(runner._committed_result(generation_job_id).payload)
+    _job, _result, payload = runner._validated_committed(generation_job_id)
+    payload = dict(payload)
+    from r2v_data_v2.v3.reference_edit_boogu import _validated_native_png
+
+    candidate_rgb = _validated_native_png(
+        candidate_bytes,
+        expected_size=(int(payload.get("width", 0)), int(payload.get("height", 0))),
+    )
     return SimpleNamespace(
         png_bytes=candidate_bytes,
         output_sha256=candidate_sha256,
         seed=int(payload.get("seed", 0)),
+        candidate_rgb=candidate_rgb,
         output=_GenerationOutputReplay(payload),
     )
 

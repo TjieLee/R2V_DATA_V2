@@ -1374,7 +1374,7 @@ def build_removal_epoch_factories(
             )
 
             epoch = build_sam_epoch(
-                config,
+                config.sam3,
                 pool=pool,
                 process_manager=process_manager,
                 log_root=log_root,
