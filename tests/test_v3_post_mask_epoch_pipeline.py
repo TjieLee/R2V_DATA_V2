@@ -1518,37 +1518,29 @@ class _CompositionSamHandle:
         mask = np.zeros((height, width), dtype=bool)
         if self._storage is not None:
             owner = self._owner_mask(int(kwargs["frame_slot"]))
-            if owner is not None:
-                rows, columns = np.nonzero(owner)
-                # Centre the probe block on the owner's own pixels rather than
-                # its bounding box, so a sparse or offset mask still yields a
-                # non-empty attribute mask that ownership geometry can accept.
-                centre_row = int(np.median(rows))
-                centre_column = int(np.median(columns))
-                block = np.zeros_like(owner)
-                block[
-                    max(0, centre_row - 6) : centre_row + 6,
-                    max(0, centre_column - 8) : centre_column + 8,
-                ] = True
-                usable = np.logical_and(block, owner)
-                if int(usable.sum()) >= 16:
-                    return [usable]
-                # Any blob thinner than that still has an interior: take the
-                # owner mask itself minus its border so the fixture always has
-                # usable evidence.
-                eroded = np.logical_and(
-                    owner,
-                    np.logical_and(
-                        np.logical_and(
-                            np.roll(owner, 1, axis=0), np.roll(owner, -1, axis=0)
-                        ),
-                        np.logical_and(
-                            np.roll(owner, 1, axis=1), np.roll(owner, -1, axis=1)
-                        ),
-                    ),
-                )
-                if eroded.any():
-                    return [eroded]
+            if owner is not None and owner.any():
+                # A real attribute is a strict part of its owner: the legacy
+                # geometry rejects a mask that mostly contains the owner
+                # (MAX_ATTRIBUTE_TO_OWNER_AREA_RATIO), so the probe returns the
+                # owner minus one row and one column. On the shared fixture's
+                # 6x5 frame that is 20 of 30 pixels, comfortably above the
+                # sixteen-pixel attribute floor and well below the owner ratio.
+                # If the intersection is too thin to pass, shrink the owner by
+                # another border until it does.
+                candidate = owner.copy()
+                while candidate.any():
+                    trimmed = candidate.copy()
+                    trimmed[-1, :] = False
+                    trimmed[:, -1] = False
+                    if int(trimmed.sum()) < 16 or not trimmed.any():
+                        break
+                    if int(trimmed.sum()) < int(candidate.sum()):
+                        candidate = trimmed
+                    if int(candidate.sum()) <= 16:
+                        break
+                    break
+                if int(candidate.sum()) >= 16:
+                    return [candidate]
                 return [owner]
         mask[height // 3 : height // 3 + height // 8,
              width // 3 : width // 3 + width // 8] = True
@@ -2490,6 +2482,8 @@ def _production_reference_integrity_outcome(
     qwen: Any = None,
     sam: Any = None,
     attribute_ready: bool = False,
+    storage: Any = None,
+    paths: Any = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], Any, Any, Any]:
     """Run the real ``build_removal_epoch_runner`` with Reference Integrity on.
 
@@ -2530,14 +2524,44 @@ def _production_reference_integrity_outcome(
             ),
         )
         config.validate()
-    storage = _pending_storage(config, clip_uids=("clip-1",))
+    post_mask_root = tmp_path / "workspace" / "data" / "campaign"
+    entity_mask_root = _parts_root(tmp_path, (SHARD,))
+    shard_paths = paths or removal_shard_paths(
+        post_mask_root=post_mask_root,
+        entity_mask_root=entity_mask_root,
+        shard=SHARD,
+    )
+    if storage is not None:
+        pass
+    elif attribute_ready:
+        # Real per-shard roots. The storage must be configured exactly like the
+        # shard the export writes into or the publication cannot complete, and
+        # the monkeypatched prepare_shard_storage bypasses initialize_shard, so
+        # the identity sidecar the exporter reads is written here.
+        from r2v_data_v2.reconciliation import write_json_atomic
+        from r2v_data_v2.v3.post_mask_production import (
+            _identity as _shard_identity,
+        )
+        from r2v_data_v2.v3.post_mask_production import (
+            prepare_shard_config,
+        )
+
+        _patch_attribute_ready_mask(monkeypatch)
+        shard_config = prepare_shard_config(config, shard_paths)
+        storage = _pending_storage(shard_config, clip_uids=("clip-1",))
+        assert storage.root == shard_paths.run_root
+        assert storage.config.export_root == shard_paths.export_root
+        shard_paths.state_root.mkdir(parents=True, exist_ok=True)
+        write_json_atomic(
+            shard_paths.identity_path, _shard_identity(shard_config, shard_paths)
+        )
+    else:
+        storage = _pending_storage(config, clip_uids=("clip-1",))
     handle = qwen if qwen is not None else _CompositionQwenHandle()
     boogu = _CompositionBooguHandle()
     sam = sam if sam is not None else _CompositionSamHandle(
         storage if attribute_ready else None
     )
-    post_mask_root = tmp_path / "workspace" / "data" / "campaign"
-    entity_mask_root = _parts_root(tmp_path, (SHARD,))
 
     def prepare(*args: Any, **kwargs: Any) -> Any:
         return PreparedRemovalShard(
@@ -2714,64 +2738,69 @@ def test_shared_qwen_identities_include_reference_integrity_judge(
 # ---------------------------------------------------------------------------
 
 
-def _enlarge_owner_mask(storage: Any, clip_uid: str = "clip-1") -> None:
-    """Give the fixture's subject a mask big enough for attribute evidence.
+def _patch_attribute_ready_mask(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Enlarge only the shared fixture's SUBJECT mask, and only its geometry.
 
-    The shared removal fixture builds a deliberately tiny subject mask, and the
-    legacy ownership geometry requires an attribute mask of at least sixteen
-    pixels inside its owner, so no attribute mask could ever pass. This rewrites
-    the subject's present frame with a real central block, which is fixture
-    setup only: no production policy is relaxed to accommodate it.
+    The shared fixture's ``_mask()`` is a single pixel on a 6x5 frame, and the
+    legacy ownership geometry needs an attribute mask of at least
+    MIN_ATTRIBUTE_AREA_PIXELS inside its owner, so no attribute could ever be
+    accepted. The mask is shared with the background reference, so patching
+    ``_mask`` itself would change Removal's own classification; instead the
+    fixture artifact is built unchanged and only the subject entity's frames are
+    rewritten with a consistent enlarged RLE, area, ratio and bbox. No production
+    policy is relaxed.
 
-    Known limitation, reported as follow-up: the Removal stage runs after this
-    and republishes the masks artifact from its own SAM result, so the enlarged
-    block does not survive into Subject Attributes yet. Landing the accepted
-    attribute fixture therefore needs either a larger shared fixture mask or an
-    enlargement applied after Removal, not a production change.
+    KNOWN BLOCKER, reported rather than papered over: even the subject-only
+    enlargement moves the removal fixture's own invariant. ``_pending_storage``
+    asserts ``build_background_candidates(...).pending_remove == 1`` and the
+    enlarged subject makes the background land in ``rejected`` instead, so an
+    attribute-ready storage cannot be built from this fixture at all. Landing the
+    accepted-attribute fixture needs a shared removal fixture whose subject and
+    background geometry are already distinct and both above the legacy floors,
+    not a patch applied on top of the current one.
     """
     import numpy as np
 
-    from r2v_data_v2.reconciliation import write_json_atomic
+    import tests.test_v3_post_mask_epoch_removal as removal_fixture
+    from r2v_data_v2.v3.mask_codec import encode_binary_mask
 
-    path = storage.clip_dir(clip_uid) / "masks.rle.json"
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    for track in payload["entities"].values():
-        if track.get("reference_type") != "subject":
-            continue
-        frame = next(
-            (item for item in track["frames"] if item["present"]),
-            track["frames"][0],
-        )
-        size = frame["rle"]["size"]
-        height, width = int(size[0]), int(size[1])
-        y1, y2 = height // 5, height - height // 5
-        x1, x2 = width // 5, width - width // 5
-        run = x2 - x1
-        counts = [y1 * width + x1]
-        for _ in range(y2 - y1):
-            counts.extend((run, width - run))
-        mask = np.zeros((height, width), dtype=bool)
-        mask[y1:y2, x1:x2] = True
-        rows, columns = np.nonzero(mask)
-        frame.update(
-            {
-                "present": True,
-                "track_valid": True,
-                "confidence": 0.9,
-                "backend_confidences": [0.9],
-                "backend_object_ids": ["1"],
-                "area_pixels": int(mask.sum()),
-                "area_ratio": float(mask.sum()) / float(height * width),
-                "bbox_xyxy": [
-                    int(columns.min()),
-                    int(rows.min()),
-                    int(columns.max()) + 1,
-                    int(rows.max()) + 1,
-                ],
-                "rle": {"size": [height, width], "counts": counts},
-            }
-        )
-    write_json_atomic(path, payload)
+    original_tracked = removal_fixture._tracked_masks
+
+    def attribute_ready_tracked(clip_uid: str) -> Any:
+        artifact = original_tracked(clip_uid)
+        enlarged = np.ones((artifact.height, artifact.width), dtype=bool)
+        rows, columns = np.nonzero(enlarged)
+        frame_update = {
+            "rle": encode_binary_mask(enlarged),
+            "area_pixels": int(enlarged.sum()),
+            "area_ratio": float(enlarged.mean()),
+            "bbox_xyxy": [
+                int(columns.min()),
+                int(rows.min()),
+                int(columns.max()) + 1,
+                int(rows.max()) + 1,
+            ],
+        }
+        entities = {
+            key: (
+                entity.model_copy(
+                    update={
+                        "frames": [
+                            frame.model_copy(update=frame_update)
+                            for frame in entity.frames
+                        ]
+                    }
+                )
+                if entity.reference_type == "subject"
+                else entity
+            )
+            for key, entity in artifact.entities.items()
+        }
+        return artifact.model_copy(update={"entities": entities})
+
+    monkeypatch.setattr(
+        removal_fixture, "_tracked_masks", attribute_ready_tracked
+    )
 
 
 def _install_stub_subject_attributes(
