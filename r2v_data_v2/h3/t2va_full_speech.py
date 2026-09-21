@@ -57,11 +57,15 @@ def _environment(prefix):
     }
 
 
-@lru_cache(maxsize=1)
-def _diar_configuration():
+def _environment_key(environment):
+    return tuple(sorted(environment.items()))
+
+
+@lru_cache(maxsize=None)
+def _diar_configuration_cached(environment_key):
     from tools.run_h3_diarization_binding import _configuration_fingerprint
 
-    environment = _environment("DIARIZEN")
+    environment = dict(environment_key)
     model = fingerprint_local_model_path(Path(environment["DIARIZEN_MODEL_PATH"]))
     identifier = environment.get(
         "DIARIZEN_MODEL_IDENTIFIER", diar.DEFAULT_DIARIZEN_MODEL_IDENTIFIER
@@ -88,20 +92,30 @@ def _diar_configuration():
     }
 
 
-@lru_cache(maxsize=1)
-def _asr_configuration():
+def _diar_configuration():
+    return _diar_configuration_cached(_environment_key(_environment("DIARIZEN")))
+
+
+@lru_cache(maxsize=None)
+def _asr_configuration_cached(environment_key):
+    environment = dict(environment_key)
     configuration = asr.Qwen3ASRConfiguration.from_environment().model_copy(
         update={"device": "cuda:0"}
     )
     return {
         "adapter_version": 1,
-        "environment": _environment("QWEN3_ASR"),
+        "environment": environment,
         "configuration": configuration.model_dump(mode="json"),
         "model_fingerprint": fingerprint_local_model_path(
             Path(configuration.local_model_path)
         ),
         "preprocessing": asr.QWEN3_ASR_PREPROCESSING_POLICY,
     }
+
+
+def _asr_configuration():
+    environment = _environment("QWEN3_ASR")
+    return _asr_configuration_cached(_environment_key(environment))
 
 
 def _inference(backend, call):
