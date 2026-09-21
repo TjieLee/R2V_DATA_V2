@@ -70,6 +70,7 @@ from r2v_data_v2.v3.post_mask_epoch_jobs import (
     OUTCOME_TERMINAL_REJECT,
     RESOURCE_BOOGU,
     RESOURCE_QWEN,
+    RESOURCE_SAM,
     JobResult,
     ModelJob,
     semantic_input_digest,
@@ -1315,6 +1316,7 @@ def build_removal_epoch_factories(
     qwen_max_inflight: int = 8,
     log_root: Path | None = None,
     job_runner: Callable[[Any, Any], Any] | None = None,
+    with_sam_epoch: bool = False,
 ) -> dict[str, Callable[[], tuple[Any, Any]]]:
     """Resource-epoch factories for the Boogu and Qwen epochs.
 
@@ -1359,7 +1361,30 @@ def build_removal_epoch_factories(
             max_inflight=qwen_max_inflight,
         )
 
-    return {RESOURCE_BOOGU: boogu_factory, RESOURCE_QWEN: qwen_factory}
+    factories: dict[str, Callable[[], tuple[Any, Any]]] = {
+        RESOURCE_BOOGU: boogu_factory,
+        RESOURCE_QWEN: qwen_factory,
+    }
+    if with_sam_epoch:
+        from r2v_data_v2.v3.post_mask_epoch_resources import build_sam_epoch
+
+        def sam_factory() -> tuple[Any, Any]:
+            from r2v_data_v2.v3.post_mask_epoch_resources import (
+                WorkerSlotExecutor,
+            )
+
+            epoch = build_sam_epoch(
+                config,
+                pool=pool,
+                process_manager=process_manager,
+                log_root=log_root,
+            )
+            return epoch, WorkerSlotExecutor(
+                run_job, slot_count=slot_count, resource=epoch
+            )
+
+        factories[RESOURCE_SAM] = sam_factory
+    return factories
 
 
 @dataclass(frozen=True)
@@ -1633,6 +1658,9 @@ def build_removal_epoch_runner(
                     _EpochStageDispatch,
                     run_removal_pair_resource_session,
                 )
+                from r2v_data_v2.v3.post_mask_epoch_reference_edit import (
+                    ReferenceEditEpochRunner as _ReferenceEditEpochRunner,
+                )
 
                 dispatch = _EpochStageDispatch()
                 created: dict[str, Any] = {}
@@ -1642,6 +1670,7 @@ def build_removal_epoch_runner(
                     created["removal"] = runner
                     return runner
 
+                reference_edit_enabled = bool(config.reference_edit.enabled)
                 manager = ResourceEpochManager(
                     factories=build_removal_epoch_factories(
                         config,
@@ -1654,6 +1683,7 @@ def build_removal_epoch_runner(
                         qwen_max_inflight=qwen_max_inflight,
                         log_root=log_root,
                         job_runner=dispatch.run,
+                        with_sam_epoch=reference_edit_enabled,
                     )
                 )
                 outcome = run_removal_pair_resource_session(
@@ -1682,6 +1712,34 @@ def build_removal_epoch_runner(
                             window_size=window_size,
                             close_resource_manager_on_exit=False,
                         )
+                    ),
+                    build_reference_edit_scheduler=(
+                        (
+                            lambda runner, _dispatch: ResourceEpochScheduler(
+                                ledger=ledger,
+                                finalize=runner.finalize,
+                                resource_manager=manager,
+                                window_size=window_size,
+                                close_resource_manager_on_exit=False,
+                            )
+                        )
+                        if reference_edit_enabled
+                        else None
+                    ),
+                    reference_edit_runner_factory=(
+                        (
+                            lambda **kwargs: _ReferenceEditEpochRunner(
+                                kwargs["config"],
+                                kwargs["storages"],
+                                kwargs["ledger"],
+                                eligible_clip_uids_by_shard=kwargs[
+                                    "eligible_clip_uids_by_shard"
+                                ],
+                                emit=kwargs.get("emit"),
+                            )
+                        )
+                        if reference_edit_enabled
+                        else None
                     ),
                     emit=emit,
                 )

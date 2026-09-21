@@ -99,6 +99,8 @@ def run_removal_pair_epochs(
     pair_scheduler_factory: PairSchedulerFactory,
     removal_runner_factory: RemovalRunnerFactory = default_removal_runner_factory,
     pair_runner_factory: PairRunnerFactory = default_pair_runner_factory,
+    reference_edit_runner_factory: Callable[..., Any] | None = None,
+    reference_edit_scheduler_factory: Callable[[Any], Any] | None = None,
     emit: Any = None,
 ) -> dict[str, Any]:
     """Drain Removal, then Pair primary, then the frozen Pair cross pass.
@@ -199,6 +201,48 @@ def run_removal_pair_epochs(
             ),
         }
     )
+    if reference_edit_runner_factory is None:
+        return result
+    if not pair_completed:
+        # Hard stage barrier: no Reference Edit plan, seed or model call.
+        result["reference_edit_completed"] = False
+        result["reference_edit_job_count"] = 0
+        result["reference_edit_unresolved"] = ()
+        result["reference_edit_stats"] = {}
+        return result
+    reference_edit = reference_edit_runner_factory(**shared)
+    reference_edit_seed = reference_edit.seed_jobs()
+    result["reference_edit_job_count"] = len(reference_edit_seed)
+    _emit(emit, "post_mask_epoch_reference_edit_seeded",
+          seeded_jobs=len(reference_edit_seed))
+    reference_edit_outcome = reference_edit_scheduler_factory(
+        reference_edit
+    ).run(reference_edit_seed)
+    reference_edit_unresolved = tuple(
+        reference_edit_outcome.get("unresolved_job_ids", ())
+    )
+    reference_edit_completed = not reference_edit_unresolved
+    reference_edit_stats: dict[str, Any] = {}
+    if reference_edit_completed:
+        for shard in sorted(reference_edit.storages):
+            stats = reference_edit.reconcile_stats(shard)
+            payload = stats.to_dict()
+            reference_edit.storages[shard].update_stage_counts(
+                "reference_edit", payload
+            )
+            reference_edit_stats[shard] = payload
+    result.update(
+        {
+            "reference_edit_completed": reference_edit_completed,
+            "reference_edit_unresolved": reference_edit_unresolved,
+            "reference_edit_stats": reference_edit_stats,
+            "reason": (
+                DOWNSTREAM_REASON
+                if reference_edit_completed
+                else "reference edit resource epoch incomplete"
+            ),
+        }
+    )
     return result
 
 
@@ -252,6 +296,9 @@ def shared_qwen_model_identities(config: V3Config) -> tuple[str, ...]:
         config.qwen.candidate_judge,
         config.qwen.cross_pair_judge,
         config.qwen.background_final_judge,
+        config.qwen.reference_edit_judge
+        if getattr(config.reference_edit, "enabled", False)
+        else None,
     )
     return tuple(
         str(service.model)
@@ -285,6 +332,9 @@ def run_removal_pair_resource_session(
     dispatch: _EpochStageDispatch | None = None,
     removal_runner_factory: RemovalRunnerFactory = default_removal_runner_factory,
     pair_runner_factory: PairRunnerFactory = default_pair_runner_factory,
+    build_reference_edit_scheduler: Callable[[Any, _EpochStageDispatch], Any]
+    | None = None,
+    reference_edit_runner_factory: Callable[..., Any] | None = None,
     **composition: Any,
 ) -> dict[str, Any]:
     """Run the 4a composition inside one shared resource session.
@@ -307,6 +357,12 @@ def run_removal_pair_resource_session(
         dispatch.bind(runner)
         return build_pair_scheduler(runner, dispatch)
 
+    def reference_edit_scheduler(runner: Any) -> Any:
+        # The cached Qwen executor must reach the Reference Edit runner here,
+        # never the Pair or Removal runner.
+        dispatch.bind(runner)
+        return build_reference_edit_scheduler(runner, dispatch)
+
     try:
         result = run_removal_pair_epochs(
             config=config,
@@ -314,6 +370,16 @@ def run_removal_pair_resource_session(
             pair_scheduler_factory=pair_scheduler,
             removal_runner_factory=removal_runner_factory,
             pair_runner_factory=pair_runner_factory,
+            reference_edit_runner_factory=(
+                None
+                if build_reference_edit_scheduler is None
+                else reference_edit_runner_factory
+            ),
+            reference_edit_scheduler_factory=(
+                None
+                if build_reference_edit_scheduler is None
+                else reference_edit_scheduler
+            ),
             **composition,
         )
     finally:

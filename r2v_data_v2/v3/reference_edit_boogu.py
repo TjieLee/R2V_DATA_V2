@@ -1492,6 +1492,7 @@ def prepare_boogu_reference_edit_attempt(
     completion_source_frame_index: int | None = None,
     publish_final: bool = True,
     overwrite: bool = False,
+    resume_existing_outputs: bool = False,
 ) -> PreparedBooguReferenceEditAttempt:
     """Deterministic pre-flight for one Boogu reference edit attempt.
 
@@ -1583,9 +1584,11 @@ def prepare_boogu_reference_edit_attempt(
         if operation == "complete_entity"
         else "background_rejection.json"
     )
-    if not overwrite and (candidate_path.exists() or metadata_path.exists()):
+    if not overwrite and not resume_existing_outputs and (
+        candidate_path.exists() or metadata_path.exists()
+    ):
         raise FileExistsError(f"Boogu edit output already exists: {metadata_path}")
-    if overwrite:
+    if overwrite and not resume_existing_outputs:
         stale_paths = [candidate_path, metadata_path, rejection_path]
         if publish_final:
             stale_paths.extend((final_path, final_metadata_path))
@@ -1682,6 +1685,7 @@ def run_boogu_reference_edit_generation(
     backend: BooguReferenceEditBackend,
     *,
     seed: int,
+    materialize_candidate: bool = True,
 ) -> BooguGenerationResult:
     """One Boogu generation call plus its native-PNG validation.
 
@@ -1722,7 +1726,8 @@ def run_boogu_reference_edit_generation(
         output.png_bytes,
         expected_size=(prepared.width, prepared.height),
     )
-    _write_bytes_atomic(prepared.candidate_path, output.png_bytes)
+    if materialize_candidate:
+        _write_bytes_atomic(prepared.candidate_path, output.png_bytes)
     return BooguGenerationResult(
         output=output,
         seed=seed,
