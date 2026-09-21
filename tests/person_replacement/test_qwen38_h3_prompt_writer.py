@@ -508,10 +508,9 @@ def test_validator_requires_dynamic_preface_and_rejects_speculation():
     )
 
     missing_preface = LEGAL_PROMPT.replace(
-        DETAIL_PRESERVATION_PREFIX + "\n\n"
-        "<Subject 1> raises one hand toward <Subject 2> while <Subject 2> remains in place, "
-        "with the camera holding a static wide framing throughout.\n\n",
+        DETAIL_PRESERVATION_PREFIX + "\n\n",
         "",
+        1,
     )
     with pytest.raises(ValueError,match="canonical preservation prefix"):
         validate_h3_prompt_writer_output(missing_preface)
