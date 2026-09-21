@@ -350,7 +350,9 @@ def run_diarizen(
         route="resolved",
         allow_unverified=allow_unverified,
     )
+    print("diarizen_config_start", flush=True)
     configuration = _diar_configuration()
+    print("diarizen_config_ready", flush=True)
     provenance = diar.DiarizationBackendProvenance.model_validate(
         configuration["provenance"]
     )
@@ -416,7 +418,9 @@ def run_asr(
     if provenance.unverified_clip_uids and not allow_unverified:
         raise ValueError("unverified stems require allow_unverified")
     inputs = asr._load_inputs(root)
+    print("asr_config_start", flush=True)
     configuration = {**_asr_configuration(), "ffmpeg": ffmpeg}
+    print("asr_config_ready", flush=True)
     jobs = []
     keys = {}
     for row in inputs.readable_segments:
