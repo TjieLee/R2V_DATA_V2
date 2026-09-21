@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -56,6 +57,7 @@ def _environment(prefix):
     }
 
 
+@lru_cache(maxsize=1)
 def _diar_configuration():
     from tools.run_h3_diarization_binding import _configuration_fingerprint
 
@@ -86,6 +88,7 @@ def _diar_configuration():
     }
 
 
+@lru_cache(maxsize=1)
 def _asr_configuration():
     configuration = asr.Qwen3ASRConfiguration.from_environment().model_copy(
         update={"device": "cuda:0"}
@@ -179,6 +182,7 @@ class _ASRWorker:
         self._loader = None
         self._jobs = None
         self._prefetched = None
+        self._validated_source_hashes = set()
 
     @contextmanager
     def batch_jobs(self, jobs):
@@ -208,8 +212,11 @@ class _ASRWorker:
     def _load_waveform(self, job):
         row = asr._ReadableDiarizationSegment.model_validate(job["segment"])
         path = Path(row.source_audio_path)
-        if frozen.sha256_file(path) != job["source_audio_sha256"]:
-            raise ValueError("ASR source audio changed")
+        source_identity = (str(path), job["source_audio_sha256"])
+        if source_identity not in self._validated_source_hashes:
+            if frozen.sha256_file(path) != job["source_audio_sha256"]:
+                raise ValueError("ASR source audio changed")
+            self._validated_source_hashes.add(source_identity)
         return asr.load_qwen3_asr_model_input(
             path,
             row.start_time,
