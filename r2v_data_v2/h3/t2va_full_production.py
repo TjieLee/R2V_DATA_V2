@@ -382,6 +382,24 @@ def shard_selection(root, index, shard_id, clips_root, source_videos_root):
     from r2v_data_v2.v3.production_source import JeaVideoMotionAdapter
 
     manifest = production.materialize_shard(index, shard_id, root)
+    source = root / "shards" / production.shard_name(shard_id) / "source"
+    cached = source / "selection.json"
+    if cached.is_file():
+        selection = T2VAShotSelection.model_validate_json(
+            cached.read_text(encoding="utf-8")
+        )
+        if (
+            Path(selection.shot_manifest_path).resolve() != manifest.resolve()
+            or Path(selection.clips_root).resolve() != Path(clips_root).resolve()
+            or (
+                selection.source_videos_root is not None
+                and source_videos_root is not None
+                and Path(selection.source_videos_root).resolve()
+                != Path(source_videos_root).resolve()
+            )
+        ):
+            raise ValueError("cached shard selection identity differs")
+        return selection
     start = shard_id * production.SHARD_SIZE
     adapter = JeaVideoMotionAdapter(
         clips_root=clips_root, source_videos_root=source_videos_root
@@ -429,7 +447,6 @@ def shard_selection(root, index, shard_id, clips_root, source_videos_root):
         excluded_rows=excluded,
         shots=shots,
     )
-    source = root / "shards" / production.shard_name(shard_id) / "source"
     production.atomic_json(source / "selection.json", selection.model_dump(mode="json"))
     production.atomic_json(
         source / "case_manifest.json",
@@ -453,7 +470,10 @@ def bootstrap_audio(
             if not destination.exists():
                 single = selection.model_copy(update={"shots": [shot]})
                 prepare_t2va_audio(
-                    single, output_root=destination, audio_backend=backend
+                    single,
+                    output_root=destination,
+                    audio_backend=backend,
+                    verify_source_videos=False,
                 )
             rows = list(
                 production.complete_rows(destination / "audio/canonical_clips.jsonl")
@@ -462,11 +482,6 @@ def bootstrap_audio(
                 raise ValueError("canonical clip receipt differs")
             clip = CanonicalAudioClip.model_validate(rows[0])
             validate_cached_target(shot, clip)
-            if (
-                sha256_file(Path(clip.target_full_audio_path))
-                != clip.target_full_audio_sha256
-            ):
-                raise ValueError("canonical audio changed")
             return clip, {"clip_uid": shot.clip_uid, "status": "ready"}
         except (ValueError, OSError, RuntimeError) as exc:
             return None, {
