@@ -36,17 +36,27 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from PIL import Image
 
 from r2v_data_v2.reconciliation import write_json_atomic
+from r2v_data_v2.v3.boogu_seed import new_boogu_seed
 from r2v_data_v2.v3.config import V3Config
-from r2v_data_v2.v3.pair import build_entity_reference_candidates
+from r2v_data_v2.v3.pair import (
+    build_entity_reference_candidates,
+    build_reference_crop,
+    mask_component_diagnostics,
+)
 from r2v_data_v2.v3.post_mask_epoch_jobs import (
     OUTCOME_COMPLETED,
     OUTCOME_RETRYABLE_FAILED,
+    RESOURCE_BOOGU,
     RESOURCE_QWEN,
     JobResult,
     ModelJob,
     canonical_json,
+)
+from r2v_data_v2.v3.post_mask_epoch_jobs import (
+    RESOURCE_SAM as RESOURCE_SAM_NAME,
 )
 from r2v_data_v2.v3.post_mask_epoch_state import atomic_write_bytes, atomic_write_json
 from r2v_data_v2.v3.storage import RunStorage, evaluate_export_state
@@ -54,6 +64,8 @@ from r2v_data_v2.v3.subject_attributes import (
     DISCOVERY_SYSTEM_PROMPT,
     MAX_ATTRIBUTE_SOURCE_CANDIDATES,
     MAX_ATTRIBUTES_PER_OWNER,
+    MIN_ATTRIBUTE_AREA_PIXELS,
+    MIN_ATTRIBUTE_LONG_SIDE_PIXELS,
     QWEN_INPUT_MAX_LONG_SIDE_PIXELS,
     REVIEW_SYSTEM_PROMPT,
     ClipEnrichmentResult,
@@ -62,18 +74,28 @@ from r2v_data_v2.v3.subject_attributes import (
     OwnerEnrichmentArtifact,
     OwnerEnrichmentMetrics,
     QwenSubjectAttributeClient,
+    QwenSubjectAttributeCompletionJudge,
+    SubjectAttributeBboxReview,
+    SubjectAttributeCompletionReview,
     SubjectAttributeDiscovery,
     SubjectAttributeRecord,
     SubjectAttributeReviewBatch,
+    _attribute_bbox_crop,
     _build_enriched_sample,
+    _clean_completion_mask,
     _clip_sample_path,
     _collect_attribute_candidates,
+    _completion_mask_postcheck_rejection,
     _duplicate_attribute_mask_conflicts,
+    _evaluate_completion_quality,
     _load_cached_owner_artifact,
     _owner_artifact_path,
+    _process_owner,
     _rejected_record,
     _resize_qwen_input_image,
+    _save_completion_input,
     _source_image,
+    attribute_completion_prompt,
     build_candidate_context_image,
     evaluate_owner_eligibility,
     prefer_attribute_candidate_frames,
@@ -86,7 +108,7 @@ SUBJECT_ATTRIBUTE_OWNER_PLAN_SCHEMA = (
     "post_mask_epoch_subject_attributes_owner_plan/2"
 )
 SUBJECT_ATTRIBUTE_OWNER_OUTCOME_SCHEMA = (
-    "post_mask_epoch_subject_attributes_owner_outcome/1"
+    "post_mask_epoch_subject_attributes_owner_outcome/2"
 )
 SUBJECT_ATTRIBUTE_CLIP_OUTCOME_SCHEMA = (
     "post_mask_epoch_subject_attributes_clip_outcome/1"
@@ -108,6 +130,38 @@ SUBJECT_ATTRIBUTE_SELECTION_POLICY_VERSION = (
 )
 SUBJECT_ATTRIBUTE_RAW_REVIEW_POLICY_VERSION = "subject_attribute_raw_review/1"
 
+# -- 8c: completion and bbox -------------------------------------------------
+SUBJECT_ATTRIBUTE_COMPLETION_SEED_SCHEMA = (
+    "post_mask_epoch_subject_attribute_completion_seed/1"
+)
+SUBJECT_ATTRIBUTE_COMPLETION_OUTCOME_SCHEMA = (
+    "post_mask_epoch_subject_attribute_completion_outcome/1"
+)
+SUBJECT_ATTRIBUTE_COMPLETION_GENERATE_POLICY_VERSION = (
+    "subject_attribute_completion_generate/1"
+)
+SUBJECT_ATTRIBUTE_COMPLETION_REVIEW_POLICY_VERSION = (
+    "subject_attribute_completion_review/1"
+)
+SUBJECT_ATTRIBUTE_BBOX_REVIEW_POLICY_VERSION = "subject_attribute_bbox_review/1"
+
+#: Terminal completion statuses. ``review_required`` is the non-terminal stage
+#: between a passing CPU postcheck and the committed review receipt, so it is
+#: never persisted: the durable marker exists only once the chain is terminal.
+COMPLETION_GENERATION_FAILED = "generation_failed"
+COMPLETION_SAM_FAILED = "sam_failed"
+COMPLETION_POSTCHECK_REJECTED = "postcheck_rejected"
+COMPLETION_REVIEW_REQUIRED = "review_required"
+COMPLETION_REVIEW_REJECTED = "review_rejected"
+COMPLETION_ACCEPTED = "accepted"
+COMPLETION_TERMINAL_STATUSES = (
+    COMPLETION_GENERATION_FAILED,
+    COMPLETION_SAM_FAILED,
+    COMPLETION_POSTCHECK_REJECTED,
+    COMPLETION_REVIEW_REJECTED,
+    COMPLETION_ACCEPTED,
+)
+
 #: The only model job this epoch owns. Everything else in Subject Attributes is
 #: still legacy-only.
 SUBJECT_ATTRIBUTE_DISCOVERY_JOB = "subject_attribute_discovery"
@@ -116,13 +170,22 @@ SUBJECT_ATTRIBUTE_DISCOVERY_JOB = "subject_attribute_discovery"
 SUBJECT_ATTRIBUTE_SAM_PROBE_JOB = "subject_attribute_sam_probe"
 #: One owner-batched rank-0 raw review call.
 SUBJECT_ATTRIBUTE_RAW_REVIEW_JOB = "subject_attribute_raw_review"
-RESOURCE_SAM = "sam"
+
+#: 8c model calls. One completion chain is generate -> SAM -> review; the bbox
+#: review is the legacy last-resort route and is one job per attribute.
+SUBJECT_ATTRIBUTE_COMPLETION_GENERATE_JOB = "subject_attribute_completion_generate"
+SUBJECT_ATTRIBUTE_COMPLETION_SAM_JOB = "subject_attribute_completion_sam"
+SUBJECT_ATTRIBUTE_COMPLETION_REVIEW_JOB = "subject_attribute_completion_review"
+SUBJECT_ATTRIBUTE_BBOX_REVIEW_JOB = "subject_attribute_bbox_review"
+RESOURCE_SAM = RESOURCE_SAM_NAME
 
 CLIP_NO_WORK = "no_work"
 CLIP_OWNERS = "owners"
 
 OWNER_SOURCE_PREEXISTING = "preexisting"
 OWNER_SOURCE_DISCOVERY = "discovery"
+#: The owner artifact written by the epoch's own semantic graph (8c).
+OWNER_SOURCE_PROCESSED = "processed"
 
 DISCOVERY_FAILED_PREFIX = "discovery_failed:"
 
@@ -170,32 +233,696 @@ class ResolvedDiscoveryClient:
     owned: bool
 
 
-class _PendingSamProbe(Exception):
-    """Internal marker: the legacy selection reached an unexecuted SAM probe."""
+class _OwnerReplay:
+    """The durable state one owner's legacy re-run replays from.
 
-    def __init__(self, probe_index: int, owner_candidate_id: str) -> None:
-        super().__init__(f"SAM probe {probe_index} is pending")
-        self.probe_index = probe_index
-        self.owner_candidate_id = owner_candidate_id
+    Everything here is derived from frozen plans and committed receipts: the
+    replayed legacy algorithm never sees a live model, and the first call it
+    cannot answer from a receipt aborts the re-run through ``_PendingModelCall``.
+    """
+
+    def __init__(self, *, epoch, shard, storage, clip, owner, owner_plan,
+                 reference, discovery, discovery_job_id, candidates, masks,
+                 states) -> None:
+        self.epoch = epoch
+        self.shard = shard
+        self.storage = storage
+        self.clip = clip
+        self.clip_uid = clip.clip_uid
+        self.owner = owner
+        self.owner_plan = owner_plan
+        self.reference = reference
+        self.discovery = discovery
+        self.discovery_job_id = discovery_job_id
+        self.candidates = list(candidates)
+        self.masks = masks
+        self.states = list(states)
+        self.by_slot = {
+            int(candidate.frame_slot): index
+            for index, candidate in enumerate(self.candidates)
+        }
+        self._states_by_id = {state.attribute_id: state for state in self.states}
+        self._chains: dict[str, list[ModelJob]] = {}
+        self._receipts: dict[str, dict[int, Mapping[str, Any]]] = {}
+        self.attribute_cursor = 0
+        self.attribute_run_started = False
+        #: 8c chain currently being replayed: legacy calls generation, then the
+        #: generated-frame segmentation, then the review.
+        self.completion: dict[str, Any] | None = None
+        self.bbox_used: set[str] = set()
+
+    # -- lookups -------------------------------------------------------------
+
+    @property
+    def owner_entity_id(self) -> str:
+        return str(self.owner_plan["owner_entity_id"])
+
+    def state_for(self, attribute_id: str) -> _AttributeReplay:
+        state = self._states_by_id.get(str(attribute_id))
+        if state is None:
+            raise SubjectAttributeDurableError(
+                f"attribute {attribute_id!r} is not a frozen attribute of "
+                f"{self.clip_uid}/{self.owner_entity_id}"
+            )
+        return state
+
+    def ordered_candidates(self) -> list[Any]:
+        return self.epoch._ordered_owner_candidates(
+            self.shard, self.storage, self.clip_uid, self.owner_plan, self.reference
+        )
+
+    def chain_for(self, state: _AttributeReplay) -> list[ModelJob]:
+        chain = self._chains.get(state.attribute_id)
+        if chain is None:
+            chain = self.epoch._sam_probe_chain(
+                self.shard,
+                self.clip_uid,
+                self.owner_plan,
+                state.attribute_plan,
+                self.ordered_candidates(),
+            )
+            self._chains[state.attribute_id] = chain
+        return chain
+
+    def receipts_for(self, state: _AttributeReplay) -> dict[int, Mapping[str, Any]]:
+        receipts = self._receipts.get(state.attribute_id)
+        if receipts is None:
+            receipts = {}
+            for index, job in enumerate(self.chain_for(state)):
+                payload = self.epoch._committed_payload_or_none(job)
+                if payload is not None:
+                    receipts[index] = payload
+            self._receipts[state.attribute_id] = receipts
+        return receipts
+
+    def resolve_state(self, grounding_prompt: str, probe_index: int) -> _AttributeReplay:
+        """Which attribute of this owner is legacy probing right now.
+
+        Legacy walks the frozen attributes in discovery order and each attribute
+        starts its probe list at the first owner candidate frame, so a probe at
+        index zero opens a new attribute run. Matching on the grounding prompt as
+        well keeps two identically prompted attributes apart.
+        """
+        count = len(self.states)
+        if probe_index == 0:
+            start = (
+                self.attribute_cursor + 1
+                if self.attribute_run_started
+                else self.attribute_cursor
+            )
+            for index in range(start, count):
+                state = self.states[index]
+                if (
+                    str(state.attribute_plan["discovered"]["grounding_prompt"])
+                    == grounding_prompt
+                ):
+                    self.attribute_cursor = index
+                    self.attribute_run_started = True
+                    return state
+            raise SubjectAttributeDurableError(
+                f"SAM probe prompt {grounding_prompt!r} is not a frozen attribute "
+                f"of {self.clip_uid}/{self.owner_entity_id}"
+            )
+        if not self.attribute_run_started or self.attribute_cursor >= count:
+            raise SubjectAttributeDurableError(
+                "SAM probe continued without a frozen attribute run"
+            )
+        state = self.states[self.attribute_cursor]
+        if (
+            str(state.attribute_plan["discovered"]["grounding_prompt"])
+            != grounding_prompt
+        ):
+            raise SubjectAttributeDurableError(
+                "SAM probe input drifted from its frozen attribute"
+            )
+        return state
+
+    # -- completion chain ----------------------------------------------------
+
+    def begin_completion(self, state, rank, candidate, generate_job) -> None:
+        self.completion = {
+            "state": state,
+            "rank": int(rank),
+            "candidate": candidate,
+            "generate_job": generate_job,
+        }
+
+    def _completion_context(self) -> dict[str, Any]:
+        if self.completion is None:
+            raise SubjectAttributeDurableError(
+                "a completion stage was reached outside a completion chain"
+            )
+        return self.completion
+
+    def completion_target(self, source_path: Path) -> tuple[Any, int, Any]:
+        """Recover ``(attribute state, candidate rank, candidate)`` from a path."""
+        root = self.epoch._output_root(self.storage) / "completion_candidates"
+        try:
+            relative = Path(source_path).resolve(strict=False).relative_to(root)
+        except ValueError as exc:
+            raise SubjectAttributeDurableError(
+                f"completion source {source_path} is outside the legacy root"
+            ) from exc
+        parts = relative.parts
+        if len(parts) != 6 or parts[4] != "raw" or parts[5] != "source.png":
+            raise SubjectAttributeDurableError(
+                f"completion source {source_path} is not a legacy candidate path"
+            )
+        clip_uid, owner_entity_id, attribute_id, owner_candidate_id = parts[:4]
+        if clip_uid != self.clip_uid or owner_entity_id != self.owner_entity_id:
+            raise SubjectAttributeDurableError(
+                f"completion source {source_path} belongs to another owner"
+            )
+        state = self.state_for(attribute_id)
+        ranks = [
+            index
+            for index, candidate in enumerate(state.options)
+            if str(candidate.owner_candidate.candidate_id) == owner_candidate_id
+        ]
+        if len(ranks) != 1:
+            raise SubjectAttributeDurableError(
+                f"completion candidate {owner_candidate_id} is not a frozen "
+                f"option of {attribute_id}"
+            )
+        return state, ranks[0], state.options[ranks[0]]
+
+    def completion_cpu(self, context: Mapping[str, Any]) -> dict[str, Any]:
+        """The CPU postcheck state of one completion context."""
+        epoch = self.epoch
+        state = context["state"]
+        candidate = context["candidate"]
+        rank = int(context["rank"])
+        generate_job = context["generate_job"]
+        payload = epoch._committed_payload_or_none(generate_job)
+        if payload is None:
+            raise _PendingModelCall(generate_job)
+        if str(payload.get("status")) == "completion_failed":
+            raise _sam_failure_exception(payload)
+        generated = epoch._generated_png_bytes(self.storage, payload)
+        sam_job = epoch._expected_completion_sam_job(
+            self.shard,
+            self.clip_uid,
+            self.owner_plan,
+            state.attribute_plan,
+            candidate,
+            rank,
+            generate_job,
+            str(payload.get("generated", {}).get("sha256")),
+            str(payload.get("generated_png_path", "")),
+        )
+        sam_payload = epoch._committed_payload_or_none(sam_job)
+        if sam_payload is None:
+            raise _PendingModelCall(sam_job)
+        if str(sam_payload.get("status")) == "sam_failed":
+            raise _sam_failure_exception(sam_payload)
+        masks = epoch._load_sam_masks(sam_payload)
+        return {
+            "generated": generated,
+            "masks": masks,
+            "sam_job": sam_job,
+            "cpu": epoch._completion_cpu_result(generated, masks),
+        }
+
+    def segment_generated_frame(
+        self, *, frame_path: Path, grounding_prompt: str
+    ) -> list[Any]:
+        epoch = self.epoch
+        context = self._completion_context()
+        state = context["state"]
+        candidate = context["candidate"]
+        if grounding_prompt != str(
+            state.attribute_plan["discovered"]["grounding_prompt"]
+        ):
+            raise SubjectAttributeDurableError(
+                "completion SAM prompt drifted from its frozen attribute"
+            )
+        expected = epoch._completion_output_path(
+            self.storage,
+            self.clip_uid,
+            self.owner_entity_id,
+            state.attribute_id,
+            str(candidate.owner_candidate.candidate_id),
+        )
+        if Path(frame_path).resolve(strict=False) != expected.resolve(strict=False):
+            raise SubjectAttributeDurableError(
+                "completion SAM input drifted from its generated candidate"
+            )
+        return list(self.completion_cpu(context)["masks"])
+
+    def completion_review(self, *, generated_candidate: Any) -> Any:
+        epoch = self.epoch
+        context = self._completion_context()
+        state = context["state"]
+        candidate = context["candidate"]
+        rank = int(context["rank"])
+        evaluated = self.completion_cpu(context)
+        cpu = evaluated["cpu"]
+        if cpu["status"] != COMPLETION_REVIEW_REQUIRED:
+            raise SubjectAttributeDurableError(
+                "completion review was reached for a rejected postcheck"
+            )
+        if _image_png_sha256(
+            cpu["completed_rgba"].convert("RGBA")
+        ) != _image_png_sha256(generated_candidate.convert("RGBA")):
+            raise SubjectAttributeDurableError(
+                "completion review candidate drifted from its postcheck"
+            )
+        review_job = epoch._expected_completion_review_job(
+            self.shard,
+            self.clip_uid,
+            self.owner_plan,
+            state.attribute_plan,
+            candidate,
+            rank,
+            evaluated["sam_job"],
+            _image_png_sha256(candidate.crop.convert("RGBA")),
+            _image_png_sha256(
+                _attribute_bbox_crop(
+                    candidate.source_image,
+                    candidate.attribute_mask,
+                    crop_padding_ratio=float(epoch.config.pair.crop_padding_ratio),
+                )
+            ),
+            _image_png_sha256(cpu["completed_rgba"].convert("RGBA")),
+        )
+        payload = epoch._committed_payload_or_none(review_job)
+        if payload is None:
+            raise _PendingModelCall(review_job)
+        if str(payload.get("status")) == "review_failed":
+            raise _sam_failure_exception(payload)
+        try:
+            return SubjectAttributeCompletionReview.model_validate(
+                payload.get("review")
+            )
+        except Exception as exc:
+            raise SubjectAttributeDurableError(
+                "committed completion review payload is invalid"
+            ) from exc
+
+    # -- frozen accounting ---------------------------------------------------
+
+    def frozen_seed_for(self, attribute_id: str) -> int | None:
+        """The seed of the last completion this attribute actually attempted."""
+        state = self.state_for(attribute_id)
+        found: int | None = None
+        for rank in range(len(state.options)):
+            path = self.epoch._completion_seed_path(
+                self.shard,
+                self.clip_uid,
+                self.owner_entity_id,
+                attribute_id,
+                rank,
+            )
+            payload = _read_json(path)
+            if payload is not None:
+                found = int(payload["seed"])
+        return found
+
+    def _owner_jobs(self) -> list[ModelJob]:
+        """Every job this owner's receipts can pay, in a stable order."""
+        jobs: list[ModelJob] = []
+        for state in self.states:
+            jobs.extend(self.chain_for(state))
+            for rank in range(len(state.options)):
+                # Only a rank the routes actually attempted has a frozen seed;
+                # reading it is what keeps this accounting free of side effects.
+                frozen = _read_json(
+                    self.epoch._completion_seed_path(
+                        self.shard,
+                        self.clip_uid,
+                        self.owner_entity_id,
+                        state.attribute_id,
+                        rank,
+                    )
+                )
+                if frozen is None:
+                    continue
+                generate = self.epoch._expected_completion_generate_job(
+                    self.shard,
+                    self.clip_uid,
+                    self.owner_plan,
+                    state.attribute_plan,
+                    state.options[rank],
+                    rank,
+                    int(frozen["seed"]),
+                )
+                jobs.append(generate)
+                payload = self.epoch._committed_payload_or_none(generate)
+                if payload is None or str(payload.get("status")) != "completion":
+                    continue
+                sam = self.epoch._expected_completion_sam_job(
+                    self.shard,
+                    self.clip_uid,
+                    self.owner_plan,
+                    state.attribute_plan,
+                    state.options[rank],
+                    rank,
+                    generate,
+                    str(payload.get("generated", {}).get("sha256")),
+                    str(payload.get("generated_png_path", "")),
+                )
+                jobs.append(sam)
+        return jobs
+
+    @property
+    def qwen_seconds(self) -> float:
+        """Qwen model time summed from durable receipts, never from replay."""
+        total = float(
+            self.epoch._discovery_payload(
+                self.shard, self.clip_uid, self.owner_plan
+            ).get("qwen_model_call_time_seconds", 0.0)
+        )
+        for job in self._owner_jobs():
+            payload = self.epoch._committed_payload_or_none(job)
+            if payload is None or not job.job_type.endswith(("review", "discovery")):
+                continue
+            value = payload.get("qwen_model_call_time_seconds")
+            if isinstance(value, (int, float)):
+                total += max(0.0, float(value))
+        return total
+
+    @property
+    def sam3_seconds(self) -> float:
+        """SAM model time summed from durable receipts, never from replay."""
+        total = 0.0
+        for job in self._owner_jobs():
+            if job.resource != "sam":
+                continue
+            payload = self.epoch._committed_payload_or_none(job)
+            if payload is None:
+                continue
+            value = payload.get("model_call_time_seconds")
+            if isinstance(value, (int, float)):
+                total += max(0.0, float(value))
+        return total
+
+
+class _OwnerDiscoveryClient:
+    """Legacy discovery surface answered from the committed receipt."""
+
+    def __init__(self, replay: _OwnerReplay) -> None:
+        self.r = replay
+
+    def discover(self, *, owner, owner_candidates, source_images) -> Any:
+        del owner, owner_candidates, source_images
+        payload = self.r.epoch._discovery_payload(
+            self.r.shard, self.r.clip_uid, self.r.owner_plan
+        )
+        if str(payload.get("status")) == "discovery_failed":
+            raise _sam_failure_exception(payload)
+        return SubjectAttributeDiscovery.model_validate(payload.get("discovery"))
+
+
+class _OwnerSegmentationBackend:
+    """Legacy segmentation surface answered from the SAM receipts."""
+
+    def __init__(self, replay: _OwnerReplay) -> None:
+        self.r = replay
+
+    def segment_frame(
+        self, *, frame_path: Path, frame_slot: int, grounding_prompt: str
+    ) -> list[Any]:
+        r = self.r
+        index = r.by_slot.get(int(frame_slot))
+        if index is None:
+            raise SubjectAttributeDurableError(
+                f"SAM probe frame slot {frame_slot} is not a frozen owner candidate"
+            )
+        state = r.resolve_state(grounding_prompt, index)
+        candidate = r.candidates[index]
+        expected = (r.storage.root / candidate.image_path).resolve(strict=False)
+        if (
+            Path(frame_path).resolve(strict=False) != expected
+            or grounding_prompt
+            != str(state.attribute_plan["discovered"]["grounding_prompt"])
+        ):
+            raise SubjectAttributeDurableError(
+                "SAM probe input drifted from its frozen candidate"
+            )
+        job = r.chain_for(state)[index]
+        payload = r.receipts_for(state).get(index)
+        if payload is None:
+            raise _PendingModelCall(job)
+        if str(payload.get("status")) == "sam_failed":
+            raise _sam_failure_exception(payload)
+        return list(r.epoch._load_sam_masks(payload))
+
+    def segment_generated_frame(
+        self, *, frame_path: Path, grounding_prompt: str
+    ) -> list[Any]:
+        return self.r.segment_generated_frame(
+            frame_path=frame_path, grounding_prompt=grounding_prompt
+        )
+
+
+class _OwnerReviewClient:
+    """Legacy raw review and last-resort bbox review, from the receipts."""
+
+    def __init__(self, replay: _OwnerReplay) -> None:
+        self.r = replay
+
+    def review(self, *, owner, candidates) -> Any:
+        del owner
+        r = self.r
+        epoch = r.epoch
+        batch = list(candidates)
+        if not batch:
+            raise SubjectAttributeDurableError("raw review batch is empty")
+        states = [r.state_for(str(candidate.attribute_id)) for candidate in batch]
+        rank: int | None = None
+        for state, candidate in zip(states, batch, strict=True):
+            ids = [
+                str(option.owner_candidate.candidate_id)
+                for option in state.options
+            ]
+            try:
+                index = ids.index(str(candidate.owner_candidate.candidate_id))
+            except ValueError as exc:
+                raise SubjectAttributeDurableError(
+                    f"raw review candidate {candidate.owner_candidate.candidate_id} "
+                    "is not a frozen option"
+                ) from exc
+            if rank is None:
+                rank = index
+            elif rank != index:
+                raise SubjectAttributeDurableError(
+                    "raw review batch mixes candidate ranks"
+                )
+        job = epoch._expected_raw_review_job(
+            r.shard,
+            r.clip_uid,
+            r.owner_plan,
+            r.discovery,
+            r.discovery_job_id,
+            states,
+            batch,
+            candidate_rank=int(rank or 0),
+        )
+        payload = epoch._committed_payload_or_none(job)
+        if payload is None:
+            raise _PendingModelCall(job)
+        if str(payload.get("status")) == "review_failed":
+            raise _sam_failure_exception(payload)
+        try:
+            return SubjectAttributeReviewBatch.model_validate(
+                payload.get("review_batch")
+            )
+        except Exception as exc:
+            raise SubjectAttributeDurableError(
+                "committed raw review payload is invalid"
+            ) from exc
+
+    def review_attribute_bbox(
+        self, *, bbox_candidate, owner_context, attribute_type, attribute_phrase
+    ) -> Any:
+        r = self.r
+        epoch = r.epoch
+        bbox_sha = _image_png_sha256(bbox_candidate)
+        context_sha = _image_png_sha256(_resize_qwen_input_image(owner_context))
+        for state in r.states:
+            if state.attribute_id in r.bbox_used or not state.options:
+                continue
+            discovered = state.attribute_plan["discovered"]
+            if str(discovered["attribute_type"]) != str(attribute_type):
+                continue
+            if str(discovered["phrase"]) != str(attribute_phrase):
+                continue
+            candidate = state.options[0]
+            expected_bbox = _image_png_sha256(
+                _attribute_bbox_crop(
+                    candidate.source_image,
+                    candidate.attribute_mask,
+                    crop_padding_ratio=float(epoch.config.pair.crop_padding_ratio),
+                )
+            )
+            if expected_bbox != bbox_sha:
+                continue
+            expected_context = _image_png_sha256(
+                _resize_qwen_input_image(
+                    build_candidate_context_image(
+                        candidate.source_image, candidate.owner_candidate.mask
+                    )
+                )
+            )
+            if expected_context != context_sha:
+                continue
+            r.bbox_used.add(state.attribute_id)
+            job = epoch._expected_bbox_review_job(
+                r.shard,
+                r.clip_uid,
+                r.owner_plan,
+                state.attribute_plan,
+                candidate,
+                0,
+                context_sha,
+                bbox_sha,
+            )
+            payload = epoch._committed_payload_or_none(job)
+            if payload is None:
+                raise _PendingModelCall(job)
+            if str(payload.get("status")) == "bbox_failed":
+                raise _sam_failure_exception(payload)
+            try:
+                return SubjectAttributeBboxReview.model_validate(
+                    payload.get("bbox_review")
+                )
+            except Exception as exc:
+                raise SubjectAttributeDurableError(
+                    "committed bbox review payload is invalid"
+                ) from exc
+        raise SubjectAttributeDurableError(
+            "bbox review has no frozen semantic candidate for this attribute"
+        )
+
+
+class _OwnerCompletionBackend:
+    """Legacy Boogu completion surface answered from the generation receipt."""
+
+    def __init__(self, replay: _OwnerReplay) -> None:
+        self.r = replay
+
+    def attribute_completion(
+        self, *, source_path: Path, output_path: Path, instruction: str, seed: int
+    ) -> dict[str, object]:
+        del seed
+        r = self.r
+        epoch = r.epoch
+        state, rank, candidate = r.completion_target(source_path)
+        frozen_seed = epoch._completion_seed(
+            r.shard,
+            r.clip_uid,
+            r.owner_entity_id,
+            state.attribute_id,
+            rank,
+            str(candidate.owner_candidate.candidate_id),
+        )
+        generate_job = epoch._expected_completion_generate_job(
+            r.shard,
+            r.clip_uid,
+            r.owner_plan,
+            state.attribute_plan,
+            candidate,
+            rank,
+            frozen_seed,
+        )
+        r.begin_completion(state, rank, candidate, generate_job)
+        del instruction
+        expected_source = epoch._completion_input_bytes(candidate.crop)
+        if (
+            not Path(source_path).is_file()
+            or Path(source_path).read_bytes() != expected_source
+        ):
+            _save_completion_input(Path(source_path), candidate.crop)
+        payload = epoch._committed_payload_or_none(generate_job)
+        if payload is None:
+            raise _PendingModelCall(generate_job)
+        if str(payload.get("status")) == "completion_failed":
+            raise _sam_failure_exception(payload)
+        epoch._generated_png_bytes(r.storage, payload)
+        return {
+            "width": int(payload.get("width", 0)),
+            "height": int(payload.get("height", 0)),
+            "model_call_time_seconds": float(
+                payload.get("model_call_time_seconds", 0.0)
+            ),
+        }
+
+
+class _OwnerCompletionJudge:
+    """Legacy completion review surface answered from the review receipt."""
+
+    def __init__(self, replay: _OwnerReplay) -> None:
+        self.r = replay
+
+    def review(
+        self,
+        *,
+        source_attribute,
+        source_bbox,
+        generated_candidate,
+        attribute_type,
+        attribute_phrase,
+    ) -> Any:
+        del source_attribute, source_bbox, attribute_type, attribute_phrase
+        return self.r.completion_review(generated_candidate=generated_candidate)
 
 
 @dataclass(frozen=True)
-class _AttributeReplay:
-    """One attribute's replayed legacy selection state."""
+class _CompletionChain:
+    """One candidate's completion chain, derived from its durable receipts.
+
+    ``status`` is ``None`` while a prerequisite is still missing, and one of
+    ``COMPLETION_TERMINAL_STATUSES`` once the chain is terminal;
+    ``review_required`` is the non-terminal stage before the review receipt, so
+    it is reported here but never persisted.
+    """
 
     attribute_id: str
     attribute_type: str
-    attribute_plan: dict[str, Any]
-    marker: dict[str, Any] | None
-    options: tuple[Any, ...]
-    record: Any | None
-    processing_failure: int
-    pending_job: ModelJob | None
-    sam_job_ids: dict[str, str]
+    candidate_rank: int
+    owner_candidate_id: str
+    candidate: Any
+    seed: int
+    generate_job: ModelJob
+    sam_job: ModelJob | None
+    review_job: ModelJob | None
+    status: str | None
+    reason: str | None
+    next_job: ModelJob | None
+    review: Any | None
+    completed_crop_sha256: str | None
 
     @property
-    def has_candidate2(self) -> bool:
-        return len(self.options) > 1
+    def accepted(self) -> bool:
+        return self.status == COMPLETION_ACCEPTED
+
+    @property
+    def terminal(self) -> bool:
+        return self.status in COMPLETION_TERMINAL_STATUSES
+
+
+_COMPLETION_REVIEW_FAILED = "review_failed"
+COMPLETION_REVIEW_FAILED = _COMPLETION_REVIEW_FAILED
+COMPLETION_TERMINAL_STATUSES = COMPLETION_TERMINAL_STATUSES + (
+    _COMPLETION_REVIEW_FAILED,
+)
+
+
+class _PendingModelCall(BaseException):
+    """Internal abort: the legacy algorithm reached a call with no receipt.
+
+    This derives from ``BaseException`` on purpose. The legacy subject attribute
+    code isolates every model call with ``except Exception`` so that one bad
+    frame, attribute or review round cannot abort a whole clip; an epoch cannot
+    let a pending call be mistaken for a model failure, so the pending signal has
+    to travel through those handlers untouched and abort the invocation. The
+    legacy policy is then re-run from scratch next round with one more receipt
+    committed, exactly like 8b's SAM probe chain.
+    """
+
+    def __init__(self, job: ModelJob) -> None:
+        super().__init__(f"model call {job.job_id()} has no committed receipt")
+        self.job = job
 
 
 class _ReplaySegmentationBackend:
@@ -203,9 +930,8 @@ class _ReplaySegmentationBackend:
 
     Committed probes replay their exact ledger masks; a committed ``sam_failed``
     probe re-raises an exception of the same type and message so the legacy
-    ``probe_failures`` reason stays identical; the first probe without a receipt
-    is reported through ``_PendingSamProbe`` and recorded as this attribute's
-    next job.
+    ``probe_failures`` reason stays identical; a probe without a receipt aborts
+    the invocation with its own job through ``_PendingModelCall``.
     """
 
     def __init__(
@@ -216,16 +942,29 @@ class _ReplaySegmentationBackend:
         receipts: Mapping[int, Mapping[str, Any]],
         storage: RunStorage,
         grounding_prompt: str,
+        chain: Sequence[ModelJob] = (),
+        generated: Any = None,
     ) -> None:
         self._epoch = epoch
         self._ordered = list(ordered)
         self._receipts = dict(receipts)
         self._storage = storage
         self._grounding_prompt = grounding_prompt
+        self._chain = list(chain)
+        #: 8c: the completion chain currently being replayed, if any. Legacy
+        #: calls completion generation, then the generated-frame segmentation,
+        #: then the review, so one context carries the whole chain.
+        self.generated = generated
         self._by_slot: dict[int, int] = {}
         for index, candidate in enumerate(self._ordered):
             self._by_slot[int(candidate.frame_slot)] = index
-        self.pending: tuple[int, str] | None = None
+
+    def _pending(self, index: int) -> _PendingModelCall:
+        if index >= len(self._chain):
+            raise SubjectAttributeDurableError(
+                f"SAM probe {index} has no frozen job to unlock"
+            )
+        return _PendingModelCall(self._chain[index])
 
     def segment_frame(
         self, *, frame_path: Path, frame_slot: int, grounding_prompt: str
@@ -247,12 +986,41 @@ class _ReplaySegmentationBackend:
             )
         payload = self._receipts.get(index)
         if payload is None:
-            if self.pending is None:
-                self.pending = (index, str(candidate.candidate_id))
-            raise _PendingSamProbe(index, str(candidate.candidate_id))
+            raise self._pending(index)
         if str(payload.get("status")) == "sam_failed":
             raise _sam_failure_exception(payload)
         return self._epoch._load_sam_masks(payload)
+
+    def segment_generated_frame(
+        self, *, frame_path: Path, grounding_prompt: str
+    ) -> list[Any]:
+        """The completion SAM call of the chain the replay is currently in."""
+        if self.generated is None:
+            raise SubjectAttributeDurableError(
+                "generated-frame segmentation was reached outside a completion"
+            )
+        return self.generated.segment_generated_frame(
+            frame_path=frame_path, grounding_prompt=grounding_prompt
+        )
+
+
+@dataclass(frozen=True)
+class _AttributeReplay:
+    """One attribute's replayed legacy selection state."""
+
+    attribute_id: str
+    attribute_type: str
+    attribute_plan: dict[str, Any]
+    marker: dict[str, Any] | None
+    options: tuple[Any, ...]
+    record: Any | None
+    processing_failure: int
+    pending_job: ModelJob | None
+    sam_job_ids: dict[str, str]
+
+    @property
+    def has_candidate2(self) -> bool:
+        return len(self.options) > 1
 
 
 @dataclass(frozen=True)
@@ -284,13 +1052,56 @@ def resolve_subject_attribute_discovery_client(
         raise SubjectAttributeEpochError(
             "subject attribute discovery needs a client handle"
         )
-    if isinstance(handle, str):
-        service = config.qwen.candidate_judge
-        return ResolvedDiscoveryClient(
-            QwenSubjectAttributeClient(replace(service, base_url=handle)),
-            owned=True,
+    return resolve_subject_attribute_qwen_client(handle, config)
+
+
+def resolve_subject_attribute_qwen_client(
+    handle: Any, config: V3Config, *, judge: bool = False
+) -> ResolvedDiscoveryClient:
+    """The shared Qwen endpoint resolver for every subject attribute review call.
+
+    A real Resource Epoch handle can be an endpoint string such as
+    ``http://127.0.0.1:....../v1``, in which case an owned client is built
+    against the configured candidate judge and closed after the call. An
+    injected client object is reused as-is and never closed, and ``None`` is an
+    error rather than a fallback to another model.
+    """
+    if handle is None:
+        raise SubjectAttributeEpochError(
+            "subject attribute review needs a client handle"
         )
+    if isinstance(handle, str):
+        service = replace(config.qwen.candidate_judge, base_url=handle)
+        client = (
+            QwenSubjectAttributeCompletionJudge(service)
+            if judge
+            else QwenSubjectAttributeClient(service)
+        )
+        return ResolvedDiscoveryClient(client, owned=True)
     return ResolvedDiscoveryClient(handle, owned=False)
+
+
+def _completion_adapter(handle: Any, storage: RunStorage, direct: bool) -> Any:
+    """The production Boogu completion adapter, imported without a cycle.
+
+    A handle that already exposes ``attribute_completion`` is used as-is; a raw
+    Boogu ``.edit`` backend is wrapped by the production runtime adapter so the
+    epoch never restates the completion prompt, size or seed policy.
+    """
+    if direct:
+        return handle
+    from r2v_data_v2.v3.post_mask_runtime import _AttributeCompletion
+
+    return _AttributeCompletion(handle, storage)
+
+
+def _close_owned(resolved: Any) -> None:
+    """Close a client the epoch owns; an injected client is never closed."""
+    if not resolved.owned:
+        return
+    close = getattr(resolved.client, "close", None)
+    if callable(close):
+        close()
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:
@@ -886,6 +1697,14 @@ class SubjectAttributeEpochRunner:
             return self._run_sam_probe(job, handle)
         if job.job_type == SUBJECT_ATTRIBUTE_RAW_REVIEW_JOB:
             return self._run_raw_review(job, handle)
+        if job.job_type == SUBJECT_ATTRIBUTE_COMPLETION_GENERATE_JOB:
+            return self._run_completion_generate(job, handle)
+        if job.job_type == SUBJECT_ATTRIBUTE_COMPLETION_SAM_JOB:
+            return self._run_completion_sam(job, handle)
+        if job.job_type == SUBJECT_ATTRIBUTE_COMPLETION_REVIEW_JOB:
+            return self._run_completion_review(job, handle)
+        if job.job_type == SUBJECT_ATTRIBUTE_BBOX_REVIEW_JOB:
+            return self._run_bbox_review(job, handle)
         if job.job_type != SUBJECT_ATTRIBUTE_DISCOVERY_JOB:
             raise SubjectAttributeEpochError(
                 f"unsupported job type {job.job_type!r}"
@@ -1220,13 +2039,37 @@ class SubjectAttributeEpochRunner:
             )
             discovery_payload = self._committed_payload_or_none(discovery_job)
             if discovery_payload is not None:
-                discovery = SubjectAttributeDiscovery.model_validate(
-                    discovery_payload.get("discovery")
+                # A committed discovery failure, a non-human owner and a human
+                # owner without attributes are all complete legacy terminals and
+                # only ever come from the terminal artifact derivation. A failed
+                # payload has no ``discovery`` key at all, so it must never be
+                # validated as one.
+                terminal = self._expected_discovery_terminal_artifact(
+                    clip_uid=clip_uid,
+                    owner_plan=owner_plan,
+                    payload=discovery_payload,
                 )
-                if discovery.owner_is_human and discovery.attributes:
+                if terminal is None:
                     return self._advance_attributes(
                         shard, storage, clip_uid, owner_entity_id
                     )
+                self._publish_owner_artifact(
+                    shard, clip_uid, owner_plan, terminal
+                )
+                self._write_owner_outcome(
+                    shard,
+                    clip_uid,
+                    owner_entity_id,
+                    self._expected_owner_outcome(
+                        clip_uid=clip_uid,
+                        owner_entity_id=owner_entity_id,
+                        owner_plan=owner_plan,
+                        artifact=terminal,
+                        source=OWNER_SOURCE_DISCOVERY,
+                        discovery_job_id=discovery_job.job_id(),
+                    ),
+                )
+                continue
             return [discovery_job]
         self._publish_clip_outcome(shard, storage, clip_uid, plan)
         return []
@@ -1265,8 +2108,14 @@ class SubjectAttributeEpochRunner:
         """CPU continuation of one committed model receipt."""
         if job.job_type == SUBJECT_ATTRIBUTE_SAM_PROBE_JOB:
             return self._finalize_sam_probe(job, result)
-        if job.job_type == SUBJECT_ATTRIBUTE_RAW_REVIEW_JOB:
-            return self._finalize_raw_review(job, result)
+        if job.job_type in {
+            SUBJECT_ATTRIBUTE_RAW_REVIEW_JOB,
+            SUBJECT_ATTRIBUTE_COMPLETION_GENERATE_JOB,
+            SUBJECT_ATTRIBUTE_COMPLETION_SAM_JOB,
+            SUBJECT_ATTRIBUTE_COMPLETION_REVIEW_JOB,
+            SUBJECT_ATTRIBUTE_BBOX_REVIEW_JOB,
+        }:
+            return self._finalize_owner_chain(job, result)
         if job.job_type != SUBJECT_ATTRIBUTE_DISCOVERY_JOB:
             raise SubjectAttributeEpochError(
                 f"unsupported job type {job.job_type!r}"
@@ -1371,6 +2220,7 @@ class SubjectAttributeEpochRunner:
         if marker.get("source") not in (
             OWNER_SOURCE_PREEXISTING,
             OWNER_SOURCE_DISCOVERY,
+            OWNER_SOURCE_PROCESSED,
         ):
             raise SubjectAttributeDurableError(
                 f"owner outcome source is unknown for {label}"
@@ -1430,6 +2280,48 @@ class SubjectAttributeEpochRunner:
                 artifact=artifact,
                 source=OWNER_SOURCE_PREEXISTING,
                 discovery_job_id=None,
+            )
+        elif marker["source"] == OWNER_SOURCE_PROCESSED:
+            # The processed owner is authority-free too: the whole legacy owner
+            # algorithm is re-run over the committed receipts and must land on
+            # exactly the artifact and marker that were published.
+            discovery_job = self._expected_discovery_job(shard, clip_uid, owner_plan)
+            discovery_job_id = discovery_job.job_id()
+            if marker["discovery_job_id"] != discovery_job_id:
+                raise SubjectAttributeDurableError(
+                    f"owner outcome discovery job drifted for {label}"
+                )
+            context = self._rank0_context(
+                shard,
+                storage,
+                clip_uid,
+                owner_plan,
+                SubjectAttributeDiscovery.model_validate(
+                    self._discovery_payload(shard, clip_uid, owner_plan).get(
+                        "discovery"
+                    )
+                ),
+                discovery_job_id,
+            )
+            if context["pending"]:
+                raise SubjectAttributeDurableError(
+                    f"owner outcome exists while owner {label} is still pending"
+                )
+            self._verified_raw_state(shard, storage, clip_uid, owner_plan, context)
+            artifact = self._owner_artifact_from_receipts(
+                shard, storage, clip_uid, owner_plan, context["states"]
+            )
+            if isinstance(artifact, _PendingModelCall):
+                raise SubjectAttributeDurableError(
+                    f"owner outcome exists while owner {label} still owes a model call"
+                )
+            expected = self._expected_owner_outcome(
+                clip_uid=clip_uid,
+                owner_entity_id=owner_entity_id,
+                owner_plan=owner_plan,
+                artifact=artifact,
+                source=OWNER_SOURCE_PROCESSED,
+                discovery_job_id=discovery_job_id,
             )
         else:
             job = self._expected_discovery_job(shard, clip_uid, owner_plan)
@@ -1964,7 +2856,11 @@ class SubjectAttributeEpochRunner:
             owner_plan,
             owner_reference,
             discovery,
-            self._attribute_index(discovery, attribute_id),
+            self._attribute_index(
+                discovery,
+                attribute_id,
+                int(owner_plan["attribute_id_start"]),
+            ),
             attribute_id,
             self._expected_discovery_job(shard, clip_uid, owner_plan).job_id(),
         )
@@ -1998,14 +2894,28 @@ class SubjectAttributeEpochRunner:
 
     @staticmethod
     def _attribute_index(
-        discovery: SubjectAttributeDiscovery, attribute_id: str
+        discovery: SubjectAttributeDiscovery,
+        attribute_id: str,
+        attribute_id_start: int,
     ) -> int:
+        """Map ``a<N>`` to its offset inside *this owner's* discovery.
+
+        Attribute ids are absolutely numbered from the owner's
+        ``attribute_id_start``, so a second human owner starts at ``a3``; the
+        offset is only meaningful relative to that owner.
+        """
         try:
-            return int(attribute_id[1:]) - 1
+            index = int(attribute_id[1:]) - int(attribute_id_start)
         except ValueError as exc:
             raise SubjectAttributeDurableError(
                 f"attribute id {attribute_id!r} is malformed"
             ) from exc
+        if not 0 <= index < len(discovery.attributes):
+            raise SubjectAttributeDurableError(
+                f"attribute id {attribute_id!r} is outside the frozen discovery "
+                f"of its owner"
+            )
+        return index
 
     # -- attribute selection replay -------------------------------------------
 
@@ -2057,6 +2967,7 @@ class SubjectAttributeEpochRunner:
             receipts=receipts,
             storage=storage,
             grounding_prompt=str(attribute_plan["discovered"]["grounding_prompt"]),
+            chain=list(probe_jobs.values()),
         )
         clip = storage.read_clip(clip_uid)
         owner = next(
@@ -2092,18 +3003,9 @@ class SubjectAttributeEpochRunner:
                 completion_config=self.config.subject_attributes.completion,
                 max_candidates=MAX_ATTRIBUTE_SOURCE_CANDIDATES,
             )
-        except Exception as exc:  # noqa: BLE001 - legacy attribute isolation
-            processing_failure = 1
-            selected = _rejected_record(
-                discovered,
-                attribute_id=attribute_id,
-                owner_entity_id=owner_entity_id,
-                reason=f"attribute_processing_failed:{type(exc).__name__}:{exc}",
-            )
-        if backend.pending is not None:
+        except _PendingModelCall as pending:
             # The replay stopped at a probe that has no receipt yet: that probe
             # is the next job and everything after it is not decided.
-            pending_index = backend.pending[0]
             return _AttributeReplay(
                 attribute_id=attribute_id,
                 attribute_type=str(attribute_plan["discovered"]["attribute_type"]),
@@ -2112,8 +3014,16 @@ class SubjectAttributeEpochRunner:
                 options=(),
                 record=None,
                 processing_failure=0,
-                pending_job=probe_jobs[pending_index],
+                pending_job=pending.job,
                 sam_job_ids={},
+            )
+        except Exception as exc:  # noqa: BLE001 - legacy attribute isolation
+            processing_failure = 1
+            selected = _rejected_record(
+                discovered,
+                attribute_id=attribute_id,
+                owner_entity_id=owner_entity_id,
+                reason=f"attribute_processing_failed:{type(exc).__name__}:{exc}",
             )
         marker, options, record = self._selection_marker(
             clip_uid=clip_uid,
@@ -2323,6 +3233,8 @@ class SubjectAttributeEpochRunner:
                 "review": None,
                 "reviews": {},
                 "failure": None,
+                "discovery": discovery,
+                "discovery_job_id": discovery_job_id,
             }
         rank0 = [
             state.options[0]
@@ -2385,6 +3297,8 @@ class SubjectAttributeEpochRunner:
             "review": payload,
             "reviews": reviews,
             "failure": failure,
+            "discovery": discovery,
+            "discovery_job_id": discovery_job_id,
         }
 
     def _raw_review_semantic_inputs(
@@ -2396,6 +3310,7 @@ class SubjectAttributeEpochRunner:
         discovery_job_id: str,
         states: Sequence[_AttributeReplay],
         batch: Sequence[Any],
+        candidate_rank: int = 0,
     ) -> dict[str, Any]:
         sam_job_by_attribute = {
             state.attribute_id: state.sam_job_ids for state in states
@@ -2433,7 +3348,7 @@ class SubjectAttributeEpochRunner:
         return {
             "clip_uid": clip_uid,
             "owner_entity_id": str(owner_plan["owner_entity_id"]),
-            "candidate_rank": "0",
+            "candidate_rank": str(int(candidate_rank)),
             "discovery_job_id": discovery_job_id,
             "attribute_order": [
                 f"a{int(owner_plan['attribute_id_start']) + index}"
@@ -2452,6 +3367,7 @@ class SubjectAttributeEpochRunner:
         discovery_job_id: str,
         states: Sequence[_AttributeReplay],
         batch: Sequence[Any],
+        candidate_rank: int = 0,
     ) -> ModelJob:
         dependencies: dict[str, str] = {
             SUBJECT_ATTRIBUTE_DISCOVERY_JOB: discovery_job_id
@@ -2480,12 +3396,14 @@ class SubjectAttributeEpochRunner:
                 discovery_job_id=discovery_job_id,
                 states=states,
                 batch=batch,
+                candidate_rank=candidate_rank,
             ),
             model_identity=f"qwen:{self.config.qwen.candidate_judge.model}",
             target={
                 "owner_entity_id": str(owner_plan["owner_entity_id"]),
-                "candidate_rank": "0",
+                "candidate_rank": str(int(candidate_rank)),
             },
+            attempt_index=int(candidate_rank),
             dependencies=dependencies,
         )
 
@@ -2499,9 +3417,12 @@ class SubjectAttributeEpochRunner:
             for item in context["clip"].annotation.entities
             if item.entity_id == context["owner_entity_id"]
         )
+        resolved = resolve_subject_attribute_qwen_client(handle, self.config)
         started = time.perf_counter()
         try:
-            batch = handle.review(owner=owner, candidates=list(context["batch"]))
+            batch = resolved.client.review(
+                owner=owner, candidates=list(context["batch"])
+            )
         except Exception as exc:  # noqa: BLE001 - legacy review round isolation
             return JobResult(
                 OUTCOME_COMPLETED,
@@ -2512,6 +3433,8 @@ class SubjectAttributeEpochRunner:
                     "qwen_model_call_time_seconds": time.perf_counter() - started,
                 },
             )
+        finally:
+            _close_owned(resolved)
         return JobResult(
             OUTCOME_COMPLETED,
             payload={
@@ -2527,9 +3450,10 @@ class SubjectAttributeEpochRunner:
         storage = self._storage_for(shard)
         clip_uid = job.clip_uid
         owner_entity_id = str(dict(job.target).get("owner_entity_id", ""))
-        if str(dict(job.target).get("candidate_rank")) != "0":
+        rank = int(dict(job.target).get("candidate_rank", "0"))
+        if rank not in (0, 1):
             raise SubjectAttributeEpochError(
-                f"unsupported raw review rank {dict(job.target).get('candidate_rank')!r}"
+                f"unsupported raw review rank {rank!r}"
             )
         plan = self._clip_plan(shard, clip_uid)
         owner_plan = self._owner_plan_for(shard, plan, owner_entity_id)
@@ -2543,20 +3467,26 @@ class SubjectAttributeEpochRunner:
         context = self._rank0_context(
             shard, storage, clip_uid, owner_plan, discovery, discovery_job_id
         )
-        if context["job"] is None:
+        if context["pending"]:
             raise SubjectAttributeDurableError(
-                f"raw review job {job.job_id()} has no rank-0 batch"
+                f"raw review job {job.job_id()} was reached before its probes"
             )
-        expected = context["job"]
-        if (
-            expected.job_id() != job.job_id()
-            or job.input_digest != expected.input_digest
-            or job.model_identity != expected.model_identity
-        ):
+        if rank == 0:
+            expected = context["job"]
+            batch = context["batch"]
+        else:
+            # Rank 1 only ever exists once every rank-0 completion has settled,
+            # so the graph is the authority for the frozen second-candidate batch.
+            graph = self._owner_graph(
+                shard, storage, clip_uid, owner_plan, context
+            )
+            expected = graph["rank1_job"]
+            batch = graph["batch1"]
+        if expected is None:
             raise SubjectAttributeDurableError(
-                f"raw review job {job.job_id()} is not the frozen rank-0 job for "
-                f"{clip_uid}/{owner_entity_id}"
+                f"raw review job {job.job_id()} has no rank-{rank} batch"
             )
+        self._require_same_job(job, expected)
         return {
             "storage": storage,
             "clip": storage.read_clip(clip_uid),
@@ -2564,19 +3494,24 @@ class SubjectAttributeEpochRunner:
             "owner_plan": owner_plan,
             "discovery": discovery,
             "discovery_job_id": discovery_job_id,
-            "batch": context["batch"],
+            "batch": batch,
             "context": context,
+            "candidate_rank": rank,
         }
 
     # -- rank-0 routes ---------------------------------------------------------
 
     @staticmethod
     def _rank0_route(
-        state: _AttributeReplay, context: Mapping[str, Any]
+        state: _AttributeReplay,
+        context: Mapping[str, Any],
+        *,
+        has_candidate2: bool | None = None,
     ) -> str:
-        """The exact legacy rank-0 route of one attribute."""
+        """The exact legacy route of one attribute in a raw review round."""
         review = context["reviews"].get(state.attribute_id)
-        has_candidate2 = len(state.options) > 1
+        if has_candidate2 is None:
+            has_candidate2 = len(state.options) > 1
         if review is None:
             return (
                 ROUTE_CANDIDATE2_READY if has_candidate2 else ROUTE_TERMINAL_REJECT
@@ -2665,7 +3600,14 @@ class SubjectAttributeEpochRunner:
     def _advance_attributes(
         self, shard: str, storage: RunStorage, clip_uid: str, owner_entity_id: str
     ) -> list[ModelJob]:
-        """Advance one human owner's attribute chain as far as durable state allows."""
+        """Advance one human owner's semantic graph as far as receipts allow.
+
+        The rank-0 boundary marker is verified first (it is derived, never
+        trusted), then the real legacy owner algorithm is re-run over the
+        committed receipts. The first model call it cannot answer from a receipt
+        is the next job, and once every call is paid the legacy artifact is
+        published together with the processed owner outcome.
+        """
         plan = self._clip_plan(shard, clip_uid)
         owner_plan = self._owner_plan_for(shard, plan, owner_entity_id)
         discovery_payload = self._discovery_payload(shard, clip_uid, owner_plan)
@@ -2680,23 +3622,43 @@ class SubjectAttributeEpochRunner:
         )
         if context["pending"]:
             return sorted(context["pending"], key=lambda job: job.job_id())
-        path = self._raw_state_path(shard, clip_uid, owner_entity_id)
-        if path.is_file():
-            # 8b ends here: 8c completes the raw routes and publishes the owner.
-            return []
-        if context["job"] is None:
-            _write_json_once(
-                path,
-                self._raw_state_payload(
-                    clip_uid=clip_uid,
-                    owner_plan=owner_plan,
-                    discovery=discovery,
-                    discovery_job_id=discovery_job_id,
-                    context=context,
-                ),
+        if context["job"] is not None and context["review"] is None:
+            # The owner's rank-0 raw review is still owed; the boundary marker is
+            # only meaningful once every rank-0 verdict exists.
+            return [context["job"]]
+        self._verified_raw_state(shard, storage, clip_uid, owner_plan, context)
+        outcome = self._owner_outcome(shard, clip_uid, owner_entity_id)
+        if outcome is not None:
+            self._verify_owner_outcome(
+                shard, storage, clip_uid, owner_entity_id, owner_plan, outcome
             )
-            return []
-        return [context["job"]]
+            return self._advance_clip(shard, storage, clip_uid)
+        result = self._owner_artifact_from_receipts(
+            shard, storage, clip_uid, owner_plan, context["states"]
+        )
+        graph = self._owner_graph(
+            shard, storage, clip_uid, owner_plan, context
+        )
+        self._publish_owner_markers(
+            shard, storage, clip_uid, owner_plan, graph
+        )
+        if isinstance(result, _PendingModelCall):
+            return [result.job]
+        self._publish_owner_artifact(shard, clip_uid, owner_plan, result)
+        self._write_owner_outcome(
+            shard,
+            clip_uid,
+            owner_entity_id,
+            self._expected_owner_outcome(
+                clip_uid=clip_uid,
+                owner_entity_id=owner_entity_id,
+                owner_plan=owner_plan,
+                artifact=result,
+                source=OWNER_SOURCE_PROCESSED,
+                discovery_job_id=discovery_job_id,
+            ),
+        )
+        return self._advance_clip(shard, storage, clip_uid)
 
     def _finalize_sam_probe(self, job: ModelJob, result: JobResult) -> Sequence[ModelJob]:
         """CPU continuation of one committed SAM probe."""
@@ -2717,38 +3679,1516 @@ class SubjectAttributeEpochRunner:
             str(dict(job.target).get("owner_entity_id", "")),
         )
 
-    def _finalize_raw_review(self, job: ModelJob, result: JobResult) -> Sequence[ModelJob]:
-        """CPU continuation of one committed rank-0 raw review."""
+    def _finalize_owner_chain(
+        self, job: ModelJob, result: JobResult
+    ) -> Sequence[ModelJob]:
+        """CPU continuation of any committed 8b/8c owner model call.
+
+        Every payload shape is validated here so that a torn or foreign receipt
+        fails closed, and the owner's graph is then re-derived from the receipts:
+        whatever the next missing call is becomes the next job.
+        """
         payload = dict(result.payload)
         status = str(payload.get("status", ""))
-        if status not in {"review", "review_failed"}:
+        expected_statuses = {
+            SUBJECT_ATTRIBUTE_RAW_REVIEW_JOB: {"review", "review_failed"},
+            SUBJECT_ATTRIBUTE_COMPLETION_GENERATE_JOB: {
+                "completion",
+                "completion_failed",
+            },
+            SUBJECT_ATTRIBUTE_COMPLETION_SAM_JOB: {"sam", "sam_failed"},
+            SUBJECT_ATTRIBUTE_COMPLETION_REVIEW_JOB: {"review", "review_failed"},
+            SUBJECT_ATTRIBUTE_BBOX_REVIEW_JOB: {"bbox", "bbox_failed"},
+        }
+        if status not in expected_statuses[job.job_type]:
             raise SubjectAttributeDurableError(
-                f"committed raw review {job.job_id()} has an unknown payload status"
+                f"committed {job.job_type} {job.job_id()} has an unknown payload "
+                f"status {status!r}"
             )
-        if status == "review":
+        if status == "review" and job.job_type == SUBJECT_ATTRIBUTE_RAW_REVIEW_JOB:
             try:
-                SubjectAttributeReviewBatch.model_validate(payload.get("review_batch"))
+                SubjectAttributeReviewBatch.model_validate(
+                    payload.get("review_batch")
+                )
             except Exception as exc:
                 raise SubjectAttributeDurableError(
                     f"committed raw review {job.job_id()} has an invalid batch"
                 ) from exc
-        context = self._raw_review_context(job)
-        raw_context = context["context"]
-        _write_json_once(
-            self._raw_state_path(
-                job.canonical_shard, job.clip_uid, context["owner_entity_id"]
+        if status == "sam":
+            self._load_sam_masks(payload)
+        if status == "completion":
+            storage = self._storage_for(job.canonical_shard)
+            self._generated_png_bytes(storage, payload)
+        return self._advance_attributes(
+            job.canonical_shard,
+            self._storage_for(job.canonical_shard),
+            job.clip_uid,
+            str(dict(job.target).get("owner_entity_id", "")),
+        )
+
+    # -- 8c: completion seed, CPU postcheck and chain state ---------------------
+
+    def _completion_dir(
+        self, shard: str, clip_uid: str, owner: str, attribute_id: str
+    ) -> Path:
+        return self._attribute_dir(shard, clip_uid, owner, attribute_id) / "completion"
+
+    def _completion_seed_path(self, shard, clip_uid, owner, attribute_id, rank) -> Path:
+        return self._completion_dir(
+            shard, clip_uid, owner, attribute_id
+        ) / f"rank-{rank}-seed.json"
+
+    def _completion_outcome_path(self, shard, clip_uid, owner, attribute_id, rank):
+        return self._completion_dir(
+            shard, clip_uid, owner, attribute_id
+        ) / f"rank-{rank}-outcome.json"
+
+    def _completion_source_path(
+        self, storage: RunStorage, clip_uid, owner, attribute_id, candidate_id
+    ) -> Path:
+        return (
+            self._output_root(storage)
+            / "completion_candidates"
+            / clip_uid
+            / owner
+            / attribute_id
+            / candidate_id
+            / "raw"
+            / "source.png"
+        )
+
+    def _completion_output_path(
+        self, storage: RunStorage, clip_uid, owner, attribute_id, candidate_id
+    ) -> Path:
+        return (
+            self._output_root(storage)
+            / "completion_candidates"
+            / clip_uid
+            / owner
+            / attribute_id
+            / candidate_id
+            / "generated"
+            / "candidate.png"
+        )
+
+    def _completion_seed(
+        self,
+        shard: str,
+        clip_uid: str,
+        owner_entity_id: str,
+        attribute_id: str,
+        rank: int,
+        owner_candidate_id: str,
+    ) -> int:
+        """Create-once durable Boogu seed.
+
+        Legacy draws a fresh seed per completion request, which a restart would
+        redraw and thereby change both the model call and the recorded artifact.
+        The epoch freezes it instead: the seed is drawn once, stored next to the
+        attribute it belongs to, and reused exactly afterwards.
+        """
+        path = self._completion_seed_path(
+            shard, clip_uid, owner_entity_id, attribute_id, rank
+        )
+        expected = {
+            "schema": SUBJECT_ATTRIBUTE_COMPLETION_SEED_SCHEMA,
+            "clip_uid": clip_uid,
+            "owner_entity_id": owner_entity_id,
+            "attribute_id": attribute_id,
+            "candidate_rank": int(rank),
+            "owner_candidate_id": owner_candidate_id,
+        }
+        existing = _read_json(path)
+        if existing is not None:
+            if set(existing) != set(expected) | {"seed"}:
+                raise SubjectAttributeDurableError(
+                    f"frozen completion seed keyset drifted for {path}"
+                )
+            for key, value in expected.items():
+                if existing.get(key) != value:
+                    raise SubjectAttributeDurableError(
+                        f"frozen completion seed {key} drifted for {path}"
+                    )
+            seed = existing.get("seed")
+            if not isinstance(seed, int) or isinstance(seed, bool):
+                raise SubjectAttributeDurableError(
+                    f"frozen completion seed is invalid for {path}"
+                )
+            return seed
+        seed = int(new_boogu_seed())
+        _write_json_once(path, {**expected, "seed": seed})
+        return seed
+
+    def _completion_input_bytes(self, crop: Any) -> bytes:
+        """The exact PNG legacy ``_save_completion_input`` writes for a crop."""
+        buffer = io.BytesIO()
+        crop.convert("RGB").save(buffer, format="PNG")
+        return buffer.getvalue()
+
+    def _completion_cpu_result(
+        self, generated_bytes: bytes, masks: Sequence[Any]
+    ) -> dict[str, Any]:
+        """Legacy ``_attempt_attribute_completion`` CPU stages, in legacy order.
+
+        Only the stages that do not need a model live here: the mask postcheck,
+        the cleanup, the size and component gates, the reference crop and the
+        quality evaluation. The reasons are byte-identical to legacy so the
+        recorded ``completion_outcome`` never diverges from the durable marker.
+        """
+        completion = self.config.subject_attributes.completion
+        with Image.open(io.BytesIO(generated_bytes)) as opened:
+            opened.load()
+            completed_rgb = opened.convert("RGB")
+        usable, rejection = _completion_mask_postcheck_rejection(
+            tuple(masks),
+            expected_shape=(completed_rgb.height, completed_rgb.width),
+        )
+        counters = {
+            "sam_masks_returned_total": len(masks),
+            "sam_zero_mask_rejects": 0,
+            "postcheck_rejects": 0,
+            "sam_single_mask": 0,
+            "sam_multi_mask": 0,
+        }
+        if rejection is not None:
+            counters["postcheck_rejects"] = 1
+            return {
+                "status": COMPLETION_POSTCHECK_REJECTED,
+                "reason": f"completion_postcheck:{rejection}",
+                "completed_rgba": None,
+                **counters,
+            }
+        if not usable:
+            counters["sam_zero_mask_rejects"] = 1
+            counters["postcheck_rejects"] = 1
+            return {
+                "status": COMPLETION_POSTCHECK_REJECTED,
+                "reason": "completion_postcheck:missing_entity",
+                "completed_rgba": None,
+                **counters,
+            }
+        counters["sam_single_mask"] = int(len(usable) == 1)
+        counters["sam_multi_mask"] = int(len(usable) > 1)
+        union_mask = np.logical_or.reduce(list(usable))
+        cleaned_mask, cleanup_diagnostics = _clean_completion_mask(
+            union_mask, config=completion.quality_filter
+        )
+        completed_rows, completed_columns = np.nonzero(cleaned_mask)
+        # An empty cleaned mask raises here exactly like legacy's own reduction.
+        completed_long_side = max(
+            int(completed_columns.max() - completed_columns.min() + 1),
+            int(completed_rows.max() - completed_rows.min() + 1),
+        )
+        if (
+            int(cleaned_mask.sum()) < MIN_ATTRIBUTE_AREA_PIXELS
+            or completed_long_side < MIN_ATTRIBUTE_LONG_SIDE_PIXELS
+        ):
+            counters["postcheck_rejects"] = 1
+            return {
+                "status": COMPLETION_POSTCHECK_REJECTED,
+                "reason": "completion_postcheck:attribute_too_small",
+                "completed_rgba": None,
+                **counters,
+            }
+        components = mask_component_diagnostics(cleaned_mask)
+        if (
+            components.significant_component_count
+            > completion.maximum_completed_significant_components
+        ):
+            counters["postcheck_rejects"] = 1
+            return {
+                "status": COMPLETION_POSTCHECK_REJECTED,
+                "reason": "completion_postcheck:extra_entity_contours",
+                "completed_rgba": None,
+                **counters,
+            }
+        completed_rgba, _ = build_reference_crop(
+            completed_rgb,
+            cleaned_mask,
+            crop_padding_ratio=float(self.config.pair.crop_padding_ratio),
+        )
+        quality = _evaluate_completion_quality(
+            completed_rgba,
+            config=completion.quality_filter,
+            minimum_mean_luminance=completion.minimum_mean_luminance,
+            minimum_sharpness_score=completion.minimum_sharpness_score,
+        )
+        del cleanup_diagnostics
+        if not quality.passed:
+            counters["postcheck_rejects"] = 1
+            return {
+                "status": COMPLETION_POSTCHECK_REJECTED,
+                "reason": "completion_postcheck:" + ",".join(quality.reasons),
+                "completed_rgba": None,
+                **counters,
+            }
+        return {
+            "status": COMPLETION_REVIEW_REQUIRED,
+            "reason": None,
+            "completed_rgba": completed_rgba,
+            "completed_rgb": completed_rgb,
+            **counters,
+        }
+
+    # -- 8c: model job identities ---------------------------------------------
+
+    def _completion_postcheck_policy_identity(self) -> dict[str, Any]:
+        completion = self.config.subject_attributes.completion
+        return {
+            "policy_version": SUBJECT_ATTRIBUTE_COMPLETION_GENERATE_POLICY_VERSION,
+            "completion_enabled": bool(completion.enabled),
+            "maximum_completed_significant_components": int(
+                completion.maximum_completed_significant_components
             ),
-            self._raw_state_payload(
-                clip_uid=job.clip_uid,
-                owner_plan=context["owner_plan"],
-                discovery=context["discovery"],
-                discovery_job_id=context["discovery_job_id"],
-                context=raw_context,
+            "minimum_mean_luminance": float(completion.minimum_mean_luminance),
+            "minimum_sharpness_score": float(completion.minimum_sharpness_score),
+            "quality_filter_version": str(completion.quality_filter.version),
+            "mode": "legacy_completion_postcheck_v1",
+        }
+
+    def _completion_generate_policy_identity(self) -> dict[str, Any]:
+        """Semantic identity of one Boogu completion request."""
+        edit = self.config.reference_edit
+        return {
+            "policy_version": SUBJECT_ATTRIBUTE_COMPLETION_GENERATE_POLICY_VERSION,
+            "model_path": str(edit.model_path),
+            "model_revision": str(edit.model_revision),
+            "target_area": int(edit.target_area),
+            "alignment": int(edit.alignment),
+            "thinking_enabled": False,
+            "instruction_rewrite_enabled": False,
+            "completion_instruction_rewrite_enabled": bool(
+                edit.completion_instruction_rewrite_enabled
+            ),
+            "add_background_to_complete": bool(edit.add_background_to_complete),
+            "crop_padding_ratio": float(self.config.pair.crop_padding_ratio),
+            "mode": "legacy_attempt_attribute_completion_v1",
+        }
+
+    def _completion_review_policy_identity(self) -> dict[str, Any]:
+        service = self.config.qwen.candidate_judge
+        return {
+            "policy_version": SUBJECT_ATTRIBUTE_COMPLETION_REVIEW_POLICY_VERSION,
+            "model": str(service.model),
+            "temperature": float(service.temperature),
+            "max_tokens": int(service.max_tokens),
+            "qwen_input_max_long_side_pixels": int(QWEN_INPUT_MAX_LONG_SIDE_PIXELS),
+            "mode": "comparative_alpha_versus_completion_v1",
+        }
+
+    def _bbox_review_policy_identity(self) -> dict[str, Any]:
+        service = self.config.qwen.candidate_judge
+        return {
+            "policy_version": SUBJECT_ATTRIBUTE_BBOX_REVIEW_POLICY_VERSION,
+            "model": str(service.model),
+            "temperature": float(service.temperature),
+            "max_tokens": int(service.max_tokens),
+            "qwen_input_max_long_side_pixels": int(QWEN_INPUT_MAX_LONG_SIDE_PIXELS),
+            "mode": "last_resort_attribute_bbox_review_v1",
+        }
+
+    def _expected_completion_generate_job(
+        self,
+        shard: str,
+        clip_uid: str,
+        owner_plan: Mapping[str, Any],
+        attribute_plan: Mapping[str, Any],
+        candidate: Any,
+        rank: int,
+        seed: int,
+    ) -> ModelJob:
+        owner_entity_id = str(owner_plan["owner_entity_id"])
+        attribute_id = str(attribute_plan["attribute_id"])
+        owner_candidate_id = str(candidate.owner_candidate.candidate_id)
+        discovered = attribute_plan["discovered"]
+        return ModelJob.create(
+            job_type=SUBJECT_ATTRIBUTE_COMPLETION_GENERATE_JOB,
+            resource=RESOURCE_BOOGU,
+            canonical_shard=shard,
+            clip_uid=clip_uid,
+            semantic_inputs={
+                "clip_uid": clip_uid,
+                "owner_entity_id": owner_entity_id,
+                "attribute_id": attribute_id,
+                "candidate_rank": str(int(rank)),
+                "owner_candidate_id": owner_candidate_id,
+                "attribute_type": discovered["attribute_type"],
+                "attribute_phrase": discovered["phrase"],
+                "grounding_prompt": discovered["grounding_prompt"],
+                "instruction": attribute_completion_prompt(
+                    discovered["attribute_type"]
+                ),
+                "raw_crop_png_sha256": _image_png_sha256(
+                    candidate.crop.convert("RGBA")
+                ),
+                "completion_input_png_sha256": _sha256_bytes(
+                    self._completion_input_bytes(candidate.crop)
+                ),
+                "seed": int(seed),
+                "completion_generate_policy": (
+                    self._completion_generate_policy_identity()
+                ),
+            },
+            model_identity=f"boogu:{self.config.reference_edit.model_revision}",
+            target={
+                "owner_entity_id": owner_entity_id,
+                "attribute_id": attribute_id,
+                "candidate_rank": str(int(rank)),
+                "owner_candidate_id": owner_candidate_id,
+            },
+            attempt_index=int(rank),
+            dependencies={
+                SUBJECT_ATTRIBUTE_DISCOVERY_JOB: str(
+                    attribute_plan["discovery_job_id"]
+                )
+            },
+        )
+
+    def _expected_completion_sam_job(
+        self,
+        shard: str,
+        clip_uid: str,
+        owner_plan: Mapping[str, Any],
+        attribute_plan: Mapping[str, Any],
+        candidate: Any,
+        rank: int,
+        generate_job: ModelJob,
+        generated_sha256: str,
+        generated_path: str,
+    ) -> ModelJob:
+        owner_entity_id = str(owner_plan["owner_entity_id"])
+        attribute_id = str(attribute_plan["attribute_id"])
+        return ModelJob.create(
+            job_type=SUBJECT_ATTRIBUTE_COMPLETION_SAM_JOB,
+            resource=RESOURCE_SAM,
+            canonical_shard=shard,
+            clip_uid=clip_uid,
+            semantic_inputs={
+                "clip_uid": clip_uid,
+                "owner_entity_id": owner_entity_id,
+                "attribute_id": attribute_id,
+                "candidate_rank": str(int(rank)),
+                "owner_candidate_id": str(candidate.owner_candidate.candidate_id),
+                "grounding_prompt": attribute_plan["discovered"]["grounding_prompt"],
+                "generated_png_path": str(generated_path),
+                "generated_png_sha256": str(generated_sha256),
+                "generation_job_id": generate_job.job_id(),
+                "postcheck_policy": self._completion_postcheck_policy_identity(),
+            },
+            model_identity="sam3",
+            target={
+                "owner_entity_id": owner_entity_id,
+                "attribute_id": attribute_id,
+                "candidate_rank": str(int(rank)),
+                "owner_candidate_id": str(candidate.owner_candidate.candidate_id),
+            },
+            attempt_index=int(rank),
+            dependencies={"completion_generate": generate_job.job_id()},
+        )
+
+    def _expected_completion_review_job(
+        self,
+        shard: str,
+        clip_uid: str,
+        owner_plan: Mapping[str, Any],
+        attribute_plan: Mapping[str, Any],
+        candidate: Any,
+        rank: int,
+        sam_job: ModelJob,
+        source_attribute_png_sha256: str,
+        source_bbox_png_sha256: str,
+        generated_candidate_png_sha256: str,
+    ) -> ModelJob:
+        owner_entity_id = str(owner_plan["owner_entity_id"])
+        attribute_id = str(attribute_plan["attribute_id"])
+        discovered = attribute_plan["discovered"]
+        return ModelJob.create(
+            job_type=SUBJECT_ATTRIBUTE_COMPLETION_REVIEW_JOB,
+            resource=RESOURCE_QWEN,
+            canonical_shard=shard,
+            clip_uid=clip_uid,
+            semantic_inputs={
+                "clip_uid": clip_uid,
+                "owner_entity_id": owner_entity_id,
+                "attribute_id": attribute_id,
+                "candidate_rank": str(int(rank)),
+                "owner_candidate_id": str(candidate.owner_candidate.candidate_id),
+                "attribute_type": discovered["attribute_type"],
+                "attribute_phrase": discovered["phrase"],
+                "source_attribute_png_sha256": str(source_attribute_png_sha256),
+                "source_bbox_png_sha256": str(source_bbox_png_sha256),
+                "generated_candidate_png_sha256": str(
+                    generated_candidate_png_sha256
+                ),
+                "sam_job_id": sam_job.job_id(),
+                "completion_review_policy": self._completion_review_policy_identity(),
+            },
+            model_identity=f"qwen:{self.config.qwen.candidate_judge.model}",
+            target={
+                "owner_entity_id": owner_entity_id,
+                "attribute_id": attribute_id,
+                "candidate_rank": str(int(rank)),
+                "owner_candidate_id": str(candidate.owner_candidate.candidate_id),
+            },
+            attempt_index=int(rank),
+            dependencies={"completion_sam": sam_job.job_id()},
+        )
+
+    def _expected_bbox_review_job(
+        self,
+        shard: str,
+        clip_uid: str,
+        owner_plan: Mapping[str, Any],
+        attribute_plan: Mapping[str, Any],
+        candidate: Any,
+        rank: int,
+        owner_context_png_sha256: str,
+        bbox_png_sha256: str,
+    ) -> ModelJob:
+        owner_entity_id = str(owner_plan["owner_entity_id"])
+        attribute_id = str(attribute_plan["attribute_id"])
+        discovered = attribute_plan["discovered"]
+        return ModelJob.create(
+            job_type=SUBJECT_ATTRIBUTE_BBOX_REVIEW_JOB,
+            resource=RESOURCE_QWEN,
+            canonical_shard=shard,
+            clip_uid=clip_uid,
+            semantic_inputs={
+                "clip_uid": clip_uid,
+                "owner_entity_id": owner_entity_id,
+                "attribute_id": attribute_id,
+                "candidate_rank": str(int(rank)),
+                "owner_candidate_id": str(candidate.owner_candidate.candidate_id),
+                "attribute_type": discovered["attribute_type"],
+                "attribute_phrase": discovered["phrase"],
+                "owner_context_qwen_png_sha256": str(owner_context_png_sha256),
+                "bbox_qwen_png_sha256": str(bbox_png_sha256),
+                "bbox_review_policy": self._bbox_review_policy_identity(),
+            },
+            model_identity=f"qwen:{self.config.qwen.candidate_judge.model}",
+            target={
+                "owner_entity_id": owner_entity_id,
+                "attribute_id": attribute_id,
+                "candidate_rank": str(int(rank)),
+            },
+            attempt_index=int(rank),
+            dependencies={
+                SUBJECT_ATTRIBUTE_DISCOVERY_JOB: str(
+                    attribute_plan["discovery_job_id"]
+                )
+            },
+        )
+
+    # -- 8c: durable completion chain -----------------------------------------
+
+    def _completion_png_path(self, job_id: str) -> Path:
+        return self._semantic("binary", "completion", job_id, "generated.png")
+
+    def _generated_png_bytes(
+        self, storage: RunStorage, payload: Mapping[str, Any]
+    ) -> bytes:
+        """The generated PNG of one committed generation, materialised on disk.
+
+        The ledger copy is authority; the legacy working path under the storage
+        root is restored from it when it is missing or was tampered with, so the
+        completion SAM call always sees the exact bytes the model produced.
+        """
+        record = payload.get("generated")
+        if not isinstance(record, Mapping):
+            raise SubjectAttributeDurableError(
+                "committed completion generation has no generated image"
+            )
+        ledger_path = Path(self.ledger.root) / str(record.get("path", ""))
+        if not ledger_path.is_file():
+            raise SubjectAttributeDurableError(
+                f"completion generated image is missing: {record.get('path')}"
+            )
+        data = ledger_path.read_bytes()
+        if _sha256_bytes(data) != str(record.get("sha256")):
+            raise SubjectAttributeDurableError(
+                "completion generated image drifted from its receipt"
+            )
+        target = Path(storage.root) / str(payload.get("generated_png_path", ""))
+        if not target.is_file() or target.read_bytes() != data:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_bytes(target, data)
+        return data
+
+    def _completion_chain(
+        self,
+        shard: str,
+        storage: RunStorage,
+        clip_uid: str,
+        owner_plan: Mapping[str, Any],
+        attribute_plan: Mapping[str, Any],
+        candidate: Any,
+        rank: int,
+    ) -> _CompletionChain:
+        """Derive one candidate's completion chain from its durable receipts."""
+        owner_entity_id = str(owner_plan["owner_entity_id"])
+        attribute_id = str(attribute_plan["attribute_id"])
+        seed = self._completion_seed(
+            shard,
+            clip_uid,
+            owner_entity_id,
+            attribute_id,
+            rank,
+            str(candidate.owner_candidate.candidate_id),
+        )
+        generate_job = self._expected_completion_generate_job(
+            shard, clip_uid, owner_plan, attribute_plan, candidate, rank, seed
+        )
+        base = {
+            "attribute_id": attribute_id,
+            "attribute_type": str(attribute_plan["discovered"]["attribute_type"]),
+            "candidate_rank": int(rank),
+            "owner_candidate_id": str(candidate.owner_candidate.candidate_id),
+            "candidate": candidate,
+            "seed": seed,
+            "generate_job": generate_job,
+        }
+        payload = self._committed_payload_or_none(generate_job)
+        if payload is None:
+            return _CompletionChain(
+                sam_job=None,
+                review_job=None,
+                status=None,
+                reason=None,
+                next_job=generate_job,
+                review=None,
+                completed_crop_sha256=None,
+                **base,
+            )
+        if str(payload.get("status")) == "completion_failed":
+            return _CompletionChain(
+                sam_job=None,
+                review_job=None,
+                status=COMPLETION_GENERATION_FAILED,
+                reason=(
+                    f"completion_failed:{payload.get('exception_type')}:"
+                    f"{payload.get('error')}"
+                ),
+                next_job=None,
+                review=None,
+                completed_crop_sha256=None,
+                **base,
+            )
+        generated = self._generated_png_bytes(storage, payload)
+        sam_job = self._expected_completion_sam_job(
+            shard,
+            clip_uid,
+            owner_plan,
+            attribute_plan,
+            candidate,
+            rank,
+            generate_job,
+            str(payload.get("generated", {}).get("sha256")),
+            str(payload.get("generated_png_path", "")),
+        )
+        sam_payload = self._committed_payload_or_none(sam_job)
+        if sam_payload is None:
+            return _CompletionChain(
+                sam_job=sam_job,
+                review_job=None,
+                status=None,
+                reason=None,
+                next_job=sam_job,
+                review=None,
+                completed_crop_sha256=None,
+                **base,
+            )
+        if str(sam_payload.get("status")) == "sam_failed":
+            return _CompletionChain(
+                sam_job=sam_job,
+                review_job=None,
+                status=COMPLETION_SAM_FAILED,
+                reason=(
+                    f"completion_failed:{sam_payload.get('exception_type')}:"
+                    f"{sam_payload.get('error')}"
+                ),
+                next_job=None,
+                review=None,
+                completed_crop_sha256=None,
+                **base,
+            )
+        masks = self._load_sam_masks(sam_payload)
+        cpu = self._completion_cpu_result(generated, masks)
+        if cpu["status"] == COMPLETION_POSTCHECK_REJECTED:
+            return _CompletionChain(
+                sam_job=sam_job,
+                review_job=None,
+                status=COMPLETION_POSTCHECK_REJECTED,
+                reason=str(cpu["reason"]),
+                next_job=None,
+                review=None,
+                completed_crop_sha256=None,
+                **base,
+            )
+        completed_rgba = cpu["completed_rgba"]
+        completed_sha = _image_png_sha256(completed_rgba.convert("RGBA"))
+        review_job = self._expected_completion_review_job(
+            shard,
+            clip_uid,
+            owner_plan,
+            attribute_plan,
+            candidate,
+            rank,
+            sam_job,
+            _image_png_sha256(candidate.crop.convert("RGBA")),
+            _image_png_sha256(
+                _attribute_bbox_crop(
+                    candidate.source_image,
+                    candidate.attribute_mask,
+                    crop_padding_ratio=float(self.config.pair.crop_padding_ratio),
+                )
+            ),
+            completed_sha,
+        )
+        review_payload = self._committed_payload_or_none(review_job)
+        if review_payload is None:
+            return _CompletionChain(
+                sam_job=sam_job,
+                review_job=review_job,
+                status=COMPLETION_REVIEW_REQUIRED,
+                reason=None,
+                next_job=review_job,
+                review=None,
+                completed_crop_sha256=completed_sha,
+                **base,
+            )
+        if str(review_payload.get("status")) == "review_failed":
+            return _CompletionChain(
+                sam_job=sam_job,
+                review_job=review_job,
+                status=COMPLETION_REVIEW_FAILED,
+                reason=(
+                    f"completion_failed:{review_payload.get('exception_type')}:"
+                    f"{review_payload.get('error')}"
+                ),
+                next_job=None,
+                review=None,
+                completed_crop_sha256=completed_sha,
+                **base,
+            )
+        try:
+            review = SubjectAttributeCompletionReview.model_validate(
+                review_payload.get("review")
+            )
+        except Exception as exc:
+            raise SubjectAttributeDurableError(
+                "committed completion review payload is invalid"
+            ) from exc
+        accepted = review.verdict == "accept"
+        return _CompletionChain(
+            sam_job=sam_job,
+            review_job=review_job,
+            status=COMPLETION_ACCEPTED if accepted else COMPLETION_REVIEW_REJECTED,
+            reason=(
+                "completion_identity_accepted"
+                if accepted
+                else "completion_qwen_review_reject"
+            ),
+            next_job=None,
+            review=review,
+            completed_crop_sha256=completed_sha,
+            **base,
+        )
+
+    def _completion_outcome_payload(
+        self,
+        storage: RunStorage,
+        chain: _CompletionChain,
+    ) -> dict[str, Any]:
+        """The exact durable completion outcome marker of a terminal chain."""
+        if not chain.terminal:
+            raise SubjectAttributeDurableError(
+                f"completion chain {chain.attribute_id} is not terminal"
+            )
+        return {
+            "schema": SUBJECT_ATTRIBUTE_COMPLETION_OUTCOME_SCHEMA,
+            "clip_uid": chain.generate_job.clip_uid,
+            "owner_entity_id": str(
+                dict(chain.generate_job.target)["owner_entity_id"]
+            ),
+            "attribute_id": chain.attribute_id,
+            "candidate_rank": int(chain.candidate_rank),
+            "owner_candidate_id": chain.owner_candidate_id,
+            "status": chain.status,
+            "reason": chain.reason,
+            "seed": int(chain.seed),
+            "generation_job_id": chain.generate_job.job_id(),
+            "sam_job_id": (
+                chain.sam_job.job_id() if chain.sam_job is not None else None
+            ),
+            "review_job_id": (
+                chain.review_job.job_id() if chain.review_job is not None else None
+            ),
+            "completed_crop_sha256": chain.completed_crop_sha256,
+            "completion_review": (
+                chain.review.model_dump(mode="json")
+                if chain.review is not None
+                else None
+            ),
+        }
+
+    def _publish_completion_outcome(
+        self,
+        shard: str,
+        storage: RunStorage,
+        clip_uid: str,
+        owner_entity_id: str,
+        chain: _CompletionChain,
+    ) -> None:
+        if not chain.terminal:
+            return
+        path = self._completion_outcome_path(
+            shard, clip_uid, owner_entity_id, chain.attribute_id, chain.candidate_rank
+        )
+        _write_json_once(path, self._completion_outcome_payload(storage, chain))
+
+    # -- 8c: legacy re-run over the committed receipts -------------------------
+
+    def _owner_replay(
+        self,
+        shard: str,
+        storage: RunStorage,
+        clip_uid: str,
+        owner_plan: Mapping[str, Any],
+        states: Sequence[_AttributeReplay],
+    ) -> _OwnerReplay:
+        clip = storage.read_clip(clip_uid)
+        owner_entity_id = str(owner_plan["owner_entity_id"])
+        owner = next(
+            item
+            for item in clip.annotation.entities
+            if item.entity_id == owner_entity_id
+        )
+        return _OwnerReplay(
+            epoch=self,
+            shard=shard,
+            storage=storage,
+            clip=clip,
+            owner=owner,
+            owner_plan=owner_plan,
+            reference=self._owner_reference(storage, clip_uid, owner_entity_id),
+            discovery=SubjectAttributeDiscovery.model_validate(
+                self._discovery_payload(shard, clip_uid, owner_plan).get("discovery")
+            ),
+            discovery_job_id=self._expected_discovery_job(
+                shard, clip_uid, owner_plan
+            ).job_id(),
+            candidates=self._owner_candidate_objects(shard, clip_uid, owner_plan),
+            masks=storage.read_masks(clip_uid),
+            states=list(states),
+        )
+
+    def _owner_artifact_from_receipts(
+        self,
+        shard: str,
+        storage: RunStorage,
+        clip_uid: str,
+        owner_plan: Mapping[str, Any],
+        states: Sequence[_AttributeReplay],
+    ) -> Any:
+        """The exact legacy owner artifact, re-run over the committed receipts.
+
+        The real legacy ``_process_owner`` drives every route, record and
+        counter; the epoch only replaces the five model surfaces with replay
+        clients that answer from durable receipts. The first call without a
+        receipt aborts through ``_PendingModelCall`` and becomes the next job, so
+        the model graph and the recorded artifact are the legacy ones by
+        construction rather than by transcription.
+        """
+        replay = self._owner_replay(shard, storage, clip_uid, owner_plan, states)
+        try:
+            artifact = _process_owner(
+                config=self.config,
+                storage=storage,
+                output_root=self._output_root(storage),
+                clip=replay.clip,
+                owner=replay.owner,
+                owner_candidates=replay.candidates,
+                masks=replay.masks,
+                attribute_id_start=int(owner_plan["attribute_id_start"]),
+                discovery_client=_OwnerDiscoveryClient(replay),
+                review_client=_OwnerReviewClient(replay),
+                segmentation_backend=_OwnerSegmentationBackend(replay),
+                gme_screener=None,
+                completion_backend=_OwnerCompletionBackend(replay),
+                completion_judge=_OwnerCompletionJudge(replay),
+            )
+        except _PendingModelCall as pending:
+            return pending
+        return self._reconcile_owner_artifact(replay, artifact)
+
+    def _reconcile_owner_artifact(self, replay: _OwnerReplay, artifact: Any) -> Any:
+        """Freeze the two execution-time-only legacy inputs.
+
+        Wall-clock model timing and the freshly drawn Boogu seed are the only
+        legacy values that must not survive into a durable epoch artifact: the
+        times come from the committed receipts instead of restart CPU replay, and
+        each record's ``completion_seed`` is the frozen per-attribute seed.
+        """
+        records = []
+        for record in artifact.records:
+            if not record.completion_attempted:
+                records.append(record)
+                continue
+            seeded = replay.frozen_seed_for(record.attribute_id)
+            records.append(
+                record.model_copy(update={"completion_seed": seeded})
+                if seeded is not None
+                else record
+            )
+        metrics = artifact.metrics.model_copy(
+            update={
+                "qwen_model_call_time_seconds": replay.qwen_seconds,
+                "sam3_model_call_time_seconds": replay.sam3_seconds,
+            }
+        )
+        return artifact.model_copy(update={"records": records, "metrics": metrics})
+
+    # -- 8c: the owner's semantic graph ---------------------------------------
+
+    def _rank_route_context(self, context: Mapping[str, Any]) -> dict[str, Any]:
+        completion = self.config.subject_attributes.completion
+        return {
+            **context,
+            "completion_enabled": bool(completion.enabled),
+            "completion_eligible_types": tuple(completion.eligible_types),
+        }
+
+    def _owner_routes(self, context: Mapping[str, Any]) -> dict[str, str]:
+        """The exact legacy route of every attribute in the rank-0 round."""
+        route_context = self._rank_route_context(context)
+        routes: dict[str, str] = {}
+        for state in context["states"]:
+            marker = state.marker
+            if marker is None or marker["status"] != SELECTION_CANDIDATES:
+                routes[state.attribute_id] = ROUTE_SELECTION_REJECTED
+            elif state.attribute_id in context["conflicts"]:
+                routes[state.attribute_id] = ROUTE_DUPLICATE_CONFLICT
+            else:
+                routes[state.attribute_id] = self._rank0_route(state, route_context)
+        return routes
+
+    def _owner_graph(
+        self,
+        shard: str,
+        storage: RunStorage,
+        clip_uid: str,
+        owner_plan: Mapping[str, Any],
+        context: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Derive the whole owner graph from the receipts, in legacy order.
+
+        Rank-0 completions settle before the single rank-1 batch is decided, so
+        no rank-1 review is ever planned speculatively. Every seed is created
+        only for a completion the routes actually attempt.
+        """
+        routes0 = self._owner_routes(context)
+        chains0: dict[str, _CompletionChain] = {}
+        for state in context["states"]:
+            if routes0[state.attribute_id] != ROUTE_COMPLETION_REQUIRED:
+                continue
+            chains0[state.attribute_id] = self._completion_chain(
+                shard,
+                storage,
+                clip_uid,
+                owner_plan,
+                state.attribute_plan,
+                state.options[0],
+                0,
+            )
+        rank1_states: list[_AttributeReplay] = []
+        for state in context["states"]:
+            if len(state.options) < 2:
+                continue
+            route = routes0[state.attribute_id]
+            if route == ROUTE_CANDIDATE2_READY or (
+                route == ROUTE_COMPLETION_REQUIRED
+                and not chains0[state.attribute_id].accepted
+            ):
+                rank1_states.append(state)
+        batch1 = [state.options[1] for state in rank1_states]
+        discovery = context["discovery"]
+        discovery_job_id = context["discovery_job_id"]
+        job1 = (
+            self._expected_raw_review_job(
+                shard,
+                clip_uid,
+                owner_plan,
+                discovery,
+                discovery_job_id,
+                rank1_states,
+                batch1,
+                candidate_rank=1,
+            )
+            if batch1
+            else None
+        )
+        payload1 = self._committed_payload_or_none(job1) if job1 is not None else None
+        reviews1: dict[str, Any] = {}
+        if payload1 is not None and str(payload1.get("status")) == "review":
+            try:
+                batch_model = SubjectAttributeReviewBatch.model_validate(
+                    payload1.get("review_batch")
+                )
+            except Exception as exc:
+                raise SubjectAttributeDurableError(
+                    "committed rank-1 raw review payload is invalid"
+                ) from exc
+            reviews1 = {review.attribute_id: review for review in batch_model.reviews}
+        elif payload1 is not None and str(payload1.get("status")) != "review_failed":
+            raise SubjectAttributeDurableError(
+                "committed rank-1 raw review has an unknown payload status"
+            )
+        routes1: dict[str, str] = {}
+        if job1 is not None:
+            route_context = {**self._rank_route_context(context), "reviews": reviews1}
+            for state in rank1_states:
+                routes1[state.attribute_id] = self._rank0_route(
+                    state, route_context, has_candidate2=False
+                )
+        chains1: dict[str, _CompletionChain] = {}
+        if all(
+            routes1[state.attribute_id] != ROUTE_COMPLETION_REQUIRED
+            for state in rank1_states
+        ):
+            for state in rank1_states:
+                if routes1[state.attribute_id] != ROUTE_COMPLETION_REQUIRED:
+                    continue
+                chains1[state.attribute_id] = self._completion_chain(
+                    shard,
+                    storage,
+                    clip_uid,
+                    owner_plan,
+                    state.attribute_plan,
+                    state.options[1],
+                    1,
+                )
+        bbox: list[tuple[_AttributeReplay, int, Any]] = []
+        for state in context["states"]:
+            if routes0[state.attribute_id] == ROUTE_BBOX_PENDING:
+                bbox.append((state, 0, state.options[0]))
+            elif routes1.get(state.attribute_id) == ROUTE_BBOX_PENDING:
+                bbox.append((state, 1, state.options[1]))
+        return {
+            "routes0": routes0,
+            "chains0": chains0,
+            "rank1_states": rank1_states,
+            "batch1": batch1,
+            "rank1_job": job1,
+            "reviews1": reviews1,
+            "routes1": routes1,
+            "chains1": chains1,
+            "bbox": bbox,
+        }
+
+    def _publish_owner_markers(
+        self,
+        shard: str,
+        storage: RunStorage,
+        clip_uid: str,
+        owner_plan: Mapping[str, Any],
+        graph: Mapping[str, Any],
+    ) -> None:
+        """Publish the terminal completion outcomes the graph has settled."""
+        owner_entity_id = str(owner_plan["owner_entity_id"])
+        for chain in list(graph["chains0"].values()) + list(
+            graph["chains1"].values()
+        ):
+            self._publish_completion_outcome(
+                shard, storage, clip_uid, owner_entity_id, chain
+            )
+
+    def _verified_raw_state(
+        self,
+        shard: str,
+        storage: RunStorage,
+        clip_uid: str,
+        owner_plan: Mapping[str, Any],
+        context: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """The rank-0 boundary marker, written once and then re-derived exactly.
+
+        The marker is never authority: it is recomputed from the discovery
+        receipt, the selection markers, the SAM receipts, the duplicate-mask CPU
+        pass and the committed raw review, and any difference fails closed.
+        """
+        path = self._raw_state_path(
+            shard, clip_uid, str(owner_plan["owner_entity_id"])
+        )
+        expected = self._raw_state_payload(
+            clip_uid=clip_uid,
+            owner_plan=owner_plan,
+            discovery=context["discovery"],
+            discovery_job_id=context["discovery_job_id"],
+            context=context,
+        )
+        stored = _read_json(path)
+        if stored is None:
+            _write_json_once(path, expected)
+            return expected
+        if stored != expected:
+            raise SubjectAttributeDurableError(
+                f"frozen Subject Attributes raw state drifted for {clip_uid}"
+            )
+        return expected
+
+    # -- 8c: model job execution ----------------------------------------------
+
+    def _completion_job_context(self, job: ModelJob) -> dict[str, Any]:
+        """Resolve and re-verify one completion or bbox job."""
+        shard = job.canonical_shard
+        storage = self._storage_for(shard)
+        clip_uid = job.clip_uid
+        target = dict(job.target)
+        owner_entity_id = str(target.get("owner_entity_id", ""))
+        attribute_id = str(target.get("attribute_id", ""))
+        rank = int(target.get("candidate_rank", "0"))
+        plan = self._clip_plan(shard, clip_uid)
+        owner_plan = self._owner_plan_for(shard, plan, owner_entity_id)
+        discovery_payload = self._discovery_payload(shard, clip_uid, owner_plan)
+        discovery = SubjectAttributeDiscovery.model_validate(
+            discovery_payload.get("discovery")
+        )
+        discovery_job_id = self._expected_discovery_job(
+            shard, clip_uid, owner_plan
+        ).job_id()
+        reference = self._owner_reference(storage, clip_uid, owner_entity_id)
+        index = self._attribute_index(
+            discovery, attribute_id, int(owner_plan["attribute_id_start"])
+        )
+        attribute_plan = self._attribute_plan(
+            shard,
+            storage,
+            clip_uid,
+            owner_plan,
+            reference,
+            discovery,
+            index,
+            attribute_id,
+            discovery_job_id,
+        )
+        state = self._replay_attribute_selection(
+            shard,
+            storage,
+            clip_uid,
+            owner_plan,
+            reference,
+            discovery,
+            index,
+            attribute_id,
+            discovery_job_id,
+        )
+        if state.pending_job is not None or rank >= len(state.options):
+            raise SubjectAttributeDurableError(
+                f"job {job.job_id()} has no frozen candidate "
+                f"{attribute_id}/rank-{rank}"
+            )
+        candidate = state.options[rank]
+        if job.job_type == SUBJECT_ATTRIBUTE_COMPLETION_GENERATE_JOB:
+            self._require_same_job(
+                job,
+                self._expected_completion_generate_job(
+                    shard,
+                    clip_uid,
+                    owner_plan,
+                    attribute_plan,
+                    candidate,
+                    rank,
+                    self._completion_seed(
+                        shard,
+                        clip_uid,
+                        owner_entity_id,
+                        attribute_id,
+                        rank,
+                        str(candidate.owner_candidate.candidate_id),
+                    ),
+                ),
+            )
+        return {
+            "storage": storage,
+            "clip": storage.read_clip(clip_uid),
+            "owner_plan": owner_plan,
+            "attribute_plan": attribute_plan,
+            "state": state,
+            "rank": rank,
+            "candidate": candidate,
+            "attribute_id": attribute_id,
+            "owner_entity_id": owner_entity_id,
+        }
+
+    @staticmethod
+    def _require_same_job(job: ModelJob, expected: ModelJob) -> None:
+        if (
+            expected.job_id() != job.job_id()
+            or job.input_digest != expected.input_digest
+            or job.model_identity != expected.model_identity
+        ):
+            raise SubjectAttributeDurableError(
+                f"job {job.job_id()} is not the frozen job for its target"
+            )
+
+    def _run_completion_generate(self, job: ModelJob, handle: Any) -> JobResult:
+        """One Boogu completion request. Nothing outside the call is caught."""
+        context = self._completion_job_context(job)
+        if handle is None:
+            raise SubjectAttributeEpochError(
+                "subject attribute completion needs a Boogu handle"
+            )
+        storage = context["storage"]
+        candidate = context["candidate"]
+        state = context["state"]
+        rank = int(context["rank"])
+        owner_candidate_id = str(candidate.owner_candidate.candidate_id)
+        source_path = self._completion_source_path(
+            storage,
+            job.clip_uid,
+            context["owner_entity_id"],
+            context["attribute_id"],
+            owner_candidate_id,
+        )
+        output_path = self._completion_output_path(
+            storage,
+            job.clip_uid,
+            context["owner_entity_id"],
+            context["attribute_id"],
+            owner_candidate_id,
+        )
+        expected_source = self._completion_input_bytes(candidate.crop)
+        if not source_path.is_file() or source_path.read_bytes() != expected_source:
+            _save_completion_input(source_path, candidate.crop)
+        adapter = _completion_adapter(
+            handle, storage, callable(getattr(handle, "attribute_completion", None))
+        )
+        started = time.perf_counter()
+        try:
+            result = adapter.attribute_completion(
+                source_path=source_path,
+                output_path=output_path,
+                instruction=attribute_completion_prompt(
+                    state.attribute_plan["discovered"]["attribute_type"]
+                ),
+                seed=self._completion_seed(
+                    job.canonical_shard,
+                    job.clip_uid,
+                    context["owner_entity_id"],
+                    context["attribute_id"],
+                    rank,
+                    owner_candidate_id,
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 - legacy completion failure scope
+            return JobResult(
+                OUTCOME_COMPLETED,
+                payload={
+                    "status": "completion_failed",
+                    "exception_type": type(exc).__name__,
+                    "error": str(exc),
+                    "model_call_time_seconds": time.perf_counter() - started,
+                },
+            )
+        data = output_path.read_bytes()
+        ledger_path = self._completion_png_path(job.job_id())
+        atomic_write_bytes(ledger_path, data)
+        return JobResult(
+            OUTCOME_COMPLETED,
+            payload={
+                "status": "completion",
+                "generated": {
+                    "path": ledger_path.relative_to(
+                        Path(self.ledger.root)
+                    ).as_posix(),
+                    "sha256": _sha256_bytes(data),
+                },
+                "generated_png_path": output_path.relative_to(
+                    Path(storage.root)
+                ).as_posix(),
+                "width": int(result.get("width", 0)),
+                "height": int(result.get("height", 0)),
+                "model_call_time_seconds": float(
+                    result.get(
+                        "model_call_time_seconds", time.perf_counter() - started
+                    )
+                ),
+            },
+        )
+
+    def _run_completion_sam(self, job: ModelJob, handle: Any) -> JobResult:
+        """One generated-frame segmentation call. Nothing else is caught."""
+        context = self._completion_job_context(job)
+        if handle is None:
+            raise SubjectAttributeEpochError(
+                "subject attribute completion SAM needs a handle"
+            )
+        storage = context["storage"]
+        candidate = context["candidate"]
+        rank = int(context["rank"])
+        owner_candidate_id = str(candidate.owner_candidate.candidate_id)
+        generate_job = self._expected_completion_generate_job(
+            job.canonical_shard,
+            job.clip_uid,
+            context["owner_plan"],
+            context["attribute_plan"],
+            candidate,
+            rank,
+            self._completion_seed(
+                job.canonical_shard,
+                job.clip_uid,
+                context["owner_entity_id"],
+                context["attribute_id"],
+                rank,
+                owner_candidate_id,
             ),
         )
-        # Every rank-0 route still needs 8c (completion, candidate 2, bbox or the
-        # final human owner artifact), so 8b unlocks nothing further.
-        return ()
+        payload = self._committed_payload_or_none(generate_job)
+        if payload is None:
+            raise SubjectAttributeDurableError(
+                f"completion SAM {job.job_id()} has no committed generation"
+            )
+        self._generated_png_bytes(storage, payload)
+        output_path = self._completion_output_path(
+            storage,
+            job.clip_uid,
+            context["owner_entity_id"],
+            context["attribute_id"],
+            owner_candidate_id,
+        )
+        self._require_same_job(
+            job,
+            self._expected_completion_sam_job(
+                job.canonical_shard,
+                job.clip_uid,
+                context["owner_plan"],
+                context["attribute_plan"],
+                candidate,
+                rank,
+                generate_job,
+                str(payload.get("generated", {}).get("sha256")),
+                str(payload.get("generated_png_path", "")),
+            ),
+        )
+        started = time.perf_counter()
+        try:
+            returned = handle.segment_generated_frame(
+                frame_path=output_path,
+                grounding_prompt=str(
+                    context["attribute_plan"]["discovered"]["grounding_prompt"]
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 - legacy completion failure scope
+            return JobResult(
+                OUTCOME_COMPLETED,
+                payload={
+                    "status": "sam_failed",
+                    "exception_type": type(exc).__name__,
+                    "error": str(exc),
+                    "model_call_time_seconds": time.perf_counter() - started,
+                },
+            )
+        records = self._publish_masks(job.job_id(), returned)
+        return JobResult(
+            OUTCOME_COMPLETED,
+            payload={
+                "status": "sam",
+                "mask_count": len(records),
+                "masks": records,
+                "model_call_time_seconds": time.perf_counter() - started,
+            },
+        )
+
+    def _run_completion_review(self, job: ModelJob, handle: Any) -> JobResult:
+        """One comparative alpha-versus-completion review. Nothing else caught."""
+        context = self._completion_job_context(job)
+        storage = context["storage"]
+        candidate = context["candidate"]
+        rank = int(context["rank"])
+        owner_candidate_id = str(candidate.owner_candidate.candidate_id)
+        generate_job = self._expected_completion_generate_job(
+            job.canonical_shard,
+            job.clip_uid,
+            context["owner_plan"],
+            context["attribute_plan"],
+            candidate,
+            rank,
+            self._completion_seed(
+                job.canonical_shard,
+                job.clip_uid,
+                context["owner_entity_id"],
+                context["attribute_id"],
+                rank,
+                owner_candidate_id,
+            ),
+        )
+        payload = self._committed_payload_or_none(generate_job)
+        if payload is None:
+            raise SubjectAttributeDurableError(
+                f"completion review {job.job_id()} has no committed generation"
+            )
+        generated = self._generated_png_bytes(storage, payload)
+        sam_job = self._expected_completion_sam_job(
+            job.canonical_shard,
+            job.clip_uid,
+            context["owner_plan"],
+            context["attribute_plan"],
+            candidate,
+            rank,
+            generate_job,
+            str(payload.get("generated", {}).get("sha256")),
+            str(payload.get("generated_png_path", "")),
+        )
+        sam_payload = self._committed_payload_or_none(sam_job)
+        if sam_payload is None:
+            raise SubjectAttributeDurableError(
+                f"completion review {job.job_id()} has no committed SAM"
+            )
+        cpu = self._completion_cpu_result(
+            generated, self._load_sam_masks(sam_payload)
+        )
+        if cpu["status"] != COMPLETION_REVIEW_REQUIRED:
+            raise SubjectAttributeDurableError(
+                f"completion review {job.job_id()} has a rejected postcheck"
+            )
+        completed_rgba = cpu["completed_rgba"]
+        discovered = context["attribute_plan"]["discovered"]
+        self._require_same_job(
+            job,
+            self._expected_completion_review_job(
+                job.canonical_shard,
+                job.clip_uid,
+                context["owner_plan"],
+                context["attribute_plan"],
+                candidate,
+                rank,
+                sam_job,
+                _image_png_sha256(candidate.crop.convert("RGBA")),
+                _image_png_sha256(
+                    _attribute_bbox_crop(
+                        candidate.source_image,
+                        candidate.attribute_mask,
+                        crop_padding_ratio=float(
+                            self.config.pair.crop_padding_ratio
+                        ),
+                    )
+                ),
+                _image_png_sha256(completed_rgba.convert("RGBA")),
+            ),
+        )
+        resolved = resolve_subject_attribute_qwen_client(
+            handle, self.config, judge=True
+        )
+        started = time.perf_counter()
+        try:
+            review = resolved.client.review(
+                source_attribute=candidate.crop,
+                source_bbox=_attribute_bbox_crop(
+                    candidate.source_image,
+                    candidate.attribute_mask,
+                    crop_padding_ratio=float(self.config.pair.crop_padding_ratio),
+                ),
+                generated_candidate=completed_rgba,
+                attribute_type=discovered["attribute_type"],
+                attribute_phrase=discovered["phrase"],
+            )
+        except Exception as exc:  # noqa: BLE001 - legacy completion failure scope
+            return JobResult(
+                OUTCOME_COMPLETED,
+                payload={
+                    "status": "review_failed",
+                    "exception_type": type(exc).__name__,
+                    "error": str(exc),
+                    "qwen_model_call_time_seconds": time.perf_counter() - started,
+                },
+            )
+        finally:
+            _close_owned(resolved)
+        return JobResult(
+            OUTCOME_COMPLETED,
+            payload={
+                "status": "review",
+                "review": review.model_dump(mode="json"),
+                "qwen_model_call_time_seconds": time.perf_counter() - started,
+            },
+        )
+
+    def _run_bbox_review(self, job: ModelJob, handle: Any) -> JobResult:
+        """One last-resort bbox review call. Nothing else is caught."""
+        context = self._completion_job_context(job)
+        candidate = context["candidate"]
+        rank = int(context["rank"])
+        discovered = context["attribute_plan"]["discovered"]
+        bbox_image = _attribute_bbox_crop(
+            candidate.source_image,
+            candidate.attribute_mask,
+            crop_padding_ratio=float(self.config.pair.crop_padding_ratio),
+        )
+        owner_context = build_candidate_context_image(
+            candidate.source_image, candidate.owner_candidate.mask
+        )
+        self._require_same_job(
+            job,
+            self._expected_bbox_review_job(
+                job.canonical_shard,
+                job.clip_uid,
+                context["owner_plan"],
+                context["attribute_plan"],
+                candidate,
+                rank,
+                _image_png_sha256(_resize_qwen_input_image(owner_context)),
+                _image_png_sha256(bbox_image),
+            ),
+        )
+        resolved = resolve_subject_attribute_qwen_client(handle, self.config)
+        started = time.perf_counter()
+        try:
+            review = resolved.client.review_attribute_bbox(
+                bbox_candidate=bbox_image,
+                owner_context=owner_context,
+                attribute_type=discovered["attribute_type"],
+                attribute_phrase=discovered["phrase"],
+            )
+        except Exception as exc:  # noqa: BLE001 - fail closed, one job per attribute
+            return JobResult(
+                OUTCOME_COMPLETED,
+                payload={
+                    "status": "bbox_failed",
+                    "exception_type": type(exc).__name__,
+                    "error": str(exc),
+                    "qwen_model_call_time_seconds": time.perf_counter() - started,
+                },
+            )
+        finally:
+            _close_owned(resolved)
+        return JobResult(
+            OUTCOME_COMPLETED,
+            payload={
+                "status": "bbox",
+                "bbox_review": review.model_dump(mode="json"),
+                "qwen_model_call_time_seconds": time.perf_counter() - started,
+            },
+        )
+
+    def _publish_masks(self, job_id: str, masks: Sequence[Any]) -> list[dict[str, Any]]:
+        """Store returned masks as durable ledger ``.npy`` artifacts."""
+        records: list[dict[str, Any]] = []
+        for index, mask in enumerate(masks):
+            array = np.asarray(mask)
+            buffer = io.BytesIO()
+            np.save(buffer, array, allow_pickle=False)
+            data = buffer.getvalue()
+            path = self._sam_mask_path(job_id, index)
+            atomic_write_bytes(path, data)
+            records.append(
+                {
+                    "path": path.relative_to(Path(self.ledger.root)).as_posix(),
+                    "sha256": _sha256_bytes(data),
+                    "dtype": str(array.dtype),
+                    "shape": [int(value) for value in array.shape],
+                }
+            )
+        return records
 
     # -- stats -----------------------------------------------------------------
 

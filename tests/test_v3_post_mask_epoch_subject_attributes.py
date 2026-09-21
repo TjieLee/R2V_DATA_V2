@@ -11,6 +11,7 @@ human owner artifact stay out of scope.
 
 from __future__ import annotations
 
+import io
 import json
 import time
 from collections.abc import Mapping
@@ -20,9 +21,14 @@ from typing import Any
 
 import numpy as np
 import pytest
+from PIL import Image
 
 import tests.test_v3_reference_integrity as legacy_integrity
-from r2v_data_v2.v3.post_mask_epoch_jobs import RESOURCE_QWEN, RESOURCE_SAM
+from r2v_data_v2.v3.post_mask_epoch_jobs import (
+    RESOURCE_BOOGU,
+    RESOURCE_QWEN,
+    RESOURCE_SAM,
+)
 from r2v_data_v2.v3.post_mask_epoch_scheduler import (
     JobExecution,
     ResourceEpochScheduler,
@@ -42,6 +48,8 @@ from r2v_data_v2.v3.subject_attributes import (
     DiscoveredSubjectAttribute,
     OwnerEnrichmentArtifact,
     OwnerEnrichmentMetrics,
+    SubjectAttributeBboxReview,
+    SubjectAttributeCompletionReview,
     SubjectAttributeDiscovery,
     SubjectAttributeReview,
     SubjectAttributeReviewBatch,
@@ -152,6 +160,87 @@ def _raw_review(attribute_id: str, **overrides: Any) -> Any:
     return SubjectAttributeReview.model_validate(payload)
 
 
+def _completion_review(verdict: str = "accept", **overrides: Any) -> Any:
+    passed = verdict == "accept"
+    payload = {
+        "same_physical_attribute": True,
+        "original_visible_details_preserved": True,
+        "no_wrong_new_instance": True,
+        "no_duplicate_component": True,
+        "no_unrelated_content": True,
+        "no_structural_distortion": True,
+        "target_clear_and_prominent": True,
+        "candidate_better_than_alpha": passed,
+        "certain": True,
+        "reason": "completion looks like the same attribute",
+        "verdict": verdict,
+        **overrides,
+    }
+    return SubjectAttributeCompletionReview.model_validate(payload)
+
+
+def _bbox_review(verdict: str = "accept", **overrides: Any) -> Any:
+    passed = verdict == "accept"
+    payload = {
+        "correct_attribute": True,
+        "owner_binding_correct": True,
+        "target_is_dominant_and_identifiable": True,
+        "no_large_competing_attribute_or_entity": True,
+        "context_is_limited_and_supportive": True,
+        "no_strong_owner_pose_or_scene_leakage": True,
+        "no_severe_blur_or_artifact": True,
+        "usable_as_attribute_condition": passed,
+        "certain": True,
+        "reason": "bbox crop is usable",
+        "verdict": verdict,
+        **overrides,
+    }
+    return SubjectAttributeBboxReview.model_validate(payload)
+
+
+def _generated_png(*, colour: tuple[int, int, int] = (210, 70, 70)) -> bytes:
+    """A valid generated candidate the tiny fixture can postcheck."""
+    buffer = io.BytesIO()
+    Image.new("RGB", (32, 24), colour).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+class _BooguBackend:
+    """The Boogu completion handle: one scripted generation per call."""
+
+    def __init__(self, *results: Any, timeline: list[str] | None = None) -> None:
+        self.results = list(results)
+        self.calls = 0
+        self.seeds: list[int] = []
+        self.requests: list[dict[str, Any]] = []
+        self.timeline = timeline
+
+    def attribute_completion(
+        self, *, source_path: Path, output_path: Path, instruction: str, seed: int
+    ) -> dict[str, Any]:
+        self.calls += 1
+        self.seeds.append(int(seed))
+        self.requests.append(
+            {
+                "source_path": Path(source_path),
+                "output_path": Path(output_path),
+                "instruction": instruction,
+            }
+        )
+        if self.timeline is not None:
+            self.timeline.append("boogu")
+        result = self.results[min(self.calls, len(self.results)) - 1]
+        if isinstance(result, Exception):
+            raise result
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(output_path).write_bytes(result)
+        return {
+            "width": 32,
+            "height": 24,
+            "model_call_time_seconds": 0.0,
+        }
+
+
 class _SamBackend:
     """The SAM epoch resource handle: one scripted ``segment_frame`` per probe.
 
@@ -166,11 +255,16 @@ class _SamBackend:
         *results: Any,
         timeline: list[str] | None = None,
         by_prompt: Mapping[str, Any] | None = None,
+        generated: Any = (),
     ) -> None:
         self.results = list(results)
         self.by_prompt = dict(by_prompt or {})
+        self.generated_script = list(generated)
         self.calls = 0
         self.requests: list[dict[str, Any]] = []
+        self.generated: list[Any] = list(self.generated_script)
+        self.generated_calls = 0
+        self.generated_requests: list[dict[str, Any]] = []
         self.timeline = timeline
 
     def segment_frame(self, **kwargs: Any) -> Any:
@@ -186,21 +280,41 @@ class _SamBackend:
             raise result
         return list(result)
 
+    def segment_generated_frame(self, **kwargs: Any) -> Any:
+        """The completion SAM call: one scripted result per generated frame."""
+        self.generated_calls += 1
+        self.generated_requests.append(kwargs)
+        if self.timeline is not None:
+            self.timeline.append("sam:generated")
+        result = self.generated[
+            min(self.generated_calls, len(self.generated)) - 1
+        ]
+        if isinstance(result, Exception):
+            raise result
+        return list(result)
+
 
 class _QwenClient:
-    """One handle serving both discovery and the owner-batched raw review."""
+    """One handle serving discovery, the raw reviews, the completion
+    reviews and the last-resort bbox review."""
 
     def __init__(
         self,
         *,
         discoveries: Any = (),
         reviews: Any = (),
+        completion_reviews: Any = (),
+        bbox_reviews: Any = (),
         timeline: list[str] | None = None,
     ) -> None:
         self.discoveries = list(discoveries)
         self.reviews = list(reviews)
+        self.completion_review_results = list(completion_reviews)
+        self.bbox_review_results = list(bbox_reviews)
         self.discovery_calls = 0
         self.review_calls = 0
+        self.completion_review_calls = 0
+        self.bbox_calls = 0
         self.review_requests: list[list[str]] = []
         self.timeline = timeline
 
@@ -215,17 +329,40 @@ class _QwenClient:
             raise result
         return result
 
-    def review(self, *, owner: Any, candidates: Any) -> Any:
-        del owner
+    def review(self, **kwargs: Any) -> Any:
+        if "candidates" in kwargs:
+            return self._raw_review(list(kwargs["candidates"]))
+        return self._completion_review()
+
+    def _raw_review(self, candidates: list[Any]) -> Any:
         self.review_calls += 1
-        self.review_requests.append(
-            [candidate.attribute_id for candidate in candidates]
-        )
+        ids = [candidate.attribute_id for candidate in candidates]
+        self.review_requests.append(ids)
         if self.timeline is not None:
-            self.timeline.append(
-                f"review:{','.join(candidate.attribute_id for candidate in candidates)}"
-            )
+            self.timeline.append(f"review:{','.join(ids)}")
         result = self.reviews[min(self.review_calls, len(self.reviews)) - 1]
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    def _completion_review(self) -> Any:
+        self.completion_review_calls += 1
+        if self.timeline is not None:
+            self.timeline.append("completion_review")
+        result = self.completion_review_results[
+            min(self.completion_review_calls, len(self.completion_review_results)) - 1
+        ]
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    def review_attribute_bbox(self, **kwargs: Any) -> Any:
+        self.bbox_calls += 1
+        if self.timeline is not None:
+            self.timeline.append("bbox")
+        result = self.bbox_review_results[
+            min(self.bbox_calls, len(self.bbox_review_results)) - 1
+        ]
         if isinstance(result, Exception):
             raise result
         return result
@@ -278,11 +415,17 @@ class _SerialQwenExecutor:
 
 
 def _scheduler(
-    runner: Any, executor: Any, finalize: Any = None, sam: Any = None
+    runner: Any,
+    executor: Any,
+    finalize: Any = None,
+    sam: Any = None,
+    boogu: Any = None,
 ) -> Any:
     executors: dict[str, Any] = {RESOURCE_QWEN: executor}
     if sam is not None:
         executors[RESOURCE_SAM] = sam
+    if boogu is not None:
+        executors[RESOURCE_BOOGU] = boogu
     return ResourceEpochScheduler(
         ledger=runner.ledger,
         finalize=finalize or runner.finalize,
@@ -296,12 +439,14 @@ def _drain(
     *,
     finalize: Any = None,
     sam: Any = None,
+    boogu: Any = None,
 ) -> tuple[Any, list[Any]]:
     executor = _SerialQwenExecutor(runner, client)
     sam_executor = None if sam is None else _SerialQwenExecutor(runner, sam)
+    boogu_executor = None if boogu is None else _SerialQwenExecutor(runner, boogu)
     jobs = runner.seed_jobs()
     if jobs:
-        _scheduler(runner, executor, finalize, sam_executor).run(jobs)
+        _scheduler(runner, executor, finalize, sam_executor, boogu_executor).run(jobs)
     return executor, jobs
 
 
@@ -774,8 +919,7 @@ def test_discovery_receipt_before_finalizer_restart_pays_no_qwen(
     fresh = _runner(config, storage, tmp_path)
     fresh_executor, fresh_jobs = _drain(fresh, client)
 
-    assert len(fresh_jobs) == 1, "the same frozen job is re-seeded"
-    assert fresh_jobs[0].job_id() == jobs[0].job_id()
+    assert fresh_jobs == [], "a committed terminal discovery re-seeds nothing"
     assert fresh_executor.batches == 0, "the committed receipt is reused"
     assert client.calls == 1, "restart must not pay another discovery call"
     assert _owner_artifact_file(storage).is_file()
@@ -855,27 +999,21 @@ def test_human_discovery_terminal_and_attribute_owner_defers(
     assert qwen.discovery_calls == 1
     assert sam.calls == 1, "the first SAM probe is the next job"
     assert qwen.review_calls == 0, "a rejected selection pays no raw review"
-    # 8b never publishes the human owner artifact: 8c owns that.
-    assert not _owner_artifact_file(storage).exists()
-    outcome_path = (
-        Path(runner.ledger.root)
-        / "semantic"
-        / "subject_attributes"
-        / "owners"
-        / SHARD
-        / CLIP_UID
-        / OWNER
-        / "outcome.json"
-    )
-    assert not outcome_path.exists()
     marker = _raw_state_marker(runner)
     assert [item["route_after_rank0"] for item in marker["attributes"]] == [
         "selection_rejected"
     ]
     assert marker["rank0_review_job_id"] is None
     assert marker["attributes"][0]["selection_status"] == "rejected"
-    with pytest.raises(SubjectAttributeEpochError, match="not terminal"):
-        runner.reconcile_stats(SHARD)
+    # A rejected selection is a terminal owner record: 8c publishes it.
+    artifact = _read_artifact(storage)
+    assert [record.status for record in artifact.records] == ["rejected"]
+    assert artifact.metrics.discovery_calls == 1
+    assert artifact.metrics.sam3_attempts == 1
+    assert artifact.metrics.review_calls == 0
+    outcome = json.loads(_owner_outcome_path(runner).read_text(encoding="utf-8"))
+    assert outcome["source"] == "processed"
+    assert runner.reconcile_stats(SHARD).terminal_clips == 1
 
     fresh = _runner(config, storage, tmp_path, ledger_name="ledger-attrs")
     fresh_qwen = _QwenClient()
@@ -886,9 +1024,10 @@ def test_human_discovery_terminal_and_attribute_owner_defers(
     assert fresh_executor.batches == 0
     assert fresh_qwen.discovery_calls == 0
     assert fresh_qwen.review_calls == 0
-    assert not _owner_artifact_file(storage).exists()
-    with pytest.raises(SubjectAttributeEpochError, match="not terminal"):
-        fresh.reconcile_stats(SHARD)
+    assert _read_artifact(storage).model_dump(mode="json") == artifact.model_dump(
+        mode="json"
+    )
+    assert fresh.reconcile_stats(SHARD).terminal_clips == 1
 
 
 def test_frozen_discovery_input_drift_fails_closed(
@@ -1251,7 +1390,7 @@ def test_owner_batched_rank0_review_matches_legacy(
         ],
     )
     legacy_sam = _SamBackend(by_prompt=script(legacy_storage))
-    _, _, _ = _legacy_run(
+    legacy_result, _, _ = _legacy_run(
         legacy_config,
         legacy_storage,
         legacy_qwen,
@@ -1295,11 +1434,14 @@ def test_owner_batched_rank0_review_matches_legacy(
         "a1",
         "a2",
     ]
-    # 8b never publishes the human owner artifact or its clip outcome.
-    assert not _owner_artifact_file(storage).exists()
-    assert not _owner_outcome_path(runner).exists()
-    with pytest.raises(SubjectAttributeEpochError, match="not terminal"):
-        runner.reconcile_stats(SHARD)
+    # Both attributes are accepted raw, so the owner is terminal and the epoch
+    # publishes exactly the legacy artifact and the legacy clip counts.
+    assert _read_artifact(storage).model_dump(mode="json") == _read_artifact(
+        legacy_storage
+    ).model_dump(mode="json")
+    outcome = json.loads(_owner_outcome_path(runner).read_text(encoding="utf-8"))
+    assert outcome["source"] == "processed"
+    assert runner.reconcile_stats(SHARD).to_dict() == legacy_result.to_counts()
     assert jobs
 
     # The attribute plan is create-once and re-derived, exactly like the clip and
@@ -1374,10 +1516,14 @@ def test_owner_batched_rank0_review_matches_legacy(
     assert duplicate_runner.seed_jobs() == []
 
 
-def test_review_round_failure_routes_without_seeding_candidate2(
+def test_review_round_failure_defers_to_candidate2_then_rejects(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A failed rank-0 review round is a legacy route, not a scheduler retry."""
+    """A failed review round is a legacy route, never a scheduler retry.
+
+    Rank 0 fails and defers to candidate 2, rank 1 fails too, and because there
+    is no third candidate the attribute ends in the legacy terminal reject.
+    """
     monkeypatch.setattr(time, "perf_counter", lambda: 1.0)
     config, storage = _storage_variant(tmp_path, monkeypatch, "run-review-failure")
     _add_owner_frame(storage, slot=1)
@@ -1393,24 +1539,30 @@ def test_review_round_failure_routes_without_seeding_candidate2(
     sam = _SamBackend(by_prompt={ACCESSORY[2]: masks})
     executor, jobs = _drain(runner, qwen, sam=sam)
 
-    assert qwen.review_calls == 1
     assert sam.calls == 2
     marker = _raw_state_marker(runner)
     attribute = marker["attributes"][0]
     assert attribute["rank0_review"] is None
     assert attribute["rank0_review_failure"] == "review_failed:ValueError:review exploded"
-    # Two options exist, so legacy defers to candidate 2 -- but 8b never seeds it.
+    # Two options exist, so legacy defers to candidate 2 and rank 1 is the frozen
+    # next round; there is no third candidate, so rank 1 ends the attribute.
     assert attribute["route_after_rank0"] == "candidate2_ready"
     assert len(_selection_marker(runner, "a1")["options"]) == 2
+    assert qwen.review_calls == 2
     assert [job.job_type for job in executor.executed] == [
         SUBJECT_ATTRIBUTE_DISCOVERY_JOB,
         SUBJECT_ATTRIBUTE_RAW_REVIEW_JOB,
+        SUBJECT_ATTRIBUTE_RAW_REVIEW_JOB,
     ]
     assert [job.job_type for job in jobs] == [SUBJECT_ATTRIBUTE_DISCOVERY_JOB]
-    assert runner.seed_jobs() == [], "8b must not speculatively seed candidate 2"
-    assert not _owner_artifact_file(storage).exists()
-    with pytest.raises(SubjectAttributeEpochError, match="not terminal"):
-        runner.reconcile_stats(SHARD)
+    assert runner.seed_jobs() == []
+    artifact = _read_artifact(storage)
+    assert [record.status for record in artifact.records] == ["rejected"]
+    assert artifact.records[0].reason == "review_failed:ValueError:review exploded"
+    assert artifact.metrics.review_calls == 2
+    assert artifact.metrics.attribute_second_candidate_attempts == 1
+    assert artifact.failure_reason == "review_failed:ValueError:review exploded"
+    assert runner.reconcile_stats(SHARD).terminal_clips == 1
 
 
 def test_raw_review_receipt_before_finalizer_restart_pays_no_model(
@@ -1451,36 +1603,42 @@ def test_raw_review_receipt_before_finalizer_restart_pays_no_model(
     assert fresh_sam.calls == 0
     # The dry run re-offers the same rank-0 job; its committed receipt is reused,
     # so no executor ever ran and only the CPU finalizer replayed.
-    assert [job.job_type for job in jobs] == [SUBJECT_ATTRIBUTE_RAW_REVIEW_JOB]
+    assert jobs == [], "the committed receipt is enough to finish on CPU"
     assert executor.executed == []
     marker = _raw_state_marker(fresh)
     assert [item["route_after_rank0"] for item in marker["attributes"]] == [
         "raw_accept"
     ]
     assert marker["attributes"][0]["rank0_review"] is not None
+    # The raw accept is terminal, so the owner artifact is backfilled on CPU too.
+    assert _read_artifact(storage).records[0].status == "accepted"
+    assert json.loads(
+        _owner_outcome_path(fresh).read_text(encoding="utf-8")
+    )["source"] == "processed"
 
 
-def test_completion_required_blocks_candidate2_seeding(
+def test_completion_accepts_before_any_candidate2_review(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A completion-recommended rank-0 accept must stop before any rank-1 review.
+    """A completion-recommended rank-0 accept never reaches candidate 2.
 
-    Legacy tries completion first and only falls back to candidate 2 when that
-    fails, so 8b may not speculatively seed a second-candidate review. This is
-    the architectural boundary between 8b and 8c.
+    Legacy tries completion first and only falls back to candidate 2 when the
+    completion chain fails, so the rank-1 review batch must stay empty while the
+    rank-0 completion succeeds. The whole completion chain is one Boogu call,
+    one generated-frame SAM call and one comparative review, all durable.
     """
     monkeypatch.setattr(time, "perf_counter", lambda: 1.0)
-    completion_attribute = (
-        "upper_clothing",
-        "a denim jacket",
-        "jacket over the torso",
-    )
+    attribute = ("upper_clothing", "a denim jacket", "jacket over the torso")
     config, storage = _storage_variant(tmp_path, monkeypatch, "run-completion")
     _add_owner_frame(storage, slot=1)
     config = _completion_config(config)
     runner = _runner(config, storage, tmp_path)
+    masks = [
+        _attribute_mask(storage, slot=1, band=0),
+        _attribute_mask(storage, slot=0, band=0),
+    ]
     qwen = _QwenClient(
-        discoveries=[_human_discovery(attributes=(completion_attribute,))],
+        discoveries=[_human_discovery(attributes=(attribute,))],
         reviews=[
             SubjectAttributeReviewBatch(
                 owner_entity_id=OWNER,
@@ -1493,57 +1651,600 @@ def test_completion_required_blocks_candidate2_seeding(
                 ],
             )
         ],
+        completion_reviews=[_completion_review("accept")],
     )
+    sam = _SamBackend(
+        by_prompt={attribute[2]: masks},
+        generated=[masks[:1]],
+    )
+    boogu = _BooguBackend(_generated_png())
+    timeline: list[str] = []
+    for surface in (qwen, sam, boogu):
+        surface.timeline = timeline
+    _drain(runner, qwen, sam=sam, boogu=boogu)
+
+    marker = _raw_state_marker(runner)
+    attribute_state = marker["attributes"][0]
+    assert attribute_state["selection_status"] == "candidates"
+    assert attribute_state["route_after_rank0"] == "completion_required"
+    assert attribute_state["rank0_review"]["completion_recommended"] is True
+
+    # Exactly one Boogu call, one generated-frame SAM call, one completion
+    # review, and no rank-1 raw review at all.
+    assert boogu.calls == 1
+    assert sam.calls == 2, "the two rank-0 selection probes"
+    assert sam.generated_calls == 1
+    assert qwen.review_calls == 1, "rank 1 is never reviewed"
+    assert qwen.completion_review_calls == 1
+    assert qwen.bbox_calls == 0
+    assert timeline == [
+        "discovery",
+        "sam:1",
+        "sam:0",
+        "review:a1",
+        "boogu",
+        "sam:generated",
+        "completion_review",
+    ]
+    assert runner.seed_jobs() == []
+
+    artifact = _read_artifact(storage)
+    assert [record.status for record in artifact.records] == ["accepted"]
+    record = artifact.records[0]
+    assert record.final_selection == "completed"
+    assert record.completion_attempted is True
+    assert record.completion_outcome == "selected_completed"
+    assert record.completion_review.verdict == "accept"
+    assert record.completion_seed == boogu.seeds[0]
+    assert artifact.metrics.completion_attempts == 1
+    assert artifact.metrics.completion_accepted == 1
+    assert artifact.metrics.completion_selected_completed == 1
+    assert artifact.metrics.attribute_completion_candidate1_accepted == 1
+    assert artifact.metrics.attribute_completion_candidate2_accepted == 0
+    assert artifact.metrics.attribute_second_candidate_attempts == 0
+    assert artifact.metrics.attribute_bbox_fallback_attempts == 0
+
+    # The durable seed and the completion outcome marker exist and agree.
+    seed_path = (
+        Path(runner.ledger.root)
+        / "semantic"
+        / "subject_attributes"
+        / "owners"
+        / SHARD
+        / CLIP_UID
+        / OWNER
+        / "attributes"
+        / "a1"
+        / "completion"
+        / "rank-0-seed.json"
+    )
+    seed = json.loads(seed_path.read_text(encoding="utf-8"))
+    assert seed["seed"] == boogu.seeds[0]
+    assert seed["owner_candidate_id"] == "candidate_1"
+    outcome_path = seed_path.with_name("rank-0-outcome.json")
+    completion_outcome = json.loads(outcome_path.read_text(encoding="utf-8"))
+    assert completion_outcome["status"] == "accepted"
+    assert completion_outcome["reason"] == "completion_identity_accepted"
+    assert completion_outcome["candidate_rank"] == 0
+    assert completion_outcome["completed_crop_sha256"] is not None
+    assert completion_outcome["completion_review"]["verdict"] == "accept"
+    assert runner.reconcile_stats(SHARD).terminal_clips == 1
+
+
+# ---------------------------------------------------------------------------
+# 8c: the completion chain, the rank-1 fallback, bbox and the terminal owner
+# ---------------------------------------------------------------------------
+
+COMPLETION_ATTRIBUTE = ("upper_clothing", "a denim jacket", "jacket over the torso")
+FACE_ATTRIBUTE = ("face", "a calm face", "face of the person")
+
+
+def _completion_config_for(config: Any) -> Any:
+    return _completion_config(config)
+
+
+def _completion_fixture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    run_name: str,
+    attribute: tuple[str, str, str],
+    reviews: list[Any],
+    completion_reviews: list[Any] = (),
+    bbox_reviews: list[Any] = (),
+    boogu: Any = (),
+) -> tuple[Any, Any, Any, _QwenClient, _SamBackend, _BooguBackend, Any]:
+    """One human attribute with two owner candidate frames and completion on."""
+    config, storage = _storage_variant(tmp_path, monkeypatch, run_name)
+    _add_owner_frame(storage, slot=1)
+    config = _completion_config(config)
+    runner = _runner(config, storage, tmp_path, ledger_name=f"ledger-{run_name}")
     masks = [
         _attribute_mask(storage, slot=1, band=0),
         _attribute_mask(storage, slot=0, band=0),
     ]
-    sam = _SamBackend(by_prompt={completion_attribute[2]: masks})
+    qwen = _QwenClient(
+        discoveries=[_human_discovery(attributes=(attribute,))],
+        reviews=reviews,
+        completion_reviews=list(completion_reviews),
+        bbox_reviews=list(bbox_reviews),
+    )
+    sam = _SamBackend(
+        by_prompt={attribute[2]: masks},
+        # One generated-frame SAM result per completion chain a test may run.
+        generated=[masks[:1], masks[1:]],
+    )
+    backend = _BooguBackend(*boogu) if boogu else _BooguBackend()
+    timeline: list[str] = []
+    for surface in (qwen, sam, backend):
+        surface.timeline = timeline
+    return config, storage, runner, qwen, sam, backend, timeline
+
+
+def test_raw_state_tamper_fails_closed_without_any_model_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rank-0 boundary marker is derived, never authority."""
+    monkeypatch.setattr(time, "perf_counter", lambda: 1.0)
+    config, storage = _storage_variant(tmp_path, monkeypatch, "run-raw-tamper")
+    runner = _runner(config, storage, tmp_path)
+    qwen = _QwenClient(
+        discoveries=[_human_discovery(attributes=(ACCESSORY,))],
+        reviews=[
+            SubjectAttributeReviewBatch(
+                owner_entity_id=OWNER, reviews=[_raw_review("a1")]
+            )
+        ],
+    )
+    sam = _SamBackend(by_prompt={ACCESSORY[2]: _usable_sam(storage, slot=0)})
     _drain(runner, qwen, sam=sam)
 
-    marker = _raw_state_marker(runner)
-    assert len(marker["attributes"]) == 1
-    attribute = marker["attributes"][0]
-    assert attribute["selection_status"] == "candidates"
-    assert attribute["route_after_rank0"] == "completion_required"
-    assert attribute["rank0_review"]["completion_recommended"] is True
+    path = _raw_state_file(runner)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["attributes"][0]["route_after_rank0"] = "raw_accept_tampered"
+    path.write_text(json.dumps(payload), encoding="utf-8")
 
-    plan = runner._clip_plan(SHARD, CLIP_UID)
-    owner_plan = runner._owner_plan_for(SHARD, plan, OWNER)
-    reference = runner._owner_reference(storage, CLIP_UID, OWNER)
-    discovery_job = runner._expected_discovery_job(SHARD, CLIP_UID, owner_plan)
-    attribute_plan = runner._attribute_plan(
-        SHARD,
-        storage,
-        CLIP_UID,
-        owner_plan,
-        reference,
-        _human_discovery(attributes=(completion_attribute,)),
-        0,
-        "a1",
-        discovery_job.job_id(),
-    )
-    ordered = runner._ordered_owner_candidates(
-        SHARD, storage, CLIP_UID, owner_plan, reference
-    )
-    chain = runner._sam_probe_chain(
-        SHARD, CLIP_UID, owner_plan, attribute_plan, ordered
-    )
-    marker_options = _selection_marker(runner, "a1")["options"]
-    assert len(marker_options) == 2, "candidate 2 exists but must stay unseeded"
-    assert [option["sam_job_id"] for option in marker_options] == [
-        chain[0].job_id(),
-        chain[1].job_id(),
-    ]
-
-    # No rank-1 review job, no completion job, and the owner stays unresolved.
-    assert len(chain) == 2
-    assert sam.calls == 2
-    assert qwen.review_calls == 1
-    assert not _owner_artifact_file(storage).exists()
-    assert not _owner_outcome_path(runner).exists()
     fresh = _runner(config, storage, tmp_path)
-    assert fresh.seed_jobs() == [], "8b has nothing further to unlock"
-    with pytest.raises(SubjectAttributeEpochError, match="not terminal"):
-        fresh.reconcile_stats(SHARD)
-    assert _owner_artifact_file(storage).exists() is False
+    fresh_qwen = _QwenClient()
+    with pytest.raises(SubjectAttributeDurableError, match="raw state drifted"):
+        _drain(fresh, fresh_qwen, sam=_SamBackend())
+    assert fresh_qwen.discovery_calls == 0
+    assert fresh_qwen.review_calls == 0
+
+
+def test_discovery_failure_receipt_restart_backfills_the_legacy_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A committed discovery failure replays on CPU with no Qwen call."""
+    monkeypatch.setattr(time, "perf_counter", lambda: 1.0)
+    config, storage = _storage_variant(tmp_path, monkeypatch, "run-failure")
+    runner = _runner(config, storage, tmp_path)
+    client = _DiscoveryClient(ValueError("discovery exploded"))
+    _drain(runner, client, finalize=lambda job, result: ())
+
+    assert client.calls == 1
+    assert not _owner_artifact_file(storage).exists()
+
+    fresh = _runner(config, storage, tmp_path)
+    fresh_client = _DiscoveryClient(ValueError("discovery exploded"))
+    fresh_executor, fresh_jobs = _drain(fresh, fresh_client)
+
+    assert fresh_jobs == [], "a committed terminal failure re-seeds nothing"
+    assert fresh_executor.batches == 0
+    assert fresh_client.calls == 0, "the failure receipt is reused"
+    artifact = _read_artifact(storage)
+    assert artifact.owner_is_human is None
+    assert artifact.failure_reason == (
+        "discovery_failed:ValueError:discovery exploded"
+    )
+    assert artifact.metrics.failures == 1
+    assert fresh.reconcile_stats(SHARD).terminal_clips == 1
+
+
+def test_raw_review_accepts_an_endpoint_string_handle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real runner hands a base URL, so the epoch must build the client."""
+    monkeypatch.setattr(time, "perf_counter", lambda: 1.0)
+    config, storage = _storage_variant(tmp_path, monkeypatch, "run-endpoint")
+    runner = _runner(config, storage, tmp_path)
+    calls: list[tuple[str, list[str]]] = []
+
+    class _EndpointClient:
+        def __init__(self, service: Any) -> None:
+            self.service = service
+            self.closed = False
+
+        def review(self, *, owner: Any, candidates: list[Any]) -> Any:
+            del owner
+            calls.append(
+                (
+                    str(getattr(self.service, "base_url", "")),
+                    [candidate.attribute_id for candidate in candidates],
+                )
+            )
+            return SubjectAttributeReviewBatch(
+                owner_entity_id=OWNER, reviews=[_raw_review("a1")]
+            )
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(
+        "r2v_data_v2.v3.post_mask_epoch_subject_attributes."
+        "QwenSubjectAttributeClient",
+        _EndpointClient,
+    )
+    # Commit the discovery receipt first, then drive the review surface with a
+    # plain base URL the way the production resource handle does.
+    _drain(
+        runner,
+        _DiscoveryClient(_human_discovery(attributes=(ACCESSORY,))),
+        finalize=_swallow(SUBJECT_ATTRIBUTE_DISCOVERY_JOB, runner),
+    )
+    sam = _SamBackend(by_prompt={ACCESSORY[2]: _usable_sam(storage, slot=0)})
+    _drain(runner, "http://127.0.0.1:8123/v1", sam=sam)
+
+    assert calls == [("http://127.0.0.1:8123/v1", ["a1"])]
+    assert _read_artifact(storage).records[0].status == "accepted"
+
+
+def test_attribute_ids_are_relative_to_the_owner_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A second human owner starts at a3 and a3 must map to its own first attribute."""
+    monkeypatch.setattr(time, "perf_counter", lambda: 1.0)
+    config, storage = _storage_variant(tmp_path, monkeypatch, "run-offset")
+    runner = _runner(config, storage, tmp_path)
+    discovery = _human_discovery(attributes=(ACCESSORY, SCARF))
+    assert runner._attribute_index(discovery, "a1", 1) == 0
+    assert runner._attribute_index(discovery, "a2", 1) == 1
+    assert runner._attribute_index(discovery, "a3", 3) == 0
+    assert runner._attribute_index(discovery, "a4", 3) == 1
+    with pytest.raises(SubjectAttributeDurableError, match="outside the frozen"):
+        runner._attribute_index(discovery, "a1", 3)
+    with pytest.raises(SubjectAttributeDurableError, match="outside the frozen"):
+        runner._attribute_index(discovery, "a3", 1)
+
+    # And the whole owner flow honours a second owner's numbering end to end.
+    monkeypatch.setattr(
+        SubjectAttributeEpochRunner,
+        "_attribute_id_start",
+        lambda self, shard, clip_uid, owners, index: 3,
+    )
+    runner = _runner(config, storage, tmp_path, ledger_name="ledger-offset-run")
+    qwen = _QwenClient(
+        discoveries=[_human_discovery(attributes=(ACCESSORY, SCARF))],
+        reviews=[
+            SubjectAttributeReviewBatch(
+                owner_entity_id=OWNER,
+                reviews=[_raw_review("a3"), _raw_review("a4")],
+            )
+        ],
+    )
+    sam = _SamBackend(
+        by_prompt={
+            ACCESSORY[2]: _usable_sam(storage, slot=0),
+            SCARF[2]: [_attribute_mask(storage, slot=0, band=1)],
+        }
+    )
+    _drain(runner, qwen, sam=sam)
+
+    artifact = _read_artifact(storage)
+    assert artifact.attribute_id_start == 3
+    assert [record.attribute_id for record in artifact.records] == ["a3", "a4"]
+    assert [record.status for record in artifact.records] == ["accepted", "accepted"]
+    assert runner.reconcile_stats(SHARD).terminal_clips == 1
+
+
+def test_rank0_completion_fails_then_rank1_completion_accepts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Completion runs before candidate 2, and candidate 2 gets its own chain."""
+    monkeypatch.setattr(time, "perf_counter", lambda: 1.0)
+    _config, storage, runner, qwen, sam, boogu, timeline = _completion_fixture(
+        tmp_path,
+        monkeypatch,
+        run_name="run-c2-accept",
+        attribute=COMPLETION_ATTRIBUTE,
+        reviews=[
+            SubjectAttributeReviewBatch(
+                owner_entity_id=OWNER,
+                reviews=[
+                    _raw_review(
+                        "a1", structure_complete=False, completion_recommended=True
+                    )
+                ],
+            ),
+            SubjectAttributeReviewBatch(
+                owner_entity_id=OWNER,
+                reviews=[
+                    _raw_review(
+                        "a1", structure_complete=False, completion_recommended=True
+                    )
+                ],
+            ),
+        ],
+        completion_reviews=[
+            _completion_review("reject"),
+            _completion_review("accept"),
+        ],
+        boogu=[_generated_png(), _generated_png(colour=(40, 90, 200))],
+    )
+    _drain(runner, qwen, sam=sam, boogu=boogu)
+
+    assert timeline == [
+        "discovery",
+        "sam:1",
+        "sam:0",
+        "review:a1",
+        "boogu",
+        "sam:generated",
+        "completion_review",
+        "review:a1",
+        "boogu",
+        "sam:generated",
+        "completion_review",
+    ]
+    artifact = _read_artifact(storage)
+    assert [record.status for record in artifact.records] == ["accepted"]
+    record = artifact.records[0]
+    assert record.final_selection == "completed"
+    assert artifact.metrics.review_calls == 2
+    assert artifact.metrics.completion_attempts == 2
+    assert artifact.metrics.completion_qwen_review_rejects == 1
+    assert artifact.metrics.completion_accepted == 1
+    assert artifact.metrics.attribute_second_candidate_attempts == 1
+    assert artifact.metrics.attribute_completion_candidate1_accepted == 0
+    assert artifact.metrics.attribute_completion_candidate2_accepted == 1
+    assert record.completion_seed == boogu.seeds[1]
+    assert boogu.calls == 2
+    assert qwen.bbox_calls == 0
+
+
+def test_two_completion_rejects_never_fall_back_to_raw_or_bbox(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two failing completion chains end the attribute, exactly like legacy."""
+    monkeypatch.setattr(time, "perf_counter", lambda: 1.0)
+    _config, storage, runner, qwen, sam, boogu, _timeline = _completion_fixture(
+        tmp_path,
+        monkeypatch,
+        run_name="run-two-rejects",
+        attribute=COMPLETION_ATTRIBUTE,
+        reviews=[
+            SubjectAttributeReviewBatch(
+                owner_entity_id=OWNER,
+                reviews=[
+                    _raw_review(
+                        "a1", structure_complete=False, completion_recommended=True
+                    )
+                ],
+            ),
+            SubjectAttributeReviewBatch(
+                owner_entity_id=OWNER,
+                reviews=[
+                    _raw_review(
+                        "a1", structure_complete=False, completion_recommended=True
+                    )
+                ],
+            ),
+        ],
+        completion_reviews=[
+            _completion_review("reject"),
+            _completion_review("reject"),
+        ],
+        boogu=[_generated_png(), _generated_png()],
+    )
+    _drain(runner, qwen, sam=sam, boogu=boogu)
+
+    artifact = _read_artifact(storage)
+    assert [record.status for record in artifact.records] == ["rejected"]
+    assert artifact.records[0].reason == "completion_qwen_review_reject"
+    assert artifact.metrics.completion_attempts == 2
+    assert artifact.metrics.completion_qwen_review_rejects == 2
+    assert artifact.metrics.completion_rejected == 1
+    assert artifact.metrics.completion_fallback_to_raw == 0
+    assert artifact.metrics.attribute_bbox_fallback_attempts == 0
+    assert boogu.calls == 2
+    assert qwen.bbox_calls == 0
+    assert runner.reconcile_stats(SHARD).terminal_clips == 1
+
+
+def test_rank1_insufficient_evidence_falls_back_to_the_bbox_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The last-resort bbox review is one Qwen job per attribute."""
+    monkeypatch.setattr(time, "perf_counter", lambda: 1.0)
+    config, storage = _storage_variant(tmp_path, monkeypatch, "run-bbox")
+    _add_owner_frame(storage, slot=1)
+    runner = _runner(config, storage, tmp_path)
+    masks = [
+        _attribute_mask(storage, slot=1, band=0),
+        _attribute_mask(storage, slot=0, band=0),
+    ]
+    qwen = _QwenClient(
+        discoveries=[_human_discovery(attributes=(ACCESSORY,))],
+        reviews=[
+            SubjectAttributeReviewBatch(
+                owner_entity_id=OWNER,
+                reviews=[_raw_review("a1", sufficient_source_evidence=False)],
+            ),
+            SubjectAttributeReviewBatch(
+                owner_entity_id=OWNER,
+                reviews=[_raw_review("a1", sufficient_source_evidence=False)],
+            ),
+        ],
+        bbox_reviews=[_bbox_review("accept")],
+    )
+    sam = _SamBackend(by_prompt={ACCESSORY[2]: masks})
+    _drain(runner, qwen, sam=sam)
+
+    assert qwen.bbox_calls == 1
+    artifact = _read_artifact(storage)
+    assert [record.status for record in artifact.records] == ["accepted"]
+    assert artifact.records[0].final_selection == "bbox"
+    assert artifact.metrics.attribute_bbox_fallback_attempts == 1
+    assert artifact.metrics.attribute_bbox_fallback_accepted == 1
+    assert artifact.metrics.attribute_second_candidate_attempts == 1
+    assert artifact.metrics.review_calls == 2
+
+
+@pytest.mark.parametrize(
+    ("verdict", "expected"),
+    [
+        ("reject", "attribute_bbox_fallback_rejected:bbox crop is usable"),
+        ("failed", "attribute_bbox_fallback_rejected:attribute_bbox_judge_failed"),
+    ],
+)
+def test_bbox_review_reject_and_judge_failure_are_terminal_rejects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verdict: str, expected: str
+) -> None:
+    """A rejected or failed bbox review is one legacy terminal reject."""
+    monkeypatch.setattr(time, "perf_counter", lambda: 1.0)
+    config, storage = _storage_variant(
+        tmp_path, monkeypatch, f"run-bbox-{verdict}"
+    )
+    _add_owner_frame(storage, slot=1)
+    runner = _runner(config, storage, tmp_path)
+    masks = [
+        _attribute_mask(storage, slot=1, band=0),
+        _attribute_mask(storage, slot=0, band=0),
+    ]
+    bbox_result: Any = (
+        ValueError("bbox exploded") if verdict == "failed" else _bbox_review("reject")
+    )
+    qwen = _QwenClient(
+        discoveries=[_human_discovery(attributes=(ACCESSORY,))],
+        reviews=[
+            SubjectAttributeReviewBatch(
+                owner_entity_id=OWNER,
+                reviews=[_raw_review("a1", sufficient_source_evidence=False)],
+            ),
+            SubjectAttributeReviewBatch(
+                owner_entity_id=OWNER,
+                reviews=[_raw_review("a1", sufficient_source_evidence=False)],
+            ),
+        ],
+        bbox_reviews=[bbox_result],
+    )
+    sam = _SamBackend(by_prompt={ACCESSORY[2]: masks})
+    _drain(runner, qwen, sam=sam)
+
+    artifact = _read_artifact(storage)
+    assert [record.status for record in artifact.records] == ["rejected"]
+    assert artifact.records[0].reason.startswith(expected)
+    if verdict == "failed":
+        assert artifact.records[0].reason.endswith(
+            "attribute_bbox_judge_failed:ValueError:bbox exploded"
+        )
+    assert artifact.metrics.attribute_bbox_fallback_attempts == 1
+    assert artifact.metrics.attribute_bbox_fallback_accepted == 0
+    assert qwen.bbox_calls == 1
+
+
+def test_face_accept_never_pays_completion_or_the_bbox_judge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A face is accepted from the raw review with the CPU bbox variant."""
+    monkeypatch.setattr(time, "perf_counter", lambda: 1.0)
+    _config, storage, runner, qwen, sam, boogu, timeline = _completion_fixture(
+        tmp_path,
+        monkeypatch,
+        run_name="run-face",
+        attribute=FACE_ATTRIBUTE,
+        reviews=[
+            SubjectAttributeReviewBatch(
+                owner_entity_id=OWNER, reviews=[_raw_review("a1")]
+            )
+        ],
+    )
+    _drain(runner, qwen, sam=sam, boogu=boogu)
+
+    assert boogu.calls == 0
+    assert qwen.bbox_calls == 0
+    assert qwen.completion_review_calls == 0
+    artifact = _read_artifact(storage)
+    record = artifact.records[0]
+    assert record.status == "accepted"
+    assert record.attribute_type == "face"
+    assert record.final_selection == "bbox"
+    assert record.variants.bbox.review_status == "accepted_via_raw_face_review"
+    assert artifact.metrics.attribute_bbox_fallback_attempts == 0
+    assert artifact.metrics.attribute_bbox_fallback_accepted == 0
+    assert artifact.metrics.attribute_source_candidates_considered == 2
+    assert timeline == ["discovery", "sam:1", "sam:0", "review:a1"]
+
+
+def test_longest_chain_restart_pays_no_model_call_at_all(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The longest chain replays entirely on CPU once every receipt is committed."""
+    monkeypatch.setattr(time, "perf_counter", lambda: 1.0)
+    config, storage, runner, qwen, sam, boogu, _timeline = _completion_fixture(
+        tmp_path,
+        monkeypatch,
+        run_name="run-longest",
+        attribute=COMPLETION_ATTRIBUTE,
+        reviews=[
+            SubjectAttributeReviewBatch(
+                owner_entity_id=OWNER,
+                reviews=[
+                    _raw_review(
+                        "a1", structure_complete=False, completion_recommended=True
+                    )
+                ],
+            ),
+            SubjectAttributeReviewBatch(
+                owner_entity_id=OWNER,
+                reviews=[
+                    _raw_review(
+                        "a1", structure_complete=False, completion_recommended=True
+                    )
+                ],
+            ),
+        ],
+        completion_reviews=[
+            _completion_review("reject"),
+            _completion_review("accept"),
+        ],
+        boogu=[_generated_png(), _generated_png(colour=(40, 90, 200))],
+    )
+    _drain(runner, qwen, sam=sam, boogu=boogu)
+
+    artifact = _read_artifact(storage)
+    counts = runner.reconcile_stats(SHARD).to_dict()
+    outcome = json.loads(_owner_outcome_path(runner).read_text(encoding="utf-8"))
+    assert outcome["source"] == "processed"
+    assert boogu.calls == 2
+    assert sam.calls == 2
+    assert sam.generated_calls == 2
+    assert qwen.review_calls == 2
+    assert qwen.completion_review_calls == 2
+
+    # Crash between the last model receipt and the processed owner outcome: the
+    # artifact is on disk but the outcome is not.
+    _owner_outcome_path(runner).unlink()
+
+    fresh = _runner(config, storage, tmp_path, ledger_name="ledger-run-longest")
+    fresh_qwen = _QwenClient()
+    fresh_sam = _SamBackend()
+    fresh_boogu = _BooguBackend()
+    executor, jobs = _drain(fresh, fresh_qwen, sam=fresh_sam, boogu=fresh_boogu)
+
+    assert jobs == [], "every call is durable, so nothing is re-seeded"
+    assert executor.executed == []
+    assert fresh_qwen.discovery_calls == 0
+    assert fresh_qwen.review_calls == 0
+    assert fresh_qwen.completion_review_calls == 0
+    assert fresh_qwen.bbox_calls == 0
+    assert fresh_sam.calls == 0
+    assert fresh_sam.generated_calls == 0
+    assert fresh_boogu.calls == 0
+    assert _read_artifact(storage).model_dump(mode="json") == artifact.model_dump(
+        mode="json"
+    )
+    assert json.loads(
+        _owner_outcome_path(fresh).read_text(encoding="utf-8")
+    ) == outcome
+    assert fresh.reconcile_stats(SHARD).to_dict() == counts
