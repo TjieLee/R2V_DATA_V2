@@ -118,6 +118,11 @@ After the fixed preservation prefix, write [Shot 1] directly (and later shots
 only if real source cuts exist). Do not add a separate overview paragraph unless
 it contributes information not already stated in the shot narration.
 
+The [Shot 1] narration must explicitly use both labels <Subject 1> and
+<Subject 2>. Do not replace these labels with "the man", "the woman", "the left
+person", "the other person", or other unnamed references when first describing
+their visible actions.
+
 Describe only meaningful visible action/state changes in playback order. Include
 head direction, gaze, mouth/jaw motion, hand motion, interaction, or occlusion
 when they are salient to the source performance. Do not enumerate every blink,
@@ -132,6 +137,18 @@ Describe camera movement or cuts when they occur; say the camera is static when
 it is genuinely static. Do not invent intent, psychology, hidden causes,
 unsupported objects, cinematic styling, lens details, or camera behavior.
 If uncertain, stay conservative.
+
+COMPACT STYLE EXAMPLE
+
+This example shows naming and density only. Do not copy its motion unless it is
+actually visible in the current video.
+
+detailed_description:
+[Shot 1]
+<Subject 1> sits on the left and turns the head from <Subject 2> toward the
+front while <Subject 2> remains seated on the right with only a small gaze
+change; the camera stays static. <Subject 1> then holds the new orientation while
+<Subject 2> keeps nearly the same pose.
 
 Do not transcribe or describe source audio. Visible mouth movement may be
 described only as visual behavior.
@@ -178,7 +195,8 @@ Source-person locator:
 {source_performer_2}
 
 Keep each binding fixed. Watch the complete video. In detailed_description,
-write [Shot 1] directly after the fixed preservation prefix and describe only
+write [Shot 1] directly after the fixed preservation prefix. In the [Shot 1]
+narration explicitly use both <Subject 1> and <Subject 2>, then describe only
 salient visible motion/state changes and camera behavior in temporal order; do
 not repeat appearance or pad the caption with micro-events.
 

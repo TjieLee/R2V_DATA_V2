@@ -448,6 +448,9 @@ def test_system_prompt_is_slim_and_prioritizes_salient_motion():
     assert "Do not repeat replacement\nappearance" in prompt
     assert "Describe only meaningful visible action/state changes" in prompt
     assert "write [Shot 1] directly" in prompt
+    assert "The [Shot 1] narration must explicitly use both labels <Subject 1> and" in prompt
+    assert "COMPACT STYLE EXAMPLE" in prompt
+    assert "<Subject 1> sits on the left and turns the head from <Subject 2> toward the" in prompt
     assert "one short dynamic overview sentence naming both" not in prompt
     assert "Do not enumerate every blink" in prompt
     assert 'Use words such\nas "throughout", "maintains", or "remains" only' in prompt
