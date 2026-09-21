@@ -21,6 +21,7 @@ import r2v_data_v2.v3.storage as storage_module
 import tests.test_v3_reference_integrity as legacy_integrity
 from r2v_data_v2.v3.post_mask_epoch_reference_integrity import (
     ReferenceIntegrityDurableError,
+    ReferenceIntegrityEpochError,
     ReferenceIntegrityEpochRunner,
 )
 from r2v_data_v2.v3.post_mask_epoch_state import GroupLedger
@@ -576,3 +577,310 @@ def test_pre_existing_failed_same_reason_can_terminal_again(
         if line.strip()
     ]
     assert len(after) == 1, "restart must not append another failure record"
+
+
+# ---------------------------------------------------------------------------
+# 6c: main integrity review epoch
+# ---------------------------------------------------------------------------
+
+
+class _SerialQwenExecutor:
+    """Serial executor for the real scheduler; one resource, no real model."""
+
+    def __init__(self, runner: ReferenceIntegrityEpochRunner, handle: Any) -> None:
+        self.runner = runner
+        self.handle = handle
+        self.batches = 0
+
+    def execute_batch(self, jobs: Any) -> dict[str, Any]:
+        from r2v_data_v2.v3.post_mask_epoch_scheduler import JobExecution
+
+        self.batches += 1
+        outcomes: dict[str, Any] = {}
+        for job in sorted(jobs, key=lambda item: item.job_id()):
+            try:
+                outcomes[job.job_id()] = JobExecution(
+                    job, self.runner.run(job, self.handle), None
+                )
+            except Exception as exc:  # noqa: BLE001 - isolate per job
+                outcomes[job.job_id()] = JobExecution(job, None, exc)
+        return outcomes
+
+
+def _epoch_scheduler(runner: Any, executor: Any, finalize: Any = None) -> Any:
+    from r2v_data_v2.v3.post_mask_epoch_jobs import RESOURCE_QWEN
+    from r2v_data_v2.v3.post_mask_epoch_scheduler import ResourceEpochScheduler
+
+    return ResourceEpochScheduler(
+        ledger=runner.ledger,
+        finalize=finalize or runner.finalize,
+        executors={RESOURCE_QWEN: executor},
+    )
+
+
+def _run_epoch(
+    config: Any,
+    storage: Any,
+    tmp_path: Path,
+    judge: Any,
+    *,
+    scheduler_finalize: Any = None,
+) -> tuple[Any, Any, Any]:
+    """Seed + drain the epoch through the real scheduler."""
+    runner = _runner(config, storage, tmp_path)
+    executor = _SerialQwenExecutor(runner, judge)
+    scheduler = _epoch_scheduler(runner, executor, scheduler_finalize)
+    jobs = runner.seed_jobs()
+    if jobs:
+        scheduler.run(jobs)
+    return runner, executor, jobs
+
+
+def _main_review_fixture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    run_name: str,
+    *,
+    second_scope: str = "local",
+    second_synthetic: bool = False,
+    second_phrase: str = CLEAN_OBJECT_PHRASE,
+    completion_state: bool = False,
+) -> tuple[Any, Any]:
+    config, storage = _storage_variant(
+        tmp_path,
+        monkeypatch,
+        run_name,
+        second_scope=second_scope,
+        second_synthetic=second_synthetic,
+        second_phrase=second_phrase,
+    )
+    if completion_state:
+        legacy_integrity._write_completion_reference_edit_state(storage)
+    return config, storage
+
+
+def _fake_main_judge(*results: Any) -> Any:
+    return legacy_integrity.FakeIntegrityJudge(list(results))
+
+
+def test_main_review_accept_matches_legacy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A main accept terminalizes the entity and publishes exactly like legacy."""
+    judge_result = legacy_integrity._review(accept=True, reason="usable reference")
+    legacy_config, legacy_storage = _main_review_fixture(
+        tmp_path, monkeypatch, "run-legacy"
+    )
+    legacy_judge = _fake_main_judge(judge_result)
+    legacy_stats = legacy_integrity.reference_integrity_clips(
+        legacy_config,
+        legacy_storage,
+        judge=legacy_judge,
+        bbox_fallback_judge=legacy_integrity.FakeSourceBboxFallbackJudge([]),
+    )
+    assert len(legacy_judge.calls) == 1
+
+    config, storage = _main_review_fixture(tmp_path, monkeypatch, "run-epoch")
+    judge = _fake_main_judge(judge_result)
+    runner, _executor, jobs = _run_epoch(config, storage, tmp_path, judge)
+
+    assert len(jobs) == 1
+    assert jobs[0].job_type == "reference_integrity_review"
+    assert jobs[0].resource == "qwen"
+    assert dict(jobs[0].target) == {"entity_id": "e2", "variant": "final"}
+    assert len(judge.calls) == 1, "exactly one main review call"
+    stats = runner.reconcile_stats(SHARD)
+    assert stats.to_dict() == legacy_stats.to_dict()
+    assert stats.entities_reviewed == 1
+    assert stats.entities_accepted == 2
+    epoch_clip = storage.read_clip("clip-1")
+    legacy_clip = legacy_storage.read_clip("clip-1")
+    _assert_same_publication(epoch_clip, legacy_clip)
+    marker = json.loads(
+        runner._entity_outcome_path(SHARD, "clip-1", "e2").read_text(encoding="utf-8")
+    )
+    assert marker["reviewed"] is True
+    assert marker["status"] == "accepted"
+    assert marker["judge_failed"] is False
+    assert marker["review_job_id"] == jobs[0].job_id()
+    assert marker["delta"]["entities_reviewed"] == 1
+
+
+def test_main_review_reject_matches_legacy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A main reject without alpha/bbox routes is terminal in 6c."""
+    judge_result = legacy_integrity._primary_identity_loss_review()
+    legacy_config, legacy_storage = _main_review_fixture(
+        tmp_path, monkeypatch, "run-legacy"
+    )
+    legacy_judge = _fake_main_judge(judge_result)
+    legacy_stats = legacy_integrity.reference_integrity_clips(
+        legacy_config,
+        legacy_storage,
+        judge=legacy_judge,
+        bbox_fallback_judge=legacy_integrity.FakeSourceBboxFallbackJudge([]),
+    )
+    assert len(legacy_judge.calls) == 1
+    assert legacy_storage.read_clip("clip-1").references.entities[1].status == (
+        "rejected"
+    )
+
+    config, storage = _main_review_fixture(tmp_path, monkeypatch, "run-epoch")
+    judge = _fake_main_judge(judge_result)
+    runner, _executor, _jobs = _run_epoch(config, storage, tmp_path, judge)
+
+    assert len(judge.calls) == 1
+    stats = runner.reconcile_stats(SHARD)
+    assert stats.to_dict() == legacy_stats.to_dict()
+    assert stats.entities_rejected == 1
+    assert stats.entities_reviewed == 1
+    epoch_clip = storage.read_clip("clip-1")
+    legacy_clip = legacy_storage.read_clip("clip-1")
+    _assert_same_publication(epoch_clip, legacy_clip)
+    marker = json.loads(
+        runner._entity_outcome_path(SHARD, "clip-1", "e2").read_text(encoding="utf-8")
+    )
+    assert marker["status"] == "rejected"
+    assert marker["reason"] == judge_result.reason
+    assert marker["delta"]["entities_rejected"] == 1
+
+
+def test_main_review_judge_failure_matches_legacy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A judge failure is a legacy semantic rejection, not a retry."""
+    failure = legacy_integrity.ReferenceIntegrityJudgeFailure(
+        "judge exploded", raw_responses=("raw",)
+    )
+    legacy_config, legacy_storage = _main_review_fixture(
+        tmp_path, monkeypatch, "run-legacy"
+    )
+    legacy_judge = _fake_main_judge(failure)
+    legacy_stats = legacy_integrity.reference_integrity_clips(
+        legacy_config,
+        legacy_storage,
+        judge=legacy_judge,
+        bbox_fallback_judge=legacy_integrity.FakeSourceBboxFallbackJudge([]),
+    )
+    assert len(legacy_judge.calls) == 1
+
+    config, storage = _main_review_fixture(tmp_path, monkeypatch, "run-epoch")
+    judge = _fake_main_judge(failure)
+    runner, _executor, _jobs = _run_epoch(config, storage, tmp_path, judge)
+
+    assert len(judge.calls) == 1
+    stats = runner.reconcile_stats(SHARD)
+    assert stats.to_dict() == legacy_stats.to_dict()
+    assert stats.judge_failed == 1
+    assert stats.entities_reviewed == 1
+    assert stats.entities_rejected == 1
+    epoch_clip = storage.read_clip("clip-1")
+    legacy_clip = legacy_storage.read_clip("clip-1")
+    _assert_same_publication(epoch_clip, legacy_clip)
+    marker = json.loads(
+        runner._entity_outcome_path(SHARD, "clip-1", "e2").read_text(encoding="utf-8")
+    )
+    assert marker["judge_failed"] is True
+    assert marker["review"] is None
+    assert marker["reason"] == "integrity_judge_failed:judge exploded"
+    assert marker["delta"]["judge_failed"] == 1
+
+
+def test_committed_review_receipt_restart_pays_no_qwen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A receipt committed before the CPU finalizer replays without new calls."""
+    judge_result = legacy_integrity._review(accept=True, reason="usable reference")
+    legacy_config, legacy_storage = _main_review_fixture(
+        tmp_path, monkeypatch, "run-legacy"
+    )
+    legacy_stats = legacy_integrity.reference_integrity_clips(
+        legacy_config,
+        legacy_storage,
+        judge=_fake_main_judge(judge_result),
+        bbox_fallback_judge=legacy_integrity.FakeSourceBboxFallbackJudge([]),
+    )
+
+    config, storage = _main_review_fixture(tmp_path, monkeypatch, "run-epoch")
+    judge = _fake_main_judge(judge_result)
+    # Simulate a crash between the receipt commit and the CPU finalizer.
+    runner, executor, _jobs = _run_epoch(
+        config, storage, tmp_path, judge, scheduler_finalize=lambda job, result: ()
+    )
+    assert executor.batches == 1
+    assert len(judge.calls) == 1
+    assert runner._entity_outcome(SHARD, "clip-1", "e2") is None
+    from r2v_data_v2.v3.post_mask_epoch_jobs import RESOURCE_QWEN
+    from r2v_data_v2.v3.post_mask_epoch_scheduler import ResourceEpochScheduler
+
+    fresh = _runner(config, storage, tmp_path)
+    fresh_executor = _SerialQwenExecutor(fresh, judge)
+    fresh_scheduler = ResourceEpochScheduler(
+        ledger=fresh.ledger,
+        finalize=fresh.finalize,
+        executors={RESOURCE_QWEN: fresh_executor},
+    )
+    fresh_jobs = fresh.seed_jobs()
+    assert len(fresh_jobs) == 1, "the same frozen job is re-seeded"
+    fresh_scheduler.run(fresh_jobs)
+
+    assert fresh_executor.batches == 0, "no executor call for a committed receipt"
+    assert len(judge.calls) == 1, "restart must not pay another Qwen call"
+    stats = fresh.reconcile_stats(SHARD)
+    assert stats.to_dict() == legacy_stats.to_dict()
+    clip = storage.read_clip("clip-1")
+    assert clip.reference_integrity is not None
+    assert clip.reference_integrity.status == "ready"
+    _assert_same_publication(clip, legacy_storage.read_clip("clip-1"))
+
+
+@pytest.mark.parametrize("continuation", ("source_alpha", "artifact_bbox"))
+def test_6d_continuations_stay_unresolved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, continuation: str
+) -> None:
+    """A main review that legacy continues into 6d keeps only its receipt."""
+    if continuation == "source_alpha":
+        config, storage = _main_review_fixture(
+            tmp_path,
+            monkeypatch,
+            "run-epoch",
+            second_scope="full",
+            second_synthetic=True,
+            completion_state=True,
+        )
+        judge_result = legacy_integrity._severe_reference_artifact_review()
+    else:
+        config, storage = _main_review_fixture(tmp_path, monkeypatch, "run-epoch")
+        judge_result = legacy_integrity._transient_removal_artifact_review()
+    judge = _fake_main_judge(judge_result)
+    runner, _executor, jobs = _run_epoch(config, storage, tmp_path, judge)
+
+    assert len(jobs) == 1
+    assert len(judge.calls) == 1, "6c must not run any continuation model call"
+    assert runner._entity_outcome(SHARD, "clip-1", "e2") is None
+    clip = storage.read_clip("clip-1")
+    assert clip.reference_integrity is None
+    with pytest.raises(ReferenceIntegrityEpochError, match="not terminal"):
+        runner.reconcile_stats(SHARD)
+    # 6d owns the continuation: no bbox judge exists in this epoch at all.
+    assert not hasattr(runner, "bbox_fallback_judge")
+
+
+def test_reviewed_marker_tamper_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tampered reviewed marker must fail closed against its receipt."""
+    judge_result = legacy_integrity._review(accept=True, reason="usable reference")
+    config, storage = _main_review_fixture(tmp_path, monkeypatch, "run-epoch")
+    judge = _fake_main_judge(judge_result)
+    runner, _executor, _jobs = _run_epoch(config, storage, tmp_path, judge)
+
+    path = runner._entity_outcome_path(SHARD, "clip-1", "e2")
+    marker = json.loads(path.read_text(encoding="utf-8"))
+    marker["delta"]["entities_accepted"] = 100
+    path.write_text(json.dumps(marker), encoding="utf-8")
+
+    fresh = _runner(config, storage, tmp_path)
+    with pytest.raises(ReferenceIntegrityDurableError, match="reviewed entity outcome"):
+        fresh.reconcile_stats(SHARD)
