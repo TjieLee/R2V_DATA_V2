@@ -166,7 +166,7 @@ def test_variant_contracts_are_distinct_and_group_size_is_not_semantic(tmp_path)
     _,text = module.make_config(arguments(base+["--variant","text"]))
     _,frame0 = module.make_config(arguments(base+["--variant","frame0"]))
     assert text["identity"] != frame0["identity"]
-    assert text["identity_details"]["contract"] == "text_two_person_pdd_fsdp2_pair_v28"
+    assert text["identity_details"]["contract"] == "text_two_person_pdd_fsdp2_pair_v29"
     assert frame0["identity_details"]["contract"] == "frame0_two_person_pdd_fsdp2_pair_v18"
     for key in ("boogu_python","boogu_code_root","boogu_model_root"):
         assert key in frame0["identity_details"]["resources"] and key not in text["identity_details"]["resources"]

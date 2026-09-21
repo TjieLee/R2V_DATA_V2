@@ -15,6 +15,15 @@ VIDEO_FPS = 4.0
 REPLACEMENT_MAX_NEW_TOKENS = 512
 PROMPT_MAX_NEW_TOKENS = 4096
 
+DETAIL_PRESERVATION_SENTENCE = (
+    "Keep <Subject 1> and <Subject 2>'s actions, body poses and motion, head "
+    "orientation and motion, facial expressions, gaze, mouth/lip/jaw movement, "
+    "hand-object and person-person interactions, positions, scale, occlusion, and "
+    "timing exactly the same as in <Video 1>, and keep the source camera movement, "
+    "framing, background, lighting, and scene structure unchanged; only their "
+    "identities and appearances are replaced."
+)
+
 CALL1_LABELS = ("SOURCE_PERFORMER_1","SOURCE_PERFORMER_2",
                 "REPLACEMENT_SUBJECT_1","REPLACEMENT_SUBJECT_2")
 
@@ -260,16 +269,22 @@ except ordinary non-interactive parts of clothing.
 
 GLOBAL DETAILED-DESCRIPTION PREFACE
 
-Immediately after the `detailed_description:` heading and before `[Shot 1]`,
-write exactly one source-grounded dynamic overview sentence.
+The first sentence immediately after the `detailed_description:` heading is a
+mandatory preservation statement. Write this exact sentence first:
 
-This sentence is especially important. It must summarize the dominant visible
-motion of <Subject 1> and <Subject 2>, their relative movement or most important
-interaction when one is visible, and the dominant camera behavior across the
-source clip.
+Keep <Subject 1> and <Subject 2>'s actions, body poses and motion, head orientation and motion, facial expressions, gaze, mouth/lip/jaw movement, hand-object and person-person interactions, positions, scale, occlusion, and timing exactly the same as in <Video 1>, and keep the source camera movement, framing, background, lighting, and scene structure unchanged; only their identities and appearances are replaced.
 
-Write concrete target-video content, not editing instructions. Describe what
-visibly happens rather than saying to preserve it.
+After that fixed preservation sentence and before `[Shot 1]`, write exactly one
+source-grounded dynamic overview sentence.
+
+The dynamic overview must summarize the dominant visible motion of <Subject 1>
+and <Subject 2>, their relative movement or most important interaction when one
+is visible, and the dominant camera behavior across the source clip.
+
+The preservation sentence states the editing constraint. The following dynamic
+overview and [Shot] narration describe the observed source performance in
+concrete target-video terms. Do not reinterpret, embellish, intensify, simplify,
+or creatively restage that performance.
 
 Prioritize concrete dynamic information such as subject trajectories,
 body/head/hand movement, interaction progression, camera tracking, panning,
@@ -277,13 +292,8 @@ tilting, zooming, reframing, handheld movement, or cuts when those are actually
 visible. If the source camera is genuinely static, say that the framing remains
 static instead of inventing camera movement.
 
-Do not use generic wording such as:
-"The target video is a direct edit of <Video 1>."
-or
-"Preserve the complete source motion."
-
-Do not use this sentence for static appearance, clothing, background, lighting,
-or style description.
+Do not use the dynamic overview for static appearance, clothing, background,
+lighting, or style description.
 
 FIRST-SENTENCE PRIORITY
 
@@ -358,6 +368,7 @@ the current <Video 1>.
 Example A — face-dominant static close-up:
 
 detailed_description:
+Keep <Subject 1> and <Subject 2>'s actions, body poses and motion, head orientation and motion, facial expressions, gaze, mouth/lip/jaw movement, hand-object and person-person interactions, positions, scale, occlusion, and timing exactly the same as in <Video 1>, and keep the source camera movement, framing, background, lighting, and scene structure unchanged; only their identities and appearances are replaced.
 <Subject 1> holds a three-quarter-right head orientation toward <Subject 2>, keeping her eyes on him as her initially parted lips gradually come together, while <Subject 2> remains in near left profile, briefly lowers his gaze and opens then closes his mouth; the camera holds a static tight two-shot throughout.
 
 [Shot 1]
@@ -366,6 +377,7 @@ detailed_description:
 Example B — subtle head, gaze and mouth transitions:
 
 detailed_description:
+Keep <Subject 1> and <Subject 2>'s actions, body poses and motion, head orientation and motion, facial expressions, gaze, mouth/lip/jaw movement, hand-object and person-person interactions, positions, scale, occlusion, and timing exactly the same as in <Video 1>, and keep the source camera movement, framing, background, lighting, and scene structure unchanged; only their identities and appearances are replaced.
 <Subject 1> starts nearly frontal, shifts her gaze toward <Subject 2> before turning her head slightly right and parting her lips, while <Subject 2> raises his chin and closes his previously open mouth; the camera remains static.
 
 [Shot 1]
@@ -374,6 +386,7 @@ detailed_description:
 Example C — body motion with a moving camera:
 
 detailed_description:
+Keep <Subject 1> and <Subject 2>'s actions, body poses and motion, head orientation and motion, facial expressions, gaze, mouth/lip/jaw movement, hand-object and person-person interactions, positions, scale, occlusion, and timing exactly the same as in <Video 1>, and keep the source camera movement, framing, background, lighting, and scene structure unchanged; only their identities and appearances are replaced.
 <Subject 1> and <Subject 2> walk forward side by side while briefly turning their heads toward each other and exchanging hand gestures, as the camera tracks backward with them and gradually tightens the two-shot.
 
 [Shot 1]
@@ -588,6 +601,27 @@ def split_sections(text):
     return sections
 
 
+def enforce_detail_preservation_preface(text):
+    """Guarantee the H3 detailed description starts with the canonical constraint."""
+    if not isinstance(text,str):
+        return text
+    match = re.search(r"(?m)^detailed_description:[ \t]*$",text)
+    if match is None:
+        return text
+    body_start = match.end()
+    next_match = re.search(r"(?m)^overall_soundscape:[ \t]*$",text[body_start:])
+    if next_match is None:
+        return text
+    body_end = body_start + next_match.start()
+    body = text[body_start:body_end].strip()
+    if body.startswith(DETAIL_PRESERVATION_SENTENCE):
+        return text.strip()
+    replacement = (
+        "\n" + DETAIL_PRESERVATION_SENTENCE + "\n\n" + body + "\n\n"
+    )
+    return (text[:body_start] + replacement + text[body_end:]).strip()
+
+
 def validate_h3_prompt_writer_output(text):
     """Fail-closed structural check; never a semantic parser."""
     if not isinstance(text,str) or not text.strip():
@@ -634,13 +668,16 @@ def validate_h3_prompt_writer_output(text):
     if "[Shot 1]" not in detailed:
         raise ValueError("detailed_description must contain [Shot 1]")
     preface = detailed.split("[Shot 1]",1)[0].strip()
-    if not preface:
-        raise ValueError("detailed_description must contain a dynamic preface before [Shot 1]")
+    if not preface.startswith(DETAIL_PRESERVATION_SENTENCE):
+        raise ValueError("detailed_description must start with the canonical preservation sentence")
+    dynamic_preface = preface[len(DETAIL_PRESERVATION_SENTENCE):].strip()
+    if not dynamic_preface:
+        raise ValueError("detailed_description must contain a dynamic overview after the preservation sentence")
     for token in ("<Subject 1>","<Subject 2>"):
-        if token not in preface:
-            raise ValueError(f"dynamic preface is missing {token}")
-    if not re.search(r"\b(?:camera|framing|shot|view)\b",preface,re.IGNORECASE):
-        raise ValueError("dynamic preface must describe camera or framing behavior")
+        if token not in dynamic_preface:
+            raise ValueError(f"dynamic overview is missing {token}")
+    if not re.search(r"\b(?:camera|framing|shot|view)\b",dynamic_preface,re.IGNORECASE):
+        raise ValueError("dynamic overview must describe camera or framing behavior")
     speculative = re.search(
         r"\b(?:as if|seems to|appears to be trying to|suggesting that|invisible force)\b",
         detailed,
@@ -752,7 +789,7 @@ class LocalQwen38H3PromptWriter:
     def write_h3_prompt(self, video, source_performer_1, source_performer_2,
                         replacement_subject_1, replacement_subject_2, *, num_frames):
         """Call 2: watch <Video 1> again and write the whole six-section prompt."""
-        return self._generate([
+        raw = self._generate([
             {"role":"system", "content":H3_PROMPT_SYSTEM_PROMPT},
             {"role":"user", "content":[
                 self._video(video),
@@ -763,6 +800,7 @@ class LocalQwen38H3PromptWriter:
                     replacement_subject_2=replacement_subject_2)},
             ]},
         ], self.prompt_max_new_tokens, num_frames=num_frames)
+        return enforce_detail_preservation_preface(raw)
 
     def close(self):
         """Release the 27B before the H3 launcher consumes GPU memory."""
