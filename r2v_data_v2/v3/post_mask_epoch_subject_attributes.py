@@ -28,6 +28,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import math
 import time
 from collections import Counter
 from collections.abc import Mapping, Sequence
@@ -61,6 +62,9 @@ from r2v_data_v2.v3.post_mask_epoch_jobs import (
 from r2v_data_v2.v3.post_mask_epoch_state import atomic_write_bytes, atomic_write_json
 from r2v_data_v2.v3.storage import RunStorage, evaluate_export_state
 from r2v_data_v2.v3.subject_attributes import (
+    ATTRIBUTE_BBOX_REVIEW_SYSTEM_PROMPT,
+    ATTRIBUTE_COMPLETION_REVIEW_SYSTEM_PROMPT,
+    ATTRIBUTE_FACE_BBOX_REVIEW_SYSTEM_PROMPT,
     DISCOVERY_SYSTEM_PROMPT,
     MAX_ATTRIBUTE_SOURCE_CANDIDATES,
     MAX_ATTRIBUTES_PER_OWNER,
@@ -102,10 +106,10 @@ from r2v_data_v2.v3.subject_attributes import (
 )
 
 SUBJECT_ATTRIBUTE_CLIP_PLAN_SCHEMA = (
-    "post_mask_epoch_subject_attributes_clip_plan/2"
+    "post_mask_epoch_subject_attributes_clip_plan/3"
 )
 SUBJECT_ATTRIBUTE_OWNER_PLAN_SCHEMA = (
-    "post_mask_epoch_subject_attributes_owner_plan/2"
+    "post_mask_epoch_subject_attributes_owner_plan/3"
 )
 SUBJECT_ATTRIBUTE_OWNER_OUTCOME_SCHEMA = (
     "post_mask_epoch_subject_attributes_owner_outcome/2"
@@ -113,7 +117,7 @@ SUBJECT_ATTRIBUTE_OWNER_OUTCOME_SCHEMA = (
 SUBJECT_ATTRIBUTE_CLIP_OUTCOME_SCHEMA = (
     "post_mask_epoch_subject_attributes_clip_outcome/1"
 )
-SUBJECT_ATTRIBUTE_POLICY_VERSION = "subject_attributes_epoch_policy/2"
+SUBJECT_ATTRIBUTE_POLICY_VERSION = "subject_attributes_epoch_policy/3"
 SUBJECT_ATTRIBUTE_DISCOVERY_POLICY_VERSION = "subject_attribute_discovery/1"
 
 SUBJECT_ATTRIBUTE_ATTRIBUTE_PLAN_SCHEMA = (
@@ -138,12 +142,15 @@ SUBJECT_ATTRIBUTE_COMPLETION_OUTCOME_SCHEMA = (
     "post_mask_epoch_subject_attribute_completion_outcome/1"
 )
 SUBJECT_ATTRIBUTE_COMPLETION_GENERATE_POLICY_VERSION = (
-    "subject_attribute_completion_generate/1"
+    "subject_attribute_completion_generate/2"
 )
 SUBJECT_ATTRIBUTE_COMPLETION_REVIEW_POLICY_VERSION = (
-    "subject_attribute_completion_review/1"
+    "subject_attribute_completion_review/2"
 )
-SUBJECT_ATTRIBUTE_BBOX_REVIEW_POLICY_VERSION = "subject_attribute_bbox_review/1"
+SUBJECT_ATTRIBUTE_BBOX_REVIEW_POLICY_VERSION = "subject_attribute_bbox_review/2"
+SUBJECT_ATTRIBUTE_COMPLETION_POSTCHECK_POLICY_VERSION = (
+    "subject_attribute_completion_postcheck/1"
+)
 
 #: Terminal completion statuses. ``review_required`` is the non-terminal stage
 #: between a passing CPU postcheck and the committed review receipt, so it is
@@ -270,6 +277,53 @@ class _OwnerReplay:
         #: generated-frame segmentation, then the review.
         self.completion: dict[str, Any] | None = None
         self.bbox_used: set[str] = set()
+        # Model timing is accumulated from the durable receipts the replayed
+        # legacy algorithm actually walked, never from wall clock, so a restart
+        # never re-measures CPU replay. Discovery is always the first Qwen call.
+        self._qwen_seconds = _receipt_seconds(
+            self.epoch._discovery_payload(shard, self.clip_uid, owner_plan),
+            "qwen_model_call_time_seconds",
+            label=f"discovery of {self.clip_uid}/{self.owner_entity_id}",
+        )
+        self._sam3_seconds = 0.0
+        self._completion_seconds = 0.0
+
+    # -- durable model timing -------------------------------------------------
+
+    def add_qwen_seconds(self, payload: Mapping[str, Any], *, count: bool) -> None:
+        """Accumulate one Qwen call the legacy round would have measured.
+
+        Legacy times the whole raw review round around its ``try``, so a failed
+        round still contributes; the completion judge only measures a call that
+        returned, so a failed completion review contributes nothing.
+        """
+        if not count:
+            return
+        self._qwen_seconds += _receipt_seconds(
+            payload,
+            "qwen_model_call_time_seconds",
+            label=f"Qwen call of {self.clip_uid}/{self.owner_entity_id}",
+        )
+
+    def add_sam_seconds(self, payload: Mapping[str, Any]) -> None:
+        self._sam3_seconds += _receipt_seconds(
+            payload,
+            "model_call_time_seconds",
+            label=f"SAM call of {self.clip_uid}/{self.owner_entity_id}",
+        )
+
+    def add_completion_seconds(self, payload: Mapping[str, Any]) -> None:
+        """Accumulate one Boogu generation the legacy accounting measured.
+
+        Legacy adds the reported duration as soon as the backend returns, before
+        it opens the generated file, so a later PIL or read failure keeps the
+        duration. A backend that raised never reported one and adds nothing.
+        """
+        self._completion_seconds += _receipt_seconds(
+            payload,
+            "model_call_time_seconds",
+            label=f"completion of {self.clip_uid}/{self.owner_entity_id}",
+        )
 
     # -- lookups -------------------------------------------------------------
 
@@ -440,6 +494,7 @@ class _OwnerReplay:
             "generated": generated,
             "masks": masks,
             "sam_job": sam_job,
+            "sam_payload": sam_payload,
             "cpu": epoch._completion_cpu_result(generated, masks),
         }
 
@@ -467,7 +522,9 @@ class _OwnerReplay:
             raise SubjectAttributeDurableError(
                 "completion SAM input drifted from its generated candidate"
             )
-        return list(self.completion_cpu(context)["masks"])
+        evaluated = self.completion_cpu(context)
+        self.add_sam_seconds(evaluated["sam_payload"])
+        return list(evaluated["masks"])
 
     def completion_review(self, *, generated_candidate: Any) -> Any:
         epoch = self.epoch
@@ -508,6 +565,11 @@ class _OwnerReplay:
         payload = epoch._committed_payload_or_none(review_job)
         if payload is None:
             raise _PendingModelCall(review_job)
+        # Legacy only adds the review duration once ``review`` returned; a
+        # failed completion review contributes nothing to the Qwen total.
+        self.add_qwen_seconds(
+            payload, count=str(payload.get("status")) == "review"
+        )
         if str(payload.get("status")) == "review_failed":
             raise _sam_failure_exception(payload)
         try:
@@ -538,83 +600,20 @@ class _OwnerReplay:
                 found = int(payload["seed"])
         return found
 
-    def _owner_jobs(self) -> list[ModelJob]:
-        """Every job this owner's receipts can pay, in a stable order."""
-        jobs: list[ModelJob] = []
-        for state in self.states:
-            jobs.extend(self.chain_for(state))
-            for rank in range(len(state.options)):
-                # Only a rank the routes actually attempted has a frozen seed;
-                # reading it is what keeps this accounting free of side effects.
-                frozen = _read_json(
-                    self.epoch._completion_seed_path(
-                        self.shard,
-                        self.clip_uid,
-                        self.owner_entity_id,
-                        state.attribute_id,
-                        rank,
-                    )
-                )
-                if frozen is None:
-                    continue
-                generate = self.epoch._expected_completion_generate_job(
-                    self.shard,
-                    self.clip_uid,
-                    self.owner_plan,
-                    state.attribute_plan,
-                    state.options[rank],
-                    rank,
-                    int(frozen["seed"]),
-                )
-                jobs.append(generate)
-                payload = self.epoch._committed_payload_or_none(generate)
-                if payload is None or str(payload.get("status")) != "completion":
-                    continue
-                sam = self.epoch._expected_completion_sam_job(
-                    self.shard,
-                    self.clip_uid,
-                    self.owner_plan,
-                    state.attribute_plan,
-                    state.options[rank],
-                    rank,
-                    generate,
-                    str(payload.get("generated", {}).get("sha256")),
-                    str(payload.get("generated_png_path", "")),
-                )
-                jobs.append(sam)
-        return jobs
-
     @property
     def qwen_seconds(self) -> float:
-        """Qwen model time summed from durable receipts, never from replay."""
-        total = float(
-            self.epoch._discovery_payload(
-                self.shard, self.clip_uid, self.owner_plan
-            ).get("qwen_model_call_time_seconds", 0.0)
-        )
-        for job in self._owner_jobs():
-            payload = self.epoch._committed_payload_or_none(job)
-            if payload is None or not job.job_type.endswith(("review", "discovery")):
-                continue
-            value = payload.get("qwen_model_call_time_seconds")
-            if isinstance(value, (int, float)):
-                total += max(0.0, float(value))
-        return total
+        """Qwen model time from the durable receipts the replayed legacy walked."""
+        return self._qwen_seconds
 
     @property
     def sam3_seconds(self) -> float:
-        """SAM model time summed from durable receipts, never from replay."""
-        total = 0.0
-        for job in self._owner_jobs():
-            if job.resource != "sam":
-                continue
-            payload = self.epoch._committed_payload_or_none(job)
-            if payload is None:
-                continue
-            value = payload.get("model_call_time_seconds")
-            if isinstance(value, (int, float)):
-                total += max(0.0, float(value))
-        return total
+        """SAM model time from the durable receipts the replayed legacy walked."""
+        return self._sam3_seconds
+
+    @property
+    def completion_seconds(self) -> float:
+        """Boogu model time from the durable receipts legacy measured."""
+        return self._completion_seconds
 
 
 class _OwnerDiscoveryClient:
@@ -665,6 +664,7 @@ class _OwnerSegmentationBackend:
             raise _PendingModelCall(job)
         if str(payload.get("status")) == "sam_failed":
             raise _sam_failure_exception(payload)
+        r.add_sam_seconds(payload)
         return list(r.epoch._load_sam_masks(payload))
 
     def segment_generated_frame(
@@ -721,6 +721,8 @@ class _OwnerReviewClient:
         payload = epoch._committed_payload_or_none(job)
         if payload is None:
             raise _PendingModelCall(job)
+        # Legacy wraps the whole round in its timing, so a failed round counts.
+        r.add_qwen_seconds(payload, count=True)
         if str(payload.get("status")) == "review_failed":
             raise _sam_failure_exception(payload)
         try:
@@ -836,6 +838,9 @@ class _OwnerCompletionBackend:
         payload = epoch._committed_payload_or_none(generate_job)
         if payload is None:
             raise _PendingModelCall(generate_job)
+        # Legacy adds the reported duration before it touches the output file, so
+        # a generation that reported a duration and then failed still counts it.
+        r.add_completion_seconds(payload)
         if str(payload.get("status")) == "completion_failed":
             raise _sam_failure_exception(payload)
         epoch._generated_png_bytes(r.storage, payload)
@@ -1073,12 +1078,32 @@ def resolve_subject_attribute_qwen_client(
     if isinstance(handle, str):
         service = replace(config.qwen.candidate_judge, base_url=handle)
         client = (
-            QwenSubjectAttributeCompletionJudge(service)
+            QwenSubjectAttributeCompletionJudge(
+                service,
+                completion_component="qwen_attribute_completion_review",
+            )
             if judge
             else QwenSubjectAttributeClient(service)
         )
         return ResolvedDiscoveryClient(client, owned=True)
     return ResolvedDiscoveryClient(handle, owned=False)
+
+
+def _receipt_seconds(
+    payload: Mapping[str, Any], key: str, *, label: str
+) -> float:
+    """One receipt-reported model duration, validated and never negative."""
+    value = payload.get(key, 0.0)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise SubjectAttributeDurableError(
+            f"committed {label} has an invalid {key}"
+        )
+    seconds = float(value)
+    if not math.isfinite(seconds) or seconds < 0.0:
+        raise SubjectAttributeDurableError(
+            f"committed {label} has an invalid {key}"
+        )
+    return seconds
 
 
 def _completion_adapter(handle: Any, storage: RunStorage, direct: bool) -> Any:
@@ -2308,6 +2333,13 @@ class SubjectAttributeEpochRunner:
                     f"owner outcome exists while owner {label} is still pending"
                 )
             self._verified_raw_state(shard, storage, clip_uid, owner_plan, context)
+            self._verify_completion_outcomes(
+                shard,
+                storage,
+                clip_uid,
+                owner_plan,
+                self._owner_graph(shard, storage, clip_uid, owner_plan, context),
+            )
             artifact = self._owner_artifact_from_receipts(
                 shard, storage, clip_uid, owner_plan, context["states"]
             )
@@ -3933,16 +3965,55 @@ class SubjectAttributeEpochRunner:
     # -- 8c: model job identities ---------------------------------------------
 
     def _completion_postcheck_policy_identity(self) -> dict[str, Any]:
+        """Every input the completion CPU postcheck actually reads.
+
+        These values decide the cleanup, the quality verdict and therefore the
+        completed crop, so they are part of the SAM-to-review semantic identity:
+        a threshold change must produce a different review job.
+        """
         completion = self.config.subject_attributes.completion
+        quality = completion.quality_filter
         return {
-            "policy_version": SUBJECT_ATTRIBUTE_COMPLETION_GENERATE_POLICY_VERSION,
+            "policy_version": (
+                SUBJECT_ATTRIBUTE_COMPLETION_POSTCHECK_POLICY_VERSION
+            ),
+            "minimum_attribute_area_pixels": int(MIN_ATTRIBUTE_AREA_PIXELS),
+            "minimum_attribute_long_side_pixels": int(
+                MIN_ATTRIBUTE_LONG_SIDE_PIXELS
+            ),
+            "crop_padding_ratio": float(self.config.pair.crop_padding_ratio),
             "completion_enabled": bool(completion.enabled),
             "maximum_completed_significant_components": int(
                 completion.maximum_completed_significant_components
             ),
             "minimum_mean_luminance": float(completion.minimum_mean_luminance),
             "minimum_sharpness_score": float(completion.minimum_sharpness_score),
-            "quality_filter_version": str(completion.quality_filter.version),
+            "quality_filter_enabled": bool(quality.enabled),
+            "quality_filter_version": str(quality.version),
+            "quality_filter_secondary_component_ratio_max": float(
+                quality.secondary_component_ratio_max
+            ),
+            "quality_filter_second_component_ratio_max": float(
+                quality.second_component_ratio_max
+            ),
+            "quality_filter_soft_alpha_ratio_max": float(
+                quality.soft_alpha_ratio_max
+            ),
+            "quality_filter_weak_alpha_ratio_max": float(
+                quality.weak_alpha_ratio_max
+            ),
+            "quality_filter_outer_weak_alpha_ratio_max": float(
+                quality.outer_weak_alpha_ratio_max
+            ),
+            "quality_filter_foreground_fill_min": float(
+                quality.foreground_fill_min
+            ),
+            "quality_filter_cleanup_component_ratio_max": float(
+                quality.cleanup_component_ratio_max
+            ),
+            "quality_filter_cleanup_component_pixels_max": int(
+                quality.cleanup_component_pixels_max
+            ),
             "mode": "legacy_completion_postcheck_v1",
         }
 
@@ -3966,23 +4037,60 @@ class SubjectAttributeEpochRunner:
         }
 
     def _completion_review_policy_identity(self) -> dict[str, Any]:
+        """Semantic identity of the comparative completion review.
+
+        ``QwenSubjectAttributeCompletionJudge`` sends a fixed request: the
+        configured candidate judge model and max tokens, but temperature 0.0,
+        top-p 1.0 and presence penalty 0.0 regardless of the service config, with
+        one structured repair retry. The policy therefore binds those real
+        request parameters and both prompt and schema digests, never the service
+        temperature, and never endpoint, key or timeout.
+        """
         service = self.config.qwen.candidate_judge
         return {
             "policy_version": SUBJECT_ATTRIBUTE_COMPLETION_REVIEW_POLICY_VERSION,
             "model": str(service.model),
-            "temperature": float(service.temperature),
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "presence_penalty": 0.0,
             "max_tokens": int(service.max_tokens),
+            "repair_retries": 1,
+            "system_prompt_sha256": _sha256_bytes(
+                ATTRIBUTE_COMPLETION_REVIEW_SYSTEM_PROMPT.encode("utf-8")
+            ),
+            "review_schema_sha256": _sha256_bytes(
+                canonical_json(
+                    SubjectAttributeCompletionReview.model_json_schema()
+                ).encode("utf-8")
+            ),
             "qwen_input_max_long_side_pixels": int(QWEN_INPUT_MAX_LONG_SIDE_PIXELS),
             "mode": "comparative_alpha_versus_completion_v1",
         }
 
     def _bbox_review_policy_identity(self) -> dict[str, Any]:
+        """Semantic identity of the last-resort bbox review.
+
+        A face normally never reaches this judge, but both legacy bbox system
+        prompts are bound so the identity stays complete if it ever legally did.
+        """
         service = self.config.qwen.candidate_judge
         return {
             "policy_version": SUBJECT_ATTRIBUTE_BBOX_REVIEW_POLICY_VERSION,
             "model": str(service.model),
             "temperature": float(service.temperature),
             "max_tokens": int(service.max_tokens),
+            "repair_retries": 1,
+            "bbox_system_prompt_sha256": _sha256_bytes(
+                ATTRIBUTE_BBOX_REVIEW_SYSTEM_PROMPT.encode("utf-8")
+            ),
+            "face_bbox_system_prompt_sha256": _sha256_bytes(
+                ATTRIBUTE_FACE_BBOX_REVIEW_SYSTEM_PROMPT.encode("utf-8")
+            ),
+            "bbox_schema_sha256": _sha256_bytes(
+                canonical_json(
+                    SubjectAttributeBboxReview.model_json_schema()
+                ).encode("utf-8")
+            ),
             "qwen_input_max_long_side_pixels": int(QWEN_INPUT_MAX_LONG_SIDE_PIXELS),
             "mode": "last_resort_attribute_bbox_review_v1",
         }
@@ -4544,6 +4652,7 @@ class SubjectAttributeEpochRunner:
             update={
                 "qwen_model_call_time_seconds": replay.qwen_seconds,
                 "sam3_model_call_time_seconds": replay.sam3_seconds,
+                "completion_model_call_time_seconds": replay.completion_seconds,
             }
         )
         return artifact.model_copy(update={"records": records, "metrics": metrics})
@@ -4651,12 +4760,11 @@ class SubjectAttributeEpochRunner:
                     state, route_context, has_candidate2=False
                 )
         chains1: dict[str, _CompletionChain] = {}
-        if all(
-            routes1[state.attribute_id] != ROUTE_COMPLETION_REQUIRED
-            for state in rank1_states
-        ):
+        # Only a committed rank-1 review can route an attribute into a rank-1
+        # completion, so nothing is planned speculatively here either.
+        if payload1 is not None and str(payload1.get("status")) == "review":
             for state in rank1_states:
-                if routes1[state.attribute_id] != ROUTE_COMPLETION_REQUIRED:
+                if routes1.get(state.attribute_id) != ROUTE_COMPLETION_REQUIRED:
                     continue
                 chains1[state.attribute_id] = self._completion_chain(
                     shard,
@@ -4701,6 +4809,40 @@ class SubjectAttributeEpochRunner:
             self._publish_completion_outcome(
                 shard, storage, clip_uid, owner_entity_id, chain
             )
+
+    def _verify_completion_outcomes(
+        self,
+        shard: str,
+        storage: RunStorage,
+        clip_uid: str,
+        owner_plan: Mapping[str, Any],
+        graph: Mapping[str, Any],
+    ) -> None:
+        """Require every settled completion chain to carry its exact marker.
+
+        A processed owner outcome is the last durable authority for this owner, so
+        at that point a missing, extra or altered completion marker is durable
+        corruption: it is never backfilled, because a restart must not invent a
+        marker under an owner that already claims to be terminal.
+        """
+        for chain in list(graph["chains0"].values()) + list(
+            graph["chains1"].values()
+        ):
+            if not chain.terminal:
+                continue
+            path = self._completion_outcome_path(
+                shard,
+                clip_uid,
+                str(owner_plan["owner_entity_id"]),
+                chain.attribute_id,
+                chain.candidate_rank,
+            )
+            expected = self._completion_outcome_payload(storage, chain)
+            if _read_json(path) != expected:
+                raise SubjectAttributeDurableError(
+                    f"completion outcome drifted for {chain.attribute_id} "
+                    f"rank {chain.candidate_rank}"
+                )
 
     def _verified_raw_state(
         self,
@@ -4864,6 +5006,12 @@ class SubjectAttributeEpochRunner:
             handle, storage, callable(getattr(handle, "attribute_completion", None))
         )
         started = time.perf_counter()
+        # Exactly the legacy failure scope: the backend call, the reported
+        # duration validation, the image load and the output read are all inside
+        # it, because legacy validates the reported time and loads the generated
+        # image before the SAM postcheck ever runs. Source materialisation above
+        # stays outside, exactly like legacy's ``_save_completion_input``.
+        reported_seconds: float | None = None
         try:
             result = adapter.attribute_completion(
                 source_path=source_path,
@@ -4880,6 +5028,21 @@ class SubjectAttributeEpochRunner:
                     owner_candidate_id,
                 ),
             )
+            reported = result.get(
+                "model_call_time_seconds", time.perf_counter() - started
+            )
+            if (
+                isinstance(reported, bool)
+                or not isinstance(reported, (int, float))
+                or not math.isfinite(float(reported))
+            ):
+                raise ValueError("completion model-call time is invalid")
+            reported_seconds = max(0.0, float(reported))
+            # Legacy opens and converts the generated image before the postcheck.
+            with Image.open(output_path) as opened:
+                opened.load()
+                opened.convert("RGB")
+            data = output_path.read_bytes()
         except Exception as exc:  # noqa: BLE001 - legacy completion failure scope
             return JobResult(
                 OUTCOME_COMPLETED,
@@ -4887,10 +5050,11 @@ class SubjectAttributeEpochRunner:
                     "status": "completion_failed",
                     "exception_type": type(exc).__name__,
                     "error": str(exc),
-                    "model_call_time_seconds": time.perf_counter() - started,
+                    "model_call_time_seconds": (
+                        0.0 if reported_seconds is None else reported_seconds
+                    ),
                 },
             )
-        data = output_path.read_bytes()
         ledger_path = self._completion_png_path(job.job_id())
         atomic_write_bytes(ledger_path, data)
         return JobResult(
@@ -4908,10 +5072,8 @@ class SubjectAttributeEpochRunner:
                 ).as_posix(),
                 "width": int(result.get("width", 0)),
                 "height": int(result.get("height", 0)),
-                "model_call_time_seconds": float(
-                    result.get(
-                        "model_call_time_seconds", time.perf_counter() - started
-                    )
+                "model_call_time_seconds": (
+                    0.0 if reported_seconds is None else reported_seconds
                 ),
             },
         )

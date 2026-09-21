@@ -12,11 +12,13 @@ human owner artifact stay out of scope.
 from __future__ import annotations
 
 import io
+import itertools
 import json
 import time
 from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -43,8 +45,10 @@ from r2v_data_v2.v3.post_mask_epoch_subject_attributes import (
     SubjectAttributeEpochRunner,
     _image_png_sha256,
     _ReplaySegmentationBackend,
+    _sha256_bytes,
 )
 from r2v_data_v2.v3.subject_attributes import (
+    ATTRIBUTE_COMPLETION_REVIEW_SYSTEM_PROMPT,
     DiscoveredSubjectAttribute,
     OwnerEnrichmentArtifact,
     OwnerEnrichmentMetrics,
@@ -205,11 +209,28 @@ def _generated_png(*, colour: tuple[int, int, int] = (210, 70, 70)) -> bytes:
     return buffer.getvalue()
 
 
-class _BooguBackend:
-    """The Boogu completion handle: one scripted generation per call."""
+class _NoOutput:
+    """Scripted Boogu result: the backend returns but never writes a file."""
 
-    def __init__(self, *results: Any, timeline: list[str] | None = None) -> None:
+
+NO_OUTPUT = _NoOutput()
+
+
+class _BooguBackend:
+    """The Boogu completion handle: one scripted generation per call.
+
+    A scripted entry is either PNG bytes, ``NO_OUTPUT`` for a backend that
+    reports success without producing a file, or an exception to raise.
+    """
+
+    def __init__(
+        self,
+        *results: Any,
+        timeline: list[str] | None = None,
+        reported: Any = 0.0,
+    ) -> None:
         self.results = list(results)
+        self.reported = reported
         self.calls = 0
         self.seeds: list[int] = []
         self.requests: list[dict[str, Any]] = []
@@ -232,12 +253,18 @@ class _BooguBackend:
         result = self.results[min(self.calls, len(self.results)) - 1]
         if isinstance(result, Exception):
             raise result
-        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-        Path(output_path).write_bytes(result)
+        reported = (
+            self.reported
+            if not isinstance(self.reported, list)
+            else self.reported[min(self.calls, len(self.reported)) - 1]
+        )
+        if result is not NO_OUTPUT:
+            Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(output_path).write_bytes(result)
         return {
             "width": 32,
             "height": 24,
-            "model_call_time_seconds": 0.0,
+            "model_call_time_seconds": reported,
         }
 
 
@@ -1753,6 +1780,7 @@ def _completion_fixture(
     completion_reviews: list[Any] = (),
     bbox_reviews: list[Any] = (),
     boogu: Any = (),
+    reported: Any = 0.0,
 ) -> tuple[Any, Any, Any, _QwenClient, _SamBackend, _BooguBackend, Any]:
     """One human attribute with two owner candidate frames and completion on."""
     config, storage = _storage_variant(tmp_path, monkeypatch, run_name)
@@ -1774,7 +1802,7 @@ def _completion_fixture(
         # One generated-frame SAM result per completion chain a test may run.
         generated=[masks[:1], masks[1:]],
     )
-    backend = _BooguBackend(*boogu) if boogu else _BooguBackend()
+    backend = _BooguBackend(*boogu, reported=reported)
     timeline: list[str] = []
     for surface in (qwen, sam, backend):
         surface.timeline = timeline
@@ -2248,3 +2276,474 @@ def test_longest_chain_restart_pays_no_model_call_at_all(
         _owner_outcome_path(fresh).read_text(encoding="utf-8")
     ) == outcome
     assert fresh.reconcile_stats(SHARD).to_dict() == counts
+
+
+# ---------------------------------------------------------------------------
+# 8c seal: durable model timing, failure scope, policy identity and markers
+# ---------------------------------------------------------------------------
+
+
+def _monotonic_clock(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """A strictly increasing deterministic clock, so every call reports time."""
+    counter = itertools.count(1)
+    monkeypatch.setattr(time, "perf_counter", lambda: float(next(counter)))
+
+
+def _committed_qwen_seconds(runner: Any, statuses: set[str]) -> float:
+    """Sum the Qwen durations of committed receipts with these statuses."""
+    total = 0.0
+    for path in sorted(Path(runner.ledger.root).rglob("result.json")):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            continue
+        body = payload.get("result_payload")
+        if not isinstance(body, Mapping) or str(body.get("status")) not in statuses:
+            continue
+        value = body.get("qwen_model_call_time_seconds", 0.0)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            total += max(0.0, float(value))
+    return total
+
+
+def test_qwen_model_time_is_the_sum_of_the_receipts_legacy_walked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Qwen total covers every review round, not just the discovery call."""
+    _monotonic_clock(monkeypatch)
+    _config, storage, runner, qwen, sam, boogu, _timeline = _completion_fixture(
+        tmp_path,
+        monkeypatch,
+        run_name="run-qwen-time",
+        attribute=COMPLETION_ATTRIBUTE,
+        reviews=[
+            SubjectAttributeReviewBatch(
+                owner_entity_id=OWNER,
+                reviews=[
+                    _raw_review(
+                        "a1", structure_complete=False, completion_recommended=True
+                    )
+                ],
+            ),
+            SubjectAttributeReviewBatch(
+                owner_entity_id=OWNER,
+                reviews=[
+                    _raw_review(
+                        "a1", structure_complete=False, completion_recommended=True
+                    )
+                ],
+            ),
+        ],
+        completion_reviews=[
+            _completion_review("reject"),
+            _completion_review("accept"),
+        ],
+        boogu=[_generated_png(), _generated_png(colour=(40, 90, 200))],
+    )
+    _drain(runner, qwen, sam=sam, boogu=boogu)
+
+    # Exactly discovery, the two raw review rounds and the two completion
+    # reviews carry Qwen time; the bbox judge never ran here.
+    expected = _committed_qwen_seconds(runner, {"discovery", "review"})
+    assert expected > 0.0
+    artifact = _read_artifact(storage)
+    assert artifact.metrics.qwen_model_call_time_seconds == pytest.approx(expected)
+
+    discovery_only = float(
+        runner._discovery_payload(SHARD, CLIP_UID, _owner_plan_of(runner)).get(
+            "qwen_model_call_time_seconds", 0.0
+        )
+    )
+    assert artifact.metrics.qwen_model_call_time_seconds > discovery_only
+    assert qwen.review_calls == 2
+    assert qwen.completion_review_calls == 2
+
+
+def test_bbox_review_time_is_not_part_of_the_qwen_total(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Legacy never adds the bbox fallback call to the owner Qwen total."""
+    _monotonic_clock(monkeypatch)
+    config, storage = _storage_variant(tmp_path, monkeypatch, "run-bbox-time")
+    _add_owner_frame(storage, slot=1)
+    runner = _runner(config, storage, tmp_path)
+    masks = [
+        _attribute_mask(storage, slot=1, band=0),
+        _attribute_mask(storage, slot=0, band=0),
+    ]
+    qwen = _QwenClient(
+        discoveries=[_human_discovery(attributes=(ACCESSORY,))],
+        reviews=[
+            SubjectAttributeReviewBatch(
+                owner_entity_id=OWNER,
+                reviews=[_raw_review("a1", sufficient_source_evidence=False)],
+            ),
+            SubjectAttributeReviewBatch(
+                owner_entity_id=OWNER,
+                reviews=[_raw_review("a1", sufficient_source_evidence=False)],
+            ),
+        ],
+        bbox_reviews=[_bbox_review("accept")],
+    )
+    sam = _SamBackend(by_prompt={ACCESSORY[2]: masks})
+    _drain(runner, qwen, sam=sam)
+
+    assert qwen.bbox_calls == 1
+    expected = _committed_qwen_seconds(runner, {"discovery", "review"})
+    bbox_seconds = _committed_qwen_seconds(runner, {"bbox", "bbox_failed"})
+    assert bbox_seconds > 0.0
+    artifact = _read_artifact(storage)
+    assert artifact.metrics.qwen_model_call_time_seconds == pytest.approx(expected)
+    assert artifact.metrics.qwen_model_call_time_seconds != pytest.approx(
+        expected + bbox_seconds
+    )
+
+
+def _owner_plan_of(runner: Any) -> dict[str, Any]:
+    return runner._owner_plan_for(
+        SHARD, runner._clip_plan(SHARD, CLIP_UID), OWNER
+    )
+
+
+@pytest.mark.parametrize(
+    ("scripted", "reported", "expected"),
+    [
+        (NO_OUTPUT, 0.0, "FileNotFoundError"),
+        (b"definitely not a PNG", 0.0, "UnidentifiedImageError"),
+        (_generated_png(), float("nan"), None),
+    ],
+)
+def test_completion_generation_failure_scope_matches_legacy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scripted: Any,
+    reported: Any,
+    expected: str | None,
+) -> None:
+    """A missing, corrupt or mis-reported generation is a terminal completion failure."""
+    _monotonic_clock(monkeypatch)
+    _config, storage, runner, qwen, sam, boogu, _timeline = _completion_fixture(
+        tmp_path,
+        monkeypatch,
+        run_name=f"run-gen-{abs(hash(str(expected)))}",
+        attribute=COMPLETION_ATTRIBUTE,
+        reviews=[
+            SubjectAttributeReviewBatch(
+                owner_entity_id=OWNER,
+                reviews=[
+                    _raw_review(
+                        "a1", structure_complete=False, completion_recommended=True
+                    )
+                ],
+            ),
+            SubjectAttributeReviewBatch(
+                owner_entity_id=OWNER,
+                reviews=[
+                    _raw_review(
+                        "a1", structure_complete=False, completion_recommended=True
+                    )
+                ],
+            ),
+        ],
+        boogu=[scripted, scripted],
+        reported=reported,
+    )
+    _drain(runner, qwen, sam=sam, boogu=boogu)
+
+    # Both generations failed, so the completion SAM never ran at all.
+    assert boogu.calls == 2
+    assert sam.generated_calls == 0
+    assert runner.seed_jobs() == []
+    artifact = _read_artifact(storage)
+    assert [record.status for record in artifact.records] == ["rejected"]
+    reason = artifact.records[0].reason
+    assert reason.startswith("completion_failed:")
+    if expected is not None:
+        assert expected in reason
+    else:
+        assert reason == "completion_failed:ValueError:completion model-call time is invalid"
+    assert artifact.metrics.completion_failures == 2
+    assert artifact.metrics.completion_backend_failures == 2
+    assert runner.reconcile_stats(SHARD).terminal_clips == 1
+
+    completion_outcome = json.loads(
+        (
+            Path(runner.ledger.root)
+            / "semantic"
+            / "subject_attributes"
+            / "owners"
+            / SHARD
+            / CLIP_UID
+            / OWNER
+            / "attributes"
+            / "a1"
+            / "completion"
+            / "rank-0-outcome.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert completion_outcome["status"] == "generation_failed"
+    assert completion_outcome["review_job_id"] is None
+    assert completion_outcome["completed_crop_sha256"] is None
+
+
+def test_policy_identities_bind_prompts_schemas_and_every_threshold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The semantic identities carry the real prompts, schemas and thresholds."""
+    monkeypatch.setattr(time, "perf_counter", lambda: 1.0)
+    config, storage = _storage_variant(tmp_path, monkeypatch, "run-policy")
+    runner = _runner(config, storage, tmp_path)
+
+    completion_review = runner._completion_review_policy_identity()
+    assert completion_review["policy_version"] == "subject_attribute_completion_review/2"
+    assert completion_review["temperature"] == 0.0
+    assert completion_review["top_p"] == 1.0
+    assert completion_review["presence_penalty"] == 0.0
+    assert completion_review["repair_retries"] == 1
+    assert len(completion_review["system_prompt_sha256"]) == 64
+    assert len(completion_review["review_schema_sha256"]) == 64
+    assert completion_review["system_prompt_sha256"] == _sha256_bytes(
+        ATTRIBUTE_COMPLETION_REVIEW_SYSTEM_PROMPT.encode("utf-8")
+    )
+    assert "endpoint" not in completion_review
+    assert "timeout" not in completion_review
+
+    bbox = runner._bbox_review_policy_identity()
+    assert bbox["policy_version"] == "subject_attribute_bbox_review/2"
+    assert len(bbox["bbox_system_prompt_sha256"]) == 64
+    assert len(bbox["face_bbox_system_prompt_sha256"]) == 64
+    assert len(bbox["bbox_schema_sha256"]) == 64
+    assert bbox["bbox_system_prompt_sha256"] != bbox["face_bbox_system_prompt_sha256"]
+
+    postcheck = runner._completion_postcheck_policy_identity()
+    assert (
+        postcheck["policy_version"]
+        == "subject_attribute_completion_postcheck/1"
+    )
+    quality = config.subject_attributes.completion.quality_filter
+    for key, value in (
+        ("quality_filter_secondary_component_ratio_max", quality.secondary_component_ratio_max),
+        ("quality_filter_second_component_ratio_max", quality.second_component_ratio_max),
+        ("quality_filter_soft_alpha_ratio_max", quality.soft_alpha_ratio_max),
+        ("quality_filter_weak_alpha_ratio_max", quality.weak_alpha_ratio_max),
+        ("quality_filter_outer_weak_alpha_ratio_max", quality.outer_weak_alpha_ratio_max),
+        ("quality_filter_foreground_fill_min", quality.foreground_fill_min),
+        ("quality_filter_cleanup_component_ratio_max", quality.cleanup_component_ratio_max),
+        ("quality_filter_cleanup_component_pixels_max", quality.cleanup_component_pixels_max),
+    ):
+        assert postcheck[key] == value, key
+
+    # A single quality-filter threshold change must move the completion SAM job,
+    # because that threshold decides the postcheck and therefore the crop the
+    # completion review is shown.
+    plan = runner._clip_plan(SHARD, CLIP_UID)
+    owner_plan = runner._owner_plan_for(SHARD, plan, OWNER)
+    reference = runner._owner_reference(storage, CLIP_UID, OWNER)
+    discovery = _human_discovery(attributes=(COMPLETION_ATTRIBUTE,))
+    discovery_job_id = runner._expected_discovery_job(
+        SHARD, CLIP_UID, owner_plan
+    ).job_id()
+    attribute_plan = runner._attribute_plan(
+        SHARD,
+        storage,
+        CLIP_UID,
+        owner_plan,
+        reference,
+        discovery,
+        0,
+        "a1",
+        discovery_job_id,
+    )
+    stub = SimpleNamespace(
+        crop=Image.new("RGBA", (8, 8), (10, 20, 30, 255)),
+        owner_candidate=SimpleNamespace(candidate_id="candidate_1"),
+    )
+
+    def sam_job_id(active: Any) -> str:
+        generate = active._expected_completion_generate_job(
+            SHARD, CLIP_UID, owner_plan, attribute_plan, stub, 0, 7
+        )
+        return active._expected_completion_sam_job(
+            SHARD,
+            CLIP_UID,
+            owner_plan,
+            attribute_plan,
+            stub,
+            0,
+            generate,
+            "0" * 64,
+            "candidate.png",
+        ).job_id()
+
+    mutated = _runner(
+        replace(
+            config,
+            subject_attributes=replace(
+                config.subject_attributes,
+                completion=replace(
+                    config.subject_attributes.completion,
+                    quality_filter=replace(
+                        quality, foreground_fill_min=0.99
+                    ),
+                ),
+            ),
+        ),
+        storage,
+        tmp_path,
+        ledger_name="ledger-run-policy-mutated",
+    )
+    assert sam_job_id(runner) != sam_job_id(mutated)
+
+
+def test_rank1_completion_outcome_marker_is_published_and_checked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rank-1 completion outcome is durable authority, never its own."""
+    monkeypatch.setattr(time, "perf_counter", lambda: 1.0)
+    config, storage, runner, qwen, sam, boogu, _timeline = _completion_fixture(
+        tmp_path,
+        monkeypatch,
+        run_name="run-rank1-marker",
+        attribute=COMPLETION_ATTRIBUTE,
+        reviews=[
+            SubjectAttributeReviewBatch(
+                owner_entity_id=OWNER,
+                reviews=[
+                    _raw_review(
+                        "a1", structure_complete=False, completion_recommended=True
+                    )
+                ],
+            ),
+            SubjectAttributeReviewBatch(
+                owner_entity_id=OWNER,
+                reviews=[
+                    _raw_review(
+                        "a1", structure_complete=False, completion_recommended=True
+                    )
+                ],
+            ),
+        ],
+        completion_reviews=[
+            _completion_review("reject"),
+            _completion_review("accept"),
+        ],
+        boogu=[_generated_png(), _generated_png(colour=(40, 90, 200))],
+    )
+    _drain(runner, qwen, sam=sam, boogu=boogu)
+
+    completion_dir = (
+        Path(runner.ledger.root)
+        / "semantic"
+        / "subject_attributes"
+        / "owners"
+        / SHARD
+        / CLIP_UID
+        / OWNER
+        / "attributes"
+        / "a1"
+        / "completion"
+    )
+    rank0 = json.loads(
+        (completion_dir / "rank-0-outcome.json").read_text(encoding="utf-8")
+    )
+    rank1_path = completion_dir / "rank-1-outcome.json"
+    rank1 = json.loads(rank1_path.read_text(encoding="utf-8"))
+    assert rank0["candidate_rank"] == 0
+    assert rank0["status"] == "review_rejected"
+    assert rank1["candidate_rank"] == 1
+    assert rank1["status"] == "accepted"
+    assert rank1["review_job_id"] is not None
+    assert rank1["reason"] == "completion_identity_accepted"
+    assert rank1["completed_crop_sha256"] is not None
+    assert runner.reconcile_stats(SHARD).terminal_clips == 1
+
+    for key, value in (
+        ("status", "generation_failed"),
+        ("seed", int(rank1["seed"]) + 1),
+        ("review_job_id", None),
+    ):
+        tampered = dict(rank1)
+        tampered[key] = value
+        rank1_path.write_text(json.dumps(tampered), encoding="utf-8")
+        with pytest.raises(
+            SubjectAttributeDurableError, match="completion outcome drifted"
+        ):
+            _runner(
+                config, storage, tmp_path, ledger_name="ledger-run-rank1-marker"
+            ).reconcile_stats(SHARD)
+        # Verification is pure CPU: no handle is ever touched, so a tampered
+        # marker can never cost a model call.
+        assert (qwen.discovery_calls, qwen.review_calls, sam.calls, boogu.calls) == (
+            1,
+            2,
+            2,
+            2,
+        )
+    rank1_path.write_text(json.dumps(rank1), encoding="utf-8")
+    assert runner.reconcile_stats(SHARD).terminal_clips == 1
+
+
+def _committed_completion_receipts(
+    runner: Any, status: str
+) -> list[dict[str, Any]]:
+    """Every committed completion generation receipt with this status."""
+    found: list[dict[str, Any]] = []
+    for path in sorted(Path(runner.ledger.root).rglob("result.json")):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        body = payload.get("result_payload") if isinstance(payload, dict) else None
+        if isinstance(body, Mapping) and str(body.get("status")) == status:
+            found.append(dict(body))
+    return found
+
+
+def test_completion_model_time_survives_a_corrupt_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Legacy measures the duration before it opens the generated file."""
+    monkeypatch.setattr(time, "perf_counter", lambda: 1.0)
+    _config, storage, runner, qwen, sam, boogu, _timeline = _completion_fixture(
+        tmp_path,
+        monkeypatch,
+        run_name="run-completion-time",
+        attribute=COMPLETION_ATTRIBUTE,
+        reviews=[
+            SubjectAttributeReviewBatch(
+                owner_entity_id=OWNER,
+                reviews=[
+                    _raw_review(
+                        "a1", structure_complete=False, completion_recommended=True
+                    )
+                ],
+            ),
+            SubjectAttributeReviewBatch(
+                owner_entity_id=OWNER,
+                reviews=[
+                    _raw_review(
+                        "a1", structure_complete=False, completion_recommended=True
+                    )
+                ],
+            ),
+        ],
+        boogu=[b"corrupt", b"corrupt"],
+        reported=3.25,
+    )
+    _drain(runner, qwen, sam=sam, boogu=boogu)
+
+    artifact = _read_artifact(storage)
+    assert [record.status for record in artifact.records] == ["rejected"]
+    # Two generations reported 3.25 each before their output failed to load.
+    assert artifact.metrics.completion_model_call_time_seconds == pytest.approx(6.5)
+    assert artifact.metrics.completion_attempts == 2
+    assert artifact.metrics.completion_failures == 2
+    assert sam.generated_calls == 0
+    assert runner.reconcile_stats(SHARD).terminal_clips == 1
+
+    # The committed semantic is the legacy one: the generation failed inside the
+    # same scope that measures the duration, so the receipt is a terminal failure
+    # that still carries the reported duration rather than a success.
+    failures = _committed_completion_receipts(runner, "completion_failed")
+    assert len(failures) == 2
+    assert all(
+        payload["model_call_time_seconds"] == pytest.approx(3.25)
+        for payload in failures
+    )
+    assert _committed_completion_receipts(runner, "completion") == []
