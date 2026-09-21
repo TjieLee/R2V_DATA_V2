@@ -34,6 +34,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 from PIL import Image
 
 from r2v_data_v2.reconciliation import write_json_atomic
@@ -48,17 +49,21 @@ from r2v_data_v2.v3.post_mask_epoch_jobs import (
     semantic_input_digest,
 )
 from r2v_data_v2.v3.reference_integrity import (
-    SYSTEM_PROMPT as REFERENCE_INTEGRITY_SYSTEM_PROMPT,
-)
-from r2v_data_v2.v3.reference_integrity import (
+    SOURCE_BBOX_FALLBACK_SYSTEM_PROMPT,
     QwenReferenceIntegrityJudge,
+    QwenSourceBboxFallbackJudge,
     ReferenceIntegrityJudgeFailure,
     ReferenceIntegrityStats,
+    SourceBboxFallbackJudgeFailure,
     _artifact_only_bbox_eligible,
     _is_self_sourced_reference,
+    _materialize_source_bbox,
     _reference_edit_after_source_alpha,
+    _reference_edit_after_source_bbox,
     _rejected_reference,
     _resolve_run_artifact,
+    _source_bbox_candidate,
+    _source_bbox_reference,
     _source_context,
     _source_evidence,
     _tokens_for_retained,
@@ -66,6 +71,9 @@ from r2v_data_v2.v3.reference_integrity import (
     reference_semantic_hard_reject_reason,
     reference_semantic_risk_reason,
     reference_topology_diagnostics,
+)
+from r2v_data_v2.v3.reference_integrity import (
+    SYSTEM_PROMPT as REFERENCE_INTEGRITY_SYSTEM_PROMPT,
 )
 from r2v_data_v2.v3.schemas import (
     EntityReferenceState,
@@ -76,22 +84,29 @@ from r2v_data_v2.v3.schemas import (
     ReferenceIntegrityReview,
     ReferenceIntegrityState,
     ReferencesState,
+    SourceBboxFallbackReview,
 )
 from r2v_data_v2.v3.storage import RunStorage
 
 REFERENCE_INTEGRITY_PLAN_SCHEMA = "post_mask_epoch_reference_integrity_plan/1"
 REFERENCE_INTEGRITY_ENTITY_OUTCOME_SCHEMA = (
-    "post_mask_epoch_reference_integrity_entity_outcome/2"
+    "post_mask_epoch_reference_integrity_entity_outcome/3"
 )
 REFERENCE_INTEGRITY_CLIP_OUTCOME_SCHEMA = (
     "post_mask_epoch_reference_integrity_outcome/1"
 )
-REFERENCE_INTEGRITY_POLICY_VERSION = "reference_integrity_epoch_policy/2"
+REFERENCE_INTEGRITY_POLICY_VERSION = "reference_integrity_epoch_policy/3"
 REFERENCE_INTEGRITY_REVIEW_INPUT_SCHEMA = (
     "post_mask_epoch_reference_integrity_review_input/1"
 )
+REFERENCE_INTEGRITY_BBOX_INPUT_SCHEMA = (
+    "post_mask_epoch_reference_integrity_bbox_input/1"
+)
 REFERENCE_INTEGRITY_MAIN_REVIEW_POLICY_VERSION = (
     "reference_integrity_main_review/1"
+)
+REFERENCE_INTEGRITY_BBOX_REVIEW_POLICY_VERSION = (
+    "reference_integrity_bbox_review/1"
 )
 
 #: The one model job type this epoch owns. 6c implements the main review
@@ -102,8 +117,18 @@ VARIANT_FINAL = "final"
 VARIANT_SOURCE_ALPHA = "source_alpha"
 IMPLEMENTED_REVIEW_VARIANTS = (VARIANT_FINAL, VARIANT_SOURCE_ALPHA)
 
+#: The second Qwen job type: the source bbox fallback review of one materialized
+#: raw-source candidate. 6d2a implements only the ``artifact_review_reject``
+#: trigger; the topology upgrade trigger stays out (6d2b).
+REFERENCE_INTEGRITY_BBOX_REVIEW_JOB = "reference_integrity_bbox_review"
+BBOX_TRIGGER_ARTIFACT = "artifact_review_reject"
+BBOX_REVIEW_MODE = "source_bbox_fallback_v1"
+BBOX_JUDGE_FAILED_PREFIX = "source_bbox_fallback_judge_failed:"
+
 #: Dependency address of the main review inside a source-alpha review job.
 MAIN_REVIEW_JOB_DEPENDENCY = "main_review"
+#: Dependency address of the parent integrity review inside a bbox review job.
+PARENT_REVIEW_JOB_DEPENDENCY = "parent_review"
 
 SOURCE_ALPHA_ACCEPTED_REASON = "completion_integrity_rejected_source_alpha_accepted"
 SOURCE_ALPHA_FALLBACK_REASON = "completion_integrity_rejected_fallback_to_alpha"
@@ -135,6 +160,10 @@ ENTITY_DELTA_FIELDS = (
     "semantic_policy_rejected",
     "entities_reviewed",
     "judge_failed",
+    "source_bbox_fallback_attempted",
+    "source_bbox_fallback_accepted",
+    "source_bbox_fallback_rejected",
+    "source_bbox_fallback_judge_failed",
 )
 
 #: Marker keys that only a reviewed outcome may carry. ``review_variant`` and
@@ -149,6 +178,21 @@ REVIEWED_MARKER_FIELDS = (
     "judge_failed",
 )
 
+#: Additional marker keys an artifact source-bbox outcome carries. ``review``
+#: stays the *parent integrity* review; ``source_bbox_fallback_review`` is the
+#: bbox judge's own verdict, and ``bbox_judge_failed`` is this epoch's internal
+#: provenance flag (legacy never sets the public
+#: ``source_bbox_fallback_judge_failed`` for the artifact trigger).
+BBOX_MARKER_FIELDS = (
+    "bbox_review_job_id",
+    "source_bbox_fallback_trigger",
+    "source_bbox_fallback_candidate_path",
+    "source_bbox_fallback_metadata_path",
+    "source_bbox_xyxy",
+    "source_bbox_fallback_review",
+    "bbox_judge_failed",
+)
+
 CLIP_DELTA_FIELDS = ("processed", "failed")
 #: The ready clip marker binds the FULL clip stats delta, so it also carries the
 #: per-entity counters its entity outcomes contributed.
@@ -156,6 +200,29 @@ CLIP_DELTA_KNOWN_FIELDS = CLIP_DELTA_FIELDS + ENTITY_DELTA_FIELDS
 
 CLEAN_REAL_FULL_REFERENCE = "clean_real_full_reference"
 REJECTED_REFERENCE_REASON = "reference_integrity_rejected"
+
+
+@dataclass(frozen=True)
+class _BboxParent:
+    """The exact frozen parent state one artifact bbox job continues from.
+
+    ``variant`` is the parent integrity review variant; ``review`` is that
+    parent's committed verdict, ``reference`` the reference it judged,
+    ``diagnostics`` its topology diagnostics and ``context_path`` its frozen
+    review context PNG. ``parent_review_job_id`` is the *grandparent* main
+    review job for an alpha parent, which is what the entity marker binds.
+    """
+
+    variant: str
+    job: ModelJob
+    payload: dict[str, Any]
+    review: ReferenceIntegrityReview
+    reference: EntityReferenceState
+    diagnostics: Any
+    main_diagnostics: Any
+    context_path: str
+    context_sha256: str
+    parent_review_job_id: str | None
 
 
 @dataclass(frozen=True)
@@ -201,6 +268,33 @@ def resolve_reference_integrity_judge(
             )
         return ResolvedIntegrityJudge(
             QwenReferenceIntegrityJudge(replace(service, base_url=handle)),
+            owned=True,
+        )
+    return ResolvedIntegrityJudge(handle, owned=False)
+
+
+def resolve_source_bbox_fallback_judge(
+    handle: Any, config: V3Config
+) -> ResolvedIntegrityJudge:
+    """Turn the epoch's handle into a source bbox fallback judge.
+
+    Same contract as the integrity judge resolver: an endpoint string builds an
+    owned judge against the configured service, an injected judge is reused and
+    never closed, and ``None`` is an error rather than a fallback to another
+    model.
+    """
+    if handle is None:
+        raise ReferenceIntegrityEpochError(
+            "reference integrity bbox review needs a judge handle"
+        )
+    if isinstance(handle, str):
+        service = config.qwen.reference_integrity_judge
+        if service is None:
+            raise ReferenceIntegrityEpochError(
+                "no configured reference integrity judge for the endpoint handle"
+            )
+        return ResolvedIntegrityJudge(
+            QwenSourceBboxFallbackJudge(replace(service, base_url=handle)),
             owned=True,
         )
     return ResolvedIntegrityJudge(handle, owned=False)
@@ -379,6 +473,10 @@ class ReferenceIntegrityEpochRunner:
             "review_inputs", shard, clip_uid, entity_id, f"{variant}.json"
         )
 
+    def _bbox_input_path(self, shard: str, clip_uid: str, entity_id: str) -> Path:
+        """One entity has at most one legacy bbox route, so no attempt index."""
+        return self._semantic("bbox_inputs", shard, clip_uid, f"{entity_id}.json")
+
     def _storage_for(self, shard: str) -> RunStorage:
         storage = self.storages.get(shard)
         if storage is None:
@@ -417,6 +515,29 @@ class ReferenceIntegrityEpochRunner:
             "mode": "targeted_qwen_v1",
         }
 
+    def _bbox_review_policy_identity(self) -> dict[str, Any]:
+        """Semantic identity of the source bbox fallback review model behavior."""
+        service = self.config.qwen.reference_integrity_judge
+        if service is None:
+            raise ReferenceIntegrityEpochError(
+                "reference integrity Qwen judge is not configured"
+            )
+        return {
+            "policy_version": REFERENCE_INTEGRITY_BBOX_REVIEW_POLICY_VERSION,
+            "model": str(service.model),
+            "max_tokens": int(service.max_tokens),
+            "system_prompt_sha256": hashlib.sha256(
+                SOURCE_BBOX_FALLBACK_SYSTEM_PROMPT.encode("utf-8")
+            ).hexdigest(),
+            "review_schema_sha256": hashlib.sha256(
+                canonical_json(
+                    SourceBboxFallbackReview.model_json_schema()
+                ).encode("utf-8")
+            ).hexdigest(),
+            "mode": BBOX_REVIEW_MODE,
+            "crop_padding_ratio": float(self.config.pair.crop_padding_ratio),
+        }
+
     def _policy_identity(self) -> dict[str, Any]:
         policy = self.config.reference_integrity
         return {
@@ -426,6 +547,7 @@ class ReferenceIntegrityEpochRunner:
             "reference_edit_enabled": bool(self.config.reference_edit.enabled),
             "crop_padding_ratio": float(self.config.pair.crop_padding_ratio),
             "main_review": self._main_review_policy_identity(),
+            "bbox_review": self._bbox_review_policy_identity(),
         }
 
     # -- clip classification ---------------------------------------------------
@@ -952,6 +1074,10 @@ class ReferenceIntegrityEpochRunner:
         main review job is the dependency address, which makes the alpha job
         conditional on one exact main receipt instead of a standalone root job.
         """
+        if variant == VARIANT_SOURCE_ALPHA and main_job is None:
+            raise ReferenceIntegrityDurableError(
+                "source alpha review requires its frozen main review job"
+            )
         input_reference = (
             self._frozen_source_alpha_reference(plan_entry, entity.entity_id)
             if variant == VARIANT_SOURCE_ALPHA
@@ -1015,6 +1141,7 @@ class ReferenceIntegrityEpochRunner:
                 f"CPU entity outcome {outcome!r} is impossible for {label}"
             )
         present = [key for key in REVIEWED_MARKER_FIELDS if key in marker]
+        bbox_present = [key for key in BBOX_MARKER_FIELDS if key in marker]
         if reviewed:
             if len(present) != len(REVIEWED_MARKER_FIELDS):
                 raise ReferenceIntegrityDurableError(
@@ -1051,6 +1178,65 @@ class ReferenceIntegrityEpochRunner:
                 raise ReferenceIntegrityDurableError(
                     f"reviewed entity outcome judge_failed is not a bool for {label}"
                 )
+            if bbox_present:
+                if len(bbox_present) != len(BBOX_MARKER_FIELDS):
+                    raise ReferenceIntegrityDurableError(
+                        f"source bbox entity outcome is missing provenance for "
+                        f"{label}"
+                    )
+                bbox_job_id = marker.get("bbox_review_job_id")
+                if not isinstance(bbox_job_id, str) or not bbox_job_id:
+                    raise ReferenceIntegrityDurableError(
+                        f"source bbox entity outcome has no bbox job id for "
+                        f"{label}"
+                    )
+                if marker.get("source_bbox_fallback_trigger") != BBOX_TRIGGER_ARTIFACT:
+                    raise ReferenceIntegrityDurableError(
+                        f"source bbox entity outcome trigger is unknown for {label}"
+                    )
+                for key in (
+                    "source_bbox_fallback_candidate_path",
+                    "source_bbox_fallback_metadata_path",
+                ):
+                    value = marker.get(key)
+                    if not isinstance(value, str) or not value:
+                        raise ReferenceIntegrityDurableError(
+                            f"source bbox entity outcome {key} is missing for "
+                            f"{label}"
+                        )
+                xyxy = marker.get("source_bbox_xyxy")
+                if (
+                    not isinstance(xyxy, list)
+                    or len(xyxy) != 4
+                    or any(
+                        isinstance(value, bool) or not isinstance(value, int)
+                        for value in xyxy
+                    )
+                ):
+                    raise ReferenceIntegrityDurableError(
+                        f"source bbox entity outcome bbox is malformed for {label}"
+                    )
+                bbox_judge_failed = marker.get("bbox_judge_failed")
+                if not isinstance(bbox_judge_failed, bool):
+                    raise ReferenceIntegrityDurableError(
+                        f"source bbox entity outcome bbox_judge_failed is not a "
+                        f"bool for {label}"
+                    )
+                bbox_review = marker.get("source_bbox_fallback_review")
+                if bbox_judge_failed:
+                    if bbox_review is not None:
+                        raise ReferenceIntegrityDurableError(
+                            f"judge-failed source bbox outcome must not carry a "
+                            f"review for {label}"
+                        )
+                else:
+                    try:
+                        SourceBboxFallbackReview.model_validate(bbox_review)
+                    except Exception as exc:
+                        raise ReferenceIntegrityDurableError(
+                            f"source bbox entity outcome has an invalid review for "
+                            f"{label}"
+                        ) from exc
             review = marker.get("review")
             if judge_failed:
                 if review is not None:
@@ -1072,7 +1258,7 @@ class ReferenceIntegrityEpochRunner:
                     raise ReferenceIntegrityDurableError(
                         f"reviewed entity outcome has an invalid review for {label}"
                     ) from exc
-        elif present:
+        elif present or bbox_present:
             raise ReferenceIntegrityDurableError(
                 f"CPU entity outcome must not carry review provenance for {label}"
             )
@@ -1122,6 +1308,18 @@ class ReferenceIntegrityEpochRunner:
                 if not reason.startswith(prefix):
                     raise ReferenceIntegrityDurableError(
                         f"judge-failed entity outcome reason drifted for {label}"
+                    )
+            elif bbox_present:
+                if marker["bbox_judge_failed"]:
+                    if not reason.startswith(BBOX_JUDGE_FAILED_PREFIX):
+                        raise ReferenceIntegrityDurableError(
+                            f"source bbox judge-failed entity outcome reason "
+                            f"drifted for {label}"
+                        )
+                elif reason != marker["source_bbox_fallback_review"]["reason"]:
+                    raise ReferenceIntegrityDurableError(
+                        f"source bbox entity outcome reason disagrees with its "
+                        f"review for {label}"
                     )
             elif (
                 review_variant == VARIANT_SOURCE_ALPHA
@@ -1503,7 +1701,7 @@ class ReferenceIntegrityEpochRunner:
             },
         }
 
-    def _expected_source_alpha_marker(
+    def _expected_source_alpha_outcome(
         self,
         *,
         clip_uid: str,
@@ -1518,14 +1716,16 @@ class ReferenceIntegrityEpochRunner:
         alpha_diagnostics: Any,
         alpha_anchor: Mapping[str, Any],
         pre_edit: ReferenceEditState | None,
-    ) -> dict[str, Any] | None:
-        """The exact durable marker one committed source-alpha review produces.
+    ) -> tuple[dict[str, Any] | None, ReferenceIntegrityReview | None]:
+        """The exact durable outcome one committed source-alpha review produces.
 
         The main receipt is validated here as well: a source-alpha outcome is a
         continuation of one exact main review, never a standalone decision. The
         delta carries the whole entity's legacy counters, so both reviews are
-        accounted for. ``None`` means the frozen policy continues into the 6d2
-        artifact bbox route.
+        accounted for. ``(None, review)`` means the frozen policy continues into
+        the artifact bbox route and ``review`` is the alpha review that parented
+        it; ``(None, None)`` never happens because this helper is only reached
+        for a committed review.
         """
         entity_id = entity.entity_id
         main_payload = self._committed_review_payload(main_job)
@@ -1556,6 +1756,12 @@ class ReferenceIntegrityEpochRunner:
                 f"committed source alpha job {alpha_job.job_id()} has an unknown "
                 "payload status"
             )
+        if alpha_status == "review":
+            alpha_review = ReferenceIntegrityReview.model_validate(
+                alpha_payload.get("review")
+            )
+        else:
+            alpha_review = None
         common: dict[str, Any] = {
             "schema": REFERENCE_INTEGRITY_ENTITY_OUTCOME_SCHEMA,
             "clip_uid": clip_uid,
@@ -1585,18 +1791,15 @@ class ReferenceIntegrityEpochRunner:
                 "review": None,
                 "judge_failed": True,
                 "delta": {**delta, "judge_failed": 1, "entities_rejected": 1},
-            }
-        alpha_review = ReferenceIntegrityReview.model_validate(alpha_payload.get("review"))
+            }, None
+        assert alpha_review is not None
         if alpha_review.verdict == "reject":
-            if (
-                _artifact_only_bbox_eligible(alpha_review)
-                and not alpha_reference.source_bbox_fallback
-                and _is_self_sourced_reference(
-                    clip_uid=clip_uid, reference=alpha_reference
-                )
+            if self._artifact_bbox_route(
+                clip_uid=clip_uid, reference=alpha_reference, review=alpha_review
             ):
-                # 6d2 owns the artifact bbox continuation: only the receipt stays.
-                return None
+                # The artifact bbox continuation owns this entity now: only the
+                # alpha receipt stays durable here.
+                return None, alpha_review
             return {
                 **common,
                 "outcome": ENTITY_OUTCOME_REJECTED,
@@ -1605,7 +1808,7 @@ class ReferenceIntegrityEpochRunner:
                 "review": alpha_review.model_dump(mode="json"),
                 "judge_failed": False,
                 "delta": {**delta, "entities_rejected": 1},
-            }
+            }, None
         return {
             **common,
             "outcome": ENTITY_OUTCOME_ACCEPTED,
@@ -1614,7 +1817,7 @@ class ReferenceIntegrityEpochRunner:
             "review": alpha_review.model_dump(mode="json"),
             "judge_failed": False,
             "delta": {**delta, "entities_accepted": 1},
-        }
+        }, None
 
     def _write_review_debug(
         self,
@@ -1644,7 +1847,9 @@ class ReferenceIntegrityEpochRunner:
         write_json_atomic(path, body)
 
     def run(self, job: ModelJob, handle: Any) -> JobResult:
-        """One integrity review call. No prompt or retry policy is copied."""
+        """One review call. No prompt or retry policy is copied."""
+        if job.job_type == REFERENCE_INTEGRITY_BBOX_REVIEW_JOB:
+            return self._run_bbox_review(job, handle)
         variant = self._review_variant(job)
         shard, storage, _clip, entity, reference, plan_entry, _pre_edit = (
             self._job_review_context(job)
@@ -1770,25 +1975,34 @@ class ReferenceIntegrityEpochRunner:
                 raise ReferenceIntegrityDurableError(
                     f"source alpha job id drifted for {clip_uid}/{entity.entity_id}"
                 )
-            return _ReviewOutcome(
-                marker=self._expected_source_alpha_marker(
-                    clip_uid=clip_uid,
-                    entity=entity,
-                    plan_entry=plan_entry,
-                    main_job=main_job,
-                    main_anchor=main_anchor,
-                    main_diagnostics=main_diagnostics,
-                    alpha_job=alpha_job,
-                    alpha_payload=payload,
-                    alpha_reference=alpha_reference,
-                    alpha_diagnostics=self._review_diagnostics(
-                        storage, alpha_reference
-                    ),
-                    alpha_anchor=alpha_anchor,
-                    pre_edit=pre_edit,
-                ),
-                unlock=None,
+            marker, _alpha_review = self._expected_source_alpha_outcome(
+                clip_uid=clip_uid,
+                entity=entity,
+                plan_entry=plan_entry,
+                main_job=main_job,
+                main_anchor=main_anchor,
+                main_diagnostics=main_diagnostics,
+                alpha_job=alpha_job,
+                alpha_payload=payload,
+                alpha_reference=alpha_reference,
+                alpha_diagnostics=self._review_diagnostics(storage, alpha_reference),
+                alpha_anchor=alpha_anchor,
+                pre_edit=pre_edit,
             )
+            if marker is not None:
+                return _ReviewOutcome(marker=marker, unlock=None)
+            # The source-alpha review routes into the artifact source bbox.
+            _parent, _anchor, bbox_job = self._bbox_context(
+                shard=shard,
+                storage=storage,
+                clip_uid=clip_uid,
+                entity=entity,
+                pre_reference=reference,
+                plan_entry=plan_entry,
+                pre_edit=pre_edit,
+                parent_variant=VARIANT_SOURCE_ALPHA,
+            )
+            return _ReviewOutcome(marker=None, unlock=bbox_job)
         if main_job.job_id() != job.job_id():
             raise ReferenceIntegrityDurableError(
                 f"review job {job.job_id()} is not the frozen job for "
@@ -1815,23 +2029,36 @@ class ReferenceIntegrityEpochRunner:
             review=review,
             pre_edit=pre_edit,
         )
-        if continuation != "source_alpha":
-            # The topology/artifact bbox routes belong to 6d2.
-            return _ReviewOutcome(marker=None, unlock=None)
-        _alpha_reference, _alpha_anchor, alpha_job = self._expected_review_inputs(
-            shard=shard,
-            storage=storage,
-            clip_uid=clip_uid,
-            plan_entry=plan_entry,
-            entity=entity,
-            reference=reference,
-            variant=VARIANT_SOURCE_ALPHA,
-            main_job=main_job,
-        )
-        return _ReviewOutcome(marker=None, unlock=alpha_job)
+        if continuation == "source_alpha":
+            _alpha_reference, _alpha_anchor, alpha_job = self._expected_review_inputs(
+                shard=shard,
+                storage=storage,
+                clip_uid=clip_uid,
+                plan_entry=plan_entry,
+                entity=entity,
+                reference=reference,
+                variant=VARIANT_SOURCE_ALPHA,
+                main_job=main_job,
+            )
+            return _ReviewOutcome(marker=None, unlock=alpha_job)
+        if continuation == "artifact_bbox":
+            _parent, _anchor, bbox_job = self._bbox_context(
+                shard=shard,
+                storage=storage,
+                clip_uid=clip_uid,
+                entity=entity,
+                pre_reference=reference,
+                plan_entry=plan_entry,
+                pre_edit=pre_edit,
+            )
+            return _ReviewOutcome(marker=None, unlock=bbox_job)
+        # The topology upgrade route belongs to 6d2b.
+        return _ReviewOutcome(marker=None, unlock=None)
 
     def finalize(self, job: ModelJob, result: JobResult) -> Sequence[ModelJob]:
         """CPU continuation of one committed review. Never unlocks a job early."""
+        if job.job_type == REFERENCE_INTEGRITY_BBOX_REVIEW_JOB:
+            return self._finalize_bbox_review(job, result)
         variant = self._review_variant(job)
         payload = dict(result.payload)
         status = str(payload.get("status", ""))
@@ -1870,6 +2097,740 @@ class ReferenceIntegrityEpochRunner:
         self._write_entity_outcome(
             shard, job.clip_uid, entity.entity_id, outcome.marker
         )
+        self._publish_clip_if_terminal(shard, storage, job.clip_uid)
+        return ()
+
+    # -- artifact source bbox review -------------------------------------------
+
+    def _bbox_semantic_inputs(
+        self, *, entity: Any, parent: _BboxParent, anchor: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Exactly the semantic inputs of one artifact bbox review call."""
+        return {
+            "entity_id": entity.entity_id,
+            "trigger": BBOX_TRIGGER_ARTIFACT,
+            "parent_variant": parent.variant,
+            "parent_review_job_id": parent.job.job_id(),
+            "reference_type": entity.reference_type,
+            "phrase": entity.phrase,
+            "grounding_prompt": entity.grounding_prompt,
+            "reference_scope": parent.reference.reference_scope,
+            "source_context_sha256": str(anchor["source_context_sha256"]),
+            "current_reference_sha256": str(anchor["current_reference_sha256"]),
+            "candidate_sha256": str(anchor["candidate_sha256"]),
+            "bbox_xyxy": list(anchor["bbox_xyxy"]),
+            "bbox_review_policy": dict(anchor["bbox_review_policy"]),
+        }
+
+    def _bbox_input_anchor(
+        self,
+        *,
+        storage: RunStorage,
+        clip_uid: str,
+        entity: Any,
+        parent: _BboxParent,
+    ) -> dict[str, Any]:
+        """Derive the frozen artifact bbox input from frozen evidence.
+
+        Everything here is deterministic CPU work: the legacy candidate crop, the
+        source frame/mask identity, the current reference and the parent review
+        context. The legacy materializer itself is never re-run, because its
+        metadata is a two-phase artifact that may already have advanced.
+        """
+        evidence = _source_evidence(
+            storage, clip_uid=clip_uid, reference=parent.reference
+        )
+        crop_padding_ratio = float(self.config.pair.crop_padding_ratio)
+        candidate_image, bbox_xyxy = _source_bbox_candidate(
+            evidence, crop_padding_ratio=crop_padding_ratio
+        )
+        buffer = io.BytesIO()
+        candidate_image.save(buffer, format="PNG")
+        candidate_sha256 = hashlib.sha256(buffer.getvalue()).hexdigest()
+        current_reference_relative = str(parent.reference.image_path)
+        current_reference_sha256 = hashlib.sha256(
+            _resolve_run_artifact(storage, current_reference_relative).read_bytes()
+        ).hexdigest()
+        context_sha256 = hashlib.sha256(
+            _resolve_run_artifact(storage, parent.context_path).read_bytes()
+        ).hexdigest()
+        policy = self._bbox_review_policy_identity()
+        anchor: dict[str, Any] = {
+            "schema": REFERENCE_INTEGRITY_BBOX_INPUT_SCHEMA,
+            "clip_uid": clip_uid,
+            "entity_id": entity.entity_id,
+            "trigger": BBOX_TRIGGER_ARTIFACT,
+            "parent_variant": parent.variant,
+            "parent_review_job_id": parent.job.job_id(),
+            "reference_type": entity.reference_type,
+            "phrase": entity.phrase,
+            "grounding_prompt": entity.grounding_prompt,
+            "reference_scope": parent.reference.reference_scope,
+            "source_context_path": parent.context_path,
+            "source_context_sha256": context_sha256,
+            "current_reference_path": current_reference_relative,
+            "current_reference_sha256": current_reference_sha256,
+            "source_clip_uid": evidence.source_clip_uid,
+            "source_entity_id": evidence.source_entity_id,
+            "source_frame_slot": evidence.frame_slot,
+            "source_frame_index": evidence.source_frame_index,
+            "source_frame_path": storage.relative_artifact_path(
+                evidence.frame_path
+            ),
+            "source_frame_sha256": hashlib.sha256(
+                evidence.frame_path.read_bytes()
+            ).hexdigest(),
+            "source_mask_sha256": hashlib.sha256(
+                np.ascontiguousarray(evidence.mask.astype(np.uint8)).tobytes()
+            ).hexdigest(),
+            "bbox_xyxy": [int(value) for value in bbox_xyxy],
+            "crop_padding_ratio": crop_padding_ratio,
+            "candidate_path": storage.relative_artifact_path(
+                storage.selected_path(
+                    clip_uid, f"source_bbox_fallback_{entity.entity_id}.png"
+                )
+            ),
+            "candidate_sha256": candidate_sha256,
+            "metadata_path": storage.relative_artifact_path(
+                storage.selected_path(
+                    clip_uid, f"source_bbox_fallback_{entity.entity_id}.json"
+                )
+            ),
+            "parent_integrity_review": parent.review.model_dump(mode="json"),
+            "bbox_review_policy": policy,
+            "semantic_digest": "",
+        }
+        anchor["semantic_digest"] = semantic_input_digest(
+            self._bbox_semantic_inputs(entity=entity, parent=parent, anchor=anchor)
+        )
+        return anchor
+
+    @staticmethod
+    def _bbox_anchor_projection(anchor: Mapping[str, Any]) -> dict[str, Any]:
+        """Everything in an anchor that must be recomputable from frozen state."""
+        return {key: value for key, value in anchor.items() if key != "base_metadata"}
+
+    @staticmethod
+    def _verify_frozen_base_metadata(anchor: Mapping[str, Any]) -> None:
+        """Tie the frozen legacy materialized metadata to the derived anchor.
+
+        The materialized metadata is legacy authority, stored verbatim; this
+        check proves it still describes exactly the artifact the anchor froze.
+        """
+        base = anchor.get("base_metadata")
+        label = f"{anchor.get('clip_uid')}/{anchor.get('entity_id')}"
+        if not isinstance(base, dict):
+            raise ReferenceIntegrityDurableError(
+                f"frozen Reference Integrity bbox base metadata is missing for "
+                f"{label}"
+            )
+        expected = {
+            "mode": BBOX_REVIEW_MODE,
+            "trigger": f"{BBOX_TRIGGER_ARTIFACT}_v1",
+            "status": "materialized",
+            "review_status": "not_reviewed",
+            "synthetic": False,
+            "raw_source_pixels_only": True,
+            "clip_uid": anchor["clip_uid"],
+            "entity_id": anchor["entity_id"],
+            "source_clip_uid": anchor["source_clip_uid"],
+            "source_entity_id": anchor["source_entity_id"],
+            "source_frame_slot": anchor["source_frame_slot"],
+            "source_frame_index": anchor["source_frame_index"],
+            "source_frame_path": anchor["source_frame_path"],
+            "source_frame_sha256": anchor["source_frame_sha256"],
+            "source_mask_sha256": anchor["source_mask_sha256"],
+            "bbox_xyxy": list(anchor["bbox_xyxy"]),
+            "crop_padding_ratio": anchor["crop_padding_ratio"],
+            "candidate_path": anchor["candidate_path"],
+            "candidate_sha256": anchor["candidate_sha256"],
+            "original_reference_path": anchor["current_reference_path"],
+            "original_reference_sha256": anchor["current_reference_sha256"],
+            "original_integrity_review": anchor["parent_integrity_review"],
+            "failed_reference_path": anchor["current_reference_path"],
+            "failed_reference_sha256": anchor["current_reference_sha256"],
+        }
+        for key, value in expected.items():
+            if base.get(key) != value:
+                raise ReferenceIntegrityDurableError(
+                    f"frozen Reference Integrity bbox base metadata {key} drifted "
+                    f"for {label}"
+                )
+
+    def _materialize_bbox_input(
+        self, *, storage: RunStorage, clip_uid: str, entity: Any, parent: _BboxParent
+    ) -> dict[str, Any]:
+        """First freeze: let the legacy materializer produce both artifacts.
+
+        Only the candidate crop and the base metadata come from legacy; the model
+        call is this epoch's own job. The materializer runs exactly once per
+        entity because no job can exist before its anchor does.
+        """
+        metadata_path = storage.selected_path(
+            clip_uid, f"source_bbox_fallback_{entity.entity_id}.json"
+        )
+        if metadata_path.is_file():
+            stale = _read_json(metadata_path)
+            if stale is not None and stale.get("status") != "materialized":
+                raise ReferenceIntegrityDurableError(
+                    f"frozen Reference Integrity bbox metadata drifted: "
+                    f"{metadata_path}"
+                )
+        evaluation = _materialize_source_bbox(
+            storage=storage,
+            clip_uid=clip_uid,
+            entity_id=entity.entity_id,
+            source_evidence=_source_evidence(
+                storage, clip_uid=clip_uid, reference=parent.reference
+            ),
+            current_reference=_load_reference_image(
+                storage, str(parent.reference.image_path)
+            ),
+            current_reference_path=_resolve_run_artifact(
+                storage, str(parent.reference.image_path)
+            ),
+            reference=parent.reference,
+            original_review=parent.review,
+            diagnostics=parent.diagnostics,
+            crop_padding_ratio=float(self.config.pair.crop_padding_ratio),
+            trigger=BBOX_TRIGGER_ARTIFACT,
+        )
+        base = _read_json(
+            _resolve_run_artifact(storage, evaluation.metadata_relative)
+        )
+        if base is None:
+            raise ReferenceIntegrityDurableError(
+                f"legacy source bbox metadata is missing: "
+                f"{evaluation.metadata_relative}"
+            )
+        anchor = self._bbox_input_anchor(
+            storage=storage, clip_uid=clip_uid, entity=entity, parent=parent
+        )
+        anchor["base_metadata"] = base
+        self._verify_frozen_base_metadata(anchor)
+        return anchor
+
+    def _frozen_bbox_input(
+        self,
+        *,
+        shard: str,
+        storage: RunStorage,
+        clip_uid: str,
+        entity: Any,
+        parent: _BboxParent,
+    ) -> dict[str, Any]:
+        """Create-once bbox input anchor, re-derived and compared exactly."""
+        path = self._bbox_input_path(shard, clip_uid, entity.entity_id)
+        existing = _read_json(path)
+        if existing is None:
+            anchor = self._materialize_bbox_input(
+                storage=storage, clip_uid=clip_uid, entity=entity, parent=parent
+            )
+            _write_json_once(path, anchor)
+            return anchor
+        # The input is frozen, so neither the candidate nor any of its evidence
+        # may be re-materialized: re-derive and compare instead.
+        try:
+            expected = self._bbox_input_anchor(
+                storage=storage, clip_uid=clip_uid, entity=entity, parent=parent
+            )
+        except ReferenceIntegrityDurableError:
+            raise
+        except Exception as exc:
+            raise ReferenceIntegrityDurableError(
+                f"cannot re-derive frozen Reference Integrity bbox input for "
+                f"{clip_uid}/{entity.entity_id}"
+            ) from exc
+        if self._bbox_anchor_projection(existing) != expected:
+            raise ReferenceIntegrityDurableError(
+                f"frozen Reference Integrity bbox input drifted for "
+                f"{clip_uid}/{entity.entity_id}"
+            )
+        self._verify_frozen_base_metadata(existing)
+        try:
+            candidate = _resolve_run_artifact(storage, str(existing["candidate_path"]))
+            candidate_sha256 = hashlib.sha256(candidate.read_bytes()).hexdigest()
+        except ReferenceIntegrityDurableError:
+            raise
+        except Exception as exc:
+            raise ReferenceIntegrityDurableError(
+                f"frozen Reference Integrity bbox candidate is unreadable for "
+                f"{clip_uid}/{entity.entity_id}"
+            ) from exc
+        if candidate_sha256 != str(existing["candidate_sha256"]):
+            raise ReferenceIntegrityDurableError(
+                f"frozen Reference Integrity bbox candidate drifted for "
+                f"{clip_uid}/{entity.entity_id}"
+            )
+        return existing
+
+    def _expected_bbox_job(
+        self,
+        *,
+        shard: str,
+        entity: Any,
+        parent: _BboxParent,
+        anchor: Mapping[str, Any],
+    ) -> ModelJob:
+        """The deterministic artifact bbox job of one frozen chain."""
+        return ModelJob.create(
+            job_type=REFERENCE_INTEGRITY_BBOX_REVIEW_JOB,
+            resource=RESOURCE_QWEN,
+            canonical_shard=shard,
+            clip_uid=str(anchor["clip_uid"]),
+            semantic_inputs=self._bbox_semantic_inputs(
+                entity=entity, parent=parent, anchor=anchor
+            ),
+            model_identity=(
+                f"qwen:{self.config.qwen.reference_integrity_judge.model}"
+            ),
+            target={
+                "entity_id": entity.entity_id,
+                "trigger": BBOX_TRIGGER_ARTIFACT,
+                "parent_variant": parent.variant,
+            },
+            dependencies={PARENT_REVIEW_JOB_DEPENDENCY: parent.job.job_id()},
+        )
+
+    @staticmethod
+    def _artifact_bbox_route(
+        *,
+        clip_uid: str,
+        reference: EntityReferenceState,
+        review: ReferenceIntegrityReview,
+    ) -> bool:
+        """Legacy's artifact-only source bbox route, exactly."""
+        return (
+            review.verdict == "reject"
+            and _artifact_only_bbox_eligible(review)
+            and not reference.source_bbox_fallback
+            and _is_self_sourced_reference(clip_uid=clip_uid, reference=reference)
+        )
+
+    def _bbox_parent(
+        self,
+        *,
+        shard: str,
+        storage: RunStorage,
+        clip_uid: str,
+        entity: Any,
+        pre_reference: EntityReferenceState,
+        plan_entry: Mapping[str, Any],
+        pre_edit: ReferenceEditState | None,
+    ) -> _BboxParent:
+        """Re-derive the whole frozen artifact-bbox parent chain.
+
+        For a final parent the main receipt must route to the artifact bbox; for
+        a source-alpha parent the main receipt must route to source alpha, the
+        alpha receipt must exist and succeed, and only then may the alpha review
+        route to the artifact bbox. Nothing about the parent is guessed from live
+        state.
+        """
+        label = f"{clip_uid}/{entity.entity_id}"
+        main_reference, main_anchor, main_job = self._expected_review_inputs(
+            shard=shard,
+            storage=storage,
+            clip_uid=clip_uid,
+            plan_entry=plan_entry,
+            entity=entity,
+            reference=pre_reference,
+            variant=VARIANT_FINAL,
+        )
+        main_payload = self._committed_review_payload(main_job)
+        if str(main_payload.get("status")) != "review":
+            raise ReferenceIntegrityDurableError(
+                f"artifact bbox continuation needs a successful main review for "
+                f"{label}"
+            )
+        main_review = ReferenceIntegrityReview.model_validate(main_payload.get("review"))
+        main_diagnostics = self._review_diagnostics(storage, main_reference)
+        continuation = self._review_continuation(
+            clip_uid=clip_uid,
+            entity=entity,
+            reference=main_reference,
+            diagnostics=main_diagnostics,
+            review=main_review,
+            pre_edit=pre_edit,
+        )
+        if continuation == "artifact_bbox":
+            return _BboxParent(
+                variant=VARIANT_FINAL,
+                job=main_job,
+                payload=main_payload,
+                review=main_review,
+                reference=main_reference,
+                diagnostics=main_diagnostics,
+                main_diagnostics=main_diagnostics,
+                context_path=str(main_anchor["source_context_path"]),
+                context_sha256=str(main_anchor["source_context_sha256"]),
+                parent_review_job_id=None,
+            )
+        if continuation == "source_alpha":
+            alpha_reference, alpha_anchor, alpha_job = self._expected_review_inputs(
+                shard=shard,
+                storage=storage,
+                clip_uid=clip_uid,
+                plan_entry=plan_entry,
+                entity=entity,
+                reference=pre_reference,
+                variant=VARIANT_SOURCE_ALPHA,
+                main_job=main_job,
+            )
+            alpha_payload = self._committed_review_payload(alpha_job)
+            if str(alpha_payload.get("status")) != "review":
+                raise ReferenceIntegrityDurableError(
+                    f"artifact bbox continuation needs a successful source alpha "
+                    f"review for {label}"
+                )
+            alpha_review = ReferenceIntegrityReview.model_validate(
+                alpha_payload.get("review")
+            )
+            if self._artifact_bbox_route(
+                clip_uid=clip_uid, reference=alpha_reference, review=alpha_review
+            ):
+                return _BboxParent(
+                    variant=VARIANT_SOURCE_ALPHA,
+                    job=alpha_job,
+                    payload=alpha_payload,
+                    review=alpha_review,
+                    reference=alpha_reference,
+                    diagnostics=self._review_diagnostics(storage, alpha_reference),
+                    main_diagnostics=main_diagnostics,
+                    context_path=str(alpha_anchor["source_context_path"]),
+                    context_sha256=str(alpha_anchor["source_context_sha256"]),
+                    parent_review_job_id=main_job.job_id(),
+                )
+        raise ReferenceIntegrityDurableError(
+            f"frozen policy no longer routes {label} to the artifact source bbox"
+        )
+
+    def _bbox_context(
+        self,
+        *,
+        shard: str,
+        storage: RunStorage,
+        clip_uid: str,
+        entity: Any,
+        pre_reference: EntityReferenceState,
+        plan_entry: Mapping[str, Any],
+        pre_edit: ReferenceEditState | None,
+        parent_variant: str | None = None,
+    ) -> tuple[_BboxParent, dict[str, Any], ModelJob]:
+        """The frozen parent, anchor and deterministic job of one bbox route."""
+        parent = self._bbox_parent(
+            shard=shard,
+            storage=storage,
+            clip_uid=clip_uid,
+            entity=entity,
+            pre_reference=pre_reference,
+            plan_entry=plan_entry,
+            pre_edit=pre_edit,
+        )
+        if parent_variant is not None and parent.variant != parent_variant:
+            raise ReferenceIntegrityDurableError(
+                f"artifact bbox parent variant drifted for "
+                f"{clip_uid}/{entity.entity_id}"
+            )
+        anchor = self._frozen_bbox_input(
+            shard=shard,
+            storage=storage,
+            clip_uid=clip_uid,
+            entity=entity,
+            parent=parent,
+        )
+        job = self._expected_bbox_job(
+            shard=shard, entity=entity, parent=parent, anchor=anchor
+        )
+        return parent, anchor, job
+
+    def _expected_bbox_metadata(
+        self, *, base_metadata: Mapping[str, Any], bbox_payload: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """The exact legacy final metadata for one committed bbox receipt."""
+        metadata = dict(base_metadata)
+        status = str(bbox_payload.get("status", ""))
+        if status == "judge_failed":
+            metadata.update(
+                {
+                    "status": "judge_failed",
+                    "review_status": "judge_failed",
+                    "reason": str(bbox_payload.get("error")),
+                    "raw_response": bbox_payload.get("raw_response"),
+                }
+            )
+            return metadata
+        if status != "review":
+            raise ReferenceIntegrityDurableError(
+                "committed source bbox review has an unknown payload status"
+            )
+        review = SourceBboxFallbackReview.model_validate(bbox_payload.get("review"))
+        metadata.update(
+            {
+                "status": "accepted" if review.verdict == "accept" else "rejected",
+                "review_status": review.verdict,
+                "review": review.model_dump(mode="json"),
+                "raw_response": str(bbox_payload.get("raw_response")),
+                "finish_reason": bbox_payload.get("finish_reason"),
+            }
+        )
+        return metadata
+
+    def _publish_bbox_metadata(
+        self,
+        *,
+        storage: RunStorage,
+        anchor: Mapping[str, Any],
+        bbox_payload: Mapping[str, Any],
+    ) -> None:
+        """Advance the legacy bbox metadata from materialized to final.
+
+        The metadata is a two-phase artifact and the model call must never touch
+        it: a crash between the Qwen call and the receipt commit would otherwise
+        leave a state that claims an unreceipted review. Only the frozen base may
+        transition, and only to the exact expected final state.
+        """
+        label = f"{anchor['clip_uid']}/{anchor['entity_id']}"
+        base = anchor["base_metadata"]
+        path = _resolve_run_artifact(storage, str(anchor["metadata_path"]))
+        current = _read_json(path)
+        expected = self._expected_bbox_metadata(
+            base_metadata=base, bbox_payload=bbox_payload
+        )
+        if current == expected:
+            return
+        if current != base:
+            raise ReferenceIntegrityDurableError(
+                f"frozen Reference Integrity bbox metadata drifted for {label}"
+            )
+        write_json_atomic(path, expected)
+
+    def _expected_bbox_marker(
+        self,
+        *,
+        clip_uid: str,
+        entity: Any,
+        parent: _BboxParent,
+        bbox_job: ModelJob,
+        bbox_payload: Mapping[str, Any],
+        bbox_anchor: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """The exact durable marker one committed artifact bbox review produces.
+
+        The delta carries the entity's whole legacy counter accumulation: the
+        parent integrity review's counters plus this bbox attempt. The bbox judge
+        itself never counts as an integrity review.
+        """
+        if parent.variant == VARIANT_FINAL:
+            topology = int(parent.diagnostics.suspicious)
+            reviewed = 1
+        else:
+            topology = int(parent.main_diagnostics.suspicious) + int(
+                parent.diagnostics.suspicious
+            )
+            reviewed = 2
+        common: dict[str, Any] = {
+            "schema": REFERENCE_INTEGRITY_ENTITY_OUTCOME_SCHEMA,
+            "clip_uid": clip_uid,
+            "entity_id": entity.entity_id,
+            "reviewed": True,
+            "semantic_policy_reason": None,
+            "source_context_path": parent.context_path,
+            "diagnostics": parent.diagnostics.model_dump(mode="json"),
+            "review": parent.review.model_dump(mode="json"),
+            "review_job_id": parent.job.job_id(),
+            "review_variant": parent.variant,
+            "parent_review_job_id": parent.parent_review_job_id,
+            "bbox_review_job_id": bbox_job.job_id(),
+            "source_bbox_fallback_trigger": BBOX_TRIGGER_ARTIFACT,
+            "source_bbox_fallback_candidate_path": str(bbox_anchor["candidate_path"]),
+            "source_bbox_fallback_metadata_path": str(bbox_anchor["metadata_path"]),
+            "source_bbox_xyxy": list(bbox_anchor["bbox_xyxy"]),
+        }
+        delta_prefix = {
+            "topology_suspicious": topology,
+            "entities_reviewed": reviewed,
+            "source_bbox_fallback_attempted": 1,
+        }
+        status = str(bbox_payload.get("status", ""))
+        if status == "judge_failed":
+            # Legacy keeps this a plain rejection with the parent review as its
+            # public provenance; only this epoch's marker remembers the bbox job.
+            return {
+                **common,
+                "outcome": ENTITY_OUTCOME_REJECTED,
+                "status": ENTITY_OUTCOME_REJECTED,
+                "final_reference_path": parent.reference.image_path,
+                "judge_failed": False,
+                "bbox_judge_failed": True,
+                "source_bbox_fallback_review": None,
+                "reason": f"{BBOX_JUDGE_FAILED_PREFIX}{bbox_payload.get('error')}",
+                "delta": {
+                    **delta_prefix,
+                    "source_bbox_fallback_judge_failed": 1,
+                    "source_bbox_fallback_rejected": 1,
+                    "entities_rejected": 1,
+                },
+            }
+        if status != "review":
+            raise ReferenceIntegrityDurableError(
+                "committed source bbox review has an unknown payload status"
+            )
+        review = SourceBboxFallbackReview.model_validate(bbox_payload.get("review"))
+        accepted = review.verdict == "accept"
+        outcome = ENTITY_OUTCOME_ACCEPTED if accepted else ENTITY_OUTCOME_REJECTED
+        return {
+            **common,
+            "outcome": outcome,
+            "status": outcome,
+            "final_reference_path": (
+                str(bbox_anchor["candidate_path"])
+                if accepted
+                else parent.reference.image_path
+            ),
+            "judge_failed": False,
+            "bbox_judge_failed": False,
+            "source_bbox_fallback_review": review.model_dump(mode="json"),
+            "reason": review.reason,
+            "delta": {
+                **delta_prefix,
+                **(
+                    {"source_bbox_fallback_accepted": 1, "entities_accepted": 1}
+                    if accepted
+                    else {
+                        "source_bbox_fallback_rejected": 1,
+                        "entities_rejected": 1,
+                    }
+                ),
+            },
+        }
+
+    def _run_bbox_review(self, job: ModelJob, handle: Any) -> JobResult:
+        """One source bbox fallback call. No prompt or schema logic is copied."""
+        if str(dict(job.target).get("trigger", "")) != BBOX_TRIGGER_ARTIFACT:
+            raise ReferenceIntegrityEpochError(
+                f"unsupported bbox trigger {dict(job.target).get('trigger')!r}"
+            )
+        parent_variant = str(dict(job.target).get("parent_variant", ""))
+        shard, storage, _clip, entity, reference, plan_entry, pre_edit = (
+            self._job_review_context(job)
+        )
+        _parent, anchor, expected = self._bbox_context(
+            shard=shard,
+            storage=storage,
+            clip_uid=job.clip_uid,
+            entity=entity,
+            pre_reference=reference,
+            plan_entry=plan_entry,
+            pre_edit=pre_edit,
+            parent_variant=parent_variant,
+        )
+        if (
+            expected.job_id() != job.job_id()
+            or job.input_digest != str(anchor["semantic_digest"])
+            or job.model_identity != expected.model_identity
+        ):
+            return JobResult(
+                OUTCOME_RETRYABLE_FAILED,
+                detail="Reference Integrity bbox review semantic identity drifted",
+            )
+        resolved = resolve_source_bbox_fallback_judge(handle, self.config)
+        try:
+            with Image.open(
+                _resolve_run_artifact(storage, str(anchor["source_context_path"]))
+            ) as opened:
+                opened.load()
+                source_context = opened.copy()
+            with Image.open(
+                _resolve_run_artifact(storage, str(anchor["candidate_path"]))
+            ) as opened:
+                opened.load()
+                candidate = opened.convert("RGB")
+            attempt = resolved.judge.review(
+                source_context=source_context,
+                failed_reference=_load_reference_image(
+                    storage, str(anchor["current_reference_path"])
+                ),
+                source_bbox_candidate=candidate,
+                reference_type=entity.reference_type,
+                phrase=entity.phrase,
+                grounding_prompt=entity.grounding_prompt,
+                reference_scope=str(anchor["reference_scope"]),
+                trigger=BBOX_TRIGGER_ARTIFACT,
+            )
+        except SourceBboxFallbackJudgeFailure as exc:
+            return JobResult(
+                OUTCOME_COMPLETED,
+                payload={
+                    "status": "judge_failed",
+                    "error": str(exc),
+                    "raw_response": exc.raw_response,
+                },
+            )
+        finally:
+            if resolved.owned:
+                resolved.judge.close()
+        return JobResult(
+            OUTCOME_COMPLETED,
+            payload={
+                "status": "review",
+                "review": attempt.review.model_dump(mode="json"),
+                "raw_response": attempt.raw_response,
+                "finish_reason": attempt.finish_reason,
+            },
+        )
+
+    def _finalize_bbox_review(
+        self, job: ModelJob, result: JobResult
+    ) -> Sequence[ModelJob]:
+        """CPU continuation of one committed bbox review. Unlocks nothing."""
+        if str(dict(job.target).get("trigger", "")) != BBOX_TRIGGER_ARTIFACT:
+            raise ReferenceIntegrityEpochError(
+                f"unsupported bbox trigger {dict(job.target).get('trigger')!r}"
+            )
+        parent_variant = str(dict(job.target).get("parent_variant", ""))
+        payload = dict(result.payload)
+        status = str(payload.get("status", ""))
+        if status not in {"review", "judge_failed"}:
+            raise ReferenceIntegrityDurableError(
+                f"committed bbox job {job.job_id()} has an unknown payload status"
+            )
+        if status == "review":
+            try:
+                SourceBboxFallbackReview.model_validate(payload.get("review"))
+            except Exception as exc:
+                raise ReferenceIntegrityDurableError(
+                    f"committed bbox job {job.job_id()} has an invalid review"
+                ) from exc
+        shard, storage, _clip, entity, reference, plan_entry, pre_edit = (
+            self._job_review_context(job)
+        )
+        parent, anchor, expected = self._bbox_context(
+            shard=shard,
+            storage=storage,
+            clip_uid=job.clip_uid,
+            entity=entity,
+            pre_reference=reference,
+            plan_entry=plan_entry,
+            pre_edit=pre_edit,
+            parent_variant=parent_variant,
+        )
+        if expected.job_id() != job.job_id():
+            raise ReferenceIntegrityDurableError(
+                f"bbox review job {job.job_id()} is not the frozen job for "
+                f"{job.clip_uid}/{entity.entity_id}"
+            )
+        self._publish_bbox_metadata(
+            storage=storage, anchor=anchor, bbox_payload=payload
+        )
+        marker = self._expected_bbox_marker(
+            clip_uid=job.clip_uid,
+            entity=entity,
+            parent=parent,
+            bbox_job=expected,
+            bbox_payload=payload,
+            bbox_anchor=anchor,
+        )
+        self._write_entity_outcome(shard, job.clip_uid, entity.entity_id, marker)
         self._publish_clip_if_terminal(shard, storage, job.clip_uid)
         return ()
 
@@ -1957,6 +2918,23 @@ class ReferenceIntegrityEpochRunner:
             payload["judge_failed"] = marker["judge_failed"]
             if marker["review"] is not None:
                 payload["review"] = marker["review"]
+            # Legacy publishes the artifact bbox provenance only for an explicit
+            # bbox verdict; a bbox judge failure keeps the parent review as its
+            # whole public provenance.
+            if marker.get("bbox_review_job_id") and not marker["bbox_judge_failed"]:
+                payload["source_bbox_fallback_trigger"] = marker[
+                    "source_bbox_fallback_trigger"
+                ]
+                payload["source_bbox_fallback_candidate_path"] = marker[
+                    "source_bbox_fallback_candidate_path"
+                ]
+                payload["source_bbox_fallback_metadata_path"] = marker[
+                    "source_bbox_fallback_metadata_path"
+                ]
+                payload["source_bbox_xyxy"] = tuple(marker["source_bbox_xyxy"])
+                payload["source_bbox_fallback_review"] = marker[
+                    "source_bbox_fallback_review"
+                ]
         return ReferenceIntegrityEntityState.model_validate(payload)
 
     def _verify_entity_branch(
@@ -2072,23 +3050,56 @@ class ReferenceIntegrityEpochRunner:
                 f"reviewed entity outcome job id drifted for "
                 f"{clip.clip_uid}/{entity_id}"
             )
-        outcome = self._review_outcome(
+        bbox_job_id = marker.get("bbox_review_job_id")
+        if bbox_job_id is None:
+            outcome = self._review_outcome(
+                shard=shard,
+                storage=storage,
+                clip_uid=clip.clip_uid,
+                entity=entity,
+                reference=reference,
+                plan_entry=plan_entry,
+                pre_edit=pre_edit,
+                job=job,
+                payload=self._committed_review_payload(job),
+            )
+            if outcome.marker is None:
+                raise ReferenceIntegrityDurableError(
+                    f"entity {clip.clip_uid}/{entity_id} has a durable review "
+                    "outcome but the frozen policy now defers it"
+                )
+            if dict(marker) != outcome.marker:
+                raise ReferenceIntegrityDurableError(
+                    f"reviewed entity outcome drifted for "
+                    f"{clip.clip_uid}/{entity_id}"
+                )
+            return
+        # An artifact bbox outcome must be re-derived from the whole frozen
+        # chain: both parent receipts, the frozen bbox anchor and the bbox
+        # receipt. Nothing the marker carries is trusted.
+        parent, anchor, bbox_job = self._bbox_context(
             shard=shard,
             storage=storage,
             clip_uid=clip.clip_uid,
             entity=entity,
-            reference=reference,
+            pre_reference=reference,
             plan_entry=plan_entry,
             pre_edit=pre_edit,
-            job=job,
-            payload=self._committed_review_payload(job),
+            parent_variant=str(variant),
         )
-        if outcome.marker is None:
+        if bbox_job_id != bbox_job.job_id():
             raise ReferenceIntegrityDurableError(
-                f"entity {clip.clip_uid}/{entity_id} has a durable review outcome "
-                "but the frozen policy now defers it"
+                f"source bbox job id drifted for {clip.clip_uid}/{entity_id}"
             )
-        if dict(marker) != outcome.marker:
+        expected = self._expected_bbox_marker(
+            clip_uid=clip.clip_uid,
+            entity=entity,
+            parent=parent,
+            bbox_job=bbox_job,
+            bbox_payload=self._committed_review_payload(bbox_job),
+            bbox_anchor=anchor,
+        )
+        if dict(marker) != expected:
             raise ReferenceIntegrityDurableError(
                 f"reviewed entity outcome drifted for {clip.clip_uid}/{entity_id}"
             )
@@ -2155,10 +3166,24 @@ class ReferenceIntegrityEpochRunner:
             for entity_id, marker in markers.items()
             if marker.get("review_variant") == VARIANT_SOURCE_ALPHA
         }
+        # A source-alpha *outcome* accepted on its own falls back to the alpha
+        # reference. An artifact bbox outcome that happens to have an alpha
+        # parent also carries ``review_variant == source_alpha``, so it must be
+        # excluded here: its Reference Edit mutation is the bbox one.
         alpha_accepted_ids = {
             entity_id
             for entity_id, marker in markers.items()
             if entity_id in alpha_references
+            and not marker.get("bbox_review_job_id")
+            and marker["outcome"] == ENTITY_OUTCOME_ACCEPTED
+        }
+        # The bbox parent's reference is what an artifact outcome judged: the
+        # frozen pre-stage reference for a final parent, the frozen source alpha
+        # for an alpha parent. That is the same rule as ``input_references``.
+        bbox_accepted_ids = {
+            entity_id
+            for entity_id, marker in markers.items()
+            if marker.get("bbox_review_job_id")
             and marker["outcome"] == ENTITY_OUTCOME_ACCEPTED
         }
         input_references = {
@@ -2168,9 +3193,29 @@ class ReferenceIntegrityEpochRunner:
             )
             if entity_id in retained
         }
+        # ``_verify_entity_branch`` has already re-derived every marker from its
+        # receipts and the frozen bbox anchor, so these provenance paths are the
+        # verified ones.
+        bbox_references = {
+            entity_id: _source_bbox_reference(
+                input_references[entity_id],
+                clip_uid=clip_uid,
+                image_path=str(markers[entity_id]["source_bbox_fallback_candidate_path"]),
+                bbox_xyxy=tuple(
+                    int(value)
+                    for value in markers[entity_id]["source_bbox_xyxy"]
+                ),
+                metadata_path=str(
+                    markers[entity_id]["source_bbox_fallback_metadata_path"]
+                ),
+            )
+            for entity_id in bbox_accepted_ids
+        }
         final_references = [
             (
-                alpha_references[item.entity_id]
+                bbox_references[item.entity_id]
+                if item.entity_id in bbox_references
+                else alpha_references[item.entity_id]
                 if item.entity_id in alpha_accepted_ids
                 else _rejected_reference(item, REJECTED_REFERENCE_REASON)
                 if item.entity_id in rejected_ids
@@ -2208,23 +3253,37 @@ class ReferenceIntegrityEpochRunner:
             entities=final_references,
             background=pre_references.get("background"),
         )
-        # Legacy applies the accepted source-alpha fallback to Reference Edit in
-        # the frozen retained order; several entities may fall back in one clip.
+        # Legacy mutates Reference Edit per entity in the frozen retained order,
+        # and several entities may fall back in one clip. An entity reaches at
+        # most one of the two routes, because an accepted source alpha never
+        # continues into the bbox fallback.
         reference_edit = pre_edit
         for entity_id in retained:
-            if entity_id not in alpha_accepted_ids:
-                continue
             try:
-                reference_edit = _reference_edit_after_source_alpha(
-                    reference_edit,
-                    entity_id=entity_id,
-                    reason=SOURCE_ALPHA_FALLBACK_REASON,
-                )
+                if entity_id in alpha_accepted_ids:
+                    reference_edit = _reference_edit_after_source_alpha(
+                        reference_edit,
+                        entity_id=entity_id,
+                        reason=SOURCE_ALPHA_FALLBACK_REASON,
+                    )
+                elif entity_id in bbox_accepted_ids:
+                    reference_edit = _reference_edit_after_source_bbox(
+                        reference_edit,
+                        entity_id=entity_id,
+                        output_image_path=str(
+                            markers[entity_id][
+                                "source_bbox_fallback_candidate_path"
+                            ]
+                        ),
+                        metadata_path=str(
+                            markers[entity_id]["source_bbox_fallback_metadata_path"]
+                        ),
+                    )
             except ReferenceIntegrityDurableError:
                 raise
             except Exception as exc:
                 raise ReferenceIntegrityDurableError(
-                    f"cannot apply the frozen source alpha fallback for "
+                    f"cannot apply the frozen source fallback for "
                     f"{clip_uid}/{entity_id}"
                 ) from exc
         integrity_state = ReferenceIntegrityState(
