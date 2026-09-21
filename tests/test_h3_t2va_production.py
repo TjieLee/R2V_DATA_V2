@@ -215,6 +215,47 @@ def test_ready_resume_does_not_grow_journal(tmp_path):
     assert path.read_bytes() == before
 
 
+def test_prevalidated_processor_skips_repeated_source_hashes(
+    tmp_path, finalized, monkeypatch
+):
+    from r2v_data_v2.h3 import ta2va_shadow as ta
+    from tests.test_h3_ta2va_shadow import ProfileClient
+
+    inventory = shared.build(finalized, tmp_path)
+    job = next(item for item in inventory.jobs if not item.upstream_failure)
+    backend = shared.T2VAMimoBackend(
+        shared.config(tmp_path),
+        client=shared.Client([shared.draft_for(job).model_dump_json()]),
+    )
+    profiles = ta.TA2VAProfileBackend(
+        shared.config(tmp_path), client=ProfileClient()
+    )
+    processor = production.FrozenProductionProcessor(
+        {job.clip_uid: (job, inventory)},
+        backend,
+        profiles,
+        allow_unverified=True,
+        verify_sources_per_sample=False,
+    )
+
+    monkeypatch.setattr(
+        ta,
+        "_verify",
+        lambda *args, **kwargs: pytest.fail(
+            "prevalidated processor repeated aggregate source hashes"
+        ),
+    )
+    output = tmp_path / "fast-t2va"
+    output.mkdir()
+    result = processor.process(
+        "t2va",
+        {"clip_uid": job.clip_uid},
+        output,
+        output,
+    )
+    assert result["model_call_count"] == 2
+
+
 def test_t2va_shadow_equivalence(tmp_path, finalized):
     from tests import test_h3_t2va_shadow as shared
 
