@@ -320,6 +320,13 @@ Python runtimes before execution, and writes node logs under
 `$OUTPUT_ROOT/cluster_logs/node-rank-XXXXXX.log`. Do not add an in-job git pull:
 all nodes must run the same pinned worktree.
 
+The outer PyTorchJob's distributed environment (`RANK`, `WORLD_SIZE`,
+`MASTER_ADDR`, `MASTER_PORT`, `TORCHELASTIC_*`, `PET_*`, etc.) is stripped
+before launching independent per-pair workers. Each H3 group then starts its own
+single-node c10d rendezvous at `127.0.0.1:0` with a unique rendezvous id. This is
+required because two 4-GPU torchrun instances are stacked on the same 8-GPU node;
+they must not join or wait on the outer cluster rendezvous.
+
 ## Mandatory acceptance sequence (operator only)
 
 ### Four-GPU resume of the existing failed case_05

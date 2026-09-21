@@ -37,6 +37,14 @@ TEXT_SETTING_KEYS = ("prompt_writer_backend","prompt_writer_base_url","prompt_wr
 FRAME0_RESOURCE_KEYS = ("qwen_model","boogu_python","boogu_code_root","boogu_model_root")
 RESOURCE_KEYS = (*BASE_RESOURCE_KEYS,*TEXT_RESOURCE_KEYS)
 
+# The outer cluster/PyTorchJob injects distributed coordinates for the node
+# process. Inner per-pair torchrun jobs are independent single-node groups and
+# must never inherit those coordinates.
+PARENT_DISTRIBUTED_ENV_KEYS = {
+    "RANK","WORLD_SIZE","LOCAL_RANK","LOCAL_WORLD_SIZE","GROUP_RANK",
+    "ROLE_RANK","ROLE_WORLD_SIZE","MASTER_ADDR","MASTER_PORT",
+}
+
 
 def visible_pair(value, group_size=2):
     devices = [device.strip() for device in value.split(",")]
@@ -112,6 +120,10 @@ def worker_environment(directory, devices):
     for key in ("PYTHONPATH","PYTHONHOME","VIRTUAL_ENV","CONDA_PREFIX",
                 "CONDA_DEFAULT_ENV","PYTHONUSERBASE","TRANSFORMERS_CACHE"):
         env.pop(key,None)
+    for key in list(env):
+        if (key in PARENT_DISTRIBUTED_ENV_KEYS or key.startswith("PET_")
+                or key.startswith("TORCHELASTIC_")):
+            env.pop(key,None)
     no_proxy = [item for item in env.get("NO_PROXY",env.get("no_proxy","")).split(",") if item]
     for host in ("127.0.0.1","localhost","::1"):
         if host not in no_proxy:
@@ -256,8 +268,12 @@ def execute_phases(config, root, devices, lock_fd, *, prepare_only=False):
     while not prepare_only and pending("generate"):
         before = sum(failure_count(c,"generate") for c in config["cases"])
         stats = session_root/f"h3-{restart}.json"
-        specs = [{"command":[config["h3_python"],"-m","torch.distributed.run","--standalone",
-                              f"--nproc_per_node={group_size}","--max-restarts=0",str(TOOLS/"h3_pdd_fsdp_worker.py"),
+        rdzv_id = f"r2v-p{config['pair_id']}-{session}-{restart}"
+        specs = [{"command":[config["h3_python"],"-m","torch.distributed.run",
+                              "--nnodes=1","--node-rank=0",
+                              "--rdzv-backend=c10d","--rdzv-endpoint=127.0.0.1:0",
+                              f"--rdzv-id={rdzv_id}",f"--nproc_per_node={group_size}",
+                              "--max-restarts=0",str(TOOLS/"h3_pdd_fsdp_worker.py"),
                               "--config",str(config_path),"--stats",str(stats)],
                   "env":worker_environment(session_root/f"h3-{restart}",devices),
                   "log":session_root/f"h3-{restart}.log"}]

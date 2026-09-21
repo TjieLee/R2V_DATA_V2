@@ -105,7 +105,13 @@ def test_two_prepare_children_then_one_torchrun_resume_skips_done(tmp_path, monk
     assert len(calls) == 2 and len(calls[0]) == group_size and len(calls[1]) == 1
     assert [spec["env"]["CUDA_VISIBLE_DEVICES"] for spec in calls[0]] == devices.split(",")
     assert calls[1][0]["env"]["CUDA_VISIBLE_DEVICES"] == devices
-    assert f"--nproc_per_node={group_size}" in calls[1][0]["command"]
+    command = calls[1][0]["command"]
+    assert f"--nproc_per_node={group_size}" in command
+    assert "--nnodes=1" in command and "--node-rank=0" in command
+    assert "--rdzv-backend=c10d" in command
+    assert "--rdzv-endpoint=127.0.0.1:0" in command
+    assert any(arg.startswith("--rdzv-id=r2v-p0-") for arg in command)
+    assert "--standalone" not in command
     calls.clear()
     module.execute_phases(config,tmp_path/"shard-000000",devices,123)
     assert calls == []
@@ -209,9 +215,17 @@ def test_group_validation_before_launch_and_allocator_override(tmp_path, monkeyp
     for key in ("PYTHONPATH","PYTHONHOME","VIRTUAL_ENV","CONDA_PREFIX",
                 "CONDA_DEFAULT_ENV","PYTHONUSERBASE"):
         monkeypatch.setenv(key,"/contaminated")
+    for key in ("RANK","WORLD_SIZE","LOCAL_RANK","LOCAL_WORLD_SIZE","GROUP_RANK",
+                "ROLE_RANK","ROLE_WORLD_SIZE","MASTER_ADDR","MASTER_PORT",
+                "TORCHELASTIC_RUN_ID","PET_RDZV_ENDPOINT"):
+        monkeypatch.setenv(key,"outer-job")
     clean = module.worker_environment(tmp_path,"0,1")
     for key in ("PYTHONPATH","PYTHONHOME","VIRTUAL_ENV","CONDA_PREFIX",
                 "CONDA_DEFAULT_ENV","PYTHONUSERBASE"):
+        assert key not in clean
+    for key in ("RANK","WORLD_SIZE","LOCAL_RANK","LOCAL_WORLD_SIZE","GROUP_RANK",
+                "ROLE_RANK","ROLE_WORLD_SIZE","MASTER_ADDR","MASTER_PORT",
+                "TORCHELASTIC_RUN_ID","PET_RDZV_ENDPOINT"):
         assert key not in clean
     assert clean["PYTHONNOUSERSITE"] == "1"
     assert "127.0.0.1" in clean["NO_PROXY"].split(",")
