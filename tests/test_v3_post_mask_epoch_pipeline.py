@@ -2356,6 +2356,180 @@ def result_instruction_unchanged(current: Any, previous: Any) -> bool:
     return current.model_dump(mode="json") == previous.model_dump(mode="json")
 
 
+def _production_reference_integrity_outcome(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    qwen: Any = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]], Any, Any, Any]:
+    """Run the real ``build_removal_epoch_runner`` with Reference Integrity on.
+
+    This is the production ``--job-runner`` wiring path: the same shared
+    resource session, the same shard locks and the same stage dispatch, with the
+    three resource epochs replaced by fakes. It exists because the composition
+    helper being correct is not the same thing as production passing the
+    Reference Integrity factories to it.
+    """
+    from r2v_data_v2.v3.post_mask_epoch_groups import resource_epoch_root
+    from r2v_data_v2.v3.post_mask_epoch_removal import (
+        PreparedRemovalShard,
+        build_qwen_epoch_config,
+        build_removal_campaign,
+        build_removal_epoch_runner,
+        removal_shard_paths,
+    )
+    from r2v_data_v2.v3.post_mask_epoch_resources import ResourceEpochManager
+    from tests.test_v3_post_mask_epoch_removal import (
+        _fake_process_manager,
+        _group_with,
+        _parts_root,
+        _pending_storage,
+    )
+
+    _with_instruction_template(monkeypatch)
+    config = _enable_reference_integrity(_config(tmp_path, monkeypatch, "run-ri"))
+    storage = _pending_storage(config, clip_uids=("clip-1",))
+    handle = qwen if qwen is not None else _CompositionQwenHandle()
+    boogu = _CompositionBooguHandle()
+    sam = _CompositionSamHandle()
+    post_mask_root = tmp_path / "workspace" / "data" / "campaign"
+    entity_mask_root = _parts_root(tmp_path, (SHARD,))
+
+    def prepare(*args: Any, **kwargs: Any) -> Any:
+        return PreparedRemovalShard(
+            shard=kwargs["shard"],
+            paths=removal_shard_paths(
+                post_mask_root=kwargs["post_mask_root"],
+                entity_mask_root=kwargs["entity_mask_root"],
+                shard=kwargs["shard"],
+            ),
+            storage=storage,
+            clip_uids=("clip-1",),
+            ready=1,
+            excluded=0,
+            corrupt=0,
+        )
+
+    def factories(config: Any, runner: Any, **kwargs: Any) -> dict[str, Any]:
+        dispatch = kwargs["job_runner"]
+        return {
+            RESOURCE_BOOGU: lambda: (
+                _TrackedResource(RESOURCE_BOOGU, []),
+                _PassthroughExecutor(dispatch, boogu),
+            ),
+            RESOURCE_QWEN: lambda: (
+                _TrackedResource(RESOURCE_QWEN, []),
+                _PassthroughExecutor(dispatch, handle),
+            ),
+            RESOURCE_SAM: lambda: (
+                _TrackedResource(RESOURCE_SAM, []),
+                _PassthroughExecutor(dispatch, sam),
+            ),
+        }
+
+    monkeypatch.setattr(
+        "r2v_data_v2.v3.post_mask_epoch_removal.prepare_shard_storage", prepare
+    )
+    monkeypatch.setattr(
+        "r2v_data_v2.v3.post_mask_epoch_removal.build_removal_epoch_factories",
+        factories,
+    )
+    monkeypatch.setattr(
+        "r2v_data_v2.v3.post_mask_epoch_removal.ResourceEpochManager",
+        ResourceEpochManager,
+    )
+    runner_callable = build_removal_epoch_runner(
+        config,
+        post_mask_root=post_mask_root,
+        entity_mask_root=entity_mask_root,
+        process_manager=_fake_process_manager(),
+        temporary_root=tmp_path / "tmp",
+        allowed_server_root=tmp_path / "workspace" / "data",
+        qwen_epoch_config=build_qwen_epoch_config(config),
+    )
+    group = _group_with(
+        SHARD, campaign=build_removal_campaign(config, entity_mask_root=entity_mask_root)
+    )
+    ledger = GroupLedger(resource_epoch_root(post_mask_root) / group.group_id)
+    events: list[dict[str, Any]] = []
+    outcome = runner_callable(
+        group,
+        ledger,
+        lambda event, **payload: events.append({"event": event, **payload}),
+    )
+    return outcome, events, handle, storage, ledger
+
+
+def test_production_runner_wires_reference_integrity_and_instruct(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real production runner must reach Reference Integrity and Instruct."""
+    outcome, events, handle, storage, ledger = _production_reference_integrity_outcome(
+        tmp_path, monkeypatch
+    )
+
+    assert outcome["remove_completed"] is True
+    assert outcome["pair_completed"] is True, outcome.get("pair_primary_unresolved")
+    assert outcome["reference_edit_completed"] is True, outcome.get(
+        "reference_edit_reconcile_error"
+    )
+    assert outcome["reference_integrity_completed"] is True, outcome.get(
+        "reference_integrity_reconcile_error"
+    )
+    assert outcome["reference_integrity_unresolved"] == ()
+    assert outcome["instruct_completed"] is True
+    assert outcome["completed"] is False
+    assert outcome["reason"] == DOWNSTREAM_REASON
+
+    # The shared Qwen session really paid the integrity review in production.
+    assert handle.integrity_reviews >= 1
+    clip = storage.read_clip("clip-1")
+    assert clip.reference_integrity is not None
+    assert clip.reference_integrity.status == "ready"
+    assert clip.instruction is not None
+    assert clip.instruction.status == "ready"
+
+    composition_root = Path(ledger.root) / "composition"
+    assert (composition_root / f"{REFERENCE_INTEGRITY_STARTED}.json").is_file()
+    assert (composition_root / f"{INSTRUCT_STARTED}.json").is_file()
+
+    finished = [
+        event for event in events if event["event"] == "post_mask_removal_epoch_finished"
+    ]
+    assert finished
+    assert finished[-1]["unresolved"] == 0
+    assert finished[-1]["remove_completed"] is True
+
+
+def test_production_wrapper_counts_reference_integrity_unresolved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unresolved Reference Integrity job must reach the production counters."""
+    outcome, events, _handle, storage, _ledger = (
+        _production_reference_integrity_outcome(
+            tmp_path, monkeypatch, qwen=_IntegrityFailingQwenHandle()
+        )
+    )
+
+    assert outcome["remove_completed"] is True
+    assert outcome["pair_completed"] is True
+    assert outcome["reference_edit_completed"] is True
+    assert outcome["reference_integrity_completed"] is False
+    assert outcome["reference_integrity_unresolved"], "the review never committed"
+    assert outcome["instruct_completed"] is False
+    assert outcome["reason"] == "reference integrity resource epoch incomplete"
+    assert storage.read_clip("clip-1").instruction is None
+
+    finished = [
+        event for event in events if event["event"] == "post_mask_removal_epoch_finished"
+    ]
+    assert finished
+    assert finished[-1]["unresolved"] == len(
+        outcome["reference_integrity_unresolved"]
+    )
+    assert finished[-1]["unresolved"] > 0, "the Reference Integrity job must count"
+
+
 def test_shared_qwen_identities_include_reference_integrity_judge(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

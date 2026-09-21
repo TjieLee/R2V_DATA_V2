@@ -1661,6 +1661,9 @@ def build_removal_epoch_runner(
                 from r2v_data_v2.v3.post_mask_epoch_reference_edit import (
                     ReferenceEditEpochRunner as _ReferenceEditEpochRunner,
                 )
+                from r2v_data_v2.v3.post_mask_epoch_reference_integrity import (
+                    ReferenceIntegrityEpochRunner as _ReferenceIntegrityEpochRunner,
+                )
 
                 dispatch = _EpochStageDispatch()
                 created: dict[str, Any] = {}
@@ -1671,6 +1674,11 @@ def build_removal_epoch_runner(
                     return runner
 
                 reference_edit_enabled = bool(config.reference_edit.enabled)
+                # Reference Integrity only ever needs the cached Qwen resource
+                # and adds no SAM/Boogu/other dependency; Instruct is pure CPU.
+                reference_integrity_enabled = bool(
+                    config.reference_integrity.enabled
+                )
                 manager = ResourceEpochManager(
                     factories=build_removal_epoch_factories(
                         config,
@@ -1741,6 +1749,34 @@ def build_removal_epoch_runner(
                         if reference_edit_enabled
                         else None
                     ),
+                    build_reference_integrity_scheduler=(
+                        (
+                            lambda runner, _dispatch: ResourceEpochScheduler(
+                                ledger=ledger,
+                                finalize=runner.finalize,
+                                resource_manager=manager,
+                                window_size=window_size,
+                                close_resource_manager_on_exit=False,
+                            )
+                        )
+                        if reference_integrity_enabled
+                        else None
+                    ),
+                    reference_integrity_runner_factory=(
+                        (
+                            lambda **kwargs: _ReferenceIntegrityEpochRunner(
+                                kwargs["config"],
+                                kwargs["storages"],
+                                kwargs["ledger"],
+                                eligible_clip_uids_by_shard=kwargs[
+                                    "eligible_clip_uids_by_shard"
+                                ],
+                                emit=kwargs.get("emit"),
+                            )
+                        )
+                        if reference_integrity_enabled
+                        else None
+                    ),
                     emit=emit,
                 )
                 removal = created["removal"]
@@ -1750,10 +1786,14 @@ def build_removal_epoch_runner(
                 removal_unresolved = tuple(
                     outcome.get("removal_outcome", {}).get("unresolved_job_ids", ())
                 )
+                # Instruct owns no ModelJob, so it can never contribute an
+                # unresolved job id; every other stage can.
                 unresolved = (
                     len(removal_unresolved)
                     + len(outcome.get("pair_primary_unresolved", ()))
                     + len(outcome.get("pair_cross_unresolved", ()))
+                    + len(outcome.get("reference_edit_unresolved", ()))
+                    + len(outcome.get("reference_integrity_unresolved", ()))
                 )
                 reason = str(outcome["reason"])
             else:
