@@ -264,6 +264,47 @@ unrelated aggregate hash changes cannot trigger repeat inference. Previously
 upstream-skipped clips can reopen when their own inputs become available.
 Published data remains available to the existing snapshot builder.
 
+### Pre-submit checklist
+
+Before a new cluster submission, update only the dedicated production worktree:
+
+```bash
+cd /mnt/workspace/litengjie/data/R2V_DATA_V2_h3_prod
+
+git fetch origin feature/h3-audio-jea-qwen3-v1
+git merge --ff-only origin/feature/h3-audio-jea-qwen3-v1
+
+git rev-parse HEAD
+git status --short
+```
+
+If .venv and server_env.sh are intentionally local symlinks, they may appear as
+untracked entries in this worktree. Do not commit them and do not replace them
+merely to make git status empty.
+
+For lifecycle/scheduling changes, the focused CPU checks are:
+
+```bash
+source .venv/bin/activate
+
+bash -n scripts/run_h3_t2va_full_production.sh
+
+python -m compileall -q \
+  r2v_data_v2/h3/t2va_mimo_stage_server.py \
+  r2v_data_v2/h3/t2va_full_production.py \
+  tools/run_h3_t2va_full_production.py
+
+python -m pytest -q \
+  tests/test_h3_t2va_mimo_stage_server.py \
+  tests/test_h3_t2va_full_production.py \
+  tests/test_h3_t2va_full_overlap.py \
+  tests/test_h3_t2va_full_launcher.py \
+  tests/test_h3_t2va_production.py::test_cross_mount_source_identity_and_changed_content
+```
+
+These tests validate orchestration and resume behavior but do not replace a real
+GPU smoke or continued production observation after serving/runtime changes.
+
 ### Startup diagnostics and resume scheduling
 
 The full supervisor prints startup phase markers to the supervisor log, not to
