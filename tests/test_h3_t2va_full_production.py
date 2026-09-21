@@ -445,6 +445,56 @@ def test_sam_full_inventory_publication(tmp_path):
     )
 
 
+def test_shard_selection_resume_reuses_cached_video_hashes(tmp_path, monkeypatch):
+    manifest = shot_manifest(tmp_path)
+    root = tmp_path / "out"
+    index = production.build_source_index(manifest, root)
+    first = full.shard_selection(root, index, 0, tmp_path, tmp_path)
+
+    original = full.sha256_file
+
+    def no_video_rehash(path):
+        path = __import__("pathlib").Path(path)
+        if path.suffix == ".mp4":
+            pytest.fail("resume rehashed cached target video")
+        return original(path)
+
+    monkeypatch.setattr(full, "sha256_file", no_video_rehash)
+    resumed = full.shard_selection(root, index, 0, tmp_path, tmp_path)
+    assert resumed == first
+
+
+def test_bootstrap_resume_does_not_rehash_cached_media(tmp_path, monkeypatch):
+    from r2v_data_v2.h3 import t2va_source
+
+    manifest = shot_manifest(tmp_path)
+    root = tmp_path / "out"
+    index = production.build_source_index(manifest, root)
+    selection = full.shard_selection(root, index, 0, tmp_path, tmp_path)
+    shard = root / "shards" / production.shard_name(0)
+    audio = full.bootstrap_audio(shard, selection, Audio())
+
+    full_hash = full.sha256_file
+    source_hash = t2va_source.sha256_file
+
+    def no_cached_media_full(path):
+        path = __import__("pathlib").Path(path)
+        if path.suffix in {".mp4", ".flac"}:
+            pytest.fail(f"resume rehashed cached media: {path}")
+        return full_hash(path)
+
+    def no_cached_media_source(path):
+        path = __import__("pathlib").Path(path)
+        if path.suffix in {".mp4", ".flac"}:
+            pytest.fail(f"resume rehashed cached media: {path}")
+        return source_hash(path)
+
+    monkeypatch.setattr(full, "sha256_file", no_cached_media_full)
+    monkeypatch.setattr(t2va_source, "sha256_file", no_cached_media_source)
+    resumed = full.bootstrap_audio(shard, selection, Audio())
+    assert resumed == audio
+
+
 def test_bootstrap_from_index_and_resume(tmp_path):
     manifest = shot_manifest(tmp_path)
     root = tmp_path / "out"
