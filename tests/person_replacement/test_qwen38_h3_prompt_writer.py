@@ -515,6 +515,31 @@ def test_final_prompt_uses_appearance_first_and_explicit_source_bindings(tmp_pat
     )
 
 
+def test_preservation_prefix_is_not_duplicated_when_model_uses_newline_between_fixed_sentences():
+    from r2v_data_v2.person_replacement.qwen38_h3_prompt_writer import (
+        DETAIL_CAMERA_SENTENCE,
+        DETAIL_PRESERVATION_PREFIX,
+        DETAIL_PRESERVATION_SENTENCE,
+        enforce_detail_preservation_preface,
+        split_sections,
+    )
+
+    raw = LEGAL_PROMPT.replace(
+        DETAIL_PRESERVATION_PREFIX,
+        DETAIL_PRESERVATION_SENTENCE + "\n" + DETAIL_CAMERA_SENTENCE,
+        1,
+    )
+    fixed = enforce_detail_preservation_preface(
+        raw,
+        "a younger woman in a yellow shirt",
+        "an older woman in a light shirt",
+    )
+    detailed = dict(split_sections(fixed))["detailed_description"].strip()
+    assert detailed.startswith(DETAIL_PRESERVATION_PREFIX)
+    assert detailed.count(DETAIL_PRESERVATION_SENTENCE) == 1
+    assert detailed.count(DETAIL_CAMERA_SENTENCE) == 1
+
+
 def test_preservation_sentence_is_deterministically_prepended():
     from r2v_data_v2.person_replacement.qwen38_h3_prompt_writer import (
         DETAIL_PRESERVATION_PREFIX,

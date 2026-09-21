@@ -716,6 +716,22 @@ def enforce_source_binding_sections(
     })
 
 
+def _strip_leading_preservation_prefixes(body):
+    """Remove model-emitted canonical prefix copies regardless of whitespace."""
+    pattern = re.compile(
+        r"^" + re.escape(DETAIL_PRESERVATION_SENTENCE)
+        + r"\s*" + re.escape(DETAIL_CAMERA_SENTENCE)
+        + r"(?:\s*\n\s*)*",
+        re.DOTALL,
+    )
+    value = body.strip()
+    while True:
+        match = pattern.match(value)
+        if match is None:
+            return value
+        value = value[match.end():].lstrip()
+
+
 def enforce_detail_preservation_preface(text, source_performer_1=None, source_performer_2=None):
     """Guarantee preservation first, followed by one unambiguous source binding."""
     if not isinstance(text,str):
@@ -729,10 +745,7 @@ def enforce_detail_preservation_preface(text, source_performer_1=None, source_pe
         return text
     body_end = body_start + next_match.start()
     body = text[body_start:body_end].strip()
-    if body.startswith(DETAIL_PRESERVATION_PREFIX):
-        tail = body[len(DETAIL_PRESERVATION_PREFIX):].strip()
-    else:
-        tail = body
+    tail = _strip_leading_preservation_prefixes(body)
     pieces = [DETAIL_PRESERVATION_PREFIX]
     if source_performer_1 is not None and source_performer_2 is not None:
         binding = source_binding_sentence(source_performer_1,source_performer_2)
