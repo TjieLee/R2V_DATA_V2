@@ -783,6 +783,10 @@ def build_t2va_inventory(
         )
     resolved, stem_records, _ = load_resolved_stems(resolved_root)
     stems_by_uid = {r.clip_uid: r for r in stem_records}
+    resolved_jobs_by_uid = {j.clip_uid: j for j in resolved.jobs}
+    if len(resolved_jobs_by_uid) != len(resolved.jobs):
+        raise ValueError("duplicate resolved job identity")
+    resolved_clip_uids = set(resolved.clip_uids)
     if (
         Path(resolved.source_canonical_audio_manifest_path).resolve() != canonical_path
         or resolved.source_canonical_audio_manifest_sha256
@@ -805,12 +809,20 @@ def build_t2va_inventory(
         or raw_by_key.keys() != asr_by_key.keys()
     ):
         raise ValueError("T2VA DiariZen/ASR segment inventory differs")
+
+    raw_by_uid = {}
+    for segment in raw:
+        raw_by_uid.setdefault(segment.target_clip_uid, []).append(segment)
+    for segments in raw_by_uid.values():
+        segments.sort(key=lambda s: (s.start_time, s.end_time, s.segment_id))
+
+    asr_ready_uids = set(asr_provenance.clip_uids)
     jobs = []
     for uid in selected:
-        if uid not in by_clip or uid not in resolved.clip_uids:
+        if uid not in by_clip or uid not in resolved_clip_uids:
             jobs.append(job_for(uid, [], "audio_preprocessing_required"))
             continue
-        source_job = next(j for j in resolved.jobs if j.clip_uid == uid)
+        source_job = resolved_jobs_by_uid[uid]
         clip = by_clip[uid]
         if (
             source_job.target_video_path != shots[uid].video_path
@@ -820,20 +832,10 @@ def build_t2va_inventory(
             or source_job.source_frame_count != clip.frame_count
         ):
             raise ValueError("T2VA selected JEA shot differs from resolved cache")
-        reason = (
-            None if uid in asr_provenance.clip_uids else "resolved_speech_unavailable"
-        )
+        reason = None if uid in asr_ready_uids else "resolved_speech_unavailable"
         facts = []
-        for key, segment in sorted(
-            raw_by_key.items(),
-            key=lambda row: (
-                row[1].start_time,
-                row[1].end_time,
-                row[1].segment_id,
-            ),
-        ):
-            if key[0] != uid:
-                continue
+        for segment in raw_by_uid.get(uid, ()):
+            key = (uid, segment.segment_id)
             result = asr_by_key[key]
             if (
                 segment.source_audio_path
