@@ -77,22 +77,61 @@ The formal production root is:
 
     /mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/T2VA
 
-Use the existing cluster job wrapper. Do not hard-code a node count into the
-wrapper. The scheduler supplies a unique RANK and a common WORLD_SIZE for each
-allocation, so the same file works when a resumed allocation has a different
-number of nodes. Keep the fallbacks only for single-node/manual use:
+Use the dedicated production worktree, not the mutable development checkout.
+The development checkout at /mnt/workspace/litengjie/data/R2V_DATA_V2 may switch
+branches freely; cluster production must always launch from:
+
+    /mnt/workspace/litengjie/data/R2V_DATA_V2_h3_prod
+
+Keep that worktree on the Audio/H3 production line and update it explicitly
+before a new cluster submission:
 
 ```bash
+cd /mnt/workspace/litengjie/data/R2V_DATA_V2_h3_prod
+
+git fetch origin feature/h3-audio-jea-qwen3-v1
+git merge --ff-only origin/feature/h3-audio-jea-qwen3-v1
+
+git rev-parse HEAD
+```
+
+Do not use the mutable main checkout as the cluster launcher path. A previous
+failure occurred after the main checkout switched branches and no longer contained
+tools/run_h3_t2va_full_production.py. The full launcher now passes the runner by
+absolute REPO_ROOT path, but the dedicated worktree remains the production
+authority.
+
+Do not hard-code a node count into the wrapper. The scheduler supplies a unique
+RANK and a common WORLD_SIZE for each allocation. Keep fallbacks only for
+single-node/manual use. The current cluster wrapper can remain minimal:
+
+```bash
+export MASTER_ADDR=${MASTER_ADDR:-"localhost"}
+export MASTER_PORT=${MASTER_PORT:-29506}
 export RANK=${RANK:-0}
 export WORLD_SIZE=${WORLD_SIZE:-1}
+
+# Required by OmniShotCut-related runtime code used elsewhere in this environment.
+export TORCH_HOME=/mnt/workspace/public/.cache/
 
 export PRODUCTION_ROOT=/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/T2VA
 export SHARD_SEED=20260918
 export ALLOW_UNVERIFIED=1
 
-cd /mnt/workspace/litengjie/data/R2V_DATA_V2_h3_prod
-bash scripts/run_h3_t2va_full_production.sh
+echo "hostname=$(hostname) rank=$RANK world_size=$WORLD_SIZE"
+
+exec /bin/bash \
+  /mnt/workspace/litengjie/data/R2V_DATA_V2_h3_prod/scripts/run_h3_t2va_full_production.sh
 ```
+
+The cluster submission itself stays a single command:
+
+```bash
+bash /mnt/workspace/litengjie/data/parallel_scripts/run_h3_t2va_cluster_dynamic.sh
+```
+
+Do not put `export PRODUCTION_ROOT=...` after an inline `#` comment on the
+TORCH_HOME line; shell comments consume the remainder of that line.
 
 Each allocated node is expected to have eight GPUs. The full launcher already
 defaults GPU_IDS=0,1,2,3,4,5,6,7, CANONICAL_WORKERS=16 and REQUEST_WORKERS=1,
@@ -118,33 +157,58 @@ SHARDS=59,12,87 ALLOW_UNVERIFIED=1 \
   bash scripts/run_h3_t2va_full_production.sh
 ```
 
-### Cluster filesystem / Python runtime prerequisite
+### Production worktree and Python/runtime prerequisites
 
-/mnt/workspace is shared, but a venv executable may still be a symlink to a
-node-local path. This caused the cluster launcher to fail immediately with:
+The production worktree may reuse the repository venv and server_env.sh through
+symlinks, but code and Python runtime ownership are separate concerns. A typical
+one-time worktree setup is:
+
+```bash
+cd /mnt/workspace/litengjie/data/R2V_DATA_V2
+git fetch origin
+git worktree add \
+  -b h3-audio-prod \
+  /mnt/workspace/litengjie/data/R2V_DATA_V2_h3_prod \
+  origin/feature/h3-audio-jea-qwen3-v1
+
+ln -s \
+  /mnt/workspace/litengjie/data/R2V_DATA_V2/.venv \
+  /mnt/workspace/litengjie/data/R2V_DATA_V2_h3_prod/.venv
+
+ln -s \
+  /mnt/workspace/litengjie/data/R2V_DATA_V2/server_env.sh \
+  /mnt/workspace/litengjie/data/R2V_DATA_V2_h3_prod/server_env.sh
+```
+
+The .venv symlink is acceptable because the launcher now executes
+`$REPO_ROOT/tools/run_h3_t2va_full_production.py` with an absolute production
+worktree path. Do not regress that runner path back to a relative
+`tools/run_h3_t2va_full_production.py`; doing so previously made production
+depend on whichever branch was checked out in the main repository.
+
+Separately, /mnt/workspace is shared but a venv interpreter may still resolve to
+a node-local path. This previously caused:
 
     Missing AUK_PYTHON: /mnt/workspace/litengjie/data/audio_deps/auk/auk-venv/bin/python
 
-The AuK venv path itself existed on shared storage, but bin/python originally
-resolved through /opt/uv/python/... on the notebook. Ephemeral compute nodes did
-not provide that notebook-local /opt/uv target. Do not try to repair /opt/uv on
-each temporary node. Make the venv resolve to a shared runtime (or to a Python
-provided by the common base image) once on shared storage.
-
-The accepted AuK layout resolves to the shared runtime alias:
+The AuK venv itself was on shared storage, but bin/python resolved through
+/opt/uv/python/... on the notebook. Ephemeral compute nodes did not necessarily
+provide that notebook-local /opt/uv target. The accepted fix is to make the AuK
+venv resolve directly to a shared versioned Python runtime rather than recreating
+/opt/uv on every compute node:
 
     /mnt/workspace/litengjie/data/shared_uv_runtime/python/cpython-3.10-linux-x86_64-gnu/bin/python3.10
 
-DiariZen already uses a shared audio_deps/uv-python runtime. Qwen3-ASR and the
-SGLang environment currently resolve to /usr/bin/python3.12 and therefore rely on
-the common cluster base image providing that interpreter.
+DiariZen uses a shared audio_deps/uv-python runtime. Qwen3-ASR and SGLang
+currently resolve to /usr/bin/python3.12 and therefore rely on the common cluster
+base image providing that interpreter.
 
-Before changing or recreating any environment, inspect resolution without exiting
-the current shell:
+Before changing or recreating environments, inspect the exact resolution without
+commands that terminate the current notebook shell:
 
 ```bash
 for py in \
-  /mnt/workspace/litengjie/data/R2V_DATA_V2/.venv/bin/python \
+  /mnt/workspace/litengjie/data/R2V_DATA_V2_h3_prod/.venv/bin/python \
   /mnt/workspace/litengjie/data/audio_deps/auk/auk-venv/bin/python \
   /mnt/workspace/litengjie/data/audio_deps/diarizen-venv/bin/python \
   /mnt/workspace/litengjie/data/audio_deps/qwen3-asr-venv/bin/python \
@@ -156,10 +220,10 @@ do
 done
 ```
 
-A shared path that ultimately resolves back to notebook-local /opt/uv is not
-cluster-portable even though ls shows the venv under /mnt/workspace. Prefer
-shared, versioned Python runtime directories with relative aliases; avoid
-absolute aliases back into /opt/uv.
+A path under /mnt/workspace is not cluster-portable if its final symlink target
+still points into notebook-local /opt/uv. Prefer shared, versioned Python runtime
+directories or Python from the common base image. Do not add per-node /opt/uv
+repair logic to the production cluster wrapper.
 
 Do not supply an existing Audio cache to the full runner. It owns
 shards/<shard>/audio_production, including canonical_items, audio manifests and
@@ -177,7 +241,8 @@ are logs/canonical-prefetch.log within the shard. Lazy MiMo server logs are
 logs/<hostname>/mimo-shard-<shard>-<timestamp>-<supervisor-pid>.log. Stage wall
 seconds, canonical prefetch start/completion, and MiMo server start/ready/stop
 events are printed in the supervisor log.
-Node logs are logs/<hostname>/{mimo,supervisor}-<timestamp>-<pid>.log.
+The node-level shell log is logs/<hostname>/supervisor-<timestamp>-<pid>.log;
+MiMo logs are shard-local lifecycle logs as described above.
 Only the parent publishes full ordered inventories. Worker outputs never race on
 canonical records.jsonl. Successful receipt/media hashes are checked before
 reuse; failed jobs retry once on the next invocation. A worker crash waits for
@@ -198,6 +263,40 @@ downstream adapter binds ready outputs to validated per-clip dependencies;
 unrelated aggregate hash changes cannot trigger repeat inference. Previously
 upstream-skipped clips can reopen when their own inputs become available.
 Published data remains available to the existing snapshot builder.
+
+### Startup diagnostics and resume scheduling
+
+The full supervisor prints startup phase markers to the supervisor log, not to
+the outer cluster terminal. The outer terminal normally stops after printing the
+supervisor log path. Inspect the referenced log directly, for example:
+
+```bash
+tail -f /mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/T2VA/logs/<hostname>/supervisor-<stamp>.log
+```
+
+A healthy startup begins with:
+
+    source_index_start
+    source_index_ready shards=1920 records=3839096
+    resume_scan_start assigned=<rank slice size>
+    schedule {"complete_skipped": ..., "fresh": ..., "unfinished": ..., ...}
+
+Interpret stalls by marker. If only source_index_start appears, the source-index
+path is the bottleneck. If source_index_ready appears but schedule does not,
+resume metadata enumeration is the bottleneck.
+
+Do not reintroduce full-manifest SHA validation on every cluster node. The source
+index already stores the authoritative SHA from creation. On resumed cluster
+mounts, path + size + mtime_ns are used as the fast cross-mount identity; a full
+SHA is only the fallback when those content-facing fields change. device, inode,
+and ctime may differ across shared mounts and must not by themselves trigger a
+multi-million-row manifest rehash.
+
+Resume-first scheduling is intentionally cheap. After the fixed
+SHARD_SEED/rank/world-size partition, each node enumerates shards/ once. Existing
+assigned shard directories without a top-level COMPLETE marker are prioritized;
+absent directories are fresh; COMPLETE shards are skipped. No stage JSON, receipt,
+media file, or artifact hash is read for scheduling.
 
 ### Raw-video server acceptance (2026-09-18)
 
