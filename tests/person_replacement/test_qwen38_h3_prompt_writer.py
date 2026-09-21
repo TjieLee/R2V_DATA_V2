@@ -423,6 +423,14 @@ def test_prompt_includes_identity_and_motion_icl_examples():
     assert "young adult woman with a cropped black pixie cut" in replacement
     assert "middle-aged man with wavy dark-brown hair" in replacement
     assert "a face-shape or grooming detail" in replacement
+    assert "Optional diversity dimensions may also include a broad country/region" in replacement
+    assert "skin tone" in replacement and "profession-inspired styling" in replacement
+    assert "Black British woman in her forties with deep brown skin" in replacement
+    assert "young South Asian woman with medium-brown skin" in replacement
+    assert "white Eastern European man with fair skin" in replacement
+    assert "young Southeast Asian man with warm tan skin" in replacement
+    assert "Latina woman in her fifties with medium olive skin" in replacement
+    assert "Do not force every replacement to mention every one" in replacement
 
     system = H3_PROMPT_SYSTEM_PROMPT
     assert "OBSERVATION-ONLY LANGUAGE" in system

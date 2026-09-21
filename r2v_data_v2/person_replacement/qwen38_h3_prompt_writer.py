@@ -128,6 +128,11 @@ visually plausible, include:
 - a face-shape or grooming detail,
 - and a clothing/style detail with at least one useful colour or material cue.
 
+Optional diversity dimensions may also include a broad country/region or
+ethnic-background cue, apparent skin tone, or profession-inspired styling.
+These are optional appearance cues, not required fields. Do not force all of
+them into every replacement.
+
 Do not use empty identity phrases such as "a generic man", "a generic woman",
 "a generic person", or "an ordinary person" as the replacement description.
 The replacement must read like a specific new casting choice, not a vague
@@ -139,17 +144,29 @@ These examples demonstrate the desired identity distance and description
 density only. Do not copy their attributes unless the current video and
 diversity cue support them.
 
-Example A:
+Example A — gender, age and skin-tone contrast:
 SOURCE_PERFORMER_1: a young adult man with short black hair and a light grey hoodie, initially on the left
 SOURCE_PERFORMER_2: a young adult woman with long straight dark hair and a pale blouse, initially on the right
-REPLACEMENT_SUBJECT_1: a woman in her forties with short textured auburn hair, high cheekbones, defined brows, and a dark teal crew-neck knit top
-REPLACEMENT_SUBJECT_2: an older man in his sixties with swept-back silver hair, a rectangular face, a neatly trimmed moustache, and a burgundy casual button-up shirt
+REPLACEMENT_SUBJECT_1: a Black British woman in her forties with deep brown skin, short natural coily hair, high cheekbones, and a dark teal office-professional knit top
+REPLACEMENT_SUBJECT_2: an older East Asian man in his sixties with light-medium skin, swept-back silver hair, a rectangular face, a neatly trimmed moustache, and a burgundy casual button-up shirt
 
-Example B:
+Example B — regional background and profession styling:
 SOURCE_PERFORMER_1: an older man with thinning grey hair and a dark jacket, initially nearer the camera
 SOURCE_PERFORMER_2: a young woman with shoulder-length dark hair and a plain top, initially farther back
-REPLACEMENT_SUBJECT_1: a young adult woman with a cropped black pixie cut, a round face, minimal makeup, and a fitted navy jacket
-REPLACEMENT_SUBJECT_2: a middle-aged man with wavy dark-brown hair, a broad oval face, a short beard, and a muted rust polo shirt
+REPLACEMENT_SUBJECT_1: a young South Asian woman with medium-brown skin, a cropped black pixie cut, a round face, and a fitted navy pharmacist-style work jacket
+REPLACEMENT_SUBJECT_2: a middle-aged white Eastern European man with fair skin, wavy dark-brown hair, a broad oval face, a short beard, and a muted rust polo shirt
+
+Example C — keep some dimensions ordinary while changing others:
+SOURCE_PERFORMER_1: a middle-aged woman with straight dark hair and a beige sweater, initially in the foreground
+SOURCE_PERFORMER_2: a young adult man with short dark hair and a black t-shirt, initially behind her
+REPLACEMENT_SUBJECT_1: a young Southeast Asian man with warm tan skin, short textured hair, a lean oval face, and simple dark barista-style workwear
+REPLACEMENT_SUBJECT_2: a Latina woman in her fifties with medium olive skin, shoulder-length wavy brown hair, a square face, and a muted blue everyday blouse
+
+The examples intentionally use different subsets of age, gender presentation,
+broad regional or ethnic-background cue, skin tone, profession-inspired styling,
+hair, face and clothing. Do not force every replacement to mention every one of
+these dimensions. Use whichever subset makes the new identity distinct,
+plausible and concise.
 
 Keep the replacement person's overall height/body scale and silhouette broadly
 compatible with the corresponding source performer so source pose and spatial
