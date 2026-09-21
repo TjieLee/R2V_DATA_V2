@@ -29,9 +29,16 @@ if (( RANK >= WORLD_SIZE )); then
   exit 2
 fi
 
-PAIR_PYTHON="${PAIR_PYTHON:-/mnt/workspace/litengjie/data/person_replacement_deps/bernini-qwen-env/bin/python}"
+PAIR_PYTHON="${PAIR_PYTHON:-/mnt/workspace/litengjie/data/R2V_DATA_V2/.venv/bin/python}"
 H3_PYTHON="${H3_PYTHON:-/mnt/workspace/litengjie/data/person_replacement_deps/minimax-h3-env/bin/python}"
 PROMPT_WRITER_PYTHON="${PROMPT_WRITER_PYTHON:-/mnt/workspace/litengjie/data/audio_deps/qwen38-sglang-env/bin/python}"
+
+for PYTHON_BIN in "$PAIR_PYTHON" "$H3_PYTHON" "$PROMPT_WRITER_PYTHON"; do
+  if [[ ! -x "$PYTHON_BIN" ]]; then
+    echo "Required Python runtime is missing or not executable: $PYTHON_BIN" >&2
+    exit 2
+  fi
+done
 
 PROMPT_WRITER_MODEL="${PROMPT_WRITER_MODEL:-/mnt/workspace/public/pretrained/Qwen/Qwen3.5-27B}"
 H3_MODEL_ROOT="${H3_MODEL_ROOT:-/mnt/workspace/public/pretrained/MiniMaxAI/MiniMax-H3}"
