@@ -1800,11 +1800,17 @@ class ReferenceEditEpochRunner:
             self._materialize_candidate(prepared.candidate_path, candidate_bytes)
             qwen_review = None
             override: str | None = None
+            qwen_failed = (
+                qwen_payload is not None and qwen_payload.get("status") != "review"
+            )
+            sam_failed = (
+                sam_payload is not None and sam_payload.get("status") != "review"
+            )
             if qwen_payload is not None and qwen_payload.get("status") == "review":
                 qwen_review = _deserialize_qwen_review(
                     shard, qwen_payload["qwen_review"]
                 )
-            elif qwen_payload is not None:
+            elif qwen_failed:
                 override = (
                     f"boogu_reference_edit_failed: {qwen_payload.get('error')}"
                 )
@@ -1812,7 +1818,7 @@ class ReferenceEditEpochRunner:
             sam_review = None
             if sam_payload is not None and sam_payload.get("status") == "review":
                 sam_review = BooguSamReview.model_validate(sam_payload["sam_review"])
-            elif sam_payload is not None:
+            elif sam_failed and not qwen_failed:
                 override = (
                     f"boogu_reference_edit_failed: {sam_payload.get('error')}"
                 )
@@ -1976,6 +1982,18 @@ class ReferenceEditEpochRunner:
             if second is not None:
                 raise ReferenceEditDurableError(
                     f"{clip_uid}/{entity_id} is accepted on attempt 1 but an "
+                    "attempt-2 marker exists"
+                )
+            return
+        if outcome == "fallback" and attempt_index == 1:
+            if first is None or first.get("accepted"):
+                raise ReferenceEditDurableError(
+                    f"{clip_uid}/{entity_id} fell back on attempt 1 but its "
+                    "attempt-1 marker disagrees"
+                )
+            if second is not None:
+                raise ReferenceEditDurableError(
+                    f"{clip_uid}/{entity_id} fell back on attempt 1 but an "
                     "attempt-2 marker exists"
                 )
             return
