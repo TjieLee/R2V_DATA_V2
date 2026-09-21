@@ -81,13 +81,15 @@ def run_assigned_shards(root, shard_ids, pipeline):
     """One node owns a shard through all barriers, including downstream writes."""
     results = {}
     for position, shard_id in enumerate(shard_ids):
-        if hasattr(pipeline, "prepare_ahead"):
-            pipeline.prepare_ahead(
-                shard_id,
-                shard_ids[position + 1] if position + 1 < len(shard_ids) else None,
-            )
         shard = root / "shards" / production.shard_name(shard_id)
         try:
+            if hasattr(pipeline, "prepare_ahead"):
+                pipeline.prepare_ahead(
+                    shard_id,
+                    shard_ids[position + 1]
+                    if position + 1 < len(shard_ids)
+                    else None,
+                )
             with production.file_lock(shard / "invocation.lock"):
                 results[shard_id] = {}
                 for name in STAGES:
@@ -186,7 +188,12 @@ class FullPipeline:
     def prepare_ahead(self, shard_id, next_shard_id):
         if self.prefetch is None:
             return
-        result = self.prefetch.wait(shard_id)
+        try:
+            result = self.prefetch.wait(shard_id)
+        except production.ShardLockedError:
+            if next_shard_id is not None:
+                self.prefetch.start(next_shard_id)
+            raise
         self.prepared[shard_id] = PreparedShard(
             Path(result["audio_root"]), result["summary"]
         )
