@@ -30,6 +30,7 @@ from .qwen38_h3_prompt_writer import (
     REPLACEMENT_MAX_NEW_TOKENS,
     VIDEO_FPS,
     LocalQwen38H3PromptWriter,
+    OpenAIMimoH3PromptWriter,
     OpenAIQwen38H3PromptWriter,
     validate_h3_prompt_writer_output,
 )
@@ -41,7 +42,7 @@ MINIMUM_SOURCE_DURATION_SECONDS = 5.0
 SOURCE_SUBJECT_FIELDS = ("source_subject_1","source_subject_2")
 PERFORMANCE_FIELDS = ("source_performance_1","source_performance_2")
 QWEN_FIELDS = (*SOURCE_SUBJECT_FIELDS,*PERFORMANCE_FIELDS,"shot_description")
-PROMPT_WRITER_CONTRACT = "qwen38_sglang_or_qwen35_local_two_call_h3_prompt_v14"
+PROMPT_WRITER_CONTRACT = "mimo8_qwen38_or_qwen35_two_call_h3_prompt_v15"
 PROMPT_SOURCE = "qwen35_full_video"
 
 
@@ -153,6 +154,12 @@ def prepare_text_partition_v19(config, worker, writer_factory=None):
         return
     if writer_factory is not None:
         factory = writer_factory
+    elif config.get("prompt_writer_backend","local") == "mimo":
+        factory = lambda path:OpenAIMimoH3PromptWriter(
+            path,
+            base_url=config["prompt_writer_base_url"],
+            served_model=config["prompt_writer_served_model"],
+        )
     elif config.get("prompt_writer_backend","local") == "sglang":
         factory = lambda path:OpenAIQwen38H3PromptWriter(
             path,
@@ -219,16 +226,21 @@ def prepare_text_partition_v19(config, worker, writer_factory=None):
                         "prompt_writer_served_model":config.get("prompt_writer_served_model"),
                         "prompt_writer_contract":PROMPT_WRITER_CONTRACT,
                         "prompt_writer_video_fps":(
-                            VIDEO_FPS if getattr(writer,"uses_local_frame_sampling",True) else None),
+                            getattr(writer,"video_fps",VIDEO_FPS)
+                            if (getattr(writer,"uses_local_frame_sampling",True)
+                                or config.get("prompt_writer_backend") == "mimo")
+                            else None),
                         "prompt_writer_replacement_max_new_tokens":REPLACEMENT_MAX_NEW_TOKENS,
                         "prompt_writer_prompt_max_new_tokens":PROMPT_MAX_NEW_TOKENS,
                         "prompt_writer_thinking":writer.thinking_disabled,
                         "prompt_writer_num_frames":(
                             num_frames if getattr(writer,"uses_local_frame_sampling",True) else None),
                         "prompt_source":(
-                            "qwen38_sglang_full_video"
-                            if config.get("prompt_writer_backend") == "sglang"
-                            else PROMPT_SOURCE)},
+                            "mimo25_sglang_full_video_fps8"
+                            if config.get("prompt_writer_backend") == "mimo"
+                            else ("qwen38_sglang_full_video"
+                                  if config.get("prompt_writer_backend") == "sglang"
+                                  else PROMPT_SOURCE))},
                         {"h3_prompt":prompt})
                 except Exception as exc:  # noqa: BLE001 -- failure is case-local and durable
                     fail_attempt(case,attempt,exc)

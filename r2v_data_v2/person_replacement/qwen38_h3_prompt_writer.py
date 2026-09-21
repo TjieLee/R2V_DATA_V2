@@ -25,6 +25,13 @@ QWEN38_MIN_P = 0.0
 QWEN38_PRESENCE_PENALTY = 1.5
 QWEN38_REPETITION_PENALTY = 1.0
 
+MIMO_SGLANG_BASE_URL = "http://127.0.0.1:8092/v1"
+MIMO_SGLANG_SERVED_MODEL = "mimo-v2.5"
+MIMO_CHECKPOINT = "/mnt/workspace/public/pretrained/MiMo/MiMo-V2.5"
+MIMO_VIDEO_FPS = 8.0
+MIMO_MEDIA_RESOLUTION = "default"
+MIMO_TEMPERATURE = 0.0
+
 DETAIL_PRESERVATION_SENTENCE = (
     "Only replace <Subject 1> and <Subject 2>'s identities and appearances; "
     "reproduce the source performers' motion and performance from <Video 1> exactly: "
@@ -1000,6 +1007,73 @@ class OpenAIQwen38H3PromptWriter:
 
     def close(self):
         self.client = None
+
+
+class OpenAIMimoH3PromptWriter(OpenAIQwen38H3PromptWriter):
+    """MiMo-V2.5 SGLang writer with explicit 8 FPS visual sampling."""
+
+    uses_local_frame_sampling = False
+    thinking_disabled = True
+
+    def __init__(
+        self,
+        checkpoint_id=MIMO_CHECKPOINT,
+        *,
+        base_url=MIMO_SGLANG_BASE_URL,
+        served_model=MIMO_SGLANG_SERVED_MODEL,
+        api_key="EMPTY",
+        timeout_seconds=900.0,
+        video_fps=MIMO_VIDEO_FPS,
+        replacement_max_new_tokens=REPLACEMENT_MAX_NEW_TOKENS,
+        prompt_max_new_tokens=PROMPT_MAX_NEW_TOKENS,
+        client=None,
+    ):
+        super().__init__(
+            checkpoint_id,
+            base_url=base_url,
+            served_model=served_model,
+            api_key=api_key,
+            timeout_seconds=timeout_seconds,
+            replacement_max_new_tokens=replacement_max_new_tokens,
+            prompt_max_new_tokens=prompt_max_new_tokens,
+            client=client,
+        )
+        self.video_fps = float(video_fps)
+        if self.video_fps != MIMO_VIDEO_FPS:
+            raise ValueError(f"MiMo person-replacement writer requires {MIMO_VIDEO_FPS:g} FPS")
+
+    def _video(self, video):
+        path = Path(video).expanduser().resolve(strict=True)
+        return {
+            "type":"video_url",
+            "video_url":{"url":path.as_uri()},
+            "fps":self.video_fps,
+            "media_resolution":MIMO_MEDIA_RESOLUTION,
+        }
+
+    def _generate(self, messages, max_new_tokens, *, num_frames=None):
+        del num_frames
+        self._load()
+        completion = self.client.chat.completions.create(
+            model=self.served_model,
+            messages=messages,
+            temperature=MIMO_TEMPERATURE,
+            max_completion_tokens=max_new_tokens,
+            stream=False,
+            reasoning_effort="none",
+            extra_body={
+                "use_audio_in_video":False,
+                "chat_template_kwargs":{"thinking":False,"enable_thinking":False},
+            },
+        )
+        choices = getattr(completion,"choices",None)
+        if not choices:
+            raise ValueError("MiMo SGLang returned no choices")
+        message = choices[0].message
+        text = getattr(message,"content",None)
+        if not isinstance(text,str) or not text.strip():
+            raise ValueError("MiMo SGLang returned an empty completion")
+        return text.strip()
 
 
 class LocalQwen38H3PromptWriter:

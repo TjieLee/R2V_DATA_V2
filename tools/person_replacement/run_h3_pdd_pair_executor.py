@@ -39,8 +39,8 @@ def arguments(argv=None):
     parser.add_argument("--prompt-writer-model",type=Path,
                         default=Path("/mnt/workspace/public/pretrained/Qwen/Qwen3.5-27B"),
                         help="Prompt-writer checkpoint identity; local path for local backend")
-    parser.add_argument("--prompt-writer-backend",choices=("local","sglang"),default="local",
-                        help="Text captioner backend: local Qwen3.5-27B or Qwen3.8 SGLang")
+    parser.add_argument("--prompt-writer-backend",choices=("local","sglang","mimo"),default="local",
+                        help="Text captioner backend: local Qwen3.5-27B, Qwen3.8 SGLang, or MiMo-V2.5 SGLang")
     parser.add_argument("--prompt-writer-base-url",default="http://127.0.0.1:8000/v1",
                         help="Qwen3.8 SGLang OpenAI-compatible endpoint")
     parser.add_argument("--prompt-writer-served-model",default="Qwen/Qwen3.8-Flash-Next",

@@ -168,6 +168,46 @@ def test_qwen38_sglang_writer_uses_video_url_and_non_thinking_contract(tmp_path)
     assert "mm_processor_kwargs" not in calls[0]["extra_body"]
 
 
+def test_mimo_writer_uses_explicit_fps8_and_visual_only_contract(tmp_path):
+    from r2v_data_v2.person_replacement.qwen38_h3_prompt_writer import (
+        OpenAIMimoH3PromptWriter,
+    )
+
+    calls = []
+    class Completions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            content = CALL1_RESPONSE if len(calls) == 1 else LEGAL_PROMPT
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+            )
+    client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+    writer = OpenAIMimoH3PromptWriter(
+        "/mnt/workspace/public/pretrained/MiMo/MiMo-V2.5",
+        client=client,
+    )
+    video = tmp_path/"source.mp4"
+    video.touch()
+    result = writer.invent_replacements(video,"generic","doctor",num_frames=40)
+    writer.write_h3_prompt(video,*result,num_frames=40)
+    media = calls[0]["messages"][0]["content"][0]
+    assert calls[0]["model"] == "mimo-v2.5"
+    assert media == {
+        "type":"video_url",
+        "video_url":{"url":video.resolve().as_uri()},
+        "fps":8.0,
+        "media_resolution":"default",
+    }
+    assert calls[0]["temperature"] == 0.0
+    assert calls[0]["max_completion_tokens"] == 512
+    assert calls[1]["max_completion_tokens"] == 4096
+    assert calls[0]["reasoning_effort"] == "none"
+    assert calls[0]["extra_body"]["use_audio_in_video"] is False
+    assert calls[0]["extra_body"]["chat_template_kwargs"] == {
+        "thinking":False,"enable_thinking":False,
+    }
+
+
 def test_lazy_single_load_uses_local_files_only(tmp_path, monkeypatch):
     from r2v_data_v2.person_replacement.qwen38_h3_prompt_writer import (
         LocalQwen38H3PromptWriter,

@@ -196,7 +196,7 @@ def test_prepared_provenance_and_artifacts(tmp_path, monkeypatch):
     directory = tmp_path/"case0"/"preparation"
     prepared = read_json(directory/"prepared.json")
     assert prepared["prompt_writer_model"] == "/mnt/workspace/public/pretrained/Qwen/Qwen3.5-27B"
-    assert prepared["prompt_writer_contract"] == "qwen38_sglang_or_qwen35_local_two_call_h3_prompt_v14"
+    assert prepared["prompt_writer_contract"] == "mimo8_qwen38_or_qwen35_two_call_h3_prompt_v15"
     assert prepared["prompt_writer_video_fps"] == 4.0
     assert prepared["prompt_writer_replacement_max_new_tokens"] == 512
     assert prepared["prompt_writer_prompt_max_new_tokens"] == 4096
@@ -210,13 +210,50 @@ def test_prepared_provenance_and_artifacts(tmp_path, monkeypatch):
     assert prepared["replacement_diversity_1"] and prepared["replacement_diversity_2"]
 
 
+def test_mimo_backend_factory_and_provenance_use_fps8(tmp_path, monkeypatch):
+    from r2v_data_v2.person_replacement import h3_pair_prepare as module
+
+    clips = tmp_path/"clips"
+    clips.mkdir()
+    cases = make_cases(tmp_path,1,clips)
+    config = config_for(cases,clips)
+    config.update({
+        "prompt_writer_model":"/mnt/workspace/public/pretrained/MiMo/MiMo-V2.5",
+        "prompt_writer_backend":"mimo",
+        "prompt_writer_base_url":"http://127.0.0.1:8092/v1",
+        "prompt_writer_served_model":"mimo-v2.5",
+    })
+    monkeypatch.setattr(module,"ensure_h3_reference",
+                        lambda source,directory:(source,{"reference_audio_normalized":False,
+                                                         "reference_audio_source_channels":None,
+                                                         "reference_audio_target_channels":None}))
+    monkeypatch.setattr(module,"inspect_video_timeline",
+                        lambda _:VideoTimeline(138,25,25,1,1920,1080,5.52))
+
+    class FakeMimo(FakeWriter):
+        uses_local_frame_sampling = False
+        thinking_disabled = True
+        video_fps = 8.0
+        def __init__(self, path, *, base_url, served_model):
+            super().__init__(path)
+            assert base_url == "http://127.0.0.1:8092/v1"
+            assert served_model == "mimo-v2.5"
+
+    monkeypatch.setattr(module,"OpenAIMimoH3PromptWriter",FakeMimo)
+    module.prepare_text_partition_v19(config,0)
+    prepared = read_json(tmp_path/"case0"/"preparation"/"prepared.json")
+    assert prepared["prompt_writer_backend"] == "mimo"
+    assert prepared["prompt_writer_video_fps"] == 8.0
+    assert prepared["prompt_source"] == "mimo25_sglang_full_video_fps8"
+
+
 def test_frame0_never_instantiates_the_27b(tmp_path, monkeypatch):
     """frame0 stays on the 8B + Boogu path and keeps its own v18 contract."""
     from r2v_data_v2.person_replacement import h3_pair_prepare as module
     from r2v_data_v2.person_replacement.h3_pair_executor import VARIANTS
 
     assert VARIANTS["frame0"] == "frame0_two_person_pdd_fsdp2_pair_v18"
-    assert VARIANTS["text"] == "text_two_person_pdd_fsdp2_pair_v36"
+    assert VARIANTS["text"] == "text_two_person_pdd_fsdp2_pair_v37"
 
     clips = tmp_path/"clips"
     clips.mkdir()
