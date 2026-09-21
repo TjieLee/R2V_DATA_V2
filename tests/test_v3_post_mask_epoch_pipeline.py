@@ -1196,3 +1196,173 @@ def test_production_wrapper_keeps_pair_incomplete_reason(
         if event["event"] == "post_mask_removal_epoch_finished"
     ]
     assert finished[-1]["unresolved"] > 0
+
+
+def _stage_counts_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Any, dict[str, Any], dict[str, Any], Any, list[str]]:
+    config, storages, eligible, _, _log = _fixture(tmp_path, monkeypatch)
+    ledger = GroupLedger(tmp_path / "ledger")
+    paid: list[str] = []
+    return config, storages, eligible, ledger, paid
+
+
+def _stage_counts_run(
+    config: Any,
+    storages: dict[str, Any],
+    eligible: dict[str, Any],
+    ledger: Any,
+    paid: list[str],
+) -> dict[str, Any]:
+    """Run the shared-session composition over the given durable state."""
+    from r2v_data_v2.v3.post_mask_epoch_pipeline import (
+        run_removal_pair_resource_session,
+    )
+    from r2v_data_v2.v3.post_mask_epoch_resources import ResourceEpochManager
+
+    class _CountingQwen(_SharedQwenHandle):
+        def review(self, **kwargs: Any) -> Any:
+            paid.append("removal-judge")
+            return super().review(**kwargs)
+
+        def decide(self, **kwargs: Any) -> Any:
+            paid.append("pair-judge")
+            return super().decide(**kwargs)
+
+    holder = _DispatchHolder()
+
+    def qwen_factory() -> tuple[Any, Any]:
+        return _TrackedResource(RESOURCE_QWEN, []), _PassthroughExecutor(
+            holder, _CountingQwen()
+        )
+
+    def boogu_factory() -> tuple[Any, Any]:
+        return _TrackedResource(RESOURCE_BOOGU, []), _PassthroughExecutor(
+            holder, _BooguWorker()
+        )
+
+    manager = ResourceEpochManager(
+        {RESOURCE_BOOGU: boogu_factory, RESOURCE_QWEN: qwen_factory}
+    )
+
+    def make(runner: Any, dispatch: Any) -> Any:
+        holder.dispatch = dispatch
+        return ResourceEpochScheduler(
+            ledger=ledger,
+            finalize=runner.finalize,
+            resource_manager=manager,
+            close_resource_manager_on_exit=False,
+        )
+
+    return run_removal_pair_resource_session(
+        config=config,
+        storages=storages,
+        eligible_clip_uids_by_shard=eligible,
+        ledger=ledger,
+        manager=manager,
+        build_removal_scheduler=make,
+        build_pair_scheduler=make,
+    )
+
+
+def test_stage_counts_pair_written_only_when_complete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from r2v_data_v2.v3.post_mask_epoch_pair import PairEpochRunner
+
+    config, storages, eligible, ledger, _paid = _stage_counts_build(tmp_path, monkeypatch)
+    outcome = _stage_counts_run(config, storages, eligible, ledger, _paid)
+    assert outcome["pair_completed"] is True, outcome["reason"]
+    assert outcome["pair_stats"], "a completed Pair must report reconciled stats"
+    for shard, storage in storages.items():
+        run = storage.read_run()
+        runner = PairEpochRunner(
+            config,
+            {shard: storage},
+            GroupLedger(Path(ledger.root)),
+            eligible_clip_uids_by_shard={shard: list(eligible[shard])},
+        )
+        reconciled = runner.reconcile_stats(shard).to_dict()
+        for field, value in reconciled.items():
+            assert run.counts[f"pair.{field}"] == value, (shard, field)
+        assert outcome["pair_stats"][shard] == reconciled
+
+
+def test_stage_counts_restart_is_idempotent_and_pays_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, storages, eligible, ledger, paid = _stage_counts_build(tmp_path, monkeypatch)
+    first = _stage_counts_run(config, storages, eligible, ledger, paid)
+    assert first["pair_completed"] is True
+    paid_first = list(paid)
+    before = {
+        shard: dict(storage.read_run().counts) for shard, storage in storages.items()
+    }
+    second = _stage_counts_run(config, storages, eligible, ledger, paid)
+    assert second["pair_completed"] is True
+    # Restart pays no model call and rewrites exactly the same Pair stage
+    # counts. (Removal's own counters legitimately re-classify a finished
+    # clip as skipped_existing, which is not this test's subject.)
+    assert paid == paid_first
+    for shard, storage in storages.items():
+        after = {
+            key: value
+            for key, value in storage.read_run().counts.items()
+            if key.startswith("pair.")
+        }
+        expected = {
+            key: value
+            for key, value in before[shard].items()
+            if key.startswith("pair.")
+        }
+        assert after == expected, shard
+    assert second["pair_stats"] == first["pair_stats"]
+
+
+def test_stage_counts_not_written_when_pair_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from r2v_data_v2.v3.post_mask_epoch_pipeline import (
+        run_removal_pair_resource_session,
+    )
+    from r2v_data_v2.v3.post_mask_epoch_resources import ResourceEpochManager
+
+    config, storages, eligible, _, _log = _fixture(tmp_path, monkeypatch)
+    ledger = GroupLedger(tmp_path / "ledger")
+
+    class _NoResultExecutor:
+        def execute_batch(self, jobs: Any) -> dict[str, Any]:
+            return {}
+
+    holder = _DispatchHolder()
+    manager = ResourceEpochManager(
+        {
+            RESOURCE_BOOGU: lambda: (_TrackedResource(RESOURCE_BOOGU, []), _NoResultExecutor()),
+            RESOURCE_QWEN: lambda: (_TrackedResource(RESOURCE_QWEN, []), _NoResultExecutor()),
+        }
+    )
+
+    def make(runner: Any, dispatch: Any) -> Any:
+        holder.dispatch = dispatch
+        return ResourceEpochScheduler(
+            ledger=ledger,
+            finalize=runner.finalize,
+            resource_manager=manager,
+            close_resource_manager_on_exit=False,
+        )
+
+    outcome = run_removal_pair_resource_session(
+        config=config,
+        storages=storages,
+        eligible_clip_uids_by_shard=eligible,
+        ledger=ledger,
+        manager=manager,
+        build_removal_scheduler=make,
+        build_pair_scheduler=make,
+    )
+    assert outcome["remove_completed"] is False
+    assert outcome["pair_completed"] is False
+    assert outcome.get("pair_stats", {}) == {}
+    for shard, storage in storages.items():
+        counts = storage.read_run().counts
+        assert not any(key.startswith("pair.") for key in counts), shard

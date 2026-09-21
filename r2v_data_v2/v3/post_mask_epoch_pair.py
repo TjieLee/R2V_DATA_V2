@@ -50,6 +50,7 @@ from r2v_data_v2.v3.pair import (
     run_entity_reference_judge,
 )
 from r2v_data_v2.v3.post_mask_epoch_jobs import (
+    JOB_SCHEMA_VERSION,
     OUTCOME_COMPLETED,
     OUTCOME_RETRYABLE_FAILED,
     RESOURCE_QWEN,
@@ -1009,12 +1010,14 @@ class PairEpochRunner:
         seen: dict[str, dict[str, Any]] = {}
         for phase_id in self.ledger.phase_ids():
             phase = self.ledger.phase(phase_id)
+            if not phase.plan_path.is_file():
+                continue
             try:
                 records = phase.read_plan()
-            except Exception:  # noqa: BLE001 - a phase without a plan is empty
-                records = None
-            if records is None:
-                continue
+            except Exception as exc:  # a broken plan is corruption, not empty
+                raise PairEpochError(
+                    f"invalid Pair phase plan in {phase_id}"
+                ) from exc
             for record in records:
                 if record.get("canonical_shard") != shard:
                     continue
@@ -1031,12 +1034,62 @@ class PairEpochRunner:
                 seen.setdefault(job_id, record)
         return tuple(seen.values())
 
-    def _committed_payload(self, job_id: str) -> dict[str, Any] | None:
-        """Result payload of a committed job, or None when it never committed.
+    def _job_from_plan_record(self, record: Mapping[str, Any]) -> ModelJob:
+        """Rebuild the ModelJob its immutable plan record describes.
 
-        The GroupLedger index locates the receipt whichever ``rXXX-*`` phase
-        committed it; no artifact path is guessed here.
+        ``job_id``/``job_identity`` are re-derived and must match the record,
+        so a tampered or miswritten plan can never reach ``classify``.
         """
+        job = ModelJob(
+            job_type=str(record["job_type"]),
+            resource=str(record["resource"]),
+            canonical_shard=str(record["canonical_shard"]),
+            clip_uid=str(record["clip_uid"]),
+            input_digest=str(record["input_digest"]),
+            model_identity=str(record["model_identity"]),
+            target=tuple(
+                (str(key), str(value))
+                for key, value in (record.get("target") or [])
+            ),
+            attempt_index=int(record.get("attempt_index", 0)),
+            seed=record.get("seed"),
+            dependency_digests=tuple(
+                (str(key), str(value))
+                for key, value in (record.get("dependency_digests") or [])
+            ),
+            schema_version=str(record.get("schema_version", JOB_SCHEMA_VERSION)),
+        )
+        if job.job_id() != str(record.get("job_id", "")) or job.identity() != str(
+            record.get("job_identity", "")
+        ):
+            raise PairEpochError(
+                f"pair plan record {record.get('job_id', '')} does not rebuild"
+            )
+        return job
+
+    def _validated_committed_payload(
+        self, record: Mapping[str, Any]
+    ) -> dict[str, Any] | None:
+        """Committed result payload, receipt-verified. None when pending."""
+        from r2v_data_v2.v3.post_mask_epoch_state import STATE_MISMATCH
+
+        job = self._job_from_plan_record(record)
+        state = self.ledger.classify(job)
+        if state.state == STATE_MISMATCH:
+            raise PairEpochError(
+                f"pair job {job.job_id()} receipt mismatch: {state.detail or ''}"
+            )
+        if not state.skippable:
+            return None
+        result = self.ledger.load_committed_result(job)
+        if result is None:
+            raise PairEpochError(
+                f"committed pair job {job.job_id()} has no replayable result"
+            )
+        return dict(result.payload)
+
+    def _committed_payload(self, job_id: str) -> dict[str, Any] | None:
+        """Legacy 4c1 lookup kept for the primary reconciliation helpers."""
         result = self.ledger.load_committed_result(_JobIdRef(job_id))
         if result is None:
             return None
@@ -1132,6 +1185,262 @@ class PairEpochRunner:
                     stats.background_final_guard_attempted += 1
                     stats.background_final_guard_failed_closed += 1
         return PairStats(**counts)
+
+    # -- full legacy-equivalent PairStats reconciliation (4c2) -------------
+
+    def reconcile_stats(self, shard: str) -> Any:
+        """Complete legacy-equivalent PairStats for a TERMINAL Pair stage.
+
+        Authorities: the frozen primary plan, receipt-validated scheduler
+        commits, the frozen cross baseline / cross terminal markers, the final
+        published live Pair state and a read-only prefilter replay. The
+        invocation-local ``self.stats`` and ``_guard_counters`` are never read.
+
+        Refuses incomplete work instead of guessing: any planned Pair job that
+        is still pending, or any frozen cross target without a durable cross
+        terminal marker, raises ``PairEpochError``.
+        """
+        from r2v_data_v2.v3.pair import PairStats
+
+        primary = self.reconcile_primary_stats(shard)
+        counts = primary.to_dict()
+        storage = self._storage_for(shard)
+        plan = self._existing_primary_plan_for_reconcile(shard)
+        records = self._planned_jobs(shard)
+
+        # Refuse incomplete: every planned Pair job must be committed.
+        for record in records:
+            job = self._job_from_plan_record(record)
+            state = self.ledger.classify(job)
+            if state.state != "pending" and not state.skippable:
+                raise PairEpochError(
+                    f"pair job {job.job_id()} receipt mismatch: {state.detail or ''}"
+                )
+            if not state.skippable:
+                raise PairEpochError(
+                    f"pair job {job.job_id()} is not terminal; "
+                    "reconcile_stats refuses an incomplete Pair stage"
+                )
+
+        # Read-only prefilter replay for fresh targets with valid inputs.
+        if self.config.pair.reference_prefilter_mode == "conservative_v1":
+            self._reconcile_prefilter(shard, storage, plan, counts)
+
+        # Cross statistics, only when the donor snapshot was frozen.
+        snapshot_payload = _read_json(self._snapshot_path(shard))
+        if snapshot_payload is not None:
+            self._reconcile_cross(shard, storage, snapshot_payload, records, counts)
+
+        # Final live net state for every processed fresh target.
+        counts["ready"] = 0
+        counts["rejected"] = 0
+        counts["entities_ready"] = 0
+        counts["entities_rejected"] = 0
+        counts["backgrounds_bound"] = 0
+        for clip_uid in sorted(plan.get("clips", {})):
+            if plan["clips"][clip_uid]["classification"] != CLIP_FRESH_TARGET:
+                continue
+            if not self._pair_inputs_valid(storage, clip_uid):
+                continue
+            clip = storage.read_clip(clip_uid)
+            if clip.pairing is None:
+                continue
+            if clip.pairing.status == "ready":
+                counts["ready"] += 1
+            elif clip.pairing.status == "rejected":
+                counts["rejected"] += 1
+            if clip.pairing.background_token is not None:
+                counts["backgrounds_bound"] += 1
+            for state in clip.references.entities if clip.references else ():
+                if state.status == "ready":
+                    counts["entities_ready"] += 1
+                else:
+                    counts["entities_rejected"] += 1
+
+        # Full guard counters = primary (already counted) + cross call site.
+        if self.config.pair.background_final_guard_mode != "off":
+            self._reconcile_guard_site(
+                shard, storage, plan, records, counts, CALL_SITE_CROSS_PAIR
+            )
+        return PairStats(**counts)
+
+    def _reconcile_prefilter(
+        self,
+        shard: str,
+        storage: RunStorage,
+        plan: Mapping[str, Any],
+        counts: dict[str, int],
+    ) -> None:
+        """Replay the legacy primary prefilter counters. Never writes debug."""
+        from r2v_data_v2.v3.pair import (
+            _build_entity_reference_candidates,
+            _load_source_images,
+            _record_prefilter_stats,
+            prefilter_entity_reference_candidates,
+        )
+
+        for clip_uid in sorted(plan.get("clips", {})):
+            if plan["clips"][clip_uid]["classification"] != CLIP_FRESH_TARGET:
+                continue
+            if not self._pair_inputs_valid(storage, clip_uid):
+                continue
+            clip = storage.read_clip(clip_uid)
+            frames = _validate_frames(storage, clip_uid)
+            masks = storage.read_masks(clip_uid)
+            assert clip.annotation is not None
+            for entity in clip.annotation.entities:
+                tracked = masks.entities[entity.entity_id]
+                if tracked.status != "ready":
+                    continue
+                candidates, _tiny, _fragmented = _build_entity_reference_candidates(
+                    self.config,
+                    storage,
+                    clip_uid=clip_uid,
+                    entity=entity,
+                    frames=frames,
+                    masks=masks,
+                )
+                if not candidates:
+                    continue
+                source_images = _load_source_images(storage, candidates)
+                try:
+                    result = prefilter_entity_reference_candidates(
+                        entity, candidates, source_images
+                    )
+                except Exception:  # noqa: BLE001 - legacy fail-open semantics
+                    counts["prefilter_candidates_examined"] += len(candidates)
+                    counts["prefilter_fail_open_entities"] += 1
+                else:
+                    _record_prefilter_stats(counts, result)
+
+    def _reconcile_cross(
+        self,
+        shard: str,
+        storage: RunStorage,
+        snapshot_payload: Mapping[str, Any],
+        records: Sequence[Mapping[str, Any]],
+        counts: dict[str, int],
+    ) -> None:
+        """Cross statistics from receipt-validated commits and terminals."""
+        cross_records = [
+            record
+            for record in records
+            if record.get("job_type") == PAIR_CROSS_JUDGE_JOB
+        ]
+        # Every committed cross job is one legacy attempted call.
+        for record in cross_records:
+            payload = self._validated_committed_payload(record)
+            assert payload is not None, "incomplete cross work was refused above"
+            counts["cross_pair_attempted"] += 1
+            if str(payload.get("status", "")) == "decision" and int(
+                payload.get("repair_attempts", 0)
+            ) > 0:
+                counts["cross_pair_repaired"] += 1
+
+        targets = list(snapshot_payload.get("cross_pair_target_clip_uids", ()))
+        for clip_uid in targets:
+            terminal = self._cross_terminal(shard, clip_uid)
+            if terminal is None:
+                raise PairEpochError(
+                    f"cross target {clip_uid!r} has no durable cross terminal; "
+                    "reconcile_stats refuses an incomplete Pair stage"
+                )
+            if str(terminal.get("status", "")) == "failed":
+                counts["failed"] += 1
+            if str(terminal.get("status", "")) != "completed" or str(
+                terminal.get("reason_kind", "")
+            ) != "published":
+                continue
+            # A published target: every accepted donor decision made one
+            # ready cross reference, and the live entity must match the donor
+            # the job carried.
+            for record in cross_records:
+                if record.get("clip_uid") != clip_uid:
+                    continue
+                payload = self._validated_committed_payload(record)
+                assert payload is not None
+                if str(payload.get("status", "")) != "decision":
+                    continue
+                decision = payload.get("decision") or {}
+                if str(decision.get("verdict", "")) != "accept":
+                    continue
+                counts["cross_pair_ready"] += 1
+                self._verify_cross_published_entity(
+                    storage, clip_uid, record, decision
+                )
+
+    def _verify_cross_published_entity(
+        self,
+        storage: RunStorage,
+        clip_uid: str,
+        record: Mapping[str, Any],
+        decision: Mapping[str, Any],
+    ) -> None:
+        target = dict(record.get("target") or [])
+        entity_id = str(target.get("target_entity_id", ""))
+        donor_clip_uid = str(target.get("donor_clip_uid", ""))
+        donor_entity_id = str(target.get("donor_entity_id", ""))
+        clip = storage.read_clip(clip_uid)
+        for state in clip.references.entities if clip.references else ():
+            if state.entity_id != entity_id:
+                continue
+            if state.status != "ready":
+                raise PairEpochError(
+                    f"cross-published entity {clip_uid}/{entity_id} is not ready"
+                )
+            if (
+                state.source_clip_uid != donor_clip_uid
+                or state.source_entity_id != donor_entity_id
+            ):
+                raise PairEpochError(
+                    f"cross-published entity {clip_uid}/{entity_id} does not "
+                    "match its committed donor"
+                )
+            return
+        raise PairEpochError(
+            f"cross-published entity {clip_uid}/{entity_id} is missing"
+        )
+
+    def _reconcile_guard_site(
+        self,
+        shard: str,
+        storage: RunStorage,
+        plan: Mapping[str, Any],
+        records: Sequence[Mapping[str, Any]],
+        counts: dict[str, int],
+        call_site: str,
+    ) -> None:
+        """Guard counters for one call site, from durable markers."""
+        for record in records:
+            if record.get("job_type") != PAIR_BACKGROUND_GUARD_JOB:
+                continue
+            if dict(record.get("target") or {}).get("call_site") != call_site:
+                continue
+            job_id = str(record.get("job_id", ""))
+            if not self._marker_exists(f"guard_attempted-{job_id}"):
+                continue
+            counts["background_final_guard_attempted"] += 1
+            if not self._marker_exists(f"guard_applied-{job_id}"):
+                continue
+            status = str(
+                (self._validated_committed_payload(record) or {}).get("status", "")
+            )
+            if status == "failed_closed":
+                counts["background_final_guard_failed_closed"] += 1
+            elif status == "accepted":
+                counts["background_final_guard_accepted"] += 1
+            elif status == "rejected":
+                counts["background_final_guard_rejected"] += 1
+            else:
+                raise PairEpochError(
+                    f"committed {call_site} guard result has no durable "
+                    f"status: {job_id}"
+                )
+        for clip_uid in sorted(plan.get("clips", {})):
+            key = f"guard_deterministic-{shard}-{call_site}-{clip_uid}"
+            if self._marker_exists(key):
+                counts["background_final_guard_attempted"] += 1
+                counts["background_final_guard_failed_closed"] += 1
 
     def _reconcile_primary_pairing(
         self, shard: str, storage: RunStorage, clip_uid: str

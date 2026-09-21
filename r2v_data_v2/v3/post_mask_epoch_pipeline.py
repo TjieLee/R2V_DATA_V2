@@ -171,6 +171,15 @@ def run_removal_pair_epochs(
     pair_primary_completed = not primary_unresolved
     pair_cross_completed = not cross_unresolved
     pair_completed = pair_primary_completed and pair_cross_completed
+    pair_stats: dict[str, Any] = {}
+    if pair_completed:
+        # Final durable accounting: only a fully terminal Pair stage may write
+        # stage counts, and the write is the same dict on every restart.
+        for shard in sorted(pair.storages):
+            stats = pair.reconcile_stats(shard)
+            payload = stats.to_dict()
+            pair.storages[shard].update_stage_counts("pair", payload)
+            pair_stats[shard] = payload
     result.update(
         {
             "pair_primary_completed":pair_primary_completed,
@@ -178,6 +187,7 @@ def run_removal_pair_epochs(
             "pair_completed":pair_completed,
             "pair_primary_unresolved":primary_unresolved,
             "pair_cross_unresolved":cross_unresolved,
+            "pair_stats":pair_stats,
             "pair_outcome":{
                 "primary":primary_outcome,
                 "cross":cross_outcome,
