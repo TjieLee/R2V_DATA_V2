@@ -411,13 +411,25 @@ def test_entity_delta_tamper_fails_closed(
 
 
 @pytest.mark.parametrize(
-    "tamper",
-    ("delete_clip_entry", "classification_switch", "drop_retained_entity"),
+    ("tamper", "entrypoint"),
+    (
+        ("delete_clip_entry", "seed"),
+        ("delete_clip_entry", "reconcile"),
+        ("classification_switch", "seed"),
+        ("drop_retained_entity", "seed"),
+    ),
 )
 def test_plan_scope_tamper_fails_closed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tamper: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper: str,
+    entrypoint: str,
 ) -> None:
-    """A tampered plan may not silently change what this stage executes."""
+    """A tampered plan may not silently change what this stage executes.
+
+    The seed path and the reconcile path must agree about a valid plan, so the
+    scope tamper is checked through both entry points.
+    """
     config, storage = _storage_variant(
         tmp_path,
         monkeypatch,
@@ -439,7 +451,10 @@ def test_plan_scope_tamper_fails_closed(
 
     fresh = _runner(config, storage, tmp_path)
     with pytest.raises(ReferenceIntegrityDurableError):
-        fresh.seed_jobs()
+        if entrypoint == "seed":
+            fresh.seed_jobs()
+        else:
+            fresh.reconcile_stats(SHARD)
 
 
 def test_failed_publication_drift_fails_closed(
@@ -496,3 +511,68 @@ def test_failed_publication_drift_fails_closed(
         if line.strip()
     ]
     assert len(after) == 1
+
+
+def test_pre_existing_failed_same_reason_can_terminal_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A re-run that republishes the SAME failed state is a legal no-op.
+
+    The frozen baseline already carries failed("publication exploded"), and this
+    epoch's own CPU failure produces the identical state, so the storage write
+    is a no-op and the live state still equals the baseline while a legitimate
+    failed clip outcome marker exists. That is terminal, not corruption.
+    """
+    config, storage = _storage_variant(
+        tmp_path,
+        monkeypatch,
+        "run-epoch",
+        second_scope="full",
+        second_phrase=CLEAN_OBJECT_PHRASE,
+    )
+    storage.write_reference_integrity_failure("clip-1", "publication exploded")
+    runner = _runner(config, storage, tmp_path)
+    runner._plan(SHARD)  # freeze the plan over the pre-existing failed state
+
+    def exploding_publish(shard: str, stor: Any, clip_uid: str) -> None:
+        raise ValueError("publication exploded")
+
+    runner._publish_clip_if_terminal = exploding_publish  # type: ignore[method-assign]
+    assert runner.seed_jobs() == []
+
+    clip = storage.read_clip("clip-1")
+    assert clip.reference_integrity is not None
+    assert clip.reference_integrity.status == "failed"
+    assert clip.reference_integrity.reason == "publication exploded"
+    marker_path = runner._clip_outcome_path(SHARD, "clip-1")
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    assert marker["terminal"] == "failed"
+    assert marker["reason"] == "publication exploded"
+    # The clip delta also carries the counters of the two entities that reached
+    # their CPU branch before the publication failed, exactly like legacy.
+    assert marker["delta"] == {
+        "processed": 1,
+        "failed": 1,
+        "topology_suspicious": 0,
+        "entities_skipped_review": 2,
+        "entities_accepted": 2,
+    }
+    failures_path = Path(storage.root) / "failures.jsonl"
+    records = [
+        json.loads(line)
+        for line in failures_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(records) == 1
+
+    fresh = _runner(config, storage, tmp_path)
+    assert fresh.seed_jobs() == []
+    stats = fresh.reconcile_stats(SHARD)
+    assert stats.processed == 1
+    assert stats.failed == 1
+    after = [
+        json.loads(line)
+        for line in failures_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(after) == 1, "restart must not append another failure record"

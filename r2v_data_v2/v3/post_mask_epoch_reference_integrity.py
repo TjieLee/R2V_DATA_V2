@@ -399,56 +399,67 @@ class ReferenceIntegrityEpochRunner:
         if classification != CLIP_FRESH_TARGET:
             return
 
-        baselines = self._live_baselines(clip)
-        marker_exists = self._clip_outcome_path(shard, clip_uid).is_file()
-        if all(entry.get(key) == value for key, value in baselines.items()):
-            # Nothing from this epoch has been published yet, even when the
-            # frozen baseline already carries a failed Reference Integrity
-            # state: legacy re-runs such a clip as a fresh target.
-            if marker_exists:
-                raise ReferenceIntegrityDurableError(
-                    f"clip {clip_uid!r} has a durable outcome marker but its live "
-                    "state equals the pre-stage baseline"
-                )
+        marker = _read_json(self._clip_outcome_path(shard, clip_uid))
+        if marker is not None:
+            # The clip outcome marker is the durable terminal authority: verify
+            # the live publication against it. Live state may legitimately equal
+            # the frozen baseline here, because a re-run can republish the very
+            # same failed state (same clip, same reason) as a no-op write.
+            self._verify_published_clip(shard, storage, clip_uid, entry)
             return
-        # The live state moved away from the baseline: only a verified epoch
-        # publication may explain that, with or without the marker present.
+        # No marker yet: the live state decides whether this epoch has published
+        # anything. Equality with the frozen baseline means it has not, even when
+        # that baseline already carries a failed Reference Integrity state
+        # (legacy re-runs a failed clip as a fresh target). Any other state is a
+        # publication-before-marker crash candidate that must verify exactly.
+        baselines = self._live_baselines(clip)
+        if all(entry.get(key) == value for key, value in baselines.items()):
+            return
         self._verify_published_clip(shard, storage, clip_uid, entry)
+
+    def _validate_existing_plan(
+        self, shard: str, payload: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """The single strict validation of one frozen plan, used by every reader.
+
+        The seed path and the reconcile path must never disagree about what a
+        valid plan is, so both go through this helper.
+        """
+        expected = {
+            "schema": REFERENCE_INTEGRITY_PLAN_SCHEMA,
+            "canonical_shard": shard,
+            "eligible_clip_uids": list(self.eligible.get(shard, ())),
+            "policy": self._policy_identity(),
+        }
+        for key, value in expected.items():
+            if payload.get(key) != value:
+                raise ReferenceIntegrityDurableError(
+                    f"frozen Reference Integrity plan {key} drifted for {shard!r}"
+                )
+        clips = payload.get("clips")
+        if not isinstance(clips, dict):
+            raise ReferenceIntegrityDurableError(
+                f"frozen Reference Integrity plan clips map is malformed for "
+                f"{shard!r}"
+            )
+        if set(clips) != set(self.eligible.get(shard, ())):
+            raise ReferenceIntegrityDurableError(
+                f"frozen Reference Integrity plan scope drifted for {shard!r}"
+            )
+        storage = self._storage_for(shard)
+        for clip_uid, entry in clips.items():
+            if not isinstance(entry, dict):
+                raise ReferenceIntegrityDurableError(
+                    f"frozen Reference Integrity plan entry is malformed for "
+                    f"{clip_uid!r}"
+                )
+            self._verify_plan_entry(shard, storage, clip_uid, entry)
+        return dict(payload)
 
     def _plan(self, shard: str) -> dict[str, Any]:
         existing = _read_json(self._plan_path(shard))
         if existing is not None:
-            expected = {
-                "schema": REFERENCE_INTEGRITY_PLAN_SCHEMA,
-                "canonical_shard": shard,
-                "eligible_clip_uids": list(self.eligible.get(shard, ())),
-                "policy": self._policy_identity(),
-            }
-            for key, value in expected.items():
-                if existing.get(key) != value:
-                    raise ReferenceIntegrityDurableError(
-                        f"frozen Reference Integrity plan {key} drifted for "
-                        f"{shard!r}"
-                    )
-            clips = existing.get("clips")
-            if not isinstance(clips, dict):
-                raise ReferenceIntegrityDurableError(
-                    f"frozen Reference Integrity plan clips map is malformed for "
-                    f"{shard!r}"
-                )
-            if set(clips) != set(self.eligible.get(shard, ())):
-                raise ReferenceIntegrityDurableError(
-                    f"frozen Reference Integrity plan scope drifted for {shard!r}"
-                )
-            storage = self._storage_for(shard)
-            for clip_uid, entry in clips.items():
-                if not isinstance(entry, dict):
-                    raise ReferenceIntegrityDurableError(
-                        f"frozen Reference Integrity plan entry is malformed for "
-                        f"{clip_uid!r}"
-                    )
-                self._verify_plan_entry(shard, storage, clip_uid, entry)
-            return existing
+            return self._validate_existing_plan(shard, existing)
 
         storage = self._storage_for(shard)
         clips: dict[str, dict[str, Any]] = {}
@@ -472,21 +483,7 @@ class ReferenceIntegrityEpochRunner:
                 f"reconcile_stats needs a frozen Reference Integrity plan for "
                 f"{shard!r}"
             )
-        expected = {
-            "schema": REFERENCE_INTEGRITY_PLAN_SCHEMA,
-            "canonical_shard": shard,
-            "eligible_clip_uids": list(self.eligible.get(shard, ())),
-            "policy": self._policy_identity(),
-        }
-        for key, value in expected.items():
-            if payload.get(key) != value:
-                raise ReferenceIntegrityDurableError(
-                    f"frozen Reference Integrity plan {key} drifted for {shard!r}"
-                )
-        storage = self._storage_for(shard)
-        for clip_uid, entry in payload.get("clips", {}).items():
-            self._verify_plan_entry(shard, storage, clip_uid, entry)
-        return payload
+        return self._validate_existing_plan(shard, payload)
 
     # -- per-entity durable outcomes -------------------------------------------
 
