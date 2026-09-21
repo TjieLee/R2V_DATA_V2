@@ -596,6 +596,21 @@ def test_validator_requires_dynamic_preface_and_allows_speculative_phrasing():
     assert validate_h3_prompt_writer_output(speculative) == speculative.strip()
 
 
+def test_prompt_explicitly_requires_the_fixed_audio_tail():
+    from r2v_data_v2.person_replacement.qwen38_h3_prompt_writer import (
+        H3_PROMPT_SYSTEM_PROMPT,
+        H3_PROMPT_USER_TEMPLATE,
+    )
+
+    assert "COMPLETION REQUIREMENT" in H3_PROMPT_SYSTEM_PROMPT
+    assert "Never stop the response after detailed_description" in H3_PROMPT_SYSTEM_PROMPT
+    assert "ALWAYS append these exact final two" in H3_PROMPT_SYSTEM_PROMPT
+    assert "all six top-level section headings appear exactly once" in H3_PROMPT_SYSTEM_PROMPT
+    tail = "overall_soundscape:\nN/A\n\nnon_diegetic_music:\nN/A"
+    assert tail in H3_PROMPT_SYSTEM_PROMPT
+    assert tail in H3_PROMPT_USER_TEMPLATE
+
+
 def test_system_prompt_still_enforces_the_six_section_contract():
     from r2v_data_v2.person_replacement.qwen38_h3_prompt_writer import (
         H3_PROMPT_SYSTEM_PROMPT,

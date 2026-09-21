@@ -30,7 +30,7 @@ from .pipeline import validate_output_root
 TOOLS = Path(__file__).resolve().parents[2]/"tools/person_replacement"
 
 # text V19 dropped the 8B writer, so frame0 keeps its own v18 contract.
-VARIANTS = {"text":"text_two_person_pdd_fsdp2_pair_v35", "frame0":"frame0_two_person_pdd_fsdp2_pair_v18"}
+VARIANTS = {"text":"text_two_person_pdd_fsdp2_pair_v36", "frame0":"frame0_two_person_pdd_fsdp2_pair_v18"}
 BASE_RESOURCE_KEYS = ("h3_python","h3_model_root","pdd_code_root","pdd_lora")
 TEXT_RESOURCE_KEYS = ("prompt_writer_python","prompt_writer_model")
 TEXT_SETTING_KEYS = ("prompt_writer_backend","prompt_writer_base_url","prompt_writer_served_model")

@@ -196,7 +196,7 @@ def test_prepared_provenance_and_artifacts(tmp_path, monkeypatch):
     directory = tmp_path/"case0"/"preparation"
     prepared = read_json(directory/"prepared.json")
     assert prepared["prompt_writer_model"] == "/mnt/workspace/public/pretrained/Qwen/Qwen3.5-27B"
-    assert prepared["prompt_writer_contract"] == "qwen38_sglang_or_qwen35_local_two_call_h3_prompt_v13"
+    assert prepared["prompt_writer_contract"] == "qwen38_sglang_or_qwen35_local_two_call_h3_prompt_v14"
     assert prepared["prompt_writer_video_fps"] == 4.0
     assert prepared["prompt_writer_replacement_max_new_tokens"] == 512
     assert prepared["prompt_writer_prompt_max_new_tokens"] == 4096
@@ -216,7 +216,7 @@ def test_frame0_never_instantiates_the_27b(tmp_path, monkeypatch):
     from r2v_data_v2.person_replacement.h3_pair_executor import VARIANTS
 
     assert VARIANTS["frame0"] == "frame0_two_person_pdd_fsdp2_pair_v18"
-    assert VARIANTS["text"] == "text_two_person_pdd_fsdp2_pair_v35"
+    assert VARIANTS["text"] == "text_two_person_pdd_fsdp2_pair_v36"
 
     clips = tmp_path/"clips"
     clips.mkdir()

@@ -41,7 +41,7 @@ MINIMUM_SOURCE_DURATION_SECONDS = 5.0
 SOURCE_SUBJECT_FIELDS = ("source_subject_1","source_subject_2")
 PERFORMANCE_FIELDS = ("source_performance_1","source_performance_2")
 QWEN_FIELDS = (*SOURCE_SUBJECT_FIELDS,*PERFORMANCE_FIELDS,"shot_description")
-PROMPT_WRITER_CONTRACT = "qwen38_sglang_or_qwen35_local_two_call_h3_prompt_v13"
+PROMPT_WRITER_CONTRACT = "qwen38_sglang_or_qwen35_local_two_call_h3_prompt_v14"
 PROMPT_SOURCE = "qwen35_full_video"
 
 

@@ -572,7 +572,7 @@ Visible mouth movement may be described only as visual behavior.
 
 OUTPUT FORMAT
 
-Output exactly these six sections and nothing else:
+Output exactly these six sections and nothing else, in this exact order:
 
 subject_definitions:
 ...
@@ -591,6 +591,23 @@ N/A
 
 non_diegetic_music:
 N/A
+
+COMPLETION REQUIREMENT
+
+Never stop the response after detailed_description or after the final [Shot N].
+After finishing the visual description, ALWAYS append these exact final two
+sections:
+
+overall_soundscape:
+N/A
+
+non_diegetic_music:
+N/A
+
+These two final sections are mandatory even when the visual description is long.
+Do not omit, rename, merge, reorder, summarize, or replace them. Before ending
+the response, verify that all six top-level section headings appear exactly once
+and in the required order.
 
 subject_definitions style:
 
@@ -663,7 +680,14 @@ with the required replacement appearance.
 Watch the complete <Video 1> and describe the target video fully from beginning
 to end.
 
-Output only the final six-section MiniMax-H3 prompt."""
+Output only the final six-section MiniMax-H3 prompt. Do not stop after
+detailed_description. The response must always end with exactly:
+
+overall_soundscape:
+N/A
+
+non_diegetic_music:
+N/A"""
 
 SECTION_HEADINGS = ("subject_definitions","summary","retention_analysis",
                     "detailed_description","overall_soundscape","non_diegetic_music")
