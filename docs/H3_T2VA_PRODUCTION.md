@@ -371,6 +371,42 @@ If `canonical_prefetch_started` appears without completion, inspect
 `shards/<shard>/logs/canonical-prefetch.log` and whether another allocation is
 still active on the same production root.
 
+### Downstream inventory complexity
+
+Downstream preparation must be linear in the shard population plus speech
+segments. A previous implementation rebuilt T2VA speech facts with this pattern:
+
+    for each selected clip:
+        find the resolved job by scanning all resolved jobs
+        sort every diarization segment in the shard
+        discard segments belonging to other clips
+
+For a 2,000-row shard with roughly 4,500-6,500 ASR/diarization segments, that
+became thousands of repeated whole-segment sorts and left all GPUs idle for
+hours after ASR while the supervisor stopped at:
+
+    shard=<id> downstream_prepare_start
+
+The production path now builds dictionaries/sets for resolved jobs and clip
+membership once, groups raw diarization segments by clip once, sorts only each
+clip's own segment list once, and then performs O(1) lookups while constructing
+jobs. The downstream dependency processor likewise indexes raw/ASR segment keys
+by clip once rather than scanning the complete segment dictionary for every
+clip.
+
+Expected phase markers are now:
+
+    downstream_prepare_start
+    downstream_prepare_ready
+    downstream_processor_start
+    downstream_processor_ready
+    downstream_preflight_start
+    downstream_preflight_ready
+
+If preparation stalls before downstream_prepare_ready, inspect inventory
+construction rather than GPU serving. Do not reintroduce per-clip scans or sorts
+over shard-global resolved jobs, raw segments, or ASR segments.
+
 ### Downstream hash policy and GPU-idle diagnosis
 
 MiMo is lazy, so CPU/shared-storage work before the first real downstream request
