@@ -875,6 +875,70 @@ def test_parallel_independent_sam_failure_keeps_qwen_result(
     assert metadata is None or metadata.get("sam_review") is not None
 
 
+def test_parallel_independent_double_exception_matches_legacy_qwen_precedence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both review failures keep the legacy Qwen-first exception provenance."""
+    from r2v_data_v2.v3.reference_edit import reference_edit_clips
+
+    class _FailingLegacySamReviewer:
+        def review(self, **kwargs: Any) -> Any:
+            del kwargs
+            raise RuntimeError("sam backend exploded")
+
+    legacy_config = _reference_edit_config(tmp_path, monkeypatch, "run-legacy")
+    legacy_storage = _prepared_storage(
+        legacy_config, monkeypatch, run_name="run-legacy"
+    )
+    legacy = reference_edit_clips(
+        legacy_config,
+        legacy_storage,
+        backend=_FakeBoogu(),
+        judge=_FakeQwen(fail=True),
+        sam_reviewer=_FailingLegacySamReviewer(),
+        review_execution="parallel_independent",
+    )
+
+    _config, storage, runner, scheduler, routing = _build(
+        tmp_path,
+        monkeypatch,
+        run_name="run-epoch",
+        review_execution="parallel_independent",
+    )
+    routing.qwen.fail = True
+    routing.sam.fail = True
+    _drain(runner, scheduler)
+
+    stats = runner.reconcile_stats(SHARD)
+    assert stats.to_dict() == legacy.to_dict()
+    epoch_clip = storage.read_clip("clip-1")
+    legacy_clip = legacy_storage.read_clip("clip-1")
+    assert epoch_clip.reference_edit.model_dump(mode="json") == (
+        legacy_clip.reference_edit.model_dump(mode="json")
+    )
+
+    legacy_rejection = json.loads(
+        (
+            Path(legacy_storage.root)
+            / "clips/clip-1/reference_edit/e1/completion_rejection.json"
+        ).read_text(encoding="utf-8")
+    )
+    epoch_rejection = json.loads(
+        (
+            Path(storage.root)
+            / "clips/clip-1/reference_edit/e1/completion_rejection.json"
+        ).read_text(encoding="utf-8")
+    )
+    expected_reason = "boogu_reference_edit_failed: qwen judge exploded"
+    assert legacy_rejection["reason"] == expected_reason
+    assert epoch_rejection["reason"] == legacy_rejection["reason"]
+
+    marker = _read_attempt_marker(runner, 1)
+    assert marker is not None
+    assert marker["status"] == "qwen_failed"
+    assert marker["rejection_reason"] == expected_reason
+
+
 def test_parallel_independent_finalize_crash_replays_cpu_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1744,6 +1808,44 @@ def test_attempt1_accepted_flag_tamper_fails_closed(
     )
     with pytest.raises(ReferenceEditDurableError, match="attempt 2 without a rejected"):
         fresh.reconcile_stats(SHARD)
+
+
+@pytest.mark.parametrize("tamper", ("attempt1_accepted", "attempt2_exists"))
+def test_fallback_attempt1_marker_consistency_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tamper: str
+) -> None:
+    """fallback@1 requires rejected attempt1 and no attempt2 marker."""
+    _config, _storage, runner, scheduler, routing = _build(
+        tmp_path, monkeypatch, run_name="run-fallback-attempt1"
+    )
+    monkeypatch.setattr(runner, "durable_alternate", lambda *args, **kwargs: None)
+    routing.qwen.accept = False
+    _drain(runner, scheduler)
+
+    outcome = runner._entity_outcome(SHARD, "clip-1", "e1")
+    assert outcome is not None
+    assert outcome["outcome"] == "fallback"
+    assert outcome["attempt_index"] == 1
+    first_path = runner._attempt_outcome_path(SHARD, "clip-1", "e1", 1)
+    first = json.loads(first_path.read_text(encoding="utf-8"))
+    assert first["accepted"] is False
+    second_path = runner._attempt_outcome_path(SHARD, "clip-1", "e1", 2)
+    assert not second_path.exists()
+
+    if tamper == "attempt1_accepted":
+        first["accepted"] = True
+        first["status"] = "accepted"
+        first_path.write_text(json.dumps(first), encoding="utf-8")
+        match = "fell back on attempt 1.*attempt-1 marker disagrees"
+    else:
+        second = dict(first)
+        second["attempt_index"] = 2
+        second_path.parent.mkdir(parents=True, exist_ok=True)
+        second_path.write_text(json.dumps(second), encoding="utf-8")
+        match = "fell back on attempt 1.*attempt-2 marker exists"
+
+    with pytest.raises(ReferenceEditDurableError, match=match):
+        runner.reconcile_stats(SHARD)
 
 
 def test_attempt2_index_tamper_fails_closed(
