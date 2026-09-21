@@ -1686,9 +1686,18 @@ def build_removal_epoch_runner(
                     emit=emit,
                 )
                 removal = created["removal"]
-                unresolved = len(outcome.get("pair_primary_unresolved", ())) + len(
-                    outcome.get("pair_cross_unresolved", ())
+                # Every scheduler's unresolved work counts. The hard stage
+                # barrier guarantees only one of these can be non-zero, so
+                # there is no double counting.
+                removal_unresolved = tuple(
+                    outcome.get("removal_outcome", {}).get("unresolved_job_ids", ())
                 )
+                unresolved = (
+                    len(removal_unresolved)
+                    + len(outcome.get("pair_primary_unresolved", ()))
+                    + len(outcome.get("pair_cross_unresolved", ()))
+                )
+                reason = str(outcome["reason"])
             else:
                 removal = RemovalEpochRunner(
                     config,
@@ -1728,10 +1737,19 @@ def build_removal_epoch_runner(
                 finally:
                     removal.close()
                 unresolved = len(outcome.get("unresolved_job_ids", ()))
+                remove_completed = bool(outcome.get("completed", False))
+                reason = (
+                    "downstream resource-epoch phases are not wired"
+                    if remove_completed
+                    else "background removal incomplete"
+                )
             # Locks are released only when this block exits, i.e. after
             # publication and the stage-count update.
         # The shared 4b session reports "remove_completed"; the removal-only
-        # path reports the scheduler outcome's "completed" under the same name.
+        # path computed the same thing from the scheduler outcome. ``reason``
+        # was chosen per path: the shared path keeps the composition's own
+        # reason so an incomplete Pair is not reported as "only downstream
+        # phases are missing".
         remove_completed = bool(
             outcome.get("remove_completed", outcome.get("completed", False))
         )
@@ -1763,11 +1781,7 @@ def build_removal_epoch_runner(
             **outcome,
             "remove_completed": remove_completed,
             "completed": False,
-            "reason": (
-                "downstream resource-epoch phases are not wired"
-                if remove_completed
-                else "background removal incomplete"
-            ),
+            "reason": reason,
         }
 
     return runner

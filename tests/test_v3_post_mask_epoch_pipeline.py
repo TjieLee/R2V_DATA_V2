@@ -1041,3 +1041,157 @@ def test_production_runner_holds_the_shard_lock_across_removal_and_pair(
     assert "downstream" in outcome["reason"]
     assert lock_state, "the shared session really opened resources"
     assert all(lock_state), "every resource open happened under the shard lock"
+
+
+class _EmptyResultExecutor:
+    """Model call that yields nothing: retryable, never a committed attempt."""
+
+    def execute_batch(self, jobs: Any) -> dict[str, Any]:
+        return {}
+
+
+def _production_runner_outcome(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    qwen: Any,
+    empty_results: bool = False,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Run ``build_removal_epoch_runner`` with fake resources and one handle."""
+    from r2v_data_v2.v3.post_mask_epoch_groups import resource_epoch_root
+    from r2v_data_v2.v3.post_mask_epoch_removal import (
+        PreparedRemovalShard,
+        build_qwen_epoch_config,
+        build_removal_campaign,
+        build_removal_epoch_runner,
+        removal_shard_paths,
+    )
+    from r2v_data_v2.v3.post_mask_epoch_resources import ResourceEpochManager
+    from tests.test_v3_post_mask_epoch_removal import (
+        _fake_process_manager,
+        _group_with,
+        _parts_root,
+        _pending_storage,
+    )
+
+    config = _config(tmp_path, monkeypatch, "run-outcome")
+    storage = _pending_storage(config, clip_uids=("clip-1",))
+    post_mask_root = tmp_path / "workspace" / "data" / "campaign"
+    entity_mask_root = _parts_root(tmp_path, (SHARD,))
+
+    def prepare(*args: Any, **kwargs: Any) -> Any:
+        return PreparedRemovalShard(
+            shard=kwargs["shard"],
+            paths=removal_shard_paths(
+                post_mask_root=kwargs["post_mask_root"],
+                entity_mask_root=kwargs["entity_mask_root"],
+                shard=kwargs["shard"],
+            ),
+            storage=storage,
+            clip_uids=("clip-1",),
+            ready=1,
+            excluded=0,
+            corrupt=0,
+        )
+
+    def factories(config: Any, runner: Any, **kwargs: Any) -> dict[str, Any]:
+        dispatch = kwargs["job_runner"]
+        return {
+            RESOURCE_BOOGU: lambda: (
+                _TrackedResource(RESOURCE_BOOGU, []),
+                _EmptyResultExecutor()
+                if empty_results
+                else _PassthroughExecutor(dispatch, _BooguWorker()),
+            ),
+            RESOURCE_QWEN: lambda: (
+                _TrackedResource(RESOURCE_QWEN, []),
+                _EmptyResultExecutor()
+                if empty_results
+                else _PassthroughExecutor(dispatch, qwen),
+            ),
+        }
+
+    monkeypatch.setattr(
+        "r2v_data_v2.v3.post_mask_epoch_removal.prepare_shard_storage", prepare
+    )
+    monkeypatch.setattr(
+        "r2v_data_v2.v3.post_mask_epoch_removal.build_removal_epoch_factories", factories
+    )
+    monkeypatch.setattr(
+        "r2v_data_v2.v3.post_mask_epoch_removal.ResourceEpochManager", ResourceEpochManager
+    )
+    runner_callable = build_removal_epoch_runner(
+        config,
+        post_mask_root=post_mask_root,
+        entity_mask_root=entity_mask_root,
+        process_manager=_fake_process_manager(),
+        temporary_root=tmp_path / "tmp",
+        allowed_server_root=tmp_path / "workspace" / "data",
+        qwen_epoch_config=build_qwen_epoch_config(config),
+    )
+    group = _group_with(
+        SHARD, campaign=build_removal_campaign(config, entity_mask_root=entity_mask_root)
+    )
+    events: list[dict[str, Any]] = []
+    outcome = runner_callable(
+        group,
+        GroupLedger(resource_epoch_root(post_mask_root) / group.group_id),
+        lambda event, **payload: events.append({"event":event, **payload}),
+    )
+    return outcome, events
+
+
+def test_production_wrapper_reports_removal_incomplete_with_unresolved_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Removal retryable: Pair never starts and unresolved must not read 0."""
+    outcome, events = _production_runner_outcome(
+        tmp_path, monkeypatch, qwen=_SharedQwenHandle(), empty_results=True
+    )
+    assert outcome["remove_completed"] is False
+    assert outcome["completed"] is False
+    assert outcome["reason"] == "background removal incomplete"
+    finished = [
+        event for event in events if event["event"] == "post_mask_removal_epoch_finished"
+    ]
+    assert finished
+    # Removal's own unresolved jobs are counted, not just Pair's two lists.
+    assert finished[-1]["unresolved"] > 0, finished
+    assert outcome["pair_primary_job_count"] == 0
+    assert outcome["pair_cross_job_count"] == 0
+
+
+def test_production_wrapper_keeps_pair_incomplete_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Removal complete + Pair unresolved keeps the composition's reason."""
+
+    class _FailingPairHandle(_SharedQwenHandle):
+        """Removal judge accepts; the first Pair decision is retryable."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.failed = False
+
+        def decide(self, **kwargs: Any) -> Any:
+            if not self.failed:
+                self.failed = True
+                raise RuntimeError("pair qwen unavailable")
+            return super().decide(**kwargs)
+
+    outcome, events = _production_runner_outcome(
+        tmp_path, monkeypatch, qwen=_FailingPairHandle()
+    )
+    assert outcome["remove_completed"] is True
+    if outcome["pair_primary_unresolved"]:
+        assert outcome["pair_completed"] is False
+        assert outcome["reason"] == "pair resource epoch incomplete", outcome["reason"]
+        assert outcome["completed"] is False
+        finished = [
+            event
+            for event in events
+            if event["event"] == "post_mask_removal_epoch_finished"
+        ]
+        assert finished[-1]["unresolved"] > 0
+    else:
+        pytest.skip("fixture produced no unresolved Pair work")
