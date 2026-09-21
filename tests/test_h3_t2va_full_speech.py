@@ -112,6 +112,35 @@ def test_asr_prefetch_overlaps_only_next_load_and_preserves_results(
     assert [worker.process(job, tmp_path) for job in asr_jobs] == results
 
 
+def test_asr_worker_hashes_each_source_audio_once(
+    speech, asr_jobs, tmp_path, monkeypatch
+):
+    original = frozen.sha256_file
+    calls = Counter()
+
+    def counted(path):
+        calls[str(path)] += 1
+        return original(path)
+
+    monkeypatch.setattr(frozen, "sha256_file", counted)
+    monkeypatch.setattr(
+        speech.asr,
+        "load_qwen3_asr_model_input",
+        lambda path, start, end, *, ffmpeg: (int(start), 16000),
+    )
+    worker = speech._ASRWorker(
+        SimpleNamespace(
+            _process=SimpleNamespace(poll=lambda: None),
+            transcribe=lambda **kwargs: (str(kwargs["waveform"]), None),
+        ),
+        "test-ffmpeg",
+    )
+    with worker.batch_jobs(asr_jobs):
+        [worker.process(job, tmp_path) for job in asr_jobs]
+    source = asr_jobs[0]["segment"]["source_audio_path"]
+    assert calls[source] == 1
+
+
 @pytest.mark.parametrize("failure", ["loader", "hash", "inference"])
 def test_asr_prefetch_failure_belongs_to_current_job(
     speech, asr_jobs, tmp_path, monkeypatch, failure
@@ -454,24 +483,39 @@ def test_invalid_asr_not_cacheable(speech, result):
 
 def test_model_configuration_changes_cache_identity(monkeypatch, tmp_path):
     speech = importlib.import_module("r2v_data_v2.h3.t2va_full_speech")
-    monkeypatch.setattr(speech, "fingerprint_local_model_path", lambda path: "a" * 64)
-    monkeypatch.setenv("DIARIZEN_MODEL_PATH", str(tmp_path))
+    speech._diar_configuration_cached.cache_clear()
+    speech._asr_configuration_cached.cache_clear()
+    calls = Counter()
+
+    def fingerprint(path):
+        calls[str(path)] += 1
+        return ("a" if calls[str(path)] == 1 else "b") * 64
+
+    monkeypatch.setattr(speech, "fingerprint_local_model_path", fingerprint)
+    monkeypatch.setenv("DIARIZEN_MODEL_PATH", str(tmp_path / "diar"))
     monkeypatch.setenv("DIARIZEN_DEVICE", "cuda:5")
-    monkeypatch.setenv("QWEN3_ASR_MODEL_PATH", str(tmp_path))
+    monkeypatch.setenv("QWEN3_ASR_MODEL_PATH", str(tmp_path / "asr"))
     monkeypatch.setenv("QWEN3_ASR_DEVICE", "cuda:6")
     monkeypatch.setenv("QWEN3_ASR_DTYPE", "bfloat16")
     before = dict(os.environ)
+
     dc = speech._diar_configuration()
     ac = speech._asr_configuration()
     assert dc == speech._diar_configuration()
     assert ac == speech._asr_configuration()
+    assert calls[str(tmp_path / "diar")] == 1
+    assert calls[str(tmp_path / "asr")] == 1
     assert ac["configuration"]["device"] == "cuda:0"
     assert dc["environment"]["DIARIZEN_DEVICE"] == "cuda:0"
     assert dict(os.environ) == before
+
     monkeypatch.setenv("QWEN3_ASR_DTYPE", "float32")
     assert ac != speech._asr_configuration()
-    monkeypatch.setattr(speech, "fingerprint_local_model_path", lambda path: "b" * 64)
+    assert calls[str(tmp_path / "asr")] == 2
+
+    monkeypatch.setenv("DIARIZEN_MODEL_IDENTIFIER", "changed-model")
     assert dc != speech._diar_configuration()
+    assert calls[str(tmp_path / "diar")] == 2
 
 
 def test_startup_failure_is_fatal(speech, monkeypatch):
