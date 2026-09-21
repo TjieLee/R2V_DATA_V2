@@ -1397,8 +1397,44 @@ class _CompositionQwenHandle:
         self.completion_reviews = 0
         self.pair_decisions = 0
         self.integrity_reviews = 0
+        self.discovery_calls = 0
+        self.attribute_reviews = 0
+
+    def discover(self, **kwargs: Any) -> Any:
+        """The Subject Attributes discovery surface: one accepted accessory."""
+        from r2v_data_v2.v3.subject_attributes import (
+            DiscoveredSubjectAttribute,
+            SubjectAttributeDiscovery,
+        )
+
+        owner = kwargs["owner"]
+        self.discovery_calls += 1
+        return SubjectAttributeDiscovery(
+            owner_entity_id=str(owner.entity_id),
+            owner_is_human=True,
+            attributes=[
+                DiscoveredSubjectAttribute(
+                    attribute_type="accessory",
+                    phrase="a leather strap",
+                    grounding_prompt="leather strap across the chest",
+                )
+            ],
+        )
 
     def review(self, **kwargs: Any) -> Any:
+        if "candidates" in kwargs:
+            from r2v_data_v2.v3.subject_attributes import (
+                SubjectAttributeReviewBatch,
+            )
+
+            self.attribute_reviews += 1
+            return SubjectAttributeReviewBatch(
+                owner_entity_id=str(kwargs["owner"].entity_id),
+                reviews=[
+                    _attribute_review(candidate.attribute_id)
+                    for candidate in kwargs["candidates"]
+                ],
+            )
         if "final_reference" in kwargs:
             from r2v_data_v2.v3.reference_integrity import (
                 ReferenceIntegrityReviewAttempt,
@@ -1437,11 +1473,99 @@ class _CompositionQwenHandle:
         )
 
 
-class _CompositionSamHandle:
-    """The SAM epoch resource handle: a segmenter backend fake."""
+def _attribute_review(attribute_id: str) -> Any:
+    """An accepted raw attribute review: the record must end up accepted."""
+    from r2v_data_v2.v3.subject_attributes import SubjectAttributeReview
 
-    def __init__(self) -> None:
+    return SubjectAttributeReview.model_validate(
+        {
+            "attribute_id": attribute_id,
+            "matches_attribute": True,
+            "owner_binding_correct": True,
+            "recognizable": True,
+            "characteristic_appearance_visible": True,
+            "usable_as_attribute_condition": True,
+            "sufficient_source_evidence": True,
+            "structure_complete": True,
+            "completion_recommended": False,
+            "reason": "clean raw attribute crop",
+        }
+    )
+
+
+class _CompositionSamHandle:
+    """The SAM epoch resource handle: a segmenter backend fake.
+
+    ``segment_frame`` answers the Subject Attributes probes with a compact block
+    strictly inside the owner mask of that frame, which is what makes the legacy
+    ownership geometry accept the candidate and the record land as accepted.
+    """
+
+    def __init__(self, storage: Any = None, clip_uid: str = "clip-1") -> None:
         self.calls = 0
+        self.attribute_calls = 0
+        self._storage = storage
+        self._clip_uid = clip_uid
+
+    def segment_frame(self, **kwargs: Any) -> Any:
+        import numpy as np
+        from PIL import Image
+
+
+        self.attribute_calls += 1
+        with Image.open(kwargs["frame_path"]) as opened:
+            width, height = opened.size
+        mask = np.zeros((height, width), dtype=bool)
+        if self._storage is not None:
+            owner = self._owner_mask(int(kwargs["frame_slot"]))
+            if owner is not None:
+                rows, columns = np.nonzero(owner)
+                # Centre the probe block on the owner's own pixels rather than
+                # its bounding box, so a sparse or offset mask still yields a
+                # non-empty attribute mask that ownership geometry can accept.
+                centre_row = int(np.median(rows))
+                centre_column = int(np.median(columns))
+                block = np.zeros_like(owner)
+                block[
+                    max(0, centre_row - 6) : centre_row + 6,
+                    max(0, centre_column - 8) : centre_column + 8,
+                ] = True
+                usable = np.logical_and(block, owner)
+                if int(usable.sum()) >= 16:
+                    return [usable]
+                # Any blob thinner than that still has an interior: take the
+                # owner mask itself minus its border so the fixture always has
+                # usable evidence.
+                eroded = np.logical_and(
+                    owner,
+                    np.logical_and(
+                        np.logical_and(
+                            np.roll(owner, 1, axis=0), np.roll(owner, -1, axis=0)
+                        ),
+                        np.logical_and(
+                            np.roll(owner, 1, axis=1), np.roll(owner, -1, axis=1)
+                        ),
+                    ),
+                )
+                if eroded.any():
+                    return [eroded]
+                return [owner]
+        mask[height // 3 : height // 3 + height // 8,
+             width // 3 : width // 3 + width // 8] = True
+        return [mask]
+
+    def _owner_mask(self, slot: int) -> Any:
+        from r2v_data_v2.v3.subject_attributes import _decode_owner_mask
+
+        try:
+            masks = self._storage.read_masks(self._clip_uid)
+        except Exception:  # noqa: BLE001 - the probe only needs a best effort
+            return None
+        for entity_id in ("e1", "e2"):
+            decoded = _decode_owner_mask(masks, entity_id=entity_id, slot=slot)
+            if decoded is not None:
+                return decoded
+        return None
 
     def track(self, **kwargs: Any) -> Any:
         import numpy as np
@@ -2364,6 +2488,8 @@ def _production_reference_integrity_outcome(
     monkeypatch: pytest.MonkeyPatch,
     *,
     qwen: Any = None,
+    sam: Any = None,
+    attribute_ready: bool = False,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], Any, Any, Any]:
     """Run the real ``build_removal_epoch_runner`` with Reference Integrity on.
 
@@ -2391,10 +2517,25 @@ def _production_reference_integrity_outcome(
 
     _with_instruction_template(monkeypatch)
     config = _enable_reference_integrity(_config(tmp_path, monkeypatch, "run-ri"))
+    if attribute_ready:
+        # The fixture clip is small, so the legacy candidate geometry floors must
+        # be relaxed or the owner has no usable candidate evidence at all and
+        # Subject Attributes would legitimately classify the clip as no_work.
+        config = replace(
+            config,
+            reference_edit=replace(
+                config.reference_edit,
+                min_source_content_area_pixels=1,
+                min_source_content_long_side_pixels=1,
+            ),
+        )
+        config.validate()
     storage = _pending_storage(config, clip_uids=("clip-1",))
     handle = qwen if qwen is not None else _CompositionQwenHandle()
     boogu = _CompositionBooguHandle()
-    sam = _CompositionSamHandle()
+    sam = sam if sam is not None else _CompositionSamHandle(
+        storage if attribute_ready else None
+    )
     post_mask_root = tmp_path / "workspace" / "data" / "campaign"
     entity_mask_root = _parts_root(tmp_path, (SHARD,))
 
@@ -2571,6 +2712,66 @@ def test_shared_qwen_identities_include_reference_integrity_judge(
 # ---------------------------------------------------------------------------
 # Subject Attributes publication: handoff, receipts, per-shard export, seal
 # ---------------------------------------------------------------------------
+
+
+def _enlarge_owner_mask(storage: Any, clip_uid: str = "clip-1") -> None:
+    """Give the fixture's subject a mask big enough for attribute evidence.
+
+    The shared removal fixture builds a deliberately tiny subject mask, and the
+    legacy ownership geometry requires an attribute mask of at least sixteen
+    pixels inside its owner, so no attribute mask could ever pass. This rewrites
+    the subject's present frame with a real central block, which is fixture
+    setup only: no production policy is relaxed to accommodate it.
+
+    Known limitation, reported as follow-up: the Removal stage runs after this
+    and republishes the masks artifact from its own SAM result, so the enlarged
+    block does not survive into Subject Attributes yet. Landing the accepted
+    attribute fixture therefore needs either a larger shared fixture mask or an
+    enlargement applied after Removal, not a production change.
+    """
+    import numpy as np
+
+    from r2v_data_v2.reconciliation import write_json_atomic
+
+    path = storage.clip_dir(clip_uid) / "masks.rle.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    for track in payload["entities"].values():
+        if track.get("reference_type") != "subject":
+            continue
+        frame = next(
+            (item for item in track["frames"] if item["present"]),
+            track["frames"][0],
+        )
+        size = frame["rle"]["size"]
+        height, width = int(size[0]), int(size[1])
+        y1, y2 = height // 5, height - height // 5
+        x1, x2 = width // 5, width - width // 5
+        run = x2 - x1
+        counts = [y1 * width + x1]
+        for _ in range(y2 - y1):
+            counts.extend((run, width - run))
+        mask = np.zeros((height, width), dtype=bool)
+        mask[y1:y2, x1:x2] = True
+        rows, columns = np.nonzero(mask)
+        frame.update(
+            {
+                "present": True,
+                "track_valid": True,
+                "confidence": 0.9,
+                "backend_confidences": [0.9],
+                "backend_object_ids": ["1"],
+                "area_pixels": int(mask.sum()),
+                "area_ratio": float(mask.sum()) / float(height * width),
+                "bbox_xyxy": [
+                    int(columns.min()),
+                    int(rows.min()),
+                    int(columns.max()) + 1,
+                    int(rows.max()) + 1,
+                ],
+                "rle": {"size": [height, width], "counts": counts},
+            }
+        )
+    write_json_atomic(path, payload)
 
 
 def _install_stub_subject_attributes(

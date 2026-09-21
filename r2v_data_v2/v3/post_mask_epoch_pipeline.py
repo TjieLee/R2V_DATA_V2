@@ -489,14 +489,23 @@ def publish_subject_attribute_receipts(
 ) -> None:
     """Publish the final attribute receipts of every eligible clip, or fail.
 
-    Missing is an atomic write, an exact existing receipt is a no-op and any
-    drift fails closed: a terminal receipt is never silently overwritten.
+    Phase A inspects every expected receipt with zero writes: an exact existing
+    receipt passes, a missing one is queued and a malformed or drifted one fails
+    immediately. Phase B then writes only the queued ones, so a drift on one clip
+    can never leave another clip with a published receipt.
     """
-    from r2v_data_v2.v3.post_mask_runtime import _publish_attribute_receipt
+    from r2v_data_v2.v3.post_mask_runtime import (
+        _attribute_receipt_state,
+        _write_attribute_receipt,
+    )
 
     expected = _expected_subject_attribute_receipts(storages, eligible)
+    pending: list[tuple[str, str]] = []
     for (shard, uid), payload in expected.items():
-        _publish_attribute_receipt(storages[shard], uid, payload)
+        if not _attribute_receipt_state(storages[shard], uid, payload):
+            pending.append((shard, uid))
+    for shard, uid in pending:
+        _write_attribute_receipt(storages[shard], uid, expected[(shard, uid)])
 
 
 def verify_subject_attribute_receipts(

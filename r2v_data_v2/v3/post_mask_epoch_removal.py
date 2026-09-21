@@ -1566,26 +1566,35 @@ def _shard_state_root(paths: Any) -> Path:
     return Path(paths.state_root)
 
 
-def expected_shard_completion(storage: Any, paths: Any, clip_uids: Sequence[str]) -> dict[str, Any]:
+def expected_shard_completion(
+    selected: Any, paths: Any, clip_uids: Sequence[str]
+) -> dict[str, Any]:
     """The exact sealed completion marker of one shard.
 
-    Both sides of the publication are frozen: the export-side tree digest and
-    the source-side final attribute receipt digest.
+    ``selected`` must be the same filtered shard view the exporter used. Both
+    sides of the publication are frozen: the export-side tree digest and the
+    source-side final attribute receipt and aggregate sidecar digests. A run root
+    can legitimately hold clips that hydration excluded, so the raw storage must
+    never take part in the final export identity.
     """
     from r2v_data_v2.v3.post_mask_runtime import (
         _export_identity,
         _export_tree_sha256,
         _subject_attribute_receipts_sha256,
+        _subject_attribute_sidecars_sha256,
         _validate_publication,
     )
 
-    dataset = _validate_publication(storage, paths)
+    dataset = _validate_publication(selected, paths)
     return {
-        "identity": _export_identity(storage, paths),
+        "identity": _export_identity(selected, paths),
         "sample_count": int(dataset.sample_count),
         "export_tree_sha256": _export_tree_sha256(paths),
         "subject_attribute_receipts_sha256": _subject_attribute_receipts_sha256(
-            storage, clip_uids
+            selected, clip_uids
+        ),
+        "subject_attribute_sidecars_sha256": _subject_attribute_sidecars_sha256(
+            selected
         ),
     }
 
@@ -1618,7 +1627,15 @@ def export_shard(
             raise RemovalEpochError(
                 f"sealed export marker is unreadable: {marker}"
             ) from exc
-        expected = expected_shard_completion(storage, paths, clip_uids)
+        # The filtered view is the only inventory the sealed marker may be
+        # compared against, exactly like the export that produced it.
+        try:
+            expected = expected_shard_completion(selected, paths, clip_uids)
+        except (OSError, ValueError) as exc:
+            raise RemovalEpochError(
+                f"sealed export publication is unverifiable: {paths.export_root}: "
+                f"{exc}"
+            ) from exc
         if sealed != expected:
             raise RemovalEpochError(
                 f"sealed export publication drifted: {paths.export_root}"
@@ -1638,7 +1655,7 @@ def export_shard(
     DatasetExporter(storage.config, selected).export(
         overwrite=Path(paths.export_root).exists()
     )
-    expected = expected_shard_completion(storage, paths, clip_uids)
+    expected = expected_shard_completion(selected, paths, clip_uids)
     atomic_write_json(marker, expected)
     return {"sample_count": expected["sample_count"], "rebuilt": True}
 
