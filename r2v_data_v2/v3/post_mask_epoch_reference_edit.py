@@ -1723,17 +1723,25 @@ class ReferenceEditEpochRunner:
     def _maybe_finalize_attempt(self, job: ModelJob) -> Sequence[ModelJob]:
         """parallel_independent: finalize once BOTH reviews are terminal.
 
-        The durable attempt-outcome marker is the sole "already finalized"
-        authority. It is written at the END of ``_complete_attempt``, so a
-        crash between the review receipts and the CPU finalize simply replays
-        the finalize on restart with zero model calls.
+        The attempt-outcome marker is written BEFORE ``_after_attempt`` runs,
+        so the marker alone is NOT proof that the attempt's continuation
+        completed: a crash in that window leaves the marker on disk with no
+        entity outcome and no candidate2 unlocked. The continuation boundary is
+        the entity outcome, so only a marker AND an entity outcome may short
+        circuit; otherwise the review receipts are re-checked and the whole
+        ``_complete_attempt`` replays (create-once marker, deterministic
+        unlock, zero model calls).
         """
         generation_job_id = str(dict(job.dependency_digests)["generation"])
         target = dict(job.target)
-        if self._attempt_outcome_path(
-            job.canonical_shard, job.clip_uid, str(target["entity_id"]),
-            int(target["attempt_index"]),
-        ).is_file():
+        entity_id = str(target["entity_id"])
+        attempt_index = int(target["attempt_index"])
+        marker = self._validated_attempt_outcome(
+            job.canonical_shard, job.clip_uid, entity_id, attempt_index
+        )
+        if marker is not None and self._entity_outcome(
+            job.canonical_shard, job.clip_uid, entity_id
+        ) is not None:
             return ()
         qwen_job = self._review_job_for(
             generation_job_id, REFERENCE_EDIT_QWEN_REVIEW_JOB

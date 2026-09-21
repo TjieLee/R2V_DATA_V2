@@ -1151,6 +1151,120 @@ def test_parallel_independent_finalize_crash_replays_cpu_only(
     assert clip.reference_edit is not None
 
 
+def test_parallel_independent_restart_after_attempt_marker_replays_continuation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Crash after the attempt marker but before _after_attempt completes.
+
+    The marker is written BEFORE ``_after_attempt``, so a restart must not
+    treat it as "the continuation already ran": with no entity outcome and no
+    candidate2 unlocked yet, the attempt has to be re-finalized (CPU only) so
+    candidate2 is re-unlocked and the entity chain can finish.
+    """
+    from r2v_data_v2.v3.reference_edit import reference_edit_clips
+
+    # Legacy reference for the same parallel candidate1-reject/candidate2-accept
+    # chain, so this single test also locks full legacy equality.
+    legacy_config = _reference_edit_config(
+        tmp_path, monkeypatch, "run-legacy", same_parent_fallback_enabled=True
+    )
+    legacy_storage = _with_alternate(
+        legacy_config, monkeypatch, run_name="run-legacy"
+    )
+    legacy = reference_edit_clips(
+        legacy_config,
+        legacy_storage,
+        backend=_FakeBoogu(),
+        judge=_FakeQwen(reject_candidate1=True),
+        sam_reviewer=_LegacySamReviewer(),
+        review_execution="parallel_independent",
+    )
+
+    config, storage, runner, scheduler, routing = _build(
+        tmp_path, monkeypatch, run_name="run-epoch", with_alternate=True,
+        review_execution="parallel_independent",
+    )
+    routing.qwen.reject_candidate1 = True
+
+    # Crash exactly after _write_attempt_outcome: the first _after_attempt call
+    # raises, so the marker is durable while the continuation is not.
+    real_after_attempt = runner._after_attempt
+    crashes = 0
+
+    def crashing_after_attempt(*args: Any, **kwargs: Any) -> Any:
+        nonlocal crashes
+        crashes += 1
+        if crashes == 1:
+            raise RuntimeError("crash after the attempt outcome marker")
+        return real_after_attempt(*args, **kwargs)
+
+    runner._after_attempt = crashing_after_attempt  # type: ignore[method-assign]
+    scheduler.run(runner.seed_jobs())
+
+    # The exact crash window: marker durable, continuation not.
+    first_marker = runner._validated_attempt_outcome(SHARD, "clip-1", "e1", 1)
+    assert first_marker is not None
+    assert first_marker["accepted"] is False
+    assert runner._entity_outcome(SHARD, "clip-1", "e1") is None
+    assert not runner._attempt_outcome_path(SHARD, "clip-1", "e1", 2).is_file()
+    # Candidate1 really paid one Boogu, one Qwen and one SAM call.
+    assert (routing.boogu.calls, routing.qwen.calls, routing.sam.calls) == (1, 1, 1)
+
+    # Restart on the same durable state with the real continuation.
+    runner._after_attempt = real_after_attempt  # type: ignore[method-assign]
+    fresh = ReferenceEditEpochRunner(
+        config,
+        {SHARD: storage},
+        GroupLedger(tmp_path / "ledger"),
+        eligible_clip_uids_by_shard={SHARD: ["clip-1", "alt"]},
+        review_execution="parallel_independent",
+    )
+    fresh_routing = _RoutingExecutor(fresh)
+    fresh_scheduler = ResourceEpochScheduler(
+        ledger=fresh.ledger,
+        finalize=fresh.finalize,
+        executors={
+            resource: _FullExecutor(fresh, fresh_routing).executor_for(resource)
+            for resource in (RESOURCE_BOOGU, RESOURCE_QWEN, RESOURCE_SAM)
+        },
+    )
+    _drain(fresh, fresh_scheduler)
+
+    # Only candidate2 paid: attempt1's receipts were reused, its continuation
+    # was replayed by CPU, and candidate2 was re-unlocked.
+    assert (fresh_routing.boogu.calls, fresh_routing.qwen.calls, fresh_routing.sam.calls) == (
+        1,
+        1,
+        1,
+    )
+
+    first_marker = fresh._validated_attempt_outcome(SHARD, "clip-1", "e1", 1)
+    second_marker = fresh._validated_attempt_outcome(SHARD, "clip-1", "e1", 2)
+    assert first_marker is not None and first_marker["accepted"] is False
+    assert second_marker is not None and second_marker["accepted"] is True
+    entity_outcome = fresh._entity_outcome(SHARD, "clip-1", "e1")
+    assert entity_outcome is not None
+    assert entity_outcome["outcome"] == "accepted"
+    assert entity_outcome["attempt_index"] == 2
+    epoch_clip = storage.read_clip("clip-1")
+    assert epoch_clip.reference_edit is not None
+    assert epoch_clip.reference_edit.status == "ready"
+
+    # Full legacy equality for the same chain.
+    stats = fresh.reconcile_stats(SHARD)
+    assert stats.to_dict() == legacy.to_dict()
+    legacy_clip = legacy_storage.read_clip("clip-1")
+    assert epoch_clip.reference_edit.model_dump(mode="json") == (
+        legacy_clip.reference_edit.model_dump(mode="json")
+    )
+    assert epoch_clip.references.model_dump(mode="json") == (
+        legacy_clip.references.model_dump(mode="json")
+    )
+    assert epoch_clip.pairing.model_dump(mode="json") == (
+        legacy_clip.pairing.model_dump(mode="json")
+    )
+
+
 class _FullExecutor:
     """Runs every job through the routing handles."""
 
