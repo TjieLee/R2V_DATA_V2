@@ -339,6 +339,38 @@ assigned shard directories without a top-level COMPLETE marker are prioritized;
 absent directories are fresh; COMPLETE shards are skipped. No stage JSON, receipt,
 media file, or artifact hash is read for scheduling.
 
+### Canonical prefetch resume policy
+
+Canonical lookahead is CPU/shared-storage work and can leave all GPUs idle while
+the parent waits for the current shard's preparation. Resume must therefore avoid
+re-reading immutable media and must never wait indefinitely on another
+invocation.
+
+For an existing shard, `source/selection.json` is the durable source-selection
+authority. If it matches the current shard manifest and configured roots,
+canonical prefetch reuses it directly instead of hashing every target video
+again. Existing canonical clip receipts are also reused without re-hashing each
+cached full-audio file. For a fresh shard, the target-video SHA is established
+once when the selection is first created; the per-clip Audio bootstrap does not
+hash that same video a second time.
+
+The prefetch child uses a nonblocking `invocation.lock`. If another allocation
+currently owns the shard, that shard is skipped for this invocation and the
+lookahead advances to the next assigned shard. Do not change this back to a
+blocking invocation lock: a blocking lock can make the parent wait for hours
+with all GPUs at 0% while another allocation owns the shard. The narrower
+`canonical.lock` may still block briefly while a legitimate canonical writer
+finishes.
+
+When diagnosing GPU-idle time before SAM, check:
+
+    shard=<id> canonical_prefetch_started
+    shard=<id> canonical_prefetch_completed elapsed_seconds=...
+
+If `canonical_prefetch_started` appears without completion, inspect
+`shards/<shard>/logs/canonical-prefetch.log` and whether another allocation is
+still active on the same production root.
+
 ### Downstream hash policy and GPU-idle diagnosis
 
 MiMo is lazy, so CPU/shared-storage work before the first real downstream request
