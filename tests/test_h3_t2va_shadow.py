@@ -421,6 +421,31 @@ def build(finalized, tmp_path, **kwargs):
     )
 
 
+def test_preselected_inventory_skips_media_reselection_and_audio_rehash(
+    finalized, tmp_path, monkeypatch
+):
+    selection = select_t2va_shots(tmp_path / "shots_f03_motion.jsonl")
+
+    monkeypatch.setattr(
+        t2va,
+        "select_t2va_shots",
+        lambda *args, **kwargs: pytest.fail("preselected inventory reselected shots"),
+    )
+    monkeypatch.setattr(
+        t2va,
+        "check_audio_files",
+        lambda *args, **kwargs: pytest.fail("prevalidated audio was rehashed"),
+    )
+
+    inventory = build(
+        finalized,
+        tmp_path,
+        preselected=selection,
+        verify_audio_files=False,
+    )
+    assert inventory.clip_uids == [shot.clip_uid for shot in selection.shots]
+
+
 def test_finalized_source_projection_and_publication(finalized, tmp_path):
     inventory = build(finalized, tmp_path)
     assert inventory.clip_uids == shot_ids(tmp_path)
