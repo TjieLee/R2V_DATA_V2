@@ -70,6 +70,9 @@ def make_cases(tmp_path, count, clips):
 def config_for(cases, clips, *, budget=2):
     return {"cases":cases,"clips_root":str(clips),"seed":42,"pair_id":0,"identity":"identity",
             "prompt_writer_model":"/mnt/workspace/public/pretrained/Qwen/Qwen3.5-27B",
+            "prompt_writer_backend":"local",
+            "prompt_writer_base_url":"http://127.0.0.1:8000/v1",
+            "prompt_writer_served_model":"Qwen/Qwen3.8-Flash-Next",
             "limits":{case["case_id"]:{"prepare":budget,"generate":2} for case in cases}}
 
 
@@ -193,7 +196,7 @@ def test_prepared_provenance_and_artifacts(tmp_path, monkeypatch):
     directory = tmp_path/"case0"/"preparation"
     prepared = read_json(directory/"prepared.json")
     assert prepared["prompt_writer_model"] == "/mnt/workspace/public/pretrained/Qwen/Qwen3.5-27B"
-    assert prepared["prompt_writer_contract"] == "qwen35_two_call_full_video_h3_prompt_v10"
+    assert prepared["prompt_writer_contract"] == "qwen38_sglang_or_qwen35_local_two_call_h3_prompt_v11"
     assert prepared["prompt_writer_video_fps"] == 4.0
     assert prepared["prompt_writer_replacement_max_new_tokens"] == 512
     assert prepared["prompt_writer_prompt_max_new_tokens"] == 4096
@@ -213,7 +216,7 @@ def test_frame0_never_instantiates_the_27b(tmp_path, monkeypatch):
     from r2v_data_v2.person_replacement.h3_pair_executor import VARIANTS
 
     assert VARIANTS["frame0"] == "frame0_two_person_pdd_fsdp2_pair_v18"
-    assert VARIANTS["text"] == "text_two_person_pdd_fsdp2_pair_v32"
+    assert VARIANTS["text"] == "text_two_person_pdd_fsdp2_pair_v33"
 
     clips = tmp_path/"clips"
     clips.mkdir()

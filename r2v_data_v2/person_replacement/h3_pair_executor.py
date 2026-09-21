@@ -30,9 +30,10 @@ from .pipeline import validate_output_root
 TOOLS = Path(__file__).resolve().parents[2]/"tools/person_replacement"
 
 # text V19 dropped the 8B writer, so frame0 keeps its own v18 contract.
-VARIANTS = {"text":"text_two_person_pdd_fsdp2_pair_v32", "frame0":"frame0_two_person_pdd_fsdp2_pair_v18"}
+VARIANTS = {"text":"text_two_person_pdd_fsdp2_pair_v33", "frame0":"frame0_two_person_pdd_fsdp2_pair_v18"}
 BASE_RESOURCE_KEYS = ("h3_python","h3_model_root","pdd_code_root","pdd_lora")
 TEXT_RESOURCE_KEYS = ("prompt_writer_python","prompt_writer_model")
+TEXT_SETTING_KEYS = ("prompt_writer_backend","prompt_writer_base_url","prompt_writer_served_model")
 FRAME0_RESOURCE_KEYS = ("qwen_model","boogu_python","boogu_code_root","boogu_model_root")
 RESOURCE_KEYS = (*BASE_RESOURCE_KEYS,*TEXT_RESOURCE_KEYS)
 
@@ -62,6 +63,12 @@ def make_config(args):
         if value is None:
             raise ValueError(f"{key} is required for the {variant} variant")
         values[key] = str(Path(value).expanduser().absolute())
+    if variant == "text":
+        for key in TEXT_SETTING_KEYS:
+            value = getattr(args,key,None)
+            if value is None or not str(value).strip():
+                raise ValueError(f"{key} is required for the text variant")
+            values[key] = str(value)
     identity = {"input":str(source),"clips_root":str(clips),"pair_id":args.pair_id,
                 "pair_size":args.pair_size,"seed":args.seed,"variant":variant,"resources":values,
                 "rows":[(case["source_index"],case["row_sha256"]) for case in cases],

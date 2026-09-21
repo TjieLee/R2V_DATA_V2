@@ -133,6 +133,41 @@ def writer(tmp_path, monkeypatch, **kwargs):
     return instance
 
 
+def test_qwen38_sglang_writer_uses_video_url_and_non_thinking_contract(tmp_path):
+    from r2v_data_v2.person_replacement.qwen38_h3_prompt_writer import (
+        OpenAIQwen38H3PromptWriter,
+    )
+
+    calls = []
+    class Completions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            content = CALL1_RESPONSE if len(calls) == 1 else LEGAL_PROMPT
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(
+                    content=content, reasoning_content=None))]
+            )
+    client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+    writer = OpenAIQwen38H3PromptWriter(
+        "/mnt/workspace/guocong/model/Qwen/Qwen3.8-Flash-Next",
+        client=client,
+    )
+    video = tmp_path/"source.mp4"
+    video.touch()
+    result = writer.invent_replacements(video,"generic","doctor",num_frames=40)
+    assert result[0].startswith("a younger woman")
+    writer.write_h3_prompt(video,*result,num_frames=40)
+    assert calls[0]["model"] == "Qwen/Qwen3.8-Flash-Next"
+    media = calls[0]["messages"][0]["content"][0]
+    assert media["type"] == "video_url" and media["video_url"]["url"] == video.resolve().as_uri()
+    assert calls[0]["temperature"] == 0.7 and calls[0]["top_p"] == 0.8
+    assert calls[0]["extra_body"]["top_k"] == 20
+    assert calls[0]["presence_penalty"] == 1.5
+    assert calls[0]["extra_body"]["chat_template_kwargs"]["enable_thinking"] is False
+    assert calls[0]["max_tokens"] == 512 and calls[1]["max_tokens"] == 4096
+    assert "mm_processor_kwargs" not in calls[0]["extra_body"]
+
+
 def test_lazy_single_load_uses_local_files_only(tmp_path, monkeypatch):
     from r2v_data_v2.person_replacement.qwen38_h3_prompt_writer import (
         LocalQwen38H3PromptWriter,

@@ -15,6 +15,16 @@ VIDEO_FPS = 4.0
 REPLACEMENT_MAX_NEW_TOKENS = 512
 PROMPT_MAX_NEW_TOKENS = 4096
 
+QWEN38_SGLANG_BASE_URL = "http://127.0.0.1:8000/v1"
+QWEN38_SGLANG_SERVED_MODEL = "Qwen/Qwen3.8-Flash-Next"
+QWEN38_SGLANG_CHECKPOINT = "/mnt/workspace/guocong/model/Qwen/Qwen3.8-Flash-Next"
+QWEN38_TEMPERATURE = 0.7
+QWEN38_TOP_P = 0.8
+QWEN38_TOP_K = 20
+QWEN38_MIN_P = 0.0
+QWEN38_PRESENCE_PENALTY = 1.5
+QWEN38_REPETITION_PENALTY = 1.0
+
 DETAIL_PRESERVATION_SENTENCE = (
     "Only replace <Subject 1> and <Subject 2>'s identities and appearances; "
     "reproduce the source performers' motion and performance from <Video 1> exactly: "
@@ -800,8 +810,125 @@ def validate_h3_prompt_writer_output(text):
     return text.strip()
 
 
+class OpenAIQwen38H3PromptWriter:
+    """Qwen3.8 SGLang client using the repository's validated non-thinking contract."""
+
+    uses_local_frame_sampling = False
+    thinking_disabled = True
+
+    def __init__(
+        self,
+        checkpoint_id=QWEN38_SGLANG_CHECKPOINT,
+        *,
+        base_url=QWEN38_SGLANG_BASE_URL,
+        served_model=QWEN38_SGLANG_SERVED_MODEL,
+        api_key="EMPTY",
+        timeout_seconds=900.0,
+        replacement_max_new_tokens=REPLACEMENT_MAX_NEW_TOKENS,
+        prompt_max_new_tokens=PROMPT_MAX_NEW_TOKENS,
+        client=None,
+    ):
+        self.model_path = Path(checkpoint_id)
+        self.checkpoint_id = str(checkpoint_id)
+        self.base_url = str(base_url)
+        self.served_model = str(served_model)
+        self.api_key = str(api_key)
+        self.timeout_seconds = float(timeout_seconds)
+        self.replacement_max_new_tokens = replacement_max_new_tokens
+        self.prompt_max_new_tokens = prompt_max_new_tokens
+        self.client = client
+
+    def _load(self):
+        if self.client is not None:
+            return
+        try:
+            from openai import OpenAI
+        except ImportError as exc:
+            raise RuntimeError(
+                "Qwen3.8 SGLang writer needs the OpenAI client in the isolated "
+                "prompt-writer environment"
+            ) from exc
+        self.client = OpenAI(
+            api_key=self.api_key,
+            base_url=self.base_url,
+            timeout=self.timeout_seconds,
+        )
+
+    @staticmethod
+    def _video(video):
+        path = Path(video).expanduser().resolve(strict=True)
+        return {"type":"video_url","video_url":{"url":path.as_uri()}}
+
+    def _generate(self, messages, max_new_tokens, *, num_frames=None):
+        # SGLang/Qwen3.8 uses its validated default video processing. The
+        # repository's validated server path intentionally sends no former
+        # vLLM-only fps/mm_processor override.
+        del num_frames
+        self._load()
+        completion = self.client.chat.completions.create(
+            model=self.served_model,
+            messages=messages,
+            temperature=QWEN38_TEMPERATURE,
+            top_p=QWEN38_TOP_P,
+            presence_penalty=QWEN38_PRESENCE_PENALTY,
+            max_tokens=max_new_tokens,
+            stream=False,
+            modalities=["text"],
+            extra_body={
+                "top_k":QWEN38_TOP_K,
+                "min_p":QWEN38_MIN_P,
+                "repetition_penalty":QWEN38_REPETITION_PENALTY,
+                "chat_template_kwargs":{"enable_thinking":False},
+            },
+        )
+        choices = getattr(completion,"choices",None)
+        if not choices:
+            raise ValueError("Qwen3.8 SGLang returned no choices")
+        message = choices[0].message
+        reasoning = getattr(message,"reasoning_content",None)
+        if reasoning not in (None,""):
+            raise ValueError("Qwen3.8 SGLang emitted reasoning despite enable_thinking=false")
+        text = getattr(message,"content",None)
+        if not isinstance(text,str) or not text.strip():
+            raise ValueError("Qwen3.8 SGLang returned an empty completion")
+        return text.strip()
+
+    def invent_replacements(self, video, cue1, cue2, *, num_frames):
+        text = self._generate([
+            {"role":"user","content":[
+                self._video(video),
+                {"type":"text","text":REPLACEMENT_PLANNING_PROMPT.format(cue1=cue1,cue2=cue2)},
+            ]},
+        ], self.replacement_max_new_tokens, num_frames=num_frames)
+        return _labelled_fields(text,CALL1_LABELS)
+
+    def write_h3_prompt(self, video, source_performer_1, source_performer_2,
+                        replacement_subject_1, replacement_subject_2, *, num_frames):
+        raw = self._generate([
+            {"role":"system","content":H3_PROMPT_SYSTEM_PROMPT},
+            {"role":"user","content":[
+                self._video(video),
+                {"type":"text","text":H3_PROMPT_USER_TEMPLATE.format(
+                    source_performer_1=source_performer_1,
+                    replacement_subject_1=replacement_subject_1,
+                    source_performer_2=source_performer_2,
+                    replacement_subject_2=replacement_subject_2)},
+            ]},
+        ], self.prompt_max_new_tokens, num_frames=num_frames)
+        prompt = enforce_detail_preservation_preface(
+            raw,source_performer_1,source_performer_2)
+        return enforce_source_binding_sections(
+            prompt,source_performer_1,source_performer_2,
+            replacement_subject_1,replacement_subject_2)
+
+    def close(self):
+        self.client = None
+
+
 class LocalQwen38H3PromptWriter:
-    """One resident Qwen3.8-27B instance for a whole worker partition."""
+    """One resident local Qwen3.5-27B instance for a whole worker partition."""
+
+    uses_local_frame_sampling = True
 
     def __init__(self, model_path, *, video_fps=VIDEO_FPS,
                  replacement_max_new_tokens=REPLACEMENT_MAX_NEW_TOKENS,

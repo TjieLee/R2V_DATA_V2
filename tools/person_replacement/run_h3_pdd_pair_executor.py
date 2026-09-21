@@ -38,7 +38,13 @@ def arguments(argv=None):
                         help="Text V22 isolated prompt-writer runtime; frame0 never uses it")
     parser.add_argument("--prompt-writer-model",type=Path,
                         default=Path("/mnt/workspace/public/pretrained/Qwen/Qwen3.5-27B"),
-                        help="Text V22 writer: one resident Qwen3.5-27B instance per GPU worker")
+                        help="Prompt-writer checkpoint identity; local path for local backend")
+    parser.add_argument("--prompt-writer-backend",choices=("local","sglang"),default="local",
+                        help="Text captioner backend: local Qwen3.5-27B or Qwen3.8 SGLang")
+    parser.add_argument("--prompt-writer-base-url",default="http://127.0.0.1:8000/v1",
+                        help="Qwen3.8 SGLang OpenAI-compatible endpoint")
+    parser.add_argument("--prompt-writer-served-model",default="Qwen/Qwen3.8-Flash-Next",
+                        help="Qwen3.8 SGLang served model name")
     parser.add_argument("--h3-python",type=Path,default=Path(
         "/mnt/workspace/litengjie/data/person_replacement_deps/minimax-h3-env/bin/python"))
     parser.add_argument("--h3-model-root",type=Path,default=Path("/mnt/workspace/public/pretrained/MiniMaxAI/MiniMax-H3"))
