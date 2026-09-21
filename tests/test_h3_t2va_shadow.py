@@ -448,6 +448,37 @@ def test_preselected_inventory_skips_media_reselection_and_audio_rehash(
     assert inventory.clip_uids == [shot.clip_uid for shot in selection.shots]
 
 
+def test_inventory_does_not_sort_global_segments_once_per_clip(
+    finalized, tmp_path, monkeypatch
+):
+    import builtins
+
+    original_sorted = builtins.sorted
+    global_segment_sorts = 0
+
+    def counted_sorted(iterable, *args, **kwargs):
+        nonlocal global_segment_sorts
+        if type(iterable).__name__ == "dict_items":
+            values = list(iterable)
+            if values and isinstance(values[0], tuple):
+                key = values[0][0]
+                if (
+                    isinstance(key, tuple)
+                    and len(key) == 2
+                    and isinstance(key[0], str)
+                    and isinstance(key[1], str)
+                ):
+                    global_segment_sorts += 1
+            iterable = values
+        return original_sorted(iterable, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "sorted", counted_sorted)
+    inventory = build(finalized, tmp_path)
+
+    assert inventory.clip_uids == shot_ids(tmp_path)
+    assert global_segment_sorts == 0
+
+
 def test_finalized_source_projection_and_publication(finalized, tmp_path):
     inventory = build(finalized, tmp_path)
     assert inventory.clip_uids == shot_ids(tmp_path)
