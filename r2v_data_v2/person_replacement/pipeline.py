@@ -19,6 +19,12 @@ from .bernini import (
 from .timeline import inspect_video_timeline
 
 
+PERSON_REPLACEMENT_PRODUCTION_ROOT = Path(
+    "/mnt/workspace/public/dataset/jea-video/"
+    "moive-183t-0808_processed/multi_person_replace"
+).resolve()
+
+
 def build_prompt(source: str, replacement: str) -> str:
     return (
         f"Replace {source} with {replacement}.\n\n"
@@ -40,6 +46,17 @@ def build_prompt(source: str, replacement: str) -> str:
 
 def validate_output_root(path: Path) -> Path:
     output = path.expanduser().resolve()
+
+    # Formal person-replacement production is intentionally written next to the
+    # frozen processed dataset. This exact dedicated subtree is the only writable
+    # exception under /mnt/workspace/public/dataset; every other public dataset
+    # or pretrained path remains protected.
+    if (
+        output == PERSON_REPLACEMENT_PRODUCTION_ROOT
+        or PERSON_REPLACEMENT_PRODUCTION_ROOT in output.parents
+    ):
+        return output
+
     for root in ("/mnt/workspace/public/dataset", "/mnt/workspace/public/pretrained",
                  "/mnt/workspace/liutao/X_human_data"):
         protected = Path(root).resolve()
