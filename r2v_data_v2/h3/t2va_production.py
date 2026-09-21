@@ -988,7 +988,7 @@ def prepare_shard(
                 row["preparation_error"] = f"{type(exc).__name__}: {exc}"
             rows.append(row)
 
-    def build(path):
+    def build(path, *, preselected=None, verify_audio_files=True):
         return build_t2va_inventory(
             shot_manifest=path,
             clips_root=clips_root,
@@ -997,10 +997,25 @@ def prepare_shard(
             audio_shadow_run_id=audio_shadow_run_id,
             t2va_run_id="production",
             backend=backend,
+            preselected=preselected,
+            verify_audio_files=verify_audio_files,
+        )
+
+    preselected = None
+    selection_path = root / "shards" / shard_name(shard_id) / "source/selection.json"
+    if selection_path.is_file():
+        from r2v_data_v2.h3.t2va_source import T2VAShotSelection
+
+        preselected = T2VAShotSelection.model_validate_json(
+            selection_path.read_text(encoding="utf-8")
         )
 
     try:
-        inventory = build(manifest)
+        inventory = build(
+            manifest,
+            preselected=preselected,
+            verify_audio_files=preselected is None,
+        )
     except (ValueError, TypeError, KeyError, OSError):
         inventory = None
     if inventory is not None:
@@ -1153,5 +1168,7 @@ class FrozenProductionProcessor:
             temporary,
             destination,
             allow_unverified=self.allow_unverified,
-            source_hashes=inventory.source_hashes,
+            source_hashes=(
+                inventory.source_hashes if self.verify_sources_per_sample else None
+            ),
         )
