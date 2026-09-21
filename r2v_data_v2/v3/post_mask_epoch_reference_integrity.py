@@ -90,17 +90,17 @@ from r2v_data_v2.v3.storage import RunStorage
 
 REFERENCE_INTEGRITY_PLAN_SCHEMA = "post_mask_epoch_reference_integrity_plan/1"
 REFERENCE_INTEGRITY_ENTITY_OUTCOME_SCHEMA = (
-    "post_mask_epoch_reference_integrity_entity_outcome/3"
+    "post_mask_epoch_reference_integrity_entity_outcome/4"
 )
 REFERENCE_INTEGRITY_CLIP_OUTCOME_SCHEMA = (
     "post_mask_epoch_reference_integrity_outcome/1"
 )
-REFERENCE_INTEGRITY_POLICY_VERSION = "reference_integrity_epoch_policy/3"
+REFERENCE_INTEGRITY_POLICY_VERSION = "reference_integrity_epoch_policy/4"
 REFERENCE_INTEGRITY_REVIEW_INPUT_SCHEMA = (
     "post_mask_epoch_reference_integrity_review_input/1"
 )
 REFERENCE_INTEGRITY_BBOX_INPUT_SCHEMA = (
-    "post_mask_epoch_reference_integrity_bbox_input/1"
+    "post_mask_epoch_reference_integrity_bbox_input/2"
 )
 REFERENCE_INTEGRITY_MAIN_REVIEW_POLICY_VERSION = (
     "reference_integrity_main_review/1"
@@ -118,12 +118,18 @@ VARIANT_SOURCE_ALPHA = "source_alpha"
 IMPLEMENTED_REVIEW_VARIANTS = (VARIANT_FINAL, VARIANT_SOURCE_ALPHA)
 
 #: The second Qwen job type: the source bbox fallback review of one materialized
-#: raw-source candidate. 6d2a implements only the ``artifact_review_reject``
-#: trigger; the topology upgrade trigger stays out (6d2b).
+#: raw-source candidate. Both legacy triggers are implemented: the artifact
+#: rejection of a failed reference, and the topology hole upgrade of a Qwen
+#: accepted local subject alpha.
 REFERENCE_INTEGRITY_BBOX_REVIEW_JOB = "reference_integrity_bbox_review"
 BBOX_TRIGGER_ARTIFACT = "artifact_review_reject"
+BBOX_TRIGGER_TOPOLOGY = "topology_alpha_hole_upgrade"
+BBOX_TRIGGERS = (BBOX_TRIGGER_ARTIFACT, BBOX_TRIGGER_TOPOLOGY)
 BBOX_REVIEW_MODE = "source_bbox_fallback_v1"
 BBOX_JUDGE_FAILED_PREFIX = "source_bbox_fallback_judge_failed:"
+TOPOLOGY_JUDGE_FAILED_PREFIX = (
+    "topology_bbox_upgrade_judge_failed_kept_original:"
+)
 
 #: Dependency address of the main review inside a source-alpha review job.
 MAIN_REVIEW_JOB_DEPENDENCY = "main_review"
@@ -164,6 +170,10 @@ ENTITY_DELTA_FIELDS = (
     "source_bbox_fallback_accepted",
     "source_bbox_fallback_rejected",
     "source_bbox_fallback_judge_failed",
+    "source_bbox_topology_upgrade_attempted",
+    "source_bbox_topology_upgrade_accepted",
+    "source_bbox_topology_upgrade_kept_original",
+    "source_bbox_topology_upgrade_judge_failed",
 )
 
 #: Marker keys that only a reviewed outcome may carry. ``review_variant`` and
@@ -1190,9 +1200,18 @@ class ReferenceIntegrityEpochRunner:
                         f"source bbox entity outcome has no bbox job id for "
                         f"{label}"
                     )
-                if marker.get("source_bbox_fallback_trigger") != BBOX_TRIGGER_ARTIFACT:
+                bbox_trigger = marker.get("source_bbox_fallback_trigger")
+                if bbox_trigger not in BBOX_TRIGGERS:
                     raise ReferenceIntegrityDurableError(
                         f"source bbox entity outcome trigger is unknown for {label}"
+                    )
+                if (
+                    bbox_trigger == BBOX_TRIGGER_TOPOLOGY
+                    and outcome != ENTITY_OUTCOME_ACCEPTED
+                ):
+                    raise ReferenceIntegrityDurableError(
+                        f"topology source bbox entity outcome must stay accepted "
+                        f"for {label}"
                     )
                 for key in (
                     "source_bbox_fallback_candidate_path",
@@ -1311,7 +1330,12 @@ class ReferenceIntegrityEpochRunner:
                     )
             elif bbox_present:
                 if marker["bbox_judge_failed"]:
-                    if not reason.startswith(BBOX_JUDGE_FAILED_PREFIX):
+                    failure_prefix = (
+                        TOPOLOGY_JUDGE_FAILED_PREFIX
+                        if bbox_trigger == BBOX_TRIGGER_TOPOLOGY
+                        else BBOX_JUDGE_FAILED_PREFIX
+                    )
+                    if not reason.startswith(failure_prefix):
                         raise ReferenceIntegrityDurableError(
                             f"source bbox judge-failed entity outcome reason "
                             f"drifted for {label}"
@@ -2000,6 +2024,7 @@ class ReferenceIntegrityEpochRunner:
                 pre_reference=reference,
                 plan_entry=plan_entry,
                 pre_edit=pre_edit,
+                trigger=BBOX_TRIGGER_ARTIFACT,
                 parent_variant=VARIANT_SOURCE_ALPHA,
             )
             return _ReviewOutcome(marker=None, unlock=bbox_job)
@@ -2050,9 +2075,21 @@ class ReferenceIntegrityEpochRunner:
                 pre_reference=reference,
                 plan_entry=plan_entry,
                 pre_edit=pre_edit,
+                trigger=BBOX_TRIGGER_ARTIFACT,
             )
             return _ReviewOutcome(marker=None, unlock=bbox_job)
-        # The topology upgrade route belongs to 6d2b.
+        if continuation == "topology_bbox":
+            _parent, _anchor, bbox_job = self._bbox_context(
+                shard=shard,
+                storage=storage,
+                clip_uid=clip_uid,
+                entity=entity,
+                pre_reference=reference,
+                plan_entry=plan_entry,
+                pre_edit=pre_edit,
+                trigger=BBOX_TRIGGER_TOPOLOGY,
+            )
+            return _ReviewOutcome(marker=None, unlock=bbox_job)
         return _ReviewOutcome(marker=None, unlock=None)
 
     def finalize(self, job: ModelJob, result: JobResult) -> Sequence[ModelJob]:
@@ -2108,7 +2145,7 @@ class ReferenceIntegrityEpochRunner:
         """Exactly the semantic inputs of one artifact bbox review call."""
         return {
             "entity_id": entity.entity_id,
-            "trigger": BBOX_TRIGGER_ARTIFACT,
+            "trigger": str(anchor["trigger"]),
             "parent_variant": parent.variant,
             "parent_review_job_id": parent.job.job_id(),
             "reference_type": entity.reference_type,
@@ -2129,8 +2166,9 @@ class ReferenceIntegrityEpochRunner:
         clip_uid: str,
         entity: Any,
         parent: _BboxParent,
+        trigger: str,
     ) -> dict[str, Any]:
-        """Derive the frozen artifact bbox input from frozen evidence.
+        """Derive the frozen source bbox input of one trigger from frozen evidence.
 
         Everything here is deterministic CPU work: the legacy candidate crop, the
         source frame/mask identity, the current reference and the parent review
@@ -2159,7 +2197,7 @@ class ReferenceIntegrityEpochRunner:
             "schema": REFERENCE_INTEGRITY_BBOX_INPUT_SCHEMA,
             "clip_uid": clip_uid,
             "entity_id": entity.entity_id,
-            "trigger": BBOX_TRIGGER_ARTIFACT,
+            "trigger": trigger,
             "parent_variant": parent.variant,
             "parent_review_job_id": parent.job.job_id(),
             "reference_type": entity.reference_type,
@@ -2197,6 +2235,22 @@ class ReferenceIntegrityEpochRunner:
                 )
             ),
             "parent_integrity_review": parent.review.model_dump(mode="json"),
+            "topology_evidence": (
+                {
+                    "alpha_available": bool(parent.diagnostics.alpha_available),
+                    "enclosed_transparent_hole_count": int(
+                        parent.diagnostics.enclosed_transparent_hole_count
+                    ),
+                    "largest_enclosed_hole_area": int(
+                        parent.diagnostics.largest_enclosed_hole_area
+                    ),
+                    "enclosed_hole_bbox_ratio": float(
+                        parent.diagnostics.enclosed_hole_bbox_ratio
+                    ),
+                }
+                if trigger == BBOX_TRIGGER_TOPOLOGY
+                else None
+            ),
             "bbox_review_policy": policy,
             "semantic_digest": "",
         }
@@ -2212,16 +2266,23 @@ class ReferenceIntegrityEpochRunner:
 
     @staticmethod
     def _expected_base_metadata(anchor: Mapping[str, Any]) -> dict[str, Any]:
-        """The exact legacy materialized metadata shape of the artifact trigger.
+        """The exact legacy materialized metadata shape of one bbox trigger.
 
-        The legacy ``_materialize_source_bbox`` shape is fixed, so this is an
-        exact equality target: a missing, renamed or extra field in the frozen
-        copy is durable corruption. 6d2b will generalize it for the topology
-        trigger, which adds its own ``topology_evidence`` block.
+        The legacy ``_materialize_source_bbox`` shape is fixed per trigger, so
+        this is an exact equality target: a missing, renamed or extra field in
+        the frozen copy is durable corruption. The artifact trigger adds the
+        failed-reference pair, the topology trigger its evidence block, and
+        neither may carry the other's keys.
         """
+        trigger = str(anchor["trigger"])
+        if trigger not in BBOX_TRIGGERS:
+            raise ReferenceIntegrityDurableError(
+                f"frozen Reference Integrity bbox trigger is unknown for "
+                f"{anchor.get('clip_uid')}/{anchor.get('entity_id')}"
+            )
         return {
             "mode": BBOX_REVIEW_MODE,
-            "trigger": f"{BBOX_TRIGGER_ARTIFACT}_v1",
+            "trigger": f"{trigger}_v1",
             "status": "materialized",
             "review_status": "not_reviewed",
             "synthetic": False,
@@ -2242,8 +2303,14 @@ class ReferenceIntegrityEpochRunner:
             "original_reference_path": anchor["current_reference_path"],
             "original_reference_sha256": anchor["current_reference_sha256"],
             "original_integrity_review": anchor["parent_integrity_review"],
-            "failed_reference_path": anchor["current_reference_path"],
-            "failed_reference_sha256": anchor["current_reference_sha256"],
+            **(
+                {
+                    "failed_reference_path": anchor["current_reference_path"],
+                    "failed_reference_sha256": anchor["current_reference_sha256"],
+                }
+                if trigger == BBOX_TRIGGER_ARTIFACT
+                else {"topology_evidence": dict(anchor["topology_evidence"])}
+            ),
         }
 
     @classmethod
@@ -2267,7 +2334,13 @@ class ReferenceIntegrityEpochRunner:
             )
 
     def _materialize_bbox_input(
-        self, *, storage: RunStorage, clip_uid: str, entity: Any, parent: _BboxParent
+        self,
+        *,
+        storage: RunStorage,
+        clip_uid: str,
+        entity: Any,
+        parent: _BboxParent,
+        trigger: str,
     ) -> dict[str, Any]:
         """First freeze: let the legacy materializer produce both artifacts.
 
@@ -2302,7 +2375,7 @@ class ReferenceIntegrityEpochRunner:
             original_review=parent.review,
             diagnostics=parent.diagnostics,
             crop_padding_ratio=float(self.config.pair.crop_padding_ratio),
-            trigger=BBOX_TRIGGER_ARTIFACT,
+            trigger=trigger,
         )
         base = _read_json(
             _resolve_run_artifact(storage, evaluation.metadata_relative)
@@ -2313,7 +2386,11 @@ class ReferenceIntegrityEpochRunner:
                 f"{evaluation.metadata_relative}"
             )
         anchor = self._bbox_input_anchor(
-            storage=storage, clip_uid=clip_uid, entity=entity, parent=parent
+            storage=storage,
+            clip_uid=clip_uid,
+            entity=entity,
+            parent=parent,
+            trigger=trigger,
         )
         anchor["base_metadata"] = base
         self._verify_frozen_base_metadata(anchor)
@@ -2327,13 +2404,18 @@ class ReferenceIntegrityEpochRunner:
         clip_uid: str,
         entity: Any,
         parent: _BboxParent,
+        trigger: str,
     ) -> dict[str, Any]:
         """Create-once bbox input anchor, re-derived and compared exactly."""
         path = self._bbox_input_path(shard, clip_uid, entity.entity_id)
         existing = _read_json(path)
         if existing is None:
             anchor = self._materialize_bbox_input(
-                storage=storage, clip_uid=clip_uid, entity=entity, parent=parent
+                storage=storage,
+                clip_uid=clip_uid,
+                entity=entity,
+                parent=parent,
+                trigger=trigger,
             )
             _write_json_once(path, anchor)
             return anchor
@@ -2341,7 +2423,11 @@ class ReferenceIntegrityEpochRunner:
         # may be re-materialized: re-derive and compare instead.
         try:
             expected = self._bbox_input_anchor(
-                storage=storage, clip_uid=clip_uid, entity=entity, parent=parent
+                storage=storage,
+                clip_uid=clip_uid,
+                entity=entity,
+                parent=parent,
+                trigger=trigger,
             )
         except ReferenceIntegrityDurableError:
             raise
@@ -2395,7 +2481,7 @@ class ReferenceIntegrityEpochRunner:
             ),
             target={
                 "entity_id": entity.entity_id,
-                "trigger": BBOX_TRIGGER_ARTIFACT,
+                "trigger": str(anchor["trigger"]),
                 "parent_variant": parent.variant,
             },
             dependencies={PARENT_REVIEW_JOB_DEPENDENCY: parent.job.job_id()},
@@ -2426,15 +2512,23 @@ class ReferenceIntegrityEpochRunner:
         pre_reference: EntityReferenceState,
         plan_entry: Mapping[str, Any],
         pre_edit: ReferenceEditState | None,
+        trigger: str,
     ) -> _BboxParent:
-        """Re-derive the whole frozen artifact-bbox parent chain.
+        """Re-derive the whole frozen parent chain of one bbox trigger.
 
-        For a final parent the main receipt must route to the artifact bbox; for
-        a source-alpha parent the main receipt must route to source alpha, the
-        alpha receipt must exist and succeed, and only then may the alpha review
-        route to the artifact bbox. Nothing about the parent is guessed from live
-        state.
+        For the artifact trigger a final parent needs the main receipt to route
+        to the artifact bbox, and a source-alpha parent needs the main receipt to
+        route to source alpha, the alpha receipt to exist and succeed, and only
+        then may the alpha review route to the artifact bbox. The topology
+        trigger can only ever have the main review as its parent: an accepted
+        source alpha is terminal, and a rejected one cannot satisfy the topology
+        helper's accept requirement. The trigger is an explicit input, never read
+        from a marker or a job target.
         """
+        if trigger not in BBOX_TRIGGERS:
+            raise ReferenceIntegrityEpochError(
+                f"unsupported bbox trigger {trigger!r}"
+            )
         label = f"{clip_uid}/{entity.entity_id}"
         main_reference, main_anchor, main_job = self._expected_review_inputs(
             shard=shard,
@@ -2461,6 +2555,24 @@ class ReferenceIntegrityEpochRunner:
             review=main_review,
             pre_edit=pre_edit,
         )
+        if trigger == BBOX_TRIGGER_TOPOLOGY:
+            if main_review.verdict != "accept" or continuation != "topology_bbox":
+                raise ReferenceIntegrityDurableError(
+                    f"frozen policy no longer routes {label} to the topology "
+                    "source bbox upgrade"
+                )
+            return _BboxParent(
+                variant=VARIANT_FINAL,
+                job=main_job,
+                payload=main_payload,
+                review=main_review,
+                reference=main_reference,
+                diagnostics=main_diagnostics,
+                main_diagnostics=main_diagnostics,
+                context_path=str(main_anchor["source_context_path"]),
+                context_sha256=str(main_anchor["source_context_sha256"]),
+                parent_review_job_id=None,
+            )
         if continuation == "artifact_bbox":
             return _BboxParent(
                 variant=VARIANT_FINAL,
@@ -2513,6 +2625,15 @@ class ReferenceIntegrityEpochRunner:
             f"frozen policy no longer routes {label} to the artifact source bbox"
         )
 
+    def _bbox_trigger_of(self, job: ModelJob) -> str:
+        """The implemented bbox trigger of one job, or fail closed."""
+        trigger = str(dict(job.target).get("trigger", ""))
+        if trigger not in BBOX_TRIGGERS:
+            raise ReferenceIntegrityEpochError(
+                f"unsupported bbox trigger {trigger!r}"
+            )
+        return trigger
+
     def _bbox_context(
         self,
         *,
@@ -2523,6 +2644,7 @@ class ReferenceIntegrityEpochRunner:
         pre_reference: EntityReferenceState,
         plan_entry: Mapping[str, Any],
         pre_edit: ReferenceEditState | None,
+        trigger: str,
         parent_variant: str | None = None,
     ) -> tuple[_BboxParent, dict[str, Any], ModelJob]:
         """The frozen parent, anchor and deterministic job of one bbox route."""
@@ -2534,6 +2656,7 @@ class ReferenceIntegrityEpochRunner:
             pre_reference=pre_reference,
             plan_entry=plan_entry,
             pre_edit=pre_edit,
+            trigger=trigger,
         )
         if parent_variant is not None and parent.variant != parent_variant:
             raise ReferenceIntegrityDurableError(
@@ -2546,7 +2669,13 @@ class ReferenceIntegrityEpochRunner:
             clip_uid=clip_uid,
             entity=entity,
             parent=parent,
+            trigger=trigger,
         )
+        if str(anchor["trigger"]) != trigger:
+            raise ReferenceIntegrityDurableError(
+                f"frozen Reference Integrity bbox trigger drifted for "
+                f"{clip_uid}/{entity.entity_id}"
+            )
         job = self._expected_bbox_job(
             shard=shard, entity=entity, parent=parent, anchor=anchor
         )
@@ -2663,6 +2792,12 @@ class ReferenceIntegrityEpochRunner:
                 parent.diagnostics.suspicious
             )
             reviewed = 2
+        trigger = str(bbox_anchor["trigger"])
+        if trigger not in BBOX_TRIGGERS:
+            raise ReferenceIntegrityDurableError(
+                f"frozen Reference Integrity bbox trigger is unknown for "
+                f"{clip_uid}/{entity.entity_id}"
+            )
         common: dict[str, Any] = {
             "schema": REFERENCE_INTEGRITY_ENTITY_OUTCOME_SCHEMA,
             "clip_uid": clip_uid,
@@ -2676,17 +2811,75 @@ class ReferenceIntegrityEpochRunner:
             "review_variant": parent.variant,
             "parent_review_job_id": parent.parent_review_job_id,
             "bbox_review_job_id": bbox_job.job_id(),
-            "source_bbox_fallback_trigger": BBOX_TRIGGER_ARTIFACT,
+            "source_bbox_fallback_trigger": trigger,
             "source_bbox_fallback_candidate_path": str(bbox_anchor["candidate_path"]),
             "source_bbox_fallback_metadata_path": str(bbox_anchor["metadata_path"]),
             "source_bbox_xyxy": list(bbox_anchor["bbox_xyxy"]),
         }
+        status = str(bbox_payload.get("status", ""))
+        if trigger == BBOX_TRIGGER_TOPOLOGY:
+            # The topology upgrade never rejects the entity: a bbox reject or
+            # judge failure keeps the Qwen accepted original reference, and only
+            # an explicit bbox accept replaces it.
+            delta_prefix = {
+                "topology_suspicious": topology,
+                "entities_reviewed": reviewed,
+                "source_bbox_topology_upgrade_attempted": 1,
+            }
+            if status == "judge_failed":
+                return {
+                    **common,
+                    "outcome": ENTITY_OUTCOME_ACCEPTED,
+                    "status": ENTITY_OUTCOME_ACCEPTED,
+                    "final_reference_path": parent.reference.image_path,
+                    "judge_failed": False,
+                    "bbox_judge_failed": True,
+                    "source_bbox_fallback_review": None,
+                    "reason": (
+                        f"{TOPOLOGY_JUDGE_FAILED_PREFIX}"
+                        f"{bbox_payload.get('error')}"
+                    ),
+                    "delta": {
+                        **delta_prefix,
+                        "source_bbox_topology_upgrade_judge_failed": 1,
+                        "source_bbox_topology_upgrade_kept_original": 1,
+                        "entities_accepted": 1,
+                    },
+                }
+            if status != "review":
+                raise ReferenceIntegrityDurableError(
+                    "committed source bbox review has an unknown payload status"
+                )
+            review = SourceBboxFallbackReview.model_validate(bbox_payload.get("review"))
+            accepted = review.verdict == "accept"
+            return {
+                **common,
+                "outcome": ENTITY_OUTCOME_ACCEPTED,
+                "status": ENTITY_OUTCOME_ACCEPTED,
+                "final_reference_path": (
+                    str(bbox_anchor["candidate_path"])
+                    if accepted
+                    else parent.reference.image_path
+                ),
+                "judge_failed": False,
+                "bbox_judge_failed": False,
+                "source_bbox_fallback_review": review.model_dump(mode="json"),
+                "reason": review.reason,
+                "delta": {
+                    **delta_prefix,
+                    **(
+                        {"source_bbox_topology_upgrade_accepted": 1}
+                        if accepted
+                        else {"source_bbox_topology_upgrade_kept_original": 1}
+                    ),
+                    "entities_accepted": 1,
+                },
+            }
         delta_prefix = {
             "topology_suspicious": topology,
             "entities_reviewed": reviewed,
             "source_bbox_fallback_attempted": 1,
         }
-        status = str(bbox_payload.get("status", ""))
         if status == "judge_failed":
             # Legacy keeps this a plain rejection with the parent review as its
             # public provenance; only this epoch's marker remembers the bbox job.
@@ -2741,10 +2934,7 @@ class ReferenceIntegrityEpochRunner:
 
     def _run_bbox_review(self, job: ModelJob, handle: Any) -> JobResult:
         """One source bbox fallback call. No prompt or schema logic is copied."""
-        if str(dict(job.target).get("trigger", "")) != BBOX_TRIGGER_ARTIFACT:
-            raise ReferenceIntegrityEpochError(
-                f"unsupported bbox trigger {dict(job.target).get('trigger')!r}"
-            )
+        trigger = self._bbox_trigger_of(job)
         parent_variant = str(dict(job.target).get("parent_variant", ""))
         shard, storage, _clip, entity, reference, plan_entry, pre_edit = (
             self._job_review_context(job)
@@ -2757,6 +2947,7 @@ class ReferenceIntegrityEpochRunner:
             pre_reference=reference,
             plan_entry=plan_entry,
             pre_edit=pre_edit,
+            trigger=trigger,
             parent_variant=parent_variant,
         )
         if (
@@ -2790,7 +2981,7 @@ class ReferenceIntegrityEpochRunner:
                 phrase=entity.phrase,
                 grounding_prompt=entity.grounding_prompt,
                 reference_scope=str(anchor["reference_scope"]),
-                trigger=BBOX_TRIGGER_ARTIFACT,
+                trigger=trigger,
             )
         except SourceBboxFallbackJudgeFailure as exc:
             return JobResult(
@@ -2818,10 +3009,7 @@ class ReferenceIntegrityEpochRunner:
         self, job: ModelJob, result: JobResult
     ) -> Sequence[ModelJob]:
         """CPU continuation of one committed bbox review. Unlocks nothing."""
-        if str(dict(job.target).get("trigger", "")) != BBOX_TRIGGER_ARTIFACT:
-            raise ReferenceIntegrityEpochError(
-                f"unsupported bbox trigger {dict(job.target).get('trigger')!r}"
-            )
+        trigger = self._bbox_trigger_of(job)
         parent_variant = str(dict(job.target).get("parent_variant", ""))
         payload = dict(result.payload)
         status = str(payload.get("status", ""))
@@ -2847,6 +3035,7 @@ class ReferenceIntegrityEpochRunner:
             pre_reference=reference,
             plan_entry=plan_entry,
             pre_edit=pre_edit,
+            trigger=trigger,
             parent_variant=parent_variant,
         )
         if expected.job_id() != job.job_id():
@@ -2953,10 +3142,14 @@ class ReferenceIntegrityEpochRunner:
             payload["judge_failed"] = marker["judge_failed"]
             if marker["review"] is not None:
                 payload["review"] = marker["review"]
-            # Legacy publishes the artifact bbox provenance only for an explicit
-            # bbox verdict; a bbox judge failure keeps the parent review as its
-            # whole public provenance.
-            if marker.get("bbox_review_job_id") and not marker["bbox_judge_failed"]:
+            # Legacy hides the artifact bbox provenance only on an artifact
+            # judge failure, where the parent review becomes the whole public
+            # provenance. A topology judge failure is the opposite: it keeps the
+            # provenance and sets the public failure flag.
+            if marker.get("bbox_review_job_id") and not (
+                marker["bbox_judge_failed"]
+                and marker["source_bbox_fallback_trigger"] == BBOX_TRIGGER_ARTIFACT
+            ):
                 payload["source_bbox_fallback_trigger"] = marker[
                     "source_bbox_fallback_trigger"
                 ]
@@ -2970,6 +3163,8 @@ class ReferenceIntegrityEpochRunner:
                 payload["source_bbox_fallback_review"] = marker[
                     "source_bbox_fallback_review"
                 ]
+                if marker["bbox_judge_failed"]:
+                    payload["source_bbox_fallback_judge_failed"] = True
         return ReferenceIntegrityEntityState.model_validate(payload)
 
     def _verify_entity_branch(
@@ -3120,6 +3315,7 @@ class ReferenceIntegrityEpochRunner:
             pre_reference=reference,
             plan_entry=plan_entry,
             pre_edit=pre_edit,
+            trigger=str(marker["source_bbox_fallback_trigger"]),
             parent_variant=str(variant),
         )
         if bbox_job_id != bbox_job.job_id():
@@ -3221,11 +3417,15 @@ class ReferenceIntegrityEpochRunner:
         # The bbox parent's reference is what an artifact outcome judged: the
         # frozen pre-stage reference for a final parent, the frozen source alpha
         # for an alpha parent. That is the same rule as ``input_references``.
+        # Only an explicit bbox *accept* replaces the published reference. A
+        # topology bbox reject or judge failure is still an accepted entity whose
+        # original reference is kept, so ``outcome`` alone cannot decide this.
         bbox_accepted_ids = {
             entity_id
             for entity_id, marker in markers.items()
             if marker.get("bbox_review_job_id")
-            and marker["outcome"] == ENTITY_OUTCOME_ACCEPTED
+            and marker.get("source_bbox_fallback_review") is not None
+            and marker["source_bbox_fallback_review"]["verdict"] == "accept"
         }
         input_references = {
             entity_id: (alpha_references.get(entity_id) or pre_reference)

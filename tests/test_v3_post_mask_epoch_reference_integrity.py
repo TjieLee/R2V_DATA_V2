@@ -20,20 +20,16 @@ from PIL import Image
 import r2v_data_v2.v3.storage as storage_module
 import tests.test_v3_reference_integrity as legacy_integrity
 from r2v_data_v2.v3.post_mask_epoch_jobs import (
-    OUTCOME_COMPLETED,
     RESOURCE_QWEN,
-    JobResult,
     ModelJob,
 )
 from r2v_data_v2.v3.post_mask_epoch_reference_integrity import (
     REFERENCE_INTEGRITY_BBOX_REVIEW_JOB,
     ReferenceIntegrityDurableError,
-    ReferenceIntegrityEpochError,
     ReferenceIntegrityEpochRunner,
 )
 from r2v_data_v2.v3.post_mask_epoch_state import GroupLedger
 from r2v_data_v2.v3.reference_integrity import reference_integrity_clips
-from r2v_data_v2.v3.schemas import ReferenceTopologyDiagnostics
 
 SHARD = "shard-000000000-000000000"
 CLEAN_OBJECT_PHRASE = "a black camera"
@@ -646,7 +642,6 @@ class _SerialQwenExecutor:
 
 
 def _epoch_scheduler(runner: Any, executor: Any, finalize: Any = None) -> Any:
-    from r2v_data_v2.v3.post_mask_epoch_jobs import RESOURCE_QWEN
     from r2v_data_v2.v3.post_mask_epoch_scheduler import ResourceEpochScheduler
 
     return ResourceEpochScheduler(
@@ -849,7 +844,6 @@ def test_committed_review_receipt_restart_pays_no_qwen(
     assert executor.batches == 1
     assert len(judge.calls) == 1
     assert runner._entity_outcome(SHARD, "clip-1", "e2") is None
-    from r2v_data_v2.v3.post_mask_epoch_jobs import RESOURCE_QWEN
     from r2v_data_v2.v3.post_mask_epoch_scheduler import ResourceEpochScheduler
 
     fresh = _runner(config, storage, tmp_path)
@@ -871,71 +865,6 @@ def test_committed_review_receipt_restart_pays_no_qwen(
     assert clip.reference_integrity is not None
     assert clip.reference_integrity.status == "ready"
     _assert_same_publication(clip, legacy_storage.read_clip("clip-1"))
-
-
-def test_6d2b_topology_upgrade_stays_unresolved(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The topology hole upgrade route is classified but never executed here.
-
-    6d2a implements only the ``artifact_review_reject`` trigger, so a topology
-    eligible main review has no continuation to unlock and no bbox job to run.
-    Building a real topology-eligible clip image needs annotation surgery this
-    fixture cannot express, so the frozen classifier is asserted directly and the
-    epoch is shown to reject the topology trigger outright.
-    """
-    config, storage = _main_review_fixture(tmp_path, monkeypatch, "run-epoch")
-    runner = _runner(config, storage, tmp_path)
-    clip = storage.read_clip("clip-1")
-    reference = next(
-        item for item in clip.references.entities if item.entity_id == "e2"
-    )
-    entity = next(
-        item for item in clip.annotation.entities if item.entity_id == "e2"
-    ).model_copy(update={"reference_type": "subject"})
-    diagnostics = ReferenceTopologyDiagnostics(
-        alpha_available=True,
-        significant_component_count=1,
-        largest_component_ratio=1.0,
-        second_component_ratio=0.0,
-        bbox_fill_ratio=0.98,
-        border_contact=False,
-        enclosed_transparent_hole_count=1,
-        largest_enclosed_hole_area=2362,
-        enclosed_hole_bbox_ratio=0.2,
-        suspicious=False,
-    )
-    assert (
-        runner._review_continuation(
-            clip_uid="clip-1",
-            entity=entity,
-            reference=reference,
-            diagnostics=diagnostics,
-            review=legacy_integrity._review(accept=True),
-            pre_edit=None,
-        )
-        == "topology_bbox"
-    )
-    topology_job = ModelJob.create(
-        job_type=REFERENCE_INTEGRITY_BBOX_REVIEW_JOB,
-        resource=RESOURCE_QWEN,
-        canonical_shard=SHARD,
-        clip_uid="clip-1",
-        semantic_inputs={"trigger": "topology_alpha_hole_upgrade"},
-        model_identity="qwen:test",
-        target={
-            "entity_id": "e2",
-            "trigger": "topology_alpha_hole_upgrade",
-            "parent_variant": "final",
-        },
-    )
-    with pytest.raises(ReferenceIntegrityEpochError, match="unsupported bbox trigger"):
-        runner.run(topology_job, _FakeEpochJudge([], []))
-    with pytest.raises(ReferenceIntegrityEpochError, match="unsupported bbox trigger"):
-        runner.finalize(
-            topology_job,
-            JobResult(OUTCOME_COMPLETED, payload={"status": "review", "review": {}}),
-        )
 
 
 @pytest.mark.parametrize("variant", ("final", "source_alpha"))
@@ -1195,16 +1124,17 @@ def _resolve(storage: Any, relative: str) -> Path:
     return _resolve_run_artifact(storage, relative)
 
 
-def _frozen_bbox_anchor(runner: Any) -> Any:
-    payload = json.loads(
-        runner._bbox_input_path(SHARD, "clip-1", "e2").read_text(encoding="utf-8")
-    )
-    return payload
-
-
-def _expected_marker(runner: Any) -> Any:
+def _frozen_bbox_anchor(runner: Any, entity_id: str = "e2") -> Any:
     return json.loads(
-        runner._entity_outcome_path(SHARD, "clip-1", "e2").read_text(encoding="utf-8")
+        runner._bbox_input_path(SHARD, "clip-1", entity_id).read_text(encoding="utf-8")
+    )
+
+
+def _expected_marker(runner: Any, entity_id: str = "e2") -> Any:
+    return json.loads(
+        runner._entity_outcome_path(SHARD, "clip-1", entity_id).read_text(
+            encoding="utf-8"
+        )
     )
 
 
@@ -1606,24 +1536,33 @@ def test_frozen_bbox_artifact_tamper_fails_closed(
         ] == []
 
 
+@pytest.mark.parametrize("route", ("artifact", "topology"))
 def test_finalized_bbox_metadata_tamper_fails_closed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: str
 ) -> None:
     """A durable bbox entity marker implies the metadata already finalized.
 
     Rewinding the metadata to the frozen materialized base after the outcome is
     durable must fail closed, never be silently re-advanced on restart.
     """
-    results = (legacy_integrity._transient_removal_artifact_review(),)
+    if route == "artifact":
+        results = (legacy_integrity._transient_removal_artifact_review(),)
+        config, storage = _main_review_fixture(tmp_path, monkeypatch, "run-epoch")
+        entity_id = "e2"
+    else:
+        results = (legacy_integrity._review(accept=True),)
+        config, storage = _topology_upgrade_fixture(
+            tmp_path, monkeypatch, "run-epoch"
+        )
+        entity_id = "e1"
     bbox_results = (legacy_integrity._bbox_review(accept=True),)
-    config, storage = _main_review_fixture(tmp_path, monkeypatch, "run-epoch")
     judge = _FakeEpochJudge(results, bbox_results)
     runner, _executor, _jobs = _run_epoch(config, storage, tmp_path, judge)
 
     clip = storage.read_clip("clip-1")
     assert clip.reference_integrity is not None
     assert clip.reference_integrity.status == "ready"
-    anchor = _frozen_bbox_anchor(runner)
+    anchor = _frozen_bbox_anchor(runner, entity_id)
     metadata_path = _resolve(storage, anchor["metadata_path"])
     assert json.loads(metadata_path.read_text(encoding="utf-8"))["status"] == "accepted"
     failures_path = Path(storage.root) / "failures.jsonl"
@@ -1696,6 +1635,275 @@ def test_source_alpha_committed_receipt_restart_pays_no_qwen(
 
     assert fresh_executor.batches == 0, "both committed receipts are reused"
     assert len(judge.calls) == 2, "restart must not pay another Qwen call"
+    stats = fresh.reconcile_stats(SHARD)
+    assert stats.to_dict() == legacy_stats.to_dict()
+    clip = storage.read_clip("clip-1")
+    assert clip.reference_integrity is not None
+    assert clip.reference_integrity.status == "ready"
+    _assert_same_publication(clip, legacy_storage.read_clip("clip-1"))
+
+
+# ---------------------------------------------------------------------------
+# topology hole upgrade continuation
+# ---------------------------------------------------------------------------
+
+
+def _topology_upgrade_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, run_name: str
+) -> tuple[Any, Any]:
+    """A human subject alpha with a real enclosed hole, built by legacy helpers.
+
+    ``_make_human_topology_upgrade_candidate`` makes e1 local and reviewable and
+    rewrites its image with an enclosed transparent hole; the helper itself
+    asserts the real diagnostics (holes = 1, largest = 2392, ratio >= 0.01,
+    suspicious = False). ``_write_not_required_reference_edit`` gives the clip a
+    ready Reference Edit state, which the bbox fallback then mutates.
+    """
+    config, storage = _main_review_fixture(
+        tmp_path, monkeypatch, run_name, second_scope="full"
+    )
+    legacy_integrity._make_human_topology_upgrade_candidate(storage)
+    legacy_integrity._write_not_required_reference_edit(storage)
+    return config, storage
+
+
+def test_topology_bbox_accept_matches_legacy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An accepted topology bbox upgrade publishes the candidate reference."""
+    results = (legacy_integrity._review(accept=True),)
+    bbox_results = (legacy_integrity._bbox_review(accept=True),)
+    legacy_config, legacy_storage = _topology_upgrade_fixture(
+        tmp_path, monkeypatch, "run-legacy"
+    )
+    legacy_stats, legacy_judge, legacy_bbox = _legacy_bbox_run(
+        legacy_config,
+        legacy_storage,
+        integrity_results=results,
+        bbox_results=bbox_results,
+    )
+    assert len(legacy_judge.calls) == 1
+    assert len(legacy_bbox.calls) == 1
+    assert legacy_bbox.calls[0]["trigger"] == "topology_alpha_hole_upgrade"
+
+    config, storage = _topology_upgrade_fixture(tmp_path, monkeypatch, "run-epoch")
+    judge = _FakeEpochJudge(results, bbox_results)
+    runner, executor, jobs = _run_epoch(config, storage, tmp_path, judge)
+
+    assert len(jobs) == 1, "only the main review is a root job"
+    assert len(judge.calls) == 1
+    assert len(judge.bbox_calls) == 1
+    assert judge.bbox_calls[0]["trigger"] == "topology_alpha_hole_upgrade"
+    assert executor.batches == 2, "one main phase, one bbox phase"
+    stats = runner.reconcile_stats(SHARD)
+    assert stats.to_dict() == legacy_stats.to_dict()
+    assert stats.source_bbox_topology_upgrade_attempted == 1
+    assert stats.source_bbox_topology_upgrade_accepted == 1
+    assert stats.source_bbox_topology_upgrade_kept_original == 0
+    assert stats.source_bbox_fallback_attempted == 0
+    assert stats.entities_reviewed == 1, "the bbox judge is not an integrity review"
+    epoch_clip = storage.read_clip("clip-1")
+    legacy_clip = legacy_storage.read_clip("clip-1")
+    _assert_same_publication(epoch_clip, legacy_clip)
+
+    anchor = _frozen_bbox_anchor(runner, "e1")
+    assert anchor["trigger"] == "topology_alpha_hole_upgrade"
+    assert anchor["topology_evidence"] == {
+        "alpha_available": True,
+        "enclosed_transparent_hole_count": 1,
+        "largest_enclosed_hole_area": 2392,
+        "enclosed_hole_bbox_ratio": anchor["topology_evidence"][
+            "enclosed_hole_bbox_ratio"
+        ],
+    }
+    published = epoch_clip.references.entities[0]
+    assert published.image_path == anchor["candidate_path"]
+    assert published.source_bbox_fallback is True
+    # This fixture installs a variants-less Reference Edit state, exactly like
+    # the legacy topology accept test, so only these three fields move.
+    edit = epoch_clip.reference_edit.entities[0]
+    assert edit.status == "fallback"
+    assert edit.fallback_policy == "source_bbox_fallback"
+    assert edit.output_image_path == anchor["candidate_path"]
+
+    metadata = json.loads(
+        _resolve(storage, anchor["metadata_path"]).read_text(encoding="utf-8")
+    )
+    assert metadata["trigger"] == "topology_alpha_hole_upgrade_v1"
+    assert metadata["status"] == "accepted"
+    assert metadata["topology_evidence"] == anchor["topology_evidence"]
+    assert "failed_reference_path" not in metadata
+    assert "failed_reference_sha256" not in metadata
+
+    marker = _expected_marker(runner, "e1")
+    assert marker["review_variant"] == "final"
+    assert marker["parent_review_job_id"] is None
+    assert marker["source_bbox_fallback_trigger"] == "topology_alpha_hole_upgrade"
+    assert marker["status"] == "accepted"
+    assert marker["bbox_judge_failed"] is False
+    assert marker["reason"] == bbox_results[0].reason
+    assert marker["delta"]["entities_reviewed"] == 1
+    assert marker["delta"]["source_bbox_topology_upgrade_attempted"] == 1
+    assert marker["delta"]["source_bbox_topology_upgrade_accepted"] == 1
+    assert marker["delta"]["entities_accepted"] == 1
+    assert "source_bbox_fallback_attempted" not in marker["delta"]
+
+
+@pytest.mark.parametrize("bbox", ("reject", "judge_failure"))
+def test_topology_bbox_reject_and_judge_failure_keep_original(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bbox: str
+) -> None:
+    """A topology bbox reject or judge failure keeps the accepted original.
+
+    This is where the topology trigger differs most from the artifact one: the
+    entity stays accepted, so only an explicit bbox *accept* may replace the
+    published reference.
+    """
+    if bbox == "reject":
+        bbox_result: Any = legacy_integrity._bbox_review(accept=False)
+    else:
+        bbox_result = legacy_integrity.SourceBboxFallbackJudgeFailure(
+            "malformed topology comparison"
+        )
+    results = (legacy_integrity._review(accept=True),)
+
+    legacy_config, legacy_storage = _topology_upgrade_fixture(
+        tmp_path, monkeypatch, "run-legacy"
+    )
+    legacy_original = legacy_storage.read_clip("clip-1").references.entities[0]
+    legacy_stats, _legacy_judge, legacy_bbox = _legacy_bbox_run(
+        legacy_config,
+        legacy_storage,
+        integrity_results=results,
+        bbox_results=(bbox_result,),
+    )
+    assert len(legacy_bbox.calls) == 1
+
+    config, storage = _topology_upgrade_fixture(tmp_path, monkeypatch, "run-epoch")
+    original = storage.read_clip("clip-1").references.entities[0]
+    original_bytes = _resolve(storage, str(original.image_path)).read_bytes()
+    judge = _FakeEpochJudge(results, (bbox_result,))
+    runner, _executor, _jobs = _run_epoch(config, storage, tmp_path, judge)
+
+    stats = runner.reconcile_stats(SHARD)
+    assert stats.to_dict() == legacy_stats.to_dict()
+    assert stats.source_bbox_topology_upgrade_attempted == 1
+    assert stats.source_bbox_topology_upgrade_kept_original == 1
+    assert stats.source_bbox_topology_upgrade_accepted == 0
+    assert stats.entities_rejected == 0, "the topology upgrade never rejects"
+    assert stats.entities_accepted == 2
+    epoch_clip = storage.read_clip("clip-1")
+    legacy_clip = legacy_storage.read_clip("clip-1")
+    _assert_same_publication(epoch_clip, legacy_clip)
+
+    # The candidate replacement gate: the marker is an *accepted* outcome, so
+    # only the bbox verdict may decide whether the reference is replaced.
+    marker = _expected_marker(runner, "e1")
+    assert marker["status"] == "accepted"
+    assert marker["outcome"] == "accepted"
+    anchor = _frozen_bbox_anchor(runner, "e1")
+    published = epoch_clip.references.entities[0]
+    assert published.image_path == original.image_path
+    assert published.image_path != anchor["candidate_path"]
+    assert published.image_path == legacy_original.image_path
+    assert published.source_bbox_fallback is False
+    assert _resolve(storage, str(original.image_path)).read_bytes() == original_bytes
+    edit = epoch_clip.reference_edit.entities[0]
+    assert edit.status == "not_required"
+    assert edit.fallback_policy == "not_used"
+    assert edit.default_variant is None
+    public = next(
+        item
+        for item in epoch_clip.reference_integrity.entities
+        if item.entity_id == "e1"
+    )
+    assert public.status == "accepted"
+    assert public.final_reference_path == original.image_path
+    assert public.source_bbox_fallback_trigger == "topology_alpha_hole_upgrade"
+    assert public.source_bbox_fallback_candidate_path == anchor["candidate_path"]
+
+    metadata = json.loads(
+        _resolve(storage, anchor["metadata_path"]).read_text(encoding="utf-8")
+    )
+    if bbox == "judge_failure":
+        assert stats.source_bbox_topology_upgrade_judge_failed == 1
+        assert stats.source_bbox_fallback_judge_failed == 0
+        assert stats.judge_failed == 0
+        assert marker["bbox_judge_failed"] is True
+        assert marker["judge_failed"] is False
+        assert marker["source_bbox_fallback_review"] is None
+        assert marker["reason"] == (
+            "topology_bbox_upgrade_judge_failed_kept_original:"
+            "malformed topology comparison"
+        )
+        # Unlike the artifact trigger, the topology failure keeps the public
+        # bbox provenance and raises the public failure flag.
+        assert public.source_bbox_fallback_judge_failed is True
+        assert public.source_bbox_fallback_review is None
+        assert public.source_bbox_fallback_metadata_path == anchor["metadata_path"]
+        assert list(public.source_bbox_xyxy) == anchor["bbox_xyxy"]
+        assert metadata["status"] == "judge_failed"
+        assert metadata["review_status"] == "judge_failed"
+        assert metadata["reason"] == "malformed topology comparison"
+        assert metadata["topology_evidence"] == anchor["topology_evidence"]
+    else:
+        assert marker["bbox_judge_failed"] is False
+        assert marker["reason"] == bbox_result.reason
+        assert public.source_bbox_fallback_judge_failed is False
+        assert public.source_bbox_fallback_review is not None
+        assert public.source_bbox_fallback_review.verdict == "reject"
+        assert metadata["status"] == "rejected"
+        assert metadata["review_status"] == "reject"
+
+
+def test_topology_bbox_committed_receipt_restart_pays_no_qwen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash after the topology bbox receipt replays the chain for free."""
+    results = (legacy_integrity._review(accept=True),)
+    bbox_results = (legacy_integrity._bbox_review(accept=True),)
+    legacy_config, legacy_storage = _topology_upgrade_fixture(
+        tmp_path, monkeypatch, "run-legacy"
+    )
+    legacy_stats, _legacy_judge, _legacy_bbox = _legacy_bbox_run(
+        legacy_config,
+        legacy_storage,
+        integrity_results=results,
+        bbox_results=bbox_results,
+    )
+
+    config, storage = _topology_upgrade_fixture(tmp_path, monkeypatch, "run-epoch")
+    judge = _FakeEpochJudge(results, bbox_results)
+    runner = _runner(config, storage, tmp_path)
+    executor = _SerialQwenExecutor(runner, judge)
+
+    def swallow_bbox(job: Any, result: Any) -> Any:
+        # Simulate a crash between the bbox receipt and its CPU finalizer.
+        if job.job_type == REFERENCE_INTEGRITY_BBOX_REVIEW_JOB:
+            return ()
+        return runner.finalize(job, result)
+
+    scheduler = _epoch_scheduler(runner, executor, swallow_bbox)
+    jobs = runner.seed_jobs()
+    assert [dict(job.target)["variant"] for job in jobs] == ["final"]
+    scheduler.run(jobs)
+
+    assert len(judge.calls) == 1
+    assert len(judge.bbox_calls) == 1
+    assert runner._entity_outcome(SHARD, "clip-1", "e1") is None
+    assert storage.read_clip("clip-1").reference_integrity is None
+
+    fresh = _runner(config, storage, tmp_path)
+    fresh_executor = _SerialQwenExecutor(fresh, judge)
+    fresh_scheduler = _epoch_scheduler(fresh, fresh_executor)
+    fresh_jobs = fresh.seed_jobs()
+    # The bbox job is never a root: only the main receipt unlocks it.
+    assert [dict(job.target)["variant"] for job in fresh_jobs] == ["final"]
+    fresh_scheduler.run(fresh_jobs)
+
+    assert fresh_executor.batches == 0, "both committed receipts are reused"
+    assert len(judge.calls) == 1, "restart pays no integrity call"
+    assert len(judge.bbox_calls) == 1, "restart pays no bbox call"
     stats = fresh.reconcile_stats(SHARD)
     assert stats.to_dict() == legacy_stats.to_dict()
     clip = storage.read_clip("clip-1")
