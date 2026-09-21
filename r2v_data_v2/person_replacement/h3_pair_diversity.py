@@ -7,7 +7,7 @@ input, seed and contract always produce the same two cues.
 
 import hashlib
 
-GENERIC = "generic"
+GENERIC = "ordinary modern everyday appearance with no profession or period constraint; freely vary gender presentation and adult age band from the source"
 
 # Everyday occupations only; each cue is expressed through clothing/grooming.
 PROFESSION_CUES = (
@@ -37,7 +37,7 @@ PERIOD_CUES = (
 # Ordinary clothing dominates; special cues stay a minority.
 BUCKET_WEIGHTS = {"generic":65, "profession":25, "period":10}
 BUCKETS = ("generic", "profession", "period")
-DIVERSITY_CONTRACT = "pair_replacement_diversity_v1"
+DIVERSITY_CONTRACT = "pair_replacement_diversity_v2"
 
 
 def _digest(*parts):

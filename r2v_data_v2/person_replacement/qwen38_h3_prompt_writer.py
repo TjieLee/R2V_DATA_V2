@@ -76,6 +76,31 @@ Do not introduce:
 Each replacement should be noticeably different from its corresponding source
 performer, not just a lightly modified lookalike.
 
+CASTING VARIATION
+
+The source performer's apparent gender presentation and approximate age are
+identification facts, not attributes that need to be preserved in the
+replacement.
+
+Do not default to the same gender presentation or a nearby age band merely
+because the source performer has them. Same-gender or similar-age casting is
+allowed, but it should be only one possible outcome rather than the default.
+
+For the pair of two replacements, when physically plausible and not contradicted
+by an explicitly gendered diversity cue, prefer:
+- at least one replacement whose apparent gender presentation differs from its
+  corresponding source performer;
+- at least one replacement whose apparent adult age band differs clearly from
+  its corresponding source performer.
+
+These two differences may occur in the same replacement or in different
+replacements. Keep age changes realistic: do not introduce a child merely to
+create contrast.
+
+Body-scale compatibility means approximate occupied height/build volume for
+motion transfer. It does NOT mean preserving gender presentation, age, face,
+hair, grooming or clothing.
+
 When reasonable, create difference across at least two or three of the
 following aspects:
 - apparent age band,
@@ -117,14 +142,14 @@ diversity cue support them.
 Example A:
 SOURCE_PERFORMER_1: a young adult man with short black hair and a light grey hoodie, initially on the left
 SOURCE_PERFORMER_2: a young adult woman with long straight dark hair and a pale blouse, initially on the right
-REPLACEMENT_SUBJECT_1: a middle-aged man with cropped salt-and-pepper hair, a broad angular face, light stubble, and a dark green crew-neck t-shirt
-REPLACEMENT_SUBJECT_2: a woman in her thirties with a short wavy auburn bob, a narrow oval face, subtle makeup, and a burgundy retro blouse with restrained sequined trim
+REPLACEMENT_SUBJECT_1: a woman in her forties with short textured auburn hair, high cheekbones, defined brows, and a dark teal crew-neck knit top
+REPLACEMENT_SUBJECT_2: an older man in his sixties with swept-back silver hair, a rectangular face, a neatly trimmed moustache, and a burgundy casual button-up shirt
 
 Example B:
 SOURCE_PERFORMER_1: an older man with thinning grey hair and a dark jacket, initially nearer the camera
 SOURCE_PERFORMER_2: a young woman with shoulder-length dark hair and a plain top, initially farther back
-REPLACEMENT_SUBJECT_1: a younger adult man with thick curly brown hair, a clean-shaven round face, and a fitted navy casual shirt
-REPLACEMENT_SUBJECT_2: a middle-aged woman with a neat short black bob, a defined square jaw, thin rectangular glasses, and a muted blue professional blouse
+REPLACEMENT_SUBJECT_1: a young adult woman with a cropped black pixie cut, a round face, minimal makeup, and a fitted navy jacket
+REPLACEMENT_SUBJECT_2: a middle-aged man with wavy dark-brown hair, a broad oval face, a short beard, and a muted rust polo shirt
 
 Keep the replacement person's overall height/body scale and silhouette broadly
 compatible with the corresponding source performer so source pose and spatial
