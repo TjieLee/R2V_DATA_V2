@@ -192,6 +192,7 @@ def prepare_t2va_audio(
     *,
     output_root: Path,
     audio_backend: AudioMediaBackend,
+    verify_source_videos: bool = True,
 ) -> Path:
     """Create a NEW caller-owned Audio workspace; never modify an existing population."""
     from r2v_data_v2.h3.t2va_shadow import write_json
@@ -210,7 +211,10 @@ def prepare_t2va_audio(
         temporary.mkdir(parents=True)
         clips = []
         for shot in selection.shots:
-            if sha256_file(Path(shot.video_path)) != shot.video_sha256:
+            if (
+                verify_source_videos
+                and sha256_file(Path(shot.video_path)) != shot.video_sha256
+            ):
                 raise ValueError("selected JEA target video changed")
             relative = Path("audio/full_audio") / f"{shot.clip_uid}.flac"
             actual = temporary / relative
@@ -262,6 +266,7 @@ def prepare_t2va_audio(
             )
             for c in clips
         ]
+        canonical_sha256 = sha256_file(canonical)
         values = {
             "source_pairs_sha256": None,
             "source_asr_inventory_fingerprint": None,
@@ -269,7 +274,7 @@ def prepare_t2va_audio(
             "targets": targets,
             "source_inventory_kind": "jea_shot_manifest",
             "source_shot_manifest_sha256": selection.shot_manifest_sha256,
-            "source_canonical_audio_manifest_sha256": sha256_file(canonical),
+            "source_canonical_audio_manifest_sha256": canonical_sha256,
         }
         inventory = DiarizationInventory(
             schema_version="r2v.h3.diarization_inventory.5",
@@ -280,7 +285,7 @@ def prepare_t2va_audio(
             source_canonical_audio_manifest_path=str(
                 destination / "audio/canonical_clips.jsonl"
             ),
-            source_canonical_audio_manifest_sha256=sha256_file(canonical),
+            source_canonical_audio_manifest_sha256=canonical_sha256,
             inventory_fingerprint=_inventory_fingerprint(**values),
             source_target_count=len(targets),
             selected_target_count=len(targets),
