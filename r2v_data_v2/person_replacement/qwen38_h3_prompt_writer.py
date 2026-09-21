@@ -797,15 +797,6 @@ def validate_h3_prompt_writer_output(text):
             raise ValueError(f"dynamic overview is missing {token}")
     if not re.search(r"\b(?:camera|framing|shot|view)\b",dynamic_preface,re.IGNORECASE):
         raise ValueError("dynamic overview must describe camera or framing behavior")
-    speculative = re.search(
-        r"\b(?:as if|seems to|appears to be trying to|suggesting that|invisible force)\b",
-        detailed,
-        re.IGNORECASE,
-    )
-    if speculative:
-        raise ValueError(
-            f"detailed_description uses speculative language: {speculative.group(0)!r}"
-        )
     return text.strip()
 
 

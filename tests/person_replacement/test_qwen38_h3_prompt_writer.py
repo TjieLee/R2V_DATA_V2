@@ -501,7 +501,7 @@ def test_preservation_sentence_is_deterministically_prepended():
     assert unchanged.count(DETAIL_PRESERVATION_PREFIX) == 1
 
 
-def test_validator_requires_dynamic_preface_and_rejects_speculation():
+def test_validator_requires_dynamic_preface_and_allows_speculative_phrasing():
     from r2v_data_v2.person_replacement.qwen38_h3_prompt_writer import (
         DETAIL_PRESERVATION_PREFIX,
         validate_h3_prompt_writer_output,
@@ -527,8 +527,7 @@ def test_validator_requires_dynamic_preface_and_rejects_speculation():
         "and lifts a hand while the camera remains static.",
         "and lifts a hand as if controlling an invisible force while the camera remains static.",
     )
-    with pytest.raises(ValueError,match="speculative language"):
-        validate_h3_prompt_writer_output(speculative)
+    assert validate_h3_prompt_writer_output(speculative) == speculative.strip()
 
 
 def test_system_prompt_still_enforces_the_six_section_contract():
