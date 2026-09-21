@@ -160,7 +160,11 @@ def _stage_receipts(shard, uid, identity, state):
                 path = Path(relative)
                 if path.is_absolute() or ".." in path.parts:
                     raise ValueError("invalid stage artifact path")
-            production._recover_stage(directory, identity)
+            if receipt.get("identity") != identity:
+                raise ValueError("production stage identity changed; use a fresh root")
+            for relative in receipt["files"]:
+                if not (directory / relative).is_file():
+                    raise ValueError("published stage artifact is missing")
             found = True
         elif state and state.get(f"{stage}_status") == "ready":
             raise ValueError("ready downstream stage is missing; refusing model replay")
