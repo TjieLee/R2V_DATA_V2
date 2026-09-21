@@ -906,8 +906,29 @@ def test_parallel_independent_double_exception_matches_legacy_qwen_precedence(
         review_execution="parallel_independent",
     )
     routing.qwen.fail = True
-    routing.sam.fail = True
+    sam_fail_calls = 0
+
+    def exploding_epoch_sam_review(*args: Any, **kwargs: Any) -> Any:
+        nonlocal sam_fail_calls
+        del args, kwargs
+        sam_fail_calls += 1
+        raise RuntimeError("sam backend exploded")
+
+    monkeypatch.setattr(
+        "r2v_data_v2.v3.post_mask_epoch_reference_edit.run_boogu_sam_review",
+        exploding_epoch_sam_review,
+    )
     _drain(runner, scheduler)
+
+    qwen_job_id = _committed_job_id(runner, "reference_edit_qwen_review")
+    _job, _result, qwen_payload = runner._validated_committed(qwen_job_id)
+    assert qwen_payload["status"] == "qwen_failed"
+    assert qwen_payload["error"] == "qwen judge exploded"
+    sam_job_id = _committed_job_id(runner, "reference_edit_sam_review")
+    _job, _result, sam_payload = runner._validated_committed(sam_job_id)
+    assert sam_payload["status"] == "sam_failed"
+    assert sam_payload["error"] == "sam backend exploded"
+    assert sam_fail_calls >= 1
 
     stats = runner.reconcile_stats(SHARD)
     assert stats.to_dict() == legacy.to_dict()
