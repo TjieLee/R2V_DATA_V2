@@ -1549,10 +1549,12 @@ def test_bbox_committed_receipt_restart_pays_no_qwen(
     _assert_same_publication(clip, legacy_storage.read_clip("clip-1"))
 
 
-def test_frozen_bbox_candidate_drift_fails_closed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("tamper", ("candidate_drift", "base_metadata_extra_field"))
+def test_frozen_bbox_artifact_tamper_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tamper: str
 ) -> None:
-    """Once the bbox input is frozen, a lost candidate is durable corruption."""
+    """Once the bbox input is frozen, neither the candidate nor the frozen
+    legacy metadata may change."""
     results = (legacy_integrity._transient_removal_artifact_review(),)
     config, storage = _main_review_fixture(tmp_path, monkeypatch, "run-epoch")
     judge = _FakeEpochJudge(results, ())
@@ -1561,8 +1563,7 @@ def test_frozen_bbox_candidate_drift_fails_closed(
     unlocked: list[ModelJob] = []
 
     def hold_bbox(job: Any, result: Any) -> Any:
-        unlocked_jobs = runner.finalize(job, result)
-        unlocked.extend(unlocked_jobs)
+        unlocked.extend(runner.finalize(job, result))
         return ()  # the bbox job never runs: no bbox receipt exists yet
 
     scheduler = _epoch_scheduler(runner, _SerialQwenExecutor(runner, judge), hold_bbox)
@@ -1570,20 +1571,27 @@ def test_frozen_bbox_candidate_drift_fails_closed(
 
     assert len(unlocked) == 1
     assert unlocked[0].job_type == REFERENCE_INTEGRITY_BBOX_REVIEW_JOB
-    anchor = _frozen_bbox_anchor(runner)
+    anchor_path = runner._bbox_input_path(SHARD, "clip-1", "e2")
+    anchor = json.loads(anchor_path.read_text(encoding="utf-8"))
     assert judge.bbox_calls == []
-    candidate = _resolve(storage, anchor["candidate_path"])
-    assert candidate.is_file()
-    candidate.write_bytes(b"tampered candidate")
+    if tamper == "candidate_drift":
+        candidate = _resolve(storage, anchor["candidate_path"])
+        assert candidate.is_file()
+        candidate.write_bytes(b"tampered candidate")
+        expected = "bbox candidate drifted"
+    else:
+        # An extra field in the frozen legacy metadata is corruption too.
+        assert "epoch_fake_field" not in anchor["base_metadata"]
+        anchor["base_metadata"]["epoch_fake_field"] = "bad"
+        anchor_path.write_text(json.dumps(anchor), encoding="utf-8")
+        expected = "bbox base metadata drifted"
 
     fresh = _runner(config, storage, tmp_path)
     main_job = fresh.seed_jobs()[0]
     assert dict(main_job.target)["variant"] == "final"
     committed = fresh.ledger.load_committed_result(main_job)
     assert committed is not None
-    with pytest.raises(
-        ReferenceIntegrityDurableError, match="bbox candidate drifted"
-    ):
+    with pytest.raises(ReferenceIntegrityDurableError, match=expected):
         fresh.finalize(main_job, committed)
 
     clip = storage.read_clip("clip-1")
@@ -1596,6 +1604,51 @@ def test_frozen_bbox_candidate_drift_fails_closed(
             for line in failures_path.read_text(encoding="utf-8").splitlines()
             if line.strip()
         ] == []
+
+
+def test_finalized_bbox_metadata_tamper_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A durable bbox entity marker implies the metadata already finalized.
+
+    Rewinding the metadata to the frozen materialized base after the outcome is
+    durable must fail closed, never be silently re-advanced on restart.
+    """
+    results = (legacy_integrity._transient_removal_artifact_review(),)
+    bbox_results = (legacy_integrity._bbox_review(accept=True),)
+    config, storage = _main_review_fixture(tmp_path, monkeypatch, "run-epoch")
+    judge = _FakeEpochJudge(results, bbox_results)
+    runner, _executor, _jobs = _run_epoch(config, storage, tmp_path, judge)
+
+    clip = storage.read_clip("clip-1")
+    assert clip.reference_integrity is not None
+    assert clip.reference_integrity.status == "ready"
+    anchor = _frozen_bbox_anchor(runner)
+    metadata_path = _resolve(storage, anchor["metadata_path"])
+    assert json.loads(metadata_path.read_text(encoding="utf-8"))["status"] == "accepted"
+    failures_path = Path(storage.root) / "failures.jsonl"
+    before_failures = (
+        failures_path.read_text(encoding="utf-8") if failures_path.is_file() else ""
+    )
+
+    metadata_path.write_text(json.dumps(anchor["base_metadata"]), encoding="utf-8")
+
+    fresh = _runner(config, storage, tmp_path)
+    with pytest.raises(
+        ReferenceIntegrityDurableError,
+        match="final Reference Integrity bbox metadata drifted",
+    ):
+        fresh.reconcile_stats(SHARD)
+
+    after = storage.read_clip("clip-1")
+    assert after.reference_integrity is not None
+    assert after.reference_integrity.status == "ready"
+    assert len(judge.calls) == 1, "restart pays no integrity call"
+    assert len(judge.bbox_calls) == 1, "restart pays no bbox call"
+    after_failures = (
+        failures_path.read_text(encoding="utf-8") if failures_path.is_file() else ""
+    )
+    assert after_failures == before_failures, "no semantic failure is recorded"
 
 
 def test_source_alpha_committed_receipt_restart_pays_no_qwen(

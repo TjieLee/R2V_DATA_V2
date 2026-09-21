@@ -2211,20 +2211,15 @@ class ReferenceIntegrityEpochRunner:
         return {key: value for key, value in anchor.items() if key != "base_metadata"}
 
     @staticmethod
-    def _verify_frozen_base_metadata(anchor: Mapping[str, Any]) -> None:
-        """Tie the frozen legacy materialized metadata to the derived anchor.
+    def _expected_base_metadata(anchor: Mapping[str, Any]) -> dict[str, Any]:
+        """The exact legacy materialized metadata shape of the artifact trigger.
 
-        The materialized metadata is legacy authority, stored verbatim; this
-        check proves it still describes exactly the artifact the anchor froze.
+        The legacy ``_materialize_source_bbox`` shape is fixed, so this is an
+        exact equality target: a missing, renamed or extra field in the frozen
+        copy is durable corruption. 6d2b will generalize it for the topology
+        trigger, which adds its own ``topology_evidence`` block.
         """
-        base = anchor.get("base_metadata")
-        label = f"{anchor.get('clip_uid')}/{anchor.get('entity_id')}"
-        if not isinstance(base, dict):
-            raise ReferenceIntegrityDurableError(
-                f"frozen Reference Integrity bbox base metadata is missing for "
-                f"{label}"
-            )
-        expected = {
+        return {
             "mode": BBOX_REVIEW_MODE,
             "trigger": f"{BBOX_TRIGGER_ARTIFACT}_v1",
             "status": "materialized",
@@ -2250,12 +2245,26 @@ class ReferenceIntegrityEpochRunner:
             "failed_reference_path": anchor["current_reference_path"],
             "failed_reference_sha256": anchor["current_reference_sha256"],
         }
-        for key, value in expected.items():
-            if base.get(key) != value:
-                raise ReferenceIntegrityDurableError(
-                    f"frozen Reference Integrity bbox base metadata {key} drifted "
-                    f"for {label}"
-                )
+
+    @classmethod
+    def _verify_frozen_base_metadata(cls, anchor: Mapping[str, Any]) -> None:
+        """Tie the frozen legacy materialized metadata to the derived anchor.
+
+        The materialized metadata is legacy authority, stored verbatim; this
+        check proves it still describes exactly the artifact the anchor froze.
+        """
+        base = anchor.get("base_metadata")
+        label = f"{anchor.get('clip_uid')}/{anchor.get('entity_id')}"
+        if not isinstance(base, dict):
+            raise ReferenceIntegrityDurableError(
+                f"frozen Reference Integrity bbox base metadata is missing for "
+                f"{label}"
+            )
+        if base != cls._expected_base_metadata(anchor):
+            raise ReferenceIntegrityDurableError(
+                f"frozen Reference Integrity bbox base metadata drifted for "
+                f"{label}"
+            )
 
     def _materialize_bbox_input(
         self, *, storage: RunStorage, clip_uid: str, entity: Any, parent: _BboxParent
@@ -2603,6 +2612,32 @@ class ReferenceIntegrityEpochRunner:
                 f"frozen Reference Integrity bbox metadata drifted for {label}"
             )
         write_json_atomic(path, expected)
+
+    def _verify_final_bbox_metadata(
+        self,
+        *,
+        storage: RunStorage,
+        anchor: Mapping[str, Any],
+        bbox_payload: Mapping[str, Any],
+    ) -> None:
+        """A durable bbox entity marker implies the metadata already finalized.
+
+        ``_finalize_bbox_review`` publishes the metadata before it writes the
+        entity marker, so once that marker exists the metadata transition is a
+        completed durable continuation. Any other metadata state - the frozen
+        base, an unreadable file, a differently corrupted one - fails closed
+        instead of being silently re-advanced on restart.
+        """
+        label = f"{anchor['clip_uid']}/{anchor['entity_id']}"
+        current = _read_json(_resolve_run_artifact(storage, str(anchor["metadata_path"])))
+        expected = self._expected_bbox_metadata(
+            base_metadata=anchor["base_metadata"],
+            bbox_payload=bbox_payload,
+        )
+        if current != expected:
+            raise ReferenceIntegrityDurableError(
+                f"final Reference Integrity bbox metadata drifted for {label}"
+            )
 
     def _expected_bbox_marker(
         self,
@@ -3091,12 +3126,18 @@ class ReferenceIntegrityEpochRunner:
             raise ReferenceIntegrityDurableError(
                 f"source bbox job id drifted for {clip.clip_uid}/{entity_id}"
             )
+        bbox_payload = self._committed_review_payload(bbox_job)
+        self._verify_final_bbox_metadata(
+            storage=storage,
+            anchor=anchor,
+            bbox_payload=bbox_payload,
+        )
         expected = self._expected_bbox_marker(
             clip_uid=clip.clip_uid,
             entity=entity,
             parent=parent,
             bbox_job=bbox_job,
-            bbox_payload=self._committed_review_payload(bbox_job),
+            bbox_payload=bbox_payload,
             bbox_anchor=anchor,
         )
         if dict(marker) != expected:
