@@ -319,27 +319,65 @@ finger configuration. Do not invent an invisible force, unseen object or motive.
 Prefer visible facial facts such as a smile, lowered gaze, tightened lips or
 furrowed brows over inferred inner states.
 
+FACIAL AND HEAD MICRO-MOTION PRIORITY
+
+For close-up, medium-close, dialogue-like, reaction, or otherwise face-dominant
+shots, facial and head motion is higher priority than static background,
+lighting, clothing, or generic emotion labels.
+
+For each clearly visible subject, describe the observable sequence when it is
+supported by <Video 1>:
+- initial torso and shoulder orientation when relevant,
+- initial head orientation: frontal, three-quarter left/right, near-profile, or profile,
+- whether the head turns and in which direction,
+- chin raised, level, or lowered and any visible change,
+- gaze direction and any gaze shift,
+- eyelid/blink or brow change when salient,
+- initial mouth state: closed, slightly parted, or open,
+- visible lip and lower-jaw movement over time,
+- whether the mouth closes, opens, parts briefly, or returns to its earlier state,
+- the final visible head/gaze/mouth state,
+- the timing of these changes relative to the other subject and to body/hand motion.
+
+Do not collapse these observations into only "shocked", "sad", "concerned",
+"angry", "stunned", "crying", "speaking" or another emotion/action label.
+If an emotion label is useful, first state the visible facial configuration that
+supports it.
+
+Do not infer spoken words or phoneme-level lip sync. The sampled video may not
+resolve every rapid mouth movement, so stay conservative when a transition is
+not clearly visible. But when a mouth, jaw, gaze, or head transition is visible,
+state its initial state, transition, and resulting state explicitly.
+
 FEW-SHOT DETAILED-DESCRIPTION STYLE EXAMPLES
 
 These examples demonstrate structure and emphasis only. Never copy their
 motion, camera behavior, scene or interaction unless it is actually visible in
 the current <Video 1>.
 
-Example A — static camera:
+Example A — face-dominant static close-up:
 
 detailed_description:
-<Subject 1> reaches his right hand toward the mostly stationary <Subject 2> and then draws it back while keeping his body oriented toward her, with the camera holding a static medium two-shot throughout.
+<Subject 1> holds a three-quarter-right head orientation toward <Subject 2>, keeping her eyes on him as her initially parted lips gradually come together, while <Subject 2> remains in near left profile, briefly lowers his gaze and opens then closes his mouth; the camera holds a static tight two-shot throughout.
 
 [Shot 1]
-<Subject 1> sits on the left facing slightly toward <Subject 2> and extends his right arm forward with an open palm and partially curled fingers, while <Subject 2> remains nearly still on the right with her head slightly lowered; the camera stays fixed in a medium composition. <Subject 1> then gradually retracts his hand toward his torso without changing seats, while <Subject 2> maintains her position and the framing remains static.
+<Subject 1> sits on the left with her shoulders mostly forward and her head rotated to the right into a three-quarter view. Her chin begins slightly lowered, her eyes stay directed toward <Subject 2>, and her lips are initially separated with the lower jaw slightly dropped. She keeps the same head direction while the jaw rises gradually and the lips meet, with her gaze remaining on <Subject 2>. <Subject 2> sits on the right in near left profile, with his nose and chin pointing toward the left side of frame. His head position stays nearly fixed while his eyes shift slightly downward. His mouth begins closed, the lips part briefly as the lower jaw drops, and the mouth returns to a closed state. The camera remains completely static with no pan, tilt, zoom, reframing, or cut.
 
-Example B — moving camera:
+Example B — subtle head, gaze and mouth transitions:
 
 detailed_description:
-<Subject 1> and <Subject 2> walk forward side by side while briefly turning toward each other and exchanging hand gestures, as the camera tracks backward with them and gradually tightens the two-shot.
+<Subject 1> starts nearly frontal, shifts her gaze toward <Subject 2> before turning her head slightly right and parting her lips, while <Subject 2> raises his chin and closes his previously open mouth; the camera remains static.
 
 [Shot 1]
-<Subject 1> and <Subject 2> advance together from the mid-ground toward the foreground while the camera tracks backward at their pace, keeping both subjects centered. <Subject 1> turns his head toward <Subject 2> and lifts one hand during the exchange; <Subject 2> responds with a small hand motion while continuing forward, and the camera slowly reframes them more tightly without introducing a cut.
+<Subject 1> begins with her face almost frontal and her mouth closed. Her eyes move first toward <Subject 2>; after the gaze shift, her head rotates slightly to the right into a shallow three-quarter view. Her lips then separate and the lower jaw lowers a little while the head holds the new angle. <Subject 2> begins facing slightly left with his chin lowered and mouth open. He gradually raises his chin, keeps his eyes on <Subject 1>, and brings the lower jaw upward until the lips meet. Neither subject changes seat or body position, and the camera keeps the same framing throughout.
+
+Example C — body motion with a moving camera:
+
+detailed_description:
+<Subject 1> and <Subject 2> walk forward side by side while briefly turning their heads toward each other and exchanging hand gestures, as the camera tracks backward with them and gradually tightens the two-shot.
+
+[Shot 1]
+<Subject 1> and <Subject 2> advance together from the mid-ground toward the foreground while the camera tracks backward at their pace, keeping both subjects centered. <Subject 1> turns his head toward <Subject 2>, briefly parts his lips and lifts one hand during the exchange; <Subject 2> shifts her gaze toward <Subject 1> before making a small hand motion while continuing forward. Their heads return closer to the walking direction as the camera slowly reframes them more tightly without introducing a cut.
 
 DETAILED DESCRIPTION
 

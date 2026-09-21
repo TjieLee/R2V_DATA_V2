@@ -434,10 +434,19 @@ def test_prompt_includes_identity_and_motion_icl_examples():
 
     system = H3_PROMPT_SYSTEM_PROMPT
     assert "OBSERVATION-ONLY LANGUAGE" in system
+    assert "FACIAL AND HEAD MICRO-MOTION PRIORITY" in system
+    assert "initial head orientation: frontal, three-quarter left/right" in system
+    assert "initial mouth state: closed, slightly parted, or open" in system
+    assert "visible lip and lower-jaw movement over time" in system
+    assert "final visible head/gaze/mouth state" in system
+    assert "Do not collapse these observations into only" in system
+    assert "Do not infer spoken words or phoneme-level lip sync." in system
     assert "FEW-SHOT DETAILED-DESCRIPTION STYLE EXAMPLES" in system
-    assert "Example A — static camera:" in system
-    assert "Example B — moving camera:" in system
-    assert "camera holding a static medium two-shot" in system
+    assert "Example A — face-dominant static close-up:" in system
+    assert "Example B — subtle head, gaze and mouth transitions:" in system
+    assert "Example C — body motion with a moving camera:" in system
+    assert "the lips meet" in system
+    assert "eyes move first toward <Subject 2>" in system
     assert "camera tracks backward with them" in system
     assert "Do not invent an invisible force" in system
 
