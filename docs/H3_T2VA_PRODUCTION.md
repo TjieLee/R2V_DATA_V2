@@ -339,6 +339,49 @@ assigned shard directories without a top-level COMPLETE marker are prioritized;
 absent directories are fresh; COMPLETE shards are skipped. No stage JSON, receipt,
 media file, or artifact hash is read for scheduling.
 
+### Downstream hash policy and GPU-idle diagnosis
+
+MiMo is lazy, so CPU/shared-storage work before the first real downstream request
+appears as 0% GPU utilization. Do not put repeated full-media SHA validation in
+that hot path.
+
+Full production reuses the canonical stage's
+`shards/<shard>/source/selection.json` when constructing the T2VA inventory.
+That selection already carries the target-video hashes established during
+canonical preparation, so downstream preparation must not re-read all 2,000
+videos merely to recompute the same hashes. Likewise, resolved/canonical records
+already carry the per-clip Audio hashes; inventory construction does not rehash
+all full/speech/music/sfx files.
+
+Aggregate `inventory.source_hashes` are validated once per unique full-production
+inventory by the full downstream processor. They are not rehashed before and
+after every T2VA/TA2VA sample. Standalone/frozen production keeps its default
+strong per-sample source verification unless explicitly using the full-production
+prevalidated path.
+
+Integrity checks that remain in the hot path are intentionally local:
+
+- pending T2VA/TA2VA work verifies the media actually used by that sample;
+- published stage artifacts retain their recorded file hashes;
+- resume performs one authoritative artifact recovery/hash validation, not a
+  duplicate preflight hash pass;
+- source/config/inventory fingerprints remain part of durable identity.
+
+The full downstream supervisor prints:
+
+    shard=<id> downstream_prepare_start
+    shard=<id> downstream_prepare_ready rows=... contexts=...
+    shard=<id> downstream_preflight_start
+    shard=<id> downstream_preflight_ready
+    shard=<id> mimo_server_started ...
+    shard=<id> mimo_server_ready ...
+
+If GPU utilization is zero for a long period, inspect these markers first. A
+stall between downstream_prepare_start and downstream_prepare_ready is inventory
+construction / shared-storage work. A stall during downstream_preflight is resume
+metadata/artifact recovery. MiMo should not consume GPU memory until
+mimo_server_started appears.
+
 ### Raw-video server acceptance (2026-09-18)
 
 The earlier performance-v2 raw-5 server run passed with resident upstream pools
