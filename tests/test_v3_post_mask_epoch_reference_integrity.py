@@ -835,45 +835,49 @@ def test_committed_review_receipt_restart_pays_no_qwen(
     _assert_same_publication(clip, legacy_storage.read_clip("clip-1"))
 
 
-@pytest.mark.parametrize("continuation", ("source_alpha", "artifact_bbox"))
-def test_6d_continuations_stay_unresolved(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, continuation: str
+def test_6d2_bbox_continuation_stays_unresolved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A main review that legacy continues into 6d keeps only its receipt."""
-    if continuation == "source_alpha":
-        config, storage = _main_review_fixture(
-            tmp_path,
-            monkeypatch,
-            "run-epoch",
-            second_scope="full",
-            second_synthetic=True,
-            completion_state=True,
-        )
-        judge_result = legacy_integrity._severe_reference_artifact_review()
-    else:
-        config, storage = _main_review_fixture(tmp_path, monkeypatch, "run-epoch")
-        judge_result = legacy_integrity._transient_removal_artifact_review()
+    """A main review legacy continues into the bbox route keeps only its receipt.
+
+    6d1 owns the source-alpha continuation, so only the source bbox fallback
+    remains deferred (6d2).
+    """
+    config, storage = _main_review_fixture(tmp_path, monkeypatch, "run-epoch")
+    judge_result = legacy_integrity._transient_removal_artifact_review()
     judge = _fake_main_judge(judge_result)
     runner, _executor, jobs = _run_epoch(config, storage, tmp_path, judge)
 
     assert len(jobs) == 1
-    assert len(judge.calls) == 1, "6c must not run any continuation model call"
+    assert len(judge.calls) == 1, "no continuation model call is made in 6d1"
     assert runner._entity_outcome(SHARD, "clip-1", "e2") is None
     clip = storage.read_clip("clip-1")
     assert clip.reference_integrity is None
     with pytest.raises(ReferenceIntegrityEpochError, match="not terminal"):
         runner.reconcile_stats(SHARD)
-    # 6d owns the continuation: no bbox judge exists in this epoch at all.
+    # The source bbox fallback review is a 6d2 job type and does not exist here.
     assert not hasattr(runner, "bbox_fallback_judge")
 
 
+@pytest.mark.parametrize("variant", ("final", "source_alpha"))
 def test_reviewed_marker_tamper_fails_closed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, variant: str
 ) -> None:
-    """A tampered reviewed marker must fail closed against its receipt."""
-    judge_result = legacy_integrity._review(accept=True, reason="usable reference")
-    config, storage = _main_review_fixture(tmp_path, monkeypatch, "run-epoch")
-    judge = _fake_main_judge(judge_result)
+    """A tampered reviewed marker must fail closed against its receipts."""
+    if variant == "final":
+        config, storage = _main_review_fixture(tmp_path, monkeypatch, "run-epoch")
+        results: tuple[Any, ...] = (
+            legacy_integrity._review(accept=True, reason="usable reference"),
+        )
+    else:
+        config, storage = _alpha_continuation_fixture(
+            tmp_path, monkeypatch, "run-epoch"
+        )
+        results = (
+            legacy_integrity._severe_reference_artifact_review(),
+            legacy_integrity._review(accept=True, reason="alpha reference is clean"),
+        )
+    judge = _fake_main_judge(*results)
     runner, _executor, _jobs = _run_epoch(config, storage, tmp_path, judge)
 
     path = runner._entity_outcome_path(SHARD, "clip-1", "e2")
@@ -886,65 +890,280 @@ def test_reviewed_marker_tamper_fails_closed(
         fresh.reconcile_stats(SHARD)
 
 
-def test_reviewed_marker_invalid_review_fails_closed(
+# ---------------------------------------------------------------------------
+# 6d1: source alpha continuation
+# ---------------------------------------------------------------------------
+
+
+def _frozen_alpha_edit(runner: Any, entity_id: str = "e2") -> Any:
+    """The frozen pre-edit entity whose source alpha 6d1 must use."""
+    plan = json.loads(runner._plan_path(SHARD).read_text(encoding="utf-8"))
+    entities = plan["clips"]["clip-1"]["pre_reference_edit"]["entities"]
+    return next(item for item in entities if item["entity_id"] == entity_id)
+
+
+def _alpha_continuation_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, run_name: str
+) -> tuple[Any, Any]:
+    return _main_review_fixture(
+        tmp_path,
+        monkeypatch,
+        run_name,
+        second_scope="full",
+        second_synthetic=True,
+        completion_state=True,
+    )
+
+
+def _legacy_alpha_run(
+    config: Any, storage: Any, *judge_results: Any
+) -> tuple[Any, Any, Any]:
+    judge = _fake_main_judge(*judge_results)
+    bbox_judge = legacy_integrity.FakeSourceBboxFallbackJudge([])
+    stats = legacy_integrity.reference_integrity_clips(
+        config,
+        storage,
+        judge=judge,
+        bbox_fallback_judge=bbox_judge,
+    )
+    return stats, judge, bbox_judge
+
+
+def test_source_alpha_accept_matches_legacy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A shape-valid but content-less review is durable corruption, not KeyError."""
-    judge_result = legacy_integrity._review(accept=True, reason="usable reference")
-    config, storage = _main_review_fixture(tmp_path, monkeypatch, "run-epoch")
-    judge = _fake_main_judge(judge_result)
+    """An accepted source alpha publishes the alpha reference exactly like legacy."""
+    results = (
+        legacy_integrity._severe_reference_artifact_review(),
+        legacy_integrity._review(accept=True, reason="alpha reference is clean"),
+    )
+    legacy_config, legacy_storage = _alpha_continuation_fixture(
+        tmp_path, monkeypatch, "run-legacy"
+    )
+    legacy_stats, legacy_judge, legacy_bbox = _legacy_alpha_run(
+        legacy_config, legacy_storage, *results
+    )
+    assert [call["synthetic"] for call in legacy_judge.calls] == [True, False]
+    assert legacy_bbox.calls == []
+
+    config, storage = _alpha_continuation_fixture(tmp_path, monkeypatch, "run-epoch")
+    judge = _fake_main_judge(*results)
+    runner, _executor, jobs = _run_epoch(config, storage, tmp_path, judge)
+
+    assert len(jobs) == 1, "only the main review is a root job"
+    assert dict(jobs[0].target) == {"entity_id": "e2", "variant": "final"}
+    assert [call["synthetic"] for call in judge.calls] == [True, False]
+    stats = runner.reconcile_stats(SHARD)
+    assert stats.to_dict() == legacy_stats.to_dict()
+    assert stats.entities_reviewed == 2
+    epoch_clip = storage.read_clip("clip-1")
+    legacy_clip = legacy_storage.read_clip("clip-1")
+    _assert_same_publication(epoch_clip, legacy_clip)
+
+    frozen = _frozen_alpha_edit(runner)
+    final_reference = epoch_clip.references.entities[1]
+    assert final_reference.synthetic is False
+    assert final_reference.image_path == frozen["source_reference"]["image_path"]
+    final_edit = epoch_clip.reference_edit.entities[1]
+    assert final_edit.default_variant == "alpha"
+    assert final_edit.fallback_policy == "keep_source"
+    assert final_edit.reason == "completion_integrity_rejected_fallback_to_alpha"
+
+    marker = json.loads(
+        runner._entity_outcome_path(SHARD, "clip-1", "e2").read_text(encoding="utf-8")
+    )
+    assert marker["review_variant"] == "source_alpha"
+    assert marker["status"] == "accepted"
+    assert marker["reason"] == "completion_integrity_rejected_source_alpha_accepted"
+    assert marker["delta"]["entities_reviewed"] == 2
+    assert marker["delta"]["entities_accepted"] == 1
+    assert marker["judge_failed"] is False
+    # The alpha job is conditional on the exact main receipt.
+    alpha_job_id = marker["review_job_id"]
+    main_marker_absent = (
+        runner._entity_outcome_path(SHARD, "clip-1", "e2").is_file()
+    )
+    assert main_marker_absent
+    plan = json.loads(runner._plan_path(SHARD).read_text(encoding="utf-8"))
+    assert plan["clips"]["clip-1"]["classification"] == "fresh_target"
+    assert alpha_job_id != jobs[0].job_id()
+
+
+def test_source_alpha_judge_failure_matches_legacy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An alpha judge failure is a legacy semantic rejection, not a retry."""
+    failure = legacy_integrity.ReferenceIntegrityJudgeFailure(
+        "alpha exploded", raw_responses=("raw",)
+    )
+    results = (legacy_integrity._severe_reference_artifact_review(), failure)
+    legacy_config, legacy_storage = _alpha_continuation_fixture(
+        tmp_path, monkeypatch, "run-legacy"
+    )
+    legacy_stats, legacy_judge, _legacy_bbox = _legacy_alpha_run(
+        legacy_config, legacy_storage, *results
+    )
+    assert len(legacy_judge.calls) == 2
+
+    config, storage = _alpha_continuation_fixture(tmp_path, monkeypatch, "run-epoch")
+    judge = _fake_main_judge(*results)
     runner, _executor, _jobs = _run_epoch(config, storage, tmp_path, judge)
 
-    path = runner._entity_outcome_path(SHARD, "clip-1", "e2")
-    marker = json.loads(path.read_text(encoding="utf-8"))
-    marker["review"] = {}  # a dict, so the old type check let it through
-    path.write_text(json.dumps(marker), encoding="utf-8")
+    assert len(judge.calls) == 2
+    stats = runner.reconcile_stats(SHARD)
+    assert stats.to_dict() == legacy_stats.to_dict()
+    assert stats.judge_failed == 1
+    assert stats.entities_reviewed == 2
+    assert stats.entities_rejected == 1
+    epoch_clip = storage.read_clip("clip-1")
+    legacy_clip = legacy_storage.read_clip("clip-1")
+    _assert_same_publication(epoch_clip, legacy_clip)
+    marker = json.loads(
+        runner._entity_outcome_path(SHARD, "clip-1", "e2").read_text(encoding="utf-8")
+    )
+    assert marker["review_variant"] == "source_alpha"
+    assert marker["judge_failed"] is True
+    assert marker["review"] is None
+    assert marker["status"] == "rejected"
+    assert marker["reason"] == (
+        "completion_rejected_then_alpha_integrity_judge_failed:alpha exploded"
+    )
+    assert marker["delta"]["entities_reviewed"] == 2
+    assert marker["delta"]["entities_rejected"] == 1
 
-    fresh = _runner(config, storage, tmp_path)
-    with pytest.raises(
-        ReferenceIntegrityDurableError, match="has an invalid review"
-    ):
-        fresh.seed_jobs()
 
-
-def test_existing_review_anchor_unreadable_input_fails_closed(
+def test_source_alpha_reject_without_bbox_matches_legacy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Once the review input is frozen, a lost final reference is corruption.
+    """An alpha reject with no bbox route terminalizes as a rejection."""
+    results = (
+        legacy_integrity._severe_reference_artifact_review(),
+        legacy_integrity._primary_identity_loss_review(),
+    )
+    legacy_config, legacy_storage = _alpha_continuation_fixture(
+        tmp_path, monkeypatch, "run-legacy"
+    )
+    legacy_stats, legacy_judge, legacy_bbox = _legacy_alpha_run(
+        legacy_config, legacy_storage, *results
+    )
+    assert len(legacy_judge.calls) == 2
+    assert legacy_bbox.calls == []
+    assert legacy_stats.source_bbox_fallback_attempted == 0
 
-    The anchor durably proves the entity entered the main review, so the epoch
-    must fail closed rather than degrade into an ordinary CPU clip failure.
-    """
-    from r2v_data_v2.v3.reference_integrity import _resolve_run_artifact
+    config, storage = _alpha_continuation_fixture(tmp_path, monkeypatch, "run-epoch")
+    judge = _fake_main_judge(*results)
+    runner, _executor, _jobs = _run_epoch(config, storage, tmp_path, judge)
 
-    config, storage = _main_review_fixture(tmp_path, monkeypatch, "run-epoch")
-    judge = _fake_main_judge(legacy_integrity._review(accept=True, reason="usable"))
-    runner = _runner(config, storage, tmp_path)
-    jobs = runner.seed_jobs()
+    assert len(judge.calls) == 2
+    stats = runner.reconcile_stats(SHARD)
+    assert stats.to_dict() == legacy_stats.to_dict()
+    epoch_clip = storage.read_clip("clip-1")
+    legacy_clip = legacy_storage.read_clip("clip-1")
+    _assert_same_publication(epoch_clip, legacy_clip)
+
+    frozen = _frozen_alpha_edit(runner)
+    # The entity records the alpha reference it was judged on ...
+    integrity_entity = next(
+        item for item in epoch_clip.reference_integrity.entities
+        if item.entity_id == "e2"
+    )
+    assert integrity_entity.status == "rejected"
+    assert integrity_entity.input_reference.model_dump(mode="json") == (
+        frozen["source_reference"]
+    )
+    # ... while the published clip reference is the rejected pre-stage one.
+    assert epoch_clip.references.entities[1].status == "rejected"
+    assert epoch_clip.references.entities[1].image_path != (
+        frozen["source_reference"]["image_path"]
+    )
+    assert epoch_clip.reference_edit.entities[1].default_variant == "accepted_base"
+    marker = json.loads(
+        runner._entity_outcome_path(SHARD, "clip-1", "e2").read_text(encoding="utf-8")
+    )
+    assert marker["review_variant"] == "source_alpha"
+    assert marker["status"] == "rejected"
+    assert marker["judge_failed"] is False
+    assert marker["reason"] == results[1].reason
+    assert marker["delta"]["entities_rejected"] == 1
+
+
+def test_source_alpha_artifact_bbox_continuation_stays_unresolved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An alpha reject that legacy routes into the bbox fallback defers to 6d2."""
+    results = (
+        legacy_integrity._severe_reference_artifact_review(),
+        legacy_integrity._severe_reference_artifact_review(),
+    )
+    config, storage = _alpha_continuation_fixture(tmp_path, monkeypatch, "run-epoch")
+    judge = _fake_main_judge(*results)
+    runner, executor, jobs = _run_epoch(config, storage, tmp_path, judge)
+
     assert len(jobs) == 1
-    assert dict(jobs[0].target) == {"entity_id": "e2", "variant": "final"}
+    assert len(judge.calls) == 2, "both reviews ran; the bbox route did not"
+    assert executor.batches == 2, "one main phase, one alpha phase"
+    assert runner._entity_outcome(SHARD, "clip-1", "e2") is None
+    clip = storage.read_clip("clip-1")
+    assert clip.reference_integrity is None
+    assert clip.references.entities[1].status != "rejected"
+    with pytest.raises(ReferenceIntegrityEpochError, match="not terminal"):
+        runner.reconcile_stats(SHARD)
+    # Both receipts are durable, and the alpha input anchor was frozen.
+    assert runner._review_input_path(SHARD, "clip-1", "e2").is_file()
+    assert runner._review_input_path(
+        SHARD, "clip-1", "e2", "source_alpha"
+    ).is_file()
+    assert not hasattr(runner, "bbox_fallback_judge")
 
-    anchor_path = runner._review_input_path(SHARD, "clip-1", "e2")
-    anchor = json.loads(anchor_path.read_text(encoding="utf-8"))
-    _resolve_run_artifact(storage, str(anchor["final_reference_path"])).unlink()
+
+def test_source_alpha_committed_receipt_restart_pays_no_qwen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash after the alpha receipt replays the whole chain for free."""
+    results = (
+        legacy_integrity._severe_reference_artifact_review(),
+        legacy_integrity._review(accept=True, reason="alpha reference is clean"),
+    )
+    legacy_config, legacy_storage = _alpha_continuation_fixture(
+        tmp_path, monkeypatch, "run-legacy"
+    )
+    legacy_stats, _legacy_judge, _legacy_bbox = _legacy_alpha_run(
+        legacy_config, legacy_storage, *results
+    )
+
+    config, storage = _alpha_continuation_fixture(tmp_path, monkeypatch, "run-epoch")
+    judge = _fake_main_judge(*results)
+    runner = _runner(config, storage, tmp_path)
+    executor = _SerialQwenExecutor(runner, judge)
+
+    def swallow_alpha(job: Any, result: Any) -> Any:
+        # Simulate a crash between the alpha receipt and its CPU finalizer.
+        if str(dict(job.target).get("variant")) == "source_alpha":
+            return ()
+        return runner.finalize(job, result)
+
+    scheduler = _epoch_scheduler(runner, executor, swallow_alpha)
+    jobs = runner.seed_jobs()
+    assert [dict(job.target)["variant"] for job in jobs] == ["final"]
+    scheduler.run(jobs)
+
+    assert len(judge.calls) == 2
+    assert runner._entity_outcome(SHARD, "clip-1", "e2") is None
+    assert storage.read_clip("clip-1").reference_integrity is None
 
     fresh = _runner(config, storage, tmp_path)
     fresh_executor = _SerialQwenExecutor(fresh, judge)
-    with pytest.raises(
-        ReferenceIntegrityDurableError, match="cannot re-derive"
-    ):
-        jobs = fresh.seed_jobs()
-        _epoch_scheduler(fresh, fresh_executor).run(jobs)
+    fresh_scheduler = _epoch_scheduler(fresh, fresh_executor)
+    fresh_jobs = fresh.seed_jobs()
+    # The alpha job is never a root: only the main receipt unlocks it.
+    assert [dict(job.target)["variant"] for job in fresh_jobs] == ["final"]
+    fresh_scheduler.run(fresh_jobs)
 
-    assert fresh_executor.batches == 0, "no model work may be scheduled"
-    assert len(judge.calls) == 0, "the epoch never pays a Qwen call here"
+    assert fresh_executor.batches == 0, "both committed receipts are reused"
+    assert len(judge.calls) == 2, "restart must not pay another Qwen call"
+    stats = fresh.reconcile_stats(SHARD)
+    assert stats.to_dict() == legacy_stats.to_dict()
     clip = storage.read_clip("clip-1")
-    assert clip.reference_integrity is None, "must not become a semantic failure"
-    failures_path = Path(storage.root) / "failures.jsonl"
-    if failures_path.is_file():
-        recorded = [
-            line
-            for line in failures_path.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
-        assert recorded == [], "no semantic failure may be appended"
+    assert clip.reference_integrity is not None
+    assert clip.reference_integrity.status == "ready"
+    _assert_same_publication(clip, legacy_storage.read_clip("clip-1"))

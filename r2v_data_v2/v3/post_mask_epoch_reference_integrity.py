@@ -56,6 +56,7 @@ from r2v_data_v2.v3.reference_integrity import (
     ReferenceIntegrityStats,
     _artifact_only_bbox_eligible,
     _is_self_sourced_reference,
+    _reference_edit_after_source_alpha,
     _rejected_reference,
     _resolve_run_artifact,
     _source_context,
@@ -80,7 +81,7 @@ from r2v_data_v2.v3.storage import RunStorage
 
 REFERENCE_INTEGRITY_PLAN_SCHEMA = "post_mask_epoch_reference_integrity_plan/1"
 REFERENCE_INTEGRITY_ENTITY_OUTCOME_SCHEMA = (
-    "post_mask_epoch_reference_integrity_entity_outcome/1"
+    "post_mask_epoch_reference_integrity_entity_outcome/2"
 )
 REFERENCE_INTEGRITY_CLIP_OUTCOME_SCHEMA = (
     "post_mask_epoch_reference_integrity_outcome/1"
@@ -93,12 +94,23 @@ REFERENCE_INTEGRITY_MAIN_REVIEW_POLICY_VERSION = (
     "reference_integrity_main_review/1"
 )
 
-#: The only model job this epoch owns so far. 6c implements the main review for
-#: ``variant="final"``; the source-alpha review and the source bbox fallback
-#: review arrive in 6d.
+#: The one model job type this epoch owns. 6c implements the main review
+#: (``variant="final"``); 6d1 adds the source-alpha review for a completion the
+#: main review rejected. The source bbox fallback review stays out (6d2).
 REFERENCE_INTEGRITY_REVIEW_JOB = "reference_integrity_review"
 VARIANT_FINAL = "final"
-IMPLEMENTED_REVIEW_VARIANTS = (VARIANT_FINAL,)
+VARIANT_SOURCE_ALPHA = "source_alpha"
+IMPLEMENTED_REVIEW_VARIANTS = (VARIANT_FINAL, VARIANT_SOURCE_ALPHA)
+
+#: Dependency address of the main review inside a source-alpha review job.
+MAIN_REVIEW_JOB_DEPENDENCY = "main_review"
+
+SOURCE_ALPHA_ACCEPTED_REASON = "completion_integrity_rejected_source_alpha_accepted"
+SOURCE_ALPHA_FALLBACK_REASON = "completion_integrity_rejected_fallback_to_alpha"
+SOURCE_ALPHA_JUDGE_FAILED_PREFIX = (
+    "completion_rejected_then_alpha_integrity_judge_failed:"
+)
+MAIN_REVIEW_JUDGE_FAILED_PREFIX = "integrity_judge_failed:"
 
 CLIP_FRESH_TARGET = "fresh_target"
 CLIP_EXISTING = "existing"
@@ -125,9 +137,13 @@ ENTITY_DELTA_FIELDS = (
     "judge_failed",
 )
 
-#: Marker keys that only a main-review outcome may carry.
+#: Marker keys that only a reviewed outcome may carry. ``review_variant`` and
+#: ``parent_review_job_id`` make the reviewed provenance explicit: a source-alpha
+#: outcome is a continuation of one exact main review receipt.
 REVIEWED_MARKER_FIELDS = (
     "review_job_id",
+    "review_variant",
+    "parent_review_job_id",
     "source_context_path",
     "review",
     "judge_failed",
@@ -140,6 +156,19 @@ CLIP_DELTA_KNOWN_FIELDS = CLIP_DELTA_FIELDS + ENTITY_DELTA_FIELDS
 
 CLEAN_REAL_FULL_REFERENCE = "clean_real_full_reference"
 REJECTED_REFERENCE_REASON = "reference_integrity_rejected"
+
+
+@dataclass(frozen=True)
+class _ReviewOutcome:
+    """One committed review's exact durable marker plus what it unlocks.
+
+    ``marker`` is ``None`` while a continuation still owns the entity; ``unlock``
+    is the deterministic model job that continuation must run next, if this
+    epoch implements it.
+    """
+
+    marker: dict[str, Any] | None
+    unlock: ModelJob | None
 
 
 @dataclass(frozen=True)
@@ -216,6 +245,55 @@ def _write_json_once(path: Path, payload: Mapping[str, Any]) -> None:
     atomic_write_json(path, dict(payload))
 
 
+def _plan_pre_reference(
+    plan_entry: Mapping[str, Any], entity_id: str
+) -> EntityReferenceState:
+    """The frozen pre-stage reference of one entity, or fail closed.
+
+    The source-alpha continuation is decided on the *pre-stage* reference (legacy
+    reads it before any replacement), so it must come from the frozen baselines.
+    """
+    pre_references = plan_entry.get("pre_references")
+    if not isinstance(pre_references, dict):
+        raise ReferenceIntegrityDurableError(
+            f"frozen plan has no pre-stage references for {entity_id!r}"
+        )
+    raw = next(
+        (
+            item
+            for item in pre_references.get("entities", [])
+            if isinstance(item, dict) and item.get("entity_id") == entity_id
+        ),
+        None,
+    )
+    if raw is None:
+        raise ReferenceIntegrityDurableError(
+            f"frozen plan has no pre-stage reference for {entity_id!r}"
+        )
+    try:
+        return EntityReferenceState.model_validate(raw)
+    except Exception as exc:
+        raise ReferenceIntegrityDurableError(
+            f"frozen pre-stage reference is invalid for {entity_id!r}"
+        ) from exc
+
+
+def _source_alpha_edit_entity(
+    pre_edit: ReferenceEditState | None, entity_id: str
+) -> Any:
+    """Legacy's ``reference_edits_by_id`` lookup, exactly.
+
+    Legacy builds that map only from a Reference Edit state that exists *and* is
+    ready, so anything else can never trigger the source-alpha continuation.
+    """
+    if pre_edit is None or pre_edit.status != "ready":
+        return None
+    return next(
+        (item for item in pre_edit.entities if item.entity_id == entity_id),
+        None,
+    )
+
+
 def _load_reference_image(storage: RunStorage, image_path: str) -> Any:
     """Read one reference PNG exactly like the legacy stage does."""
     resolved = _resolve_run_artifact(storage, image_path)
@@ -290,9 +368,15 @@ class ReferenceIntegrityEpochRunner:
     def _clip_outcome_path(self, shard: str, clip_uid: str) -> Path:
         return self._semantic("outcomes", shard, f"{clip_uid}.json")
 
-    def _review_input_path(self, shard: str, clip_uid: str, entity_id: str) -> Path:
+    def _review_input_path(
+        self,
+        shard: str,
+        clip_uid: str,
+        entity_id: str,
+        variant: str = VARIANT_FINAL,
+    ) -> Path:
         return self._semantic(
-            "review_inputs", shard, clip_uid, entity_id, f"{VARIANT_FINAL}.json"
+            "review_inputs", shard, clip_uid, entity_id, f"{variant}.json"
         )
 
     def _storage_for(self, shard: str) -> RunStorage:
@@ -601,40 +685,65 @@ class ReferenceIntegrityEpochRunner:
             )
         return self._validate_existing_plan(shard, payload)
 
-    # -- frozen main review input ---------------------------------------------
+    # -- frozen review inputs --------------------------------------------------
 
     def _review_semantic_inputs(
         self,
         entity: Any,
         reference: Any,
         *,
+        variant: str,
         source_context_sha256: str,
         final_reference_sha256: str,
         main_review_policy: Mapping[str, Any],
+        reference_scope: str | None = None,
+        synthetic: bool | None = None,
     ) -> dict[str, Any]:
-        """Exactly the semantic inputs of one main integrity review call."""
+        """Exactly the semantic inputs of one integrity review call.
+
+        ``variant`` is explicit because the source-alpha call reviews a different
+        reference and passes a literal ``synthetic=False`` while binding the very
+        same model semantic policy.
+        """
         return {
-            "variant": VARIANT_FINAL,
+            "variant": variant,
             "entity_id": entity.entity_id,
             "reference_type": entity.reference_type,
             "phrase": entity.phrase,
             "grounding_prompt": entity.grounding_prompt,
-            "reference_scope": reference.reference_scope,
-            "synthetic": bool(reference.synthetic),
+            "reference_scope": (
+                reference.reference_scope
+                if reference_scope is None
+                else str(reference_scope)
+            ),
+            "synthetic": (
+                bool(reference.synthetic) if synthetic is None else bool(synthetic)
+            ),
             "source_context_sha256": source_context_sha256,
             "final_reference_sha256": final_reference_sha256,
             "main_review_policy": dict(main_review_policy),
         }
 
     def _materialize_review_context(
-        self, storage: RunStorage, clip_uid: str, entity_id: str, context: Any
+        self,
+        storage: RunStorage,
+        clip_uid: str,
+        entity_id: str,
+        context: Any,
+        *,
+        variant: str = VARIANT_FINAL,
     ) -> tuple[str, str]:
         """Create-once Qwen context PNG with exact content validation.
 
         The context image is a model input, not a debug sidecar: an existing file
-        whose bytes differ from the derived image is durable corruption.
+        whose bytes differ from the derived image is durable corruption. The path
+        stays at the legacy location, which carries a variant suffix for the
+        source-alpha call.
         """
-        path = storage.selected_path(clip_uid, f"integrity_context_{entity_id}.png")
+        suffix = "" if variant == VARIANT_FINAL else f"_{variant}"
+        path = storage.selected_path(
+            clip_uid, f"integrity_context_{entity_id}{suffix}.png"
+        )
         buffer = io.BytesIO()
         context.save(buffer, format="PNG")
         data = buffer.getvalue()
@@ -655,33 +764,54 @@ class ReferenceIntegrityEpochRunner:
         return storage.relative_artifact_path(path), digest
 
     def _review_input_anchor(
-        self, storage: RunStorage, clip_uid: str, entity: Any, reference: Any
+        self,
+        storage: RunStorage,
+        clip_uid: str,
+        entity: Any,
+        reference: Any,
+        *,
+        variant: str = VARIANT_FINAL,
+        synthetic: bool | None = None,
     ) -> dict[str, Any]:
-        """Derive the complete frozen main-review input from live evidence."""
+        """Derive the complete frozen review input of one variant."""
         evidence = _source_evidence(storage, clip_uid=clip_uid, reference=reference)
         context_path, context_sha256 = self._materialize_review_context(
-            storage, clip_uid, entity.entity_id, _source_context(evidence)
+            storage,
+            clip_uid,
+            entity.entity_id,
+            _source_context(evidence),
+            variant=variant,
         )
         reference_path = _resolve_run_artifact(storage, str(reference.image_path))
         reference_sha256 = hashlib.sha256(reference_path.read_bytes()).hexdigest()
+        if synthetic is not None:
+            resolved_synthetic = bool(synthetic)
+        elif variant == VARIANT_SOURCE_ALPHA:
+            # Legacy passes a literal ``False`` here rather than reading the flag
+            # off the alpha reference.
+            resolved_synthetic = False
+        else:
+            resolved_synthetic = bool(reference.synthetic)
         policy = self._main_review_policy_identity()
         inputs = self._review_semantic_inputs(
             entity,
             reference,
+            variant=variant,
             source_context_sha256=context_sha256,
             final_reference_sha256=reference_sha256,
             main_review_policy=policy,
+            synthetic=resolved_synthetic,
         )
         return {
             "schema": REFERENCE_INTEGRITY_REVIEW_INPUT_SCHEMA,
             "clip_uid": clip_uid,
             "entity_id": entity.entity_id,
-            "variant": VARIANT_FINAL,
+            "variant": variant,
             "reference_type": entity.reference_type,
             "phrase": entity.phrase,
             "grounding_prompt": entity.grounding_prompt,
             "reference_scope": reference.reference_scope,
-            "synthetic": bool(reference.synthetic),
+            "synthetic": resolved_synthetic,
             "source_clip_uid": evidence.source_clip_uid,
             "source_entity_id": evidence.source_entity_id,
             "source_frame_slot": evidence.frame_slot,
@@ -695,21 +825,32 @@ class ReferenceIntegrityEpochRunner:
         }
 
     def _frozen_review_input(
-        self, shard: str, storage: RunStorage, clip_uid: str, entity: Any, reference: Any
+        self,
+        shard: str,
+        storage: RunStorage,
+        clip_uid: str,
+        entity: Any,
+        reference: Any,
+        *,
+        variant: str = VARIANT_FINAL,
     ) -> dict[str, Any]:
         """Create-once review input anchor, re-derived and compared exactly."""
-        path = self._review_input_path(shard, clip_uid, entity.entity_id)
+        path = self._review_input_path(shard, clip_uid, entity.entity_id, variant)
         existing = _read_json(path)
         if existing is None:
             # First freeze. A broken reference or source evidence here is still
             # an ordinary legacy CPU failure, not durable corruption.
-            expected = self._review_input_anchor(storage, clip_uid, entity, reference)
+            expected = self._review_input_anchor(
+                storage, clip_uid, entity, reference, variant=variant
+            )
             _write_json_once(path, expected)
             return expected
         # The model input is already frozen, so failing to re-derive it can only
         # mean the frozen evidence changed underneath us.
         try:
-            expected = self._review_input_anchor(storage, clip_uid, entity, reference)
+            expected = self._review_input_anchor(
+                storage, clip_uid, entity, reference, variant=variant
+            )
         except ReferenceIntegrityDurableError:
             raise
         except Exception as exc:
@@ -724,10 +865,52 @@ class ReferenceIntegrityEpochRunner:
             )
         return existing
 
+    @staticmethod
+    def _frozen_source_alpha_reference(
+        plan_entry: Mapping[str, Any], entity_id: str
+    ) -> EntityReferenceState:
+        """The exact source-alpha reference legacy would review, from frozen state.
+
+        Legacy reads ``edit.source_reference`` off the ready Reference Edit state
+        it already holds, so the frozen pre-edit is the only authority; live
+        references and the Pairing state must never be used to guess it.
+        """
+        dump = plan_entry.get("pre_reference_edit")
+        if not isinstance(dump, dict):
+            raise ReferenceIntegrityDurableError(
+                f"frozen source alpha needs a Reference Edit state for {entity_id!r}"
+            )
+        try:
+            state = ReferenceEditState.model_validate(dump)
+        except Exception as exc:
+            raise ReferenceIntegrityDurableError(
+                f"frozen Reference Edit state is invalid for {entity_id!r}"
+            ) from exc
+        edit_entity = _source_alpha_edit_entity(state, entity_id)
+        if edit_entity is None:
+            raise ReferenceIntegrityDurableError(
+                f"frozen source alpha has no Reference Edit entity {entity_id!r}"
+            )
+        if (
+            edit_entity.default_variant != "accepted_base"
+            or edit_entity.source_reference.image_path is None
+        ):
+            raise ReferenceIntegrityDurableError(
+                f"frozen source alpha prerequisites drifted for {entity_id!r}"
+            )
+        return edit_entity.source_reference
+
     def _expected_review_job(
-        self, shard: str, entity: Any, reference: Any, anchor: Mapping[str, Any]
+        self,
+        shard: str,
+        entity: Any,
+        reference: Any,
+        anchor: Mapping[str, Any],
+        *,
+        variant: str = VARIANT_FINAL,
+        dependencies: Mapping[str, str] | None = None,
     ) -> ModelJob:
-        """The one deterministic main review job for this entity."""
+        """The one deterministic review job for this entity and variant."""
         return ModelJob.create(
             job_type=REFERENCE_INTEGRITY_REVIEW_JOB,
             resource=RESOURCE_QWEN,
@@ -736,15 +919,60 @@ class ReferenceIntegrityEpochRunner:
             semantic_inputs=self._review_semantic_inputs(
                 entity,
                 reference,
+                variant=variant,
                 source_context_sha256=str(anchor["source_context_sha256"]),
                 final_reference_sha256=str(anchor["final_reference_sha256"]),
                 main_review_policy=dict(anchor["main_review_policy"]),
+                reference_scope=str(anchor["reference_scope"]),
+                synthetic=bool(anchor["synthetic"]),
             ),
             model_identity=(
                 f"qwen:{self.config.qwen.reference_integrity_judge.model}"
             ),
-            target={"entity_id": entity.entity_id, "variant": VARIANT_FINAL},
+            target={"entity_id": entity.entity_id, "variant": variant},
+            dependencies=dependencies,
         )
+
+    def _expected_review_inputs(
+        self,
+        *,
+        shard: str,
+        storage: RunStorage,
+        clip_uid: str,
+        plan_entry: Mapping[str, Any],
+        entity: Any,
+        reference: Any,
+        variant: str,
+        main_job: ModelJob | None = None,
+    ) -> tuple[EntityReferenceState, dict[str, Any], ModelJob]:
+        """Resolve, freeze and re-verify one variant's deterministic review job.
+
+        Every reader of a review job identity goes through here, so the writer
+        and all verifiers share exactly one derivation. For ``source_alpha`` the
+        main review job is the dependency address, which makes the alpha job
+        conditional on one exact main receipt instead of a standalone root job.
+        """
+        input_reference = (
+            self._frozen_source_alpha_reference(plan_entry, entity.entity_id)
+            if variant == VARIANT_SOURCE_ALPHA
+            else reference
+        )
+        anchor = self._frozen_review_input(
+            shard, storage, clip_uid, entity, input_reference, variant=variant
+        )
+        job = self._expected_review_job(
+            shard,
+            entity,
+            input_reference,
+            anchor,
+            variant=variant,
+            dependencies=(
+                {MAIN_REVIEW_JOB_DEPENDENCY: main_job.job_id()}
+                if main_job is not None
+                else None
+            ),
+        )
+        return input_reference, anchor, job
 
     # -- per-entity durable outcomes -------------------------------------------
 
@@ -791,6 +1019,22 @@ class ReferenceIntegrityEpochRunner:
             if len(present) != len(REVIEWED_MARKER_FIELDS):
                 raise ReferenceIntegrityDurableError(
                     f"reviewed entity outcome is missing provenance for {label}"
+                )
+            review_variant = marker.get("review_variant")
+            if review_variant not in IMPLEMENTED_REVIEW_VARIANTS:
+                raise ReferenceIntegrityDurableError(
+                    f"reviewed entity outcome variant is unknown for {label}"
+                )
+            parent_job_id = marker.get("parent_review_job_id")
+            if review_variant == VARIANT_FINAL:
+                if parent_job_id is not None:
+                    raise ReferenceIntegrityDurableError(
+                        f"main reviewed entity outcome must not carry a parent job "
+                        f"for {label}"
+                    )
+            elif not isinstance(parent_job_id, str) or not parent_job_id:
+                raise ReferenceIntegrityDurableError(
+                    f"source alpha entity outcome has no parent job for {label}"
                 )
             job_id = marker.get("review_job_id")
             if not isinstance(job_id, str) or not job_id:
@@ -869,13 +1113,31 @@ class ReferenceIntegrityEpochRunner:
                     f"reviewed entity outcome must not carry a semantic policy "
                     f"reason for {label}"
                 )
-            if marker["judge_failed"] and not reason.startswith(
-                "integrity_judge_failed:"
-            ):
-                raise ReferenceIntegrityDurableError(
-                    f"judge-failed entity outcome reason drifted for {label}"
+            if marker["judge_failed"]:
+                prefix = (
+                    SOURCE_ALPHA_JUDGE_FAILED_PREFIX
+                    if review_variant == VARIANT_SOURCE_ALPHA
+                    else MAIN_REVIEW_JUDGE_FAILED_PREFIX
                 )
-            if not marker["judge_failed"] and reason != validated_review.reason:
+                if not reason.startswith(prefix):
+                    raise ReferenceIntegrityDurableError(
+                        f"judge-failed entity outcome reason drifted for {label}"
+                    )
+            elif (
+                review_variant == VARIANT_SOURCE_ALPHA
+                and outcome == ENTITY_OUTCOME_ACCEPTED
+            ):
+                # Legacy does not reuse the alpha review's own reason here.
+                if validated_review.verdict != "accept":
+                    raise ReferenceIntegrityDurableError(
+                        f"source alpha accepted outcome needs an accept review for "
+                        f"{label}"
+                    )
+                if reason != SOURCE_ALPHA_ACCEPTED_REASON:
+                    raise ReferenceIntegrityDurableError(
+                        f"source alpha entity outcome reason drifted for {label}"
+                    )
+            elif reason != validated_review.reason:
                 raise ReferenceIntegrityDurableError(
                     f"reviewed entity outcome reason disagrees with its review for "
                     f"{label}"
@@ -1039,12 +1301,25 @@ class ReferenceIntegrityEpochRunner:
         )
         return [self._expected_review_job(shard, entity, reference, anchor)]
 
-    # -- main review execution -------------------------------------------------
+    # -- review execution ------------------------------------------------------
+
+    def _review_variant(self, job: ModelJob) -> str:
+        """The implemented review variant of one job, or fail closed."""
+        if job.job_type != REFERENCE_INTEGRITY_REVIEW_JOB:
+            raise ReferenceIntegrityEpochError(
+                f"unsupported job type {job.job_type!r}"
+            )
+        variant = str(dict(job.target).get("variant", ""))
+        if variant not in IMPLEMENTED_REVIEW_VARIANTS:
+            raise ReferenceIntegrityEpochError(
+                f"unsupported review variant {variant!r}"
+            )
+        return variant
 
     def _job_entity_reference(
         self, job: ModelJob
     ) -> tuple[str, RunStorage, Any, Any, Any]:
-        """Resolve one main review job back to its live entity and reference."""
+        """Resolve one review job back to its live entity and pre-reference."""
         shard = job.canonical_shard
         storage = self._storage_for(shard)
         clip = storage.read_clip(job.clip_uid)
@@ -1064,6 +1339,43 @@ class ReferenceIntegrityEpochRunner:
             )
         return shard, storage, clip, entity, reference
 
+    def _job_review_context(
+        self, job: ModelJob
+    ) -> tuple[str, RunStorage, Any, Any, Any, dict[str, Any], Any]:
+        """Resolve one review job to its live entity and its frozen plan entry."""
+        shard, storage, clip, entity, reference = self._job_entity_reference(job)
+        plan_entry = self._existing_plan_for_reconcile(shard)["clips"][job.clip_uid]
+        pre_edit_dump = plan_entry.get("pre_reference_edit")
+        pre_edit = (
+            ReferenceEditState.model_validate(pre_edit_dump)
+            if pre_edit_dump is not None
+            else None
+        )
+        return shard, storage, clip, entity, reference, plan_entry, pre_edit
+
+    def _committed_review_payload(self, job: ModelJob) -> dict[str, Any]:
+        """The committed receipt payload of one review job, or fail closed."""
+        from r2v_data_v2.v3.post_mask_epoch_state import STATE_MISMATCH
+
+        entity_id = str(dict(job.target).get("entity_id", ""))
+        state = self.ledger.classify(job)
+        if state.state == STATE_MISMATCH:
+            raise ReferenceIntegrityDurableError(
+                f"review receipt mismatch for {job.clip_uid}/{entity_id}: "
+                f"{state.detail or ''}"
+            )
+        if not state.skippable:
+            raise ReferenceIntegrityEpochError(
+                f"review job {job.job_id()} is not terminal; the stage is "
+                "incomplete"
+            )
+        result = self.ledger.load_committed_result(job)
+        if result is None:
+            raise ReferenceIntegrityDurableError(
+                f"committed review job {job.job_id()} has no replayable result"
+            )
+        return dict(result.payload)
+
     @staticmethod
     def _review_continuation(
         *,
@@ -1074,21 +1386,14 @@ class ReferenceIntegrityEpochRunner:
         review: ReferenceIntegrityReview,
         pre_edit: ReferenceEditState | None,
     ) -> str | None:
-        """Which 6d continuation the frozen legacy policy would take, if any.
+        """Which continuation the frozen legacy policy takes, if any.
 
         Mirrors the legacy order exactly: the source-alpha completion fallback is
         decided first, then the source-bbox routes. A non-``None`` result means
-        6c must leave this entity unresolved and keep only the durable receipt.
+        this epoch must leave the entity unresolved for 6d1/6d2.
         """
         if review.verdict == "reject" and reference.synthetic:
-            edit_entity = next(
-                (
-                    item
-                    for item in (pre_edit.entities if pre_edit is not None else [])
-                    if item.entity_id == entity.entity_id
-                ),
-                None,
-            )
+            edit_entity = _source_alpha_edit_entity(pre_edit, entity.entity_id)
             if (
                 edit_entity is not None
                 and edit_entity.default_variant == "accepted_base"
@@ -1130,7 +1435,7 @@ class ReferenceIntegrityEpochRunner:
     ) -> dict[str, Any] | None:
         """The exact durable marker one committed main review must produce.
 
-        ``None`` means 6c deliberately defers the entity to 6d. One helper serves
+        ``None`` means a continuation still owns this entity. One helper serves
         the finalizer and the restart verifier so the policy exists exactly once.
         """
         common_delta = {"topology_suspicious": int(diagnostics.suspicious)}
@@ -1141,12 +1446,14 @@ class ReferenceIntegrityEpochRunner:
                 "entity_id": entity.entity_id,
                 "outcome": ENTITY_OUTCOME_REJECTED,
                 "status": ENTITY_OUTCOME_REJECTED,
-                "reason": f"integrity_judge_failed:{payload.get('error')}",
+                "reason": f"{MAIN_REVIEW_JUDGE_FAILED_PREFIX}{payload.get('error')}",
                 "reviewed": True,
                 "semantic_policy_reason": None,
                 "final_reference_path": reference.image_path,
                 "diagnostics": diagnostics.model_dump(mode="json"),
                 "review_job_id": job.job_id(),
+                "review_variant": VARIANT_FINAL,
+                "parent_review_job_id": None,
                 "source_context_path": str(anchor["source_context_path"]),
                 "review": None,
                 "judge_failed": True,
@@ -1184,6 +1491,8 @@ class ReferenceIntegrityEpochRunner:
             "final_reference_path": reference.image_path,
             "diagnostics": diagnostics.model_dump(mode="json"),
             "review_job_id": job.job_id(),
+            "review_variant": VARIANT_FINAL,
+            "parent_review_job_id": None,
             "source_context_path": str(anchor["source_context_path"]),
             "review": review.model_dump(mode="json"),
             "judge_failed": False,
@@ -1192,6 +1501,119 @@ class ReferenceIntegrityEpochRunner:
                 "entities_reviewed": 1,
                 **({"entities_accepted": 1} if accepted else {"entities_rejected": 1}),
             },
+        }
+
+    def _expected_source_alpha_marker(
+        self,
+        *,
+        clip_uid: str,
+        entity: Any,
+        plan_entry: Mapping[str, Any],
+        main_job: ModelJob,
+        main_anchor: Mapping[str, Any],
+        main_diagnostics: Any,
+        alpha_job: ModelJob,
+        alpha_payload: Mapping[str, Any],
+        alpha_reference: EntityReferenceState,
+        alpha_diagnostics: Any,
+        alpha_anchor: Mapping[str, Any],
+        pre_edit: ReferenceEditState | None,
+    ) -> dict[str, Any] | None:
+        """The exact durable marker one committed source-alpha review produces.
+
+        The main receipt is validated here as well: a source-alpha outcome is a
+        continuation of one exact main review, never a standalone decision. The
+        delta carries the whole entity's legacy counters, so both reviews are
+        accounted for. ``None`` means the frozen policy continues into the 6d2
+        artifact bbox route.
+        """
+        entity_id = entity.entity_id
+        main_payload = self._committed_review_payload(main_job)
+        if str(main_payload.get("status")) != "review":
+            raise ReferenceIntegrityDurableError(
+                f"source alpha continuation needs a successful main review for "
+                f"{clip_uid}/{entity_id}"
+            )
+        main_review = ReferenceIntegrityReview.model_validate(main_payload.get("review"))
+        if (
+            self._review_continuation(
+                clip_uid=clip_uid,
+                entity=entity,
+                reference=_plan_pre_reference(plan_entry, entity_id),
+                diagnostics=main_diagnostics,
+                review=main_review,
+                pre_edit=pre_edit,
+            )
+            != "source_alpha"
+        ):
+            raise ReferenceIntegrityDurableError(
+                f"frozen main review no longer routes {clip_uid}/{entity_id} to "
+                "source alpha"
+            )
+        alpha_status = str(alpha_payload.get("status", ""))
+        if alpha_status not in {"review", "judge_failed"}:
+            raise ReferenceIntegrityDurableError(
+                f"committed source alpha job {alpha_job.job_id()} has an unknown "
+                "payload status"
+            )
+        common: dict[str, Any] = {
+            "schema": REFERENCE_INTEGRITY_ENTITY_OUTCOME_SCHEMA,
+            "clip_uid": clip_uid,
+            "entity_id": entity_id,
+            "reviewed": True,
+            "semantic_policy_reason": None,
+            "final_reference_path": alpha_reference.image_path,
+            "diagnostics": alpha_diagnostics.model_dump(mode="json"),
+            "review_job_id": alpha_job.job_id(),
+            "review_variant": VARIANT_SOURCE_ALPHA,
+            "parent_review_job_id": main_job.job_id(),
+            "source_context_path": str(alpha_anchor["source_context_path"]),
+        }
+        delta = {
+            "topology_suspicious": int(main_diagnostics.suspicious)
+            + int(alpha_diagnostics.suspicious),
+            "entities_reviewed": 2,
+        }
+        if alpha_status == "judge_failed":
+            return {
+                **common,
+                "outcome": ENTITY_OUTCOME_REJECTED,
+                "status": ENTITY_OUTCOME_REJECTED,
+                "reason": (
+                    f"{SOURCE_ALPHA_JUDGE_FAILED_PREFIX}{alpha_payload.get('error')}"
+                ),
+                "review": None,
+                "judge_failed": True,
+                "delta": {**delta, "judge_failed": 1, "entities_rejected": 1},
+            }
+        alpha_review = ReferenceIntegrityReview.model_validate(alpha_payload.get("review"))
+        if alpha_review.verdict == "reject":
+            if (
+                _artifact_only_bbox_eligible(alpha_review)
+                and not alpha_reference.source_bbox_fallback
+                and _is_self_sourced_reference(
+                    clip_uid=clip_uid, reference=alpha_reference
+                )
+            ):
+                # 6d2 owns the artifact bbox continuation: only the receipt stays.
+                return None
+            return {
+                **common,
+                "outcome": ENTITY_OUTCOME_REJECTED,
+                "status": ENTITY_OUTCOME_REJECTED,
+                "reason": alpha_review.reason,
+                "review": alpha_review.model_dump(mode="json"),
+                "judge_failed": False,
+                "delta": {**delta, "entities_rejected": 1},
+            }
+        return {
+            **common,
+            "outcome": ENTITY_OUTCOME_ACCEPTED,
+            "status": ENTITY_OUTCOME_ACCEPTED,
+            "reason": SOURCE_ALPHA_ACCEPTED_REASON,
+            "review": alpha_review.model_dump(mode="json"),
+            "judge_failed": False,
+            "delta": {**delta, "entities_accepted": 1},
         }
 
     def _write_review_debug(
@@ -1222,20 +1644,32 @@ class ReferenceIntegrityEpochRunner:
         write_json_atomic(path, body)
 
     def run(self, job: ModelJob, handle: Any) -> JobResult:
-        """One main integrity review call. No prompt or retry policy is copied."""
-        if job.job_type != REFERENCE_INTEGRITY_REVIEW_JOB:
-            raise ReferenceIntegrityEpochError(
-                f"unsupported job type {job.job_type!r}"
-            )
-        if dict(job.target).get("variant") != VARIANT_FINAL:
-            raise ReferenceIntegrityEpochError(
-                f"unsupported review variant {dict(job.target).get('variant')!r}"
-            )
-        shard, storage, _clip, entity, reference = self._job_entity_reference(job)
-        anchor = self._frozen_review_input(
-            shard, storage, job.clip_uid, entity, reference
+        """One integrity review call. No prompt or retry policy is copied."""
+        variant = self._review_variant(job)
+        shard, storage, _clip, entity, reference, plan_entry, _pre_edit = (
+            self._job_review_context(job)
         )
-        expected = self._expected_review_job(shard, entity, reference, anchor)
+        main_job: ModelJob | None = None
+        if variant == VARIANT_SOURCE_ALPHA:
+            _r, _a, main_job = self._expected_review_inputs(
+                shard=shard,
+                storage=storage,
+                clip_uid=job.clip_uid,
+                plan_entry=plan_entry,
+                entity=entity,
+                reference=reference,
+                variant=VARIANT_FINAL,
+            )
+        _input_reference, anchor, expected = self._expected_review_inputs(
+            shard=shard,
+            storage=storage,
+            clip_uid=job.clip_uid,
+            plan_entry=plan_entry,
+            entity=entity,
+            reference=reference,
+            variant=variant,
+            main_job=main_job,
+        )
         if (
             expected.job_id() != job.job_id()
             or job.input_digest != str(anchor["semantic_digest"])
@@ -1260,8 +1694,8 @@ class ReferenceIntegrityEpochRunner:
                 reference_type=entity.reference_type,
                 phrase=entity.phrase,
                 grounding_prompt=entity.grounding_prompt,
-                reference_scope=reference.reference_scope,
-                synthetic=bool(reference.synthetic),
+                reference_scope=str(anchor["reference_scope"]),
+                synthetic=bool(anchor["synthetic"]),
             )
         except ReferenceIntegrityJudgeFailure as exc:
             return JobResult(
@@ -1287,16 +1721,118 @@ class ReferenceIntegrityEpochRunner:
             },
         )
 
+    def _review_outcome(
+        self,
+        *,
+        shard: str,
+        storage: RunStorage,
+        clip_uid: str,
+        entity: Any,
+        reference: Any,
+        plan_entry: Mapping[str, Any],
+        pre_edit: ReferenceEditState | None,
+        job: ModelJob,
+        payload: Mapping[str, Any],
+    ) -> _ReviewOutcome:
+        """Everything one committed review job means, from frozen state.
+
+        Returns the exact durable marker (``None`` while a continuation still
+        owns the entity) plus the model job that continuation unlocks, if any.
+        This is the one policy point shared by the finalizer and every restart
+        verifier, so neither can drift from the other.
+
+        The caller resolves the frozen context, so a verifier never re-reads the
+        plan inside itself: publication verification already holds it.
+        """
+        variant = self._review_variant(job)
+        main_reference, main_anchor, main_job = self._expected_review_inputs(
+            shard=shard,
+            storage=storage,
+            clip_uid=clip_uid,
+            plan_entry=plan_entry,
+            entity=entity,
+            reference=reference,
+            variant=VARIANT_FINAL,
+        )
+        main_diagnostics = self._review_diagnostics(storage, main_reference)
+        if variant == VARIANT_SOURCE_ALPHA:
+            alpha_reference, alpha_anchor, alpha_job = self._expected_review_inputs(
+                shard=shard,
+                storage=storage,
+                clip_uid=clip_uid,
+                plan_entry=plan_entry,
+                entity=entity,
+                reference=reference,
+                variant=VARIANT_SOURCE_ALPHA,
+                main_job=main_job,
+            )
+            if alpha_job.job_id() != job.job_id():
+                raise ReferenceIntegrityDurableError(
+                    f"source alpha job id drifted for {clip_uid}/{entity.entity_id}"
+                )
+            return _ReviewOutcome(
+                marker=self._expected_source_alpha_marker(
+                    clip_uid=clip_uid,
+                    entity=entity,
+                    plan_entry=plan_entry,
+                    main_job=main_job,
+                    main_anchor=main_anchor,
+                    main_diagnostics=main_diagnostics,
+                    alpha_job=alpha_job,
+                    alpha_payload=payload,
+                    alpha_reference=alpha_reference,
+                    alpha_diagnostics=self._review_diagnostics(
+                        storage, alpha_reference
+                    ),
+                    alpha_anchor=alpha_anchor,
+                    pre_edit=pre_edit,
+                ),
+                unlock=None,
+            )
+        if main_job.job_id() != job.job_id():
+            raise ReferenceIntegrityDurableError(
+                f"review job {job.job_id()} is not the frozen job for "
+                f"{clip_uid}/{entity.entity_id}"
+            )
+        marker = self._expected_reviewed_marker(
+            clip_uid=clip_uid,
+            entity=entity,
+            reference=main_reference,
+            diagnostics=main_diagnostics,
+            job=main_job,
+            payload=payload,
+            anchor=main_anchor,
+            pre_edit=pre_edit,
+        )
+        if marker is not None:
+            return _ReviewOutcome(marker=marker, unlock=None)
+        review = ReferenceIntegrityReview.model_validate(payload.get("review"))
+        continuation = self._review_continuation(
+            clip_uid=clip_uid,
+            entity=entity,
+            reference=main_reference,
+            diagnostics=main_diagnostics,
+            review=review,
+            pre_edit=pre_edit,
+        )
+        if continuation != "source_alpha":
+            # The topology/artifact bbox routes belong to 6d2.
+            return _ReviewOutcome(marker=None, unlock=None)
+        _alpha_reference, _alpha_anchor, alpha_job = self._expected_review_inputs(
+            shard=shard,
+            storage=storage,
+            clip_uid=clip_uid,
+            plan_entry=plan_entry,
+            entity=entity,
+            reference=reference,
+            variant=VARIANT_SOURCE_ALPHA,
+            main_job=main_job,
+        )
+        return _ReviewOutcome(marker=None, unlock=alpha_job)
+
     def finalize(self, job: ModelJob, result: JobResult) -> Sequence[ModelJob]:
-        """CPU continuation of one committed main review. Never unlocks a job."""
-        if job.job_type != REFERENCE_INTEGRITY_REVIEW_JOB:
-            raise ReferenceIntegrityEpochError(
-                f"unsupported job type {job.job_type!r}"
-            )
-        if dict(job.target).get("variant") != VARIANT_FINAL:
-            raise ReferenceIntegrityEpochError(
-                f"unsupported review variant {dict(job.target).get('variant')!r}"
-            )
+        """CPU continuation of one committed review. Never unlocks a job early."""
+        variant = self._review_variant(job)
         payload = dict(result.payload)
         status = str(payload.get("status", ""))
         if status not in {"review", "judge_failed"}:
@@ -1310,38 +1846,30 @@ class ReferenceIntegrityEpochRunner:
                 raise ReferenceIntegrityDurableError(
                     f"committed review job {job.job_id()} has an invalid review"
                 ) from exc
-        shard, storage, _clip, entity, reference = self._job_entity_reference(job)
-        anchor = self._frozen_review_input(
-            shard, storage, job.clip_uid, entity, reference
+        shard, storage, _clip, entity, reference, plan_entry, pre_edit = (
+            self._job_review_context(job)
         )
-        expected = self._expected_review_job(shard, entity, reference, anchor)
-        if expected.job_id() != job.job_id():
-            raise ReferenceIntegrityDurableError(
-                f"review job {job.job_id()} is not the frozen job for "
-                f"{job.clip_uid}/{entity.entity_id}"
-            )
-        self._write_review_debug(storage, job.clip_uid, entity.entity_id, payload)
-        plan = self._existing_plan_for_reconcile(shard)
-        pre_edit_dump = plan["clips"][job.clip_uid].get("pre_reference_edit")
-        pre_edit = (
-            ReferenceEditState.model_validate(pre_edit_dump)
-            if pre_edit_dump is not None
-            else None
-        )
-        marker = self._expected_reviewed_marker(
+        if variant == VARIANT_FINAL:
+            # Only the main review owns the legacy debug sidecar; the alpha
+            # continuation never overwrites it.
+            self._write_review_debug(storage, job.clip_uid, entity.entity_id, payload)
+        outcome = self._review_outcome(
+            shard=shard,
+            storage=storage,
             clip_uid=job.clip_uid,
             entity=entity,
             reference=reference,
-            diagnostics=self._review_diagnostics(storage, reference),
+            plan_entry=plan_entry,
+            pre_edit=pre_edit,
             job=job,
             payload=payload,
-            anchor=anchor,
-            pre_edit=pre_edit,
         )
-        if marker is None:
-            # 6d owns this entity; only the durable receipt is kept.
-            return ()
-        self._write_entity_outcome(shard, job.clip_uid, entity.entity_id, marker)
+        if outcome.marker is None:
+            # A continuation owns this entity; only the durable receipt is kept.
+            return (outcome.unlock,) if outcome.unlock is not None else ()
+        self._write_entity_outcome(
+            shard, job.clip_uid, entity.entity_id, outcome.marker
+        )
         self._publish_clip_if_terminal(shard, storage, job.clip_uid)
         return ()
 
@@ -1411,12 +1939,12 @@ class ReferenceIntegrityEpochRunner:
     def _entity_state(
         self,
         marker: Mapping[str, Any],
-        reference: EntityReferenceState,
+        input_reference: EntityReferenceState,
     ) -> ReferenceIntegrityEntityState:
         payload = {
             "entity_id": marker["entity_id"],
             "status": marker["status"],
-            "input_reference": reference.model_dump(mode="json"),
+            "input_reference": input_reference.model_dump(mode="json"),
             "final_reference_path": marker["final_reference_path"],
             "diagnostics": marker["diagnostics"],
             "reviewed": marker["reviewed"],
@@ -1436,6 +1964,7 @@ class ReferenceIntegrityEpochRunner:
         shard: str,
         storage: RunStorage,
         clip: Any,
+        plan_entry: Mapping[str, Any],
         entities_by_id: Mapping[str, Any],
         pre_entities: Sequence[EntityReferenceState],
         pre_edit: ReferenceEditState | None,
@@ -1468,7 +1997,14 @@ class ReferenceIntegrityEpochRunner:
                 )
             return
         self._verify_reviewed_branch(
-            shard, storage, clip, entity, reference, pre_edit, marker
+            shard,
+            storage,
+            clip,
+            plan_entry,
+            entity,
+            reference,
+            pre_edit,
+            marker,
         )
 
     def _verify_reviewed_branch(
@@ -1476,56 +2012,83 @@ class ReferenceIntegrityEpochRunner:
         shard: str,
         storage: RunStorage,
         clip: Any,
+        plan_entry: Mapping[str, Any],
         entity: Any,
         reference: Any,
         pre_edit: ReferenceEditState | None,
         marker: Mapping[str, Any],
     ) -> None:
-        """Re-derive a reviewed marker from its committed review receipt."""
-        from r2v_data_v2.v3.post_mask_epoch_state import STATE_MISMATCH
+        """Re-derive a reviewed marker from its committed review receipts.
 
+        The main receipt and (for a source-alpha outcome) the alpha receipt are
+        both validated through the ledger, then the whole marker -- including
+        both reviews' counters -- is re-derived from those payloads. Nothing the
+        marker itself carries is trusted.
+        """
         entity_id = entity.entity_id
-        anchor = self._frozen_review_input(
-            shard, storage, clip.clip_uid, entity, reference
-        )
-        job = self._expected_review_job(shard, entity, reference, anchor)
+        variant = marker.get("review_variant")
+        if variant == VARIANT_FINAL:
+            _input_reference, _anchor, job = self._expected_review_inputs(
+                shard=shard,
+                storage=storage,
+                clip_uid=clip.clip_uid,
+                plan_entry=plan_entry,
+                entity=entity,
+                reference=reference,
+                variant=VARIANT_FINAL,
+            )
+        elif variant == VARIANT_SOURCE_ALPHA:
+            _r, _a, main_job = self._expected_review_inputs(
+                shard=shard,
+                storage=storage,
+                clip_uid=clip.clip_uid,
+                plan_entry=plan_entry,
+                entity=entity,
+                reference=reference,
+                variant=VARIANT_FINAL,
+            )
+            if marker.get("parent_review_job_id") != main_job.job_id():
+                raise ReferenceIntegrityDurableError(
+                    f"reviewed entity outcome parent job id drifted for "
+                    f"{clip.clip_uid}/{entity_id}"
+                )
+            _r2, _a2, job = self._expected_review_inputs(
+                shard=shard,
+                storage=storage,
+                clip_uid=clip.clip_uid,
+                plan_entry=plan_entry,
+                entity=entity,
+                reference=reference,
+                variant=VARIANT_SOURCE_ALPHA,
+                main_job=main_job,
+            )
+        else:
+            raise ReferenceIntegrityDurableError(
+                f"reviewed entity outcome variant is unknown for "
+                f"{clip.clip_uid}/{entity_id}"
+            )
         if marker.get("review_job_id") != job.job_id():
             raise ReferenceIntegrityDurableError(
                 f"reviewed entity outcome job id drifted for "
                 f"{clip.clip_uid}/{entity_id}"
             )
-        state = self.ledger.classify(job)
-        if state.state == STATE_MISMATCH:
-            raise ReferenceIntegrityDurableError(
-                f"review receipt mismatch for {clip.clip_uid}/{entity_id}: "
-                f"{state.detail or ''}"
-            )
-        if not state.skippable:
-            raise ReferenceIntegrityEpochError(
-                f"review job {job.job_id()} is not terminal; the stage is "
-                "incomplete"
-            )
-        result = self.ledger.load_committed_result(job)
-        if result is None:
-            raise ReferenceIntegrityDurableError(
-                f"committed review job {job.job_id()} has no replayable result"
-            )
-        expected = self._expected_reviewed_marker(
+        outcome = self._review_outcome(
+            shard=shard,
+            storage=storage,
             clip_uid=clip.clip_uid,
             entity=entity,
             reference=reference,
-            diagnostics=self._review_diagnostics(storage, reference),
-            job=job,
-            payload=dict(result.payload),
-            anchor=anchor,
+            plan_entry=plan_entry,
             pre_edit=pre_edit,
+            job=job,
+            payload=self._committed_review_payload(job),
         )
-        if expected is None:
+        if outcome.marker is None:
             raise ReferenceIntegrityDurableError(
                 f"entity {clip.clip_uid}/{entity_id} has a durable review outcome "
-                "but the frozen policy now defers it to 6d"
+                "but the frozen policy now defers it"
             )
-        if dict(marker) != expected:
+        if dict(marker) != outcome.marker:
             raise ReferenceIntegrityDurableError(
                 f"reviewed entity outcome drifted for {clip.clip_uid}/{entity_id}"
             )
@@ -1570,6 +2133,7 @@ class ReferenceIntegrityEpochRunner:
                 shard,
                 storage,
                 clip,
+                plan_entry,
                 entities_by_id,
                 pre_entities,
                 pre_edit,
@@ -1581,9 +2145,34 @@ class ReferenceIntegrityEpochRunner:
             for entity_id, marker in markers.items()
             if marker["outcome"] == ENTITY_OUTCOME_REJECTED
         }
+        # Legacy keeps two separate maps: ``fallback_references`` (published in
+        # place of the pre-stage reference) only ever receives an *accepted*
+        # source alpha, while ``rejected_ids`` collects every rejection. The
+        # entity outcome, by contrast, records the alpha reference it judged for
+        # both. The frozen pre-edit is the only source of either.
+        alpha_references = {
+            entity_id: self._frozen_source_alpha_reference(plan_entry, entity_id)
+            for entity_id, marker in markers.items()
+            if marker.get("review_variant") == VARIANT_SOURCE_ALPHA
+        }
+        alpha_accepted_ids = {
+            entity_id
+            for entity_id, marker in markers.items()
+            if entity_id in alpha_references
+            and marker["outcome"] == ENTITY_OUTCOME_ACCEPTED
+        }
+        input_references = {
+            entity_id: (alpha_references.get(entity_id) or pre_reference)
+            for entity_id, pre_reference in (
+                (item.entity_id, item) for item in pre_entities
+            )
+            if entity_id in retained
+        }
         final_references = [
             (
-                _rejected_reference(item, REJECTED_REFERENCE_REASON)
+                alpha_references[item.entity_id]
+                if item.entity_id in alpha_accepted_ids
+                else _rejected_reference(item, REJECTED_REFERENCE_REASON)
                 if item.entity_id in rejected_ids
                 else item
             )
@@ -1619,23 +2208,32 @@ class ReferenceIntegrityEpochRunner:
             entities=final_references,
             background=pre_references.get("background"),
         )
+        # Legacy applies the accepted source-alpha fallback to Reference Edit in
+        # the frozen retained order; several entities may fall back in one clip.
         reference_edit = pre_edit
+        for entity_id in retained:
+            if entity_id not in alpha_accepted_ids:
+                continue
+            try:
+                reference_edit = _reference_edit_after_source_alpha(
+                    reference_edit,
+                    entity_id=entity_id,
+                    reason=SOURCE_ALPHA_FALLBACK_REASON,
+                )
+            except ReferenceIntegrityDurableError:
+                raise
+            except Exception as exc:
+                raise ReferenceIntegrityDurableError(
+                    f"cannot apply the frozen source alpha fallback for "
+                    f"{clip_uid}/{entity_id}"
+                ) from exc
         integrity_state = ReferenceIntegrityState(
             status="ready",
             entities=[
-                self._entity_state(
-                    markers[entity_id],
-                    next(
-                        item
-                        for item in pre_entities
-                        if item.entity_id == entity_id
-                    ),
-                )
+                self._entity_state(markers[entity_id], input_references[entity_id])
                 for entity_id in retained
             ],
         )
-        # 6b never mutates Reference Edit state: the frozen baseline IS the
-        # publication, so a drift here is corruption, not policy.
         delta: dict[str, int] = {"processed": 1, "failed": 0}
         for entity_id in retained:
             for key, value in markers[entity_id]["delta"].items():
