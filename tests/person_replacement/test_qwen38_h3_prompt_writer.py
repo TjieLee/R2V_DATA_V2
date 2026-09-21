@@ -447,6 +447,8 @@ def test_system_prompt_is_slim_and_prioritizes_salient_motion():
     assert "Change who the two people are; do not change what happens." in prompt
     assert "Do not repeat replacement\nappearance" in prompt
     assert "Describe only meaningful visible action/state changes" in prompt
+    assert "write [Shot 1] directly" in prompt
+    assert "one short dynamic overview sentence naming both" not in prompt
     assert "Do not enumerate every blink" in prompt
     assert 'Use words such\nas "throughout", "maintains", or "remains" only' in prompt
     assert "If uncertain, stay conservative." in prompt
@@ -534,7 +536,7 @@ def test_preservation_sentence_is_deterministically_prepended():
     assert unchanged.count(DETAIL_PRESERVATION_PREFIX) == 1
 
 
-def test_validator_requires_dynamic_preface_and_allows_speculative_phrasing():
+def test_validator_allows_shot1_directly_after_prefix_and_allows_speculative_phrasing():
     from r2v_data_v2.person_replacement.qwen38_h3_prompt_writer import (
         DETAIL_PRESERVATION_PREFIX,
         validate_h3_prompt_writer_output,
@@ -548,13 +550,14 @@ def test_validator_requires_dynamic_preface_and_allows_speculative_phrasing():
     with pytest.raises(ValueError,match="canonical preservation prefix"):
         validate_h3_prompt_writer_output(missing_preface)
 
-    missing_camera = LEGAL_PROMPT.replace(
-        "with the camera holding a static wide framing throughout.",
-        "and both remain visible throughout.",
+    # No separate dynamic overview is required in V38-slim.
+    direct = LEGAL_PROMPT.replace(
+        "<Subject 1> raises one hand toward <Subject 2> while <Subject 2> remains in place, "
+        "with the camera holding a static wide framing throughout.\n\n",
+        "",
         1,
     )
-    with pytest.raises(ValueError,match="camera or framing"):
-        validate_h3_prompt_writer_output(missing_camera)
+    assert validate_h3_prompt_writer_output(direct) == direct.strip()
 
     speculative = LEGAL_PROMPT.replace(
         "and lifts a hand while the camera remains static.",

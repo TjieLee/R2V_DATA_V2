@@ -114,9 +114,9 @@ Keep this section concise and source-grounded. Do not repeat replacement
 appearance, static clothing, or unchanged background here; those details already
 belong in subject_definitions or <Video 1>.
 
-Start detailed_description with one short dynamic overview sentence naming both
-subjects and the dominant camera behavior. Then write [Shot 1] (and later shots
-only if real source cuts exist).
+After the fixed preservation prefix, write [Shot 1] directly (and later shots
+only if real source cuts exist). Do not add a separate overview paragraph unless
+it contributes information not already stated in the shot narration.
 
 Describe only meaningful visible action/state changes in playback order. Include
 head direction, gaze, mouth/jaw motion, hand motion, interaction, or occlusion
@@ -151,7 +151,6 @@ retention_analysis:
 [three concise lines for Subject 1, Subject 2, and Video 1]
 
 detailed_description:
-[one concise dynamic overview]
 [Shot 1]
 [concise chronological visible action/camera description]
 
@@ -179,8 +178,9 @@ Source-person locator:
 {source_performer_2}
 
 Keep each binding fixed. Watch the complete video. In detailed_description,
-describe only the salient visible motion/state changes and camera behavior in
-temporal order; do not repeat appearance or pad the caption with micro-events.
+write [Shot 1] directly after the fixed preservation prefix and describe only
+salient visible motion/state changes and camera behavior in temporal order; do
+not repeat appearance or pad the caption with micro-events.
 
 End exactly with:
 overall_soundscape:
@@ -340,22 +340,17 @@ def validate_h3_prompt_writer_output(text):
         raise ValueError("H3 prompt must not use '(appears in [Shot ...])' syntax")
 
     detailed = bodies["detailed_description"]
-    for token in ("<Subject 1>","<Subject 2>"):
-        if token not in detailed:
-            raise ValueError(f"detailed_description is missing {token}")
     if "[Shot 1]" not in detailed:
         raise ValueError("detailed_description must contain [Shot 1]")
-    preface = detailed.split("[Shot 1]",1)[0].strip()
+    preface, shot_text = detailed.split("[Shot 1]",1)
+    preface = preface.strip()
     if not preface.startswith(DETAIL_PRESERVATION_PREFIX):
         raise ValueError("detailed_description must start with the canonical preservation prefix")
-    dynamic_preface = preface[len(DETAIL_PRESERVATION_PREFIX):].strip()
-    if not dynamic_preface:
-        raise ValueError("detailed_description must contain a concise dynamic overview")
+    # V38-slim deliberately does not require a separate dynamic-overview paragraph.
+    # The actual shot narration is the useful conditioning signal.
     for token in ("<Subject 1>","<Subject 2>"):
-        if token not in dynamic_preface:
-            raise ValueError(f"dynamic overview is missing {token}")
-    if not re.search(r"\b(?:camera|framing|shot|view)\b",dynamic_preface,re.IGNORECASE):
-        raise ValueError("dynamic overview must describe camera or framing behavior")
+        if token not in shot_text:
+            raise ValueError(f"[Shot 1] narration is missing {token}")
     return text.strip()
 
 
