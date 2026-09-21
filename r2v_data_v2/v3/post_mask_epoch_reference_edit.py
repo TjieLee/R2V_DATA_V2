@@ -1816,7 +1816,11 @@ class ReferenceEditEpochRunner:
                 )
                 failure_kind = "qwen_failed"
             sam_review = None
-            if sam_payload is not None and sam_payload.get("status") == "review":
+            if (
+                not qwen_failed
+                and sam_payload is not None
+                and sam_payload.get("status") == "review"
+            ):
                 sam_review = BooguSamReview.model_validate(sam_payload["sam_review"])
             elif sam_failed and not qwen_failed:
                 override = (
