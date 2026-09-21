@@ -274,7 +274,13 @@ def check_audio_files(evidence: T2VAAudioEvidence) -> None:
             raise ValueError(f"T2VA {kind} evidence hash differs")
 
 
-def audio_evidence(clip: CanonicalAudioClip, record, root: Path) -> T2VAAudioEvidence:
+def audio_evidence(
+    clip: CanonicalAudioClip,
+    record,
+    root: Path,
+    *,
+    verify_files: bool = True,
+) -> T2VAAudioEvidence:
     if record.status != "ready" or record.clip_uid != clip.clip_uid:
         raise ValueError("T2VA audio requires ready matching resolved stems")
     values = {
@@ -298,7 +304,8 @@ def audio_evidence(clip: CanonicalAudioClip, record, root: Path) -> T2VAAudioEvi
         values[f"{kind}_path"] = stem.canonical_stem_path
         values[f"{kind}_sha256"] = stem.canonical_stem_sha256
     evidence = T2VAAudioEvidence(**values)
-    check_audio_files(evidence)
+    if verify_files:
+        check_audio_files(evidence)
     return evidence
 
 
@@ -681,18 +688,32 @@ def build_t2va_inventory(
     sample_size: int | None = None,
     sample_seed: int | None = None,
     shot_index_root: Path | None = None,
+    preselected: T2VAShotSelection | None = None,
+    verify_audio_files: bool = True,
 ) -> T2VAInventory:
     from r2v_data_v2.h3.t2va_source import select_t2va_shots, validate_cached_target
 
-    selection = select_t2va_shots(
-        shot_manifest,
-        clips_root=clips_root,
-        source_videos_root=source_videos_root,
-        case_manifest=case_manifest,
-        sample_size=sample_size,
-        sample_seed=sample_seed,
-        shot_index_root=shot_index_root,
-    )
+    if preselected is not None:
+        if any(
+            value is not None
+            for value in (case_manifest, sample_size, sample_seed, shot_index_root)
+        ):
+            raise ValueError(
+                "preselected T2VA shots cannot be combined with selection options"
+            )
+        if Path(preselected.shot_manifest_path).resolve() != shot_manifest.resolve():
+            raise ValueError("preselected T2VA shot manifest differs")
+        selection = preselected
+    else:
+        selection = select_t2va_shots(
+            shot_manifest,
+            clips_root=clips_root,
+            source_videos_root=source_videos_root,
+            case_manifest=case_manifest,
+            sample_size=sample_size,
+            sample_seed=sample_seed,
+            shot_index_root=shot_index_root,
+        )
     selected = [s.clip_uid for s in selection.shots]
     shots = {s.clip_uid: s for s in selection.shots}
     production = audio_production_root.expanduser().resolve()
@@ -852,7 +873,12 @@ def build_t2va_inventory(
             )
         stem_record = stems_by_uid[uid]
         evidence = (
-            audio_evidence(clip, stem_record, resolved_root)
+            audio_evidence(
+                clip,
+                stem_record,
+                resolved_root,
+                verify_files=verify_audio_files,
+            )
             if stem_record.status == "ready"
             else None
         )
