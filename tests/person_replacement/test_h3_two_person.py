@@ -1,0 +1,353 @@
+import json
+import os
+import re
+from dataclasses import replace
+from io import BytesIO
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+from PIL import Image
+
+from r2v_data_v2.person_replacement import qwen3vl
+
+DESCRIPTIONS = ("short hair and blue coat, initially left", "long hair and red coat, initially right",
+                "<Subject 1> passes behind <Subject 2> while both hold a box; the camera pans right.")
+REPLACEMENTS = ("older adult with curly hair and green jacket", "young adult with bob and tan shirt")
+
+
+@pytest.mark.parametrize("frame0", [False, True])
+def test_six_section_two_person_prompt(frame0):
+    from r2v_data_v2.person_replacement.h3_two_person import build_prompt
+
+    prompt = build_prompt(*DESCRIPTIONS, *REPLACEMENTS, frame0=frame0)
+    assert re.findall(r"^([a-z_]+):", prompt, re.MULTILINE) == [
+        "subject_definitions", "summary", "retention_analysis", "detailed_description",
+        "overall_soundscape", "non_diegetic_music"]
+    assert "[Shot 1]" in prompt and "[Shot 2]" not in prompt
+    assert ("<Picture 1>" in prompt) == frame0
+    for value in (*DESCRIPTIONS[:2], *REPLACEMENTS, "<Subject 1>", "<Subject 2>",
+                  "partially_preserved", "fully_preserved", "<Video 1>"):
+        assert value in prompt
+    # Replacement descriptions modify the same subjects, never new subjects.
+    assert "<Subject 3>" not in prompt and "<Subject 4>" not in prompt
+    assert "attribute_transfer" not in prompt
+    assert "Use <Video 1> directly as the source video" in prompt
+    assert DESCRIPTIONS[2] not in prompt
+    if frame0:
+        assert "first-frame" in prompt
+        assert "<Picture 1> is the edited first-frame appearance anchor" in prompt
+
+
+def test_boogu_prompt_both_bindings():
+    from r2v_data_v2.person_replacement.h3_two_person import boogu_prompt
+
+    prompt = boogu_prompt(*DESCRIPTIONS[:2], *REPLACEMENTS)
+    for source, target in zip(DESCRIPTIONS[:2], REPLACEMENTS, strict=True):
+        assert f"{source} -> {target}" in prompt
+    for text in ("never swap", "pose", "contact", "background", "Do not add a missing person"):
+        assert text in prompt
+
+
+def test_two_person_qwen_calls_and_parser(tmp_path, monkeypatch):
+    video = tmp_path / "clip.mp4"
+    video.touch()
+    qwen = qwen3vl.LocalQwen(tmp_path)
+    calls = []
+    replies = iter(["SOURCE_SUBJECT_1: blue coat\nSOURCE_SUBJECT_2: red coat\nSHOT_DESCRIPTION: They cross.",
+                    "REPLACEMENT_SUBJECT_1: green coat\nREPLACEMENT_SUBJECT_2: tan shirt"])
+    def text(content):
+        calls.append(content)
+        return next(replies)
+    monkeypatch.setattr(qwen, "_text", text)
+    assert qwen.describe_two(video) == ("blue coat", "red coat", "They cross.")
+    assert qwen.invent_two("blue coat", "red coat") == ("green coat", "tan shirt")
+    assert calls[0][0] == {"type":"video", "path":str(video), "fps":4.0}
+    assert "physical performer" in calls[0][1]["text"]
+
+
+@pytest.mark.parametrize("reply", ["SOURCE_SUBJECT_1: blue coat", "SOURCE_SUBJECT_1: x\nSOURCE_SUBJECT_1: y",
+                                   "SOURCE_SUBJECT_1: x\nSOURCE_SUBJECT_2: y\nSHOT_DESCRIPTION: [Shot 2] run"])
+def test_missing_or_invalid_source_fields_fail(tmp_path, monkeypatch, reply):
+    video = tmp_path / "v.mp4"
+    video.touch()
+    qwen = qwen3vl.LocalQwen(tmp_path)
+    monkeypatch.setattr(qwen, "_text", lambda _: reply)
+    with pytest.raises(ValueError):
+        qwen.describe_two(video)
+
+
+def test_face2_explicit_opt_in_uses_existing_resolver(tmp_path):
+    from r2v_data_v2.person_replacement.pipeline import select_cases
+
+    clips = tmp_path / "clips"
+    clips.mkdir()
+    video = clips / "shot.mp4"
+    video.touch()
+    source = tmp_path / "collected_face_2.jsonl"
+    source.write_text(json.dumps({"video_path":str(video)}) + "\n")
+    with pytest.raises(ValueError, match="not enabled"):
+        select_cases(source, clips, tmp_path/"out", limit=1)
+    cases = select_cases(source, clips, tmp_path/"out", limit=1, allow_two_person=True)
+    assert Path(cases[0]["target_video_path"]) == video
+
+
+def test_dry_run_reports_pair_without_backends(tmp_path, monkeypatch, capsys):
+    from r2v_data_v2.person_replacement.timeline import VideoTimeline
+    from tools.person_replacement import run_h3_pdd_two_person_ab as cli
+
+    clips = tmp_path/"clips"
+    clips.mkdir()
+    video = clips / "clip.mp4"
+    video.touch()
+    source = tmp_path / "collected_face_2.jsonl"
+    source.write_text(json.dumps({"video_path":str(video)})+"\n")
+    def forbidden(*args, **kwargs):
+        pytest.fail("dry-run instantiated model backend")
+    monkeypatch.setattr(cli, "LocalQwen", forbidden)
+    monkeypatch.setattr(cli, "PDDBackend", forbidden)
+    monkeypatch.setattr("r2v_data_v2.person_replacement.h3_two_person_pipeline.BooguSubprocessBackend", forbidden)
+    monkeypatch.setattr(cli, "inspect_video_timeline", lambda _: VideoTimeline(138,25,25,1,1920,1080,5.52))
+    out = tmp_path/"out"
+    assert cli.main(["--input-jsonl",str(source),"--clips-root",str(clips),
+                     "--output-root",str(out),"--dry-run"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["variants"] == ["text_two_person", "frame0_two_person"]
+    assert report["cases"][0]["output_size"] == [1376,768]
+    assert not out.exists()
+
+
+@pytest.mark.parametrize("boogu_fails", [False, True])
+def test_paired_run_shares_inputs_and_decodes_only_frame_zero(tmp_path, monkeypatch, boogu_fails):
+    from r2v_data_v2.person_replacement import h3_two_person_pipeline as module
+    from r2v_data_v2.person_replacement.timeline import VideoTimeline
+    from r2v_data_v2.v3.reference_edit_boogu import BooguWorkerConfig
+
+    video = tmp_path/"original.mp4"
+    video.write_bytes(b"original bytes")
+    directory = tmp_path/"out"/"case"
+    source = VideoTimeline(138,25,25,1,1920,1080,5.52)
+    generated = replace(source, frame_count=141, fps=24, fps_num=24, duration_seconds=141/24, width=1376, height=768)
+    monkeypatch.setattr(module, "inspect_video_timeline", lambda p: source if p == video else generated)
+    events = []
+    class Decoder:
+        def decode_indices(self, path, indices):
+            assert path == video and indices == [0]
+            events.append("frame0")
+            return [SimpleNamespace(image=Image.new("RGB", (1920,1080), "blue"))]
+    monkeypatch.setattr(module, "OpenCvFrameDecoder", Decoder)
+    class Qwen:
+        model_path = tmp_path
+        def describe_two(self, path):
+            assert path == video
+            events.append("describe")
+            return DESCRIPTIONS
+        def invent_two(self, *subjects):
+            assert subjects == DESCRIPTIONS[:2]
+            events.append("invent")
+            return REPLACEMENTS
+        def close(self):
+            events.append("qwen_close")
+    class Boogu:
+        def start(self, **kwargs):
+            events.append("boogu_start")
+        def edit(self, **kwargs):
+            events.append("boogu_edit")
+            assert kwargs["source_rgb"].size == (1376,768)
+            assert kwargs["seed"] == 42
+            assert kwargs["thinking_enabled"] is False and kwargs["instruction_rewrite_enabled"] is False
+            if boogu_fails:
+                raise RuntimeError("generation failed")
+            buf = BytesIO()
+            Image.new("RGB", (1376,768), "green").save(buf,format="PNG")
+            return SimpleNamespace(png_bytes=buf.getvalue(), worker_metadata={"steps":4})
+        def close(self):
+            events.append("boogu_close")
+    monkeypatch.setattr(module, "BooguSubprocessBackend", lambda config: Boogu())
+    runs = []
+    class PDD:
+        model_root = tmp_path
+        lora = tmp_path/"weights"
+        def validate(self):
+            pass
+        def run(self, path, prompt, plan, aspect, target, seed, *, reference_image=None):
+            events.append("pdd")
+            assert "qwen_close" in events
+            if reference_image:
+                assert events.index("boogu_close") < len(events)-1
+            runs.append((path,plan,aspect,seed,reference_image))
+            (target/"raw.mp4").write_bytes(b"native")
+            return {"inference_nfe":8,"video_shift":12,"audio_shift":3}
+    config = BooguWorkerConfig(python_executable=tmp_path/"python", code_root=tmp_path,
+                              model_path=tmp_path, allowed_server_root=tmp_path)
+    report = module.run_cases([{"case_id":"case","target_video_path":str(video),"output_dir":str(directory)}],
+                              qwen=Qwen(), backend=PDD(), boogu_config=config, seed=99, variant="both")
+    if boogu_fails:
+        assert len(report["manifests"]) == 1 and len(report["failures"]) == 1
+        assert len(runs) == 1 and runs[0][4] is None
+        assert report["failures"][0]["variant"] == "frame0_two_person"
+        assert not (directory/"frame0"/"manifest.json").exists()
+        assert events[-1] == "boogu_close"
+        return
+    assert not report["failures"] and len(report["manifests"]) == 2
+    assert runs[0][:4] == runs[1][:4] and runs[0][3] == 99
+    assert runs[0][4] is None and runs[1][4] == directory/"frame0"/"repainted_frame0.png"
+    assert events.count("boogu_edit") == events.count("frame0") == 1
+    assert events.count("describe") == events.count("invent") == 1
+    manifests = [json.loads(Path(path).read_text()) for path in report["manifests"]]
+    assert [item["type"] for item in manifests[0]["references"]] == ["video"]
+    assert [item["type"] for item in manifests[1]["references"]] == ["video","image"]
+    assert manifests[1]["boogu"]["seed"] == 42
+    assert video.read_bytes() == b"original bytes"
+    assert (directory/"original.mp4").is_symlink()
+    before = {p:p.read_bytes() for p in directory.rglob("*") if p.is_file()}
+    with pytest.raises(FileExistsError):
+        module.run_cases([{"case_id":"case","target_video_path":str(video),"output_dir":str(directory)}],
+                         qwen=Qwen(), backend=PDD(), boogu_config=config, seed=99, variant="both")
+    assert all(p.read_bytes() == data for p,data in before.items())
+
+
+def test_missing_replacement_fields_fail(tmp_path, monkeypatch):
+    qwen = qwen3vl.LocalQwen(tmp_path)
+    monkeypatch.setattr(qwen,"_text",lambda _: "REPLACEMENT_SUBJECT_1: one")
+    with pytest.raises(ValueError):
+        qwen.invent_two("one", "two")
+
+
+def test_runtime_caches_are_case_local_and_environment_restored(tmp_path, monkeypatch):
+    from r2v_data_v2.person_replacement.h3_two_person_pipeline import (
+        _runtime_environment,
+    )
+
+    monkeypatch.setenv("HF_HOME", "/readonly/model/cache")
+    monkeypatch.setenv("PYTHONPATH", "/foreign/environment")
+    original = os.environ.copy()
+    with pytest.raises(RuntimeError), _runtime_environment(tmp_path):
+        for name in ("HF_HOME", "HF_HUB_CACHE", "TORCH_HOME", "TRITON_CACHE_DIR", "TMPDIR"):
+            assert Path(os.environ[name]).is_relative_to(tmp_path)
+        assert os.environ["HF_HUB_OFFLINE"] == "1" and "PYTHONPATH" not in os.environ
+        raise RuntimeError("model failed")
+    assert os.environ == original
+
+
+def test_two_subject_appearance_edit_contract():
+    from r2v_data_v2.person_replacement.h3_two_person import build_prompt
+    from r2v_data_v2.person_replacement.qwen3vl import (
+        TWO_REPLACEMENT_PROMPT,
+        TWO_SOURCE_PROMPT,
+    )
+
+    assert "SHOT_DESCRIPTION" in TWO_SOURCE_PROMPT
+    assert "clearly different from Source 1" in TWO_REPLACEMENT_PROMPT
+    assert "clearly different from Source 2" in TWO_REPLACEMENT_PROMPT
+
+    shot = "UNIQUE_TEMPORAL_MARKER_1234"
+    source1 = "a bald man with a mustache in a dark blue robe seated in the foreground"
+    source2 = "a shaved-head man in a light gray robe standing in the background"
+    replacement1 = "A middle-aged woman with auburn hair in an olive-green jacket."
+    replacement2 = "An adult man with short black hair in a cream linen shirt."
+    prompt = build_prompt(source1, source2, shot, replacement1, replacement2)
+
+    definitions = prompt.split("\n\nsummary:",1)[0]
+    retention = prompt.split("retention_analysis:\n",1)[1].split("\n\ndetailed_description:",1)[0]
+    detailed = prompt.split("detailed_description:\n",1)[1].split("\n\noverall_soundscape:",1)[0]
+
+    assert source1 in definitions and source2 in definitions
+    assert "<Subject 1> is the target performer in <Video 1>" in definitions
+    assert "<Subject 2> is the target performer in <Video 1>" in definitions
+    assert "<Subject 3>" not in prompt and "<Subject 4>" not in prompt
+
+    assert "<Subject 1> (appears in [Shot 1]): partially_preserved" in retention
+    assert "<Subject 2> (appears in [Shot 1]): partially_preserved" in retention
+    assert "<Video 1> (source video editing): fully_preserved" in retention
+    assert "attribute_transfer" not in prompt
+    assert retention.count("fully_preserved") == 1  # only <Video 1>
+    assert "to match a middle-aged woman with auburn hair in an olive-green jacket." in retention
+    assert "to match an adult man with short black hair in a cream linen shirt." in retention
+
+    assert "Modify only <Subject 1>'s" in detailed
+    assert "Modify only <Subject 2>'s" in detailed
+    assert "All other visible people" in detailed
+    assert shot not in prompt
+
+
+def test_qwen_shot_text_is_provenance_not_h3_motion_instruction():
+    from r2v_data_v2.person_replacement.h3_two_person import build_prompt
+
+    shot = (
+        "<Subject 1> remains seated without the cup until 00:04.000. "
+        "At 00:04.000, <Subject 1> raises <Subject 1>'s right hand toward the cup."
+    )
+    prompt = build_prompt("source one", "source two", shot, "target one", "target two")
+    assert shot not in prompt
+    assert "00:04.000" not in prompt
+    assert "Use <Video 1> directly as the source video" in prompt
+    assert "preserve <Video 1> and apply only the compatible appearance change" in prompt
+
+
+def test_two_person_video_sampling_only_and_short_motion_prompt(tmp_path, monkeypatch):
+    video = tmp_path/"source.mp4"
+    video.touch()
+    client = qwen3vl.LocalQwen(tmp_path)
+    calls = []
+    def text(content):
+        calls.append(content)
+        return "SOURCE_SUBJECT_1: gray hair\nSOURCE_SUBJECT_2: red coat\nSHOT_DESCRIPTION: <Subject 1> raises a cup."
+    monkeypatch.setattr(client,"_text",text)
+    client.describe_two(video)
+    client.describe(video)
+    assert calls[0][0] == {"type":"video","path":str(video.resolve()),"fps":4.0}
+    assert "fps" not in calls[1][0]
+
+
+def test_two_subject_v18_prompt_regression():
+    """Whole-prompt invariants for the 2-subject in-place appearance edit."""
+    from r2v_data_v2.person_replacement.h3_two_person import build_prompt
+
+    shot = "UNIQUE_TEMPORAL_MARKER_7788"
+    prompt = build_prompt("a man","a woman",shot,"an old man","a young woman")
+
+    assert "<Subject 1>" in prompt and "<Subject 2>" in prompt and "<Video 1>" in prompt
+    assert "<Subject 3>" not in prompt
+    assert "<Subject 4>" not in prompt
+    assert "attribute_transfer" not in prompt
+
+    for phrase in (
+        "<Subject 1> (appears in [Shot 1]): partially_preserved",
+        "<Subject 2> (appears in [Shot 1]): partially_preserved",
+        "<Video 1> (source video editing): fully_preserved",
+        "The target video preserves the original visual content and complete event sequence",
+        "camera framing and camera motion",
+        "scene geometry and depth relationships",
+        "all non-target people",
+        "all non-person objects",
+        "positions, occlusions and timing",
+        "Only the visible human identity and appearance of <Subject 1> and <Subject 2>",
+        ("Modify only <Subject 1>'s visible human identity, facial appearance, hair and "
+         "clothing to match: an old man."),
+        ("Modify only <Subject 2>'s visible human identity, facial appearance, hair and "
+         "clothing to match: a young woman."),
+        "Do not create replacement people as additional subjects",
+        "Do not reinterpret or regenerate the shot as a new scene",
+    ):
+        assert phrase in prompt, phrase
+    assert "Keep the visual style and lighting of <Video 1>." not in prompt
+    assert shot not in prompt
+    assert "overall_soundscape:\nN/A" in prompt
+    assert "non_diegetic_music:\nN/A" in prompt
+
+
+def test_v15_v16_experimental_wording_is_absent():
+    from r2v_data_v2.person_replacement.h3_two_person import build_prompt
+
+    for frame0 in (False,True):
+        prompt = build_prompt("a man","a woman","shot","an old man","a young woman",frame0=frame0)
+        for removed in ("source-only performer identity","must not appear as an additional person",
+                        "replaces <Subject 1> in place","replaces <Subject 2> in place",
+                        "must never coexist","Edit <Video 1> in place",
+                        "same visible-person count and occupancy","Do not add any new person",
+                        "duplicate either replacement","must preserve this source object interaction",
+                        "Any source object held, carried, touched",
+                        "Do not reinterpret facial emotion","The replacement happens in place"):
+            assert removed not in prompt, removed
+        assert ".." not in prompt
