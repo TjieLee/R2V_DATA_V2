@@ -27,7 +27,13 @@ def _by_uid(items):
 
 class _Processor(production.FrozenProductionProcessor):
     def __init__(self, contexts, backend, profiles, index, *, allow_unverified):
-        super().__init__(contexts, backend, profiles, allow_unverified=allow_unverified)
+        super().__init__(
+            contexts,
+            backend,
+            profiles,
+            allow_unverified=allow_unverified,
+            verify_sources_per_sample=False,
+        )
         self.population = index["source_sha256"]
         self.policy = {
             "version": "full-downstream-per-clip-v1",
@@ -80,9 +86,10 @@ class _Processor(production.FrozenProductionProcessor):
             raw_keys = sorted(key for key in raw if key[0] == uid)
             if raw_keys != sorted(key for key in asr if key[0] == uid):
                 raise ValueError("per-clip raw/ASR keys differ")
-            if production._sha(Path(job.target_video_path)) != job.target_video_sha256:
-                raise ValueError("downstream source video changed")
-            frozen.check_audio_files(job.audio_evidence)
+            # Full production already carries immutable upstream hashes in the
+            # canonical/resolved records. Actual pending T2VA/TA2VA work verifies
+            # the media at the sample boundary; do not hash every clip merely to
+            # construct resume dependencies.
             job_value = job.model_dump(mode="json")
             # Each removed link is replaced by its validated concrete dependency
             # below. All media, model, ownership, and timeline fields remain exact.
