@@ -36,10 +36,14 @@ from r2v_data_v2.v3.post_mask_epoch_jobs import (
 )
 from r2v_data_v2.v3.post_mask_epoch_pipeline import (
     DOWNSTREAM_REASON,
+    INSTRUCT_STARTED,
+    REFERENCE_INTEGRITY_STARTED,
     StageDispatchError,
     default_pair_runner_factory,
     run_removal_pair_epochs,
     run_removal_pair_resource_session,
+    shared_qwen_model_identities,
+    validate_shared_qwen_models,
 )
 from r2v_data_v2.v3.post_mask_epoch_scheduler import (
     JobExecution,
@@ -1389,8 +1393,23 @@ class _CompositionQwenHandle:
         self.removal_reviews = 0
         self.completion_reviews = 0
         self.pair_decisions = 0
+        self.integrity_reviews = 0
 
     def review(self, **kwargs: Any) -> Any:
+        if "final_reference" in kwargs:
+            from r2v_data_v2.v3.reference_integrity import (
+                ReferenceIntegrityReviewAttempt,
+            )
+            from tests.test_v3_reference_integrity import _review as _integrity_review
+
+            self.integrity_reviews += 1
+            review = _integrity_review(accept=True, reason="clean completion")
+            return ReferenceIntegrityReviewAttempt(
+                review=review,
+                raw_response=review.model_dump_json(),
+                raw_responses=(review.model_dump_json(),),
+                finish_reasons=("stop",),
+            )
         if "candidate_rgb" in kwargs:
             from tests.test_v3_reference_edit_boogu import _completion_review
 
@@ -1473,12 +1492,12 @@ class _CompositionBooguHandle:
 
 
 def _composition_manager(
-    dispatch: Any, timeline: list[str]
+    dispatch: Any, timeline: list[str], *, qwen: Any = None
 ) -> tuple[Any, dict[str, Any]]:
     from r2v_data_v2.v3.post_mask_epoch_resources import ResourceEpochManager
 
     boogu = _CompositionBooguHandle()
-    qwen = _CompositionQwenHandle()
+    qwen = qwen if qwen is not None else _CompositionQwenHandle()
     sam = _CompositionSamHandle()
 
     def boogu_factory() -> tuple[Any, Any]:
@@ -1928,3 +1947,440 @@ def test_two_shard_reconcile_failure_writes_zero_partial_stage_counts(
         stats = second["reference_edit_stats"][shard]
         for field, value in stats.items():
             assert counts[f"reference_edit.{field}"] == value, (shard, field)
+
+
+# ---------------------------------------------------------------------------
+# Reference Integrity -> Instruct composition
+# ---------------------------------------------------------------------------
+
+
+def _enable_reference_integrity(config: V3Config) -> V3Config:
+    """Turn the Reference Integrity stage on with an already-served judge."""
+    model = str(config.qwen.background_remove_judge.model)
+    updated = replace(
+        config,
+        qwen=replace(
+            config.qwen,
+            reference_integrity_judge=QwenServiceConfig(model=model),
+        ),
+        reference_integrity=replace(config.reference_integrity, enabled=True),
+    )
+    updated.validate()
+    return updated
+
+
+def _with_instruction_template(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give the Pair fixture's annotation a deterministic instruction template.
+
+    ``instruct_clips(client=None)`` renders ``annotation.instruction_template``.
+    The Pair fixture writes an annotation without one, and rewriting the
+    annotation afterwards would invalidate the frames, masks and pairing it also
+    writes, so inject the default where the fixture builds its annotation.
+    """
+    import tests.test_v3_pair as pair_module
+    import tests.test_v3_post_mask_epoch_removal as removal_module
+
+    for module in (pair_module, removal_module):
+        real = module.AnnotationState
+
+        def state(*args: Any, _real: Any = real, **kwargs: Any) -> Any:
+            # A ready annotation carries exactly one of the two, so replace the
+            # legacy caption with the deterministic template. A paired
+            # background must be mentioned exactly once, and an annotation
+            # without one must not mention it at all.
+            kwargs.pop("t2v_caption", None)
+            kwargs.setdefault(
+                "instruction_template",
+                (
+                    "{{entity_1}} moves through {{background}}."
+                    if kwargs.get("background") is not None
+                    else "{{entity_1}} crosses the frame."
+                ),
+            )
+            return _real(*args, **kwargs)
+
+        monkeypatch.setattr(module, "AnnotationState", state)
+
+
+def _reference_integrity_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, run_name: str = "run-a"
+) -> tuple[V3Config, dict, dict]:
+    """Reference Edit fixture with Reference Integrity enabled and Instruct ready."""
+    _with_instruction_template(monkeypatch)
+    config, storages, eligible = _reference_edit_fixture(tmp_path, monkeypatch)
+    return _enable_reference_integrity(config), storages, eligible
+
+
+def _compose_with_reference_integrity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    timeline: list[str],
+    *,
+    fixture: tuple[V3Config, dict, dict] | None = None,
+    qwen: Any = None,
+    ledger: GroupLedger | None = None,
+    build_reference_edit_scheduler: Any = None,
+    factory_log: list[str] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], Any, Any]:
+    from r2v_data_v2.v3.post_mask_epoch_reference_edit import (
+        ReferenceEditEpochRunner,
+    )
+    from r2v_data_v2.v3.post_mask_epoch_reference_integrity import (
+        ReferenceIntegrityEpochRunner,
+    )
+
+    if fixture is None:
+        fixture = _reference_integrity_fixture(tmp_path, monkeypatch)
+    config, storages, eligible = fixture
+    ledger = ledger if ledger is not None else GroupLedger(tmp_path / "ledger")
+    holder = _DispatchHolder()
+    manager, handles = _composition_manager(holder, timeline, qwen=qwen)
+
+    def make(runner: Any, dispatch: Any) -> Any:
+        holder.dispatch = dispatch
+        return ResourceEpochScheduler(
+            ledger=ledger,
+            finalize=runner.finalize,
+            resource_manager=manager,
+            close_resource_manager_on_exit=False,
+        )
+
+    result = run_removal_pair_resource_session(
+        config=config,
+        storages=storages,
+        eligible_clip_uids_by_shard=eligible,
+        ledger=ledger,
+        manager=manager,
+        build_removal_scheduler=make,
+        build_pair_scheduler=make,
+        build_reference_edit_scheduler=(
+            build_reference_edit_scheduler or make
+        ),
+        build_reference_integrity_scheduler=make,
+        reference_edit_runner_factory=(
+            lambda **kwargs: _stage_runner(
+                factory_log,
+                "reference_edit",
+                ReferenceEditEpochRunner(**kwargs),
+            )
+        ),
+        reference_integrity_runner_factory=(
+            lambda **kwargs: _stage_runner(
+                factory_log,
+                "reference_integrity",
+                ReferenceIntegrityEpochRunner(**kwargs),
+            )
+        ),
+    )
+    return result, storages, handles, ledger
+
+
+def _stage_runner(log: list[str] | None, stage: str, runner: Any) -> Any:
+    """Build a stage runner while recording that the stage was entered."""
+    if log is not None:
+        log.append(stage)
+    return runner
+
+
+def _stage_positions(log: Any, runner_name: str) -> list[int]:
+    return [
+        index
+        for index, entry in enumerate(log)
+        if entry.startswith(f"{runner_name}:")
+    ]
+
+
+def test_composition_runs_reference_integrity_then_instruct(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reference Edit -> Reference Integrity -> deterministic Instruct."""
+    timeline: list[str] = []
+    result, storages, handles, ledger = _compose_with_reference_integrity(
+        tmp_path, monkeypatch, timeline
+    )
+
+    assert result["remove_completed"] is True
+    assert result["pair_completed"] is True
+    assert result["reference_edit_completed"] is True, result.get(
+        "reference_edit_reconcile_error"
+    )
+    assert result["reference_integrity_completed"] is True, result.get(
+        "reference_integrity_reconcile_error"
+    )
+    assert result["reference_integrity_unresolved"] == ()
+    assert result["reference_integrity_job_count"] >= 1, "a real review job ran"
+    assert result["reference_integrity_stats"], "reconciled stats must be reported"
+    assert result["instruct_completed"] is True
+
+    # Every Reference Edit model call precedes the first Reference Integrity one.
+    log = list(result["stage_dispatch_log"])
+    reference_edit_positions = _stage_positions(log, "ReferenceEditEpochRunner")
+    reference_integrity_positions = _stage_positions(
+        log, "ReferenceIntegrityEpochRunner"
+    )
+    assert reference_edit_positions, log
+    assert reference_integrity_positions, log
+    assert max(reference_edit_positions) < min(reference_integrity_positions), log
+    assert len(reference_integrity_positions) == result[
+        "reference_integrity_job_count"
+    ], "every seeded integrity job really ran"
+    # Instruct contributes no model job and no model call at all.
+    assert "instruct" not in ",".join(log)
+    assert handles["qwen"].integrity_reviews == result["reference_integrity_job_count"]
+
+    # Every eligible clip in every shard reached both new stages.
+    for shard in storages:
+        clip = storages[shard].read_clip("clip-1")
+        assert clip.reference_integrity is not None
+        assert clip.reference_integrity.status == "ready"
+        assert clip.instruction is not None
+        assert clip.instruction.status == "ready"
+        counts = storages[shard].read_run().counts
+        assert any(key.startswith("reference_integrity.") for key in counts)
+        assert any(key.startswith("instruct.") for key in counts)
+    assert result["instruct_stats"][PAIR_SHARD]["processed"] == 1
+    assert result["instruct_stats"][PAIR_SHARD]["failed"] == 0
+    composition_root = Path(ledger.root) / "composition"
+    assert (composition_root / f"{REFERENCE_INTEGRITY_STARTED}.json").is_file()
+    assert (composition_root / f"{INSTRUCT_STARTED}.json").is_file()
+
+    assert result["completed"] is False
+    assert result["reason"] == DOWNSTREAM_REASON
+
+
+class _InertScheduler:
+    """A scheduler that executes nothing and leaves every job unresolved."""
+
+    def __init__(self, jobs: Any = ()) -> None:
+        self._jobs = tuple(jobs)
+
+    def run(self, jobs: Any = None) -> dict[str, Any]:
+        seeded = tuple(jobs) if jobs is not None else self._jobs
+        return {"unresolved_job_ids": tuple(job.job_id() for job in seeded)}
+
+
+def test_reference_edit_incomplete_blocks_reference_integrity_and_instruct(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reference Edit incomplete: no handoff, no plan, no seed, no Instruct."""
+    timeline: list[str] = []
+    result, storages, handles, ledger = _compose_with_reference_integrity(
+        tmp_path,
+        monkeypatch,
+        timeline,
+        build_reference_edit_scheduler=lambda runner, dispatch: _InertScheduler(),
+    )
+
+    assert result["pair_completed"] is True
+    assert result["reference_edit_job_count"] >= 1
+    assert result["reference_edit_completed"] is False
+    assert result["reference_edit_unresolved"], "the seeded jobs stayed unresolved"
+    assert result["reason"] == "reference edit resource epoch incomplete"
+    assert "reference_edit_boogu_generate" not in ",".join(
+        result["stage_dispatch_log"]
+    ), "the incomplete stage paid no Reference Edit model call"
+
+    assert result["reference_integrity_completed"] is False
+    assert result["reference_integrity_job_count"] == 0
+    assert result["reference_integrity_unresolved"] == ()
+    assert result["reference_integrity_stats"] == {}
+    assert result["instruct_completed"] is False
+    assert result["instruct_stats"] == {}
+    assert handles["qwen"].integrity_reviews == 0
+
+    composition_root = Path(ledger.root) / "composition"
+    assert not (composition_root / f"{REFERENCE_INTEGRITY_STARTED}.json").exists()
+    assert not (composition_root / f"{INSTRUCT_STARTED}.json").exists()
+    assert not (Path(ledger.root) / "semantic" / "reference_integrity").exists()
+    counts = storages[PAIR_SHARD].read_run().counts
+    assert not any(key.startswith("reference_integrity.") for key in counts)
+    assert not any(key.startswith("instruct.") for key in counts)
+    assert storages[PAIR_SHARD].read_clip("clip-1").instruction is None
+
+
+class _IntegrityFailingQwenHandle(_CompositionQwenHandle):
+    """Breaks only the Reference Integrity review call."""
+
+    def review(self, **kwargs: Any) -> Any:
+        if "final_reference" in kwargs:
+            self.integrity_reviews += 1
+            raise RuntimeError("integrity judge exploded")
+        return super().review(**kwargs)
+
+
+def test_reference_integrity_incomplete_blocks_instruct(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reference Integrity incomplete: no Instruct handoff, no instruction."""
+    timeline: list[str] = []
+    result, storages, _handles, ledger = _compose_with_reference_integrity(
+        tmp_path,
+        monkeypatch,
+        timeline,
+        qwen=_IntegrityFailingQwenHandle(),
+    )
+
+    assert result["reference_edit_completed"] is True
+    assert result["reference_integrity_completed"] is False
+    assert result["reference_integrity_job_count"] >= 1
+    assert result["reference_integrity_unresolved"], "the review never committed"
+    assert result["reference_integrity_stats"] == {}
+    assert result["reason"] == "reference integrity resource epoch incomplete"
+    assert result["instruct_completed"] is False
+    assert result["instruct_stats"] == {}
+
+    composition_root = Path(ledger.root) / "composition"
+    assert (composition_root / f"{REFERENCE_INTEGRITY_STARTED}.json").is_file()
+    assert not (composition_root / f"{INSTRUCT_STARTED}.json").exists()
+    clip = storages[PAIR_SHARD].read_clip("clip-1")
+    assert clip.instruction is None
+    counts = storages[PAIR_SHARD].read_run().counts
+    assert not any(key.startswith("reference_integrity.") for key in counts)
+    assert not any(key.startswith("instruct.") for key in counts)
+
+
+def test_composition_restart_after_instruct_replays_nothing_paid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both restart barriers resume without replaying any paid upstream work."""
+    import r2v_data_v2.v3.post_mask_epoch_pipeline as pipeline_module
+
+    # One fixture and one ledger root: every session resumes the exact durable
+    # state the previous one left behind.
+    fixture = _reference_integrity_fixture(tmp_path, monkeypatch)
+    ledger = GroupLedger(tmp_path / "ledger")
+
+    # 1. Simulate a crash between the Reference Integrity publication and the
+    #    Instruct handoff, so only the earlier barrier is durable.
+    real_write = pipeline_module.write_composition_handoff
+    crashed = {"done": False}
+
+    def crash_before_instruct(
+        ledger_arg: Any, stage: str, *, eligible_clip_uids_by_shard: Any
+    ) -> None:
+        if stage == INSTRUCT_STARTED and not crashed["done"]:
+            crashed["done"] = True
+            raise RuntimeError("simulated crash before the Instruct handoff")
+        real_write(
+            ledger_arg,
+            stage,
+            eligible_clip_uids_by_shard=eligible_clip_uids_by_shard,
+        )
+
+    monkeypatch.setattr(
+        pipeline_module, "write_composition_handoff", crash_before_instruct
+    )
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        _compose_with_reference_integrity(
+            tmp_path, monkeypatch, [], fixture=fixture, ledger=ledger
+        )
+
+    composition_root = Path(ledger.root) / "composition"
+    assert (composition_root / f"{REFERENCE_INTEGRITY_STARTED}.json").is_file()
+    assert not (composition_root / f"{INSTRUCT_STARTED}.json").exists()
+    storages = fixture[1]
+    clip = storages[PAIR_SHARD].read_clip("clip-1")
+    assert clip.reference_integrity is not None
+    assert clip.reference_integrity.status == "ready"
+    assert clip.instruction is None
+
+    # 2. Restart on the Reference Integrity barrier: Pair and Reference Edit are
+    #    recovered from stage counts, Reference Integrity replays its receipts
+    #    for free, and Instruct finally runs.
+    resume_timeline: list[str] = []
+    resume_runners: list[str] = []
+    resumed, _resumed_storages, resume_handles, _ledger = (
+        _compose_with_reference_integrity(
+            tmp_path,
+            monkeypatch,
+            resume_timeline,
+            fixture=fixture,
+            ledger=ledger,
+            factory_log=resume_runners,
+        )
+    )
+    # Pair and Reference Edit are not replayed: only the Reference Integrity
+    # runner is entered, and its receipts make the replay free.
+    assert resume_runners == ["reference_integrity"], resume_runners
+    assert resume_handles["boogu"].calls == 0
+    assert resume_handles["qwen"].completion_reviews == 0
+    assert resume_handles["qwen"].removal_reviews == 0
+    assert resume_handles["qwen"].pair_decisions == 0
+    assert resume_handles["sam"].calls == 0
+    assert resumed["pair_completed"] is True
+    assert resumed["reference_edit_completed"] is True
+    assert resumed["reference_edit_job_count"] == 0
+    assert resume_handles["qwen"].integrity_reviews == 0, "receipts are reused"
+    assert resumed["reference_integrity_completed"] is True
+    assert resumed["instruct_completed"] is True
+    instruction = storages[PAIR_SHARD].read_clip("clip-1").instruction
+    assert instruction is not None and instruction.status == "ready"
+    assert (composition_root / f"{INSTRUCT_STARTED}.json").is_file()
+
+    # 3. Restart on the Instruct barrier: only the cheap deterministic stage
+    #    reruns, and a ready instruction is the legacy skipped_existing.
+    final_timeline: list[str] = []
+    final_runners: list[str] = []
+    final, _storages, final_handles, _ledger = _compose_with_reference_integrity(
+        tmp_path,
+        monkeypatch,
+        final_timeline,
+        fixture=fixture,
+        ledger=ledger,
+        factory_log=final_runners,
+    )
+    # The most downstream barrier short-circuits everything upstream.
+    assert final_runners == [], final_runners
+    assert final_handles["boogu"].calls == 0
+    assert final_handles["qwen"].completion_reviews == 0
+    assert final_handles["qwen"].removal_reviews == 0
+    assert final_handles["qwen"].pair_decisions == 0
+    assert final_handles["qwen"].integrity_reviews == 0
+    assert final_handles["sam"].calls == 0
+    assert final["pair_completed"] is True
+    assert final["reference_edit_completed"] is True
+    assert final["reference_edit_job_count"] == 0
+    assert final["reference_integrity_completed"] is True
+    assert final["reference_integrity_job_count"] == 0
+    assert final["instruct_completed"] is True
+    assert final["instruct_stats"][PAIR_SHARD]["skipped_existing"] == 1
+    assert final["instruct_stats"][PAIR_SHARD]["processed"] == 0
+    after = storages[PAIR_SHARD].read_clip("clip-1").instruction
+    assert after is not None
+    assert result_instruction_unchanged(after, instruction)
+    assert final["completed"] is False
+    assert final["reason"] == DOWNSTREAM_REASON
+
+
+def result_instruction_unchanged(current: Any, previous: Any) -> bool:
+    return current.model_dump(mode="json") == previous.model_dump(mode="json")
+
+
+def test_shared_qwen_identities_include_reference_integrity_judge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one cached Qwen session must also serve the Reference Integrity judge."""
+    config = _enable_reference_integrity(_config(tmp_path, monkeypatch, "run-shared"))
+    served = str(config.qwen.background_remove_judge.model)
+    assert served in shared_qwen_model_identities(config)
+
+    mismatched = replace(
+        config,
+        qwen=replace(
+            config.qwen,
+            reference_integrity_judge=QwenServiceConfig(model="/models/other"),
+        ),
+    )
+    assert "/models/other" in shared_qwen_model_identities(mismatched)
+    with pytest.raises(StageDispatchError, match="shared Qwen session"):
+        validate_shared_qwen_models(mismatched, expected_served_model_id=served)
+
+    # The instruction writer is deliberately not part of the shared session:
+    # production Instruct is deterministic with client=None.
+    writer_mismatch = replace(
+        config,
+        qwen=replace(
+            config.qwen, instruction_writer=QwenServiceConfig(model="/models/other")
+        ),
+    )
+    assert "/models/other" not in shared_qwen_model_identities(writer_mismatch)

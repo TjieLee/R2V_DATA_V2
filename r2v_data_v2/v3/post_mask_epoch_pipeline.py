@@ -21,9 +21,18 @@ rejected) count as complete without any model call.
 Pair completion is scheduler-level: semantic terminals (a cross judge failure,
 all donors rejected) are committed outcomes, not unresolved work.
 
-The group itself is never reported completed: the downstream resource-epoch
-phases (reference_edit, reference_integrity, instruct, subject_attributes,
-export) are not wired yet.
+The composition now runs reference_edit -> reference_integrity -> instruct.
+Instruct is the existing deterministic per-clip production policy called with
+``client=None``; subject_attributes and export are still unwired, so the group
+itself is never reported completed.
+
+Cross-stage restarts are routed by create-once composition handoff markers
+rather than by guessing from live clip state: the Reference Integrity handoff is
+written only after every shard reconciled Reference Edit and published its stage
+counts, and the Instruct handoff only after every shard reconciled Reference
+Integrity. That is what lets a restart skip upstream replays -- whose live-state
+verification would otherwise mistake a legitimately rewritten downstream
+publication for corruption.
 """
 
 from __future__ import annotations
@@ -38,8 +47,11 @@ from r2v_data_v2.v3.post_mask_epoch_pair import PairEpochRunner
 from r2v_data_v2.v3.post_mask_epoch_reference_edit import (
     ReferenceEditEpochError,
 )
+from r2v_data_v2.v3.post_mask_epoch_reference_integrity import (
+    ReferenceIntegrityEpochError,
+)
 from r2v_data_v2.v3.post_mask_epoch_removal import RemovalEpochRunner
-from r2v_data_v2.v3.post_mask_epoch_state import GroupLedger
+from r2v_data_v2.v3.post_mask_epoch_state import GroupLedger, atomic_write_json
 
 #: Scheduler factories are injected so 4a can prove composition correctness
 #: without owning model lifecycle. 4b wires one ResourceEpochManager session.
@@ -47,8 +59,21 @@ RemovalSchedulerFactory = Callable[[RemovalEpochRunner], Any]
 PairSchedulerFactory = Callable[[PairEpochRunner], Any]
 RemovalRunnerFactory = Callable[..., RemovalEpochRunner]
 PairRunnerFactory = Callable[..., PairEpochRunner]
+ReferenceIntegritySchedulerFactory = Callable[[Any], Any]
+ReferenceIntegrityRunnerFactory = Callable[..., Any]
 
 DOWNSTREAM_REASON = "downstream resource-epoch phases are not wired"
+REFERENCE_INTEGRITY_INCOMPLETE_REASON = (
+    "reference integrity resource epoch incomplete"
+)
+INSTRUCT_INCOMPLETE_REASON = "instruct resource epoch incomplete"
+
+#: Create-once composition handoff markers. They are the restart barrier
+#: authority only: they never take part in any model job identity.
+COMPOSITION_HANDOFF_SCHEMA = "post_mask_resource_epoch_handoff/1"
+REFERENCE_INTEGRITY_STARTED = "reference_integrity_started"
+INSTRUCT_STARTED = "instruct_started"
+COMPOSITION_HANDOFF_STAGES = (REFERENCE_INTEGRITY_STARTED, INSTRUCT_STARTED)
 
 
 def default_removal_runner_factory(
@@ -205,6 +230,359 @@ def _reconcile_and_publish_reference_edit_stats(
     return True, reconciled, None
 
 
+class StageHandoffError(RuntimeError):
+    """Raised when a composition handoff marker is malformed or out of scope."""
+
+
+def default_reference_integrity_runner_factory(
+    config: V3Config,
+    storages: Mapping[str, Any],
+    ledger: GroupLedger,
+    *,
+    eligible_clip_uids_by_shard: Mapping[str, Sequence[str]],
+    emit: Any = None,
+) -> Any:
+    from r2v_data_v2.v3.post_mask_epoch_reference_integrity import (
+        ReferenceIntegrityEpochRunner,
+    )
+
+    return ReferenceIntegrityEpochRunner(
+        config,
+        dict(storages),
+        ledger,
+        eligible_clip_uids_by_shard={
+            shard: tuple(uids) for shard, uids in eligible_clip_uids_by_shard.items()
+        },
+        emit=emit,
+    )
+
+
+def _handoff_path(ledger: GroupLedger, stage: str) -> Path:
+    return Path(ledger.root) / "composition" / f"{stage}.json"
+
+
+def _expected_handoff(
+    stage: str, eligible_clip_uids_by_shard: Mapping[str, Sequence[str]]
+) -> dict[str, Any]:
+    return {
+        "schema": COMPOSITION_HANDOFF_SCHEMA,
+        "stage": stage,
+        "canonical_shards": sorted(
+            str(shard) for shard in eligible_clip_uids_by_shard
+        ),
+        "eligible_clip_uids_by_shard": {
+            str(shard): [str(uid) for uid in eligible_clip_uids_by_shard[shard]]
+            for shard in sorted(eligible_clip_uids_by_shard)
+        },
+    }
+
+
+def read_composition_handoff(
+    ledger: GroupLedger,
+    stage: str,
+    *,
+    eligible_clip_uids_by_shard: Mapping[str, Sequence[str]],
+) -> dict[str, Any] | None:
+    """The create-once handoff marker of one stage, or ``None`` if unwritten.
+
+    Missing is a normal first run. Anything else must match the exact expected
+    payload, so a malformed marker or a drifted eligible scope fails closed
+    instead of silently steering the restart into the wrong branch.
+    """
+    if stage not in COMPOSITION_HANDOFF_STAGES:
+        raise StageHandoffError(f"unknown composition handoff stage {stage!r}")
+    path = _handoff_path(ledger, stage)
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (ValueError, OSError) as exc:
+        raise StageHandoffError(
+            f"invalid composition handoff marker: {path}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise StageHandoffError(
+            f"composition handoff marker is not an object: {path}"
+        )
+    expected = _expected_handoff(stage, eligible_clip_uids_by_shard)
+    if payload != expected:
+        raise StageHandoffError(
+            f"composition handoff marker drifted: {path}"
+        )
+    return payload
+
+
+def write_composition_handoff(
+    ledger: GroupLedger,
+    stage: str,
+    *,
+    eligible_clip_uids_by_shard: Mapping[str, Sequence[str]],
+) -> None:
+    """Create-once handoff write; an existing exact marker is a no-op."""
+    path = _handoff_path(ledger, stage)
+    payload = _expected_handoff(stage, eligible_clip_uids_by_shard)
+    if path.is_file():
+        read_composition_handoff(
+            ledger,
+            stage,
+            eligible_clip_uids_by_shard=eligible_clip_uids_by_shard,
+        )
+        return
+    atomic_write_json(path, payload)
+
+
+def _stage_stats_from_stage_counts(
+    storages: Mapping[str, Any], stage: str
+) -> dict[str, Any]:
+    """Recover one stage's durable counts, or fail closed when a shard lacks them.
+
+    A handoff marker claims the stage completed for the whole group, so every
+    shard must have published its counts. Returning a partial mapping would
+    report a fake completion, which is exactly what the marker exists to avoid.
+    """
+    recovered: dict[str, Any] = {}
+    for shard, storage in storages.items():
+        counts = storage.read_run().counts
+        payload = {
+            key[len(stage) + 1 :]: value
+            for key, value in counts.items()
+            if key.startswith(f"{stage}.")
+        }
+        if not payload:
+            raise StageHandoffError(
+                f"composition handoff claims {stage!r} completed but shard "
+                f"{shard!r} has no {stage} stage counts"
+            )
+        recovered[shard] = payload
+    return recovered
+
+
+def _reconcile_and_publish_reference_integrity_stats(
+    reference_integrity: Any,
+) -> tuple[bool, dict[str, Any], str | None]:
+    """Two-phase Reference Integrity completion + stage-count publication.
+
+    Phase 1 reconciles EVERY shard with no writes at all. Phase 2 writes the
+    stage counts only when every shard reconciled: one failing shard must not
+    leave any other shard with partial ``reference_integrity.*`` counts.
+
+    Returns ``(completed, stats, error)``.
+    """
+    reconciled: dict[str, dict[str, Any]] = {}
+    try:
+        for shard in sorted(reference_integrity.storages):
+            stats = reference_integrity.reconcile_stats(shard)
+            reconciled[shard] = stats.to_dict()
+    except ReferenceIntegrityEpochError as exc:
+        # Durable corruption/incompleteness: write nothing, report incomplete.
+        return False, {}, str(exc)
+    for shard, payload in reconciled.items():
+        reference_integrity.storages[shard].update_stage_counts(
+            "reference_integrity", payload
+        )
+    return True, reconciled, None
+
+
+def run_deterministic_instruct(
+    *,
+    config: V3Config,
+    storages: Mapping[str, Any],
+    eligible_clip_uids_by_shard: Mapping[str, Sequence[str]],
+) -> tuple[bool, dict[str, Any], str | None]:
+    """Deterministic per-clip Instruct over every eligible clip.
+
+    The production authority is ``instruct_clips(..., client=None)``, which
+    builds the instruction from the annotation alone; there is no instruction
+    model job. It is called once per clip through a ``ClipScopedStorage`` --
+    exactly like the legacy downstream adapter -- because
+    ``ClipScopedStorage.update_stage_counts`` only writes to memory. Every shard
+    is computed first and the stage counts are published afterwards, so a shard
+    that fails cannot leave partial ``instruct.*`` counts on its siblings.
+
+    A per-clip semantic failure inside ``instruct_clips`` stays a legacy
+    terminal result (``status=failed`` plus a failure record) and does not make
+    the stage incomplete; only a top-level exception does.
+
+    Returns ``(completed, stats, error)``.
+    """
+    from r2v_data_v2.v3.instruction import instruct_clips
+    from r2v_data_v2.v3.runtime import ClipScopedStorage
+
+    fields = ("processed", "skipped_existing", "skipped_not_ready", "failed", "repaired")
+    aggregated: dict[str, dict[str, int]] = {}
+    try:
+        for shard in sorted(storages):
+            storage = storages[shard]
+            totals = {field: 0 for field in fields}
+            for clip_uid in eligible_clip_uids_by_shard.get(shard, ()):
+                scoped = ClipScopedStorage(storage, clip_uid)
+                stats = instruct_clips(config, scoped, overwrite=False, client=None)
+                payload = stats.to_dict()
+                for field in fields:
+                    totals[field] += int(payload.get(field, 0))
+            aggregated[shard] = totals
+    except Exception as exc:  # noqa: BLE001 - top-level stage failure
+        return False, {}, str(exc)
+    for shard, payload in aggregated.items():
+        storages[shard].update_stage_counts("instruct", payload)
+    return True, aggregated, None
+
+
+def _after_reference_edit(
+    *,
+    config: V3Config,
+    storages: Mapping[str, Any],
+    eligible: Mapping[str, Sequence[str]],
+    ledger: GroupLedger,
+    result: dict[str, Any],
+    reference_edit_completed: bool,
+    reference_integrity_runner_factory: Any,
+    reference_integrity_scheduler_factory: Any,
+    reference_integrity_wired: bool,
+    emit: Any = None,
+) -> dict[str, Any]:
+    """Continue into Reference Integrity only when Reference Edit completed.
+
+    Reference Edit not completing is a hard barrier: no Reference Integrity
+    handoff, no semantic plan, no seed and no Reference Integrity Qwen call.
+    """
+    if not reference_edit_completed:
+        return result
+    if not reference_integrity_wired:
+        return result
+    return _continue_with_reference_integrity(
+        config=config,
+        storages=storages,
+        eligible=eligible,
+        ledger=ledger,
+        result=result,
+        reference_integrity_runner_factory=reference_integrity_runner_factory,
+        reference_integrity_scheduler_factory=reference_integrity_scheduler_factory,
+        emit=emit,
+    )
+
+
+def _continue_with_reference_integrity(
+    *,
+    config: V3Config,
+    storages: Mapping[str, Any],
+    eligible: Mapping[str, Sequence[str]],
+    ledger: GroupLedger,
+    result: dict[str, Any],
+    reference_integrity_runner_factory: Any,
+    reference_integrity_scheduler_factory: Any,
+    emit: Any = None,
+) -> dict[str, Any]:
+    """Reference Integrity, then deterministic Instruct, then stop.
+
+    Both handoff markers are written before the work they guard, so a crash can
+    only ever restart ``from`` a barrier, never re-verify an upstream
+    publication that a downstream stage legitimately rewrote.
+    """
+    write_composition_handoff(
+        ledger,
+        REFERENCE_INTEGRITY_STARTED,
+        eligible_clip_uids_by_shard=eligible,
+    )
+    reference_integrity = reference_integrity_runner_factory(
+        config=config,
+        storages=dict(storages),
+        ledger=ledger,
+        eligible_clip_uids_by_shard=eligible,
+        emit=emit,
+    )
+    reference_integrity_seed = reference_integrity.seed_jobs()
+    _emit(
+        emit,
+        "post_mask_epoch_reference_integrity_seeded",
+        seeded_jobs=len(reference_integrity_seed),
+    )
+    reference_integrity_outcome = reference_integrity_scheduler_factory(
+        reference_integrity
+    ).run(reference_integrity_seed)
+    reference_integrity_unresolved = tuple(
+        reference_integrity_outcome.get("unresolved_job_ids", ())
+    )
+    reference_integrity_stats: dict[str, Any] = {}
+    reference_integrity_completed = False
+    reference_integrity_error: str | None = None
+    if not reference_integrity_unresolved:
+        (
+            reference_integrity_completed,
+            reference_integrity_stats,
+            reference_integrity_error,
+        ) = _reconcile_and_publish_reference_integrity_stats(reference_integrity)
+    result.update(
+        {
+            "reference_integrity_job_count": len(reference_integrity_seed),
+            "reference_integrity_unresolved": reference_integrity_unresolved,
+            "reference_integrity_completed": reference_integrity_completed,
+            "reference_integrity_stats": reference_integrity_stats,
+            "reference_integrity_reconcile_error": reference_integrity_error,
+        }
+    )
+    _emit(
+        emit,
+        "post_mask_epoch_reference_integrity_finished",
+        completed=reference_integrity_completed,
+        unresolved=len(reference_integrity_unresolved),
+    )
+    if not reference_integrity_completed:
+        result.update(
+            {
+                "instruct_completed": False,
+                "instruct_stats": {},
+                "reason": REFERENCE_INTEGRITY_INCOMPLETE_REASON,
+            }
+        )
+        return result
+
+    write_composition_handoff(
+        ledger, INSTRUCT_STARTED, eligible_clip_uids_by_shard=eligible
+    )
+    return run_instruct_stage(
+        config=config, storages=storages, eligible=eligible, result=result, emit=emit
+    )
+
+
+def run_instruct_stage(
+    *,
+    config: V3Config,
+    storages: Mapping[str, Any],
+    eligible: Mapping[str, Sequence[str]],
+    result: dict[str, Any],
+    emit: Any = None,
+) -> dict[str, Any]:
+    """Run the deterministic Instruct stage and record it in the result.
+
+    Instruct is cheap and deterministic, so a restart that sees the Instruct
+    handoff simply reruns it: a ready instruction becomes the legacy
+    ``skipped_existing`` and anything failed or missing is reprocessed. No
+    per-clip durable receipt is invented for it.
+    """
+    instruct_completed, instruct_stats, instruct_error = run_deterministic_instruct(
+        config=config,
+        storages=storages,
+        eligible_clip_uids_by_shard=eligible,
+    )
+    result.update(
+        {
+            "instruct_completed": instruct_completed,
+            "instruct_stats": instruct_stats,
+            "instruct_error": instruct_error,
+            "reason": (
+                DOWNSTREAM_REASON if instruct_completed else INSTRUCT_INCOMPLETE_REASON
+            ),
+        }
+    )
+    _emit(
+        emit,
+        "post_mask_epoch_instruct_finished",
+        completed=instruct_completed,
+    )
+    return result
+
+
 def run_removal_pair_epochs(
     *,
     config: V3Config,
@@ -217,6 +595,8 @@ def run_removal_pair_epochs(
     pair_runner_factory: PairRunnerFactory = default_pair_runner_factory,
     reference_edit_runner_factory: Callable[..., Any] | None = None,
     reference_edit_scheduler_factory: Callable[[Any], Any] | None = None,
+    reference_integrity_runner_factory: Callable[..., Any] | None = None,
+    reference_integrity_scheduler_factory: Callable[[Any], Any] | None = None,
     emit: Any = None,
 ) -> dict[str, Any]:
     """Drain Removal, then Pair primary, then the frozen Pair cross pass.
@@ -254,23 +634,106 @@ def run_removal_pair_epochs(
         "pair_cross_job_count":0,
         "pair_primary_unresolved":(),
         "pair_cross_unresolved":(),
+        "reference_edit_completed":False,
+        "reference_edit_job_count":0,
+        "reference_edit_unresolved":(),
+        "reference_edit_stats":{},
+        "reference_edit_reconcile_error":None,
+        "reference_integrity_completed":False,
+        "reference_integrity_job_count":0,
+        "reference_integrity_unresolved":(),
+        "reference_integrity_stats":{},
+        "reference_integrity_reconcile_error":None,
+        "instruct_completed":False,
+        "instruct_stats":{},
         "completed":False,
         "reason":"background removal incomplete",
         "removal_outcome":removal_outcome,
     }
+    reference_integrity_wired = (
+        reference_integrity_runner_factory is not None
+        and reference_integrity_scheduler_factory is not None
+    )
     if not remove_completed:
         # Hard stage barrier: no Pair seeding, no donor snapshot, no cross
         # baseline, no Pair Qwen call, no Reference Edit work at all.
+        return result
+
+    # A handoff marker is the durable restart barrier: it says, for the whole
+    # group, which upstream stages already completed and published their stage
+    # counts. The most downstream marker wins, and the upstream stages are then
+    # never replayed -- their live-state verification would otherwise mistake a
+    # publication that a downstream stage legitimately rewrote for corruption.
+    instruct_started = read_composition_handoff(
+        ledger, INSTRUCT_STARTED, eligible_clip_uids_by_shard=eligible
+    )
+    reference_integrity_started = read_composition_handoff(
+        ledger, REFERENCE_INTEGRITY_STARTED, eligible_clip_uids_by_shard=eligible
+    )
+    if instruct_started is not None:
         result.update(
             {
-                "reference_edit_completed": False,
+                "pair_primary_completed": True,
+                "pair_cross_completed": True,
+                "pair_completed": True,
+                "pair_primary_unresolved": (),
+                "pair_cross_unresolved": (),
+                "pair_stats": _stage_stats_from_stage_counts(storages, "pair"),
+                "reference_edit_completed": True,
                 "reference_edit_job_count": 0,
                 "reference_edit_unresolved": (),
-                "reference_edit_stats": {},
-                "reference_edit_reconcile_error": None,
+                "reference_edit_stats": _stage_stats_from_stage_counts(
+                    storages, "reference_edit"
+                ),
+                "reference_integrity_completed": True,
+                "reference_integrity_job_count": 0,
+                "reference_integrity_unresolved": (),
+                "reference_integrity_stats": _stage_stats_from_stage_counts(
+                    storages, "reference_integrity"
+                ),
             }
         )
-        return result
+        return run_instruct_stage(
+            config=config,
+            storages=storages,
+            eligible=eligible,
+            result=result,
+            emit=emit,
+        )
+    if reference_integrity_started is not None:
+        if not reference_integrity_wired:
+            raise StageHandoffError(
+                "composition handoff claims Reference Integrity completed but "
+                "no Reference Integrity runner is wired"
+            )
+        result.update(
+            {
+                "pair_primary_completed": True,
+                "pair_cross_completed": True,
+                "pair_completed": True,
+                "pair_primary_unresolved": (),
+                "pair_cross_unresolved": (),
+                "pair_stats": _stage_stats_from_stage_counts(storages, "pair"),
+                "reference_edit_completed": True,
+                "reference_edit_job_count": 0,
+                "reference_edit_unresolved": (),
+                "reference_edit_stats": _stage_stats_from_stage_counts(
+                    storages, "reference_edit"
+                ),
+            }
+        )
+        return _continue_with_reference_integrity(
+            config=config,
+            storages=storages,
+            eligible=eligible,
+            ledger=ledger,
+            result=result,
+            reference_integrity_runner_factory=reference_integrity_runner_factory,
+            reference_integrity_scheduler_factory=(
+                reference_integrity_scheduler_factory
+            ),
+            emit=emit,
+        )
 
     if _reference_edit_completion_evidence(ledger, storages):
         # Post-Reference-Edit restart: the barrier already proved Pair
@@ -321,7 +784,20 @@ def run_removal_pair_epochs(
                 ),
             }
         )
-        return result
+        return _after_reference_edit(
+            config=config,
+            storages=storages,
+            eligible=eligible,
+            ledger=ledger,
+            result=result,
+            reference_edit_completed=reference_edit_completed,
+            reference_integrity_runner_factory=reference_integrity_runner_factory,
+            reference_integrity_scheduler_factory=(
+                reference_integrity_scheduler_factory
+            ),
+            reference_integrity_wired=reference_integrity_wired,
+            emit=emit,
+        )
 
     pair = pair_runner_factory(**shared)
     primary_seed = pair.seed_primary_jobs()
@@ -424,7 +900,18 @@ def run_removal_pair_epochs(
             ),
         }
     )
-    return result
+    return _after_reference_edit(
+        config=config,
+        storages=storages,
+        eligible=eligible,
+        ledger=ledger,
+        result=result,
+        reference_edit_completed=reference_edit_completed,
+        reference_integrity_runner_factory=reference_integrity_runner_factory,
+        reference_integrity_scheduler_factory=reference_integrity_scheduler_factory,
+        reference_integrity_wired=reference_integrity_wired,
+        emit=emit,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -480,6 +967,12 @@ def shared_qwen_model_identities(config: V3Config) -> tuple[str, ...]:
         config.qwen.reference_edit_judge
         if getattr(config.reference_edit, "enabled", False)
         else None,
+        # The same service also serves the Reference Integrity main and bbox
+        # reviews. ``instruction_writer`` is deliberately absent: production
+        # Instruct is deterministic with ``client=None``.
+        config.qwen.reference_integrity_judge
+        if getattr(config.reference_integrity, "enabled", False)
+        else None,
     )
     return tuple(
         str(service.model)
@@ -516,6 +1009,10 @@ def run_removal_pair_resource_session(
     build_reference_edit_scheduler: Callable[[Any, _EpochStageDispatch], Any]
     | None = None,
     reference_edit_runner_factory: Callable[..., Any] | None = None,
+    build_reference_integrity_scheduler: Callable[[Any, _EpochStageDispatch], Any]
+    | None = None,
+    reference_integrity_runner_factory: ReferenceIntegrityRunnerFactory
+    | None = None,
     **composition: Any,
 ) -> dict[str, Any]:
     """Run the 4a composition inside one shared resource session.
@@ -544,6 +1041,12 @@ def run_removal_pair_resource_session(
         dispatch.bind(runner)
         return build_reference_edit_scheduler(runner, dispatch)
 
+    def reference_integrity_scheduler(runner: Any) -> Any:
+        # Same one cached Qwen executor, now dispatched to the Reference
+        # Integrity runner for both the main and the bbox review jobs.
+        dispatch.bind(runner)
+        return build_reference_integrity_scheduler(runner, dispatch)
+
     try:
         result = run_removal_pair_epochs(
             config=config,
@@ -560,6 +1063,19 @@ def run_removal_pair_resource_session(
                 None
                 if build_reference_edit_scheduler is None
                 else reference_edit_scheduler
+            ),
+            reference_integrity_runner_factory=(
+                None
+                if build_reference_integrity_scheduler is None
+                else (
+                    reference_integrity_runner_factory
+                    or default_reference_integrity_runner_factory
+                )
+            ),
+            reference_integrity_scheduler_factory=(
+                None
+                if build_reference_integrity_scheduler is None
+                else reference_integrity_scheduler
             ),
             **composition,
         )
