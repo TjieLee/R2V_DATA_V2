@@ -275,6 +275,18 @@ def _tokens_for_retained(retained: Sequence[str], entity_by_id: Any) -> dict[str
 # ---------------------------------------------------------------------------
 
 
+class _JobIdRef:
+    """Minimal job reference: the GroupLedger index only needs ``job_id()``."""
+
+    __slots__ = ("_job_id",)
+
+    def __init__(self, job_id: str) -> None:
+        self._job_id = job_id
+
+    def job_id(self) -> str:
+        return self._job_id
+
+
 class _MutableStats:
     """Attribute access over a plain counter dict while reconciling."""
 
@@ -441,33 +453,14 @@ class PairEpochRunner:
         """
         existing = _read_json(self._plan_path(shard))
         if existing is not None:
-            if existing.get("schema") != PAIR_PRIMARY_PLAN_SCHEMA:
-                raise PairEpochError(
-                    f"unsupported primary plan schema for {shard!r}"
-                )
-            expected = {
-                "canonical_shard": shard,
-                "config_fingerprint": self.config.fingerprint(),
-                "pair_policy": _pair_policy_semantics(self.config),
-                "eligible_clip_uids": list(self._eligible_for(shard)),
-            }
-            for key, value in expected.items():
-                if existing.get(key) != value:
-                    raise PairEpochError(
-                        f"frozen primary plan {key} drifted for {shard!r}"
-                    )
-            # The stored per-clip input digests are the whole point of the
-            # plan: re-derive them and fail closed on any pre-Pair drift.
+            payload = self._validate_primary_plan(shard, existing)
             storage = self._storage_for(shard)
-            for clip_uid, entry in existing.get("clips", {}).items():
-                actual = self._frozen_input_digest(storage, clip_uid)
-                if actual != entry.get("digest"):
-                    raise PairEpochError(
-                        f"frozen primary input drifted for {clip_uid!r} in {shard!r}"
-                    )
+            for clip_uid, entry in payload.get("clips", {}).items():
                 if entry.get("classification") == CLIP_EXISTING_PAIRING:
+                    # Legacy validates an existing pairing instead of
+                    # regenerating it; a corrupt reference is a Pair failure.
                     self._validate_existing_pairing(shard, storage, clip_uid)
-            return existing
+            return payload
 
         storage = self._storage_for(shard)
         eligible = self._eligible_for(shard)
@@ -492,6 +485,41 @@ class PairEpochRunner:
         }
         _write_json_once(self._plan_path(shard), payload)
         return payload
+
+    def _validate_primary_plan(self, shard: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Validate an existing frozen plan. Read-only; never writes it back."""
+        if payload.get("schema") != PAIR_PRIMARY_PLAN_SCHEMA:
+            raise PairEpochError(f"unsupported primary plan schema for {shard!r}")
+        expected = {
+            "canonical_shard": shard,
+            "config_fingerprint": self.config.fingerprint(),
+            "pair_policy": _pair_policy_semantics(self.config),
+            "eligible_clip_uids": list(self._eligible_for(shard)),
+        }
+        for key, value in expected.items():
+            if payload.get(key) != value:
+                raise PairEpochError(
+                    f"frozen primary plan {key} drifted for {shard!r}"
+                )
+        # The stored per-clip input digests are the whole point of the
+        # plan: re-derive them and fail closed on any pre-Pair drift.
+        storage = self._storage_for(shard)
+        for clip_uid, entry in payload.get("clips", {}).items():
+            actual = self._frozen_input_digest(storage, clip_uid)
+            if actual != entry.get("digest"):
+                raise PairEpochError(
+                    f"frozen primary input drifted for {clip_uid!r} in {shard!r}"
+                )
+        return dict(payload)
+
+    def _existing_primary_plan_for_reconcile(self, shard: str) -> dict[str, Any]:
+        """Load the frozen plan for reconciliation without ever creating it."""
+        payload = _read_json(self._plan_path(shard))
+        if payload is None:
+            raise PairEpochError(
+                f"reconcile_primary_stats needs a frozen primary plan for {shard!r}"
+            )
+        return self._validate_primary_plan(shard, payload)
 
     def _validate_existing_pairing(
         self, shard: str, storage: RunStorage, clip_uid: str
@@ -970,25 +998,49 @@ class PairEpochRunner:
         return True
 
     def _planned_jobs(self, shard: str) -> tuple[dict[str, Any], ...]:
-        try:
-            records = self.phase.read_plan()
-        except Exception:  # noqa: BLE001 - no plan yet means no planned jobs
-            return ()
-        return tuple(
-            record
-            for record in records
-            if record.get("canonical_shard") == shard
-        )
+        """Every planned Pair job of one shard, across ALL ledger phases.
+
+        The real scheduler commits receipts under ``r000-qwen``-style phase
+        ids, while ``pair`` only holds the seed/semantic plan, so scanning one
+        phase is not the receipt authority. The same job may be planned in
+        more than one phase; identical records are one job, a drifting record
+        is durable-state corruption and fails closed.
+        """
+        seen: dict[str, dict[str, Any]] = {}
+        for phase_id in self.ledger.phase_ids():
+            phase = self.ledger.phase(phase_id)
+            try:
+                records = phase.read_plan()
+            except Exception:  # noqa: BLE001 - a phase without a plan is empty
+                records = None
+            if records is None:
+                continue
+            for record in records:
+                if record.get("canonical_shard") != shard:
+                    continue
+                if record.get("job_type") not in PAIR_JOB_TYPES:
+                    continue
+                job_id = record.get("job_id")
+                if not isinstance(job_id, str) or not job_id:
+                    continue
+                previous = seen.get(job_id)
+                if previous is not None and previous != record:
+                    raise PairEpochError(
+                        f"pair job {job_id} has drifting plan records across phases"
+                    )
+                seen.setdefault(job_id, record)
+        return tuple(seen.values())
 
     def _committed_payload(self, job_id: str) -> dict[str, Any] | None:
-        """Result payload of a committed job, or None when it never committed."""
-        if job_id not in self.phase.receipts():
+        """Result payload of a committed job, or None when it never committed.
+
+        The GroupLedger index locates the receipt whichever ``rXXX-*`` phase
+        committed it; no artifact path is guessed here.
+        """
+        result = self.ledger.load_committed_result(_JobIdRef(job_id))
+        if result is None:
             return None
-        path = self.phase.artifact_path(job_id, "result.json")
-        if not path.is_file():
-            return None
-        payload = json.loads(path.read_text())
-        return dict(payload.get("result_payload") or {})
+        return dict(result.payload)
 
     def reconcile_primary_stats(self, shard: str) -> Any:
         """Primary PairStats rebuilt from durable state only (4c1).
@@ -1005,7 +1057,8 @@ class PairEpochRunner:
         from r2v_data_v2.v3.pair import PairStats
 
         storage = self._storage_for(shard)
-        plan = self._primary_plan(shard)
+        # Read-only: reconciliation must never create the plan it reads.
+        plan = self._existing_primary_plan_for_reconcile(shard)
         # PairStats is frozen, so reconciliation accumulates into a plain dict.
         counts: dict[str, int] = {field: 0 for field in PairStats.__dataclass_fields__}
         stats = _MutableStats(counts)
@@ -2075,6 +2128,13 @@ class PairEpochRunner:
 # ---------------------------------------------------------------------------
 
 PAIR_CROSS_JUDGE_JOB = "pair_cross_pair_judge"
+
+#: Job types owned by the Pair stage; used for cross-phase plan scans.
+PAIR_JOB_TYPES = (
+    PAIR_ENTITY_JUDGE_JOB,
+    PAIR_BACKGROUND_GUARD_JOB,
+    PAIR_CROSS_JUDGE_JOB,
+)
 CALL_SITE_CROSS_PAIR = "cross_pair"
 
 PAIR_DONOR_SNAPSHOT_SCHEMA = "post_mask_epoch_pair_donor_snapshot/2"

@@ -198,6 +198,7 @@ def test_existing_pairing_is_skipped_not_processed(
         config, {SHARD: storage}, GroupLedger(tmp_path / "ledger2"),
         eligible_clip_uids_by_shard={SHARD: ["clip-1"]},
     )
+    fresh.seed_primary_jobs()  # freezes the classification this launch saw
     stats = fresh.reconcile_primary_stats(SHARD)
     assert stats.skipped_existing == 1
     assert stats.processed == 0
@@ -217,6 +218,7 @@ def test_ineligible_coverage_is_skipped_not_ready(
         config, {SHARD: storage}, GroupLedger(tmp_path / "ledger"),
         eligible_clip_uids_by_shard={SHARD: ["clip-1"]},
     )
+    runner.seed_primary_jobs()  # freezes the classification this launch saw
     stats = runner.reconcile_primary_stats(SHARD)
     assert stats.skipped_not_ready == 1
     assert stats.processed == 0
@@ -238,6 +240,7 @@ def test_invalid_pair_inputs_are_skipped_not_ready(
         config, {SHARD: storage}, GroupLedger(tmp_path / "ledger"),
         eligible_clip_uids_by_shard={SHARD: ["clip-1"]},
     )
+    runner.seed_primary_jobs()  # freezes the classification this launch saw
     stats = runner.reconcile_primary_stats(SHARD)
     assert stats.skipped_not_ready == 1
     assert stats.processed == 0
@@ -414,3 +417,163 @@ def _drain_primary_with_guard(
         runner.ledger.note_commit(PAIR_PHASE, receipt)
         pending.extend(runner.finalize(job, result))
     return runner
+
+
+# ---------------------------------------------------------------------------
+# 4c1b: reconcile against the REAL ResourceEpochScheduler phase layout
+# ---------------------------------------------------------------------------
+
+class _JobRef:
+    """Minimal job reference for GroupLedger lookups by job_id."""
+
+    def __init__(self, job_id: str) -> None:
+        self._job_id = job_id
+
+    def job_id(self) -> str:
+        return self._job_id
+
+
+
+
+class _GuardSelectExecutor:
+    """Serial executor that routes each Pair job to its real judge handle."""
+
+    def __init__(self, runner: Any, entity_judge: Any, guard_judge: Any) -> None:
+        self.runner = runner
+        self.entity_judge = entity_judge
+        self.guard_judge = guard_judge
+
+    def execute_batch(self, jobs: Any) -> dict[str, Any]:
+        from r2v_data_v2.v3.post_mask_epoch_scheduler import JobExecution
+
+        outcomes: dict[str, Any] = {}
+        for job in sorted(jobs, key=lambda item: item.job_id()):
+            handle = (
+                self.guard_judge
+                if job.job_type == "pair_background_final_guard"
+                else self.entity_judge
+            )
+            try:
+                outcomes[job.job_id()] = JobExecution(
+                    job, self.runner.run(job, handle), None
+                )
+            except Exception as exc:  # noqa: BLE001 - isolate per job
+                outcomes[job.job_id()] = JobExecution(job, None, exc)
+        return outcomes
+
+
+def _run_real_scheduler(config: V3Config, storage: Any, ledger_root: Path) -> Any:
+    """Run the primary pass through the production scheduler, not by hand."""
+    from r2v_data_v2.v3.post_mask_epoch_jobs import RESOURCE_QWEN
+    from r2v_data_v2.v3.post_mask_epoch_pair import PairEpochRunner
+    from r2v_data_v2.v3.post_mask_epoch_scheduler import ResourceEpochScheduler
+    from tests.test_v3_pair import _FinalBackgroundJudge
+
+    ledger = GroupLedger(ledger_root)
+    runner = PairEpochRunner(
+        config,
+        {SHARD: storage},
+        ledger,
+        eligible_clip_uids_by_shard={SHARD: ["clip-1"]},
+    )
+    scheduler = ResourceEpochScheduler(
+        ledger=ledger,
+        finalize=runner.finalize,
+        executors={
+            RESOURCE_QWEN: _GuardSelectExecutor(
+                runner, _Judge(), _FinalBackgroundJudge(accepted=True)
+            )
+        },
+    )
+    outcome = scheduler.run(runner.seed_primary_jobs())
+    assert outcome["completed"], outcome
+    return runner, ledger, outcome
+
+
+def test_reconcile_reads_real_scheduler_phases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The receipt authority is rXXX-* phases, not the hand-fed `pair` phase."""
+    from tests.test_v3_pair import _FinalBackgroundJudge, _install_clean_background
+
+    legacy_config = _epoch_config(
+        tmp_path, monkeypatch, "run-legacy", background_final_guard_mode="qwen_v1"
+    )
+    epoch_config = _epoch_config(
+        tmp_path, monkeypatch, "run-epoch", background_final_guard_mode="qwen_v1"
+    )
+    legacy_storage = _storage(legacy_config, entity_types=("subject",))
+    epoch_storage = _storage(epoch_config, entity_types=("subject",))
+    _install_clean_background(legacy_storage)
+    _install_clean_background(epoch_storage)
+    legacy = pair_clips(
+        legacy_config,
+        legacy_storage,
+        judge=_Judge(),
+        background_final_judge=_FinalBackgroundJudge(accepted=True),
+    )
+
+    runner, ledger, outcome = _run_real_scheduler(
+        epoch_config, epoch_storage, tmp_path / "ledger"
+    )
+    # The real scheduler really used rXXX-* phases.
+    assert any(phase.startswith("r") for phase in ledger.phase_ids()), ledger.phase_ids()
+    pair_jobs = runner._planned_jobs(SHARD)
+    by_type = {record["job_type"] for record in pair_jobs}
+    assert "pair_entity_reference_judge" in by_type
+    assert "pair_background_final_guard" in by_type
+    # Every committed Pair job lives in an rXXX-* phase, never in "pair".
+    for record in pair_jobs:
+        if runner._committed_payload(record["job_id"]) is not None:
+            phase_id = ledger.phase_for(_JobRef(record["job_id"]))
+            assert phase_id is not None and phase_id != "pair", phase_id
+    pair_phase = ledger.phase("pair")
+    assert pair_phase.receipts() == {}
+
+    stats = runner.reconcile_primary_stats(SHARD)
+    assert stats.repaired == legacy.repaired == 1
+    assert stats.background_final_guard_attempted == legacy.background_final_guard_attempted
+    assert stats.background_final_guard_accepted == legacy.background_final_guard_accepted
+    assert stats.processed == legacy.processed
+    assert stats.ready == legacy.ready
+
+    # Restart: a fresh ledger over the same root reads the SAME rXXX receipts.
+    from r2v_data_v2.v3.post_mask_epoch_pair import PairEpochRunner
+
+    fresh_ledger = GroupLedger(tmp_path / "ledger")
+    fresh_runner = PairEpochRunner(
+        epoch_config,
+        {SHARD: epoch_storage},
+        fresh_ledger,
+        eligible_clip_uids_by_shard={SHARD: ["clip-1"]},
+    )
+    before = fresh_runner.reconcile_primary_stats(SHARD).to_dict()
+    for record in fresh_runner._planned_jobs(SHARD):
+        assert fresh_ledger.phase_for(_JobRef(record["job_id"])) not in (None, "pair")
+    assert before == stats.to_dict()
+    # No Qwen was paid for reconciliation: the scheduler's own execution count
+    # is the only one, and both reconciliations ran with zero model calls.
+    assert (
+        outcome["diagnostics"]["resources"]["qwen"]["jobs_executed"]
+        == len(pair_jobs)
+    )
+
+
+def test_reconcile_without_a_frozen_plan_fails_closed_and_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from r2v_data_v2.v3.post_mask_epoch_pair import PairEpochError, PairEpochRunner
+
+    config = _epoch_config(tmp_path, monkeypatch, "run-epoch")
+    storage = _storage(config, entity_types=("subject",))
+    ledger_root = tmp_path / "ledger"
+    runner = PairEpochRunner(
+        config, {SHARD: storage}, GroupLedger(ledger_root),
+        eligible_clip_uids_by_shard={SHARD: ["clip-1"]},
+    )
+    before = tuple(sorted(str(p) for p in ledger_root.rglob("*") if p.is_file()))
+    with pytest.raises(PairEpochError, match="frozen primary plan"):
+        runner.reconcile_primary_stats(SHARD)
+    after = tuple(sorted(str(p) for p in ledger_root.rglob("*") if p.is_file()))
+    assert after == before
+    assert not (ledger_root / "semantic" / "pair" / "primary" / f"{SHARD}.json").exists()
