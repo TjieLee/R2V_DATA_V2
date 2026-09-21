@@ -1,4 +1,23 @@
-# Bernini person-replacement pilot
+# Person-replacement data generation
+
+## Current production route
+
+The active production implementation is the text-only MiniMax-H3/PDD pair executor,
+not the Bernini pilot documented below. See
+[H3_PAIR_EXECUTOR.md](H3_PAIR_EXECUTOR.md) for the durable state machine, Qwen3.5-27B
+8-FPS prompt preparation, CP2 x FSDP2 generation layout, exact server paths, and
+one-command multi-node launcher.
+
+Formal output is written only to the dedicated production subtree:
+
+```text
+/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/multi_person_replace
+```
+
+That exact subtree is an explicit writable exception; other public dataset and
+pretrained paths remain protected read-only inputs.
+
+## Historical Bernini pilot
 
 Independent, sequential data generation; no changes to Visual/H3 pipelines,
 no training, scheduler, structured Qwen output, or automatic quality judgement.

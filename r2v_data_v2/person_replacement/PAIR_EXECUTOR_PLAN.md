@@ -1,5 +1,10 @@
 # Two-GPU pair executor implementation plan
 
+> Historical implementation plan. The executor has since evolved to the V38
+> production path documented in [H3_PAIR_EXECUTOR.md](H3_PAIR_EXECUTOR.md),
+> including 2/4/8-GPU groups, CP2 x FSDP2, Qwen3.5-27B 8-FPS preparation and the
+> multi-node one-command launcher. Keep this file only as design history.
+
 Baseline: `fdca08616314562e637b622359b45f6ad6817ac7`. Separate text-only path;
 the existing A/B runner and single-GPU PDD worker stay unchanged.
 

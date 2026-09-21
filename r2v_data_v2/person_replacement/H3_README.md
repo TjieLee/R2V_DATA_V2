@@ -1,12 +1,14 @@
 # Independent accelerated H3 Ref2VA replacement candidates
 
-For the new, separate persistent two-GPU **text-only** pair executor, see
-[H3_PAIR_EXECUTOR.md](H3_PAIR_EXECUTOR.md). Its FSDP2 route is not yet H200-validated;
-the single-GPU and A/B paths described below remain unchanged.
+The current production person-replacement path is the persistent text-only H3/PDD
+pair executor in [H3_PAIR_EXECUTOR.md](H3_PAIR_EXECUTOR.md). Its active contract is
+V38 slim: local Qwen3.5-27B at 8 FPS (maximum 120 frames), explicit two-person
+identity replacement, and 4-GPU CP2 x FSDP2 H3/PDD groups. Formal 8xH200 nodes run
+two independent groups and are submitted through the one-command cluster launcher.
 
-This experiment does not replace Bernini or write production training tuples.
-It only adds a separate CLI, deterministic prompt, subprocess adapters and tests.
-No existing Audio/H3, Visual, Bernini, JoyAI, Qwen or shared dependency file changes.
+The older Bernini, LightX2V and single-process/A-B material below is retained as
+historical development context. It is not the current production route and must
+not be used to infer production output paths or runtime defaults.
 
 ## Implementation and validation plan
 

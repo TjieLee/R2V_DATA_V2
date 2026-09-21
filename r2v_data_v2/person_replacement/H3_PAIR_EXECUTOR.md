@@ -1,11 +1,18 @@
 # Text-only H3-PDD 2/4/8-GPU executor
 
-`pair` is the historical file/API name. Execution groups support
-`--group-size {2,4,8}` (default 2); all sizes use the same worker and durable state.
-The visible GPU count must equal group-size before any worker is launched.
-Group size is execution-only, excluded from input/case identity; the existing
-`text_two_person_pdd_fsdp2_pair_v1` identity contract is unchanged. Prepared and
-DONE artifacts from a two-GPU run remain reusable with four/eight GPUs.
+`pair` is the historical file/API name. The current production text contract is
+`text_two_person_pdd_fsdp2_pair_v38` with the slim two-call prompt writer
+`slim_two_call_h3_prompt_v18`. The text path uses local Qwen3.5-27B, samples the
+source video at 8 FPS with a maximum of 120 frames for each writer call, and keeps
+the final H3 prompt intentionally compact so <Video 1> remains the primary motion
+and camera authority.
+
+Execution groups support `--group-size {2,4,8}`; group size is execution-only and
+does not change case identity. The production 8xH200 node layout is two independent
+4-GPU groups with `--ulysses-degree 2` (CP2 x FSDP2), one persistent H3/PDD worker
+per group, and four fixed Qwen preparation partitions per group. Durable prepared
+and DONE markers remain authoritative across resume/restart; successful cases are
+never overwritten.
 
 ## Optional hybrid context parallelism
 
@@ -211,28 +218,33 @@ infrastructure error is nonzero. Other pairs continue independently in either ca
 
 ```bash
 cd /mnt/workspace/litengjie/data/R2V_DATA_V2
-export PAIR_PYTHON=/mnt/workspace/litengjie/data/person_replacement_deps/bernini-qwen-env/bin/python
+export PAIR_PYTHON=/mnt/workspace/litengjie/data/R2V_DATA_V2/.venv/bin/python
+export PROMPT_WRITER_PYTHON=/mnt/workspace/litengjie/data/audio_deps/qwen38-sglang-env/bin/python
+export PROMPT_WRITER_MODEL=/mnt/workspace/public/pretrained/Qwen/Qwen3.5-27B
 export H3_PYTHON=/mnt/workspace/litengjie/data/person_replacement_deps/minimax-h3-env/bin/python
 export H3_MODEL_ROOT=/mnt/workspace/public/pretrained/MiniMaxAI/MiniMax-H3
 export H3_PDD_CODE_ROOT=/mnt/workspace/litengjie/data/vendor/MiniMax-H3-Acc-LoRAs
+export H3_PDD_LORA=/mnt/workspace/litengjie/data/pretrained/alibaba-pai/MiniMax-H3-Acc-LoRAs/MiniMax-H3-Ref2VA-Acc-8Step.safetensors
 export PAIR_INPUT=/mnt/workspace/liutao/X_human_data/collected_face_2.jsonl
 export PAIR_CLIPS=/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/clips_clean_cropped
-# Retain the server's already-confirmed exact value. Codex cannot inspect that
-# server environment and does not invent a weight location.
-: "${H3_PDD_LORA:?Set the existing server MiniMax-H3-Ref2VA-Acc-8Step.safetensors path}"
-export H3_PDD_LORA
-export PAIR_ROOT=/mnt/workspace/litengjie/data/person_replacement/h3_pdd_pairs_v1
+export PAIR_ROOT=/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/multi_person_replace
 COMMON=(--input-jsonl "$PAIR_INPUT" --clips-root "$PAIR_CLIPS"
   --output-root "$PAIR_ROOT" --h3-python "$H3_PYTHON"
   --h3-model-root "$H3_MODEL_ROOT" --pdd-code-root "$H3_PDD_CODE_ROOT"
-  --pdd-lora "$H3_PDD_LORA" --pair-size 1000 --seed 42 --resume)
+  --pdd-lora "$H3_PDD_LORA" --pair-size 2000 --seed 42 --resume
+  --group-size 4 --ulysses-degree 2
+  --prompt-writer-python "$PROMPT_WRITER_PYTHON"
+  --prompt-writer-model "$PROMPT_WRITER_MODEL" --prompt-writer-backend local)
 PAIR_CLI=tools/person_replacement/run_h3_pdd_pair_executor.py
 ```
 
-Caches are offline and redirected inside writable session directories:
-HF_HOME/HF_HUB_CACHE, Torch, Triton, Inductor, XDG and TMPDIR. Read-only model,
-vendor and dataset directories are never cache destinations. No dependency/model
-downloads. The parent must be the Qwen environment; H3 runs in its own Python.
+Caches remain redirected inside writable session directories; pretrained/model and
+source-dataset directories remain read-only inputs. The formal
+`multi_person_replace` subtree above is the one explicit production-output
+exception under `/mnt/workspace/public/dataset`; `validate_output_root()` rejects
+every other public dataset/pretrained location. The parent/orchestrator uses the
+main R2V `.venv`, the prompt writer uses its isolated Qwen-capable Python, and H3
+runs in its isolated MiniMax-H3 Python.
 
 Import-only smoke in the isolated H3 environment (from the repository root;
 no model loading or GPU work):
@@ -268,12 +280,40 @@ CUDA_VISIBLE_DEVICES=0,1 "$PAIR_PYTHON" "$PAIR_CLI" "${COMMON[@]}" --pair-id 0 -
   --gpus 0,1,2,3,4,5,6,7 --pair-start 0
 ```
 
-The node command defaults to four independent pairs, fixed non-overlapping ranges.
-With eight GPUs, `--group-size 4` creates two groups (0–3, 4–7), while
+The node command creates one pair shard per execution group, with fixed
+non-overlapping ranges. With eight GPUs, `--group-size 4` creates two groups
+(0–3, 4–7) and therefore two pair shards per node, while
 `--group-size 8` creates one. Any distinct GPU list divisible by group-size is
 allowed; each group keeps its original pair-id-based fixed input range.
 The same node command resumes them. `--dry-run` or `--status` is forwarded
 read-only to every pair. No cross-node work stealing or dynamic GPU selection.
+
+## Multi-node production launcher
+
+Formal production is submitted with one bash command per 8xH200 node. The cluster
+platform injects zero-based `RANK` and `WORLD_SIZE`; every node runs the same
+script from an immutable detached worktree:
+
+```bash
+bash /mnt/workspace/litengjie/data/R2V_DATA_V2_person_replace_prod_<shortsha>/scripts/run_person_replacement_h3_pdd_cluster.sh
+```
+
+Production defaults are:
+
+- 8 visible GPUs/node;
+- `group_size=4`, `ulysses_degree=2`;
+- two pair shards/node;
+- `pair_size=2000`;
+- rank 0 -> pair 0,1 -> rows 0..3999; rank 1 -> pair 2,3 -> rows 4000..7999;
+- local Qwen3.5-27B writer, 8 FPS, maximum 120 sampled frames;
+- `--resume`, two prepare attempts, two generation attempts;
+- output root `/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/multi_person_replace`.
+
+The launcher derives the repository root from its own path, logs `repo=` and
+`code_sha=`, clears ambient Python/conda/PYTHONPATH state, validates all three
+Python runtimes before execution, and writes node logs under
+`$OUTPUT_ROOT/cluster_logs/node-rank-XXXXXX.log`. Do not add an in-job git pull:
+all nodes must run the same pinned worktree.
 
 ## Mandatory acceptance sequence (operator only)
 
