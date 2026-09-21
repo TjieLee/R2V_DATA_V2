@@ -1031,11 +1031,20 @@ def prepare_shard(
 
 
 class FrozenProductionProcessor:
-    def __init__(self, contexts, backend, profile_backend, *, allow_unverified=False):
+    def __init__(
+        self,
+        contexts,
+        backend,
+        profile_backend,
+        *,
+        allow_unverified=False,
+        verify_sources_per_sample=True,
+    ):
         self.contexts = contexts
         self.backend = backend
         self.profile_backend = profile_backend
         self.allow_unverified = allow_unverified
+        self.verify_sources_per_sample = verify_sources_per_sample
         self._sources = {}
         # Load immutable source records once, never once per clip.
         from r2v_data_v2.h3 import t2va_shadow as t
@@ -1096,9 +1105,11 @@ class FrozenProductionProcessor:
             raise ValueError(row["preparation_error"])
         job, inventory = self.contexts[row["clip_uid"]]
         if stage == "t2va":
-            _verify(inventory.source_hashes)
+            if self.verify_sources_per_sample:
+                _verify(inventory.source_hashes)
             result = t2va_stage(job, self.backend, temporary)
-            _verify(inventory.source_hashes)
+            if self.verify_sources_per_sample:
+                _verify(inventory.source_hashes)
             return result
         core_path = destination.parent / "t2va/core.json"
         core = t.H3NoReferenceAVCore.model_validate_json(core_path.read_text())
