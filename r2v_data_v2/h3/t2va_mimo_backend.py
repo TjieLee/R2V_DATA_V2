@@ -101,8 +101,15 @@ def _get(value: Any, key: str, default: Any = None) -> Any:
 
 
 class T2VAMimoBackend:
-    def __init__(self, config: T2VAMimoConfig, *, client: Any = None) -> None:
+    def __init__(
+        self,
+        config: T2VAMimoConfig,
+        *,
+        client: Any = None,
+        verify_media: bool = True,
+    ) -> None:
         self.config = config
+        self.verify_media = verify_media
         if client is None:
             from openai import OpenAI
 
@@ -321,7 +328,8 @@ class T2VAMimoBackend:
         try:
             if job.audio_evidence is None:
                 raise ValueError("T2VA requires resolved music/sfx evidence")
-            check_audio_files(job.audio_evidence)
+            if self.verify_media:
+                check_audio_files(job.audio_evidence)
             semantic = self._complete(self.build_request(job))
             for key, value in semantic.model_dump().items():
                 setattr(raw, key, value)
@@ -340,7 +348,8 @@ class T2VAMimoBackend:
             parse_structured_json_response(
                 raw.audio_finalize.response or "", MimoAudioFinalizeDraft
             )
-            check_audio_files(job.audio_evidence)
+            if self.verify_media:
+                check_audio_files(job.audio_evidence)
         except Exception as exc:  # noqa: BLE001 - persist both stages, never retry.
             raw.error = f"{type(exc).__name__}: {exc}"
         return raw
