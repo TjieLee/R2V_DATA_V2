@@ -20,7 +20,7 @@ from r2v_data_v2.h3.t2va_full_workers import (
     _read_json,
     _stop_workers,
 )
-from r2v_data_v2.h3.t2va_production import file_lock, shard_name
+from r2v_data_v2.h3.t2va_production import ShardLockedError, file_lock, shard_name
 
 _SIGNALS = {signal.SIGINT, signal.SIGTERM}
 _DEFAULT_WORKER = "r2v_data_v2.h3.t2va_full_prefetch:prepare_canonical"
@@ -219,6 +219,10 @@ class CanonicalPrefetch:
                 time.sleep(0.02)
             if not isinstance(payload, dict) or payload.get("shard_id") != shard_id:
                 raise ValueError("invalid canonical prefetch response identity")
+            if payload.get("locked"):
+                raise ShardLockedError(
+                    f"canonical prefetch shard={shard_id} is owned by another invocation"
+                )
             if payload.get("error"):
                 raise RuntimeError(
                     f"canonical prefetch shard={shard_id}: {payload['error']}; log={log_path}"
@@ -230,6 +234,8 @@ class CanonicalPrefetch:
                 flush=True,
             )
             return result
+        except ShardLockedError:
+            raise
         except Exception as exc:
             self._failed = True
             raise RuntimeError(f"canonical prefetch failed: {exc}") from exc
@@ -267,12 +273,15 @@ def _worker(request_path: Path) -> None:
         # A duplicate node must not republish canonical manifests while the
         # current owner is consuming them in GPU stages. Keep lock order aligned
         # with the synchronous path (invocation, then canonical).
-        with (
-            file_lock(Path(request["shard_root"]) / "invocation.lock", blocking=True),
-            file_lock(Path(request["shard_root"]) / "canonical.lock", blocking=True),
-        ):
-            result = _validate_result(prepare(request))
-        payload = {"shard_id": shard_id, "result": result}
+        try:
+            with (
+                file_lock(Path(request["shard_root"]) / "invocation.lock"),
+                file_lock(Path(request["shard_root"]) / "canonical.lock", blocking=True),
+            ):
+                result = _validate_result(prepare(request))
+            payload = {"shard_id": shard_id, "result": result}
+        except ShardLockedError:
+            payload = {"shard_id": shard_id, "locked": True}
     except Exception as exc:  # noqa: BLE001 - return child failure through the control file
         payload = {"shard_id": shard_id, "error": f"{type(exc).__name__}: {exc}"}
     elapsed = time.monotonic() - started
