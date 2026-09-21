@@ -842,37 +842,148 @@ def test_parallel_independent_normal_matches_legacy(
     )
 
 
-def test_parallel_independent_qwen_failure_still_pays_sam(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("sam_passed", (True, False))
+def test_parallel_independent_qwen_failure_still_pays_sam_but_discards_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sam_passed: bool
 ) -> None:
-    _config, _storage, runner, scheduler, routing = _build(
-        tmp_path, monkeypatch, run_name="run",
+    """Qwen exception wins and SAM stays paid but out of publication input."""
+    from r2v_data_v2.v3.reference_edit import reference_edit_clips
+
+    legacy_config = _reference_edit_config(tmp_path, monkeypatch, "run-legacy")
+    legacy_storage = _prepared_storage(
+        legacy_config, monkeypatch, run_name="run-legacy"
+    )
+    legacy = reference_edit_clips(
+        legacy_config,
+        legacy_storage,
+        backend=_FakeBoogu(),
+        judge=_FakeQwen(fail=True),
+        sam_reviewer=_LegacySamReviewer(passed=sam_passed),
+        review_execution="parallel_independent",
+    )
+
+    _config, storage, runner, scheduler, routing = _build(
+        tmp_path,
+        monkeypatch,
+        run_name="run-epoch",
         review_execution="parallel_independent",
     )
     routing.qwen.fail = True
+    routing.sam.passed = sam_passed
     _drain(runner, scheduler)
-    # A Qwen failure must never skip the SAM call in parallel mode.
+
+    # Parallel execution still pays SAM even though Qwen's exception is the
+    # frozen publication provenance.
     assert routing.sam.calls >= 1
     assert routing.qwen.calls == routing.boogu.calls
+    assert routing.sam.calls == routing.qwen.calls
+
+    stats = runner.reconcile_stats(SHARD)
+    assert stats.to_dict() == legacy.to_dict()
+    epoch_clip = storage.read_clip("clip-1")
+    legacy_clip = legacy_storage.read_clip("clip-1")
+    assert epoch_clip.reference_edit.model_dump(mode="json") == (
+        legacy_clip.reference_edit.model_dump(mode="json")
+    )
+
+    legacy_metadata = json.loads(
+        (
+            Path(legacy_storage.root)
+            / "clips/clip-1/reference_edit/e1/completion_metadata.json"
+        ).read_text(encoding="utf-8")
+    )
+    epoch_metadata = _read_completion_metadata(runner)
+    assert epoch_metadata is not None
+    assert legacy_metadata["qwen_review"] is None
+    assert legacy_metadata["sam_review"] is None
+    assert epoch_metadata["qwen_review"] is None
+    assert epoch_metadata["sam_review"] is None
+
     marker = _read_attempt_marker(runner, 1)
     assert marker is not None
-    assert marker["status"] in {"qwen_failed", "rejected"}
+    assert marker["status"] == "qwen_failed"
+    assert marker["rejection_reason"] == (
+        "boogu_reference_edit_failed: qwen judge exploded"
+    )
 
 
 def test_parallel_independent_sam_failure_keeps_qwen_result(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _config, _storage, runner, scheduler, routing = _build(
-        tmp_path, monkeypatch, run_name="run",
+    """SAM exception preserves the successful Qwen review, matching legacy."""
+    from r2v_data_v2.v3.reference_edit import reference_edit_clips
+
+    class _FailingLegacySamReviewer:
+        def review(self, **kwargs: Any) -> Any:
+            del kwargs
+            raise RuntimeError("sam backend exploded")
+
+    legacy_config = _reference_edit_config(tmp_path, monkeypatch, "run-legacy")
+    legacy_storage = _prepared_storage(
+        legacy_config, monkeypatch, run_name="run-legacy"
+    )
+    legacy = reference_edit_clips(
+        legacy_config,
+        legacy_storage,
+        backend=_FakeBoogu(),
+        judge=_FakeQwen(),
+        sam_reviewer=_FailingLegacySamReviewer(),
         review_execution="parallel_independent",
     )
-    routing.sam.fail = True
+
+    _config, storage, runner, scheduler, _routing = _build(
+        tmp_path,
+        monkeypatch,
+        run_name="run-epoch",
+        review_execution="parallel_independent",
+    )
+    sam_fail_calls = 0
+
+    def exploding_epoch_sam_review(*args: Any, **kwargs: Any) -> Any:
+        nonlocal sam_fail_calls
+        del args, kwargs
+        sam_fail_calls += 1
+        raise RuntimeError("sam backend exploded")
+
+    monkeypatch.setattr(
+        "r2v_data_v2.v3.post_mask_epoch_reference_edit.run_boogu_sam_review",
+        exploding_epoch_sam_review,
+    )
     _drain(runner, scheduler)
-    assert routing.qwen.calls >= 1
-    assert routing.sam.calls == routing.qwen.calls
-    metadata = _read_completion_metadata(runner)
-    # The Qwen result is retained; the SAM failure rejects the attempt.
-    assert metadata is None or metadata.get("sam_review") is not None
+
+    sam_job_id = _committed_job_id(runner, "reference_edit_sam_review")
+    _job, _result, sam_payload = runner._validated_committed(sam_job_id)
+    assert sam_payload["status"] == "sam_failed"
+    assert sam_payload["error"] == "sam backend exploded"
+    assert sam_fail_calls >= 1
+
+    stats = runner.reconcile_stats(SHARD)
+    assert stats.to_dict() == legacy.to_dict()
+    epoch_clip = storage.read_clip("clip-1")
+    legacy_clip = legacy_storage.read_clip("clip-1")
+    assert epoch_clip.reference_edit.model_dump(mode="json") == (
+        legacy_clip.reference_edit.model_dump(mode="json")
+    )
+
+    legacy_metadata = json.loads(
+        (
+            Path(legacy_storage.root)
+            / "clips/clip-1/reference_edit/e1/completion_metadata.json"
+        ).read_text(encoding="utf-8")
+    )
+    epoch_metadata = _read_completion_metadata(runner)
+    assert epoch_metadata is not None
+    assert legacy_metadata["qwen_review"] is not None
+    assert legacy_metadata["sam_review"] is None
+    assert epoch_metadata["qwen_review"] == legacy_metadata["qwen_review"]
+    assert epoch_metadata["sam_review"] is None
+
+    marker = _read_attempt_marker(runner, 1)
+    assert marker is not None
+    assert marker["status"] == "sam_failed"
+    assert marker["rejection_reason"] == (
+        "boogu_reference_edit_failed: sam backend exploded"
+    )
 
 
 def test_parallel_independent_double_exception_matches_legacy_qwen_precedence(
