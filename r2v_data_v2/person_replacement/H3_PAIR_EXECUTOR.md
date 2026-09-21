@@ -211,8 +211,13 @@ shard-000000/
   work during teardown. SIGINT/SIGTERM forwards termination and escalates residual
   groups after a 60-second grace. Wait for cleanup before resuming.
 
-Exit 0: scan completed; exit 2: cases exhausted their failure budgets; an
-infrastructure error is nonzero. Other pairs continue independently in either case.
+At the pair-CLI level, exit 0 means the scan completed without exhausted cases
+and exit 2 means one or more cases exhausted their per-case failure budget.
+Exit 2 is data-local, not infrastructure failure. The node/cluster launcher treats
+pair exits 0 and 2 as nonfatal so a few bad clips or prompt failures cannot fail the
+whole multi-node PyTorchJob; their durable failure records remain under the shard
+for later inspection/retry. Other nonzero/signal exits remain fatal infrastructure
+errors.
 
 ## Canonical server paths
 

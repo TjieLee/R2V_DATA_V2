@@ -165,6 +165,36 @@ def test_node_maps_four_nonoverlapping_pairs_without_barrier(tmp_path, monkeypat
     assert all(x["command"][x["command"].index("--ulysses-degree")+1] == "2" for x in calls)
 
 
+@pytest.mark.parametrize(
+    ("codes","expected"),
+    [
+        ([0,0],0),
+        ([0,2],0),
+        ([2,2],0),
+        ([0,1],1),
+        ([2,1],1),
+        ([0,-9],1),
+    ],
+)
+def test_node_treats_exhausted_case_status_as_nonfatal(tmp_path, monkeypatch, capsys, codes, expected):
+    from tools.person_replacement import run_h3_pdd_node as cli
+
+    monkeypatch.setattr(cli,"run_children",lambda specs,*a,**k:list(codes))
+    result = cli.main([
+        "--gpus","0,1,2,3,4,5,6,7",
+        "--pair-start","0",
+        "--output-root",str(tmp_path),
+        "--pair-size","1000",
+        "--resume",
+        "--group-size","4",
+        "--ulysses-degree","2",
+    ])
+    assert result == expected
+    stderr = capsys.readouterr().err
+    if 2 in codes:
+        assert "exhausted case failures" in stderr
+
+
 def test_group_validation_before_launch_and_allocator_override(tmp_path, monkeypatch):
     from r2v_data_v2.person_replacement import h3_pair_executor as module
     from tools.person_replacement.run_h3_pdd_node import main

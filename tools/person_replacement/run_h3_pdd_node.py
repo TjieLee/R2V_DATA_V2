@@ -45,7 +45,21 @@ def main(argv=None):
         specs.append({"command":[sys.executable,str(Path(__file__).with_name("run_h3_pdd_pair_executor.py")),*options],
                       "env":child_env,
                       "log":root/"node_logs"/session/f"pair-{args.pair_start+i}.log"})
-    return 1 if specs and any(run_children(specs,stop_on_error=False)) else 0
+    if not specs:
+        return 0
+    codes = run_children(specs,stop_on_error=False)
+    # Pair exit 2 is a completed scan with one or more cases that exhausted their
+    # per-case retry budget. That is data-local and must not fail a multi-node
+    # PyTorchJob. Only infrastructure/process failures are fatal at node level.
+    fatal = [code for code in codes if code not in (0,2)]
+    if any(code == 2 for code in codes):
+        print(
+            "One or more pair shards completed with exhausted case failures; "
+            "continuing cluster job. Inspect shard failure records/status for details.",
+            file=sys.stderr,
+            flush=True,
+        )
+    return 1 if fatal else 0
 
 
 if __name__ == "__main__":
