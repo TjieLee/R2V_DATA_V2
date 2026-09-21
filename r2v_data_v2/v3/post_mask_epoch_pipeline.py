@@ -190,3 +190,126 @@ def run_removal_pair_epochs(
         }
     )
     return result
+
+
+# ---------------------------------------------------------------------------
+# 4b: one ResourceEpochManager session across the Removal -> Pair barriers
+# ---------------------------------------------------------------------------
+
+
+class StageDispatchError(RuntimeError):
+    """Raised when a shared executor is used before a stage is bound."""
+
+
+class _EpochStageDispatch:
+    """Mutable stage binding behind one cached resource executor.
+
+    ``ResourceEpochManager.enter()`` returns the cached executor while its
+    resource is open, so the Qwen executor created for Removal would keep
+    calling the Removal runner during Pair. This proxy is the only thing that
+    changes between stages: it holds no policy of its own.
+    """
+
+    def __init__(self) -> None:
+        self._runner: Any = None
+        self.log: list[str] = []
+
+    def bind(self, runner: Any) -> None:
+        self._runner = runner
+
+    @property
+    def runner(self) -> Any:
+        return self._runner
+
+    def run(self, job: Any, handle: Any) -> Any:
+        if self._runner is None:
+            raise StageDispatchError("stage dispatch used before bind()")
+        self.log.append(f"{type(self._runner).__name__}:{job.job_type}")
+        return self._runner.run(job, handle)
+
+    def __call__(self, job: Any, handle: Any) -> Any:
+        return self.run(job, handle)
+
+
+def shared_qwen_model_identities(config: V3Config) -> tuple[str, ...]:
+    """Judge services that the shared Qwen session must serve.
+
+    Empty in the config means the service is not used by this launch, so it is
+    not part of the compatibility check.
+    """
+    services = (
+        config.qwen.background_remove_judge,
+        config.qwen.candidate_judge,
+        config.qwen.cross_pair_judge,
+        config.qwen.background_final_judge,
+    )
+    return tuple(
+        str(service.model)
+        for service in services
+        if service is not None and str(service.model)
+    )
+
+
+def validate_shared_qwen_models(
+    config: V3Config, *, expected_served_model_id: str
+) -> None:
+    """Fail before the first model call when a shared server cannot serve all."""
+    expected = str(expected_served_model_id)
+    incompatible = sorted(
+        {model for model in shared_qwen_model_identities(config) if model != expected}
+    )
+    if incompatible:
+        raise StageDispatchError(
+            "shared Qwen session cannot serve every stage model: "
+            f"expected {expected!r}, configured {incompatible}"
+        )
+
+
+def run_removal_pair_resource_session(
+    *,
+    manager: Any,
+    build_removal_scheduler: Callable[[Any, _EpochStageDispatch], Any],
+    build_pair_scheduler: Callable[[Any, _EpochStageDispatch], Any],
+    config: V3Config | None = None,
+    expected_served_model_id: str | None = None,
+    dispatch: _EpochStageDispatch | None = None,
+    removal_runner_factory: RemovalRunnerFactory = default_removal_runner_factory,
+    pair_runner_factory: PairRunnerFactory = default_pair_runner_factory,
+    **composition: Any,
+) -> dict[str, Any]:
+    """Run the 4a composition inside one shared resource session.
+
+    The stage dispatch is rebound before each scheduler so the cached Qwen
+    executor always calls the runner that owns the current stage, and the outer
+    session -- not the schedulers -- owns the single ``manager.close()``.
+    """
+    if expected_served_model_id is not None and config is not None:
+        validate_shared_qwen_models(config, expected_served_model_id=expected_served_model_id)
+    # Production builds its manager factories before this call, so it hands in
+    # the dispatch those factories already captured.
+    dispatch = dispatch if dispatch is not None else _EpochStageDispatch()
+
+    def removal_scheduler(runner: Any) -> Any:
+        dispatch.bind(runner)
+        return build_removal_scheduler(runner, dispatch)
+
+    def pair_scheduler(runner: Any) -> Any:
+        dispatch.bind(runner)
+        return build_pair_scheduler(runner, dispatch)
+
+    try:
+        result = run_removal_pair_epochs(
+            config=config,
+            removal_scheduler_factory=removal_scheduler,
+            pair_scheduler_factory=pair_scheduler,
+            removal_runner_factory=removal_runner_factory,
+            pair_runner_factory=pair_runner_factory,
+            **composition,
+        )
+    finally:
+        manager.close()
+    result = dict(result)
+    # Read the lifecycle only after the outer close, so open_resource is None.
+    result["resource_lifecycle"] = manager.counters()
+    result["stage_dispatch_log"] = tuple(dispatch.log)
+    return result

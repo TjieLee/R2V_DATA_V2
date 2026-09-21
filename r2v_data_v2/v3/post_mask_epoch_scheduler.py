@@ -166,6 +166,7 @@ class ResourceEpochScheduler:
         window_size: int = DEFAULT_WINDOW_SIZE,
         diagnostics: EpochDiagnostics | None = None,
         max_rounds: int = 100_000,
+        close_resource_manager_on_exit: bool = True,
     ) -> None:
         if executors is None and resource_manager is None:
             raise ValueError("scheduler needs executors or a resource manager")
@@ -185,6 +186,9 @@ class ResourceEpochScheduler:
         self.window_size = window_size
         self.diagnostics = diagnostics if diagnostics is not None else EpochDiagnostics()
         self.max_rounds = max_rounds
+        # Default: this scheduler owns and closes its resource manager. A shared
+        # Removal -> Pair session opts out so the outer session closes once.
+        self.close_resource_manager_on_exit = close_resource_manager_on_exit
 
     # -- planning ---------------------------------------------------------
     def _pick_resource(self, ready: Sequence[ModelJob], current: str | None) -> str:
@@ -275,8 +279,10 @@ class ResourceEpochScheduler:
                     break
         finally:
             if self.resource_manager is not None:
-                # Close first so the final exit is part of the recorded timeline.
-                self.resource_manager.close()
+                # Close first so the final exit is part of the recorded timeline,
+                # unless an outer session owns that lifetime (4b).
+                if self.close_resource_manager_on_exit:
+                    self.resource_manager.close()
                 self.diagnostics.resource_lifecycle = (
                     self.resource_manager.counters()
                 )

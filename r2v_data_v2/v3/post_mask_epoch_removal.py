@@ -1305,7 +1305,7 @@ def _cycle_index(job: ModelJob) -> int:
 
 def build_removal_epoch_factories(
     config: V3Config,
-    runner: RemovalEpochRunner,
+    runner: RemovalEpochRunner | None,
     *,
     qwen_epoch_config: QwenEpochConfig,
     pool: WorkerPoolConfig,
@@ -1314,14 +1314,25 @@ def build_removal_epoch_factories(
     allowed_server_root: Path,
     qwen_max_inflight: int = 8,
     log_root: Path | None = None,
+    job_runner: Callable[[Any, Any], Any] | None = None,
 ) -> dict[str, Callable[[], tuple[Any, Any]]]:
     """Resource-epoch factories for the Boogu and Qwen epochs.
 
     The Qwen epoch is the managed TP1 x DP8 judge server. No image-edit remover
     is ever loaded here: generation belongs to the Boogu worker epoch.
+
+    ``job_runner`` lets a shared 4b session hand in a stage dispatch that
+    rebinds Removal -> Pair behind the same cached Qwen executor. Without it the
+    behaviour is exactly the current one: both executors call ``runner.run``.
     """
     require_boogu_backend(config)
     slot_count = len(pool.gpu_ids)
+    if job_runner is None:
+        if runner is None:
+            raise ValueError("removal epoch factories need a runner or job_runner")
+        run_job = runner.run
+    else:
+        run_job = job_runner
 
     def boogu_factory() -> tuple[Any, Any]:
         epoch = build_boogu_epoch(
@@ -1333,7 +1344,7 @@ def build_removal_epoch_factories(
             log_root=log_root,
         )
         return epoch, WorkerSlotExecutor(
-            runner.run, slot_count=slot_count, resource=epoch
+            run_job, slot_count=slot_count, resource=epoch
         )
 
     def qwen_factory() -> tuple[Any, Any]:
@@ -1343,7 +1354,7 @@ def build_removal_epoch_factories(
             log_root=log_root,
         )
         return epoch, QwenConcurrentExecutor(
-            runner.run,
+            run_job,
             endpoint=qwen_epoch_config.base_url,
             max_inflight=qwen_max_inflight,
         )
@@ -1614,46 +1625,116 @@ def build_removal_epoch_runner(
                 }
             storages = {shard: item.storage for shard, item in prepared.items()}
             eligible = {shard: item.clip_uids for shard, item in prepared.items()}
-            removal = RemovalEpochRunner(
-                config,
-                storages,
-                ledger,
-                emit=emit,
-                eligible_clip_uids_by_shard=eligible,
-            )
-            seed_jobs = removal.seed_jobs()
-            emit(
-                "post_mask_removal_epoch_planned",
-                group_id=getattr(group, "group_id", ""),
-                seeded_jobs=len(seed_jobs),
-                hydration=hydration,
-            )
-            manager = ResourceEpochManager(
-                factories=build_removal_epoch_factories(
-                    config,
-                    removal,
-                    qwen_epoch_config=qwen_epoch_config,
-                    pool=worker_pool,
-                    process_manager=process_manager,
-                    temporary_root=temporary_root,
-                    allowed_server_root=allowed_server_root,
-                    qwen_max_inflight=qwen_max_inflight,
-                    log_root=log_root,
+            pair_enabled = bool(config.pair.enabled and config.reference_edit.enabled)
+            if pair_enabled:
+                # 4b: one shared resource session spans Removal -> Pair, and the
+                # same shard locks stay held across every stage.
+                from r2v_data_v2.v3.post_mask_epoch_pipeline import (
+                    _EpochStageDispatch,
+                    run_removal_pair_resource_session,
                 )
-            )
-            scheduler = ResourceEpochScheduler(
-                ledger=ledger,
-                finalize=removal.finalize,
-                resource_manager=manager,
-                window_size=window_size,
-            )
-            try:
-                outcome = scheduler.run(seed_jobs)
-            finally:
-                removal.close()
+
+                dispatch = _EpochStageDispatch()
+                created: dict[str, Any] = {}
+
+                def removal_factory(**kwargs: Any) -> Any:
+                    runner = RemovalEpochRunner(**kwargs)
+                    created["removal"] = runner
+                    return runner
+
+                manager = ResourceEpochManager(
+                    factories=build_removal_epoch_factories(
+                        config,
+                        None,
+                        qwen_epoch_config=qwen_epoch_config,
+                        pool=worker_pool,
+                        process_manager=process_manager,
+                        temporary_root=temporary_root,
+                        allowed_server_root=allowed_server_root,
+                        qwen_max_inflight=qwen_max_inflight,
+                        log_root=log_root,
+                        job_runner=dispatch.run,
+                    )
+                )
+                outcome = run_removal_pair_resource_session(
+                    config=config,
+                    storages=storages,
+                    eligible_clip_uids_by_shard=eligible,
+                    ledger=ledger,
+                    manager=manager,
+                    expected_served_model_id=qwen_epoch_config.expected_served_model_id,
+                    dispatch=dispatch,
+                    removal_runner_factory=removal_factory,
+                    build_removal_scheduler=lambda runner, _dispatch: (
+                        ResourceEpochScheduler(
+                            ledger=ledger,
+                            finalize=runner.finalize,
+                            resource_manager=manager,
+                            window_size=window_size,
+                            close_resource_manager_on_exit=False,
+                        )
+                    ),
+                    build_pair_scheduler=lambda runner, _dispatch: (
+                        ResourceEpochScheduler(
+                            ledger=ledger,
+                            finalize=runner.finalize,
+                            resource_manager=manager,
+                            window_size=window_size,
+                            close_resource_manager_on_exit=False,
+                        )
+                    ),
+                    emit=emit,
+                )
+                removal = created["removal"]
+                unresolved = len(outcome.get("pair_primary_unresolved", ())) + len(
+                    outcome.get("pair_cross_unresolved", ())
+                )
+            else:
+                removal = RemovalEpochRunner(
+                    config,
+                    storages,
+                    ledger,
+                    emit=emit,
+                    eligible_clip_uids_by_shard=eligible,
+                )
+                seed_jobs = removal.seed_jobs()
+                emit(
+                    "post_mask_removal_epoch_planned",
+                    group_id=getattr(group, "group_id", ""),
+                    seeded_jobs=len(seed_jobs),
+                    hydration=hydration,
+                )
+                manager = ResourceEpochManager(
+                    factories=build_removal_epoch_factories(
+                        config,
+                        removal,
+                        qwen_epoch_config=qwen_epoch_config,
+                        pool=worker_pool,
+                        process_manager=process_manager,
+                        temporary_root=temporary_root,
+                        allowed_server_root=allowed_server_root,
+                        qwen_max_inflight=qwen_max_inflight,
+                        log_root=log_root,
+                    )
+                )
+                scheduler = ResourceEpochScheduler(
+                    ledger=ledger,
+                    finalize=removal.finalize,
+                    resource_manager=manager,
+                    window_size=window_size,
+                )
+                try:
+                    outcome = scheduler.run(seed_jobs)
+                finally:
+                    removal.close()
+                unresolved = len(outcome.get("unresolved_job_ids", ()))
             # Locks are released only when this block exits, i.e. after
             # publication and the stage-count update.
-        remove_completed = bool(outcome.get("completed"))
+        # The shared 4b session reports "remove_completed"; the removal-only
+        # path reports the scheduler outcome's "completed" under the same name.
+        remove_completed = bool(
+            outcome.get("remove_completed", outcome.get("completed", False))
+        )
         summary = {
             shard: {
                 "ready_removed": counters["ready_removed"],
@@ -1675,7 +1756,7 @@ def build_removal_epoch_runner(
             "post_mask_removal_epoch_finished",
             group_id=getattr(group, "group_id", ""),
             remove_completed=remove_completed,
-            unresolved=len(outcome.get("unresolved_job_ids", ())),
+            unresolved=unresolved,
             shards=summary,
         )
         return {
