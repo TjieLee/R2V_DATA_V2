@@ -8,6 +8,7 @@ may ever reach a Qwen judge.
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -339,3 +340,159 @@ def test_durable_corruption_fails_closed(
     clip = storage.read_clip("clip-1")
     assert clip.reference_integrity is not None
     assert clip.reference_integrity.status == "ready"
+
+
+def test_pre_existing_failed_state_is_reprocessed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pre-existing failed RI state is a fresh target, not skipped_existing.
+
+    Legacy re-runs such a clip; treating the old failure as this epoch's
+    publication would silently skip the stage.
+    """
+    legacy_config, legacy_storage = _storage_variant(
+        tmp_path,
+        monkeypatch,
+        "run-legacy",
+        second_scope="full",
+        second_phrase=CLEAN_OBJECT_PHRASE,
+    )
+    legacy_storage.write_reference_integrity_failure("clip-1", "old failure")
+    legacy_stats, _judge, _bbox_judge = _legacy_run(legacy_config, legacy_storage)
+    assert legacy_stats.processed == 1
+    assert legacy_stats.skipped_existing == 0
+    assert legacy_storage.read_clip("clip-1").reference_integrity.status == "ready"
+
+    config, storage = _storage_variant(
+        tmp_path,
+        monkeypatch,
+        "run-epoch",
+        second_scope="full",
+        second_phrase=CLEAN_OBJECT_PHRASE,
+    )
+    storage.write_reference_integrity_failure("clip-1", "old failure")
+    runner = _runner(config, storage, tmp_path)
+    assert runner.seed_jobs() == []
+    stats = runner.reconcile_stats(SHARD)
+
+    assert stats.to_dict() == legacy_stats.to_dict()
+    assert stats.processed == 1
+    assert stats.skipped_existing == 0
+    epoch_clip = storage.read_clip("clip-1")
+    legacy_clip = legacy_storage.read_clip("clip-1")
+    assert epoch_clip.reference_integrity is not None
+    assert epoch_clip.reference_integrity.status == "ready"
+    _assert_same_publication(epoch_clip, legacy_clip)
+
+
+def test_entity_delta_tamper_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A schema-valid but wrong entity counter must never reach the stats."""
+    config, storage = _storage_variant(
+        tmp_path,
+        monkeypatch,
+        "run-epoch",
+        second_scope="full",
+        second_phrase=CLEAN_OBJECT_PHRASE,
+    )
+    runner = _runner(config, storage, tmp_path)
+    runner.seed_jobs()
+    runner.reconcile_stats(SHARD)
+
+    marker_path = runner._entity_outcome_path(SHARD, "clip-1", "e1")
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker["delta"]["entities_accepted"] = 100
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+
+    fresh = _runner(config, storage, tmp_path)
+    with pytest.raises(ReferenceIntegrityDurableError, match="entity outcome drifted"):
+        fresh.reconcile_stats(SHARD)
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ("delete_clip_entry", "classification_switch", "drop_retained_entity"),
+)
+def test_plan_scope_tamper_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tamper: str
+) -> None:
+    """A tampered plan may not silently change what this stage executes."""
+    config, storage = _storage_variant(
+        tmp_path,
+        monkeypatch,
+        "run-epoch",
+        second_scope="full",
+        second_phrase=CLEAN_OBJECT_PHRASE,
+    )
+    runner = _runner(config, storage, tmp_path)
+    runner._plan(SHARD)  # freeze the plan, exactly like the first seed does
+    plan_path = runner._plan_path(SHARD)
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    if tamper == "delete_clip_entry":
+        plan["clips"].pop("clip-1")
+    elif tamper == "classification_switch":
+        plan["clips"]["clip-1"]["classification"] = "existing"
+    else:
+        plan["clips"]["clip-1"]["retained_entity_ids"] = ["e1"]
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+
+    fresh = _runner(config, storage, tmp_path)
+    with pytest.raises(ReferenceIntegrityDurableError):
+        fresh.seed_jobs()
+
+
+def test_failed_publication_drift_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed publication only replaces RI; any other drift fails closed."""
+    config, storage = _storage_variant(
+        tmp_path,
+        monkeypatch,
+        "run-epoch",
+        second_scope="full",
+        second_phrase=CLEAN_OBJECT_PHRASE,
+    )
+    runner = _runner(config, storage, tmp_path)
+
+    def exploding_publish(shard: str, stor: Any, clip_uid: str) -> None:
+        raise ValueError("publication exploded")
+
+    runner._publish_clip_if_terminal = exploding_publish  # type: ignore[method-assign]
+    assert runner.seed_jobs() == []
+    marker_path = runner._clip_outcome_path(SHARD, "clip-1")
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    assert marker["terminal"] == "failed"
+    assert marker["reason"] == "publication exploded"
+    clip = storage.read_clip("clip-1")
+    assert clip.reference_integrity is not None
+    assert clip.reference_integrity.status == "failed"
+    assert clip.reference_integrity.reason == "publication exploded"
+    failures_path = Path(storage.root) / "failures.jsonl"
+    records = [
+        json.loads(line)
+        for line in failures_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(records) == 1
+    assert records[0]["reason"] == "publication exploded"
+    assert records[0]["details"]["exception_type"] == "ValueError"
+
+    storage_module.write_json_atomic(
+        storage.clip_path("clip-1"),
+        clip.model_copy(
+            update={"export": clip.export.model_copy(update={"accepted": False})}
+        ).model_dump(mode="json"),
+    )
+
+    fresh = _runner(config, storage, tmp_path)
+    with pytest.raises(
+        ReferenceIntegrityDurableError, match="failed publication drifted"
+    ):
+        fresh.seed_jobs()
+    after = [
+        json.loads(line)
+        for line in failures_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(after) == 1

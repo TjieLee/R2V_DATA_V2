@@ -307,29 +307,9 @@ class ReferenceIntegrityEpochRunner:
             "pre_export": clip.export.model_dump(mode="json"),
         }
 
-    def _verify_plan_entry(
-        self, shard: str, storage: RunStorage, clip_uid: str, entry: Mapping[str, Any]
-    ) -> None:
-        """Validate one frozen plan entry against the live clip."""
-        clip = storage.read_clip(clip_uid)
-        actual = self._clip_digest(storage, clip)
-        if actual != entry.get("digest"):
-            raise ReferenceIntegrityDurableError(
-                f"frozen Reference Integrity input drifted for {clip_uid!r}"
-            )
-        if entry.get("classification") != CLIP_FRESH_TARGET:
-            return
-        if clip.reference_integrity is not None:
-            # Published: rebuild the expected publication and verify the live
-            # state against it, with or without the marker present.
-            self._verify_published_clip(shard, storage, clip_uid, entry)
-            return
-        if self._clip_outcome_path(shard, clip_uid).is_file():
-            raise ReferenceIntegrityDurableError(
-                f"clip {clip_uid!r} has a durable outcome marker but no published "
-                "Reference Integrity state"
-            )
-        baselines = {
+    def _live_baselines(self, clip: Any) -> dict[str, Any]:
+        """The six pre-stage sections compared against a frozen plan entry."""
+        return {
             "pre_references": clip.references.model_dump(mode="json"),
             "pre_pairing": (
                 clip.pairing.model_dump(mode="json")
@@ -353,11 +333,87 @@ class ReferenceIntegrityEpochRunner:
             ),
             "pre_export": clip.export.model_dump(mode="json"),
         }
-        for key, value in baselines.items():
-            if entry.get(key) != value:
+
+    @staticmethod
+    def _expected_classification(config: Any, entry: Mapping[str, Any]) -> str:
+        """Re-derive the legacy classification from the frozen baselines."""
+        pre_pairing = entry.get("pre_pairing")
+        if not isinstance(pre_pairing, dict) or pre_pairing.get("status") != "ready":
+            return CLIP_INELIGIBLE
+        pre_edit = entry.get("pre_reference_edit")
+        if config.reference_edit.enabled and (
+            not isinstance(pre_edit, dict) or pre_edit.get("status") != "ready"
+        ):
+            return CLIP_INELIGIBLE
+        pre_integrity = entry.get("pre_reference_integrity")
+        if isinstance(pre_integrity, dict) and pre_integrity.get("status") == "ready":
+            return CLIP_EXISTING
+        return CLIP_FRESH_TARGET
+
+    def _verify_plan_entry(
+        self, shard: str, storage: RunStorage, clip_uid: str, entry: Mapping[str, Any]
+    ) -> None:
+        """Strictly validate one frozen plan entry against the live clip.
+
+        A plan entry is durable authority, so both its structure and its
+        classification are re-derived; a tampered plan may never silently change
+        which clips or entities this stage executes.
+        """
+        clip = storage.read_clip(clip_uid)
+        actual = self._clip_digest(storage, clip)
+        if actual != entry.get("digest"):
+            raise ReferenceIntegrityDurableError(
+                f"frozen Reference Integrity input drifted for {clip_uid!r}"
+            )
+        classification = entry.get("classification")
+        if classification not in (CLIP_FRESH_TARGET, CLIP_EXISTING, CLIP_INELIGIBLE):
+            raise ReferenceIntegrityDurableError(
+                f"frozen Reference Integrity classification is unknown for "
+                f"{clip_uid!r}"
+            )
+        expected_classification = self._expected_classification(self.config, entry)
+        if classification != expected_classification:
+            raise ReferenceIntegrityDurableError(
+                f"frozen Reference Integrity classification drifted for "
+                f"{clip_uid!r}"
+            )
+        retained = entry.get("retained_entity_ids")
+        if not isinstance(retained, list) or not all(
+            isinstance(item, str) for item in retained
+        ):
+            raise ReferenceIntegrityDurableError(
+                f"frozen Reference Integrity retained entities are malformed for "
+                f"{clip_uid!r}"
+            )
+        pre_pairing = entry.get("pre_pairing") or {}
+        if classification == CLIP_FRESH_TARGET:
+            if retained != list(pre_pairing.get("retained_entity_ids", [])):
                 raise ReferenceIntegrityDurableError(
-                    f"frozen Reference Integrity {key} drifted for {clip_uid!r}"
+                    f"frozen Reference Integrity retained entities drifted for "
+                    f"{clip_uid!r}"
                 )
+        elif retained:
+            raise ReferenceIntegrityDurableError(
+                f"non-fresh clip {clip_uid!r} must not retain review entities"
+            )
+        if classification != CLIP_FRESH_TARGET:
+            return
+
+        baselines = self._live_baselines(clip)
+        marker_exists = self._clip_outcome_path(shard, clip_uid).is_file()
+        if all(entry.get(key) == value for key, value in baselines.items()):
+            # Nothing from this epoch has been published yet, even when the
+            # frozen baseline already carries a failed Reference Integrity
+            # state: legacy re-runs such a clip as a fresh target.
+            if marker_exists:
+                raise ReferenceIntegrityDurableError(
+                    f"clip {clip_uid!r} has a durable outcome marker but its live "
+                    "state equals the pre-stage baseline"
+                )
+            return
+        # The live state moved away from the baseline: only a verified epoch
+        # publication may explain that, with or without the marker present.
+        self._verify_published_clip(shard, storage, clip_uid, entry)
 
     def _plan(self, shard: str) -> dict[str, Any]:
         existing = _read_json(self._plan_path(shard))
@@ -374,8 +430,23 @@ class ReferenceIntegrityEpochRunner:
                         f"frozen Reference Integrity plan {key} drifted for "
                         f"{shard!r}"
                     )
+            clips = existing.get("clips")
+            if not isinstance(clips, dict):
+                raise ReferenceIntegrityDurableError(
+                    f"frozen Reference Integrity plan clips map is malformed for "
+                    f"{shard!r}"
+                )
+            if set(clips) != set(self.eligible.get(shard, ())):
+                raise ReferenceIntegrityDurableError(
+                    f"frozen Reference Integrity plan scope drifted for {shard!r}"
+                )
             storage = self._storage_for(shard)
-            for clip_uid, entry in existing.get("clips", {}).items():
+            for clip_uid, entry in clips.items():
+                if not isinstance(entry, dict):
+                    raise ReferenceIntegrityDurableError(
+                        f"frozen Reference Integrity plan entry is malformed for "
+                        f"{clip_uid!r}"
+                    )
                 self._verify_plan_entry(shard, storage, clip_uid, entry)
             return existing
 
@@ -569,6 +640,35 @@ class ReferenceIntegrityEpochRunner:
             },
         )
 
+    def _expected_entity_marker(
+        self,
+        clip_uid: str,
+        entity: Any,
+        reference: Any,
+        diagnostics: Any,
+    ) -> dict[str, Any] | None:
+        """The exact durable marker this entity must have, or ``None`` for 6c/6d.
+
+        One helper serves both the writer and the verifier so the branch policy
+        exists exactly once.
+        """
+        branch = self._entity_branch(entity, reference, diagnostics)
+        if branch.requires_model:
+            return None
+        return {
+            "schema": REFERENCE_INTEGRITY_ENTITY_OUTCOME_SCHEMA,
+            "clip_uid": clip_uid,
+            "entity_id": entity.entity_id,
+            "outcome": branch.outcome,
+            "status": branch.status,
+            "reason": branch.reason,
+            "reviewed": branch.reviewed,
+            "semantic_policy_reason": branch.semantic_policy_reason,
+            "final_reference_path": reference.image_path,
+            "diagnostics": branch.diagnostics.model_dump(mode="json"),
+            "delta": branch.delta,
+        }
+
     def _advance_entity(
         self,
         shard: str,
@@ -580,24 +680,15 @@ class ReferenceIntegrityEpochRunner:
         """Resolve one entity's CPU branch, or leave it for 6c/6d."""
         final_image = _load_reference_image(storage, str(reference.image_path))
         diagnostics = reference_topology_diagnostics(final_image)
-        branch = self._entity_branch(entity, reference, diagnostics)
-        if branch.requires_model:
+        expected = self._expected_entity_marker(
+            clip.clip_uid, entity, reference, diagnostics
+        )
+        if expected is None:
             # 6c/6d own this entity: stay unresolved, never fake a terminal.
             return
-        self._write_entity_outcome(
-            shard,
-            clip.clip_uid,
-            entity.entity_id,
-            {
-                "outcome": branch.outcome,
-                "status": branch.status,
-                "reason": branch.reason,
-                "reviewed": branch.reviewed,
-                "semantic_policy_reason": branch.semantic_policy_reason,
-                "final_reference_path": reference.image_path,
-                "diagnostics": branch.diagnostics.model_dump(mode="json"),
-                "delta": branch.delta,
-            },
+        _write_json_once(
+            self._entity_outcome_path(shard, clip.clip_uid, entity.entity_id),
+            expected,
         )
 
     def _advance_clip(
@@ -684,63 +775,29 @@ class ReferenceIntegrityEpochRunner:
         pre_entities: Sequence[EntityReferenceState],
         marker: Mapping[str, Any],
     ) -> None:
-        """Re-derive one entity's CPU branch from frozen state and require it.
+        """Re-derive one entity's CPU marker from frozen state and require it.
 
         The plan's pre-reference image is re-read from disk, the legacy
-        diagnostics and gates are recomputed, and the durable marker must agree
-        exactly: this is the drift detector for one entity.
+        diagnostics and branch policy are recomputed through the same helper the
+        writer used, and the durable marker must match it exactly -- including
+        every counter in ``delta``. This is the drift detector for one entity.
         """
         entity_id = str(marker["entity_id"])
         reference = next(item for item in pre_entities if item.entity_id == entity_id)
         entity = entities_by_id[entity_id]
         final_image = _load_reference_image(storage, str(reference.image_path))
         diagnostics = reference_topology_diagnostics(final_image)
-        if marker["diagnostics"] != diagnostics.model_dump(mode="json"):
-            raise ReferenceIntegrityDurableError(
-                f"entity outcome diagnostics drifted for {clip.clip_uid}/{entity_id}"
-            )
-        policy_reason = reference_semantic_hard_reject_reason(
-            reference_type=entity.reference_type,
-            phrase=entity.phrase,
+        expected = self._expected_entity_marker(
+            clip.clip_uid, entity, reference, diagnostics
         )
-        semantic_risk = reference_semantic_risk_reason(
-            reference_type=entity.reference_type,
-            phrase=entity.phrase,
-            grounding_prompt=entity.grounding_prompt,
-        )
-        requires_review = bool(
-            reference.synthetic
-            or reference.reference_scope == "local"
-            or reference.source_bbox_fallback
-            or diagnostics.suspicious
-            or semantic_risk is not None
-        )
-        if policy_reason is not None:
-            expected: tuple[str, str, str | None] = (
-                ENTITY_OUTCOME_REJECTED,
-                policy_reason,
-                policy_reason,
-            )
-        elif not requires_review:
-            expected = (ENTITY_OUTCOME_SKIPPED, CLEAN_REAL_FULL_REFERENCE, None)
-        else:
+        if expected is None:
             raise ReferenceIntegrityDurableError(
-                f"entity {clip.clip_uid}/{entity_id} carries a CPU outcome but "
-                "now requires a Qwen review"
+                f"entity {clip.clip_uid}/{entity_id} carries a CPU outcome but now "
+                "requires a Qwen review"
             )
-        actual = (
-            marker["outcome"],
-            marker["reason"],
-            marker.get("semantic_policy_reason"),
-        )
-        if actual != expected:
+        if dict(marker) != expected:
             raise ReferenceIntegrityDurableError(
-                f"entity outcome branch drifted for {clip.clip_uid}/{entity_id}"
-            )
-        if marker["final_reference_path"] != reference.image_path:
-            raise ReferenceIntegrityDurableError(
-                f"entity outcome final reference drifted for "
-                f"{clip.clip_uid}/{entity_id}"
+                f"entity outcome drifted for {clip.clip_uid}/{entity_id}"
             )
 
     def _reconstruct_clip_publication(
@@ -980,6 +1037,22 @@ class ReferenceIntegrityEpochRunner:
                 "reason": str(integrity.reason or ""),
                 "delta": self._failed_clip_delta(shard, clip_uid, integrity),
             }
+            # ``write_reference_integrity_failure`` only replaces the Reference
+            # Integrity section, so every other section must still equal the
+            # frozen pre-stage baseline.
+            baselines = self._live_baselines(clip)
+            for key in (
+                "pre_references",
+                "pre_pairing",
+                "pre_reference_edit",
+                "pre_instruction",
+                "pre_export",
+            ):
+                if plan_entry.get(key) != baselines[key]:
+                    raise ReferenceIntegrityDurableError(
+                        f"clip {clip_uid!r} failed publication drifted {key} away "
+                        "from its frozen baseline"
+                    )
             if marker is None:
                 _write_json_once(marker_path, expected_marker)
                 return
