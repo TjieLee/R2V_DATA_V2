@@ -287,7 +287,13 @@ def _worker(request_path: Path) -> None:
     elapsed = time.monotonic() - started
     payload["elapsed_seconds"] = elapsed
     _atomic_json(request_path.with_name("result.json"), payload)
-    event = "failed" if "error" in payload else "completed"
+    event = (
+        "locked"
+        if payload.get("locked")
+        else "failed"
+        if "error" in payload
+        else "completed"
+    )
     print(
         f"shard={shard_id} canonical_prefetch_{event} elapsed_seconds={elapsed:.3f}",
         flush=True,
