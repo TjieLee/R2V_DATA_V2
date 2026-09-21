@@ -530,13 +530,13 @@ def training_row(video, caption, audios=()):
     return {"video": video, "images": [], "audios": list(audios), "caption": caption}
 
 
-def t2va_stage(job, backend, temporary: Path):
+def t2va_stage(job, backend, temporary: Path, *, verify_video: bool = True):
     """Mirror shadow orchestration using the frozen parser/validator/renderer."""
     from r2v_data_v2.h3 import t2va_shadow as frozen
     from r2v_data_v2.structured_output import parse_structured_json_response
 
     identity = frozen.request_fingerprint(job, backend.provenance())
-    if _sha(Path(job.target_video_path)) != job.target_video_sha256:
+    if verify_video and _sha(Path(job.target_video_path)) != job.target_video_sha256:
         raise ValueError("original target video hash differs")
     try:
         raw = backend.annotate(job, identity)
@@ -560,7 +560,7 @@ def t2va_stage(job, backend, temporary: Path):
         raw.audio_finalize.response or "", frozen.MimoAudioFinalizeDraft
     )
     core = frozen.validate_t2va_draft(job, draft, audio)
-    if _sha(Path(job.target_video_path)) != job.target_video_sha256:
+    if verify_video and _sha(Path(job.target_video_path)) != job.target_video_sha256:
         raise ValueError("original target video changed during annotation")
     frozen.write_json(temporary / "job.json", job)
     frozen.write_json(temporary / "core.json", core)
@@ -586,6 +586,7 @@ def ta2va_stage(
     *,
     allow_unverified=False,
     source_hashes=None,
+    verify_media=True,
 ):
     """Production writer around frozen TA2VA waveform and rendering operations."""
     import numpy as np
@@ -601,7 +602,8 @@ def ta2va_stage(
             for kind in ("full_audio", "speech", "music", "sfx")
         },
     }
-    ta._verify(hashes)
+    if verify_media:
+        ta._verify(hashes)
     frames = ta.probe_canonical_target_frames(
         Path(evidence.full_audio_path), evidence.full_audio_sha256
     )
@@ -629,7 +631,8 @@ def ta2va_stage(
         (temporary / f"{variant}.txt").write_text(product.prompt, encoding="utf-8")
 
     def finish(failed_calls=0):
-        ta._verify(hashes)
+        if verify_media:
+            ta._verify(hashes)
         (temporary / "records.jsonl").write_text(
             "".join(p.model_dump_json() + "\n" for p in products), encoding="utf-8"
         )
@@ -1122,14 +1125,25 @@ class FrozenProductionProcessor:
         if stage == "t2va":
             if self.verify_sources_per_sample:
                 _verify(inventory.source_hashes)
-            result = t2va_stage(job, self.backend, temporary)
-            if self.verify_sources_per_sample:
+                result = t2va_stage(job, self.backend, temporary)
                 _verify(inventory.source_hashes)
-            return result
+                return result
+            if _sha(Path(job.target_video_path)) != job.target_video_sha256:
+                raise ValueError("original target video hash differs")
+            t.check_audio_files(job.audio_evidence)
+            return t2va_stage(
+                job,
+                self.backend,
+                temporary,
+                verify_video=False,
+            )
         core_path = destination.parent / "t2va/core.json"
         core = t.H3NoReferenceAVCore.model_validate_json(core_path.read_text())
         t.validate_t2va_draft(job, core)
-        t.check_audio_files(job.audio_evidence)
+        if self.verify_sources_per_sample:
+            t.check_audio_files(job.audio_evidence)
+        elif _sha(Path(job.target_video_path)) != job.target_video_sha256:
+            raise ValueError("original target video hash differs")
         root = t.stem_shadow_root(
             Path(inventory.audio_production_root), inventory.audio_shadow_run_id
         )
@@ -1171,4 +1185,5 @@ class FrozenProductionProcessor:
             source_hashes=(
                 inventory.source_hashes if self.verify_sources_per_sample else None
             ),
+            verify_media=self.verify_sources_per_sample,
         )
