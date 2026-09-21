@@ -1391,7 +1391,81 @@ def publish_boogu_final_reference(
     )
 
 
-def run_boogu_reference_edit(
+class PreparedBooguReferenceEditAttempt:
+    """Everything deterministic that happens before the first model call.
+
+    Built by :func:`prepare_boogu_reference_edit_attempt`; path safety, source
+    validation, geometry and the tiny-source gate all live here so a resource
+    epoch can later freeze this stage without touching a model.
+    """
+
+    __slots__ = (
+        "alignment",
+        "candidate_name",
+        "candidate_path",
+        "canonical_sha256",
+        "clip_uid",
+        "comparison_source_path",
+        "comparison_source_rgb",
+        "completion_attempt_index",
+        "completion_source_candidate_id",
+        "completion_source_frame_index",
+        "entity_id",
+        "entity_phrase",
+        "fallback_status",
+        "final_metadata_path",
+        "final_path",
+        "geometry_source_path",
+        "geometry_source_rgba",
+        "geometry_source_sha256",
+        "grounding_prompt",
+        "height",
+        "instruction",
+        "instruction_rewrite_enabled",
+        "metadata_path",
+        "model_revision",
+        "operation",
+        "publish_final",
+        "reference_type",
+        "rejection_path",
+        "root",
+        "source_content_geometry",
+        "source_evidence_path",
+        "source_gate_reason",
+        "source_input_path",
+        "source_input_rgb",
+        "source_rgba",
+        "source_sha256",
+        "target_area",
+        "thinking_enabled",
+        "width",
+    )
+
+    def __init__(self, **values: Any) -> None:
+        for name in self.__slots__:
+            setattr(self, name, values[name])
+
+
+class BooguGenerationResult:
+    """One committed Boogu generation: validated bytes plus provenance."""
+
+    __slots__ = ("candidate_rgb", "output", "output_sha256", "seed")
+
+    def __init__(
+        self,
+        *,
+        output: BooguEditOutput,
+        seed: int,
+        output_sha256: str,
+        candidate_rgb: Image.Image,
+    ) -> None:
+        self.output = output
+        self.seed = seed
+        self.output_sha256 = output_sha256
+        self.candidate_rgb = candidate_rgb
+
+
+def prepare_boogu_reference_edit_attempt(
     *,
     run_root: Path,
     clip_uid: str,
@@ -1401,9 +1475,6 @@ def run_boogu_reference_edit(
     entity_phrase: str,
     grounding_prompt: str | None = None,
     reference_type: ReferenceType,
-    backend: BooguReferenceEditBackend,
-    judge: BooguReferenceEditJudge,
-    sam_reviewer: BooguSamReviewer | None = None,
     instruction_rewrite_enabled: bool | None = None,
     target_area: int = DEFAULT_TARGET_AREA,
     alignment: int = DEFAULT_ALIGNMENT,
@@ -1421,15 +1492,15 @@ def run_boogu_reference_edit(
     completion_source_frame_index: int | None = None,
     publish_final: bool = True,
     overwrite: bool = False,
-    review_execution: Literal["sequential", "parallel_independent"] = "sequential",
-    review_observer: Callable[[dict[str, int | float]], None] | None = None,
-) -> BooguReferenceEditResult:
-    """Generate, review, and publish one native Boogu reference artifact."""
+) -> PreparedBooguReferenceEditAttempt:
+    """Deterministic pre-flight for one Boogu reference edit attempt.
 
+    Never calls a model and never draws a seed; it validates every pre-Pair
+    input, resolves the frozen artifact names and computes the tiny-source
+    gate that the wrapper turns into a zero-model-call rejection.
+    """
     if operation not in {"complete_entity", "add_entity_background"}:
         raise ValueError(f"unsupported Boogu edit operation: {operation}")
-    if review_execution not in {"sequential", "parallel_independent"}:
-        raise ValueError(f"unsupported review execution: {review_execution}")
     if operation == "complete_entity":
         completion_attempt_index = completion_attempt_index or 1
         if completion_attempt_index not in {1, 2}:
@@ -1563,104 +1634,479 @@ def run_boogu_reference_edit(
     )
     _save_rgb_png_atomic(source_input_path, source_input_rgb)
     thinking_enabled = operation == "complete_entity"
+    return PreparedBooguReferenceEditAttempt(
+        root=root,
+        clip_uid=clip_uid,
+        entity_id=entity_id,
+        operation=operation,
+        reference_type=reference_type,
+        instruction=instruction,
+        entity_phrase=entity_phrase,
+        grounding_prompt=grounding_prompt,
+        completion_attempt_index=completion_attempt_index,
+        completion_source_candidate_id=completion_source_candidate_id,
+        completion_source_frame_index=completion_source_frame_index,
+        canonical_sha256=canonical_sha256,
+        source_sha256=source_sha256,
+        source_rgba=source_rgba,
+        source_evidence_path=source_evidence_path,
+        geometry_source_path=geometry_source_path,
+        geometry_source_sha256=geometry_source_sha256,
+        geometry_source_rgba=geometry_source_rgba,
+        source_content_geometry=source_content_geometry,
+        source_gate_reason=source_gate_reason,
+        source_input_rgb=source_input_rgb,
+        source_input_path=source_input_path,
+        comparison_source_path=comparison_source_path,
+        comparison_source_rgb=comparison_source_rgb,
+        candidate_path=candidate_path,
+        candidate_name=candidate_name,
+        metadata_path=metadata_path,
+        final_path=final_path,
+        final_metadata_path=final_metadata_path,
+        rejection_path=rejection_path,
+        width=width,
+        height=height,
+        target_area=target_area,
+        alignment=alignment,
+        model_revision=model_revision,
+        fallback_status=fallback_status,
+        publish_final=publish_final,
+        thinking_enabled=thinking_enabled,
+        instruction_rewrite_enabled=instruction_rewrite_enabled,
+    )
 
-    output: BooguEditOutput | None = None
-    generation_seed: int | None = None
-    output_sha256: str | None = None
+
+def run_boogu_reference_edit_generation(
+    prepared: PreparedBooguReferenceEditAttempt,
+    backend: BooguReferenceEditBackend,
+    *,
+    seed: int,
+) -> BooguGenerationResult:
+    """One Boogu generation call plus its native-PNG validation.
+
+    The seed comes from the caller; the wrapper keeps drawing it with
+    ``new_boogu_seed()`` so legacy behaviour is unchanged.
+    """
+    with profile_model_call(
+        component=(
+            "boogu_complete_entity"
+            if prepared.operation == "complete_entity"
+            else "boogu_add_entity_background"
+        ),
+        operation=prepared.operation,
+        retry_index=0,
+        model=type(backend).__name__,
+        input_text_chars=len(prepared.instruction),
+        input_image_count=1,
+        metadata={
+            "width": prepared.width,
+            "height": prepared.height,
+            "thinking_enabled": prepared.thinking_enabled,
+            "instruction_rewrite_enabled": prepared.instruction_rewrite_enabled,
+            "generation_seed": seed,
+        },
+    ):
+        output = backend.edit(
+            source_rgb=prepared.source_input_rgb.copy(),
+            instruction=prepared.instruction,
+            width=prepared.width,
+            height=prepared.height,
+            thinking_enabled=prepared.thinking_enabled,
+            instruction_rewrite_enabled=prepared.instruction_rewrite_enabled,
+            seed=seed,
+        )
+    if output.original_instruction != prepared.instruction:
+        raise RuntimeError("backend changed original instruction metadata")
+    candidate_rgb = _validated_native_png(
+        output.png_bytes,
+        expected_size=(prepared.width, prepared.height),
+    )
+    _write_bytes_atomic(prepared.candidate_path, output.png_bytes)
+    return BooguGenerationResult(
+        output=output,
+        seed=seed,
+        output_sha256=_sha256_bytes(output.png_bytes),
+        candidate_rgb=candidate_rgb,
+    )
+
+
+def run_boogu_qwen_review(
+    prepared: PreparedBooguReferenceEditAttempt,
+    generation: BooguGenerationResult,
+    judge: BooguReferenceEditJudge,
+) -> BooguQwenReview:
+    """One Qwen review call over the frozen prepared inputs and candidate."""
+    review = judge.review(
+        operation=prepared.operation,
+        source_rgba=prepared.source_rgba.copy(),
+        source_input_rgb=prepared.source_input_rgb.copy(),
+        comparison_source_rgb=(
+            prepared.comparison_source_rgb.copy()
+            if prepared.comparison_source_rgb is not None
+            else None
+        ),
+        candidate_rgb=generation.candidate_rgb.copy(),
+        entity_phrase=prepared.entity_phrase,
+        reference_type=prepared.reference_type,
+    )
+    _validate_qwen_review_type(prepared.operation, review)
+    return review
+
+
+def run_boogu_sam_review(
+    prepared: PreparedBooguReferenceEditAttempt,
+    generation: BooguGenerationResult,
+    sam_reviewer: BooguSamReviewer | None,
+) -> BooguSamReview | None:
+    """One SAM review call; ``None`` when no reviewer is configured."""
+    if sam_reviewer is None:
+        return None
+    with profile_model_call(
+        component="sam3_boogu_review",
+        operation=prepared.operation,
+        retry_index=0,
+        model=type(sam_reviewer).__name__,
+        input_text_chars=len(prepared.entity_phrase),
+        input_image_count=2,
+        metadata={"reference_type": prepared.reference_type},
+    ):
+        review = sam_reviewer.review(
+            operation=prepared.operation,
+            source_rgba=prepared.geometry_source_rgba.copy(),
+            candidate_rgb=generation.candidate_rgb.copy(),
+            entity_phrase=prepared.entity_phrase,
+            reference_type=prepared.reference_type,
+        )
+    if not isinstance(review, BooguSamReview):
+        raise TypeError("sam_reviewer must return BooguSamReview")
+    return review
+
+
+def finalize_boogu_reference_edit_attempt(
+    prepared: PreparedBooguReferenceEditAttempt,
+    generation: BooguGenerationResult | None,
+    *,
+    qwen_review: BooguQwenReview | None,
+    qwen_review_skipped_reason: str | None,
+    sam_review: BooguSamReview | None,
+    rejection_reason_override: str | None = None,
+) -> BooguReferenceEditResult:
+    """CPU publication for one attempt: metadata, acceptance, artifacts.
+
+    Never calls a model. The tiny-source and model-exception paths hand in a
+    ``rejection_reason_override`` and a ``generation`` of ``None``.
+    """
+    geometry_metadata = _sam_geometry_metadata(sam_review)
+    sam_warning: str | None = None
+    qwen_accepted = qwen_review is not None and qwen_review.verdict == "accept"
+    sam_accepted = sam_review is None or sam_review.passed
+    if (
+        prepared.operation == "add_entity_background"
+        and geometry_metadata
+        and not geometry_metadata["geometry_gate_passed"]
+    ):
+        sam_accepted = False
+    if (
+        qwen_accepted
+        and prepared.operation == "add_entity_background"
+        and sam_review is not None
+        and sam_review.diagnostics["failure_kind"] == "not_found"
+    ):
+        sam_accepted = True
+        sam_warning = "target_not_found"
+    accepted = bool(generation is not None and qwen_accepted and sam_accepted)
+    if not accepted:
+        rejection_reason = (
+            rejection_reason_override
+            if rejection_reason_override is not None
+            else (
+                str(geometry_metadata["geometry_rejection_reason"])
+                if prepared.operation == "add_entity_background"
+                and geometry_metadata
+                and not geometry_metadata["geometry_gate_passed"]
+                else qwen_review_skipped_reason
+                if qwen_review_skipped_reason is not None
+                else _background_qwen_rejection_reason(qwen_review)
+                if isinstance(qwen_review, BooguBackgroundReview)
+                and qwen_review.verdict == "reject"
+                else qwen_review.reason
+                if qwen_review is not None and qwen_review.verdict == "reject"
+                else sam_review.reason
+                if sam_review is not None
+                else "candidate_rejected"
+            )
+        )
+    else:
+        rejection_reason = None
+    output = generation.output if generation is not None else None
+    output_sha256 = generation.output_sha256 if generation is not None else None
+    source_ratio = prepared.source_rgba.width / prepared.source_rgba.height
+    output_ratio = prepared.width / prepared.height
+    metadata: dict[str, Any] = {
+        "schema_version": 1,
+        "backend": "boogu_image_0_1_edit_turbo",
+        "clip_uid": prepared.clip_uid,
+        "entity_id": prepared.entity_id,
+        "status": "accepted" if accepted else "rejected",
+        "operation": prepared.operation,
+        "completion_attempt_index": prepared.completion_attempt_index,
+        "completion_source_candidate_id": prepared.completion_source_candidate_id,
+        "completion_source_frame_index": prepared.completion_source_frame_index,
+        "entity_phrase": prepared.entity_phrase,
+        "grounding_prompt": prepared.grounding_prompt,
+        "source_dimensions": {
+            "width": prepared.source_rgba.width,
+            "height": prepared.source_rgba.height,
+        },
+        "resolved_output_dimensions": {
+            "width": prepared.width,
+            "height": prepared.height,
+        },
+        "target_area": prepared.target_area,
+        "alignment": prepared.alignment,
+        "source_aspect_ratio": source_ratio,
+        "output_aspect_ratio": output_ratio,
+        "aspect_ratio_error": abs(output_ratio - source_ratio) / source_ratio,
+        "output_pixel_count": prepared.width * prepared.height,
+        "model_name": BOOGU_MODEL_NAME,
+        "model_revision": prepared.model_revision,
+        "original_instruction": prepared.instruction,
+        "rewritten_instruction": (
+            output.rewritten_instruction if output is not None else None
+        ),
+        "effective_instruction": (
+            output.effective_instruction if output is not None else prepared.instruction
+        ),
+        "thinking_enabled": prepared.thinking_enabled,
+        "instruction_rewrite_enabled": prepared.instruction_rewrite_enabled,
+        "generation_seed": generation.seed if generation is not None else None,
+        "output_sha256": output_sha256,
+        "canonical_source_sha256": prepared.canonical_sha256,
+        "source_image_path": prepared.source_evidence_path.relative_to(
+            prepared.root
+        ).as_posix(),
+        "source_image_sha256": prepared.source_sha256,
+        "source_geometry_image_path": prepared.geometry_source_path.relative_to(
+            prepared.root
+        ).as_posix(),
+        "source_geometry_image_sha256": prepared.geometry_source_sha256,
+        "source_input_rgb_path": prepared.source_input_path.relative_to(
+            prepared.root
+        ).as_posix(),
+        "comparison_source_image_path": (
+            prepared.comparison_source_path.relative_to(prepared.root).as_posix()
+            if prepared.comparison_source_path is not None
+            else None
+        ),
+        "comparison_source_image_sha256": (
+            _sha256_bytes(prepared.comparison_source_path.read_bytes())
+            if prepared.comparison_source_path is not None
+            else None
+        ),
+        "generated_reference_sha256": output_sha256,
+        "qwen_review": (
+            qwen_review.model_dump(mode="json") if qwen_review is not None else None
+        ),
+        "qwen_review_skipped_reason": qwen_review_skipped_reason,
+        "sam_review": (
+            sam_review.model_dump(mode="json") if sam_review is not None else None
+        ),
+        "sam_warning": sam_warning,
+        "sam_mask_usage": "review_only",
+        "fallback_status": "not_used" if accepted else prepared.fallback_status,
+        "candidate_path": (
+            prepared.candidate_name
+            if prepared.candidate_path.is_file()
+            else None
+        ),
+        "worker_metadata": output.worker_metadata if output is not None else {},
+        **source_geometry_metadata(
+            prepared.source_content_geometry,
+            source_gate_reason=prepared.source_gate_reason,
+        ),
+        **geometry_metadata,
+    }
+    write_json_atomic(prepared.metadata_path, metadata)
+
+    canonical_path = (
+        prepared.root
+        / "clips"
+        / prepared.clip_uid
+        / "selected"
+        / f"{prepared.entity_id}.png"
+    )
+    if _sha256_bytes(canonical_path.read_bytes()) != prepared.canonical_sha256:
+        raise RuntimeError("canonical reference changed during Boogu reference edit")
+
+    if accepted:
+        if (
+            not prepared.candidate_path.is_file()
+            or generation is None
+            or generation.output_sha256 is None
+        ):
+            raise RuntimeError("accepted Boogu edit has no candidate artifact")
+        publication = None
+        if prepared.publish_final:
+            publication = publish_boogu_final_reference(
+                run_root=prepared.root,
+                clip_uid=prepared.clip_uid,
+                entity_id=prepared.entity_id,
+                candidate_path=prepared.candidate_path,
+                selected_metadata_path=prepared.metadata_path,
+                completion_metadata_path=(
+                    prepared.metadata_path
+                    if prepared.operation == "complete_entity"
+                    else None
+                ),
+                background_metadata_path=(
+                    prepared.metadata_path
+                    if prepared.operation == "add_entity_background"
+                    else None
+                ),
+                final_selection=(
+                    "completion_candidate"
+                    if prepared.operation == "complete_entity"
+                    else "background_candidate"
+                ),
+                final_selection_reason=(
+                    "accepted_completion_candidate"
+                    if prepared.operation == "complete_entity"
+                    else "accepted_background_candidate_preferred_over_source"
+                ),
+            )
+        prepared.rejection_path.unlink(missing_ok=True)
+        return BooguReferenceEditResult(
+            status="accepted",
+            operation=prepared.operation,
+            candidate_path=prepared.candidate_path,
+            final_reference_path=(
+                publication.final_reference_path if publication is not None else None
+            ),
+            metadata_path=prepared.metadata_path,
+            rejection_path=None,
+            fallback_status="not_used",
+        )
+
+    if prepared.publish_final:
+        prepared.final_path.unlink(missing_ok=True)
+        prepared.final_metadata_path.unlink(missing_ok=True)
+    rejection = {
+        "schema_version": 1,
+        "status": "rejected",
+        "operation": prepared.operation,
+        "reason": rejection_reason or "candidate_rejected",
+        "canonical_source_sha256": prepared.canonical_sha256,
+        "candidate_sha256": output_sha256,
+        "fallback_status": prepared.fallback_status,
+    }
+    write_json_atomic(prepared.rejection_path, rejection)
+    return BooguReferenceEditResult(
+        status="rejected",
+        operation=prepared.operation,
+        candidate_path=(
+            prepared.candidate_path if prepared.candidate_path.is_file() else None
+        ),
+        final_reference_path=None,
+        metadata_path=prepared.metadata_path,
+        rejection_path=prepared.rejection_path,
+        fallback_status=prepared.fallback_status,
+    )
+
+
+def run_boogu_reference_edit(
+    *,
+    run_root: Path,
+    clip_uid: str,
+    entity_id: str,
+    operation: BooguEditOperation,
+    instruction: str,
+    entity_phrase: str,
+    grounding_prompt: str | None = None,
+    reference_type: ReferenceType,
+    backend: BooguReferenceEditBackend,
+    judge: BooguReferenceEditJudge,
+    sam_reviewer: BooguSamReviewer | None = None,
+    instruction_rewrite_enabled: bool | None = None,
+    target_area: int = DEFAULT_TARGET_AREA,
+    alignment: int = DEFAULT_ALIGNMENT,
+    min_source_content_area_pixels: int = DEFAULT_MIN_SOURCE_CONTENT_AREA_PIXELS,
+    min_source_content_long_side_pixels: int = (
+        DEFAULT_MIN_SOURCE_CONTENT_LONG_SIDE_PIXELS
+    ),
+    model_revision: str = BOOGU_MODEL_REVISION,
+    fallback_status: str = "canonical_preserved",
+    source_image_path: Path | None = None,
+    geometry_source_image_path: Path | None = None,
+    comparison_source_image_path: Path | None = None,
+    completion_attempt_index: int | None = None,
+    completion_source_candidate_id: str | None = None,
+    completion_source_frame_index: int | None = None,
+    publish_final: bool = True,
+    overwrite: bool = False,
+    review_execution: Literal["sequential", "parallel_independent"] = "sequential",
+    review_observer: Callable[[dict[str, int | float]], None] | None = None,
+) -> BooguReferenceEditResult:
+    """Generate, review, and publish one native Boogu reference artifact.
+
+    The public authority stays this wrapper; the five resource-epoch-ready
+    stages it composes are ``prepare_boogu_reference_edit_attempt``,
+    ``run_boogu_reference_edit_generation``, ``run_boogu_qwen_review``,
+    ``run_boogu_sam_review`` and ``finalize_boogu_reference_edit_attempt``.
+    """
+    if review_execution not in {"sequential", "parallel_independent"}:
+        raise ValueError(f"unsupported review execution: {review_execution}")
+
+    prepared = prepare_boogu_reference_edit_attempt(
+        run_root=run_root,
+        clip_uid=clip_uid,
+        entity_id=entity_id,
+        operation=operation,
+        instruction=instruction,
+        entity_phrase=entity_phrase,
+        grounding_prompt=grounding_prompt,
+        reference_type=reference_type,
+        instruction_rewrite_enabled=instruction_rewrite_enabled,
+        target_area=target_area,
+        alignment=alignment,
+        min_source_content_area_pixels=min_source_content_area_pixels,
+        min_source_content_long_side_pixels=min_source_content_long_side_pixels,
+        model_revision=model_revision,
+        fallback_status=fallback_status,
+        source_image_path=source_image_path,
+        geometry_source_image_path=geometry_source_image_path,
+        comparison_source_image_path=comparison_source_image_path,
+        completion_attempt_index=completion_attempt_index,
+        completion_source_candidate_id=completion_source_candidate_id,
+        completion_source_frame_index=completion_source_frame_index,
+        publish_final=publish_final,
+        overwrite=overwrite,
+    )
+
+    generation: BooguGenerationResult | None = None
     qwen_review: BooguQwenReview | None = None
     qwen_review_skipped_reason: str | None = None
     sam_review: BooguSamReview | None = None
-    sam_warning: str | None = None
     rejection_reason: str | None = None
-    accepted = False
     try:
-        if source_gate_reason is not None:
+        if prepared.source_gate_reason is not None:
             rejection_reason = "tiny_source_entity"
             raise _TinySourceRejected
-        generation_seed = new_boogu_seed()
-        with profile_model_call(
-            component=(
-                "boogu_complete_entity"
-                if operation == "complete_entity"
-                else "boogu_add_entity_background"
-            ),
-            operation=operation,
-            retry_index=0,
-            model=type(backend).__name__,
-            input_text_chars=len(instruction),
-            input_image_count=1,
-            metadata={
-                "width": width,
-                "height": height,
-                "thinking_enabled": thinking_enabled,
-                "instruction_rewrite_enabled": instruction_rewrite_enabled,
-                "generation_seed": generation_seed,
-            },
-        ):
-            output = backend.edit(
-                source_rgb=source_input_rgb.copy(),
-                instruction=instruction,
-                width=width,
-                height=height,
-                thinking_enabled=thinking_enabled,
-                instruction_rewrite_enabled=instruction_rewrite_enabled,
-                seed=generation_seed,
-            )
-        if output.original_instruction != instruction:
-            raise RuntimeError("backend changed original instruction metadata")
-        candidate_rgb = _validated_native_png(
-            output.png_bytes,
-            expected_size=(width, height),
+        generation = run_boogu_reference_edit_generation(
+            prepared, backend, seed=new_boogu_seed()
         )
-        _write_bytes_atomic(candidate_path, output.png_bytes)
-        output_sha256 = _sha256_bytes(output.png_bytes)
 
         def run_qwen_review() -> BooguQwenReview:
-            review = judge.review(
-                operation=operation,
-                source_rgba=source_rgba.copy(),
-                source_input_rgb=source_input_rgb.copy(),
-                comparison_source_rgb=(
-                    comparison_source_rgb.copy()
-                    if comparison_source_rgb is not None
-                    else None
-                ),
-                candidate_rgb=candidate_rgb.copy(),
-                entity_phrase=entity_phrase,
-                reference_type=reference_type,
-            )
-            _validate_qwen_review_type(operation, review)
-            return review
+            return run_boogu_qwen_review(prepared, generation, judge)
 
         def run_sam_review() -> BooguSamReview | None:
-            if sam_reviewer is None:
-                return None
-            with profile_model_call(
-                component="sam3_boogu_review",
-                operation=operation,
-                retry_index=0,
-                model=type(sam_reviewer).__name__,
-                input_text_chars=len(entity_phrase),
-                input_image_count=2,
-                metadata={"reference_type": reference_type},
-            ):
-                review = sam_reviewer.review(
-                    operation=operation,
-                    source_rgba=geometry_source_rgba.copy(),
-                    candidate_rgb=candidate_rgb.copy(),
-                    entity_phrase=entity_phrase,
-                    reference_type=reference_type,
-                )
-            if not isinstance(review, BooguSamReview):
-                raise TypeError("sam_reviewer must return BooguSamReview")
-            return review
+            return run_boogu_sam_review(prepared, generation, sam_reviewer)
 
-        if operation == "add_entity_background":
+        if prepared.operation == "add_entity_background":
             sam_review = run_sam_review()
-            geometry_metadata = _sam_geometry_metadata(sam_review)
             qwen_review_skipped_reason = _background_qwen_skip_reason(
                 sam_review,
-                geometry_metadata,
+                _sam_geometry_metadata(sam_review),
             )
             if qwen_review_skipped_reason is None:
                 qwen_review = run_qwen_review()
@@ -1707,42 +2153,6 @@ def run_boogu_reference_edit(
             else:
                 qwen_review = run_qwen_review()
                 sam_review = run_sam_review()
-            geometry_metadata = _sam_geometry_metadata(sam_review)
-
-        qwen_accepted = qwen_review is not None and qwen_review.verdict == "accept"
-        sam_accepted = sam_review is None or sam_review.passed
-        if (
-            operation == "add_entity_background"
-            and geometry_metadata
-            and not geometry_metadata["geometry_gate_passed"]
-        ):
-            sam_accepted = False
-        if (
-            qwen_accepted
-            and operation == "add_entity_background"
-            and sam_review is not None
-            and sam_review.diagnostics["failure_kind"] == "not_found"
-        ):
-            sam_accepted = True
-            sam_warning = "target_not_found"
-        accepted = qwen_accepted and sam_accepted
-        if not accepted:
-            rejection_reason = (
-                str(geometry_metadata["geometry_rejection_reason"])
-                if operation == "add_entity_background"
-                and geometry_metadata
-                and not geometry_metadata["geometry_gate_passed"]
-                else qwen_review_skipped_reason
-                if qwen_review_skipped_reason is not None
-                else _background_qwen_rejection_reason(qwen_review)
-                if isinstance(qwen_review, BooguBackgroundReview)
-                and qwen_review.verdict == "reject"
-                else qwen_review.reason
-                if qwen_review is not None and qwen_review.verdict == "reject"
-                else sam_review.reason
-                if sam_review is not None
-                else "candidate_rejected"
-            )
     except _TinySourceRejected:
         pass
     except (
@@ -1752,149 +2162,17 @@ def run_boogu_reference_edit(
         ValueError,
         subprocess.SubprocessError,
     ) as exc:
-        accepted = False
         rejection_reason = f"boogu_reference_edit_failed: {exc}"
 
-    source_ratio = source_rgba.width / source_rgba.height
-    output_ratio = width / height
-    metadata: dict[str, Any] = {
-        "schema_version": 1,
-        "backend": "boogu_image_0_1_edit_turbo",
-        "clip_uid": clip_uid,
-        "entity_id": entity_id,
-        "status": "accepted" if accepted else "rejected",
-        "operation": operation,
-        "completion_attempt_index": completion_attempt_index,
-        "completion_source_candidate_id": completion_source_candidate_id,
-        "completion_source_frame_index": completion_source_frame_index,
-        "entity_phrase": entity_phrase,
-        "grounding_prompt": grounding_prompt,
-        "source_dimensions": {
-            "width": source_rgba.width,
-            "height": source_rgba.height,
-        },
-        "resolved_output_dimensions": {"width": width, "height": height},
-        "target_area": target_area,
-        "alignment": alignment,
-        "source_aspect_ratio": source_ratio,
-        "output_aspect_ratio": output_ratio,
-        "aspect_ratio_error": abs(output_ratio - source_ratio) / source_ratio,
-        "output_pixel_count": width * height,
-        "model_name": BOOGU_MODEL_NAME,
-        "model_revision": model_revision,
-        "original_instruction": instruction,
-        "rewritten_instruction": (
-            output.rewritten_instruction if output is not None else None
-        ),
-        "effective_instruction": (
-            output.effective_instruction if output is not None else instruction
-        ),
-        "thinking_enabled": thinking_enabled,
-        "instruction_rewrite_enabled": instruction_rewrite_enabled,
-        "generation_seed": generation_seed,
-        "output_sha256": output_sha256,
-        "canonical_source_sha256": canonical_sha256,
-        "source_image_path": source_evidence_path.relative_to(root).as_posix(),
-        "source_image_sha256": source_sha256,
-        "source_geometry_image_path": geometry_source_path.relative_to(root).as_posix(),
-        "source_geometry_image_sha256": geometry_source_sha256,
-        "source_input_rgb_path": source_input_path.relative_to(root).as_posix(),
-        "comparison_source_image_path": (
-            comparison_source_path.relative_to(root).as_posix()
-            if comparison_source_path is not None
-            else None
-        ),
-        "comparison_source_image_sha256": (
-            _sha256_bytes(comparison_source_path.read_bytes())
-            if comparison_source_path is not None
-            else None
-        ),
-        "generated_reference_sha256": output_sha256,
-        "qwen_review": (
-            qwen_review.model_dump(mode="json") if qwen_review is not None else None
-        ),
-        "qwen_review_skipped_reason": qwen_review_skipped_reason,
-        "sam_review": (
-            sam_review.model_dump(mode="json") if sam_review is not None else None
-        ),
-        "sam_warning": sam_warning,
-        "sam_mask_usage": "review_only",
-        "fallback_status": "not_used" if accepted else fallback_status,
-        "candidate_path": candidate_name if candidate_path.is_file() else None,
-        "worker_metadata": output.worker_metadata if output is not None else {},
-        **source_geometry_metadata(
-            source_content_geometry,
-            source_gate_reason=source_gate_reason,
-        ),
-        **_sam_geometry_metadata(sam_review),
-    }
-    write_json_atomic(metadata_path, metadata)
-
-    if _sha256_bytes(canonical_path.read_bytes()) != canonical_sha256:
-        raise RuntimeError("canonical reference changed during Boogu reference edit")
-
-    if accepted:
-        if not candidate_path.is_file() or output_sha256 is None:
-            raise RuntimeError("accepted Boogu edit has no candidate artifact")
-        publication = None
-        if publish_final:
-            publication = publish_boogu_final_reference(
-                run_root=root,
-                clip_uid=clip_uid,
-                entity_id=entity_id,
-                candidate_path=candidate_path,
-                selected_metadata_path=metadata_path,
-                completion_metadata_path=(
-                    metadata_path if operation == "complete_entity" else None
-                ),
-                background_metadata_path=(
-                    metadata_path if operation == "add_entity_background" else None
-                ),
-                final_selection=(
-                    "completion_candidate"
-                    if operation == "complete_entity"
-                    else "background_candidate"
-                ),
-                final_selection_reason=(
-                    "accepted_completion_candidate"
-                    if operation == "complete_entity"
-                    else "accepted_background_candidate_preferred_over_source"
-                ),
-            )
-        rejection_path.unlink(missing_ok=True)
-        return BooguReferenceEditResult(
-            status="accepted",
-            operation=operation,
-            candidate_path=candidate_path,
-            final_reference_path=(
-                publication.final_reference_path if publication is not None else None
-            ),
-            metadata_path=metadata_path,
-            rejection_path=None,
-            fallback_status="not_used",
-        )
-
-    if publish_final:
-        final_path.unlink(missing_ok=True)
-        final_metadata_path.unlink(missing_ok=True)
-    rejection = {
-        "schema_version": 1,
-        "status": "rejected",
-        "operation": operation,
-        "reason": rejection_reason or "candidate_rejected",
-        "canonical_source_sha256": canonical_sha256,
-        "candidate_sha256": output_sha256,
-        "fallback_status": fallback_status,
-    }
-    write_json_atomic(rejection_path, rejection)
-    return BooguReferenceEditResult(
-        status="rejected",
-        operation=operation,
-        candidate_path=candidate_path if candidate_path.is_file() else None,
-        final_reference_path=None,
-        metadata_path=metadata_path,
-        rejection_path=rejection_path,
-        fallback_status=fallback_status,
+    # CPU finalize owns acceptance, publication and rejection artifacts. The
+    # tiny-source and exception paths override the durable rejection reason.
+    return finalize_boogu_reference_edit_attempt(
+        prepared,
+        generation,
+        qwen_review=qwen_review,
+        qwen_review_skipped_reason=qwen_review_skipped_reason,
+        sam_review=sam_review,
+        rejection_reason_override=rejection_reason,
     )
 
 

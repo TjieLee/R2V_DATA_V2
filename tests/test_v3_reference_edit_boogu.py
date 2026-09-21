@@ -24,6 +24,7 @@ from r2v_data_v2.v3.reference_edit_boogu import (
     BooguWorkerConfig,
     QwenBooguReferenceEditJudge,
     Sam3BooguReferenceReviewer,
+    prepare_boogu_reference_edit_attempt,
     resolve_boogu_1k_size,
     run_boogu_reference_edit,
 )
@@ -2100,3 +2101,244 @@ def test_production_sam3_boogu_reviewer_classifies_tracking_failure(
 
     assert review.passed is False
     assert review.diagnostics["failure_kind"] == expected_failure_kind
+
+
+# ---------------------------------------------------------------------------
+# 5a characterization: the split stage boundaries keep the frozen behaviour
+# ---------------------------------------------------------------------------
+
+
+def test_split_stages_accepted_completion_call_order_and_artifacts(
+    tmp_path: Path,
+) -> None:
+    """prepare CPU -> Boogu -> Qwen -> SAM -> finalize, artifacts unchanged."""
+    run_root, canonical, canonical_bytes = _environment(tmp_path)
+    events: list[str] = []
+    backend = _Backend(events=events)
+    judge = _Judge(events=events)
+    sam = _SamReviewer(events=events)
+
+    result = run_boogu_reference_edit(
+        run_root=run_root,
+        clip_uid="clip-1",
+        entity_id="e1",
+        operation="complete_entity",
+        instruction="Complete the same entity.",
+        entity_phrase="green object",
+        reference_type="object",
+        backend=backend,
+        judge=judge,
+        sam_reviewer=sam,
+    )
+
+    assert events == ["boogu", "qwen", "sam"], events
+    assert result.status == "accepted"
+    assert result.candidate_path is not None
+    assert result.candidate_path.name == "completion_candidate_1k.png"
+    metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
+    assert metadata["status"] == "accepted"
+    assert metadata["generation_seed"] is not None
+    import hashlib
+
+    assert (
+        metadata["canonical_source_sha256"]
+        == hashlib.sha256(canonical_bytes).hexdigest()
+    )
+    assert result.rejection_path is None
+    assert not canonical_bytes or canonical.read_bytes() == canonical_bytes
+
+
+def test_split_stages_qwen_reject_still_runs_sam(tmp_path: Path) -> None:
+    run_root, _canonical, _canonical_bytes = _environment(tmp_path)
+    events: list[str] = []
+    backend = _Backend(events=events)
+    judge = _Judge(accept=False, events=events)
+    sam = _SamReviewer(passed=True, events=events)
+
+    result = run_boogu_reference_edit(
+        run_root=run_root,
+        clip_uid="clip-1",
+        entity_id="e1",
+        operation="complete_entity",
+        instruction="Complete it.",
+        entity_phrase="green object",
+        reference_type="object",
+        backend=backend,
+        judge=judge,
+        sam_reviewer=sam,
+    )
+
+    assert events.count("boogu") == 1
+    assert events.count("qwen") == 1
+    assert events.count("sam") == 1
+    assert events == ["boogu", "qwen", "sam"]
+    assert result.status == "rejected"
+    rejection = json.loads(result.rejection_path.read_text(encoding="utf-8"))
+    assert rejection["reason"] == _completion_review(accept=False).reason
+
+
+def test_split_stages_qwen_exception_skips_sam_in_sequential_mode(
+    tmp_path: Path,
+) -> None:
+    run_root, _canonical, _canonical_bytes = _environment(tmp_path)
+    events: list[str] = []
+
+    class _ExplodingJudge:
+        def review(self, **kwargs: object) -> object:
+            events.append("qwen")
+            raise RuntimeError("qwen unavailable")
+
+    result = run_boogu_reference_edit(
+        run_root=run_root,
+        clip_uid="clip-1",
+        entity_id="e1",
+        operation="complete_entity",
+        instruction="Complete it.",
+        entity_phrase="green object",
+        reference_type="object",
+        backend=_Backend(events=events),
+        judge=_ExplodingJudge(),
+        sam_reviewer=_SamReviewer(events=events),
+    )
+
+    assert events.count("boogu") == 1
+    assert events.count("qwen") == 1
+    assert events.count("sam") == 0, "a Qwen exception must not run SAM"
+    assert result.status == "rejected"
+    rejection = json.loads(result.rejection_path.read_text(encoding="utf-8"))
+    assert rejection["reason"].startswith("boogu_reference_edit_failed:")
+
+
+def test_split_stages_sam_reject_rejects_candidate(tmp_path: Path) -> None:
+    run_root, _canonical, _canonical_bytes = _environment(tmp_path)
+    events: list[str] = []
+    result = run_boogu_reference_edit(
+        run_root=run_root,
+        clip_uid="clip-1",
+        entity_id="e1",
+        operation="complete_entity",
+        instruction="Complete it.",
+        entity_phrase="green object",
+        reference_type="object",
+        backend=_Backend(events=events),
+        judge=_Judge(events=events),
+        sam_reviewer=_SamReviewer(passed=False, events=events),
+    )
+
+    assert events.count("boogu") == 1
+    assert events.count("qwen") == 1
+    assert events.count("sam") == 1
+    assert result.status == "rejected"
+    metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
+    assert metadata["sam_review"]["passed"] is False
+
+
+def test_split_stages_tiny_source_runs_no_model(tmp_path: Path) -> None:
+    run_root, _canonical, _canonical_bytes = _environment(tmp_path, size=(64, 64))
+    events: list[str] = []
+    result = run_boogu_reference_edit(
+        run_root=run_root,
+        clip_uid="clip-1",
+        entity_id="e1",
+        operation="complete_entity",
+        instruction="Complete it.",
+        entity_phrase="small person",
+        reference_type="subject",
+        backend=_Backend(events=events),
+        judge=_Judge(events=events),
+        sam_reviewer=_SamReviewer(events=events),
+    )
+
+    assert events == [], "the tiny-source gate must run zero model calls"
+    assert result.status == "rejected"
+    rejection = json.loads(result.rejection_path.read_text(encoding="utf-8"))
+    assert rejection["reason"] == "tiny_source_entity"
+
+
+def test_split_stages_parallel_independent_keeps_both_reviews_and_observer(
+    tmp_path: Path,
+) -> None:
+    run_root, _canonical, _canonical_bytes = _environment(tmp_path)
+    events: list[str] = []
+    observed: list[dict[str, int | float]] = []
+    result = run_boogu_reference_edit(
+        run_root=run_root,
+        clip_uid="clip-1",
+        entity_id="e1",
+        operation="complete_entity",
+        instruction="Complete it.",
+        entity_phrase="green object",
+        reference_type="object",
+        backend=_Backend(events=events),
+        judge=_Judge(events=events),
+        sam_reviewer=_SamReviewer(events=events),
+        review_execution="parallel_independent",
+        review_observer=observed.append,
+    )
+
+    assert events.count("boogu") == 1
+    assert events.count("qwen") == 1
+    assert events.count("sam") == 1
+    assert result.status == "accepted"
+    assert observed, "observer telemetry must still fire"
+    metrics = observed[-1]
+    assert metrics["reference_complete_parallel_attempts"] == 1
+    assert metrics["reference_complete_parallel_both_success"] == 1
+    assert "reference_complete_parallel_qwen_seconds" in metrics
+    assert "reference_complete_parallel_sam_seconds" in metrics
+    assert "reference_complete_parallel_wall_seconds" in metrics
+
+
+def test_split_stages_candidate2_artifact_names_are_frozen(tmp_path: Path) -> None:
+    run_root, _canonical, _canonical_bytes = _environment(tmp_path)
+    result = run_boogu_reference_edit(
+        run_root=run_root,
+        clip_uid="clip-1",
+        entity_id="e1",
+        operation="complete_entity",
+        instruction="Complete it again.",
+        entity_phrase="green object",
+        reference_type="object",
+        backend=_Backend(),
+        judge=_Judge(),
+        sam_reviewer=_SamReviewer(),
+        completion_attempt_index=2,
+    )
+
+    assert result.status == "accepted"
+    assert result.candidate_path.name == "completion_candidate_2_1k.png"
+    assert result.metadata_path.name == "completion_metadata_2.json"
+    edit_dir = result.metadata_path.parent
+    assert (edit_dir / "completion_source_input_rgb_2.png").is_file()
+    assert not (edit_dir / "completion_candidate_1k.png").exists()
+
+
+def test_prepare_helper_never_calls_a_model_or_draws_a_seed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """prepare is deterministic: no backend, judge, SAM or seed draw."""
+    run_root, _canonical, _canonical_bytes = _environment(tmp_path)
+    calls: list[str] = []
+    monkeypatch.setattr(
+        boogu_module,
+        "new_boogu_seed",
+        lambda: (_ for _ in ()).throw(AssertionError("prepare must not draw a seed")),
+    )
+
+    prepared = prepare_boogu_reference_edit_attempt(
+        run_root=run_root,
+        clip_uid="clip-1",
+        entity_id="e1",
+        operation="complete_entity",
+        instruction="Complete it.",
+        entity_phrase="green object",
+        reference_type="object",
+    )
+    del calls
+
+    assert prepared.candidate_path.name == "completion_candidate_1k.png"
+    assert prepared.source_gate_reason is None
+    assert prepared.thinking_enabled is True
+    assert prepared.instruction_rewrite_enabled is True
+    assert prepared.width == 1248 and prepared.height == 832
+    assert (prepared.source_input_path).is_file()
