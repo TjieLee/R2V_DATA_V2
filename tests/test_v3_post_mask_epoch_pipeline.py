@@ -13,6 +13,7 @@ model is started. What is proven is the orchestration:
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -1738,3 +1739,192 @@ def test_composition_pair_incomplete_blocks_reference_edit(
     dispatch_log = ",".join(result["stage_dispatch_log"])
     assert "reference_edit_boogu_generate" not in dispatch_log
     assert handles["boogu"].calls == 0
+
+
+def _two_shard_reference_edit_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[V3Config, dict, dict]:
+    """Two independent Pair shards, both with a repairable reference."""
+    from tests.test_v3_pair import pair_clips
+    from tests.test_v3_post_mask_epoch_pair import _ScopedJudge
+
+    config = _config(tmp_path, monkeypatch, "run-a")
+    removal_storage = _pending_storage(config, clip_uids=("clip-1",))
+    storages: dict[str, Any] = {SHARD: removal_storage}
+    eligible: dict[str, Any] = {SHARD: ("clip-1",)}
+    for index, shard in enumerate(("shard-a", "shard-b")):
+        shard_config = _config(tmp_path, monkeypatch, f"run-{index + 1}")
+        storage = _storage(shard_config, entity_types=("subject",))
+        pair_clips(
+            shard_config,
+            storage,
+            judge=_ScopedJudge({("clip-1", "e1"): "repairable"}),
+        )
+        clip = storage.read_clip("clip-1")
+        assert clip.references.entities[0].completeness == "repairable"
+        storages[shard] = storage
+        eligible[shard] = ("clip-1",)
+    return config, storages, eligible
+
+
+def _run_two_shard_composition(
+    config: V3Config,
+    storages: dict,
+    eligible: dict,
+    *,
+    after_reference_edit: Any = None,
+) -> dict[str, Any]:
+    from r2v_data_v2.v3.post_mask_epoch_reference_edit import (
+        ReferenceEditEpochRunner,
+    )
+
+    ledger = GroupLedger(Path(storages[SHARD].root).parent.parent / "epoch-ledger")
+    timeline: list[str] = []
+    holder = _DispatchHolder()
+    manager, _handles = _composition_manager(holder, timeline)
+
+    def make(runner: Any, dispatch: Any) -> Any:
+        holder.dispatch = dispatch
+        return ResourceEpochScheduler(
+            ledger=ledger,
+            finalize=runner.finalize,
+            resource_manager=manager,
+            close_resource_manager_on_exit=False,
+        )
+
+    def reference_edit_scheduler(runner: Any, dispatch: Any) -> Any:
+        holder.dispatch = dispatch
+        scheduler = ResourceEpochScheduler(
+            ledger=ledger,
+            finalize=runner.finalize,
+            resource_manager=manager,
+            close_resource_manager_on_exit=False,
+        )
+        if after_reference_edit is None:
+            return scheduler
+
+        class _Hooked:
+            def run(self, jobs: Any) -> Any:
+                outcome = scheduler.run(jobs)
+                after_reference_edit()
+                return outcome
+
+        return _Hooked()
+
+    return run_removal_pair_resource_session(
+        config=config,
+        storages=storages,
+        eligible_clip_uids_by_shard=eligible,
+        ledger=ledger,
+        manager=manager,
+        build_removal_scheduler=make,
+        build_pair_scheduler=make,
+        build_reference_edit_scheduler=reference_edit_scheduler,
+        reference_edit_runner_factory=(
+            lambda **kwargs: ReferenceEditEpochRunner(
+                kwargs["config"],
+                kwargs["storages"],
+                kwargs["ledger"],
+                eligible_clip_uids_by_shard=kwargs[
+                    "eligible_clip_uids_by_shard"
+                ],
+            )
+        ),
+    )
+
+
+def test_two_shard_reconcile_failure_writes_zero_partial_stage_counts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One failing shard must not leave partial counts on its sibling."""
+    config, storages, eligible = _two_shard_reference_edit_fixture(
+        tmp_path, monkeypatch
+    )
+    pair_shards = [shard for shard in storages if shard != SHARD]
+    snapshot: dict[str, dict[str, int]] = {}
+
+    def corrupt_shard_b() -> None:
+        """Snapshot both shards, then corrupt shard B's publication."""
+        import r2v_data_v2.v3.storage as storage_module
+
+        for shard in pair_shards:
+            snapshot[shard] = dict(storages[shard].read_run().counts)
+        storage_b = storages["shard-b"]
+        clip = storage_b.read_clip("clip-1")
+        assert clip.reference_edit is not None
+        tampered = [
+            entity.model_copy(update={"metadata_path": "clips/tampered.json"})
+            if index == 0
+            else entity
+            for index, entity in enumerate(clip.reference_edit.entities)
+        ]
+        storage_module.write_json_atomic(
+            storage_b.clip_path("clip-1"),
+            clip.model_copy(
+                update={
+                    "reference_edit": clip.reference_edit.model_copy(
+                        update={"entities": tampered}
+                    )
+                }
+            ).model_dump(mode="json"),
+        )
+
+    result = _run_two_shard_composition(
+        config, storages, eligible, after_reference_edit=corrupt_shard_b
+    )
+
+    assert result["reference_edit_completed"] is False
+    assert result["reference_edit_stats"] == {}
+    assert result["reference_edit_reconcile_error"], "the failure must be reported"
+    for shard in pair_shards:
+        after = dict(storages[shard].read_run().counts)
+        # The snapshot is taken after Pair wrote its counts and before the
+        # Reference Edit reconcile, so ANY difference here is partial work.
+        assert after == snapshot[shard], f"{shard} was left with partial counts"
+        assert not any(
+            key.startswith("reference_edit.") for key in after
+        ), f"{shard} has partial reference_edit keys"
+
+    # Restart with the shard repaired: both shards are written atomically.
+    import r2v_data_v2.v3.storage as storage_module
+    from r2v_data_v2.v3.post_mask_epoch_reference_edit import (
+        ReferenceEditEpochRunner,
+    )
+
+    storage_b = storages["shard-b"]
+    stored = storage_b.read_clip("clip-1")
+    ledger_root = Path(storages[SHARD].root).parent.parent / "epoch-ledger"
+    repair = ReferenceEditEpochRunner(
+        config,
+        {"shard-b": storage_b},
+        GroupLedger(ledger_root),
+        eligible_clip_uids_by_shard={"shard-b": ["clip-1"]},
+    )
+    # Read the frozen plan directly: the strict verifier intentionally refuses
+    # the tampered state we are about to repair.
+    plan = json.loads(
+        Path(repair._plan_path("shard-b")).read_text(encoding="utf-8")
+    )
+    expected = repair._reconstruct_clip_publication(
+        "shard-b", storage_b, "clip-1", plan["clips"]["clip-1"]
+    )
+    storage_module.write_json_atomic(
+        storage_b.clip_path("clip-1"),
+        stored.model_copy(
+            update={
+                "references": expected[0],
+                "pairing": expected[1],
+                "reference_edit": expected[2],
+            }
+        ).model_dump(mode="json"),
+    )
+
+    second = _run_two_shard_composition(config, storages, eligible)
+    assert second["reference_edit_completed"] is True, second.get(
+        "reference_edit_reconcile_error"
+    )
+    for shard in pair_shards:
+        counts = storages[shard].read_run().counts
+        stats = second["reference_edit_stats"][shard]
+        for field, value in stats.items():
+            assert counts[f"reference_edit.{field}"] == value, (shard, field)

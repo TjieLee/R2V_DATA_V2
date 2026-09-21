@@ -99,13 +99,26 @@ def _reference_edit_completion_evidence(
 ) -> bool:
     """True when the Reference Edit stage durably completed for these storages.
 
-    Evidence is the frozen Reference Edit plan plus a terminal clip outcome
-    marker for every fresh clip it planned. The composition barrier guarantees
-    Pair completed before any of that could be written, so on a full-session
-    restart the Pair CPU replay -- which compares live published state against
-    the Pair-only reconstruction and cannot know that Reference Edit
-    legitimately rewrote references afterwards -- must not run again.
+    This is a RESTART OPTIMIZATION, never a semantic authority: it only decides
+    whether the Pair CPU replay may be skipped, and the Reference Edit stage
+    itself still runs its full plan/seed_jobs/reconcile verification right
+    after. Malformed or wrongly-shaped durable files therefore report False
+    instead of steering the session into the fast path.
+
+    Evidence is a well-formed frozen Reference Edit plan plus a well-formed
+    terminal clip outcome marker for every fresh clip it planned. The
+    composition barrier guarantees Pair completed before any of that could be
+    written, so on a full-session restart the Pair replay -- which compares
+    live published state against the Pair-only reconstruction and cannot know
+    that Reference Edit legitimately rewrote references afterwards -- must not
+    run again.
     """
+    from r2v_data_v2.v3.post_mask_epoch_reference_edit import (
+        CLIP_FRESH_TARGET,
+        REFERENCE_EDIT_CLIP_OUTCOME_SCHEMA,
+        REFERENCE_EDIT_PLAN_SCHEMA,
+    )
+
     semantic_root = Path(ledger.root) / "semantic" / "reference_edit"
     plan_root = semantic_root / "primary"
     outcomes_root = semantic_root / "outcomes"
@@ -117,12 +130,36 @@ def _reference_edit_completion_evidence(
             return False
         try:
             plan = json.loads(plan_path.read_text(encoding="utf-8"))
-        except ValueError:
+        except (ValueError, OSError):
             return False
-        for clip_uid, entry in (plan.get("clips") or {}).items():
-            if entry.get("classification") != "fresh_target":
+        if not isinstance(plan, dict):
+            return False
+        if plan.get("schema") != REFERENCE_EDIT_PLAN_SCHEMA:
+            return False
+        if plan.get("canonical_shard") != shard:
+            return False
+        clips = plan.get("clips")
+        if not isinstance(clips, dict):
+            return False
+        for clip_uid, entry in clips.items():
+            if not isinstance(entry, dict):
+                return False
+            if entry.get("classification") != CLIP_FRESH_TARGET:
                 continue
-            if not (outcomes_root / shard / f"{clip_uid}.json").is_file():
+            marker_path = outcomes_root / shard / f"{clip_uid}.json"
+            if not marker_path.is_file():
+                return False
+            try:
+                marker = json.loads(marker_path.read_text(encoding="utf-8"))
+            except (ValueError, OSError):
+                return False
+            if not isinstance(marker, dict):
+                return False
+            if marker.get("schema") != REFERENCE_EDIT_CLIP_OUTCOME_SCHEMA:
+                return False
+            if marker.get("clip_uid") != clip_uid:
+                return False
+            if marker.get("terminal") not in {"ready", "failed"}:
                 return False
     return True
 
@@ -140,6 +177,32 @@ def _pair_stats_from_stage_counts(storages: Mapping[str, Any]) -> dict[str, Any]
         if recovered:
             stats[shard] = recovered
     return stats
+
+
+def _reconcile_and_publish_reference_edit_stats(
+    reference_edit: Any,
+) -> tuple[bool, dict[str, Any], str | None]:
+    """Two-phase Reference Edit completion + stage-count publication.
+
+    Phase 1 reconciles EVERY shard with no writes at all. Phase 2 writes the
+    stage counts only when every shard reconciled: one failing shard must not
+    leave any other shard with partial ``reference_edit.*`` counts.
+
+    Returns ``(completed, stats, error)``.
+    """
+    reconciled: dict[str, dict[str, Any]] = {}
+    try:
+        for shard in sorted(reference_edit.storages):
+            stats = reference_edit.reconcile_stats(shard)
+            reconciled[shard] = stats.to_dict()
+    except ReferenceEditEpochError as exc:
+        # Durable corruption/incompleteness: write nothing, report incomplete.
+        return False, {}, str(exc)
+    for shard, payload in reconciled.items():
+        reference_edit.storages[shard].update_stage_counts(
+            "reference_edit", payload
+        )
+    return True, reconciled, None
 
 
 def run_removal_pair_epochs(
@@ -240,19 +303,11 @@ def run_removal_pair_epochs(
         reference_edit_completed = False
         reconcile_error: str | None = None
         if not reference_edit_unresolved:
-            try:
-                for shard in sorted(reference_edit.storages):
-                    stats = reference_edit.reconcile_stats(shard)
-                    payload = stats.to_dict()
-                    reference_edit.storages[shard].update_stage_counts(
-                        "reference_edit", payload
-                    )
-                    reference_edit_stats[shard] = payload
-            except ReferenceEditEpochError as exc:
-                reconcile_error = str(exc)
-                reference_edit_stats = {}
-            else:
-                reference_edit_completed = True
+            (
+                reference_edit_completed,
+                reference_edit_stats,
+                reconcile_error,
+            ) = _reconcile_and_publish_reference_edit_stats(reference_edit)
         result.update(
             {
                 "reference_edit_completed": reference_edit_completed,
@@ -345,24 +400,17 @@ def run_removal_pair_epochs(
     reference_edit_stats: dict[str, Any] = {}
     # Completion is confirmed by the durable reconcile, not by the scheduler
     # alone: every shard must reconcile (which re-verifies each fresh clip's
-    # terminal publication) before any stage count is written.
+    # terminal publication) before any stage count is written. The reconcile
+    # and the publication are strictly two-phase so a failing shard can never
+    # leave partial stage counts behind on its siblings.
     reference_edit_completed = False
     reconcile_error: str | None = None
     if not reference_edit_unresolved:
-        try:
-            for shard in sorted(reference_edit.storages):
-                stats = reference_edit.reconcile_stats(shard)
-                payload = stats.to_dict()
-                reference_edit.storages[shard].update_stage_counts(
-                    "reference_edit", payload
-                )
-                reference_edit_stats[shard] = payload
-        except ReferenceEditEpochError as exc:
-            # Durable corruption: no partial stage counts, not completed.
-            reconcile_error = str(exc)
-            reference_edit_stats = {}
-        else:
-            reference_edit_completed = True
+        (
+            reference_edit_completed,
+            reference_edit_stats,
+            reconcile_error,
+        ) = _reconcile_and_publish_reference_edit_stats(reference_edit)
     result.update(
         {
             "reference_edit_completed": reference_edit_completed,

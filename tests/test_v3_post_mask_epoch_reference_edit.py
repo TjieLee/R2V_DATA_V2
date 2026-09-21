@@ -21,6 +21,7 @@ from r2v_data_v2.v3.post_mask_epoch_jobs import (
     RESOURCE_SAM,
 )
 from r2v_data_v2.v3.post_mask_epoch_reference_edit import (
+    ReferenceEditDurableError,
     ReferenceEditEpochError,
     ReferenceEditEpochRunner,
     resolve_reference_edit_judge,
@@ -1202,9 +1203,10 @@ def test_alternate_artifact_tamper_fails_closed(
     artifact.write_bytes(original)
 
 
-def test_alternate_plan_identity_drift_fails_closed(
+def test_alternate_plan_candidate_id_tamper_fails_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A frozen plan whose candidate identity was tampered fails closed."""
     _config, storage, runner, _scheduler, routing = _build(
         tmp_path, monkeypatch, run_name="run", with_alternate=True
     )
@@ -1215,12 +1217,80 @@ def test_alternate_plan_identity_drift_fails_closed(
     frozen["candidate_id"] = "candidate_99"
     alternate_path.write_text(json.dumps(frozen), encoding="utf-8")
     clip = storage.read_clip("clip-1")
-    rebuilt = runner.durable_alternate(
-        SHARD, storage, "clip-1", clip.annotation.entities[0],
-        clip.references.entities[0],
+    with pytest.raises(ReferenceEditEpochError, match="metadata candidate_id"):
+        runner.durable_alternate(
+            SHARD, storage, "clip-1", clip.annotation.entities[0],
+            clip.references.entities[0],
+        )
+
+
+def test_alternate_plan_source_frame_tamper_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _config, storage, runner, _scheduler, routing = _build(
+        tmp_path, monkeypatch, run_name="run", with_alternate=True
     )
-    # The frozen identity is the authority: candidate_99 is what comes back.
-    assert rebuilt.candidate.candidate_id == "candidate_99"
+    routing.qwen.accept = False
+    _drain_run_until_alternate(runner, _scheduler, routing)
+    alternate_path = runner._alternate_path(SHARD, "clip-1", "e1")
+    frozen = json.loads(alternate_path.read_text(encoding="utf-8"))
+    frozen["source_frame_index"] = int(frozen["source_frame_index"]) + 1
+    alternate_path.write_text(json.dumps(frozen), encoding="utf-8")
+    clip = storage.read_clip("clip-1")
+    with pytest.raises(
+        ReferenceEditEpochError, match="metadata source_frame_index"
+    ):
+        runner.durable_alternate(
+            SHARD, storage, "clip-1", clip.annotation.entities[0],
+            clip.references.entities[0],
+        )
+
+
+def test_alternate_metadata_identity_tamper_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The legacy materialized metadata is independent evidence of the plan."""
+    _config, storage, runner, _scheduler, routing = _build(
+        tmp_path, monkeypatch, run_name="run", with_alternate=True
+    )
+    routing.qwen.accept = False
+    _drain_run_until_alternate(runner, _scheduler, routing)
+    alternate_path = runner._alternate_path(SHARD, "clip-1", "e1")
+    frozen = json.loads(alternate_path.read_text(encoding="utf-8"))
+    metadata_path = (
+        Path(storage.root)
+        / Path(frozen["alternate_source_path"]).with_name("alternate_source_2.json")
+    )
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["candidate_id"] = "candidate_99"
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    clip = storage.read_clip("clip-1")
+    with pytest.raises(ReferenceEditEpochError, match="metadata candidate_id"):
+        runner.durable_alternate(
+            SHARD, storage, "clip-1", clip.annotation.entities[0],
+            clip.references.entities[0],
+        )
+
+
+def test_alternate_source_image_tamper_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The original candidate image is re-hashed on every rebuild."""
+    _config, storage, runner, _scheduler, routing = _build(
+        tmp_path, monkeypatch, run_name="run", with_alternate=True
+    )
+    routing.qwen.accept = False
+    _drain_run_until_alternate(runner, _scheduler, routing)
+    alternate_path = runner._alternate_path(SHARD, "clip-1", "e1")
+    frozen = json.loads(alternate_path.read_text(encoding="utf-8"))
+    source_image = Path(storage.root) / frozen["source_image_path"]
+    source_image.write_bytes(b"tampered source")
+    clip = storage.read_clip("clip-1")
+    with pytest.raises(ReferenceEditEpochError, match="source image drifted"):
+        runner.durable_alternate(
+            SHARD, storage, "clip-1", clip.annotation.entities[0],
+            clip.references.entities[0],
+        )
 
 
 def _drain_run_until_alternate(
@@ -1414,3 +1484,103 @@ def test_ordinary_clip_cpu_failure_is_terminal_and_isolated(
     )
     assert fresh.seed_jobs() == []
     assert fresh.reconcile_stats(SHARD).to_dict() == stats.to_dict()
+
+
+# ---------------------------------------------------------------------------
+# Durable authority: seed-plan corruption through the real seed_jobs() path
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ("anchor_digest", "seed_not_int", "seed_out_of_range", "schema"),
+)
+def test_seed_plan_tamper_through_seed_jobs_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tamper: str
+) -> None:
+    """A corrupted seed plan must fail closed, never become a clip failure."""
+    config, storage, runner, _scheduler, _routing = _build(tmp_path, monkeypatch)
+    runner.seed_jobs()
+    seed_path = runner._seed_path(SHARD, "clip-1", "e1", 1)
+    payload = json.loads(seed_path.read_text(encoding="utf-8"))
+    if tamper == "anchor_digest":
+        payload["anchor_digest"] = "0" * 64
+    elif tamper == "seed_not_int":
+        payload["seed"] = "not-an-int"
+    elif tamper == "seed_out_of_range":
+        payload["seed"] = 2**31 + 1
+    else:
+        payload["schema"] = "tampered-schema"
+    seed_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    failures_path = Path(storage.root) / "failures.jsonl"
+    before_failures = failures_path.read_text(encoding="utf-8") if failures_path.is_file() else ""
+
+    fresh = ReferenceEditEpochRunner(
+        config,
+        {SHARD: storage},
+        GroupLedger(tmp_path / "ledger"),
+        eligible_clip_uids_by_shard={SHARD: ["clip-1"]},
+    )
+    with pytest.raises(ReferenceEditDurableError):
+        fresh.seed_jobs()
+    # The clip is NOT published as a semantic failure.
+    clip = storage.read_clip("clip-1")
+    assert clip.reference_edit is None
+    after_failures = failures_path.read_text(encoding="utf-8") if failures_path.is_file() else ""
+    assert after_failures == before_failures, "no new semantic failure diagnostic"
+    assert "reference_edit" not in after_failures
+    # Zero model calls: seed_jobs is pure CPU and never reached a backend.
+    assert clip.pairing is not None
+
+
+def test_failure_marker_reason_tamper_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failure marker must bind terminal + reason + delta, not just status."""
+    from tests.test_v3_pair import _add_ready_clip
+    from tests.test_v3_post_mask_epoch_pair import _ScopedJudge
+
+    config = _reference_edit_config(
+        tmp_path, monkeypatch, "run", same_parent_fallback_enabled=True
+    )
+    storage = _pair_storage(config, entity_types=("subject",))
+    _add_ready_clip(
+        config, storage, clip_uid="clip-2", clip_suffix="9", entity_types=("subject",)
+    )
+    _pair_clips()(
+        config,
+        storage,
+        judge=_ScopedJudge(
+            scopes={("clip-1", "e1"): "full", ("clip-2", "e1"): "full"}
+        ),
+    )
+    runner = ReferenceEditEpochRunner(
+        config,
+        {SHARD: storage},
+        GroupLedger(tmp_path / "ledger"),
+        eligible_clip_uids_by_shard={SHARD: ["clip-1", "clip-2"]},
+    )
+    real_publish = runner._publish_clip_if_terminal
+
+    def exploding_publish(shard: str, stor: Any, clip_uid: str) -> None:
+        if clip_uid == "clip-1":
+            raise ValueError("publication exploded")
+        real_publish(shard, stor, clip_uid)
+
+    runner._publish_clip_if_terminal = exploding_publish
+    runner.seed_jobs()
+    marker_path = runner._clip_outcome_path(SHARD, "clip-1")
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    assert marker["terminal"] == "failed"
+    marker["reason"] = "tampered"
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+
+    fresh = ReferenceEditEpochRunner(
+        config,
+        {SHARD: storage},
+        GroupLedger(tmp_path / "ledger"),
+        eligible_clip_uids_by_shard={SHARD: ["clip-1", "clip-2"]},
+    )
+    with pytest.raises(ReferenceEditDurableError, match="failure marker reason"):
+        fresh.seed_jobs()

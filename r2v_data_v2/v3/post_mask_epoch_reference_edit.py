@@ -174,7 +174,7 @@ def _write_json_once(path: Path, payload: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.is_file():
         if _read_json(path) != dict(payload):
-            raise ReferenceEditEpochError(
+            raise ReferenceEditDurableError(
                 f"durable Reference Edit file drifted: {path}"
             )
         return
@@ -183,6 +183,24 @@ def _write_json_once(path: Path, payload: Mapping[str, Any]) -> None:
 
 def _sha256_bytes(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
+
+
+#: The frozen Boogu seed contract: ``new_boogu_seed()`` draws
+#: ``secrets.randbelow(2**31)``, so any other value is durable corruption.
+BOOGU_SEED_UPPER_BOUND = 2**31
+
+
+def _validated_boogu_seed(seed: Any, *, clip_uid: str, entity_id: str) -> int:
+    """Validate one durable seed. A malformed seed is durable corruption."""
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise ReferenceEditDurableError(
+            f"durable Boogu seed for {clip_uid}/{entity_id} is not an int"
+        )
+    if not 0 <= seed < BOOGU_SEED_UPPER_BOUND:
+        raise ReferenceEditDurableError(
+            f"durable Boogu seed for {clip_uid}/{entity_id} is out of range"
+        )
+    return seed
 
 
 class ReferenceEditEpochRunner:
@@ -549,12 +567,15 @@ class ReferenceEditEpochRunner:
             if (
                 existing.get("schema") != REFERENCE_EDIT_SEED_SCHEMA
                 or existing.get("anchor_digest") != anchor_digest
+                or existing.get("attempt_index") != attempt_index
             ):
-                raise ReferenceEditEpochError(
+                raise ReferenceEditDurableError(
                     f"durable Boogu seed plan drifted for {clip_uid}/{entity_id} "
                     f"attempt {attempt_index}"
                 )
-            return int(existing["seed"])
+            return _validated_boogu_seed(
+                existing.get("seed"), clip_uid=clip_uid, entity_id=entity_id
+            )
         seed = _draw_boogu_seed()
         _write_json_once(
             path,
@@ -602,6 +623,9 @@ class ReferenceEditEpochRunner:
         )
         if alternate is None:
             return None
+        source_image_path = _resolve_artifact(
+            storage, alternate.candidate.image_path
+        )
         identity = {
             "schema": REFERENCE_EDIT_ALTERNATE_SCHEMA,
             "canonical_source_sha256": _sha256_bytes(
@@ -610,6 +634,7 @@ class ReferenceEditEpochRunner:
             "candidate_id": alternate.candidate.candidate_id,
             "source_frame_index": alternate.candidate.source_frame_index,
             "source_image_path": alternate.candidate.image_path,
+            "source_image_sha256": _sha256_bytes(source_image_path.read_bytes()),
             "alternate_source_path": storage.relative_artifact_path(
                 alternate.image_path
             ),
@@ -629,7 +654,15 @@ class ReferenceEditEpochRunner:
         reference: Any,
         frozen: Mapping[str, Any],
     ) -> Any:
-        """Validate the frozen alternate plan and rebuild its descriptor."""
+        """Validate the frozen alternate plan and rebuild its descriptor.
+
+        The frozen plan is the authority for WHICH candidate was chosen, but
+        the legacy materialized artifacts (``alternate_source_2.png`` and
+        ``alternate_source_2.json``) plus the original candidate image are
+        independent evidence that the plan itself was not tampered with or
+        corrupted. Any mismatch fails closed; the candidate is never
+        re-selected and no artifact is ever regenerated.
+        """
         del shard
         if frozen.get("schema") != REFERENCE_EDIT_ALTERNATE_SCHEMA:
             raise ReferenceEditDurableError(
@@ -661,10 +694,51 @@ class ReferenceEditEpochRunner:
             raise ReferenceEditDurableError(
                 f"frozen alternate artifact drifted: {alternate_rel}"
             )
+        # The legacy materialized metadata is an independent record of the
+        # same decision and must agree with the frozen plan field for field.
         metadata_path = alternate_path.with_name("alternate_source_2.json")
         if not metadata_path.is_file():
             raise ReferenceEditDurableError(
                 f"frozen alternate metadata is missing: {metadata_path}"
+            )
+        metadata = _read_json(metadata_path)
+        if not isinstance(metadata, dict):
+            raise ReferenceEditDurableError(
+                f"frozen alternate metadata is not an object: {metadata_path}"
+            )
+        if metadata.get("schema_version") != 1:
+            raise ReferenceEditDurableError(
+                f"unsupported alternate metadata schema: {metadata_path}"
+            )
+        expected_metadata = {
+            "candidate_id": frozen.get("candidate_id"),
+            "source_frame_index": frozen.get("source_frame_index"),
+            "source_image_path": frozen.get("source_image_path"),
+            "source_image_sha256": frozen.get("source_image_sha256"),
+            "alternate_source_path": alternate_rel,
+            "alternate_source_sha256": frozen.get("alternate_source_sha256"),
+        }
+        for key, value in expected_metadata.items():
+            if metadata.get(key) != value:
+                raise ReferenceEditDurableError(
+                    f"frozen alternate metadata {key} disagrees with the "
+                    f"frozen plan for {clip_uid}/{entity.entity_id}"
+                )
+        # The original candidate image is a run artifact: it must still exist
+        # and still hash to the frozen value.
+        source_image_path = frozen.get("source_image_path")
+        source_image_sha256 = frozen.get("source_image_sha256")
+        if not isinstance(source_image_path, str) or not isinstance(
+            source_image_sha256, str
+        ):
+            raise ReferenceEditDurableError(
+                f"frozen alternate plan has no source image identity for "
+                f"{clip_uid}/{entity.entity_id}"
+            )
+        resolved_source = _resolve_artifact(storage, source_image_path)
+        if _sha256_bytes(resolved_source.read_bytes()) != source_image_sha256:
+            raise ReferenceEditDurableError(
+                f"frozen alternate source image drifted: {source_image_path}"
             )
         # Rebuild the legacy descriptor from frozen metadata only. The
         # candidate is never re-selected.
@@ -674,7 +748,7 @@ class ReferenceEditEpochRunner:
             candidate=SimpleNamespace(
                 candidate_id=str(frozen["candidate_id"]),
                 source_frame_index=int(frozen["source_frame_index"]),
-                image_path=str(frozen.get("source_image_path", "")),
+                image_path=str(source_image_path),
             ),
             image_path=alternate_path,
             metadata_path=metadata_path,
@@ -717,8 +791,9 @@ class ReferenceEditEpochRunner:
         geometry_source: Path | None = None
         if attempt_index == 2:
             if alternate_image_path is None:
-                raise ReferenceEditEpochError(
-                    f"attempt 2 needs a frozen alternate for {clip_uid}/{entity.entity_id}"
+                raise ReferenceEditDurableError(
+                    f"attempt 2 needs a frozen alternate for "
+                    f"{clip_uid}/{entity.entity_id}"
                 )
             source_path = alternate_image_path
             geometry_source = alternate_image_path
@@ -1282,6 +1357,11 @@ class ReferenceEditEpochRunner:
                 OUTCOME_RETRYABLE_FAILED,
                 detail="Reference Edit generation has no durable seed plan yet",
             )
+        if existing_seed.get("schema") != REFERENCE_EDIT_SEED_SCHEMA:
+            raise ReferenceEditDurableError(
+                f"durable Boogu seed plan schema drifted for "
+                f"{clip_uid}/{entity.entity_id}"
+            )
         if existing_seed.get("anchor_digest") != semantic_input_digest(
             dict(anchor)
         ):
@@ -1289,7 +1369,11 @@ class ReferenceEditEpochRunner:
                 OUTCOME_RETRYABLE_FAILED,
                 detail="Reference Edit generation anchor drifted",
             )
-        seed = int(existing_seed["seed"])
+        seed = _validated_boogu_seed(
+            existing_seed.get("seed"),
+            clip_uid=clip_uid,
+            entity_id=entity.entity_id,
+        )
         inputs = {
             "anchor": dict(anchor),
             "seed": seed,
@@ -2337,6 +2421,16 @@ class ReferenceEditEpochRunner:
                 raise ReferenceEditDurableError(
                     f"clip {clip_uid!r} published a failure but its durable "
                     "outcome marker says otherwise"
+                )
+            live_reason = str(clip.reference_edit.reason or "")
+            if marker.get("reason") != live_reason:
+                raise ReferenceEditDurableError(
+                    f"clip {clip_uid!r} failure marker reason does not match "
+                    "the published failure"
+                )
+            if marker.get("delta") != {"processed": 1, "failed": 1}:
+                raise ReferenceEditDurableError(
+                    f"clip {clip_uid!r} failure marker delta is not terminal"
                 )
             return
         if clip.reference_edit is None:
