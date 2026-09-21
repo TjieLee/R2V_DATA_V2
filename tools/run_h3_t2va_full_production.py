@@ -195,7 +195,11 @@ def main(argv=None):
         gpu_ids=gpu_ids,
         sam_configuration=sam_config,
         auk_configuration=auk_config,
-        backend=T2VAMimoBackend(config, client=mimo_client),
+        backend=T2VAMimoBackend(
+            config,
+            client=mimo_client,
+            verify_media=False,
+        ),
         profiles=TA2VAProfileBackend(config, client=mimo_client),
         allow_unverified=args.allow_unverified,
         request_workers=args.request_workers,
