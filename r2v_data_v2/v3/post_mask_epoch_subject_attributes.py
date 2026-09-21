@@ -272,7 +272,9 @@ class _OwnerReplay:
         self._chains: dict[str, list[ModelJob]] = {}
         self._receipts: dict[str, dict[int, Mapping[str, Any]]] = {}
         self.attribute_cursor = 0
-        self.attribute_run_started = False
+        #: How many probes of each attribute this replay already served, which is
+        #: what separates two attributes that share one grounding prompt.
+        self._probe_counts: dict[str, int] = {}
         #: 8c chain currently being replayed: legacy calls generation, then the
         #: generated-frame segmentation, then the review.
         self.completion: dict[str, Any] | None = None
@@ -369,47 +371,50 @@ class _OwnerReplay:
             self._receipts[state.attribute_id] = receipts
         return receipts
 
-    def resolve_state(self, grounding_prompt: str, probe_index: int) -> _AttributeReplay:
+    def resolve_state(self, grounding_prompt: str) -> _AttributeReplay:
         """Which attribute of this owner is legacy probing right now.
 
-        Legacy walks the frozen attributes in discovery order and each attribute
-        starts its probe list at the first owner candidate frame, so a probe at
-        index zero opens a new attribute run. Matching on the grounding prompt as
-        well keeps two identically prompted attributes apart.
+        The attribute is identified by its grounding prompt, and a state whose
+        probe list is already drained is not revisited. Legacy walks the frozen
+        attributes in discovery order and probes one owner candidate frame at a
+        time, so counting the probes actually served is what keeps two identically
+        prompted attributes apart without depending on the caller's frame
+        ordering: an earlier version treated the candidate's index in the frozen
+        list as a "run start" marker, which rejected the first probe of an
+        attribute whenever that frame was not the frozen list's first entry.
         """
         count = len(self.states)
-        if probe_index == 0:
-            start = (
-                self.attribute_cursor + 1
-                if self.attribute_run_started
-                else self.attribute_cursor
-            )
-            for index in range(start, count):
-                state = self.states[index]
-                if (
-                    str(state.attribute_plan["discovered"]["grounding_prompt"])
-                    == grounding_prompt
-                ):
-                    self.attribute_cursor = index
-                    self.attribute_run_started = True
-                    return state
-            raise SubjectAttributeDurableError(
-                f"SAM probe prompt {grounding_prompt!r} is not a frozen attribute "
-                f"of {self.clip_uid}/{self.owner_entity_id}"
-            )
-        if not self.attribute_run_started or self.attribute_cursor >= count:
-            raise SubjectAttributeDurableError(
-                "SAM probe continued without a frozen attribute run"
-            )
-        state = self.states[self.attribute_cursor]
-        if (
-            str(state.attribute_plan["discovered"]["grounding_prompt"])
-            != grounding_prompt
-        ):
-            raise SubjectAttributeDurableError(
-                "SAM probe input drifted from its frozen attribute"
-            )
-        return state
+        if self.attribute_cursor < count:
+            current = self.states[self.attribute_cursor]
+            if (
+                str(current.attribute_plan["discovered"]["grounding_prompt"])
+                == grounding_prompt
+                and not self._run_drained(current)
+            ):
+                self._probe_counts[current.attribute_id] = (
+                    self._probe_counts.get(current.attribute_id, 0) + 1
+                )
+                return current
+        for index in range(count):
+            state = self.states[index]
+            if (
+                str(state.attribute_plan["discovered"]["grounding_prompt"])
+                == grounding_prompt
+                and not self._run_drained(state)
+            ):
+                self.attribute_cursor = index
+                self._probe_counts[state.attribute_id] = (
+                    self._probe_counts.get(state.attribute_id, 0) + 1
+                )
+                return state
+        raise SubjectAttributeDurableError(
+            f"SAM probe prompt {grounding_prompt!r} is not a frozen attribute of "
+            f"{self.clip_uid}/{self.owner_entity_id}"
+        )
+
+    def _run_drained(self, state: _AttributeReplay) -> bool:
+        """True once every frozen owner candidate of one attribute was probed."""
+        return self._probe_counts.get(state.attribute_id, 0) >= len(self.candidates)
 
     # -- completion chain ----------------------------------------------------
 
@@ -647,7 +652,7 @@ class _OwnerSegmentationBackend:
             raise SubjectAttributeDurableError(
                 f"SAM probe frame slot {frame_slot} is not a frozen owner candidate"
             )
-        state = r.resolve_state(grounding_prompt, index)
+        state = r.resolve_state(grounding_prompt)
         candidate = r.candidates[index]
         expected = (r.storage.root / candidate.image_path).resolve(strict=False)
         if (

@@ -1501,11 +1501,20 @@ class _CompositionSamHandle:
     ownership geometry accept the candidate and the record land as accepted.
     """
 
-    def __init__(self, storage: Any = None, clip_uid: str = "clip-1") -> None:
+    def __init__(
+        self,
+        storage: Any = None,
+        clip_uid: str = "clip-1",
+        *,
+        attribute_ready: bool = False,
+    ) -> None:
         self.calls = 0
         self.attribute_calls = 0
+        self.generated_calls = 0
+        self.generated_requests: list[dict[str, Any]] = []
         self._storage = storage
         self._clip_uid = clip_uid
+        self._attribute_ready = attribute_ready
 
     def segment_frame(self, **kwargs: Any) -> Any:
         import numpy as np
@@ -1515,6 +1524,29 @@ class _CompositionSamHandle:
         self.attribute_calls += 1
         with Image.open(kwargs["frame_path"]) as opened:
             width, height = opened.size
+        if self._attribute_ready:
+            # The attribute-ready geometry is fully deterministic: every probe,
+            # on every frame slot, returns the same 4x4 attribute. It is strictly
+            # inside every owner candidate mask (the frozen 6x6 subject block)
+            # and therefore owner-contained, and it is a constant instead of a
+            # function of the decoded owner mask, so the epoch and legacy replay
+            # can never disagree about which attribute a probe belongs to.
+            # Sixteen pixels is exactly the legacy attribute floor and 16 of 36
+            # is well under the owner-like area ratio, so no production policy
+            # is relaxed and the default fixture below is untouched.
+            probe = np.zeros(
+                (ATTRIBUTE_FIXTURE_HEIGHT, ATTRIBUTE_FIXTURE_WIDTH), dtype=bool
+            )
+            probe[
+                ATTRIBUTE_FIXTURE_PROBE_TOP : ATTRIBUTE_FIXTURE_PROBE_TOP
+                + ATTRIBUTE_FIXTURE_PROBE_SIDE,
+                ATTRIBUTE_FIXTURE_PROBE_LEFT : ATTRIBUTE_FIXTURE_PROBE_LEFT
+                + ATTRIBUTE_FIXTURE_PROBE_SIDE,
+            ] = True
+            assert int(probe.sum()) == ATTRIBUTE_FIXTURE_PROBE_SIDE**2
+            # Owner-contained, which is what the legacy ownership geometry needs.
+            assert not (probe & ~_attribute_ready_subject_mask()).any()
+            return [probe]
         mask = np.zeros((height, width), dtype=bool)
         if self._storage is not None:
             owner = self._owner_mask(int(kwargs["frame_slot"]))
@@ -2546,9 +2578,14 @@ def _production_reference_integrity_outcome(
             prepare_shard_config,
         )
 
-        _patch_attribute_ready_mask(monkeypatch)
         shard_config = prepare_shard_config(config, shard_paths)
-        storage = _pending_storage(shard_config, clip_uids=("clip-1",))
+        storage = _pending_storage(
+            shard_config,
+            clip_uids=("clip-1",),
+            width=ATTRIBUTE_FIXTURE_WIDTH,
+            height=ATTRIBUTE_FIXTURE_HEIGHT,
+            subject_mask=_attribute_ready_subject_mask(),
+        )
         assert storage.root == shard_paths.run_root
         assert storage.config.export_root == shard_paths.export_root
         shard_paths.state_root.mkdir(parents=True, exist_ok=True)
@@ -2560,7 +2597,8 @@ def _production_reference_integrity_outcome(
     handle = qwen if qwen is not None else _CompositionQwenHandle()
     boogu = _CompositionBooguHandle()
     sam = sam if sam is not None else _CompositionSamHandle(
-        storage if attribute_ready else None
+        storage if attribute_ready else None,
+        attribute_ready=attribute_ready,
     )
 
     def prepare(*args: Any, **kwargs: Any) -> Any:
@@ -2738,69 +2776,47 @@ def test_shared_qwen_identities_include_reference_integrity_judge(
 # ---------------------------------------------------------------------------
 
 
-def _patch_attribute_ready_mask(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Enlarge only the shared fixture's SUBJECT mask, and only its geometry.
+#: The attribute-ready fixture geometry. The default shared fixture is a 6x5
+#: frame whose subject mask is a single pixel, which the legacy ownership
+#: geometry can never accept; these are the same fixture helpers at a scale where
+#: a 6x6 owner holds a 4x4 attribute, so no production policy is relaxed.
+ATTRIBUTE_FIXTURE_WIDTH = 16
+ATTRIBUTE_FIXTURE_HEIGHT = 16
 
-    The shared fixture's ``_mask()`` is a single pixel on a 6x5 frame, and the
-    legacy ownership geometry needs an attribute mask of at least
-    MIN_ATTRIBUTE_AREA_PIXELS inside its owner, so no attribute could ever be
-    accepted. The mask is shared with the background reference, so patching
-    ``_mask`` itself would change Removal's own classification; instead the
-    fixture artifact is built unchanged and only the subject entity's frames are
-    rewritten with a consistent enlarged RLE, area, ratio and bbox. No production
-    policy is relaxed.
+#: The attribute probe the SAM fake returns for every frame slot: a 4x4 block
+#: strictly inside the owner. 16 pixels is exactly the legacy attribute floor and
+#: 4 is exactly its long-side floor, so the fixture sits on the acceptance
+#: boundary rather than above it.
+ATTRIBUTE_FIXTURE_PROBE_TOP = 5
+ATTRIBUTE_FIXTURE_PROBE_LEFT = 6
+ATTRIBUTE_FIXTURE_PROBE_SIDE = 4
 
-    KNOWN BLOCKER, reported rather than papered over: even the subject-only
-    enlargement moves the removal fixture's own invariant. ``_pending_storage``
-    asserts ``build_background_candidates(...).pending_remove == 1`` and the
-    enlarged subject makes the background land in ``rejected`` instead, so an
-    attribute-ready storage cannot be built from this fixture at all. Landing the
-    accepted-attribute fixture needs a shared removal fixture whose subject and
-    background geometry are already distinct and both above the legacy floors,
-    not a patch applied on top of the current one.
+
+def _attribute_ready_attribute_crop_side(crop_padding_ratio: float) -> int:
+    """The side of the raw accepted PNG, derived from production's own crop rule.
+
+    ``_save_attribute_crop`` writes ``_attribute_bbox_crop``'s output, which pads
+    the attribute bbox by ``ceil(long_side * crop_padding_ratio)`` per side. The
+    caller passes the ratio off the very shard config production ran with, so the
+    assertion tracks the real geometry instead of a hard-coded number.
     """
+    import math
+
+    padding = math.ceil(ATTRIBUTE_FIXTURE_PROBE_SIDE * crop_padding_ratio)
+    return ATTRIBUTE_FIXTURE_PROBE_SIDE + 2 * padding
+
+
+
+def _attribute_ready_subject_mask() -> Any:
+    """A 6x6 subject mask: 36 of 256 pixels, well under the background ratio."""
     import numpy as np
 
-    import tests.test_v3_post_mask_epoch_removal as removal_fixture
-    from r2v_data_v2.v3.mask_codec import encode_binary_mask
-
-    original_tracked = removal_fixture._tracked_masks
-
-    def attribute_ready_tracked(clip_uid: str) -> Any:
-        artifact = original_tracked(clip_uid)
-        enlarged = np.ones((artifact.height, artifact.width), dtype=bool)
-        rows, columns = np.nonzero(enlarged)
-        frame_update = {
-            "rle": encode_binary_mask(enlarged),
-            "area_pixels": int(enlarged.sum()),
-            "area_ratio": float(enlarged.mean()),
-            "bbox_xyxy": [
-                int(columns.min()),
-                int(rows.min()),
-                int(columns.max()) + 1,
-                int(rows.max()) + 1,
-            ],
-        }
-        entities = {
-            key: (
-                entity.model_copy(
-                    update={
-                        "frames": [
-                            frame.model_copy(update=frame_update)
-                            for frame in entity.frames
-                        ]
-                    }
-                )
-                if entity.reference_type == "subject"
-                else entity
-            )
-            for key, entity in artifact.entities.items()
-        }
-        return artifact.model_copy(update={"entities": entities})
-
-    monkeypatch.setattr(
-        removal_fixture, "_tracked_masks", attribute_ready_tracked
+    mask = np.zeros(
+        (ATTRIBUTE_FIXTURE_HEIGHT, ATTRIBUTE_FIXTURE_WIDTH), dtype=bool
     )
+    mask[4:10, 5:11] = True
+    assert int(mask.sum()) == 36
+    return mask
 
 
 def _install_stub_subject_attributes(
@@ -2928,3 +2944,475 @@ def test_subject_attributes_incomplete_blocks_the_export(
     assert outcome["reason"] == "subject attributes resource epoch incomplete"
     _started, completed = _sat_markers(ledger)
     assert completed is False
+
+
+# ---------------------------------------------------------------------------
+# Acceptance: one accepted attribute, its receipt, and the sealed export
+# ---------------------------------------------------------------------------
+
+
+def _attribute_ready_outcome(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    **kwargs: Any,
+) -> tuple[dict[str, Any], Any, Any, Any]:
+    """Run the real production group runner over the attribute-ready fixture.
+
+    The shard paths are rebuilt afterwards from the same inputs the harness used,
+    so they are the identical values: ``removal_shard_paths`` can only be called
+    once the harness' config fixture has pinned the writable root.
+    """
+    from r2v_data_v2.v3.post_mask_epoch_removal import removal_shard_paths
+    from tests.test_v3_post_mask_epoch_removal import _parts_root
+
+    outcome, _events, handle, storage, _ledger = (
+        _production_reference_integrity_outcome(
+            tmp_path, monkeypatch, attribute_ready=True, **kwargs
+        )
+    )
+    paths = removal_shard_paths(
+        post_mask_root=tmp_path / "workspace" / "data" / "campaign",
+        entity_mask_root=_parts_root(tmp_path, (SHARD,)),
+        shard=SHARD,
+    )
+    return outcome, handle, storage, paths
+
+
+def _accepted_owner_record(storage: Any) -> Any:
+    from r2v_data_v2.v3.subject_attributes import OwnerEnrichmentArtifact
+
+    owner_path = (
+        storage.root
+        / "subject_attributes"
+        / "owners"
+        / "clip-1"
+        / "e1.json"
+    )
+    artifact = OwnerEnrichmentArtifact.model_validate_json(
+        owner_path.read_text(encoding="utf-8")
+    )
+    assert artifact.owner_is_human is True
+    assert len(artifact.records) == 1
+    record = artifact.records[0]
+    assert record.status == "accepted"
+    assert record.attribute_type == "accessory"
+    assert record.image_path is not None
+    return record
+
+
+def test_attribute_ready_fixture_yields_an_accepted_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The production fixture really accepts one attribute, end to end."""
+    from PIL import Image
+
+    from r2v_data_v2.v3.post_mask_runtime import _expected_attribute_receipt
+
+    outcome, handle, storage, paths = _attribute_ready_outcome(tmp_path, monkeypatch)
+
+    assert outcome["remove_completed"] is True
+    assert outcome["pair_completed"] is True
+    assert outcome["reference_edit_completed"] is True
+    assert outcome["reference_integrity_completed"] is True
+    assert outcome["instruct_completed"] is True
+    assert outcome["subject_attributes_completed"] is True
+    assert outcome["export_completed"] is True
+    assert outcome["completed"] is True
+    assert outcome["reason"] == "complete"
+    assert handle.discovery_calls == 1
+    assert handle.attribute_reviews >= 1
+
+    # The accepted record and its real PNG, not just a path string.
+    record = _accepted_owner_record(storage)
+    assert record.final_selection == "raw"
+    assert record.completion_attempted is False
+    attribute_png = storage.root / "subject_attributes" / record.image_path
+    assert attribute_png.is_file()
+    with Image.open(attribute_png) as opened:
+        opened.load()
+        assert opened.format == "PNG"
+        assert opened.mode == "RGBA"
+        # The raw crop is the 4x4 attribute dilated by production's pad, not the
+        # whole frame: prove the artifact is the attribute, not a full-frame copy.
+        side = _attribute_ready_attribute_crop_side(
+            storage.config.pair.crop_padding_ratio
+        )
+        assert opened.size == (side, side)
+        assert side < ATTRIBUTE_FIXTURE_WIDTH
+        assert opened.getpixel((side // 2, side // 2))[3] != 0
+    assert attribute_png.read_bytes()
+
+    # Its variants and default path are the legacy shapes.
+    assert record.variants is not None
+    assert record.variants.bbox.image_path is not None
+    assert record.default_image_path == record.image_path
+    assert record.accepted_base_image_path is None or isinstance(
+        record.accepted_base_image_path, str
+    )
+
+    # The receipt digests that PNG, and the export is sealed on disk.
+    receipt = _expected_attribute_receipt(storage, "clip-1")
+    assert record.image_path in receipt["artifacts"]
+    assert (storage.clip_dir("clip-1") / ".post_mask_attributes.json").is_file()
+    assert paths.export_root.is_dir()
+    assert (paths.export_root / "dataset.json").is_file()
+    assert (paths.export_root / "samples.jsonl").is_file()
+    marker = paths.state_root / "completed.json"
+    assert marker.is_file()
+    sealed = json.loads(marker.read_text(encoding="utf-8"))
+    assert sealed["sample_count"] >= 1
+    assert sealed["export_tree_sha256"]
+    assert sealed["subject_attribute_receipts_sha256"]
+    assert sealed["subject_attribute_sidecars_sha256"]
+    for name in ("attributes.jsonl", "enriched_samples.jsonl", "summary.json"):
+        assert (storage.root / "subject_attributes" / name).is_file(), name
+
+
+def test_attribute_candidate_selection_is_deterministic_across_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The frozen epoch selection and the legacy selection must agree, always.
+
+    The epoch derives the attribute selection many times per owner (every replay
+    round), while the real legacy ``_process_owner`` derives it once. If they ever
+    disagree, a committed raw review receipt names candidates the epoch can no
+    longer reproduce, so this asserts both determinism and cross-agreement.
+    """
+    import r2v_data_v2.v3.post_mask_epoch_subject_attributes as epoch_module
+    from r2v_data_v2.v3 import subject_attributes
+
+    epoch_calls: list[tuple[str, ...]] = []
+    legacy_calls: list[tuple[str, ...]] = []
+
+    def collect(original: Any, sink: list[tuple[str, ...]]) -> Any:
+        def spy(*args: Any, **kwargs: Any) -> Any:
+            out = original(*args, **kwargs)
+            if isinstance(out, list):
+                sink.append(
+                    tuple(c.owner_candidate.candidate_id for c in out)
+                )
+            return out
+
+        return spy
+
+    monkeypatch.setattr(
+        epoch_module,
+        "_collect_attribute_candidates",
+        collect(
+            epoch_module._collect_attribute_candidates, epoch_calls
+        ),
+    )
+    monkeypatch.setattr(
+        subject_attributes,
+        "_collect_attribute_candidates",
+        collect(
+            subject_attributes._collect_attribute_candidates, legacy_calls
+        ),
+    )
+    # Capture the frames legacy actually probes, so the premise below can be
+    # asserted instead of assumed.
+    probe_slots: list[int] = []
+    backend = epoch_module._OwnerSegmentationBackend
+    original_segment_frame = backend.segment_frame
+
+    def spying_segment_frame(self: Any, **kwargs: Any) -> Any:
+        probe_slots.append(int(kwargs["frame_slot"]))
+        return original_segment_frame(self, **kwargs)
+
+    monkeypatch.setattr(backend, "segment_frame", spying_segment_frame)
+
+    outcome, _events, _handle, storage, ledger = (
+        _production_reference_integrity_outcome(
+            tmp_path, monkeypatch, attribute_ready=True
+        )
+    )
+    assert outcome["completed"] is True
+    assert epoch_calls, "the epoch must derive the selection"
+    assert legacy_calls, "legacy _process_owner must derive the selection"
+    assert len(set(epoch_calls)) == 1, epoch_calls
+    assert len(set(legacy_calls)) == 1, legacy_calls
+    assert epoch_calls[0] == legacy_calls[0]
+
+    # Why this regression has teeth: legacy enumerates candidates in
+    # prefer_attribute_candidate_frames order, which moves the owner reference's
+    # own frame to the end, while the epoch indexes the frozen plan order. The
+    # fixture's reference frame is itself the frozen plan's first candidate, so
+    # legacy's very first probe carries a non-zero frozen index. That is exactly
+    # the shape the old "frozen index zero starts a new attribute run" rule
+    # misread, and asserting it here keeps this test from going vacuous if the
+    # fixture geometry is ever changed.
+    plan_path = (
+        Path(ledger.root)
+        / "semantic"
+        / "subject_attributes"
+        / "owners"
+        / SHARD
+        / "clip-1"
+        / "e1"
+        / "plan.json"
+    )
+    frozen_candidates = json.loads(plan_path.read_text(encoding="utf-8"))["candidates"]
+    frozen_slots = [int(item["frame_slot"]) for item in frozen_candidates]
+    assert len(frozen_slots) >= 3, frozen_slots
+    assert probe_slots, "legacy must have probed at least one owner candidate"
+    assert probe_slots[0] != frozen_slots[0], probe_slots
+    assert frozen_slots.index(probe_slots[0]) != 0
+
+    # The accepted record's owner candidate is the epoch's frozen rank-0 option,
+    # which is legacy's first probe and not the frozen plan's first candidate.
+    record = _accepted_owner_record(storage)
+    assert record.owner_candidate_id == epoch_calls[0][0]
+    assert record.owner_candidate_id != str(frozen_candidates[0]["candidate_id"])
+
+
+def test_completed_handoff_restart_reuses_receipts_and_sealed_export(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A completed handoff restarts on receipts only, with no SAT runner at all."""
+    outcome, _handle, storage, paths = _attribute_ready_outcome(tmp_path, monkeypatch)
+    assert outcome["completed"] is True
+    sealed = json.loads(
+        (paths.state_root / "completed.json").read_text(encoding="utf-8")
+    )
+
+    from tests.test_v3_post_mask_epoch_pipeline import (
+        _CompositionQwenHandle,
+        _CompositionSamHandle,
+    )
+
+    class _ExplodingRunner:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            raise AssertionError(
+                "a completed handoff must not construct the SAT runner"
+            )
+
+    monkeypatch.setattr(
+        "r2v_data_v2.v3.post_mask_epoch_subject_attributes."
+        "SubjectAttributeEpochRunner",
+        _ExplodingRunner,
+    )
+    fresh_qwen = _CompositionQwenHandle()
+    fresh_sam = _CompositionSamHandle(attribute_ready=True)
+    fresh_outcome, _events, fresh_handle, _storage, _ledger = (
+        _production_reference_integrity_outcome(
+            tmp_path,
+            monkeypatch,
+            attribute_ready=True,
+            qwen=fresh_qwen,
+            sam=fresh_sam,
+            storage=storage,
+        )
+    )
+
+    assert fresh_outcome["subject_attributes_completed"] is True
+    assert fresh_outcome["subject_attributes_job_count"] == 0
+    assert fresh_outcome["export_completed"] is True
+    assert fresh_outcome["completed"] is True
+    assert fresh_outcome["reason"] == "complete"
+    assert fresh_qwen.discovery_calls == 0
+    assert fresh_qwen.attribute_reviews == 0
+    assert fresh_sam.attribute_calls == 0
+    assert fresh_handle.attribute_reviews == 0
+    # The sealed marker is re-verified, not rewritten.
+    assert json.loads(
+        (paths.state_root / "completed.json").read_text(encoding="utf-8")
+    ) == sealed
+
+
+def test_tampered_accepted_attribute_png_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tampered accepted PNG is reported, never rebuilt by a restart."""
+    from PIL import Image
+
+    _outcome, _handle, storage, paths = _attribute_ready_outcome(tmp_path, monkeypatch)
+    record = _accepted_owner_record(storage)
+    attribute_png = storage.root / "subject_attributes" / record.image_path
+    original = attribute_png.read_bytes()
+    with Image.open(attribute_png) as opened:
+        size = opened.size
+    Image.new("RGBA", size, (1, 2, 3, 255)).save(attribute_png, format="PNG")
+    tampered = attribute_png.read_bytes()
+    assert tampered != original
+
+    with pytest.raises(Exception, match="final attribute"):
+        _attribute_ready_outcome(
+            tmp_path, monkeypatch, storage=storage
+        )
+    assert attribute_png.read_bytes() == tampered
+    assert (paths.state_root / "completed.json").is_file()
+
+
+def test_unsealed_export_is_rebuilt_from_the_frozen_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An export tree without its seal is rebuilt, never trusted."""
+    from PIL import Image
+
+    from r2v_data_v2.v3.post_mask_epoch_removal import export_shard
+    from r2v_data_v2.v3.post_mask_runtime import _export_tree_sha256
+
+    _outcome, _handle, storage, paths = _attribute_ready_outcome(tmp_path, monkeypatch)
+    marker = paths.state_root / "completed.json"
+    assert marker.is_file()
+    published = min(
+        path for path in paths.export_root.rglob("*.png") if path.is_file()
+    )
+    frozen = published.read_bytes()
+    marker.unlink()
+    with Image.open(published) as opened:
+        size = opened.size
+    Image.new("RGBA", size, (9, 9, 9, 255)).save(published, format="PNG")
+    assert published.read_bytes() != frozen
+
+    result = export_shard(storage, paths, ("clip-1",))
+    assert result["rebuilt"] is True
+    assert marker.is_file()
+    sealed = json.loads(marker.read_text(encoding="utf-8"))
+    assert sealed["export_tree_sha256"] == _export_tree_sha256(paths)
+
+
+def test_sealed_export_tamper_fails_closed_without_reexport(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A sealed shard is verified only, never re-exported or self-healed."""
+    from PIL import Image
+
+    from r2v_data_v2.v3.post_mask_epoch_removal import (
+        RemovalEpochError,
+        export_shard,
+    )
+
+    _outcome, _handle, storage, paths = _attribute_ready_outcome(tmp_path, monkeypatch)
+    published = min(
+        path for path in paths.export_root.rglob("*.png") if path.is_file()
+    )
+    with Image.open(published) as opened:
+        size = opened.size
+    Image.new("RGBA", size, (7, 7, 7, 255)).save(published, format="PNG")
+    tampered = published.read_bytes()
+
+    with pytest.raises(RemovalEpochError, match="sealed export publication"):
+        export_shard(storage, paths, ("clip-1",))
+    assert published.read_bytes() == tampered
+
+
+def test_filtered_inventory_excludes_a_stale_raw_clip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sealed inventory is the filtered shard view, not the raw run root."""
+    import shutil
+
+    from r2v_data_v2.v3.post_mask_epoch_removal import (
+        expected_shard_completion,
+        export_shard,
+    )
+    from r2v_data_v2.v3.post_mask_runtime import (
+        _export_identity,
+        _ShardStorage,
+        _validate_publication,
+    )
+
+    _outcome, _handle, storage, paths = _attribute_ready_outcome(tmp_path, monkeypatch)
+    sealed = json.loads(
+        (paths.state_root / "completed.json").read_text(encoding="utf-8")
+    )
+    selected = _ShardStorage(storage, ("clip-1",))
+    assert expected_shard_completion(selected, paths, ("clip-1",)) == sealed
+
+    # A stale clip that hydration excluded still lives in the raw run root. It has
+    # to be a genuinely valid ClipRecord, because the raw inventory really does
+    # read it: only the uid and the self-provenance of its references are
+    # rewritten, so the record stays legal rather than being ignored as junk.
+    from r2v_data_v2.v3.schemas import ClipRecord
+
+    source = storage.clip_dir("clip-1")
+    stale = storage.clip_dir("clip-old")
+    shutil.copytree(source, stale)
+    payload = json.loads((stale / "clip.json").read_text(encoding="utf-8"))
+    payload["clip_uid"] = "clip-old"
+    for reference in payload["references"]["entities"]:
+        for field in ("source_clip_uid",):
+            if reference.get(field) == "clip-1":
+                reference[field] = "clip-old"
+    (stale / "clip.json").write_text(json.dumps(payload), encoding="utf-8")
+    stale_record = ClipRecord.model_validate_json(
+        (stale / "clip.json").read_text(encoding="utf-8")
+    )
+    assert stale_record.clip_uid == "clip-old"
+    assert {clip.clip_uid for clip in storage.iter_clips()} >= {"clip-1", "clip-old"}
+
+    # The raw run root now disagrees with the seal, which was computed on the
+    # filtered selection, so validating the raw storage fails outright...
+    with pytest.raises(ValueError, match="provenance/identity mismatch"):
+        _validate_publication(storage, paths)
+    # ...while production, which re-verifies a sealed shard through the filtered
+    # view, still accepts it and reproduces exactly the marker it wrote. This is
+    # the load-bearing half: with the stale clip already present, an inventory
+    # taken from the raw run root could not satisfy the equality below.
+    assert _export_identity(selected, paths) == json.loads(
+        (paths.state_root / "export_identity.json").read_text(encoding="utf-8")
+    )
+    result = export_shard(storage, paths, ("clip-1",))
+    assert result == {"sample_count": sealed["sample_count"], "rebuilt": False}
+    assert json.loads(
+        (paths.state_root / "completed.json").read_text(encoding="utf-8")
+    ) == sealed
+
+
+def test_sealed_shard_sidecar_tamper_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The run-local enriched samples the compact reads are sealed too."""
+    from r2v_data_v2.v3.post_mask_epoch_removal import (
+        RemovalEpochError,
+        export_shard,
+    )
+
+    _outcome, _handle, storage, paths = _attribute_ready_outcome(tmp_path, monkeypatch)
+    sidecar = storage.root / "subject_attributes" / "enriched_samples.jsonl"
+    assert sidecar.is_file()
+    original = sidecar.read_bytes()
+    sidecar.write_bytes(original + b"\n")
+    tampered = sidecar.read_bytes()
+    assert tampered != original
+
+    with pytest.raises(RemovalEpochError, match="sealed export publication"):
+        export_shard(storage, paths, ("clip-1",))
+    assert sidecar.read_bytes() == tampered
+
+
+def test_attribute_receipt_preflight_publishes_nothing_on_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One drifted receipt stops the whole group before any receipt is written."""
+    from r2v_data_v2.reconciliation import write_json_atomic
+    from r2v_data_v2.v3.post_mask_epoch_pipeline import (
+        publish_subject_attribute_receipts,
+    )
+    from r2v_data_v2.v3.post_mask_epoch_removal import removal_shard_paths
+    from r2v_data_v2.v3.post_mask_production import _identity, prepare_shard_config
+    from r2v_data_v2.v3.post_mask_runtime import _expected_attribute_receipt
+    from tests.test_v3_post_mask_epoch_removal import _parts_root, _pending_storage
+
+    base = _config(tmp_path, monkeypatch, "run-preflight")
+    paths = removal_shard_paths(
+        post_mask_root=tmp_path / "workspace" / "data" / "campaign",
+        entity_mask_root=_parts_root(tmp_path, (SHARD,)),
+        shard=SHARD,
+    )
+    shard_config = prepare_shard_config(base, paths)
+    storage = _pending_storage(shard_config, clip_uids=("clip-a", "clip-b"))
+    paths.state_root.mkdir(parents=True, exist_ok=True)
+    write_json_atomic(paths.identity_path, _identity(shard_config, paths))
+
+    drifted = storage.clip_dir("clip-b") / ".post_mask_attributes.json"
+    payload = _expected_attribute_receipt(storage, "clip-b")
+    payload["artifacts"]["owners/clip-b/e1.json"] = "0" * 64
+    write_json_atomic(drifted, payload)
+
+    with pytest.raises(ValueError, match="drifted"):
+        publish_subject_attribute_receipts(
+            {SHARD: storage}, {SHARD: ("clip-a", "clip-b")}
+        )
+    assert not (storage.clip_dir("clip-a") / ".post_mask_attributes.json").exists()

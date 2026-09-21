@@ -346,8 +346,27 @@ def _bbox(mask: np.ndarray) -> tuple[int, int, int, int]:
     return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
 
 
-def _tracked_masks(clip_uid: str) -> TrackedMasksArtifact:
-    mask = _mask()
+def _tracked_masks(
+    clip_uid: str,
+    *,
+    width: int = WIDTH,
+    height: int = HEIGHT,
+    subject_mask: np.ndarray | None = None,
+) -> TrackedMasksArtifact:
+    """The fixture's mask artifact.
+
+    ``subject_mask`` selects a larger attribute-ready subject geometry. Every
+    frame's area, ratio, bbox and RLE stay derived from the actual mask, which is
+    what makes the artifact self-consistent for any geometry. With no override the
+    original single-pixel mask is used and every default result is unchanged.
+    """
+    mask = _mask() if subject_mask is None else np.asarray(subject_mask, dtype=bool)
+    if subject_mask is not None and mask.shape != (height, width):
+        raise ValueError("subject mask must match the fixture geometry")
+    area_pixels = int(mask.sum())
+    area_ratio = float(mask.mean())
+    bbox = _bbox(mask)
+    rle = encode_binary_mask(mask)
     frames = [
         TrackedMaskFrame(
             slot=slot,
@@ -356,17 +375,17 @@ def _tracked_masks(clip_uid: str) -> TrackedMasksArtifact:
             confidence=0.9,
             backend_confidences=[0.9],
             backend_object_ids=["obj-1"],
-            area_pixels=1,
-            area_ratio=float(mask.mean()),
-            bbox_xyxy=_bbox(mask),
-            rle=encode_binary_mask(mask),
+            area_pixels=area_pixels,
+            area_ratio=area_ratio,
+            bbox_xyxy=bbox,
+            rle=rle,
         )
         for slot in range(10)
     ]
     return TrackedMasksArtifact(
         clip_uid=clip_uid,
-        width=WIDTH,
-        height=HEIGHT,
+        width=width,
+        height=height,
         entities={
             "e1": TrackedEntityMasks(
                 status="ready",
@@ -379,7 +398,17 @@ def _tracked_masks(clip_uid: str) -> TrackedMasksArtifact:
     )
 
 
-def _coverage() -> CoverageState:
+def _coverage(
+    *,
+    width: int = WIDTH,
+    height: int = HEIGHT,
+    subject_mask: np.ndarray | None = None,
+) -> CoverageState:
+    ratio = (
+        1 / (WIDTH * HEIGHT)
+        if subject_mask is None
+        else float(np.asarray(subject_mask, dtype=bool).mean())
+    )
     return CoverageState(
         passed=True,
         qualifying_entity_ids=["e1"],
@@ -390,18 +419,26 @@ def _coverage() -> CoverageState:
                 visible_frame_count=10,
                 coverage_ratio=1.0,
                 qualifies=True,
-                per_frame_area_ratio=[1 / (WIDTH * HEIGHT)] * 10,
+                per_frame_area_ratio=[ratio] * 10,
                 per_frame_confidence=[0.9] * 10,
             )
         },
     )
 
 
-def _write_frames(storage: RunStorage, clip_uid: str) -> None:
+def _write_frames(
+    storage: RunStorage,
+    clip_uid: str,
+    *,
+    width: int = WIDTH,
+    height: int = HEIGHT,
+) -> None:
     frames = []
     for slot in range(10):
         path = storage.frame_path(clip_uid, slot)
-        Image.new("RGB", (WIDTH, HEIGHT), (10 + slot, 20, 30)).save(path, format="JPEG")
+        Image.new("RGB", (width, height), (10 + slot, 20, 30)).save(
+            path, format="JPEG"
+        )
         frames.append(
             SampledFrame(
                 slot=slot,
@@ -414,7 +451,7 @@ def _write_frames(storage: RunStorage, clip_uid: str) -> None:
     write_json_atomic(
         storage.frames_manifest_path(clip_uid),
         SampledFramesArtifact(
-            clip_uid=clip_uid, width=WIDTH, height=HEIGHT, frames=frames
+            clip_uid=clip_uid, width=width, height=height, frames=frames
         ).model_dump(mode="json"),
     )
 
@@ -424,6 +461,9 @@ def _pending_storage(
     *,
     clip_uids: tuple[str, ...] = ("clip-1",),
     source_index_start: int = 0,
+    width: int = WIDTH,
+    height: int = HEIGHT,
+    subject_mask: np.ndarray | None = None,
 ) -> RunStorage:
     storage = RunStorage(config)
     storage.initialize(git_commit="abc123")
@@ -462,9 +502,24 @@ def _pending_storage(
                 ),
             ),
         )
-        _write_frames(storage, clip_uid)
-        storage.write_masks(clip_uid, _tracked_masks(clip_uid))
-        storage.write_coverage(clip_uid, _coverage())
+        _write_frames(storage, clip_uid, width=width, height=height)
+        storage.write_masks(
+            clip_uid,
+            _tracked_masks(
+                clip_uid,
+                width=width,
+                height=height,
+                subject_mask=subject_mask,
+            ),
+        )
+        storage.write_coverage(
+            clip_uid,
+            _coverage(
+                width=width,
+                height=height,
+                subject_mask=subject_mask,
+            ),
+        )
     stats = build_background_candidates(config, storage)
     assert stats.pending_remove == len(clip_uids)
     return storage
