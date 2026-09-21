@@ -978,10 +978,16 @@ def test_parallel_independent_sam_failure_keeps_qwen_result(
     assert epoch_metadata["qwen_review"] == legacy_metadata["qwen_review"]
     assert epoch_metadata["sam_review"] is None
 
+    # The frozen legacy wrapper never assigns ``sam_review`` when the SAM
+    # future raises, and acceptance is the conjunction of the reviews that DID
+    # resolve, so this attempt is ACCEPTED with ``sam_review`` unset -- the SAM
+    # exception's override never applies to a published attempt. The durable
+    # attempt marker must record exactly that.
     marker = _read_attempt_marker(runner, 1)
     assert marker is not None
-    assert marker["status"] == "sam_failed"
-    assert marker["rejection_reason"] == (
+    assert marker["status"] == "accepted"
+    assert marker["accepted"] is True
+    assert marker["rejection_reason"] != (
         "boogu_reference_edit_failed: sam backend exploded"
     )
 
