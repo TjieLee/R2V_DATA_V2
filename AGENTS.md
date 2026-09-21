@@ -30,6 +30,13 @@ This file is the repository-level handoff and operating contract for Codex, Chat
 > stages. The original target AV remains final factual authority; stem evidence
 > is auxiliary only. Do not mutate frozen production Audio, Visual, MiMo, or H3
 > outputs while operating a shadow run.
+>
+> **Person-replacement integration on this branch:** the independent two-person
+> H3/PDD production path is now merged here under `r2v_data_v2/person_replacement/`,
+> `tools/person_replacement/`, and `tests/person_replacement/`. Before changing
+> or operating it, read `r2v_data_v2/person_replacement/H3_PAIR_EXECUTOR.md`.
+> Keep this path isolated from Audio/H3 semantics: person replacement does not
+> modify MiMo, SAM Audio, DiariZen, Qwen3-ASR, or frozen Audio/H3 outputs.
 
 > **Branch-specific V3 override — `feature/v3-subject-attributes-v1`:** The
 > repository is `TjieLee/R2V_DATA_V2`; the
@@ -93,7 +100,7 @@ The only generally writable server root is:
 /mnt/workspace/litengjie/data/
 ```
 
-Repository files, environments, caches, temporary files, downloaded optional assets, outputs, benchmarks, and generated diagnostics must remain below this root.
+Repository files, environments, caches, temporary files, downloaded optional assets, outputs, benchmarks, and generated diagnostics must remain below this root, except for the single explicit person-replacement production-output exception documented below.
 
 Known writable locations include:
 
@@ -113,12 +120,23 @@ Existing pilot outputs are valuable state. Do not delete, rename, bulk-rewrite, 
 
 ### Read-only inputs
 
-These inputs are strictly read-only:
+These inputs are strictly read-only by default:
 
 ```text
 /mnt/workspace/public/dataset/
 /mnt/workspace/public/pretrained/
 ```
+
+The only write exception is the dedicated person-replacement production subtree:
+
+```text
+/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/multi_person_replace
+```
+
+That exact subtree and its descendants are writable only for the
+person-replacement H3/PDD production pipeline. It does not make neighboring
+public dataset paths writable. `validate_output_root()` must continue to reject
+every other public dataset/pretrained destination.
 
 The fixed source manifest currently used by the project is:
 
@@ -284,7 +302,7 @@ Agents may read:
 
 - the entire `TjieLee/R2V_DATA_V2` repository and Git history;
 - tests, README, configuration schema/defaults, and generated logs/artifacts supplied by the user;
-- the public dataset and pretrained roots strictly as read-only inputs when operating on the server;
+- the public dataset and pretrained roots strictly as read-only inputs when operating on the server, except the dedicated person-replacement production subtree explicitly listed above;
 - the configured local SAM3 source strictly as required for integration inspection.
 
 Agents may modify:
