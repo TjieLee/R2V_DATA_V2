@@ -176,6 +176,14 @@ def new_counters() -> dict[str, int]:
     return {name: 0 for name in _COUNTER_NAMES}
 
 
+def require_subject_attribute_gme_disabled(config: Any) -> None:
+    """The Resource Epoch never implements a GME screen, so refuse it up front."""
+    if bool(getattr(getattr(config, "subject_attribute_gme", None), "enabled", False)):
+        raise RemovalEpochError(
+            "Post-Mask Resource Epoch requires subject attribute GME disabled"
+        )
+
+
 class RemovalEpochError(RuntimeError):
     """The removal adapter could not run a job safely; fail closed."""
 
@@ -1554,6 +1562,87 @@ def _current_git_commit(repo: Path) -> str:
         return "unknown"
 
 
+def _shard_state_root(paths: Any) -> Path:
+    return Path(paths.state_root)
+
+
+def expected_shard_completion(storage: Any, paths: Any, clip_uids: Sequence[str]) -> dict[str, Any]:
+    """The exact sealed completion marker of one shard.
+
+    Both sides of the publication are frozen: the export-side tree digest and
+    the source-side final attribute receipt digest.
+    """
+    from r2v_data_v2.v3.post_mask_runtime import (
+        _export_identity,
+        _export_tree_sha256,
+        _subject_attribute_receipts_sha256,
+        _validate_publication,
+    )
+
+    dataset = _validate_publication(storage, paths)
+    return {
+        "identity": _export_identity(storage, paths),
+        "sample_count": int(dataset.sample_count),
+        "export_tree_sha256": _export_tree_sha256(paths),
+        "subject_attribute_receipts_sha256": _subject_attribute_receipts_sha256(
+            storage, clip_uids
+        ),
+    }
+
+
+def export_shard(
+    storage: Any, paths: Any, clip_uids: Sequence[str]
+) -> dict[str, Any]:
+    """Publish or re-verify one shard's export under the Resource Epoch rules.
+
+    A sealed shard (``state_root/completed.json`` present) is never re-exported:
+    its tree digest, sample count, identity and source attribute receipts are
+    re-derived and required to match exactly. An unsealed shard is always
+    rebuilt from the frozen source, even when an export tree already exists,
+    because a tree without its completion marker was never proven complete.
+    """
+    from r2v_data_v2.v3.post_mask_runtime import (
+        _cleanup_export_staging,
+        _export_identity,
+        _ShardStorage,
+    )
+    from r2v_data_v2.v3.storage import DatasetExporter
+    from r2v_data_v2.v3.subject_attributes import reconcile_subject_attribute_outputs
+
+    selected = _ShardStorage(storage, tuple(str(uid) for uid in clip_uids))
+    marker = _shard_state_root(paths) / "completed.json"
+    if marker.is_file():
+        try:
+            sealed = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise RemovalEpochError(
+                f"sealed export marker is unreadable: {marker}"
+            ) from exc
+        expected = expected_shard_completion(storage, paths, clip_uids)
+        if sealed != expected:
+            raise RemovalEpochError(
+                f"sealed export publication drifted: {paths.export_root}"
+            )
+        return {"sample_count": expected["sample_count"], "rebuilt": False}
+    reconcile_subject_attribute_outputs(
+        storage=selected,
+        output_root=storage.root / "subject_attributes",
+        owner_limit=None,
+        invocation_wall_time_seconds=0.0,
+    )
+    _cleanup_export_staging(selected, paths)
+    atomic_write_json(
+        _shard_state_root(paths) / "export_identity.json",
+        _export_identity(selected, paths),
+    )
+    DatasetExporter(storage.config, selected).export(
+        overwrite=Path(paths.export_root).exists()
+    )
+    expected = expected_shard_completion(storage, paths, clip_uids)
+    atomic_write_json(marker, expected)
+    return {"sample_count": expected["sample_count"], "rebuilt": True}
+
+
 def build_removal_epoch_runner(
     config: V3Config,
     *,
@@ -1594,9 +1683,14 @@ def build_removal_epoch_runner(
     ``group.campaign_identity``.
     """
     require_boogu_backend(config)
+    require_subject_attribute_gme_disabled(config)
     worker_pool = pool or WorkerPoolConfig()
 
     def runner(group: Any, ledger: GroupLedger, emit: Any) -> dict[str, Any]:
+        # Policy first: the epoch cannot run a GME screen, so a config that asks
+        # for one must fail here, before the first shard lock and long before any
+        # earlier stage has paid for a model.
+        require_subject_attribute_gme_disabled(config)
         # Campaign identity first: it is derived from the config, the dataset
         # and the Stage2 root this runner is about to read, never from a
         # caller-supplied dict, and it must fail before the first shard lock.
@@ -1664,6 +1758,9 @@ def build_removal_epoch_runner(
                 from r2v_data_v2.v3.post_mask_epoch_reference_integrity import (
                     ReferenceIntegrityEpochRunner as _ReferenceIntegrityEpochRunner,
                 )
+                from r2v_data_v2.v3.post_mask_epoch_subject_attributes import (
+                    SubjectAttributeEpochRunner as _SubjectAttributeEpochRunner,
+                )
 
                 dispatch = _EpochStageDispatch()
                 created: dict[str, Any] = {}
@@ -1679,6 +1776,11 @@ def build_removal_epoch_runner(
                 reference_integrity_enabled = bool(
                     config.reference_integrity.enabled
                 )
+                # Subject Attributes is a formal Resource Epoch stage, not an
+                # optional model feature, so its SAM probes always need the
+                # shared manager to own the SAM lifecycle. Boogu is already
+                # required by Removal and is reused by completion.
+                subject_attributes_enabled = True
                 manager = ResourceEpochManager(
                     factories=build_removal_epoch_factories(
                         config,
@@ -1691,7 +1793,9 @@ def build_removal_epoch_runner(
                         qwen_max_inflight=qwen_max_inflight,
                         log_root=log_root,
                         job_runner=dispatch.run,
-                        with_sam_epoch=reference_edit_enabled,
+                        with_sam_epoch=(
+                            reference_edit_enabled or subject_attributes_enabled
+                        ),
                     )
                 )
                 outcome = run_removal_pair_resource_session(
@@ -1777,6 +1881,26 @@ def build_removal_epoch_runner(
                         if reference_integrity_enabled
                         else None
                     ),
+                    build_subject_attributes_scheduler=(
+                        lambda runner, _dispatch: ResourceEpochScheduler(
+                            ledger=ledger,
+                            finalize=runner.finalize,
+                            resource_manager=manager,
+                            window_size=window_size,
+                            close_resource_manager_on_exit=False,
+                        )
+                    ),
+                    subject_attributes_runner_factory=(
+                        lambda **kwargs: _SubjectAttributeEpochRunner(
+                            kwargs["config"],
+                            kwargs["storages"],
+                            kwargs["ledger"],
+                            eligible_clip_uids_by_shard=kwargs[
+                                "eligible_clip_uids_by_shard"
+                            ],
+                            emit=kwargs.get("emit"),
+                        )
+                    ),
                     emit=emit,
                 )
                 removal = created["removal"]
@@ -1794,6 +1918,7 @@ def build_removal_epoch_runner(
                     + len(outcome.get("pair_cross_unresolved", ()))
                     + len(outcome.get("reference_edit_unresolved", ()))
                     + len(outcome.get("reference_integrity_unresolved", ()))
+                    + len(outcome.get("subject_attributes_unresolved", ()))
                 )
                 reason = str(outcome["reason"])
             else:
@@ -1841,6 +1966,35 @@ def build_removal_epoch_runner(
                     if remove_completed
                     else "background removal incomplete"
                 )
+            # Subject Attributes is the last semantic stage, and its completed
+            # handoff is the only barrier this publication may trust. The export
+            # runs inside the same all-or-nothing shard locks as every stage
+            # above, one shard at a time, and always rebuilds an unsealed tree
+            # from the frozen source rather than trusting a bare export root.
+            # Compact is deliberately NOT run here: it is a campaign-level
+            # barrier that needs every shard group to have completed first, so a
+            # group-local call would race its concurrent siblings.
+            export_completed = False
+            export_stats: dict[str, Any] = {}
+            export_error: str | None = None
+            if bool(outcome.get("subject_attributes_completed")):
+                try:
+                    for shard in ordered_shards:
+                        export_stats[shard] = export_shard(
+                            storages[shard], paths_by_shard[shard], eligible[shard]
+                        )
+                except Exception as exc:  # noqa: BLE001 - never fake a completion
+                    export_completed = False
+                    export_stats = {}
+                    export_error = str(exc)
+                else:
+                    export_completed = True
+                emit(
+                    "post_mask_export_finished",
+                    group_id=getattr(group, "group_id", ""),
+                    export_completed=export_completed,
+                    error=export_error,
+                )
             # Locks are released only when this block exits, i.e. after
             # publication and the stage-count update.
         # The shared 4b session reports "remove_completed"; the removal-only
@@ -1875,10 +2029,21 @@ def build_removal_epoch_runner(
             unresolved=unresolved,
             shards=summary,
         )
+        group_completed = bool(
+            remove_completed
+            and outcome.get("subject_attributes_completed")
+            and export_completed
+        )
+        if group_completed:
+            reason = "complete"
+        elif outcome.get("subject_attributes_completed") and not export_completed:
+            reason = "post-mask export incomplete"
         return {
             **outcome,
             "remove_completed": remove_completed,
-            "completed": False,
+            "export_completed": export_completed,
+            "export_stats": export_stats,
+            "completed": group_completed,
             "reason": reason,
         }
 

@@ -36,8 +36,11 @@ from r2v_data_v2.v3.post_mask_epoch_jobs import (
 )
 from r2v_data_v2.v3.post_mask_epoch_pipeline import (
     DOWNSTREAM_REASON,
+    EXPORT_PENDING_REASON,
     INSTRUCT_STARTED,
     REFERENCE_INTEGRITY_STARTED,
+    SUBJECT_ATTRIBUTES_COMPLETED,
+    SUBJECT_ATTRIBUTES_STARTED,
     StageDispatchError,
     default_pair_runner_factory,
     run_removal_pair_epochs,
@@ -2478,8 +2481,11 @@ def test_production_runner_wires_reference_integrity_and_instruct(
     )
     assert outcome["reference_integrity_unresolved"] == ()
     assert outcome["instruct_completed"] is True
+    # Subject Attributes is now wired, so the chain reaches it and stops at the
+    # publication barrier instead of at the old downstream placeholder.
+    assert outcome["subject_attributes_completed"] is True
     assert outcome["completed"] is False
-    assert outcome["reason"] == DOWNSTREAM_REASON
+    assert outcome["reason"] in {EXPORT_PENDING_REASON, "post-mask export incomplete"}
 
     # The shared Qwen session really paid the integrity review in production.
     assert handle.integrity_reviews >= 1
@@ -2492,6 +2498,8 @@ def test_production_runner_wires_reference_integrity_and_instruct(
     composition_root = Path(ledger.root) / "composition"
     assert (composition_root / f"{REFERENCE_INTEGRITY_STARTED}.json").is_file()
     assert (composition_root / f"{INSTRUCT_STARTED}.json").is_file()
+    assert (composition_root / f"{SUBJECT_ATTRIBUTES_STARTED}.json").is_file()
+    assert (composition_root / f"{SUBJECT_ATTRIBUTES_COMPLETED}.json").is_file()
 
     finished = [
         event for event in events if event["event"] == "post_mask_removal_epoch_finished"
@@ -2558,3 +2566,135 @@ def test_shared_qwen_identities_include_reference_integrity_judge(
         ),
     )
     assert "/models/other" not in shared_qwen_model_identities(writer_mismatch)
+
+
+# ---------------------------------------------------------------------------
+# Subject Attributes publication: handoff, receipts, per-shard export, seal
+# ---------------------------------------------------------------------------
+
+
+def _install_stub_subject_attributes(
+    monkeypatch: pytest.MonkeyPatch, *, unresolved: tuple[str, ...]
+) -> None:
+    """Replace the Subject Attributes runner with an always-unresolved stub.
+
+    The stub still goes through the real production scheduler and the real
+    shared manager, so the group sees a genuinely unresolved Subject Attributes
+    job; it simply never completes one.
+    """
+    from r2v_data_v2.v3.post_mask_epoch_jobs import ModelJob
+
+    class _StubSubjectAttributes:
+        def __init__(
+            self,
+            config: Any,
+            storages: Any,
+            ledger: Any,
+            *,
+            eligible_clip_uids_by_shard: Any,
+            emit: Any = None,
+        ) -> None:
+            self.storages = dict(storages)
+            self.ledger = ledger
+            self.jobs = [
+                ModelJob.create(
+                    job_type="stub_subject_attribute",
+                    resource=RESOURCE_QWEN,
+                    canonical_shard=SHARD,
+                    clip_uid="clip-1",
+                    semantic_inputs={"stub": True},
+                    model_identity="stub",
+                )
+                for _ in unresolved
+            ]
+
+        def seed_jobs(self) -> list[Any]:
+            return list(self.jobs)
+
+        def run(self, job: Any, handle: Any) -> Any:
+            raise RuntimeError("stub subject attribute job never completes")
+
+        def finalize(self, job: Any, result: Any) -> Any:
+            return ()
+
+        def reconcile_stats(self, shard: str) -> Any:
+            raise AssertionError("an unresolved stage must never reconcile")
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "r2v_data_v2.v3.post_mask_epoch_subject_attributes."
+        "SubjectAttributeEpochRunner",
+        _StubSubjectAttributes,
+    )
+
+
+def _sat_markers(ledger: Any) -> tuple[bool, bool]:
+    root = Path(ledger.root) / "composition"
+    return (root / f"{SUBJECT_ATTRIBUTES_STARTED}.json").is_file(), (
+        root / f"{SUBJECT_ATTRIBUTES_COMPLETED}.json"
+    ).is_file()
+
+
+def test_production_reaches_subject_attributes_and_publishes_receipts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real production runner reaches Subject Attributes and its publication.
+
+    The composition runs the real Subject Attributes resource epoch through the
+    same shared manager, ledger and dispatch as every stage above it, and its
+    completed handoff gates the publication. The semantic depth of one owner's
+    chain is covered by the Subject Attributes suite; what this asserts is the
+    production wiring and the receipt the export is allowed to trust.
+    """
+    outcome, _events, _handle, storage, ledger = (
+        _production_reference_integrity_outcome(tmp_path, monkeypatch)
+    )
+
+    assert outcome["remove_completed"] is True
+    assert outcome["pair_completed"] is True
+    assert outcome["reference_edit_completed"] is True
+    assert outcome["reference_integrity_completed"] is True
+    assert outcome["instruct_completed"] is True
+    assert outcome["subject_attributes_completed"] is True, outcome.get(
+        "subject_attributes_reconcile_error"
+    )
+    assert outcome["subject_attributes_unresolved"] == ()
+    assert outcome["subject_attributes_job_count"] >= 1
+    started, completed = _sat_markers(ledger)
+    assert started is True
+    assert completed is True
+
+    # The stage counts exist, so the completed handoff is backed by real counts.
+    counts = storage.read_run().counts
+    assert any(key.startswith("subject_attributes.") for key in counts)
+
+    # The final attribute receipt is published, and it is now pixel authority:
+    # it digests the owner JSON, the sample and every final image they reference.
+    from r2v_data_v2.v3.post_mask_runtime import _expected_attribute_receipt
+
+    receipt = storage.clip_dir("clip-1") / ".post_mask_attributes.json"
+    assert receipt.is_file()
+    payload = json.loads(receipt.read_text(encoding="utf-8"))
+    assert payload["clip"]
+    assert payload["artifacts"]
+    assert payload == _expected_attribute_receipt(storage, "clip-1")
+
+
+def test_subject_attributes_incomplete_blocks_the_export(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unresolved Subject Attributes job stops the publication barrier."""
+    _install_stub_subject_attributes(monkeypatch, unresolved=("stub-job",))
+    outcome, _events, _handle, _storage, ledger = (
+        _production_reference_integrity_outcome(tmp_path, monkeypatch)
+    )
+
+    assert outcome["subject_attributes_completed"] is False
+    assert len(outcome["subject_attributes_unresolved"]) == 1
+    assert outcome["export_completed"] is False
+    assert outcome["completed"] is False
+    assert outcome["reason"] == "subject attributes resource epoch incomplete"
+    _started, completed = _sat_markers(ledger)
+    assert completed is False

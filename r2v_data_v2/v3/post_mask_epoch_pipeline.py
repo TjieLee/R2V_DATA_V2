@@ -61,19 +61,32 @@ RemovalRunnerFactory = Callable[..., RemovalEpochRunner]
 PairRunnerFactory = Callable[..., PairEpochRunner]
 ReferenceIntegritySchedulerFactory = Callable[[Any], Any]
 ReferenceIntegrityRunnerFactory = Callable[..., Any]
+SubjectAttributesSchedulerFactory = Callable[[Any], Any]
+SubjectAttributesRunnerFactory = Callable[..., Any]
 
 DOWNSTREAM_REASON = "downstream resource-epoch phases are not wired"
+EXPORT_PENDING_REASON = "post-mask attribute publication is not wired"
 REFERENCE_INTEGRITY_INCOMPLETE_REASON = (
     "reference integrity resource epoch incomplete"
 )
 INSTRUCT_INCOMPLETE_REASON = "instruct resource epoch incomplete"
+SUBJECT_ATTRIBUTES_INCOMPLETE_REASON = (
+    "subject attributes resource epoch incomplete"
+)
 
 #: Create-once composition handoff markers. They are the restart barrier
 #: authority only: they never take part in any model job identity.
 COMPOSITION_HANDOFF_SCHEMA = "post_mask_resource_epoch_handoff/1"
 REFERENCE_INTEGRITY_STARTED = "reference_integrity_started"
 INSTRUCT_STARTED = "instruct_started"
-COMPOSITION_HANDOFF_STAGES = (REFERENCE_INTEGRITY_STARTED, INSTRUCT_STARTED)
+SUBJECT_ATTRIBUTES_STARTED = "subject_attributes_started"
+SUBJECT_ATTRIBUTES_COMPLETED = "subject_attributes_completed"
+COMPOSITION_HANDOFF_STAGES = (
+    REFERENCE_INTEGRITY_STARTED,
+    INSTRUCT_STARTED,
+    SUBJECT_ATTRIBUTES_STARTED,
+    SUBJECT_ATTRIBUTES_COMPLETED,
+)
 
 
 def default_removal_runner_factory(
@@ -104,6 +117,30 @@ def default_pair_runner_factory(
     emit: Any = None,
 ) -> PairEpochRunner:
     return PairEpochRunner(
+        config,
+        dict(storages),
+        ledger,
+        eligible_clip_uids_by_shard={
+            shard: tuple(uids) for shard, uids in eligible_clip_uids_by_shard.items()
+        },
+        emit=emit,
+    )
+
+
+def default_subject_attributes_runner_factory(
+    config: V3Config,
+    storages: Mapping[str, Any],
+    ledger: GroupLedger,
+    *,
+    eligible_clip_uids_by_shard: Mapping[str, Sequence[str]],
+    emit: Any = None,
+) -> Any:
+    """The production Subject Attributes resource-epoch runner."""
+    from r2v_data_v2.v3.post_mask_epoch_subject_attributes import (
+        SubjectAttributeEpochRunner,
+    )
+
+    return SubjectAttributeEpochRunner(
         config,
         dict(storages),
         ledger,
@@ -428,6 +465,195 @@ def run_deterministic_instruct(
     return True, aggregated, None
 
 
+def _expected_subject_attribute_receipts(
+    storages: Mapping[str, Any], eligible: Mapping[str, Sequence[str]]
+) -> dict[tuple[str, str], dict[str, Any]]:
+    """Recompute every expected final attribute receipt before writing any.
+
+    A shard that fails derivation must not leave another shard with a published
+    receipt, so the whole group is computed first and only then published.
+    """
+    from r2v_data_v2.v3.post_mask_runtime import _expected_attribute_receipt
+
+    expected: dict[tuple[str, str], dict[str, Any]] = {}
+    for shard in sorted(storages):
+        for uid in eligible.get(shard, ()):
+            expected[(str(shard), str(uid))] = _expected_attribute_receipt(
+                storages[shard], str(uid)
+            )
+    return expected
+
+
+def publish_subject_attribute_receipts(
+    storages: Mapping[str, Any], eligible: Mapping[str, Sequence[str]]
+) -> None:
+    """Publish the final attribute receipts of every eligible clip, or fail.
+
+    Missing is an atomic write, an exact existing receipt is a no-op and any
+    drift fails closed: a terminal receipt is never silently overwritten.
+    """
+    from r2v_data_v2.v3.post_mask_runtime import _publish_attribute_receipt
+
+    expected = _expected_subject_attribute_receipts(storages, eligible)
+    for (shard, uid), payload in expected.items():
+        _publish_attribute_receipt(storages[shard], uid, payload)
+
+
+def verify_subject_attribute_receipts(
+    storages: Mapping[str, Any], eligible: Mapping[str, Sequence[str]]
+) -> None:
+    """Verify every final attribute receipt and its pixels, or fail closed.
+
+    This is the only check a completed handoff is allowed to run: it never seeds
+    a job, never reconciles a semantic stage and never rewrites an artifact, so a
+    tampered terminal PNG stays tampered and is reported instead of repaired.
+    """
+    from r2v_data_v2.v3.post_mask_runtime import _expected_attribute_receipt
+
+    for shard in sorted(storages):
+        storage = storages[shard]
+        for uid in eligible.get(shard, ()):
+            path = storage.clip_dir(uid) / ".post_mask_attributes.json"
+            if not path.is_file():
+                raise StageHandoffError(
+                    f"final attribute receipt is missing for {uid!r}"
+                )
+            try:
+                existing = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                raise StageHandoffError(
+                    f"final attribute receipt is unreadable for {uid!r}"
+                ) from exc
+            try:
+                expected = _expected_attribute_receipt(storage, uid)
+            except (OSError, ValueError) as exc:
+                raise StageHandoffError(
+                    f"final attribute artifact is missing or invalid for {uid!r}: {exc}"
+                ) from exc
+            if existing != expected:
+                raise StageHandoffError(
+                    f"final attribute receipt drifted for {uid!r}"
+                )
+
+
+def _reconcile_and_publish_subject_attribute_stats(
+    *,
+    subject_attributes: Any,
+    storages: Mapping[str, Any],
+    eligible: Mapping[str, Sequence[str]],
+) -> tuple[bool, dict[str, Any], str | None]:
+    """Reconcile every shard, publish the final receipts, then the counts.
+
+    Phase 1 reconciles every shard with no writes at all. Phase 2 publishes the
+    final attribute receipts, which are the pixel authority of this stage, and
+    only then writes the ``subject_attributes.*`` stage counts. A failure in any
+    phase leaves the group without counts and without the completed handoff.
+    """
+    from r2v_data_v2.v3.post_mask_epoch_subject_attributes import (
+        SubjectAttributeEpochError,
+    )
+
+    reconciled: dict[str, dict[str, Any]] = {}
+    try:
+        for shard in sorted(subject_attributes.storages):
+            stats = subject_attributes.reconcile_stats(shard)
+            # The run record's durable stage counts are integer counters, so the
+            # model durations the stats also carry stay in the receipts instead
+            # of being truncated into the counts.
+            reconciled[shard] = {
+                key: value
+                for key, value in stats.to_dict().items()
+                if isinstance(value, int) and not isinstance(value, bool)
+            }
+    except SubjectAttributeEpochError as exc:
+        return False, {}, str(exc)
+    try:
+        publish_subject_attribute_receipts(storages, eligible)
+    except (OSError, ValueError) as exc:
+        return False, {}, str(exc)
+    for shard, payload in reconciled.items():
+        subject_attributes.storages[shard].update_stage_counts(
+            "subject_attributes", payload
+        )
+    return True, reconciled, None
+
+
+def run_subject_attributes_stage(
+    *,
+    config: V3Config,
+    storages: Mapping[str, Any],
+    eligible: Mapping[str, Sequence[str]],
+    ledger: GroupLedger,
+    result: dict[str, Any],
+    subject_attributes_runner_factory: SubjectAttributesRunnerFactory,
+    subject_attributes_scheduler_factory: SubjectAttributesSchedulerFactory,
+    emit: Any = None,
+) -> dict[str, Any]:
+    """Subject Attributes, then its receipt publication and completed handoff.
+
+    The started marker is written before the runner may seed or pay for anything,
+    so a crash can only ever restart inside this stage. The completed marker is
+    written last, after every shard reconciled and every final attribute receipt
+    was published, so it is the barrier the export is allowed to trust.
+    """
+    write_composition_handoff(
+        ledger,
+        SUBJECT_ATTRIBUTES_STARTED,
+        eligible_clip_uids_by_shard=eligible,
+    )
+    subject_attributes = subject_attributes_runner_factory(
+        config=config,
+        storages=dict(storages),
+        ledger=ledger,
+        eligible_clip_uids_by_shard=eligible,
+        emit=emit,
+    )
+    seeded = subject_attributes.seed_jobs()
+    _emit(
+        emit,
+        "post_mask_epoch_subject_attributes_seeded",
+        seeded_jobs=len(seeded),
+    )
+    outcome = subject_attributes_scheduler_factory(subject_attributes).run(seeded)
+    unresolved = tuple(outcome.get("unresolved_job_ids", ()))
+    completed = False
+    stats: dict[str, Any] = {}
+    error: str | None = None
+    if not unresolved:
+        completed, stats, error = _reconcile_and_publish_subject_attribute_stats(
+            subject_attributes=subject_attributes,
+            storages=storages,
+            eligible=eligible,
+        )
+    result.update(
+        {
+            "subject_attributes_job_count": len(seeded),
+            "subject_attributes_unresolved": unresolved,
+            "subject_attributes_completed": completed,
+            "subject_attributes_stats": stats,
+            "subject_attributes_reconcile_error": error,
+            "reason": (
+                EXPORT_PENDING_REASON
+                if completed
+                else SUBJECT_ATTRIBUTES_INCOMPLETE_REASON
+            ),
+        }
+    )
+    _emit(
+        emit,
+        "post_mask_epoch_subject_attributes_finished",
+        completed=completed,
+        unresolved=len(unresolved),
+    )
+    if completed:
+        write_composition_handoff(
+            ledger,
+            SUBJECT_ATTRIBUTES_COMPLETED,
+            eligible_clip_uids_by_shard=eligible,
+        )
+    return result
+
+
 def _after_reference_edit(
     *,
     config: V3Config,
@@ -439,6 +665,8 @@ def _after_reference_edit(
     reference_integrity_runner_factory: Any,
     reference_integrity_scheduler_factory: Any,
     reference_integrity_wired: bool,
+    subject_attributes_runner_factory: Any = None,
+    subject_attributes_scheduler_factory: Any = None,
     emit: Any = None,
 ) -> dict[str, Any]:
     """Continue into Reference Integrity only when Reference Edit completed.
@@ -458,6 +686,8 @@ def _after_reference_edit(
         result=result,
         reference_integrity_runner_factory=reference_integrity_runner_factory,
         reference_integrity_scheduler_factory=reference_integrity_scheduler_factory,
+        subject_attributes_runner_factory=subject_attributes_runner_factory,
+        subject_attributes_scheduler_factory=subject_attributes_scheduler_factory,
         emit=emit,
     )
 
@@ -471,9 +701,11 @@ def _continue_with_reference_integrity(
     result: dict[str, Any],
     reference_integrity_runner_factory: Any,
     reference_integrity_scheduler_factory: Any,
+    subject_attributes_runner_factory: Any = None,
+    subject_attributes_scheduler_factory: Any = None,
     emit: Any = None,
 ) -> dict[str, Any]:
-    """Reference Integrity, then deterministic Instruct, then stop.
+    """Reference Integrity, deterministic Instruct, then Subject Attributes.
 
     Both handoff markers are written before the work they guard, so a crash can
     only ever restart ``from`` a barrier, never re-verify an upstream
@@ -541,7 +773,14 @@ def _continue_with_reference_integrity(
         ledger, INSTRUCT_STARTED, eligible_clip_uids_by_shard=eligible
     )
     return run_instruct_stage(
-        config=config, storages=storages, eligible=eligible, result=result, emit=emit
+        config=config,
+        storages=storages,
+        eligible=eligible,
+        result=result,
+        ledger=ledger,
+        subject_attributes_runner_factory=subject_attributes_runner_factory,
+        subject_attributes_scheduler_factory=subject_attributes_scheduler_factory,
+        emit=emit,
     )
 
 
@@ -551,6 +790,10 @@ def run_instruct_stage(
     storages: Mapping[str, Any],
     eligible: Mapping[str, Sequence[str]],
     result: dict[str, Any],
+    ledger: GroupLedger,
+    subject_attributes_runner_factory: SubjectAttributesRunnerFactory | None = None,
+    subject_attributes_scheduler_factory: SubjectAttributesSchedulerFactory
+    | None = None,
     emit: Any = None,
 ) -> dict[str, Any]:
     """Run the deterministic Instruct stage and record it in the result.
@@ -580,7 +823,26 @@ def run_instruct_stage(
         "post_mask_epoch_instruct_finished",
         completed=instruct_completed,
     )
-    return result
+    if not instruct_completed:
+        return result
+    if (
+        subject_attributes_runner_factory is None
+        or subject_attributes_scheduler_factory is None
+    ):
+        return result
+    # Subject Attributes is the last semantic stage: its started marker is only
+    # written once every instruction is published, and its completed marker is
+    # the barrier the per-shard export is allowed to trust.
+    return run_subject_attributes_stage(
+        config=config,
+        storages=storages,
+        eligible=eligible,
+        ledger=ledger,
+        result=result,
+        subject_attributes_runner_factory=subject_attributes_runner_factory,
+        subject_attributes_scheduler_factory=subject_attributes_scheduler_factory,
+        emit=emit,
+    )
 
 
 def run_removal_pair_epochs(
@@ -597,6 +859,9 @@ def run_removal_pair_epochs(
     reference_edit_scheduler_factory: Callable[[Any], Any] | None = None,
     reference_integrity_runner_factory: Callable[..., Any] | None = None,
     reference_integrity_scheduler_factory: Callable[[Any], Any] | None = None,
+    subject_attributes_runner_factory: SubjectAttributesRunnerFactory | None = None,
+    subject_attributes_scheduler_factory: SubjectAttributesSchedulerFactory
+    | None = None,
     emit: Any = None,
 ) -> dict[str, Any]:
     """Drain Removal, then Pair primary, then the frozen Pair cross pass.
@@ -646,6 +911,11 @@ def run_removal_pair_epochs(
         "reference_integrity_reconcile_error":None,
         "instruct_completed":False,
         "instruct_stats":{},
+        "subject_attributes_completed":False,
+        "subject_attributes_job_count":0,
+        "subject_attributes_unresolved":(),
+        "subject_attributes_stats":{},
+        "subject_attributes_reconcile_error":None,
         "completed":False,
         "reason":"background removal incomplete",
         "removal_outcome":removal_outcome,
@@ -664,12 +934,119 @@ def run_removal_pair_epochs(
     # counts. The most downstream marker wins, and the upstream stages are then
     # never replayed -- their live-state verification would otherwise mistake a
     # publication that a downstream stage legitimately rewrote for corruption.
+    subject_attributes_completed = read_composition_handoff(
+        ledger, SUBJECT_ATTRIBUTES_COMPLETED, eligible_clip_uids_by_shard=eligible
+    )
+    subject_attributes_started = read_composition_handoff(
+        ledger, SUBJECT_ATTRIBUTES_STARTED, eligible_clip_uids_by_shard=eligible
+    )
     instruct_started = read_composition_handoff(
         ledger, INSTRUCT_STARTED, eligible_clip_uids_by_shard=eligible
     )
     reference_integrity_started = read_composition_handoff(
         ledger, REFERENCE_INTEGRITY_STARTED, eligible_clip_uids_by_shard=eligible
     )
+    if subject_attributes_completed is not None:
+        # The most downstream marker there is. Subject Attributes semantic is
+        # terminal, so the runner may not be constructed at all: re-deriving a
+        # processed owner would rerun the legacy materialisers and silently
+        # repair a tampered final PNG. Only the receipts are verified.
+        if (
+            subject_attributes_runner_factory is None
+            or subject_attributes_scheduler_factory is None
+        ):
+            raise StageHandoffError(
+                "composition handoff claims Subject Attributes completed but no "
+                "Subject Attributes runner is wired"
+            )
+        result.update(
+            {
+                "pair_primary_completed": True,
+                "pair_cross_completed": True,
+                "pair_completed": True,
+                "pair_primary_unresolved": (),
+                "pair_cross_unresolved": (),
+                "pair_stats": _stage_stats_from_stage_counts(storages, "pair"),
+                "reference_edit_completed": True,
+                "reference_edit_job_count": 0,
+                "reference_edit_unresolved": (),
+                "reference_edit_stats": _stage_stats_from_stage_counts(
+                    storages, "reference_edit"
+                ),
+                "reference_integrity_completed": True,
+                "reference_integrity_job_count": 0,
+                "reference_integrity_unresolved": (),
+                "reference_integrity_stats": _stage_stats_from_stage_counts(
+                    storages, "reference_integrity"
+                ),
+                "instruct_completed": True,
+                "instruct_stats": _stage_stats_from_stage_counts(
+                    storages, "instruct"
+                ),
+                "instruct_error": None,
+                "subject_attributes_completed": True,
+                "subject_attributes_job_count": 0,
+                "subject_attributes_unresolved": (),
+                "subject_attributes_stats": _stage_stats_from_stage_counts(
+                    storages, "subject_attributes"
+                ),
+                "subject_attributes_reconcile_error": None,
+                "reason": EXPORT_PENDING_REASON,
+            }
+        )
+        verify_subject_attribute_receipts(storages, eligible)
+        _emit(
+            emit,
+            "post_mask_epoch_subject_attributes_verified",
+            completed=True,
+        )
+        return result
+    if subject_attributes_started is not None:
+        if (
+            subject_attributes_runner_factory is None
+            or subject_attributes_scheduler_factory is None
+        ):
+            raise StageHandoffError(
+                "composition handoff claims Subject Attributes started but no "
+                "Subject Attributes runner is wired"
+            )
+        result.update(
+            {
+                "pair_primary_completed": True,
+                "pair_cross_completed": True,
+                "pair_completed": True,
+                "pair_primary_unresolved": (),
+                "pair_cross_unresolved": (),
+                "pair_stats": _stage_stats_from_stage_counts(storages, "pair"),
+                "reference_edit_completed": True,
+                "reference_edit_job_count": 0,
+                "reference_edit_unresolved": (),
+                "reference_edit_stats": _stage_stats_from_stage_counts(
+                    storages, "reference_edit"
+                ),
+                "reference_integrity_completed": True,
+                "reference_integrity_job_count": 0,
+                "reference_integrity_unresolved": (),
+                "reference_integrity_stats": _stage_stats_from_stage_counts(
+                    storages, "reference_integrity"
+                ),
+                "instruct_completed": True,
+                "instruct_stats": _stage_stats_from_stage_counts(
+                    storages, "instruct"
+                ),
+                "instruct_error": None,
+            }
+        )
+        return run_subject_attributes_stage(
+            config=config,
+            storages=storages,
+            eligible=eligible,
+            ledger=ledger,
+            result=result,
+            subject_attributes_runner_factory=subject_attributes_runner_factory,
+            subject_attributes_scheduler_factory=subject_attributes_scheduler_factory,
+            emit=emit,
+        )
     if instruct_started is not None:
         result.update(
             {
@@ -698,6 +1075,11 @@ def run_removal_pair_epochs(
             storages=storages,
             eligible=eligible,
             result=result,
+            ledger=ledger,
+            subject_attributes_runner_factory=subject_attributes_runner_factory,
+            subject_attributes_scheduler_factory=(
+                subject_attributes_scheduler_factory
+            ),
             emit=emit,
         )
     if reference_integrity_started is not None:
@@ -796,6 +1178,10 @@ def run_removal_pair_epochs(
                 reference_integrity_scheduler_factory
             ),
             reference_integrity_wired=reference_integrity_wired,
+            subject_attributes_runner_factory=subject_attributes_runner_factory,
+            subject_attributes_scheduler_factory=(
+                subject_attributes_scheduler_factory
+            ),
             emit=emit,
         )
 
@@ -910,6 +1296,8 @@ def run_removal_pair_epochs(
         reference_integrity_runner_factory=reference_integrity_runner_factory,
         reference_integrity_scheduler_factory=reference_integrity_scheduler_factory,
         reference_integrity_wired=reference_integrity_wired,
+        subject_attributes_runner_factory=subject_attributes_runner_factory,
+        subject_attributes_scheduler_factory=subject_attributes_scheduler_factory,
         emit=emit,
     )
 
@@ -1013,6 +1401,9 @@ def run_removal_pair_resource_session(
     | None = None,
     reference_integrity_runner_factory: ReferenceIntegrityRunnerFactory
     | None = None,
+    build_subject_attributes_scheduler: Callable[[Any, _EpochStageDispatch], Any]
+    | None = None,
+    subject_attributes_runner_factory: SubjectAttributesRunnerFactory | None = None,
     **composition: Any,
 ) -> dict[str, Any]:
     """Run the 4a composition inside one shared resource session.
@@ -1047,6 +1438,12 @@ def run_removal_pair_resource_session(
         dispatch.bind(runner)
         return build_reference_integrity_scheduler(runner, dispatch)
 
+    def subject_attributes_scheduler(runner: Any) -> Any:
+        # The same one cached Qwen executor, plus the Boogu and SAM resources
+        # Removal already needs, now dispatched to the Subject Attributes runner.
+        dispatch.bind(runner)
+        return build_subject_attributes_scheduler(runner, dispatch)
+
     try:
         result = run_removal_pair_epochs(
             config=config,
@@ -1076,6 +1473,19 @@ def run_removal_pair_resource_session(
                 None
                 if build_reference_integrity_scheduler is None
                 else reference_integrity_scheduler
+            ),
+            subject_attributes_runner_factory=(
+                None
+                if build_subject_attributes_scheduler is None
+                else (
+                    subject_attributes_runner_factory
+                    or default_subject_attributes_runner_factory
+                )
+            ),
+            subject_attributes_scheduler_factory=(
+                None
+                if build_subject_attributes_scheduler is None
+                else subject_attributes_scheduler
             ),
             **composition,
         )
