@@ -699,11 +699,24 @@ class ReferenceIntegrityEpochRunner:
     ) -> dict[str, Any]:
         """Create-once review input anchor, re-derived and compared exactly."""
         path = self._review_input_path(shard, clip_uid, entity.entity_id)
-        expected = self._review_input_anchor(storage, clip_uid, entity, reference)
         existing = _read_json(path)
         if existing is None:
+            # First freeze. A broken reference or source evidence here is still
+            # an ordinary legacy CPU failure, not durable corruption.
+            expected = self._review_input_anchor(storage, clip_uid, entity, reference)
             _write_json_once(path, expected)
             return expected
+        # The model input is already frozen, so failing to re-derive it can only
+        # mean the frozen evidence changed underneath us.
+        try:
+            expected = self._review_input_anchor(storage, clip_uid, entity, reference)
+        except ReferenceIntegrityDurableError:
+            raise
+        except Exception as exc:
+            raise ReferenceIntegrityDurableError(
+                f"cannot re-derive frozen Reference Integrity review input for "
+                f"{clip_uid}/{entity.entity_id}"
+            ) from exc
         if existing != expected:
             raise ReferenceIntegrityDurableError(
                 f"frozen Reference Integrity review input drifted for "
@@ -801,10 +814,20 @@ class ReferenceIntegrityEpochRunner:
                         f"judge-failed entity outcome must not carry a review for "
                         f"{label}"
                     )
-            elif not isinstance(review, dict):
-                raise ReferenceIntegrityDurableError(
-                    f"reviewed entity outcome has no review for {label}"
-                )
+            else:
+                if not isinstance(review, dict):
+                    raise ReferenceIntegrityDurableError(
+                        f"reviewed entity outcome has no review for {label}"
+                    )
+                # Structural fail-closed layer: a shape-valid but content-less
+                # review (for example {}) must never reach the reason comparison
+                # as a bare ``marker["review"]["reason"]`` KeyError.
+                try:
+                    validated_review = ReferenceIntegrityReview.model_validate(review)
+                except Exception as exc:
+                    raise ReferenceIntegrityDurableError(
+                        f"reviewed entity outcome has an invalid review for {label}"
+                    ) from exc
         elif present:
             raise ReferenceIntegrityDurableError(
                 f"CPU entity outcome must not carry review provenance for {label}"
@@ -852,7 +875,7 @@ class ReferenceIntegrityEpochRunner:
                 raise ReferenceIntegrityDurableError(
                     f"judge-failed entity outcome reason drifted for {label}"
                 )
-            if not marker["judge_failed"] and reason != marker["review"]["reason"]:
+            if not marker["judge_failed"] and reason != validated_review.reason:
                 raise ReferenceIntegrityDurableError(
                     f"reviewed entity outcome reason disagrees with its review for "
                     f"{label}"
@@ -985,6 +1008,19 @@ class ReferenceIntegrityEpochRunner:
         reference: Any,
     ) -> list[ModelJob]:
         """Terminal CPU marker, or the deterministic main review job to run."""
+        review_input_path = self._review_input_path(
+            shard, clip.clip_uid, entity.entity_id
+        )
+        if _read_json(review_input_path) is not None:
+            # A durable review input already proves this entity entered the main
+            # review, so re-verify the whole frozen model input before re-issuing
+            # the same deterministic job. Without this fast path a missing final
+            # reference would surface as an ordinary CPU failure instead of
+            # frozen-input corruption.
+            anchor = self._frozen_review_input(
+                shard, storage, clip.clip_uid, entity, reference
+            )
+            return [self._expected_review_job(shard, entity, reference, anchor)]
         final_image = _load_reference_image(storage, str(reference.image_path))
         diagnostics = reference_topology_diagnostics(final_image)
         expected = self._expected_entity_marker(

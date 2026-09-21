@@ -884,3 +884,67 @@ def test_reviewed_marker_tamper_fails_closed(
     fresh = _runner(config, storage, tmp_path)
     with pytest.raises(ReferenceIntegrityDurableError, match="reviewed entity outcome"):
         fresh.reconcile_stats(SHARD)
+
+
+def test_reviewed_marker_invalid_review_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A shape-valid but content-less review is durable corruption, not KeyError."""
+    judge_result = legacy_integrity._review(accept=True, reason="usable reference")
+    config, storage = _main_review_fixture(tmp_path, monkeypatch, "run-epoch")
+    judge = _fake_main_judge(judge_result)
+    runner, _executor, _jobs = _run_epoch(config, storage, tmp_path, judge)
+
+    path = runner._entity_outcome_path(SHARD, "clip-1", "e2")
+    marker = json.loads(path.read_text(encoding="utf-8"))
+    marker["review"] = {}  # a dict, so the old type check let it through
+    path.write_text(json.dumps(marker), encoding="utf-8")
+
+    fresh = _runner(config, storage, tmp_path)
+    with pytest.raises(
+        ReferenceIntegrityDurableError, match="has an invalid review"
+    ):
+        fresh.seed_jobs()
+
+
+def test_existing_review_anchor_unreadable_input_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once the review input is frozen, a lost final reference is corruption.
+
+    The anchor durably proves the entity entered the main review, so the epoch
+    must fail closed rather than degrade into an ordinary CPU clip failure.
+    """
+    from r2v_data_v2.v3.reference_integrity import _resolve_run_artifact
+
+    config, storage = _main_review_fixture(tmp_path, monkeypatch, "run-epoch")
+    judge = _fake_main_judge(legacy_integrity._review(accept=True, reason="usable"))
+    runner = _runner(config, storage, tmp_path)
+    jobs = runner.seed_jobs()
+    assert len(jobs) == 1
+    assert dict(jobs[0].target) == {"entity_id": "e2", "variant": "final"}
+
+    anchor_path = runner._review_input_path(SHARD, "clip-1", "e2")
+    anchor = json.loads(anchor_path.read_text(encoding="utf-8"))
+    _resolve_run_artifact(storage, str(anchor["final_reference_path"])).unlink()
+
+    fresh = _runner(config, storage, tmp_path)
+    fresh_executor = _SerialQwenExecutor(fresh, judge)
+    with pytest.raises(
+        ReferenceIntegrityDurableError, match="cannot re-derive"
+    ):
+        jobs = fresh.seed_jobs()
+        _epoch_scheduler(fresh, fresh_executor).run(jobs)
+
+    assert fresh_executor.batches == 0, "no model work may be scheduled"
+    assert len(judge.calls) == 0, "the epoch never pays a Qwen call here"
+    clip = storage.read_clip("clip-1")
+    assert clip.reference_integrity is None, "must not become a semantic failure"
+    failures_path = Path(storage.root) / "failures.jsonl"
+    if failures_path.is_file():
+        recorded = [
+            line
+            for line in failures_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        assert recorded == [], "no semantic failure may be appended"
