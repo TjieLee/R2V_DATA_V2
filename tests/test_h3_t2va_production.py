@@ -215,6 +215,58 @@ def test_ready_resume_does_not_grow_journal(tmp_path):
     assert path.read_bytes() == before
 
 
+def test_full_t2va_pending_sample_verifies_media_once(
+    tmp_path, finalized, monkeypatch
+):
+    from r2v_data_v2.h3 import t2va_shadow as t
+    from r2v_data_v2.h3 import ta2va_shadow as ta
+    from tests.test_h3_ta2va_shadow import ProfileClient
+
+    inventory = shared.build(finalized, tmp_path)
+    job = next(item for item in inventory.jobs if not item.upstream_failure)
+    backend = shared.T2VAMimoBackend(
+        shared.config(tmp_path),
+        client=shared.Client([shared.draft_for(job).model_dump_json()]),
+        verify_media=False,
+    )
+    profiles = ta.TA2VAProfileBackend(
+        shared.config(tmp_path), client=ProfileClient()
+    )
+    processor = production.FrozenProductionProcessor(
+        {job.clip_uid: (job, inventory)},
+        backend,
+        profiles,
+        allow_unverified=True,
+        verify_sources_per_sample=False,
+    )
+
+    original_sha = production._sha
+    original_audio = t.check_audio_files
+    calls = {"video": 0, "audio": 0}
+
+    def count_video(path):
+        calls["video"] += 1
+        return original_sha(path)
+
+    def count_audio(evidence):
+        calls["audio"] += 1
+        return original_audio(evidence)
+
+    monkeypatch.setattr(production, "_sha", count_video)
+    monkeypatch.setattr(t, "check_audio_files", count_audio)
+
+    output = tmp_path / "single-pass-t2va"
+    output.mkdir()
+    result = processor.process(
+        "t2va",
+        {"clip_uid": job.clip_uid},
+        output,
+        output,
+    )
+    assert result["model_call_count"] == 2
+    assert calls == {"video": 1, "audio": 1}
+
+
 def test_prevalidated_processor_skips_repeated_source_hashes(
     tmp_path, finalized, monkeypatch
 ):
