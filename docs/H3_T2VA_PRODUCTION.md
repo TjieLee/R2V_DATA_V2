@@ -371,6 +371,33 @@ If `canonical_prefetch_started` appears without completion, inspect
 `shards/<shard>/logs/canonical-prefetch.log` and whether another allocation is
 still active on the same production root.
 
+### Speech-stage model fingerprint policy
+
+DiariZen and Qwen3-ASR configuration provenance includes a fingerprint of the
+local model path. Do not recompute that fingerprint once per shard. The model
+paths are pinned for one production supervisor invocation, and recursively
+hashing a model directory means reading every model file from shared storage
+before any GPU worker starts.
+
+The full-production speech runner therefore caches the model fingerprint/config
+by the relevant environment configuration (model path, model identifier, dtype,
+timeouts, etc.). Repeated shards with identical configuration reuse the cached
+fingerprint. If the configuration key changes, the fingerprint is recomputed.
+
+The supervisor prints:
+
+    diarizen_config_start
+    diarizen_config_ready
+    asr_config_start
+    asr_config_ready
+
+A long gap between a *_config_start and *_config_ready marker indicates model
+configuration/fingerprint work, not GPU inference.
+
+Within an ASR worker, multiple transcript segments from the same speech stem also
+reuse one successful source-audio hash validation instead of hashing the same stem
+for every segment.
+
 ### Downstream inventory complexity
 
 Downstream preparation must be linear in the shard population plus speech
