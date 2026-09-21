@@ -424,10 +424,12 @@ def build(finalized, tmp_path, **kwargs):
 def test_preselected_inventory_skips_media_reselection_and_audio_rehash(
     finalized, tmp_path, monkeypatch
 ):
+    from r2v_data_v2.h3 import t2va_source
+
     selection = select_t2va_shots(tmp_path / "shots_f03_motion.jsonl")
 
     monkeypatch.setattr(
-        t2va,
+        t2va_source,
         "select_t2va_shots",
         lambda *args, **kwargs: pytest.fail("preselected inventory reselected shots"),
     )
