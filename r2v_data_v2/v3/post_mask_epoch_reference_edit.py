@@ -87,6 +87,17 @@ REFERENCE_EDIT_ENTITY_OUTCOME_SCHEMA = (
     "post_mask_epoch_reference_edit_entity_outcome/1"
 )
 REFERENCE_EDIT_CLIP_OUTCOME_SCHEMA = "post_mask_epoch_reference_edit_outcome/1"
+REFERENCE_EDIT_ATTEMPT_OUTCOME_SCHEMA = (
+    "post_mask_epoch_reference_edit_attempt_outcome/1"
+)
+#: Statuses the attempt-outcome writer can actually produce.
+ATTEMPT_OUTCOME_STATUSES = (
+    "accepted",
+    "rejected",
+    "generation_failed",
+    "qwen_failed",
+    "sam_failed",
+)
 
 CLIP_FRESH_TARGET = "fresh_target"
 CLIP_EXISTING = "existing"
@@ -162,9 +173,26 @@ def resolve_reference_edit_judge(
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:
+    """Durable reader: missing is ``None``, corrupt is always fail-closed.
+
+    A durable authority file that exists but cannot be read, cannot be parsed,
+    or does not hold a JSON object is corruption -- never an empty state. The
+    exception is always :class:`ReferenceEditDurableError` so no caller can
+    turn it into a semantic clip failure.
+    """
     if not path.is_file():
         return None
-    return json.loads(path.read_text(encoding="utf-8"))
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ReferenceEditDurableError(
+            f"invalid durable Reference Edit JSON: {path}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise ReferenceEditDurableError(
+            f"durable Reference Edit JSON is not an object: {path}"
+        )
+    return payload
 
 
 def _write_json_once(path: Path, payload: Mapping[str, Any]) -> None:
@@ -1067,9 +1095,7 @@ class ReferenceEditEpochRunner:
                 except Exception as exc:  # noqa: BLE001 - legacy clip isolation
                     # Ordinary legacy CPU failure: terminal for THIS clip,
                     # other clips continue.
-                    self._fail_clip_terminal(
-                        shard, storage, clip_uid, f"{type(exc).__name__}: {exc}"
-                    )
+                    self._fail_clip_terminal(shard, storage, clip_uid, exc)
         jobs.sort(key=lambda job: job.job_id())
         self.ledger.phase(REFERENCE_EDIT_PHASE).write_plan(jobs)
         return jobs
@@ -1829,7 +1855,7 @@ class ReferenceEditEpochRunner:
                 shard, clip_uid, entity_id, attempt_index
             ),
             {
-                "schema": "post_mask_epoch_reference_edit_attempt_outcome/1",
+                "schema": REFERENCE_EDIT_ATTEMPT_OUTCOME_SCHEMA,
                 "attempt_index": attempt_index,
                 "status": (
                     "accepted"
@@ -1873,6 +1899,109 @@ class ReferenceEditEpochRunner:
                 f"boogu_reference_edit_failed: {payload.get('error')}"
             ),
         )
+
+    def _validated_attempt_outcome(
+        self,
+        shard: str,
+        clip_uid: str,
+        entity_id: str,
+        attempt_index: int,
+    ) -> dict[str, Any] | None:
+        """Durable per-attempt accounting marker, strictly validated.
+
+        ``None`` means the attempt never reached a terminal outcome. Anything
+        else must be exactly what the writer produces for this attempt, so a
+        tampered marker can never skew the completion counters.
+        """
+        marker = _read_json(
+            self._attempt_outcome_path(shard, clip_uid, entity_id, attempt_index)
+        )
+        if marker is None:
+            return None
+        label = f"{clip_uid}/{entity_id} attempt {attempt_index}"
+        if marker.get("schema") != REFERENCE_EDIT_ATTEMPT_OUTCOME_SCHEMA:
+            raise ReferenceEditDurableError(
+                f"attempt outcome schema drifted for {label}"
+            )
+        if marker.get("attempt_index") != attempt_index:
+            raise ReferenceEditDurableError(
+                f"attempt outcome index drifted for {label}"
+            )
+        accepted = marker.get("accepted")
+        if not isinstance(accepted, bool):
+            raise ReferenceEditDurableError(
+                f"attempt outcome accepted flag is not a bool for {label}"
+            )
+        status = marker.get("status")
+        if status not in ATTEMPT_OUTCOME_STATUSES:
+            raise ReferenceEditDurableError(
+                f"attempt outcome status is unknown for {label}"
+            )
+        if accepted != (status == "accepted"):
+            raise ReferenceEditDurableError(
+                f"attempt outcome accepted flag disagrees with its status for "
+                f"{label}"
+            )
+        if not isinstance(marker.get("rejection_reason"), str):
+            raise ReferenceEditDurableError(
+                f"attempt outcome rejection_reason is not a string for {label}"
+            )
+        return marker
+
+    def _verify_entity_attempt_consistency(
+        self,
+        shard: str,
+        clip_uid: str,
+        entity_id: str,
+        entity_outcome: Mapping[str, Any],
+        attempt_markers: Mapping[int, Mapping[str, Any]],
+    ) -> None:
+        """Cross-check the entity outcome against its attempt markers.
+
+        Only the relationships the frozen candidate1/candidate2 chain always
+        produces are asserted; there is no general state machine here.
+        """
+        attempt_index = entity_outcome.get("attempt_index")
+        if not isinstance(attempt_index, int):
+            return
+        first = attempt_markers.get(1)
+        second = attempt_markers.get(2)
+        outcome = entity_outcome.get("outcome")
+        if outcome == "accepted" and attempt_index == 1:
+            if first is None or not first.get("accepted"):
+                raise ReferenceEditDurableError(
+                    f"{clip_uid}/{entity_id} is accepted on attempt 1 but its "
+                    "attempt-1 marker disagrees"
+                )
+            if second is not None:
+                raise ReferenceEditDurableError(
+                    f"{clip_uid}/{entity_id} is accepted on attempt 1 but an "
+                    "attempt-2 marker exists"
+                )
+            return
+        if outcome == "accepted" and attempt_index == 2:
+            if second is None or not second.get("accepted"):
+                raise ReferenceEditDurableError(
+                    f"{clip_uid}/{entity_id} is accepted on attempt 2 but its "
+                    "attempt-2 marker disagrees"
+                )
+            if first is None or first.get("accepted"):
+                raise ReferenceEditDurableError(
+                    f"{clip_uid}/{entity_id} reached attempt 2 without a "
+                    "rejected attempt 1"
+                )
+            return
+        if outcome == "fallback" and attempt_index == 2:
+            if second is None or second.get("accepted"):
+                raise ReferenceEditDurableError(
+                    f"{clip_uid}/{entity_id} fell back on attempt 2 but its "
+                    "attempt-2 marker disagrees"
+                )
+            if first is None or first.get("accepted"):
+                raise ReferenceEditDurableError(
+                    f"{clip_uid}/{entity_id} reached attempt 2 without a "
+                    "rejected attempt 1"
+                )
 
     def _routing_delta(self, shard: str, clip_uid: str, entity_id: str) -> dict[str, int]:
         routing = _read_json(self._routing_path(shard, clip_uid, entity_id)) or {}
@@ -2363,9 +2492,18 @@ class ReferenceEditEpochRunner:
         )
 
     def _fail_clip_terminal(
-        self, shard: str, storage: RunStorage, clip_uid: str, reason: str
+        self,
+        shard: str,
+        storage: RunStorage,
+        clip_uid: str,
+        exc: Exception,
     ) -> None:
-        """Legacy clip isolation: one ordinary CPU failure is terminal."""
+        """Legacy clip isolation: one ordinary CPU failure is terminal.
+
+        The legacy diagnostic is reproduced exactly: the failure reason is
+        ``str(exc)`` and the diagnostic details carry the real exception type.
+        """
+        reason = str(exc)
         if self._clip_outcome_path(shard, clip_uid).is_file():
             return
         storage.write_reference_edit_failure(clip_uid, reason)
@@ -2373,7 +2511,7 @@ class ReferenceEditEpochRunner:
             stage="reference_edit",
             clip_uid=clip_uid,
             reason=reason,
-            details={"exception_type": "ReferenceEditClipFailure"},
+            details={"exception_type": type(exc).__name__},
         )
         _write_json_once(
             self._clip_outcome_path(shard, clip_uid),
@@ -2395,42 +2533,30 @@ class ReferenceEditEpochRunner:
     ) -> None:
         """Verify a published clip against its durable outcome marker.
 
-        A crash between ``write_reference_edit_result``/``write_reference_edit_
-        failure`` and the clip outcome marker is repaired here: the expected
-        publication is reconstructed and, when it matches the live state, the
-        marker is back-filled with zero model calls. A mismatch (or a missing
-        marker with no reconstructable state) fails closed.
+        The marker is a strict authority: its exact payload is derived from the
+        verified publication and compared field for field. A crash between
+        ``write_reference_edit_result``/``write_reference_edit_failure`` and the
+        marker is repaired by back-filling that same exact payload with zero
+        model calls; any other difference fails closed.
         """
         clip = storage.read_clip(clip_uid)
-        marker = _read_json(self._clip_outcome_path(shard, clip_uid))
+        marker_path = self._clip_outcome_path(shard, clip_uid)
+        marker = _read_json(marker_path)
         if clip.reference_edit is not None and clip.reference_edit.status == "failed":
+            expected_marker = {
+                "schema": REFERENCE_EDIT_CLIP_OUTCOME_SCHEMA,
+                "clip_uid": clip_uid,
+                "terminal": "failed",
+                "reason": str(clip.reference_edit.reason or ""),
+                "delta": {"processed": 1, "failed": 1},
+            }
             if marker is None:
-                # Crash between the failure publication and the marker.
-                _write_json_once(
-                    self._clip_outcome_path(shard, clip_uid),
-                    {
-                        "schema": REFERENCE_EDIT_CLIP_OUTCOME_SCHEMA,
-                        "clip_uid": clip_uid,
-                        "terminal": "failed",
-                        "reason": str(clip.reference_edit.reason or ""),
-                        "delta": {"processed": 1, "failed": 1},
-                    },
-                )
+                _write_json_once(marker_path, expected_marker)
                 return
-            if marker.get("terminal") != "failed":
+            if marker != expected_marker:
                 raise ReferenceEditDurableError(
-                    f"clip {clip_uid!r} published a failure but its durable "
-                    "outcome marker says otherwise"
-                )
-            live_reason = str(clip.reference_edit.reason or "")
-            if marker.get("reason") != live_reason:
-                raise ReferenceEditDurableError(
-                    f"clip {clip_uid!r} failure marker reason does not match "
+                    f"clip {clip_uid!r} failure outcome marker does not match "
                     "the published failure"
-                )
-            if marker.get("delta") != {"processed": 1, "failed": 1}:
-                raise ReferenceEditDurableError(
-                    f"clip {clip_uid!r} failure marker delta is not terminal"
                 )
             return
         if clip.reference_edit is None:
@@ -2457,16 +2583,20 @@ class ReferenceEditEpochRunner:
                 f"published Reference Edit state for {clip_uid!r} does not "
                 "match its durable outcome"
             )
+        expected_marker = {
+            "schema": REFERENCE_EDIT_CLIP_OUTCOME_SCHEMA,
+            "clip_uid": clip_uid,
+            "terminal": "ready",
+            "delta": outcome_delta,
+        }
         if marker is None:
             # Crash window: the publication is verified; back-fill the marker.
-            _write_json_once(
-                self._clip_outcome_path(shard, clip_uid),
-                {
-                    "schema": REFERENCE_EDIT_CLIP_OUTCOME_SCHEMA,
-                    "clip_uid": clip_uid,
-                    "terminal": "ready",
-                    "delta": outcome_delta,
-                },
+            _write_json_once(marker_path, expected_marker)
+            return
+        if marker != expected_marker:
+            raise ReferenceEditDurableError(
+                f"clip {clip_uid!r} ready outcome marker does not match its "
+                "durable publication"
             )
 
     # -- durable stats ---------------------------------------------------------
@@ -2491,26 +2621,54 @@ class ReferenceEditEpochRunner:
                     f"Reference Edit clip {clip_uid!r} has no durable outcome; "
                     "the stage is not terminal"
                 )
-            for field, value in outcome.get("delta", {}).items():
-                counts[field] = counts.get(field, 0) + int(value)
+            if outcome.get("schema") != REFERENCE_EDIT_CLIP_OUTCOME_SCHEMA:
+                raise ReferenceEditDurableError(
+                    f"clip outcome schema drifted for {clip_uid!r}"
+                )
+            if outcome.get("clip_uid") != clip_uid:
+                raise ReferenceEditDurableError(
+                    f"clip outcome clip_uid drifted for {clip_uid!r}"
+                )
+            if outcome.get("terminal") not in {"ready", "failed"}:
+                raise ReferenceEditDurableError(
+                    f"clip outcome terminal is unknown for {clip_uid!r}"
+                )
+            delta = outcome.get("delta")
+            if not isinstance(delta, dict):
+                raise ReferenceEditDurableError(
+                    f"clip outcome delta is not an object for {clip_uid!r}"
+                )
+            for field, value in delta.items():
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise ReferenceEditDurableError(
+                        f"clip outcome delta {field} is not an int for "
+                        f"{clip_uid!r}"
+                    )
+                counts[field] = counts.get(field, 0) + value
             # Completion stats come from the durable per-attempt markers.
             for entity_id in entry.get("chain_entity_ids", []):
+                markers: dict[int, dict[str, Any]] = {}
                 for attempt_index in (1, 2):
-                    marker = _read_json(
-                        self._attempt_outcome_path(
-                            shard, clip_uid, entity_id, attempt_index
-                        )
+                    marker = self._validated_attempt_outcome(
+                        shard, clip_uid, entity_id, attempt_index
                     )
                     if marker is None:
                         continue
+                    markers[attempt_index] = marker
                     counts["completion_attempts"] += 1
-                    if attempt_index == 1 and marker.get("accepted"):
+                    if attempt_index == 1 and marker["accepted"]:
                         counts["completion_candidate1_accepted"] += 1
                     if attempt_index == 2:
                         counts["completion_candidate2_attempts"] += 1
-                        if marker.get("accepted"):
+                        if marker["accepted"]:
                             counts["completion_candidate2_accepted"] += 1
+                entity_outcome = self._entity_outcome(shard, clip_uid, entity_id)
+                if entity_outcome is not None:
+                    self._verify_entity_attempt_consistency(
+                        shard, clip_uid, entity_id, entity_outcome, markers
+                    )
         return ReferenceEditStats(**counts)
+
 
 def publish_final_reference(
     *,
