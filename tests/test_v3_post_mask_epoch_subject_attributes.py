@@ -271,10 +271,12 @@ class _BooguBackend:
 class _SamBackend:
     """The SAM epoch resource handle: one scripted ``segment_frame`` per probe.
 
-    Two script modes. ``*results`` is consumed one entry per call, which is what
+    Three script modes. ``*results`` is consumed one entry per call, which is what
     a conditional probe chain needs. ``by_prompt`` keys the returned masks by the
     grounding prompt, so several attributes of one owner can be driven
     independently of the order the scheduler happens to run their probes in.
+    ``by_slot`` keys them by the frame slot instead, which is what proves that a
+    probe is answered by the receipt of the frame it actually asked for.
     """
 
     def __init__(
@@ -282,10 +284,12 @@ class _SamBackend:
         *results: Any,
         timeline: list[str] | None = None,
         by_prompt: Mapping[str, Any] | None = None,
+        by_slot: Mapping[int, Any] | None = None,
         generated: Any = (),
     ) -> None:
         self.results = list(results)
         self.by_prompt = dict(by_prompt or {})
+        self.by_slot = {int(slot): value for slot, value in (by_slot or {}).items()}
         self.generated_script = list(generated)
         self.calls = 0
         self.requests: list[dict[str, Any]] = []
@@ -299,7 +303,9 @@ class _SamBackend:
         self.requests.append(kwargs)
         if self.timeline is not None:
             self.timeline.append(f"sam:{kwargs['frame_slot']}")
-        if self.by_prompt:
+        if self.by_slot:
+            result = self.by_slot.get(int(kwargs["frame_slot"]), [])
+        elif self.by_prompt:
             result = self.by_prompt.get(str(kwargs["grounding_prompt"]), [])
         else:
             result = self.results[min(self.calls, len(self.results)) - 1]
@@ -2747,3 +2753,340 @@ def test_completion_model_time_survives_a_corrupt_output(
         for payload in failures
     )
     assert _committed_completion_receipts(runner, "completion") == []
+
+
+# ---------------------------------------------------------------------------
+# The legacy probe index is the only replay job index authority
+# ---------------------------------------------------------------------------
+
+#: The frozen owner-plan order this section's fixture produces, and the legacy
+#: probe order legacy derives from it. ``_SLOT_PRIORITY`` ranks slot 5 before
+#: slot 4 before slot 6, and the owner reference sits on slot 5, so
+#: ``prefer_attribute_candidate_frames`` moves that frame to the end and the two
+#: orders genuinely disagree. A frozen index of 0 is then never probed at all.
+FROZEN_PROBE_SLOTS = (5, 4, 6)
+LEGACY_PROBE_SLOTS = (4, 6, 5)
+#: One grounding prompt, two different attribute types: the schema forbids
+#: repeating a type, so this is the only way two attributes of one owner can
+#: share a prompt.
+SHARED_PROMPT = "the strap over the left shoulder"
+SHARED_PROMPT_ATTRIBUTES = (
+    ("accessory", "a leather belt", SHARED_PROMPT),
+    ("bag", "a small satchel", SHARED_PROMPT),
+)
+
+
+def _point_owner_reference_at(storage: Any, slot: int) -> None:
+    """Move the owner's published reference onto one frame slot.
+
+    The reference frame is what ``prefer_attribute_candidate_frames`` sorts last,
+    so a reference frame that is also a probe candidate is exactly what makes the
+    legacy probe order differ from the frozen owner-plan order.
+    """
+    from r2v_data_v2.reconciliation import write_json_atomic
+
+    path = Path(storage.root) / "clips" / CLIP_UID / "clip.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    for reference in payload["references"]["entities"]:
+        if reference["entity_id"] == OWNER:
+            reference["source_frame_index"] = int(slot)
+    write_json_atomic(path, payload)
+
+
+def _probe_block(
+    storage: Any,
+    *,
+    slot: int,
+    top_offset: int,
+    rows: int,
+    left_offset: int = 5,
+    width: int = 8,
+) -> Any:
+    """A usable SAM attribute mask of a *chosen shape* inside the owner.
+
+    The fixture frame is one flat colour, so two probes only produce different
+    crops when their mask *shapes* differ. A per-slot script that returned the
+    same block everywhere would let a probe be answered by the wrong receipt
+    without changing a single recorded byte.
+    """
+    owner = _owner_mask(storage, slot)
+    row_indices, column_indices = np.nonzero(owner)
+    top = int(row_indices.min())
+    left = int(column_indices.min())
+    block = np.zeros_like(owner)
+    block[
+        top + top_offset : top + top_offset + rows,
+        left + left_offset : left + left_offset + width,
+    ] = True
+    usable = np.logical_and(block, owner)
+    assert int(usable.sum()) >= 16, "fixture probe mask is too small"
+    return usable
+
+
+def _probe_order_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, run_name: str
+) -> tuple[Any, Any]:
+    """A ready-pair clip whose frozen and legacy probe orders disagree."""
+    config, storage = _storage_variant(tmp_path, monkeypatch, run_name)
+    for slot in (4, 5, 6):
+        _add_owner_frame(storage, slot=slot)
+    _point_owner_reference_at(storage, 5)
+    return config, storage
+
+
+def _probe_orders(runner: Any, attribute_id: str) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """The frozen owner-plan order and the frozen legacy probe order, from disk.
+
+    Both are durable: the owner plan freezes the candidate pool and the attribute
+    plan freezes the legacy order's candidate IDs, so this reads what the epoch
+    actually committed rather than re-deriving it.
+    """
+    plan = _planned_owner_plan(runner)
+    slot_of = {
+        str(item["candidate_id"]): int(item["frame_slot"])
+        for item in plan["candidates"]
+    }
+    frozen = tuple(int(item["frame_slot"]) for item in plan["candidates"])
+    attribute_plan = json.loads(
+        _attribute_plan_file(runner, attribute_id).read_text(encoding="utf-8")
+    )
+    legacy = tuple(
+        slot_of[str(candidate_id)]
+        for candidate_id in attribute_plan["ordered_owner_candidate_ids"]
+    )
+    return frozen, legacy
+
+
+def test_sam_receipt_follows_the_legacy_probe_order_not_the_frozen_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A probe must be answered by the receipt of the frame it actually asked for.
+
+    With the frozen and legacy orders disagreeing, the first legacy probe sits at
+    frozen index 1. Reading the chain by that frozen index answers probe 0 with
+    probe 1's receipt; reading it by the legacy probe index answers it with its
+    own, which is the whole reason the replay indexes jobs and receipts by the
+    legacy probe order.
+    """
+    monkeypatch.setattr(time, "perf_counter", lambda: 1.0)
+    attributes = (ACCESSORY,)
+
+    legacy_config, legacy_storage = _probe_order_fixture(
+        tmp_path, monkeypatch, "run-legacy"
+    )
+    legacy_sam = _SamBackend(
+        by_slot={
+            4: [_probe_block(legacy_storage, slot=4, top_offset=2, rows=4)],
+            6: [_probe_block(legacy_storage, slot=6, top_offset=9, rows=6)],
+        }
+    )
+    legacy_qwen = _QwenClient(
+        discoveries=[_human_discovery(attributes=attributes)],
+        reviews=[
+            SubjectAttributeReviewBatch(
+                owner_entity_id=OWNER, reviews=[_raw_review("a1")]
+            )
+        ],
+    )
+    _legacy_run(
+        legacy_config,
+        legacy_storage,
+        legacy_qwen,
+        review=legacy_qwen,
+        segmentation=legacy_sam,
+    )
+    legacy_artifact = _read_artifact(legacy_storage)
+    assert [record.owner_candidate_id for record in legacy_artifact.records] == [
+        "candidate_2"
+    ], "legacy's first probe is the frozen order's *second* candidate"
+    assert legacy_sam.calls == 2, "legacy stops once it collected its quota"
+
+    config, storage = _probe_order_fixture(tmp_path, monkeypatch, "run-epoch")
+    qwen = _QwenClient(
+        discoveries=[_human_discovery(attributes=attributes)],
+        reviews=[
+            SubjectAttributeReviewBatch(
+                owner_entity_id=OWNER, reviews=[_raw_review("a1")]
+            )
+        ],
+    )
+    sam = _SamBackend(
+        by_slot={
+            4: [_probe_block(storage, slot=4, top_offset=2, rows=4)],
+            6: [_probe_block(storage, slot=6, top_offset=9, rows=6)],
+        }
+    )
+    runner = _runner(config, storage, tmp_path)
+    _drain(runner, qwen, sam=sam)
+
+    # The premise, read back from the frozen plans rather than assumed.
+    frozen, legacy = _probe_orders(runner, "a1")
+    assert frozen == FROZEN_PROBE_SLOTS, frozen
+    assert legacy == LEGACY_PROBE_SLOTS, legacy
+    assert legacy[0] != frozen[0]
+    assert frozen.index(legacy[0]) == 1, "the first legacy probe is not frozen index 0"
+
+    # Probe 0 and probe 1 were answered by two different receipts, so the order
+    # they were read in is observable rather than incidental.
+    marker = _selection_marker(runner, "a1")
+    assert marker["status"] == "candidates"
+    assert [option["source_frame_slot"] for option in marker["options"]] == [4, 6]
+    cropped = [option["crop_sha256"] for option in marker["options"]]
+    assert len(set(cropped)) == 2, "per-slot probes must not be interchangeable"
+    assert sam.calls == 2, "the epoch probes exactly what legacy probes"
+
+    # The replay is the legacy authority, candidate for candidate.
+    assert _read_artifact(storage).model_dump(mode="json") == legacy_artifact.model_dump(
+        mode="json"
+    )
+    record = _read_artifact(storage).records[0]
+    assert record.status == "accepted"
+    assert record.owner_candidate_id == "candidate_2"
+    assert record.source_frame_slot == 4
+    # Its pixels are probe 0's crop, not probe 1's.
+    published = _sha256_bytes(
+        (_output_root(storage) / str(record.image_path)).read_bytes()
+    )
+    assert published == marker["options"][0]["crop_sha256"]
+    assert published != marker["options"][1]["crop_sha256"]
+
+
+def test_same_prompt_attributes_keep_their_own_probe_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two attributes that share a prompt must each restart at the first probe.
+
+    ``_collect_attribute_candidates`` may leave an attribute early once it has
+    collected ``MAX_ATTRIBUTE_SOURCE_CANDIDATES`` candidates, so the tail of the
+    legacy probe order is legitimately never probed. The next attribute then
+    starts again from the first probe, even though its prompt is the same. A
+    probe *count* cannot tell those apart - the unprobed tail never arrives - so
+    it hands the second attribute's first probe to the first attribute and pays
+    for a probe legacy never makes.
+    """
+    monkeypatch.setattr(time, "perf_counter", lambda: 1.0)
+    attributes = SHARED_PROMPT_ATTRIBUTES
+
+    legacy_config, legacy_storage = _probe_order_fixture(
+        tmp_path, monkeypatch, "run-legacy"
+    )
+    legacy_script = {
+        4: [_probe_block(legacy_storage, slot=4, top_offset=2, rows=4)],
+        6: [_probe_block(legacy_storage, slot=6, top_offset=9, rows=6)],
+    }
+    legacy_timeline: list[str] = []
+    legacy_qwen = _QwenClient(
+        discoveries=[_human_discovery(attributes=attributes)],
+        reviews=[
+            SubjectAttributeReviewBatch(
+                owner_entity_id=OWNER,
+                reviews=[_raw_review("a1"), _raw_review("a2")],
+            )
+        ],
+    )
+    _legacy_run(
+        legacy_config,
+        legacy_storage,
+        legacy_qwen,
+        review=legacy_qwen,
+        segmentation=_SamBackend(by_slot=legacy_script, timeline=legacy_timeline),
+    )
+    legacy_artifact = _read_artifact(legacy_storage)
+    # The premise: legacy probes C0 and C1 for a1, then C0 and C1 again for a2.
+    assert legacy_timeline == [
+        f"sam:{LEGACY_PROBE_SLOTS[0]}",
+        f"sam:{LEGACY_PROBE_SLOTS[1]}",
+        f"sam:{LEGACY_PROBE_SLOTS[0]}",
+        f"sam:{LEGACY_PROBE_SLOTS[1]}",
+    ], legacy_timeline
+    assert [record.attribute_id for record in legacy_artifact.records] == ["a1", "a2"]
+
+    config, storage = _probe_order_fixture(tmp_path, monkeypatch, "run-epoch")
+    shared_script = {
+        4: [_probe_block(storage, slot=4, top_offset=2, rows=4)],
+        6: [_probe_block(storage, slot=6, top_offset=9, rows=6)],
+    }
+    qwen = _QwenClient(
+        discoveries=[_human_discovery(attributes=attributes)],
+        reviews=[
+            SubjectAttributeReviewBatch(
+                owner_entity_id=OWNER,
+                reviews=[_raw_review("a1"), _raw_review("a2")],
+            )
+        ],
+    )
+    sam = _SamBackend(by_slot=shared_script)
+    runner = _runner(config, storage, tmp_path)
+    sam_executor = _SerialQwenExecutor(runner, sam)
+    _scheduler(
+        runner,
+        _SerialQwenExecutor(runner, qwen),
+        runner.finalize,
+        sam_executor,
+        None,
+    ).run(runner.seed_jobs())
+
+    frozen, legacy = _probe_orders(runner, "a1")
+    assert frozen == FROZEN_PROBE_SLOTS, frozen
+    assert legacy == LEGACY_PROBE_SLOTS, legacy
+    assert _probe_orders(runner, "a2")[1] == LEGACY_PROBE_SLOTS
+
+    # Every attribute probes the legacy order's first two slots, and only those:
+    # probe index 2 is never requested, because legacy never requests it.
+    probes: dict[str, list[int]] = {}
+    job_attribute: dict[str, str] = {}
+    for job in sam_executor.executed:
+        if job.job_type != SUBJECT_ATTRIBUTE_SAM_PROBE_JOB:
+            continue
+        target = dict(job.target)
+        attribute_id = str(target["attribute_id"])
+        job_attribute[job.job_id()] = attribute_id
+        probes.setdefault(attribute_id, []).append(int(target["probe_index"]))
+    assert set(probes) == {"a1", "a2"}, probes
+    for attribute_id in ("a1", "a2"):
+        assert sorted(probes[attribute_id]) == [0, 1], probes
+    assert sam.calls == 4, "two attributes, two probes each - never a third"
+
+    # No cross-binding: each attribute's selection points at its own SAM jobs,
+    # at the same two legacy probe slots, and never at its sibling's.
+    for attribute_id in ("a1", "a2"):
+        marker = _selection_marker(runner, attribute_id)
+        assert marker["status"] == "candidates", marker
+        options = marker["options"]
+        assert [option["source_frame_slot"] for option in options] == [4, 6]
+        assert {job_attribute[option["sam_job_id"]] for option in options} == {
+            attribute_id
+        }
+    assert qwen.discovery_calls == 1
+    # Both attributes claim the same pixels, so this is a legacy duplicate
+    # conflict: legacy reviews neither of them, and neither is reviewed here.
+    assert qwen.review_calls == 0
+
+    # The epoch replays the legacy authority exactly, duplicate conflict included:
+    # the two attributes claim the same pixels, which is a normal legacy outcome.
+    assert _read_artifact(storage).model_dump(mode="json") == legacy_artifact.model_dump(
+        mode="json"
+    )
+    raw_state = _raw_state_marker(runner)
+    assert [item["route_after_rank0"] for item in raw_state["attributes"]] == [
+        "duplicate_conflict",
+        "duplicate_conflict",
+    ]
+    assert runner.reconcile_stats(SHARD).terminal_clips == 1
+
+    # A fresh runner re-walks the same sequence on CPU: no SAM, no Qwen, and the
+    # artifact and counts are exactly the ones already durable.
+    fresh = _runner(config, storage, tmp_path)
+    assert fresh.seed_jobs() == []
+    fresh_qwen = _QwenClient()
+    fresh_sam = _SamBackend(by_slot=shared_script)
+    _drain(fresh, fresh_qwen, sam=fresh_sam)
+    assert fresh_sam.calls == 0
+    assert fresh_qwen.discovery_calls == 0
+    assert fresh_qwen.review_calls == 0
+    assert _read_artifact(storage).model_dump(mode="json") == legacy_artifact.model_dump(
+        mode="json"
+    )
+    assert fresh.reconcile_stats(SHARD).to_dict() == runner.reconcile_stats(
+        SHARD
+    ).to_dict()

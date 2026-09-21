@@ -261,20 +261,30 @@ class _OwnerReplay:
         self.reference = reference
         self.discovery = discovery
         self.discovery_job_id = discovery_job_id
+        #: The frozen owner-plan order, which is what legacy ``_process_owner``
+        #: is handed as ``owner_candidates``. It is *not* the probe order: legacy
+        #: re-sorts it with ``prefer_attribute_candidate_frames``.
         self.candidates = list(candidates)
         self.masks = masks
         self.states = list(states)
-        self.by_slot = {
-            int(candidate.frame_slot): index
-            for index, candidate in enumerate(self.candidates)
-        }
+        #: The legacy probe order, frozen once. ``_ordered_owner_candidates``
+        #: proves the frame slots are unique, and every SAM probe job, receipt and
+        #: mask artifact is keyed on this order's index, so the replay must index
+        #: chains and receipts with it instead of with the frozen owner-plan order.
+        self._legacy_probe_candidates = self._freeze_legacy_probe_candidates()
+        self._legacy_probe_slots = tuple(
+            int(candidate.frame_slot) for candidate in self._legacy_probe_candidates
+        )
         self._states_by_id = {state.attribute_id: state for state in self.states}
         self._chains: dict[str, list[ModelJob]] = {}
         self._receipts: dict[str, dict[int, Mapping[str, Any]]] = {}
-        self.attribute_cursor = 0
-        #: How many probes of each attribute this replay already served, which is
-        #: what separates two attributes that share one grounding prompt.
-        self._probe_counts: dict[str, int] = {}
+        #: ``-1`` until legacy's first probe opens the attribute run. Legacy walks
+        #: the discovery order once and never goes back, so the replay only ever
+        #: stays on the current attribute or advances to the next one.
+        self.attribute_cursor = -1
+        #: How many legacy probes of one attribute were already served, which is
+        #: also the index of its next expected probe in the legacy probe order.
+        self._probe_cursors: dict[str, int] = {}
         #: 8c chain currently being replayed: legacy calls generation, then the
         #: generated-frame segmentation, then the review.
         self.completion: dict[str, Any] | None = None
@@ -342,10 +352,39 @@ class _OwnerReplay:
             )
         return state
 
-    def ordered_candidates(self) -> list[Any]:
-        return self.epoch._ordered_owner_candidates(
-            self.shard, self.storage, self.clip_uid, self.owner_plan, self.reference
+    def _freeze_legacy_probe_candidates(self) -> tuple[Any, ...]:
+        """Derive the legacy probe order exactly the way legacy would.
+
+        ``_process_owner`` is handed ``self.candidates`` (the frozen owner-plan
+        order) and re-sorts it with ``prefer_attribute_candidate_frames``, whose
+        tie-break rank is the input order, so feeding the frozen order in
+        reproduces legacy's probe order exactly. ``_ordered_owner_candidates``
+        proves the frame slots are unique, so one slot names one probe index.
+        """
+        ordered = tuple(
+            self.epoch._ordered_owner_candidates(
+                self.shard,
+                self.storage,
+                self.clip_uid,
+                self.owner_plan,
+                self.reference,
+            )
         )
+        if not ordered:
+            raise SubjectAttributeDurableError(
+                f"owner {self.clip_uid}/{self.owner_entity_id} has no frozen "
+                "attribute probe candidate"
+            )
+        return ordered
+
+    def ordered_candidates(self) -> tuple[Any, ...]:
+        """The frozen legacy probe order, derived once per owner replay.
+
+        Every SAM probe job, receipt and mask artifact is keyed on this order's
+        index, so this - not the frozen owner-plan order - is the replay's job
+        index authority.
+        """
+        return self._legacy_probe_candidates
 
     def chain_for(self, state: _AttributeReplay) -> list[ModelJob]:
         chain = self._chains.get(state.attribute_id)
@@ -371,50 +410,85 @@ class _OwnerReplay:
             self._receipts[state.attribute_id] = receipts
         return receipts
 
-    def resolve_state(self, grounding_prompt: str) -> _AttributeReplay:
-        """Which attribute of this owner is legacy probing right now.
+    def resolve_probe(
+        self, grounding_prompt: str, frame_slot: int
+    ) -> tuple[_AttributeReplay, int]:
+        """Which attribute legacy is probing, and at which legacy probe index.
 
-        The attribute is identified by its grounding prompt, and a state whose
-        probe list is already drained is not revisited. Legacy walks the frozen
-        attributes in discovery order and probes one owner candidate frame at a
-        time, so counting the probes actually served is what keeps two identically
-        prompted attributes apart without depending on the caller's frame
-        ordering: an earlier version treated the candidate's index in the frozen
-        list as a "run start" marker, which rejected the first probe of an
-        attribute whenever that frame was not the frozen list's first entry.
+        Legacy's ``_collect_attribute_candidates`` walks the frozen attributes in
+        discovery order and never looks back, and it may leave an attribute early
+        once it has collected ``MAX_ATTRIBUTE_SOURCE_CANDIDATES`` candidates. So
+        the replay advances one way only: a call is either the current attribute's
+        next expected probe, or it opens the *next* attribute at the *first*
+        legacy probe. That is what keeps two attributes sharing one grounding
+        prompt apart - a probe count cannot, because an attribute that stopped
+        early never probes the tail of the probe order, so the next attribute's
+        first probe would be mistaken for a continuation of the previous one.
+
+        The returned index is the position in the legacy probe order, which is
+        the index the SAM probe job, its receipt and its mask artifacts are all
+        keyed on. It is deliberately not the position in the frozen owner-plan
+        order: ``prefer_attribute_candidate_frames`` moves the owner reference's
+        own frame to the end, so the two orders disagree whenever the reference
+        frame is also a candidate.
         """
+        slot = int(frame_slot)
         count = len(self.states)
-        if self.attribute_cursor < count:
-            current = self.states[self.attribute_cursor]
-            if (
-                str(current.attribute_plan["discovered"]["grounding_prompt"])
-                == grounding_prompt
-                and not self._run_drained(current)
-            ):
-                self._probe_counts[current.attribute_id] = (
-                    self._probe_counts.get(current.attribute_id, 0) + 1
+        if count == 0:
+            raise SubjectAttributeDurableError(
+                f"owner {self.clip_uid}/{self.owner_entity_id} has no frozen "
+                "attribute to probe"
+            )
+        if self.attribute_cursor < 0:
+            # Legacy's very first probe of this owner opens attribute zero, at
+            # the first slot of the legacy probe order.
+            state = self.states[0]
+            expected_slot = self._legacy_probe_slots[0]
+            if self._prompt_of(state) != grounding_prompt or expected_slot != slot:
+                raise SubjectAttributeDurableError(
+                    "legacy SAM probe sequence drifted at the first probe of "
+                    f"{self.clip_uid}/{self.owner_entity_id}: expected "
+                    f"{self._prompt_of(state)!r} at slot {expected_slot}, got "
+                    f"{grounding_prompt!r} at slot {slot}"
                 )
-                return current
-        for index in range(count):
-            state = self.states[index]
-            if (
-                str(state.attribute_plan["discovered"]["grounding_prompt"])
-                == grounding_prompt
-                and not self._run_drained(state)
-            ):
-                self.attribute_cursor = index
-                self._probe_counts[state.attribute_id] = (
-                    self._probe_counts.get(state.attribute_id, 0) + 1
-                )
-                return state
-        raise SubjectAttributeDurableError(
-            f"SAM probe prompt {grounding_prompt!r} is not a frozen attribute of "
-            f"{self.clip_uid}/{self.owner_entity_id}"
-        )
+            self.attribute_cursor = 0
+            self._probe_cursors[state.attribute_id] = 1
+            return state, 0
+        current = self.states[self.attribute_cursor]
+        probe_index = self._probe_cursors.get(current.attribute_id, 0)
+        if (
+            probe_index < len(self._legacy_probe_slots)
+            and self._prompt_of(current) == grounding_prompt
+            and self._legacy_probe_slots[probe_index] == slot
+        ):
+            self._probe_cursors[current.attribute_id] = probe_index + 1
+            return current, probe_index
+        # Legacy stopped probing the current attribute: either it exhausted the
+        # probe order or it collected its candidate quota early. Only the next
+        # discovery-order attribute may open here, and only at the first probe.
+        next_index = self.attribute_cursor + 1
+        if next_index >= count:
+            raise SubjectAttributeDurableError(
+                "legacy SAM probe sequence drifted past the last frozen attribute "
+                f"of {self.clip_uid}/{self.owner_entity_id}: {grounding_prompt!r} "
+                f"at slot {slot}"
+            )
+        next_state = self.states[next_index]
+        expected_slot = self._legacy_probe_slots[0]
+        if self._prompt_of(next_state) != grounding_prompt or expected_slot != slot:
+            raise SubjectAttributeDurableError(
+                "legacy SAM probe sequence drifted between frozen attributes of "
+                f"{self.clip_uid}/{self.owner_entity_id}: expected "
+                f"{self._prompt_of(next_state)!r} at slot {expected_slot}, got "
+                f"{grounding_prompt!r} at slot {slot}"
+            )
+        self.attribute_cursor = next_index
+        self._probe_cursors[next_state.attribute_id] = 1
+        return next_state, 0
 
-    def _run_drained(self, state: _AttributeReplay) -> bool:
-        """True once every frozen owner candidate of one attribute was probed."""
-        return self._probe_counts.get(state.attribute_id, 0) >= len(self.candidates)
+    @staticmethod
+    def _prompt_of(state: _AttributeReplay) -> str:
+        return str(state.attribute_plan["discovered"]["grounding_prompt"])
 
     # -- completion chain ----------------------------------------------------
 
@@ -647,24 +721,32 @@ class _OwnerSegmentationBackend:
         self, *, frame_path: Path, frame_slot: int, grounding_prompt: str
     ) -> list[Any]:
         r = self.r
-        index = r.by_slot.get(int(frame_slot))
-        if index is None:
+        slot = int(frame_slot)
+        # The legacy probe index is the only job index authority: the frozen
+        # owner-plan order disagrees with it as soon as the owner reference's own
+        # frame is a candidate, because legacy sorts that frame to the end.
+        state, probe_index = r.resolve_probe(grounding_prompt, slot)
+        candidate = r.ordered_candidates()[probe_index]
+        if int(candidate.frame_slot) != slot:
             raise SubjectAttributeDurableError(
-                f"SAM probe frame slot {frame_slot} is not a frozen owner candidate"
+                "SAM probe frame slot drifted from its legacy probe candidate: "
+                f"expected {int(candidate.frame_slot)}, got {slot}"
             )
-        state = r.resolve_state(grounding_prompt)
-        candidate = r.candidates[index]
         expected = (r.storage.root / candidate.image_path).resolve(strict=False)
-        if (
-            Path(frame_path).resolve(strict=False) != expected
-            or grounding_prompt
-            != str(state.attribute_plan["discovered"]["grounding_prompt"])
-        ):
+        if Path(frame_path).resolve(strict=False) != expected:
             raise SubjectAttributeDurableError(
                 "SAM probe input drifted from its frozen candidate"
             )
-        job = r.chain_for(state)[index]
-        payload = r.receipts_for(state).get(index)
+        job = r.chain_for(state)[probe_index]
+        target = dict(job.target)
+        if str(target.get("probe_index")) != str(probe_index) or str(
+            target.get("owner_candidate_id")
+        ) != str(candidate.candidate_id):
+            raise SubjectAttributeDurableError(
+                f"SAM probe job {job.job_id()} is not the frozen probe "
+                f"{probe_index} of {r.clip_uid}/{r.owner_entity_id}"
+            )
+        payload = r.receipts_for(state).get(probe_index)
         if payload is None:
             raise _PendingModelCall(job)
         if str(payload.get("status")) == "sam_failed":
