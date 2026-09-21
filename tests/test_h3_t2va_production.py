@@ -453,6 +453,35 @@ def test_partial_stage_exports_survive_retry(tmp_path):
     assert processor.calls["clip0", "ta2va"] == 2
 
 
+def test_full_preselected_inventory_matches_legacy_inventory(tmp_path, finalized):
+    from r2v_data_v2.h3 import t2va_full_production as full
+    from r2v_data_v2.h3 import t2va_shadow as frozen
+
+    root = tmp_path / "production"
+    manifest = tmp_path / "shots_f03_motion.jsonl"
+    index = production.build_source_index(manifest, root)
+    shard_manifest = production.materialize_shard(index, 0, root)
+    selection = full.shard_selection(root, index, 0, tmp_path, tmp_path)
+
+    kwargs = {
+        "shot_manifest": shard_manifest,
+        "clips_root": tmp_path,
+        "source_videos_root": tmp_path,
+        "audio_production_root": finalized[0],
+        "audio_shadow_run_id": finalized[1],
+        "t2va_run_id": "production",
+        "backend": shared.config(tmp_path).provenance(),
+    }
+    legacy = frozen.build_t2va_inventory(**kwargs)
+    fast = frozen.build_t2va_inventory(
+        **kwargs,
+        preselected=selection,
+        verify_audio_files=False,
+    )
+    assert fast == legacy
+    assert fast.inventory_fingerprint == legacy.inventory_fingerprint
+
+
 def test_runner_dry_run_and_source_adapter(tmp_path, finalized):
     from tools.run_h3_t2va_production import main
 
