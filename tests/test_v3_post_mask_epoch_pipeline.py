@@ -28,7 +28,11 @@ from r2v_data_v2.v3.config import (
     ReferenceScopeConfig,
     V3Config,
 )
-from r2v_data_v2.v3.post_mask_epoch_jobs import RESOURCE_BOOGU, RESOURCE_QWEN
+from r2v_data_v2.v3.post_mask_epoch_jobs import (
+    RESOURCE_BOOGU,
+    RESOURCE_QWEN,
+    RESOURCE_SAM,
+)
 from r2v_data_v2.v3.post_mask_epoch_pipeline import (
     DOWNSTREAM_REASON,
     StageDispatchError,
@@ -1366,3 +1370,371 @@ def test_stage_counts_not_written_when_pair_incomplete(
     for shard, storage in storages.items():
         counts = storage.read_run().counts
         assert not any(key.startswith("pair.") for key in counts), shard
+
+
+# ---------------------------------------------------------------------------
+# 5c: full composition with a real Reference Edit repairable chain
+# ---------------------------------------------------------------------------
+
+
+class _CompositionQwenHandle:
+    """One Qwen handle serving Removal, Pair and Reference Edit stages.
+
+    ``review`` kwargs distinguish the callers: the completion review carries
+    ``candidate_rgb``; the removal review carries ``candidate_image``.
+    """
+
+    def __init__(self) -> None:
+        self.removal_reviews = 0
+        self.completion_reviews = 0
+        self.pair_decisions = 0
+
+    def review(self, **kwargs: Any) -> Any:
+        if "candidate_rgb" in kwargs:
+            from tests.test_v3_reference_edit_boogu import _completion_review
+
+            self.completion_reviews += 1
+            return _completion_review(accept=True)
+        from tests.test_v3_post_mask_epoch_removal import _accept as _removal_accept
+
+        self.removal_reviews += 1
+        return _removal_accept()
+
+    def decide(self, **kwargs: Any) -> Any:
+        from r2v_data_v2.v3.reference_judge import EntityReferenceDecisionAttempt
+
+        self.pair_decisions += 1
+        # A repairable decision gives the Reference Edit stage real work.
+        return EntityReferenceDecisionAttempt(
+            decision=_decision(
+                "repairable", str(kwargs.get("reference_type", "subject"))
+            ),
+            raw_responses=("{}",),
+            repair_attempts=0,
+        )
+
+
+class _CompositionSamHandle:
+    """The SAM epoch resource handle: a segmenter backend fake."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def track(self, **kwargs: Any) -> Any:
+        import numpy as np
+        from PIL import Image
+
+        from r2v_data_v2.v3.sam3_backend import (
+            BackendMaskObservation,
+            EntityTrackResult,
+        )
+
+        self.calls += 1
+        with Image.open(kwargs["frame_paths"][0]) as opened:
+            width, height = opened.size
+        mask = np.zeros((height, width), dtype=bool)
+        mask[height // 3 : height // 3 + height // 8,
+             width // 3 : width // 3 + width // 8] = True
+        return EntityTrackResult(
+            status="ready",
+            observations=(
+                BackendMaskObservation(
+                    slot=5, mask=mask, confidence=0.9, object_id="target"
+                ),
+            ),
+        )
+
+
+class _CompositionBooguHandle:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def edit(self, **kwargs: Any) -> Any:
+        import io
+
+        from PIL import Image
+
+        from r2v_data_v2.v3.reference_edit_boogu import BooguEditOutput
+
+        self.calls += 1
+        buffer = io.BytesIO()
+        Image.new(
+            "RGB", (int(kwargs["width"]), int(kwargs["height"])), (191, 22, 43)
+        ).save(buffer, format="PNG")
+        instruction = str(kwargs["instruction"])
+        return BooguEditOutput(
+            png_bytes=buffer.getvalue(),
+            original_instruction=instruction,
+            rewritten_instruction="rewritten",
+            effective_instruction="rewritten",
+            worker_metadata={},
+        )
+
+
+def _composition_manager(
+    dispatch: Any, timeline: list[str]
+) -> tuple[Any, dict[str, Any]]:
+    from r2v_data_v2.v3.post_mask_epoch_resources import ResourceEpochManager
+
+    boogu = _CompositionBooguHandle()
+    qwen = _CompositionQwenHandle()
+    sam = _CompositionSamHandle()
+
+    def boogu_factory() -> tuple[Any, Any]:
+        return (
+            _TrackedResource(RESOURCE_BOOGU, timeline),
+            _PassthroughExecutor(dispatch, boogu),
+        )
+
+    def qwen_factory() -> tuple[Any, Any]:
+        return (
+            _TrackedResource(RESOURCE_QWEN, timeline),
+            _PassthroughExecutor(dispatch, qwen),
+        )
+
+    def sam_factory() -> tuple[Any, Any]:
+        return (
+            _TrackedResource(RESOURCE_SAM, timeline),
+            _PassthroughExecutor(dispatch, sam),
+        )
+
+    manager = ResourceEpochManager(
+        {
+            RESOURCE_BOOGU: boogu_factory,
+            RESOURCE_QWEN: qwen_factory,
+            RESOURCE_SAM: sam_factory,
+        }
+    )
+    return manager, {"boogu": boogu, "qwen": qwen, "sam": sam}
+
+
+def _reference_edit_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[V3Config, dict, dict]:
+    """Removal pending clip + a Pair storage with a repairable reference."""
+    from tests.test_v3_pair import pair_clips
+    from tests.test_v3_post_mask_epoch_pair import _ScopedJudge
+
+    config = _config(tmp_path, monkeypatch, "run-a")
+    removal_storage = _pending_storage(config, clip_uids=("clip-1",))
+    pair_config = _config(tmp_path, monkeypatch, "run-b")
+    pair_storage = _storage(pair_config, entity_types=("subject",))
+    pair_clips(pair_config, pair_storage, judge=_ScopedJudge({("clip-1", "e1"): "repairable"}))
+    clip = pair_storage.read_clip("clip-1")
+    assert clip.pairing is not None and clip.pairing.status == "ready"
+    assert clip.references.entities[0].completeness == "repairable"
+    storages = {SHARD: removal_storage, PAIR_SHARD: pair_storage}
+    eligible = {SHARD: ("clip-1",), PAIR_SHARD: ("clip-1",)}
+    return config, storages, eligible
+
+
+def _compose_with_reference_edit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    timeline: list[str],
+    fixture: tuple[V3Config, dict, dict] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], Any, Any]:
+    from r2v_data_v2.v3.post_mask_epoch_reference_edit import (
+        ReferenceEditEpochRunner,
+    )
+
+    if fixture is None:
+        fixture = _reference_edit_fixture(tmp_path, monkeypatch)
+    config, storages, eligible = fixture
+    # Same durable ledger root: the restart resumes the same receipts.
+    ledger = GroupLedger(tmp_path / "ledger")
+    holder = _DispatchHolder()
+    manager, handles = _composition_manager(holder, timeline)
+
+    def make(runner: Any, dispatch: Any) -> Any:
+        holder.dispatch = dispatch
+        return ResourceEpochScheduler(
+            ledger=ledger,
+            finalize=runner.finalize,
+            resource_manager=manager,
+            close_resource_manager_on_exit=False,
+        )
+
+    result = run_removal_pair_resource_session(
+        config=config,
+        storages=storages,
+        eligible_clip_uids_by_shard=eligible,
+        ledger=ledger,
+        manager=manager,
+        build_removal_scheduler=make,
+        build_pair_scheduler=make,
+        build_reference_edit_scheduler=make,
+        reference_edit_runner_factory=(
+            lambda **kwargs: ReferenceEditEpochRunner(
+                kwargs["config"],
+                kwargs["storages"],
+                kwargs["ledger"],
+                eligible_clip_uids_by_shard=kwargs[
+                    "eligible_clip_uids_by_shard"
+                ],
+            )
+        ),
+    )
+    return result, storages, handles, ledger
+
+
+def test_composition_completes_reference_edit_with_three_resources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    timeline: list[str] = []
+    result, storages, handles, ledger = _compose_with_reference_edit(
+        tmp_path, monkeypatch, timeline
+    )
+
+    assert result["remove_completed"] is True
+    assert result["pair_completed"] is True
+    assert result["reference_edit_completed"] is True, result.get(
+        "reference_edit_reconcile_error"
+    )
+    assert result["reference_edit_unresolved"] == ()
+    assert result["reference_edit_stats"], "reconciled stats must be reported"
+    assert result["reason"] == "downstream resource-epoch phases are not wired"
+    assert result["completed"] is False
+
+    # The repairable chain really paid all three resources.
+    assert handles["boogu"].calls >= 1
+    assert handles["qwen"].completion_reviews >= 1
+    assert handles["sam"].calls >= 1
+
+    # stage_counts equal the reconciled stats.
+    pair_storage = storages[PAIR_SHARD]
+    stats = result["reference_edit_stats"][PAIR_SHARD]
+    run = pair_storage.read_run()
+    for field, value in stats.items():
+        assert run.counts[f"reference_edit.{field}"] == value, field
+
+    # The shared dispatch routed every Reference Edit job to its own runner.
+    dispatch_log = ",".join(result["stage_dispatch_log"])
+    assert "ReferenceEditEpochRunner:reference_edit_boogu_generate" in dispatch_log
+    assert "ReferenceEditEpochRunner:reference_edit_qwen_review" in dispatch_log
+    assert "ReferenceEditEpochRunner:reference_edit_sam_review" in dispatch_log
+    assert "PairEpochRunner:reference_edit_" not in dispatch_log
+    assert "RemovalEpochRunner:reference_edit_" not in dispatch_log
+
+    # Resource lifecycle: at most one heavy resource open, all closed at end.
+    assert result["resource_lifecycle"]["max_open_observed"] == 1
+    assert result["resource_lifecycle"]["open_resource"] is None
+    assert timeline.count("start:boogu") >= 1
+    assert timeline.count("start:qwen") >= 1
+    assert timeline.count("start:sam") >= 1
+    # boogu -> qwen -> sam switches actually happened during Reference Edit.
+    removal_qwen = timeline.index("start:qwen")
+    re_boogu = timeline.index("start:boogu", removal_qwen)
+    re_qwen = timeline.index("start:qwen", re_boogu)
+    re_sam = timeline.index("start:sam", re_qwen)
+    assert re_boogu < re_qwen < re_sam
+    del ledger
+
+
+def test_composition_reference_edit_restart_is_free(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _reference_edit_fixture(tmp_path, monkeypatch)
+    timeline: list[str] = []
+    first, storages, _handles, _ledger = _compose_with_reference_edit(
+        tmp_path, monkeypatch, timeline, fixture
+    )
+    assert first["reference_edit_completed"] is True
+    pair_storage = storages[PAIR_SHARD]
+    before_counts = dict(pair_storage.read_run().counts)
+
+    # Restart the whole composition over the same durable state.
+    restart_timeline: list[str] = []
+    second, _storages, restart_handles, _ = _compose_with_reference_edit(
+        tmp_path, monkeypatch, restart_timeline, fixture
+    )
+    assert second["reference_edit_completed"] is True
+    assert second["reference_edit_stats"] == first["reference_edit_stats"]
+    assert dict(pair_storage.read_run().counts) == before_counts
+    # Zero extra Reference Edit model calls on restart.
+    assert restart_handles["boogu"].calls == 0
+    assert restart_handles["qwen"].completion_reviews == 0
+    assert restart_handles["sam"].calls == 0
+
+
+def test_composition_pair_incomplete_blocks_reference_edit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pair incomplete: no Reference Edit plan, seed or model call."""
+    from r2v_data_v2.v3.post_mask_epoch_reference_edit import (
+        ReferenceEditEpochRunner,
+    )
+
+    config, storages, eligible = _reference_edit_fixture(tmp_path, monkeypatch)
+    ledger = GroupLedger(tmp_path / "ledger")
+    timeline: list[str] = []
+    holder = _DispatchHolder()
+    manager, handles = _composition_manager(holder, timeline)
+
+    class _NoResultExecutor:
+        def execute_batch(self, jobs: Any) -> dict[str, Any]:
+            return {}
+
+    from r2v_data_v2.v3.post_mask_epoch_resources import ResourceEpochManager
+
+    manager = ResourceEpochManager(
+        {
+            RESOURCE_BOOGU: lambda: (
+                _TrackedResource(RESOURCE_BOOGU, timeline),
+                _NoResultExecutor(),
+            ),
+            RESOURCE_QWEN: lambda: (
+                _TrackedResource(RESOURCE_QWEN, timeline),
+                _NoResultExecutor(),
+            ),
+            RESOURCE_SAM: lambda: (
+                _TrackedResource(RESOURCE_SAM, timeline),
+                _NoResultExecutor(),
+            ),
+        }
+    )
+
+    def make(runner: Any, dispatch: Any) -> Any:
+        holder.dispatch = dispatch
+        return ResourceEpochScheduler(
+            ledger=ledger,
+            finalize=runner.finalize,
+            resource_manager=manager,
+            close_resource_manager_on_exit=False,
+        )
+
+    result = run_removal_pair_resource_session(
+        config=config,
+        storages=storages,
+        eligible_clip_uids_by_shard=eligible,
+        ledger=ledger,
+        manager=manager,
+        build_removal_scheduler=make,
+        build_pair_scheduler=make,
+        build_reference_edit_scheduler=make,
+        reference_edit_runner_factory=(
+            lambda **kwargs: ReferenceEditEpochRunner(
+                kwargs["config"],
+                kwargs["storages"],
+                kwargs["ledger"],
+                eligible_clip_uids_by_shard=kwargs[
+                    "eligible_clip_uids_by_shard"
+                ],
+            )
+        ),
+    )
+    assert result["remove_completed"] is False
+    assert result["pair_completed"] is False
+    assert result["reference_edit_completed"] is False
+    assert result["reference_edit_job_count"] == 0
+    assert result["reference_edit_unresolved"] == ()
+    assert result["reference_edit_stats"] == {}
+    semantic_root = Path(ledger.root) / "semantic" / "reference_edit"
+    assert not semantic_root.exists()
+    pair_storage = storages[PAIR_SHARD]
+    counts = pair_storage.read_run().counts
+    assert not any(key.startswith("reference_edit.") for key in counts)
+    # No Reference Edit model call was paid.
+    dispatch_log = ",".join(result["stage_dispatch_log"])
+    assert "reference_edit_boogu_generate" not in dispatch_log
+    assert handles["boogu"].calls == 0

@@ -168,6 +168,9 @@ def _read_json(path: Path) -> dict[str, Any] | None:
 
 
 def _write_json_once(path: Path, payload: Mapping[str, Any]) -> None:
+    """Create-or-validate with the epoch durable-state fsync writer."""
+    from r2v_data_v2.v3.post_mask_epoch_state import atomic_write_json
+
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.is_file():
         if _read_json(path) != dict(payload):
@@ -175,14 +178,7 @@ def _write_json_once(path: Path, payload: Mapping[str, Any]) -> None:
                 f"durable Reference Edit file drifted: {path}"
             )
         return
-    temporary = path.with_name(f".{path.name}.tmp")
-    try:
-        temporary.write_text(
-            json.dumps(payload, sort_keys=True), encoding="utf-8"
-        )
-        temporary.replace(path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    atomic_write_json(path, dict(payload))
 
 
 def _sha256_bytes(payload: bytes) -> str:
@@ -374,12 +370,14 @@ class ReferenceEditEpochRunner:
         if entry.get("classification") != CLIP_FRESH_TARGET:
             return
         if clip.reference_edit is not None:
-            # Published: the durable outcome marker is the authority.
-            if self._clip_outcome_path(shard, clip_uid).is_file():
-                return
+            # Published: reconstruct the expected publication and verify the
+            # live state against it, with or without the marker present.
+            self._verify_published_clip(shard, storage, clip_uid, entry)
+            return
+        if self._clip_outcome_path(shard, clip_uid).is_file():
             raise ReferenceEditDurableError(
-                f"clip {clip_uid!r} published Reference Edit state without a "
-                "durable outcome marker"
+                f"clip {clip_uid!r} has a durable outcome marker but no "
+                "published Reference Edit state"
             )
         pre_pairing = (
             clip.pairing.model_dump(mode="json") if clip.pairing is not None else None
@@ -582,8 +580,19 @@ class ReferenceEditEpochRunner:
         entity: Any,
         reference: Any,
     ) -> Any:
-        """Resolve (once) and freeze the candidate2 alternate source."""
+        """Resolve (once) and freeze the candidate2 alternate source.
+
+        Once the plan is frozen the legacy re-selection is NEVER run again:
+        the frozen candidate identity, the canonical SHA and the materialized
+        ``alternate_source_2.png`` SHA are re-verified against disk, and any
+        drift fails closed instead of being silently regenerated.
+        """
         path = self._alternate_path(shard, clip_uid, entity.entity_id)
+        existing = _read_json(path)
+        if existing is not None:
+            return self._rebuild_frozen_alternate(
+                shard, storage, clip_uid, entity, reference, existing
+            )
         alternate = _alternate_completion_source(
             self.config,
             storage,
@@ -601,12 +610,75 @@ class ReferenceEditEpochRunner:
             "candidate_id": alternate.candidate.candidate_id,
             "source_frame_index": alternate.candidate.source_frame_index,
             "source_image_path": alternate.candidate.image_path,
+            "alternate_source_path": storage.relative_artifact_path(
+                alternate.image_path
+            ),
             "alternate_source_sha256": _sha256_bytes(
                 alternate.image_path.read_bytes()
             ),
         }
         _write_json_once(path, identity)
         return alternate
+
+    def _rebuild_frozen_alternate(
+        self,
+        shard: str,
+        storage: RunStorage,
+        clip_uid: str,
+        entity: Any,
+        reference: Any,
+        frozen: Mapping[str, Any],
+    ) -> Any:
+        """Validate the frozen alternate plan and rebuild its descriptor."""
+        del shard
+        if frozen.get("schema") != REFERENCE_EDIT_ALTERNATE_SCHEMA:
+            raise ReferenceEditDurableError(
+                f"unsupported alternate plan schema for {clip_uid}/"
+                f"{entity.entity_id}"
+            )
+        canonical_sha = _sha256_bytes(
+            _resolve_artifact(storage, reference.image_path).read_bytes()
+        )
+        if frozen.get("canonical_source_sha256") != canonical_sha:
+            raise ReferenceEditDurableError(
+                f"frozen alternate canonical source drifted for {clip_uid}/"
+                f"{entity.entity_id}"
+            )
+        alternate_rel = frozen.get("alternate_source_path")
+        if not isinstance(alternate_rel, str):
+            raise ReferenceEditDurableError(
+                f"frozen alternate plan has no artifact path for {clip_uid}/"
+                f"{entity.entity_id}"
+            )
+        alternate_path = _resolve_artifact(storage, alternate_rel)
+        if not alternate_path.is_file():
+            raise ReferenceEditDurableError(
+                f"frozen alternate artifact is missing: {alternate_rel}"
+            )
+        if _sha256_bytes(alternate_path.read_bytes()) != frozen.get(
+            "alternate_source_sha256"
+        ):
+            raise ReferenceEditDurableError(
+                f"frozen alternate artifact drifted: {alternate_rel}"
+            )
+        metadata_path = alternate_path.with_name("alternate_source_2.json")
+        if not metadata_path.is_file():
+            raise ReferenceEditDurableError(
+                f"frozen alternate metadata is missing: {metadata_path}"
+            )
+        # Rebuild the legacy descriptor from frozen metadata only. The
+        # candidate is never re-selected.
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            candidate=SimpleNamespace(
+                candidate_id=str(frozen["candidate_id"]),
+                source_frame_index=int(frozen["source_frame_index"]),
+                image_path=str(frozen.get("source_image_path", "")),
+            ),
+            image_path=alternate_path,
+            metadata_path=metadata_path,
+        )
 
     # -- entity/clip outcomes -------------------------------------------------
 
@@ -910,7 +982,19 @@ class ReferenceEditEpochRunner:
                 entry = plan["clips"][clip_uid]
                 if entry["classification"] != CLIP_FRESH_TARGET:
                     continue
-                jobs.extend(self._advance_clip(shard, storage, clip_uid))
+                if self._clip_outcome_path(shard, clip_uid).is_file():
+                    continue
+                try:
+                    jobs.extend(self._advance_clip(shard, storage, clip_uid))
+                except ReferenceEditDurableError:
+                    # Durable corruption is never a semantic clip failure.
+                    raise
+                except Exception as exc:  # noqa: BLE001 - legacy clip isolation
+                    # Ordinary legacy CPU failure: terminal for THIS clip,
+                    # other clips continue.
+                    self._fail_clip_terminal(
+                        shard, storage, clip_uid, f"{type(exc).__name__}: {exc}"
+                    )
         jobs.sort(key=lambda job: job.job_id())
         self.ledger.phase(REFERENCE_EDIT_PHASE).write_plan(jobs)
         return jobs
@@ -1527,8 +1611,20 @@ class ReferenceEditEpochRunner:
         return None
 
     def _maybe_finalize_attempt(self, job: ModelJob) -> Sequence[ModelJob]:
-        """parallel_independent: finalize once BOTH reviews are terminal."""
+        """parallel_independent: finalize once BOTH reviews are terminal.
+
+        The durable attempt-outcome marker is the sole "already finalized"
+        authority. It is written at the END of ``_complete_attempt``, so a
+        crash between the review receipts and the CPU finalize simply replays
+        the finalize on restart with zero model calls.
+        """
         generation_job_id = str(dict(job.dependency_digests)["generation"])
+        target = dict(job.target)
+        if self._attempt_outcome_path(
+            job.canonical_shard, job.clip_uid, str(target["entity_id"]),
+            int(target["attempt_index"]),
+        ).is_file():
+            return ()
         qwen_job = self._review_job_for(
             generation_job_id, REFERENCE_EDIT_QWEN_REVIEW_JOB
         )
@@ -1544,16 +1640,6 @@ class ReferenceEditEpochRunner:
         if not qwen_state.skippable or not sam_state.skippable:
             # The sibling review is still outstanding; it finalizes the attempt.
             return ()
-        marker = self._attempt_finalized_marker(generation_job_id)
-        if marker.is_file():
-            return ()
-        _write_json_once(
-            marker,
-            {
-                "generation_job_id": generation_job_id,
-                "finalized_by": job.job_id(),
-            },
-        )
         return self._complete_attempt(
             job,
             generation_job_id=generation_job_id,
@@ -1571,6 +1657,9 @@ class ReferenceEditEpochRunner:
         generation_job, _result, generation_payload = self._validated_committed(
             generation_job_id
         )
+        # The whole finalize is pure CPU on committed receipts, so replaying
+        # it after a crash is safe: every durable write below is
+        # create-once/idempotent and no model is ever paid again.
         qwen_payload: dict[str, Any] | None = None
         sam_payload: dict[str, Any] | None = None
         qwen_job = self._review_job_for(
@@ -1835,33 +1924,48 @@ class ReferenceEditEpochRunner:
 
     # -- clip publication ---    # -- clip publication --------------------------------------------------------
 
-    def _publish_clip_if_terminal(
-        self, shard: str, storage: RunStorage, clip_uid: str
-    ) -> None:
-        # Read-only plan access: the strict publication verification runs in
-        # reconcile_stats AFTER the clip outcome marker exists, so calling it
-        # here (mid-publication) would fail against its own ordering.
-        plan = _read_json(self._plan_path(shard))
-        if plan is None:
-            raise ReferenceEditDurableError(
-                f"Reference Edit publication needs the frozen plan for {shard!r}"
-            )
-        chain_ids = list(plan["clips"][clip_uid]["chain_entity_ids"])
+    def _reconstruct_clip_publication(
+        self,
+        shard: str,
+        storage: RunStorage,
+        clip_uid: str,
+        plan_entry: Mapping[str, Any],
+    ) -> tuple[Any, Any, Any, dict[str, int]]:
+        """Pure-CPU expected final publication for one fresh clip.
+
+        Rebuilds the legacy-equivalent ``(ReferencesState, PairingState,
+        ReferenceEditState, stats delta)`` from the frozen pre-edit
+        pairing/references, the entity outcomes, the routing metadata and the
+        production completion metadata. No model is ever called; the final
+        publication artifacts are (re)written with identical content only.
+        Publication and restart verification share this helper.
+        """
+        from r2v_data_v2.v3.schemas import EntityReferenceState
+
+        chain_ids = list(plan_entry.get("chain_entity_ids", []))
         outcomes = {
             entity_id: self._entity_outcome(shard, clip_uid, entity_id)
             for entity_id in chain_ids
         }
         if any(outcome is None for outcome in outcomes.values()):
-            return
-        if self._clip_outcome_path(shard, clip_uid).is_file():
-            return
+            raise ReferenceEditDurableError(
+                f"clip {clip_uid!r} cannot be reconstructed: an entity "
+                "outcome is missing"
+            )
         clip = self._clip(storage, clip_uid)
         entities = {entity.entity_id: entity for entity in clip.annotation.entities}
-        retained = set(clip.pairing.retained_entity_ids)
+        pre_pairing = dict(plan_entry.get("pre_pairing") or {})
+        pre_references = dict(plan_entry.get("pre_references") or {})
+        pre_entity_states = [
+            EntityReferenceState.model_validate(item)
+            for item in pre_references.get("entities", [])
+        ]
+        retained = set(pre_pairing.get("retained_entity_ids", []))
+        background = pre_references.get("background")
         final_references = []
         edit_states: list[ReferenceEditEntityState] = []
         delta: dict[str, int] = {}
-        for reference in clip.references.entities:
+        for reference in pre_entity_states:
             entity_id = reference.entity_id
             entity = entities.get(entity_id)
             if entity_id not in outcomes:
@@ -1899,9 +2003,7 @@ class ReferenceEditEpochRunner:
                 if entity_variant_route
                 else None
             )
-            routing = _read_json(
-                self._routing_path(shard, clip_uid, entity_id)
-            )
+            routing = _read_json(self._routing_path(shard, clip_uid, entity_id))
             bbox_paths = dict((routing or {}).get("bbox_paths") or {})
             bbox_error = (routing or {}).get("bbox_error")
             bbox_variant = (
@@ -1947,9 +2049,6 @@ class ReferenceEditEpochRunner:
                 and generated_variant is not None
                 else None
             )
-            # Legacy special case: a non subject/object entity with a known
-            # completeness and no operation is not_required BEFORE the
-            # entities_eligible increment (no eligible/accepted delta).
             if (
                 entity is not None
                 and entity.reference_type not in {"subject", "object"}
@@ -2068,7 +2167,6 @@ class ReferenceEditEpochRunner:
                     )
                 )
                 continue
-            # fallback (completion rejected)
             final_references.append(reference)
             edit_states.append(
                 ReferenceEditEntityState(
@@ -2130,21 +2228,46 @@ class ReferenceEditEpochRunner:
                 status="ready",
                 retained_entity_ids=retained_ids,
                 tokens=_tokens_for_retained(retained_ids, entities),
-                background_token=clip.pairing.background_token,
+                background_token=pre_pairing.get("background_token"),
             )
-        storage.write_reference_edit_result(
-            clip_uid,
-            ReferencesState(
-                entities=final_references, background=clip.references.background
-            ),
-            pairing,
-            ReferenceEditState(status="ready", entities=edit_states),
+        references_state = ReferencesState(
+            entities=final_references, background=background
         )
+        edit_state = ReferenceEditState(status="ready", entities=edit_states)
         outcome_delta = {
             "processed": 1,
-            "failed": int(any(o["outcome"] == "failed" for o in outcomes.values() if o)),
+            "failed": int(
+                any(o["outcome"] == "failed" for o in outcomes.values() if o)
+            ),
         }
         outcome_delta.update(delta)
+        return references_state, pairing, edit_state, outcome_delta
+
+    def _publish_clip_if_terminal(
+        self, shard: str, storage: RunStorage, clip_uid: str
+    ) -> None:
+        # Read-only plan access: the strict publication verification runs in
+        # reconcile_stats AFTER the clip outcome marker exists, so calling it
+        # here (mid-publication) would fail against its own ordering.
+        plan = _read_json(self._plan_path(shard))
+        if plan is None:
+            raise ReferenceEditDurableError(
+                f"Reference Edit publication needs the frozen plan for {shard!r}"
+            )
+        plan_entry = plan["clips"][clip_uid]
+        if any(
+            self._entity_outcome(shard, clip_uid, entity_id) is None
+            for entity_id in plan_entry.get("chain_entity_ids", [])
+        ):
+            return
+        if self._clip_outcome_path(shard, clip_uid).is_file():
+            return
+        references_state, pairing, edit_state, outcome_delta = (
+            self._reconstruct_clip_publication(shard, storage, clip_uid, plan_entry)
+        )
+        storage.write_reference_edit_result(
+            clip_uid, references_state, pairing, edit_state
+        )
         _write_json_once(
             self._clip_outcome_path(shard, clip_uid),
             {
@@ -2154,6 +2277,103 @@ class ReferenceEditEpochRunner:
                 "delta": outcome_delta,
             },
         )
+
+    def _fail_clip_terminal(
+        self, shard: str, storage: RunStorage, clip_uid: str, reason: str
+    ) -> None:
+        """Legacy clip isolation: one ordinary CPU failure is terminal."""
+        if self._clip_outcome_path(shard, clip_uid).is_file():
+            return
+        storage.write_reference_edit_failure(clip_uid, reason)
+        storage.append_failure(
+            stage="reference_edit",
+            clip_uid=clip_uid,
+            reason=reason,
+            details={"exception_type": "ReferenceEditClipFailure"},
+        )
+        _write_json_once(
+            self._clip_outcome_path(shard, clip_uid),
+            {
+                "schema": REFERENCE_EDIT_CLIP_OUTCOME_SCHEMA,
+                "clip_uid": clip_uid,
+                "terminal": "failed",
+                "reason": reason,
+                "delta": {"processed": 1, "failed": 1},
+            },
+        )
+
+    def _verify_published_clip(
+        self,
+        shard: str,
+        storage: RunStorage,
+        clip_uid: str,
+        plan_entry: Mapping[str, Any],
+    ) -> None:
+        """Verify a published clip against its durable outcome marker.
+
+        A crash between ``write_reference_edit_result``/``write_reference_edit_
+        failure`` and the clip outcome marker is repaired here: the expected
+        publication is reconstructed and, when it matches the live state, the
+        marker is back-filled with zero model calls. A mismatch (or a missing
+        marker with no reconstructable state) fails closed.
+        """
+        clip = storage.read_clip(clip_uid)
+        marker = _read_json(self._clip_outcome_path(shard, clip_uid))
+        if clip.reference_edit is not None and clip.reference_edit.status == "failed":
+            if marker is None:
+                # Crash between the failure publication and the marker.
+                _write_json_once(
+                    self._clip_outcome_path(shard, clip_uid),
+                    {
+                        "schema": REFERENCE_EDIT_CLIP_OUTCOME_SCHEMA,
+                        "clip_uid": clip_uid,
+                        "terminal": "failed",
+                        "reason": str(clip.reference_edit.reason or ""),
+                        "delta": {"processed": 1, "failed": 1},
+                    },
+                )
+                return
+            if marker.get("terminal") != "failed":
+                raise ReferenceEditDurableError(
+                    f"clip {clip_uid!r} published a failure but its durable "
+                    "outcome marker says otherwise"
+                )
+            return
+        if clip.reference_edit is None:
+            if marker is not None:
+                raise ReferenceEditDurableError(
+                    f"clip {clip_uid!r} has a durable outcome marker but no "
+                    "published Reference Edit state"
+                )
+            raise ReferenceEditDurableError(
+                f"clip {clip_uid!r} published Reference Edit state without a "
+                "durable outcome marker"
+            )
+        references_state, pairing, edit_state, outcome_delta = (
+            self._reconstruct_clip_publication(shard, storage, clip_uid, plan_entry)
+        )
+        if (
+            clip.references.model_dump(mode="json")
+            != references_state.model_dump(mode="json")
+            or clip.pairing.model_dump(mode="json") != pairing.model_dump(mode="json")
+            or clip.reference_edit.model_dump(mode="json")
+            != edit_state.model_dump(mode="json")
+        ):
+            raise ReferenceEditDurableError(
+                f"published Reference Edit state for {clip_uid!r} does not "
+                "match its durable outcome"
+            )
+        if marker is None:
+            # Crash window: the publication is verified; back-fill the marker.
+            _write_json_once(
+                self._clip_outcome_path(shard, clip_uid),
+                {
+                    "schema": REFERENCE_EDIT_CLIP_OUTCOME_SCHEMA,
+                    "clip_uid": clip_uid,
+                    "terminal": "ready",
+                    "delta": outcome_delta,
+                },
+            )
 
     # -- durable stats ---------------------------------------------------------
 

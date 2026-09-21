@@ -28,11 +28,16 @@ export) are not wired yet.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
 from r2v_data_v2.v3.config import V3Config
 from r2v_data_v2.v3.post_mask_epoch_pair import PairEpochRunner
+from r2v_data_v2.v3.post_mask_epoch_reference_edit import (
+    ReferenceEditEpochError,
+)
 from r2v_data_v2.v3.post_mask_epoch_removal import RemovalEpochRunner
 from r2v_data_v2.v3.post_mask_epoch_state import GroupLedger
 
@@ -87,6 +92,54 @@ def default_pair_runner_factory(
 def _emit(emit: Any, event: str, **payload: Any) -> None:
     if emit is not None:
         emit(event, **payload)
+
+
+def _reference_edit_completion_evidence(
+    ledger: GroupLedger, storages: Mapping[str, Any]
+) -> bool:
+    """True when the Reference Edit stage durably completed for these storages.
+
+    Evidence is the frozen Reference Edit plan plus a terminal clip outcome
+    marker for every fresh clip it planned. The composition barrier guarantees
+    Pair completed before any of that could be written, so on a full-session
+    restart the Pair CPU replay -- which compares live published state against
+    the Pair-only reconstruction and cannot know that Reference Edit
+    legitimately rewrote references afterwards -- must not run again.
+    """
+    semantic_root = Path(ledger.root) / "semantic" / "reference_edit"
+    plan_root = semantic_root / "primary"
+    outcomes_root = semantic_root / "outcomes"
+    if not plan_root.is_dir() or not outcomes_root.is_dir():
+        return False
+    for shard in storages:
+        plan_path = plan_root / f"{shard}.json"
+        if not plan_path.is_file():
+            return False
+        try:
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        except ValueError:
+            return False
+        for clip_uid, entry in (plan.get("clips") or {}).items():
+            if entry.get("classification") != "fresh_target":
+                continue
+            if not (outcomes_root / shard / f"{clip_uid}.json").is_file():
+                return False
+    return True
+
+
+def _pair_stats_from_stage_counts(storages: Mapping[str, Any]) -> dict[str, Any]:
+    """Recover the durable Pair stage counts written by a previous session."""
+    stats: dict[str, Any] = {}
+    for shard, storage in storages.items():
+        counts = storage.read_run().counts
+        recovered = {
+            key[len("pair.") :]: value
+            for key, value in counts.items()
+            if key.startswith("pair.")
+        }
+        if recovered:
+            stats[shard] = recovered
+    return stats
 
 
 def run_removal_pair_epochs(
@@ -144,7 +197,75 @@ def run_removal_pair_epochs(
     }
     if not remove_completed:
         # Hard stage barrier: no Pair seeding, no donor snapshot, no cross
-        # baseline, no Pair Qwen call.
+        # baseline, no Pair Qwen call, no Reference Edit work at all.
+        result.update(
+            {
+                "reference_edit_completed": False,
+                "reference_edit_job_count": 0,
+                "reference_edit_unresolved": (),
+                "reference_edit_stats": {},
+                "reference_edit_reconcile_error": None,
+            }
+        )
+        return result
+
+    if _reference_edit_completion_evidence(ledger, storages):
+        # Post-Reference-Edit restart: the barrier already proved Pair
+        # completed, and the Pair replay would compare live state that
+        # Reference Edit legitimately rewrote. Reuse the durable stage counts.
+        pair_stats = _pair_stats_from_stage_counts(storages)
+        result.update(
+            {
+                "pair_primary_completed": True,
+                "pair_cross_completed": True,
+                "pair_completed": True,
+                "pair_primary_unresolved": (),
+                "pair_cross_unresolved": (),
+                "pair_stats": pair_stats,
+                "reason": DOWNSTREAM_REASON,
+            }
+        )
+        if reference_edit_runner_factory is None:
+            return result
+        reference_edit = reference_edit_runner_factory(**shared)
+        reference_edit_seed = reference_edit.seed_jobs()
+        result["reference_edit_job_count"] = len(reference_edit_seed)
+        reference_edit_outcome = reference_edit_scheduler_factory(
+            reference_edit
+        ).run(reference_edit_seed)
+        reference_edit_unresolved = tuple(
+            reference_edit_outcome.get("unresolved_job_ids", ())
+        )
+        reference_edit_stats: dict[str, Any] = {}
+        reference_edit_completed = False
+        reconcile_error: str | None = None
+        if not reference_edit_unresolved:
+            try:
+                for shard in sorted(reference_edit.storages):
+                    stats = reference_edit.reconcile_stats(shard)
+                    payload = stats.to_dict()
+                    reference_edit.storages[shard].update_stage_counts(
+                        "reference_edit", payload
+                    )
+                    reference_edit_stats[shard] = payload
+            except ReferenceEditEpochError as exc:
+                reconcile_error = str(exc)
+                reference_edit_stats = {}
+            else:
+                reference_edit_completed = True
+        result.update(
+            {
+                "reference_edit_completed": reference_edit_completed,
+                "reference_edit_unresolved": reference_edit_unresolved,
+                "reference_edit_stats": reference_edit_stats,
+                "reference_edit_reconcile_error": reconcile_error,
+                "reason": (
+                    DOWNSTREAM_REASON
+                    if reference_edit_completed
+                    else "reference edit resource epoch incomplete"
+                ),
+            }
+        )
         return result
 
     pair = pair_runner_factory(**shared)
@@ -221,21 +342,33 @@ def run_removal_pair_epochs(
     reference_edit_unresolved = tuple(
         reference_edit_outcome.get("unresolved_job_ids", ())
     )
-    reference_edit_completed = not reference_edit_unresolved
     reference_edit_stats: dict[str, Any] = {}
-    if reference_edit_completed:
-        for shard in sorted(reference_edit.storages):
-            stats = reference_edit.reconcile_stats(shard)
-            payload = stats.to_dict()
-            reference_edit.storages[shard].update_stage_counts(
-                "reference_edit", payload
-            )
-            reference_edit_stats[shard] = payload
+    # Completion is confirmed by the durable reconcile, not by the scheduler
+    # alone: every shard must reconcile (which re-verifies each fresh clip's
+    # terminal publication) before any stage count is written.
+    reference_edit_completed = False
+    reconcile_error: str | None = None
+    if not reference_edit_unresolved:
+        try:
+            for shard in sorted(reference_edit.storages):
+                stats = reference_edit.reconcile_stats(shard)
+                payload = stats.to_dict()
+                reference_edit.storages[shard].update_stage_counts(
+                    "reference_edit", payload
+                )
+                reference_edit_stats[shard] = payload
+        except ReferenceEditEpochError as exc:
+            # Durable corruption: no partial stage counts, not completed.
+            reconcile_error = str(exc)
+            reference_edit_stats = {}
+        else:
+            reference_edit_completed = True
     result.update(
         {
             "reference_edit_completed": reference_edit_completed,
             "reference_edit_unresolved": reference_edit_unresolved,
             "reference_edit_stats": reference_edit_stats,
+            "reference_edit_reconcile_error": reconcile_error,
             "reason": (
                 DOWNSTREAM_REASON
                 if reference_edit_completed

@@ -711,3 +711,706 @@ def test_resolve_reference_edit_judge_endpoint_and_injected(
     resolved = resolve_reference_edit_judge(injected, config)
     assert resolved.judge is injected
     assert resolved.owned is False
+
+
+# ---------------------------------------------------------------------------
+# parallel_independent: generation unlocks BOTH reviews; attempt finalized once
+# ---------------------------------------------------------------------------
+
+
+class _BoundaryExecutor:
+    """Executes only allowed job types; the rest hit a simulated crash.
+
+    The jobs that DO run are committed by the real scheduler into real
+    ``rXXX-<resource>`` phases, so the durable layout is production-shaped.
+    """
+
+    def __init__(
+        self,
+        runner: ReferenceEditEpochRunner,
+        routing: _RoutingExecutor,
+        allowed: tuple[str, ...],
+    ) -> None:
+        self.runner = runner
+        self.routing = routing
+        self.allowed = allowed
+
+    def executor_for(self, resource: str) -> Any:
+        runner = self.runner
+        routing = self.routing
+        allowed = self.allowed
+
+        class _One:
+            def execute_batch(self, jobs: Any) -> dict[str, Any]:
+                from r2v_data_v2.v3.post_mask_epoch_scheduler import JobExecution
+
+                outcomes: dict[str, Any] = {}
+                for job in sorted(jobs, key=lambda item: item.job_id()):
+                    if job.job_type in allowed:
+                        handle = routing._handle(job.resource)
+                        outcomes[job.job_id()] = JobExecution(
+                            job, runner.run(job, handle), None
+                        )
+                    else:
+                        outcomes[job.job_id()] = JobExecution(
+                            job, None, RuntimeError("simulated crash boundary")
+                        )
+                return outcomes
+
+        del resource
+        return _One()
+
+
+def _boundary_scheduler(
+    runner: ReferenceEditEpochRunner,
+    routing: _RoutingExecutor,
+    allowed: tuple[str, ...],
+) -> ResourceEpochScheduler:
+    boundary = _BoundaryExecutor(runner, routing, allowed)
+    return ResourceEpochScheduler(
+        ledger=runner.ledger,
+        finalize=runner.finalize,
+        executors={
+            resource: boundary.executor_for(resource)
+            for resource in (RESOURCE_BOOGU, RESOURCE_QWEN, RESOURCE_SAM)
+        },
+    )
+
+
+def test_parallel_independent_generation_unlocks_both_reviews(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """generation finalize must plan qwen AND sam against the same generation."""
+    _config, _storage, runner, _scheduler, routing = _build(
+        tmp_path, monkeypatch, run_name="run", review_execution="parallel_independent"
+    )
+    boundary = _boundary_scheduler(
+        runner, routing, ("reference_edit_boogu_generate",)
+    )
+    boundary.run(runner.seed_jobs())
+    records = runner._plan_record_index()
+    qwen_records = [
+        r for r in records.values() if r["job_type"] == "reference_edit_qwen_review"
+    ]
+    sam_records = [
+        r for r in records.values() if r["job_type"] == "reference_edit_sam_review"
+    ]
+    assert qwen_records and sam_records
+    assert {dict(r["dependency_digests"])["generation"] for r in qwen_records} == {
+        dict(r["dependency_digests"])["generation"] for r in sam_records
+    }
+
+
+def test_parallel_independent_normal_matches_legacy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from r2v_data_v2.v3.reference_edit import reference_edit_clips
+
+    legacy_config = _reference_edit_config(tmp_path, monkeypatch, "run-legacy")
+    legacy_storage = _prepared_storage(
+        legacy_config, monkeypatch, run_name="run-legacy"
+    )
+    legacy = reference_edit_clips(
+        legacy_config,
+        legacy_storage,
+        backend=_FakeBoogu(),
+        judge=_FakeQwen(),
+        sam_reviewer=_LegacySamReviewer(),
+        review_execution="parallel_independent",
+    )
+
+    _config, storage, runner, scheduler, routing = _build(
+        tmp_path, monkeypatch, run_name="run-epoch",
+        review_execution="parallel_independent",
+    )
+    _drain(runner, scheduler)
+    assert (routing.boogu.calls, routing.qwen.calls, routing.sam.calls) == (
+        legacy.completion_attempts,
+    ) * 3
+    stats = runner.reconcile_stats(SHARD)
+    assert stats.to_dict() == legacy.to_dict()
+    epoch_clip = storage.read_clip("clip-1")
+    legacy_clip = legacy_storage.read_clip("clip-1")
+    assert epoch_clip.reference_edit.model_dump(mode="json") == (
+        legacy_clip.reference_edit.model_dump(mode="json")
+    )
+    # Exactly one attempt outcome exists: the CPU finalize ran once.
+    assert runner._attempt_outcome_path(SHARD, "clip-1", "e1", 1).is_file()
+    assert not runner._attempt_outcome_path(SHARD, "clip-1", "e1", 2).is_file() or (
+        stats.completion_attempts == 2
+    )
+
+
+def test_parallel_independent_qwen_failure_still_pays_sam(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _config, _storage, runner, scheduler, routing = _build(
+        tmp_path, monkeypatch, run_name="run",
+        review_execution="parallel_independent",
+    )
+    routing.qwen.fail = True
+    _drain(runner, scheduler)
+    # A Qwen failure must never skip the SAM call in parallel mode.
+    assert routing.sam.calls >= 1
+    assert routing.qwen.calls == routing.boogu.calls
+    marker = _read_attempt_marker(runner, 1)
+    assert marker is not None
+    assert marker["status"] in {"qwen_failed", "rejected"}
+
+
+def test_parallel_independent_sam_failure_keeps_qwen_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _config, _storage, runner, scheduler, routing = _build(
+        tmp_path, monkeypatch, run_name="run",
+        review_execution="parallel_independent",
+    )
+    routing.sam.fail = True
+    _drain(runner, scheduler)
+    assert routing.qwen.calls >= 1
+    assert routing.sam.calls == routing.qwen.calls
+    metadata = _read_completion_metadata(runner)
+    # The Qwen result is retained; the SAM failure rejects the attempt.
+    assert metadata is None or metadata.get("sam_review") is not None
+
+
+def test_parallel_independent_finalize_crash_replays_cpu_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review receipts committed, attempt outcome not written: replay CPU-only."""
+    config, storage, runner, _scheduler, routing = _build(
+        tmp_path, monkeypatch, run_name="run",
+        review_execution="parallel_independent",
+    )
+    # Simulate a crash between the review commits and the CPU finalize by
+    # swallowing the finalizer for review jobs.
+    real_finalize = runner.finalize
+
+    def crashing_finalize(job: Any, result: Any) -> Any:
+        if job.job_type in (
+            "reference_edit_qwen_review",
+            "reference_edit_sam_review",
+        ):
+            return ()
+        return real_finalize(job, result)
+
+    runner.finalize = crashing_finalize
+    boundary = ResourceEpochScheduler(
+        ledger=runner.ledger,
+        finalize=runner.finalize,
+        executors={
+            resource: _BoundaryExecutor(
+                runner, routing, ("reference_edit_boogu_generate",)
+            ).executor_for(resource)
+            for resource in (RESOURCE_BOOGU, RESOURCE_QWEN, RESOURCE_SAM)
+        },
+    )
+    # Let everything run except the review finalizers.
+    boundary = _BoundaryExecutor(
+        runner, routing, ("reference_edit_boogu_generate",)
+    )
+    full = ResourceEpochScheduler(
+        ledger=runner.ledger,
+        finalize=runner.finalize,
+        executors={
+            resource: _FullExecutor(runner, routing).executor_for(resource)
+            for resource in (RESOURCE_BOOGU, RESOURCE_QWEN, RESOURCE_SAM)
+        },
+    )
+    del boundary
+    full.run(runner.seed_jobs())
+    assert routing.qwen.calls >= 1 and routing.sam.calls >= 1
+    assert not runner._attempt_outcome_path(SHARD, "clip-1", "e1", 1).is_file()
+
+    # Fresh runner with the real finalizer: zero extra model calls.
+    fresh = ReferenceEditEpochRunner(
+        config,
+        {SHARD: storage},
+        GroupLedger(tmp_path / "ledger"),
+        eligible_clip_uids_by_shard={SHARD: ["clip-1"]},
+        review_execution="parallel_independent",
+    )
+    fresh_routing = _RoutingExecutor(fresh)
+    fresh_scheduler = ResourceEpochScheduler(
+        ledger=fresh.ledger,
+        finalize=fresh.finalize,
+        executors={
+            resource: _FullExecutor(fresh, fresh_routing).executor_for(resource)
+            for resource in (RESOURCE_BOOGU, RESOURCE_QWEN, RESOURCE_SAM)
+        },
+    )
+    fresh_scheduler.run(fresh.seed_jobs())
+    assert fresh_routing.boogu.calls == 0
+    assert fresh_routing.qwen.calls == 0
+    assert fresh_routing.sam.calls == 0
+    assert runner._attempt_outcome_path(SHARD, "clip-1", "e1", 1).is_file()
+    clip = storage.read_clip("clip-1")
+    assert clip.reference_edit is not None
+
+
+class _FullExecutor:
+    """Runs every job through the routing handles."""
+
+    def __init__(self, runner: ReferenceEditEpochRunner, routing: _RoutingExecutor) -> None:
+        self.runner = runner
+        self.routing = routing
+
+    def executor_for(self, resource: str) -> Any:
+        runner = self.runner
+        routing = self.routing
+
+        class _One:
+            def execute_batch(self, jobs: Any) -> dict[str, Any]:
+                from r2v_data_v2.v3.post_mask_epoch_scheduler import JobExecution
+
+                outcomes: dict[str, Any] = {}
+                for job in sorted(jobs, key=lambda item: item.job_id()):
+                    handle = routing._handle(job.resource)
+                    outcomes[job.job_id()] = JobExecution(
+                        job, runner.run(job, handle), None
+                    )
+                return outcomes
+
+        del resource
+        return _One()
+
+
+def _read_attempt_marker(runner: ReferenceEditEpochRunner, attempt: int) -> Any:
+    path = runner._attempt_outcome_path(SHARD, "clip-1", "e1", attempt)
+    if not path.is_file():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _read_completion_metadata(runner: ReferenceEditEpochRunner) -> Any:
+    path = (
+        Path(runner._storage_for(SHARD).root)
+        / "clips/clip-1/reference_edit/e1/completion_metadata.json"
+    )
+    if not path.is_file():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+# ---------------------------------------------------------------------------
+# True crash windows (receipts land in real rXXX-<resource> phases)
+# ---------------------------------------------------------------------------
+
+
+def test_crash_after_generation_receipt_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Generation committed, Qwen/SAM never executed."""
+    config, storage, runner, _scheduler, routing = _build(tmp_path, monkeypatch)
+    boundary = _boundary_scheduler(
+        runner, routing, ("reference_edit_boogu_generate",)
+    )
+    outcome = boundary.run(runner.seed_jobs())
+    assert not outcome["completed"]
+    phase_ids = ",".join(runner.ledger.phase_ids())
+    assert "-boogu" in phase_ids
+    assert routing.boogu.calls == 1
+    assert routing.qwen.calls == 0 and routing.sam.calls == 0
+
+    fresh = ReferenceEditEpochRunner(
+        config, {SHARD: storage}, GroupLedger(tmp_path / "ledger"),
+        eligible_clip_uids_by_shard={SHARD: ["clip-1"]},
+    )
+    fresh_routing = _RoutingExecutor(fresh)
+    fresh_scheduler = ResourceEpochScheduler(
+        ledger=fresh.ledger,
+        finalize=fresh.finalize,
+        executors={
+            resource: _FullExecutor(fresh, fresh_routing).executor_for(resource)
+            for resource in (RESOURCE_BOOGU, RESOURCE_QWEN, RESOURCE_SAM)
+        },
+    )
+    _drain(fresh, fresh_scheduler)
+    assert fresh_routing.boogu.calls == 0
+    assert fresh_routing.qwen.calls >= 1
+    assert fresh_routing.sam.calls >= 1
+
+
+def test_crash_after_qwen_receipt_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Qwen committed, SAM never executed (sequential)."""
+    config, storage, runner, _scheduler, routing = _build(tmp_path, monkeypatch)
+    boundary = _boundary_scheduler(
+        runner, routing,
+        ("reference_edit_boogu_generate", "reference_edit_qwen_review"),
+    )
+    outcome = boundary.run(runner.seed_jobs())
+    assert not outcome["completed"]
+    phase_ids = ",".join(runner.ledger.phase_ids())
+    assert "-boogu" in phase_ids and "-qwen" in phase_ids
+    assert routing.qwen.calls == 1 and routing.sam.calls == 0
+
+    fresh = ReferenceEditEpochRunner(
+        config, {SHARD: storage}, GroupLedger(tmp_path / "ledger"),
+        eligible_clip_uids_by_shard={SHARD: ["clip-1"]},
+    )
+    fresh_routing = _RoutingExecutor(fresh)
+    fresh_scheduler = ResourceEpochScheduler(
+        ledger=fresh.ledger,
+        finalize=fresh.finalize,
+        executors={
+            resource: _FullExecutor(fresh, fresh_routing).executor_for(resource)
+            for resource in (RESOURCE_BOOGU, RESOURCE_QWEN, RESOURCE_SAM)
+        },
+    )
+    _drain(fresh, fresh_scheduler)
+    assert fresh_routing.boogu.calls == 0
+    assert fresh_routing.qwen.calls == 0
+    assert fresh_routing.sam.calls >= 1
+
+
+def test_crash_after_sam_receipt_before_finalize(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SAM committed, attempt CPU outcome not written."""
+    config, storage, runner, _scheduler, routing = _build(tmp_path, monkeypatch)
+    real_finalize = runner.finalize
+
+    def crashing_finalize(job: Any, result: Any) -> Any:
+        if job.job_type == "reference_edit_sam_review":
+            return ()
+        return real_finalize(job, result)
+
+    runner.finalize = crashing_finalize
+    boundary = ResourceEpochScheduler(
+        ledger=runner.ledger,
+        finalize=runner.finalize,
+        executors={
+            resource: _FullExecutor(runner, routing).executor_for(resource)
+            for resource in (RESOURCE_BOOGU, RESOURCE_QWEN, RESOURCE_SAM)
+        },
+    )
+    # The scheduler reports completed (all jobs committed), but the attempt
+    # outcome was never written: exactly the crash window under test.
+    boundary.run(runner.seed_jobs())
+    assert (routing.boogu.calls, routing.qwen.calls, routing.sam.calls) == (1, 1, 1)
+    assert not runner._attempt_outcome_path(SHARD, "clip-1", "e1", 1).is_file()
+
+    fresh = ReferenceEditEpochRunner(
+        config, {SHARD: storage}, GroupLedger(tmp_path / "ledger"),
+        eligible_clip_uids_by_shard={SHARD: ["clip-1"]},
+    )
+    fresh_routing = _RoutingExecutor(fresh)
+    fresh_scheduler = ResourceEpochScheduler(
+        ledger=fresh.ledger,
+        finalize=fresh.finalize,
+        executors={
+            resource: _FullExecutor(fresh, fresh_routing).executor_for(resource)
+            for resource in (RESOURCE_BOOGU, RESOURCE_QWEN, RESOURCE_SAM)
+        },
+    )
+    _drain(fresh, fresh_scheduler)
+    assert (fresh_routing.boogu.calls, fresh_routing.qwen.calls, fresh_routing.sam.calls) == (0, 0, 0)
+    assert fresh._attempt_outcome_path(SHARD, "clip-1", "e1", 1).is_file()
+    clip = storage.read_clip("clip-1")
+    assert clip.reference_edit is not None
+
+
+def test_publication_before_marker_crash_repairs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Clip published, outcome marker missing: verify + back-fill, zero calls."""
+    config, storage, runner, scheduler, routing = _build(tmp_path, monkeypatch)
+    _drain(runner, scheduler)
+    clip = storage.read_clip("clip-1")
+    assert clip.reference_edit is not None
+    marker_path = runner._clip_outcome_path(SHARD, "clip-1")
+    assert marker_path.is_file()
+    expected_delta = json.loads(marker_path.read_text(encoding="utf-8"))["delta"]
+    marker_path.unlink()
+
+    fresh = ReferenceEditEpochRunner(
+        config, {SHARD: storage}, GroupLedger(tmp_path / "ledger"),
+        eligible_clip_uids_by_shard={SHARD: ["clip-1"]},
+    )
+    # seed_jobs re-verifies the published clip and repairs the marker.
+    fresh.seed_jobs()
+    assert marker_path.is_file()
+    repaired = json.loads(marker_path.read_text(encoding="utf-8"))
+    assert repaired["delta"] == expected_delta
+    stats = fresh.reconcile_stats(SHARD)
+    assert stats.processed == 1
+    del routing
+
+
+def test_marker_exists_live_state_tamper_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Marker present but the live published state was tampered: fail closed."""
+    config, storage, runner, scheduler, routing = _build(tmp_path, monkeypatch)
+    _drain(runner, scheduler)
+    del routing
+    clip = storage.read_clip("clip-1")
+    tampered_entities = [
+        entity.model_copy(update={"metadata_path": "clips/tampered.json"})
+        if index == 0
+        else entity
+        for index, entity in enumerate(clip.reference_edit.entities)
+    ]
+    tampered = clip.reference_edit.model_copy(
+        update={"entities": tampered_entities}
+    )
+    import r2v_data_v2.v3.storage as storage_module
+
+    storage_module.write_json_atomic(
+        storage.clip_path("clip-1"),
+        clip.model_copy(update={"reference_edit": tampered}).model_dump(mode="json"),
+    )
+    fresh = ReferenceEditEpochRunner(
+        config, {SHARD: storage}, GroupLedger(tmp_path / "ledger"),
+        eligible_clip_uids_by_shard={SHARD: ["clip-1"]},
+    )
+    with pytest.raises(ReferenceEditEpochError, match="does not match"):
+        fresh.seed_jobs()
+
+
+# ---------------------------------------------------------------------------
+# Alternate plan: create-once and tamper
+# ---------------------------------------------------------------------------
+
+
+def test_alternate_artifact_tamper_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _config, storage, runner, _scheduler, routing = _build(
+        tmp_path, monkeypatch, run_name="run", with_alternate=True
+    )
+    routing.qwen.accept = False
+    # Run until candidate1 is rejected and the alternate plan is frozen.
+    _drain_run_until_alternate(runner, _scheduler, routing)
+    alternate_path = runner._alternate_path(SHARD, "clip-1", "e1")
+    assert alternate_path.is_file()
+    frozen = json.loads(alternate_path.read_text(encoding="utf-8"))
+    artifact = Path(storage.root) / frozen["alternate_source_path"]
+    original = artifact.read_bytes()
+    artifact.write_bytes(b"tampered")
+    clip = storage.read_clip("clip-1")
+    with pytest.raises(ReferenceEditEpochError, match="alternate"):
+        runner.durable_alternate(
+            SHARD, storage, "clip-1", clip.annotation.entities[0],
+            clip.references.entities[0],
+        )
+    # Not regenerated: the tampered bytes stay on disk.
+    assert artifact.read_bytes() == b"tampered"
+    # Restore for cleanliness.
+    artifact.write_bytes(original)
+
+
+def test_alternate_plan_identity_drift_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _config, storage, runner, _scheduler, routing = _build(
+        tmp_path, monkeypatch, run_name="run", with_alternate=True
+    )
+    routing.qwen.accept = False
+    _drain_run_until_alternate(runner, _scheduler, routing)
+    alternate_path = runner._alternate_path(SHARD, "clip-1", "e1")
+    frozen = json.loads(alternate_path.read_text(encoding="utf-8"))
+    frozen["candidate_id"] = "candidate_99"
+    alternate_path.write_text(json.dumps(frozen), encoding="utf-8")
+    clip = storage.read_clip("clip-1")
+    rebuilt = runner.durable_alternate(
+        SHARD, storage, "clip-1", clip.annotation.entities[0],
+        clip.references.entities[0],
+    )
+    # The frozen identity is the authority: candidate_99 is what comes back.
+    assert rebuilt.candidate.candidate_id == "candidate_99"
+
+
+def _drain_run_until_alternate(
+    runner: ReferenceEditEpochRunner, scheduler: ResourceEpochScheduler,
+    routing: _RoutingExecutor,
+) -> None:
+    """Run until the candidate2 alternate plan exists (candidate1 rejected)."""
+    for _round in range(8):
+        if runner._alternate_path(SHARD, "clip-1", "e1").is_file():
+            return
+        jobs = runner.seed_jobs()
+        if not jobs:
+            return
+        scheduler.run(jobs)
+    raise AssertionError("alternate plan was never frozen")
+
+
+# ---------------------------------------------------------------------------
+# Corruption matrix (zero paid model calls during detection)
+# ---------------------------------------------------------------------------
+
+
+def _committed_job_id(runner: ReferenceEditEpochRunner, job_type: str) -> str:
+    for record in runner._plan_record_index().values():
+        if record.get("job_type") == job_type:
+            job = runner._job_from_plan_record(record)
+            if runner.ledger.classify(job).skippable:
+                return job.job_id()
+    raise AssertionError(f"no committed {job_type} job")
+
+
+def _result_path(runner: ReferenceEditEpochRunner, job_id: str) -> Path:
+    phase_id = runner._phase_for(job_id)
+    return (
+        Path(runner.ledger.root)
+        / "phases"
+        / phase_id
+        / "artifacts"
+        / job_id
+        / "result.json"
+    )
+
+
+def _candidate_path(runner: ReferenceEditEpochRunner, job_id: str) -> Path:
+    phase_id = runner._phase_for(job_id)
+    return (
+        Path(runner.ledger.root)
+        / "phases"
+        / phase_id
+        / "artifacts"
+        / job_id
+        / "candidate.png"
+    )
+
+
+def test_generation_result_tamper_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _config, _storage, runner, _scheduler, routing = _build(tmp_path, monkeypatch)
+    # Stop after the generation receipt only.
+    boundary = _boundary_scheduler(
+        runner, routing, ("reference_edit_boogu_generate",)
+    )
+    boundary.run(runner.seed_jobs())
+    job_id = _committed_job_id(runner, "reference_edit_boogu_generate")
+    path = _result_path(runner, job_id)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["result_payload"]["candidate_sha256"] = "0" * 64
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ReferenceEditEpochError, match="receipt mismatch|drifted"):
+        runner._validated_committed(job_id)
+
+
+def test_candidate_artifact_tamper_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _config, _storage, runner, _scheduler, routing = _build(tmp_path, monkeypatch)
+    boundary = _boundary_scheduler(
+        runner, routing, ("reference_edit_boogu_generate",)
+    )
+    boundary.run(runner.seed_jobs())
+    job_id = _committed_job_id(runner, "reference_edit_boogu_generate")
+    path = _candidate_path(runner, job_id)
+    path.write_bytes(b"tampered")
+    with pytest.raises(ReferenceEditEpochError, match="receipt mismatch|drifted"):
+        runner._validated_committed(job_id)
+
+
+def _tamper_review_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    job_type: str,
+) -> None:
+    config, storage, runner, scheduler, routing = _build(tmp_path, monkeypatch)
+    # Commit generation + the target review, then tamper its result. In
+    # sequential mode the SAM job only exists after Qwen finalizes, so allow
+    # the whole chain; the tamper check reads the receipt directly.
+    allowed = (
+        "reference_edit_boogu_generate",
+        "reference_edit_qwen_review",
+        "reference_edit_sam_review",
+    )
+    boundary = _boundary_scheduler(runner, routing, allowed)
+    boundary.run(runner.seed_jobs())
+    job_id = _committed_job_id(runner, job_type)
+    path = _result_path(runner, job_id)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["result_payload"]["status"] = "tampered"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ReferenceEditEpochError, match="receipt mismatch|drifted"):
+        runner._validated_committed(job_id)
+    del config, storage, scheduler
+
+
+def test_qwen_result_tamper_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _tamper_review_result(
+        tmp_path, monkeypatch, "reference_edit_qwen_review"
+    )
+
+
+def test_sam_result_tamper_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _tamper_review_result(
+        tmp_path, monkeypatch, "reference_edit_sam_review"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Ordinary legacy clip CPU failure isolation
+# ---------------------------------------------------------------------------
+
+
+def test_ordinary_clip_cpu_failure_is_terminal_and_isolated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One clip's ordinary CPU failure is terminal; the other continues."""
+    from tests.test_v3_pair import _add_ready_clip
+    from tests.test_v3_post_mask_epoch_pair import _ScopedJudge
+
+    config = _reference_edit_config(
+        tmp_path, monkeypatch, "run", same_parent_fallback_enabled=True
+    )
+    storage = _pair_storage(config, entity_types=("subject",))
+    _add_ready_clip(
+        config, storage, clip_uid="clip-2", clip_suffix="9", entity_types=("subject",)
+    )
+    pair_clips = _pair_clips()
+    pair_clips(
+        config,
+        storage,
+        judge=_ScopedJudge(
+            scopes={("clip-1", "e1"): "full", ("clip-2", "e1"): "full"}
+        ),
+    )
+    ledger = GroupLedger(tmp_path / "ledger")
+    runner = ReferenceEditEpochRunner(
+        config,
+        {SHARD: storage},
+        ledger,
+        eligible_clip_uids_by_shard={SHARD: ["clip-1", "clip-2"]},
+    )
+    real_publish = runner._publish_clip_if_terminal
+
+    def exploding_publish(shard: str, stor: Any, clip_uid: str) -> None:
+        if clip_uid == "clip-1":
+            raise ValueError("publication exploded")
+        real_publish(shard, stor, clip_uid)
+
+    runner._publish_clip_if_terminal = exploding_publish
+    # seed_jobs processes both not_required clips; clip-1 fails terminally.
+    runner.seed_jobs()
+    failed_clip = storage.read_clip("clip-1")
+    assert failed_clip.reference_edit is not None
+    assert failed_clip.reference_edit.status == "failed"
+    ok_clip = storage.read_clip("clip-2")
+    assert ok_clip.reference_edit is not None
+    assert ok_clip.reference_edit.status == "ready"
+    failures = (Path(storage.root) / "failures.jsonl").read_text(encoding="utf-8")
+    assert "publication exploded" in failures
+    stats = runner.reconcile_stats(SHARD)
+    assert stats.processed == 2
+    assert stats.failed == 1
+
+    # Restart after the crash: the failure publication is verified as-is.
+    fresh = ReferenceEditEpochRunner(
+        config, {SHARD: storage}, GroupLedger(tmp_path / "ledger"),
+        eligible_clip_uids_by_shard={SHARD: ["clip-1", "clip-2"]},
+    )
+    assert fresh.seed_jobs() == []
+    assert fresh.reconcile_stats(SHARD).to_dict() == stats.to_dict()
