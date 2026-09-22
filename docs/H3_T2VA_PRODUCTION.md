@@ -398,6 +398,36 @@ Within an ASR worker, multiple transcript segments from the same speech stem als
 reuse one successful source-audio hash validation instead of hashing the same stem
 for every segment.
 
+### Bulk downstream preparation failure policy
+
+Full-production downstream preparation builds one T2VA inventory for the whole
+shard. If that bulk inventory build fails, the invocation must fail immediately
+and expose the real exception. Do not silently fall back to rebuilding the full
+canonical/resolved/diarization/ASR inventory once per clip.
+
+A previous fallback swallowed any bulk ValueError/TypeError/KeyError/OSError and
+then called build_t2va_inventory() separately for every row missing from contexts.
+For a 2,000-row shard this could reload and revalidate the same shard-global
+upstream state up to 2,000 times, leaving all GPUs idle for hours while the
+supervisor showed only:
+
+    shard=<id> downstream_prepare_start
+
+Malformed source rows, missing media, and other row-local ingestion failures are
+already isolated before the bulk inventory build. Upstream per-clip failures are
+represented in the bulk inventory as job.upstream_failure. Therefore a bulk
+inventory exception is treated as a shard/infrastructure/lineage error, not as a
+reason to replay the entire inventory once per clip.
+
+Current markers are:
+
+    downstream_inventory_build_start
+    downstream_inventory_build_ready jobs=...
+    downstream_inventory_build_failed <ExceptionType>: <message>
+
+No per-UID prepared/*.jsonl fallback files should be created by normal
+full-production resume.
+
 ### Downstream inventory complexity
 
 Downstream preparation must be linear in the shard population plus speech
