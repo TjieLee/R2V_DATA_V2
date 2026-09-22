@@ -305,13 +305,44 @@ def test_downstream_evidence_ignores_mimo_model_for_resume():
             "profiles": {"model": "mimo-v2.5"},
             "allow_unverified": True,
         },
-        "dependencies": {"resolved": {"clip_uid": "clip"}},
+        "dependencies": {
+            "resolved": {"clip_uid": "clip"},
+            "diarization_backend": {"model_identifier": "old-diar"},
+            "sam": {"configuration": {"model": "old-sam"}},
+            "auk": {"configuration": {"model": "old-auk"}},
+            "asr": [
+                {
+                    "segment_id": "s1",
+                    "text": "hello",
+                    "language": "English",
+                    "model_identifier": "old-asr",
+                    "package": "old-package",
+                    "configuration": {"dtype": "old"},
+                }
+            ],
+        },
     }
     current_v26 = {
         **old_v25,
         "policy": {
             "version": "full-downstream-per-clip-v2-model-agnostic",
             "allow_unverified": True,
+        },
+        "dependencies": {
+            **old_v25["dependencies"],
+            "diarization_backend": {"model_identifier": "new-diar"},
+            "sam": {"configuration": {"model": "new-sam"}},
+            "auk": {"configuration": {"model": "new-auk"}},
+            "asr": [
+                {
+                    "segment_id": "s1",
+                    "text": "hello",
+                    "language": "English",
+                    "model_identifier": "new-asr",
+                    "package": "new-package",
+                    "configuration": {"dtype": "new"},
+                }
+            ],
         },
     }
 
