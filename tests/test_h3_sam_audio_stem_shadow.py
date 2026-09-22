@@ -2537,9 +2537,15 @@ def test_stem_reconcile_cli_forwards_experimental_controls(
     assert captured[0].thinking == "enabled"
     assert captured[0].icl == "v1"
     assert captured[0].temperature == 0.0
+    assert captured[0].model == "mimo-v2.6-flash-rl"
     assert result["thinking"] == "enabled"
     assert result["icl"] == "v1"
     assert result["temperature"] == 0.0
+    assert result["model"] == "mimo-v2.6-flash-rl"
+    assert result["mimo_run_id"] == "mimo-v2.6-flash-rl"
+    assert result["output_root"].endswith(
+        "/mimo_runs/mimo-v2.6-flash-rl/legacy_lr_asd"
+    )
     assert json.loads(capsys.readouterr().out.splitlines()[-1]) == result
 
 
