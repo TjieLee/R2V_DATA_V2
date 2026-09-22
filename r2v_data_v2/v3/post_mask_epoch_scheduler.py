@@ -381,8 +381,11 @@ class ResourceEpochScheduler:
                             job.job_id(), name, payload
                         )
                         self.ledger.note_artifact(phase_id, job.job_id())
+                    # ``result.json`` is bound by ``result_digest`` alone. Also
+                    # listing it as an artifact digest made every resume hash the
+                    # same file twice and forced a directory walk for jobs whose
+                    # only committed artifact is the result.
                     result_digest = phase.publish_result(job, result)
-                    digests["result.json"] = result_digest
                     receipt = phase.commit(
                         job,
                         outcome=result.outcome,

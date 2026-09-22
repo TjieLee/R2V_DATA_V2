@@ -108,7 +108,9 @@ def _load_runner(spec: str):
     return runner
 
 
-def _publish_resolved_environment(args: argparse.Namespace) -> None:
+def _publish_resolved_environment(
+    args: argparse.Namespace, *, canonical_shard_count: int
+) -> None:
     """Mirror the resolved CLI values into the runner's environment.
 
     An external job runner such as ``run_removal_epoch`` resolves its roots
@@ -116,10 +118,17 @@ def _publish_resolved_environment(args: argparse.Namespace) -> None:
     parsed CLI values. Rewriting the environment from the *final* parsed values
     makes parser output the single authority, so ``--base-config B`` overriding
     an environment ``A`` cannot leave the runner writing under ``A``.
+
+    ``POST_MASK_CANONICAL_SHARD_COUNT`` is the same idea for campaign identity:
+    the launcher already enumerated the canonical shards to build the groups, so
+    it publishes that count instead of making every group runner rescan the
+    entity-mask root. A standalone runner that never saw a launcher falls back
+    to enumerating the root itself, so the identity is unchanged either way.
     """
     os.environ["POST_MASK_BASE_CONFIG"] = str(args.base_config)
     os.environ["POST_MASK_TAG"] = str(args.tag)
     os.environ["POST_MASK_ENTITY_MASK_ROOT"] = str(args.entity_mask_root)
+    os.environ["POST_MASK_CANONICAL_SHARD_COUNT"] = str(int(canonical_shard_count))
     if args.post_mask_root:
         os.environ["POST_MASK_ROOT"] = str(args.post_mask_root)
     else:
@@ -148,6 +157,8 @@ def main(argv=None) -> int:
         group_ownership,
         record_group_outcome,
         resource_epoch_root,
+        resume_first_assigned_groups,
+        write_group_completed,
         write_group_descriptor,
     )
     from r2v_data_v2.v3.post_mask_epoch_state import GroupLedger
@@ -179,6 +190,11 @@ def main(argv=None) -> int:
             group_size=args.group_size,
         )
         owned = assigned_groups(groups, rank=args.rank, world_size=args.world_size)
+        # Completed groups are skipped from top-level metadata alone: no runner,
+        # no ledger, no shard storage. The remaining work is ordered
+        # unfinished-before-fresh so a restart finishes what it already began
+        # before it starts anything new.
+        resume = resume_first_assigned_groups(state_root, owned)
         # --dry-run and --job-runner are mutually exclusive at the parser, so
         # reaching here with neither is a real usage error, not a silent plan.
         if not args.job_runner and not args.dry_run:
@@ -188,7 +204,7 @@ def main(argv=None) -> int:
             )
         # The job runner reads its roots from the environment, so publish the
         # resolved values before anything can import or call it.
-        _publish_resolved_environment(args)
+        _publish_resolved_environment(args, canonical_shard_count=len(shards))
         runner = _load_runner(args.job_runner) if args.job_runner else None
 
         try:
@@ -204,13 +220,16 @@ def main(argv=None) -> int:
             world_size=args.world_size,
             group_count=len(groups),
             assigned_groups=len(owned),
+            groups_complete_skipped=len(resume.complete),
+            groups_unfinished=len(resume.unfinished),
+            groups_fresh=len(resume.fresh),
             group_size=args.group_size,
             git_commit=git_commit,
             dry_run=bool(args.dry_run),
         )
 
         planned, completed, incomplete, skipped = 0, 0, 0, 0
-        for group in owned:
+        for group in resume.ordered:
             with group_ownership(state_root, group) as held:
                 if not held:
                     skipped += 1
@@ -239,7 +258,11 @@ def main(argv=None) -> int:
                 outcome = runner(group, ledger, _emit) or {}
                 if outcome.get("completed"):
                     completed += 1
+                    # History first, then the create-once completion marker: the
+                    # marker is what the next restart skips on, so it may only
+                    # exist once the completion is durably recorded.
                     record_group_outcome(state_root, group, outcome=GROUP_COMPLETED)
+                    write_group_completed(state_root, group)
                     _emit(
                         "post_mask_resource_epoch_group_completed",
                         group_id=group.group_id,
@@ -266,6 +289,9 @@ def main(argv=None) -> int:
             "group_completed": completed,
             "group_incomplete": incomplete,
             "groups_locked_elsewhere": skipped,
+            "groups_complete_skipped": len(resume.complete),
+            "groups_unfinished": len(resume.unfinished),
+            "groups_fresh": len(resume.fresh),
         }
         state_root.mkdir(parents=True, exist_ok=True)
         (resource_epoch_root(state_root) / f"summary-rank{args.rank}.json").write_text(

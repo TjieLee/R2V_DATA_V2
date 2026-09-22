@@ -456,14 +456,40 @@ class PhaseLedger:
         # Shared committed validation. A terminal reject is as committed as a
         # completed job, so its internal artifacts are validated identically
         # rather than being exempted.
-        expected = receipt.get("artifact_digests") or {}
-        if expected != self.artifact_digests(job.job_id()):
+        #
+        # ``result.json`` is bound by ``result_digest``, not by ``artifact_digests``.
+        # Receipts written before that split also listed it, so it is popped here
+        # and checked against the result digest; a legacy receipt that disagrees
+        # with itself is still a mismatch. When nothing else is expected, the
+        # artifact directory is never walked at all - a purely result-bound job
+        # must not pay for a directory scan on resume.
+        expected = dict(receipt.get("artifact_digests") or {})
+        legacy_result_digest = expected.pop("result.json", None)
+        if (
+            legacy_result_digest is not None
+            and legacy_result_digest != str(receipt.get("result_digest", ""))
+        ):
             return JobState(
                 STATE_MISMATCH,
                 dict(receipt),
-                "receipt artifact digests do not match artifacts on disk",
+                "receipt result digest disagrees with its artifact digest",
                 phase_id=self.root.name,
             )
+        if expected:
+            # Only the artifacts the receipt actually lists are validated. The
+            # directory also holds ``result.json``, which is bound by its own
+            # digest, so comparing whole directory listings would reject every
+            # receipt that has one.
+            artifacts = self.artifact_digests(job.job_id())
+            if any(
+                artifacts.get(name) != digest for name, digest in expected.items()
+            ):
+                return JobState(
+                    STATE_MISMATCH,
+                    dict(receipt),
+                    "receipt artifact digests do not match artifacts on disk",
+                    phase_id=self.root.name,
+                )
         # From here on every committed outcome is validated identically.
         # result.json is mandatory: a receipt without a durable result cannot
         # be replayed, and replaying nothing would silently drop downstream
@@ -546,13 +572,12 @@ class PhaseLedger:
         """Resolve one job's resume state against this phase."""
         receipt = self.receipts().get(job.job_id())
         if receipt is None:
+            # One directory scan, not two: the artifact listing answers both the
+            # state and its detail.
+            artifacts = self.artifact_digests(job.job_id())
             return JobState(
-                STATE_RERUN_NO_RECEIPT
-                if self.artifact_digests(job.job_id())
-                else STATE_PENDING,
-                detail="artifact without receipt"
-                if self.artifact_digests(job.job_id())
-                else "",
+                STATE_RERUN_NO_RECEIPT if artifacts else STATE_PENDING,
+                detail="artifact without receipt" if artifacts else "",
                 phase_id=self.root.name,
             )
         return self.verify_committed(job, receipt)

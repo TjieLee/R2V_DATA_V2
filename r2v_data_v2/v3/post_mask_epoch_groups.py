@@ -48,6 +48,11 @@ GROUP_SCHEMA_VERSION = "post_mask_resource_epoch_v3/group/1"
 GROUP_INCOMPLETE = "incomplete"
 GROUP_COMPLETED = "completed"
 
+#: Top-level completion marker of one group root. A completed group restart is a
+#: pure metadata question, so it is answered from a single small file next to the
+#: descriptor rather than by reopening the group ledger.
+GROUP_COMPLETE_MARKER = "COMPLETE.json"
+
 
 def campaign_identity(semantic: Mapping[str, Any]) -> str:
     """Digest the campaign's semantic identity (config/dataset), nothing else."""
@@ -208,6 +213,105 @@ def record_group_outcome(
         # A newly created outcomes file needs its directory entry durable too.
         _fsync_directory(path.parent)
     return path
+
+
+def group_completed_marker(
+    post_mask_state_root: Path, group: ResourceEpochGroup
+) -> Path:
+    """The group's create-once completion marker path."""
+    return group_root(post_mask_state_root, group) / GROUP_COMPLETE_MARKER
+
+
+def _group_completion_payload(group: ResourceEpochGroup) -> dict[str, Any]:
+    return {"group_id": group.group_id, "group_identity": group.identity()}
+
+
+def write_group_completed(
+    post_mask_state_root: Path, group: ResourceEpochGroup
+) -> Path:
+    """Publish the create-once completion marker after a completed group run.
+
+    Create-once and exact-match, exactly like the group descriptor: a marker that
+    disagrees with this group's identity belongs to another campaign and must
+    never be overwritten, because that would let a completed group be skipped by
+    a run it does not describe.
+    """
+    payload = _group_completion_payload(group)
+    path = group_completed_marker(post_mask_state_root, group)
+    if path.is_file():
+        if json.loads(path.read_text()) != payload:
+            raise ValueError(
+                f"resource epoch completion marker identity mismatch at {path}"
+            )
+        return path
+    atomic_write_json(path, payload)
+    return path
+
+
+def group_is_completed(
+    post_mask_state_root: Path, group: ResourceEpochGroup
+) -> bool:
+    """Whether this group is already complete, from top-level metadata only.
+
+    This is the whole fast-skip contract: one stat plus one tiny JSON read. It
+    never opens the group ledger, a shard run root, a receipt, a media asset or
+    any digest. An unreadable or mismatched marker fails closed instead of being
+    treated as "not completed", so a corrupt marker can never cause a completed
+    group to be re-executed.
+    """
+    path = group_completed_marker(post_mask_state_root, group)
+    if not path.is_file():
+        return False
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        raise ValueError(
+            f"resource epoch completion marker is unreadable: {path}"
+        ) from exc
+    if payload != _group_completion_payload(group):
+        raise ValueError(
+            f"resource epoch completion marker identity mismatch at {path}"
+        )
+    return True
+
+
+@dataclass(frozen=True)
+class GroupResumePlan:
+    """Assigned groups split by cheap metadata, in the order to process them."""
+
+    unfinished: tuple[ResourceEpochGroup, ...]
+    fresh: tuple[ResourceEpochGroup, ...]
+    complete: tuple[ResourceEpochGroup, ...]
+
+    @property
+    def ordered(self) -> tuple[ResourceEpochGroup, ...]:
+        """Unfinished work first, then never-started groups. Complete groups are
+        absent: they are skipped entirely and never reach the runner."""
+        return self.unfinished + self.fresh
+
+
+def resume_first_assigned_groups(
+    post_mask_state_root: Path, groups: Sequence[ResourceEpochGroup]
+) -> GroupResumePlan:
+    """Classify already-statically-assigned groups without reading any ledger.
+
+    A group is ``complete`` when its completion marker exists, and otherwise
+    ``unfinished`` when its group root already exists and ``fresh`` when it does
+    not. Three stats per group, no recursion, no shard access.
+    """
+    unfinished: list[ResourceEpochGroup] = []
+    fresh: list[ResourceEpochGroup] = []
+    complete: list[ResourceEpochGroup] = []
+    for group in groups:
+        if group_is_completed(post_mask_state_root, group):
+            complete.append(group)
+        elif group_root(post_mask_state_root, group).is_dir():
+            unfinished.append(group)
+        else:
+            fresh.append(group)
+    return GroupResumePlan(
+        unfinished=tuple(unfinished), fresh=tuple(fresh), complete=tuple(complete)
+    )
 
 
 def read_group_outcomes(

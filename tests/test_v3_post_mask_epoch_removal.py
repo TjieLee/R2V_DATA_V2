@@ -1876,6 +1876,12 @@ def test_corrupt_historical_clip_is_never_seeded(
 
     # The second launch sees clip-B as corrupt: its frozen Stage2 manifest is
     # gone, so hydration admits only clip-A this time.
+    #
+    # The destination mirror is damaged as well, on purpose. A restart answers
+    # "already hydrated" from the destination alone and never reopens Stage2, so
+    # a source-only change is invisible by design; a destination that can no
+    # longer prove itself falls back to the full path, and that path is what
+    # discovers the missing frozen manifest.
     corrupt_source = (
         entity_mask_root
         / "artifacts"
@@ -1888,6 +1894,7 @@ def test_corrupt_historical_clip_is_never_seeded(
         / "frames.json"
     )
     corrupt_source.unlink()
+    (first.storage.root / "clips" / "clip-B" / "frames" / "frames.json").unlink()
 
     second = prepare_shard_storage(
         config,

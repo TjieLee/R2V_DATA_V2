@@ -71,6 +71,23 @@ def enumerate_shards(entity_mask_root: Path) -> tuple[Path, ...]:
     return tuple(paths)
 
 
+def require_canonical_shard(root: Path, shard: Path) -> None:
+    """Prove one shard path is canonical without enumerating the whole root.
+
+    ``enumerate_shards`` walks, globs and stats every canonical part, which is
+    O(campaign) work for a question about a single file. The same facts are
+    available in O(1): ``root/parts`` is the exact parent, the name is a
+    canonical shard name, nothing on the way is a symlink and the entry is a
+    regular file. ``root`` must already be resolved, exactly as
+    ``enumerate_shards`` resolves it.
+    """
+    if shard.is_symlink() or not _SHARD.fullmatch(shard.name):
+        raise ValueError("not a canonical Stage2 shard")
+    resolved = shard.resolve(strict=False)
+    if resolved.parent != Path(root) / "parts" or not resolved.is_file():
+        raise ValueError("not a canonical Stage2 shard")
+
+
 @dataclass(frozen=True)
 class ShardPaths:
     shard_path: Path
@@ -178,6 +195,35 @@ def _identity(config: V3Config, paths: ShardPaths) -> dict[str, Any]:
         **_semantic_identity(config, paths),
         "shard_sha256": _digest(paths.shard_path),
     }
+
+
+def _verify_shard_identity(storage: RunStorage, paths: ShardPaths) -> None:
+    """Re-verify a shard's identity without re-hashing its canonical JSONL.
+
+    ``initialize_shard`` already bound ``shard_sha256`` into ``identity.json``,
+    and once initialization succeeded that file *is* the authority. A restart
+    therefore only has to re-derive the cheap semantic fields, confirm the run
+    root is the one this identity describes and check the digest field is still
+    a well-formed digest. Reading the whole shard again to recompute the same
+    value would be duplicated I/O on every restart.
+    """
+    if storage.root != paths.run_root or not paths.identity_path.is_file():
+        raise ValueError("Post-Mask source/config identity mismatch")
+    try:
+        persisted = json.loads(paths.identity_path.read_text())
+    except (OSError, ValueError) as exc:
+        raise ValueError("Post-Mask source/config identity mismatch") from exc
+    if not isinstance(persisted, dict):
+        persisted = {}
+    semantic = _semantic_identity(storage.config, paths)
+    recorded = {key: persisted.get(key) for key in semantic}
+    shard_sha256 = persisted.get("shard_sha256")
+    if (
+        recorded != semantic
+        or not isinstance(shard_sha256, str)
+        or len(shard_sha256) != 64
+    ):
+        raise ValueError("Post-Mask source/config identity mismatch")
 
 
 def initialize_shard(
@@ -343,6 +389,102 @@ def _make_staging_writable(root: Path) -> None:
             path.chmod(path.stat().st_mode | stat.S_IRUSR | stat.S_IWUSR)
 
 
+#: The three small manifests that make a hydrated destination readable at all.
+#: Their presence is what lets a restart answer "is this clip already hydrated?"
+#: from the destination alone.
+_RESUME_MANIFESTS = ("clip.json", "frames/frames.json", "masks.rle.json")
+
+
+def _resume_destination_assets(destination: Path, clip: ClipRecord) -> bool:
+    """Whether every asset the hydrated copy references is still present.
+
+    The expected inventory is read from the destination's own manifests, never
+    from Stage2, so a restart still notices a deleted or replaced frame or
+    reference (and declines to the repairing path) without touching the frozen
+    input. A manifest that no longer parses is itself the answer: it is not a
+    destination this fast path may trust.
+    """
+    try:
+        frames = SampledFramesArtifact.model_validate_json(
+            (destination / "frames/frames.json").read_text()
+        )
+        masks = TrackedMasksArtifact.model_validate_json(
+            (destination / "masks.rle.json").read_text()
+        )
+    except (OSError, ValueError):
+        return False
+    if frames.clip_uid != clip.clip_uid or masks.clip_uid != clip.clip_uid:
+        return False
+    relatives = [str(frame.image_path) for frame in frames.frames]
+    for relative in _reference_paths(clip.references.model_dump(mode="json")):
+        if relative.startswith("clips/"):
+            prefix = f"clips/{clip.clip_uid}/"
+            if not relative.startswith(prefix):
+                return False
+            relative = relative[len(prefix) :]
+        relatives.append(relative)
+    for relative in relatives:
+        try:
+            path = _beneath(destination, relative)
+        except ValueError:
+            return False
+        if path.is_symlink() or not path.is_file():
+            return False
+    return True
+
+
+def _resume_destination_is_complete(
+    storage: RunStorage,
+    *,
+    destination: Path,
+    root: Path,
+    shard: Path,
+    row: dict[str, Any],
+    uid: str,
+) -> bool:
+    """Whether an existing destination is provably the mirror this row describes.
+
+    ``True`` means the hydration of this row is already done, so the row is
+    eligible without re-reading Stage2 at all: no source clip/frame/mask
+    manifest, no source frame or reference path walk, no shard re-hash and no
+    copy. Everything consulted is the destination plus the provenance marker
+    that hydration itself wrote.
+
+    ``False`` is always safe: the caller then runs the original full validation
+    and repair path, which is what a restart used to do unconditionally. So this
+    can only ever skip work the slow path would have gone on to discard.
+    """
+    marker = destination / _PROVENANCE
+    if marker.is_symlink() or not marker.is_file():
+        return False
+    try:
+        recorded = json.loads(marker.read_text())
+    except (OSError, ValueError):
+        return False
+    if not isinstance(recorded, dict):
+        return False
+    expected_artifact = f"artifacts/{shard.stem}/{uid}"
+    if row.get("artifact_root") != expected_artifact:
+        return False
+    if str(recorded.get("artifact_root")) != str(Path(root) / expected_artifact):
+        return False
+    if str(recorded.get("canonical_shard")) != str(shard):
+        return False
+    if recorded.get("row") != row:
+        return False
+    for relative in _RESUME_MANIFESTS:
+        path = destination / relative
+        if path.is_symlink() or not path.is_file():
+            return False
+    try:
+        clip = storage.read_clip(uid)
+    except (OSError, ValueError):
+        return False
+    if clip.clip_uid != uid or clip.source.source_index != row.get("source_index"):
+        return False
+    return _resume_destination_assets(destination, clip)
+
+
 def hydrate_shard(
     storage: RunStorage, *, entity_mask_root: Path, shard_path: Path, paths: ShardPaths
 ) -> HydrationResult:
@@ -354,12 +496,13 @@ def hydrate_shard(
     """
     root = Path(entity_mask_root).resolve()
     shard = Path(shard_path).absolute()
-    if shard not in enumerate_shards(root) or shard != paths.shard_path:
+    if shard != paths.shard_path:
         raise ValueError("not a canonical Stage2 shard")
-    if storage.root != paths.run_root or _identity(storage.config, paths) != json.loads(
-        paths.identity_path.read_text()
-    ):
-        raise ValueError("Post-Mask source/config identity mismatch")
+    # O(1) provenance instead of re-enumerating every canonical part: the shard
+    # has to be exactly root/parts/<canonical name>, a regular file, and the
+    # run/config identity has to be the one initialization already published.
+    require_canonical_shard(root, shard)
+    _verify_shard_identity(storage, paths)
     for destination in (paths.run_root, paths.export_root, paths.state_root):
         if destination.resolve().is_relative_to(root):
             raise ValueError("Post-Mask destination overlaps frozen input")
@@ -410,10 +553,23 @@ def hydrate_shard(
                 or indices[index] > 1
             ):
                 raise ValueError("invalid or duplicate Stage2 row identity")
+            destination = _beneath(storage.root, f"clips/{uid}")
+            if destination.exists() and _resume_destination_is_complete(
+                storage,
+                destination=destination,
+                root=root,
+                shard=shard,
+                row=row,
+                uid=uid,
+            ):
+                # Already hydrated, and the destination proved it from its own
+                # artifacts and provenance marker: Stage2 is never opened, no
+                # source frame/reference path is walked, no shard digest is
+                # recomputed and nothing is copied.
+                ready.append(uid)
+                continue
             source, provenance, required = _validate_input(root, shard, row)
             provenance["canonical_shard"] = str(shard)
-            destination = _beneath(storage.root, f"clips/{uid}")
-            marker = destination / _PROVENANCE
             if destination.exists():
                 marker = _beneath(destination, _PROVENANCE)
                 if not marker.is_file() or json.loads(marker.read_text()) != provenance:

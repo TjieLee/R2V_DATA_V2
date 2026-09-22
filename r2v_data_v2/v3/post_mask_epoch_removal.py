@@ -1474,7 +1474,10 @@ def prepare_shard_storage(
 
 
 def build_removal_campaign(
-    config: V3Config, *, entity_mask_root: Path
+    config: V3Config,
+    *,
+    entity_mask_root: Path,
+    canonical_shard_count: int | None = None,
 ) -> dict[str, Any]:
     """Rebuild the launcher's campaign semantic payload from live inputs.
 
@@ -1483,21 +1486,33 @@ def build_removal_campaign(
     ``--job-runner`` path receives no campaign argument, so it has to derive
     the same identity the launcher baked into ``group.campaign_identity`` from
     the config, the dataset and the Stage2 root it is actually about to read.
+
+    ``canonical_shard_count`` is the one input the launcher already computed: it
+    enumerated the canonical shards to build the groups, so it publishes the
+    count and each group runner reuses it instead of rescanning the whole
+    ``parts`` directory again. A standalone runner that was never given a count
+    (no launcher, or a test that drives the runner directly) still falls back to
+    enumerating the root itself, so the identity is byte-identical either way.
     """
-
-    from r2v_data_v2.v3.post_mask_production import enumerate_shards
-
     root = Path(entity_mask_root)
+    if canonical_shard_count is None:
+        from r2v_data_v2.v3.post_mask_production import enumerate_shards
+
+        canonical_shard_count = len(enumerate_shards(root))
     return {
         "config_hash": config.fingerprint(),
         "dataset_json": str(getattr(config, "dataset_json", "")),
         "entity_mask_root": str(root),
-        "canonical_shard_count": len(enumerate_shards(root)),
+        "canonical_shard_count": int(canonical_shard_count),
     }
 
 
 def validate_removal_campaign(
-    group: Any, *, config: V3Config, entity_mask_root: Path
+    group: Any,
+    *,
+    config: V3Config,
+    entity_mask_root: Path,
+    canonical_shard_count: int | None = None,
 ) -> dict[str, Any]:
     """Fail closed unless the group's campaign identity matches live inputs.
 
@@ -1507,7 +1522,11 @@ def validate_removal_campaign(
     correctness bug, not a warning, so it is raised before the first shard
     lock, before any initialize/hydrate and before any model call.
     """
-    expected = build_removal_campaign(config, entity_mask_root=entity_mask_root)
+    expected = build_removal_campaign(
+        config,
+        entity_mask_root=entity_mask_root,
+        canonical_shard_count=canonical_shard_count,
+    )
     expected_identity = campaign_identity(expected)
     actual_identity = str(getattr(group, "campaign_identity", ""))
     if actual_identity != expected_identity:
@@ -1675,6 +1694,7 @@ def build_removal_epoch_runner(
     log_root: Path | None = None,
     repo_root: Path | None = None,
     campaign: Mapping[str, Any] | None = None,
+    canonical_shard_count: int | None = None,
 ) -> Callable[[Any, GroupLedger, Any], dict[str, Any]]:
     """Build the ``--job-runner`` callable for one removal resource epoch.
 
@@ -1696,8 +1716,10 @@ def build_removal_epoch_runner(
 
     Before any of that, it re-derives the launcher's campaign semantic identity
     from ``config.fingerprint()``, ``dataset_json``, ``entity_mask_root`` and
-    the live canonical shard count, and refuses to continue unless it matches
-    ``group.campaign_identity``.
+    the canonical shard count, and refuses to continue unless it matches
+    ``group.campaign_identity``. ``canonical_shard_count`` is the count the
+    launcher already enumerated and published; when it is absent the identity
+    falls back to enumerating the Stage2 root, which is the same number.
     """
     require_boogu_backend(config)
     require_subject_attribute_gme_disabled(config)
@@ -1712,7 +1734,10 @@ def build_removal_epoch_runner(
         # and the Stage2 root this runner is about to read, never from a
         # caller-supplied dict, and it must fail before the first shard lock.
         validate_removal_campaign(
-            group, config=config, entity_mask_root=entity_mask_root
+            group,
+            config=config,
+            entity_mask_root=entity_mask_root,
+            canonical_shard_count=canonical_shard_count,
         )
         validate_removal_roots(
             ledger,
@@ -2145,6 +2170,12 @@ def run_removal_epoch(
         or post_mask_root / "tmp" / "resource_epoch"
     )
     repo_root = Path(os.environ.get("POST_MASK_REPO") or Path.cwd())
+    # The launcher already enumerated the canonical shards to build the groups,
+    # so it publishes that count and no group runner rescans the parts
+    # directory. Absent (standalone or test invocation) it stays None and the
+    # campaign identity falls back to its own enumeration, unchanged.
+    raw_shard_count = os.environ.get("POST_MASK_CANONICAL_SHARD_COUNT", "").strip()
+    canonical_shard_count = int(raw_shard_count) if raw_shard_count else None
     runner = build_removal_epoch_runner(
         config,
         post_mask_root=post_mask_root,
@@ -2155,5 +2186,6 @@ def run_removal_epoch(
         qwen_epoch_config=build_qwen_epoch_config(config),
         log_root=temporary_root / "logs",
         repo_root=repo_root,
+        canonical_shard_count=canonical_shard_count,
     )
     return runner(group, ledger, emit)

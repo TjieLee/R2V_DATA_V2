@@ -944,12 +944,20 @@ def _commit_result(
     *,
     outcome: str | None = None,
     result_digest: str | None = None,
+    legacy_result_artifact: bool = False,
 ) -> None:
+    """Commit a result exactly like the scheduler does.
+
+    ``result.json`` is bound by ``result_digest``; ``legacy_result_artifact``
+    additionally lists it among ``artifact_digests``, which is what receipts
+    written before that split look like.
+    """
     digests: dict[str, str] = {}
     for name, payload in sorted(result.artifacts.items()):
         digests[name] = ledger.publish_artifact(job.job_id(), name, payload)
     digest = ledger.publish_result(job, result)
-    digests["result.json"] = digest
+    if legacy_result_artifact:
+        digests["result.json"] = digest
     ledger.commit(
         job,
         outcome=outcome or result.outcome,
@@ -1336,3 +1344,200 @@ def test_valid_plan_growth_still_passes(tmp_path: Path):
     ledger.write_plan([other])
     planned = {record["job_id"] for record in ledger.read_plan()}
     assert planned == {job.job_id(), other.job_id()}
+
+
+# --------------------------------------------------------------------------
+# 12. result.json is bound once, by digest
+# --------------------------------------------------------------------------
+
+
+def _scheduled_receipt(tmp_path: Path, result: JobResult) -> dict[str, Any]:
+    """Run one real scheduler pass and return the receipt it committed."""
+    job = _job()
+    ledger = GroupLedger(tmp_path / "group")
+    executor = _FakeBatchExecutor({job.job_id(): result})
+    _scheduler(
+        tmp_path, {RESOURCE_BOOGU: executor}, lambda *a, **k: (), ledger=ledger
+    ).run([job])
+    return ledger.phase(f"r000-{RESOURCE_BOOGU}").receipts()[job.job_id()]
+
+
+def test_scheduler_does_not_list_result_json_as_an_artifact(tmp_path: Path):
+    """The durable result is bound by its own digest, not by an artifact digest."""
+    result = JobResult(OUTCOME_COMPLETED, {"out.png": b"payload"}, payload={"ok": True})
+    receipt = _scheduled_receipt(tmp_path, result)
+    assert set(receipt["artifact_digests"]) == {"out.png"}
+    assert receipt["result_digest"]
+    assert "result.json" not in receipt["artifact_digests"]
+
+
+def test_result_only_receipt_resumes_without_walking_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A job whose only committed artifact is its result never scans a directory."""
+    ledger = PhaseLedger(tmp_path / "phase")
+    job = _job(job_type="judge")
+    _commit_result(ledger, job, JobResult(OUTCOME_COMPLETED, payload={"ok": True}))
+
+    monkeypatch.setattr(
+        PhaseLedger,
+        "artifact_digests",
+        lambda *a, **k: pytest.fail("a result-only receipt walked the artifact dir"),
+    )
+    state = ledger.classify(job)
+    assert state.state == STATE_COMPLETED
+    assert state.skippable
+
+
+def test_legacy_receipt_listing_result_json_still_resumes(tmp_path: Path):
+    """Receipts written before the split keep resuming."""
+    ledger = PhaseLedger(tmp_path / "phase")
+    job = _job()
+    _commit_result(
+        ledger,
+        job,
+        JobResult(OUTCOME_COMPLETED, {"out.png": b"payload"}),
+        legacy_result_artifact=True,
+    )
+    state = ledger.classify(job)
+    assert state.state == STATE_COMPLETED
+    assert state.skippable
+
+
+def test_legacy_receipt_with_disagreeing_result_artifact_fails_closed(tmp_path: Path):
+    """A legacy receipt that disagrees with its own result digest is corrupt."""
+    ledger = PhaseLedger(tmp_path / "phase")
+    job = _job()
+    result = JobResult(OUTCOME_COMPLETED, {"out.png": b"payload"})
+    digest = ledger.publish_artifact(job.job_id(), "out.png", b"payload")
+    result_digest = ledger.publish_result(job, result)
+    ledger.commit(
+        job,
+        outcome=OUTCOME_COMPLETED,
+        artifact_digests={"out.png": digest, "result.json": "0" * 64},
+        result_digest=result_digest,
+    )
+    assert ledger.classify(job).state == STATE_MISMATCH
+
+
+def test_result_tamper_still_fails_closed(tmp_path: Path):
+    """The result digest remains the authority for the result bytes."""
+    ledger = PhaseLedger(tmp_path / "phase")
+    job = _job()
+    _commit_result(ledger, job, JobResult(OUTCOME_COMPLETED, payload={"ok": True}))
+    assert ledger.classify(job).state == STATE_COMPLETED
+
+    path = ledger.artifact_path(job.job_id(), "result.json")
+    path.write_text(json.dumps({"outcome": "completed", "payload": {"ok": False}}))
+    assert ledger.classify(job).state == STATE_MISMATCH
+
+
+# --------------------------------------------------------------------------
+# 13. multi-node / multi-GPU execution correctness (no model is ever run)
+# --------------------------------------------------------------------------
+
+
+def test_static_ownership_union_covers_every_group_exactly_once():
+    """Under world_size 3 and 5 the union is the campaign and overlaps are empty."""
+    groups = build_groups(_shards(24 * DEFAULT_GROUP_SIZE), campaign=CAMPAIGN)
+    assert len(groups) == 24
+
+    for world_size in (3, 5):
+        owners: dict[int, list[int]] = {}
+        for rank in range(world_size):
+            for group in assigned_groups(groups, rank=rank, world_size=world_size):
+                owners.setdefault(group.group_index, []).append(rank)
+        # Union: every group is owned. Intersection: by exactly one rank.
+        assert sorted(owners) == list(range(24)), world_size
+        assert all(len(ranks) == 1 for ranks in owners.values()), owners
+
+
+def test_job_identity_is_independent_of_slot_rank_and_world_size():
+    """Placement is execution-only: one semantic job is always one identity."""
+    plain = _job()
+    for label in (
+        "slot-0/gpu-0",
+        "slot-7/gpu-5",
+        "rank=0/world_size=3",
+        "rank=2/world_size=5",
+    ):
+        placed = ModelJob.create(
+            job_type=plain.job_type,
+            resource=plain.resource,
+            canonical_shard=plain.canonical_shard,
+            clip_uid=plain.clip_uid,
+            semantic_inputs={"prompt": "remove bg"},
+            model_identity=plain.model_identity,
+            label=label,
+        )
+        assert placed.identity() == plain.identity(), label
+        assert placed.job_id() == plain.job_id(), label
+
+
+def test_partial_group_restart_matches_an_uninterrupted_run(tmp_path: Path):
+    """A restart re-pays every committed job zero times and converges identically."""
+    first = _job(job_type="removal", clip_uid="clip-000001")
+    second = _job(job_type="removal", clip_uid="clip-000002")
+    follow = _job(
+        job_type="removal_judge", resource=RESOURCE_QWEN, clip_uid="clip-000001"
+    )
+
+    def finalize(job: ModelJob, result: JobResult):
+        return (follow,) if job.job_id() == first.job_id() else ()
+
+    def receipts_by_phase(root: Path) -> dict[str, Any]:
+        ledger = GroupLedger(root)
+        return {
+            phase_id: ledger.phase(phase_id).receipts()
+            for phase_id in ledger.phase_ids()
+        }
+
+    # Uninterrupted serial run: everything succeeds on the first pass.
+    clean_root = tmp_path / "clean"
+    clean_log: list[str] = []
+    clean = _scheduler(
+        clean_root,
+        {
+            RESOURCE_BOOGU: _OutcomeExecutor(clean_log),
+            RESOURCE_QWEN: _OutcomeExecutor(clean_log),
+        },
+        finalize,
+        ledger=GroupLedger(clean_root),
+    )
+    assert clean.run([first, second])["completed"] is True
+
+    # Interrupted run: `second` fails retryably, so the group stays incomplete.
+    partial_root = tmp_path / "partial"
+    partial_log: list[str] = []
+    interrupted = _scheduler(
+        partial_root,
+        {
+            RESOURCE_BOOGU: _OutcomeExecutor(partial_log, {second.job_id()}),
+            RESOURCE_QWEN: _OutcomeExecutor(partial_log),
+        },
+        finalize,
+        ledger=GroupLedger(partial_root),
+    )
+    outcome = interrupted.run([first, second])
+    assert outcome["completed"] is False
+    assert outcome["unresolved_job_ids"] == [second.job_id()]
+    assert partial_log.count(second.job_id()) == 1
+
+    # Restart with a brand-new ledger over the same root: only `second` is pending.
+    restarted = _scheduler(
+        partial_root,
+        {
+            RESOURCE_BOOGU: _OutcomeExecutor(partial_log),
+            RESOURCE_QWEN: _OutcomeExecutor(partial_log),
+        },
+        finalize,
+        ledger=GroupLedger(partial_root),
+    )
+    outcome = restarted.run([first, second])
+    assert outcome["completed"] is True
+    assert partial_log.count(first.job_id()) == 1, "a committed job is never re-paid"
+    assert partial_log.count(follow.job_id()) == 1, "the finalizer replay is not re-paid"
+    assert partial_log.count(second.job_id()) == 2, "only the pending job runs again"
+
+    # The durable outcome converges on the uninterrupted one, job for job.
+    assert receipts_by_phase(partial_root) == receipts_by_phase(clean_root)

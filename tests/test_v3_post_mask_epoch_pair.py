@@ -3277,3 +3277,80 @@ def test_newly_cross_paired_target_never_becomes_another_donor(
         call["donor_clip_uid"] != "target-b" for call in c_calls
     ), "the cross-produced B never became a donor for C"
     assert {call["donor_clip_uid"] for call in c_calls} <= frozen_donor_uids
+
+
+def test_frozen_donor_index_is_scoped_per_shard_inside_one_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A group holds both shards; neither frozen donor index may see the other.
+
+    A resource-epoch group is one execution unit over several canonical shards,
+    so a group-level refactor could plausibly build donor snapshots from the
+    whole group storage. Legacy donor scope is exactly one canonical shard, and
+    this pins both directions on the frozen index the pair runner is fed.
+    """
+    from dataclasses import replace
+
+    from r2v_data_v2.v3.post_mask_epoch_pair import PairEpochRunner
+    from r2v_data_v2.v3.post_mask_epoch_state import GroupLedger
+
+    config = _pair_config(tmp_path, monkeypatch, same_parent_fallback_enabled=True)
+    shard_a = _storage(config, entity_types=("subject",))
+    _add_ready_clip(
+        config,
+        shard_a,
+        clip_uid="donor-a",
+        clip_suffix="2",
+        entity_types=("subject",),
+    )
+    _add_ready_clip(
+        config,
+        shard_a,
+        clip_uid="target-a",
+        clip_suffix="20",
+        entity_types=("subject",),
+    )
+
+    shard_b_config = replace(config, run_root=config.run_root.parent / "shard-b-run")
+    shard_b = RunStorage(shard_b_config)
+    shard_b.initialize(git_commit="shard-b")
+    _add_ready_clip(
+        config,
+        shard_b,
+        clip_uid="donor-b",
+        clip_suffix="3",
+        entity_types=("subject",),
+    )
+    _add_ready_clip(
+        config,
+        shard_b,
+        clip_uid="target-b",
+        clip_suffix="30",
+        entity_types=("subject",),
+    )
+
+    runner = PairEpochRunner(
+        config,
+        {"shard-a": shard_a, "shard-b": shard_b},
+        GroupLedger(tmp_path / "ledger"),
+        eligible_clip_uids_by_shard={
+            "shard-a": ["clip-1", "donor-a", "target-a"],
+            "shard-b": ["donor-b", "target-b"],
+        },
+    )
+    _drain_primary_shard(runner, "shard-a", shard_a)
+    _drain_primary_shard(runner, "shard-b", shard_b)
+    runner.freeze_donor_snapshot("shard-a")
+    runner.freeze_donor_snapshot("shard-b")
+
+    def donor_uids(shard: str) -> set[str]:
+        index = runner.frozen_donor_index(shard)
+        return {donor.clip.clip_uid for donors in index.values() for donor in donors}
+
+    in_a = donor_uids("shard-a")
+    in_b = donor_uids("shard-b")
+    assert "donor-a" in in_a
+    assert "donor-b" in in_b
+    assert "donor-b" not in in_a, "a shard-B donor leaked into shard-A's frozen index"
+    assert "donor-a" not in in_b, "a shard-A donor leaked into shard-B's frozen index"
+    assert not (in_a & in_b), "the two frozen donor indexes must be disjoint"

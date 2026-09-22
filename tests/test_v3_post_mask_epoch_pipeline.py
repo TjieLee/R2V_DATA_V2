@@ -3416,3 +3416,105 @@ def test_attribute_receipt_preflight_publishes_nothing_on_drift(
             {SHARD: storage}, {SHARD: ("clip-a", "clip-b")}
         )
     assert not (storage.clip_dir("clip-a") / ".post_mask_attributes.json").exists()
+
+
+def test_published_clip_satisfies_the_legacy_semantic_authorities(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Serial-equivalence acceptance against re-derived legacy authority.
+
+    The resource-epoch group output is compared section by section with the
+    legacy authority that owns each section, instead of with a second full
+    legacy run. Model timing, execution diagnostics, resource placement, wall
+    clock and receipt paths are excluded by construction: none of them is part
+    of any compared payload.
+    """
+    import shutil
+
+    from r2v_data_v2.v3.storage import evaluate_export_state
+    from r2v_data_v2.v3.subject_attributes import (
+        EnrichedSample,
+        OwnerEnrichmentArtifact,
+        reconcile_subject_attribute_outputs,
+    )
+
+    outcome, _handle, storage, paths = _attribute_ready_outcome(tmp_path, monkeypatch)
+    assert outcome["completed"] is True
+    clip = storage.read_clip("clip-1")
+
+    # 1. The legacy export gate accepts exactly the clips the export published.
+    accepted = {
+        item.clip_uid
+        for item in storage.iter_clips()
+        if evaluate_export_state(
+            item,
+            require_reference_edit=storage.config.reference_edit.enabled,
+            require_reference_integrity=storage.config.reference_integrity.enabled,
+        ).accepted
+    }
+    samples = [
+        json.loads(line)
+        for line in (paths.export_root / "samples.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    assert {sample["sample_id"] for sample in samples} == accepted == {"clip-1"}
+
+    # 2. The four legacy semantic sections of the published clip.
+    assert clip.pairing is not None and clip.pairing.status == "ready"
+    assert clip.reference_edit is not None and clip.reference_edit.status == "ready"
+    assert (
+        clip.reference_integrity is not None
+        and clip.reference_integrity.status == "ready"
+    )
+    assert clip.instruction is not None and clip.instruction.status == "ready"
+    # The legacy deterministic per-type token numbering survived the epoch.
+    assert clip.annotation is not None
+    annotation_by_id = {entity.entity_id: entity for entity in clip.annotation.entities}
+    counters: dict[str, int] = {}
+    expected_tokens: dict[str, str] = {}
+    for entity_id in clip.pairing.retained_entity_ids:
+        kind = annotation_by_id[entity_id].reference_type
+        counters[kind] = counters.get(kind, 0) + 1
+        expected_tokens[entity_id] = f"<ref_{kind}_{counters[kind]}>"
+    assert clip.pairing.tokens == expected_tokens
+    # A published reference edit output is the published reference path, exactly.
+    references_by_id = {item.entity_id: item for item in clip.references.entities}
+    for edited in clip.reference_edit.entities:
+        assert edited.output_image_path == references_by_id[edited.entity_id].image_path
+
+    # 3. OwnerEnrichmentArtifact / EnrichedSample / sidecars, re-derived by the
+    #    legacy reconciler from the same published owner artifacts and samples.
+    published = storage.root / "subject_attributes"
+    legacy_root = tmp_path / "legacy-subject-attributes"
+    shutil.copytree(published, legacy_root)
+    reconcile_subject_attribute_outputs(
+        storage=storage,
+        output_root=legacy_root,
+        owner_limit=None,
+        invocation_wall_time_seconds=0.0,
+    )
+    for name in ("attributes.jsonl", "enriched_samples.jsonl"):
+        assert (published / name).read_bytes() == (legacy_root / name).read_bytes(), name
+    ignored = (
+        "invocation_wall_time_seconds",
+        "gpu_peak_memory_bytes_before",
+        "gpu_peak_memory_bytes_after",
+        # A path, not a semantic: the two runs wrote to different roots.
+        "output_root",
+    )
+    epoch_summary = json.loads((published / "summary.json").read_text())
+    legacy_summary = json.loads((legacy_root / "summary.json").read_text())
+    for key in ignored:
+        epoch_summary.pop(key, None)
+        legacy_summary.pop(key, None)
+    assert epoch_summary == legacy_summary
+
+    artifact = OwnerEnrichmentArtifact.model_validate_json(
+        (published / "owners" / "clip-1" / "e1.json").read_text(encoding="utf-8")
+    )
+    sample = EnrichedSample.model_validate_json(
+        (published / "samples" / "clip-1.json").read_text(encoding="utf-8")
+    )
+    assert artifact.owner_is_human is True
+    assert sample.sample_id == "clip-1"
+    assert artifact.records and artifact.records[0].status == "accepted"

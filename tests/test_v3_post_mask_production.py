@@ -379,15 +379,29 @@ def test_destination_symlink_never_grants_hydration_access_to_frozen_source(case
 
 
 def test_changed_source_manifest_after_hydration_does_not_overwrite_destination(case):
+    """A hydrated destination stays the authority, and restart never recopies it.
+
+    The resume fast path deliberately never reads Stage2 again, so a change to
+    the frozen source is not re-validated on restart: the destination is complete
+    and is accepted from its own artifacts and provenance marker. What must still
+    hold is the part that protects published work - the destination is never
+    rewritten from the source, and the clip is still eligible.
+    """
     row = _ready(case)
     _write_rows(case, [row])
     api, paths, storage = _start(case)
-    _hydrate(case, api, paths, storage)
+    assert _hydrate(case, api, paths, storage).ready == 1
     before = storage.clip_path("clip-0").read_bytes()
     source = case[1] / row["artifact_root"] / "run" / "clips" / "clip-0/clip.json"
     source.write_text(source.read_text() + "\n")
-    assert _hydrate(case, api, paths, storage).corrupt == 1
+    restarted = _hydrate(case, api, paths, storage)
+    assert (restarted.clip_uids, restarted.ready, restarted.corrupt) == (
+        ("clip-0",),
+        1,
+        0,
+    )
     assert storage.clip_path("clip-0").read_bytes() == before
+    assert source.read_text().endswith("\n")
 
 
 def test_malformed_row_is_isolated_and_source_line_is_recorded(case):
@@ -660,3 +674,165 @@ def test_resume_never_resets_mutable_or_unsafe_destination(case, damage):
         assert clip.read_text() == "broken"
     elif damage == "symlink":
         assert frame.is_symlink()
+
+
+# ---------------------------------------------------------------------------
+# Resume fast path: a restart must not re-read the frozen Stage2 tree
+# ---------------------------------------------------------------------------
+
+
+def _count_reads_under(monkeypatch, root):
+    """Count byte/text reads of any file beneath one root."""
+    counts = {"reads": 0}
+    prefix = str(root)
+    real_bytes, real_text = Path.read_bytes, Path.read_text
+
+    def wrap(original):
+        def counting(self, *args, **kwargs):
+            if str(self).startswith(prefix):
+                counts["reads"] += 1
+            return original(self, *args, **kwargs)
+
+        return counting
+
+    monkeypatch.setattr(Path, "read_bytes", wrap(real_bytes))
+    monkeypatch.setattr(Path, "read_text", wrap(real_text))
+    return counts
+
+
+def test_restart_hydration_never_reopens_stage2(case, monkeypatch):
+    """A restart answers "already hydrated" from the destination alone."""
+    row = _ready(case)
+    _write_rows(case, [row])
+    api, paths, storage = _start(case)
+    fresh = _hydrate(case, api, paths, storage)
+    assert (fresh.clip_uids, fresh.ready, fresh.corrupt) == (("clip-0",), 1, 0)
+
+    monkeypatch.setattr(
+        api,
+        "_validate_input",
+        lambda *a, **k: pytest.fail("restart reopened the frozen Stage2 input"),
+    )
+    monkeypatch.setattr(
+        api.shutil,
+        "copy2",
+        lambda *a, **k: pytest.fail("restart recopied a hydrated asset"),
+    )
+    reads = _count_reads_under(monkeypatch, case[1])
+    restarted = _hydrate(case, api, paths, storage)
+
+    assert (
+        restarted.clip_uids,
+        restarted.ready,
+        restarted.excluded,
+        restarted.corrupt,
+    ) == (fresh.clip_uids, fresh.ready, fresh.excluded, fresh.corrupt)
+    # The shard JSONL rows are the only frozen input a restart may still open.
+    assert reads["reads"] == 1, reads
+
+
+def test_restart_eligible_clips_match_the_first_hydration(case, monkeypatch):
+    """The fast path must select exactly the same rows as the slow one."""
+    rows = [_ready(case, uid="clip-0", index=0), _ready(case, uid="clip-1", index=1)]
+    _write_rows(case, rows)
+    api, paths, storage = _start(case)
+    first = _hydrate(case, api, paths, storage)
+    assert first.clip_uids == ("clip-0", "clip-1")
+
+    monkeypatch.setattr(
+        api,
+        "_validate_input",
+        lambda *a, **k: pytest.fail("restart reopened the frozen Stage2 input"),
+    )
+    second = _hydrate(case, api, paths, storage)
+    assert (second.clip_uids, second.ready, second.excluded, second.corrupt) == (
+        first.clip_uids,
+        first.ready,
+        first.excluded,
+        first.corrupt,
+    )
+
+
+def test_hydration_binds_the_shard_digest_once_per_preparation(case, monkeypatch):
+    """Initialization binds the shard digest; hydration must not recompute it."""
+    _write_rows(case, [_ready(case)])
+    api = importlib.import_module("r2v_data_v2.v3.post_mask_production")
+    digests = {"shard": 0}
+    real_digest = api._digest
+
+    def counting(path):
+        if Path(path) == case[2]:
+            digests["shard"] += 1
+        return real_digest(path)
+
+    monkeypatch.setattr(api, "_digest", counting)
+    config, _root, shard = case
+    paths = api.ShardPaths.for_shard(config.run_root.parent / "campaign", shard)
+    storage = api.initialize_shard(config, paths, git_commit="first")
+    _hydrate(case, api, paths, storage)
+    _hydrate(case, api, paths, storage)
+
+    assert digests["shard"] == 1, digests
+
+
+def test_shard_hydration_never_enumerates_the_campaign(case, monkeypatch):
+    """Canonicity is proved in O(1); the whole parts list is never rescanned."""
+    _write_rows(case, [_ready(case)])
+    api, paths, storage = _start(case)
+    calls = {"n": 0}
+    real_enumerate = api.enumerate_shards
+
+    def counting(root):
+        calls["n"] += 1
+        return real_enumerate(root)
+
+    monkeypatch.setattr(api, "enumerate_shards", counting)
+    for _ in range(8):
+        assert _hydrate(case, api, paths, storage).ready == 1
+    assert calls["n"] == 0, calls
+
+
+@pytest.mark.parametrize("field", ["row", "canonical_shard", "artifact_root"])
+def test_resume_marker_mismatch_fails_closed(case, field):
+    """A marker that does not describe this row is never trusted."""
+    row = _ready(case)
+    _write_rows(case, [row])
+    api, paths, storage = _start(case)
+    assert _hydrate(case, api, paths, storage).ready == 1
+
+    marker = storage.clip_dir("clip-0") / ".post_mask_hydration.json"
+    payload = json.loads(marker.read_text())
+    if field == "row":
+        payload["row"] = {**payload["row"], "source_index": 999}
+    elif field == "canonical_shard":
+        payload["canonical_shard"] = "/elsewhere/shard-000000000-000000000.jsonl"
+    else:
+        payload["artifact_root"] = "/elsewhere/artifacts"
+    marker.write_text(json.dumps(payload))
+
+    assert _hydrate(case, api, paths, storage).corrupt == 1
+
+
+@pytest.mark.parametrize("relative", ["frames/frames.json", "masks.rle.json"])
+def test_missing_key_manifest_falls_back_to_the_repairing_path(case, relative):
+    """A missing small manifest declines to the full path, which repairs it."""
+    _write_rows(case, [_ready(case)])
+    api, paths, storage = _start(case)
+    assert _hydrate(case, api, paths, storage).ready == 1
+    target = storage.clip_dir("clip-0") / relative
+    expected = target.read_bytes()
+    target.unlink()
+
+    assert _hydrate(case, api, paths, storage).ready == 1
+    assert target.read_bytes() == expected
+
+
+def test_missing_durable_clip_still_fails_closed(case):
+    """The durable clip is never rebuilt from the source: it is authority."""
+    _write_rows(case, [_ready(case)])
+    api, paths, storage = _start(case)
+    assert _hydrate(case, api, paths, storage).ready == 1
+    storage.clip_path("clip-0").unlink()
+
+    assert _hydrate(case, api, paths, storage).corrupt == 1
+    assert not storage.clip_path("clip-0").exists()
