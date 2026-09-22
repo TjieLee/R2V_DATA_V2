@@ -1150,16 +1150,6 @@ def _usable_sam(storage: Any, *, slot: int) -> list[Any]:
     return [_attribute_mask(storage, slot=slot, band=0)]
 
 
-@pytest.mark.parametrize(
-    ("mutation", "expected"),
-    [
-        ("clip_plan_extra_field", "clip plan drifted"),
-        ("owner_plan_extra_field", "owner plan keyset drifted"),
-        ("owner_plan_bad_cache_digest", "artifact cache digest is invalid"),
-        ("owner_plan_cache_digest_for_miss", "must not carry a digest"),
-        ("owner_plan_missing_cache_key", "artifact cache is malformed"),
-    ],
-)
 def test_clip_plan_is_rederived_once_per_runner_invocation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1198,6 +1188,18 @@ def test_clip_plan_is_rederived_once_per_runner_invocation(
     fresh._clip_plan(SHARD, CLIP_UID)
     assert fresh_calls == 1
 
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected"),
+    [
+        ("clip_plan_extra_field", "clip plan drifted"),
+        ("owner_plan_extra_field", "owner plan keyset drifted"),
+        ("owner_plan_bad_cache_digest", "artifact cache digest is invalid"),
+        ("owner_plan_cache_digest_for_miss", "must not carry a digest"),
+        ("owner_plan_missing_cache_key", "artifact cache is malformed"),
+    ],
+)
 
 def test_durable_plans_reject_any_shape_drift(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str, expected: str
