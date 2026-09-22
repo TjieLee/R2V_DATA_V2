@@ -861,9 +861,12 @@ def build_t2va_inventory(
                     raise ValueError(
                         f"T2VA DiariZen/ASR reconciliation differs: {field}"
                     )
-            if (
-                result.status == "failed"
-                or not isinstance(result.language, str)
+            if result.status == "failed":
+                reason = "asr_failed"
+                facts = []
+                break
+            if result.status == "transcribed" and (
+                not isinstance(result.language, str)
                 or not result.language.strip()
             ):
                 reason = "asr_failed"
