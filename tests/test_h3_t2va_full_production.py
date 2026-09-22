@@ -288,17 +288,48 @@ def test_node_lifetime_does_not_start_persistent_upstream_pools(tmp_path, monkey
     assert pipeline.pools is None
 
 
-def test_downstream_evidence_ignores_mimo_model_for_resume():
+def test_downstream_evidence_ignores_runtime_provenance_for_resume():
     from r2v_data_v2.h3.t2va_full_downstream import _model_agnostic_evidence
 
-    old_v25 = {
-        "population": "source",
-        "source": {
-            "source_index": 1,
-            "source_row_sha256": "a" * 64,
-            "clip_uid": "clip",
-            "video": "/video.mp4",
+    job = {
+        "clip_uid": "clip",
+        "clip_display_path": "episode/clip",
+        "target_video_path": "/video.mp4",
+        "target_video_sha256": "1" * 64,
+        "target_duration_seconds": 5.0,
+        "speech_facts": [
+            {
+                "segment_id": "s1",
+                "source_speaker_cluster": "speaker",
+                "start_time": 0.0,
+                "end_time": 1.0,
+                "language": "English",
+                "text": "hello",
+            }
+        ],
+        "audio_evidence": {
+            "resolved_root": "/resolved",
+            "resolved_record_fingerprint": "2" * 64,
+            "full_audio_path": "/full.wav",
+            "full_audio_sha256": "3" * 64,
+            "speech_path": "/speech.wav",
+            "speech_sha256": "4" * 64,
+            "music_path": "/music.wav",
+            "music_sha256": "5" * 64,
+            "sfx_path": "/sfx.wav",
+            "sfx_sha256": "6" * 64,
         },
+        "upstream_failure": None,
+    }
+    source = {
+        "source_index": 1,
+        "source_row_sha256": "a" * 64,
+        "clip_uid": "clip",
+        "video": "/video.mp4",
+    }
+    old = {
+        "population": "source",
+        "source": source,
         "policy": {
             "version": "full-downstream-per-clip-v1",
             "backend": {"model": "mimo-v2.5"},
@@ -306,47 +337,67 @@ def test_downstream_evidence_ignores_mimo_model_for_resume():
             "allow_unverified": True,
         },
         "dependencies": {
-            "resolved": {"clip_uid": "clip"},
+            "job": job,
+            "resolved": {"clip_uid": "clip", "record_fingerprint": "7" * 64},
             "diarization_backend": {"model_identifier": "old-diar"},
             "sam": {"configuration": {"model": "old-sam"}},
             "auk": {"configuration": {"model": "old-auk"}},
-            "asr": [
-                {
-                    "segment_id": "s1",
-                    "text": "hello",
-                    "language": "English",
-                    "model_identifier": "old-asr",
-                    "package": "old-package",
-                    "configuration": {"dtype": "old"},
-                }
-            ],
+            "asr": [{"model_identifier": "old-asr", "package": "old"}],
         },
     }
-    current_v26 = {
-        **old_v25,
+    current_job = json.loads(json.dumps(job))
+    current_job["audio_evidence"]["resolved_record_fingerprint"] = "8" * 64
+    current = {
+        "population": "source",
+        "source": source,
         "policy": {
-            "version": "full-downstream-per-clip-v2-model-agnostic",
+            "version": "full-downstream-per-clip-v3-content-only",
             "allow_unverified": True,
         },
-        "dependencies": {
-            **old_v25["dependencies"],
-            "diarization_backend": {"model_identifier": "new-diar"},
-            "sam": {"configuration": {"model": "new-sam"}},
-            "auk": {"configuration": {"model": "new-auk"}},
-            "asr": [
-                {
-                    "segment_id": "s1",
-                    "text": "hello",
-                    "language": "English",
-                    "model_identifier": "new-asr",
-                    "package": "new-package",
-                    "configuration": {"dtype": "new"},
-                }
-            ],
-        },
+        "dependencies": {"job": current_job},
     }
 
-    assert _model_agnostic_evidence(old_v25) == _model_agnostic_evidence(current_v26)
+    assert _model_agnostic_evidence(old) == _model_agnostic_evidence(current)
+
+
+def test_downstream_dependency_sidecar_is_audit_only(tmp_path):
+    from r2v_data_v2.h3.t2va_full_downstream import _preflight
+
+    shard = tmp_path / "shard"
+    sidecars = shard / "downstream_dependencies"
+    sidecars.mkdir(parents=True)
+    row = {
+        "source_index": 1,
+        "source_row_sha256": "a" * 64,
+        "clip_uid": "clip",
+        "video": "/video.mp4",
+    }
+    current = {
+        "population": "new-source",
+        "source": row,
+        "policy": {"version": "current", "allow_unverified": True},
+        "dependencies": {"job": {"clip_uid": "clip", "speech_facts": []}},
+    }
+    production.atomic_json(
+        sidecars / "clip.json",
+        {
+            "population": "old-source",
+            "source": row,
+            "policy": {"version": "old", "allow_unverified": True},
+            "dependencies": {"sam": {"configuration": {"model": "old"}}},
+        },
+    )
+
+    class Processor:
+        def evidence(self, _row):
+            return current
+
+        def identity(self, _row):
+            return "current-identity"
+
+    _preflight(shard, [row], Processor())
+
+    assert json.loads((sidecars / "clip.json").read_text()) == current
 
 
 def test_mimo_stage_is_wrapped_by_per_shard_lifecycle(tmp_path, monkeypatch):
