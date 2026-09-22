@@ -586,7 +586,6 @@ def test_native_foreground_components_matches_legacy_eight_connectivity() -> Non
         PairConfig(repair_retries=-1),
     ],
 )
-
 def test_pair_config_is_strict(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

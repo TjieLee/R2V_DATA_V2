@@ -1228,7 +1228,6 @@ def test_clip_plan_is_rederived_once_per_runner_invocation(
         ("owner_plan_missing_cache_key", "artifact cache is malformed"),
     ],
 )
-
 def test_durable_plans_reject_any_shape_drift(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str, expected: str
 ) -> None:
