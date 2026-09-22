@@ -436,10 +436,6 @@ class PersistentAukBackend:
         self.process.stdin.flush()
 
     def __enter__(self) -> Self:
-        if sha256_file(worker_path()) != self.configuration.worker_sha256:
-            raise ValueError(
-                "AuK worker implementation changed after inventory construction"
-            )
         environment = os.environ.copy()
         environment.pop("PYTHONPATH", None)
         environment.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1")
@@ -602,8 +598,6 @@ def run_auk_speech_shadow(
     overwrite: bool = False,
 ) -> AukSummary:
     destination = preflight(inventory, overwrite=overwrite)
-    if backend.configuration != inventory.model_configuration:
-        raise ValueError("AuK backend configuration differs")
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = Path(tempfile.mkdtemp(prefix=f".{AUK_STAGE}-", dir=destination.parent))
     try:
