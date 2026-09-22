@@ -273,6 +273,22 @@ def test_missing_local_dependencies_fail_before_model(setup, missing):
     assert not Path(c.config_path).with_name("worker_calls.jsonl").exists()
 
 
+def test_auk_checkpoint_provenance_does_not_read_weight_content(setup):
+    c = setup.model_configuration
+    checkpoint = Path(c.checkpoint_path)
+    before = c.dependency_files[str(checkpoint)]
+    payload = checkpoint.read_bytes()
+    checkpoint.write_bytes(bytes((byte ^ 1) for byte in payload))
+
+    rebuilt = auk.auk_configuration(
+        python_path=Path(c.python_path),
+        code_root=Path(c.code_root),
+        checkpoint=checkpoint,
+        qwen_path=Path(c.qwen_path),
+    )
+    assert rebuilt.dependency_files[str(checkpoint)] == before
+
+
 def test_empty_python_sources_are_hashed_and_worker_startup_accepts(setup):
     c = setup.model_configuration
     paths = [
