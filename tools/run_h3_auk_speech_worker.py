@@ -64,7 +64,6 @@ def run_worker(input_stream, output_stream) -> None:
 
     try:
         configuration = json.loads(input_stream.readline())
-        validate_dependencies(configuration)
         source_root = Path(configuration["code_root"]) / "src"
         sys.path.insert(0, str(source_root))
         with contextlib.redirect_stdout(sys.stderr):
