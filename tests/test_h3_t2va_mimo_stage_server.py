@@ -31,9 +31,14 @@ def test_mimo_serve_command_uses_full_stage_memory():
         "--model-path",
         "/models/mimo",
     ]
+    assert command[command.index("--served-model-name") + 1] == "mimo-v2.6-flash-rl"
     assert command[command.index("--mem-fraction-static") + 1] == "0.65"
     assert command[command.index("--tp") + 1] == "8"
     assert command[command.index("--dp") + 1] == "2"
+    assert command[command.index("--speculative-algorithm") + 1] == "EAGLE"
+    assert command[command.index("--speculative-num-steps") + 1] == "3"
+    assert command[command.index("--speculative-num-draft-tokens") + 1] == "4"
+    assert "--enable-multi-layer-eagle" in command
 
 
 def test_stage_without_requests_never_starts_mimo(tmp_path, monkeypatch):
