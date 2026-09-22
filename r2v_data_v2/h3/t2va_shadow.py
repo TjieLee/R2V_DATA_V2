@@ -22,6 +22,7 @@ from r2v_data_v2.h3.jea_target_audio_caption import (
 from r2v_data_v2.h3.mimo25_backend import (
     AUDIO_FINALIZE_SYSTEM_PROMPT,
     MIMO25_AUDIO_FINALIZE_PROMPT_VERSION,
+    MIMO_MODEL,
     MimoAudioFinalizeDraft,
     MimoSecondaryVocalActivity,
     VocalComposition,
@@ -571,7 +572,7 @@ class T2VABackendProvenance(SchemaModel):
     prompt_sha256: Hash
     response_schema_sha256: Hash
     transport: Literal["sglang", "xiaomi"]
-    model: Literal["mimo-v2.5"] = "mimo-v2.5"
+    model: Text = MIMO_MODEL
     base_url: Text
     media_root: Text
     media_mode: Literal["base64", "http"]
