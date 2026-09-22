@@ -10,6 +10,7 @@ from typing import Any, Literal
 
 from r2v_data_v2.h3.mimo25_backend import (
     AUDIO_FINALIZE_SYSTEM_PROMPT,
+    MIMO_MODEL,
     MimoAudioFinalizeDraft,
     MimoMediaResolver,
     _completion_diagnostic,
@@ -62,7 +63,7 @@ class T2VAMimoConfig:
     media_resolver: MimoMediaResolver
     base_url: str
     api_key: str
-    model: str = "mimo-v2.5"
+    model: str = MIMO_MODEL
     transport: Literal["sglang", "xiaomi"] = "sglang"
     max_completion_tokens: int = 32768
     timeout_seconds: float = 900.0
@@ -71,7 +72,7 @@ class T2VAMimoConfig:
         if (
             not self.api_key.strip()
             or not self.base_url.strip()
-            or self.model != "mimo-v2.5"
+            or not self.model.strip()
             or self.transport not in {"sglang", "xiaomi"}
             or self.max_completion_tokens <= 0
             or self.timeout_seconds <= 0
