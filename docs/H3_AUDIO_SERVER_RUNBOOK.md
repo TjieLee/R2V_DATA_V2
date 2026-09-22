@@ -378,9 +378,13 @@ SAM/AuK/DiariZen/ASR. RA2VA outputs are namespaced under
 `mimo_runs/<mimo_run_id>/<binding_evidence_mode>/`; keep the same upstream root
 and choose a new MiMo run ID when comparing or upgrading models.
 
-Runtime provenance must not read large model-weight files merely to compute SHA256.
-Checkpoint paths/model identifiers/configuration are recorded, while source media
-and generated artifacts retain their normal content hashes.
+MiMo serving provenance records the model name/checkpoint path/configuration and
+does not hash MiMo checkpoint bytes. Full-production DiariZen/Qwen3-ASR likewise
+uses lightweight logical model identity instead of rereading whole model
+directories. Legacy SAM/AuK dependency SHA fields are retained only for
+compatibility with existing upstream receipts and are not part of switching the
+MLLM version. Source media and generated artifacts retain their normal content
+hashes.
 
 There are no standalone stem-description calls. Canonical speech/music/SFX stem hashes
 are checked against separation provenance before inference.
