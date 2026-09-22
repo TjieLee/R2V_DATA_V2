@@ -1326,6 +1326,14 @@ class SubjectAttributeEpochRunner:
             shard: tuple(uids) for shard, uids in eligible_clip_uids_by_shard.items()
         }
         self.emit = emit
+        # Invocation-local execution cache only. The first access still
+        # re-derives and validates the complete frozen clip plan from live
+        # upstream artifacts. Subsequent accesses in the same locked resource-
+        # epoch invocation reuse that validated plan instead of rebuilding every
+        # owner candidate, image digest and discovery context on every receipt.
+        # A restart constructs a fresh runner and therefore revalidates from
+        # disk, preserving fail-closed durable semantics.
+        self._clip_plan_cache: dict[tuple[str, str], dict[str, Any]] = {}
 
     # -- durable paths ---------------------------------------------------------
 
@@ -1524,7 +1532,12 @@ class SubjectAttributeEpochRunner:
         return base
 
     def _clip_plan(self, shard: str, clip_uid: str) -> dict[str, Any]:
-        """Create-once freeze of the clip plan, re-derived on every read."""
+        """Create once, validate once per invocation, then reuse while locked."""
+        cache_key = (shard, clip_uid)
+        cached = self._clip_plan_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         storage = self._storage_for(shard)
         existing = _read_json(self._clip_plan_path(shard, clip_uid))
         try:
@@ -1537,12 +1550,14 @@ class SubjectAttributeEpochRunner:
             ) from exc
         if existing is None:
             _write_json_once(self._clip_plan_path(shard, clip_uid), expected)
+            self._clip_plan_cache[cache_key] = expected
             return expected
         if existing != expected:
             # Whole-plan equality: an extra, missing or changed field is drift.
             raise SubjectAttributeDurableError(
                 f"frozen Subject Attributes clip plan drifted for {clip_uid!r}"
             )
+        self._clip_plan_cache[cache_key] = existing
         return existing
 
     def _eligible_owners(self, plan: Mapping[str, Any]) -> list[dict[str, Any]]:

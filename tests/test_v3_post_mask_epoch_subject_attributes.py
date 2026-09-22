@@ -1160,6 +1160,45 @@ def _usable_sam(storage: Any, *, slot: int) -> list[Any]:
         ("owner_plan_missing_cache_key", "artifact cache is malformed"),
     ],
 )
+def test_clip_plan_is_rederived_once_per_runner_invocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Repeated owner-chain replay must not rebuild frozen clip evidence."""
+    config, storage = _storage_variant(tmp_path, monkeypatch, "run-plan-cache")
+    runner = _runner(config, storage, tmp_path)
+    original = runner._derive_clip_plan
+    calls = 0
+
+    def counted(storage_arg: Any, clip_uid_arg: str) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        return original(storage_arg, clip_uid_arg)
+
+    monkeypatch.setattr(runner, "_derive_clip_plan", counted)
+
+    first = runner._clip_plan(SHARD, CLIP_UID)
+    second = runner._clip_plan(SHARD, CLIP_UID)
+    third = runner._clip_plan(SHARD, CLIP_UID)
+
+    assert calls == 1
+    assert first is second is third
+
+    # Restart correctness remains unchanged: a fresh runner has no memory cache
+    # and must revalidate the durable plan from live upstream state.
+    fresh = _runner(config, storage, tmp_path)
+    fresh_calls = 0
+    fresh_original = fresh._derive_clip_plan
+
+    def fresh_counted(storage_arg: Any, clip_uid_arg: str) -> dict[str, Any]:
+        nonlocal fresh_calls
+        fresh_calls += 1
+        return fresh_original(storage_arg, clip_uid_arg)
+
+    monkeypatch.setattr(fresh, "_derive_clip_plan", fresh_counted)
+    fresh._clip_plan(SHARD, CLIP_UID)
+    assert fresh_calls == 1
+
+
 def test_durable_plans_reject_any_shape_drift(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str, expected: str
 ) -> None:

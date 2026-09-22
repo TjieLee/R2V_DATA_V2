@@ -1933,6 +1933,22 @@ def test_completion_sam_still_rejects_multiple_instances(tmp_path: Path) -> None
     assert review.diagnostics["failure_kind"] == "multiple_instances"
 
 
+def test_native_significant_component_count_preserves_four_connectivity() -> None:
+    mask = np.zeros((64, 64), dtype=bool)
+    mask[2:12, 2:12] = True
+    mask[12:22, 12:22] = True  # diagonal only: 4-connectivity keeps separate
+    mask[30:50, 30:55] = True
+
+    # Total foreground=700, significant threshold=max(16,14)=16, so all three
+    # components count. This specifically distinguishes 4- from 8-connectivity.
+    assert boogu_module._significant_component_count(mask) == 3
+
+    tiny = np.zeros((32, 32), dtype=bool)
+    tiny[0:10, 0:10] = True
+    tiny[20:22, 20:22] = True
+    assert boogu_module._significant_component_count(tiny) == 1
+
+
 def test_completion_sam_still_rejects_fragmentation(tmp_path: Path) -> None:
     candidate_mask = np.zeros((10, 10), dtype=bool)
     candidate_mask[:4, :4] = True

@@ -27,6 +27,7 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any, Literal, Protocol, TextIO
 
+import cv2
 import numpy as np
 from openai import BadRequestError, OpenAI
 from PIL import Image
@@ -888,39 +889,23 @@ def _background_qwen_rejection_reason(review: BooguBackgroundReview) -> str:
 
 
 def _significant_component_count(mask: np.ndarray) -> int:
+    """Count legacy 4-connected significant SAM components in native code."""
     binary = np.asarray(mask, dtype=bool)
     if binary.ndim != 2:
         raise ValueError("SAM review mask must be two-dimensional")
-    visited = np.zeros(binary.shape, dtype=bool)
+    if not binary.any():
+        return 0
     minimum_area = max(16, int(binary.sum() * 0.02))
-    count = 0
-    height, width = binary.shape
-    rows, columns = np.nonzero(binary)
-    for row, column in zip(rows, columns):
-        if visited[row, column]:
-            continue
-        stack = [(int(row), int(column))]
-        visited[row, column] = True
-        area = 0
-        while stack:
-            current_row, current_column = stack.pop()
-            area += 1
-            for next_row, next_column in (
-                (current_row - 1, current_column),
-                (current_row + 1, current_column),
-                (current_row, current_column - 1),
-                (current_row, current_column + 1),
-            ):
-                if (
-                    0 <= next_row < height
-                    and 0 <= next_column < width
-                    and binary[next_row, next_column]
-                    and not visited[next_row, next_column]
-                ):
-                    visited[next_row, next_column] = True
-                    stack.append((next_row, next_column))
-        count += int(area >= minimum_area)
-    return count
+    foreground = np.ascontiguousarray(binary, dtype=np.uint8)
+    label_count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(
+        foreground,
+        connectivity=4,
+        ltype=cv2.CV_32S,
+    )
+    if label_count <= 1:
+        return 0
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    return int(np.count_nonzero(areas >= minimum_area))
 
 
 @dataclass(frozen=True)
