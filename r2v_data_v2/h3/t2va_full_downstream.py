@@ -1,7 +1,7 @@
 """Full-supervisor resume policy around the unchanged target-side scheduler.
 
 The caller holds invocation.lock across upstream publication and this call.
-Existing downstream roots without these dependency receipts are not adopted.
+Dependency sidecars are audit records; resume is not gated on runtime provenance.
 """
 
 from __future__ import annotations
@@ -73,10 +73,8 @@ def _stage_receipts(shard, uid, identity, state):
                 path = Path(relative)
                 if path.is_absolute() or ".." in path.parts:
                     raise ValueError("invalid stage artifact path")
-            # Full-production resume is intentionally MLLM-version agnostic.
-            # Current source/upstream lineage is validated by _Processor before
-            # adopting any existing downstream artifact; historical stage
-            # identities may include the MiMo backend/model and are not a replay gate.
+            # Historical stage identities may include runtime/model provenance.
+            # Published artifact presence, not model metadata, is the resume gate.
             for relative in receipt["files"]:
                 if not (directory / relative).is_file():
                     raise ValueError("published stage artifact is missing")
@@ -174,8 +172,6 @@ def _preflight(shard, rows, processor):
         state = states.get(uid)
         if path.is_symlink():
             raise ValueError("redirected downstream dependencies")
-        previous = json.loads(path.read_text()) if path.exists() else None
-        artifacts = shard / "artifacts" / uid
         exported = any(row["video"] in task for task in exports.values())
         # Historical dependency sidecars are audit records, never resume gates.
         # The immutable source population and published artifact checks below are
@@ -222,7 +218,7 @@ def _preflight(shard, rows, processor):
                     },
                 }
         updates.append((path, evidence, transition))
-    # No durable mutation until every clip's existing evidence has passed.
+    # Publish current audit evidence only after structural preflight succeeds.
     production._repair_tail(journal)
     _reopen_exports(shard, exports)
     for path, evidence, transition in updates:
