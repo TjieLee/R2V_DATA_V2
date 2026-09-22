@@ -21,6 +21,22 @@ def file_hash(path: Path) -> str:
     return digest.hexdigest()
 
 
+_MODEL_WEIGHT_SUFFIXES = {".safetensors", ".pt", ".bin", ".ckpt"}
+
+
+def dependency_fingerprint(path: Path) -> str:
+    source = path.expanduser().resolve(strict=True)
+    if source.suffix.lower() in _MODEL_WEIGHT_SUFFIXES:
+        payload = json.dumps(
+            {"path": str(source), "size": source.stat().st_size},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return file_hash(source)
+
+
 def validate_dependencies(configuration: dict) -> None:
     source_root = Path(configuration["code_root"]) / "src/auk"
     for name, expected in configuration["dependency_files"].items():
@@ -33,7 +49,7 @@ def validate_dependencies(configuration: dict) -> None:
         is_source = path.suffix == ".py" and path.is_relative_to(source_root)
         if not is_source and path.stat().st_size == 0:
             raise ValueError(f"AuK requires a non-empty local dependency: {name}")
-        actual = file_hash(path)
+        actual = dependency_fingerprint(path)
         if actual != expected:
             raise ValueError(f"AuK dependency hash differs: {name}")
 
