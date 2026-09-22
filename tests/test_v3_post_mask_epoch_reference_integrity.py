@@ -26,6 +26,7 @@ from r2v_data_v2.v3.post_mask_epoch_jobs import (
 from r2v_data_v2.v3.post_mask_epoch_reference_integrity import (
     REFERENCE_INTEGRITY_BBOX_REVIEW_JOB,
     ReferenceIntegrityDurableError,
+    ReferenceIntegrityEpochError,
     ReferenceIntegrityEpochRunner,
 )
 from r2v_data_v2.v3.post_mask_epoch_state import GroupLedger
@@ -2395,9 +2396,10 @@ def test_seed_validates_the_shard_plan_once_not_once_per_clip(
     jobs = runner.seed_jobs()
 
     assert jobs, "the fixture still seeds its review job"
-    # One full validation, which verifies each clip in the shard exactly once.
     assert runner.plan_counters["plan_full_validation_count"] == 1
-    assert len(per_clip) == 1, per_clip
+    # Every clip check during seeding belongs to this shard's single clip: the
+    # one from the full validation, plus the publication's own hot check.
+    assert set(per_clip) == {"clip-1"}, per_clip
     # Neither the seed loop nor _advance_clip re-reads the shard plan.
     assert reconciles == [], reconciles
 
@@ -2409,6 +2411,7 @@ def test_advance_clip_does_not_revalidate_the_shard(
         tmp_path, monkeypatch, "run-plan-advance"
     )
     plan = runner._plan(SHARD)
+    runner._remember_validated_plan(SHARD, plan)
     entry = plan["clips"]["clip-1"]
 
     reconciles: list[Any] = []
@@ -2522,3 +2525,243 @@ def test_cold_runner_still_fully_validates(
     before = cold.plan_counters["plan_full_validation_count"]
     cold.reconcile_stats(SHARD)
     assert cold.plan_counters["plan_full_validation_count"] == before + 1
+
+
+# ---------------------------------------------------------------------------
+# The hot path stats the plan; it does not read, parse or hash it
+# ---------------------------------------------------------------------------
+
+
+def _reset_plan_counters(runner: Any) -> None:
+    """Zero the execution-only plan diagnostics before the phase under test."""
+    for key in runner.plan_counters:
+        runner.plan_counters[key] = 0
+
+
+def _guard_plan_reads(
+    monkeypatch: pytest.MonkeyPatch, runner: Any
+) -> dict[str, list[Any]]:
+    """Record whole-plan reads and semantic digests, without changing behaviour."""
+    import r2v_data_v2.v3.post_mask_epoch_reference_integrity as module
+
+    plan_path = runner._plan_path(SHARD)
+    seen: dict[str, list[Any]] = {"reads": [], "digests": [], "reconciles": []}
+
+    real_read = module._read_json
+
+    def reading(path: Any, *args: Any, **kwargs: Any) -> Any:
+        if Path(path) == plan_path:
+            seen["reads"].append(path)
+        return real_read(path, *args, **kwargs)
+
+    real_digest = ReferenceIntegrityEpochRunner._plan_semantic_digest
+
+    def digest(payload: Any) -> str:
+        seen["digests"].append(payload)
+        return real_digest(payload)
+
+    real_reconcile = runner._existing_plan_for_reconcile
+
+    def reconcile(shard: str) -> Any:
+        seen["reconciles"].append(shard)
+        return real_reconcile(shard)
+
+    monkeypatch.setattr(module, "_read_json", reading)
+    monkeypatch.setattr(
+        ReferenceIntegrityEpochRunner, "_plan_semantic_digest", staticmethod(digest)
+    )
+    monkeypatch.setattr(runner, "_existing_plan_for_reconcile", reconcile)
+    return seen
+
+
+def test_hot_job_never_reads_the_whole_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _config, _storage, runner, judge = _seeded_review_fixture(
+        tmp_path, monkeypatch, "run-sig-hot"
+    )
+    job = _runnable_job(runner, "final")
+
+    per_clip: list[Any] = []
+    _record_method(monkeypatch, runner, "_verify_plan_entry", per_clip)
+    seen = _guard_plan_reads(monkeypatch, runner)
+    _reset_plan_counters(runner)
+
+    result = runner.run(job, judge)
+
+    assert result.payload["status"] == "review"
+    assert len(judge.calls) == 1, "the model really ran"
+    assert seen["reads"] == [], "the hot path must not read the plan"
+    assert seen["digests"] == [], "the hot path must not hash the plan"
+    assert seen["reconciles"] == [], "the hot path must not full-validate"
+    assert per_clip == ["clip-1"], per_clip
+    assert runner.plan_counters["plan_stat_hit"] == 1
+    assert runner.plan_counters["plan_content_read_count"] == 0
+    assert runner.plan_counters["plan_semantic_digest_count"] == 0
+
+
+def test_hot_finalize_never_reads_the_whole_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _config, _storage, runner, judge = _seeded_review_fixture(
+        tmp_path, monkeypatch, "run-sig-finalize"
+    )
+    job = _runnable_job(runner, "final")
+
+    # Commit the receipt first, exactly like the scheduler does.
+    def no_finalize(job: Any, result: Any) -> Any:
+        return ()
+
+    _epoch_scheduler(
+        runner, _SerialQwenExecutor(runner, judge), no_finalize
+    ).run([job])
+    committed = runner.ledger.load_committed_result(job)
+    assert committed is not None
+
+    per_clip: list[Any] = []
+    _record_method(monkeypatch, runner, "_verify_plan_entry", per_clip)
+    seen = _guard_plan_reads(monkeypatch, runner)
+
+    runner.finalize(job, committed)
+
+    assert seen["reads"] == [], "finalize must not read the whole plan"
+    assert seen["digests"] == [], "finalize must not hash the whole plan"
+    assert seen["reconciles"] == [], "finalize must not full-validate"
+    # Only this clip is ever verified, never the rest of the shard.
+    assert set(per_clip) == {"clip-1"}, per_clip
+
+
+def test_plan_content_tamper_is_detected_from_the_signature(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _config, _storage, runner, judge = _seeded_review_fixture(
+        tmp_path, monkeypatch, "run-sig-tamper"
+    )
+    job = _runnable_job(runner, "final")
+    plan_path = runner._plan_path(SHARD)
+    payload = json.loads(plan_path.read_text(encoding="utf-8"))
+    payload["clips"]["clip-1"]["classification"] = "not_a_classification"
+    plan_path.write_text(json.dumps(payload), encoding="utf-8")
+    _reset_plan_counters(runner)
+
+    with pytest.raises(ReferenceIntegrityDurableError):
+        runner.run(job, judge)
+
+    assert len(judge.calls) == 0, "no model call on a tampered plan"
+    assert runner.plan_counters["plan_stat_miss"] == 1
+    assert runner.plan_counters["plan_content_read_count"] == 1
+    assert runner.plan_counters["plan_semantic_digest_count"] == 1
+
+
+def test_equivalent_plan_rewrite_keeps_the_validated_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reformat is not a semantic change, and must not re-validate N clips."""
+    _config, _storage, runner, judge = _seeded_review_fixture(
+        tmp_path, monkeypatch, "run-sig-rewrite"
+    )
+    job = _runnable_job(runner, "final")
+    plan_path = runner._plan_path(SHARD)
+
+    # Same parsed JSON, different key order and whitespace.
+    payload = json.loads(plan_path.read_text(encoding="utf-8"))
+    plan_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    cached_signature = runner._validated_plan_signatures[SHARD]
+    assert runner._plan_file_signature(plan_path) != cached_signature
+
+    per_clip: list[Any] = []
+    _record_method(monkeypatch, runner, "_verify_plan_entry", per_clip)
+    seen = _guard_plan_reads(monkeypatch, runner)
+
+    result = runner.run(job, judge)
+
+    assert result.payload["status"] == "review"
+    assert seen["reads"] == [plan_path], "the changed file is read once"
+    assert seen["digests"] != [], "the canonical digest is compared"
+    assert seen["reconciles"] == [], "an equivalent rewrite is not re-validated"
+    assert per_clip == ["clip-1"], "only the current clip is verified"
+    # The signature was refreshed, so the next lookup is stat-only again.
+    assert runner._validated_plan_signatures[SHARD] == runner._plan_file_signature(
+        plan_path
+    )
+    before_reads = runner.plan_counters["plan_content_read_count"]
+    runner._hot_plan_entry(SHARD, _storage, "clip-1")
+    assert runner.plan_counters["plan_content_read_count"] == before_reads
+
+
+def test_same_size_change_with_restored_mtime_is_still_detected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Size + mtime are not enough; inode/ctime are what make this safe."""
+    import os
+
+    _config, _storage, runner, judge = _seeded_review_fixture(
+        tmp_path, monkeypatch, "run-sig-ctime"
+    )
+    job = _runnable_job(runner, "final")
+    plan_path = runner._plan_path(SHARD)
+    before_text = plan_path.read_text(encoding="utf-8")
+    before_stat = plan_path.stat()
+    cached_signature = runner._validated_plan_signatures[SHARD]
+
+    # Same byte length, different semantics.
+    mutated = before_text.replace('"clip-1"', '"clip-2"', 1)
+    assert len(mutated) == len(before_text)
+    plan_path.write_text(mutated, encoding="utf-8")
+    os.utime(plan_path, ns=(before_stat.st_atime_ns, before_stat.st_mtime_ns))
+
+    after_stat = plan_path.stat()
+    assert after_stat.st_size == before_stat.st_size
+    assert after_stat.st_mtime_ns == before_stat.st_mtime_ns
+    assert runner._plan_file_signature(plan_path) != cached_signature
+
+    with pytest.raises(ReferenceIntegrityDurableError):
+        runner.run(job, judge)
+    assert len(judge.calls) == 0
+
+
+def test_missing_plan_is_never_served_from_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _config, _storage, runner, judge = _seeded_review_fixture(
+        tmp_path, monkeypatch, "run-sig-missing"
+    )
+    job = _runnable_job(runner, "final")
+    assert runner._validated_plan_entries.get((SHARD, "clip-1"))
+
+    runner._plan_path(SHARD).unlink()
+
+    # The missing-plan error is the pre-existing one from the strict reader; the
+    # point is that the cached entry is never used and no model call happens.
+    with pytest.raises(
+        (ReferenceIntegrityDurableError, ReferenceIntegrityEpochError)
+    ):
+        runner.run(job, judge)
+    assert len(judge.calls) == 0, "a job cannot run without its frozen plan"
+
+
+def test_cold_runner_captures_a_signature_then_stats_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, storage, _seed_runner, judge = _seeded_review_fixture(
+        tmp_path, monkeypatch, "run-sig-cold"
+    )
+    job = _runnable_job(_seed_runner, "final")
+    _epoch_scheduler(
+        _seed_runner, _SerialQwenExecutor(_seed_runner, judge), lambda job, r: ()
+    ).run([job])
+
+    cold = _runner(config, storage, tmp_path)
+    assert cold._validated_plan_signatures == {}
+
+    cold.seed_jobs()
+    assert cold.plan_counters["plan_full_validation_count"] == 1
+    assert SHARD in cold._validated_plan_signatures
+
+    # The next lookup is stat-only.
+    _reset_plan_counters(cold)
+    cold._hot_plan_entry(SHARD, storage, "clip-1")
+    assert cold.plan_counters["plan_stat_hit"] == 1
+    assert cold.plan_counters["plan_content_read_count"] == 0

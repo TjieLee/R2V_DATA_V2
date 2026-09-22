@@ -216,6 +216,25 @@ REJECTED_REFERENCE_REASON = "reference_integrity_rejected"
 
 
 @dataclass(frozen=True)
+class _PlanFileSignature:
+    """Cheap identity of a durable plan file, without reading its content.
+
+    ``atomic_write_json`` publishes through ``os.replace``, so the inode changes;
+    an in-place edit updates ``ctime``, which no ordinary file API can restore.
+    Size and mtime catch the obvious cases. Together they let the hot path decide
+    "the same file this invocation already validated" with one ``stat``.
+
+    Execution-only: never part of a ModelJob, a receipt or any schema.
+    """
+
+    st_dev: int
+    st_ino: int
+    st_size: int
+    st_mtime_ns: int
+    st_ctime_ns: int
+
+
+@dataclass(frozen=True)
 class _DerivedReviewInput:
     """One variant's frozen review input, derived purely.
 
@@ -483,12 +502,17 @@ class ReferenceIntegrityEpochRunner:
         # cold restart simply starts empty and re-validates everything.
         self._validated_plan_entries: dict[tuple[str, str], dict[str, Any]] = {}
         self._validated_plan_digests: dict[str, str] = {}
+        self._validated_plan_signatures: dict[str, _PlanFileSignature] = {}
         self._plan_cache_lock = threading.Lock()
         self.plan_counters: dict[str, int] = {
             "plan_full_validation_count": 0,
             "plan_entry_hot_validation_count": 0,
             "plan_cache_hit": 0,
             "plan_cache_miss": 0,
+            "plan_stat_hit": 0,
+            "plan_stat_miss": 0,
+            "plan_content_read_count": 0,
+            "plan_semantic_digest_count": 0,
         }
 
     # -- durable paths ---------------------------------------------------------
@@ -801,10 +825,38 @@ class ReferenceIntegrityEpochRunner:
         with self._plan_cache_lock:
             self.plan_counters[key] += delta
 
+    @staticmethod
+    def _plan_file_signature(path: Path) -> _PlanFileSignature | None:
+        """The file signature of a durable plan, without reading its content."""
+        try:
+            status = path.stat()
+        except OSError:
+            return None
+        return _PlanFileSignature(
+            st_dev=status.st_dev,
+            st_ino=status.st_ino,
+            st_size=status.st_size,
+            st_mtime_ns=status.st_mtime_ns,
+            st_ctime_ns=status.st_ctime_ns,
+        )
+
+    def _refresh_plan_signature(self, shard: str) -> None:
+        """Re-capture only the file signature, keeping the validated entries."""
+        signature = self._plan_file_signature(self._plan_path(shard))
+        with self._plan_cache_lock:
+            if signature is None:
+                self._validated_plan_signatures.pop(shard, None)
+            else:
+                self._validated_plan_signatures[shard] = signature
+
     def _remember_validated_plan(
         self, shard: str, payload: Mapping[str, Any]
     ) -> None:
-        """Remember a fully validated shard plan for this invocation."""
+        """Remember a fully validated shard plan for this invocation.
+
+        Entries, canonical digest and file signature are stored together, under
+        one lock, so all three always describe the same validated generation.
+        """
         clips = payload.get("clips")
         if not isinstance(clips, dict):
             return
@@ -813,45 +865,82 @@ class ReferenceIntegrityEpochRunner:
             for clip_uid, entry in clips.items()
             if isinstance(entry, dict)
         }
+        signature = self._plan_file_signature(self._plan_path(shard))
+        digest = self._plan_semantic_digest(payload)
         with self._plan_cache_lock:
             for key in [key for key in self._validated_plan_entries if key[0] == shard]:
                 self._validated_plan_entries.pop(key, None)
             self._validated_plan_entries.update(entries)
-            self._validated_plan_digests[shard] = self._plan_semantic_digest(payload)
+            self._validated_plan_digests[shard] = digest
+            if signature is None:
+                self._validated_plan_signatures.pop(shard, None)
+            else:
+                self._validated_plan_signatures[shard] = signature
 
     def _hot_plan_entry(
         self, shard: str, storage: RunStorage, clip_uid: str
     ) -> dict[str, Any]:
         """The frozen plan entry for one clip, validated for THIS invocation.
 
-        On the hot path this validates only the current clip against live state
-        instead of re-validating every clip in the shard. The durable plan is
-        still read and its canonical semantic digest compared, so a plan that
-        changed underneath the invocation is never trusted blindly: a mismatch
-        falls back to the original full validation.
+        The hot path never reads, parses or hashes the whole plan. It stats the
+        durable file and, when the signature is the one this invocation already
+        validated, validates only the current clip against live state. The plan
+        is read only when the file actually changed, and then the existing rules
+        decide: an equivalent rewrite keeps the validated entries and only
+        refreshes the signature, while a real change goes to the original full
+        validator. A vanished plan never falls back to cached data.
         """
+        path = self._plan_path(shard)
+        with self._plan_cache_lock:
+            signature = self._validated_plan_signatures.get(shard)
+            cached = self._validated_plan_entries.get((shard, clip_uid))
+        if signature is None:
+            self._bump_plan_counter("plan_cache_miss")
+            return self._full_plan_entry(shard, storage, clip_uid)
+
+        current = self._plan_file_signature(path)
+        if current is not None and current == signature:
+            self._bump_plan_counter("plan_stat_hit")
+            return self._serve_cached_plan_entry(shard, storage, clip_uid, cached)
+        self._bump_plan_counter("plan_stat_miss")
+
+        # The durable file is not the one validated. Read it once and let the
+        # canonical digest decide whether anything semantic moved.
+        self._bump_plan_counter("plan_content_read_count")
+        payload = _read_json(path)
+        if not isinstance(payload, dict):
+            # Missing or malformed: the original strict path owns the error, so
+            # a deleted plan can never be served from cache.
+            self._bump_plan_counter("plan_cache_miss")
+            return self._full_plan_entry(shard, storage, clip_uid)
         with self._plan_cache_lock:
             digest = self._validated_plan_digests.get(shard)
-            cached = self._validated_plan_entries.get((shard, clip_uid))
-        if digest is None:
-            self._bump_plan_counter("plan_cache_miss")
-            return self._full_plan_entry(shard, storage, clip_uid)
-        payload = _read_json(self._plan_path(shard))
-        if not isinstance(payload, dict) or (
-            self._plan_semantic_digest(payload) != digest
-        ):
-            # The durable plan is not the plan this invocation validated. Do not
-            # declare drift: the existing validator decides, and if it accepts
-            # the new payload the cache is refreshed from it.
-            self._bump_plan_counter("plan_cache_miss")
-            return self._full_plan_entry(shard, storage, clip_uid)
+        self._bump_plan_counter("plan_semantic_digest_count")
+        if digest is not None and self._plan_semantic_digest(payload) == digest:
+            # Case A: the same plan, rewritten. The entries already validated
+            # this exact content, so only the signature is refreshed.
+            self._refresh_plan_signature(shard)
+            return self._serve_cached_plan_entry(shard, storage, clip_uid, cached)
+        # Case B: the content really changed. The existing validator decides
+        # whether the new plan is valid, and refreshes everything if it is.
+        self._bump_plan_counter("plan_cache_miss")
+        return self._full_plan_entry(shard, storage, clip_uid)
+
+    def _serve_cached_plan_entry(
+        self,
+        shard: str,
+        storage: RunStorage,
+        clip_uid: str,
+        cached: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Serve a cached entry after validating this clip against live state."""
         self._bump_plan_counter("plan_cache_hit")
         if cached is None:
             raise ReferenceIntegrityDurableError(
                 f"frozen Reference Integrity plan has no entry for {clip_uid!r}"
             )
-        # The entry came from a fully validated plan, but the clip's LIVE state
-        # may still have drifted since: verify this clip, and only this clip.
+        # The entry came from a fully validated plan, but this clip's LIVE state
+        # may still have drifted: verify this clip, and only this clip.
         self._verify_plan_entry(shard, storage, clip_uid, cached)
         self._bump_plan_counter("plan_entry_hot_validation_count")
         return cached
@@ -3953,13 +4042,10 @@ class ReferenceIntegrityEpochRunner:
     def _publish_clip_if_terminal(
         self, shard: str, storage: RunStorage, clip_uid: str
     ) -> None:
-        plan = _read_json(self._plan_path(shard))
-        if plan is None:
-            raise ReferenceIntegrityDurableError(
-                f"Reference Integrity publication needs the frozen plan for "
-                f"{shard!r}"
-            )
-        plan_entry = plan["clips"][clip_uid]
+        # The clip's own frozen entry, through the same stat-only invocation
+        # cache the job context uses: publication must not re-read and re-parse
+        # the whole shard plan just to reach one entry.
+        plan_entry = self._hot_plan_entry(shard, storage, clip_uid)
         if any(
             self._entity_outcome(shard, clip_uid, entity_id) is None
             for entity_id in plan_entry.get("retained_entity_ids", [])
