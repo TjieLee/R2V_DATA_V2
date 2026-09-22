@@ -12,7 +12,13 @@ The production root and all T2VA/TA2VA shard paths are independent of the MLLM
 version. Changing MiMo must not create a new downstream directory, invalidate
 existing ready artifacts, or require a fresh production root.
 
-Current default MiMo:
+Current production default remains MiMo V2.5 until the fixed random20 V2.6
+multi-call A/B passes:
+
+    model: mimo-v2.5
+    checkpoint: /mnt/workspace/public/pretrained/MiMo/MiMo-V2.5
+
+V2.6 candidate:
 
     model: mimo-v2.6-flash-rl
     checkpoint: /mnt/workspace/public/pretrained/MiMo/MiMo-V2.6-Flash-RL
@@ -35,11 +41,10 @@ cache-compatible; removing those fields requires a separate compatibility
 migration and is intentionally not coupled to an MLLM upgrade. Source media and
 generated artifacts keep their content hashes.
 
-MiMo V2.6 uses the same OpenAI-compatible multimodal request format. The current
-server command keeps TP=8, DP=2, DP attention/lm-head/mm-encoder,
-mem-fraction-static=0.65 and chunked-prefill-size=16384, and enables the official
-EAGLE/MTP speculative decoder by default. Set `MIMO_SPECULATIVE=0` only for
-compatibility/debugging.
+MiMo V2.6 uses the same OpenAI-compatible multimodal request format. For the
+first random20 quality A/B, keep the existing multi-call prompts/turns and leave
+speculative decoding disabled so the model change is isolated. EAGLE/MTP remains
+available as an explicit serving optimization after quality validation.
 
 ## Full Raw-Video Production
 
