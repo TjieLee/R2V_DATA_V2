@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
+import cv2
 import numpy as np
 from PIL import Image, ImageDraw
 
@@ -456,90 +457,41 @@ def _bbox_from_mask(mask: np.ndarray) -> tuple[int, int, int, int]:
 
 
 def _foreground_components(mask: np.ndarray) -> tuple[MaskComponent, ...]:
+    """Return the legacy 8-connected foreground components in native code.
+
+    The previous implementation encoded each row into runs and merged adjacent
+    runs with a Python union-find. Because an end coordinate equal to the next
+    row's start coordinate was considered overlapping, diagonal contact was
+    intentionally/observably connected: the frozen behavior is 8-connectivity,
+    not 4-connectivity. OpenCV is already a pinned production dependency and
+    preserves that exact topology while moving the full image walk out of
+    Python.
+    """
     binary = np.asarray(mask, dtype=bool)
     if binary.ndim != 2 or not binary.any():
         raise ValueError("component diagnostics require a non-empty 2D mask")
 
-    parents: list[int] = []
-    run_areas: list[int] = []
-    run_bboxes: list[tuple[int, int, int, int]] = []
-
-    def make_set(
-        area: int,
-        bbox_xyxy: tuple[int, int, int, int],
-    ) -> int:
-        label = len(parents)
-        parents.append(label)
-        run_areas.append(area)
-        run_bboxes.append(bbox_xyxy)
-        return label
-
-    def find(label: int) -> int:
-        root = label
-        while parents[root] != root:
-            root = parents[root]
-        while parents[label] != label:
-            parent = parents[label]
-            parents[label] = root
-            label = parent
-        return root
-
-    def union(first: int, second: int) -> None:
-        first_root = find(first)
-        second_root = find(second)
-        if first_root != second_root:
-            parents[max(first_root, second_root)] = min(first_root, second_root)
-
-    previous_runs: list[tuple[int, int, int]] = []
-    for row_index, row in enumerate(binary):
-        padded = np.pad(row.astype(np.int8, copy=False), (1, 1))
-        transitions = np.diff(padded)
-        starts = np.flatnonzero(transitions == 1)
-        ends = np.flatnonzero(transitions == -1)
-        current_runs: list[tuple[int, int, int]] = []
-        previous_index = 0
-        for start, end in zip(starts.tolist(), ends.tolist()):
-            label = make_set(
-                end - start,
-                (start, row_index, end, row_index + 1),
+    foreground = np.ascontiguousarray(binary, dtype=np.uint8)
+    label_count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(
+        foreground,
+        connectivity=8,
+        ltype=cv2.CV_32S,
+    )
+    components = []
+    for label in range(1, label_count):
+        left = int(stats[label, cv2.CC_STAT_LEFT])
+        top = int(stats[label, cv2.CC_STAT_TOP])
+        width = int(stats[label, cv2.CC_STAT_WIDTH])
+        height = int(stats[label, cv2.CC_STAT_HEIGHT])
+        components.append(
+            MaskComponent(
+                area_pixels=int(stats[label, cv2.CC_STAT_AREA]),
+                bbox_xyxy=(left, top, left + width, top + height),
             )
-            while (
-                previous_index < len(previous_runs)
-                and previous_runs[previous_index][1] < start
-            ):
-                previous_index += 1
-            overlap_index = previous_index
-            while (
-                overlap_index < len(previous_runs)
-                and previous_runs[overlap_index][0] <= end
-            ):
-                union(label, previous_runs[overlap_index][2])
-                overlap_index += 1
-            current_runs.append((start, end, label))
-        previous_runs = current_runs
-
-    component_areas: dict[int, int] = {}
-    component_bboxes: dict[int, tuple[int, int, int, int]] = {}
-    for label, area in enumerate(run_areas):
-        root = find(label)
-        component_areas[root] = component_areas.get(root, 0) + area
-        x1, y1, x2, y2 = run_bboxes[label]
-        previous = component_bboxes.get(root)
-        if previous is not None:
-            x1 = min(x1, previous[0])
-            y1 = min(y1, previous[1])
-            x2 = max(x2, previous[2])
-            y2 = max(y2, previous[3])
-        component_bboxes[root] = (x1, y1, x2, y2)
+        )
     return tuple(
         sorted(
-            (
-                MaskComponent(
-                    area_pixels=area,
-                    bbox_xyxy=component_bboxes[root],
-                )
-                for root, area in component_areas.items()
-            ),
+            components,
             key=lambda component: (
                 -component.area_pixels,
                 component.bbox_xyxy,
