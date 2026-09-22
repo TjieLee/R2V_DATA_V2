@@ -19,10 +19,11 @@ reference tokens.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import threading
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -1215,16 +1216,19 @@ def _runner(
     *,
     shard: str = SHARD,
     clip_uids: Sequence[str] = ("clip-1",),
+    ledger_dir: str = "ledger",
+    cpu_workers: int | None = None,
 ):
     from r2v_data_v2.v3.post_mask_epoch_pair import PairEpochRunner
     from r2v_data_v2.v3.post_mask_epoch_state import GroupLedger
 
-    ledger = GroupLedger(tmp_path / "ledger")
+    ledger = GroupLedger(tmp_path / ledger_dir)
     return PairEpochRunner(
         config,
         {shard: storage},
         ledger,
         eligible_clip_uids_by_shard={shard: list(clip_uids)},
+        cpu_workers=cpu_workers,
     )
 
 
@@ -2933,7 +2937,7 @@ def test_cross_background_drift_is_not_terminal(
     """Frozen-state drift from _background_token must never become terminal."""
     from r2v_data_v2.v3.post_mask_epoch_pair import PairEpochError
 
-    _config, storage, runner = _cross_fixture(tmp_path, monkeypatch)
+    _config, _storage, runner = _cross_fixture(tmp_path, monkeypatch)
     job, result = _committed_cross_accept(runner, "target-b")
 
     def drift(*args: Any, **kwargs: Any) -> Any:
@@ -3264,7 +3268,7 @@ def test_scheduler_stops_after_cross_pair_judge_failure(
     )
 
     class _ExplodingCrossJudge:
-        calls: list[int] = []
+        calls: ClassVar[list[int]] = []
 
         def decide(self, **kwargs: Any) -> Any:
             _ExplodingCrossJudge.calls.append(1)
@@ -3776,3 +3780,215 @@ def test_primary_preparation_runs_independent_entities_concurrently(
     # completion order of the workers never leaks into the job or state order.
     assert sorted(int(dict(job.target)["entity_index"]) for job in jobs) == [0, 1]
     assert {str(dict(job.target)["entity_id"]) for job in jobs} == {"e1", "e2"}
+
+
+def _primary_clips_fixture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    run_name: str,
+    clip_uids: Sequence[str],
+    *,
+    entity_types: tuple[str, ...] = ("subject",),
+    cpu_workers: int | None = None,
+    config: Any = None,
+) -> tuple[Any, Any, Any]:
+    """One storage with several ready clips, on its own ledger and run root."""
+    base = config if config is not None else _pair_config(tmp_path, monkeypatch)
+    run_config = replace(base, run_root=base.run_root.parent / run_name)
+    storage = _storage(run_config, entity_types=entity_types)
+    for clip_uid in clip_uids[1:]:
+        _add_ready_clip(
+            run_config, storage, clip_uid=clip_uid, entity_types=entity_types
+        )
+    runner = _runner(
+        tmp_path,
+        run_config,
+        storage,
+        clip_uids=clip_uids,
+        ledger_dir=f"ledger-{run_name}",
+        cpu_workers=cpu_workers,
+    )
+    return run_config, storage, runner
+
+
+def _primary_clip_snapshot(storage: Any, clip_uids: Sequence[str]) -> dict[str, Any]:
+    """The durable Primary surface of every clip, canonically ordered."""
+    return {
+        clip_uid: storage.read_clip(clip_uid).model_dump(mode="json")
+        for clip_uid in clip_uids
+    }
+
+
+@pytest.mark.parametrize("cpu_workers", (1, 4))
+def test_primary_prepare_failure_is_stage_level_and_canonical(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cpu_workers: int
+) -> None:
+    """An ordinary preparation failure aborts the stage at its canonical place.
+
+    Pair primary has no per-clip isolation: the exception propagates out of
+    seeding, the clips before it are computed and their jobs recorded, and the
+    clip that failed and everything after it are left untouched. These judged
+    entities publish only after their receipts, so no clip is published here.
+    This is the reference behaviour the flat preparation must reproduce at
+    every worker count, including that a later clip's speculative preparation
+    is never applied ahead of the earlier canonical failure.
+    """
+    clip_uids = ("clip-1", "clip-2", "clip-3")
+    _unused_config, storage, runner = _primary_clips_fixture(
+        tmp_path,
+        monkeypatch,
+        f"run-fail-{cpu_workers}",
+        clip_uids,
+        cpu_workers=cpu_workers,
+    )
+    real_prepare = runner._prepare_primary_entity
+
+    def failing(storage_: Any, clip_uid: str, *args: Any, **kwargs: Any) -> Any:
+        if clip_uid == "clip-2":
+            raise RuntimeError("ordinary preparation failure")
+        return real_prepare(storage_, clip_uid, *args, **kwargs)
+
+    monkeypatch.setattr(runner, "_prepare_primary_entity", failing)
+
+    with pytest.raises(RuntimeError, match="ordinary preparation failure"):
+        runner.seed_primary_jobs()
+
+    # The clip before the failure was computed and its jobs recorded.
+    assert (SHARD, "clip-1") in runner._primary_jobs
+    # The failing clip and everything after it were never applied: clip-3 was
+    # prepared concurrently here, and its result must not be applied ahead of
+    # the earlier canonical failure.
+    assert (SHARD, "clip-2") not in runner._primary_jobs
+    assert (SHARD, "clip-3") not in runner._primary_jobs
+    # No judged clip can publish before its receipts exist.
+    for clip_uid in clip_uids:
+        assert storage.read_clip(clip_uid).pairing is None
+
+
+def test_pair_primary_preparation_overlaps_across_clips(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Entities of DIFFERENT clips are prepared concurrently.
+
+    Every clip here has one entity, which is the common production shape and
+    exactly the case a per-clip pool cannot parallelize. A serial preparation
+    cannot satisfy the gate and fails on the bounded timeout.
+    """
+    clip_uids = ("clip-1", "clip-2", "clip-3", "clip-4")
+    _unused_config, _unused_storage, runner = _primary_clips_fixture(
+        tmp_path,
+        monkeypatch,
+        "run-cross-clip",
+        clip_uids,
+        cpu_workers=4,
+    )
+    barrier = threading.Barrier(2, timeout=30.0)
+    entered: list[tuple[str, int]] = []
+    lock = threading.Lock()
+    real_prepare = runner._prepare_primary_entity
+
+    def gated(storage_: Any, clip_uid: str, *args: Any, **kwargs: Any) -> Any:
+        with lock:
+            entered.append((clip_uid, threading.get_ident()))
+        barrier.wait()
+        return real_prepare(storage_, clip_uid, *args, **kwargs)
+
+    monkeypatch.setattr(runner, "_prepare_primary_entity", gated)
+    jobs = runner.seed_primary_jobs()
+
+    assert len(entered) == 4, entered
+    assert len({clip_uid for clip_uid, _tid in entered}) >= 2, (
+        f"preparations from different clips overlapped: {entered}"
+    )
+    assert len({tid for _clip_uid, tid in entered}) >= 2
+    counters = runner.prepare_counters
+    assert counters["primary_prepare_tasks"] == 4
+    assert counters["primary_prepare_parallel_tasks"] == 4
+    assert counters["primary_prepare_peak_inflight"] >= 2
+    assert counters["primary_prepare_peak_buffered_results"] >= 2
+    assert counters["primary_prepare_commit_batches"] >= 1
+    assert len(jobs) == 4, jobs
+
+
+def _primary_job_snapshot(jobs: Sequence[Any]) -> list[tuple[str, str, str, str]]:
+    return sorted(
+        (
+            job.job_id(),
+            job.input_digest,
+            job.clip_uid,
+            str(dict(job.target)["entity_id"]),
+        )
+        for job in jobs
+    )
+
+
+def _primary_selection_hashes(
+    storage: Any, clip_uids: Sequence[str], entity_ids: Mapping[str, Sequence[str]]
+) -> dict[str, Any]:
+    import hashlib
+
+    hashes: dict[str, Any] = {}
+    for clip_uid in clip_uids:
+        for entity_id in entity_ids[clip_uid]:
+            path = storage.selected_path(clip_uid, f"{entity_id}.png")
+            hashes[f"{clip_uid}/{entity_id}"] = (
+                hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+            )
+    return hashes
+
+
+def test_parallel_primary_seed_matches_serial_exactly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The flat pool reproduces the serial Pair primary result exactly."""
+    clip_uids = ("clip-1", "clip-2", "clip-3", "clip-4")
+    base = _pair_config(tmp_path, monkeypatch)
+    snapshots: dict[str, Any] = {}
+    for tag, workers in (("serial", 1), ("parallel", 4)):
+        _unused_config, storage, runner = _primary_clips_fixture(
+            tmp_path,
+            monkeypatch,
+            f"run-equiv-{tag}",
+            clip_uids,
+            cpu_workers=workers,
+            config=base,
+        )
+        seeded = runner.seed_primary_jobs()
+        assert seeded, "the fixture has real primary work"
+        results = {job.job_id(): _run_one(runner, job, _Judge()) for job in seeded}
+        assert all(result.committed for result in results.values())
+        for job in seeded:
+            runner.finalize(job, results[job.job_id()])
+
+        entity_ids = {
+            clip_uid: [
+                entity.entity_id
+                for entity in storage.read_clip(clip_uid).annotation.entities
+            ]
+            for clip_uid in clip_uids
+        }
+        snapshots[tag] = {
+            "jobs": _primary_job_snapshot(seeded),
+            "primary_index": {
+                clip_uid: [job.job_id() for job in runner._primary_jobs[(SHARD, clip_uid)]]
+                for clip_uid in clip_uids
+                if (SHARD, clip_uid) in runner._primary_jobs
+            },
+            "references": {
+                clip_uid: storage.read_clip(clip_uid).references.model_dump(mode="json")
+                for clip_uid in clip_uids
+            },
+            "pairing": {
+                clip_uid: storage.read_clip(clip_uid).pairing.model_dump(mode="json")
+                for clip_uid in clip_uids
+            },
+            "selected": _primary_selection_hashes(storage, clip_uids, entity_ids),
+            "stats": runner.reconcile_stats(SHARD).to_dict(),
+            "unresolved": runner.primary_unresolved_job_ids(),
+        }
+
+    assert snapshots["parallel"] == snapshots["serial"]
+    assert snapshots["serial"]["unresolved"] == ()
+    assert all(
+        payload is not None for payload in snapshots["serial"]["pairing"].values()
+    ), "every clip reached a Pair terminal state"

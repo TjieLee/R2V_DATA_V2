@@ -26,7 +26,7 @@ from __future__ import annotations
 import json
 import threading
 from collections.abc import Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -381,6 +381,16 @@ class PairEpochRunner:
         self._frozen_inputs: dict[tuple[str, str], tuple[Any, Any]] = {}
         self._prepared: dict[str, Any] = {}
         self._prepared_lock = threading.Lock()
+        #: Execution-only seed-preparation telemetry. Never part of PairStats,
+        #: stage counts, ModelJob identity, receipts or any public schema.
+        self._prepare_counters_lock = threading.Lock()
+        self.prepare_counters: dict[str, int] = {
+            "primary_prepare_tasks": 0,
+            "primary_prepare_parallel_tasks": 0,
+            "primary_prepare_peak_inflight": 0,
+            "primary_prepare_peak_buffered_results": 0,
+            "primary_prepare_commit_batches": 0,
+        }
 
     def _remember_primary_jobs(
         self,
@@ -764,6 +774,150 @@ class PairEpochRunner:
         for temporary, _ in temporary_images.values():
             temporary.unlink(missing_ok=True)
 
+    def _primary_cpu_workers(self) -> int:
+        """Execution-only CPU budget for Pair primary preparation."""
+        return int(getattr(self, "cpu_workers", 1) or 1)
+
+    def _primary_seed_residency_budget(self) -> int:
+        """How many prepared entity results may wait for application at once.
+
+        Preparation is streaming: a batch never carries more prepared results
+        than this, so residency stays O(cpu_workers) instead of O(entities in
+        the campaign). A single clip with more entities than the budget is
+        processed alone, which is the one explicit exception.
+        """
+        workers = self._primary_cpu_workers()
+        return max(workers, workers * 2)
+
+    def _bump_prepare_counter(self, key: str, delta: int = 1) -> None:
+        with self._prepare_counters_lock:
+            self.prepare_counters[key] += delta
+
+    def _note_prepare_inflight(self, inflight: int) -> None:
+        with self._prepare_counters_lock:
+            self.prepare_counters["primary_prepare_peak_inflight"] = max(
+                self.prepare_counters["primary_prepare_peak_inflight"], inflight
+            )
+
+    def _note_prepare_buffered(self, buffered: int) -> None:
+        with self._prepare_counters_lock:
+            self.prepare_counters["primary_prepare_peak_buffered_results"] = max(
+                self.prepare_counters["primary_prepare_peak_buffered_results"],
+                buffered,
+            )
+
+    def _prepare_primary_batch_tasks(
+        self,
+        pool: Any,
+        batch: Sequence[tuple[str, RunStorage, str, Any]],
+    ) -> list[Any]:
+        """Prepare one batch's entity tasks on the shared pool, in task order.
+
+        One slot per task - the prepared entity, or the exception its
+        preparation raised - always ordered by task, never by completion, so the
+        caller applies deterministically. The outstanding window is bounded by
+        the residency budget.
+        """
+        tasks: list[tuple[RunStorage, str, Any, Any, Any, dict[str, int]]] = []
+        for _shard, storage, clip_uid, context in batch:
+            clip, frames, masks = context
+            for entity in clip.annotation.entities:
+                tasks.append(
+                    (
+                        storage,
+                        clip_uid,
+                        entity,
+                        frames,
+                        masks,
+                        self._empty_stats(),
+                    )
+                )
+        results: list[Any] = [None] * len(tasks)
+        max_pending = self._primary_seed_residency_budget()
+        pending: dict[Any, int] = {}
+        next_index = 0
+        while next_index < len(tasks) or pending:
+            while next_index < len(tasks) and len(pending) < max_pending:
+                future = pool.submit(self._prepare_primary_entity, *tasks[next_index])
+                pending[future] = next_index
+                next_index += 1
+                self._bump_prepare_counter("primary_prepare_tasks")
+                self._bump_prepare_counter("primary_prepare_parallel_tasks")
+            self._note_prepare_inflight(len(pending))
+            done, _pending = wait(pending, return_when=FIRST_COMPLETED)
+            for future in done:
+                index = pending.pop(future)
+                try:
+                    results[index] = future.result()
+                except Exception as exc:  # noqa: BLE001 - re-raised in order
+                    results[index] = exc
+        # Merge the private scratch counters in task order: a worker never
+        # writes a counter dict shared with another worker.
+        merged = self._scratch(batch[0][0])
+        for task in tasks:
+            for key, value in task[5].items():
+                merged[key] = merged.get(key, 0) + value
+        return results
+
+    def _prepare_and_advance_primary_batch(
+        self,
+        pool: Any,
+        batch: Sequence[tuple[str, RunStorage, str, Any]],
+    ) -> list[ModelJob]:
+        """Prepare a bounded batch flat, then apply it in canonical order.
+
+        Prepared results are released as soon as the batch is applied, so
+        residency never grows with the size of the campaign. Application is
+        strictly canonical: the first canonical failure is raised at its own
+        position, so a speculative result from a later clip is never applied
+        ahead of it.
+        """
+        results = self._prepare_primary_batch_tasks(pool, batch)
+        self._note_prepare_buffered(len(results))
+        self._bump_prepare_counter("primary_prepare_commit_batches")
+        jobs: list[ModelJob] = []
+        cursor = 0
+        for shard, storage, clip_uid, context in batch:
+            clip, _frames, _masks = context
+            count = len(clip.annotation.entities)
+            row = results[cursor : cursor + count]
+            cursor += count
+            for item in row:
+                if isinstance(item, BaseException):
+                    raise item
+            jobs.extend(
+                self._advance_prepared_primary_clip(
+                    shard, storage, clip_uid, context, row
+                )
+            )
+        return jobs
+
+    def _prepare_primary_entity(
+        self,
+        storage: RunStorage,
+        clip_uid: str,
+        entity: Any,
+        frames: Any,
+        masks: Any,
+        counters: dict[str, int],
+    ) -> Any:
+        """Purely prepare ONE entity of one clip. Read-only, worker-safe.
+
+        This is the single authority every Pair preparation path calls - the
+        per-clip fan-out and the flat cross-clip seed both go through it - so
+        ``prepare_entity_reference`` is invoked with exactly the same arguments
+        whichever scheduling shape is active.
+        """
+        return prepare_entity_reference(
+            self.config,
+            storage,
+            clip_uid=clip_uid,
+            entity=entity,
+            frames=frames,
+            masks=masks,
+            counters=counters,
+        )
+
     def _prepare_entities(
         self,
         shard: str,
@@ -792,31 +946,24 @@ class PairEpochRunner:
 
         Results are returned in annotation order, never in completion order.
         """
-        workers = int(getattr(self, "cpu_workers", 1) or 1)
+        workers = self._primary_cpu_workers()
         if workers <= 1 or len(entities) < 2:
             return [
-                prepare_entity_reference(
-                    self.config,
-                    storage,
-                    clip_uid=clip_uid,
-                    entity=entity,
-                    frames=frames,
-                    masks=masks,
-                    counters=counters,
+                self._prepare_primary_entity(
+                    storage, clip_uid, entity, frames, masks, counters
                 )
                 for _index, entity in entities
             ]
         per_entity: list[dict[str, int]] = [self._empty_stats() for _ in entities]
 
         def prepare(position: int) -> Any:
-            return prepare_entity_reference(
-                self.config,
+            return self._prepare_primary_entity(
                 storage,
-                clip_uid=clip_uid,
-                entity=entities[position][1],
-                frames=frames,
-                masks=masks,
-                counters=per_entity[position],
+                clip_uid,
+                entities[position][1],
+                frames,
+                masks,
+                per_entity[position],
             )
 
         with ThreadPoolExecutor(max_workers=min(workers, len(entities))) as pool:
@@ -859,6 +1006,40 @@ class PairEpochRunner:
         prepared_by_entity = self._prepare_entities(
             shard, storage, clip_uid, entities, frames, masks, counters
         )
+        return self._apply_prepared_primary_clip(
+            shard,
+            storage,
+            clip_uid,
+            context,
+            prepared_by_entity,
+            stop_at_unresolved=stop_at_unresolved,
+        )
+
+    def _apply_prepared_primary_clip(
+        self,
+        shard: str,
+        storage: RunStorage,
+        clip_uid: str,
+        context: Any,
+        prepared_by_entity: Sequence[Any],
+        *,
+        stop_at_unresolved: bool,
+    ) -> tuple[
+        list[EntityReferenceState],
+        dict[str, tuple[Path, Image.Image]],
+        list[ModelJob],
+    ]:
+        """Apply already-prepared entity results for one clip, in annotation order.
+
+        MAIN THREAD ONLY, and the only place a clip's primary state is turned
+        into durable work: it builds the entity jobs, records the prepared
+        decision for each of them, reads committed receipts, finalizes what is
+        already committed and answers the clip's receipt barrier. The
+        preparation itself happened elsewhere, so this half performs no
+        ``prepare_entity_reference`` call.
+        """
+        clip, _frames, _masks = context
+        entities = list(enumerate(clip.annotation.entities))
         entity_states: list[EntityReferenceState] = []
         temporary_images: dict[str, tuple[Path, Image.Image]] = {}
         pending: list[ModelJob] = []
@@ -1123,18 +1304,54 @@ class PairEpochRunner:
         a genuinely unresolved model job is handed back.
         """
         jobs: list[ModelJob] = []
-        for shard in sorted(self.storages):
-            plan = self._primary_plan(shard)
-            storage = self._storage_for(shard)
-            for clip_uid in plan["eligible_clip_uids"]:
-                if plan["clips"][clip_uid]["classification"] != CLIP_FRESH_TARGET:
-                    continue
-                context = self._primary_context(storage, clip_uid)
-                if context is None:
-                    continue
-                jobs.extend(
-                    self._advance_primary_clip(shard, storage, clip_uid, context)
-                )
+        if self._primary_cpu_workers() <= 1:
+            # Direct serial path: one clip at a time, no executor.
+            for shard in sorted(self.storages):
+                plan = self._primary_plan(shard)
+                storage = self._storage_for(shard)
+                for clip_uid in plan["eligible_clip_uids"]:
+                    if plan["clips"][clip_uid]["classification"] != CLIP_FRESH_TARGET:
+                        continue
+                    context = self._primary_context(storage, clip_uid)
+                    if context is None:
+                        continue
+                    jobs.extend(
+                        self._advance_primary_clip(shard, storage, clip_uid, context)
+                    )
+            jobs.sort(key=lambda job: job.job_id())
+            self.phase.write_plan(jobs)
+            return jobs
+
+        # Flat preparation: ONE pool serves the whole seeding invocation and
+        # independent entities of many clips share it, so single-entity clips
+        # still fan out. Preparation and application alternate over bounded
+        # batches of consecutive canonical clips.
+        budget = self._primary_seed_residency_budget()
+        with ThreadPoolExecutor(
+            max_workers=self._primary_cpu_workers(), thread_name_prefix="pair-primary"
+        ) as pool:
+            batch: list[tuple[str, RunStorage, str, Any]] = []
+            buffered = 0
+            for shard in sorted(self.storages):
+                plan = self._primary_plan(shard)
+                storage = self._storage_for(shard)
+                for clip_uid in plan["eligible_clip_uids"]:
+                    if plan["clips"][clip_uid]["classification"] != CLIP_FRESH_TARGET:
+                        continue
+                    context = self._primary_context(storage, clip_uid)
+                    if context is None:
+                        continue
+                    count = len(context[0].annotation.entities)
+                    if batch and buffered + count > budget:
+                        jobs.extend(
+                            self._prepare_and_advance_primary_batch(pool, batch)
+                        )
+                        batch = []
+                        buffered = 0
+                    batch.append((shard, storage, clip_uid, context))
+                    buffered += count
+            if batch:
+                jobs.extend(self._prepare_and_advance_primary_batch(pool, batch))
         jobs.sort(key=lambda job: job.job_id())
         self.phase.write_plan(jobs)
         return jobs
@@ -1155,6 +1372,30 @@ class PairEpochRunner:
         """
         states, temporary, pending = self._replay_primary_clip(
             shard, storage, clip_uid, context, stop_at_unresolved=True
+        )
+        if pending:
+            return pending
+        guard = self._publish_primary(
+            shard, storage, clip_uid, context[1], states, temporary
+        )
+        return [guard] if guard is not None else []
+
+    def _advance_prepared_primary_clip(
+        self,
+        shard: str,
+        storage: RunStorage,
+        clip_uid: str,
+        context: Any,
+        prepared_by_entity: Sequence[Any],
+    ) -> list[ModelJob]:
+        """The same fixed point, applied from already-prepared entity results."""
+        states, temporary, pending = self._apply_prepared_primary_clip(
+            shard,
+            storage,
+            clip_uid,
+            context,
+            prepared_by_entity,
+            stop_at_unresolved=True,
         )
         if pending:
             return pending
