@@ -3879,3 +3879,139 @@ def test_clip_after_primary_only_pair_still_projects_to_downstream(
     paths = _cross_artifact_paths(ledger_root, PAIR_SHARD)
     assert not paths["donor_snapshot"].exists()
     assert not paths["cross_terminal"].exists()
+
+
+def _collecting_emit(events: list[dict[str, Any]]) -> Any:
+    def emit(event: str, **payload: Any) -> None:
+        events.append({"event": event, **payload})
+
+    return emit
+
+
+def test_stage_timing_events_cover_every_stage_phase(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every stage phase reports its own wall time without changing the outcome."""
+    config, storages, eligible, _, log = _fixture(tmp_path, monkeypatch)
+    ledger = GroupLedger(tmp_path / "ledger")
+    events: list[dict[str, Any]] = []
+
+    def removal_factory(runner: Any) -> Any:
+        return ResourceEpochScheduler(
+            ledger=ledger,
+            finalize=runner.finalize,
+            executors=_removal_executors(runner, log),
+        )
+
+    def pair_factory(runner: Any) -> Any:
+        return ResourceEpochScheduler(
+            ledger=ledger,
+            finalize=runner.finalize,
+            executors={
+                RESOURCE_QWEN: _RecordingExecutor(runner, _EntityJudge(), "pair", log)
+            },
+        )
+
+    outcome = run_removal_pair_epochs(
+        config=config,
+        storages=storages,
+        eligible_clip_uids_by_shard=eligible,
+        ledger=ledger,
+        removal_scheduler_factory=removal_factory,
+        pair_scheduler_factory=pair_factory,
+        emit=_collecting_emit(events),
+    )
+    assert outcome["pair_completed"] is True
+
+    timings = {
+        (entry["stage"], entry["phase"]): entry["wall_seconds"]
+        for entry in events
+        if entry["event"] == "post_mask_epoch_stage_timing"
+    }
+    for stage, phase in (
+        ("removal", "seed"),
+        ("removal", "scheduler"),
+        ("pair", "primary_seed"),
+        ("pair", "primary_scheduler"),
+        ("pair", "reconcile"),
+    ):
+        assert (stage, phase) in timings, timings
+    for value in timings.values():
+        assert isinstance(value, float)
+        assert value >= 0.0
+
+    scheduler_events = [
+        entry
+        for entry in events
+        if entry["event"] == "post_mask_epoch_stage_scheduler"
+    ]
+    assert {entry["stage"] for entry in scheduler_events} >= {"removal", "pair"}
+    for entry in scheduler_events:
+        assert entry["wall_seconds"] >= 0.0
+        assert entry["job_count"] >= 0
+        assert entry["attempted_job_count"] >= 0
+        assert entry["resolved_job_count"] >= 0
+        assert isinstance(entry["resources"], dict)
+    # Diagnostics come from the scheduler, not from a second measurement.
+    pair_diagnostics = next(
+        entry for entry in scheduler_events if entry["stage"] == "pair"
+    )
+    assert pair_diagnostics["job_count"] == outcome["pair_primary_job_count"]
+
+    # Emitting changed nothing: the stage order and the result are unchanged.
+    removal_calls = [index for index, e in enumerate(log) if e.startswith("removal:")]
+    pair_calls = [index for index, e in enumerate(log) if e.startswith("pair:")]
+    assert removal_calls and pair_calls
+    assert max(removal_calls) < min(pair_calls), log
+    assert outcome["pair_cross_job_count"] == 0
+
+
+def test_resource_lifecycle_event_reports_the_shared_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The session emits its manager counters verbatim at the end."""
+    config, storages, eligible, _, log = _fixture(tmp_path, monkeypatch)
+    ledger = GroupLedger(tmp_path / "ledger")
+    holder = _DispatchHolder()
+    timeline: list[str] = []
+    manager = _shared_manager(holder, timeline)
+    events: list[dict[str, Any]] = []
+
+    def removal_make(runner: Any, dispatch: Any) -> Any:
+        holder.dispatch = dispatch
+        return ResourceEpochScheduler(
+            ledger=ledger,
+            finalize=runner.finalize,
+            executors=_removal_executors(runner, log),
+        )
+
+    def pair_make(runner: Any, dispatch: Any) -> Any:
+        holder.dispatch = dispatch
+        return ResourceEpochScheduler(
+            ledger=ledger,
+            finalize=runner.finalize,
+            executors={
+                RESOURCE_QWEN: _RecordingExecutor(runner, _EntityJudge(), "pair", log)
+            },
+        )
+
+    result = run_removal_pair_resource_session(
+        config=config,
+        storages=storages,
+        eligible_clip_uids_by_shard=eligible,
+        ledger=ledger,
+        manager=manager,
+        build_removal_scheduler=removal_make,
+        build_pair_scheduler=pair_make,
+        emit=_collecting_emit(events),
+    )
+
+    lifecycle = [
+        entry
+        for entry in events
+        if entry["event"] == "post_mask_epoch_resource_lifecycle"
+    ]
+    assert len(lifecycle) == 1, events
+    assert lifecycle[0]["counters"] == result["resource_lifecycle"]
+    assert lifecycle[0]["counters"], "the manager reported something"
+    assert result["pair_completed"] is True

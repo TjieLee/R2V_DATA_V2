@@ -38,7 +38,9 @@ publication for corruption.
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Mapping, Sequence
+import time
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -155,6 +157,69 @@ def default_subject_attributes_runner_factory(
         },
         emit=emit,
     )
+
+
+@contextmanager
+def _stage_timing(emit: Any, stage: str, phase: str) -> Iterator[None]:
+    """Emit one execution-only wall-time event for one stage phase.
+
+    Telemetry only: it never changes ordering, never writes durable state and is
+    never part of a ModelJob, a receipt or a config fingerprint. If ``emit`` is
+    not wired the event simply goes nowhere.
+    """
+    started = time.perf_counter()
+    try:
+        yield
+    finally:
+        _emit(
+            emit,
+            "post_mask_epoch_stage_timing",
+            stage=stage,
+            phase=phase,
+            wall_seconds=time.perf_counter() - started,
+        )
+
+
+def _timed(
+    emit: Any, stage: str, phase: str, fn: Callable[..., Any], *args: Any, **kwargs: Any
+) -> Any:
+    """Run one callable inside one stage-timing event and return its value."""
+    with _stage_timing(emit, stage, phase):
+        return fn(*args, **kwargs)
+
+
+def _emit_scheduler_diagnostics(
+    emit: Any, stage: str, outcome: Mapping[str, Any]
+) -> None:
+    """Emit the scheduler's own accounting for one stage, unmodified.
+
+    The scheduler already measures wall time and per-resource diagnostics, so
+    nothing is reimplemented here and no field is invented: a value that is not
+    instrumented is reported exactly as the scheduler reports it.
+    """
+    diagnostics = outcome.get("diagnostics")
+    if not isinstance(diagnostics, Mapping):
+        return
+    _emit(
+        emit,
+        "post_mask_epoch_stage_scheduler",
+        stage=stage,
+        wall_seconds=float(outcome.get("wall_seconds", 0.0) or 0.0),
+        job_count=int(outcome.get("job_count", 0) or 0),
+        attempted_job_count=int(outcome.get("attempted_job_count", 0) or 0),
+        resolved_job_count=int(outcome.get("resolved_job_count", 0) or 0),
+        resources=dict(diagnostics.get("resources", {}) or {}),
+    )
+
+
+def _run_staged_scheduler(
+    emit: Any, scheduler: Any, jobs: Any, *, stage: str, phase: str
+) -> dict[str, Any]:
+    """Run one stage's scheduler, then emit its wall time and diagnostics."""
+    with _stage_timing(emit, stage, phase):
+        outcome = scheduler.run(jobs)
+    _emit_scheduler_diagnostics(emit, stage, outcome)
+    return outcome
 
 
 def _emit(emit: Any, event: str, **payload: Any) -> None:
@@ -627,19 +692,30 @@ def run_subject_attributes_stage(
         emit=emit,
         cpu_workers=cpu_workers,
     )
-    seeded = subject_attributes.seed_jobs()
+    with _stage_timing(emit, "subject_attributes", "seed"):
+        seeded = subject_attributes.seed_jobs()
     _emit(
         emit,
         "post_mask_epoch_subject_attributes_seeded",
         seeded_jobs=len(seeded),
     )
-    outcome = subject_attributes_scheduler_factory(subject_attributes).run(seeded)
+    outcome = _run_staged_scheduler(
+        emit,
+        subject_attributes_scheduler_factory(subject_attributes),
+        seeded,
+        stage="subject_attributes",
+        phase="scheduler",
+    )
     unresolved = tuple(outcome.get("unresolved_job_ids", ()))
     completed = False
     stats: dict[str, Any] = {}
     error: str | None = None
     if not unresolved:
-        completed, stats, error = _reconcile_and_publish_subject_attribute_stats(
+        completed, stats, error = _timed(
+            emit,
+            "subject_attributes",
+            "reconcile",
+            _reconcile_and_publish_subject_attribute_stats,
             subject_attributes=subject_attributes,
             storages=storages,
             eligible=eligible,
@@ -746,15 +822,20 @@ def _continue_with_reference_integrity(
         emit=emit,
         cpu_workers=cpu_workers,
     )
-    reference_integrity_seed = reference_integrity.seed_jobs()
+    with _stage_timing(emit, "reference_integrity", "seed"):
+        reference_integrity_seed = reference_integrity.seed_jobs()
     _emit(
         emit,
         "post_mask_epoch_reference_integrity_seeded",
         seeded_jobs=len(reference_integrity_seed),
     )
-    reference_integrity_outcome = reference_integrity_scheduler_factory(
-        reference_integrity
-    ).run(reference_integrity_seed)
+    reference_integrity_outcome = _run_staged_scheduler(
+        emit,
+        reference_integrity_scheduler_factory(reference_integrity),
+        reference_integrity_seed,
+        stage="reference_integrity",
+        phase="scheduler",
+    )
     reference_integrity_unresolved = tuple(
         reference_integrity_outcome.get("unresolved_job_ids", ())
     )
@@ -766,7 +847,13 @@ def _continue_with_reference_integrity(
             reference_integrity_completed,
             reference_integrity_stats,
             reference_integrity_error,
-        ) = _reconcile_and_publish_reference_integrity_stats(reference_integrity)
+        ) = _timed(
+            emit,
+            "reference_integrity",
+            "reconcile",
+            _reconcile_and_publish_reference_integrity_stats,
+            reference_integrity,
+        )
     result.update(
         {
             "reference_integrity_job_count": len(reference_integrity_seed),
@@ -828,7 +915,11 @@ def run_instruct_stage(
     ``skipped_existing`` and anything failed or missing is reprocessed. No
     per-clip durable receipt is invented for it.
     """
-    instruct_completed, instruct_stats, instruct_error = run_deterministic_instruct(
+    instruct_completed, instruct_stats, instruct_error = _timed(
+        emit,
+        "instruct",
+        "stage",
+        run_deterministic_instruct,
         config=config,
         storages=storages,
         eligible_clip_uids_by_shard=eligible,
@@ -910,9 +1001,16 @@ def run_removal_pair_epochs(
 
     removal = removal_runner_factory(**shared)
     try:
-        removal_seed = removal.seed_jobs()
+        with _stage_timing(emit, "removal", "seed"):
+            removal_seed = removal.seed_jobs()
         _emit(emit,"post_mask_epoch_removal_seeded",seeded_jobs=len(removal_seed))
-        removal_outcome = removal_scheduler_factory(removal).run(removal_seed)
+        removal_outcome = _run_staged_scheduler(
+            emit,
+            removal_scheduler_factory(removal),
+            removal_seed,
+            stage="removal",
+            phase="scheduler",
+        )
     finally:
         removal.close()
     remove_completed = bool(removal_outcome.get("completed"))
@@ -1167,11 +1265,16 @@ def run_removal_pair_epochs(
         if reference_edit_runner_factory is None:
             return result
         reference_edit = reference_edit_runner_factory(**shared)
-        reference_edit_seed = reference_edit.seed_jobs()
+        with _stage_timing(emit, "reference_edit", "seed"):
+            reference_edit_seed = reference_edit.seed_jobs()
         result["reference_edit_job_count"] = len(reference_edit_seed)
-        reference_edit_outcome = reference_edit_scheduler_factory(
-            reference_edit
-        ).run(reference_edit_seed)
+        reference_edit_outcome = _run_staged_scheduler(
+            emit,
+            reference_edit_scheduler_factory(reference_edit),
+            reference_edit_seed,
+            stage="reference_edit",
+            phase="scheduler",
+        )
         reference_edit_unresolved = tuple(
             reference_edit_outcome.get("unresolved_job_ids", ())
         )
@@ -1183,7 +1286,13 @@ def run_removal_pair_epochs(
                 reference_edit_completed,
                 reference_edit_stats,
                 reconcile_error,
-            ) = _reconcile_and_publish_reference_edit_stats(reference_edit)
+            ) = _timed(
+                emit,
+                "reference_edit",
+                "reconcile",
+                _reconcile_and_publish_reference_edit_stats,
+                reference_edit,
+            )
         result.update(
             {
                 "reference_edit_completed": reference_edit_completed,
@@ -1229,10 +1338,17 @@ def run_removal_pair_epochs(
             "launch that owns Cross Pair, or run this group on a ledger without "
             "Cross state."
         )
-    primary_seed = pair.seed_primary_jobs()
+    with _stage_timing(emit, "pair", "primary_seed"):
+        primary_seed = pair.seed_primary_jobs()
     result["pair_primary_job_count"] = len(primary_seed)
     _emit(emit,"post_mask_epoch_pair_primary_seeded",seeded_jobs=len(primary_seed))
-    primary_outcome = pair_scheduler_factory(pair).run(primary_seed)
+    primary_outcome = _run_staged_scheduler(
+        emit,
+        pair_scheduler_factory(pair),
+        primary_seed,
+        stage="pair",
+        phase="primary_scheduler",
+    )
     primary_unresolved = tuple(primary_outcome.get("unresolved_job_ids", ()))
     _emit(
         emit,
@@ -1269,7 +1385,9 @@ def run_removal_pair_epochs(
         # Final durable accounting: only a fully terminal Pair stage may write
         # stage counts, and the write is the same dict on every restart.
         for shard in sorted(pair.storages):
-            stats = pair.reconcile_stats(shard)
+            stats = _timed(
+                emit, "pair", "reconcile", pair.reconcile_stats, shard
+            )
             payload = stats.to_dict()
             pair.storages[shard].update_stage_counts("pair", payload)
             pair_stats[shard] = payload
@@ -1302,13 +1420,18 @@ def run_removal_pair_epochs(
         result["reference_edit_stats"] = {}
         return result
     reference_edit = reference_edit_runner_factory(**shared)
-    reference_edit_seed = reference_edit.seed_jobs()
+    with _stage_timing(emit, "reference_edit", "seed"):
+        reference_edit_seed = reference_edit.seed_jobs()
     result["reference_edit_job_count"] = len(reference_edit_seed)
     _emit(emit, "post_mask_epoch_reference_edit_seeded",
           seeded_jobs=len(reference_edit_seed))
-    reference_edit_outcome = reference_edit_scheduler_factory(
-        reference_edit
-    ).run(reference_edit_seed)
+    reference_edit_outcome = _run_staged_scheduler(
+        emit,
+        reference_edit_scheduler_factory(reference_edit),
+        reference_edit_seed,
+        stage="reference_edit",
+        phase="scheduler",
+    )
     reference_edit_unresolved = tuple(
         reference_edit_outcome.get("unresolved_job_ids", ())
     )
@@ -1325,7 +1448,13 @@ def run_removal_pair_epochs(
             reference_edit_completed,
             reference_edit_stats,
             reconcile_error,
-        ) = _reconcile_and_publish_reference_edit_stats(reference_edit)
+        ) = _timed(
+                emit,
+                "reference_edit",
+                "reconcile",
+                _reconcile_and_publish_reference_edit_stats,
+                reference_edit,
+            )
     result.update(
         {
             "reference_edit_completed": reference_edit_completed,
@@ -1551,5 +1680,10 @@ def run_removal_pair_resource_session(
     result = dict(result)
     # Read the lifecycle only after the outer close, so open_resource is None.
     result["resource_lifecycle"] = manager.counters()
+    _emit(
+        composition.get("emit"),
+        "post_mask_epoch_resource_lifecycle",
+        counters=dict(result["resource_lifecycle"] or {}),
+    )
     result["stage_dispatch_log"] = tuple(dispatch.log)
     return result
