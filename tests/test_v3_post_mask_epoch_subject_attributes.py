@@ -3250,3 +3250,219 @@ def test_two_independent_completion_attributes_are_seeded_together(
         _owner_artifact_file(storage).read_text(encoding="utf-8")
     )
     assert [record.attribute_id for record in artifact.records] == ["a1", "a2"]
+
+
+# --------------------------------------------------------------------------
+# Receipt-boundary replay: caches, cold start, and legacy parity
+# --------------------------------------------------------------------------
+
+_COMPLETION_ATTRIBUTES = (
+    ("upper_clothing", "a denim jacket", "jacket over the torso"),
+    ("accessory", "a leather belt", "belt around the waist"),
+)
+
+
+def _two_completion_owner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """An owner whose two attributes are both routed to completion."""
+    config, storage = _storage_variant(tmp_path, monkeypatch, "run-two-completion")
+    _add_owner_frame(storage, slot=1)
+    _add_owner_frame(storage, slot=2)
+    config = _completion_config(config)
+    runner = _runner(config, storage, tmp_path)
+    by_prompt = {
+        _COMPLETION_ATTRIBUTES[0][2]: [
+            _attribute_mask(storage, slot=1, band=0),
+            _attribute_mask(storage, slot=0, band=0),
+        ],
+        # The two attribute masks must differ in pixels, or legacy reports a
+        # duplicate conflict instead of routing either one to completion.
+        _COMPLETION_ATTRIBUTES[1][2]: [
+            _attribute_mask(storage, slot=2, band=1),
+        ],
+    }
+    qwen = _QwenClient(
+        discoveries=[_human_discovery(attributes=_COMPLETION_ATTRIBUTES)],
+        reviews=[
+            SubjectAttributeReviewBatch(
+                owner_entity_id=OWNER,
+                reviews=[
+                    _raw_review(
+                        "a1", structure_complete=False, completion_recommended=True
+                    ),
+                    _raw_review(
+                        "a2", structure_complete=False, completion_recommended=True
+                    ),
+                ],
+            )
+        ],
+        completion_reviews=[
+            _completion_review("accept"),
+            _completion_review("accept"),
+        ],
+    )
+    sam = _SamBackend(
+        by_prompt=by_prompt, generated=[by_prompt[_COMPLETION_ATTRIBUTES[0][2]][:1]]
+    )
+    return config, storage, runner, qwen, sam
+
+
+def _count_selection_replays(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    from r2v_data_v2.v3.post_mask_epoch_subject_attributes import (
+        SubjectAttributeEpochRunner,
+    )
+
+    real = SubjectAttributeEpochRunner._replay_attribute_selection
+    calls: list[str] = []
+
+    def counting(
+        self,
+        shard,
+        storage,
+        clip_uid,
+        owner_plan,
+        owner_reference,
+        discovery,
+        attribute_index,
+        attribute_id,
+        discovery_job_id,
+    ):
+        calls.append(str(attribute_id))
+        return real(
+            self,
+            shard,
+            storage,
+            clip_uid,
+            owner_plan,
+            owner_reference,
+            discovery,
+            attribute_index,
+            attribute_id,
+            discovery_job_id,
+        )
+
+    monkeypatch.setattr(
+        SubjectAttributeEpochRunner, "_replay_attribute_selection", counting
+    )
+    return calls
+
+
+def test_terminal_attribute_selection_is_not_rebuilt_at_every_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A later receipt must not re-derive an already-terminal attribute.
+
+    Each attribute's selection is heavy: JPEG and mask decode, candidate
+    geometry, cropping. Before this optimisation the same two-attribute owner
+    reconstructed both selections 36 times over one run; a receipt arriving for
+    one attribute rebuilt the other's as well. It is now 15, and the rest are
+    served from the per-attribute cache with the durable marker still verified.
+    """
+    monkeypatch.setattr(time, "perf_counter", lambda: 1.0)
+    calls = _count_selection_replays(monkeypatch)
+    _, _, runner, qwen, sam = _two_completion_owner(tmp_path, monkeypatch)
+
+    scheduler = _scheduler(
+        runner,
+        _SerialQwenExecutor(runner, qwen),
+        runner.finalize,
+        _SerialQwenExecutor(runner, sam),
+        _SerialQwenExecutor(runner, _BooguBackend(_generated_png())),
+    )
+    outcome = scheduler.run(runner.seed_jobs())
+
+    assert outcome["completed"] is True
+    assert len(calls) <= 20, (
+        f"attribute selections rebuilt {len(calls)} times; a receipt is "
+        "re-deriving attributes that are already terminal"
+    )
+    assert runner.replay_counters["attribute_selection_cache_hit"] > 0
+    # The frozen owner prefix is reused too, not rebuilt per receipt.
+    assert runner.replay_counters["owner_context_cache_hit"] > 0
+
+
+def test_completion_job_context_reuses_a_terminal_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Running a completion job reuses the selection and keeps its identity.
+
+    The model path used to re-derive the whole attribute selection before every
+    Boogu call. With a terminal selection cached, that heavy rebuild is skipped
+    while the attribute plan - and therefore the job identity built from it - is
+    byte-identical.
+    """
+    monkeypatch.setattr(time, "perf_counter", lambda: 1.0)
+    _, _, runner, qwen, sam = _two_completion_owner(tmp_path, monkeypatch)
+
+    unlocked_jobs: list[Any] = []
+    real_finalize = runner.finalize
+
+    def recording(job: Any, result: Any) -> Sequence[Any]:
+        unlocked = list(real_finalize(job, result))
+        unlocked_jobs.extend(unlocked)
+        return unlocked
+
+    runner.finalize = recording  # type: ignore[method-assign]
+    _scheduler(
+        runner,
+        _SerialQwenExecutor(runner, qwen),
+        runner.finalize,
+        _SerialQwenExecutor(runner, sam),
+        _SerialQwenExecutor(runner, _BooguBackend(_generated_png())),
+    ).run(runner.seed_jobs())
+
+    generate = next(
+        (
+            job
+            for job in unlocked_jobs
+            if job.job_type == SUBJECT_ATTRIBUTE_COMPLETION_GENERATE_JOB
+        ),
+        None,
+    )
+    assert generate is not None, "a completion generate job was planned"
+
+    before = runner.replay_counters["attribute_selection_rebuilds"]
+    first = runner._completion_job_context(generate)
+    second = runner._completion_job_context(generate)
+    # Neither call re-derives: the terminal selection is reused.
+    assert runner.replay_counters["attribute_selection_rebuilds"] == before
+    assert second["attribute_plan"] == first["attribute_plan"]
+    assert dict(generate.target)["attribute_id"] == str(
+        first["attribute_plan"]["attribute_id"]
+    )
+
+
+def test_cold_runner_rederives_without_any_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fresh runner with empty caches produces the same durable outcome."""
+    monkeypatch.setattr(time, "perf_counter", lambda: 1.0)
+    config, storage, runner, qwen, sam = _two_completion_owner(tmp_path, monkeypatch)
+    scheduler = _scheduler(
+        runner,
+        _SerialQwenExecutor(runner, qwen),
+        runner.finalize,
+        _SerialQwenExecutor(runner, sam),
+        _SerialQwenExecutor(runner, _BooguBackend(_generated_png())),
+    )
+    outcome = scheduler.run(runner.seed_jobs())
+    assert outcome["completed"] is True
+    artifact = _read_artifact(storage)
+
+    # A brand new runner over the same durable state: every cache starts cold.
+    fresh = _runner(config, storage, tmp_path, ledger_name="cold-ledger")
+    assert fresh.replay_counters["owner_context_cache_hit"] == 0
+    assert fresh.replay_counters["attribute_selection_cache_hit"] == 0
+    assert fresh._owner_context_cache == {}
+    assert fresh._attribute_selection_cache == {}
+
+    fresh_scheduler = _scheduler(
+        fresh,
+        _SerialQwenExecutor(fresh, qwen),
+        fresh.finalize,
+        _SerialQwenExecutor(fresh, sam),
+        _SerialQwenExecutor(fresh, _BooguBackend(_generated_png())),
+    )
+    fresh_outcome = fresh_scheduler.run(fresh.seed_jobs())
+    assert fresh_outcome["completed"] is True
+    # Nothing is owed and the published artifact is byte-identical.
+    assert _read_artifact(storage) == artifact

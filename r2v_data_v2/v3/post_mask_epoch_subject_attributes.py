@@ -29,9 +29,11 @@ import hashlib
 import io
 import json
 import math
+import threading
 import time
 from collections import Counter
 from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -1342,6 +1344,29 @@ class SubjectAttributeEpochRunner:
             tuple[str, str, str], tuple[Any, ...]
         ] = {}
         self._owner_candidate_cache_limit = 16
+        # Receipt-boundary replay caches. Both hold only what a newly arriving
+        # receipt cannot change: the frozen owner prefix, and an attribute
+        # selection that is already terminal and whose durable marker still
+        # verifies. Everything that a receipt *can* change - review verdicts,
+        # completion outcomes, routes, the owner outcome - is still read from
+        # the ledger every time. A restart starts cold and re-derives it all.
+        self._owner_context_cache: dict[tuple[str, str, str], dict[str, Any]] = {}
+        self._attribute_selection_cache: dict[
+            tuple[str, str, str, str], Any
+        ] = {}
+        self._owner_context_cache_limit = 32
+        self._attribute_selection_cache_limit = 32
+        self._candidate_cache_lock = threading.Lock()
+        #: Execution-only counters. They measure how much CPU replay was skipped
+        #: and are never part of any job identity, receipt or public schema.
+        self.replay_counters: dict[str, int] = {
+            "owner_context_cache_hit": 0,
+            "owner_context_cache_miss": 0,
+            "attribute_selection_cache_hit": 0,
+            "attribute_selection_cache_miss": 0,
+            "owner_graph_rebuilds": 0,
+            "attribute_selection_rebuilds": 0,
+        }
 
     # -- durable paths ---------------------------------------------------------
 
@@ -1799,12 +1824,16 @@ class SubjectAttributeEpochRunner:
         """Validate owner candidates once per invocation, then reuse them."""
         owner_entity_id = str(owner_plan["owner_entity_id"])
         cache_key = (shard, clip_uid, owner_entity_id)
-        cached = self._owner_candidate_cache.get(cache_key)
-        if cached is not None:
-            # Refresh insertion order for a tiny LRU without another dependency.
-            self._owner_candidate_cache.pop(cache_key)
-            self._owner_candidate_cache[cache_key] = cached
-            return list(cached)
+        # Attribute replays can run on several threads, so the bounded cache is
+        # guarded: losing an entry would only cost a rebuild, but the bound and
+        # the drift check must stay coherent.
+        with self._candidate_cache_lock:
+            cached = self._owner_candidate_cache.get(cache_key)
+            if cached is not None:
+                # Refresh insertion order for a tiny LRU without another dependency.
+                self._owner_candidate_cache.pop(cache_key)
+                self._owner_candidate_cache[cache_key] = cached
+                return list(cached)
 
         storage = self._storage_for(shard)
         clip = storage.read_clip(clip_uid)
@@ -1831,10 +1860,11 @@ class SubjectAttributeEpochRunner:
                 f"{clip_uid}/{owner_entity_id}"
             )
 
-        if len(self._owner_candidate_cache) >= self._owner_candidate_cache_limit:
-            oldest = next(iter(self._owner_candidate_cache))
-            self._owner_candidate_cache.pop(oldest)
-        self._owner_candidate_cache[cache_key] = tuple(candidates)
+        with self._candidate_cache_lock:
+            if len(self._owner_candidate_cache) >= self._owner_candidate_cache_limit:
+                oldest = next(iter(self._owner_candidate_cache))
+                self._owner_candidate_cache.pop(oldest)
+            self._owner_candidate_cache[cache_key] = tuple(candidates)
         return candidates
 
     # -- run -------------------------------------------------------------------
@@ -3306,8 +3336,18 @@ class SubjectAttributeEpochRunner:
         attribute_id: str,
         discovery_job_id: str,
     ) -> _AttributeReplay:
-        """Create-once terminal selection marker, re-derived on every read."""
-        replay = self._replay_attribute_selection(
+        """Create-once terminal selection marker, re-derived on every read.
+
+        A selection that is already terminal - every SAM probe for this attribute
+        has a receipt and the durable marker has been written - cannot be changed
+        by any later review, completion or bbox receipt, so it is reused instead
+        of being rebuilt from JPEG and mask decodes at every receipt boundary. The
+        marker is still read back and compared on every hit, so drift is detected
+        exactly as before; only the heavy reconstruction is skipped. A selection
+        that still owes a probe is never cached, because its own next receipt is
+        what advances it.
+        """
+        replay = self._replay_or_cached_selection(
             shard,
             storage,
             clip_uid,
@@ -3318,34 +3358,170 @@ class SubjectAttributeEpochRunner:
             attribute_id,
             discovery_job_id,
         )
-        stored = _read_json(
-            self._selection_path(
-                shard, clip_uid, str(owner_plan["owner_entity_id"]), attribute_id
-            )
+        self._verify_or_write_selection_marker(
+            shard, clip_uid, owner_plan, attribute_id, replay
         )
+        return replay
+
+    def _replay_or_cached_selection(
+        self,
+        shard: str,
+        storage: RunStorage,
+        clip_uid: str,
+        owner_plan: Mapping[str, Any],
+        owner_reference: Any,
+        discovery: SubjectAttributeDiscovery,
+        attribute_index: int,
+        attribute_id: str,
+        discovery_job_id: str,
+    ) -> Any:
+        """The heavy part: replay one attribute's selection, or reuse a stable one.
+
+        This is pure CPU over frozen inputs and committed SAM receipts. It writes
+        nothing durable, which is what allows several attributes to be replayed at
+        the same time.
+        """
+        owner_entity_id = str(owner_plan["owner_entity_id"])
+        cache_key = (shard, clip_uid, owner_entity_id, attribute_id)
+        cached = self._attribute_selection_cache.get(cache_key)
+        if cached is not None:
+            stored = _read_json(
+                self._selection_path(shard, clip_uid, owner_entity_id, attribute_id)
+            )
+            if stored is not None and stored == cached.marker:
+                self.replay_counters["attribute_selection_cache_hit"] += 1
+                return cached
+            # The marker is gone or moved: fall through and rebuild fail-closed.
+            self._attribute_selection_cache.pop(cache_key, None)
+        self.replay_counters["attribute_selection_cache_miss"] += 1
+        self.replay_counters["attribute_selection_rebuilds"] += 1
+        return self._replay_attribute_selection(
+            shard,
+            storage,
+            clip_uid,
+            owner_plan,
+            owner_reference,
+            discovery,
+            attribute_index,
+            attribute_id,
+            discovery_job_id,
+        )
+
+    def _verify_or_write_selection_marker(
+        self,
+        shard: str,
+        clip_uid: str,
+        owner_plan: Mapping[str, Any],
+        attribute_id: str,
+        replay: Any,
+    ) -> None:
+        """The durable part: create-once selection marker and drift check.
+
+        Always runs on the main thread, in annotation order, after any parallel
+        replay has completed.
+        """
+        owner_entity_id = str(owner_plan["owner_entity_id"])
+        marker_path = self._selection_path(
+            shard, clip_uid, owner_entity_id, attribute_id
+        )
+        stored = _read_json(marker_path)
         if replay.pending_job is not None:
             if stored is not None:
                 raise SubjectAttributeDurableError(
                     f"attribute {clip_uid}/{attribute_id} has a terminal selection "
                     "marker but its SAM probes are incomplete"
                 )
-            return replay
+            return
         if stored is None:
-            _write_json_once(
-                self._selection_path(
-                    shard,
-                    clip_uid,
-                    str(owner_plan["owner_entity_id"]),
-                    attribute_id,
-                ),
-                replay.marker,
-            )
+            _write_json_once(marker_path, replay.marker)
         elif stored != replay.marker:
             raise SubjectAttributeDurableError(
                 f"frozen Subject Attributes selection marker drifted for "
                 f"{clip_uid}/{attribute_id}"
             )
-        return replay
+        if replay.marker is None:
+            return
+        cache_key = (shard, clip_uid, owner_entity_id, attribute_id)
+        if (
+            len(self._attribute_selection_cache)
+            >= self._attribute_selection_cache_limit
+        ):
+            self._attribute_selection_cache.pop(
+                next(iter(self._attribute_selection_cache)), None
+            )
+        self._attribute_selection_cache[cache_key] = replay
+
+    def _replay_attribute_selections(
+        self,
+        shard: str,
+        storage: RunStorage,
+        clip_uid: str,
+        owner_plan: Mapping[str, Any],
+        owner_reference: Any,
+        discovery: SubjectAttributeDiscovery,
+        attribute_ids: Sequence[str],
+        discovery_job_id: str,
+    ) -> list[Any]:
+        """Replay every attribute's selection, concurrently when there are several.
+
+        An attribute's selection depends only on the owner, the discovery and its
+        own SAM probe receipts, never on a sibling attribute's outcome, so they
+        can be replayed at the same time. Threads rather than processes: the work
+        is JPEG and RLE decode, mask geometry and cropping inside C extensions,
+        and a process pool would have to pickle every decoded image and mask.
+
+        Results come back in annotation order, never in completion order. Nothing
+        here writes durable state - markers are published afterwards, on the
+        calling thread - so the parallel region cannot move a durable write.
+        """
+        if len(attribute_ids) < 2:
+            return [
+                self._replay_or_cached_selection(
+                    shard,
+                    storage,
+                    clip_uid,
+                    owner_plan,
+                    owner_reference,
+                    discovery,
+                    index,
+                    attribute_id,
+                    discovery_job_id,
+                )
+                for index, attribute_id in enumerate(attribute_ids)
+            ]
+        workers = int(getattr(self.config.runtime, "cpu_workers", 1) or 1)
+        if workers <= 1:
+            return [
+                self._replay_or_cached_selection(
+                    shard,
+                    storage,
+                    clip_uid,
+                    owner_plan,
+                    owner_reference,
+                    discovery,
+                    index,
+                    attribute_id,
+                    discovery_job_id,
+                )
+                for index, attribute_id in enumerate(attribute_ids)
+            ]
+        with ThreadPoolExecutor(max_workers=min(workers, len(attribute_ids))) as pool:
+            return list(
+                pool.map(
+                    lambda pair: self._replay_or_cached_selection(
+                        shard,
+                        storage,
+                        clip_uid,
+                        owner_plan,
+                        owner_reference,
+                        discovery,
+                        pair[0],
+                        pair[1],
+                        discovery_job_id,
+                    ),
+                    list(enumerate(attribute_ids)),
+                )
+            )
 
     def _rank0_context(
         self,
@@ -3359,20 +3535,26 @@ class SubjectAttributeEpochRunner:
         """Replay every attribute selection, the duplicate CPU pass and the batch."""
         owner_entity_id = str(owner_plan["owner_entity_id"])
         owner_reference = self._owner_reference(storage, clip_uid, owner_entity_id)
-        states = [
-            self._attribute_selection(
-                shard,
-                storage,
-                clip_uid,
-                owner_plan,
-                owner_reference,
-                discovery,
-                index,
-                f"a{int(owner_plan['attribute_id_start']) + index}",
-                discovery_job_id,
-            )
+        attribute_ids = [
+            f"a{int(owner_plan['attribute_id_start']) + index}"
             for index in range(len(discovery.attributes))
         ]
+        states = self._replay_attribute_selections(
+            shard,
+            storage,
+            clip_uid,
+            owner_plan,
+            owner_reference,
+            discovery,
+            attribute_ids,
+            discovery_job_id,
+        )
+        # Durable marker work stays on this thread and in annotation order, so
+        # parallel replay never changes what is published or when.
+        for attribute_id, replay in zip(attribute_ids, states):
+            self._verify_or_write_selection_marker(
+                shard, clip_uid, owner_plan, attribute_id, replay
+            )
         pending = [
             state.pending_job for state in states if state.pending_job is not None
         ]
@@ -3752,6 +3934,41 @@ class SubjectAttributeEpochRunner:
             "attributes": attributes,
         }
 
+    def _owner_prefix(
+        self, shard: str, clip_uid: str, owner_entity_id: str
+    ) -> dict[str, Any]:
+        """The frozen owner prefix: plan, discovery and discovery job id.
+
+        All three are fixed by the time an owner is advanced - the clip plan and
+        owner plan are frozen plans, and the discovery is a durable receipt - and
+        none of them can be changed by a later review, completion or bbox receipt.
+        Caching them removes repeated plan derivation and discovery validation
+        from every receipt boundary. Receipt-driven state is never cached here.
+        """
+        key = (shard, clip_uid, owner_entity_id)
+        cached = self._owner_context_cache.get(key)
+        if cached is not None:
+            self.replay_counters["owner_context_cache_hit"] += 1
+            return cached
+        self.replay_counters["owner_context_cache_miss"] += 1
+        plan = self._clip_plan(shard, clip_uid)
+        owner_plan = self._owner_plan_for(shard, plan, owner_entity_id)
+        discovery_payload = self._discovery_payload(shard, clip_uid, owner_plan)
+        discovery = SubjectAttributeDiscovery.model_validate(
+            discovery_payload.get("discovery")
+        )
+        payload = {
+            "owner_plan": owner_plan,
+            "discovery": discovery,
+            "discovery_job_id": self._expected_discovery_job(
+                shard, clip_uid, owner_plan
+            ).job_id(),
+        }
+        if len(self._owner_context_cache) >= self._owner_context_cache_limit:
+            self._owner_context_cache.pop(next(iter(self._owner_context_cache)), None)
+        self._owner_context_cache[key] = payload
+        return payload
+
     def _advance_attributes(
         self, shard: str, storage: RunStorage, clip_uid: str, owner_entity_id: str
     ) -> list[ModelJob]:
@@ -3763,15 +3980,10 @@ class SubjectAttributeEpochRunner:
         is the next job, and once every call is paid the legacy artifact is
         published together with the processed owner outcome.
         """
-        plan = self._clip_plan(shard, clip_uid)
-        owner_plan = self._owner_plan_for(shard, plan, owner_entity_id)
-        discovery_payload = self._discovery_payload(shard, clip_uid, owner_plan)
-        discovery = SubjectAttributeDiscovery.model_validate(
-            discovery_payload.get("discovery")
-        )
-        discovery_job_id = self._expected_discovery_job(
-            shard, clip_uid, owner_plan
-        ).job_id()
+        prefix = self._owner_prefix(shard, clip_uid, owner_entity_id)
+        owner_plan = prefix["owner_plan"]
+        discovery = prefix["discovery"]
+        discovery_job_id = prefix["discovery_job_id"]
         context = self._rank0_context(
             shard, storage, clip_uid, owner_plan, discovery, discovery_job_id
         )
@@ -3788,6 +4000,7 @@ class SubjectAttributeEpochRunner:
                 shard, storage, clip_uid, owner_entity_id, owner_plan, outcome
             )
             return self._advance_clip(shard, storage, clip_uid)
+        self.replay_counters["owner_graph_rebuilds"] += 1
         graph = self._owner_graph(
             shard, storage, clip_uid, owner_plan, context
         )
@@ -5078,7 +5291,7 @@ class SubjectAttributeEpochRunner:
             attribute_id,
             discovery_job_id,
         )
-        state = self._replay_attribute_selection(
+        state = self._replay_or_cached_selection(
             shard,
             storage,
             clip_uid,
