@@ -370,7 +370,7 @@ def test_full_cli_dry_run_does_not_require_models(tmp_path):
     assert result["shards"] == [0]
     assert result["request_workers"] == 1
     assert result["canonical_workers"] == 16
-    assert result["mimo_model"] == "mimo-v2.6-flash-rl"
+    assert result["mimo_model"] == "mimo-v2.5"
     assert result["gpu_ids"] == [str(i) for i in range(8)]
     assert result["model_call_count"] == 0
 
