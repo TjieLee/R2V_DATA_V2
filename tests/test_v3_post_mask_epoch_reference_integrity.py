@@ -8,9 +8,12 @@ may ever reach a Qwen judge.
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import os
+import threading
+from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -88,12 +91,15 @@ def _storage_variant(
     return config, storage
 
 
-def _runner(config: Any, storage: Any, tmp_path: Path) -> Any:
+def _runner(
+    config: Any, storage: Any, tmp_path: Path, *, cpu_workers: int | None = None
+) -> Any:
     return ReferenceIntegrityEpochRunner(
         config,
         {SHARD: storage},
         GroupLedger(tmp_path / "ledger"),
         eligible_clip_uids_by_shard={SHARD: ["clip-1"]},
+        cpu_workers=cpu_workers,
     )
 
 
@@ -2255,6 +2261,10 @@ def test_finalize_still_creates_the_new_continuation_input(
     required: list[str] = []
 
     real_freeze = runner._create_or_verify_review_input
+    # A worker prepares a new review input purely; the main thread freezes it
+    # through the prepared-publication point. Both are a freeze from this test's
+    # point of view, and either one is the only legitimate place one can happen.
+    real_publish_prepared = runner._publish_prepared_review_input
     # Production reaches the strict require through the *_derived* entry, so
     # that is the only patch target that can observe a real require replay.
     real_require = runner._require_review_input_derived
@@ -2263,11 +2273,18 @@ def test_finalize_still_creates_the_new_continuation_input(
         frozen.append(str(kwargs.get("variant") or "final"))
         return real_freeze(*args, **kwargs)
 
+    def freeze_prepared(prepared: Any) -> Any:
+        frozen.append("final")
+        return real_publish_prepared(prepared)
+
     def require(*args: Any, **kwargs: Any) -> Any:
         required.append(str(kwargs.get("variant") or "final"))
         return real_require(*args, **kwargs)
 
     monkeypatch.setattr(runner, "_create_or_verify_review_input", freeze)
+    monkeypatch.setattr(
+        runner, "_publish_prepared_review_input", freeze_prepared
+    )
     monkeypatch.setattr(runner, "_require_review_input_derived", require)
 
     executor = _SerialQwenExecutor(runner, judge)
@@ -3455,3 +3472,568 @@ def test_inherited_marker_is_verified_before_it_is_trusted(
     inherited._publish_clip_if_terminal(SHARD, storage, "clip-1")
     assert seen["branch_entities"] == verified_once, "round two must not re-verify"
     assert inherited.entity_verify_counters["entity_verify_cache_hit"] >= 2
+
+
+# ---------------------------------------------------------------------------
+# Parallel seed CPU preparation
+# ---------------------------------------------------------------------------
+
+
+def _extended_clip_fixture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    run_name: str,
+    *,
+    review_entity_ids: tuple[str, ...] = ("e2", "e3"),
+    cpu_workers: int | None = None,
+) -> tuple[Any, Any, Any]:
+    """One clip: ``e1`` CPU-terminal plus ``review_entity_ids`` needing review.
+
+    Extends the shared ready-pair fixture - already a validated clip - with the
+    extra entities. Nothing is mocked: the extra entities go through the real
+    plan builder, the real CPU policy and the real review derivation.
+
+    Re-annotating a clip invalidates its downstream artifacts, so the frames,
+    masks, coverage and references are all rebuilt here in the order the shared
+    fixture uses.
+    """
+    import hashlib as _hashlib
+
+    from r2v_data_v2.reconciliation import write_json_atomic
+    from r2v_data_v2.v3.mask_codec import encode_binary_mask
+    from r2v_data_v2.v3.schemas import (
+        AnnotationEntity,
+        AnnotationState,
+        CoverageState,
+        PairingState,
+        ReferencesState,
+        SampledFrame,
+        SampledFramesArtifact,
+        TrackedEntityMasks,
+        TrackedMaskFrame,
+        TrackedMasksArtifact,
+    )
+
+    config, storage = _storage_variant(tmp_path, monkeypatch, run_name)
+    entity_ids = ("e1", *review_entity_ids)
+
+    annotation = [
+        AnnotationEntity(
+            entity_id="e1",
+            reference_type="subject",
+            phrase="a person in an orange cap",
+            grounding_prompt="person in orange cap near center",
+        )
+    ]
+    for entity_id in review_entity_ids:
+        annotation.append(
+            AnnotationEntity(
+                entity_id=entity_id,
+                reference_type="object",
+                phrase=CLEAN_OBJECT_PHRASE,
+                grounding_prompt=f"{CLEAN_OBJECT_PHRASE} beside the person",
+            )
+        )
+    storage.write_annotation(
+        "clip-1",
+        AnnotationState(
+            status="ready",
+            instruction_template="{{entity_1}} holds {{entity_2}}.",
+            entities=annotation,
+        ),
+    )
+
+    frames_dir = storage.frames_dir("clip-1")
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    frame_records = []
+    for slot in range(10):
+        frame_path = frames_dir / f"{slot:02d}.jpg"
+        Image.new("RGB", (32, 24), (80, 100, 120)).save(frame_path)
+        frame_records.append(
+            SampledFrame(
+                slot=slot,
+                source_frame_index=slot,
+                timestamp_seconds=float(slot),
+                image_path=f"frames/{slot:02d}.jpg",
+                sha256=_hashlib.sha256(frame_path.read_bytes()).hexdigest(),
+            )
+        )
+    write_json_atomic(
+        storage.frames_manifest_path("clip-1"),
+        SampledFramesArtifact(
+            clip_uid="clip-1", width=32, height=24, frames=frame_records
+        ).model_dump(mode="json"),
+    )
+
+    mask = np.zeros((24, 32), dtype=bool)
+    mask[4:20, 6:26] = True
+    empty = encode_binary_mask(np.zeros_like(mask))
+    tracks: dict[str, Any] = {}
+    for entity in annotation:
+        tracks[entity.entity_id] = TrackedEntityMasks(
+            status="ready",
+            reference_type=entity.reference_type,
+            grounding_prompt=entity.grounding_prompt,
+            backend_object_ids=["1"],
+            frames=[
+                TrackedMaskFrame(
+                    slot=slot,
+                    present=slot == 0,
+                    confidence=0.9 if slot == 0 else None,
+                    backend_confidences=[0.9] if slot == 0 else [],
+                    backend_object_ids=["1"] if slot == 0 else [],
+                    area_pixels=int(mask.sum()) if slot == 0 else 0,
+                    area_ratio=float(mask.mean()) if slot == 0 else 0.0,
+                    bbox_xyxy=(6, 4, 26, 20) if slot == 0 else None,
+                    rle=encode_binary_mask(mask) if slot == 0 else empty,
+                )
+                for slot in range(10)
+            ],
+        )
+    storage.write_masks(
+        "clip-1",
+        TrackedMasksArtifact(clip_uid="clip-1", width=32, height=24, entities=tracks),
+    )
+    storage.write_coverage(
+        "clip-1",
+        CoverageState(
+            passed=True,
+            qualifying_entity_ids=list(entity_ids),
+            required_visible_frames=7,
+            entity_visibility_summary={
+                entity_id: legacy_integrity._visibility() for entity_id in entity_ids
+            },
+        ),
+    )
+
+    references = []
+    for index, entity_id in enumerate(entity_ids, start=1):
+        path = storage.selected_path("clip-1", f"{entity_id}.png")
+        rgba = np.zeros((64, 64, 4), dtype=np.uint8)
+        rgba[..., :3] = (30 * index, 90, 140)
+        rgba[..., 3] = 255
+        Image.fromarray(rgba).save(path)
+        references.append(
+            legacy_integrity._ready_reference(
+                entity_id,
+                storage.relative_artifact_path(path),
+                reference_scope="full" if entity_id == "e1" else "local",
+            )
+        )
+    storage.write_references_and_pairing(
+        "clip-1",
+        ReferencesState(entities=references),
+        PairingState(
+            status="ready",
+            retained_entity_ids=list(entity_ids),
+            # Tokens follow the legacy <ref_{reference_type}_{n}> convention the
+            # pairing schema validates.
+            tokens={
+                entity_id: (
+                    f"<ref_subject_{index}>"
+                    if entity_id == "e1"
+                    else f"<ref_object_{index - 1}>"
+                )
+                for index, entity_id in enumerate(entity_ids, start=1)
+            },
+        ),
+    )
+    return config, storage, _runner(config, storage, tmp_path, cpu_workers=cpu_workers)
+
+
+def _epoch_runner(
+    config: Any, storage: Any, ledger_root: Path, *, cpu_workers: int | None = None
+) -> Any:
+    """A runner on its own ledger root, so two runs stay independent."""
+    ledger_root.parent.mkdir(parents=True, exist_ok=True)
+    return ReferenceIntegrityEpochRunner(
+        config,
+        {SHARD: storage},
+        GroupLedger(ledger_root),
+        eligible_clip_uids_by_shard={SHARD: ["clip-1"]},
+        cpu_workers=cpu_workers,
+    )
+
+
+def _job_snapshot(jobs: Sequence[Any]) -> list[tuple[str, str, str]]:
+    return sorted(
+        (job.job_id(), job.input_digest, str(dict(job.target)["entity_id"]))
+        for job in jobs
+    )
+
+
+def _seed_snapshot(
+    runner: Any, storage: Any, entity_ids: Sequence[str]
+) -> dict[str, Any]:
+    """Every durable artifact one seed invocation can produce."""
+    anchors: dict[str, Any] = {}
+    contexts: dict[str, Any] = {}
+    markers: dict[str, Any] = {}
+    for entity_id in entity_ids:
+        anchor_path = runner._review_input_path(SHARD, "clip-1", entity_id, "final")
+        anchors[entity_id] = (
+            json.loads(anchor_path.read_text(encoding="utf-8"))
+            if anchor_path.is_file()
+            else None
+        )
+        context_path = storage.selected_path(
+            "clip-1", f"integrity_context_{entity_id}.png"
+        )
+        contexts[entity_id] = (
+            hashlib.sha256(context_path.read_bytes()).hexdigest()
+            if context_path.is_file()
+            else None
+        )
+        markers[entity_id] = runner._entity_outcome(SHARD, "clip-1", entity_id)
+    return {"anchors": anchors, "contexts": contexts, "markers": markers}
+
+
+def _failing_review_derivation(
+    real: Any, entity_id: str, exc: Exception
+) -> Any:
+    """A derivation that fails for one entity and defers otherwise.
+
+    Built by a factory so no closure captures a loop variable.
+    """
+
+    def derive(
+        storage: Any, clip_uid: str, entity: Any, reference: Any, **kwargs: Any
+    ) -> Any:
+        if entity.entity_id == entity_id:
+            raise exc
+        return real(storage, clip_uid, entity, reference, **kwargs)
+
+    return derive
+
+
+def _clip_outcome(runner: Any) -> Any:
+    path = runner._clip_outcome_path(SHARD, "clip-1")
+    return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
+
+
+def _thread_guard(
+    monkeypatch: pytest.MonkeyPatch, runner: Any, storage: Any
+) -> dict[str, list[Any]]:
+    """Record which thread performs preparation and which performs publication.
+
+    Covers the durable publication surface: entity markers, review contexts,
+    raw JSON writes, clip failures and the published integrity result.
+    """
+    import r2v_data_v2.v3.post_mask_epoch_reference_integrity as module
+
+    seen: dict[str, list[Any]] = {"prepared": [], "writes": []}
+
+    real_prepare = runner._prepare_seed_entity
+
+    def prepare(*args: Any, **kwargs: Any) -> Any:
+        seen["prepared"].append(threading.get_ident())
+        return real_prepare(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "_prepare_seed_entity", prepare)
+
+    def record(owner: Any, name: str) -> None:
+        real = getattr(owner, name)
+
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            seen["writes"].append((name, threading.get_ident()))
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(owner, name, wrapper)
+
+    record(runner, "_publish_entity_marker")
+    record(runner, "_publish_review_context")
+    record(runner, "_fail_clip_terminal")
+    record(storage, "write_reference_integrity_result")
+    record(module, "_write_json_once")
+    return seen
+
+
+def test_seed_preparation_overlaps_across_workers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two preparations must be inside the expensive step at the same time.
+
+    Both review entities are gated on a real preparation point, so the gate can
+    only open if they run concurrently. A serial preparation blocks on the first
+    entrant and the bounded barrier timeout turns that into a failure.
+    """
+    _config, _storage, runner = _extended_clip_fixture(
+        tmp_path, monkeypatch, "run-seed-overlap", cpu_workers=2
+    )
+
+    barrier = threading.Barrier(2, timeout=30.0)
+    entrants: list[int] = []
+    lock = threading.Lock()
+    real_encode = runner._encode_review_context
+
+    def gated(
+        storage: Any, clip_uid: str, entity_id: str, context: Any, *, variant: str
+    ) -> Any:
+        with lock:
+            entrants.append(threading.get_ident())
+        barrier.wait()
+        return real_encode(storage, clip_uid, entity_id, context, variant=variant)
+
+    monkeypatch.setattr(runner, "_encode_review_context", gated)
+    jobs = runner.seed_jobs()
+
+    assert len(entrants) == 2, f"both preparations reached the gate: {entrants}"
+    assert len(set(entrants)) == 2, f"they ran on two threads: {entrants}"
+    assert _job_snapshot(jobs) == sorted(
+        _job_snapshot(jobs)
+    ), "the seed still returned its deterministic jobs"
+    assert len(jobs) == 2, jobs
+    assert runner.seed_prepare_counters["seed_prepare_peak_inflight"] >= 2
+
+
+def test_seed_durable_writes_stay_on_the_main_thread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Preparation is read-only: every durable write happens on the seed thread."""
+    _config, storage, runner = _extended_clip_fixture(
+        tmp_path, monkeypatch, "run-seed-main-thread", cpu_workers=4
+    )
+    main = threading.get_ident()
+    seen = _thread_guard(monkeypatch, runner, storage)
+
+    jobs = runner.seed_jobs()
+
+    workers = set(seen["prepared"])
+    assert workers, "at least one preparation ran on a worker"
+    assert main not in workers, "preparation never runs on the seed thread here"
+    assert len(workers) >= 2, f"more than one worker thread was used: {workers}"
+
+    labels = [label for label, _tid in seen["writes"]]
+    assert labels, "at least one durable publication happened"
+    off_main = [(label, tid) for label, tid in seen["writes"] if tid != main]
+    assert off_main == [], f"durable writes off the seed thread: {off_main}"
+    assert len(jobs) == 2, jobs
+
+
+def test_parallel_seed_matches_serial_seed_exactly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pool produces exactly the single-threaded result, terminal state too."""
+    results = (
+        legacy_integrity._review(accept=True, reason="usable reference"),
+        legacy_integrity._review(accept=True, reason="usable reference"),
+    )
+    snapshots: dict[str, Any] = {}
+    clips: dict[str, Any] = {}
+    outcomes: dict[str, Any] = {}
+    for tag, workers in (("serial", 1), ("parallel", 4)):
+        config, storage, _unused = _extended_clip_fixture(
+            tmp_path, monkeypatch, f"run-equivalence-{tag}", cpu_workers=workers
+        )
+        runner = _epoch_runner(
+            config, storage, tmp_path / f"ledger-{tag}", cpu_workers=workers
+        )
+        judge = _FakeEpochJudge(results, ())
+        jobs = runner.seed_jobs()
+        if jobs:
+            _epoch_scheduler(runner, _SerialQwenExecutor(runner, judge)).run(jobs)
+        snapshots[tag] = (_job_snapshot(jobs), _seed_snapshot(runner, storage, ("e1", "e2", "e3")))
+        clips[tag] = storage.read_clip("clip-1").model_dump(mode="json")
+        outcomes[tag] = _clip_outcome(runner)
+
+    assert snapshots["serial"] == snapshots["parallel"]
+    assert clips["serial"] == clips["parallel"]
+    assert outcomes["serial"] == outcomes["parallel"]
+    assert outcomes["serial"] is not None, "the clip reached a terminal state"
+
+
+def test_failed_entity_hides_later_prepared_results(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Order still decides: e2's failure discards e3's already-prepared work.
+
+    ``e3`` is prepared concurrently with ``e2``, so this only holds because the
+    commit walks retained order and holds the clip's jobs until it completes.
+    """
+    outcomes: dict[str, Any] = {}
+    jobs_by_tag: dict[str, Any] = {}
+    for tag, workers in (("serial", 1), ("parallel", 4)):
+        config, storage, _unused = _extended_clip_fixture(
+            tmp_path, monkeypatch, f"run-failure-order-{tag}", cpu_workers=workers
+        )
+        # The ledger root holds the semantic state, so two runs need their own.
+        runner = _epoch_runner(
+            config, storage, tmp_path / f"ledger-failure-{tag}", cpu_workers=workers
+        )
+        monkeypatch.setattr(
+            runner,
+            "_derive_review_input",
+            _failing_review_derivation(
+                runner._derive_review_input,
+                "e2",
+                RuntimeError("ordinary preparation failure"),
+            ),
+        )
+        jobs_by_tag[tag] = runner.seed_jobs()
+
+        assert runner._entity_outcome(SHARD, "clip-1", "e1") is not None
+        assert runner._entity_outcome(SHARD, "clip-1", "e3") is None, (
+            "a later prepared entity must not be published"
+        )
+        assert not runner._review_input_path(
+            SHARD, "clip-1", "e3", "final"
+        ).exists(), "a later prepared review input must not be frozen"
+        outcomes[tag] = _clip_outcome(runner)
+        assert outcomes[tag] is not None
+        assert outcomes[tag]["terminal"] == "failed"
+
+    assert jobs_by_tag["serial"] == []
+    assert jobs_by_tag["parallel"] == []
+    # e1's already published delta is carried into the failure exactly as serial.
+    assert outcomes["serial"] == outcomes["parallel"]
+
+
+def test_worker_durable_error_propagates_and_never_fails_the_clip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Durable corruption raised during preparation is never a clip failure."""
+    _config, _storage, runner = _extended_clip_fixture(
+        tmp_path, monkeypatch, "run-durable-error", cpu_workers=4
+    )
+    failed_clips: list[Any] = []
+    real_fail = runner._fail_clip_terminal
+
+    def record_fail(*args: Any, **kwargs: Any) -> Any:
+        failed_clips.append(args)
+        return real_fail(*args, **kwargs)
+
+    monkeypatch.setattr(
+        runner,
+        "_derive_review_input",
+        _failing_review_derivation(
+            runner._derive_review_input,
+            "e2",
+            ReferenceIntegrityDurableError("frozen input drifted"),
+        ),
+    )
+    monkeypatch.setattr(runner, "_fail_clip_terminal", record_fail)
+
+    with pytest.raises(ReferenceIntegrityDurableError):
+        runner.seed_jobs()
+
+    assert failed_clips == [], "a durable error is not a semantic clip failure"
+    assert _clip_outcome(runner) is None, "no clip outcome is published"
+
+
+def test_parallel_seed_reuses_existing_review_inputs_read_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A second runner replays the frozen inputs read-only and writes nothing."""
+    config, storage, _unused = _extended_clip_fixture(
+        tmp_path, monkeypatch, "run-existing-input", cpu_workers=4
+    )
+    first = _epoch_runner(config, storage, tmp_path / "ledger-shared", cpu_workers=4)
+    jobs_first = first.seed_jobs()
+    assert len(jobs_first) == 2, jobs_first
+
+    second = _epoch_runner(config, storage, tmp_path / "ledger-shared", cpu_workers=4)
+    seen = _thread_guard(monkeypatch, second, storage)
+    jobs_second = second.seed_jobs()
+
+    assert _job_snapshot(jobs_second) == _job_snapshot(jobs_first)
+    assert second.seed_prepare_counters["seed_prepare_existing_review"] == 2
+    assert second.seed_prepare_counters["seed_prepare_new_review"] == 0
+    assert seen["writes"] == [], "an existing input is verified, never rewritten"
+
+
+def test_new_review_preparation_never_rederives_on_the_main_thread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pool exists to move CPU work off the seed thread, so main does none."""
+    import r2v_data_v2.v3.post_mask_epoch_reference_integrity as module
+
+    _config, _storage, runner = _extended_clip_fixture(
+        tmp_path, monkeypatch, "run-no-main-derive", cpu_workers=4
+    )
+    main = threading.get_ident()
+    evidence_idents: list[int] = []
+    encode_idents: list[int] = []
+    real_evidence = module._source_evidence
+    real_encode = runner._encode_review_context
+
+    def record_evidence(*args: Any, **kwargs: Any) -> Any:
+        evidence_idents.append(threading.get_ident())
+        return real_evidence(*args, **kwargs)
+
+    def record_encode(*args: Any, **kwargs: Any) -> Any:
+        encode_idents.append(threading.get_ident())
+        return real_encode(*args, **kwargs)
+
+    monkeypatch.setattr(module, "_source_evidence", record_evidence)
+    monkeypatch.setattr(runner, "_encode_review_context", record_encode)
+
+    jobs = runner.seed_jobs()
+
+    assert len(jobs) == 2
+    assert evidence_idents, "the worker derived the source evidence"
+    assert encode_idents, "the worker encoded the context"
+    assert main not in evidence_idents, "no source evidence lookup on the seed thread"
+    assert main not in encode_idents, "no context encoding on the seed thread"
+    assert runner.seed_prepare_counters["seed_prepare_new_review"] == 2
+
+
+def test_cpu_terminal_preparation_never_recomputes_topology_on_main(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Topology for a CPU-terminal entity is derived once, on the worker."""
+    import r2v_data_v2.v3.post_mask_epoch_reference_integrity as module
+
+    _config, _storage, runner = _extended_clip_fixture(
+        tmp_path, monkeypatch, "run-no-main-topology", cpu_workers=4
+    )
+    main = threading.get_ident()
+    calls: list[int] = []
+    real_topology = module.reference_topology_diagnostics
+
+    def topology(*args: Any, **kwargs: Any) -> Any:
+        calls.append(threading.get_ident())
+        return real_topology(*args, **kwargs)
+
+    monkeypatch.setattr(module, "reference_topology_diagnostics", topology)
+    runner.seed_jobs()
+
+    assert calls, "topology really ran"
+    assert main not in calls, "no topology pass on the seed thread"
+    assert runner._entity_outcome(SHARD, "clip-1", "e1") is not None
+
+
+def test_parallel_preparation_window_and_thread_spread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Four independent preparations really spread over the pool's threads.
+
+    One CPU-terminal entity plus three that need the review: enough independent
+    work that the bounded window must have more than one task in flight.
+    """
+    _config, _storage, runner = _extended_clip_fixture(
+        tmp_path,
+        monkeypatch,
+        "run-seed-evidence",
+        review_entity_ids=("e2", "e3", "e4"),
+        cpu_workers=4,
+    )
+    idents: list[int] = []
+    lock = threading.Lock()
+    real_prepare = runner._prepare_seed_entity
+
+    def record(*args: Any, **kwargs: Any) -> Any:
+        with lock:
+            idents.append(threading.get_ident())
+        return real_prepare(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "_prepare_seed_entity", record)
+    jobs = runner.seed_jobs()
+
+    counters = runner.seed_prepare_counters
+    assert counters["seed_prepare_tasks"] == 4
+    assert counters["seed_prepare_parallel_tasks"] == 4
+    assert counters["seed_prepare_peak_inflight"] >= 2
+    assert counters["seed_prepare_cpu_terminal"] == 1
+    assert counters["seed_prepare_new_review"] == 3
+    assert len(set(idents)) >= 2, f"distinct worker threads: {set(idents)}"
+    assert len(jobs) == 3, jobs

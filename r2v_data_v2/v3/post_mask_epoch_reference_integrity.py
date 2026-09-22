@@ -33,6 +33,7 @@ import json
 import threading
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -146,6 +147,11 @@ SOURCE_ALPHA_JUDGE_FAILED_PREFIX = (
     "completion_rejected_then_alpha_integrity_judge_failed:"
 )
 MAIN_REVIEW_JUDGE_FAILED_PREFIX = "integrity_judge_failed:"
+
+#: Semantic kinds of one prepared seed entity. Execution-only.
+SEED_PREPARE_EXISTING_REVIEW = "existing_review"
+SEED_PREPARE_CPU_TERMINAL = "cpu_terminal"
+SEED_PREPARE_NEW_REVIEW = "new_review"
 
 CLIP_FRESH_TARGET = "fresh_target"
 CLIP_EXISTING = "existing"
@@ -279,6 +285,45 @@ class _DerivedReviewInput:
     context_png_bytes: bytes
     context_sha256: str
     source_frame_path: Path
+
+
+@dataclass(frozen=True)
+class _PreparedSeedEntity:
+    """One seed entity's CPU work, computed away from the publication thread.
+
+    A worker thread produces this purely: it reads clip artifacts, loads the
+    reference image, decodes the source mask, builds the Qwen context image,
+    encodes and hashes it, and constructs the exact ``ModelJob`` - but it writes
+    nothing. The seed/main thread then applies it in canonical order, which is
+    what keeps every durable write on one thread.
+
+    Execution-only: never part of a ModelJob, a receipt or any public schema.
+    """
+
+    shard: str
+    clip_uid: str
+    entity_id: str
+    kind: str
+    entity: Any
+    reference: Any
+    marker: dict[str, Any] | None = None
+    job: ModelJob | None = None
+    derived_review_input: _DerivedReviewInput | None = None
+
+
+@dataclass(frozen=True)
+class _SeedClipPlan:
+    """Canonical-order seed work for one fresh clip. Execution-only.
+
+    Built on the seed/main thread from the clip snapshot the serial loop also
+    used, so preparation workers never observe a partially published clip.
+    """
+
+    shard: str
+    storage: RunStorage
+    clip_uid: str
+    entry: Mapping[str, Any]
+    entities: tuple[tuple[str, Any, Any], ...]
 
 
 @dataclass(frozen=True)
@@ -555,6 +600,17 @@ class ReferenceIntegrityEpochRunner:
         ] = OrderedDict()
         self._verified_marker_limit = 512
         self._verified_marker_lock = threading.Lock()
+        # Execution-only seed-preparation telemetry. Never durable stage stats.
+        self._seed_prepare_lock = threading.Lock()
+        self.seed_prepare_counters: dict[str, int] = {
+            "seed_prepare_tasks": 0,
+            "seed_prepare_batches": 0,
+            "seed_prepare_parallel_tasks": 0,
+            "seed_prepare_peak_inflight": 0,
+            "seed_prepare_cpu_terminal": 0,
+            "seed_prepare_existing_review": 0,
+            "seed_prepare_new_review": 0,
+        }
         self.entity_verify_counters: dict[str, int] = {
             "entity_verify_cache_hit": 0,
             "entity_verify_cache_miss": 0,
@@ -2190,6 +2246,191 @@ class ReferenceIntegrityEpochRunner:
             "delta": branch.delta,
         }
 
+    def _bump_seed_prepare_counter(self, key: str, delta: int = 1) -> None:
+        with self._seed_prepare_lock:
+            self.seed_prepare_counters[key] += delta
+
+    def _note_seed_prepare_inflight(self, inflight: int) -> None:
+        with self._seed_prepare_lock:
+            self.seed_prepare_counters["seed_prepare_peak_inflight"] = max(
+                self.seed_prepare_counters["seed_prepare_peak_inflight"], inflight
+            )
+
+    def _prepare_seed_entity(
+        self,
+        shard: str,
+        storage: RunStorage,
+        clip_uid: str,
+        plan_entry: Mapping[str, Any],
+        entity: Any,
+        reference: Any,
+    ) -> _PreparedSeedEntity:
+        """Purely prepare one seed entity, writing nothing durable.
+
+        This is what a preparation worker thread runs. Allowed: read clip and
+        reference artifacts, read the frozen anchor, look up source evidence,
+        decode the mask, load the reference image, compute topology, build and
+        encode the Qwen context image, hash the final reference, derive the
+        anchor and build the exact ``ModelJob``. Forbidden: publishing a context
+        PNG, an anchor, an entity marker, a clip outcome or a clip failure, and
+        any ledger, stage-count or pending-map mutation. Publication is
+        ``_apply_prepared_seed_entity`` on the seed/main thread.
+        """
+        entity_id = str(entity.entity_id)
+        review_input_path = self._review_input_path(shard, clip_uid, entity_id)
+        if _read_json(review_input_path) is not None:
+            # A durable review input already proves this entity entered the main
+            # review, so re-verify the whole frozen model input before re-issuing
+            # the same deterministic job. Without this fast path a missing final
+            # reference would surface as an ordinary CPU failure instead of
+            # frozen-input corruption. The require path performs exactly the
+            # verification the create-or-verify path performs once the anchor
+            # exists, and it can never create or repair it.
+            _input_reference, _anchor, job = self._require_review_inputs_and_job(
+                shard=shard,
+                storage=storage,
+                clip_uid=clip_uid,
+                plan_entry=plan_entry,
+                entity=entity,
+                reference=reference,
+                variant=VARIANT_FINAL,
+            )
+            self._bump_seed_prepare_counter("seed_prepare_existing_review")
+            return _PreparedSeedEntity(
+                shard=shard,
+                clip_uid=clip_uid,
+                entity_id=entity_id,
+                kind=SEED_PREPARE_EXISTING_REVIEW,
+                entity=entity,
+                reference=reference,
+                job=job,
+            )
+        final_image = _load_reference_image(storage, str(reference.image_path))
+        diagnostics = reference_topology_diagnostics(final_image)
+        expected = self._expected_entity_marker(
+            clip_uid, entity, reference, diagnostics
+        )
+        if expected is not None:
+            self._bump_seed_prepare_counter("seed_prepare_cpu_terminal")
+            return _PreparedSeedEntity(
+                shard=shard,
+                clip_uid=clip_uid,
+                entity_id=entity_id,
+                kind=SEED_PREPARE_CPU_TERMINAL,
+                entity=entity,
+                reference=reference,
+                marker=expected,
+            )
+        # The entity needs the main review: derive its full frozen input purely,
+        # so the job identity and its provenance are decided before any model
+        # call. A broken reference or source evidence is still an ordinary legacy
+        # CPU failure here, so the derivation is deliberately not wrapped.
+        derived = self._derive_review_input(
+            storage, clip_uid, entity, reference, variant=VARIANT_FINAL
+        )
+        job = self._expected_review_job(
+            shard, entity, reference, derived.anchor, variant=VARIANT_FINAL
+        )
+        self._bump_seed_prepare_counter("seed_prepare_new_review")
+        return _PreparedSeedEntity(
+            shard=shard,
+            clip_uid=clip_uid,
+            entity_id=entity_id,
+            kind=SEED_PREPARE_NEW_REVIEW,
+            entity=entity,
+            reference=reference,
+            job=job,
+            derived_review_input=derived,
+        )
+
+    def _publish_prepared_review_input(
+        self, prepared: _PreparedSeedEntity
+    ) -> dict[str, Any]:
+        """MAIN THREAD ONLY: publish one worker's purely derived review input.
+
+        Only the durable writes happen here - the derivation is never repeated,
+        so no source evidence lookup, mask decode, context construction or PNG
+        encoding runs on this thread.
+        """
+        derived = prepared.derived_review_input
+        if derived is None:
+            raise ReferenceIntegrityDurableError(
+                f"prepared review input is missing for "
+                f"{prepared.clip_uid}/{prepared.entity_id}"
+            )
+        path = self._review_input_path(
+            prepared.shard, prepared.clip_uid, prepared.entity_id, VARIANT_FINAL
+        )
+        existing = _read_json(path)
+        if existing is None:
+            self._publish_review_context(
+                derived.context_path,
+                derived.context_png_bytes,
+                derived.context_sha256,
+            )
+            _write_json_once(path, derived.anchor)
+            return derived.anchor
+        # The anchor appeared by publication time (a crash window between the
+        # context and the anchor): verify it instead of silently replacing it.
+        self._verify_review_context_bytes(
+            derived.context_path, derived.context_sha256
+        )
+        if existing != derived.anchor:
+            raise ReferenceIntegrityDurableError(
+                f"frozen Reference Integrity review input drifted for "
+                f"{prepared.clip_uid}/{prepared.entity_id}"
+            )
+        return existing
+
+    def _apply_prepared_seed_entity(
+        self, prepared: _PreparedSeedEntity
+    ) -> list[ModelJob]:
+        """MAIN THREAD ONLY: durably apply one prepared seed entity."""
+        if prepared.kind == SEED_PREPARE_EXISTING_REVIEW:
+            # The worker verified the frozen input read-only and rebuilt the same
+            # deterministic job, so there is nothing to publish.
+            row: list[ModelJob] = []
+            if prepared.job is not None:
+                row.append(prepared.job)
+            return row
+        if prepared.kind == SEED_PREPARE_CPU_TERMINAL:
+            marker = prepared.marker
+            if marker is None:
+                raise ReferenceIntegrityDurableError(
+                    f"prepared CPU outcome vanished for "
+                    f"{prepared.clip_uid}/{prepared.entity_id}"
+                )
+            # Same publication point as the model finalizer, so a CPU terminal
+            # marker participates in this invocation's verified-marker cache.
+            self._publish_entity_marker(
+                prepared.shard, prepared.clip_uid, prepared.entity_id, marker
+            )
+            return []
+        if prepared.kind == SEED_PREPARE_NEW_REVIEW:
+            anchor = self._publish_prepared_review_input(prepared)
+            published = self._expected_review_job(
+                prepared.shard,
+                prepared.entity,
+                prepared.reference,
+                anchor,
+                variant=VARIANT_FINAL,
+            )
+            prepared_job = prepared.job
+            if prepared_job is None or published.job_id() != prepared_job.job_id():
+                raise ReferenceIntegrityDurableError(
+                    f"published review job differs from the prepared one for "
+                    f"{prepared.clip_uid}/{prepared.entity_id}"
+                )
+            if published.input_digest != prepared_job.input_digest:
+                raise ReferenceIntegrityDurableError(
+                    f"published review input digest differs from the prepared one "
+                    f"for {prepared.clip_uid}/{prepared.entity_id}"
+                )
+            return [published]
+        raise ReferenceIntegrityEpochError(
+            f"unsupported prepared seed kind {prepared.kind!r}"
+        )
+
     def _advance_entity(
         self,
         shard: str,
@@ -2197,39 +2438,23 @@ class ReferenceIntegrityEpochRunner:
         clip: Any,
         entity: Any,
         reference: Any,
+        plan_entry: Mapping[str, Any] | None = None,
     ) -> list[ModelJob]:
-        """Terminal CPU marker, or the deterministic main review job to run."""
-        review_input_path = self._review_input_path(
-            shard, clip.clip_uid, entity.entity_id
-        )
-        if _read_json(review_input_path) is not None:
-            # A durable review input already proves this entity entered the main
-            # review, so re-verify the whole frozen model input before re-issuing
-            # the same deterministic job. Without this fast path a missing final
-            # reference would surface as an ordinary CPU failure instead of
-            # frozen-input corruption.
-            anchor = self._create_or_verify_review_input(
-                shard, storage, clip.clip_uid, entity, reference
+        """Terminal CPU marker, or the deterministic main review job to run.
+
+        The single-threaded prepare-then-apply form: it is the same two halves
+        the parallel seed uses, so the semantic policy exists exactly once.
+        """
+        return self._apply_prepared_seed_entity(
+            self._prepare_seed_entity(
+                shard,
+                storage,
+                clip.clip_uid,
+                plan_entry or {},
+                entity,
+                reference,
             )
-            return [self._expected_review_job(shard, entity, reference, anchor)]
-        final_image = _load_reference_image(storage, str(reference.image_path))
-        diagnostics = reference_topology_diagnostics(final_image)
-        expected = self._expected_entity_marker(
-            clip.clip_uid, entity, reference, diagnostics
         )
-        if expected is not None:
-            # Same publication point as the model finalizer, so a CPU terminal
-            # marker participates in this invocation's verified-marker cache.
-            self._publish_entity_marker(
-                shard, clip.clip_uid, entity.entity_id, expected
-            )
-            return []
-        # The entity needs the main review: freeze its full input first, so the
-        # job identity and its provenance are durable before any model call.
-        anchor = self._create_or_verify_review_input(
-            shard, storage, clip.clip_uid, entity, reference
-        )
-        return [self._expected_review_job(shard, entity, reference, anchor)]
 
     # -- review execution ------------------------------------------------------
 
@@ -3928,6 +4153,116 @@ class ReferenceIntegrityEpochRunner:
         self._publish_clip_if_terminal(shard, storage, job.clip_uid)
         return ()
 
+    def _clip_seed_targets(
+        self,
+        shard: str,
+        storage: RunStorage,
+        clip_uid: str,
+        entry: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any], list[str]] | None:
+        """MAIN THREAD ONLY: the entities one fresh clip still needs seeded.
+
+        ``None`` means the clip needs no work at all - it is not a fresh target,
+        or it is already terminal. Otherwise the retained entity ids that have no
+        durable outcome yet, in the frozen plan's order. The clip snapshot is
+        taken once here, exactly where the serial loop took it, so workers read
+        the same pre-publication state.
+        """
+        if entry.get("classification") != CLIP_FRESH_TARGET:
+            return None
+        if self._clip_outcome_path(shard, clip_uid).is_file():
+            return None
+        clip = storage.read_clip(clip_uid)
+        references_by_id = {item.entity_id: item for item in clip.references.entities}
+        entities_by_id = {
+            item.entity_id: item
+            for item in (
+                clip.annotation.entities if clip.annotation is not None else []
+            )
+        }
+        retained = [
+            entity_id
+            for entity_id in entry.get("retained_entity_ids", [])
+            if self._entity_outcome(shard, clip_uid, entity_id) is None
+        ]
+        return entities_by_id, references_by_id, retained
+
+    def _commit_prepared_clip(
+        self,
+        shard: str,
+        storage: RunStorage,
+        clip_uid: str,
+        prepared: Sequence[Any],
+    ) -> list[ModelJob]:
+        """MAIN THREAD ONLY: apply one clip's prepared entities in canonical order.
+
+        Results are applied in retained order and the clip's jobs are held until
+        the whole clip succeeds, so the first failure makes the clip terminal
+        exactly as the serial loop did: any later prepared result is discarded
+        unpublished, no ModelJob is contributed by this clip, and the exception
+        propagates to the caller that owns the clip-failure decision.
+
+        A result slot may carry the exception its preparation raised, which is
+        re-raised at that entity's position so completion order cannot reorder
+        failures.
+        """
+        jobs: list[ModelJob] = []
+        for item in prepared:
+            if isinstance(item, BaseException):
+                raise item
+            jobs.extend(self._apply_prepared_seed_entity(item))
+        self._publish_clip_if_terminal(shard, storage, clip_uid)
+        return jobs
+
+    def _prepare_seed_entities(
+        self,
+        tasks: Sequence[tuple[str, Any, str, Mapping[str, Any], Any, Any]],
+    ) -> list[Any]:
+        """Prepare every task with bounded concurrency, in submission order.
+
+        Returns one slot per task - the prepared entity, or the exception its
+        preparation raised - always ordered by task, never by completion, so the
+        caller commits deterministically. The window is bounded so a large shard
+        cannot retain an unbounded number of derived context PNG buffers.
+
+        ``cpu_workers <= 1`` takes the direct serial path, which produces exactly
+        the single-threaded result without creating a pool.
+        """
+        results: list[Any] = [None] * len(tasks)
+        if self.cpu_workers <= 1:
+            for index, task in enumerate(tasks):
+                self._bump_seed_prepare_counter("seed_prepare_tasks")
+                try:
+                    results[index] = self._prepare_seed_entity(*task)
+                except Exception as exc:  # noqa: BLE001 - re-raised in order
+                    results[index] = exc
+            return results
+        max_pending = max(self.cpu_workers, self.cpu_workers * 2)
+        with ThreadPoolExecutor(
+            max_workers=self.cpu_workers, thread_name_prefix="ri-seed"
+        ) as pool:
+            pending: dict[Any, int] = {}
+            next_index = 0
+            while next_index < len(tasks) or pending:
+                while next_index < len(tasks) and len(pending) < max_pending:
+                    future = pool.submit(
+                        self._prepare_seed_entity, *tasks[next_index]
+                    )
+                    pending[future] = next_index
+                    next_index += 1
+                    self._bump_seed_prepare_counter("seed_prepare_tasks")
+                    self._bump_seed_prepare_counter("seed_prepare_parallel_tasks")
+                self._note_seed_prepare_inflight(len(pending))
+                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                self._bump_seed_prepare_counter("seed_prepare_batches")
+                for future in done:
+                    index = pending.pop(future)
+                    try:
+                        results[index] = future.result()
+                    except Exception as exc:  # noqa: BLE001 - re-raised in order
+                        results[index] = exc
+        return results
+
     def _advance_clip(
         self,
         shard: str,
@@ -3940,34 +4275,26 @@ class ReferenceIntegrityEpochRunner:
         It must not re-read or re-validate the shard plan: the seed loop holds a
         plan it has just validated, and validating it again per clip is exactly
         the quadratic work this avoids.
+
+        Kept as the single-threaded form of what the parallel seed performs per
+        clip, so the semantic policy and the commit order exist exactly once.
         """
-        if entry.get("classification") != CLIP_FRESH_TARGET:
+        targets = self._clip_seed_targets(shard, storage, clip_uid, entry)
+        if targets is None:
             return []
-        if self._clip_outcome_path(shard, clip_uid).is_file():
-            return []
-        clip = storage.read_clip(clip_uid)
-        references_by_id = {item.entity_id: item for item in clip.references.entities}
-        entities_by_id = {
-            item.entity_id: item
-            for item in (
-                clip.annotation.entities if clip.annotation is not None else []
+        entities_by_id, references_by_id, retained = targets
+        prepared = [
+            self._prepare_seed_entity(
+                shard,
+                storage,
+                clip_uid,
+                entry,
+                entities_by_id[entity_id],
+                references_by_id[entity_id],
             )
-        }
-        jobs: list[ModelJob] = []
-        for entity_id in entry.get("retained_entity_ids", []):
-            if self._entity_outcome(shard, clip_uid, entity_id) is not None:
-                continue
-            jobs.extend(
-                self._advance_entity(
-                    shard,
-                    storage,
-                    clip,
-                    entities_by_id[entity_id],
-                    references_by_id[entity_id],
-                )
-            )
-        self._publish_clip_if_terminal(shard, storage, clip_uid)
-        return jobs
+            for entity_id in retained
+        ]
+        return self._commit_prepared_clip(shard, storage, clip_uid, prepared)
 
     # -- CPU replay entry point ------------------------------------------------
 
@@ -3978,7 +4305,10 @@ class ReferenceIntegrityEpochRunner:
         already terminal is skipped, so the same frozen state always yields the
         same job ids.
         """
-        jobs: list[ModelJob] = []
+        # Phase 1, main thread: validate each shard plan once and collect every
+        # fresh clip's seed targets in canonical order. One pool serves the whole
+        # invocation across all clips, so single-entity clips still fan out.
+        records: list[_SeedClipPlan] = []
         for shard in sorted(self.storages):
             # _plan already fully validates an existing durable plan and
             # constructs a new one from live validated inputs, so re-reading and
@@ -3989,17 +4319,55 @@ class ReferenceIntegrityEpochRunner:
             clips = plan.get("clips", {})
             for clip_uid in sorted(clips):
                 entry = clips[clip_uid]
-                if entry.get("classification") != CLIP_FRESH_TARGET:
+                targets = self._clip_seed_targets(shard, storage, clip_uid, entry)
+                if targets is None:
                     continue
-                if self._clip_outcome_path(shard, clip_uid).is_file():
-                    continue
-                try:
-                    jobs.extend(self._advance_clip(shard, storage, clip_uid, entry))
-                except ReferenceIntegrityDurableError:
-                    # Durable corruption is never a semantic clip failure.
-                    raise
-                except Exception as exc:  # noqa: BLE001 - legacy clip isolation
-                    self._fail_clip_terminal(shard, storage, clip_uid, exc)
+                entities_by_id, references_by_id, retained = targets
+                records.append(
+                    _SeedClipPlan(
+                        shard=shard,
+                        storage=storage,
+                        clip_uid=clip_uid,
+                        entry=entry,
+                        entities=tuple(
+                            (
+                                entity_id,
+                                entities_by_id[entity_id],
+                                references_by_id[entity_id],
+                            )
+                            for entity_id in retained
+                        ),
+                    )
+                )
+
+        # Phase 1b: the expensive CPU half, on a bounded pool, read-only.
+        tasks = [
+            (record.shard, record.storage, record.clip_uid, record.entry, entity, reference)
+            for record in records
+            for _entity_id, entity, reference in record.entities
+        ]
+        prepared = self._prepare_seed_entities(tasks)
+
+        # Phase 2, main thread: commit in canonical order and own every durable
+        # write, including the clip-failure decision.
+        jobs: list[ModelJob] = []
+        cursor = 0
+        for record in records:
+            row = prepared[cursor : cursor + len(record.entities)]
+            cursor += len(record.entities)
+            try:
+                jobs.extend(
+                    self._commit_prepared_clip(
+                        record.shard, record.storage, record.clip_uid, row
+                    )
+                )
+            except ReferenceIntegrityDurableError:
+                # Durable corruption is never a semantic clip failure.
+                raise
+            except Exception as exc:  # noqa: BLE001 - legacy clip isolation
+                self._fail_clip_terminal(
+                    record.shard, record.storage, record.clip_uid, exc
+                )
         return sorted(jobs, key=lambda job: job.job_id())
 
     # -- publication -----------------------------------------------------------
