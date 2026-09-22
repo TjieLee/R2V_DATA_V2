@@ -545,6 +545,23 @@ class ReferenceIntegrityEpochRunner:
         ] = OrderedDict()
         self._review_context_limit = 256
         self._review_context_lock = threading.Lock()
+        # Execution-only: the exact durable entity markers this invocation has
+        # itself produced or strictly verified, keyed by (shard, clip, entity).
+        # It only ever short-circuits a semantic replay for a marker that was
+        # read back and compared equal first, and never substitutes for reading
+        # the durable marker. A cold runner starts empty.
+        self._verified_entity_markers: OrderedDict[
+            tuple[str, str, str], dict[str, Any]
+        ] = OrderedDict()
+        self._verified_marker_limit = 512
+        self._verified_marker_lock = threading.Lock()
+        self.entity_verify_counters: dict[str, int] = {
+            "entity_verify_cache_hit": 0,
+            "entity_verify_cache_miss": 0,
+            "entity_verify_cache_store": 0,
+            "entity_verify_cache_eviction": 0,
+            "entity_verify_marker_mismatch": 0,
+        }
         self.review_context_counters: dict[str, int] = {
             "review_context_cache_hit": 0,
             "review_context_cache_miss": 0,
@@ -2009,8 +2026,11 @@ class ReferenceIntegrityEpochRunner:
     def _write_entity_outcome(
         self, shard: str, clip_uid: str, entity_id: str, payload: Mapping[str, Any]
     ) -> None:
-        _write_json_once(
-            self._entity_outcome_path(shard, clip_uid, entity_id),
+        """The normal publication point for every newly derived entity outcome."""
+        self._publish_entity_marker(
+            shard,
+            clip_uid,
+            entity_id,
             {
                 "schema": REFERENCE_INTEGRITY_ENTITY_OUTCOME_SCHEMA,
                 "clip_uid": clip_uid,
@@ -2018,6 +2038,69 @@ class ReferenceIntegrityEpochRunner:
                 **payload,
             },
         )
+
+    def _bump_entity_verify_counter(self, key: str, delta: int = 1) -> None:
+        with self._verified_marker_lock:
+            self.entity_verify_counters[key] += delta
+
+    def _remember_verified_marker(
+        self, shard: str, clip_uid: str, entity_id: str, marker: Mapping[str, Any]
+    ) -> None:
+        """Record a marker this invocation has itself published or verified."""
+        key = (shard, clip_uid, entity_id)
+        with self._verified_marker_lock:
+            self._verified_entity_markers[key] = dict(marker)
+            self._verified_entity_markers.move_to_end(key)
+            self.entity_verify_counters["entity_verify_cache_store"] += 1
+            while len(self._verified_entity_markers) > self._verified_marker_limit:
+                self._verified_entity_markers.popitem(last=False)
+                self.entity_verify_counters["entity_verify_cache_eviction"] += 1
+
+    def _marker_already_verified(
+        self, shard: str, clip_uid: str, entity_id: str, marker: Mapping[str, Any]
+    ) -> bool:
+        """Whether this exact durable marker was already verified this invocation.
+
+        The caller must have read the marker from durable state first: this only
+        compares an already-read marker against the invocation cache, so a marker
+        that changed underneath the invocation can never be skipped.
+        """
+        key = (shard, clip_uid, entity_id)
+        with self._verified_marker_lock:
+            cached = self._verified_entity_markers.get(key)
+        if cached is not None and cached == dict(marker):
+            self._bump_entity_verify_counter("entity_verify_cache_hit")
+            return True
+        if cached is not None:
+            # The durable marker is not the one verified here: the strict
+            # verifier stays the authority and decides what it means.
+            self._bump_entity_verify_counter("entity_verify_marker_mismatch")
+        self._bump_entity_verify_counter("entity_verify_cache_miss")
+        return False
+
+    def _publish_entity_marker(
+        self,
+        shard: str,
+        clip_uid: str,
+        entity_id: str,
+        body: Mapping[str, Any],
+    ) -> None:
+        """Durably publish one entity marker, then verify and cache it.
+
+        The marker is read back through the strict reader and must equal what was
+        published, so the invocation cache can only ever hold a marker this
+        runner actually produced and confirmed on disk.
+        """
+        _write_json_once(
+            self._entity_outcome_path(shard, clip_uid, entity_id), dict(body)
+        )
+        durable = self._entity_outcome(shard, clip_uid, entity_id)
+        if durable is None or durable != dict(body):
+            raise ReferenceIntegrityDurableError(
+                f"entity outcome did not survive publication for "
+                f"{clip_uid}/{entity_id}"
+            )
+        self._remember_verified_marker(shard, clip_uid, entity_id, durable)
 
     def _entity_branch(
         self, entity: Any, reference: Any, diagnostics: Any
@@ -2135,9 +2218,10 @@ class ReferenceIntegrityEpochRunner:
             clip.clip_uid, entity, reference, diagnostics
         )
         if expected is not None:
-            _write_json_once(
-                self._entity_outcome_path(shard, clip.clip_uid, entity.entity_id),
-                expected,
+            # Same publication point as the model finalizer, so a CPU terminal
+            # marker participates in this invocation's verified-marker cache.
+            self._publish_entity_marker(
+                shard, clip.clip_uid, entity.entity_id, expected
             )
             return []
         # The entity needs the main review: freeze its full input first, so the
@@ -4181,16 +4265,25 @@ class ReferenceIntegrityEpochRunner:
                     f"clip {clip_uid!r} cannot be reconstructed: entity "
                     f"{entity_id!r} has no durable outcome"
                 )
-            self._verify_entity_branch(
-                shard,
-                storage,
-                clip,
-                plan_entry,
-                entities_by_id,
-                pre_entities,
-                pre_edit,
-                marker,
-            )
+            # Never publish from the Python cache alone: the durable marker is
+            # always read first, and the cache can only skip the expensive
+            # semantic replay for a marker that compared equal.
+            if not self._marker_already_verified(
+                shard, clip_uid, entity_id, marker
+            ):
+                self._verify_entity_branch(
+                    shard,
+                    storage,
+                    clip,
+                    plan_entry,
+                    entities_by_id,
+                    pre_entities,
+                    pre_edit,
+                    marker,
+                )
+                self._remember_verified_marker(
+                    shard, clip_uid, entity_id, marker
+                )
             markers[entity_id] = marker
         rejected_ids = {
             entity_id

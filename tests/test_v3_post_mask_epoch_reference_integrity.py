@@ -3079,3 +3079,179 @@ def test_cold_runner_never_assumes_a_cached_context(
     # The strict path still finalises correctly with no cache at all.
     cold.finalize(job, committed)
     assert cold._entity_outcome_path(SHARD, "clip-1", "e2").is_file()
+
+
+# ---------------------------------------------------------------------------
+# Terminal publication reuses the marker this invocation just published
+# ---------------------------------------------------------------------------
+
+
+def _terminal_replay_guards(
+    monkeypatch: pytest.MonkeyPatch, runner: Any
+) -> dict[str, list[Any]]:
+    """Record the expensive terminal-reconstruction work, without changing it."""
+    seen: dict[str, list[Any]] = {
+        "verified_branch": [],
+        "diagnostics": [],
+        "requires": [],
+        "marker_reads": [],
+    }
+    for name, bucket in (
+        ("_verify_entity_branch", "verified_branch"),
+        ("_review_diagnostics", "diagnostics"),
+        ("_require_review_input_derived", "requires"),
+        ("_entity_outcome", "marker_reads"),
+    ):
+        real = getattr(runner, name)
+
+        def wrapper(*args: Any, _real: Any = real, _bucket: str = bucket, **kwargs: Any) -> Any:
+            seen[_bucket].append(True)
+            return _real(*args, **kwargs)
+
+        monkeypatch.setattr(runner, name, wrapper)
+    return seen
+
+
+def _committed_review(runner: Any, judge: Any) -> tuple[Any, Any]:
+    """Seed, run and commit one main review job without finalising it."""
+    job = _runnable_job(runner, "final")
+
+    def no_finalize(job: Any, result: Any) -> Any:
+        return ()
+
+    _epoch_scheduler(
+        runner, _SerialQwenExecutor(runner, judge), no_finalize
+    ).run([job])
+    committed = runner.ledger.load_committed_result(job)
+    assert committed is not None
+    return job, committed
+
+
+@pytest.fixture
+def published_except_clip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Any, Any, Any, Any, Any]:
+    """A finalised entity marker whose terminal clip publication is still ahead."""
+    config, storage, runner, judge = _seeded_review_fixture(
+        tmp_path, monkeypatch, "run-marker-pending"
+    )
+    job, committed = _committed_review(runner, judge)
+    real_publish = runner._publish_clip_if_terminal
+    monkeypatch.setattr(runner, "_publish_clip_if_terminal", lambda *a, **k: None)
+    runner.finalize(job, committed)
+    monkeypatch.setattr(runner, "_publish_clip_if_terminal", real_publish)
+    assert runner._verified_entity_markers, "the marker was verified and cached"
+    return config, storage, runner, real_publish, job
+
+
+def test_main_reviewed_entity_skips_immediate_terminal_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The finalizer publishes the marker the terminal replay then reuses."""
+    _config, storage, runner, judge = _seeded_review_fixture(
+        tmp_path, monkeypatch, "run-no-replay"
+    )
+    job, committed = _committed_review(runner, judge)
+
+    seen = _terminal_replay_guards(monkeypatch, runner)
+    runner.finalize(job, committed)
+
+    # The finalizer derives the marker once, and nothing else does.
+    assert len(seen["diagnostics"]) == 1, seen["diagnostics"]
+    assert seen["marker_reads"], "the durable marker must still be read"
+    assert seen["verified_branch"] == [], seen["verified_branch"]
+    assert seen["requires"] == [], seen["requires"]
+    assert runner.entity_verify_counters["entity_verify_cache_hit"] >= 1
+    assert runner.entity_verify_counters["entity_verify_cache_miss"] == 0
+
+    clip = storage.read_clip("clip-1")
+    assert clip.reference_integrity is not None
+    assert clip.reference_integrity.status == "ready"
+    assert runner._clip_outcome_path(SHARD, "clip-1").is_file()
+
+
+def test_shape_valid_marker_tamper_is_not_hidden(
+    published_except_clip: tuple[Any, Any, Any, Any, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A changed-but-valid durable marker bypasses the cache and fails closed."""
+    _config, storage, runner, real_publish, _job = published_except_clip
+
+    marker_path = runner._entity_outcome_path(SHARD, "clip-1", "e2")
+    payload = json.loads(marker_path.read_text(encoding="utf-8"))
+    payload["delta"] = {**payload["delta"], "entities_reviewed": 99}
+    marker_path.write_text(json.dumps(payload), encoding="utf-8")
+    # Still structurally acceptable to the durable reader: only the semantic
+    # branch verification can notice.
+    assert runner._entity_outcome(SHARD, "clip-1", "e2")["delta"][
+        "entities_reviewed"
+    ] == 99
+
+    seen = _terminal_replay_guards(monkeypatch, runner)
+    with pytest.raises(ReferenceIntegrityDurableError):
+        real_publish(SHARD, storage, "clip-1")
+
+    assert seen["verified_branch"], "the strict verifier must run on a mismatch"
+    assert runner.entity_verify_counters["entity_verify_marker_mismatch"] >= 1
+    assert not runner._clip_outcome_path(SHARD, "clip-1").exists(), (
+        "no publication after a mismatch"
+    )
+
+
+def test_missing_marker_is_not_served_from_the_cache(
+    published_except_clip: tuple[Any, Any, Any, Any, Any],
+) -> None:
+    """A removed durable marker fails closed; the cache cannot substitute."""
+    _config, storage, runner, real_publish, _job = published_except_clip
+
+    runner._entity_outcome_path(SHARD, "clip-1", "e2").unlink()
+
+    # The durable reader is the only source: with the marker gone the clip is
+    # simply not terminal, so nothing is published. The cache must not stand in
+    # for the missing marker.
+    real_publish(SHARD, storage, "clip-1")
+
+    assert not runner._clip_outcome_path(SHARD, "clip-1").exists()
+    assert storage.read_clip("clip-1").reference_integrity is None
+
+
+def test_cold_runner_reverifies_the_marker_strictly(
+    published_except_clip: tuple[Any, Any, Any, Any, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A new runner on the same ledger starts empty and replays strictly."""
+    config, storage, seed_runner, _real_publish, _job = published_except_clip
+
+    cold = _runner(config, storage, seed_runner.ledger.root.parent)
+    assert cold._verified_entity_markers == {}
+
+    seen = _terminal_replay_guards(monkeypatch, cold)
+    cold._publish_clip_if_terminal(SHARD, storage, "clip-1")
+
+    assert seen["marker_reads"], "the durable marker is still read"
+    assert seen["verified_branch"], "a cold runner must verify strictly"
+    assert cold.entity_verify_counters["entity_verify_cache_miss"] >= 1
+    assert cold._clip_outcome_path(SHARD, "clip-1").is_file()
+
+
+def test_real_marker_cache_eviction_falls_back_to_strict_verification(
+    published_except_clip: tuple[Any, Any, Any, Any, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real eviction only costs CPU: the strict verifier runs instead."""
+    _config, storage, runner, real_publish, _job = published_except_clip
+
+    monkeypatch.setattr(runner, "_verified_marker_limit", 1)
+    other = runner._verified_entity_markers[(SHARD, "clip-1", "e2")]
+    runner._remember_verified_marker(SHARD, "clip-1", "e9", other)
+
+    assert runner.entity_verify_counters["entity_verify_cache_eviction"] >= 1
+    assert (SHARD, "clip-1", "e2") not in runner._verified_entity_markers
+
+    before = runner.entity_verify_counters["entity_verify_cache_hit"]
+    seen = _terminal_replay_guards(monkeypatch, runner)
+    real_publish(SHARD, storage, "clip-1")
+
+    assert seen["verified_branch"], "an evicted marker must be verified strictly"
+    assert runner.entity_verify_counters["entity_verify_cache_hit"] == before
+    assert runner._clip_outcome_path(SHARD, "clip-1").is_file()
