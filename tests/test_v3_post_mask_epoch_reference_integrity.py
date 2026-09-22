@@ -2349,3 +2349,176 @@ def test_finalize_requires_the_current_source_alpha_input(
 
     assert not alpha_input.exists(), "the alpha input must not be recreated"
     assert "_create_or_verify_review_input" not in seen
+
+
+# ---------------------------------------------------------------------------
+# Frozen-plan validation is per shard, not per clip and not per model job
+# ---------------------------------------------------------------------------
+
+
+def _record_method(
+    monkeypatch: pytest.MonkeyPatch, target: Any, name: str, seen: list[Any]
+) -> None:
+    """Record the clip_uid argument of every call to one bound method."""
+    real = getattr(target, name)
+
+    def recording(*args: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs.get("clip_uid", args[2] if len(args) > 2 else None))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(target, name, recording)
+
+
+def _seeded_review_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, run_name: str
+) -> tuple[Any, Any, Any, Any]:
+    config, storage = _main_review_fixture(tmp_path, monkeypatch, run_name)
+    judge = _fake_main_judge(
+        legacy_integrity._review(accept=True, reason="usable reference")
+    )
+    return config, storage, _runner(config, storage, tmp_path), judge
+
+
+def test_seed_validates_the_shard_plan_once_not_once_per_clip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _config, _storage, runner, _judge = _seeded_review_fixture(
+        tmp_path, monkeypatch, "run-plan-seed"
+    )
+    runner._plan(SHARD)  # freeze the plan first, like a real second invocation
+
+    per_clip: list[Any] = []
+    reconciles: list[Any] = []
+    _record_method(monkeypatch, runner, "_verify_plan_entry", per_clip)
+    _record_method(monkeypatch, runner, "_existing_plan_for_reconcile", reconciles)
+
+    jobs = runner.seed_jobs()
+
+    assert jobs, "the fixture still seeds its review job"
+    # One full validation, which verifies each clip in the shard exactly once.
+    assert runner.plan_counters["plan_full_validation_count"] == 1
+    assert len(per_clip) == 1, per_clip
+    # Neither the seed loop nor _advance_clip re-reads the shard plan.
+    assert reconciles == [], reconciles
+
+
+def test_advance_clip_does_not_revalidate_the_shard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _config, storage, runner, _judge = _seeded_review_fixture(
+        tmp_path, monkeypatch, "run-plan-advance"
+    )
+    plan = runner._plan(SHARD)
+    entry = plan["clips"]["clip-1"]
+
+    reconciles: list[Any] = []
+    _record_method(monkeypatch, runner, "_existing_plan_for_reconcile", reconciles)
+
+    jobs = runner._advance_clip(SHARD, storage, "clip-1", entry)
+
+    assert reconciles == [], "an already-validated entry must be passed in"
+    assert [dict(job.target)["variant"] for job in jobs] == ["final"]
+
+
+def test_model_job_validates_only_its_own_clip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _config, _storage, runner, judge = _seeded_review_fixture(
+        tmp_path, monkeypatch, "run-plan-hot"
+    )
+    job = _runnable_job(runner, "final")
+
+    per_clip: list[Any] = []
+    reconciles: list[Any] = []
+    _record_method(monkeypatch, runner, "_verify_plan_entry", per_clip)
+    _record_method(monkeypatch, runner, "_existing_plan_for_reconcile", reconciles)
+
+    before = runner.plan_counters["plan_full_validation_count"]
+    result = runner.run(job, judge)
+
+    assert result.payload["status"] == "review"
+    assert len(judge.calls) == 1, "the model really ran"
+    assert reconciles == [], "the hot path must not re-read the shard plan"
+    assert runner.plan_counters["plan_full_validation_count"] == before, (
+        "the hot path must not run a full-shard validation"
+    )
+    # Exactly one per-clip validation, for the clip that owns this job.
+    assert per_clip == ["clip-1"], per_clip
+    assert runner.plan_counters["plan_cache_hit"] >= 1
+
+
+def test_semantic_plan_tamper_is_not_hidden_by_the_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _config, _storage, runner, judge = _seeded_review_fixture(
+        tmp_path, monkeypatch, "run-plan-tamper"
+    )
+    job = _runnable_job(runner, "final")
+    assert runner._validated_plan_digests.get(SHARD)
+
+    # A genuinely invalid durable plan change, made after validation.
+    plan_path = runner._plan_path(SHARD)
+    payload = json.loads(plan_path.read_text(encoding="utf-8"))
+    payload["clips"]["clip-1"]["classification"] = "not_a_classification"
+    plan_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ReferenceIntegrityDurableError):
+        runner.run(job, judge)
+    assert len(judge.calls) == 0, "no model call on a tampered plan"
+
+
+def test_equivalent_plan_rewrite_keeps_its_semantics() -> None:
+    """The identity is canonical semantics, never raw file bytes."""
+    compact = {"schema": "s", "clips": {"clip-1": {"a": 1, "b": [1, 2]}}}
+    formatted = {"clips": {"clip-1": {"b": [1, 2], "a": 1}}, "schema": "s"}
+
+    assert ReferenceIntegrityEpochRunner._plan_semantic_digest(
+        compact
+    ) == ReferenceIntegrityEpochRunner._plan_semantic_digest(formatted)
+    assert ReferenceIntegrityEpochRunner._plan_semantic_digest(
+        compact
+    ) != ReferenceIntegrityEpochRunner._plan_semantic_digest(
+        {"schema": "s", "clips": {"clip-1": {"a": 2, "b": [1, 2]}}}
+    )
+
+
+def test_current_clip_live_drift_is_still_detected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cache is per-plan, never blind trust in the clip's live state."""
+    _config, storage, runner, judge = _seeded_review_fixture(
+        tmp_path, monkeypatch, "run-plan-live-drift"
+    )
+    job = _runnable_job(runner, "final")
+
+    # Drift the live annotation of the very clip this job belongs to.
+    clip_path = storage.clip_path("clip-1")
+    payload = json.loads(clip_path.read_text(encoding="utf-8"))
+    payload["annotation"]["entities"][0]["phrase"] = "a different phrase"
+    clip_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ReferenceIntegrityDurableError):
+        runner.run(job, judge)
+    assert len(judge.calls) == 0, "no model call on a drifted clip"
+
+
+def test_cold_runner_still_fully_validates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, storage, _seed_runner, judge = _seeded_review_fixture(
+        tmp_path, monkeypatch, "run-plan-cold"
+    )
+    _run_epoch(config, storage, tmp_path, judge)
+
+    cold = _runner(config, storage, tmp_path)
+    assert cold._validated_plan_entries == {}
+    assert cold._validated_plan_digests == {}
+
+    cold.seed_jobs()
+    assert cold.plan_counters["plan_full_validation_count"] == 1
+    assert cold._validated_plan_digests.get(SHARD)
+
+    # And reconcile keeps its own fully strict validation.
+    before = cold.plan_counters["plan_full_validation_count"]
+    cold.reconcile_stats(SHARD)
+    assert cold.plan_counters["plan_full_validation_count"] == before + 1

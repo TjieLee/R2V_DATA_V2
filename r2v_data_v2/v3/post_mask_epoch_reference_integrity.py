@@ -26,9 +26,11 @@ here.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import io
 import json
+import threading
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -473,6 +475,21 @@ class ReferenceIntegrityEpochRunner:
             shard: tuple(uids) for shard, uids in eligible_clip_uids_by_shard.items()
         }
         self.emit = emit
+        # Invocation-local execution state: the frozen plan entries this
+        # invocation has already fully validated, plus the canonical digest of
+        # the durable plan each of them came from. It holds plan-entry JSON
+        # metadata only - no images, no masks, no model objects and no durable
+        # state - and it is never part of a ModelJob, a receipt or any schema. A
+        # cold restart simply starts empty and re-validates everything.
+        self._validated_plan_entries: dict[tuple[str, str], dict[str, Any]] = {}
+        self._validated_plan_digests: dict[str, str] = {}
+        self._plan_cache_lock = threading.Lock()
+        self.plan_counters: dict[str, int] = {
+            "plan_full_validation_count": 0,
+            "plan_entry_hot_validation_count": 0,
+            "plan_cache_hit": 0,
+            "plan_cache_miss": 0,
+        }
 
     # -- durable paths ---------------------------------------------------------
 
@@ -770,6 +787,93 @@ class ReferenceIntegrityEpochRunner:
             return
         self._verify_published_clip(shard, storage, clip_uid, entry)
 
+    @staticmethod
+    def _plan_semantic_digest(payload: Mapping[str, Any]) -> str:
+        """Canonical semantic digest of a frozen plan.
+
+        Uses the repository's canonical JSON machinery, never raw file bytes: a
+        rewrite that parses to the same JSON keeps the same semantics, exactly
+        as it does today.
+        """
+        return semantic_input_digest(dict(payload))
+
+    def _bump_plan_counter(self, key: str, delta: int = 1) -> None:
+        with self._plan_cache_lock:
+            self.plan_counters[key] += delta
+
+    def _remember_validated_plan(
+        self, shard: str, payload: Mapping[str, Any]
+    ) -> None:
+        """Remember a fully validated shard plan for this invocation."""
+        clips = payload.get("clips")
+        if not isinstance(clips, dict):
+            return
+        entries = {
+            (shard, str(clip_uid)): copy.deepcopy(dict(entry))
+            for clip_uid, entry in clips.items()
+            if isinstance(entry, dict)
+        }
+        with self._plan_cache_lock:
+            for key in [key for key in self._validated_plan_entries if key[0] == shard]:
+                self._validated_plan_entries.pop(key, None)
+            self._validated_plan_entries.update(entries)
+            self._validated_plan_digests[shard] = self._plan_semantic_digest(payload)
+
+    def _hot_plan_entry(
+        self, shard: str, storage: RunStorage, clip_uid: str
+    ) -> dict[str, Any]:
+        """The frozen plan entry for one clip, validated for THIS invocation.
+
+        On the hot path this validates only the current clip against live state
+        instead of re-validating every clip in the shard. The durable plan is
+        still read and its canonical semantic digest compared, so a plan that
+        changed underneath the invocation is never trusted blindly: a mismatch
+        falls back to the original full validation.
+        """
+        with self._plan_cache_lock:
+            digest = self._validated_plan_digests.get(shard)
+            cached = self._validated_plan_entries.get((shard, clip_uid))
+        if digest is None:
+            self._bump_plan_counter("plan_cache_miss")
+            return self._full_plan_entry(shard, storage, clip_uid)
+        payload = _read_json(self._plan_path(shard))
+        if not isinstance(payload, dict) or (
+            self._plan_semantic_digest(payload) != digest
+        ):
+            # The durable plan is not the plan this invocation validated. Do not
+            # declare drift: the existing validator decides, and if it accepts
+            # the new payload the cache is refreshed from it.
+            self._bump_plan_counter("plan_cache_miss")
+            return self._full_plan_entry(shard, storage, clip_uid)
+        self._bump_plan_counter("plan_cache_hit")
+        if cached is None:
+            raise ReferenceIntegrityDurableError(
+                f"frozen Reference Integrity plan has no entry for {clip_uid!r}"
+            )
+        # The entry came from a fully validated plan, but the clip's LIVE state
+        # may still have drifted since: verify this clip, and only this clip.
+        self._verify_plan_entry(shard, storage, clip_uid, cached)
+        self._bump_plan_counter("plan_entry_hot_validation_count")
+        return cached
+
+    def _full_plan_entry(
+        self, shard: str, storage: RunStorage, clip_uid: str
+    ) -> dict[str, Any]:
+        """Fallback: the original full strict validation of the whole shard.
+
+        Used on a cache miss (a direct caller that never seeded, or a plan whose
+        durable content changed since validation). The cache is then refreshed
+        from the newly validated payload, which already verified every clip.
+        """
+        plan = self._existing_plan_for_reconcile(shard)
+        self._remember_validated_plan(shard, plan)
+        entry = plan.get("clips", {}).get(clip_uid)
+        if not isinstance(entry, dict):
+            raise ReferenceIntegrityDurableError(
+                f"frozen Reference Integrity plan has no entry for {clip_uid!r}"
+            )
+        return entry
+
     def _validate_existing_plan(
         self, shard: str, payload: Mapping[str, Any]
     ) -> dict[str, Any]:
@@ -807,6 +911,7 @@ class ReferenceIntegrityEpochRunner:
                     f"{clip_uid!r}"
                 )
             self._verify_plan_entry(shard, storage, clip_uid, entry)
+        self._bump_plan_counter("plan_full_validation_count")
         return dict(payload)
 
     def _plan(self, shard: str) -> dict[str, Any]:
@@ -1749,7 +1854,7 @@ class ReferenceIntegrityEpochRunner:
     ) -> tuple[str, RunStorage, Any, Any, Any, dict[str, Any], Any]:
         """Resolve one review job to its live entity and its frozen plan entry."""
         shard, storage, clip, entity, reference = self._job_entity_reference(job)
-        plan_entry = self._existing_plan_for_reconcile(shard)["clips"][job.clip_uid]
+        plan_entry = self._hot_plan_entry(shard, storage, job.clip_uid)
         pre_edit_dump = plan_entry.get("pre_reference_edit")
         pre_edit = (
             ReferenceEditState.model_validate(pre_edit_dump)
@@ -3348,10 +3453,18 @@ class ReferenceIntegrityEpochRunner:
         return ()
 
     def _advance_clip(
-        self, shard: str, storage: RunStorage, clip_uid: str
+        self,
+        shard: str,
+        storage: RunStorage,
+        clip_uid: str,
+        entry: Mapping[str, Any],
     ) -> list[ModelJob]:
-        plan = self._existing_plan_for_reconcile(shard)
-        entry = plan["clips"][clip_uid]
+        """Advance one clip whose frozen plan entry the caller already validated.
+
+        It must not re-read or re-validate the shard plan: the seed loop holds a
+        plan it has just validated, and validating it again per clip is exactly
+        the quadratic work this avoids.
+        """
         if entry.get("classification") != CLIP_FRESH_TARGET:
             return []
         if self._clip_outcome_path(shard, clip_uid).is_file():
@@ -3391,16 +3504,21 @@ class ReferenceIntegrityEpochRunner:
         """
         jobs: list[ModelJob] = []
         for shard in sorted(self.storages):
-            self._plan(shard)
+            # _plan already fully validates an existing durable plan and
+            # constructs a new one from live validated inputs, so re-reading and
+            # re-validating it here would duplicate that work per shard.
+            plan = self._plan(shard)
+            self._remember_validated_plan(shard, plan)
             storage = self._storage_for(shard)
-            plan = self._existing_plan_for_reconcile(shard)
-            for clip_uid in sorted(plan.get("clips", {})):
-                if plan["clips"][clip_uid].get("classification") != CLIP_FRESH_TARGET:
+            clips = plan.get("clips", {})
+            for clip_uid in sorted(clips):
+                entry = clips[clip_uid]
+                if entry.get("classification") != CLIP_FRESH_TARGET:
                     continue
                 if self._clip_outcome_path(shard, clip_uid).is_file():
                     continue
                 try:
-                    jobs.extend(self._advance_clip(shard, storage, clip_uid))
+                    jobs.extend(self._advance_clip(shard, storage, clip_uid, entry))
                 except ReferenceIntegrityDurableError:
                     # Durable corruption is never a semantic clip failure.
                     raise
