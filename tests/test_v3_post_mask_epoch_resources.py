@@ -1239,3 +1239,56 @@ def test_worker_slot_executor_refills_a_slot_while_another_slot_is_busy():
         }
     finally:
         executor.close()
+
+
+def test_worker_slot_executor_refills_whichever_slot_finishes_first():
+    """The slot that frees up takes the next job, not a fixed round-robin slot.
+
+    Slot 0 stays busy on a slow job while slot 1 finishes. The next job must go
+    to the slot that is actually free - handing it to a fixed next-in-turn slot
+    would park it behind the slow job and leave slot 1 idle, which is exactly the
+    stall the streaming refill has to avoid.
+    """
+    both_running = threading.Barrier(2)
+    release_slot0 = threading.Event()
+    third_started = threading.Event()
+    slot_of: dict[str, int] = {}
+
+    def runner(job: ModelJob, slot: int) -> JobResult:
+        slot_of[job.clip_uid] = slot
+        if job.clip_uid == "clip-000000":
+            # Slow: holds its slot until the very end.
+            both_running.wait(timeout=5)
+            release_slot0.wait(timeout=5)
+            return JobResult(OUTCOME_COMPLETED, payload={})
+        if job.clip_uid == "clip-000001":
+            # Fast: frees its slot first, out of submission order.
+            both_running.wait(timeout=5)
+            return JobResult(OUTCOME_COMPLETED, payload={})
+        third_started.set()
+        return JobResult(OUTCOME_COMPLETED, payload={})
+
+    executor = WorkerSlotExecutor(runner, slot_count=2)
+    try:
+        executor.submit(_boogu_job("clip-000000"))
+        executor.submit(_boogu_job("clip-000001"))
+        first = executor.collect()
+        assert [e.job.clip_uid for e in first] == ["clip-000001"]
+
+        freed_slot = slot_of["clip-000001"]
+        busy_slot = slot_of["clip-000000"]
+        assert freed_slot != busy_slot
+
+        executor.submit(_boogu_job("clip-000002"))
+        assert third_started.wait(timeout=5), "no free slot took the next job"
+        assert slot_of["clip-000002"] == freed_slot, "the freed slot must take it"
+        assert slot_of["clip-000002"] != busy_slot
+
+        release_slot0.set()
+        rest: list[Any] = []
+        while len(rest) < 2:
+            rest.extend(executor.collect())
+        assert {e.job.clip_uid for e in rest} == {"clip-000000", "clip-000002"}
+        assert sorted(slot_of.values()) == sorted((freed_slot, freed_slot, busy_slot))
+    finally:
+        executor.close()

@@ -783,13 +783,17 @@ class _SlotAbort:
 
 
 class WorkerSlotExecutor:
-    """One persistent worker per GPU slot, each pulling from its own queue.
+    """One persistent worker per GPU slot, fed only when that slot is free.
 
-    A slot that finishes its job immediately takes the next job queued for it,
-    without waiting for the other slots' queues to drain. Placement stays exactly
-    as before - round-robin in submission order, so work never skews onto one GPU
-    - and is still execution-only: a slot never runs two jobs at once, and the
-    handle the runner receives is the live backend of the slot executing it.
+    A job is handed to a slot that is *actually* available at submission time.
+    Targeting a fixed round-robin slot instead would queue the job behind
+    whatever that slot is still running while other slots sit idle - which is
+    exactly the stall the streaming refill exists to remove.
+
+    Placement stays execution-only and never affects ModelJob identity: when
+    several slots are free the next one in round-robin order is taken, so work
+    still spreads across GPUs, and a slot never runs two jobs at once. The handle
+    the runner receives is the live backend of the slot that really executes it.
     """
 
     def __init__(
@@ -806,18 +810,36 @@ class WorkerSlotExecutor:
         self.resource = resource
         self._queues: list[Queue] = [Queue() for _ in range(slot_count)]
         self._events: Queue = Queue()
+        self._free: set[int] = set(range(slot_count))
         self._next_slot = 0
         self._threads: list[threading.Thread] = []
         self._lock = threading.Lock()
+        self._slot_freed = threading.Condition(self._lock)
 
     def capacity(self) -> int:
         return self.slot_count
 
     def submit(self, job: Any) -> None:
         self._start_slots()
-        queue = self._queues[self._next_slot % self.slot_count]
-        self._next_slot += 1
-        queue.put(job)
+        with self._slot_freed:
+            while not self._free:
+                # Capacity is slot_count, so the scheduler never gets here. A
+                # direct over-submission waits for a slot rather than queueing
+                # behind one that is already busy.
+                self._slot_freed.wait()
+            slot_id = self._claim_free_slot()
+        self._queues[slot_id].put(job)
+
+    def _claim_free_slot(self) -> int:
+        """Reserve the next free slot in round-robin order. Lock is held."""
+        start = self._next_slot % self.slot_count
+        for offset in range(self.slot_count):
+            candidate = (start + offset) % self.slot_count
+            if candidate in self._free:
+                self._free.discard(candidate)
+                self._next_slot = candidate + 1
+                return candidate
+        raise RuntimeError("no free slot available")  # pragma: no cover
 
     def _start_slots(self) -> None:
         with self._lock:
@@ -849,6 +871,12 @@ class WorkerSlotExecutor:
                     self._events.put(JobExecution(job, None, exc))
                 else:
                     self._events.put(JobExecution(job, result, None))
+                finally:
+                    # The slot is available again the moment its job settles, so
+                    # the next submit can use it even if every other slot is busy.
+                    with self._slot_freed:
+                        self._free.add(slot_id)
+                        self._slot_freed.notify_all()
         except BaseException as exc:  # re-raised on the caller's thread
             self._events.put(_SlotAbort(exc))
             raise
@@ -893,14 +921,19 @@ class WorkerSlotExecutor:
 
     def execute_batch(self, jobs: Sequence[Any]) -> Mapping[str, JobExecution]:
         results: dict[str, JobExecution] = {}
-        remaining = 0
-        for job in sorted(jobs, key=job_order_key):
-            self.submit(job)
-            remaining += 1
-        while remaining:
+        remaining = sorted(jobs, key=job_order_key)
+        outstanding = 0
+        # Keep at most slot_count in flight and refill as slots come back, so a
+        # job is never queued behind a slot that is still working.
+        while remaining or outstanding:
+            while remaining and outstanding < self.slot_count:
+                self.submit(remaining.pop(0))
+                outstanding += 1
+            if not outstanding:
+                break
             for execution in self.collect():
                 results[execution.job.job_id()] = execution
-                remaining -= 1
+                outstanding -= 1
         self.close()
         return results
 
