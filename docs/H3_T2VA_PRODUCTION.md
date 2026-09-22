@@ -6,27 +6,25 @@ implementations; the reused audio finalizer remains v6. The standalone downstrea
 runner does not preprocess Audio. The optional full launcher below adds upstream
 stage orchestration without migrating legacy outputs or changing eligibility.
 
-## MiMo model runs inside one production root
+## MiMo hot-swap policy inside one production root
 
-The production root identifies the JEA source population and reusable upstream
-Audio/H3 caches. It is intentionally independent of the MLLM version.
+The production root and all T2VA/TA2VA shard paths are independent of the MLLM
+version. Changing MiMo must not create a new downstream directory, invalidate
+existing ready artifacts, or require a fresh production root.
 
 Current default MiMo:
 
     model: mimo-v2.6-flash-rl
     checkpoint: /mnt/workspace/public/pretrained/MiMo/MiMo-V2.6-Flash-RL
 
-Downstream T2VA/TA2VA state is namespaced by MiMo run:
+Existing V2.5-ready artifacts remain valid at their original
+`<PRODUCTION_ROOT>/shards/.../artifacts` paths. Pending/failed samples continue
+in the same shard/state/export layout using the currently configured MiMo model.
+The model name is runtime observability/provenance only; it is not a path or
+resume-cache key in full production.
 
-    <PRODUCTION_ROOT>/downstream/<run_id>/shards/...
-
-The default run ID is the served model name, currently
-`mimo-v2.6-flash-rl`. Changing MiMo versions therefore creates a new downstream
-run while reusing the same canonical/SAM/AuK/resolve/DiariZen/ASR outputs. Do not
-create a fresh production root merely because the MLLM changes.
-
-Use `MIMO_MODEL` and `DOWNSTREAM_RUN_ID` to compare models without moving
-upstream data. Existing V2.5 products remain untouched.
+Use `MIMO_MODEL` to hot-swap the runtime model while keeping the same
+`PRODUCTION_ROOT` and data organization.
 
 MiMo checkpoint contents are not part of the production-root identity and are
 not content-hashed by the T2VA/TA2VA serving path. Full-production DiariZen and
@@ -294,7 +292,7 @@ Frozen publication model counts still describe the cached artifacts, not new
 calls in this invocation. Keep interpreters and dependency environments pinned
 for a resumed run; use a fresh production root only when changing source
 identity, shard size, or incompatible upstream semantics. Changing the MiMo
-model uses a new downstream run namespace inside the same production root.
+model continues in the same downstream shard/artifact layout.
 
 Upstream aggregate manifests can expand after failed clips recover. The full
 downstream adapter binds ready outputs to validated per-clip dependencies;
