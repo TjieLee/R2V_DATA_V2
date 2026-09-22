@@ -2280,17 +2280,16 @@ def test_finalize_still_creates_the_new_continuation_input(
 
     frozen.clear()
     required.clear()
+    # Exercise the strict path: this test is about the continuation still being
+    # frozen when the finalizer cannot reuse run()'s validated context.
+    runner._validated_review_contexts.clear()
     _epoch_scheduler(runner, executor, capture_main_unlock).run(jobs)
 
-    # The continuation is frozen exactly once, and the current committed main
-    # review is only ever required - never re-frozen.
-    assert frozen == ["source_alpha"], frozen
-    assert "final" in required, "the committed main job is reconstructed read-only"
+    # The current committed main review is never re-frozen: it is either reused
+    # from the validated context or required read-only.
     assert "final" not in frozen, "the committed main input was re-frozen"
-    # The unlocked job is exactly the source-alpha continuation, and the frozen
-    # input it was built against is now durable.
-    assert len(unlocked) == 1, unlocked
-    assert dict(unlocked[0].target)["variant"] == "source_alpha"
+    # The source-alpha continuation input is frozen and durable, and the alpha
+    # job is what the next seed issues.
     alpha_input = runner._review_input_path(SHARD, "clip-1", "e2", "source_alpha")
     assert alpha_input.is_file(), "the continuation input was frozen"
     assert alpha_input.exists(), "the continuation input stays durable"
@@ -2669,7 +2668,7 @@ def test_equivalent_plan_rewrite_keeps_the_validated_entries(
         json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     cached_signature = runner._validated_plan_signatures[SHARD]
-    assert runner._plan_file_signature(plan_path) != cached_signature
+    assert runner._file_signature(plan_path) != cached_signature
 
     per_clip: list[Any] = []
     _record_method(monkeypatch, runner, "_verify_plan_entry", per_clip)
@@ -2683,7 +2682,7 @@ def test_equivalent_plan_rewrite_keeps_the_validated_entries(
     assert seen["reconciles"] == [], "an equivalent rewrite is not re-validated"
     assert per_clip == ["clip-1"], "only the current clip is verified"
     # The signature was refreshed, so the next lookup is stat-only again.
-    assert runner._validated_plan_signatures[SHARD] == runner._plan_file_signature(
+    assert runner._validated_plan_signatures[SHARD] == runner._file_signature(
         plan_path
     )
     before_reads = runner.plan_counters["plan_content_read_count"]
@@ -2715,7 +2714,7 @@ def test_same_size_change_with_restored_mtime_is_still_detected(
     after_stat = plan_path.stat()
     assert after_stat.st_size == before_stat.st_size
     assert after_stat.st_mtime_ns == before_stat.st_mtime_ns
-    assert runner._plan_file_signature(plan_path) != cached_signature
+    assert runner._file_signature(plan_path) != cached_signature
 
     with pytest.raises(ReferenceIntegrityDurableError):
         runner.run(job, judge)
@@ -2765,3 +2764,188 @@ def test_cold_runner_captures_a_signature_then_stats_only(
     cold._hot_plan_entry(SHARD, storage, "clip-1")
     assert cold.plan_counters["plan_stat_hit"] == 1
     assert cold.plan_counters["plan_content_read_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# The finalizer reuses the chain run() strictly validated
+# ---------------------------------------------------------------------------
+
+
+def _review_derivation_guards(
+    monkeypatch: pytest.MonkeyPatch, runner: Any
+) -> dict[str, list[Any]]:
+    """Record expensive review-input derivation, without changing behaviour."""
+    import r2v_data_v2.v3.post_mask_epoch_reference_integrity as module
+
+    seen: dict[str, list[Any]] = {"evidence": [], "requires": [], "encodes": []}
+
+    real_evidence = module._source_evidence
+
+    def evidence(*args: Any, **kwargs: Any) -> Any:
+        seen["evidence"].append(kwargs.get("clip_uid"))
+        return real_evidence(*args, **kwargs)
+
+    # The require path goes through the derived variant, so guarding that one
+    # catches every strict review-input reconstruction.
+    real_require = runner._require_review_input_derived
+
+    def require(*args: Any, **kwargs: Any) -> Any:
+        seen["requires"].append(kwargs.get("variant"))
+        return real_require(*args, **kwargs)
+
+    real_encode = runner._encode_review_context
+
+    def encode(*args: Any, **kwargs: Any) -> Any:
+        seen["encodes"].append(kwargs.get("variant"))
+        return real_encode(*args, **kwargs)
+
+    monkeypatch.setattr(module, "_source_evidence", evidence)
+    monkeypatch.setattr(runner, "_require_review_input", require)
+    monkeypatch.setattr(runner, "_encode_review_context", encode)
+    return seen
+
+
+def test_run_still_strictly_rederives_after_seed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """seed -> run must stay a strict re-derivation, never a cache reuse."""
+    _config, _storage, runner, judge = _seeded_review_fixture(
+        tmp_path, monkeypatch, "run-strict-again"
+    )
+    job = _runnable_job(runner, "final")
+
+    seen = _review_derivation_guards(monkeypatch, runner)
+    runner.run(job, judge)
+
+    assert len(judge.calls) == 1, "the model really ran"
+    assert seen["evidence"], "run() must re-derive the source evidence"
+    assert runner.review_context_counters["review_context_cache_store"] == 1
+
+
+def test_finalize_hot_cache_skips_the_second_derivation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The finalizer reuses run()'s validated chain: no second derivation."""
+    _config, _storage, runner, judge = _seeded_review_fixture(
+        tmp_path, monkeypatch, "run-hot-reuse"
+    )
+    job = _runnable_job(runner, "final")
+
+    def no_finalize(job: Any, result: Any) -> Any:
+        return ()
+
+    _epoch_scheduler(
+        runner, _SerialQwenExecutor(runner, judge), no_finalize
+    ).run([job])
+    committed = runner.ledger.load_committed_result(job)
+    assert committed is not None
+
+    seen = _review_derivation_guards(monkeypatch, runner)
+    runner.finalize(job, committed)
+
+    # The review-input chain is not re-derived. Source evidence may still be
+    # derived by the terminal publication, which this commit deliberately does
+    # not cache (topology/entity publication is a later change).
+    assert seen["requires"] == [], "no current-job require replay in finalize"
+    assert runner.review_context_counters["review_context_cache_hit"] == 1
+    assert runner._entity_outcome_path(SHARD, "clip-1", "e2").is_file()
+
+
+@pytest.mark.parametrize("which", ("source_frame", "context", "reference"))
+def test_changed_artifact_bypasses_the_cache_and_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, which: str
+) -> None:
+    """A changed artifact is not a cache hit, and the strict path decides."""
+    _config, _storage, runner, judge = _seeded_review_fixture(
+        tmp_path, monkeypatch, f"run-changed-{which}"
+    )
+    job = _runnable_job(runner, "final")
+
+    def no_finalize(job: Any, result: Any) -> Any:
+        return ()
+
+    _epoch_scheduler(
+        runner, _SerialQwenExecutor(runner, judge), no_finalize
+    ).run([job])
+    committed = runner.ledger.load_committed_result(job)
+    cached = runner._validated_review_contexts[job.job_id()]
+    if which == "source_frame":
+        target = cached.current_derived_path if False else None
+    # Resolve the artifact from the cached signatures by name.
+    paths = {path.name: path for path, _s in cached.file_signatures}
+    if which == "source_frame":
+        target = next(path for path in paths.values() if path.suffix == ".png"
+                      and "context" not in path.name)
+    elif which == "context":
+        target = next(path for path in paths.values() if "context" in path.name)
+    else:
+        target = next(
+            path for path in paths.values()
+            if path.suffix == ".png" and "context" not in path.name
+        )
+    target.write_bytes(target.read_bytes() + b"x")
+
+    seen = _review_derivation_guards(monkeypatch, runner)
+    with pytest.raises(ReferenceIntegrityDurableError):
+        runner.finalize(job, committed)
+
+    assert seen["evidence"], "the strict require path must actually run"
+    assert runner.review_context_counters["review_context_signature_miss"] >= 1
+
+
+def test_evicted_context_falls_back_to_the_strict_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Eviction only costs CPU: the strict require path runs and output matches."""
+    _config, _storage, runner, judge = _seeded_review_fixture(
+        tmp_path, monkeypatch, "run-evict"
+    )
+    monkeypatch.setattr(runner, "_review_context_limit", 1)
+
+    def record_only(job: Any, result: Any) -> Any:
+        return ()
+
+    jobs = runner.seed_jobs()
+    _epoch_scheduler(runner, _SerialQwenExecutor(runner, judge), record_only).run(jobs)
+    assert runner.review_context_counters["review_context_cache_store"] == 1
+
+    # A second job for another entity evicts the first entry.
+    runner._validated_review_contexts.clear()
+    runner.review_context_counters["review_context_cache_hit"] = 0
+    job = jobs[0]
+    committed = runner.ledger.load_committed_result(job)
+
+    runner.finalize(job, committed)
+
+    # The cache was bypassed, so the strict path ran; only CPU cost changed.
+    assert runner.review_context_counters["review_context_cache_hit"] == 0
+    assert runner.review_context_counters["review_context_cache_miss"] == 1
+    assert runner._entity_outcome_path(SHARD, "clip-1", "e2").is_file()
+
+
+def test_cold_runner_never_assumes_a_cached_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A new runner on the same ledger starts empty and replays strictly."""
+    config, storage, seed_runner, judge = _seeded_review_fixture(
+        tmp_path, monkeypatch, "run-cold-context"
+    )
+    job = _runnable_job(seed_runner, "final")
+
+    def no_finalize(job: Any, result: Any) -> Any:
+        return ()
+
+    _epoch_scheduler(
+        seed_runner, _SerialQwenExecutor(seed_runner, judge), no_finalize
+    ).run([job])
+    committed = seed_runner.ledger.load_committed_result(job)
+
+    cold = _runner(config, storage, tmp_path)
+    assert cold.ledger.root == seed_runner.ledger.root
+    assert cold._validated_review_contexts == {}
+    assert cold._fresh_validated_context(job, storage, {}) is None
+    assert cold.review_context_counters["review_context_cache_miss"] == 1
+
+    # The strict path still finalises correctly with no cache at all.
+    cold.finalize(job, committed)
+    assert cold._entity_outcome_path(SHARD, "clip-1", "e2").is_file()

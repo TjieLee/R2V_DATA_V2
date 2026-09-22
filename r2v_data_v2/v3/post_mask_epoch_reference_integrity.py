@@ -31,6 +31,7 @@ import hashlib
 import io
 import json
 import threading
+from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -216,12 +217,12 @@ REJECTED_REFERENCE_REASON = "reference_integrity_rejected"
 
 
 @dataclass(frozen=True)
-class _PlanFileSignature:
-    """Cheap identity of a durable plan file, without reading its content.
+class _FileSignature:
+    """Cheap identity of a durable file, without reading its content.
 
     ``atomic_write_json`` publishes through ``os.replace``, so the inode changes;
     an in-place edit updates ``ctime``, which no ordinary file API can restore.
-    Size and mtime catch the obvious cases. Together they let the hot path decide
+    Size and mtime catch the obvious cases. Together they let a hot path decide
     "the same file this invocation already validated" with one ``stat``.
 
     Execution-only: never part of a ModelJob, a receipt or any schema.
@@ -232,6 +233,36 @@ class _PlanFileSignature:
     st_size: int
     st_mtime_ns: int
     st_ctime_ns: int
+
+
+@dataclass(frozen=True)
+class _ValidatedReviewJobContext:
+    """One review job's strictly validated frozen chain, for reuse by its finalizer.
+
+    Built only after ``run(job)`` has strictly re-derived and verified the whole
+    chain, and only reused by the finalizer of the very same ``job_id``. It holds
+    plan metadata, anchors, references and the derived jobs - never source images,
+    decoded masks, NumPy arrays or model clients - plus the file signatures that
+    prove every artifact it was validated against is still the same filesystem
+    generation. Execution-only: never part of a ModelJob, a receipt or any schema.
+    """
+
+    job_id: str
+    shard: str
+    clip_uid: str
+    entity_id: str
+    variant: str
+
+    main_reference: Any
+    main_anchor: dict[str, Any]
+    main_job: ModelJob
+
+    current_reference: Any
+    current_anchor: dict[str, Any]
+    current_job: ModelJob
+
+    plan_entry_digest: str
+    file_signatures: tuple[tuple[Path, _FileSignature], ...]
 
 
 @dataclass(frozen=True)
@@ -247,6 +278,7 @@ class _DerivedReviewInput:
     context_path: Path
     context_png_bytes: bytes
     context_sha256: str
+    source_frame_path: Path
 
 
 @dataclass(frozen=True)
@@ -502,8 +534,24 @@ class ReferenceIntegrityEpochRunner:
         # cold restart simply starts empty and re-validates everything.
         self._validated_plan_entries: dict[tuple[str, str], dict[str, Any]] = {}
         self._validated_plan_digests: dict[str, str] = {}
-        self._validated_plan_signatures: dict[str, _PlanFileSignature] = {}
+        self._validated_plan_signatures: dict[str, _FileSignature] = {}
         self._plan_cache_lock = threading.Lock()
+        # Execution-only reuse of a review job's own strictly validated chain.
+        # Built by run(job) after it has re-derived everything, consumed by that
+        # same job's finalizer, bounded, and never part of any identity or
+        # durable state. A cold runner starts empty and replays strictly.
+        self._validated_review_contexts: OrderedDict[
+            str, _ValidatedReviewJobContext
+        ] = OrderedDict()
+        self._review_context_limit = 256
+        self._review_context_lock = threading.Lock()
+        self.review_context_counters: dict[str, int] = {
+            "review_context_cache_hit": 0,
+            "review_context_cache_miss": 0,
+            "review_context_cache_store": 0,
+            "review_context_cache_eviction": 0,
+            "review_context_signature_miss": 0,
+        }
         self.plan_counters: dict[str, int] = {
             "plan_full_validation_count": 0,
             "plan_entry_hot_validation_count": 0,
@@ -821,18 +869,27 @@ class ReferenceIntegrityEpochRunner:
         """
         return semantic_input_digest(dict(payload))
 
+    @staticmethod
+    def _plan_entry_semantic_digest(entry: Mapping[str, Any]) -> str:
+        """Canonical digest of ONE clip's plan entry.
+
+        Deliberately not the shard digest: comparing the cached chain's own entry
+        must stay bounded by that entry, never by the size of the shard.
+        """
+        return semantic_input_digest(dict(entry))
+
     def _bump_plan_counter(self, key: str, delta: int = 1) -> None:
         with self._plan_cache_lock:
             self.plan_counters[key] += delta
 
     @staticmethod
-    def _plan_file_signature(path: Path) -> _PlanFileSignature | None:
+    def _file_signature(path: Path) -> _FileSignature | None:
         """The file signature of a durable plan, without reading its content."""
         try:
             status = path.stat()
         except OSError:
             return None
-        return _PlanFileSignature(
+        return _FileSignature(
             st_dev=status.st_dev,
             st_ino=status.st_ino,
             st_size=status.st_size,
@@ -842,7 +899,7 @@ class ReferenceIntegrityEpochRunner:
 
     def _refresh_plan_signature(self, shard: str) -> None:
         """Re-capture only the file signature, keeping the validated entries."""
-        signature = self._plan_file_signature(self._plan_path(shard))
+        signature = self._file_signature(self._plan_path(shard))
         with self._plan_cache_lock:
             if signature is None:
                 self._validated_plan_signatures.pop(shard, None)
@@ -865,7 +922,7 @@ class ReferenceIntegrityEpochRunner:
             for clip_uid, entry in clips.items()
             if isinstance(entry, dict)
         }
-        signature = self._plan_file_signature(self._plan_path(shard))
+        signature = self._file_signature(self._plan_path(shard))
         digest = self._plan_semantic_digest(payload)
         with self._plan_cache_lock:
             for key in [key for key in self._validated_plan_entries if key[0] == shard]:
@@ -876,6 +933,121 @@ class ReferenceIntegrityEpochRunner:
                 self._validated_plan_signatures.pop(shard, None)
             else:
                 self._validated_plan_signatures[shard] = signature
+
+    def _bump_review_context_counter(self, key: str, delta: int = 1) -> None:
+        with self._review_context_lock:
+            self.review_context_counters[key] += delta
+
+    def _review_chain_signatures(
+        self,
+        shard: str,
+        storage: RunStorage,
+        anchor: Mapping[str, Any],
+        derived: _DerivedReviewInput,
+    ) -> list[tuple[Path, _FileSignature]]:
+        """Sign every artifact one validated review chain depends on.
+
+        The paths come from the strict derivation ``run()`` just performed, so no
+        durable schema is touched: the anchor JSON, the derived Qwen context PNG,
+        the reference image and the source frame it was built from.
+        """
+        paths = [
+            self._review_input_path(
+                shard,
+                str(anchor["clip_uid"]),
+                str(anchor["entity_id"]),
+                str(anchor["variant"]),
+            ),
+            derived.context_path,
+            _resolve_run_artifact(storage, str(anchor["final_reference_path"])),
+            derived.source_frame_path,
+        ]
+        return [(path, self._file_signature(path)) for path in paths]
+
+    def _build_validated_context(
+        self,
+        job: ModelJob,
+        *,
+        shard: str,
+        storage: RunStorage,
+        entity: Any,
+        variant: str,
+        main_reference: Any,
+        main_anchor: Mapping[str, Any],
+        main_job: ModelJob,
+        main_derived: _DerivedReviewInput,
+        current_reference: Any,
+        current_anchor: Mapping[str, Any],
+        current_job: ModelJob,
+        current_derived: _DerivedReviewInput,
+        plan_entry: Mapping[str, Any],
+    ) -> _ValidatedReviewJobContext:
+        """Freeze the chain run() just strictly validated, with its signatures."""
+        signatures: list[tuple[Path, _FileSignature]] = []
+        signatures.extend(
+            self._review_chain_signatures(shard, storage, main_anchor, main_derived)
+        )
+        signatures.extend(
+            self._review_chain_signatures(
+                shard, storage, current_anchor, current_derived
+            )
+        )
+        return _ValidatedReviewJobContext(
+            job_id=job.job_id(),
+            shard=shard,
+            clip_uid=job.clip_uid,
+            entity_id=str(entity.entity_id),
+            variant=variant,
+            main_reference=main_reference,
+            main_anchor=dict(main_anchor),
+            main_job=main_job,
+            current_reference=current_reference,
+            current_anchor=dict(current_anchor),
+            current_job=current_job,
+            plan_entry_digest=self._plan_entry_semantic_digest(plan_entry),
+            file_signatures=tuple(signatures),
+        )
+
+    def _remember_validated_context(self, context: _ValidatedReviewJobContext) -> None:
+        with self._review_context_lock:
+            self._validated_review_contexts[context.job_id] = context
+            self._validated_review_contexts.move_to_end(context.job_id)
+            self.review_context_counters["review_context_cache_store"] += 1
+            while len(self._validated_review_contexts) > self._review_context_limit:
+                self._validated_review_contexts.popitem(last=False)
+                self.review_context_counters["review_context_cache_eviction"] += 1
+
+    def _fresh_validated_context(
+        self, job: ModelJob, storage: RunStorage, plan_entry: Mapping[str, Any]
+    ) -> _ValidatedReviewJobContext | None:
+        """The cached chain for this exact job, if it is still the same generation.
+
+        A miss - no entry, evicted, another runner, a changed plan entry or any
+        changed file signature - returns ``None`` and the caller replays the
+        strict require path. A signature change is never itself declared as
+        corruption: the strict path remains the semantic authority.
+        """
+        with self._review_context_lock:
+            cached = self._validated_review_contexts.get(job.job_id())
+        if cached is None:
+            self._bump_review_context_counter("review_context_cache_miss")
+            return None
+        if (
+            cached.job_id != job.job_id()
+            or cached.shard != job.canonical_shard
+            or cached.clip_uid != job.clip_uid
+        ):
+            self._bump_review_context_counter("review_context_cache_miss")
+            return None
+        if cached.plan_entry_digest != self._plan_entry_semantic_digest(plan_entry):
+            self._bump_review_context_counter("review_context_cache_miss")
+            return None
+        for path, signature in cached.file_signatures:
+            if self._file_signature(path) != signature:
+                self._bump_review_context_counter("review_context_signature_miss")
+                return None
+        self._bump_review_context_counter("review_context_cache_hit")
+        return cached
 
     def _hot_plan_entry(
         self, shard: str, storage: RunStorage, clip_uid: str
@@ -898,7 +1070,7 @@ class ReferenceIntegrityEpochRunner:
             self._bump_plan_counter("plan_cache_miss")
             return self._full_plan_entry(shard, storage, clip_uid)
 
-        current = self._plan_file_signature(path)
+        current = self._file_signature(path)
         if current is not None and current == signature:
             self._bump_plan_counter("plan_stat_hit")
             return self._serve_cached_plan_entry(shard, storage, clip_uid, cached)
@@ -1196,6 +1368,9 @@ class ReferenceIntegrityEpochRunner:
             context_path=context_path,
             context_png_bytes=context_png_bytes,
             context_sha256=context_sha256,
+            # Execution-only: the anchor deliberately does not carry this path,
+            # but run() needs it to sign the source pixels it validated against.
+            source_frame_path=evidence.frame_path,
         )
 
     def _create_or_verify_review_input(
@@ -1285,6 +1460,22 @@ class ReferenceIntegrityEpochRunner:
         verification. A missing anchor or context here is durable corruption, not
         something the caller may regenerate.
         """
+        anchor, _derived = self._require_review_input_derived(
+            shard, storage, clip_uid, entity, reference, variant=variant
+        )
+        return anchor
+
+    def _require_review_input_derived(
+        self,
+        shard: str,
+        storage: RunStorage,
+        clip_uid: str,
+        entity: Any,
+        reference: Any,
+        *,
+        variant: str = VARIANT_FINAL,
+    ) -> tuple[dict[str, Any], _DerivedReviewInput]:
+        """The require path, keeping the pure derivation it just re-verified."""
         path = self._review_input_path(shard, clip_uid, entity.entity_id, variant)
         existing = _read_json(path)
         if existing is None:
@@ -1303,7 +1494,7 @@ class ReferenceIntegrityEpochRunner:
                 f"frozen Reference Integrity review input drifted for "
                 f"{clip_uid}/{entity.entity_id}"
             )
-        return existing
+        return existing, expected
 
     @staticmethod
     def _frozen_source_alpha_reference(
@@ -1390,7 +1581,7 @@ class ReferenceIntegrityEpochRunner:
         Main thread only: seeding the initial final review, or unlocking a
         source-alpha continuation from a committed main receipt.
         """
-        return self._review_inputs_and_job(
+        input_reference, anchor, job, _derived = self._review_inputs_and_job(
             shard=shard,
             storage=storage,
             clip_uid=clip_uid,
@@ -1401,6 +1592,7 @@ class ReferenceIntegrityEpochRunner:
             main_job=main_job,
             create=True,
         )
+        return input_reference, anchor, job
 
     def _require_review_inputs_and_job(
         self,
@@ -1419,6 +1611,35 @@ class ReferenceIntegrityEpochRunner:
         Read-only by construction: it can never create or repair the frozen
         input, so a missing one is durable corruption. Used by model execution
         and by every restart, receipt and published-state verifier.
+        """
+        input_reference, anchor, job, _derived = self._review_inputs_and_job(
+            shard=shard,
+            storage=storage,
+            clip_uid=clip_uid,
+            plan_entry=plan_entry,
+            entity=entity,
+            reference=reference,
+            variant=variant,
+            main_job=main_job,
+            create=False,
+        )
+        return input_reference, anchor, job
+
+    def _require_review_inputs_and_job_derived(
+        self,
+        *,
+        shard: str,
+        storage: RunStorage,
+        clip_uid: str,
+        plan_entry: Mapping[str, Any],
+        entity: Any,
+        reference: Any,
+        variant: str,
+        main_job: ModelJob | None = None,
+    ) -> tuple[EntityReferenceState, dict[str, Any], ModelJob, _DerivedReviewInput]:
+        """The require path, keeping the derivation it just re-verified.
+
+        ``run()`` uses this so it can sign the exact artifacts it validated.
         """
         return self._review_inputs_and_job(
             shard=shard,
@@ -1464,15 +1685,17 @@ class ReferenceIntegrityEpochRunner:
             if variant == VARIANT_SOURCE_ALPHA
             else reference
         )
-        anchor = (
-            self._create_or_verify_review_input(
+        if create:
+            anchor = self._create_or_verify_review_input(
                 shard, storage, clip_uid, entity, input_reference, variant=variant
             )
-            if create
-            else self._require_review_input(
+            derived = self._reverified_review_input(
                 shard, storage, clip_uid, entity, input_reference, variant=variant
             )
-        )
+        else:
+            anchor, derived = self._require_review_input_derived(
+                shard, storage, clip_uid, entity, input_reference, variant=variant
+            )
         job = self._expected_review_job(
             shard,
             entity,
@@ -1485,7 +1708,7 @@ class ReferenceIntegrityEpochRunner:
                 else None
             ),
         )
-        return input_reference, anchor, job
+        return input_reference, anchor, job, derived
 
     # -- per-entity durable outcomes -------------------------------------------
 
@@ -2256,25 +2479,32 @@ class ReferenceIntegrityEpochRunner:
             self._job_review_context(job)
         )
         main_job: ModelJob | None = None
+        main_reference: Any = None
+        main_anchor: Mapping[str, Any] | None = None
+        main_derived: _DerivedReviewInput | None = None
         if variant == VARIANT_SOURCE_ALPHA:
-            _r, _a, main_job = self._require_review_inputs_and_job(
+            main_reference, main_anchor, main_job, main_derived = (
+                self._require_review_inputs_and_job_derived(
+                shard=shard,
+                storage=storage,
+                clip_uid=job.clip_uid,
+                plan_entry=plan_entry,
+                entity=entity,
+                    reference=reference,
+                    variant=VARIANT_FINAL,
+                )
+            )
+        _input_reference, anchor, expected, current_derived = (
+            self._require_review_inputs_and_job_derived(
                 shard=shard,
                 storage=storage,
                 clip_uid=job.clip_uid,
                 plan_entry=plan_entry,
                 entity=entity,
                 reference=reference,
-                variant=VARIANT_FINAL,
+                variant=variant,
+                main_job=main_job,
             )
-        _input_reference, anchor, expected = self._require_review_inputs_and_job(
-            shard=shard,
-            storage=storage,
-            clip_uid=job.clip_uid,
-            plan_entry=plan_entry,
-            entity=entity,
-            reference=reference,
-            variant=variant,
-            main_job=main_job,
         )
         if (
             expected.job_id() != job.job_id()
@@ -2285,6 +2515,32 @@ class ReferenceIntegrityEpochRunner:
                 OUTCOME_RETRYABLE_FAILED,
                 detail="Reference Integrity review semantic identity drifted",
             )
+        if variant == VARIANT_FINAL:
+            main_reference, main_anchor, main_job = (
+                _input_reference,
+                anchor,
+                expected,
+            )
+            main_derived = current_derived
+        # The whole chain is now strictly verified, so freeze it for this job's
+        # own finalizer along with the file signatures that prove nothing it was
+        # validated against has changed since.
+        prepared_context = self._build_validated_context(
+            job,
+            shard=shard,
+            storage=storage,
+            entity=entity,
+            variant=variant,
+            main_reference=main_reference,
+            main_anchor=main_anchor,
+            main_job=main_job,
+            main_derived=main_derived,
+            current_reference=_input_reference,
+            current_anchor=anchor,
+            current_job=expected,
+            current_derived=current_derived,
+            plan_entry=plan_entry,
+        )
         resolved = resolve_reference_integrity_judge(handle, self.config)
         try:
             with Image.open(
@@ -2304,6 +2560,8 @@ class ReferenceIntegrityEpochRunner:
                 synthetic=bool(anchor["synthetic"]),
             )
         except ReferenceIntegrityJudgeFailure as exc:
+            # A judge-failed receipt is still a legitimate committed result.
+            self._remember_validated_context(prepared_context)
             return JobResult(
                 OUTCOME_COMPLETED,
                 payload={
@@ -2316,6 +2574,7 @@ class ReferenceIntegrityEpochRunner:
         finally:
             if resolved.owned:
                 resolved.judge.close()
+        self._remember_validated_context(prepared_context)
         return JobResult(
             OUTCOME_COMPLETED,
             payload={
@@ -2340,6 +2599,7 @@ class ReferenceIntegrityEpochRunner:
         job: ModelJob,
         payload: Mapping[str, Any],
         create_continuation: bool,
+        prepared_current: _ValidatedReviewJobContext | None = None,
     ) -> _ReviewOutcome:
         """Everything one committed review job means, from frozen state.
 
@@ -2364,22 +2624,15 @@ class ReferenceIntegrityEpochRunner:
             else self._require_review_inputs_and_job
         )
         variant = self._review_variant(job)
-        main_reference, main_anchor, main_job = (
-            self._require_review_inputs_and_job(
-                shard=shard,
-                storage=storage,
-                clip_uid=clip_uid,
-                plan_entry=plan_entry,
-                entity=entity,
-                reference=reference,
-                variant=VARIANT_FINAL,
-            )
-        )
-        main_diagnostics = self._review_diagnostics(storage, main_reference)
-        if variant == VARIANT_SOURCE_ALPHA:
-            # The alpha job being finalised already exists, so its input is
-            # required, never frozen here.
-            alpha_reference, alpha_anchor, alpha_job = (
+        if prepared_current is not None:
+            # run() already strictly re-derived and verified this exact chain and
+            # every artifact it depends on is byte-identical to that generation,
+            # so the committed job is not re-derived a second time.
+            main_reference = prepared_current.main_reference
+            main_anchor = prepared_current.main_anchor
+            main_job = prepared_current.main_job
+        else:
+            main_reference, main_anchor, main_job = (
                 self._require_review_inputs_and_job(
                     shard=shard,
                     storage=storage,
@@ -2387,10 +2640,30 @@ class ReferenceIntegrityEpochRunner:
                     plan_entry=plan_entry,
                     entity=entity,
                     reference=reference,
-                    variant=VARIANT_SOURCE_ALPHA,
-                    main_job=main_job,
+                    variant=VARIANT_FINAL,
                 )
             )
+        main_diagnostics = self._review_diagnostics(storage, main_reference)
+        if variant == VARIANT_SOURCE_ALPHA:
+            # The alpha job being finalised already exists, so its input is
+            # required, never frozen here.
+            if prepared_current is not None:
+                alpha_reference = prepared_current.current_reference
+                alpha_anchor = prepared_current.current_anchor
+                alpha_job = prepared_current.current_job
+            else:
+                alpha_reference, alpha_anchor, alpha_job = (
+                    self._require_review_inputs_and_job(
+                        shard=shard,
+                        storage=storage,
+                        clip_uid=clip_uid,
+                        plan_entry=plan_entry,
+                        entity=entity,
+                        reference=reference,
+                        variant=VARIANT_SOURCE_ALPHA,
+                        main_job=main_job,
+                    )
+                )
             if alpha_job.job_id() != job.job_id():
                 raise ReferenceIntegrityDurableError(
                     f"source alpha job id drifted for {clip_uid}/{entity.entity_id}"
@@ -2516,6 +2789,9 @@ class ReferenceIntegrityEpochRunner:
             # Only the main review owns the legacy debug sidecar; the alpha
             # continuation never overwrites it.
             self._write_review_debug(storage, job.clip_uid, entity.entity_id, payload)
+        # The current clip's live semantic state is still strictly validated
+        # above, so a stale cache can only cost CPU, never correctness.
+        prepared_current = self._fresh_validated_context(job, storage, plan_entry)
         outcome = self._review_outcome(
             shard=shard,
             storage=storage,
@@ -2530,6 +2806,7 @@ class ReferenceIntegrityEpochRunner:
             # finalizer may unlock is frozen, and the finalizer is the only
             # main-thread continuation point.
             create_continuation=True,
+            prepared_current=prepared_current,
         )
         if outcome.marker is None:
             # A continuation owns this entity; only the durable receipt is kept.
@@ -3788,8 +4065,10 @@ class ReferenceIntegrityEpochRunner:
                 pre_edit=pre_edit,
                 job=job,
                 payload=self._committed_review_payload(job),
-                # Verification is read-only end to end.
+                # Verification is read-only end to end and never reuses a
+                # cache: a cold restart must replay strictly.
                 create_continuation=False,
+                prepared_current=None,
             )
             if outcome.marker is None:
                 raise ReferenceIntegrityDurableError(
