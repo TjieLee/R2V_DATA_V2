@@ -45,13 +45,13 @@ def main(argv=None):
     parser.add_argument(
         "--mimo-checkpoint",
         type=Path,
-        default=Path("/mnt/workspace/public/pretrained/MiMo/MiMo-V2.6-Flash-RL"),
+        default=Path("/mnt/workspace/public/pretrained/MiMo/MiMo-V2.5"),
     )
-    parser.add_argument("--mimo-model", default="mimo-v2.6-flash-rl")
+    parser.add_argument("--mimo-model", default="mimo-v2.5")
     parser.add_argument(
         "--mimo-speculative",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
     )
     parser.add_argument("--mimo-mem-fraction-static", type=float, default=0.65)
     parser.add_argument("--mimo-startup-polls", type=int, default=360)
