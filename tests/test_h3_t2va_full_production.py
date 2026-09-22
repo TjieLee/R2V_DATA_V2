@@ -288,6 +288,36 @@ def test_node_lifetime_does_not_start_persistent_upstream_pools(tmp_path, monkey
     assert pipeline.pools is None
 
 
+def test_downstream_evidence_ignores_mimo_model_for_resume():
+    from r2v_data_v2.h3.t2va_full_downstream import _model_agnostic_evidence
+
+    old_v25 = {
+        "population": "source",
+        "source": {
+            "source_index": 1,
+            "source_row_sha256": "a" * 64,
+            "clip_uid": "clip",
+            "video": "/video.mp4",
+        },
+        "policy": {
+            "version": "full-downstream-per-clip-v1",
+            "backend": {"model": "mimo-v2.5"},
+            "profiles": {"model": "mimo-v2.5"},
+            "allow_unverified": True,
+        },
+        "dependencies": {"resolved": {"clip_uid": "clip"}},
+    }
+    current_v26 = {
+        **old_v25,
+        "policy": {
+            "version": "full-downstream-per-clip-v2-model-agnostic",
+            "allow_unverified": True,
+        },
+    }
+
+    assert _model_agnostic_evidence(old_v25) == _model_agnostic_evidence(current_v26)
+
+
 def test_mimo_stage_is_wrapped_by_per_shard_lifecycle(tmp_path, monkeypatch):
     from contextlib import contextmanager
     from types import SimpleNamespace
