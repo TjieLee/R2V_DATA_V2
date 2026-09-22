@@ -6,6 +6,40 @@ implementations; the reused audio finalizer remains v6. The standalone downstrea
 runner does not preprocess Audio. The optional full launcher below adds upstream
 stage orchestration without migrating legacy outputs or changing eligibility.
 
+## MiMo model runs inside one production root
+
+The production root identifies the JEA source population and reusable upstream
+Audio/H3 caches. It is intentionally independent of the MLLM version.
+
+Current default MiMo:
+
+    model: mimo-v2.6-flash-rl
+    checkpoint: /mnt/workspace/public/pretrained/MiMo/MiMo-V2.6-Flash-RL
+
+Downstream T2VA/TA2VA state is namespaced by MiMo run:
+
+    <PRODUCTION_ROOT>/downstream/<run_id>/shards/...
+
+The default run ID is the served model name, currently
+`mimo-v2.6-flash-rl`. Changing MiMo versions therefore creates a new downstream
+run while reusing the same canonical/SAM/AuK/resolve/DiariZen/ASR outputs. Do not
+create a fresh production root merely because the MLLM changes.
+
+Use `MIMO_MODEL` and `DOWNSTREAM_RUN_ID` to compare models without moving
+upstream data. Existing V2.5 products remain untouched.
+
+Model checkpoint weights are not content-hashed for runtime provenance. Large
+model files use logical identity (path/model identifier/config; weight files in
+SAM/AuK use lightweight path/size identity) so startup does not reread many GB
+from shared storage. Source media and generated artifacts keep their content
+hashes.
+
+MiMo V2.6 uses the same OpenAI-compatible multimodal request format. The current
+server command keeps TP=8, DP=2, DP attention/lm-head/mm-encoder,
+mem-fraction-static=0.65 and chunked-prefill-size=16384, and enables the official
+EAGLE/MTP speculative decoder by default. Set `MIMO_SPECULATIVE=0` only for
+compatibility/debugging.
+
 ## Full Raw-Video Production
 
 Use scripts/run_h3_t2va_full_production.sh for the production path from original
@@ -709,6 +743,7 @@ retry loop or automatic model restart daemon.
 ```bash
 python tools/build_h3_t2va_snapshot.py \
   --production-root /mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/T2VA \
+  --downstream-run-id mimo-v2.6-flash-rl \
   --snapshot-id 20260917-200000
 ```
 
