@@ -3655,7 +3655,13 @@ def test_cold_cache_rederives_the_same_outcome(
 def test_prepared_cache_eviction_does_not_change_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Evicted entries are re-prepared; semantic output is unaffected."""
+    """Job-cache eviction is covered by the clip row; output is unaffected.
+
+    The job-id cache holds only two decisions here, but the clip's prepared row
+    owns all three for the lifetime of the clip, so the model runs still prepare
+    nothing. Evicting the clip row itself is what falls back to a real
+    re-prepare, which the dedicated eviction test covers.
+    """
     import r2v_data_v2.v3.post_mask_epoch_pair as pm
 
     monkeypatch.setattr(pm, "_PREPARED_CACHE_LIMIT", 2)
@@ -3671,8 +3677,9 @@ def test_prepared_cache_eviction_does_not_change_output(
     for entity_id in ("e1", "e2", "e3"):
         result = _run_one(runner, seeded[entity_id], _Judge())
         assert result.committed
-    # The cache only holds two, so at least one entity was prepared again.
-    assert len(calls) > after_seed, "evicted entries are re-prepared"
+    assert len(calls) == after_seed, "the clip row covers job-cache eviction"
+    assert runner.prepare_counters["primary_model_prepare_clip_fallback_hits"] >= 1
+    assert runner.prepare_counters["primary_model_prepare_cache_misses"] == 0
 
     runner.finalize(seeded["e3"], runner._committed(seeded["e3"]))
     clip = storage.read_clip("clip-1")
@@ -4166,3 +4173,165 @@ def test_mismatched_prepared_clip_row_falls_back_to_the_replay(
     assert runner.prepare_counters["primary_hot_finalize_cache_hits"] == 0
     clip = storage.read_clip("clip-1")
     assert clip.pairing is not None and clip.pairing.status == "ready"
+
+
+def _many_judged_clips_fixture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    run_name: str,
+    *,
+    clip_count: int,
+    entity_types: tuple[str, ...],
+    cpu_workers: int | None = None,
+) -> tuple[Any, Any, Any]:
+    """Several clips whose judged entities total well over the job cache."""
+    config = _pair_config(tmp_path, monkeypatch)
+    storage = _storage(config, entity_types=entity_types)
+    clip_uids = tuple(f"clip-{index}" for index in range(1, clip_count + 1))
+    for clip_uid in clip_uids[1:]:
+        _add_ready_clip(
+            config, storage, clip_uid=clip_uid, entity_types=entity_types
+        )
+    runner = _runner(
+        tmp_path,
+        config,
+        storage,
+        clip_uids=clip_uids,
+        ledger_dir=f"ledger-{run_name}",
+        cpu_workers=cpu_workers,
+    )
+    return config, storage, runner
+
+
+def test_seeded_jobs_beyond_the_job_cache_never_reprepare(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Eighteen judged clips cross the sixteen-entry job cache.
+
+    A seeding invocation with more judge jobs than the job-id cache can hold
+    used to evict decisions before Qwen ever ran them, so model execution
+    re-prepared and evicted more. The clip rows must cover all of it.
+    """
+    import r2v_data_v2.v3.post_mask_epoch_pair as pm
+
+    assert pm._PREPARED_CACHE_LIMIT == 16, "the fixture must really cross it"
+    _unused_config, storage, runner = _many_judged_clips_fixture(
+        tmp_path,
+        monkeypatch,
+        "run-over-job-cache",
+        clip_count=18,
+        entity_types=("subject",),
+        cpu_workers=4,
+    )
+    prepared = _counting_primary_prepare(monkeypatch)
+
+    seeded = runner.seed_primary_jobs()
+    assert len(seeded) == 18
+    after_seed = len(prepared)
+    assert after_seed == 18, f"one prepare per entity: {prepared}"
+
+    for job in seeded:
+        assert _run_one(runner, job, _Judge()).committed
+    assert len(prepared) == after_seed, "model execution must not prepare again"
+
+    counters = runner.prepare_counters
+    assert counters["primary_model_prepare_cache_misses"] == 0
+    assert counters["primary_model_prepare_clip_fallback_hits"] >= 1, (
+        "the first jobs were evicted from the job cache and came from the clip row"
+    )
+
+    before_finalize = len(prepared)
+    for job in seeded:
+        runner.finalize(job, runner._committed(job))
+    assert len(prepared) == before_finalize, "hot finalizers must not prepare again"
+    assert all(
+        storage.read_clip(clip_uid).pairing is not None
+        for clip_uid in ("clip-1", "clip-18")
+    )
+
+
+def test_model_execution_reuses_clip_rows_whatever_the_job_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The job cache holds one decision; execution order must not cause churn.
+
+    The real scheduler sorts jobs by id, which is not the seed insertion order,
+    so a cache that only grew on misses would evict work a later job still
+    needs. Twenty judged entities against a one-entry job cache prove the clip
+    rows carry all of it.
+    """
+    import r2v_data_v2.v3.post_mask_epoch_pair as pm
+
+    monkeypatch.setattr(pm, "_PREPARED_CACHE_LIMIT", 1)
+    _unused_config, _unused_storage, runner = _many_judged_clips_fixture(
+        tmp_path,
+        monkeypatch,
+        "run-churn",
+        clip_count=4,
+        entity_types=("subject",) * 5,
+        cpu_workers=4,
+    )
+    prepared = _counting_primary_prepare(monkeypatch)
+
+    seeded = runner.seed_primary_jobs()
+    assert len(seeded) == 20
+    after_seed = len(prepared)
+    assert after_seed == 20, f"one prepare per entity: {prepared}"
+
+    # A different execution order from the insertion order.
+    for job in sorted(seeded, key=lambda item: item.job_id(), reverse=True):
+        assert _run_one(runner, job, _Judge()).committed
+
+    assert len(prepared) == after_seed, "no churn: model execution prepared nothing"
+    counters = runner.prepare_counters
+    assert counters["primary_model_prepare_cache_misses"] == 0
+    assert counters["primary_model_prepare_clip_fallback_hits"] >= 1
+    assert runner._prepared_clips, "the clip rows are the bounded owner"
+
+
+def test_clip_row_eviction_still_falls_back_to_a_real_prepare(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Evicting the clip row is what costs CPU; correctness is unaffected.
+
+    Both bounded caches are shrunk: the job cache must not quietly cover the
+    clip whose row was evicted, otherwise this would not exercise the fallback.
+    """
+    import r2v_data_v2.v3.post_mask_epoch_pair as pm
+
+    monkeypatch.setattr(pm, "_PREPARED_CACHE_LIMIT", 1)
+    _unused_config, storage, runner = _many_judged_clips_fixture(
+        tmp_path,
+        monkeypatch,
+        "run-clip-evict",
+        clip_count=2,
+        entity_types=("subject",),
+        cpu_workers=1,
+    )
+    # The clip limit is an instance attribute, so it is set on the runner.
+    monkeypatch.setattr(runner, "_prepared_clip_limit", 1)
+    prepared = _counting_primary_prepare(monkeypatch)
+
+    seeded = runner.seed_primary_jobs()
+    by_clip = {job.clip_uid: job for job in seeded}
+    assert sorted(by_clip) == ["clip-1", "clip-2"]
+    after_seed = len(prepared)
+    assert sorted(runner._prepared_clips) == [(SHARD, "clip-2")]
+    assert len(runner._prepared) == 1, "the job cache kept only the last decision"
+
+    # clip-2 still has both caches; clip-1 was evicted from both.
+    assert _run_one(runner, by_clip["clip-2"], _Judge()).committed
+    assert len(prepared) == after_seed, "the surviving row still covers clip-2"
+
+    prepared_before_clip1 = len(prepared)
+    assert _run_one(runner, by_clip["clip-1"], _Judge()).committed
+    assert len(prepared) > prepared_before_clip1, (
+        "an evicted clip must really re-prepare"
+    )
+    assert runner.prepare_counters["primary_model_prepare_cache_misses"] >= 1
+
+    # Correctness is unaffected: both clips still publish.
+    for clip_uid in ("clip-1", "clip-2"):
+        job = by_clip[clip_uid]
+        runner.finalize(job, runner._committed(job))
+        assert storage.read_clip(clip_uid).pairing is not None

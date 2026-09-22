@@ -117,6 +117,12 @@ class _PreparedPrimaryClip:
     entity_ids: tuple[str, ...]
     job_ids: tuple[str, ...]
     row: tuple[Any, ...]
+    #: Aligned ``job id -> prepared decision`` for exactly the judged entities
+    #: of this clip. ``row`` also contains deterministic ``EntityReferenceState``
+    #: entries, so a positional zip between ``row`` and ``job_ids`` would be
+    #: wrong; this mapping is built where both are known and refers to the same
+    #: decision objects, never copies.
+    prepared_jobs: tuple[tuple[str, Any], ...] = ()
 
 
 class PairEpochError(RuntimeError):
@@ -419,6 +425,9 @@ class PairEpochRunner:
             "primary_prepare_peak_inflight": 0,
             "primary_prepare_peak_buffered_results": 0,
             "primary_prepare_commit_batches": 0,
+            "primary_model_prepare_cache_hits": 0,
+            "primary_model_prepare_clip_fallback_hits": 0,
+            "primary_model_prepare_cache_misses": 0,
             "primary_hot_finalize_cache_hits": 0,
             "primary_hot_finalize_cache_misses": 0,
             "primary_hot_finalize_replay_fallbacks": 0,
@@ -447,14 +456,36 @@ class PairEpochRunner:
         """The prepared decision this job was planned with, if still cached.
 
         Seeding already prepared every entity; running the same job immediately
-        after would prepare it a second time. The cache is keyed by job id and
-        only ever shortcuts CPU work: the job is still rebuilt from the prepared
-        decision and its input digest compared below, so a cached entry that no
-        longer matches the planned semantic inputs fails closed exactly like the
-        uncached path.
+        after would prepare it a second time. Resolution order is the direct
+        job-id cache first, then the bounded prepared row of the job's own clip,
+        and otherwise a real miss.
+
+        The small job-id cache alone is not enough: a seeding invocation with
+        more judge jobs than ``_PREPARED_CACHE_LIMIT`` evicts decisions before
+        Qwen runs them, so the clip row - whose lifetime is the clip, not the
+        job - is what keeps a seeded decision reachable.
+
+        Only ever shortcuts CPU work: the job is still rebuilt from the prepared
+        decision and its input digest compared by the caller, so a cached entry
+        that no longer matches the planned semantic inputs fails closed exactly
+        like the uncached path.
         """
         with self._prepared_lock:
-            return self._prepared.get(job.job_id())
+            cached = self._prepared.get(job.job_id())
+        if cached is not None:
+            self._bump_prepare_counter("primary_model_prepare_cache_hits")
+            return cached
+        with self._prepared_clips_lock:
+            clip_row = self._prepared_clips.get(
+                (job.canonical_shard, job.clip_uid)
+            )
+        if clip_row is not None:
+            for job_id, prepared in clip_row.prepared_jobs:
+                if job_id == job.job_id():
+                    self._bump_prepare_counter("primary_model_prepare_clip_fallback_hits")
+                    return prepared
+        self._bump_prepare_counter("primary_model_prepare_cache_misses")
+        return None
 
     def _remember_prepared(self, job: ModelJob, prepared: Any) -> None:
         if not isinstance(prepared, PreparedEntityReferenceDecision):
@@ -845,14 +876,22 @@ class PairEpochRunner:
         entity_ids: Sequence[str],
         jobs: Sequence[ModelJob],
         row: Sequence[Any],
+        prepared_jobs: Sequence[tuple[str, Any]] = (),
     ) -> None:
-        """Keep one clip's prepared row for its hot finalizer. Bounded."""
+        """Keep one clip's prepared row for its own finalizer and its model runs.
+
+        Bounded. This is the only bounded owner of a clip's prepared decisions,
+        which is what lets the model execution of a job created by this seeding
+        find its decision even after the much smaller job-id cache has evicted
+        it.
+        """
         entry = _PreparedPrimaryClip(
             shard=shard,
             clip_uid=clip_uid,
             entity_ids=tuple(entity_ids),
             job_ids=tuple(job.job_id() for job in jobs),
             row=tuple(row),
+            prepared_jobs=tuple(prepared_jobs),
         )
         with self._prepared_clips_lock:
             if (
@@ -939,12 +978,10 @@ class PairEpochRunner:
                     results[index] = future.result()
                 except Exception as exc:  # noqa: BLE001 - re-raised in order
                     results[index] = exc
-        # Merge the private scratch counters in task order: a worker never
-        # writes a counter dict shared with another worker.
-        merged = self._scratch(batch[0][0])
-        for task in tasks:
-            for key, value in task[5].items():
-                merged[key] = merged.get(key, 0) + value
+        # Each task gets its own counters dict so no two workers ever write the
+        # same dict, and those dicts are deliberately dropped: ``_scratch()`` is
+        # a throwaway, so there is nothing to merge into. The per-task dicts are
+        # required for thread safety, not for accounting.
         return results
 
     def _prepare_and_advance_primary_batch(
@@ -1132,12 +1169,14 @@ class PairEpochRunner:
         temporary_images: dict[str, tuple[Path, Image.Image]] = {}
         pending: list[ModelJob] = []
         entity_jobs: list[ModelJob] = []
+        judged_prepared: list[tuple[str, Any]] = []
         for (index, entity), prepared in zip(entities, prepared_by_entity):
             if isinstance(prepared, EntityReferenceState):
                 entity_states.append(prepared)
                 continue
             job = self._entity_job(shard, storage, clip_uid, entity, index, prepared)
             entity_jobs.append(job)
+            judged_prepared.append((job.job_id(), prepared))
             # Seeding has already prepared this entity, so the model call can
             # reuse it instead of preparing a second time.
             self._remember_prepared(job, prepared)
@@ -1169,6 +1208,7 @@ class PairEpochRunner:
             [str(entity.entity_id) for _index, entity in entities],
             entity_jobs,
             prepared_by_entity,
+            judged_prepared,
         )
         if pending:
             # Rebuilt temporaries are not progress: only receipts are, and the
