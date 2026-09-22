@@ -485,13 +485,9 @@ def test_model_configuration_changes_cache_identity(monkeypatch, tmp_path):
     speech = importlib.import_module("r2v_data_v2.h3.t2va_full_speech")
     speech._diar_configuration_cached.cache_clear()
     speech._asr_configuration_cached.cache_clear()
-    calls = Counter()
+    (tmp_path / "diar").mkdir()
+    (tmp_path / "asr").mkdir()
 
-    def fingerprint(path):
-        calls[str(path)] += 1
-        return ("a" if calls[str(path)] == 1 else "b") * 64
-
-    monkeypatch.setattr(speech, "fingerprint_local_model_path", fingerprint)
     monkeypatch.setenv("DIARIZEN_MODEL_PATH", str(tmp_path / "diar"))
     monkeypatch.setenv("DIARIZEN_DEVICE", "cuda:5")
     monkeypatch.setenv("QWEN3_ASR_MODEL_PATH", str(tmp_path / "asr"))
@@ -503,19 +499,29 @@ def test_model_configuration_changes_cache_identity(monkeypatch, tmp_path):
     ac = speech._asr_configuration()
     assert dc == speech._diar_configuration()
     assert ac == speech._asr_configuration()
-    assert calls[str(tmp_path / "diar")] == 1
-    assert calls[str(tmp_path / "asr")] == 1
     assert ac["configuration"]["device"] == "cuda:0"
     assert dc["environment"]["DIARIZEN_DEVICE"] == "cuda:0"
     assert dict(os.environ) == before
 
+    # Runtime provenance is logical identity only; it never reads model weights.
+    assert dc["provenance"]["model_fingerprint"] == speech._logical_model_fingerprint(
+        tmp_path / "diar",
+        dc["provenance"]["model_identifier"],
+    )
+    assert ac["model_fingerprint"] == speech._logical_model_fingerprint(
+        tmp_path / "asr",
+        "qwen3-asr",
+    )
+
     monkeypatch.setenv("QWEN3_ASR_DTYPE", "float32")
-    assert ac != speech._asr_configuration()
-    assert calls[str(tmp_path / "asr")] == 2
+    changed_asr = speech._asr_configuration()
+    assert ac != changed_asr
+    assert ac["model_fingerprint"] == changed_asr["model_fingerprint"]
 
     monkeypatch.setenv("DIARIZEN_MODEL_IDENTIFIER", "changed-model")
-    assert dc != speech._diar_configuration()
-    assert calls[str(tmp_path / "diar")] == 2
+    changed_diar = speech._diar_configuration()
+    assert dc != changed_diar
+    assert dc["provenance"]["model_fingerprint"] != changed_diar["provenance"]["model_fingerprint"]
 
 
 def test_startup_failure_is_fatal(speech, monkeypatch):
