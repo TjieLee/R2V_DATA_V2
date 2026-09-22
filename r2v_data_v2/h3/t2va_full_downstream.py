@@ -322,9 +322,11 @@ def run_downstream(
     allow_unverified=False,
     request_workers=1,
     run_id="production",
+    output_root=None,
 ):
     """Run target stages; caller must hold this shard's invocation.lock."""
     root = Path(root).resolve()
+    output_root = Path(output_root or root).resolve()
     print(f"shard={shard_id} downstream_prepare_start", flush=True)
     rows, contexts = production.prepare_shard(
         root,
@@ -346,11 +348,11 @@ def run_downstream(
         contexts, backend, profiles, index, allow_unverified=allow_unverified
     )
     print(f"shard={shard_id} downstream_processor_ready", flush=True)
-    shard = root / "shards" / production.shard_name(shard_id)
+    shard = output_root / "shards" / production.shard_name(shard_id)
     print(f"shard={shard_id} downstream_preflight_start", flush=True)
     with production.file_lock(shard / "shard.lock"):
         _preflight(shard, rows, processor)
     print(f"shard={shard_id} downstream_preflight_ready", flush=True)
     return production.process_shard(
-        root, shard_id, rows, processor, request_workers=request_workers
+        output_root, shard_id, rows, processor, request_workers=request_workers
     )
