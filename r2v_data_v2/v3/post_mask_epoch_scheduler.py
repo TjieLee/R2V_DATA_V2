@@ -438,13 +438,45 @@ class ResourceEpochScheduler:
                     f"{resource} executor returned no completion while "
                     f"{len(inflight)} job(s) are still in flight"
                 )
+            # Free every finished slot *before* doing any CPU work. Those jobs
+            # have already handed their slots back to the executor, so anything
+            # that was ready before this collect can be submitted now and the
+            # model service starts on it while this thread is still settling.
             for execution in completions:
                 inflight.pop(execution.job.job_id(), None)
+            self._refill(
+                resource,
+                executor,
+                counters,
+                phase,
+                planned,
+                inflight,
+                pending,
+                resolved,
+                attempted,
+                finalize_attempted,
+            )
+            for execution in completions:
                 self._settle(
                     phase_id,
                     phase,
                     counters,
                     execution,
+                    pending,
+                    resolved,
+                    attempted,
+                    finalize_attempted,
+                )
+                # A finalizer is CPU work and can be slow. Anything it unlocked
+                # for this resource is submitted before the next sibling is
+                # settled, so one slow finalizer cannot idle every free slot.
+                self._refill(
+                    resource,
+                    executor,
+                    counters,
+                    phase,
+                    planned,
+                    inflight,
                     pending,
                     resolved,
                     attempted,

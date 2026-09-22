@@ -1827,3 +1827,73 @@ def test_streaming_keeps_one_resource_loaded_while_it_keeps_unlocking(tmp_path: 
     # resource was entered exactly once.
     assert scheduler.diagnostics.resource_switches == 0
     assert scheduler.diagnostics.resource(RESOURCE_BOOGU)["epoch_count"] == 1
+
+
+def _recording_executor(capacity: int, completions: Sequence[Sequence[str]], events: list[str]) -> Any:
+    """A scripted executor that logs submits and collects into ``events``."""
+    executor = _ScriptedExecutor(capacity=capacity, completions=completions)
+    real_submit = executor.submit
+    real_collect = executor.collect
+
+    def submit(job: Any) -> None:
+        events.append(f"submit:{job.clip_uid}")
+        real_submit(job)
+
+    def collect() -> list[JobExecution]:
+        events.append("collect")
+        return real_collect()
+
+    executor.submit = submit  # type: ignore[method-assign]
+    executor.collect = collect  # type: ignore[method-assign]
+    return executor
+
+
+def test_streaming_submits_ready_work_before_the_heavy_finalizer(
+    tmp_path: Path,
+) -> None:
+    """Already-ready work is submitted before this thread runs a finalizer."""
+    first = _job(job_type="removal", clip_uid="clip-000001")
+    second = _job(job_type="removal", clip_uid="clip-000002")
+    third = _job(job_type="removal", clip_uid="clip-000003")
+
+    events: list[str] = []
+    executor = _recording_executor(2, [[first.job_id()]], events)
+
+    def finalize(job: ModelJob, result: JobResult) -> Sequence[ModelJob]:
+        events.append(f"settle:{job.clip_uid}")
+        return ()
+
+    outcome = _stream_scheduler(tmp_path, executor, finalize).run(
+        [first, second, third]
+    )
+
+    assert outcome["completed"] is True
+    # A finished slot is refilled from the ready set before any CPU finalizer.
+    assert events.index(f"submit:{third.clip_uid}") < events.index(
+        f"settle:{first.clip_uid}"
+    )
+
+
+def test_streaming_submits_unlocked_work_before_the_next_sibling_finalizer(
+    tmp_path: Path,
+) -> None:
+    """One finalizer's unlock is submitted before the next sibling is settled."""
+    first = _job(job_type="removal", clip_uid="clip-000001")
+    second = _job(job_type="removal", clip_uid="clip-000002")
+    unlocked = _job(job_type="removal", clip_uid="clip-000003")
+
+    events: list[str] = []
+    executor = _recording_executor(
+        2, [[first.job_id(), second.job_id()]], events
+    )
+
+    def finalize(job: ModelJob, result: JobResult) -> Sequence[ModelJob]:
+        events.append(f"settle:{job.clip_uid}")
+        return (unlocked,) if job.job_id() == first.job_id() else ()
+
+    outcome = _stream_scheduler(tmp_path, executor, finalize).run([first, second])
+
+    assert outcome["completed"] is True
+    assert events.index(f"submit:{unlocked.clip_uid}") < events.index(
+        f"settle:{second.clip_uid}"
+    )
