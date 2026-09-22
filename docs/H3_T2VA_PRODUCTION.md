@@ -23,6 +23,10 @@ V2.6 candidate:
     model: mimo-v2.6-flash-rl
     checkpoint: /mnt/workspace/public/pretrained/MiMo/MiMo-V2.6-Flash-RL
 
+When the served model is `mimo-v2.6-flash-rl`, the full-production launcher
+automatically enables the official EAGLE/MTP speculative decoder parameters.
+There is no separate speculative on/off operator switch.
+
 Existing V2.5-ready artifacts remain valid at their original
 `<PRODUCTION_ROOT>/shards/.../artifacts` paths. Pending/failed samples continue
 in the same shard/state/export layout using the currently configured MiMo model.
@@ -41,10 +45,9 @@ cache-compatible; removing those fields requires a separate compatibility
 migration and is intentionally not coupled to an MLLM upgrade. Source media and
 generated artifacts keep their content hashes.
 
-MiMo V2.6 uses the same OpenAI-compatible multimodal request format. For the
-first random20 quality A/B, keep the existing multi-call prompts/turns and leave
-speculative decoding disabled so the model change is isolated. EAGLE/MTP remains
-available as an explicit serving optimization after quality validation.
+MiMo V2.6 uses the same OpenAI-compatible multimodal request format. The existing
+multi-call prompts/turns stay unchanged, while V2.6 always uses the official
+EAGLE/MTP speculative serving configuration for best runtime performance.
 
 ## Full Raw-Video Production
 
