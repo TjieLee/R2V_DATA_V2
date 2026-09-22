@@ -4563,3 +4563,179 @@ def test_cold_prefilter_replay_overlaps_across_clips(
     # The merge is canonical clip order, whatever the completion order was.
     assert merged == sorted(merged), merged
     assert sorted(merged) == sorted(clip_uids)
+
+
+def _many_clip_pair_storage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, run_name: str, *, clip_count: int,
+    cpu_workers: int,
+) -> tuple[Any, Any, Any, tuple[str, ...]]:
+    config = _pair_config(tmp_path, monkeypatch)
+    storage = _storage(config, entity_types=("subject",))
+    clip_uids = tuple(f"clip-{index}" for index in range(1, clip_count + 1))
+    for clip_uid in clip_uids[1:]:
+        _add_ready_clip(config, storage, clip_uid=clip_uid, entity_types=("subject",))
+    runner = _runner(
+        tmp_path, config, storage, clip_uids=clip_uids,
+        ledger_dir=f"ledger-{run_name}", cpu_workers=cpu_workers,
+    )
+    return config, storage, runner, clip_uids
+
+
+def _drain_streamed_batches(
+    runner: Any, *, judge: Any = None, commit: bool = True
+) -> dict[str, Any]:
+    """Drain the streaming batches, committing and finalizing each one.
+
+    Sampling the prepared-clip cache size after every batch is what proves the
+    prepared lifetime is bounded: the generator may only keep a batch alive
+    until the consumer asks for the next one.
+    """
+    judge = judge or _Judge()
+    batches = 0
+    jobs = 0
+    peak_residency = 0
+    for batch in runner.iter_primary_seed_batches():
+        batches += 1
+        jobs += len(batch)
+        for job in sorted(batch, key=lambda item: item.job_id()):
+            result = runner.run(job, judge)
+            if commit and result.committed:
+                _commit(runner, job, result)
+            runner.finalize(job, result)
+        peak_residency = max(peak_residency, len(runner._prepared_clips))
+    return {"batches": batches, "jobs": jobs, "peak_residency": peak_residency}
+
+
+def test_streamed_primary_preparation_is_bounded_and_prepares_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hundred clips prepare once each while residency stays bounded.
+
+    Every hot cache is far smaller than the fixture, so an unbounded
+    seed-everything-first design would evict prepared rows before their model
+    run and re-prepare them.
+    """
+    import r2v_data_v2.v3.post_mask_epoch_pair as pm
+
+    _unused_config, storage, runner, clip_uids = _many_clip_pair_storage(
+        tmp_path, monkeypatch, "run-scale", clip_count=100, cpu_workers=4
+    )
+    monkeypatch.setattr(runner, "_prepared_clip_limit", 4)
+    monkeypatch.setattr(pm, "_PREPARED_CACHE_LIMIT", 2)
+    prepared = _counting_primary_prepare(monkeypatch)
+
+    seen = _drain_streamed_batches(runner)
+
+    assert len(prepared) == len(clip_uids), (
+        f"exactly one preparation per entity: {len(prepared)}"
+    )
+    counters = runner.prepare_counters
+    assert counters["primary_model_prepare_cache_misses"] == 0, "no re-preparation"
+    assert counters["primary_hot_finalize_replay_fallbacks"] == 0
+    assert seen["jobs"] == len(clip_uids)
+    assert seen["batches"] > 1, "the fixture really streamed several batches"
+    assert seen["peak_residency"] <= 4, (
+        f"heavy prepared residency must stay bounded: {seen['peak_residency']}"
+    )
+    assert counters["primary_prepare_peak_buffered_results"] <= max(
+        4, 2 * 4
+    )
+    for clip_uid in (clip_uids[0], clip_uids[-1]):
+        assert storage.read_clip(clip_uid).pairing is not None
+
+
+def test_batch_drains_enter_the_resource_once_and_take_increasing_phases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Streaming must not turn N batches into N model-server startups."""
+    from r2v_data_v2.v3.post_mask_epoch_jobs import RESOURCE_QWEN
+    from r2v_data_v2.v3.post_mask_epoch_scheduler import (
+        JobExecution,
+        ResourceEpochScheduler,
+    )
+
+    _unused_config, _unused_storage, runner, _unused_clip_uids = _many_clip_pair_storage(
+        tmp_path, monkeypatch, "run-batch-session", clip_count=6, cpu_workers=2
+    )
+    entered: list[str] = []
+    phases: list[str] = []
+    real_phase = runner.ledger.phase
+
+    def record_phase(phase_id: str) -> Any:
+        phases.append(phase_id)
+        return real_phase(phase_id)
+
+    monkeypatch.setattr(runner.ledger, "phase", record_phase)
+
+    class _CountingExecutor:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def execute_batch(self, jobs: Any) -> Any:
+            self.calls += 1
+            outcomes: dict[str, Any] = {}
+            for job in sorted(jobs, key=lambda item: item.job_id()):
+                result = runner.run(job, _Judge())
+                if result.committed:
+                    _commit(runner, job, result)
+                outcomes[job.job_id()] = JobExecution(job, result, None)
+            return outcomes
+
+    executor = _CountingExecutor()
+
+    class _FakeManagedResource:
+        """Counts resource session boundaries, which is what a start costs."""
+
+        def __init__(self) -> None:
+            self.enters: list[str] = []
+            self.closes = 0
+            self.open = False
+
+        def enter(self, resource: str) -> Any:
+            self.enters.append(resource)
+            # A resident resource is reused; only the first entry starts it.
+            self.open = True
+            return executor
+
+        def close(self) -> None:
+            if self.open:
+                self.closes += 1
+                self.open = False
+
+        def counters(self) -> dict[str, Any]:
+            return {"enter_count": len(self.enters), "close_count": self.closes}
+
+    manager = _FakeManagedResource()
+    scheduler = ResourceEpochScheduler(
+        ledger=runner.ledger,
+        finalize=runner.finalize,
+        executors={RESOURCE_QWEN: executor},
+        resource_manager=manager,
+    )
+    real_executor_for = scheduler._executor_for
+
+    def counting_executor_for(resource: str) -> Any:
+        entered.append(resource)
+        return real_executor_for(resource)
+
+    monkeypatch.setattr(scheduler, "_executor_for", counting_executor_for)
+
+    outcome = scheduler.run_batches(runner.iter_primary_seed_batches())
+
+    # Only the scheduler's own drains matter here; the runner also asks the
+    # ledger for its publication phase.
+    scheduler_phases = [phase for phase in phases if phase.endswith("-qwen")]
+    assert outcome["completed"] is True
+    assert len(scheduler_phases) > 1, (
+        f"the fixture really streamed several drains: {scheduler_phases}"
+    )
+    distinct = sorted(set(scheduler_phases))
+    assert distinct == [f"r{index:03d}-qwen" for index in range(len(distinct))], (
+        f"each drain takes the next phase id, so they cannot collide: {distinct}"
+    )
+    assert len(distinct) > 1, distinct
+    # Every drain went through the managed resource, and the session was closed
+    # exactly once for the whole multi-batch run - not once per batch, which is
+    # what would turn N batches into N model-server startups.
+    assert entered.count(RESOURCE_QWEN) == len(distinct), entered
+    assert manager.closes == 1, manager.counters()

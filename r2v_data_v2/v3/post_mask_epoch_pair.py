@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import json
 import threading
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -1583,17 +1583,56 @@ class PairEpochRunner:
     def seed_primary_jobs(self) -> list[ModelJob]:
         """Advance every fresh Pair target to its CPU fixed point.
 
+        Compatibility wrapper over ``iter_primary_seed_batches``: it drains every
+        batch and returns one list, so existing callers keep working and no
+        second implementation of the seeding policy exists.
+
         CPU work does not stop just because this is the seeding call: a
         deterministic terminal entity is recomputed, a clip whose entities are
         all deterministic is published straight away, and a clip whose primary
         pass is complete but whose guard needs Qwen seeds the guard job. Only
         a genuinely unresolved model job is handed back.
         """
-        jobs: list[ModelJob] = []
+        jobs = [job for batch in self.iter_primary_seed_batches() for job in batch]
+        jobs.sort(key=lambda job: job.job_id())
+        # Monotonic: the per-batch writes already recorded the same records.
+        self.phase.write_plan(jobs)
+        return jobs
+
+    def freeze_primary_plans(self) -> None:
+        """Freeze every shard's primary plan before the first Pair model call.
+
+        Classification must be decided from the launch state, never from state an
+        earlier Pair publication mutated, so a streaming consumer has to freeze
+        the complete plan first and only then start bounded preparation.
+        """
+        for shard in sorted(self.storages):
+            self._primary_plan(shard)
+
+    def _frozen_primary_plan(self, shard: str) -> dict[str, Any]:
+        """The frozen plan, reusing the one this invocation already validated."""
+        reused = self._reuse_validated_plan(shard)
+        return reused if reused is not None else self._primary_plan(shard)
+
+    def iter_primary_seed_batches(self) -> Iterator[list[ModelJob]]:
+        """Yield bounded canonical batches of Pair primary seed jobs.
+
+        Each batch is prepared, applied and yielded, and its prepared rows stay
+        alive until the caller asks for the next batch - which is what keeps
+        heavy residency bounded on a ten-thousand-clip shard while still letting
+        every entity be prepared once. Batches are consecutive canonical clips,
+        so a consumer that drains each batch before requesting the next one
+        still sees canonical order and the exact same published state as a
+        single seeding pass.
+
+        ``seed_primary_jobs`` is the compatibility wrapper that consumes this
+        generator, so there is exactly one preparation and application policy.
+        """
+        self.freeze_primary_plans()
         if self._primary_cpu_workers() <= 1:
             # Direct serial path: one clip at a time, no executor.
             for shard in sorted(self.storages):
-                plan = self._primary_plan(shard)
+                plan = self._frozen_primary_plan(shard)
                 storage = self._storage_for(shard)
                 for clip_uid in plan["eligible_clip_uids"]:
                     if plan["clips"][clip_uid]["classification"] != CLIP_FRESH_TARGET:
@@ -1601,25 +1640,31 @@ class PairEpochRunner:
                     context = self._primary_context(storage, clip_uid)
                     if context is None:
                         continue
-                    jobs.extend(
-                        self._advance_primary_clip(shard, storage, clip_uid, context)
+                    batch_jobs = self._advance_primary_clip(
+                        shard, storage, clip_uid, context
                     )
-            jobs.sort(key=lambda job: job.job_id())
-            self.phase.write_plan(jobs)
-            return jobs
+                    self.phase.write_plan(batch_jobs)
+                    yield batch_jobs
+            return
 
         # Flat preparation: ONE pool serves the whole seeding invocation and
         # independent entities of many clips share it, so single-entity clips
         # still fan out. Preparation and application alternate over bounded
-        # batches of consecutive canonical clips.
+        # batches of consecutive canonical clips, and the batch is released as
+        # soon as its jobs have been yielded.
         budget = self._primary_seed_residency_budget()
+        # The batch must also fit inside the bounded prepared-clip cache: a batch
+        # whose rows cannot all stay resident would evict the very prepared work
+        # its own execution still needs, which is the re-preparation this
+        # streaming exists to remove.
+        clip_budget = max(1, int(self._prepared_clip_limit))
         with ThreadPoolExecutor(
             max_workers=self._primary_cpu_workers(), thread_name_prefix="pair-primary"
         ) as pool:
             batch: list[tuple[str, RunStorage, str, Any]] = []
             buffered = 0
             for shard in sorted(self.storages):
-                plan = self._primary_plan(shard)
+                plan = self._frozen_primary_plan(shard)
                 storage = self._storage_for(shard)
                 for clip_uid in plan["eligible_clip_uids"]:
                     if plan["clips"][clip_uid]["classification"] != CLIP_FRESH_TARGET:
@@ -1628,19 +1673,23 @@ class PairEpochRunner:
                     if context is None:
                         continue
                     count = len(context[0].annotation.entities)
-                    if batch and buffered + count > budget:
-                        jobs.extend(
-                            self._prepare_and_advance_primary_batch(pool, batch)
+                    over_budget = batch and (
+                        buffered + count > budget or len(batch) >= clip_budget
+                    )
+                    if over_budget:
+                        batch_jobs = self._prepare_and_advance_primary_batch(
+                            pool, batch
                         )
+                        self.phase.write_plan(batch_jobs)
+                        yield batch_jobs
                         batch = []
                         buffered = 0
                     batch.append((shard, storage, clip_uid, context))
                     buffered += count
             if batch:
-                jobs.extend(self._prepare_and_advance_primary_batch(pool, batch))
-        jobs.sort(key=lambda job: job.job_id())
-        self.phase.write_plan(jobs)
-        return jobs
+                batch_jobs = self._prepare_and_advance_primary_batch(pool, batch)
+                self.phase.write_plan(batch_jobs)
+                yield batch_jobs
 
     def _advance_primary_clip(
         self,

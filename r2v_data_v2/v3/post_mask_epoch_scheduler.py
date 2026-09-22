@@ -34,7 +34,7 @@ free of races.
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -159,6 +159,32 @@ def as_job_executor(executor: Any, *, window_size: int) -> ResourceJobExecutor:
     if hasattr(executor, "submit") and hasattr(executor, "collect"):
         return executor
     return BatchExecutorAdapter(executor, window_size=window_size)
+
+
+@dataclass
+class _SchedulerRun:
+    """Execution-only state shared by every drain of one scheduler invocation.
+
+    Never persisted, never part of a ModelJob, a receipt or any schema: it is
+    only how much of this invocation's work is still pending, done, already
+    given a model attempt or already given a finalizer attempt.
+    """
+
+    pending: dict[str, ModelJob] = field(default_factory=dict)
+    #: Jobs already given one real model attempt in *this* invocation. Post-Mask
+    #: has no in-launch automatic retry; restart is the retry.
+    attempted: set[str] = field(default_factory=set)
+    #: Jobs whose CPU finalizer was already attempted in *this* invocation. A
+    #: finalizer failure is also retried on restart, never in-launch, so a
+    #: successful sibling must not cause a second attempt here.
+    finalize_attempted: set[str] = field(default_factory=set)
+    resolved: set[str] = field(default_factory=set)
+    current: str | None = None
+    round_index: int = 0
+
+    def add(self, jobs: Iterable[ModelJob]) -> None:
+        for job in jobs:
+            self.pending.setdefault(job.job_id(), job)
 
 
 class SchedulerError(RuntimeError):
@@ -287,75 +313,101 @@ class ResourceEpochScheduler:
 
     # -- execution --------------------------------------------------------
     def run(self, seed_jobs: Sequence[ModelJob]) -> dict[str, Any]:
-        pending: dict[str, ModelJob] = {job.job_id(): job for job in seed_jobs}
-        resolved: set[str] = set()
-        #: Jobs already given one real model attempt in *this* invocation.
-        #: Post-Mask has no in-launch automatic retry; restart is the retry.
-        attempted: set[str] = set()
-        #: Jobs whose CPU finalizer was already attempted in *this* invocation.
-        #: A finalizer failure is also retried on restart, never in-launch, so
-        #: a successful sibling must not cause a second attempt here. This is
-        #: invocation-local execution state: never persisted, never in identity.
-        finalize_attempted: set[str] = set()
-        current: str | None = None
-        round_index = 0
         started = time.perf_counter()
-
+        run = _SchedulerRun()
+        run.add(seed_jobs)
         try:
-            while round_index < self.max_rounds:
-                ready = self._ready(pending, resolved, attempted, finalize_attempted)
-                if not ready:
-                    break
-                resource = self._pick_resource(ready, current)
-                if current is not None and resource != current:
-                    self.diagnostics.resource_switches += 1
-                current = resource
-                executor = as_job_executor(
-                    self._executor_for(resource), window_size=self.window_size
-                )
-                counters = self.diagnostics.resource(resource)
-                counters["epoch_count"] += 1
-                self.diagnostics.phase_count += 1
-                epoch_started = time.perf_counter()
-                phase_id = f"r{round_index:03d}-{resource}"
-                try:
-                    epochs_progressed = self._drain_resource(
-                        phase_id,
-                        self.ledger.phase(phase_id),
-                        resource,
-                        executor,
-                        counters,
-                        pending,
-                        resolved,
-                        attempted,
-                        finalize_attempted,
-                    )
-                finally:
-                    executor.close()
-                counters["epoch_wall_seconds"] += time.perf_counter() - epoch_started
-                round_index += 1
-                if not epochs_progressed:
-                    break
+            self._drain_to_fixed_point(run)
         finally:
-            if self.resource_manager is not None:
-                # Close first so the final exit is part of the recorded timeline,
-                # unless an outer session owns that lifetime (4b).
-                if self.close_resource_manager_on_exit:
-                    self.resource_manager.close()
-                self.diagnostics.resource_lifecycle = (
-                    self.resource_manager.counters()
-                )
+            self._close_resource_manager()
+        return self._run_outcome(run, started)
 
+    def run_batches(self, batches: Iterable[Sequence[ModelJob]]) -> dict[str, Any]:
+        """Drain consecutive job batches through ONE resource session.
+
+        Each batch is drained to its own fixed point before the next one is
+        requested, so a producer can hold a bounded amount of prepared work and
+        release it as soon as its batch is terminal - which is what makes a
+        10k-clip Pair stage feasible without unbounded memory. The managed
+        resource is entered through the normal ``_executor_for`` path and closed
+        exactly once, at the end: batching must never turn one stage into one
+        model-server start per batch. Every drain takes the next phase id from a
+        single monotonically increasing counter, so no two drains can collide on
+        a phase plan, and the phase index is execution-only placement - it is
+        never part of ModelJob identity, a semantic input digest or a receipt.
+
+        Jobs a batch could not resolve stay unresolved in the aggregate outcome,
+        exactly as they would after a single ``run`` of the same jobs.
+        """
+        started = time.perf_counter()
+        run = _SchedulerRun()
+        try:
+            for batch in batches:
+                run.add(batch)
+                self._drain_to_fixed_point(run)
+        finally:
+            self._close_resource_manager()
+        return self._run_outcome(run, started)
+
+    def _drain_to_fixed_point(self, run: _SchedulerRun) -> None:
+        """Drain every ready job, taking the next phase id for each drain."""
+        while run.round_index < self.max_rounds:
+            ready = self._ready(
+                run.pending, run.resolved, run.attempted, run.finalize_attempted
+            )
+            if not ready:
+                return
+            resource = self._pick_resource(ready, run.current)
+            if run.current is not None and resource != run.current:
+                self.diagnostics.resource_switches += 1
+            run.current = resource
+            executor = as_job_executor(
+                self._executor_for(resource), window_size=self.window_size
+            )
+            counters = self.diagnostics.resource(resource)
+            counters["epoch_count"] += 1
+            self.diagnostics.phase_count += 1
+            epoch_started = time.perf_counter()
+            phase_id = f"r{run.round_index:03d}-{resource}"
+            try:
+                epochs_progressed = self._drain_resource(
+                    phase_id,
+                    self.ledger.phase(phase_id),
+                    resource,
+                    executor,
+                    counters,
+                    run.pending,
+                    run.resolved,
+                    run.attempted,
+                    run.finalize_attempted,
+                )
+            finally:
+                executor.close()
+            counters["epoch_wall_seconds"] += time.perf_counter() - epoch_started
+            run.round_index += 1
+            if not epochs_progressed:
+                return
+
+    def _close_resource_manager(self) -> None:
+        if self.resource_manager is None:
+            return
+        # Close first so the final exit is part of the recorded timeline, unless
+        # an outer session owns that lifetime (4b).
+        if self.close_resource_manager_on_exit:
+            self.resource_manager.close()
+        self.diagnostics.resource_lifecycle = self.resource_manager.counters()
+
+    def _run_outcome(self, run: _SchedulerRun, started: float) -> dict[str, Any]:
         self.diagnostics.resume["torn_receipts_repaired"] = (
             self.ledger.torn_receipts_repaired
         )
-        unresolved = sorted(set(pending) - resolved)
+        unresolved = sorted(set(run.pending) - run.resolved)
         return {
             "completed": not unresolved,
             "unresolved_job_ids": unresolved,
-            "job_count": len(pending),
-            "resolved_job_count": len(resolved),
-            "attempted_job_count": len(attempted),
+            "job_count": len(run.pending),
+            "resolved_job_count": len(run.resolved),
+            "attempted_job_count": len(run.attempted),
             "resource_lifecycle": self.diagnostics.resource_lifecycle,
             "wall_seconds": time.perf_counter() - started,
             "diagnostics": self.diagnostics.summary(),

@@ -1338,17 +1338,39 @@ def run_removal_pair_epochs(
             "launch that owns Cross Pair, or run this group on a ledger without "
             "Cross state."
         )
-    with _stage_timing(emit, "pair", "primary_seed"):
-        primary_seed = pair.seed_primary_jobs()
-    result["pair_primary_job_count"] = len(primary_seed)
-    _emit(emit,"post_mask_epoch_pair_primary_seeded",seeded_jobs=len(primary_seed))
-    primary_outcome = _run_staged_scheduler(
-        emit,
-        pair_scheduler_factory(pair),
-        primary_seed,
-        stage="pair",
-        phase="primary_scheduler",
-    )
+    pair_scheduler = pair_scheduler_factory(pair)
+    run_batches = getattr(pair_scheduler, "run_batches", None)
+    if run_batches is None:
+        # Legacy scheduler: the compatibility wrapper seeds everything first.
+        with _stage_timing(emit, "pair", "primary_seed"):
+            primary_seed = pair.seed_primary_jobs()
+        result["pair_primary_job_count"] = len(primary_seed)
+        _emit(emit,"post_mask_epoch_pair_primary_seeded",seeded_jobs=len(primary_seed))
+        primary_outcome = _run_staged_scheduler(
+            emit,
+            pair_scheduler,
+            primary_seed,
+            stage="pair",
+            phase="primary_scheduler",
+        )
+    else:
+        # Streaming: the whole Primary semantic plan is frozen first, then
+        # bounded canonical batches are prepared, drained through ONE resource
+        # session and released, so heavy prepared residency stays bounded on a
+        # ten-thousand-clip shard without a second preparation pass.
+        with _stage_timing(emit, "pair", "primary_seed"):
+            pair.freeze_primary_plans()
+        with _stage_timing(emit, "pair", "primary_scheduler"):
+            primary_outcome = run_batches(pair.iter_primary_seed_batches())
+        _emit_scheduler_diagnostics(emit, "pair", primary_outcome)
+        result["pair_primary_job_count"] = int(
+            primary_outcome.get("job_count", 0) or 0
+        )
+        _emit(
+            emit,
+            "post_mask_epoch_pair_primary_seeded",
+            seeded_jobs=result["pair_primary_job_count"],
+        )
     primary_unresolved = tuple(primary_outcome.get("unresolved_job_ids", ()))
     _emit(
         emit,
