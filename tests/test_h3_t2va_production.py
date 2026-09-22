@@ -206,6 +206,35 @@ def test_incremental_exports_and_complete(tmp_path):
     assert len(list(production.complete_rows(shard / "exports/t2va.jsonl"))) == 3
 
 
+def test_model_agnostic_resume_reuses_existing_artifacts(tmp_path):
+    class MutableIdentityProcessor(FakeProcessor):
+        def __init__(self):
+            super().__init__()
+            self.version = "mimo-v2.5"
+
+        def identity(self, row):
+            return f"{row['clip_uid']}:{self.version}"
+
+    processor = MutableIdentityProcessor()
+    rows = sample_rows(1)
+    production.process_shard(tmp_path, 0, rows, processor, request_workers=1)
+    before = Counter(processor.calls)
+
+    processor.version = "mimo-v2.6-flash-rl"
+    states = production.process_shard(
+        tmp_path,
+        0,
+        rows,
+        processor,
+        request_workers=1,
+        allow_existing_identity_mismatch=True,
+    )
+
+    assert processor.calls == before
+    assert states["clip0"]["t2va_status"] == "ready"
+    assert states["clip0"]["ta2va_status"] == "ready"
+
+
 def test_ready_resume_does_not_grow_journal(tmp_path):
     processor = FakeProcessor()
     production.process_shard(tmp_path, 0, sample_rows(1), processor)
