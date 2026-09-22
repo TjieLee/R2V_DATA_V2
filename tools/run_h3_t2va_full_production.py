@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import signal
 import sys
 from pathlib import Path
@@ -49,7 +48,6 @@ def main(argv=None):
         default=Path("/mnt/workspace/public/pretrained/MiMo/MiMo-V2.6-Flash-RL"),
     )
     parser.add_argument("--mimo-model", default="mimo-v2.6-flash-rl")
-    parser.add_argument("--downstream-run-id")
     parser.add_argument(
         "--mimo-speculative",
         action=argparse.BooleanOptionalAction,
@@ -90,13 +88,8 @@ def main(argv=None):
     root.mkdir(parents=True, exist_ok=True)
     if not os.access(root, os.W_OK):
         raise PermissionError(f"production root is not writable: {root}")
-    run_id = args.downstream_run_id or args.mimo_model.replace("/", "_")
-    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", run_id) is None:
-        raise ValueError("invalid downstream run ID")
     if not args.mimo_model.strip():
         raise ValueError("MiMo model name must be non-empty")
-    downstream_root = root / "downstream" / run_id
-    downstream_root.mkdir(parents=True, exist_ok=True)
     print("source_index_start", flush=True)
     index = production.build_source_index(args.shot_manifest, root)
     print(
@@ -117,9 +110,7 @@ def main(argv=None):
         raise ValueError("shard outside source inventory")
     if explicit is None:
         print(f"resume_scan_start assigned={len(assigned)}", flush=True)
-        order, resume_schedule = full.resume_first_assigned_shards(
-            downstream_root, assigned
-        )
+        order, resume_schedule = full.resume_first_assigned_shards(root, assigned)
     else:
         order = assigned
         resume_schedule = {
@@ -136,8 +127,6 @@ def main(argv=None):
             "request_workers": args.request_workers,
             "canonical_workers": args.canonical_workers,
             "resume_schedule": resume_schedule,
-            "downstream_run_id": run_id,
-            "downstream_root": str(downstream_root),
             "mimo_model": args.mimo_model,
             "model_call_count": 0,
         }
@@ -210,16 +199,9 @@ def main(argv=None):
         poll_interval=args.mimo_poll_interval,
         cleanup_grace_seconds=args.mimo_cleanup_grace_seconds,
     )
-    production.atomic_json(
-        downstream_root / "run.json",
-        {
-            "model": args.mimo_model,
-            "checkpoint_path": str(args.mimo_checkpoint.resolve()),
-            "speculative": args.mimo_speculative,
-        },
-    )
     print(
-        f"downstream_run id={run_id} root={downstream_root} model={args.mimo_model}",
+        f"mimo_runtime model={args.mimo_model} checkpoint={args.mimo_checkpoint} "
+        f"speculative={args.mimo_speculative}",
         flush=True,
     )
     pipeline = full.FullPipeline(
@@ -242,7 +224,6 @@ def main(argv=None):
         ffmpeg=args.ffmpeg,
         ffprobe=args.ffprobe,
         mimo_lifecycle=mimo_client,
-        downstream_root=downstream_root,
     )
     previous = signal.getsignal(signal.SIGTERM)
 
