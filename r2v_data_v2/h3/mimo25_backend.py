@@ -29,7 +29,7 @@ from r2v_data_v2.structured_output import (
     parse_structured_json_issues,
 )
 
-MIMO_MODEL = "mimo-v2.6-flash-rl"
+MIMO_MODEL = "mimo-v2.5"
 MIMO25_MODEL = MIMO_MODEL
 MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
 MIMO25_PROMPT_VERSION = "h3_mimo25_speech_assembly_v49"
