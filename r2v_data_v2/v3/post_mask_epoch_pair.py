@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -207,7 +207,7 @@ def _resolve_qwen_judge(handle: Any, service: Any, factory: Any) -> _ResolvedJud
         return _ResolvedJudge(handle, owned=False)
     if isinstance(handle, str):
         return _ResolvedJudge(
-            factory(service.model_copy(update={"base_url": handle})), owned=True
+            factory(replace(service, base_url=handle)), owned=True
         )
     # No endpoint and no injected judge: this call built a client, so it owns it.
     return _ResolvedJudge(factory(service), owned=True)

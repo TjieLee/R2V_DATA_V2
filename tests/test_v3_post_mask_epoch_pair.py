@@ -1182,6 +1182,32 @@ def _pair_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **pair_kwargs:
     )
 
 
+def test_qwen_endpoint_handle_rebinds_frozen_dataclass_service(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Managed Qwen endpoints rebind dataclass services without Pydantic APIs."""
+    import r2v_data_v2.v3.post_mask_epoch_pair as pm
+
+    config = _pair_config(tmp_path, monkeypatch)
+    service = config.qwen.candidate_judge
+    assert service is not None
+    captured: dict[str, Any] = {}
+
+    def factory(bound_service: Any) -> object:
+        captured["service"] = bound_service
+        return object()
+
+    endpoint = "http://127.0.0.1:8000/v1"
+    resolved = pm._resolve_qwen_judge(endpoint, service, factory)
+
+    rebound = captured["service"]
+    assert resolved.owned is True
+    assert rebound is not service
+    assert rebound.base_url == endpoint
+    assert rebound.model == service.model
+    assert rebound.api_key == service.api_key
+
+
 def _runner(
     tmp_path: Path,
     config: V3Config,
