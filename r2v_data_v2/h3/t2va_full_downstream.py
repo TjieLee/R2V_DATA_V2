@@ -271,10 +271,10 @@ def _preflight(shard, rows, processor):
             )
         if previous is not None:
             normalized_previous = _model_agnostic_evidence(previous)
-            if normalized_previous not in {
+            if normalized_previous not in (
                 _model_agnostic_evidence(evidence),
                 _model_agnostic_evidence(empty),
-            }:
+            ):
                 raise ValueError("downstream per-clip source/upstream dependencies changed")
         found = _stage_receipts(shard, uid, identity, state)
         transition = None
