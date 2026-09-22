@@ -214,6 +214,21 @@ REJECTED_REFERENCE_REASON = "reference_integrity_rejected"
 
 
 @dataclass(frozen=True)
+class _DerivedReviewInput:
+    """One variant's frozen review input, derived purely.
+
+    Execution-only: it carries the encoded context bytes so a caller can publish
+    or verify them, and is never part of a ModelJob, a receipt or any public
+    schema.
+    """
+
+    anchor: dict[str, Any]
+    context_path: Path
+    context_png_bytes: bytes
+    context_sha256: str
+
+
+@dataclass(frozen=True)
 class _BboxParent:
     """The exact frozen parent state one artifact bbox job continues from.
 
@@ -862,7 +877,7 @@ class ReferenceIntegrityEpochRunner:
             "main_review_policy": dict(main_review_policy),
         }
 
-    def _materialize_review_context(
+    def _encode_review_context(
         self,
         storage: RunStorage,
         clip_uid: str,
@@ -870,13 +885,12 @@ class ReferenceIntegrityEpochRunner:
         context: Any,
         *,
         variant: str = VARIANT_FINAL,
-    ) -> tuple[str, str]:
-        """Create-once Qwen context PNG with exact content validation.
+    ) -> tuple[Path, bytes, str]:
+        """Purely encode one variant's Qwen context PNG.
 
-        The context image is a model input, not a debug sidecar: an existing file
-        whose bytes differ from the derived image is durable corruption. The path
-        stays at the legacy location, which carries a variant suffix for the
-        source-alpha call.
+        Returns the exact legacy path, the encoded bytes and their digest. It
+        creates no directory and writes no file, which is what lets a model
+        worker derive its own expected input without being able to publish it.
         """
         suffix = "" if variant == VARIANT_FINAL else f"_{variant}"
         path = storage.selected_path(
@@ -885,23 +899,38 @@ class ReferenceIntegrityEpochRunner:
         buffer = io.BytesIO()
         context.save(buffer, format="PNG")
         data = buffer.getvalue()
-        digest = hashlib.sha256(data).hexdigest()
-        if path.is_file():
-            if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
-                raise ReferenceIntegrityDurableError(
-                    f"frozen integrity context drifted: {path}"
-                )
-        else:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = path.with_name(f".{path.name}.tmp")
-            try:
-                temporary.write_bytes(data)
-                temporary.replace(path)
-            finally:
-                temporary.unlink(missing_ok=True)
-        return storage.relative_artifact_path(path), digest
+        return path, data, hashlib.sha256(data).hexdigest()
 
-    def _review_input_anchor(
+    @staticmethod
+    def _verify_review_context_bytes(path: Path, digest: str) -> None:
+        """Require the durable context PNG to exist and be byte-exact. Read-only."""
+        if not path.is_file():
+            raise ReferenceIntegrityDurableError(
+                f"frozen integrity context is missing: {path}"
+            )
+        if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+            raise ReferenceIntegrityDurableError(
+                f"frozen integrity context drifted: {path}"
+            )
+
+    def _publish_review_context(self, path: Path, data: bytes, digest: str) -> None:
+        """Create-once publication of the Qwen context PNG with drift detection.
+
+        The context image is a model input, not a debug sidecar: an existing file
+        whose bytes differ from the derived image is durable corruption.
+        """
+        if path.is_file():
+            self._verify_review_context_bytes(path, digest)
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.tmp")
+        try:
+            temporary.write_bytes(data)
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _derive_review_input(
         self,
         storage: RunStorage,
         clip_uid: str,
@@ -911,14 +940,21 @@ class ReferenceIntegrityEpochRunner:
         variant: str = VARIANT_FINAL,
         synthetic: bool | None = None,
     ) -> dict[str, Any]:
-        """Derive the complete frozen review input of one variant."""
+        """Purely derive the complete frozen review input of one variant.
+
+        Reads the source frame and mask, builds the context image, encodes the
+        PNG in memory and hashes the final reference. It creates no directory,
+        writes no file, replaces no file and never touches the ledger.
+        """
         evidence = _source_evidence(storage, clip_uid=clip_uid, reference=reference)
-        context_path, context_sha256 = self._materialize_review_context(
-            storage,
-            clip_uid,
-            entity.entity_id,
-            _source_context(evidence),
-            variant=variant,
+        context_path, context_png_bytes, context_sha256 = (
+            self._encode_review_context(
+                storage,
+                clip_uid,
+                entity.entity_id,
+                _source_context(evidence),
+                variant=variant,
+            )
         )
         reference_path = _resolve_run_artifact(storage, str(reference.image_path))
         reference_sha256 = hashlib.sha256(reference_path.read_bytes()).hexdigest()
@@ -940,7 +976,7 @@ class ReferenceIntegrityEpochRunner:
             main_review_policy=policy,
             synthetic=resolved_synthetic,
         )
-        return {
+        anchor = {
             "schema": REFERENCE_INTEGRITY_REVIEW_INPUT_SCHEMA,
             "clip_uid": clip_uid,
             "entity_id": entity.entity_id,
@@ -954,15 +990,21 @@ class ReferenceIntegrityEpochRunner:
             "source_entity_id": evidence.source_entity_id,
             "source_frame_slot": evidence.frame_slot,
             "source_frame_index": evidence.source_frame_index,
-            "source_context_path": context_path,
+            "source_context_path": storage.relative_artifact_path(context_path),
             "source_context_sha256": context_sha256,
             "final_reference_path": reference.image_path,
             "final_reference_sha256": reference_sha256,
             "main_review_policy": policy,
             "semantic_digest": semantic_input_digest(inputs),
         }
+        return _DerivedReviewInput(
+            anchor=anchor,
+            context_path=context_path,
+            context_png_bytes=context_png_bytes,
+            context_sha256=context_sha256,
+        )
 
-    def _frozen_review_input(
+    def _create_or_verify_review_input(
         self,
         shard: str,
         storage: RunStorage,
@@ -972,21 +1014,56 @@ class ReferenceIntegrityEpochRunner:
         *,
         variant: str = VARIANT_FINAL,
     ) -> dict[str, Any]:
-        """Create-once review input anchor, re-derived and compared exactly."""
+        """Create-once review input anchor, re-derived and compared exactly.
+
+        MAIN THREAD ONLY, and only when a NEW review ModelJob is about to be
+        created or unlocked. A model worker must never reach this: it would let a
+        job repair the very durable input its identity was frozen against.
+        """
         path = self._review_input_path(shard, clip_uid, entity.entity_id, variant)
         existing = _read_json(path)
         if existing is None:
             # First freeze. A broken reference or source evidence here is still
-            # an ordinary legacy CPU failure, not durable corruption.
-            expected = self._review_input_anchor(
+            # an ordinary legacy CPU failure, not durable corruption, so the
+            # derivation is deliberately not wrapped.
+            derived = self._derive_review_input(
                 storage, clip_uid, entity, reference, variant=variant
             )
-            _write_json_once(path, expected)
-            return expected
+            self._publish_review_context(
+                derived.context_path,
+                derived.context_png_bytes,
+                derived.context_sha256,
+            )
+            _write_json_once(path, derived.anchor)
+            return derived.anchor
         # The model input is already frozen, so failing to re-derive it can only
         # mean the frozen evidence changed underneath us.
+        expected = self._reverified_review_input(
+            shard, storage, clip_uid, entity, reference, variant=variant
+        )
+        self._verify_review_context_bytes(
+            expected.context_path, expected.context_sha256
+        )
+        if existing != expected.anchor:
+            raise ReferenceIntegrityDurableError(
+                f"frozen Reference Integrity review input drifted for "
+                f"{clip_uid}/{entity.entity_id}"
+            )
+        return existing
+
+    def _reverified_review_input(
+        self,
+        shard: str,
+        storage: RunStorage,
+        clip_uid: str,
+        entity: Any,
+        reference: Any,
+        *,
+        variant: str = VARIANT_FINAL,
+    ) -> _DerivedReviewInput:
+        """Re-derive across a frozen boundary, where failure means drift."""
         try:
-            expected = self._review_input_anchor(
+            return self._derive_review_input(
                 storage, clip_uid, entity, reference, variant=variant
             )
         except ReferenceIntegrityDurableError:
@@ -996,7 +1073,38 @@ class ReferenceIntegrityEpochRunner:
                 f"cannot re-derive frozen Reference Integrity review input for "
                 f"{clip_uid}/{entity.entity_id}"
             ) from exc
-        if existing != expected:
+
+    def _require_review_input(
+        self,
+        shard: str,
+        storage: RunStorage,
+        clip_uid: str,
+        entity: Any,
+        reference: Any,
+        *,
+        variant: str = VARIANT_FINAL,
+    ) -> dict[str, Any]:
+        """Read-only review input of an EXISTING job. Never creates or repairs.
+
+        Used by every path handed a job that already exists: model execution,
+        receipt verification, restart verification and published-state
+        verification. A missing anchor or context here is durable corruption, not
+        something the caller may regenerate.
+        """
+        path = self._review_input_path(shard, clip_uid, entity.entity_id, variant)
+        existing = _read_json(path)
+        if existing is None:
+            raise ReferenceIntegrityDurableError(
+                f"frozen Reference Integrity review input is missing for "
+                f"{clip_uid}/{entity.entity_id}"
+            )
+        expected = self._reverified_review_input(
+            shard, storage, clip_uid, entity, reference, variant=variant
+        )
+        self._verify_review_context_bytes(
+            expected.context_path, expected.context_sha256
+        )
+        if existing != expected.anchor:
             raise ReferenceIntegrityDurableError(
                 f"frozen Reference Integrity review input drifted for "
                 f"{clip_uid}/{entity.entity_id}"
@@ -1071,7 +1179,7 @@ class ReferenceIntegrityEpochRunner:
             dependencies=dependencies,
         )
 
-    def _expected_review_inputs(
+    def _create_review_inputs_and_job(
         self,
         *,
         shard: str,
@@ -1083,12 +1191,75 @@ class ReferenceIntegrityEpochRunner:
         variant: str,
         main_job: ModelJob | None = None,
     ) -> tuple[EntityReferenceState, dict[str, Any], ModelJob]:
-        """Resolve, freeze and re-verify one variant's deterministic review job.
+        """Freeze one variant's input and build its job. NEW jobs only.
 
-        Every reader of a review job identity goes through here, so the writer
-        and all verifiers share exactly one derivation. For ``source_alpha`` the
-        main review job is the dependency address, which makes the alpha job
-        conditional on one exact main receipt instead of a standalone root job.
+        Main thread only: seeding the initial final review, or unlocking a
+        source-alpha continuation from a committed main receipt.
+        """
+        return self._review_inputs_and_job(
+            shard=shard,
+            storage=storage,
+            clip_uid=clip_uid,
+            plan_entry=plan_entry,
+            entity=entity,
+            reference=reference,
+            variant=variant,
+            main_job=main_job,
+            create=True,
+        )
+
+    def _require_review_inputs_and_job(
+        self,
+        *,
+        shard: str,
+        storage: RunStorage,
+        clip_uid: str,
+        plan_entry: Mapping[str, Any],
+        entity: Any,
+        reference: Any,
+        variant: str,
+        main_job: ModelJob | None = None,
+    ) -> tuple[EntityReferenceState, dict[str, Any], ModelJob]:
+        """Rebuild one variant's inputs and job for a job that ALREADY exists.
+
+        Read-only by construction: it can never create or repair the frozen
+        input, so a missing one is durable corruption. Used by model execution
+        and by every restart, receipt and published-state verifier.
+        """
+        return self._review_inputs_and_job(
+            shard=shard,
+            storage=storage,
+            clip_uid=clip_uid,
+            plan_entry=plan_entry,
+            entity=entity,
+            reference=reference,
+            variant=variant,
+            main_job=main_job,
+            create=False,
+        )
+
+    def _review_inputs_and_job(
+        self,
+        *,
+        shard: str,
+        storage: RunStorage,
+        clip_uid: str,
+        plan_entry: Mapping[str, Any],
+        entity: Any,
+        reference: Any,
+        variant: str,
+        main_job: ModelJob | None,
+        create: bool,
+    ) -> tuple[EntityReferenceState, dict[str, Any], ModelJob]:
+        """The one derivation shared by the create and require paths.
+
+        ``create`` is required, never defaulted, so a call site always states
+        which side of the durable boundary it is on. Both sides build the job
+        through this same code, so an identical frozen input yields an identical
+        ``job_id``, ``input_digest``, ``model_identity``, ``target`` and
+        ``dependencies``. For ``source_alpha`` the main review job is the
+        dependency address, which makes the alpha job conditional on one exact
+        main receipt instead of a standalone root job.
         """
         if variant == VARIANT_SOURCE_ALPHA and main_job is None:
             raise ReferenceIntegrityDurableError(
@@ -1099,8 +1270,14 @@ class ReferenceIntegrityEpochRunner:
             if variant == VARIANT_SOURCE_ALPHA
             else reference
         )
-        anchor = self._frozen_review_input(
-            shard, storage, clip_uid, entity, input_reference, variant=variant
+        anchor = (
+            self._create_or_verify_review_input(
+                shard, storage, clip_uid, entity, input_reference, variant=variant
+            )
+            if create
+            else self._require_review_input(
+                shard, storage, clip_uid, entity, input_reference, variant=variant
+            )
         )
         job = self._expected_review_job(
             shard,
@@ -1507,7 +1684,7 @@ class ReferenceIntegrityEpochRunner:
             # the same deterministic job. Without this fast path a missing final
             # reference would surface as an ordinary CPU failure instead of
             # frozen-input corruption.
-            anchor = self._frozen_review_input(
+            anchor = self._create_or_verify_review_input(
                 shard, storage, clip.clip_uid, entity, reference
             )
             return [self._expected_review_job(shard, entity, reference, anchor)]
@@ -1524,7 +1701,7 @@ class ReferenceIntegrityEpochRunner:
             return []
         # The entity needs the main review: freeze its full input first, so the
         # job identity and its provenance are durable before any model call.
-        anchor = self._frozen_review_input(
+        anchor = self._create_or_verify_review_input(
             shard, storage, clip.clip_uid, entity, reference
         )
         return [self._expected_review_job(shard, entity, reference, anchor)]
@@ -1886,7 +2063,7 @@ class ReferenceIntegrityEpochRunner:
         )
         main_job: ModelJob | None = None
         if variant == VARIANT_SOURCE_ALPHA:
-            _r, _a, main_job = self._expected_review_inputs(
+            _r, _a, main_job = self._require_review_inputs_and_job(
                 shard=shard,
                 storage=storage,
                 clip_uid=job.clip_uid,
@@ -1895,7 +2072,7 @@ class ReferenceIntegrityEpochRunner:
                 reference=reference,
                 variant=VARIANT_FINAL,
             )
-        _input_reference, anchor, expected = self._expected_review_inputs(
+        _input_reference, anchor, expected = self._require_review_inputs_and_job(
             shard=shard,
             storage=storage,
             clip_uid=job.clip_uid,
@@ -1968,6 +2145,7 @@ class ReferenceIntegrityEpochRunner:
         pre_edit: ReferenceEditState | None,
         job: ModelJob,
         payload: Mapping[str, Any],
+        create: bool,
     ) -> _ReviewOutcome:
         """Everything one committed review job means, from frozen state.
 
@@ -1979,8 +2157,15 @@ class ReferenceIntegrityEpochRunner:
         The caller resolves the frozen context, so a verifier never re-reads the
         plan inside itself: publication verification already holds it.
         """
+        # The finalizer may freeze a continuation it is about to unlock; every
+        # verifier is require-only. The choice is made by the caller.
+        build = (
+            self._create_review_inputs_and_job
+            if create
+            else self._require_review_inputs_and_job
+        )
         variant = self._review_variant(job)
-        main_reference, main_anchor, main_job = self._expected_review_inputs(
+        main_reference, main_anchor, main_job = build(
             shard=shard,
             storage=storage,
             clip_uid=clip_uid,
@@ -1991,7 +2176,7 @@ class ReferenceIntegrityEpochRunner:
         )
         main_diagnostics = self._review_diagnostics(storage, main_reference)
         if variant == VARIANT_SOURCE_ALPHA:
-            alpha_reference, alpha_anchor, alpha_job = self._expected_review_inputs(
+            alpha_reference, alpha_anchor, alpha_job = build(
                 shard=shard,
                 storage=storage,
                 clip_uid=clip_uid,
@@ -2032,6 +2217,7 @@ class ReferenceIntegrityEpochRunner:
                 pre_edit=pre_edit,
                 trigger=BBOX_TRIGGER_ARTIFACT,
                 parent_variant=VARIANT_SOURCE_ALPHA,
+                create=create,
             )
             return _ReviewOutcome(marker=None, unlock=bbox_job)
         if main_job.job_id() != job.job_id():
@@ -2061,7 +2247,7 @@ class ReferenceIntegrityEpochRunner:
             pre_edit=pre_edit,
         )
         if continuation == "source_alpha":
-            _alpha_reference, _alpha_anchor, alpha_job = self._expected_review_inputs(
+            _alpha_reference, _alpha_anchor, alpha_job = build(
                 shard=shard,
                 storage=storage,
                 clip_uid=clip_uid,
@@ -2082,6 +2268,7 @@ class ReferenceIntegrityEpochRunner:
                 plan_entry=plan_entry,
                 pre_edit=pre_edit,
                 trigger=BBOX_TRIGGER_ARTIFACT,
+                create=create,
             )
             return _ReviewOutcome(marker=None, unlock=bbox_job)
         if continuation == "topology_bbox":
@@ -2094,6 +2281,7 @@ class ReferenceIntegrityEpochRunner:
                 plan_entry=plan_entry,
                 pre_edit=pre_edit,
                 trigger=BBOX_TRIGGER_TOPOLOGY,
+                create=create,
             )
             return _ReviewOutcome(marker=None, unlock=bbox_job)
         return _ReviewOutcome(marker=None, unlock=None)
@@ -2133,6 +2321,9 @@ class ReferenceIntegrityEpochRunner:
             pre_edit=pre_edit,
             job=job,
             payload=payload,
+            # The finalizer is the main-thread continuation point, so it may
+            # freeze the input of the job it is about to unlock.
+            create=True,
         )
         if outcome.marker is None:
             # A continuation owns this entity; only the durable receipt is kept.
@@ -2402,7 +2593,7 @@ class ReferenceIntegrityEpochRunner:
         self._verify_frozen_base_metadata(anchor)
         return anchor
 
-    def _frozen_bbox_input(
+    def _create_or_verify_bbox_input(
         self,
         *,
         shard: str,
@@ -2412,7 +2603,11 @@ class ReferenceIntegrityEpochRunner:
         parent: _BboxParent,
         trigger: str,
     ) -> dict[str, Any]:
-        """Create-once bbox input anchor, re-derived and compared exactly."""
+        """Create-once bbox input anchor, re-derived and compared exactly.
+
+        MAIN THREAD ONLY, and only for a NEW bbox job. This is the single path
+        allowed to materialize the legacy candidate crop and base metadata.
+        """
         path = self._bbox_input_path(shard, clip_uid, entity.entity_id)
         existing = _read_json(path)
         if existing is None:
@@ -2425,8 +2620,66 @@ class ReferenceIntegrityEpochRunner:
             )
             _write_json_once(path, anchor)
             return anchor
-        # The input is frozen, so neither the candidate nor any of its evidence
-        # may be re-materialized: re-derive and compare instead.
+        return self._verify_bbox_input(
+            shard=shard,
+            storage=storage,
+            clip_uid=clip_uid,
+            entity=entity,
+            parent=parent,
+            trigger=trigger,
+            existing=existing,
+        )
+
+    def _require_bbox_input(
+        self,
+        *,
+        shard: str,
+        storage: RunStorage,
+        clip_uid: str,
+        entity: Any,
+        parent: _BboxParent,
+        trigger: str,
+    ) -> dict[str, Any]:
+        """Read-only bbox input of an EXISTING job.
+
+        Never materializes a candidate, never publishes metadata and never
+        repairs the anchor: a bbox job that exists was frozen against all three,
+        so a missing one is durable corruption.
+        """
+        path = self._bbox_input_path(shard, clip_uid, entity.entity_id)
+        existing = _read_json(path)
+        if existing is None:
+            raise ReferenceIntegrityDurableError(
+                f"frozen Reference Integrity bbox input is missing for "
+                f"{clip_uid}/{entity.entity_id}"
+            )
+        return self._verify_bbox_input(
+            shard=shard,
+            storage=storage,
+            clip_uid=clip_uid,
+            entity=entity,
+            parent=parent,
+            trigger=trigger,
+            existing=existing,
+        )
+
+    def _verify_bbox_input(
+        self,
+        *,
+        shard: str,
+        storage: RunStorage,
+        clip_uid: str,
+        entity: Any,
+        parent: _BboxParent,
+        trigger: str,
+        existing: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Re-derive and compare a frozen bbox input. Strictly read-only.
+
+        The input is frozen, so neither the candidate nor any of its evidence may
+        be re-materialized: re-derive and compare instead.
+        """
+        existing = dict(existing)
         try:
             expected = self._bbox_input_anchor(
                 storage=storage,
@@ -2536,7 +2789,7 @@ class ReferenceIntegrityEpochRunner:
                 f"unsupported bbox trigger {trigger!r}"
             )
         label = f"{clip_uid}/{entity.entity_id}"
-        main_reference, main_anchor, main_job = self._expected_review_inputs(
+        main_reference, main_anchor, main_job = self._require_review_inputs_and_job(
             shard=shard,
             storage=storage,
             clip_uid=clip_uid,
@@ -2593,7 +2846,7 @@ class ReferenceIntegrityEpochRunner:
                 parent_review_job_id=None,
             )
         if continuation == "source_alpha":
-            alpha_reference, alpha_anchor, alpha_job = self._expected_review_inputs(
+            alpha_reference, alpha_anchor, alpha_job = self._require_review_inputs_and_job(
                 shard=shard,
                 storage=storage,
                 clip_uid=clip_uid,
@@ -2652,8 +2905,13 @@ class ReferenceIntegrityEpochRunner:
         pre_edit: ReferenceEditState | None,
         trigger: str,
         parent_variant: str | None = None,
+        create: bool,
     ) -> tuple[_BboxParent, dict[str, Any], ModelJob]:
-        """The frozen parent, anchor and deterministic job of one bbox route."""
+        """The frozen parent, anchor and deterministic job of one bbox route.
+
+        ``create`` is required, never defaulted: only the main-thread
+        continuation that unlocks a NEW bbox job may freeze its input.
+        """
         parent = self._bbox_parent(
             shard=shard,
             storage=storage,
@@ -2669,13 +2927,24 @@ class ReferenceIntegrityEpochRunner:
                 f"artifact bbox parent variant drifted for "
                 f"{clip_uid}/{entity.entity_id}"
             )
-        anchor = self._frozen_bbox_input(
-            shard=shard,
-            storage=storage,
-            clip_uid=clip_uid,
-            entity=entity,
-            parent=parent,
-            trigger=trigger,
+        anchor = (
+            self._create_or_verify_bbox_input(
+                shard=shard,
+                storage=storage,
+                clip_uid=clip_uid,
+                entity=entity,
+                parent=parent,
+                trigger=trigger,
+            )
+            if create
+            else self._require_bbox_input(
+                shard=shard,
+                storage=storage,
+                clip_uid=clip_uid,
+                entity=entity,
+                parent=parent,
+                trigger=trigger,
+            )
         )
         if str(anchor["trigger"]) != trigger:
             raise ReferenceIntegrityDurableError(
@@ -2955,6 +3224,7 @@ class ReferenceIntegrityEpochRunner:
             pre_edit=pre_edit,
             trigger=trigger,
             parent_variant=parent_variant,
+            create=False,
         )
         if (
             expected.job_id() != job.job_id()
@@ -3043,6 +3313,7 @@ class ReferenceIntegrityEpochRunner:
             pre_edit=pre_edit,
             trigger=trigger,
             parent_variant=parent_variant,
+            create=False,
         )
         if expected.job_id() != job.job_id():
             raise ReferenceIntegrityDurableError(
@@ -3242,7 +3513,7 @@ class ReferenceIntegrityEpochRunner:
         entity_id = entity.entity_id
         variant = marker.get("review_variant")
         if variant == VARIANT_FINAL:
-            _input_reference, _anchor, job = self._expected_review_inputs(
+            _input_reference, _anchor, job = self._require_review_inputs_and_job(
                 shard=shard,
                 storage=storage,
                 clip_uid=clip.clip_uid,
@@ -3252,7 +3523,7 @@ class ReferenceIntegrityEpochRunner:
                 variant=VARIANT_FINAL,
             )
         elif variant == VARIANT_SOURCE_ALPHA:
-            _r, _a, main_job = self._expected_review_inputs(
+            _r, _a, main_job = self._require_review_inputs_and_job(
                 shard=shard,
                 storage=storage,
                 clip_uid=clip.clip_uid,
@@ -3266,7 +3537,7 @@ class ReferenceIntegrityEpochRunner:
                     f"reviewed entity outcome parent job id drifted for "
                     f"{clip.clip_uid}/{entity_id}"
                 )
-            _r2, _a2, job = self._expected_review_inputs(
+            _r2, _a2, job = self._require_review_inputs_and_job(
                 shard=shard,
                 storage=storage,
                 clip_uid=clip.clip_uid,
@@ -3298,6 +3569,8 @@ class ReferenceIntegrityEpochRunner:
                 pre_edit=pre_edit,
                 job=job,
                 payload=self._committed_review_payload(job),
+                # Verification must never repair a frozen input.
+                create=False,
             )
             if outcome.marker is None:
                 raise ReferenceIntegrityDurableError(
@@ -3323,6 +3596,7 @@ class ReferenceIntegrityEpochRunner:
             pre_edit=pre_edit,
             trigger=str(marker["source_bbox_fallback_trigger"]),
             parent_variant=str(variant),
+            create=False,
         )
         if bbox_job_id != bbox_job.job_id():
             raise ReferenceIntegrityDurableError(

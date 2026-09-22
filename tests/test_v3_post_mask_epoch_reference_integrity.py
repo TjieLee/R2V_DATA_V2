@@ -1910,3 +1910,276 @@ def test_topology_bbox_committed_receipt_restart_pays_no_qwen(
     assert clip.reference_integrity is not None
     assert clip.reference_integrity.status == "ready"
     _assert_same_publication(clip, legacy_storage.read_clip("clip-1"))
+
+
+# ---------------------------------------------------------------------------
+# Durable boundary: creation belongs to the main thread, never to a worker
+# ---------------------------------------------------------------------------
+
+
+def _guard_creation(
+    monkeypatch: pytest.MonkeyPatch, runner: Any, seen: list[str]
+) -> None:
+    """Record every frozen-input creation attempt, without changing behaviour.
+
+    Recording rather than raising is deliberate: the scheduler isolates job
+    failures, so a raise inside run() would be swallowed instead of failing the
+    test.
+    """
+    import r2v_data_v2.v3.post_mask_epoch_reference_integrity as module
+
+    for name in (
+        "_create_or_verify_review_input",
+        "_publish_review_context",
+        "_create_or_verify_bbox_input",
+        "_materialize_bbox_input",
+    ):
+        real = getattr(runner, name)
+
+        def guard(*args: Any, _name: str = name, _real: Any = real, **kwargs: Any) -> Any:
+            seen.append(_name)
+            return _real(*args, **kwargs)
+
+        monkeypatch.setattr(runner, name, guard)
+
+    real_materialize = module._materialize_source_bbox
+
+    def materialize(*args: Any, **kwargs: Any) -> Any:
+        seen.append("_materialize_source_bbox")
+        return real_materialize(*args, **kwargs)
+
+    monkeypatch.setattr(module, "_materialize_source_bbox", materialize)
+
+
+def _runnable_job(runner: Any, variant: str) -> Any:
+    jobs = runner.seed_jobs()
+    return next(job for job in jobs if dict(job.target)["variant"] == variant)
+
+
+def test_main_review_worker_cannot_create_its_frozen_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """run(job) executes the judge and never freezes or repairs anything."""
+    judge_result = legacy_integrity._review(accept=True, reason="usable reference")
+    config, storage = _main_review_fixture(tmp_path, monkeypatch, "run-worker-guard")
+    judge = _fake_main_judge(judge_result)
+    runner = _runner(config, storage, tmp_path)
+    job = _runnable_job(runner, "final")
+
+    seen: list[str] = []
+    _guard_creation(monkeypatch, runner, seen)
+
+    # Only run() is guarded: the main-thread finalizer is a legitimate creation
+    # point, the model worker is not.
+    result = runner.run(job, judge)
+
+    assert result.payload["status"] == "review"
+    assert len(judge.calls) == 1, "the Qwen review really ran"
+    assert seen == [], f"the worker tried to create durable input: {seen}"
+    # The frozen input it consumed still validates.
+    shard, storage_again, _clip, entity, reference, _plan, _pre = (
+        runner._job_review_context(job)
+    )
+    anchor = runner._require_review_input(
+        shard, storage_again, job.clip_uid, entity, reference
+    )
+    assert anchor["semantic_digest"] == job.input_digest
+
+
+def test_missing_main_review_input_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A worker must not regenerate a frozen input that vanished."""
+    judge_result = legacy_integrity._review(accept=True, reason="usable reference")
+    config, storage = _main_review_fixture(tmp_path, monkeypatch, "run-worker-missing")
+    judge = _fake_main_judge(judge_result)
+    runner = _runner(config, storage, tmp_path)
+    job = _runnable_job(runner, "final")
+
+    anchor_path = runner._review_input_path(SHARD, "clip-1", "e2", "final")
+    assert anchor_path.is_file()
+    anchor_path.unlink()
+
+    seen: list[str] = []
+    _guard_creation(monkeypatch, runner, seen)
+    with pytest.raises(ReferenceIntegrityDurableError):
+        runner.run(job, judge)
+    assert not anchor_path.exists(), "the worker must not recreate the anchor"
+    assert seen in ([], ["_create_or_verify_review_input"]), seen
+    assert len(judge.calls) == 0, "no model call may happen without frozen input"
+
+
+def test_bbox_worker_cannot_materialize_its_frozen_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bbox worker only requires: no candidate, metadata or anchor creation."""
+    # A reject on both the main and the alpha review is what routes an entity
+    # into the artifact bbox fallback.
+    results = (
+        legacy_integrity._severe_reference_artifact_review(),
+        legacy_integrity._severe_reference_artifact_review(),
+    )
+    bbox_results = (legacy_integrity._bbox_review(accept=True),)
+    config, storage = _alpha_continuation_fixture(
+        tmp_path, monkeypatch, "run-bbox-guard"
+    )
+    judge = _FakeEpochJudge(results, bbox_results)
+    runner = _runner(config, storage, tmp_path)
+
+    # Run the chain once so the bbox job is unlocked by the real main-thread
+    # finalizer and its receipt is committed.
+    _epoch_scheduler(runner, _SerialQwenExecutor(runner, judge)).run(
+        runner.seed_jobs()
+    )
+    assert len(judge.bbox_calls) == 1, "the chain reached the bbox model call"
+
+    # Same ledger, brand new runner: the whole chain is re-verified read-only,
+    # including the bbox input of the already-existing bbox job.
+    seen: list[str] = []
+    fresh = _runner(config, storage, tmp_path)
+    assert fresh.ledger.root == runner.ledger.root
+    _guard_creation(monkeypatch, fresh, seen)
+    fresh_executor = _SerialQwenExecutor(fresh, judge)
+    _epoch_scheduler(fresh, fresh_executor).run(fresh.seed_jobs())
+
+    assert seen == [], f"a worker materialized frozen input: {seen}"
+    assert fresh_executor.batches == 0, "every receipt was reused"
+    assert len(judge.bbox_calls) == 1, "no repeated bbox call"
+    assert fresh.reconcile_stats(SHARD).to_dict() == (
+        runner.reconcile_stats(SHARD).to_dict()
+    )
+
+
+def test_bbox_require_refuses_to_materialize(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """_require_bbox_input fails closed instead of materializing a missing anchor."""
+    config, storage = _alpha_continuation_fixture(
+        tmp_path, monkeypatch, "run-bbox-missing"
+    )
+    runner = _runner(config, storage, tmp_path)
+    anchor_path = runner._bbox_input_path(SHARD, "clip-1", "e2")
+    assert not anchor_path.exists()
+    entity = next(
+        item
+        for item in storage.read_clip("clip-1").annotation.entities
+        if item.entity_id == "e2"
+    )
+
+    # The anchor gate runs first, so the parent chain is never even consulted.
+    with pytest.raises(ReferenceIntegrityDurableError):
+        runner._require_bbox_input(
+            shard=SHARD,
+            storage=storage,
+            clip_uid="clip-1",
+            entity=entity,
+            parent=None,
+            trigger="artifact",
+        )
+
+    assert not anchor_path.exists(), "require must never materialize the anchor"
+
+
+def test_create_and_require_build_identical_model_jobs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both sides of the boundary derive one and the same ModelJob."""
+    config, storage = _main_review_fixture(tmp_path, monkeypatch, "run-identity")
+    runner = _runner(config, storage, tmp_path)
+    job = _runnable_job(runner, "final")
+    shard, storage_again, _clip, entity, reference, plan_entry, _pre = (
+        runner._job_review_context(job)
+    )
+
+    _ref_a, _anchor_a, created = runner._create_review_inputs_and_job(
+        shard=shard,
+        storage=storage_again,
+        clip_uid=job.clip_uid,
+        plan_entry=plan_entry,
+        entity=entity,
+        reference=reference,
+        variant="final",
+    )
+    _ref_b, _anchor_b, required = runner._require_review_inputs_and_job(
+        shard=shard,
+        storage=storage_again,
+        clip_uid=job.clip_uid,
+        plan_entry=plan_entry,
+        entity=entity,
+        reference=reference,
+        variant="final",
+    )
+
+    assert created.job_id() == required.job_id()
+    assert created.input_digest == required.input_digest
+    assert created.model_identity == required.model_identity
+    assert dict(created.target) == dict(required.target)
+    assert created.job_id() == job.job_id()
+
+
+def test_restart_verification_is_require_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A same-ledger restart reuses receipts and never re-freezes an input."""
+    judge_result = legacy_integrity._review(accept=True, reason="usable reference")
+    config, storage = _main_review_fixture(tmp_path, monkeypatch, "run-restart-guard")
+    judge = _fake_main_judge(judge_result)
+    first = _runner(config, storage, tmp_path)
+    first_executor = _SerialQwenExecutor(first, judge)
+    _epoch_scheduler(first, first_executor).run(first.seed_jobs())
+    assert len(judge.calls) == 1
+
+    # Same ledger root, brand new runner: every Python cache is empty.
+    second = _runner(config, storage, tmp_path)
+    assert second.ledger.root == first.ledger.root
+    seen: list[str] = []
+    _guard_creation(monkeypatch, second, seen)
+    second_executor = _SerialQwenExecutor(second, judge)
+    _epoch_scheduler(second, second_executor).run(second.seed_jobs())
+
+    assert seen == [], f"restart verification created frozen input: {seen}"
+    assert second_executor.batches == 0, "no repeated committed Qwen call"
+    assert len(judge.calls) == 1, "the restart paid no extra review"
+
+
+def test_corrupted_review_context_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The context PNG is a model input: different bytes must fail closed."""
+    judge_result = legacy_integrity._review(accept=True, reason="usable reference")
+    config, storage = _main_review_fixture(tmp_path, monkeypatch, "run-context-drift")
+    judge = _fake_main_judge(judge_result)
+    runner = _runner(config, storage, tmp_path)
+    job = _runnable_job(runner, "final")
+
+    shard, storage_again, _clip, entity, reference, _plan, _pre = (
+        runner._job_review_context(job)
+    )
+    anchor = runner._require_review_input(
+        shard, storage_again, job.clip_uid, entity, reference
+    )
+    from r2v_data_v2.v3.post_mask_epoch_reference_integrity import (
+        _resolve_run_artifact,
+    )
+
+    durable_context = _resolve_run_artifact(
+        storage, str(anchor["source_context_path"])
+    )
+    assert durable_context.is_file()
+    durable_context.write_bytes(b"not the frozen context")
+
+    # The exact drift message matters: any other failure would mean the bytes
+    # were never actually compared against the expected digest.
+    with pytest.raises(
+        ReferenceIntegrityDurableError, match="integrity context drifted"
+    ):
+        runner.run(job, judge)
+    assert len(judge.calls) == 0, "no model call on drifted context"
+
+    # And the read-only require path rejects it too.
+    with pytest.raises(
+        ReferenceIntegrityDurableError, match="integrity context drifted"
+    ):
+        runner._require_review_input(
+            shard, storage_again, job.clip_uid, entity, reference
+        )
