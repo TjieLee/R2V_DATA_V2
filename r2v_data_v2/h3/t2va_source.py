@@ -136,15 +136,37 @@ def select_t2va_shots(
         valid_row_count = None
     else:
         source_hash = sha256_file(path)
-        for index, raw in enumerate(iter_source_records(path)):
-            try:
-                row = parse_row(index, raw)
-            except (ValueError, TypeError, KeyError, OSError) as exc:
-                excluded.append({"source_index": index, "reason": str(exc)})
-                continue
-            if row["clip_uid"] in rows:
-                raise ValueError("duplicate JEA shot clip identity")
-            rows[row["clip_uid"]] = row
+        if path.suffix.lower() == ".jsonl":
+            with path.open("r", encoding="utf-8") as handle:
+                source_rows = enumerate(handle)
+                for index, line in source_rows:
+                    try:
+                        if not line.strip():
+                            raise ValueError("empty shot manifest row")
+                        raw = json.loads(line)
+                        row = parse_row(index, raw)
+                    except (
+                        json.JSONDecodeError,
+                        ValueError,
+                        TypeError,
+                        KeyError,
+                        OSError,
+                    ) as exc:
+                        excluded.append({"source_index": index, "reason": str(exc)})
+                        continue
+                    if row["clip_uid"] in rows:
+                        raise ValueError("duplicate JEA shot clip identity")
+                    rows[row["clip_uid"]] = row
+        else:
+            for index, raw in enumerate(iter_source_records(path)):
+                try:
+                    row = parse_row(index, raw)
+                except (ValueError, TypeError, KeyError, OSError) as exc:
+                    excluded.append({"source_index": index, "reason": str(exc)})
+                    continue
+                if row["clip_uid"] in rows:
+                    raise ValueError("duplicate JEA shot clip identity")
+                rows[row["clip_uid"]] = row
         selected = select_clip_uids(list(rows), case_manifest=case_manifest)
         shots = [
             T2VAShot(
