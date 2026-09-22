@@ -284,6 +284,7 @@ def default_reference_integrity_runner_factory(
     *,
     eligible_clip_uids_by_shard: Mapping[str, Sequence[str]],
     emit: Any = None,
+    cpu_workers: int | None = None,
 ) -> Any:
     from r2v_data_v2.v3.post_mask_epoch_reference_integrity import (
         ReferenceIntegrityEpochRunner,
@@ -297,6 +298,7 @@ def default_reference_integrity_runner_factory(
             shard: tuple(uids) for shard, uids in eligible_clip_uids_by_shard.items()
         },
         emit=emit,
+        cpu_workers=cpu_workers,
     )
 
 
@@ -603,6 +605,7 @@ def run_subject_attributes_stage(
     subject_attributes_runner_factory: SubjectAttributesRunnerFactory,
     subject_attributes_scheduler_factory: SubjectAttributesSchedulerFactory,
     emit: Any = None,
+    cpu_workers: int | None = None,
 ) -> dict[str, Any]:
     """Subject Attributes, then its receipt publication and completed handoff.
 
@@ -622,6 +625,7 @@ def run_subject_attributes_stage(
         ledger=ledger,
         eligible_clip_uids_by_shard=eligible,
         emit=emit,
+        cpu_workers=cpu_workers,
     )
     seeded = subject_attributes.seed_jobs()
     _emit(
@@ -683,6 +687,7 @@ def _after_reference_edit(
     subject_attributes_runner_factory: Any = None,
     subject_attributes_scheduler_factory: Any = None,
     emit: Any = None,
+    cpu_workers: int | None = None,
 ) -> dict[str, Any]:
     """Continue into Reference Integrity only when Reference Edit completed.
 
@@ -704,6 +709,7 @@ def _after_reference_edit(
         subject_attributes_runner_factory=subject_attributes_runner_factory,
         subject_attributes_scheduler_factory=subject_attributes_scheduler_factory,
         emit=emit,
+        cpu_workers=cpu_workers,
     )
 
 
@@ -719,6 +725,7 @@ def _continue_with_reference_integrity(
     subject_attributes_runner_factory: Any = None,
     subject_attributes_scheduler_factory: Any = None,
     emit: Any = None,
+    cpu_workers: int | None = None,
 ) -> dict[str, Any]:
     """Reference Integrity, deterministic Instruct, then Subject Attributes.
 
@@ -737,6 +744,7 @@ def _continue_with_reference_integrity(
         ledger=ledger,
         eligible_clip_uids_by_shard=eligible,
         emit=emit,
+        cpu_workers=cpu_workers,
     )
     reference_integrity_seed = reference_integrity.seed_jobs()
     _emit(
@@ -796,6 +804,7 @@ def _continue_with_reference_integrity(
         subject_attributes_runner_factory=subject_attributes_runner_factory,
         subject_attributes_scheduler_factory=subject_attributes_scheduler_factory,
         emit=emit,
+        cpu_workers=cpu_workers,
     )
 
 
@@ -810,6 +819,7 @@ def run_instruct_stage(
     subject_attributes_scheduler_factory: SubjectAttributesSchedulerFactory
     | None = None,
     emit: Any = None,
+    cpu_workers: int | None = None,
 ) -> dict[str, Any]:
     """Run the deterministic Instruct stage and record it in the result.
 
@@ -857,6 +867,7 @@ def run_instruct_stage(
         subject_attributes_runner_factory=subject_attributes_runner_factory,
         subject_attributes_scheduler_factory=subject_attributes_scheduler_factory,
         emit=emit,
+        cpu_workers=cpu_workers,
     )
 
 
@@ -1063,6 +1074,7 @@ def run_removal_pair_epochs(
             subject_attributes_runner_factory=subject_attributes_runner_factory,
             subject_attributes_scheduler_factory=subject_attributes_scheduler_factory,
             emit=emit,
+            cpu_workers=cpu_workers,
         )
     if instruct_started is not None:
         result.update(
@@ -1098,6 +1110,7 @@ def run_removal_pair_epochs(
                 subject_attributes_scheduler_factory
             ),
             emit=emit,
+            cpu_workers=cpu_workers,
         )
     if reference_integrity_started is not None:
         if not reference_integrity_wired:
@@ -1132,6 +1145,7 @@ def run_removal_pair_epochs(
                 reference_integrity_scheduler_factory
             ),
             emit=emit,
+            cpu_workers=cpu_workers,
         )
 
     if _reference_edit_completion_evidence(ledger, storages):
@@ -1200,6 +1214,7 @@ def run_removal_pair_epochs(
                 subject_attributes_scheduler_factory
             ),
             emit=emit,
+            cpu_workers=cpu_workers,
         )
 
     pair = pair_runner_factory(**shared)
@@ -1316,6 +1331,7 @@ def run_removal_pair_epochs(
         subject_attributes_runner_factory=subject_attributes_runner_factory,
         subject_attributes_scheduler_factory=subject_attributes_scheduler_factory,
         emit=emit,
+        cpu_workers=cpu_workers,
     )
 
 

@@ -2172,6 +2172,7 @@ def _compose_with_reference_integrity(
     ledger: GroupLedger | None = None,
     build_reference_edit_scheduler: Any = None,
     factory_log: list[str] | None = None,
+    cpu_workers: int | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], Any, Any]:
     from r2v_data_v2.v3.post_mask_epoch_reference_edit import (
         ReferenceEditEpochRunner,
@@ -2208,6 +2209,7 @@ def _compose_with_reference_integrity(
             build_reference_edit_scheduler or make
         ),
         build_reference_integrity_scheduler=make,
+        cpu_workers=cpu_workers,
         reference_edit_runner_factory=(
             lambda **kwargs: _stage_runner(
                 factory_log,
@@ -2516,6 +2518,7 @@ def _production_reference_integrity_outcome(
     attribute_ready: bool = False,
     storage: Any = None,
     paths: Any = None,
+    cpu_workers: int | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], Any, Any, Any]:
     """Run the real ``build_removal_epoch_runner`` with Reference Integrity on.
 
@@ -2652,6 +2655,7 @@ def _production_reference_integrity_outcome(
         temporary_root=tmp_path / "tmp",
         allowed_server_root=tmp_path / "workspace" / "data",
         qwen_epoch_config=build_qwen_epoch_config(config),
+        cpu_workers=cpu_workers,
     )
     group = _group_with(
         SHARD, campaign=build_removal_campaign(config, entity_mask_root=entity_mask_root)
@@ -2839,7 +2843,9 @@ def _install_stub_subject_attributes(
             *,
             eligible_clip_uids_by_shard: Any,
             emit: Any = None,
+            cpu_workers: int | None = None,
         ) -> None:
+            self.cpu_workers = cpu_workers
             self.storages = dict(storages)
             self.ledger = ledger
             self.jobs = [
@@ -3518,3 +3524,144 @@ def test_published_clip_satisfies_the_legacy_semantic_authorities(
     assert artifact.owner_is_human is True
     assert sample.sample_id == "clip-1"
     assert artifact.records and artifact.records[0].status == "accepted"
+
+
+# ---------------------------------------------------------------------------
+# Execution-only CPU budget propagation
+# ---------------------------------------------------------------------------
+
+
+def _record_cpu_workers(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """Wrap every stage runner so the CPU budget it was built with is visible.
+
+    Subclassing the real runner keeps real construction in the path: the value
+    recorded is the one the production factories actually passed.
+    """
+    import importlib
+
+    seen: dict[str, Any] = {}
+    targets = (
+        # Removal is built from the removal module's own alias, and also from the
+        # pipeline's default factory; either construction records the same value.
+        ("removal", "r2v_data_v2.v3.post_mask_epoch_removal", "RemovalEpochRunner"),
+        ("removal", "r2v_data_v2.v3.post_mask_epoch_pipeline", "RemovalEpochRunner"),
+        ("pair", "r2v_data_v2.v3.post_mask_epoch_pipeline", "PairEpochRunner"),
+        (
+            "reference_edit",
+            "r2v_data_v2.v3.post_mask_epoch_reference_edit",
+            "ReferenceEditEpochRunner",
+        ),
+        (
+            "reference_integrity",
+            "r2v_data_v2.v3.post_mask_epoch_reference_integrity",
+            "ReferenceIntegrityEpochRunner",
+        ),
+        (
+            "subject_attributes",
+            "r2v_data_v2.v3.post_mask_epoch_subject_attributes",
+            "SubjectAttributeEpochRunner",
+        ),
+    )
+
+    def wrap(module: Any, attr: str, stage: str) -> Any:
+        real = getattr(module, attr)
+
+        class Recorder(real):  # type: ignore[misc, valid-type]
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                seen[stage] = kwargs.get("cpu_workers")
+                super().__init__(*args, **kwargs)
+
+        return Recorder
+
+    for stage, module_name, attr in targets:
+        module = importlib.import_module(module_name)
+        monkeypatch.setattr(module, attr, wrap(module, attr, stage))
+    return seen
+
+
+def test_cpu_budget_reaches_every_stage_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every production stage runner is built with the resolved CPU budget.
+
+    Exercised through the real ``build_removal_epoch_runner`` wiring, so this
+    covers the production Reference Edit / Reference Integrity / Subject
+    Attributes factories and the pipeline's own Removal and Pair factories.
+    """
+    seen = _record_cpu_workers(monkeypatch)
+
+    outcome, _events, _handle, _storage, _ledger = (
+        _production_reference_integrity_outcome(
+            tmp_path, monkeypatch, cpu_workers=32
+        )
+    )
+
+    assert outcome["remove_completed"] is True
+    assert outcome["reference_edit_completed"] is True, outcome.get(
+        "reference_edit_reconcile_error"
+    )
+    assert outcome["reference_integrity_completed"] is True
+    assert outcome["subject_attributes_completed"] is True, outcome.get(
+        "subject_attributes_reconcile_error"
+    )
+    assert seen == {
+        "removal": 32,
+        "pair": 32,
+        "reference_edit": 32,
+        "reference_integrity": 32,
+        "subject_attributes": 32,
+    }
+
+
+def test_cpu_budget_survives_the_reference_integrity_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A restart on the Reference Integrity barrier still gets the budget.
+
+    The restart branch calls the downstream helpers directly, so it is the path
+    where the value can silently be dropped.
+    """
+    import r2v_data_v2.v3.post_mask_epoch_pipeline as pipeline_module
+
+    seen = _record_cpu_workers(monkeypatch)
+    fixture = _reference_integrity_fixture(tmp_path, monkeypatch)
+    ledger = GroupLedger(tmp_path / "ledger")
+
+    # Crash between the Reference Integrity publication and the Instruct
+    # handoff, so the durable barrier is REFERENCE_INTEGRITY_STARTED.
+    real_write = pipeline_module.write_composition_handoff
+    crashed = {"done": False}
+
+    def crash_before_instruct(
+        ledger_arg: Any, stage: str, *, eligible_clip_uids_by_shard: Any
+    ) -> None:
+        if stage == INSTRUCT_STARTED and not crashed["done"]:
+            crashed["done"] = True
+            raise RuntimeError("simulated crash before the Instruct handoff")
+        real_write(
+            ledger_arg,
+            stage,
+            eligible_clip_uids_by_shard=eligible_clip_uids_by_shard,
+        )
+
+    monkeypatch.setattr(
+        pipeline_module, "write_composition_handoff", crash_before_instruct
+    )
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        _compose_with_reference_integrity(
+            tmp_path, monkeypatch, [], fixture=fixture, ledger=ledger, cpu_workers=32
+        )
+    composition_root = Path(ledger.root) / "composition"
+    assert (composition_root / f"{REFERENCE_INTEGRITY_STARTED}.json").is_file()
+    assert not (composition_root / f"{INSTRUCT_STARTED}.json").exists()
+
+    seen.clear()
+    _compose_with_reference_integrity(
+        tmp_path, monkeypatch, [], fixture=fixture, ledger=ledger, cpu_workers=32
+    )
+
+    # The resumed Reference Integrity runner is rebuilt through the restart
+    # branch and must still carry the resolved budget.
+    assert seen["reference_integrity"] == 32
+    # And the Recovery path did not fall back to the config default.
+    assert seen["removal"] == 32

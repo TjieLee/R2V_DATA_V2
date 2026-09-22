@@ -1904,6 +1904,9 @@ def build_removal_epoch_runner(
                                     "eligible_clip_uids_by_shard"
                                 ],
                                 emit=kwargs.get("emit"),
+                                # Forwarded, never re-resolved: the budget was
+                                # resolved once at the invocation boundary.
+                                cpu_workers=kwargs.get("cpu_workers"),
                             )
                         )
                         if reference_edit_enabled
@@ -1932,6 +1935,9 @@ def build_removal_epoch_runner(
                                     "eligible_clip_uids_by_shard"
                                 ],
                                 emit=kwargs.get("emit"),
+                                # Forwarded, never re-resolved: the budget was
+                                # resolved once at the invocation boundary.
+                                cpu_workers=kwargs.get("cpu_workers"),
                             )
                         )
                         if reference_integrity_enabled
@@ -1955,6 +1961,9 @@ def build_removal_epoch_runner(
                                 "eligible_clip_uids_by_shard"
                             ],
                             emit=kwargs.get("emit"),
+                            # Forwarded, never re-resolved: the budget was
+                            # resolved once at the invocation boundary.
+                            cpu_workers=kwargs.get("cpu_workers"),
                         )
                     ),
                     emit=emit,
