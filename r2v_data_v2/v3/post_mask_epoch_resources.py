@@ -585,7 +585,9 @@ def boogu_worker_factory(
             model_revision=config.model_revision,
             device="cuda:0",
             cuda_visible_devices=str(gpu_id),
-            timeout_seconds=min(config.timeout_seconds, pool.timeout_seconds),
+            timeout_seconds=int(
+                min(config.timeout_seconds, pool.timeout_seconds)
+            ),
             temporary_root=Path(temporary_root) / f"slot-{slot}",
             allowed_server_root=allowed_server_root,
         )

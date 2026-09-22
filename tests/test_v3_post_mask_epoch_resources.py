@@ -32,6 +32,7 @@ from r2v_data_v2.v3.post_mask_epoch_resources import (
     WorkerEpochResource,
     WorkerPoolConfig,
     WorkerSlotExecutor,
+    boogu_worker_factory,
     build_sam_epoch,
     deterministic_slot,
     port_in_use,
@@ -357,6 +358,51 @@ class _FakeWorker:
 
     def close(self) -> None:
         self.closed = True
+
+
+def test_boogu_worker_factory_normalizes_pool_timeout_to_integer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """WorkerPoolConfig uses float seconds; BooguWorkerConfig requires an int."""
+    from types import SimpleNamespace
+
+    import r2v_data_v2.v3.reference_edit_boogu as boogu_module
+
+    allowed = (tmp_path / "workspace" / "data").resolve()
+    python = allowed / "venv" / "python"
+    code_root = allowed / "vendor" / "Boogu-Image"
+    model_path = allowed / "models" / "Boogu"
+    config = SimpleNamespace(
+        python_executable=python,
+        code_root=code_root,
+        model_path=model_path,
+        model_revision="revision",
+        timeout_seconds=3600,
+    )
+    captured: dict[str, Any] = {}
+
+    class _Backend:
+        def __init__(self, worker_config: Any) -> None:
+            worker_config.validate()
+            captured["config"] = worker_config
+
+        def start(self, *, stderr_log_path: Path) -> None:
+            captured["stderr_log_path"] = stderr_log_path
+
+    monkeypatch.setattr(boogu_module, "BooguSubprocessBackend", _Backend)
+
+    factory = boogu_worker_factory(
+        config=config,
+        temporary_root=allowed / "tmp",
+        allowed_server_root=allowed,
+        pool=WorkerPoolConfig(gpu_ids=(0,), timeout_seconds=900.0),
+    )
+    backend = factory(0, 0)
+
+    assert isinstance(backend, _Backend)
+    worker_config = captured["config"]
+    assert worker_config.timeout_seconds == 900
+    assert type(worker_config.timeout_seconds) is int
 
 
 def test_worker_epoch_loads_one_worker_per_gpu_once(tmp_path: Path):
