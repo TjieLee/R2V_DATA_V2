@@ -1346,7 +1346,7 @@ def build_removal_epoch_factories(
 
     def boogu_factory() -> tuple[Any, Any]:
         epoch = build_boogu_epoch(
-            config=config,
+            config=config.reference_edit,
             pool=pool,
             process_manager=process_manager,
             temporary_root=temporary_root,

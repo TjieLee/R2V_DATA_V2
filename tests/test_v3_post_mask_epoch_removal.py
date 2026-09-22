@@ -1079,6 +1079,54 @@ def test_boogu_factory_builds_the_worker_slot_epoch(
     assert executor.slot_count == 8
 
 
+def test_boogu_factory_passes_reference_edit_runtime_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The persistent Boogu worker consumes ReferenceEditConfig, not V3Config."""
+    config = _fixture_config(tmp_path, monkeypatch)
+    storage = _pending_storage(config)
+    ledger = GroupLedger(tmp_path / "group")
+    runner = _runner(config, storage, ledger)
+    captured: dict[str, Any] = {}
+
+    class _Resource:
+        pass
+
+    resource = _Resource()
+
+    def fake_build_boogu_epoch(*, config: Any, **kwargs: Any) -> Any:
+        captured["config"] = config
+        captured["kwargs"] = kwargs
+        return resource
+
+    monkeypatch.setattr(
+        "r2v_data_v2.v3.post_mask_epoch_removal.build_boogu_epoch",
+        fake_build_boogu_epoch,
+    )
+    factories = build_removal_epoch_factories(
+        config,
+        runner,
+        qwen_epoch_config=build_qwen_epoch_config(config),
+        pool=WorkerPoolConfig(),
+        process_manager=_fake_process_manager(),
+        temporary_root=tmp_path / "tmp",
+        allowed_server_root=tmp_path / "workspace" / "data",
+    )
+
+    built_resource, executor = factories[RESOURCE_BOOGU]()
+
+    assert built_resource is resource
+    assert isinstance(executor, WorkerSlotExecutor)
+    assert captured["config"] is config.reference_edit
+    assert captured["config"] is not config
+    assert (
+        captured["config"].python_executable
+        == config.reference_edit.python_executable
+    )
+    assert captured["config"].code_root == config.reference_edit.code_root
+    assert captured["config"].model_path == config.reference_edit.model_path
+
+
 # ---------------------------------------------------------------------------
 # Removal-only runner never completes a group
 # ---------------------------------------------------------------------------
