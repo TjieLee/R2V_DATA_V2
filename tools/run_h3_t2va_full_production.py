@@ -48,11 +48,6 @@ def main(argv=None):
         default=Path("/mnt/workspace/public/pretrained/MiMo/MiMo-V2.5"),
     )
     parser.add_argument("--mimo-model", default="mimo-v2.5")
-    parser.add_argument(
-        "--mimo-speculative",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-    )
     parser.add_argument("--mimo-mem-fraction-static", type=float, default=0.65)
     parser.add_argument("--mimo-startup-polls", type=int, default=360)
     parser.add_argument("--mimo-poll-interval", type=float, default=5.0)
@@ -192,7 +187,6 @@ def main(argv=None):
             args.mimo_checkpoint,
             served_model_name=args.mimo_model,
             mem_fraction_static=args.mimo_mem_fraction_static,
-            enable_speculative=args.mimo_speculative,
         ),
         log_root=root / "logs" / os.uname().nodename,
         startup_polls=args.mimo_startup_polls,
@@ -200,8 +194,7 @@ def main(argv=None):
         cleanup_grace_seconds=args.mimo_cleanup_grace_seconds,
     )
     print(
-        f"mimo_runtime model={args.mimo_model} checkpoint={args.mimo_checkpoint} "
-        f"speculative={args.mimo_speculative}",
+        f"mimo_runtime model={args.mimo_model} checkpoint={args.mimo_checkpoint}",
         flush=True,
     )
     pipeline = full.FullPipeline(
