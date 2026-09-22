@@ -226,9 +226,9 @@ Production-compatible serving keeps the validated FA3/DP configuration:
   2>&1 | tee /tmp/mimo8092_v25.log
 ```
 
-For the first V2.6 random20 quality A/B, keep every request/prompt/turn unchanged
-and change only the checkpoint/model. Leave EAGLE/MTP disabled in this quality
-comparison so serving optimizations are not confounded with the model change:
+For the V2.6 random20 quality validation, keep every request/prompt/turn unchanged
+and change the checkpoint/model. Run V2.6 with the official EAGLE/MTP serving
+configuration:
 
 ```bash
 export MIMO_CHECKPOINT=/mnt/workspace/public/pretrained/MiMo/MiMo-V2.6-Flash-RL
@@ -256,11 +256,16 @@ export MIMO_MODEL=mimo-v2.6-flash-rl
   --tool-call-parser mimo \
   --constrained-json-disable-any-whitespace \
   --enable-deterministic-inference \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --enable-multi-layer-eagle \
   2>&1 | tee /tmp/mimo8092_v26_random20.log
 ```
 
-After quality validation, EAGLE/MTP can be benchmarked separately using the
-official V2.6 speculative flags.
+The full-production launcher applies these speculative parameters automatically
+whenever `MIMO_MODEL=mimo-v2.6-flash-rl`.
 
 When running this command directly in an interactive shell, use normal shell
 quoting exactly as above. Do **not** write `\"$MIMO_CHECKPOINT\"`: the backslashes
