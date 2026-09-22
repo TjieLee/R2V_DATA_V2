@@ -1213,6 +1213,24 @@ def test_legacy_cannot_enable_span_prediction(tmp_path, version):
         load_stem_shadow(output)
 
 
+def test_sam_checkpoint_provenance_does_not_read_weight_content(tmp_path):
+    configuration = _configuration(tmp_path)
+    checkpoint = Path(configuration.model_checkpoint_path)
+    before = configuration.model_checkpoint_sha256
+    payload = checkpoint.read_bytes()
+    checkpoint.write_bytes(bytes((byte ^ 1) for byte in payload))
+
+    rebuilt = sam_audio_configuration(
+        implementation_root=Path(configuration.implementation_root),
+        model_path=Path(configuration.model_path),
+        model_name=configuration.model_name,
+        t5_base_path=Path(configuration.t5_base_path),
+        device="cuda:0",
+        reranking_candidates=1,
+    )
+    assert rebuilt.model_checkpoint_sha256 == before
+
+
 def test_local_model_identifier_cannot_disagree_with_checkpoint_config(
     tmp_path: Path,
 ) -> None:
