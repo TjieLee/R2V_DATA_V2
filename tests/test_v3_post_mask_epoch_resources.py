@@ -1156,6 +1156,38 @@ def test_qwen_executor_propagates_system_exit():
         executor.execute_batch([_qwen_job("clip-1"), _qwen_job("clip-2")])
 
 
+def test_qwen_close_waits_for_running_request():
+    """Closing an aborted epoch must not unload Qwen under a live sibling."""
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    closed = threading.Event()
+
+    def runner(job: ModelJob, endpoint: Any) -> JobResult:
+        started.set()
+        release.wait(timeout=5)
+        finished.set()
+        return JobResult(OUTCOME_COMPLETED, payload={})
+
+    executor = QwenConcurrentExecutor(runner, max_inflight=1)
+    executor.submit(_qwen_job("clip-slow"))
+    assert started.wait(timeout=5)
+
+    def close_executor() -> None:
+        executor.close()
+        closed.set()
+
+    closer = threading.Thread(target=close_executor, daemon=True)
+    closer.start()
+    try:
+        assert not closed.wait(timeout=0.05), "close returned while Qwen was running"
+    finally:
+        release.set()
+    assert closed.wait(timeout=5)
+    closer.join(timeout=5)
+    assert finished.is_set()
+
+
 @pytest.mark.filterwarnings(
     "ignore::pytest.PytestUnhandledThreadExceptionWarning"
 )
@@ -1165,6 +1197,38 @@ def test_worker_slot_executor_propagates_system_exit():
     executor = WorkerSlotExecutor(_system_exit_runner, slot_count=2)
     with pytest.raises(SystemExit):
         executor.execute_batch([_boogu_job("clip-1")])
+
+
+def test_worker_slot_close_waits_for_running_job():
+    """Closing an aborted epoch must not unload a slot backend mid-call."""
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    closed = threading.Event()
+
+    def runner(job: ModelJob, slot: int) -> JobResult:
+        started.set()
+        release.wait(timeout=5)
+        finished.set()
+        return JobResult(OUTCOME_COMPLETED, payload={})
+
+    executor = WorkerSlotExecutor(runner, slot_count=1)
+    executor.submit(_boogu_job("clip-slow"))
+    assert started.wait(timeout=5)
+
+    def close_executor() -> None:
+        executor.close()
+        closed.set()
+
+    closer = threading.Thread(target=close_executor, daemon=True)
+    closer.start()
+    try:
+        assert not closed.wait(timeout=0.05), "close returned while slot work was running"
+    finally:
+        release.set()
+    assert closed.wait(timeout=5)
+    closer.join(timeout=5)
+    assert finished.is_set()
 
 
 # --------------------------------------------------------------------------

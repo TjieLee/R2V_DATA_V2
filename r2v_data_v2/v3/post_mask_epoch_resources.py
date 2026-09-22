@@ -759,20 +759,31 @@ class QwenConcurrentExecutor:
         return executions
 
     def close(self) -> None:
+        """Stop accepting work and drain every request that actually started.
+
+        A control-flow exception can escape collect() while sibling requests are
+        still executing. The resource manager must not unload Qwen underneath
+        those threads, so queued work is cancelled but running calls are joined
+        before the executor is considered closed. Normal fixed-point shutdown has
+        no in-flight work, so this adds no steady-state latency.
+        """
         pool, self._pool = self._pool, None
-        self._inflight.clear()
         if pool is not None:
-            pool.shutdown(wait=False, cancel_futures=True)
+            pool.shutdown(wait=True, cancel_futures=True)
+        self._inflight.clear()
 
     def execute_batch(self, jobs: Sequence[Any]) -> Mapping[str, JobExecution]:
         results: dict[str, JobExecution] = {}
-        for job in sorted(jobs, key=job_order_key):
-            self.submit(job)
-        while self._inflight:
-            for execution in self.collect():
-                results[execution.job.job_id()] = execution
-        self.close()
-        return results
+        try:
+            for job in sorted(jobs, key=job_order_key):
+                self.submit(job)
+            while self._inflight:
+                for execution in self.collect():
+                    results[execution.job.job_id()] = execution
+            return results
+        finally:
+            # A BaseException from one future must still drain/cancel siblings.
+            self.close()
 
 
 @dataclass(frozen=True)
@@ -910,6 +921,15 @@ class WorkerSlotExecutor:
             executions.append(event)
 
     def close(self) -> None:
+        """Drain running slot work before its GPU resource may be unloaded.
+
+        On a control-flow abort one slot can fail while siblings are still inside
+        model calls. Sentinels stop any further work, then an unbounded join waits
+        for those already-running calls to leave their backends. The old batch
+        executor also joined every slot before returning; keeping that guarantee
+        is required because ResourceEpochManager may unload the model immediately
+        after this method returns.
+        """
         with self._lock:
             threads, self._threads = self._threads, []
         if not threads:
@@ -917,25 +937,38 @@ class WorkerSlotExecutor:
         for queue in self._queues:
             queue.put(None)
         for thread in threads:
-            thread.join(timeout=5.0)
+            thread.join()
+
+        # A slot that aborted via BaseException can leave its shutdown sentinel
+        # unread. Recreate the execution-only queues/state so a reused executor
+        # cannot inherit a stale sentinel or a dead worker.
+        with self._slot_freed:
+            self._queues = [Queue() for _ in range(self.slot_count)]
+            self._events = Queue()
+            self._free = set(range(self.slot_count))
+            self._next_slot = 0
+            self._slot_freed.notify_all()
 
     def execute_batch(self, jobs: Sequence[Any]) -> Mapping[str, JobExecution]:
         results: dict[str, JobExecution] = {}
         remaining = sorted(jobs, key=job_order_key)
         outstanding = 0
-        # Keep at most slot_count in flight and refill as slots come back, so a
-        # job is never queued behind a slot that is still working.
-        while remaining or outstanding:
-            while remaining and outstanding < self.slot_count:
-                self.submit(remaining.pop(0))
-                outstanding += 1
-            if not outstanding:
-                break
-            for execution in self.collect():
-                results[execution.job.job_id()] = execution
-                outstanding -= 1
-        self.close()
-        return results
+        try:
+            # Keep at most slot_count in flight and refill as slots come back, so
+            # a job is never queued behind a slot that is still working.
+            while remaining or outstanding:
+                while remaining and outstanding < self.slot_count:
+                    self.submit(remaining.pop(0))
+                    outstanding += 1
+                if not outstanding:
+                    break
+                for execution in self.collect():
+                    results[execution.job.job_id()] = execution
+                    outstanding -= 1
+            return results
+        finally:
+            # A slot abort still has to drain siblings before GPU teardown.
+            self.close()
 
 
 # ---------------------------------------------------------------------------
