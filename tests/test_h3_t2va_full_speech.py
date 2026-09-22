@@ -461,12 +461,22 @@ def test_worker_runtime_metadata_mismatch_is_not_fatal(
     speech.run_asr(*args, ffmpeg=ffmpeg, execute=executor)
     asr_jobs = executor.batches[-1][1]
 
-    db = _Diarization()
-    db._process = SimpleNamespace(poll=lambda: None)
-    db.provenance = db.provenance.model_copy(
-        update={"model_fingerprint": "f" * 64}
-    )
-    db.environment = {}
+    class DiarBackend(_Diarization):
+        def __init__(self):
+            super().__init__()
+            self._process = SimpleNamespace(poll=lambda: None)
+            self.provenance = self.provenance.model_copy(
+                update={"model_fingerprint": "f" * 64}
+            )
+            self.environment = {}
+
+        def __enter__(self):
+            return self
+
+        def close(self):
+            pass
+
+    db = DiarBackend()
 
     class ASRBackend(_Qwen):
         def __init__(self):
@@ -475,6 +485,9 @@ def test_worker_runtime_metadata_mismatch_is_not_fatal(
             self.configuration = self.configuration.model_copy(
                 update={"dtype": "float32"}
             )
+
+        def __enter__(self):
+            return self
 
         def close(self, **kwargs):
             pass
