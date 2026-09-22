@@ -61,6 +61,7 @@ from r2v_data_v2.v3.post_mask_epoch_jobs import (
 from r2v_data_v2.v3.post_mask_epoch_jobs import (
     RESOURCE_SAM as RESOURCE_SAM_NAME,
 )
+from r2v_data_v2.v3.post_mask_epoch_resources import resolve_cpu_workers
 from r2v_data_v2.v3.post_mask_epoch_state import atomic_write_bytes, atomic_write_json
 from r2v_data_v2.v3.storage import RunStorage, evaluate_export_state
 from r2v_data_v2.v3.subject_attributes import (
@@ -1316,12 +1317,17 @@ class SubjectAttributeEpochRunner:
         *,
         eligible_clip_uids_by_shard: Mapping[str, Sequence[str]],
         emit: Any = None,
+        cpu_workers: int | None = None,
     ) -> None:
         if bool(getattr(config.subject_attribute_gme, "enabled", False)):
             raise SubjectAttributeEpochError(
                 "Post-Mask Resource Epoch requires subject attribute GME disabled"
             )
         self.config = config
+        # Execution-only CPU budget; never part of any identity or schema.
+        self.cpu_workers = (
+            resolve_cpu_workers(config) if cpu_workers is None else int(cpu_workers)
+        )
         self.storages = dict(storages)
         self.ledger = ledger
         self.eligible = {
@@ -3659,7 +3665,7 @@ class SubjectAttributeEpochRunner:
         here writes durable state - markers are published afterwards, on the
         calling thread - so the parallel region cannot move a durable write.
         """
-        workers = int(getattr(self.config.runtime, "cpu_workers", 1) or 1)
+        workers = int(getattr(self, "cpu_workers", 1) or 1)
         if workers <= 1 or len(attribute_ids) < 2:
             return [
                 self._replay_or_cached_selection(

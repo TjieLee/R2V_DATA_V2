@@ -47,9 +47,71 @@ from r2v_data_v2.v3.post_mask_epoch_scheduler import (
     ResourceJobExecutor,
 )
 
+#: Execution-only CPU worker budget for the Resource Epoch. Deliberately an
+#: environment variable rather than a ``V3Config`` field: ``runtime.cpu_workers``
+#: is part of the config fingerprint, so changing it would change run identity
+#: for a pure execution decision. It never reaches a ModelJob, an input digest, a
+#: semantic plan, a receipt or any public schema.
+CPU_WORKERS_ENV = "POST_MASK_CPU_WORKERS"
+
+#: Kept for compatibility with callers that never set the environment.
+DEFAULT_CPU_WORKERS = 8
+
+#: Upper bound for pure disk-hashing fan-out. Beyond this the work is I/O bound
+#: and more threads only add contention.
+HASH_WORKER_CAP = 16
+
 
 class EpochResourceError(RuntimeError):
     """A managed resource could not be started or stopped safely."""
+
+
+def resolve_cpu_workers(config: Any = None) -> int:
+    """Resolve the Resource Epoch CPU worker budget. Execution-only.
+
+    Precedence: ``POST_MASK_CPU_WORKERS``, then the config's existing
+    ``runtime.cpu_workers`` for old callers, then :data:`DEFAULT_CPU_WORKERS`.
+    """
+    raw = os.environ.get(CPU_WORKERS_ENV, "").strip()
+    if raw:
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise EpochResourceError(
+                f"{CPU_WORKERS_ENV} must be an integer, got {raw!r}"
+            ) from exc
+        if value < 1:
+            raise EpochResourceError(f"{CPU_WORKERS_ENV} must be >= 1, got {value}")
+        return value
+    fallback = getattr(getattr(config, "runtime", None), "cpu_workers", None)
+    if isinstance(fallback, int) and not isinstance(fallback, bool) and fallback >= 1:
+        return fallback
+    return DEFAULT_CPU_WORKERS
+
+
+def resolve_hash_workers(config: Any = None, *, tasks: int | None = None) -> int:
+    """Worker budget for read-only disk hashing, capped and never below 1."""
+    workers = min(resolve_cpu_workers(config), HASH_WORKER_CAP)
+    if tasks is not None:
+        workers = min(workers, max(1, tasks))
+    return max(1, workers)
+
+
+def limit_process_native_threads() -> None:
+    """Stop OpenCV/pyav from oversubscribing the epoch orchestrator process.
+
+    Execution-only: model work runs in its own subprocesses, whose CPU policy is
+    not touched. A missing OpenCV is not an error - some deployments run the
+    orchestrator without it.
+    """
+    try:
+        import cv2  # optional: only present in the model image
+    except ImportError:
+        return
+    try:
+        cv2.setNumThreads(1)
+    except Exception:  # noqa: BLE001 - never fail a run over a tuning call
+        return
 
 
 @dataclass(frozen=True)

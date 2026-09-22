@@ -582,3 +582,56 @@ def test_group_completed_after_the_resume_scan_is_not_rerun(
     assert summary["groups_complete_skipped"] == 1
     assert summary["groups_complete_skipped_after_lock"] == 1
     assert summary["group_completed"] == 0
+
+
+def test_started_event_reports_the_execution_only_cpu_budget(
+    launcher: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The worker budget is reported but never enters campaign identity."""
+    root = _stage2_root(tmp_path)
+    monkeypatch.setenv("POST_MASK_CPU_WORKERS", "32")
+    _install_recorder(monkeypatch, launcher, completed=True)
+
+    assert (
+        launcher.main(
+            [
+                "--base-config",
+                str(tmp_path / "cfg.yaml"),
+                "--entity-mask-root",
+                str(root),
+                "--post-mask-root",
+                str(tmp_path / "campaign"),
+                "--job-runner",
+                "pkg.module:callable",
+            ]
+        )
+        == 0
+    )
+
+    events = [
+        json.loads(line)
+        for line in capsys.readouterr().out.splitlines()
+        if line.strip().startswith("{")
+    ]
+    started = next(
+        item
+        for item in events
+        if item.get("event") == "post_mask_resource_epoch_started"
+    )
+    assert started["cpu_workers"] == 32
+    # Campaign identity is unchanged by an execution-only setting.
+    campaign = launcher.build_campaign(
+        config_module.load_config(Path(str(tmp_path / "cfg.yaml"))),
+        entity_mask_root=root,
+        canonical_shard_count=1,
+    )
+    monkeypatch.setenv("POST_MASK_CPU_WORKERS", "8")
+    again = launcher.build_campaign(
+        config_module.load_config(Path(str(tmp_path / "cfg.yaml"))),
+        entity_mask_root=root,
+        canonical_shard_count=1,
+    )
+    assert campaign == again

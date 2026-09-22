@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import subprocess
 import threading
+import types
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar
@@ -20,6 +21,9 @@ from r2v_data_v2.v3.post_mask_epoch_jobs import (
     ModelJob,
 )
 from r2v_data_v2.v3.post_mask_epoch_resources import (
+    CPU_WORKERS_ENV,
+    DEFAULT_CPU_WORKERS,
+    HASH_WORKER_CAP,
     EpochResource,
     EpochResourceError,
     OwnedProcess,
@@ -35,7 +39,10 @@ from r2v_data_v2.v3.post_mask_epoch_resources import (
     boogu_worker_factory,
     build_sam_epoch,
     deterministic_slot,
+    limit_process_native_threads,
     port_in_use,
+    resolve_cpu_workers,
+    resolve_hash_workers,
     served_model_ids,
 )
 from r2v_data_v2.v3.post_mask_epoch_scheduler import ResourceEpochScheduler
@@ -1356,3 +1363,69 @@ def test_worker_slot_executor_refills_whichever_slot_finishes_first():
         assert sorted(slot_of.values()) == sorted((freed_slot, freed_slot, busy_slot))
     finally:
         executor.close()
+
+
+# --------------------------------------------------------------------------
+# Execution-only CPU worker budget
+# --------------------------------------------------------------------------
+
+
+def test_resolve_cpu_workers_precedence(tmp_path: Path, monkeypatch) -> None:
+    from tests.test_v3_pair import _config
+
+    config = _config(tmp_path, monkeypatch)
+    monkeypatch.delenv(CPU_WORKERS_ENV, raising=False)
+    # Compatibility fallback for callers that never set the environment.
+    assert resolve_cpu_workers(config) == config.runtime.cpu_workers
+    assert resolve_cpu_workers(None) == DEFAULT_CPU_WORKERS
+
+    monkeypatch.setenv(CPU_WORKERS_ENV, "32")
+    assert resolve_cpu_workers(config) == 32
+    assert resolve_cpu_workers(None) == 32
+
+
+def test_resolve_cpu_workers_rejects_bad_values(monkeypatch) -> None:
+    for raw in ("0", "-1", "many", "1.5"):
+        monkeypatch.setenv(CPU_WORKERS_ENV, raw)
+        with pytest.raises(EpochResourceError):
+            resolve_cpu_workers(None)
+
+
+def test_cpu_workers_env_never_changes_the_config_fingerprint(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The worker budget is execution-only, so run identity must not move."""
+    from tests.test_v3_pair import _config
+
+    config = _config(tmp_path, monkeypatch)
+    before = config.fingerprint()
+    monkeypatch.setenv(CPU_WORKERS_ENV, "32")
+
+    assert resolve_cpu_workers(config) == 32
+    assert config.fingerprint() == before
+
+
+def test_hash_worker_budget_is_capped(monkeypatch) -> None:
+    monkeypatch.setenv(CPU_WORKERS_ENV, "100")
+    assert resolve_hash_workers(None) == HASH_WORKER_CAP
+    assert resolve_hash_workers(None, tasks=3) == 3
+    assert resolve_hash_workers(None, tasks=0) == 1
+
+
+def test_limit_process_native_threads_never_raises(monkeypatch) -> None:
+    """Containment is best-effort: a missing OpenCV must not fail a run."""
+    import sys
+
+    monkeypatch.setitem(sys.modules, "cv2", None)
+    limit_process_native_threads()
+
+    monkeypatch.setitem(sys.modules, "cv2", types.SimpleNamespace(setNumThreads=1))
+    limit_process_native_threads()
+
+    def exploding(_value: int) -> None:
+        raise RuntimeError("cv2 refused")
+
+    monkeypatch.setitem(
+        sys.modules, "cv2", types.SimpleNamespace(setNumThreads=exploding)
+    )
+    limit_process_native_threads()

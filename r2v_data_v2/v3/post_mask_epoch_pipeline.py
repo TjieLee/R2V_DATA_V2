@@ -96,12 +96,14 @@ def default_removal_runner_factory(
     *,
     eligible_clip_uids_by_shard: Mapping[str, Sequence[str]],
     emit: Any = None,
+    cpu_workers: int | None = None,
 ) -> RemovalEpochRunner:
     return RemovalEpochRunner(
         config,
         dict(storages),
         ledger,
         emit=emit,
+        cpu_workers=cpu_workers,
         eligible_clip_uids_by_shard={
             shard: tuple(uids) for shard, uids in eligible_clip_uids_by_shard.items()
         },
@@ -115,11 +117,13 @@ def default_pair_runner_factory(
     *,
     eligible_clip_uids_by_shard: Mapping[str, Sequence[str]],
     emit: Any = None,
+    cpu_workers: int | None = None,
 ) -> PairEpochRunner:
     return PairEpochRunner(
         config,
         dict(storages),
         ledger,
+        cpu_workers=cpu_workers,
         eligible_clip_uids_by_shard={
             shard: tuple(uids) for shard, uids in eligible_clip_uids_by_shard.items()
         },
@@ -134,6 +138,7 @@ def default_subject_attributes_runner_factory(
     *,
     eligible_clip_uids_by_shard: Mapping[str, Sequence[str]],
     emit: Any = None,
+    cpu_workers: int | None = None,
 ) -> Any:
     """The production Subject Attributes resource-epoch runner."""
     from r2v_data_v2.v3.post_mask_epoch_subject_attributes import (
@@ -144,6 +149,7 @@ def default_subject_attributes_runner_factory(
         config,
         dict(storages),
         ledger,
+        cpu_workers=cpu_workers,
         eligible_clip_uids_by_shard={
             shard: tuple(uids) for shard, uids in eligible_clip_uids_by_shard.items()
         },
@@ -872,6 +878,7 @@ def run_removal_pair_epochs(
     subject_attributes_scheduler_factory: SubjectAttributesSchedulerFactory
     | None = None,
     emit: Any = None,
+    cpu_workers: int | None = None,
 ) -> dict[str, Any]:
     """Drain Removal, then Pair primary, then the frozen Pair cross pass.
 
@@ -887,6 +894,7 @@ def run_removal_pair_epochs(
         "ledger":ledger,
         "eligible_clip_uids_by_shard":eligible,
         "emit":emit,
+        "cpu_workers":cpu_workers,
     }
 
     removal = removal_runner_factory(**shared)

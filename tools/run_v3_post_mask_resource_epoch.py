@@ -162,11 +162,21 @@ def main(argv=None) -> int:
         write_group_completed,
         write_group_descriptor,
     )
+    from r2v_data_v2.v3.post_mask_epoch_resources import (
+        limit_process_native_threads,
+        resolve_cpu_workers,
+    )
     from r2v_data_v2.v3.post_mask_epoch_state import GroupLedger
     from r2v_data_v2.v3.post_mask_production import enumerate_shards
 
     try:
         config = load_config(Path(args.base_config))
+        # The orchestrator is about to run many CPU threads. Contain native
+        # library pools in *this* process only; model subprocesses keep their own
+        # CPU policy. Both values are execution-only and never reach the config
+        # fingerprint, a job identity or a receipt.
+        limit_process_native_threads()
+        cpu_workers = resolve_cpu_workers(config)
         entity_mask_root = Path(args.entity_mask_root)
         shards = enumerate_shards(entity_mask_root)
         if not shards:
@@ -227,6 +237,7 @@ def main(argv=None) -> int:
             group_size=args.group_size,
             git_commit=git_commit,
             dry_run=bool(args.dry_run),
+            cpu_workers=cpu_workers,
         )
 
         planned, completed, incomplete, skipped = 0, 0, 0, 0

@@ -60,6 +60,7 @@ from r2v_data_v2.v3.post_mask_epoch_jobs import (
     ModelJob,
     semantic_input_digest,
 )
+from r2v_data_v2.v3.post_mask_epoch_resources import resolve_cpu_workers
 from r2v_data_v2.v3.post_mask_epoch_state import (
     GroupLedger,
     atomic_write_json,
@@ -333,6 +334,7 @@ class PairEpochRunner:
         *,
         eligible_clip_uids_by_shard: Mapping[str, Sequence[str]],
         emit: Any = None,
+        cpu_workers: int | None = None,
     ) -> None:
         config.validate()
         if not config.pair.enabled:
@@ -346,6 +348,10 @@ class PairEpochRunner:
                 "completion fallbacks are not part of the epoch Pair path"
             )
         self.config = config
+        # Execution-only CPU budget; never part of any identity or schema.
+        self.cpu_workers = (
+            resolve_cpu_workers(config) if cpu_workers is None else int(cpu_workers)
+        )
         self.storages = dict(storages)
         self.ledger = ledger
         self.eligible = {
@@ -786,7 +792,7 @@ class PairEpochRunner:
 
         Results are returned in annotation order, never in completion order.
         """
-        workers = int(getattr(self.config.runtime, "cpu_workers", 1) or 1)
+        workers = int(getattr(self, "cpu_workers", 1) or 1)
         if workers <= 1 or len(entities) < 2:
             return [
                 prepare_entity_reference(

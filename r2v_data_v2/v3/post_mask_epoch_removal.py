@@ -83,6 +83,7 @@ from r2v_data_v2.v3.post_mask_epoch_resources import (
     WorkerPoolConfig,
     WorkerSlotExecutor,
     build_boogu_epoch,
+    resolve_cpu_workers,
 )
 from r2v_data_v2.v3.post_mask_epoch_scheduler import (
     DEFAULT_WINDOW_SIZE,
@@ -639,9 +640,14 @@ class RemovalEpochRunner:
         eligible_clip_uids_by_shard: Mapping[str, Sequence[str]],
         emit: Callable[..., None] | None = None,
         seed_allocator: Callable[[], int] = new_boogu_seed,
+        cpu_workers: int | None = None,
     ) -> None:
         require_boogu_backend(config)
         self.config = config
+        # Execution-only CPU budget; never part of any identity or schema.
+        self.cpu_workers = resolve_cpu_workers(config) if cpu_workers is None else int(
+            cpu_workers
+        )
         self.storages: dict[str, RunStorage] = dict(storages)
         self.ledger = ledger
         #: The epoch's only source of clip eligibility. It is the hydration
@@ -1695,6 +1701,7 @@ def build_removal_epoch_runner(
     repo_root: Path | None = None,
     campaign: Mapping[str, Any] | None = None,
     canonical_shard_count: int | None = None,
+    cpu_workers: int | None = None,
 ) -> Callable[[Any, GroupLedger, Any], dict[str, Any]]:
     """Build the ``--job-runner`` callable for one removal resource epoch.
 
@@ -1724,6 +1731,12 @@ def build_removal_epoch_runner(
     require_boogu_backend(config)
     require_subject_attribute_gme_disabled(config)
     worker_pool = pool or WorkerPoolConfig()
+    # Execution-only CPU budget, resolved once here and passed explicitly down
+    # to every CPU-capable epoch runner. It never enters the config fingerprint,
+    # a ModelJob identity, a receipt or a public schema.
+    resolved_cpu_workers = (
+        resolve_cpu_workers(config) if cpu_workers is None else int(cpu_workers)
+    )
 
     def runner(group: Any, ledger: GroupLedger, emit: Any) -> dict[str, Any]:
         # Policy first: the epoch cannot run a GME screen, so a config that asks
@@ -1842,6 +1855,7 @@ def build_removal_epoch_runner(
                 )
                 outcome = run_removal_pair_resource_session(
                     config=config,
+                    cpu_workers=resolved_cpu_workers,
                     storages=storages,
                     eligible_clip_uids_by_shard=eligible,
                     ledger=ledger,
@@ -2145,6 +2159,7 @@ def run_removal_epoch(
     from r2v_data_v2.v3.config import load_config
     from r2v_data_v2.v3.post_mask_epoch_resources import (
         SubprocessEpochProcessManager,
+        limit_process_native_threads,
     )
 
     base_config = os.environ.get("POST_MASK_BASE_CONFIG", "").strip()
@@ -2154,6 +2169,11 @@ def run_removal_epoch(
         )
     config = load_config(Path(base_config))
     require_boogu_backend(config)
+    # The orchestrator runs dozens of CPU threads; native libraries in this
+    # process must not each spawn their own pool on top of that. Model work
+    # happens in subprocesses, whose CPU policy is untouched.
+    limit_process_native_threads()
+    cpu_workers = resolve_cpu_workers(config)
     entity_mask_root = Path(
         os.environ.get("POST_MASK_ENTITY_MASK_ROOT") or DEFAULT_ENTITY_MASK_ROOT
     )
@@ -2187,5 +2207,7 @@ def run_removal_epoch(
         log_root=temporary_root / "logs",
         repo_root=repo_root,
         canonical_shard_count=canonical_shard_count,
+        cpu_workers=cpu_workers,
     )
+    emit("post_mask_resource_epoch_cpu_workers", cpu_workers=cpu_workers)
     return runner(group, ledger, emit)

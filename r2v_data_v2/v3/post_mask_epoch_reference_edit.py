@@ -43,6 +43,7 @@ from r2v_data_v2.v3.post_mask_epoch_jobs import (
     ModelJob,
     semantic_input_digest,
 )
+from r2v_data_v2.v3.post_mask_epoch_resources import resolve_cpu_workers
 from r2v_data_v2.v3.post_mask_epoch_state import GroupLedger
 from r2v_data_v2.v3.reference_edit import (
     _alternate_completion_source,
@@ -243,11 +244,16 @@ class ReferenceEditEpochRunner:
         eligible_clip_uids_by_shard: Mapping[str, Sequence[str]],
         emit: Any = None,
         review_execution: Literal["sequential", "parallel_independent"] = "sequential",
+        cpu_workers: int | None = None,
     ) -> None:
         if not config.reference_edit.enabled:
             raise ReferenceEditEpochError(
                 "Reference Edit resource epoch requires reference_edit.enabled"
             )
+        # Execution-only CPU budget; never part of any identity or schema.
+        self.cpu_workers = (
+            resolve_cpu_workers(config) if cpu_workers is None else int(cpu_workers)
+        )
         if review_execution not in {"sequential", "parallel_independent"}:
             raise ValueError(
                 f"unsupported review execution: {review_execution}"

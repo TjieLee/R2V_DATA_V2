@@ -48,6 +48,7 @@ from r2v_data_v2.v3.post_mask_epoch_jobs import (
     canonical_json,
     semantic_input_digest,
 )
+from r2v_data_v2.v3.post_mask_epoch_resources import resolve_cpu_workers
 from r2v_data_v2.v3.reference_integrity import (
     SOURCE_BBOX_FALLBACK_SYSTEM_PROMPT,
     QwenReferenceIntegrityJudge,
@@ -439,7 +440,12 @@ class ReferenceIntegrityEpochRunner:
         *,
         eligible_clip_uids_by_shard: Mapping[str, Sequence[str]],
         emit: Any = None,
+        cpu_workers: int | None = None,
     ) -> None:
+        # Execution-only CPU budget; never part of any identity or schema.
+        self.cpu_workers = (
+            resolve_cpu_workers(config) if cpu_workers is None else int(cpu_workers)
+        )
         if not config.reference_integrity.enabled:
             raise ReferenceIntegrityEpochError(
                 "Reference Integrity resource epoch requires "
