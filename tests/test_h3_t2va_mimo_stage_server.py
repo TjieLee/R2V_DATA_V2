@@ -44,7 +44,6 @@ def test_mimo_v26_can_enable_eagle_explicitly():
         "/models/mimo-v26",
         served_model_name="mimo-v2.6-flash-rl",
         mem_fraction_static=0.65,
-        enable_speculative=True,
     )
     assert command[command.index("--served-model-name") + 1] == "mimo-v2.6-flash-rl"
     assert command[command.index("--speculative-algorithm") + 1] == "EAGLE"
