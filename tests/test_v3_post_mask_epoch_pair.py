@@ -1299,29 +1299,66 @@ def test_seed_primary_jobs_seeds_every_independent_qwen_entity(
     assert len({job.job_id() for job in jobs}) == 3
 
 
-def test_publication_waits_for_every_primary_entity_receipt(
+def _temporary_pair_pngs(storage: Any, clip_uid: str = "clip-1") -> list[str]:
+    return sorted(
+        path.name
+        for path in (storage.root / "clips" / clip_uid).rglob("*")
+        if path.is_file() and ".tmp-pair-" in path.name
+    )
+
+
+def test_intermediate_entity_completion_does_not_replay_the_clip(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Seeding is parallel, but the clip is still published as one unit."""
+    """Only the last primary receipt reconstructs and publishes the clip.
+
+    An intermediate completion has nothing to do: replaying the clip would
+    re-run every entity's prepare, crop and PNG encode and then throw the PNGs
+    away again, once per sibling. The barrier is answered from the
+    execution-only index, so the prepare count must not move at all.
+    """
+    import r2v_data_v2.v3.post_mask_epoch_pair as pm
+
     config = _pair_config(tmp_path, monkeypatch)
     storage = _storage(config, entity_types=("subject", "object", "object"))
     runner = _runner(tmp_path, config, storage)
-    judge = _Judge()
 
-    seeded = {
-        str(dict(job.target)["entity_id"]): job for job in runner.seed_primary_jobs()
-    }
-    first = seeded["e1"]
-    result = _run_one(runner, first, judge)
-    # e1 committed: e2 and e3 are still outstanding, so nothing is published.
-    remaining = runner.finalize(first, result)
+    real_prepare = pm.prepare_entity_reference
+    prepared: list[str] = []
 
-    assert sorted(dict(job.target)["entity_id"] for job in remaining) == ["e2", "e3"]
-    assert {job.job_id() for job in remaining} == {
-        seeded["e2"].job_id(),
-        seeded["e3"].job_id(),
-    }
-    assert storage.read_clip("clip-1").pairing is None, "not published mid-chain"
+    def counting_prepare(*args: Any, **kwargs: Any) -> Any:
+        prepared.append(str(kwargs["entity"].entity_id))
+        return real_prepare(*args, **kwargs)
+
+    monkeypatch.setattr(pm, "prepare_entity_reference", counting_prepare)
+    seeded = _seeded_by_entity(runner)
+    assert sorted(seeded) == ["e1", "e2", "e3"]
+    after_seed = len(prepared)
+    assert after_seed == 3, "the seed prepares each entity exactly once"
+
+    for entity_id in ("e1", "e2"):
+        result = _run_one(runner, seeded[entity_id], _Judge())
+        assert result.committed
+        # Only the finalizer is under test here: it must not prepare anything.
+        before_finalize = len(prepared)
+        unlocked = runner.finalize(seeded[entity_id], result)
+        assert unlocked == (), f"{entity_id} is intermediate: nothing is unlocked"
+        assert len(prepared) == before_finalize, f"{entity_id} must not replay"
+        assert _temporary_pair_pngs(storage) == [], "no throwaway PNG is written"
+        assert storage.read_clip("clip-1").pairing is None, "not published mid-chain"
+
+    last = _run_one(runner, seeded["e3"], _Judge())
+    assert last.committed
+    before_finalize = len(prepared)
+    runner.finalize(seeded["e3"], last)
+
+    # One reconstruction on the terminal pass: three entities, prepared once.
+    assert len(prepared) == before_finalize + 3
+    clip = storage.read_clip("clip-1")
+    assert clip.pairing is not None and clip.pairing.status == "ready"
+    assert clip.pairing.retained_entity_ids == ["e1", "e2", "e3"]
+    assert _temporary_pair_pngs(storage) == [], "publication consumed them"
+    assert runner.primary_unresolved_job_ids() == ()
 
 
 def test_entity_judge_failure_leaves_no_receipt_and_no_pairing(
@@ -3510,3 +3547,40 @@ def test_primary_publication_matches_legacy_pair_clips(
         )
         for entity_id in ("e1", "e2", "e3")
     } == legacy_png
+
+
+def test_restart_after_all_receipts_publishes_once_with_no_extra_qwen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """All receipts committed, publication crashed: restart publishes once."""
+    import r2v_data_v2.v3.post_mask_epoch_pair as pm
+
+    config = _pair_config(tmp_path, monkeypatch)
+    storage = _storage(config, entity_types=("subject", "object", "object"))
+    runner = _runner(tmp_path, config, storage)
+    seeded = _seeded_by_entity(runner)
+    for entity_id in ("e1", "e2", "e3"):
+        assert _run_one(runner, seeded[entity_id], _Judge()).committed
+    assert storage.read_clip("clip-1").pairing is None, "crash before publication"
+
+    real_prepare = pm.prepare_entity_reference
+    prepared: list[str] = []
+
+    def counting_prepare(*args: Any, **kwargs: Any) -> Any:
+        prepared.append(str(kwargs["entity"].entity_id))
+        return real_prepare(*args, **kwargs)
+
+    monkeypatch.setattr(pm, "prepare_entity_reference", counting_prepare)
+
+    resumed = _runner(tmp_path, config, storage)
+    # No entity work is left, so no further Qwen call can be seeded, and the
+    # seeding call itself replays the receipts once and completes publication.
+    assert resumed.seed_primary_jobs() == []
+
+    # Exactly one reconstruction on the restart, then one publication.
+    assert len(prepared) == 3
+    clip = storage.read_clip("clip-1")
+    assert clip.pairing is not None and clip.pairing.status == "ready"
+    assert clip.pairing.retained_entity_ids == ["e1", "e2", "e3"]
+    assert _temporary_pair_pngs(storage) == []
+    assert resumed.primary_unresolved_job_ids() == ()

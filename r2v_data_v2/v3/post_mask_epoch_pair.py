@@ -24,6 +24,7 @@ the scheduler, the resource manager or the launcher.
 from __future__ import annotations
 
 import json
+import threading
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -82,6 +83,14 @@ PAIR_PHASE = "pair"
 CLIP_FRESH_TARGET = "fresh_pair_target"
 CLIP_EXISTING_PAIRING = "existing_pairing"
 CLIP_INELIGIBLE = "ineligible"
+
+#: Bounds for the invocation-local, execution-only caches. Both hold decoded
+#: masks and PIL images, so neither may grow with the size of a campaign; an
+#: eviction or a cold cache is always safe because everything cached is
+#: deterministically re-derivable from the frozen inputs and durable receipts.
+_PRIMARY_INDEX_LIMIT = 32
+_PRIMARY_CONTEXT_LIMIT = 32
+_PREPARED_CACHE_LIMIT = 16
 
 
 class PairEpochError(RuntimeError):
@@ -349,6 +358,47 @@ class PairEpochRunner:
         self._guard_counters: dict[str, dict[str, int]] = {
             shard: self._empty_stats() for shard in self.storages
         }
+        #: Execution-only index: ``(shard, clip_uid)`` -> every primary entity
+        #: judge job this clip needs, in annotation order. It exists so the
+        #: finalizer can answer "does this clip still owe an entity receipt?"
+        #: without re-running ``prepare_entity_reference``. It is never part of
+        #: ModelJob identity, never persisted and never read by any semantic
+        #: decision: a restart with an empty index simply rebuilds it on the
+        #: next replay, and a clip missing from it falls back to that replay.
+        self._primary_jobs: dict[tuple[str, str], tuple[ModelJob, ...]] = {}
+        self._primary_jobs_lock = threading.Lock()
+
+    def _remember_primary_jobs(
+        self,
+        shard: str,
+        clip_uid: str,
+        jobs: Sequence[ModelJob],
+    ) -> None:
+        """Record a clip's primary entity jobs. Execution-only, bounded."""
+        if not jobs:
+            return
+        with self._primary_jobs_lock:
+            if len(self._primary_jobs) >= _PRIMARY_INDEX_LIMIT and (
+                shard,
+                clip_uid,
+            ) not in self._primary_jobs:
+                # Bounded: drop the oldest insertion. Losing an entry is always
+                # safe - the caller then falls back to one replay.
+                self._primary_jobs.pop(next(iter(self._primary_jobs)), None)
+            self._primary_jobs[(shard, clip_uid)] = tuple(jobs)
+
+    def _clip_primary_settled(self, shard: str, clip_uid: str) -> bool | None:
+        """Whether every recorded primary entity job for a clip is committed.
+
+        ``None`` means "no index entry", so the caller must do the replay to
+        find out. A committed job here means its durable receipt exists, which
+        is the only thing the publication barrier needs.
+        """
+        with self._primary_jobs_lock:
+            jobs = self._primary_jobs.get((shard, clip_uid))
+        if jobs is None:
+            return None
+        return all(self._committed(job) is not None for job in jobs)
 
     @staticmethod
     def _empty_stats() -> dict[str, int]:
@@ -680,6 +730,7 @@ class PairEpochRunner:
         entity_states: list[EntityReferenceState] = []
         temporary_images: dict[str, tuple[Path, Image.Image]] = {}
         pending: list[ModelJob] = []
+        entity_jobs: list[ModelJob] = []
         for index, entity in enumerate(clip.annotation.entities):
             prepared = prepare_entity_reference(
                 self.config,
@@ -694,6 +745,7 @@ class PairEpochRunner:
                 entity_states.append(prepared)
                 continue
             job = self._entity_job(shard, storage, clip_uid, entity, index, prepared)
+            entity_jobs.append(job)
             result = self._committed(job)
             if result is None:
                 if not stop_at_unresolved:
@@ -711,6 +763,9 @@ class PairEpochRunner:
             entity_states.append(finalization.state)
             if finalization.temporary is not None:
                 temporary_images[entity.entity_id] = finalization.temporary
+        # Every entity that needs a judge is now known, so the clip's receipt
+        # barrier can be answered without preparing anything again.
+        self._remember_primary_jobs(shard, clip_uid, entity_jobs)
         if pending:
             # Rebuilt temporaries are not progress: only receipts are, and the
             # clip cannot be published until every entity has one.
@@ -2426,6 +2481,13 @@ class PairEpochRunner:
     def _finalize_primary_clip(self, job: ModelJob) -> Sequence[ModelJob]:
         shard = job.canonical_shard
         storage = self._storage_for(shard)
+        # Terminal barrier. A clip is reconstructed and published exactly once,
+        # when its *last* primary entity receipt lands. Until then there is
+        # nothing to do: replaying the clip would re-run every entity's
+        # prepare, re-crop and re-encode the reference PNGs and immediately
+        # discard them again, for every single sibling completion.
+        if self._clip_primary_settled(shard, job.clip_uid) is False:
+            return ()
         # Crash resume: replay from a clean temporary state.
         storage.cleanup_pair_artifacts(job.clip_uid)
         context = self._primary_context(storage, job.clip_uid)
