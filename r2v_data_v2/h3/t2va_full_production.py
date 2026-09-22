@@ -144,10 +144,8 @@ class FullPipeline:
         ffmpeg="ffmpeg",
         ffprobe="ffprobe",
         mimo_lifecycle=None,
-        downstream_root=None,
     ):
         self.root, self.index = root, index
-        self.downstream_root = Path(downstream_root or root).resolve()
         self.clips_root, self.source_videos_root = clips_root, source_videos_root
         self.gpu_ids = gpu_ids
         self.sam_configuration, self.auk_configuration = (
@@ -359,7 +357,6 @@ class FullPipeline:
                     allow_unverified=self.allow_unverified,
                     request_workers=self.request_workers,
                     run_id=RUN_ID,
-                    output_root=self.downstream_root,
                 )
             return {
                 f"{stage}_{status}": sum(
