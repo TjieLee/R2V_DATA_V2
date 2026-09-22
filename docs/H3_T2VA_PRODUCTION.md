@@ -28,11 +28,14 @@ create a fresh production root merely because the MLLM changes.
 Use `MIMO_MODEL` and `DOWNSTREAM_RUN_ID` to compare models without moving
 upstream data. Existing V2.5 products remain untouched.
 
-Model checkpoint weights are not content-hashed for runtime provenance. Large
-model files use logical identity (path/model identifier/config; weight files in
-SAM/AuK use lightweight path/size identity) so startup does not reread many GB
-from shared storage. Source media and generated artifacts keep their content
-hashes.
+MiMo checkpoint contents are not part of the production-root identity and are
+not content-hashed by the T2VA/TA2VA serving path. Full-production DiariZen and
+Qwen3-ASR runtime provenance also uses lightweight logical model identity rather
+than rereading whole model directories. Legacy SAM/AuK schemas still contain
+historical checkpoint/dependency SHA fields so existing upstream receipts remain
+cache-compatible; removing those fields requires a separate compatibility
+migration and is intentionally not coupled to an MLLM upgrade. Source media and
+generated artifacts keep their content hashes.
 
 MiMo V2.6 uses the same OpenAI-compatible multimodal request format. The current
 server command keeps TP=8, DP=2, DP attention/lm-head/mm-encoder,
@@ -289,8 +292,9 @@ reused_ready_count and worker_count for the latest invocation. Zero scheduled
 jobs means no inference request is sent; already-resident workers remain idle.
 Frozen publication model counts still describe the cached artifacts, not new
 calls in this invocation. Keep interpreters and dependency environments pinned
-for a resumed run; use a fresh production root when changing source identity,
-shard size or incompatible runtime semantics rather than adopting old caches.
+for a resumed run; use a fresh production root only when changing source
+identity, shard size, or incompatible upstream semantics. Changing the MiMo
+model uses a new downstream run namespace inside the same production root.
 
 Upstream aggregate manifests can expand after failed clips recover. The full
 downstream adapter binds ready outputs to validated per-clip dependencies;
