@@ -17,7 +17,6 @@ import numpy as np
 from r2v_data_v2.h3 import diarization_binding as diar
 from r2v_data_v2.h3 import qwen3_asr as asr
 from r2v_data_v2.h3 import sam_audio_stem_shadow as frozen
-from r2v_data_v2.h3.audio_backends import fingerprint_local_model_path
 from r2v_data_v2.h3.resolved_audio_stems import RESOLVED_STAGE, load_stem_source
 
 
@@ -61,14 +60,29 @@ def _environment_key(environment):
     return tuple(sorted(environment.items()))
 
 
+def _logical_model_fingerprint(path: Path, identifier: str) -> str:
+    """Cheap provenance identity; never read model weight bytes."""
+    source = path.expanduser().resolve(strict=True)
+    return hashlib.sha256(
+        json.dumps(
+            {"path": str(source), "identifier": identifier},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 @lru_cache(maxsize=None)
 def _diar_configuration_cached(environment_key):
     from tools.run_h3_diarization_binding import _configuration_fingerprint
 
     environment = dict(environment_key)
-    model = fingerprint_local_model_path(Path(environment["DIARIZEN_MODEL_PATH"]))
     identifier = environment.get(
         "DIARIZEN_MODEL_IDENTIFIER", diar.DEFAULT_DIARIZEN_MODEL_IDENTIFIER
+    )
+    model = _logical_model_fingerprint(
+        Path(environment["DIARIZEN_MODEL_PATH"]),
+        identifier,
     )
     provenance = diar.DiarizationBackendProvenance(
         backend="diarizen_official_pipeline",
@@ -106,8 +120,9 @@ def _asr_configuration_cached(environment_key):
         "adapter_version": 1,
         "environment": environment,
         "configuration": configuration.model_dump(mode="json"),
-        "model_fingerprint": fingerprint_local_model_path(
-            Path(configuration.local_model_path)
+        "model_fingerprint": _logical_model_fingerprint(
+            Path(configuration.local_model_path),
+            "qwen3-asr",
         ),
         "preprocessing": asr.QWEN3_ASR_PREPROCESSING_POLICY,
     }
