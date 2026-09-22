@@ -466,19 +466,6 @@ class _Judge:
         self.close_calls += 1
 
 
-@pytest.mark.parametrize(
-    "pair_config",
-    [
-        PairConfig(enabled=1),
-        PairConfig(max_candidates_per_entity=True),
-        PairConfig(max_candidates_per_entity=0),
-        PairConfig(max_candidates_per_entity=11),
-        PairConfig(crop_padding_ratio=0),
-        PairConfig(crop_padding_ratio=float("inf")),
-        PairConfig(repair_retries=True),
-        PairConfig(repair_retries=-1),
-    ],
-)
 def _legacy_foreground_components(mask: np.ndarray):
     """Test-only copy of the pre-native run/union implementation."""
     binary = np.asarray(mask, dtype=bool)
@@ -584,6 +571,21 @@ def test_native_foreground_components_matches_legacy_eight_connectivity() -> Non
             mask
         )
 
+
+
+@pytest.mark.parametrize(
+    "pair_config",
+    [
+        PairConfig(enabled=1),
+        PairConfig(max_candidates_per_entity=True),
+        PairConfig(max_candidates_per_entity=0),
+        PairConfig(max_candidates_per_entity=11),
+        PairConfig(crop_padding_ratio=0),
+        PairConfig(crop_padding_ratio=float("inf")),
+        PairConfig(repair_retries=True),
+        PairConfig(repair_retries=-1),
+    ],
+)
 
 def test_pair_config_is_strict(
     tmp_path: Path,
