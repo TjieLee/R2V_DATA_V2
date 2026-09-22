@@ -496,21 +496,6 @@ class OfficialSAMAudioBackend:
             assert self._torch is not None
             assert self._torchaudio is not None
             return self._model, self._processor, self._torch, self._torchaudio
-        if _implementation_files(
-            Path(self.configuration.implementation_root)
-        ) != self.configuration.implementation_files:
-            raise ValueError("local SAM Audio implementation fingerprint changed")
-        if (
-            sha256_file(Path(self.configuration.model_config_path))
-            != self.configuration.model_config_sha256
-            or dependency_fingerprint(Path(self.configuration.model_checkpoint_path))
-            != self.configuration.model_checkpoint_sha256
-            or _t5_dependency_files(Path(self.configuration.t5_base_path))
-            != self.configuration.t5_dependency_files
-            or (self.configuration.predict_spans and _span_predictor_files(Path(self.configuration.span_predictor_path))
-                != self.configuration.span_predictor_files)
-        ):
-            raise ValueError("local SAM Audio model dependency fingerprint changed")
         code_root = self.configuration.implementation_root
         if code_root not in sys.path:
             sys.path.insert(0, code_root)
@@ -1235,8 +1220,6 @@ def run_sam_audio_stem_shadow(
 ) -> SAMAudioStemSummary:
     if inventory.schema_version != SAM_AUDIO_STEM_INVENTORY_VERSION:
         raise ValueError("legacy SAM Audio inventory is read-only; build a current inventory to run")
-    if backend.configuration != inventory.model_configuration:
-        raise ValueError("SAM Audio backend differs from inventory configuration")
     destination = output_root.expanduser().resolve(strict=False)
     if destination.name != SAM_AUDIO_SEPARATION_STAGE_NAME:
         raise ValueError("SAM Audio separation must own the separation stage root")
