@@ -189,16 +189,16 @@ endpoint: http://127.0.0.1:8092/v1
 The main R2V interpreter calls this endpoint. `MIMO_API_KEY` remains a
 server-local environment value and must not be committed.
 
-The current server runtime and local checkpoint are:
+The production default remains V2.5 until the fixed random20 V2.6
+multi-call quality A/B passes:
 
 ```bash
 export SGLANG_ENV=/mnt/workspace/litengjie/data/audio_deps/qwen38-sglang-env
-export MIMO_CHECKPOINT=/mnt/workspace/public/pretrained/MiMo/MiMo-V2.6-Flash-RL
-export MIMO_MODEL=mimo-v2.6-flash-rl
+export MIMO_CHECKPOINT=/mnt/workspace/public/pretrained/MiMo/MiMo-V2.5
+export MIMO_MODEL=mimo-v2.5
 ```
 
-For current Audio/H3 profiling reproducibility tests, start MiMo with deterministic
-inference enabled while preserving the validated FA3/DP configuration:
+Production-compatible serving keeps the validated FA3/DP configuration:
 
 ```bash
 "$SGLANG_ENV/bin/sglang" serve \
@@ -223,13 +223,44 @@ inference enabled while preserving the validated FA3/DP configuration:
   --tool-call-parser mimo \
   --constrained-json-disable-any-whitespace \
   --enable-deterministic-inference \
-  --speculative-algorithm EAGLE \
-  --speculative-num-steps 3 \
-  --speculative-eagle-topk 1 \
-  --speculative-num-draft-tokens 4 \
-  --enable-multi-layer-eagle \
-  2>&1 | tee /tmp/mimo8092_v26.log
+  2>&1 | tee /tmp/mimo8092_v25.log
 ```
+
+For the first V2.6 random20 quality A/B, keep every request/prompt/turn unchanged
+and change only the checkpoint/model. Leave EAGLE/MTP disabled in this quality
+comparison so serving optimizations are not confounded with the model change:
+
+```bash
+export MIMO_CHECKPOINT=/mnt/workspace/public/pretrained/MiMo/MiMo-V2.6-Flash-RL
+export MIMO_MODEL=mimo-v2.6-flash-rl
+
+"$SGLANG_ENV/bin/sglang" serve \
+  --model-path "$MIMO_CHECKPOINT" \
+  --served-model-name "$MIMO_MODEL" \
+  --host 127.0.0.1 \
+  --port 8092 \
+  --trust-remote-code \
+  --tp 8 \
+  --dp 2 \
+  --enable-dp-attention \
+  --enable-dp-lm-head \
+  --mm-enable-dp-encoder \
+  --dtype bfloat16 \
+  --attention-backend fa3 \
+  --mm-attention-backend fa3 \
+  --context-length 131072 \
+  --mem-fraction-static 0.65 \
+  --chunked-prefill-size 16384 \
+  --max-running-requests 8 \
+  --reasoning-parser mimo \
+  --tool-call-parser mimo \
+  --constrained-json-disable-any-whitespace \
+  --enable-deterministic-inference \
+  2>&1 | tee /tmp/mimo8092_v26_random20.log
+```
+
+After quality validation, EAGLE/MTP can be benchmarked separately using the
+official V2.6 speculative flags.
 
 When running this command directly in an interactive shell, use normal shell
 quoting exactly as above. Do **not** write `\"$MIMO_CHECKPOINT\"`: the backslashes
