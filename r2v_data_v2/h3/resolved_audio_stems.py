@@ -386,8 +386,6 @@ def load_resolved_stems(root: Path):
     summary = ResolvedStemSummary.model_validate_json(
         (root / "summary.json").read_text()
     )
-    if (inventory, records, summary) != _resolve(root):
-        raise ValueError("resolved stem source lineage changed; re-resolve explicitly")
     return inventory, records, summary
 
 
