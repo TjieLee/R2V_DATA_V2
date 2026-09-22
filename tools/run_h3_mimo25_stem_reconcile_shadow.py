@@ -19,6 +19,7 @@ from r2v_data_v2.h3.mimo25_av_reconcile import (
 )
 from r2v_data_v2.h3.mimo25_backend import MIMO_MODEL, MimoBackendConfig, MimoMediaResolver
 from r2v_data_v2.h3.mimo25_stem_shadow import (
+    MIMO25_STEM_RECONCILE_STAGE,
     StemAwareOpenAIMimo25Backend,
     build_stem_reconcile_jobs,
     run_mimo25_stem_reconcile_shadow,
@@ -79,7 +80,6 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
     )
     parser.add_argument("--model", default=MIMO_MODEL)
-    parser.add_argument("--mimo-run-id")
     parser.add_argument("--base-url", default="http://127.0.0.1:8092/v1")
     parser.add_argument("--media-mode", choices=("base64", "http"))
     parser.add_argument("--media-root", type=Path, default=Path("/mnt/workspace"))
@@ -117,19 +117,21 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
     asr = require_shadow_output_path(
         shadow_root=shadow, output_path=arguments.stem_asr_root or shadow / "asr",
     )
-    mimo_run_id = arguments.mimo_run_id or arguments.model.replace("/", "_")
-    if not mimo_run_id or Path(mimo_run_id).name != mimo_run_id:
-        raise ValueError("invalid MiMo run ID")
-    default_output = (
-        shadow
-        / "mimo_runs"
-        / mimo_run_id
-        / arguments.binding_evidence_mode
-    )
     output = require_shadow_output_path(
         shadow_root=shadow,
-        output_path=arguments.output_root or default_output,
+        output_path=arguments.output_root
+        or shadow
+        / (
+            "mimo_reconcile_no_lrasd_v1"
+            if arguments.binding_evidence_mode == "none"
+            else MIMO25_STEM_RECONCILE_STAGE
+        ),
     )
+    if (
+        arguments.binding_evidence_mode == "none"
+        and output == shadow / MIMO25_STEM_RECONCILE_STAGE
+    ):
+        raise ValueError("no-LR-ASD pilot requires an isolated MiMo output root")
     case_manifest = MimoCaseManifest.model_validate_json(
         arguments.case_manifest.read_text(encoding="utf-8")
     )
@@ -182,7 +184,6 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         "output_root": str(output),
         "clip_count": len(jobs),
         "binding_evidence_mode": arguments.binding_evidence_mode,
-        "mimo_run_id": mimo_run_id,
         "model": arguments.model,
         "clip_uids": [item.clip_uid for item in jobs],
         "temperature": arguments.temperature,
