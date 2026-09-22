@@ -2183,3 +2183,169 @@ def test_corrupted_review_context_fails_closed(
         runner._require_review_input(
             shard, storage_again, job.clip_uid, entity, reference
         )
+
+
+def test_finalize_requires_the_current_committed_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A committed job's input is required by the finalizer, never re-frozen.
+
+    This is the receipt/finalize crash window: the receipt is durable, the
+    frozen input is gone, and the finalizer must fail closed instead of
+    regenerating the input its committed receipt was judged against.
+    """
+    judge_result = legacy_integrity._review(accept=True, reason="usable reference")
+    config, storage = _main_review_fixture(tmp_path, monkeypatch, "run-finalize-window")
+    judge = _fake_main_judge(judge_result)
+    runner = _runner(config, storage, tmp_path)
+    executor = _SerialQwenExecutor(runner, judge)
+
+    # Commit the receipt but stop before finalisation.
+    def no_finalize(job: Any, result: Any) -> Any:
+        return ()
+
+    jobs = runner.seed_jobs()
+    job = jobs[0]
+    _epoch_scheduler(runner, executor, no_finalize).run(jobs)
+    committed = runner.ledger.load_committed_result(job)
+    assert committed is not None, "the receipt is durable"
+    assert not runner._entity_outcome_path(SHARD, "clip-1", "e2").exists()
+
+    anchor_path = runner._review_input_path(SHARD, "clip-1", "e2", "final")
+    assert anchor_path.is_file()
+    anchor_path.unlink()
+
+    seen: list[str] = []
+    _guard_creation(monkeypatch, runner, seen)
+    with pytest.raises(ReferenceIntegrityDurableError):
+        runner.finalize(job, committed)
+
+    assert not anchor_path.exists(), "the finalizer must not recreate the anchor"
+    assert "_create_or_verify_review_input" not in seen, (
+        "the current committed job must be reconstructed read-only"
+    )
+    assert not runner._entity_outcome_path(SHARD, "clip-1", "e2").exists()
+
+
+def test_finalize_still_creates_the_new_continuation_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The opposite direction: a NEW continuation input is still frozen.
+
+    Requiring the current chain read-only must not stop the main-thread
+    finalizer from freezing the input of the job it is about to unlock.
+    """
+    results = (
+        legacy_integrity._severe_reference_artifact_review(),
+        legacy_integrity._severe_reference_artifact_review(),
+    )
+    bbox_results = (legacy_integrity._bbox_review(accept=True),)
+    config, storage = _alpha_continuation_fixture(
+        tmp_path, monkeypatch, "run-continuation-create"
+    )
+    judge = _FakeEpochJudge(results, bbox_results)
+    runner = _runner(config, storage, tmp_path)
+
+    frozen: list[str] = []
+    required: list[str] = []
+
+    real_freeze = runner._create_or_verify_review_input
+    real_require = runner._require_review_input
+
+    def freeze(*args: Any, **kwargs: Any) -> Any:
+        frozen.append(str(kwargs.get("variant") or "final"))
+        return real_freeze(*args, **kwargs)
+
+    def require(*args: Any, **kwargs: Any) -> Any:
+        required.append(str(kwargs.get("variant") or "final"))
+        return real_require(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "_create_or_verify_review_input", freeze)
+    monkeypatch.setattr(runner, "_require_review_input", require)
+
+    executor = _SerialQwenExecutor(runner, judge)
+    jobs = runner.seed_jobs()
+    assert frozen == ["final"], "seed freezes the initial main review"
+
+    # Capture what the MAIN finalizer unlocks, then stop the drain so the
+    # continuation stays pending and its input stays observable.
+    unlocked: list[Any] = []
+
+    def capture_main_unlock(job: Any, result: Any) -> Any:
+        if str(dict(job.target).get("variant")) == "source_alpha":
+            return ()
+        unlocked.extend(runner.finalize(job, result))
+        return ()
+
+    frozen.clear()
+    required.clear()
+    _epoch_scheduler(runner, executor, capture_main_unlock).run(jobs)
+
+    # The continuation is frozen exactly once, and the current committed main
+    # review is only ever required - never re-frozen.
+    assert frozen == ["source_alpha"], frozen
+    assert "final" in required, "the committed main job is reconstructed read-only"
+    assert "final" not in frozen, "the committed main input was re-frozen"
+    # The unlocked job is exactly the source-alpha continuation, and the frozen
+    # input it was built against is now durable.
+    assert len(unlocked) == 1, unlocked
+    assert dict(unlocked[0].target)["variant"] == "source_alpha"
+    alpha_input = runner._review_input_path(SHARD, "clip-1", "e2", "source_alpha")
+    assert alpha_input.is_file(), "the continuation input was frozen"
+    assert alpha_input.exists(), "the continuation input stays durable"
+
+
+def test_finalize_requires_the_current_source_alpha_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The current alpha job is required too, not just the current main one."""
+    results = (
+        legacy_integrity._severe_reference_artifact_review(),
+        legacy_integrity._severe_reference_artifact_review(),
+    )
+    bbox_results = (legacy_integrity._bbox_review(accept=True),)
+    config, storage = _alpha_continuation_fixture(
+        tmp_path, monkeypatch, "run-alpha-window"
+    )
+    judge = _FakeEpochJudge(results, bbox_results)
+    runner = _runner(config, storage, tmp_path)
+
+    alpha_jobs: list[Any] = []
+
+    def capture_main_unlock(job: Any, result: Any) -> Any:
+        if str(dict(job.target).get("variant")) == "source_alpha":
+            return ()
+        unlocked = runner.finalize(job, result)
+        alpha_jobs.extend(unlocked)
+        return ()
+
+    jobs = runner.seed_jobs()
+    _epoch_scheduler(
+        runner, _SerialQwenExecutor(runner, judge), capture_main_unlock
+    ).run(jobs)
+    assert len(alpha_jobs) == 1, "the main review unlocked the alpha continuation"
+    alpha_job = alpha_jobs[0]
+
+    # Commit the alpha receipt, then stop before its finalisation.
+
+    def no_finalize(job: Any, result: Any) -> Any:
+        return ()
+
+    _epoch_scheduler(
+        runner, _SerialQwenExecutor(runner, judge), no_finalize
+    ).run([alpha_job])
+    alpha_result = runner.ledger.load_committed_result(alpha_job)
+    assert alpha_result is not None, "the alpha receipt is durable"
+    assert alpha_result.payload["status"] == "review"
+
+    alpha_input = runner._review_input_path(SHARD, "clip-1", "e2", "source_alpha")
+    assert alpha_input.is_file()
+    alpha_input.unlink()
+
+    seen: list[str] = []
+    _guard_creation(monkeypatch, runner, seen)
+    with pytest.raises(ReferenceIntegrityDurableError):
+        runner.finalize(alpha_job, alpha_result)
+
+    assert not alpha_input.exists(), "the alpha input must not be recreated"
+    assert "_create_or_verify_review_input" not in seen

@@ -2145,7 +2145,7 @@ class ReferenceIntegrityEpochRunner:
         pre_edit: ReferenceEditState | None,
         job: ModelJob,
         payload: Mapping[str, Any],
-        create: bool,
+        create_continuation: bool,
     ) -> _ReviewOutcome:
         """Everything one committed review job means, from frozen state.
 
@@ -2156,35 +2156,46 @@ class ReferenceIntegrityEpochRunner:
 
         The caller resolves the frozen context, so a verifier never re-reads the
         plan inside itself: publication verification already holds it.
+
+        ``create_continuation`` governs the NEXT job only. The current committed
+        chain - this job, and its already-existing parent for the alpha variant -
+        is always reconstructed read-only: a committed job must never be able to
+        repair or re-freeze the durable input it was judged against. Only the
+        main-thread finalizer sets it, because only the finalizer unlocks a new
+        job.
         """
-        # The finalizer may freeze a continuation it is about to unlock; every
-        # verifier is require-only. The choice is made by the caller.
-        build = (
+        build_next = (
             self._create_review_inputs_and_job
-            if create
+            if create_continuation
             else self._require_review_inputs_and_job
         )
         variant = self._review_variant(job)
-        main_reference, main_anchor, main_job = build(
-            shard=shard,
-            storage=storage,
-            clip_uid=clip_uid,
-            plan_entry=plan_entry,
-            entity=entity,
-            reference=reference,
-            variant=VARIANT_FINAL,
-        )
-        main_diagnostics = self._review_diagnostics(storage, main_reference)
-        if variant == VARIANT_SOURCE_ALPHA:
-            alpha_reference, alpha_anchor, alpha_job = build(
+        main_reference, main_anchor, main_job = (
+            self._require_review_inputs_and_job(
                 shard=shard,
                 storage=storage,
                 clip_uid=clip_uid,
                 plan_entry=plan_entry,
                 entity=entity,
                 reference=reference,
-                variant=VARIANT_SOURCE_ALPHA,
-                main_job=main_job,
+                variant=VARIANT_FINAL,
+            )
+        )
+        main_diagnostics = self._review_diagnostics(storage, main_reference)
+        if variant == VARIANT_SOURCE_ALPHA:
+            # The alpha job being finalised already exists, so its input is
+            # required, never frozen here.
+            alpha_reference, alpha_anchor, alpha_job = (
+                self._require_review_inputs_and_job(
+                    shard=shard,
+                    storage=storage,
+                    clip_uid=clip_uid,
+                    plan_entry=plan_entry,
+                    entity=entity,
+                    reference=reference,
+                    variant=VARIANT_SOURCE_ALPHA,
+                    main_job=main_job,
+                )
             )
             if alpha_job.job_id() != job.job_id():
                 raise ReferenceIntegrityDurableError(
@@ -2217,7 +2228,7 @@ class ReferenceIntegrityEpochRunner:
                 pre_edit=pre_edit,
                 trigger=BBOX_TRIGGER_ARTIFACT,
                 parent_variant=VARIANT_SOURCE_ALPHA,
-                create=create,
+                create=create_continuation,
             )
             return _ReviewOutcome(marker=None, unlock=bbox_job)
         if main_job.job_id() != job.job_id():
@@ -2247,7 +2258,7 @@ class ReferenceIntegrityEpochRunner:
             pre_edit=pre_edit,
         )
         if continuation == "source_alpha":
-            _alpha_reference, _alpha_anchor, alpha_job = build(
+            _alpha_reference, _alpha_anchor, alpha_job = build_next(
                 shard=shard,
                 storage=storage,
                 clip_uid=clip_uid,
@@ -2268,7 +2279,7 @@ class ReferenceIntegrityEpochRunner:
                 plan_entry=plan_entry,
                 pre_edit=pre_edit,
                 trigger=BBOX_TRIGGER_ARTIFACT,
-                create=create,
+                create=create_continuation,
             )
             return _ReviewOutcome(marker=None, unlock=bbox_job)
         if continuation == "topology_bbox":
@@ -2281,7 +2292,7 @@ class ReferenceIntegrityEpochRunner:
                 plan_entry=plan_entry,
                 pre_edit=pre_edit,
                 trigger=BBOX_TRIGGER_TOPOLOGY,
-                create=create,
+                create=create_continuation,
             )
             return _ReviewOutcome(marker=None, unlock=bbox_job)
         return _ReviewOutcome(marker=None, unlock=None)
@@ -2321,9 +2332,10 @@ class ReferenceIntegrityEpochRunner:
             pre_edit=pre_edit,
             job=job,
             payload=payload,
-            # The finalizer is the main-thread continuation point, so it may
-            # freeze the input of the job it is about to unlock.
-            create=True,
+            # The current committed job is always re-read; only the job this
+            # finalizer may unlock is frozen, and the finalizer is the only
+            # main-thread continuation point.
+            create_continuation=True,
         )
         if outcome.marker is None:
             # A continuation owns this entity; only the durable receipt is kept.
@@ -3569,8 +3581,8 @@ class ReferenceIntegrityEpochRunner:
                 pre_edit=pre_edit,
                 job=job,
                 payload=self._committed_review_payload(job),
-                # Verification must never repair a frozen input.
-                create=False,
+                # Verification is read-only end to end.
+                create_continuation=False,
             )
             if outcome.marker is None:
                 raise ReferenceIntegrityDurableError(
