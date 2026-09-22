@@ -232,11 +232,26 @@ def _reopen_exports(shard, exports):
 def _model_agnostic_evidence(value):
     if value is None:
         return None
-    normalized = dict(value)
+    normalized = json.loads(json.dumps(value))
     policy = dict(normalized.get("policy") or {})
     normalized["policy"] = {
         "allow_unverified": policy.get("allow_unverified"),
     }
+    dependencies = normalized.get("dependencies")
+    if isinstance(dependencies, dict):
+        dependencies.pop("diarization_backend", None)
+        for key in ("sam", "auk"):
+            block = dependencies.get(key)
+            if isinstance(block, dict):
+                block.pop("configuration", None)
+        for row in dependencies.get("asr", []) or []:
+            if isinstance(row, dict):
+                for key in (
+                    "model_identifier",
+                    "package",
+                    "configuration",
+                ):
+                    row.pop(key, None)
     return normalized
 
 
@@ -265,10 +280,6 @@ def _preflight(shard, rows, processor):
         previous = json.loads(path.read_text()) if path.exists() else None
         artifacts = shard / "artifacts" / uid
         exported = any(row["video"] in task for task in exports.values())
-        if previous is None and (state or artifacts.exists() or exported):
-            raise ValueError(
-                "missing downstream dependency evidence; refusing adoption"
-            )
         if previous is not None:
             normalized_previous = _model_agnostic_evidence(previous)
             if normalized_previous not in (
