@@ -19,6 +19,7 @@ reference tokens.
 
 from __future__ import annotations
 
+import json
 import threading
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
@@ -4335,3 +4336,230 @@ def test_clip_row_eviction_still_falls_back_to_a_real_prepare(
         job = by_clip[clip_uid]
         runner.finalize(job, runner._committed(job))
         assert storage.read_clip(clip_uid).pairing is not None
+
+
+def _drain_primary_terminal(
+    runner: Any, storage: Any, clip_uids: Sequence[str]
+) -> dict[str, Any]:
+    """Seed, run, commit and finalize every clip to a Pair terminal state."""
+    seeded = runner.seed_primary_jobs()
+    results: dict[str, Any] = {}
+    for job in seeded:
+        result = _run_one(runner, job, _Judge())
+        assert result.committed
+        results[job.job_id()] = result
+    for job in seeded:
+        runner.finalize(job, results[job.job_id()])
+    for clip_uid in clip_uids:
+        assert storage.read_clip(clip_uid).pairing is not None
+    return results
+
+
+def _counting_reconcile_probe(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
+    """Count the expensive work a reconcile would have to redo."""
+    import r2v_data_v2.v3.pair as pair_module
+    import r2v_data_v2.v3.post_mask_epoch_pair as pm
+
+    counts = {"plan_validation": 0, "candidates": 0, "prefilter": 0}
+    real_validate = pm.PairEpochRunner._validate_primary_plan
+    real_candidates = pair_module._build_entity_reference_candidates
+    real_prefilter = pair_module.prefilter_entity_reference_candidates
+
+    def validate(*args: Any, **kwargs: Any) -> Any:
+        counts["plan_validation"] += 1
+        return real_validate(*args, **kwargs)
+
+    def candidates(*args: Any, **kwargs: Any) -> Any:
+        counts["candidates"] += 1
+        return real_candidates(*args, **kwargs)
+
+    def prefilter(*args: Any, **kwargs: Any) -> Any:
+        counts["prefilter"] += 1
+        return real_prefilter(*args, **kwargs)
+
+    monkeypatch.setattr(pm.PairEpochRunner, "_validate_primary_plan", validate)
+    monkeypatch.setattr(pair_module, "_build_entity_reference_candidates", candidates)
+    monkeypatch.setattr(
+        pair_module, "prefilter_entity_reference_candidates", prefilter
+    )
+    return counts
+
+
+def _four_clip_pair_storage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, run_name: str, *, cpu_workers: int
+) -> tuple[Any, Any, Any, tuple[str, ...]]:
+    clip_uids = ("clip-1", "clip-2", "clip-3", "clip-4")
+    # The prefilter accounting only exists in the mode production smoke uses.
+    config = _pair_config(
+        tmp_path, monkeypatch, reference_prefilter_mode="conservative_v1"
+    )
+    storage = _storage(config, entity_types=("subject",))
+    for clip_uid in clip_uids[1:]:
+        _add_ready_clip(config, storage, clip_uid=clip_uid, entity_types=("subject",))
+    runner = _runner(
+        tmp_path,
+        config,
+        storage,
+        clip_uids=clip_uids,
+        ledger_dir=f"ledger-{run_name}",
+        cpu_workers=cpu_workers,
+    )
+    return config, storage, runner, clip_uids
+
+
+def test_hot_reconcile_reuses_plan_and_prefilter_accounting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A terminal reconcile of this invocation redoes none of the heavy work."""
+    _unused_config, _storage_, runner, clip_uids = _four_clip_pair_storage(
+        tmp_path, monkeypatch, "run-hot-reconcile", cpu_workers=4
+    )
+    counts = _counting_reconcile_probe(monkeypatch)
+    _drain_primary_terminal(runner, _storage_, clip_uids)
+
+    # Reset: only the reconcile phase is under test.
+    counts.update(plan_validation=0, candidates=0, prefilter=0)
+    stats = runner.reconcile_stats(SHARD)
+
+    assert counts["plan_validation"] == 0, "the validated plan is reused"
+    assert counts["candidates"] == 0, "no candidate rebuild during reconcile"
+    assert counts["prefilter"] == 0, "no prefilter replay during reconcile"
+    assert runner.prepare_counters["primary_reconcile_cache_hits"] >= 1
+    assert runner.prepare_counters["hot_prefilter_cache_hits"] == len(clip_uids)
+    assert runner.prepare_counters["strict_prefilter_replay_clips"] == 0
+    assert stats.ready + stats.rejected == len(clip_uids)
+
+
+def test_cold_reconcile_replays_strictly_and_matches_hot_stats(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cold runner validates and replays, and produces the identical stats."""
+    _config_, storage, runner, clip_uids = _four_clip_pair_storage(
+        tmp_path, monkeypatch, "run-cold-reconcile", cpu_workers=1
+    )
+    counts = _counting_reconcile_probe(monkeypatch)
+    _drain_primary_terminal(runner, storage, clip_uids)
+
+    counts.update(plan_validation=0, candidates=0, prefilter=0)
+    hot = runner.reconcile_stats(SHARD).to_dict()
+    assert counts["plan_validation"] == 0
+    assert counts["candidates"] == 0
+
+    # A new runner on the same durable state has an empty invocation cache.
+    cold = _runner(
+        tmp_path,
+        _config_,
+        storage,
+        clip_uids=clip_uids,
+        ledger_dir="ledger-run-cold-reconcile",
+        cpu_workers=4,
+    )
+    assert cold._validated_plans == {}, "a cold runner starts empty"
+    counts.update(plan_validation=0, candidates=0, prefilter=0)
+    cold_stats = cold.reconcile_stats(SHARD).to_dict()
+
+    assert counts["plan_validation"] >= 1, "the cold runner validates strictly"
+    assert counts["candidates"] >= len(clip_uids), "the cold runner replays strictly"
+    assert counts["prefilter"] >= len(clip_uids)
+    assert cold.prepare_counters["primary_reconcile_cache_fallbacks"] >= 1
+    assert cold.prepare_counters["strict_prefilter_replay_clips"] == len(clip_uids)
+    assert cold.prepare_counters["hot_prefilter_cache_hits"] == 0
+
+    # The cached and the strict path must agree exactly.
+    assert cold_stats == hot
+
+
+def test_replaced_primary_plan_cannot_be_hidden_by_the_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A changed plan file must still be validated strictly and fail closed."""
+    _unused_config, storage, runner, clip_uids = _four_clip_pair_storage(
+        tmp_path, monkeypatch, "run-plan-drift", cpu_workers=1
+    )
+    _drain_primary_terminal(runner, storage, clip_uids)
+
+    plan_path = runner._plan_path(SHARD)
+    payload = json.loads(plan_path.read_text(encoding="utf-8"))
+    payload["clips"][clip_uids[0]]["digest"] = "drifted-on-purpose"
+    plan_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    from r2v_data_v2.v3.post_mask_epoch_pair import PairEpochError
+    with pytest.raises(PairEpochError, match="frozen primary input drifted"):
+        runner.reconcile_stats(SHARD)
+    assert runner.prepare_counters["primary_plan_validation_cache_misses"] >= 1
+
+
+def test_stale_prepared_row_is_never_used_for_prefilter_accounting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A row whose identity no longer matches must replay, not be trusted."""
+    _unused_config, storage, runner, clip_uids = _four_clip_pair_storage(
+        tmp_path, monkeypatch, "run-stale-prefilter", cpu_workers=1
+    )
+    _drain_primary_terminal(runner, storage, clip_uids)
+
+    cached = runner._prepared_clips[(SHARD, clip_uids[0])]
+    runner._prepared_clips[(SHARD, clip_uids[0])] = replace(
+        cached,
+        entity_ids=tuple(
+            f"stale-{index}" for index in range(len(cached.entity_ids))
+        ),
+    )
+    counts = _counting_reconcile_probe(monkeypatch)
+
+    stats = runner.reconcile_stats(SHARD)
+
+    assert counts["candidates"] >= 1, "the stale clip must be replayed strictly"
+    assert runner.prepare_counters["strict_prefilter_replay_clips"] == 1
+    assert stats.ready + stats.rejected == len(clip_uids)
+
+
+def test_cold_prefilter_replay_overlaps_across_clips(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The strict fallback replays clips concurrently, merged in clip order."""
+    _config_, storage, runner, clip_uids = _four_clip_pair_storage(
+        tmp_path, monkeypatch, "run-parallel-prefilter", cpu_workers=4
+    )
+    _drain_primary_terminal(runner, storage, clip_uids)
+
+    cold = _runner(
+        tmp_path,
+        _config_,
+        storage,
+        clip_uids=clip_uids,
+        ledger_dir="ledger-run-parallel-prefilter",
+        cpu_workers=4,
+    )
+    import r2v_data_v2.v3.post_mask_epoch_pair as pm
+
+    barrier = threading.Barrier(2, timeout=30.0)
+    entered: list[tuple[str, int]] = []
+    lock = threading.Lock()
+    real_replay = pm.PairEpochRunner._replay_prefilter_clip
+    merged: list[str] = []
+
+    def gated(self: Any, storage_: Any, clip: Any, counts_: Any) -> Any:
+        with lock:
+            entered.append((clip.clip_uid, threading.get_ident()))
+        barrier.wait()
+        return real_replay(self, storage_, clip, counts_)
+
+    def recording_merge(self: Any, storage_: Any, pending: Any) -> Any:
+        # Record the order the caller will actually merge in, which is the
+        # order this returns - not the order it was handed.
+        result = real_replay_clips(self, storage_, pending)
+        merged.extend(clip_uid for clip_uid, _projection in result)
+        return result
+
+    real_replay_clips = pm.PairEpochRunner._replay_prefilter_clips
+    monkeypatch.setattr(pm.PairEpochRunner, "_replay_prefilter_clip", gated)
+    monkeypatch.setattr(pm.PairEpochRunner, "_replay_prefilter_clips", recording_merge)
+
+    cold.reconcile_stats(SHARD)
+
+    assert len(entered) == len(clip_uids), entered
+    assert len({tid for _uid, tid in entered}) >= 2, "the fallback really fanned out"
+    # The merge is canonical clip order, whatever the completion order was.
+    assert merged == sorted(merged), merged
+    assert sorted(merged) == sorted(clip_uids)

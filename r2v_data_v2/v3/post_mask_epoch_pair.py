@@ -102,6 +102,27 @@ _PREPARED_CLIP_LIMIT = 32
 
 
 @dataclass(frozen=True)
+class _PlanFileSignature:
+    """Cheap identity of the frozen primary-plan file, without reading it.
+
+    ``atomic_write_json`` publishes through ``os.replace``, so the inode
+    changes; an in-place edit updates ``ctime``, which no ordinary file API can
+    restore. Size and mtime catch the obvious cases. Together they let a hot
+    path decide "the same plan file this invocation already validated" with one
+    ``stat`` - the same strength the accepted Reference Integrity plan cache
+    uses. Kept local so this stage does not couple to another stage's internals.
+
+    Execution-only: never part of ModelJob identity, a receipt or any schema.
+    """
+
+    st_dev: int
+    st_ino: int
+    st_size: int
+    st_mtime_ns: int
+    st_ctime_ns: int
+
+
+@dataclass(frozen=True)
 class _PreparedPrimaryClip:
     """One clip's prepared primary row, kept for its own finalizer.
 
@@ -123,6 +144,11 @@ class _PreparedPrimaryClip:
     #: wrong; this mapping is built where both are known and refers to the same
     #: decision objects, never copies.
     prepared_jobs: tuple[tuple[str, Any], ...] = ()
+    #: The primary prefilter accounting this invocation already computed while
+    #: preparing this clip's entities, summed in annotation order. It is what
+    #: lets a terminal reconcile merge counts instead of rebuilding candidates,
+    #: loading source images and re-running the prefilter for the same clip.
+    prefilter_counts: tuple[tuple[str, int], ...] = ()
 
 
 class PairEpochError(RuntimeError):
@@ -419,7 +445,18 @@ class PairEpochRunner:
         self._prepared_clips: dict[tuple[str, str], _PreparedPrimaryClip] = {}
         self._prepared_clips_lock = threading.Lock()
         self._prepared_clip_limit = _PREPARED_CLIP_LIMIT
+        #: Frozen primary plan this invocation already validated, with the file
+        #: signature it was validated at. Execution-only: a miss, an eviction or
+        #: a changed signature falls back to the strict validation.
+        self._validated_plans: dict[str, tuple[dict[str, Any], _PlanFileSignature]] = {}
+        self._validated_plans_lock = threading.Lock()
         self.prepare_counters: dict[str, int] = {
+            "primary_plan_validation_cache_hits": 0,
+            "primary_plan_validation_cache_misses": 0,
+            "primary_reconcile_cache_hits": 0,
+            "primary_reconcile_cache_fallbacks": 0,
+            "hot_prefilter_cache_hits": 0,
+            "strict_prefilter_replay_clips": 0,
             "primary_prepare_tasks": 0,
             "primary_prepare_parallel_tasks": 0,
             "primary_prepare_peak_inflight": 0,
@@ -605,6 +642,49 @@ class PairEpochRunner:
         }
         return semantic_input_digest(projection)
 
+    @staticmethod
+    def _plan_signature(path: Path) -> _PlanFileSignature | None:
+        """Cheap identity of the plan file, or ``None`` when it is unreadable."""
+        try:
+            info = path.stat()
+        except OSError:
+            return None
+        return _PlanFileSignature(
+            st_dev=info.st_dev,
+            st_ino=info.st_ino,
+            st_size=info.st_size,
+            st_mtime_ns=info.st_mtime_ns,
+            st_ctime_ns=info.st_ctime_ns,
+        )
+
+    def _remember_validated_plan(self, shard: str, payload: Mapping[str, Any]) -> None:
+        """Record the plan this invocation just strictly validated."""
+        signature = self._plan_signature(self._plan_path(shard))
+        if signature is None:
+            return
+        with self._validated_plans_lock:
+            self._validated_plans[shard] = (dict(payload), signature)
+
+    def _reuse_validated_plan(self, shard: str) -> dict[str, Any] | None:
+        """The already validated plan, only if it is still the same generation.
+
+        A miss, a changed signature or another runner returns ``None`` and the
+        caller runs the strict validation. The cache is never authoritative and
+        path existence alone is never trusted: the signature has to match.
+        """
+        current = self._plan_signature(self._plan_path(shard))
+        with self._validated_plans_lock:
+            cached = self._validated_plans.get(shard)
+        if current is None or cached is None:
+            self._bump_prepare_counter("primary_plan_validation_cache_misses")
+            return None
+        payload, signature = cached
+        if signature != current:
+            self._bump_prepare_counter("primary_plan_validation_cache_misses")
+            return None
+        self._bump_prepare_counter("primary_plan_validation_cache_hits")
+        return dict(payload)
+
     def _primary_plan(self, shard: str) -> dict[str, Any]:
         """Load the frozen plan, or create it once from the launch state.
 
@@ -617,6 +697,7 @@ class PairEpochRunner:
         existing = _read_json(self._plan_path(shard))
         if existing is not None:
             payload = self._validate_primary_plan(shard, existing)
+            self._remember_validated_plan(shard, payload)
             storage = self._storage_for(shard)
             for clip_uid, entry in payload.get("clips", {}).items():
                 if entry.get("classification") == CLIP_EXISTING_PAIRING:
@@ -647,6 +728,7 @@ class PairEpochRunner:
             "clips": clips,
         }
         _write_json_once(self._plan_path(shard), payload)
+        self._remember_validated_plan(shard, payload)
         return payload
 
     def _validate_primary_plan(self, shard: str, payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -676,7 +758,19 @@ class PairEpochRunner:
         return dict(payload)
 
     def _existing_primary_plan_for_reconcile(self, shard: str) -> dict[str, Any]:
-        """Load the frozen plan for reconciliation without ever creating it."""
+        """Load the frozen plan for reconciliation without ever creating it.
+
+        This invocation has already created or strictly validated this very
+        plan, and the plan file is written once and never rewritten, so when the
+        signature still matches the validated payload is reused instead of
+        re-deriving every clip's frozen input digest again. A cold runner, an
+        eviction or a replaced plan file falls back to the strict validation.
+        """
+        reused = self._reuse_validated_plan(shard)
+        if reused is not None:
+            self._bump_prepare_counter("primary_reconcile_cache_hits")
+            return reused
+        self._bump_prepare_counter("primary_reconcile_cache_fallbacks")
         payload = _read_json(self._plan_path(shard))
         if payload is None:
             raise PairEpochError(
@@ -877,6 +971,7 @@ class PairEpochRunner:
         jobs: Sequence[ModelJob],
         row: Sequence[Any],
         prepared_jobs: Sequence[tuple[str, Any]] = (),
+        prefilter_counts: Mapping[str, int] | None = None,
     ) -> None:
         """Keep one clip's prepared row for its own finalizer and its model runs.
 
@@ -892,6 +987,11 @@ class PairEpochRunner:
             job_ids=tuple(job.job_id() for job in jobs),
             row=tuple(row),
             prepared_jobs=tuple(prepared_jobs),
+            prefilter_counts=(
+                tuple(sorted(prefilter_counts.items()))
+                if prefilter_counts is not None
+                else ()
+            ),
         )
         with self._prepared_clips_lock:
             if (
@@ -903,15 +1003,15 @@ class PairEpochRunner:
                 self._prepared_clips.pop(next(iter(self._prepared_clips)), None)
             self._prepared_clips[(shard, clip_uid)] = entry
 
-    def _prepared_primary_clip_row(
+    def _validated_prepared_clip_entry(
         self, shard: str, clip_uid: str, clip: Any
-    ) -> tuple[Any, ...] | None:
-        """The cached prepared row, only if it still belongs to this clip.
+    ) -> _PreparedPrimaryClip | None:
+        """The cached prepared entry, only if it still belongs to this clip.
 
         A miss, an eviction, another runner, a changed annotation order or a
-        changed expected-job set returns ``None``, and the caller replays
-        strictly. The cache is never repaired and never treated as authority:
-        a disagreement is not corruption, it is a cache miss.
+        changed expected-job set returns ``None``, and the caller falls back to
+        the strict path. The cache is never repaired and never treated as
+        authority: a disagreement is not corruption, it is a cache miss.
         """
         with self._prepared_clips_lock:
             cached = self._prepared_clips.get((shard, clip_uid))
@@ -926,18 +1026,52 @@ class PairEpochRunner:
         with self._primary_jobs_lock:
             recorded = self._primary_jobs.get((shard, clip_uid))
         if recorded is None:
-            return None
-        if cached.job_ids != tuple(job.job_id() for job in recorded):
+            # A clip whose entities are all CPU-terminal never gets a job index
+            # entry, which is consistent only when the row has no judged jobs
+            # either. Anything else is a miss.
+            if cached.job_ids:
+                return None
+        elif cached.job_ids != tuple(job.job_id() for job in recorded):
             return None
         if len(cached.row) != len(cached.entity_ids):
             return None
-        return cached.row
+        return cached
+
+    def _prepared_primary_clip_row(
+        self, shard: str, clip_uid: str, clip: Any
+    ) -> tuple[Any, ...] | None:
+        """The cached prepared row for a finalizer, if it still belongs here."""
+        entry = self._validated_prepared_clip_entry(shard, clip_uid, clip)
+        return None if entry is None else entry.row
+
+    def _hot_prefilter_projection(
+        self, shard: str, clip_uid: str, clip: Any
+    ) -> dict[str, int] | None:
+        """This invocation's own prefilter accounting for one clip, if valid.
+
+        ``None`` means the caller must replay strictly. The projection is only
+        ever the counts this invocation produced while preparing this exact
+        clip, so it can never be a stale or partial answer for another state.
+        """
+        entry = self._validated_prepared_clip_entry(shard, clip_uid, clip)
+        if entry is None or not entry.prefilter_counts:
+            return None
+        return dict(entry.prefilter_counts)
+
+    @staticmethod
+    def _prefilter_projection(counters: Mapping[str, int]) -> dict[str, int]:
+        """The prefilter subset of one scratch counter dict.
+
+        Derived from the counter names themselves, so a future PairStats field
+        cannot be silently omitted from the projection.
+        """
+        return {key: int(value) for key, value in counters.items() if key.startswith("prefilter_")}
 
     def _prepare_primary_batch_tasks(
         self,
         pool: Any,
         batch: Sequence[tuple[str, RunStorage, str, Any]],
-    ) -> list[Any]:
+    ) -> tuple[list[Any], list[Any]]:
         """Prepare one batch's entity tasks on the shared pool, in task order.
 
         One slot per task - the prepared entity, or the exception its
@@ -979,10 +1113,9 @@ class PairEpochRunner:
                 except Exception as exc:  # noqa: BLE001 - re-raised in order
                     results[index] = exc
         # Each task gets its own counters dict so no two workers ever write the
-        # same dict, and those dicts are deliberately dropped: ``_scratch()`` is
-        # a throwaway, so there is nothing to merge into. The per-task dicts are
-        # required for thread safety, not for accounting.
-        return results
+        # same dict. They are returned so the caller can sum them per clip, in
+        # canonical order, into that clip's prefilter projection.
+        return results, tasks
 
     def _prepare_and_advance_primary_batch(
         self,
@@ -997,11 +1130,12 @@ class PairEpochRunner:
         position, so a speculative result from a later clip is never applied
         ahead of it.
         """
-        results = self._prepare_primary_batch_tasks(pool, batch)
+        results, tasks = self._prepare_primary_batch_tasks(pool, batch)
         self._note_prepare_buffered(len(results))
         self._bump_prepare_counter("primary_prepare_commit_batches")
         jobs: list[ModelJob] = []
         cursor = 0
+        task_cursor = 0
         for shard, storage, clip_uid, context in batch:
             clip, _frames, _masks = context
             count = len(clip.annotation.entities)
@@ -1010,9 +1144,20 @@ class PairEpochRunner:
             for item in row:
                 if isinstance(item, BaseException):
                     raise item
+            # Sum this clip's own task counters in annotation order.
+            projection = self._empty_stats()
+            for _offset in range(count):
+                for key, value in tasks[task_cursor + _offset][5].items():
+                    projection[key] = projection.get(key, 0) + value
+            task_cursor += count
             jobs.extend(
                 self._advance_prepared_primary_clip(
-                    shard, storage, clip_uid, context, row
+                    shard,
+                    storage,
+                    clip_uid,
+                    context,
+                    row,
+                    self._prefilter_projection(projection),
                 )
             )
         return jobs
@@ -1138,6 +1283,8 @@ class PairEpochRunner:
             context,
             prepared_by_entity,
             stop_at_unresolved=stop_at_unresolved,
+            # This preparation just produced the clip's prefilter accounting.
+            prefilter_counts=self._prefilter_projection(counters),
         )
 
     def _apply_prepared_primary_clip(
@@ -1149,6 +1296,7 @@ class PairEpochRunner:
         prepared_by_entity: Sequence[Any],
         *,
         stop_at_unresolved: bool,
+        prefilter_counts: Mapping[str, int] | None = None,
     ) -> tuple[
         list[EntityReferenceState],
         dict[str, tuple[Path, Image.Image]],
@@ -1209,6 +1357,7 @@ class PairEpochRunner:
             entity_jobs,
             prepared_by_entity,
             judged_prepared,
+            prefilter_counts,
         )
         if pending:
             # Rebuilt temporaries are not progress: only receipts are, and the
@@ -1524,6 +1673,7 @@ class PairEpochRunner:
         clip_uid: str,
         context: Any,
         prepared_by_entity: Sequence[Any],
+        prefilter_counts: Mapping[str, int] | None = None,
     ) -> list[ModelJob]:
         """The same fixed point, applied from already-prepared entity results."""
         states, temporary, pending = self._apply_prepared_primary_clip(
@@ -1533,6 +1683,7 @@ class PairEpochRunner:
             context,
             prepared_by_entity,
             stop_at_unresolved=True,
+            prefilter_counts=prefilter_counts,
         )
         if pending:
             return pending
@@ -1550,9 +1701,15 @@ class PairEpochRunner:
         from r2v_data_v2.v3.pair import _validate_pair_inputs as legacy_inputs
 
         clip = storage.read_clip(clip_uid)
+        # Frames and masks are frozen for the whole Pair pass - the epoch only
+        # ever writes references, pairing and selected images - so the bounded
+        # frozen-input cache this invocation already populated can answer the
+        # read. A cold runner has an empty cache and reads exactly as before.
+        frozen = self._frozen_pair_inputs(storage, clip_uid)
+        if frozen is None:
+            return False
+        frames, masks = frozen
         try:
-            frames = _validate_frames(storage, clip_uid)
-            masks = storage.read_masks(clip_uid)
             legacy_inputs(clip, frames, masks)
         except Exception:  # noqa: BLE001 - incomplete inputs are not eligible
             return False
@@ -1846,6 +2003,36 @@ class PairEpochRunner:
         counts: dict[str, int],
     ) -> None:
         """Replay the legacy primary prefilter counters. Never writes debug."""
+
+        pending: list[tuple[str, Any]] = []
+        for clip_uid in sorted(plan.get("clips", {})):
+            if plan["clips"][clip_uid]["classification"] != CLIP_FRESH_TARGET:
+                continue
+            if not self._pair_inputs_valid(storage, clip_uid):
+                continue
+            clip = storage.read_clip(clip_uid)
+            # This invocation already ran exactly this prefilter for exactly
+            # this clip while preparing it, so its own accounting can be merged
+            # instead of rebuilding candidates and loading source images again.
+            projection = self._hot_prefilter_projection(shard, clip_uid, clip)
+            if projection is not None:
+                for key, value in projection.items():
+                    counts[key] = counts.get(key, 0) + value
+                self._bump_prepare_counter("hot_prefilter_cache_hits")
+                continue
+            pending.append((clip_uid, clip))
+        if not pending:
+            return
+        self._bump_prepare_counter("strict_prefilter_replay_clips", len(pending))
+        # Merged in canonical clip order, never in completion order.
+        for _clip_uid, projection in self._replay_prefilter_clips(storage, pending):
+            for key, value in projection.items():
+                counts[key] = counts.get(key, 0) + value
+
+    def _replay_prefilter_clip(
+        self, storage: RunStorage, clip: Any, counts: dict[str, int]
+    ) -> dict[str, int]:
+        """Strict per-clip prefilter replay. Read-only; never writes debug."""
         from r2v_data_v2.v3.pair import (
             _build_entity_reference_candidates,
             _load_source_images,
@@ -1853,39 +2040,64 @@ class PairEpochRunner:
             prefilter_entity_reference_candidates,
         )
 
-        for clip_uid in sorted(plan.get("clips", {})):
-            if plan["clips"][clip_uid]["classification"] != CLIP_FRESH_TARGET:
+        clip_uid = clip.clip_uid
+        frames = _validate_frames(storage, clip_uid)
+        masks = storage.read_masks(clip_uid)
+        assert clip.annotation is not None
+        for entity in clip.annotation.entities:
+            tracked = masks.entities[entity.entity_id]
+            if tracked.status != "ready":
                 continue
-            if not self._pair_inputs_valid(storage, clip_uid):
+            candidates, _tiny, _fragmented = _build_entity_reference_candidates(
+                self.config,
+                storage,
+                clip_uid=clip_uid,
+                entity=entity,
+                frames=frames,
+                masks=masks,
+            )
+            if not candidates:
                 continue
-            clip = storage.read_clip(clip_uid)
-            frames = _validate_frames(storage, clip_uid)
-            masks = storage.read_masks(clip_uid)
-            assert clip.annotation is not None
-            for entity in clip.annotation.entities:
-                tracked = masks.entities[entity.entity_id]
-                if tracked.status != "ready":
-                    continue
-                candidates, _tiny, _fragmented = _build_entity_reference_candidates(
-                    self.config,
-                    storage,
-                    clip_uid=clip_uid,
-                    entity=entity,
-                    frames=frames,
-                    masks=masks,
+            source_images = _load_source_images(storage, candidates)
+            try:
+                result = prefilter_entity_reference_candidates(
+                    entity, candidates, source_images
                 )
-                if not candidates:
-                    continue
-                source_images = _load_source_images(storage, candidates)
-                try:
-                    result = prefilter_entity_reference_candidates(
-                        entity, candidates, source_images
-                    )
-                except Exception:  # noqa: BLE001 - legacy fail-open semantics
-                    counts["prefilter_candidates_examined"] += len(candidates)
-                    counts["prefilter_fail_open_entities"] += 1
-                else:
-                    _record_prefilter_stats(counts, result)
+            except Exception:  # noqa: BLE001 - legacy fail-open semantics
+                counts["prefilter_candidates_examined"] += len(candidates)
+                counts["prefilter_fail_open_entities"] += 1
+            else:
+                _record_prefilter_stats(counts, result)
+        return counts
+
+    def _replay_prefilter_clips(
+        self, storage: RunStorage, pending: Sequence[tuple[str, Any]]
+    ) -> list[tuple[str, dict[str, int]]]:
+        """Strict replay for the clips without hot accounting, flat across clips.
+
+        Read-only on every worker - the legacy path never writes debug - so a
+        clip's replay is independent of any other clip's. Results are merged in
+        canonical clip order by the caller, and a worker failure is the same
+        ordinary failure the serial loop raised.
+        """
+        workers = self._primary_cpu_workers()
+        per_clip = [self._empty_stats() for _ in pending]
+        if workers <= 1 or len(pending) < 2:
+            for position, (_clip_uid, clip) in enumerate(pending):
+                self._replay_prefilter_clip(storage, clip, per_clip[position])
+        else:
+
+            def replay(position: int) -> dict[str, int]:
+                return self._replay_prefilter_clip(
+                    storage, pending[position][1], per_clip[position]
+                )
+
+            with ThreadPoolExecutor(max_workers=min(workers, len(pending))) as pool:
+                list(pool.map(replay, range(len(pending))))
+        return [
+            (pending[position][0], per_clip[position])
+            for position in range(len(pending))
+        ]
 
     def _reconcile_cross(
         self,
