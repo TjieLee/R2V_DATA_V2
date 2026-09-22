@@ -956,7 +956,7 @@ def prepare_shard(
     adapter = JeaVideoMotionAdapter(
         clips_root=clips_root, source_videos_root=source_videos_root
     )
-    rows, raw_by_uid, contexts, seen = [], {}, {}, set()
+    rows, contexts, seen = [], {}, set()
     with manifest.open("rb") as handle:
         for offset, line in enumerate(handle):
             source_index = shard_id * SHARD_SIZE + offset
@@ -986,7 +986,6 @@ def prepare_shard(
                 item = adapter.parse(raw, source_index=source_index)
                 uid = item["clip_uid"]
                 row.update(clip_uid=uid, video=item["video_path"])
-                raw_by_uid[uid] = raw
             except (ValueError, TypeError, KeyError, OSError) as exc:
                 row["preparation_error"] = f"{type(exc).__name__}: {exc}"
             rows.append(row)
