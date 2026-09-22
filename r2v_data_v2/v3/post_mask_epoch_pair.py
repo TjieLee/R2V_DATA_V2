@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import threading
 from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -757,6 +758,69 @@ class PairEpochRunner:
         for temporary, _ in temporary_images.values():
             temporary.unlink(missing_ok=True)
 
+    def _prepare_entities(
+        self,
+        shard: str,
+        storage: RunStorage,
+        clip_uid: str,
+        entities: Sequence[tuple[int, Any]],
+        frames: Any,
+        masks: Any,
+        counters: dict[str, int],
+    ) -> list[Any]:
+        """Prepare every annotated entity, concurrently when the runtime allows.
+
+        An entity's preparation depends only on the clip, its frames and masks,
+        that entity and its own candidates, so independent entities can be
+        prepared at the same time. ThreadPoolExecutor is used rather than a
+        process pool because the work is PIL, NumPy, RLE and filesystem heavy
+        inside C extensions, and a process pool would have to pickle every
+        decoded image and mask across the boundary.
+
+        Only the CPU is parallel here. Nothing a worker does touches durable
+        state: no ledger commit, no receipt, no phase plan, no pending map and
+        no publication - all of that happens afterwards, on this thread, in
+        annotation order. Debug diagnostics stay safe because each entity writes
+        to its own ``pair_debug_dir(clip_uid, entity_id)`` through an atomic
+        replace.
+
+        Results are returned in annotation order, never in completion order.
+        """
+        workers = int(getattr(self.config.runtime, "cpu_workers", 1) or 1)
+        if workers <= 1 or len(entities) < 2:
+            return [
+                prepare_entity_reference(
+                    self.config,
+                    storage,
+                    clip_uid=clip_uid,
+                    entity=entity,
+                    frames=frames,
+                    masks=masks,
+                    counters=counters,
+                )
+                for _index, entity in entities
+            ]
+        per_entity: list[dict[str, int]] = [{} for _ in entities]
+
+        def prepare(position: int) -> Any:
+            return prepare_entity_reference(
+                self.config,
+                storage,
+                clip_uid=clip_uid,
+                entity=entities[position][1],
+                frames=frames,
+                masks=masks,
+                counters=per_entity[position],
+            )
+
+        with ThreadPoolExecutor(max_workers=min(workers, len(entities))) as pool:
+            results = list(pool.map(prepare, range(len(entities))))
+        # Merge in annotation order so the scratch counters stay deterministic.
+        for collected in per_entity:
+            for key, value in collected.items():
+                counters[key] = counters.get(key, 0) + value
+        return list(results)
+
     def _replay_primary_clip(
         self,
         shard: str,
@@ -785,20 +849,15 @@ class PairEpochRunner:
         """
         clip, frames, masks = context
         counters = self._scratch(shard)
+        entities = list(enumerate(clip.annotation.entities))
+        prepared_by_entity = self._prepare_entities(
+            shard, storage, clip_uid, entities, frames, masks, counters
+        )
         entity_states: list[EntityReferenceState] = []
         temporary_images: dict[str, tuple[Path, Image.Image]] = {}
         pending: list[ModelJob] = []
         entity_jobs: list[ModelJob] = []
-        for index, entity in enumerate(clip.annotation.entities):
-            prepared = prepare_entity_reference(
-                self.config,
-                storage,
-                clip_uid=clip_uid,
-                entity=entity,
-                frames=frames,
-                masks=masks,
-                counters=counters,
-            )
+        for (index, entity), prepared in zip(entities, prepared_by_entity):
             if isinstance(prepared, EntityReferenceState):
                 entity_states.append(prepared)
                 continue

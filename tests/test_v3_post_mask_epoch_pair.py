@@ -3669,3 +3669,57 @@ def test_prepared_cache_eviction_does_not_change_output(
     assert clip.pairing is not None and clip.pairing.status == "ready"
     assert clip.pairing.retained_entity_ids == ["e1", "e2", "e3"]
     assert [item.entity_id for item in clip.references.entities] == ["e1", "e2", "e3"]
+
+
+def test_primary_preparation_runs_independent_entities_concurrently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two entities are prepared at the same time, not one after the other.
+
+    A barrier proves concurrency: if preparation ever falls back to serial, the
+    first entity blocks in the barrier until it times out and the run fails.
+    """
+    import threading
+
+    import r2v_data_v2.v3.post_mask_epoch_pair as pm
+
+    barrier = threading.Barrier(2, timeout=20)
+    real = pm.prepare_entity_reference
+    seen: list[str] = []
+
+    def preparing(
+        config: Any,
+        storage: Any,
+        *,
+        clip_uid: str,
+        entity: Any,
+        frames: Any,
+        masks: Any,
+        counters: Any,
+    ) -> Any:
+        seen.append(str(entity.entity_id))
+        barrier.wait()  # both entities must be inside before either returns
+        return real(
+            config,
+            storage,
+            clip_uid=clip_uid,
+            entity=entity,
+            frames=frames,
+            masks=masks,
+            counters=counters,
+        )
+
+    monkeypatch.setattr(pm, "prepare_entity_reference", preparing)
+
+    config = _pair_config(tmp_path, monkeypatch)
+    storage = _storage(config, entity_types=("subject", "object"))
+    runner = _runner(tmp_path, config, storage)
+
+    jobs = runner.seed_primary_jobs()
+    assert len(jobs) == 2
+    assert sorted(seen) == ["e1", "e2"]
+
+    # Ordering is still deterministic: each job keeps its annotation index, so
+    # completion order of the workers never leaks into the job or state order.
+    assert sorted(int(dict(job.target)["entity_index"]) for job in jobs) == [0, 1]
+    assert {str(dict(job.target)["entity_id"]) for job in jobs} == {"e1", "e2"}
