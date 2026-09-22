@@ -18,17 +18,21 @@ def build_mimo_serve_command(
     sglang: str | Path,
     checkpoint: str | Path,
     *,
+    served_model_name: str = "mimo-v2.6-flash-rl",
     mem_fraction_static: float = 0.65,
+    enable_speculative: bool = True,
 ) -> list[str]:
     if not 0 < mem_fraction_static <= 1:
         raise ValueError("MiMo mem fraction must be in (0, 1]")
-    return [
+    if not served_model_name.strip():
+        raise ValueError("MiMo served model name must be non-empty")
+    command = [
         str(sglang),
         "serve",
         "--model-path",
         str(checkpoint),
         "--served-model-name",
-        "mimo-v2.5",
+        served_model_name,
         "--host",
         "127.0.0.1",
         "--port",
@@ -62,6 +66,21 @@ def build_mimo_serve_command(
         "--constrained-json-disable-any-whitespace",
         "--enable-deterministic-inference",
     ]
+    if enable_speculative:
+        command.extend(
+            [
+                "--speculative-algorithm",
+                "EAGLE",
+                "--speculative-num-steps",
+                "3",
+                "--speculative-eagle-topk",
+                "1",
+                "--speculative-num-draft-tokens",
+                "4",
+                "--enable-multi-layer-eagle",
+            ]
+        )
+    return command
 
 
 def _descendants(parent: int) -> set[int]:
