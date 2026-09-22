@@ -250,11 +250,16 @@ def _sha(path: Path) -> str:
         return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
-def _recover_stage(destination: Path, identity: str):
+def _recover_stage(
+    destination: Path,
+    identity: str,
+    *,
+    allow_identity_mismatch: bool = False,
+):
     if not destination.exists():
         return None
     receipt = json.loads((destination / "stage.json").read_text())
-    if receipt["identity"] != identity:
+    if receipt["identity"] != identity and not allow_identity_mismatch:
         raise ValueError("production stage identity changed; use a fresh root")
     for relative, digest in receipt["files"].items():
         if _sha(destination / relative) != digest:
@@ -291,6 +296,7 @@ def process_shard(
     *,
     request_workers=8,
     progress_every=100,
+    allow_existing_identity_mismatch=False,
 ):
     """Processor owns semantics; this function owns durable scheduling only."""
     if request_workers < 1:
@@ -367,7 +373,9 @@ def process_shard(
                 }
             )
             if state["identity"] != identity:
-                if (
+                if allow_existing_identity_mismatch:
+                    state["identity"] = identity
+                elif (
                     state.get("preparation_failed")
                     and not (shard / "artifacts" / uid / "t2va").exists()
                 ):
@@ -391,10 +399,18 @@ def process_shard(
                     return
                 destination = shard / "artifacts" / uid / stage
                 failed_destination = destination.with_name(f"{stage}_failed")
-                previous_partial = _recover_stage(failed_destination, identity)
+                previous_partial = _recover_stage(
+                    failed_destination,
+                    identity,
+                    allow_identity_mismatch=allow_existing_identity_mismatch,
+                )
                 if previous_partial is not None:
                     publish_exports(previous_partial)
-                result = _recover_stage(destination, identity)
+                result = _recover_stage(
+                    destination,
+                    identity,
+                    allow_identity_mismatch=allow_existing_identity_mismatch,
+                )
                 if result is None:
                     temporary = destination.with_name(
                         f".{stage}.tmp-{uuid.uuid4().hex}"
