@@ -46,7 +46,9 @@ if ! "$dry_run"; then
 fi
 R2V_PYTHON="${R2V_PYTHON:-$REPO_ROOT/.venv/bin/python}"
 SGLANG_ENV="${SGLANG_ENV:-/mnt/workspace/litengjie/data/audio_deps/qwen38-sglang-env}"
-MIMO_CHECKPOINT="${MIMO_CHECKPOINT:-/mnt/workspace/public/pretrained/MiMo/MiMo-V2.5}"
+MIMO_CHECKPOINT="${MIMO_CHECKPOINT:-/mnt/workspace/public/pretrained/MiMo/MiMo-V2.6-Flash-RL}"
+MIMO_MODEL="${MIMO_MODEL:-mimo-v2.6-flash-rl}"
+DOWNSTREAM_RUN_ID="${DOWNSTREAM_RUN_ID:-$MIMO_MODEL}"
 SHOT_MANIFEST="${SHOT_MANIFEST:-/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/shots_f03_motion.jsonl}"
 JEA_CLIPS_ROOT="${JEA_CLIPS_ROOT:-/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/clips_clean_cropped}"
 JEA_SOURCE_VIDEOS_ROOT="${JEA_SOURCE_VIDEOS_ROOT:-/mnt/workspace/public/dataset/jea-video/moive-183t-0808}"
@@ -80,7 +82,7 @@ if [[ ! "$MIMO_POLL_INTERVAL" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
 fi
 
 serve=("$SGLANG_ENV/bin/sglang" serve
-  --model-path "$MIMO_CHECKPOINT" --served-model-name mimo-v2.5
+  --model-path "$MIMO_CHECKPOINT" --served-model-name "$MIMO_MODEL"
   --host 127.0.0.1 --port 8092 --trust-remote-code
   --tp 8 --dp 2 --enable-dp-attention --enable-dp-lm-head
   --mm-enable-dp-encoder --dtype bfloat16
@@ -88,7 +90,10 @@ serve=("$SGLANG_ENV/bin/sglang" serve
   --context-length 131072 --mem-fraction-static 0.65
   --chunked-prefill-size 16384 --max-running-requests 8
   --reasoning-parser mimo --tool-call-parser mimo
-  --constrained-json-disable-any-whitespace --enable-deterministic-inference)
+  --constrained-json-disable-any-whitespace --enable-deterministic-inference
+  --speculative-algorithm EAGLE --speculative-num-steps 3
+  --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
+  --enable-multi-layer-eagle)
 
 run=("$R2V_PYTHON" "$REPO_ROOT/tools/run_h3_t2va_full_production.py"
   --shot-manifest "$SHOT_MANIFEST" --clips-root "$JEA_CLIPS_ROOT"
@@ -100,6 +105,8 @@ run=("$R2V_PYTHON" "$REPO_ROOT/tools/run_h3_t2va_full_production.py"
   --ffmpeg "${FFMPEG:-ffmpeg}"
   --mimo-sglang "$SGLANG_ENV/bin/sglang"
   --mimo-checkpoint "$MIMO_CHECKPOINT"
+  --mimo-model "$MIMO_MODEL"
+  --downstream-run-id "$DOWNSTREAM_RUN_ID"
   --mimo-mem-fraction-static 0.65
   --mimo-startup-polls "$MIMO_STARTUP_POLLS"
   --mimo-poll-interval "$MIMO_POLL_INTERVAL"
