@@ -100,6 +100,20 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+_MODEL_WEIGHT_SUFFIXES = {".safetensors", ".pt", ".bin", ".ckpt"}
+
+
+def dependency_fingerprint(path: Path) -> str:
+    """Content-hash small code/config files; never read model weight bytes."""
+    source = path.expanduser().resolve(strict=True)
+    if source.suffix.lower() in _MODEL_WEIGHT_SUFFIXES:
+        stat = source.stat()
+        return _sha256_text(
+            _compact_json({"path": str(source), "size": stat.st_size})
+        )
+    return sha256_file(source)
+
+
 def _read_jsonl(path: Path) -> list[dict[str, object]]:
     with path.open("r", encoding="utf-8") as handle:
         return [json.loads(line) for line in handle if line.strip()]
@@ -304,7 +318,7 @@ def _t5_dependency_files(root: Path) -> dict[str, str]:
                 raise ValueError("local T5-base checkpoint shard is unavailable")
             required.append(shard)
     return {
-        str(path.relative_to(root)): sha256_file(path)
+        str(path.relative_to(root)): dependency_fingerprint(path)
         for path in sorted(set(required))
     }
 
@@ -331,7 +345,10 @@ def _span_predictor_files(root: Path) -> dict[str, str]:
     if not root.is_dir() or any(not (root / name).is_file() for name in required):
         raise ValueError("local SAM span predictor lacks required config/checkpoint/tokenizer files")
     optional = ("special_tokens_map.json", "added_tokens.json", "preprocessor_config.json", "processor_config.json")
-    return {name: sha256_file(root / name) for name in sorted((*required, *(n for n in optional if (root / n).is_file())))}
+    return {
+        name: dependency_fingerprint(root / name)
+        for name in sorted((*required, *(n for n in optional if (root / n).is_file())))
+    }
 
 
 def sam_audio_configuration(
@@ -397,7 +414,7 @@ def sam_audio_configuration(
         "model_config_path": str(config_path),
         "model_config_sha256": sha256_file(config_path),
         "model_checkpoint_path": str(checkpoint_path),
-        "model_checkpoint_sha256": sha256_file(checkpoint_path),
+        "model_checkpoint_sha256": dependency_fingerprint(checkpoint_path),
         "t5_base_path": str(t5),
         "t5_dependency_files": _t5_dependency_files(t5),
         "device": device,
@@ -486,7 +503,7 @@ class OfficialSAMAudioBackend:
         if (
             sha256_file(Path(self.configuration.model_config_path))
             != self.configuration.model_config_sha256
-            or sha256_file(Path(self.configuration.model_checkpoint_path))
+            or dependency_fingerprint(Path(self.configuration.model_checkpoint_path))
             != self.configuration.model_checkpoint_sha256
             or _t5_dependency_files(Path(self.configuration.t5_base_path))
             != self.configuration.t5_dependency_files
