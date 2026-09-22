@@ -18,9 +18,9 @@ def build_mimo_serve_command(
     sglang: str | Path,
     checkpoint: str | Path,
     *,
-    served_model_name: str = "mimo-v2.6-flash-rl",
+    served_model_name: str = "mimo-v2.5",
     mem_fraction_static: float = 0.65,
-    enable_speculative: bool = True,
+    enable_speculative: bool = False,
 ) -> list[str]:
     if not 0 < mem_fraction_static <= 1:
         raise ValueError("MiMo mem fraction must be in (0, 1]")
