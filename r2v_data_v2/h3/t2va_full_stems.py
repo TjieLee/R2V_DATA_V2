@@ -151,8 +151,6 @@ class SAMWorker:
         inventory = sam.SAMAudioStemInventory.model_validate_json(
             Path(configuration["inventory_path"]).read_text()
         )
-        if inventory.model_configuration != self.backend.configuration:
-            raise ValueError("SAM pool model configuration changed")
         self.inventory = inventory
 
     def __enter__(self):
