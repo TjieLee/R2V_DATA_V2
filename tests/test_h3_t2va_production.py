@@ -697,10 +697,10 @@ def test_malformed_source_row_isolated(tmp_path, finalized):
     assert rows[-1]["preparation_error"]
 
 
-def test_preparation_strategy_has_stable_identity(tmp_path, finalized, monkeypatch):
+def test_bulk_preparation_failure_is_not_replayed_per_clip(
+    tmp_path, finalized, monkeypatch
+):
     from r2v_data_v2.h3 import t2va_shadow as frozen
-    from r2v_data_v2.h3 import ta2va_shadow as ta
-    from tests.test_h3_ta2va_shadow import ProfileClient
 
     root = tmp_path / "production"
     manifest = tmp_path / "shots_f03_motion.jsonl"
@@ -713,21 +713,20 @@ def test_preparation_strategy_has_stable_identity(tmp_path, finalized, monkeypat
         "source_videos_root": tmp_path,
         "backend": config.provenance(),
     }
-    rows, contexts = production.prepare_shard(root, index, 0, **kwargs)
-    backend = shared.T2VAMimoBackend(config, client=shared.Client([]))
-    profiles = ta.TA2VAProfileBackend(config, client=ProfileClient())
-    before = production.FrozenProductionProcessor(contexts, backend, profiles)
-    build = frozen.build_t2va_inventory
+    calls = []
 
     def transient(**kw):
-        if kw["shot_manifest"].name.startswith("shard-"):
-            raise OSError("temporary bulk read failure")
-        return build(**kw)
+        calls.append(kw["shot_manifest"])
+        raise OSError("temporary bulk read failure")
 
     monkeypatch.setattr(frozen, "build_t2va_inventory", transient)
-    other_rows, other_contexts = production.prepare_shard(root, index, 0, **kwargs)
-    after = production.FrozenProductionProcessor(other_contexts, backend, profiles)
-    assert [before.identity(r) for r in rows] == [after.identity(r) for r in other_rows]
+    with pytest.raises(OSError, match="temporary bulk read failure"):
+        production.prepare_shard(root, index, 0, **kwargs)
+
+    assert len(calls) == 1
+    assert calls[0].name.startswith("shard-")
+    prepared = root / "shards" / production.shard_name(0) / "prepared"
+    assert not list(prepared.glob("*.jsonl"))
 
 
 def test_retry_after_preparation_failure(tmp_path):
