@@ -954,6 +954,15 @@ def prepare_shard(
     prepared = root / "shards" / shard_name(shard_id) / "prepared"
     prepared.mkdir(parents=True, exist_ok=True)
 
+    preselected = None
+    selection_path = root / "shards" / shard_name(shard_id) / "source/selection.json"
+    if selection_path.is_file():
+        from r2v_data_v2.h3.t2va_source import T2VAShotSelection
+
+        preselected = T2VAShotSelection.model_validate_json(
+            selection_path.read_text(encoding="utf-8")
+        )
+
     print(f"shard={shard_id} downstream_source_projection_start", flush=True)
     rows, contexts = [], {}
     if preselected is not None:
@@ -1043,15 +1052,6 @@ def prepare_shard(
             backend=backend,
             preselected=preselected,
             verify_audio_files=verify_audio_files,
-        )
-
-    preselected = None
-    selection_path = root / "shards" / shard_name(shard_id) / "source/selection.json"
-    if selection_path.is_file():
-        from r2v_data_v2.h3.t2va_source import T2VAShotSelection
-
-        preselected = T2VAShotSelection.model_validate_json(
-            selection_path.read_text(encoding="utf-8")
         )
 
     print(f"shard={shard_id} downstream_inventory_build_start", flush=True)
