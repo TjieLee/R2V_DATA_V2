@@ -3671,6 +3671,59 @@ def test_prepared_cache_eviction_does_not_change_output(
     assert [item.entity_id for item in clip.references.entities] == ["e1", "e2", "e3"]
 
 
+def test_parallel_prepare_initializes_full_pair_stats_counters(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each parallel entity gets a complete PairStats scratch counter.
+
+    Real reference prefiltering increments named counters directly. An empty
+    per-entity dict therefore raises KeyError before any Qwen job can be seeded.
+    """
+
+    import r2v_data_v2.v3.post_mask_epoch_pair as pm
+
+    config = _pair_config(tmp_path, monkeypatch)
+    storage = _storage(config, entity_types=("subject", "object"))
+    runner = _runner(tmp_path, config, storage)
+    context = runner._primary_context(storage, "clip-1")
+    assert context is not None
+    clip, frames, masks = context
+
+    touched: list[str] = []
+
+    def exercising_prepare(
+        config: Any,
+        storage: Any,
+        *,
+        clip_uid: str,
+        entity: Any,
+        frames: Any,
+        masks: Any,
+        counters: dict[str, int],
+    ) -> str:
+        del config, storage, clip_uid, frames, masks
+        counters["prefilter_candidates_examined"] += 1
+        touched.append(str(entity.entity_id))
+        return str(entity.entity_id)
+
+    monkeypatch.setattr(pm, "prepare_entity_reference", exercising_prepare)
+
+    counters = runner._scratch(SHARD)
+    prepared = runner._prepare_entities(
+        SHARD,
+        storage,
+        "clip-1",
+        list(enumerate(clip.annotation.entities)),
+        frames,
+        masks,
+        counters,
+    )
+
+    assert prepared == ["e1", "e2"]
+    assert sorted(touched) == ["e1", "e2"]
+    assert counters["prefilter_candidates_examined"] == 2
+
+
 def test_primary_preparation_runs_independent_entities_concurrently(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

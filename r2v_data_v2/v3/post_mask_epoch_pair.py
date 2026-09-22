@@ -800,7 +800,7 @@ class PairEpochRunner:
                 )
                 for _index, entity in entities
             ]
-        per_entity: list[dict[str, int]] = [{} for _ in entities]
+        per_entity: list[dict[str, int]] = [self._empty_stats() for _ in entities]
 
         def prepare(position: int) -> Any:
             return prepare_entity_reference(
