@@ -19,7 +19,6 @@ from r2v_data_v2.h3.mimo25_av_reconcile import (
 )
 from r2v_data_v2.h3.mimo25_backend import MIMO_MODEL, MimoBackendConfig, MimoMediaResolver
 from r2v_data_v2.h3.mimo25_stem_shadow import (
-    MIMO25_STEM_RECONCILE_STAGE,
     StemAwareOpenAIMimo25Backend,
     build_stem_reconcile_jobs,
     run_mimo25_stem_reconcile_shadow,
