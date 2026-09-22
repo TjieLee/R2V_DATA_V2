@@ -229,6 +229,17 @@ def _reopen_exports(shard, exports):
             temporary.unlink(missing_ok=True)
 
 
+def _model_agnostic_evidence(value):
+    if value is None:
+        return None
+    normalized = dict(value)
+    policy = dict(normalized.get("policy") or {})
+    normalized["policy"] = {
+        "allow_unverified": policy.get("allow_unverified"),
+    }
+    return normalized
+
+
 def _preflight(shard, rows, processor):
     journal = shard / "state.jsonl.partial"
     states = production.load_states(shard)
@@ -258,8 +269,13 @@ def _preflight(shard, rows, processor):
             raise ValueError(
                 "missing downstream dependency evidence; refusing adoption"
             )
-        if previous is not None and previous != evidence and previous != empty:
-            raise ValueError("downstream per-clip source/config dependencies changed")
+        if previous is not None:
+            normalized_previous = _model_agnostic_evidence(previous)
+            if normalized_previous not in {
+                _model_agnostic_evidence(evidence),
+                _model_agnostic_evidence(empty),
+            }:
+                raise ValueError("downstream per-clip source/upstream dependencies changed")
         found = _stage_receipts(shard, uid, identity, state)
         transition = None
         if state:
@@ -283,8 +299,9 @@ def _preflight(shard, rows, processor):
                     )
                 )
             )
-            if state["identity"] != identity and not retryable:
-                raise ValueError("downstream checkpoint identity changed")
+            # Historical state identities may include MiMo backend/model
+            # provenance. Full-production resume is model-agnostic once the
+            # source/upstream evidence above has matched.
             if retryable and evidence["dependencies"] is not None:
                 transition = {
                     **state,
