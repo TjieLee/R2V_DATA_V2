@@ -46,8 +46,8 @@ if ! "$dry_run"; then
 fi
 R2V_PYTHON="${R2V_PYTHON:-$REPO_ROOT/.venv/bin/python}"
 SGLANG_ENV="${SGLANG_ENV:-/mnt/workspace/litengjie/data/audio_deps/qwen38-sglang-env}"
-MIMO_CHECKPOINT="${MIMO_CHECKPOINT:-/mnt/workspace/public/pretrained/MiMo/MiMo-V2.6-Flash-RL}"
-MIMO_MODEL="${MIMO_MODEL:-mimo-v2.6-flash-rl}"
+MIMO_CHECKPOINT="${MIMO_CHECKPOINT:-/mnt/workspace/public/pretrained/MiMo/MiMo-V2.5}"
+MIMO_MODEL="${MIMO_MODEL:-mimo-v2.5}"
 SHOT_MANIFEST="${SHOT_MANIFEST:-/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/shots_f03_motion.jsonl}"
 JEA_CLIPS_ROOT="${JEA_CLIPS_ROOT:-/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/clips_clean_cropped}"
 JEA_SOURCE_VIDEOS_ROOT="${JEA_SOURCE_VIDEOS_ROOT:-/mnt/workspace/public/dataset/jea-video/moive-183t-0808}"
@@ -69,7 +69,7 @@ done
 REQUEST_WORKERS="${REQUEST_WORKERS:-1}"
 CANONICAL_WORKERS="${CANONICAL_WORKERS:-16}"
 MIMO_STARTUP_POLLS="${MIMO_STARTUP_POLLS:-360}"
-MIMO_SPECULATIVE="${MIMO_SPECULATIVE:-1}"
+MIMO_SPECULATIVE="${MIMO_SPECULATIVE:-0}"
 MIMO_POLL_INTERVAL="${MIMO_POLL_INTERVAL:-5}"
 CLEANUP_GRACE_SECONDS="${CLEANUP_GRACE_SECONDS:-30}"
 for setting in REQUEST_WORKERS CANONICAL_WORKERS MIMO_STARTUP_POLLS CLEANUP_GRACE_SECONDS; do
