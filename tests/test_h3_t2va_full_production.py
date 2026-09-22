@@ -305,8 +305,10 @@ def test_mimo_stage_is_wrapped_by_per_shard_lifecycle(tmp_path, monkeypatch):
             finally:
                 events.append(("exit", shard_id))
 
+    downstream_root = tmp_path / "downstream" / "mimo-v2.6-flash-rl"
+
     def run_downstream(*args, **kwargs):
-        events.append(("run", args[2]))
+        events.append(("run", args[2], kwargs.get("output_root")))
         return {
             "clip": {
                 "t2va_status": "ready",
@@ -327,10 +329,15 @@ def test_mimo_stage_is_wrapped_by_per_shard_lifecycle(tmp_path, monkeypatch):
         backend=None,
         profiles=None,
         mimo_lifecycle=Lifecycle(),
+        downstream_root=downstream_root,
     )
     pipeline.prepared[7] = full.PreparedShard(tmp_path / "audio", {"ready": 1})
     result = pipeline.stage("mimo", 7)
-    assert events == [("enter", 7), ("run", 7), ("exit", 7)]
+    assert events == [
+        ("enter", 7),
+        ("run", 7, downstream_root.resolve()),
+        ("exit", 7),
+    ]
     assert result["t2va_ready"] == result["ta2va_ready"] == 1
 
 
@@ -370,6 +377,11 @@ def test_full_cli_dry_run_does_not_require_models(tmp_path):
     assert result["shards"] == [0]
     assert result["request_workers"] == 1
     assert result["canonical_workers"] == 16
+    assert result["mimo_model"] == "mimo-v2.6-flash-rl"
+    assert result["downstream_run_id"] == "mimo-v2.6-flash-rl"
+    assert result["downstream_root"].endswith(
+        "/downstream/mimo-v2.6-flash-rl"
+    )
     assert result["gpu_ids"] == [str(i) for i in range(8)]
     assert result["model_call_count"] == 0
 
