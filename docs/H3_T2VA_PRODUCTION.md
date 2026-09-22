@@ -398,6 +398,38 @@ Within an ASR worker, multiple transcript segments from the same speech stem als
 reuse one successful source-audio hash validation instead of hashing the same stem
 for every segment.
 
+### Downstream source projection and shared-path metadata
+
+Full production already establishes the accepted shard source population during
+canonical preparation in `shards/<shard>/source/selection.json`. Downstream
+preparation must reuse that selection instead of resolving and stat'ing every
+target video/source-video path again.
+
+A previous implementation reparsed all 2,000 manifest rows during
+`prepare_shard()` and called the JEA adapter for every row. Each adapter call
+performed multiple `Path.resolve()` / `is_file()` operations on shared
+storage. With several nodes entering downstream preparation together, this could
+create thousands of metadata RPCs while CPU and GPU utilization both appeared
+near zero and the supervisor stopped at:
+
+    shard=<id> downstream_prepare_start
+
+When a cached canonical selection exists, downstream source projection now reads
+the shard manifest sequentially only to retain the existing source-row byte hash
+and reconstructs clip_uid/video directly from the cached selection. It does not
+re-resolve or re-stat every media path.
+
+Current markers are:
+
+    downstream_source_projection_start
+    downstream_source_projection_ready rows=...
+    downstream_inventory_build_start
+    downstream_inventory_build_ready jobs=...
+
+Do not reintroduce per-row `Path.resolve(strict=True)`, `is_file()`, or other
+shared-media metadata probes in the downstream resume hot path. Actual pending
+media remains validated at its consumption boundary.
+
 ### Bulk downstream preparation failure policy
 
 Full-production downstream preparation builds one T2VA inventory for the whole
