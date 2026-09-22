@@ -34,6 +34,10 @@ from r2v_data_v2.v3.post_mask_epoch_jobs import (
     RESOURCE_QWEN,
     RESOURCE_SAM,
 )
+from r2v_data_v2.v3.post_mask_epoch_pair import (
+    PAIR_CROSS_JUDGE_JOB,
+    PAIR_ENTITY_JUDGE_JOB,
+)
 from r2v_data_v2.v3.post_mask_epoch_pipeline import (
     DOWNSTREAM_REASON,
     EXPORT_PENDING_REASON,
@@ -42,6 +46,7 @@ from r2v_data_v2.v3.post_mask_epoch_pipeline import (
     SUBJECT_ATTRIBUTES_COMPLETED,
     SUBJECT_ATTRIBUTES_STARTED,
     StageDispatchError,
+    StageHandoffError,
     default_pair_runner_factory,
     run_removal_pair_epochs,
     run_removal_pair_resource_session,
@@ -306,14 +311,20 @@ def test_pair_primary_retryable_blocks_only_its_own_clip(
         ),
     )
 
-    # The orchestration handed the primary scheduler's unresolved ids straight
-    # to the frozen 3b barrier.
-    assert seen["unresolved_job_ids"] == outcome["pair_primary_unresolved"]
+    # Cross is not executed at all, so the barrier entry point is never reached.
+    assert seen == {}, "Cross Pair must never be seeded by this composition"
     assert outcome["pair_primary_unresolved"], "one primary job failed in this fixture"
     assert outcome["remove_completed"] is True
     assert outcome["pair_primary_completed"] is False
-    # The blocked clip is absent from the cross pass rather than blocking it.
+    # Cross is complete by construction, so it never blocks the stage; the
+    # incomplete primary is what keeps the stage from being terminal.
     assert outcome["pair_cross_completed"] is True
+    assert outcome["pair_cross_unresolved"] == ()
+    assert outcome["pair_completed"] is False
+    assert outcome["pair_cross_job_count"] == 0
+    # No downstream stage may run on an incomplete Pair.
+    assert outcome["reference_edit_job_count"] == 0
+    assert not any(entry.startswith("reference_edit:") for entry in log), log
 
 
 def test_restart_after_removal_receipts_does_not_repeat_removal(
@@ -435,17 +446,111 @@ def test_restart_after_pair_primary_receipt_does_not_repeat_pair_qwen(
     assert second["pair_completed"] is True
 
 
-def test_pre_launch_existing_pairing_donates_but_is_not_a_cross_target(
+def _cross_artifact_paths(ledger_root: Path, shard: str) -> dict[str, Path]:
+    """Every durable path the frozen legacy Cross pass would write."""
+    root = ledger_root / "semantic" / "pair"
+    return {
+        "donor_snapshot": root / "donor_snapshots" / f"{shard}.json",
+        "cross_baselines": root / "cross_baselines" / shard,
+        "cross_terminal": root / "cross_terminal" / shard,
+    }
+
+
+def test_fresh_resource_epoch_never_executes_cross_pair(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A clip that already had a pairing before launch can donate, not fall back.
+    """Cross is a compatibility no-op: nothing cross is frozen, run or written.
 
-    Proven at the composition level by reading the frozen donor snapshot the
-    pipeline produced: the pre-launch clip appears in the frozen donor set and
-    is absent from the frozen cross target list.
+    The donor/donor-target semantics still exist for the workflows that own
+    Cross; what this pins is that this composition never reaches them.
     """
-    import json
+    config, storages, eligible, _, log = _fixture(tmp_path, monkeypatch)
+    ledger_root = tmp_path / "ledger"
+    ledger = GroupLedger(ledger_root)
+    judged: list[str] = []
 
+    def removal_factory(runner: Any) -> Any:
+        return ResourceEpochScheduler(
+            ledger=ledger,
+            finalize=runner.finalize,
+            executors=_removal_executors(runner, log),
+        )
+
+    class _CrossGuardRunner:
+        """Delegates to the real runner and refuses the cross barrier."""
+
+        def __init__(self, inner: Any) -> None:
+            self._inner = inner
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._inner, name)
+
+        def freeze_cross_pair_after_primary_quiescence(
+            self, *, unresolved_job_ids: Any = ()
+        ) -> Any:
+            raise AssertionError("Cross Pair must not run in this Resource Epoch")
+
+    scheduler_calls: list[int] = []
+
+    class _CountingExecutor(_RecordingExecutor):
+        def execute_batch(self, jobs: Any) -> Any:
+            judged.extend(job.job_type for job in jobs)
+            return super().execute_batch(jobs)
+
+    def pair_factory(runner: Any) -> Any:
+        scheduler_calls.append(1)
+        return ResourceEpochScheduler(
+            ledger=ledger,
+            finalize=runner.finalize,
+            executors={
+                RESOURCE_QWEN: _CountingExecutor(runner, _EntityJudge(), "pair", log)
+            },
+        )
+
+    outcome = run_removal_pair_epochs(
+        config=config,
+        storages=storages,
+        eligible_clip_uids_by_shard=eligible,
+        ledger=ledger,
+        removal_scheduler_factory=removal_factory,
+        pair_scheduler_factory=pair_factory,
+        pair_runner_factory=lambda **kwargs: _CrossGuardRunner(
+            default_pair_runner_factory(**kwargs)
+        ),
+    )
+
+    # Exactly one Pair scheduler run: the primary pass.
+    assert len(scheduler_calls) == 1, "only the primary Pair pass is scheduled"
+    assert PAIR_CROSS_JUDGE_JOB not in judged, judged
+    assert PAIR_ENTITY_JUDGE_JOB in judged, judged
+    assert not any(entry.endswith(PAIR_CROSS_JUDGE_JOB) for entry in log), log
+
+    assert outcome["pair_cross_job_count"] == 0
+    assert outcome["pair_cross_unresolved"] == ()
+    assert outcome["pair_cross_completed"] is True
+    assert outcome["pair_completed"] == outcome["pair_primary_completed"]
+    assert outcome["pair_completed"] is True
+
+    for shard in (SHARD, PAIR_SHARD):
+        paths = _cross_artifact_paths(ledger_root, shard)
+        assert not paths["donor_snapshot"].exists(), paths["donor_snapshot"]
+        assert not paths["cross_baselines"].exists(), paths["cross_baselines"]
+        assert not paths["cross_terminal"].exists(), paths["cross_terminal"]
+
+    for payload in outcome["pair_stats"].values():
+        assert payload["cross_pair_attempted"] == 0
+        assert payload["cross_pair_ready"] == 0
+        assert payload["cross_pair_repaired"] == 0
+
+
+def test_cross_fields_stay_zero_without_a_donor_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pre-launch pairing is still a donor for other workflows, not here.
+
+    The clip that already had a pairing before launch would have been a donor
+    and the fresh clip a cross target; this composition creates neither.
+    """
     from tests.test_v3_pair import _add_ready_clip, pair_clips
     from tests.test_v3_post_mask_epoch_pair import _ScopedJudge
 
@@ -453,10 +558,8 @@ def test_pre_launch_existing_pairing_donates_but_is_not_a_cross_target(
     pair_storage = storages[PAIR_SHARD]
     pair_config = _config(tmp_path, monkeypatch, "run-b")
 
-    # clip-1 gets a pairing BEFORE this launch: it is an existing donor.
     pair_clips(pair_config, pair_storage, judge=_EntityJudge())
     assert pair_storage.read_clip("clip-1").pairing is not None
-    # target-x is a fresh clip that will need the fallback.
     _add_ready_clip(
         pair_config,
         pair_storage,
@@ -469,7 +572,8 @@ def test_pre_launch_existing_pairing_donates_but_is_not_a_cross_target(
         PAIR_SHARD: ("clip-1", "target-x"),
     }
     storages = {SHARD: storages[SHARD], PAIR_SHARD: pair_storage}
-    ledger = GroupLedger(tmp_path / "ledger")
+    ledger_root = tmp_path / "ledger"
+    ledger = GroupLedger(ledger_root)
 
     def removal_factory(runner: Any) -> Any:
         return ResourceEpochScheduler(
@@ -501,27 +605,45 @@ def test_pre_launch_existing_pairing_donates_but_is_not_a_cross_target(
         pair_scheduler_factory=pair_factory,
     )
     assert outcome["remove_completed"] is True
-
-    snapshot_path = (
-        Path(ledger.root) / "semantic" / "pair" / "donor_snapshots" / f"{PAIR_SHARD}.json"
-    )
-    assert snapshot_path.is_file(), "the pipeline froze a donor snapshot"
-    snapshot = json.loads(snapshot_path.read_text())
-
-    targets = list(snapshot["cross_pair_target_clip_uids"])
-    donors = {
-        entry["clip_uid"] for group in snapshot["groups"] for entry in group["donors"]
-    }
-    assert "clip-1" not in targets, "a pre-launch pairing never becomes a cross target"
-    assert "target-x" in targets, "the fresh clip is the cross target"
-    assert "clip-1" in donors, "the pre-launch pairing is a valid frozen donor"
-    assert "target-x" not in donors
+    paths = _cross_artifact_paths(ledger_root, PAIR_SHARD)
+    assert not paths["donor_snapshot"].exists()
+    assert not paths["cross_baselines"].exists()
+    assert not paths["cross_terminal"].exists()
+    assert outcome["pair_cross_job_count"] == 0
 
 
-# ---------------------------------------------------------------------------
-# 4b: one ResourceEpochManager session across Removal -> Pair
-# ---------------------------------------------------------------------------
+def test_legacy_cross_ledger_is_refused_on_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ledger already inside legacy Cross is never silently reinterpreted."""
+    config, storages, eligible, _, log = _fixture(tmp_path, monkeypatch)
+    ledger_root = tmp_path / "ledger"
+    ledger = GroupLedger(ledger_root)
 
+    def removal_factory(runner: Any) -> Any:
+        return ResourceEpochScheduler(
+            ledger=ledger,
+            finalize=runner.finalize,
+            executors=_removal_executors(runner, log),
+        )
+
+    def pair_factory(runner: Any) -> Any:
+        raise AssertionError("Pair must not be scheduled past the restart guard")
+
+    # An older launch froze the donor snapshot and stopped inside Cross.
+    snapshot = _cross_artifact_paths(ledger_root, PAIR_SHARD)["donor_snapshot"]
+    snapshot.parent.mkdir(parents=True, exist_ok=True)
+    snapshot.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(StageHandoffError, match="does not execute Cross Pair"):
+        run_removal_pair_epochs(
+            config=config,
+            storages=storages,
+            eligible_clip_uids_by_shard=eligible,
+            ledger=ledger,
+            removal_scheduler_factory=removal_factory,
+            pair_scheduler_factory=pair_factory,
+        )
 
 class _TrackedResource:
     """Epoch resource that records start/stop on the shared timeline."""
@@ -873,7 +995,7 @@ def test_shared_qwen_model_mismatch_fails_before_any_model_call(
     manager = _shared_manager(holder, timeline)
     mismatched = replace(
         config,
-        qwen=replace(config.qwen, cross_pair_judge=QwenServiceConfig(model="/models/other")),
+        qwen=replace(config.qwen, candidate_judge=QwenServiceConfig(model="/models/other")),
     )
     with pytest.raises(StageDispatchError, match="shared Qwen session"):
         run_removal_pair_resource_session(
@@ -3665,3 +3787,95 @@ def test_cpu_budget_survives_the_reference_integrity_restart(
     assert seen["reference_integrity"] == 32
     # And the Recovery path did not fall back to the config default.
     assert seen["removal"] == 32
+
+
+def test_shared_qwen_identities_do_not_require_the_cross_judge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """This composition never serves Cross, so its judge cannot gate the session."""
+    config, _storages, _eligible, _, _log = _fixture(tmp_path, monkeypatch)
+    served = str(config.qwen.background_remove_judge.model)
+    identities = shared_qwen_model_identities(config)
+    assert str(config.qwen.background_remove_judge.model) in identities
+    assert str(config.qwen.candidate_judge.model) in identities
+
+    # A cross judge that the shared server could not serve must not block the
+    # launch: the epoch never calls it. Before Cross was disabled this raised.
+    cross_only = replace(
+        config,
+        qwen=replace(
+            config.qwen, cross_pair_judge=QwenServiceConfig(model="/models/cross-only")
+        ),
+    )
+    assert "/models/cross-only" not in shared_qwen_model_identities(cross_only)
+    validate_shared_qwen_models(cross_only, expected_served_model_id=served)
+
+    # A judge the composition does use still has to be served.
+    with pytest.raises(StageDispatchError, match="shared Qwen session"):
+        validate_shared_qwen_models(
+            replace(
+                config,
+                qwen=replace(
+                    config.qwen,
+                    background_final_judge=QwenServiceConfig(model="/models/other"),
+                ),
+            ),
+            expected_served_model_id=served,
+        )
+
+
+def test_clip_after_primary_only_pair_still_projects_to_downstream(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The downstream projection surface is the Primary publication, nothing else.
+
+    Cross is not executed, so the final Pair state a downstream stage reads is
+    exactly what Primary published: references, pairing and retained ids. This
+    pins that the clip still loads and that the surface exposes no cross
+    artifact. (Audio/H3 is developed on its own branch and reads those same
+    three fields; there is no H3 code on this branch to call.)
+    """
+    config, storages, eligible, _, log = _fixture(tmp_path, monkeypatch)
+    ledger_root = tmp_path / "ledger"
+    ledger = GroupLedger(ledger_root)
+
+    def removal_factory(runner: Any) -> Any:
+        return ResourceEpochScheduler(
+            ledger=ledger,
+            finalize=runner.finalize,
+            executors=_removal_executors(runner, log),
+        )
+
+    def pair_factory(runner: Any) -> Any:
+        return ResourceEpochScheduler(
+            ledger=ledger,
+            finalize=runner.finalize,
+            executors={
+                RESOURCE_QWEN: _RecordingExecutor(runner, _EntityJudge(), "pair", log)
+            },
+        )
+
+    outcome = run_removal_pair_epochs(
+        config=config,
+        storages=storages,
+        eligible_clip_uids_by_shard=eligible,
+        ledger=ledger,
+        removal_scheduler_factory=removal_factory,
+        pair_scheduler_factory=pair_factory,
+    )
+    assert outcome["pair_completed"] is True
+
+    clip = storages[PAIR_SHARD].read_clip("clip-1")
+    assert clip.pairing is not None
+    assert clip.pairing.status == "ready"
+    retained = list(clip.pairing.retained_entity_ids)
+    assert retained, "the downstream stage needs retained entity ids"
+    assert clip.references is not None
+    assert {state.entity_id for state in clip.references.entities} == set(retained)
+    assert all(state.status == "ready" for state in clip.references.entities)
+    assert all(state.image_path for state in clip.references.entities)
+
+    # The projection is self-contained: no cross artifact was produced or read.
+    paths = _cross_artifact_paths(ledger_root, PAIR_SHARD)
+    assert not paths["donor_snapshot"].exists()
+    assert not paths["cross_terminal"].exists()

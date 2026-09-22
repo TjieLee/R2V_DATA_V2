@@ -1218,6 +1218,17 @@ def run_removal_pair_epochs(
         )
 
     pair = pair_runner_factory(**shared)
+    if pair.legacy_cross_in_progress():
+        # This composition does not own Cross Pair, so it must not resume one:
+        # silently treating an interrupted legacy Cross pass as complete would
+        # reinterpret frozen work this epoch never produced.
+        raise StageHandoffError(
+            "Post-Mask Resource Epoch does not execute Cross Pair, but this "
+            "ledger already froze a legacy donor snapshot; refusing to "
+            "reinterpret an interrupted legacy Cross pass. Resume it with the "
+            "launch that owns Cross Pair, or run this group on a ledger without "
+            "Cross state."
+        )
     primary_seed = pair.seed_primary_jobs()
     result["pair_primary_job_count"] = len(primary_seed)
     _emit(emit,"post_mask_epoch_pair_primary_seeded",seeded_jobs=len(primary_seed))
@@ -1228,21 +1239,31 @@ def run_removal_pair_epochs(
         "post_mask_epoch_pair_primary_finished",
         unresolved=len(primary_unresolved),
     )
-    # The formal 3b barrier: blocked clips are excluded, settled fresh targets
-    # still enter the frozen cross pass.
-    cross_seed = list(
-        pair.freeze_cross_pair_after_primary_quiescence(
-            unresolved_job_ids=primary_unresolved
-        )
-    )
-    result["pair_cross_job_count"] = len(cross_seed)
-    _emit(emit,"post_mask_epoch_pair_cross_seeded",seeded_jobs=len(cross_seed))
-    cross_outcome = pair_scheduler_factory(pair).run(cross_seed)
-    cross_unresolved = tuple(cross_outcome.get("unresolved_job_ids", ()))
+    # Cross Pair is deliberately not executed by this Resource Epoch: Primary
+    # Pair is the final Pair state. No donor snapshot, no donor index, no cross
+    # baseline, no cross ModelJob and no cross judge call is created. The
+    # compatibility shape and the log event are kept so log consumers and stage
+    # stats are unchanged.
+    result["pair_cross_job_count"] = 0
+    _emit(emit,"post_mask_epoch_pair_cross_seeded",seeded_jobs=0)
+    cross_outcome: dict[str, Any] = {
+        "completed": True,
+        "unresolved_job_ids": [],
+        "job_count": 0,
+        "resolved_job_count": 0,
+        "attempted_job_count": 0,
+        "resource_lifecycle": None,
+        "wall_seconds": 0.0,
+        "diagnostics": None,
+        "skipped": True,
+        "reason": "disabled_in_post_mask_resource_epoch",
+    }
+    cross_unresolved: tuple[str, ...] = ()
 
     pair_primary_completed = not primary_unresolved
-    pair_cross_completed = not cross_unresolved
-    pair_completed = pair_primary_completed and pair_cross_completed
+    # Cross is complete by construction, so the stage terminality is Primary's.
+    pair_cross_completed = True
+    pair_completed = pair_primary_completed
     pair_stats: dict[str, Any] = {}
     if pair_completed:
         # Final durable accounting: only a fully terminal Pair stage may write
@@ -1383,7 +1404,10 @@ def shared_qwen_model_identities(config: V3Config) -> tuple[str, ...]:
     services = (
         config.qwen.background_remove_judge,
         config.qwen.candidate_judge,
-        config.qwen.cross_pair_judge,
+        # ``cross_pair_judge`` is deliberately absent: the Post-Mask Resource
+        # Epoch composition does not execute Cross Pair, so the shared session
+        # is never asked to serve it. The service stays in the V3 config for the
+        # workflows that do own Cross.
         config.qwen.background_final_judge,
         config.qwen.reference_edit_judge
         if getattr(config.reference_edit, "enabled", False)

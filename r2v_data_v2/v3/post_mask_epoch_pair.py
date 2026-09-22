@@ -2069,6 +2069,19 @@ class PairEpochRunner:
         prepared = prepare_cross_pair_attempt(evidence, donor)
         return prepared, evidence, donor, rank, target_clip
 
+    def legacy_cross_in_progress(self) -> bool:
+        """Whether this ledger already entered the frozen legacy Cross pass.
+
+        The Post-Mask Resource Epoch composition does not own Cross Pair, so a
+        fresh run never freezes a donor snapshot: Primary Pair is the final Pair
+        state. A snapshot that already exists can therefore only come from an
+        older launch that stopped inside legacy Cross, and that frozen work must
+        not be silently reinterpreted as complete. Read-only.
+        """
+        return any(
+            self._snapshot_path(shard).is_file() for shard in sorted(self.storages)
+        )
+
     def freeze_cross_pair_after_primary_quiescence(
         self, *, unresolved_job_ids: Sequence[str] = ()
     ) -> Sequence[ModelJob]:
