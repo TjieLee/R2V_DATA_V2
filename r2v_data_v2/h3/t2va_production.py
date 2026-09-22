@@ -953,42 +953,84 @@ def prepare_shard(
     manifest = materialize_shard(index, shard_id, root)
     prepared = root / "shards" / shard_name(shard_id) / "prepared"
     prepared.mkdir(parents=True, exist_ok=True)
-    adapter = JeaVideoMotionAdapter(
-        clips_root=clips_root, source_videos_root=source_videos_root
+
+    print(f"shard={shard_id} downstream_source_projection_start", flush=True)
+    rows, contexts = [], {}
+    if preselected is not None:
+        shots_by_index = {shot.source_index: shot for shot in preselected.shots}
+        if len(shots_by_index) != len(preselected.shots):
+            raise ValueError("cached T2VA selection has duplicate source indexes")
+        excluded_by_index = {
+            row["source_index"]: row["reason"] for row in preselected.excluded_rows
+        }
+        if len(excluded_by_index) != len(preselected.excluded_rows):
+            raise ValueError("cached T2VA selection has duplicate excluded indexes")
+        with manifest.open("rb") as handle:
+            for offset, line in enumerate(handle):
+                source_index = shard_id * SHARD_SIZE + offset
+                row = {
+                    "source_index": source_index,
+                    "clip_uid": f"invalid-source-{source_index}",
+                    "video": "",
+                    "source_row_sha256": hashlib.sha256(line).hexdigest(),
+                }
+                shot = shots_by_index.get(source_index)
+                if shot is not None:
+                    row.update(clip_uid=shot.clip_uid, video=shot.video_path)
+                else:
+                    reason = excluded_by_index.get(source_index)
+                    if reason is None:
+                        raise ValueError(
+                            "cached T2VA selection does not cover source row "
+                            f"{source_index}"
+                        )
+                    row["preparation_error"] = (
+                        "ValueError: canonical selection excluded source row: " + reason
+                    )
+                rows.append(row)
+        expected = len(preselected.shots) + len(preselected.excluded_rows)
+        if len(rows) != expected:
+            raise ValueError("cached T2VA selection row count differs")
+    else:
+        adapter = JeaVideoMotionAdapter(
+            clips_root=clips_root, source_videos_root=source_videos_root
+        )
+        seen = set()
+        with manifest.open("rb") as handle:
+            for offset, line in enumerate(handle):
+                source_index = shard_id * SHARD_SIZE + offset
+                row = {
+                    "source_index": source_index,
+                    "clip_uid": f"invalid-source-{source_index}",
+                    "video": "",
+                    "source_row_sha256": hashlib.sha256(line).hexdigest(),
+                }
+                try:
+                    raw = json.loads(line)
+                    if not isinstance(raw, dict):
+                        raise TypeError("shot manifest row must be a JSON object")
+                    # Preserve ingestion identity across transient missing-media
+                    # failures when no canonical selection exists.
+                    candidate, _ = _path_below_root(
+                        raw.get("video_path"),
+                        root=clips_root,
+                        field_name="video_path",
+                        require_file=False,
+                    )
+                    uid = parse_clip_identity(candidate).clip_uid
+                    if uid in seen:
+                        raise ValueError("duplicate JEA clip identity")
+                    seen.add(uid)
+                    row.update(clip_uid=uid, video=str(candidate))
+                    item = adapter.parse(raw, source_index=source_index)
+                    row.update(clip_uid=item["clip_uid"], video=item["video_path"])
+                except (ValueError, TypeError, KeyError, OSError) as exc:
+                    row["preparation_error"] = f"{type(exc).__name__}: {exc}"
+                rows.append(row)
+    print(
+        f"shard={shard_id} downstream_source_projection_ready rows={len(rows)}",
+        flush=True,
     )
-    rows, contexts, seen = [], {}, set()
-    with manifest.open("rb") as handle:
-        for offset, line in enumerate(handle):
-            source_index = shard_id * SHARD_SIZE + offset
-            row = {
-                "source_index": source_index,
-                "clip_uid": f"invalid-source-{source_index}",
-                "video": "",
-                "source_row_sha256": hashlib.sha256(line).hexdigest(),
-            }
-            try:
-                raw = json.loads(line)
-                if not isinstance(raw, dict):
-                    raise TypeError("shot manifest row must be a JSON object")
-                # Preserve the ingestion identity across transient missing-media
-                # failures. Eligibility still goes through the full adapter.
-                candidate, _ = _path_below_root(
-                    raw.get("video_path"),
-                    root=clips_root,
-                    field_name="video_path",
-                    require_file=False,
-                )
-                uid = parse_clip_identity(candidate).clip_uid
-                if uid in seen:
-                    raise ValueError("duplicate JEA clip identity")
-                seen.add(uid)
-                row.update(clip_uid=uid, video=str(candidate))
-                item = adapter.parse(raw, source_index=source_index)
-                uid = item["clip_uid"]
-                row.update(clip_uid=uid, video=item["video_path"])
-            except (ValueError, TypeError, KeyError, OSError) as exc:
-                row["preparation_error"] = f"{type(exc).__name__}: {exc}"
-            rows.append(row)
 
     def build(path, *, preselected=None, verify_audio_files=True):
         return build_t2va_inventory(
