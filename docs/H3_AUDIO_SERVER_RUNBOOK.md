@@ -374,9 +374,9 @@ stem-video proxies are inputs.
 
 MiMo is a downstream consumer, not part of the Audio production-root identity.
 Changing MiMo versions must not require a fresh Audio/JEA production root or rerun
-SAM/AuK/DiariZen/ASR. RA2VA outputs are namespaced under
-`mimo_runs/<mimo_run_id>/<binding_evidence_mode>/`; keep the same upstream root
-and choose a new MiMo run ID when comparing or upgrading models.
+SAM/AuK/DiariZen/ASR. RA2VA keeps the existing output-stage path; changing
+`--model` only changes the runtime model used for new work and does not introduce
+a model-specific output directory.
 
 MiMo serving provenance records the model name/checkpoint path/configuration and
 does not hash MiMo checkpoint bytes. Full-production DiariZen/Qwen3-ASR likewise
