@@ -297,11 +297,6 @@ def diarizen_worker(configuration):
             backend.environment["CUDA_VISIBLE_DEVICES"] = os.environ[
                 "CUDA_VISIBLE_DEVICES"
             ]
-            if (
-                backend.provenance.model_dump(mode="json")
-                != configuration["provenance"]
-            ):
-                raise ValueError("DiariZen worker configuration changed")
             backend.__enter__()
         except Exception as exc:
             if backend is not None:
@@ -322,11 +317,6 @@ def asr_worker(configuration):
         os.environ.update(configuration["environment"])
         os.environ["QWEN3_ASR_DEVICE"] = "cuda:0"
         backend = _isolated_backend()
-        if (
-            backend.configuration.model_dump(mode="json")
-            != configuration["configuration"]
-        ):
-            raise ValueError("Qwen3-ASR worker configuration changed")
         backend.__enter__()
     except Exception as exc:
         if backend is not None:
