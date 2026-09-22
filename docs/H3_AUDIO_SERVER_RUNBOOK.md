@@ -182,7 +182,7 @@ local-files-only.
 The Audio/H3 reconcile path uses the local OpenAI-compatible MiMo service:
 
 ```text
-model:    mimo-v2.6-flash-rl
+model:    mimo-v2.5 (production default; V2.6 is an explicit validation candidate)
 endpoint: http://127.0.0.1:8092/v1
 ```
 
@@ -365,8 +365,7 @@ stem-video proxies are inputs.
 "$R2V_PYTHON" tools/run_h3_mimo25_stem_reconcile_shadow.py "${RUN_ARGS[@]}" \
   --visual-production-root "$VISUAL_PRODUCTION_ROOT" \
   --visual-runs-root "$VISUAL_RUNS_ROOT" \
-  --model mimo-v2.6-flash-rl \
-  --mimo-run-id mimo-v2.6-flash-rl \
+  --model mimo-v2.5 \
   --base-url http://127.0.0.1:8092/v1 \
   --max-completion-tokens 32768 \
   --allow-unverified
@@ -385,6 +384,21 @@ directories. Legacy SAM/AuK dependency SHA fields are retained only for
 compatibility with existing upstream receipts and are not part of switching the
 MLLM version. Source media and generated artifacts retain their normal content
 hashes.
+
+### MiMo V2.6 fixed random20 quality A/B
+
+Before changing production defaults or reducing turn count, rerun the existing
+`random20-refgraph-v1` sample set with the exact V2.5 multi-call workflow and
+only swap the MiMo model/checkpoint. The historical case manifest is
+`/tmp/mimo-refgraph-random20.json`; the historical V2.5 output is under
+`sam_audio_stem_shadow_v1/runs/random20-refgraph-v1/mimo_reconcile_stemtext_final_av_markerpolish_v1`.
+Write the V2.6 A/B to an explicit sibling experiment output root so the existing
+20 V2.5 records/prompts remain available for side-by-side review. This explicit
+A/B output path is an experiment choice, not a production model namespace.
+
+Do not merge RA2VA turns or T2VA semantic/audio-finalize calls in this first
+comparison. First determine whether V2.6 improves the existing multi-call quality;
+only then create a separate single-call experiment against the same 20 cases.
 
 There are no standalone stem-description calls. Canonical speech/music/SFX stem hashes
 are checked against separation provenance before inference.
