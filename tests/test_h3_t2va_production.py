@@ -534,6 +534,48 @@ def test_full_preselected_inventory_matches_legacy_inventory(tmp_path, finalized
     assert fast.inventory_fingerprint == legacy.inventory_fingerprint
 
 
+def test_prepare_shard_reuses_cached_selection_without_path_metadata_scans(
+    tmp_path, finalized, monkeypatch
+):
+    from r2v_data_v2.h3 import t2va_full_production as full
+    from r2v_data_v2.v3 import production_source
+
+    root = tmp_path / "production"
+    manifest = tmp_path / "shots_f03_motion.jsonl"
+    index = production.build_source_index(manifest, root)
+    selection = full.shard_selection(root, index, 0, tmp_path, tmp_path)
+
+    monkeypatch.setattr(
+        production_source,
+        "_path_below_root",
+        lambda *args, **kwargs: pytest.fail(
+            "cached downstream selection repeated shared-path resolution"
+        ),
+    )
+    monkeypatch.setattr(
+        production_source.JeaVideoMotionAdapter,
+        "parse",
+        lambda *args, **kwargs: pytest.fail(
+            "cached downstream selection reparsed source media"
+        ),
+    )
+
+    rows, contexts = production.prepare_shard(
+        root,
+        index,
+        0,
+        audio_production_root=finalized[0],
+        audio_shadow_run_id=finalized[1],
+        clips_root=tmp_path,
+        source_videos_root=tmp_path,
+        backend=shared.config(tmp_path).provenance(),
+    )
+    assert [row["clip_uid"] for row in rows] == [
+        shot.clip_uid for shot in selection.shots
+    ]
+    assert set(contexts) == {shot.clip_uid for shot in selection.shots}
+
+
 def test_runner_dry_run_and_source_adapter(tmp_path, finalized):
     from tools.run_h3_t2va_production import main
 
