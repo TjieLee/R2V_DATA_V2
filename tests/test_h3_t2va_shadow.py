@@ -663,6 +663,25 @@ def test_projection_reconciliation_remains_strict(
         build(finalized, tmp_path)
 
 
+def test_blank_asr_language_isolated_to_affected_clip(
+    finalized, tmp_path, monkeypatch
+):
+    root = t2va.stem_shadow_root(finalized[0], finalized[1])
+    validated = t2va.validate_stem_asr_lineage(root / "asr", expected_shadow_root=root)
+    monkeypatch.setattr(t2va, "validate_stem_asr_lineage", lambda *a, **kw: validated)
+    path = root / "asr/segments.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    uid = rows[0]["clip_uid"]
+    rows[0]["language"] = ""
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    inventory = build(finalized, tmp_path)
+    job = next(j for j in inventory.jobs if j.clip_uid == uid)
+
+    assert job.upstream_failure == "asr_failed"
+    assert job.speech_facts == []
+
+
 def test_failed_asr_is_not_reinterpreted_as_empty_speech(
     finalized, tmp_path, monkeypatch
 ):
