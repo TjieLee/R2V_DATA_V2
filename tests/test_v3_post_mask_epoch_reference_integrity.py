@@ -8,7 +8,9 @@ may ever reach a Qwen judge.
 
 from __future__ import annotations
 
+import inspect
 import json
+import os
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -28,6 +30,7 @@ from r2v_data_v2.v3.post_mask_epoch_reference_integrity import (
     ReferenceIntegrityDurableError,
     ReferenceIntegrityEpochError,
     ReferenceIntegrityEpochRunner,
+    _FileSignature,
 )
 from r2v_data_v2.v3.post_mask_epoch_state import GroupLedger
 from r2v_data_v2.v3.reference_integrity import reference_integrity_clips
@@ -2251,7 +2254,9 @@ def test_finalize_still_creates_the_new_continuation_input(
     required: list[str] = []
 
     real_freeze = runner._create_or_verify_review_input
-    real_require = runner._require_review_input
+    # Production reaches the strict require through the *_derived* entry, so
+    # that is the only patch target that can observe a real require replay.
+    real_require = runner._require_review_input_derived
 
     def freeze(*args: Any, **kwargs: Any) -> Any:
         frozen.append(str(kwargs.get("variant") or "final"))
@@ -2262,7 +2267,7 @@ def test_finalize_still_creates_the_new_continuation_input(
         return real_require(*args, **kwargs)
 
     monkeypatch.setattr(runner, "_create_or_verify_review_input", freeze)
-    monkeypatch.setattr(runner, "_require_review_input", require)
+    monkeypatch.setattr(runner, "_require_review_input_derived", require)
 
     executor = _SerialQwenExecutor(runner, judge)
     jobs = runner.seed_jobs()
@@ -2790,7 +2795,10 @@ def _review_derivation_guards(
     real_require = runner._require_review_input_derived
 
     def require(*args: Any, **kwargs: Any) -> Any:
-        seen["requires"].append(kwargs.get("variant"))
+        # Record the caller so a require replay driven by terminal publication
+        # can be told apart from the job-context replay this commit removes.
+        caller = inspect.currentframe().f_back.f_code.co_name  # type: ignore[union-attr]
+        seen["requires"].append((kwargs.get("variant"), caller))
         return real_require(*args, **kwargs)
 
     real_encode = runner._encode_review_context
@@ -2800,7 +2808,7 @@ def _review_derivation_guards(
         return real_encode(*args, **kwargs)
 
     monkeypatch.setattr(module, "_source_evidence", evidence)
-    monkeypatch.setattr(runner, "_require_review_input", require)
+    monkeypatch.setattr(runner, "_require_review_input_derived", require)
     monkeypatch.setattr(runner, "_encode_review_context", encode)
     return seen
 
@@ -2819,6 +2827,7 @@ def test_run_still_strictly_rederives_after_seed(
 
     assert len(judge.calls) == 1, "the model really ran"
     assert seen["evidence"], "run() must re-derive the source evidence"
+    assert seen["requires"] == [("final", "_review_inputs_and_job")], seen["requires"]
     assert runner.review_context_counters["review_context_cache_store"] == 1
 
 
@@ -2846,17 +2855,54 @@ def test_finalize_hot_cache_skips_the_second_derivation(
     # The review-input chain is not re-derived. Source evidence may still be
     # derived by the terminal publication, which this commit deliberately does
     # not cache (topology/entity publication is a later change).
-    assert seen["requires"] == [], "no current-job require replay in finalize"
+    job_context_requires = [
+        entry for entry in seen["requires"] if entry[1] == "_review_outcome"
+    ]
+    assert job_context_requires == [], job_context_requires
     assert runner.review_context_counters["review_context_cache_hit"] == 1
     assert runner._entity_outcome_path(SHARD, "clip-1", "e2").is_file()
 
 
-@pytest.mark.parametrize("which", ("source_frame", "context", "reference"))
+def _cached_chain_paths(runner: Any, job: Any, storage: Any) -> dict[str, Any]:
+    """Resolve the four signed artifacts of one cached chain, unambiguously.
+
+    Roles are read off the real artifact layout the derivation uses - the anchor
+    JSON, the derived ``integrity_context_*.png``, the frame under ``frames/``
+    and the remaining reference image - never guessed from a suffix alone.
+    """
+    cached = runner._validated_review_contexts[job.job_id()]
+    signed = [path for path, _signature in cached.file_signatures]
+    assert len(signed) == 4, signed
+
+    anchor_path = next(path for path in signed if path.suffix == ".json")
+    context_path = next(path for path in signed if "integrity_context" in path.name)
+    source_frame_path = next(path for path in signed if path.parent.name == "frames")
+    remaining = [
+        path
+        for path in signed
+        if path not in {anchor_path, context_path, source_frame_path}
+    ]
+    assert len(remaining) == 1, remaining
+    reference_path = remaining[0]
+
+    assert os.path.realpath(source_frame_path) != os.path.realpath(reference_path)
+    assert os.path.realpath(source_frame_path) != os.path.realpath(context_path)
+    assert os.path.realpath(anchor_path) != os.path.realpath(context_path)
+    return {
+        "anchor": anchor_path,
+        "context": context_path,
+        "reference": reference_path,
+        "source_frame": source_frame_path,
+        "cached": cached,
+    }
+
+
+@pytest.mark.parametrize("which", ("source_frame", "context", "reference", "anchor"))
 def test_changed_artifact_bypasses_the_cache_and_fails_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, which: str
 ) -> None:
     """A changed artifact is not a cache hit, and the strict path decides."""
-    _config, _storage, runner, judge = _seeded_review_fixture(
+    _config, storage, runner, judge = _seeded_review_fixture(
         tmp_path, monkeypatch, f"run-changed-{which}"
     )
     job = _runnable_job(runner, "final")
@@ -2868,58 +2914,142 @@ def test_changed_artifact_bypasses_the_cache_and_fails_closed(
         runner, _SerialQwenExecutor(runner, judge), no_finalize
     ).run([job])
     committed = runner.ledger.load_committed_result(job)
-    cached = runner._validated_review_contexts[job.job_id()]
-    if which == "source_frame":
-        target = cached.current_derived_path if False else None
-    # Resolve the artifact from the cached signatures by name.
-    paths = {path.name: path for path, _s in cached.file_signatures}
-    if which == "source_frame":
-        target = next(path for path in paths.values() if path.suffix == ".png"
-                      and "context" not in path.name)
-    elif which == "context":
-        target = next(path for path in paths.values() if "context" in path.name)
-    else:
-        target = next(
-            path for path in paths.values()
-            if path.suffix == ".png" and "context" not in path.name
-        )
+    assert committed is not None
+
+    paths = _cached_chain_paths(runner, job, storage)
+    assert os.path.realpath(paths["source_frame"]) != os.path.realpath(
+        paths["reference"]
+    )
+    assert os.path.realpath(paths["source_frame"]) != os.path.realpath(
+        paths["context"]
+    )
+    target = paths[which]
+    assert target.is_file()
     target.write_bytes(target.read_bytes() + b"x")
 
     seen = _review_derivation_guards(monkeypatch, runner)
-    with pytest.raises(ReferenceIntegrityDurableError):
+    if which == "source_frame":
+        # Appending bytes to the JPEG does not change the decoded source pixels,
+        # so the strict path legitimately re-derives the same input and accepts
+        # it: what matters here is that it ran instead of trusting the cache.
         runner.finalize(job, committed)
-
-    assert seen["evidence"], "the strict require path must actually run"
+        assert seen["requires"], "the strict require path must actually run"
+        assert runner._entity_outcome_path(SHARD, "clip-1", "e2").is_file()
+    else:
+        with pytest.raises(ReferenceIntegrityDurableError):
+            runner.finalize(job, committed)
+        assert seen["requires"], "the strict require path must actually run"
+        assert not runner._entity_outcome_path(SHARD, "clip-1", "e2").exists(), (
+            "no semantic publication on a bypassed cache"
+        )
     assert runner.review_context_counters["review_context_signature_miss"] >= 1
 
 
-def test_evicted_context_falls_back_to_the_strict_path(
+def test_cached_context_signatures_are_all_real_files(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Eviction only costs CPU: the strict require path runs and output matches."""
+    """A stored generation may never contain a missing-file placeholder."""
     _config, _storage, runner, judge = _seeded_review_fixture(
-        tmp_path, monkeypatch, "run-evict"
+        tmp_path, monkeypatch, "run-signature-invariant"
+    )
+    job = _runnable_job(runner, "final")
+    runner.run(job, judge)
+
+    cached = runner._validated_review_contexts[job.job_id()]
+    assert cached.file_signatures
+    for path, signature in cached.file_signatures:
+        assert isinstance(signature, _FileSignature), signature
+        assert signature is not None
+        assert path.is_file(), path
+
+def test_missing_file_at_capture_is_never_cached(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file that vanished during capture disables the cache, not semantics."""
+    _config, _storage, runner, judge = _seeded_review_fixture(
+        tmp_path, monkeypatch, "run-capture-race"
+    )
+    job = _runnable_job(runner, "final")
+    anchor_path = runner._review_input_path(SHARD, "clip-1", "e2", "final")
+
+    real_build = runner._build_validated_context
+
+    def racing(*args: Any, **kwargs: Any) -> Any:
+        # The strict require has already succeeded; the frozen anchor disappears
+        # before the signatures are captured.
+        anchor_path.unlink()
+        return real_build(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "_build_validated_context", racing)
+
+    def no_finalize(job: Any, result: Any) -> Any:
+        return ()
+
+    _epoch_scheduler(
+        runner, _SerialQwenExecutor(runner, judge), no_finalize
+    ).run([job])
+
+    assert len(judge.calls) == 1, "the model call still proceeded"
+    assert job.job_id() not in runner._validated_review_contexts, (
+        "an incomplete generation must never be cached"
+    )
+    assert runner.review_context_counters["review_context_capture_miss"] == 1
+    monkeypatch.setattr(runner, "_build_validated_context", real_build)
+    committed = runner.ledger.load_committed_result(job)
+    assert committed is not None
+    seen = _review_derivation_guards(monkeypatch, runner)
+    with pytest.raises(
+        (ReferenceIntegrityDurableError, ReferenceIntegrityEpochError)
+    ):
+        runner.finalize(job, committed)
+    assert seen["requires"], "the strict require path must actually run"
+    assert not anchor_path.exists(), "the missing input must not be recreated"
+
+
+def test_real_eviction_falls_back_to_the_strict_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real eviction only costs CPU: the strict require path runs instead."""
+    _config, _storage, runner, judge = _seeded_review_fixture(
+        tmp_path, monkeypatch, "run-real-evict"
     )
     monkeypatch.setattr(runner, "_review_context_limit", 1)
 
-    def record_only(job: Any, result: Any) -> Any:
+    def no_finalize(job: Any, result: Any) -> Any:
         return ()
 
     jobs = runner.seed_jobs()
-    _epoch_scheduler(runner, _SerialQwenExecutor(runner, judge), record_only).run(jobs)
+    _epoch_scheduler(
+        runner, _SerialQwenExecutor(runner, judge), no_finalize
+    ).run(jobs)
+    first = jobs[0]
     assert runner.review_context_counters["review_context_cache_store"] == 1
 
-    # A second job for another entity evicts the first entry.
-    runner._validated_review_contexts.clear()
+    # A second, independent job context evicts the first.
+    second = ModelJob.create(
+        job_type=first.job_type,
+        resource=first.resource,
+        canonical_shard=first.canonical_shard,
+        clip_uid=first.clip_uid,
+        semantic_inputs={"probe": "eviction"},
+        model_identity=first.model_identity,
+        target=dict(first.target),
+    )
+    cached = runner._validated_review_contexts[first.job_id()]
+    runner._remember_validated_context(
+        replace(cached, job_id=second.job_id())
+    )
+
+    assert runner.review_context_counters["review_context_cache_eviction"] == 1
+    assert first.job_id() not in runner._validated_review_contexts
+
     runner.review_context_counters["review_context_cache_hit"] = 0
-    job = jobs[0]
-    committed = runner.ledger.load_committed_result(job)
+    seen = _review_derivation_guards(monkeypatch, runner)
+    committed = runner.ledger.load_committed_result(first)
+    runner.finalize(first, committed)
 
-    runner.finalize(job, committed)
-
-    # The cache was bypassed, so the strict path ran; only CPU cost changed.
     assert runner.review_context_counters["review_context_cache_hit"] == 0
-    assert runner.review_context_counters["review_context_cache_miss"] == 1
+    assert seen["requires"], "an evicted context must replay strictly"
     assert runner._entity_outcome_path(SHARD, "clip-1", "e2").is_file()
 
 

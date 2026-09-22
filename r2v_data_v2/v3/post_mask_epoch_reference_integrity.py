@@ -551,6 +551,7 @@ class ReferenceIntegrityEpochRunner:
             "review_context_cache_store": 0,
             "review_context_cache_eviction": 0,
             "review_context_signature_miss": 0,
+            "review_context_capture_miss": 0,
         }
         self.plan_counters: dict[str, int] = {
             "plan_full_validation_count": 0,
@@ -944,12 +945,17 @@ class ReferenceIntegrityEpochRunner:
         storage: RunStorage,
         anchor: Mapping[str, Any],
         derived: _DerivedReviewInput,
-    ) -> list[tuple[Path, _FileSignature]]:
+    ) -> tuple[tuple[Path, _FileSignature], ...] | None:
         """Sign every artifact one validated review chain depends on.
 
         The paths come from the strict derivation ``run()`` just performed, so no
         durable schema is touched: the anchor JSON, the derived Qwen context PNG,
         the reference image and the source frame it was built from.
+
+        Returns ``None`` if any of them cannot be signed. A generation with a
+        missing file is not a validated generation, so it must never become a
+        cache entry: recording ``(path, None)`` would let a later ``None == None``
+        comparison turn a vanished frozen input into a cache hit.
         """
         paths = [
             self._review_input_path(
@@ -962,7 +968,13 @@ class ReferenceIntegrityEpochRunner:
             _resolve_run_artifact(storage, str(anchor["final_reference_path"])),
             derived.source_frame_path,
         ]
-        return [(path, self._file_signature(path)) for path in paths]
+        collected: list[tuple[Path, _FileSignature]] = []
+        for path in paths:
+            signature = self._file_signature(path)
+            if signature is None:
+                return None
+            collected.append((path, signature))
+        return tuple(collected)
 
     def _build_validated_context(
         self,
@@ -981,17 +993,25 @@ class ReferenceIntegrityEpochRunner:
         current_job: ModelJob,
         current_derived: _DerivedReviewInput,
         plan_entry: Mapping[str, Any],
-    ) -> _ValidatedReviewJobContext:
-        """Freeze the chain run() just strictly validated, with its signatures."""
+    ) -> _ValidatedReviewJobContext | None:
+        """Freeze the chain run() just strictly validated, with its signatures.
+
+        Returns ``None`` when any required file could not be signed: strict
+        validation already succeeded, so this is never an error - the model call
+        can still proceed, and the optimization is simply disabled for this job.
+        """
         signatures: list[tuple[Path, _FileSignature]] = []
-        signatures.extend(
-            self._review_chain_signatures(shard, storage, main_anchor, main_derived)
-        )
-        signatures.extend(
-            self._review_chain_signatures(
-                shard, storage, current_anchor, current_derived
-            )
-        )
+        # For the main variant the current chain IS the main chain, so it is
+        # signed once rather than twice.
+        chains = [(main_anchor, main_derived)]
+        if current_derived is not main_derived:
+            chains.append((current_anchor, current_derived))
+        for anchor, derived in chains:
+            chain = self._review_chain_signatures(shard, storage, anchor, derived)
+            if chain is None:
+                self._bump_review_context_counter("review_context_capture_miss")
+                return None
+            signatures.extend(chain)
         return _ValidatedReviewJobContext(
             job_id=job.job_id(),
             shard=shard,
@@ -1043,6 +1063,10 @@ class ReferenceIntegrityEpochRunner:
             self._bump_review_context_counter("review_context_cache_miss")
             return None
         for path, signature in cached.file_signatures:
+            if signature is None:
+                # Defensive: an incomplete generation must never be a hit.
+                self._bump_review_context_counter("review_context_signature_miss")
+                return None
             if self._file_signature(path) != signature:
                 self._bump_review_context_counter("review_context_signature_miss")
                 return None
@@ -2561,7 +2585,8 @@ class ReferenceIntegrityEpochRunner:
             )
         except ReferenceIntegrityJudgeFailure as exc:
             # A judge-failed receipt is still a legitimate committed result.
-            self._remember_validated_context(prepared_context)
+            if prepared_context is not None:
+                self._remember_validated_context(prepared_context)
             return JobResult(
                 OUTCOME_COMPLETED,
                 payload={
@@ -2574,7 +2599,8 @@ class ReferenceIntegrityEpochRunner:
         finally:
             if resolved.owned:
                 resolved.judge.close()
-        self._remember_validated_context(prepared_context)
+        if prepared_context is not None:
+            self._remember_validated_context(prepared_context)
         return JobResult(
             OUTCOME_COMPLETED,
             payload={
