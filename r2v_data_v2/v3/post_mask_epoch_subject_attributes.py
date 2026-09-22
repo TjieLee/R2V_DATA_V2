@@ -3788,14 +3788,22 @@ class SubjectAttributeEpochRunner:
                 shard, storage, clip_uid, owner_entity_id, owner_plan, outcome
             )
             return self._advance_clip(shard, storage, clip_uid)
-        result = self._owner_artifact_from_receipts(
-            shard, storage, clip_uid, owner_plan, context["states"]
-        )
         graph = self._owner_graph(
             shard, storage, clip_uid, owner_plan, context
         )
         self._publish_owner_markers(
             shard, storage, clip_uid, owner_plan, graph
+        )
+        # The owner graph already knows every independent model call this owner
+        # owes, so hand all of them to the pool at once instead of letting the
+        # legacy replay abort on the first one it reaches. The replay is only run
+        # once the graph owes nothing, which is when it can produce the final
+        # owner artifact without aborting.
+        owed = self._owner_owed_jobs(graph)
+        if owed:
+            return owed
+        result = self._owner_artifact_from_receipts(
+            shard, storage, clip_uid, owner_plan, context["states"]
         )
         if isinstance(result, _PendingModelCall):
             return [result.job]
@@ -4915,6 +4923,40 @@ class SubjectAttributeEpochRunner:
             "chains1": chains1,
             "bbox": bbox,
         }
+
+    def _owner_owed_jobs(self, graph: Mapping[str, Any]) -> list[ModelJob]:
+        """Every independent model job this owner's graph currently owes.
+
+        Inside one attribute the completion chain is a real dependency chain, so
+        only ``chain.next_job`` is reported - the single next stage that the
+        stage's own receipts unlock. Across attributes there is no dependency, so
+        all of them are returned together instead of one at a time.
+
+        Rank order is preserved: rank-1 work is only reported once every rank-0
+        chain has settled, and a rank-1 completion only once the rank-1 review
+        that routes it has committed. A last-resort bbox review is deliberately
+        left to the legacy replay, because its job identity is bound to the
+        owner-context and bbox crop SHAs that the replay derives in context.
+        """
+        rank0 = [
+            chain.next_job
+            for chain in graph["chains0"].values()
+            if chain.next_job is not None
+        ]
+        if rank0:
+            return sorted(rank0, key=lambda job: job.job_id())
+        rank1_review = graph.get("rank1_job")
+        if (
+            rank1_review is not None
+            and self._committed_payload_or_none(rank1_review) is None
+        ):
+            return [rank1_review]
+        rank1 = [
+            chain.next_job
+            for chain in graph["chains1"].values()
+            if chain.next_job is not None
+        ]
+        return sorted(rank1, key=lambda job: job.job_id())
 
     def _publish_owner_markers(
         self,

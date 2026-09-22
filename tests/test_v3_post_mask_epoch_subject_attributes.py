@@ -15,7 +15,7 @@ import io
 import itertools
 import json
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -37,6 +37,7 @@ from r2v_data_v2.v3.post_mask_epoch_scheduler import (
 )
 from r2v_data_v2.v3.post_mask_epoch_state import GroupLedger
 from r2v_data_v2.v3.post_mask_epoch_subject_attributes import (
+    SUBJECT_ATTRIBUTE_COMPLETION_GENERATE_JOB,
     SUBJECT_ATTRIBUTE_DISCOVERY_JOB,
     SUBJECT_ATTRIBUTE_RAW_REVIEW_JOB,
     SUBJECT_ATTRIBUTE_SAM_PROBE_JOB,
@@ -3158,3 +3159,94 @@ def test_same_prompt_attributes_keep_their_own_probe_order(
     assert fresh.reconcile_stats(SHARD).to_dict() == runner.reconcile_stats(
         SHARD
     ).to_dict()
+
+
+def test_two_independent_completion_attributes_are_seeded_together(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two attributes that each need completion are handed to the pool at once.
+
+    Both attributes are rank-0, both are routed to completion, and neither
+    depends on the other's outcome, so the owner graph owes two Boogu
+    generations and returns them as one batch rather than one per round trip.
+    """
+    monkeypatch.setattr(time, "perf_counter", lambda: 1.0)
+    attributes = (
+        ("upper_clothing", "a denim jacket", "jacket over the torso"),
+        ("accessory", "a leather belt", "belt around the waist"),
+    )
+    config, storage = _storage_variant(tmp_path, monkeypatch, "run-two-completion")
+    _add_owner_frame(storage, slot=1)
+    _add_owner_frame(storage, slot=2)
+    config = _completion_config(config)
+    runner = _runner(config, storage, tmp_path)
+    # The two attribute masks must differ in pixels, or legacy reports a
+    # duplicate conflict instead of routing either one to completion.
+    by_prompt = {
+        attributes[0][2]: [
+            _attribute_mask(storage, slot=1, band=0),
+            _attribute_mask(storage, slot=0, band=0),
+        ],
+        attributes[1][2]: [
+            _attribute_mask(storage, slot=2, band=1),
+        ],
+    }
+    qwen = _QwenClient(
+        discoveries=[_human_discovery(attributes=attributes)],
+        reviews=[
+            SubjectAttributeReviewBatch(
+                owner_entity_id=OWNER,
+                reviews=[
+                    _raw_review(
+                        "a1", structure_complete=False, completion_recommended=True
+                    ),
+                    _raw_review(
+                        "a2", structure_complete=False, completion_recommended=True
+                    ),
+                ],
+            )
+        ],
+        completion_reviews=[
+            _completion_review("accept"),
+            _completion_review("accept"),
+        ],
+    )
+    sam = _SamBackend(by_prompt=by_prompt, generated=[by_prompt[attributes[0][2]][:1]])
+    boogu = _BooguBackend(_generated_png())
+
+    # Record every batch of jobs the finalizer unlocks, so "seeded together" is
+    # observed rather than inferred from totals.
+    batches: list[list[str]] = []
+    real_finalize = runner.finalize
+
+    def recording(job: Any, result: Any) -> Sequence[Any]:
+        unlocked = list(real_finalize(job, result))
+        if unlocked:
+            batches.append(sorted(item.job_type for item in unlocked))
+        return unlocked
+
+    runner.finalize = recording  # type: ignore[method-assign]
+    _scheduler(
+        runner,
+        _SerialQwenExecutor(runner, qwen),
+        runner.finalize,
+        _SerialQwenExecutor(runner, sam),
+        _SerialQwenExecutor(runner, boogu),
+    ).run(runner.seed_jobs())
+
+    assert boogu.calls == 2, "both attributes completed"
+    assert runner.seed_jobs() == []
+    generates = [
+        batch
+        for batch in batches
+        if batch.count(SUBJECT_ATTRIBUTE_COMPLETION_GENERATE_JOB) == 2
+    ]
+    assert generates, f"the two generations were not seeded together: {batches}"
+
+    # Owner and attribute identity are untouched by the wider seeding.
+    marker = _raw_state_marker(runner)
+    assert [item["attribute_id"] for item in marker["attributes"]] == ["a1", "a2"]
+    artifact = OwnerEnrichmentArtifact.model_validate_json(
+        _owner_artifact_file(storage).read_text(encoding="utf-8")
+    )
+    assert [record.attribute_id for record in artifact.records] == ["a1", "a2"]
