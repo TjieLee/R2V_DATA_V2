@@ -22,6 +22,7 @@ from r2v_data_v2.h3.mimo25_av_reconcile import MimoCaseManifest
 from r2v_data_v2.h3.sam_audio_stem_shadow import (
     _publish_directory,
     _read_jsonl,
+    dependency_fingerprint,
     _write_json,
     _write_jsonl,
     sha256_file,
@@ -180,7 +181,9 @@ def auk_configuration(
             "vae_path": str(vae),
             "qwen_path": str(qwen_path),
             "dependency_files": {
-                str(p): sha256_file(_local_file(p) if p in source_files else _file(p))
+                str(p): dependency_fingerprint(
+                    _local_file(p) if p in source_files else _file(p)
+                )
                 for p in sorted(set(dependencies))
             },
             "worker_sha256": sha256_file(worker_path()),
