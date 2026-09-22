@@ -28,9 +28,10 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
+from queue import Empty, Queue
 from typing import Any, Protocol
 
 from r2v_data_v2.v3.post_mask_epoch_jobs import (
@@ -43,6 +44,7 @@ from r2v_data_v2.v3.post_mask_epoch_scheduler import (
     BatchJobExecutor,
     JobExecution,
     JobResult,
+    ResourceJobExecutor,
 )
 
 
@@ -671,28 +673,49 @@ def build_sam_epoch(
 
 
 class SerialBatchExecutor:
-    """Run a batch one job at a time. Useful for tests and CPU-only paths."""
+    """Run one job at a time. Useful for tests and CPU-only paths."""
 
     def __init__(self, runner: Callable[[Any, Any], JobResult], handle: Any = None):
         self.runner = runner
         self.handle = handle
+        self._queued: list[Any] = []
+
+    def capacity(self) -> int:
+        return 1
+
+    def submit(self, job: Any) -> None:
+        self._queued.append(job)
+
+    def collect(self) -> list[JobExecution]:
+        if not self._queued:
+            return []
+        job, self._queued = self._queued[0], self._queued[1:]
+        try:
+            return [JobExecution(job, self.runner(job, self.handle), None)]
+        except Exception as exc:  # noqa: BLE001 - isolate per job
+            return [JobExecution(job, None, exc)]
+
+    def close(self) -> None:
+        self._queued = []
 
     def execute_batch(
         self, jobs: Sequence[Any]
     ) -> Mapping[str, JobExecution]:
         results: dict[str, JobExecution] = {}
         for job in sorted(jobs, key=job_order_key):
-            try:
-                results[job.job_id()] = JobExecution(
-                    job, self.runner(job, self.handle), None
-                )
-            except Exception as exc:  # noqa: BLE001 - isolate per job
-                results[job.job_id()] = JobExecution(job, None, exc)
+            self.submit(job)
+            for execution in self.collect():
+                results[execution.job.job_id()] = execution
         return results
 
 
 class QwenConcurrentExecutor:
-    """Send many requests at once to the single TP1 x DP8 vLLM endpoint."""
+    """Keep up to ``max_inflight`` requests live on the TP1 x DP8 endpoint.
+
+    A slot that comes back is refilled immediately: the scheduler is told about
+    each completion as it lands instead of waiting for the whole batch, so the
+    vLLM server is never sitting idle behind one slow request.
+    """
 
     def __init__(
         self,
@@ -706,31 +729,67 @@ class QwenConcurrentExecutor:
         self.runner = runner
         self.endpoint = endpoint
         self.max_inflight = max_inflight
+        self._pool: ThreadPoolExecutor | None = None
+        self._inflight: dict[Any, Any] = {}
+
+    def capacity(self) -> int:
+        return self.max_inflight
+
+    def submit(self, job: Any) -> None:
+        if self._pool is None:
+            self._pool = ThreadPoolExecutor(max_workers=self.max_inflight)
+        self._inflight[self._pool.submit(self.runner, job, self.endpoint)] = job
+
+    def collect(self) -> list[JobExecution]:
+        if not self._inflight:
+            return []
+        done, _ = wait(list(self._inflight), return_when=FIRST_COMPLETED)
+        settled = sorted(
+            ((self._inflight.pop(future), future) for future in done),
+            key=lambda pair: job_order_key(pair[0]),
+        )
+        executions: list[JobExecution] = []
+        for job, future in settled:
+            try:
+                result = future.result()
+            except Exception as exc:  # noqa: BLE001 - isolate per job
+                executions.append(JobExecution(job, None, exc))
+            else:
+                executions.append(JobExecution(job, result, None))
+        return executions
+
+    def close(self) -> None:
+        pool, self._pool = self._pool, None
+        self._inflight.clear()
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
 
     def execute_batch(self, jobs: Sequence[Any]) -> Mapping[str, JobExecution]:
-        ordered = sorted(jobs, key=job_order_key)
         results: dict[str, JobExecution] = {}
-        if not ordered:
-            return results
-        workers = min(self.max_inflight, len(ordered))
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {
-                pool.submit(self.runner, job, self.endpoint): job for job in ordered
-            }
-            for future, job in futures.items():
-                try:
-                    results[job.job_id()] = JobExecution(job, future.result(), None)
-                except Exception as exc:  # noqa: BLE001 - isolate per job
-                    results[job.job_id()] = JobExecution(job, None, exc)
+        for job in sorted(jobs, key=job_order_key):
+            self.submit(job)
+        while self._inflight:
+            for execution in self.collect():
+                results[execution.job.job_id()] = execution
+        self.close()
         return results
 
 
-class WorkerSlotExecutor:
-    """Run one sequential queue per GPU slot, with all slots concurrent.
+@dataclass(frozen=True)
+class _SlotAbort:
+    """A control-flow exception from a slot thread, never a per-job failure."""
 
-    Placement is execution-only: jobs are round-robined across slots in
-    deterministic order, so a batch never skews onto one GPU, and a slot is
-    never asked to run two jobs at once.
+    exception: BaseException
+
+
+class WorkerSlotExecutor:
+    """One persistent worker per GPU slot, each pulling from its own queue.
+
+    A slot that finishes its job immediately takes the next job queued for it,
+    without waiting for the other slots' queues to drain. Placement stays exactly
+    as before - round-robin in submission order, so work never skews onto one GPU
+    - and is still execution-only: a slot never runs two jobs at once, and the
+    handle the runner receives is the live backend of the slot executing it.
     """
 
     def __init__(
@@ -745,52 +804,104 @@ class WorkerSlotExecutor:
         self.runner = runner
         self.slot_count = slot_count
         self.resource = resource
+        self._queues: list[Queue] = [Queue() for _ in range(slot_count)]
+        self._events: Queue = Queue()
+        self._next_slot = 0
+        self._threads: list[threading.Thread] = []
+        self._lock = threading.Lock()
 
-    def execute_batch(self, jobs: Sequence[Any]) -> Mapping[str, JobExecution]:
-        ordered = sorted(jobs, key=job_order_key)
-        slots: list[list[Any]] = [[] for _ in range(self.slot_count)]
-        for index, job in enumerate(ordered):
-            slots[index % self.slot_count].append(job)
-        results: dict[str, JobExecution] = {}
-        lock = threading.Lock()
-        #: Control-flow exceptions (SystemExit, KeyboardInterrupt) are never
-        #: recorded as a per-job failure; they are re-raised on the caller's
-        #: thread once every slot has settled.
+    def capacity(self) -> int:
+        return self.slot_count
+
+    def submit(self, job: Any) -> None:
+        self._start_slots()
+        queue = self._queues[self._next_slot % self.slot_count]
+        self._next_slot += 1
+        queue.put(job)
+
+    def _start_slots(self) -> None:
+        with self._lock:
+            if self._threads:
+                return
+            for slot_id in range(self.slot_count):
+                thread = threading.Thread(
+                    target=self._run_slot, args=(slot_id,), daemon=True
+                )
+                thread.start()
+                self._threads.append(thread)
+
+    def _handle_for(self, slot_id: int) -> Any:
+        # The runner receives the live backend, never a GPU slot id.
+        if self.resource is None:
+            return slot_id
+        return self.resource.handle_for_slot(slot_id)
+
+    def _run_slot(self, slot_id: int) -> None:
+        queue = self._queues[slot_id]
+        try:
+            while True:
+                job = queue.get()
+                if job is None:  # shutdown sentinel
+                    return
+                try:
+                    result = self.runner(job, self._handle_for(slot_id))
+                except Exception as exc:  # noqa: BLE001 - isolate per job
+                    self._events.put(JobExecution(job, None, exc))
+                else:
+                    self._events.put(JobExecution(job, result, None))
+        except BaseException as exc:  # re-raised on the caller's thread
+            self._events.put(_SlotAbort(exc))
+            raise
+
+    def collect(self) -> list[JobExecution]:
+        if not self._threads:
+            return []
+        executions: list[JobExecution] = []
         fatal: list[BaseException] = []
-
-        def run_slot(slot_id: int, queued: list[Any]) -> None:
+        # Block for the first event, then take anything else already settled.
+        self._absorb(self._events.get(), executions, fatal)
+        while True:
             try:
-                for job in queued:
-                    # The runner receives the live backend, never a GPU slot id.
-                    handle = (
-                        self.resource.handle_for_slot(slot_id)
-                        if self.resource is not None
-                        else slot_id
-                    )
-                    try:
-                        result = self.runner(job, handle)
-                    except Exception as exc:  # noqa: BLE001 - isolate per job
-                        with lock:
-                            results[job.job_id()] = JobExecution(job, None, exc)
-                    else:
-                        with lock:
-                            results[job.job_id()] = JobExecution(job, result, None)
-            except BaseException as exc:  # re-raised on the caller's thread
-                with lock:
-                    fatal.append(exc)
-                raise
-
-        threads = [
-            threading.Thread(target=run_slot, args=(slot_id, queued), daemon=True)
-            for slot_id, queued in enumerate(slots)
-            if queued
-        ]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join()
+                self._absorb(self._events.get_nowait(), executions, fatal)
+            except Empty:
+                break
         if fatal:
             raise fatal[0]
+        executions.sort(key=lambda execution: job_order_key(execution.job))
+        return executions
+
+    @staticmethod
+    def _absorb(
+        event: Any,
+        executions: list[JobExecution],
+        fatal: list[BaseException],
+    ) -> None:
+        if isinstance(event, _SlotAbort):
+            fatal.append(event.exception)
+        else:
+            executions.append(event)
+
+    def close(self) -> None:
+        with self._lock:
+            threads, self._threads = self._threads, []
+        if not threads:
+            return
+        for queue in self._queues:
+            queue.put(None)
+        for thread in threads:
+            thread.join(timeout=5.0)
+
+    def execute_batch(self, jobs: Sequence[Any]) -> Mapping[str, JobExecution]:
+        results: dict[str, JobExecution] = {}
+        remaining = 0
+        for job in sorted(jobs, key=job_order_key):
+            self.submit(job)
+            remaining += 1
+        while remaining:
+            for execution in self.collect():
+                results[execution.job.job_id()] = execution
+                remaining -= 1
+        self.close()
         return results
 
 
@@ -809,7 +920,9 @@ class ResourceEpochManager:
 
     def __init__(
         self,
-        factories: Mapping[str, Callable[[], tuple[EpochResource, BatchJobExecutor]]],
+        factories: Mapping[
+            str, Callable[[], tuple[EpochResource, ResourceJobExecutor]]
+        ],
     ) -> None:
         unknown = set(factories) - {RESOURCE_QWEN, RESOURCE_BOOGU, RESOURCE_SAM}
         if unknown:

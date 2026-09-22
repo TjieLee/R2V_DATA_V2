@@ -85,6 +85,82 @@ class BatchJobExecutor(Protocol):
     ) -> Mapping[str, JobExecution]: ...
 
 
+class ResourceJobExecutor(Protocol):
+    """Run jobs of one resource and hand each completion back as it lands.
+
+    This is the protocol the scheduler actually drives. An executor that submits
+    a whole batch and only reports back once every job settled forces every
+    dependent job to wait for the slowest sibling, so a resource epoch stalls
+    even while the model service is idle. Completion-driven executors instead
+    take work up to a capacity and report completions incrementally, so the
+    scheduler can publish, commit and finalize one job and immediately refill
+    the slot it just freed.
+    """
+
+    def capacity(self) -> int:
+        """Jobs allowed in flight at once. ``<= 0`` means unbounded."""
+
+    def submit(self, job: ModelJob) -> None:
+        """Start one job, without waiting for any other job."""
+
+    def collect(self) -> list[JobExecution]:
+        """Block until at least one in-flight job settles, then return them all.
+
+        Returns an empty list when nothing is in flight.
+        """
+
+    def close(self) -> None:
+        """Release threads or connections this executor owns. Idempotent."""
+
+
+class BatchExecutorAdapter:
+    """Drive a legacy ``execute_batch`` executor through the streaming protocol.
+
+    The adapter has a bounded capacity, so the scheduler hands over at most
+    ``window_size`` jobs and then waits for that batch, which is exactly the
+    pre-streaming bounded-window behaviour. That is still the right answer for an
+    executor with no incremental capability, and it lets a plain callable or test
+    fake keep working unchanged while the scheduler only ever speaks one
+    protocol.
+    """
+
+    def __init__(self, executor: Any, *, window_size: int) -> None:
+        self._executor = executor
+        self._window_size = max(1, int(window_size))
+        self._queued: list[ModelJob] = []
+
+    def capacity(self) -> int:
+        return self._window_size
+
+    def submit(self, job: ModelJob) -> None:
+        self._queued.append(job)
+
+    def collect(self) -> list[JobExecution]:
+        if not self._queued:
+            return []
+        batch, self._queued = self._queued, []
+        executions = self._executor.execute_batch(batch) or {}
+        return [
+            executions.get(job.job_id()) or JobExecution(job, None, None)
+            for job in batch
+        ]
+
+    def close(self) -> None:
+        self._queued = []
+
+
+def as_job_executor(executor: Any, *, window_size: int) -> ResourceJobExecutor:
+    """View an executor through the streaming protocol.
+
+    A real completion-driven executor is used as-is. Anything else is wrapped
+    once: the adapter *is* the bounded-batch behaviour expressed in the streaming
+    protocol, so the scheduler never has two execution paths.
+    """
+    if hasattr(executor, "submit") and hasattr(executor, "collect"):
+        return executor
+    return BatchExecutorAdapter(executor, window_size=window_size)
+
+
 class SchedulerError(RuntimeError):
     """Raised when durable state is unsafe to continue from."""
 
@@ -234,33 +310,19 @@ class ResourceEpochScheduler:
                 if current is not None and resource != current:
                     self.diagnostics.resource_switches += 1
                 current = resource
-                executor = self._executor_for(resource)
+                executor = as_job_executor(
+                    self._executor_for(resource), window_size=self.window_size
+                )
                 counters = self.diagnostics.resource(resource)
                 counters["epoch_count"] += 1
+                self.diagnostics.phase_count += 1
                 epoch_started = time.perf_counter()
-                epochs_progressed = False
-
-                # Fixed point: keep this resource loaded while it has work.
-                while round_index < self.max_rounds:
-                    batch = sorted(
-                        (
-                            job
-                            for job in self._ready(pending, resolved, attempted, finalize_attempted)
-                            if job.resource == resource
-                        ),
-                        key=job_order_key,
-                    )
-                    if not batch:
-                        break
-                    phase_id = f"r{round_index:03d}-{resource}"
-                    phase = self.ledger.phase(phase_id)
-                    phase.write_plan(batch)
-                    self.diagnostics.phase_count += 1
-                    before = (len(resolved), len(attempted), len(pending))
-                    self._drain_phase(
+                phase_id = f"r{round_index:03d}-{resource}"
+                try:
+                    epochs_progressed = self._drain_resource(
                         phase_id,
-                        phase,
-                        batch,
+                        self.ledger.phase(phase_id),
+                        resource,
                         executor,
                         counters,
                         pending,
@@ -268,13 +330,10 @@ class ResourceEpochScheduler:
                         attempted,
                         finalize_attempted,
                     )
-                    after = (len(resolved), len(attempted), len(pending))
-                    round_index += 1
-                    if before == after:
-                        break
-                    epochs_progressed = True
-
+                finally:
+                    executor.close()
                 counters["epoch_wall_seconds"] += time.perf_counter() - epoch_started
+                round_index += 1
                 if not epochs_progressed:
                     break
         finally:
@@ -317,26 +376,127 @@ class ResourceEpochScheduler:
             and key not in finalize_attempted
         ]
 
-    def _drain_phase(
+    def _drain_resource(
         self,
         phase_id: str,
         phase: Any,
-        batch: Sequence[ModelJob],
-        executor: BatchJobExecutor,
+        resource: str,
+        executor: ResourceJobExecutor,
         counters: dict[str, Any],
         pending: dict[str, ModelJob],
         resolved: set[str],
         attempted: set[str],
         finalize_attempted: set[str],
-    ) -> None:
-        for start in range(0, len(batch), self.window_size):
-            chunk = batch[start : start + self.window_size]
-            self.diagnostics.window_count += 1
-            to_execute: list[ModelJob] = []
+    ) -> bool:
+        """Run one resource to its completion-driven fixed point.
 
-            # Skip durable work first, but never skip its finalizer.
-            for job in chunk:
+        The resource stays loaded and keeps receiving work for as long as it has
+        either an in-flight job or a ready job. Each time a job settles the
+        scheduler settles its durable state on this thread - publish artifact,
+        publish result, commit receipt, finalize - and only then refills, so a
+        job unlocked by that finalizer can enter the very slot that just freed
+        up instead of waiting for the slowest sibling in the batch.
+
+        Jobs of any *other* resource unlocked here stay in ``pending``: they do
+        not switch the resource. The resource is exited only once it is genuinely
+        quiescent, which is what keeps a Qwen -> Boogu -> Qwen pattern from
+        thrashing the loaded model.
+        """
+        inflight: dict[str, ModelJob] = {}
+        planned: list[ModelJob] = []
+        progressed = False
+        while True:
+            before = (len(resolved), len(attempted), len(pending))
+            self._refill(
+                resource,
+                executor,
+                counters,
+                phase,
+                planned,
+                inflight,
+                pending,
+                resolved,
+                attempted,
+                finalize_attempted,
+            )
+            if not inflight:
+                # Nothing running and nothing ready: this resource is done. A
+                # refill that only replayed durable finalizers still counts as
+                # progress, because it can unlock work for the next resource.
+                progressed = progressed or (
+                    len(resolved),
+                    len(attempted),
+                    len(pending),
+                ) != before
+                break
+            self.diagnostics.window_count += 1
+            completions = executor.collect()
+            if not completions and inflight:
+                # ``collect`` promises to block until something settles. Anything
+                # else would spin here forever on work that can never finish.
+                raise SchedulerError(
+                    f"{resource} executor returned no completion while "
+                    f"{len(inflight)} job(s) are still in flight"
+                )
+            for execution in completions:
+                inflight.pop(execution.job.job_id(), None)
+                self._settle(
+                    phase_id,
+                    phase,
+                    counters,
+                    execution,
+                    pending,
+                    resolved,
+                    attempted,
+                    finalize_attempted,
+                )
+            after = (len(resolved), len(attempted), len(pending))
+            if before != after:
+                progressed = True
+        return progressed
+
+    def _refill(
+        self,
+        resource: str,
+        executor: ResourceJobExecutor,
+        counters: dict[str, Any],
+        phase: Any,
+        planned: list[ModelJob],
+        inflight: dict[str, ModelJob],
+        pending: dict[str, ModelJob],
+        resolved: set[str],
+        attempted: set[str],
+        finalize_attempted: set[str],
+    ) -> None:
+        """Top up in-flight work for one resource from its ready set.
+
+        A job with a durable receipt is skipped here but still has its finalizer
+        replayed, which can unlock further ready jobs, so the ready set is
+        recomputed while capacity remains.
+        """
+        capacity = executor.capacity()
+        while True:
+            if capacity > 0 and len(inflight) >= capacity:
+                return
+            ready = sorted(
+                (
+                    job
+                    for job in self._ready(
+                        pending, resolved, attempted, finalize_attempted
+                    )
+                    if job.resource == resource and job.job_id() not in inflight
+                ),
+                key=job_order_key,
+            )
+            if not ready:
+                return
+            handled = 0
+            for job in ready:
+                if capacity > 0 and len(inflight) >= capacity:
+                    return
+                handled += 1
                 counters["jobs_planned"] += 1
+                planned.append(job)
                 state: JobState = self.ledger.classify(job)
                 if state.state == STATE_MISMATCH:
                     raise SchedulerError(
@@ -351,57 +511,69 @@ class ResourceEpochScheduler:
                     continue
                 if state.state == "rerun_no_receipt":
                     self.diagnostics.resume["jobs_rerun_after_incomplete_commit"] += 1
-                to_execute.append(job)
-
-            executions: Mapping[str, JobExecution] = (
-                executor.execute_batch(to_execute) if to_execute else {}
-            )
-
-            # Durable publication and finalization stay on this thread.
-            for job in to_execute:
-                counters["jobs_executed"] += 1
                 attempted.add(job.job_id())
-                if job.job_type in self.diagnostics.conditional_attempts:
-                    self.diagnostics.conditional_attempts[job.job_type] += 1
-                execution = executions.get(job.job_id())
-                if execution is None or (
-                    execution.exception is None and execution.result is None
-                ):
-                    counters["jobs_retryable_failed"] += 1
-                    continue
-                if execution.exception is not None:
-                    counters["jobs_retryable_failed"] += 1
-                    continue
-                result = execution.result
-                assert result is not None
-                if result.committed:
-                    digests: dict[str, str] = {}
-                    for name, payload in sorted(result.artifacts.items()):
-                        digests[name] = phase.publish_artifact(
-                            job.job_id(), name, payload
-                        )
-                        self.ledger.note_artifact(phase_id, job.job_id())
-                    # ``result.json`` is bound by ``result_digest`` alone. Also
-                    # listing it as an artifact digest made every resume hash the
-                    # same file twice and forced a directory walk for jobs whose
-                    # only committed artifact is the result.
-                    result_digest = phase.publish_result(job, result)
-                    receipt = phase.commit(
-                        job,
-                        outcome=result.outcome,
-                        artifact_digests=digests,
-                        result_digest=result_digest,
-                        external_artifacts=result.external_artifacts,
-                    )
-                    self.ledger.note_commit(phase_id, receipt)
-                    if result.outcome == OUTCOME_TERMINAL_REJECT:
-                        counters["jobs_terminal_rejected"] += 1
-                else:
-                    counters["jobs_retryable_failed"] += 1
-                if result.committed:
-                    self._finalize(
-                        job, result, pending, resolved, finalize_attempted
-                    )
+                inflight[job.job_id()] = job
+                executor.submit(job)
+            if planned:
+                phase.write_plan(planned)
+            if not handled:
+                return
+
+    def _settle(
+        self,
+        phase_id: str,
+        phase: Any,
+        counters: dict[str, Any],
+        execution: JobExecution,
+        pending: dict[str, ModelJob],
+        resolved: set[str],
+        attempted: set[str],
+        finalize_attempted: set[str],
+    ) -> None:
+        """Publish, commit and finalize one settled job on the scheduler thread.
+
+        Durable state is never touched by the worker: the executor only reports
+        the outcome, and every artifact, receipt, pending-map mutation and
+        finalizer call happens here.
+        """
+        job = execution.job
+        counters["jobs_executed"] += 1
+        if job.job_type in self.diagnostics.conditional_attempts:
+            self.diagnostics.conditional_attempts[job.job_type] += 1
+        if execution is None or (
+            execution.exception is None and execution.result is None
+        ):
+            counters["jobs_retryable_failed"] += 1
+            return
+        if execution.exception is not None:
+            counters["jobs_retryable_failed"] += 1
+            return
+        result = execution.result
+        assert result is not None
+        if result.committed:
+            digests: dict[str, str] = {}
+            for name, payload in sorted(result.artifacts.items()):
+                digests[name] = phase.publish_artifact(job.job_id(), name, payload)
+                self.ledger.note_artifact(phase_id, job.job_id())
+            # ``result.json`` is bound by ``result_digest`` alone. Also listing
+            # it as an artifact digest made every resume hash the same file twice
+            # and forced a directory walk for jobs whose only committed artifact
+            # is the result.
+            result_digest = phase.publish_result(job, result)
+            receipt = phase.commit(
+                job,
+                outcome=result.outcome,
+                artifact_digests=digests,
+                result_digest=result_digest,
+                external_artifacts=result.external_artifacts,
+            )
+            self.ledger.note_commit(phase_id, receipt)
+            if result.outcome == OUTCOME_TERMINAL_REJECT:
+                counters["jobs_terminal_rejected"] += 1
+        else:
+            counters["jobs_retryable_failed"] += 1
+        if result.committed:
+            self._finalize(job, result, pending, resolved, finalize_attempted)
 
     def _replay_committed(
         self,

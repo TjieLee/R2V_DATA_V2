@@ -1165,3 +1165,77 @@ def test_worker_slot_executor_propagates_system_exit():
     executor = WorkerSlotExecutor(_system_exit_runner, slot_count=2)
     with pytest.raises(SystemExit):
         executor.execute_batch([_boogu_job("clip-1")])
+
+
+# --------------------------------------------------------------------------
+# Completion-driven executors report work as it lands
+# --------------------------------------------------------------------------
+
+
+def test_qwen_executor_reports_a_completion_before_slow_siblings_settle():
+    """The first result is observable without waiting for the whole batch."""
+    both_running = threading.Barrier(2)
+    release_slow = threading.Event()
+
+    def runner(job: ModelJob, endpoint: Any) -> JobResult:
+        both_running.wait(timeout=5)
+        if job.clip_uid == "clip-slow":
+            release_slow.wait(timeout=5)
+        return JobResult(OUTCOME_COMPLETED, payload={})
+
+    jobs = [_qwen_job("clip-slow"), _qwen_job("clip-fast")]
+    executor = QwenConcurrentExecutor(runner, endpoint=None, max_inflight=2)
+    try:
+        for job in jobs:
+            executor.submit(job)
+        first = executor.collect()
+        assert [e.job.clip_uid for e in first] == ["clip-fast"]
+        # The slow sibling is genuinely still in flight at this point.
+        release_slow.set()
+        assert [e.job.clip_uid for e in executor.collect()] == ["clip-slow"]
+    finally:
+        executor.close()
+
+
+def test_worker_slot_executor_refills_a_slot_while_another_slot_is_busy():
+    """A freed slot takes the next job without waiting for the other slots."""
+    both_running = threading.Barrier(2)
+    release_slot1 = threading.Event()
+    slot_of: dict[str, int] = {}
+    second_started = threading.Event()
+
+    def runner(job: ModelJob, slot: int) -> JobResult:
+        slot_of[job.clip_uid] = slot
+        if job.clip_uid == "clip-000000":
+            both_running.wait(timeout=5)
+            return JobResult(OUTCOME_COMPLETED, payload={})
+        if job.clip_uid == "clip-000001":
+            both_running.wait(timeout=5)
+            release_slot1.wait(timeout=5)
+            return JobResult(OUTCOME_COMPLETED, payload={})
+        # The third job: only reachable once slot 0 is free again.
+        second_started.set()
+        return JobResult(OUTCOME_COMPLETED, payload={})
+
+    executor = WorkerSlotExecutor(runner, slot_count=2)
+    try:
+        executor.submit(_boogu_job("clip-000000"))
+        executor.submit(_boogu_job("clip-000001"))
+        first = executor.collect()
+        assert [e.job.clip_uid for e in first] == ["clip-000000"]
+
+        # Slot 1 is still busy on clip-000001; slot 0 must take this job now.
+        executor.submit(_boogu_job("clip-000002"))
+        assert second_started.wait(timeout=5), "slot 0 did not take the next job"
+        release_slot1.set()
+        rest: list[Any] = []
+        while len(rest) < 2:
+            rest.extend(executor.collect())
+        assert {e.job.clip_uid for e in rest} == {"clip-000001", "clip-000002"}
+        assert slot_of == {
+            "clip-000000": 0,
+            "clip-000001": 1,
+            "clip-000002": 0,
+        }
+    finally:
+        executor.close()

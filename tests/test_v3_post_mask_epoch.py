@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -1617,3 +1618,212 @@ def test_unexpected_extra_binary_artifact_fails_closed(tmp_path: Path):
     state = ledger.classify(job)
     assert state.state == STATE_MISMATCH
     assert not state.skippable
+
+
+# --------------------------------------------------------------------------
+# 15. completion-driven streaming refill
+# --------------------------------------------------------------------------
+
+
+class _ScriptedExecutor:
+    """A completion-driven executor the test drives, with no sleeping.
+
+    ``completions`` is one group of job ids per ``collect`` call; when the script
+    runs out, everything still in flight settles. Nothing here depends on
+    wall-clock timing, so the assertions say *what* completed when rather than
+    racing a timeout.
+    """
+
+    def __init__(
+        self,
+        *,
+        capacity: int,
+        completions: Sequence[Sequence[str]] = (),
+        failures: Sequence[str] = (),
+        fatal: BaseException | None = None,
+    ) -> None:
+        self._capacity = capacity
+        self._completions = [list(group) for group in completions]
+        self._failures = set(failures)
+        self._fatal = fatal
+        self.inflight: list[Any] = []
+        self.submit_order: list[str] = []
+        self.collect_calls = 0
+        self.closed = False
+
+    def capacity(self) -> int:
+        return self._capacity
+
+    def submit(self, job: Any) -> None:
+        self.submit_order.append(job.job_id())
+        self.inflight.append(job)
+
+    def collect(self) -> list[JobExecution]:
+        self.collect_calls += 1
+        group = self._completions.pop(0) if self._completions else None
+        wanted = (
+            {job.job_id() for job in self.inflight} if group is None else set(group)
+        )
+        done = [job for job in self.inflight if job.job_id() in wanted]
+        self.inflight = [job for job in self.inflight if job.job_id() not in wanted]
+        executions = [
+            JobExecution(
+                job,
+                None
+                if job.job_id() in self._failures
+                else JobResult(OUTCOME_COMPLETED, payload={"ok": True}),
+                RuntimeError("model down") if job.job_id() in self._failures else None,
+            )
+            for job in done
+        ]
+        if self._fatal is not None:
+            raise self._fatal
+        return executions
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _stream_scheduler(tmp_path: Path, executor: Any, finalize: Any) -> Any:
+    return ResourceEpochScheduler(
+        ledger=GroupLedger(tmp_path / "group"),
+        finalize=finalize,
+        executors={RESOURCE_BOOGU: executor, RESOURCE_QWEN: executor},
+    )
+
+
+def test_streaming_refills_a_freed_slot_before_slow_siblings_settle(tmp_path: Path):
+    """case 1: a job unlocked by a completion takes the slot that just freed."""
+    first = _job(job_type="removal", clip_uid="clip-000001")
+    second = _job(job_type="removal", clip_uid="clip-000002")
+    unlocked = _job(job_type="removal", clip_uid="clip-000003")
+
+    def finalize(job: ModelJob, result: JobResult):
+        return (unlocked,) if job.job_id() == first.job_id() else ()
+
+    executor = _ScriptedExecutor(
+        capacity=2, completions=[[first.job_id()], [second.job_id()]]
+    )
+    outcome = _stream_scheduler(tmp_path, executor, finalize).run([first, second])
+
+    assert outcome["completed"] is True
+    assert executor.submit_order[0] == first.job_id()
+    assert executor.submit_order[1] == second.job_id()
+    # Unlocked by first's finalizer, submitted while second was still in flight.
+    assert executor.submit_order[2] == unlocked.job_id()
+
+
+def test_streaming_does_not_switch_resource_while_current_is_still_busy(tmp_path: Path):
+    """case 2: an unlock of another resource waits for the current drain."""
+    first = _job(job_type="removal", clip_uid="clip-000001")
+    second = _job(job_type="removal", clip_uid="clip-000002")
+    other = _job(
+        job_type="sam_review", resource=RESOURCE_QWEN, clip_uid="clip-000003"
+    )
+
+    def finalize(job: ModelJob, result: JobResult):
+        return (other,) if job.job_id() == first.job_id() else ()
+
+    executor = _ScriptedExecutor(
+        capacity=2, completions=[[first.job_id()], [second.job_id()]]
+    )
+    scheduler = _stream_scheduler(tmp_path, executor, finalize)
+    outcome = scheduler.run([first, second])
+
+    assert outcome["completed"] is True
+    # second is still in flight when `other` is unlocked, so `other` cannot be
+    # submitted yet: the current resource drains to its fixed point first.
+    assert executor.submit_order == [
+        first.job_id(),
+        second.job_id(),
+        other.job_id(),
+    ]
+    assert scheduler.diagnostics.resource_switches == 1
+
+
+def test_streaming_replays_a_durable_receipt_and_refills_from_its_finalizer(
+    tmp_path: Path,
+):
+    """case 3: committed job skips the model but still unlocks streaming work."""
+    committed = _job(job_type="removal", clip_uid="clip-000001")
+    pending_job = _job(job_type="removal", clip_uid="clip-000002")
+    unlocked = _job(job_type="removal", clip_uid="clip-000003")
+
+    ledger = GroupLedger(tmp_path / "group")
+    phase = ledger.phase("r000-boogu")
+    phase.write_plan([committed])
+    result = JobResult(OUTCOME_COMPLETED, payload={"ok": True})
+    digest = phase.publish_result(committed, result)
+    phase.commit(
+        committed, outcome=OUTCOME_COMPLETED, artifact_digests={}, result_digest=digest
+    )
+
+    def finalize(job: ModelJob, result: JobResult):
+        return (unlocked,) if job.job_id() == committed.job_id() else ()
+
+    executor = _ScriptedExecutor(capacity=2, completions=[[pending_job.job_id()]])
+    scheduler = ResourceEpochScheduler(
+        ledger=ledger,
+        finalize=finalize,
+        executors={RESOURCE_BOOGU: executor, RESOURCE_QWEN: executor},
+    )
+    outcome = scheduler.run([committed, pending_job])
+
+    assert outcome["completed"] is True
+    # The committed job never reached the executor...
+    assert committed.job_id() not in executor.submit_order
+    # ...but its finalizer was replayed, and the job it unlocked was submitted.
+    assert scheduler.diagnostics.resume["finalizers_replayed"] >= 1
+    assert unlocked.job_id() in executor.submit_order
+    assert pending_job.job_id() in executor.submit_order
+
+
+def test_streaming_isolates_one_model_exception_from_its_siblings(tmp_path: Path):
+    """case 4: a raising job fails alone and its sibling still commits."""
+    failing = _job(job_type="removal", clip_uid="clip-000001")
+    healthy = _job(job_type="removal", clip_uid="clip-000002")
+
+    executor = _ScriptedExecutor(capacity=2, failures=[failing.job_id()])
+    scheduler = _stream_scheduler(tmp_path, executor, lambda job, result: ())
+    outcome = scheduler.run([failing, healthy])
+
+    assert outcome["completed"] is False
+    assert outcome["unresolved_job_ids"] == [failing.job_id()]
+    counters = scheduler.diagnostics.resource(RESOURCE_BOOGU)
+    assert counters["jobs_retryable_failed"] == 1
+    assert counters["jobs_executed"] == 2
+
+
+def test_streaming_propagates_control_flow_exceptions(tmp_path: Path):
+    """case 5: KeyboardInterrupt is not swallowed as a per-job failure."""
+    job = _job(job_type="removal", clip_uid="clip-000001")
+    executor = _ScriptedExecutor(capacity=1, fatal=KeyboardInterrupt())
+
+    with pytest.raises(KeyboardInterrupt):
+        _stream_scheduler(tmp_path, executor, lambda job, result: ()).run([job])
+
+
+def test_streaming_keeps_one_resource_loaded_while_it_keeps_unlocking(tmp_path: Path):
+    """case 6: a long chain of same-resource unlocks never thrashes the load."""
+    chain = [
+        _job(job_type="removal", clip_uid=f"clip-{index:03d}") for index in range(6)
+    ]
+    by_id = {job.job_id(): job for job in chain}
+
+    def finalize(job: ModelJob, result: JobResult):
+        position = [item.job_id() for item in chain].index(job.job_id())
+        if position + 1 < len(chain):
+            return (chain[position + 1],)
+        return ()
+
+    executor = _ScriptedExecutor(capacity=2)
+    scheduler = _stream_scheduler(tmp_path, executor, finalize)
+    outcome = scheduler.run([chain[0]])
+
+    assert outcome["completed"] is True
+    assert len(executor.submit_order) == len(chain)
+    assert set(executor.submit_order) == set(by_id)
+    # Every job unlocked the next one and nothing else was resident, so the
+    # resource was entered exactly once.
+    assert scheduler.diagnostics.resource_switches == 0
+    assert scheduler.diagnostics.resource(RESOURCE_BOOGU)["epoch_count"] == 1
