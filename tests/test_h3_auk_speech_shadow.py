@@ -185,10 +185,9 @@ def test_invalid_case_inventory(setup, ids):
         )
 
 
-@pytest.mark.parametrize("dependency", ["config_path", "checkpoint_path", "vae_path"])
-def test_dependency_changes_fingerprint(setup, dependency):
+def test_config_source_change_updates_fingerprint(setup):
     c = setup.model_configuration
-    Path(getattr(c, dependency)).write_bytes(b"different local model")
+    Path(c.config_path).write_bytes(b"different local model")
     new = auk.auk_configuration(
         python_path=Path(c.python_path),
         code_root=Path(c.code_root),
@@ -203,6 +202,21 @@ def test_dependency_changes_fingerprint(setup, dependency):
         configuration=new,
     )
     assert inventory.inventory_fingerprint != setup.inventory_fingerprint
+
+
+@pytest.mark.parametrize("dependency", ["checkpoint_path", "vae_path"])
+def test_same_size_weight_content_change_does_not_force_new_identity(setup, dependency):
+    c = setup.model_configuration
+    path = Path(getattr(c, dependency))
+    original = path.read_bytes()
+    path.write_bytes(b"x" * len(original))
+    new = auk.auk_configuration(
+        python_path=Path(c.python_path),
+        code_root=Path(c.code_root),
+        checkpoint=Path(c.checkpoint_path),
+        qwen_path=Path(c.qwen_path),
+    )
+    assert new.configuration_fingerprint == c.configuration_fingerprint
 
 
 def test_local_checkpoint_symlink_keeps_sibling_assets(setup, tmp_path):
