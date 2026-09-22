@@ -24,7 +24,6 @@ from r2v_data_v2.h3.sam_audio_stem_shadow import (
     stem_separation_root,
 )
 from tools import run_h3_auk_speech_shadow as cli
-from tools.run_h3_auk_speech_worker import validate_dependencies
 
 FAKE_AUK = """import json, os, wave
 from pathlib import Path
@@ -223,15 +222,10 @@ def test_local_checkpoint_symlink_keeps_sibling_assets(setup, tmp_path):
     assert new.vae_path == c.vae_path
 
 
-def test_qwen_checkpoint_fingerprint_and_worker_preflight(setup):
+def test_qwen_checkpoint_change_affects_new_parent_configuration(setup):
     c = setup.model_configuration
     weights = Path(c.qwen_path) / "model.safetensors"
     weights.write_bytes(b"changed Qwen checkpoint")
-    with (
-        pytest.raises(RuntimeError, match="startup failed"),
-        auk.PersistentAukBackend(c),
-    ):
-        pytest.fail("changed dependencies must fail before model construction")
     new = auk.auk_configuration(
         python_path=Path(c.python_path),
         code_root=Path(c.code_root),
@@ -250,7 +244,7 @@ def test_qwen_checkpoint_fingerprint_and_worker_preflight(setup):
         "preprocessor_config.json",
     ],
 )
-def test_missing_local_dependencies_fail_before_model(setup, missing):
+def test_missing_local_dependencies_rejected_when_building_configuration(setup, missing):
     c = setup.model_configuration
     parent = (
         Path(c.checkpoint_path).parent
@@ -265,44 +259,22 @@ def test_missing_local_dependencies_fail_before_model(setup, missing):
             checkpoint=Path(c.checkpoint_path),
             qwen_path=Path(c.qwen_path),
         )
-    with (
-        pytest.raises(RuntimeError, match="startup failed"),
-        auk.PersistentAukBackend(c),
-    ):
-        pytest.fail("must not reach model startup")
-    assert not Path(c.config_path).with_name("worker_calls.jsonl").exists()
 
 
-def test_empty_python_sources_are_hashed_and_worker_startup_accepts(setup):
+def test_worker_does_not_revalidate_parent_dependency_fingerprints(setup):
     c = setup.model_configuration
-    paths = [
-        Path(c.code_root) / name
-        for name in (
-            "src/auk/__init__.py",
-            "src/auk/model/__init__.py",
-            "src/auk/model/vae/modules/__init__.py",
-        )
-    ]
-    for path in paths:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(b"")
+    path = Path(c.code_root) / "src/auk/model/vae/modules/__init__.py"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"")
     configuration = auk.auk_configuration(
         python_path=Path(c.python_path),
         code_root=Path(c.code_root),
         checkpoint=Path(c.checkpoint_path),
         qwen_path=Path(c.qwen_path),
     )
-    for path in paths:
-        assert (
-            configuration.dependency_files[str(path)] == hashlib.sha256(b"").hexdigest()
-        )
-    validate_dependencies(configuration.model_dump(mode="json"))
+    path.write_text("# changed after parent configuration was built\n")
     with auk.PersistentAukBackend(configuration) as backend:
-        assert backend.process.poll() is None  # fake engine startup only, no generation
-    assert all(path.read_bytes() == b"" for path in paths)
-    paths[-1].write_text("# changed source\n")
-    with pytest.raises(ValueError, match="hash differs"):
-        validate_dependencies(configuration.model_dump(mode="json"))
+        assert backend.process.poll() is None
 
 
 @pytest.mark.parametrize(
@@ -319,7 +291,7 @@ def test_empty_python_sources_are_hashed_and_worker_startup_accepts(setup):
         "model-00001-of-00001.safetensors",
     ],
 )
-def test_empty_runtime_artifacts_rejected_by_parent_and_worker(setup, name):
+def test_empty_runtime_artifacts_rejected_by_parent_configuration(setup, name):
     c = setup.model_configuration
     if name.startswith("model-00001"):
         root = Path(c.qwen_path)
@@ -352,11 +324,6 @@ def test_empty_runtime_artifacts_rejected_by_parent_and_worker(setup, name):
             checkpoint=Path(c.checkpoint_path),
             qwen_path=Path(c.qwen_path),
         )
-    payload = c.model_dump(mode="json")
-    payload["dependency_files"][str(path)] = hashlib.sha256(b"").hexdigest()
-    with pytest.raises(ValueError, match="non-empty"):
-        validate_dependencies(payload)  # reject even when the empty-file hash matches
-
 
 def test_persistent_worker_offline_exact_request_once(setup, tmp_path, monkeypatch):
     monkeypatch.setenv("HF_HUB_OFFLINE", "0")
