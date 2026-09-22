@@ -1334,6 +1334,14 @@ class SubjectAttributeEpochRunner:
         # A restart constructs a fresh runner and therefore revalidates from
         # disk, preserving fail-closed durable semantics.
         self._clip_plan_cache: dict[tuple[str, str], dict[str, Any]] = {}
+        # Candidate masks are full-resolution, so keep this invocation cache
+        # deliberately bounded. It exists only to avoid rebuilding the same
+        # owner evidence at every receipt boundary; a restart rebuilds and
+        # revalidates everything from durable inputs.
+        self._owner_candidate_cache: dict[
+            tuple[str, str, str], tuple[Any, ...]
+        ] = {}
+        self._owner_candidate_cache_limit = 16
 
     # -- durable paths ---------------------------------------------------------
 
@@ -1788,9 +1796,17 @@ class SubjectAttributeEpochRunner:
     def _owner_candidate_objects(
         self, shard: str, clip_uid: str, owner_plan: Mapping[str, Any]
     ) -> list[Any]:
-        """Rebuild the live candidate objects the discovery job was frozen on."""
-        storage = self._storage_for(shard)
+        """Validate owner candidates once per invocation, then reuse them."""
         owner_entity_id = str(owner_plan["owner_entity_id"])
+        cache_key = (shard, clip_uid, owner_entity_id)
+        cached = self._owner_candidate_cache.get(cache_key)
+        if cached is not None:
+            # Refresh insertion order for a tiny LRU without another dependency.
+            self._owner_candidate_cache.pop(cache_key)
+            self._owner_candidate_cache[cache_key] = cached
+            return list(cached)
+
+        storage = self._storage_for(shard)
         clip = storage.read_clip(clip_uid)
         owner = next(
             (
@@ -1814,6 +1830,11 @@ class SubjectAttributeEpochRunner:
                 f"frozen Subject Attributes candidate evidence drifted for "
                 f"{clip_uid}/{owner_entity_id}"
             )
+
+        if len(self._owner_candidate_cache) >= self._owner_candidate_cache_limit:
+            oldest = next(iter(self._owner_candidate_cache))
+            self._owner_candidate_cache.pop(oldest)
+        self._owner_candidate_cache[cache_key] = tuple(candidates)
         return candidates
 
     # -- run -------------------------------------------------------------------

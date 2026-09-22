@@ -1150,6 +1150,34 @@ def _usable_sam(storage: Any, *, slot: int) -> list[Any]:
     return [_attribute_mask(storage, slot=slot, band=0)]
 
 
+def test_owner_candidates_are_validated_once_per_runner_invocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, storage = _storage_variant(tmp_path, monkeypatch, "run-owner-cache")
+    runner = _runner(config, storage, tmp_path)
+    plan = runner._clip_plan(SHARD, CLIP_UID)
+    owner = runner._eligible_owners(plan)[0]
+    owner_plan = runner._owner_plan(SHARD, CLIP_UID, owner, 0, 1)
+
+    original = runner._owner_candidates
+    calls = 0
+
+    def counted(*args: Any, **kwargs: Any) -> list[Any]:
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "_owner_candidates", counted)
+    first = runner._owner_candidate_objects(SHARD, CLIP_UID, owner_plan)
+    second = runner._owner_candidate_objects(SHARD, CLIP_UID, owner_plan)
+    third = runner._owner_candidate_objects(SHARD, CLIP_UID, owner_plan)
+
+    assert calls == 1
+    assert [item.candidate_id for item in first] == [
+        item.candidate_id for item in second
+    ] == [item.candidate_id for item in third]
+
+
 def test_clip_plan_is_rederived_once_per_runner_invocation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
