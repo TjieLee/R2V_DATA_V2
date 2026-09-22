@@ -70,6 +70,7 @@ done
 REQUEST_WORKERS="${REQUEST_WORKERS:-1}"
 CANONICAL_WORKERS="${CANONICAL_WORKERS:-16}"
 MIMO_STARTUP_POLLS="${MIMO_STARTUP_POLLS:-360}"
+MIMO_SPECULATIVE="${MIMO_SPECULATIVE:-1}"
 MIMO_POLL_INTERVAL="${MIMO_POLL_INTERVAL:-5}"
 CLEANUP_GRACE_SECONDS="${CLEANUP_GRACE_SECONDS:-30}"
 for setting in REQUEST_WORKERS CANONICAL_WORKERS MIMO_STARTUP_POLLS CLEANUP_GRACE_SECONDS; do
@@ -81,6 +82,10 @@ if [[ ! "$MIMO_POLL_INTERVAL" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
   echo "MIMO_POLL_INTERVAL must be nonnegative seconds" >&2; exit 2
 fi
 
+if [[ "$MIMO_SPECULATIVE" != 0 && "$MIMO_SPECULATIVE" != 1 ]]; then
+  echo "MIMO_SPECULATIVE must be 0 or 1" >&2; exit 2
+fi
+
 serve=("$SGLANG_ENV/bin/sglang" serve
   --model-path "$MIMO_CHECKPOINT" --served-model-name "$MIMO_MODEL"
   --host 127.0.0.1 --port 8092 --trust-remote-code
@@ -90,10 +95,12 @@ serve=("$SGLANG_ENV/bin/sglang" serve
   --context-length 131072 --mem-fraction-static 0.65
   --chunked-prefill-size 16384 --max-running-requests 8
   --reasoning-parser mimo --tool-call-parser mimo
-  --constrained-json-disable-any-whitespace --enable-deterministic-inference
-  --speculative-algorithm EAGLE --speculative-num-steps 3
-  --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
-  --enable-multi-layer-eagle)
+  --constrained-json-disable-any-whitespace --enable-deterministic-inference)
+if [[ "$MIMO_SPECULATIVE" == 1 ]]; then
+  serve+=(--speculative-algorithm EAGLE --speculative-num-steps 3
+    --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
+    --enable-multi-layer-eagle)
+fi
 
 run=("$R2V_PYTHON" "$REPO_ROOT/tools/run_h3_t2va_full_production.py"
   --shot-manifest "$SHOT_MANIFEST" --clips-root "$JEA_CLIPS_ROOT"
@@ -111,6 +118,7 @@ run=("$R2V_PYTHON" "$REPO_ROOT/tools/run_h3_t2va_full_production.py"
   --mimo-startup-polls "$MIMO_STARTUP_POLLS"
   --mimo-poll-interval "$MIMO_POLL_INTERVAL"
   --mimo-cleanup-grace-seconds "$CLEANUP_GRACE_SECONDS")
+if [[ "$MIMO_SPECULATIVE" == 0 ]]; then run+=(--no-mimo-speculative); fi
 if [[ -n "${SHARDS:-}" ]]; then
   run+=(--shards "$SHARDS")
 else
