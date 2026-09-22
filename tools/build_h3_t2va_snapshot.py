@@ -13,12 +13,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--production-root", type=Path, required=True)
     parser.add_argument("--snapshot-id", required=True)
-    parser.add_argument("--downstream-run-id")
     args = parser.parse_args(argv)
-    root = args.production_root
-    if args.downstream_run_id:
-        root = root / "downstream" / args.downstream_run_id
-    return build_snapshot(root, args.snapshot_id)
+    return build_snapshot(args.production_root, args.snapshot_id)
 
 
 if __name__ == "__main__":
