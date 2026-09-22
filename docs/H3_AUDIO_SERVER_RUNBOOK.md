@@ -182,7 +182,7 @@ local-files-only.
 The Audio/H3 reconcile path uses the local OpenAI-compatible MiMo service:
 
 ```text
-model:    mimo-v2.5
+model:    mimo-v2.6-flash-rl
 endpoint: http://127.0.0.1:8092/v1
 ```
 
@@ -193,7 +193,8 @@ The current server runtime and local checkpoint are:
 
 ```bash
 export SGLANG_ENV=/mnt/workspace/litengjie/data/audio_deps/qwen38-sglang-env
-export MIMO_CHECKPOINT=/mnt/workspace/public/pretrained/MiMo/MiMo-V2.5
+export MIMO_CHECKPOINT=/mnt/workspace/public/pretrained/MiMo/MiMo-V2.6-Flash-RL
+export MIMO_MODEL=mimo-v2.6-flash-rl
 ```
 
 For current Audio/H3 profiling reproducibility tests, start MiMo with deterministic
@@ -202,7 +203,7 @@ inference enabled while preserving the validated FA3/DP configuration:
 ```bash
 "$SGLANG_ENV/bin/sglang" serve \
   --model-path "$MIMO_CHECKPOINT" \
-  --served-model-name mimo-v2.5 \
+  --served-model-name "$MIMO_MODEL" \
   --host 127.0.0.1 \
   --port 8092 \
   --trust-remote-code \
@@ -222,7 +223,12 @@ inference enabled while preserving the validated FA3/DP configuration:
   --tool-call-parser mimo \
   --constrained-json-disable-any-whitespace \
   --enable-deterministic-inference \
-  2>&1 | tee /tmp/mimo8092_deterministic.log
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --enable-multi-layer-eagle \
+  2>&1 | tee /tmp/mimo8092_v26.log
 ```
 
 When running this command directly in an interactive shell, use normal shell
@@ -359,11 +365,22 @@ stem-video proxies are inputs.
 "$R2V_PYTHON" tools/run_h3_mimo25_stem_reconcile_shadow.py "${RUN_ARGS[@]}" \
   --visual-production-root "$VISUAL_PRODUCTION_ROOT" \
   --visual-runs-root "$VISUAL_RUNS_ROOT" \
-  --model mimo-v2.5 \
+  --model mimo-v2.6-flash-rl \
+  --mimo-run-id mimo-v2.6-flash-rl \
   --base-url http://127.0.0.1:8092/v1 \
   --max-completion-tokens 32768 \
   --allow-unverified
 ```
+
+MiMo is a downstream consumer, not part of the Audio production-root identity.
+Changing MiMo versions must not require a fresh Audio/JEA production root or rerun
+SAM/AuK/DiariZen/ASR. RA2VA outputs are namespaced under
+`mimo_runs/<mimo_run_id>/<binding_evidence_mode>/`; keep the same upstream root
+and choose a new MiMo run ID when comparing or upgrading models.
+
+Runtime provenance must not read large model-weight files merely to compute SHA256.
+Checkpoint paths/model identifiers/configuration are recorded, while source media
+and generated artifacts retain their normal content hashes.
 
 There are no standalone stem-description calls. Canonical speech/music/SFX stem hashes
 are checked against separation provenance before inference.
