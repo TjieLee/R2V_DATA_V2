@@ -27,6 +27,7 @@ from r2v_data_v2.v3.post_mask_epoch_jobs import (
 )
 from r2v_data_v2.v3.post_mask_epoch_reference_integrity import (
     REFERENCE_INTEGRITY_BBOX_REVIEW_JOB,
+    REFERENCE_INTEGRITY_ENTITY_OUTCOME_SCHEMA,
     ReferenceIntegrityDurableError,
     ReferenceIntegrityEpochError,
     ReferenceIntegrityEpochRunner,
@@ -3215,6 +3216,63 @@ def test_missing_marker_is_not_served_from_the_cache(
     assert storage.read_clip("clip-1").reference_integrity is None
 
 
+def test_publication_readback_must_equal_what_was_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A marker only ever becomes trusted after an equal durable readback."""
+    _config, _storage, runner, _judge = _seeded_review_fixture(
+        tmp_path, monkeypatch, "run-marker-readback"
+    )
+    body = {
+        "schema": REFERENCE_INTEGRITY_ENTITY_OUTCOME_SCHEMA,
+        "clip_uid": "clip-1",
+        "entity_id": "e1",
+        "reviewed": False,
+    }
+
+    # The durable readback is what makes the cache trustworthy, so a readback
+    # that disagrees with what was just written must not enter it.
+    monkeypatch.setattr(
+        runner, "_entity_outcome", lambda *a, **k: {**body, "reason": "drifted"}
+    )
+
+    with pytest.raises(ReferenceIntegrityDurableError):
+        runner._publish_entity_marker(SHARD, "clip-1", "e1", body)
+    assert (SHARD, "clip-1", "e1") not in runner._verified_entity_markers
+
+
+def test_durable_read_cannot_be_replaced_by_the_cache(
+    published_except_clip: tuple[Any, Any, Any, Any, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The per-entity durable read is load-bearing: the cache may not stand in.
+
+    ``_publish_clip_if_terminal`` returns early when a marker is already gone, so
+    a marker that disappears *between* that existence check and the per-entity
+    read is the case where the cache could otherwise substitute for durable
+    state. The strict reader must still be the only source.
+    """
+    _config, storage, runner, real_publish, _job = published_except_clip
+    assert runner._verified_entity_markers, "the markers are cached"
+
+    real_reconstruction = runner._reconstruct_clip_publication
+    vanished = runner._entity_outcome_path(SHARD, "clip-1", "e1")
+    assert vanished.is_file()
+
+    def racing(*args: Any, **kwargs: Any) -> Any:
+        # The marker survived the existence check and disappears right before the
+        # durable read this reconstruction performs.
+        vanished.unlink()
+        return real_reconstruction(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "_reconstruct_clip_publication", racing)
+
+    with pytest.raises(ReferenceIntegrityDurableError):
+        real_publish(SHARD, storage, "clip-1")
+    assert not runner._clip_outcome_path(SHARD, "clip-1").exists()
+    assert not vanished.exists(), "the missing marker must not be recreated"
+
+
 def test_cold_runner_reverifies_the_marker_strictly(
     published_except_clip: tuple[Any, Any, Any, Any, Any],
     monkeypatch: pytest.MonkeyPatch,
@@ -3255,3 +3313,145 @@ def test_real_marker_cache_eviction_falls_back_to_strict_verification(
     assert seen["verified_branch"], "an evicted marker must be verified strictly"
     assert runner.entity_verify_counters["entity_verify_cache_hit"] == before
     assert runner._clip_outcome_path(SHARD, "clip-1").is_file()
+
+
+def _guarded_terminal_phases(
+    monkeypatch: pytest.MonkeyPatch, runner: Any
+) -> dict[str, list[Any]]:
+    """Record per-entity branch verification and every real topology pass.
+
+    ``topology`` grows by one for each genuine ``reference_topology_diagnostics``
+    call, so a caller can snapshot its length around one phase and measure exactly
+    what that phase computed.
+    """
+    import r2v_data_v2.v3.post_mask_epoch_reference_integrity as module
+
+    seen: dict[str, list[Any]] = {"branch_entities": [], "topology": []}
+
+    real_branch = runner._verify_entity_branch
+
+    def branch(*args: Any, **kwargs: Any) -> Any:
+        marker = args[7] if len(args) > 7 else kwargs.get("marker")
+        seen["branch_entities"].append(str(dict(marker).get("entity_id")))
+        return real_branch(*args, **kwargs)
+
+    real_topology = module.reference_topology_diagnostics
+
+    def topology(*args: Any, **kwargs: Any) -> Any:
+        seen["topology"].append(True)
+        return real_topology(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "_verify_entity_branch", branch)
+    monkeypatch.setattr(module, "reference_topology_diagnostics", topology)
+    return seen
+
+
+def _phase_topology(
+    monkeypatch: pytest.MonkeyPatch, runner: Any, seen: dict[str, list[Any]], name: str
+) -> list[int]:
+    """Length of ``seen["topology"]`` right after each ``<name>`` call."""
+    measured: list[int] = []
+    real = getattr(runner, name)
+
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        out = real(*args, **kwargs)
+        measured.append(len(seen["topology"]))
+        return out
+
+    monkeypatch.setattr(runner, name, wrapper)
+    return measured
+
+
+def test_cpu_terminal_entity_does_not_recompute_topology(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A CPU-terminal entity computes topology once and never again.
+
+    The fixture naturally carries two entities: ``e1`` terminates on the CPU
+    branch and ``e2`` needs the model. Both topology passes during seeding are
+    that entity's own decision - one for the CPU marker, one for deciding that
+    ``e2`` requires a review - and terminal publication afterwards adds none.
+    """
+    _config, storage, runner, judge = _seeded_review_fixture(
+        tmp_path, monkeypatch, "run-cpu-topology"
+    )
+
+    seen = _guarded_terminal_phases(monkeypatch, runner)
+    jobs = runner.seed_jobs()
+
+    # Seeding derives the CPU-terminal marker itself, through the cached
+    # publication point, and never re-verifies it.
+    assert seen["topology"] == [True, True], seen["topology"]
+    assert seen["branch_entities"] == [], seen["branch_entities"]
+    assert runner._entity_outcome(SHARD, "clip-1", "e1") is not None
+    assert (SHARD, "clip-1", "e1") in runner._verified_entity_markers
+
+    job = next(item for item in jobs if dict(item.target)["variant"] == "final")
+
+    def no_finalize(job: Any, result: Any) -> Any:
+        return ()
+
+    _epoch_scheduler(
+        runner, _SerialQwenExecutor(runner, judge), no_finalize
+    ).run([job])
+    committed = runner.ledger.load_committed_result(job)
+    assert committed is not None
+
+    # One more topology pass: the reviewed entity's own finalizer diagnostics.
+    before = len(seen["topology"])
+    reconstruction = _phase_topology(
+        monkeypatch, runner, seen, "_reconstruct_clip_publication"
+    )
+    runner.finalize(job, committed)
+
+    assert len(seen["topology"]) - before == 1, seen["topology"]
+    assert reconstruction == [before + 1], reconstruction
+    assert "e1" not in seen["branch_entities"], seen["branch_entities"]
+    assert runner.entity_verify_counters["entity_verify_cache_hit"] >= 1
+    assert storage.read_clip("clip-1").reference_integrity is not None
+    assert runner._clip_outcome_path(SHARD, "clip-1").is_file()
+
+
+def test_inherited_marker_is_verified_before_it_is_trusted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An inherited marker is strictly verified, and only then cached."""
+    config, storage, seed_runner, judge = _seeded_review_fixture(
+        tmp_path, monkeypatch, "run-inherited"
+    )
+    job = _runnable_job(seed_runner, "final")
+
+    def no_finalize(job: Any, result: Any) -> Any:
+        return ()
+
+    _epoch_scheduler(
+        seed_runner, _SerialQwenExecutor(seed_runner, judge), no_finalize
+    ).run([job])
+    committed = seed_runner.ledger.load_committed_result(job)
+    assert committed is not None
+
+    real_publish = seed_runner._publish_clip_if_terminal
+    monkeypatch.setattr(
+        seed_runner, "_publish_clip_if_terminal", lambda *a, **k: None
+    )
+    seed_runner.finalize(job, committed)
+    monkeypatch.setattr(seed_runner, "_publish_clip_if_terminal", real_publish)
+
+    # Runner B: same storage and ledger root, brand new, empty cache.
+    inherited = _runner(config, storage, seed_runner.ledger.root.parent)
+    assert inherited.ledger.root == seed_runner.ledger.root
+    assert inherited._verified_entity_markers == {}
+
+    seen = _guarded_terminal_phases(monkeypatch, inherited)
+    # Seeding sees the durable markers and does not re-issue any entity, but the
+    # terminal publication it reaches must still verify both strictly.
+    assert inherited.seed_jobs() == []
+    assert sorted(seen["branch_entities"]) == ["e1", "e2"], seen["branch_entities"]
+    assert inherited.entity_verify_counters["entity_verify_cache_miss"] >= 2
+    assert inherited._verified_entity_markers
+
+    # Round two in the same runner: both trusted markers are reused.
+    verified_once = list(seen["branch_entities"])
+    inherited._publish_clip_if_terminal(SHARD, storage, "clip-1")
+    assert seen["branch_entities"] == verified_once, "round two must not re-verify"
+    assert inherited.entity_verify_counters["entity_verify_cache_hit"] >= 2
