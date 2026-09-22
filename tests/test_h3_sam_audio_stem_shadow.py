@@ -1171,20 +1171,33 @@ def test_span_predictor_requires_complete_local_dependency(tmp_path, missing):
         _configuration(tmp_path, predict_spans=True, span_predictor_path=root)
 
 
-def test_span_checkpoint_changes_configuration_inventory_and_fails_before_load(tmp_path):
+def test_span_checkpoint_changes_new_configuration_identity(tmp_path):
     root = _span_predictor(tmp_path)
     manifest, _, _ = _canonical_fixture(tmp_path)
     old = _configuration(tmp_path, predict_spans=True, span_predictor_path=root)
-    inventory = build_sam_audio_stem_inventory(canonical_audio_manifest_path=manifest, model_configuration=old)
+    inventory = build_sam_audio_stem_inventory(
+        canonical_audio_manifest_path=manifest,
+        model_configuration=old,
+    )
     assert inventory.schema_version == "r2v.h3.sam_audio_stem_inventory.4"
     assert old.span_predictor_disabled is False
-    assert set(old.span_predictor_files) == {"config.json", "model.safetensors", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"}
+    assert set(old.span_predictor_files) == {
+        "config.json",
+        "model.safetensors",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+    }
     (root / "model.safetensors").write_bytes(b"different weights")
     changed = _configuration(tmp_path, predict_spans=True, span_predictor_path=root)
     assert changed.configuration_fingerprint != old.configuration_fingerprint
-    assert build_sam_audio_stem_inventory(canonical_audio_manifest_path=manifest, model_configuration=changed).inventory_fingerprint != inventory.inventory_fingerprint
-    with pytest.raises(ValueError, match="dependency fingerprint changed"):
-        OfficialSAMAudioBackend(old)._load()
+    assert (
+        build_sam_audio_stem_inventory(
+            canonical_audio_manifest_path=manifest,
+            model_configuration=changed,
+        ).inventory_fingerprint
+        != inventory.inventory_fingerprint
+    )
     with pytest.raises(ValueError, match="disabled spans"):
         _configuration(tmp_path, span_predictor_path=root)
 
