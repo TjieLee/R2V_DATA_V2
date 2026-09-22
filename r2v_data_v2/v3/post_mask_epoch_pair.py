@@ -367,6 +367,13 @@ class PairEpochRunner:
         #: next replay, and a clip missing from it falls back to that replay.
         self._primary_jobs: dict[tuple[str, str], tuple[ModelJob, ...]] = {}
         self._primary_jobs_lock = threading.Lock()
+        #: Invocation-local caches. Both are execution-only: every entry is
+        #: deterministically re-derivable from the frozen inputs and the durable
+        #: receipts, so a cold cache, an eviction or no cache at all changes only
+        #: how much CPU is spent, never what is decided or published.
+        self._frozen_inputs: dict[tuple[str, str], tuple[Any, Any]] = {}
+        self._prepared: dict[str, Any] = {}
+        self._prepared_lock = threading.Lock()
 
     def _remember_primary_jobs(
         self,
@@ -386,6 +393,31 @@ class PairEpochRunner:
                 # safe - the caller then falls back to one replay.
                 self._primary_jobs.pop(next(iter(self._primary_jobs)), None)
             self._primary_jobs[(shard, clip_uid)] = tuple(jobs)
+
+    def _prepared_for_job(self, job: ModelJob) -> Any:
+        """The prepared decision this job was planned with, if still cached.
+
+        Seeding already prepared every entity; running the same job immediately
+        after would prepare it a second time. The cache is keyed by job id and
+        only ever shortcuts CPU work: the job is still rebuilt from the prepared
+        decision and its input digest compared below, so a cached entry that no
+        longer matches the planned semantic inputs fails closed exactly like the
+        uncached path.
+        """
+        with self._prepared_lock:
+            return self._prepared.get(job.job_id())
+
+    def _remember_prepared(self, job: ModelJob, prepared: Any) -> None:
+        if not isinstance(prepared, PreparedEntityReferenceDecision):
+            return
+        with self._prepared_lock:
+            if len(self._prepared) >= _PREPARED_CACHE_LIMIT and (
+                job.job_id() not in self._prepared
+            ):
+                # Bounded LRU: a prepared decision holds decoded masks and PIL
+                # images, so it must never accumulate across a campaign.
+                self._prepared.pop(next(iter(self._prepared)), None)
+            self._prepared[job.job_id()] = prepared
 
     def _clip_primary_settled(self, shard: str, clip_uid: str) -> bool | None:
         """Whether every recorded primary entity job for a clip is committed.
@@ -679,13 +711,39 @@ class PairEpochRunner:
 
     # -- primary replay ---------------------------------------------------
 
-    def _primary_context(self, storage: RunStorage, clip_uid: str) -> Any:
-        from r2v_data_v2.v3.pair import _validate_pair_inputs
+    def _frozen_pair_inputs(self, storage: RunStorage, clip_uid: str) -> Any:
+        """The clip's frames and masks, cached per invocation.
 
-        clip = storage.read_clip(clip_uid)
+        Both are frozen by the time Pair runs: the epoch Pair pass only ever
+        writes references, pairing and selected reference images, never frames
+        or masks. The clip itself is deliberately *not* cached - publication
+        rewrites clip.json, and the published clip must always be the current
+        one read back from storage.
+        """
+        key = (str(storage.root), clip_uid)
+        cached = self._frozen_inputs.get(key)
+        if cached is not None:
+            return cached
         try:
             frames = _validate_frames(storage, clip_uid)
             masks = storage.read_masks(clip_uid)
+        except Exception:  # noqa: BLE001 - not eligible for Pair
+            return None
+        if len(self._frozen_inputs) >= _PRIMARY_CONTEXT_LIMIT:
+            # Bounded: drop the oldest entry. A miss only costs a re-read.
+            self._frozen_inputs.pop(next(iter(self._frozen_inputs)), None)
+        self._frozen_inputs[key] = (frames, masks)
+        return self._frozen_inputs[key]
+
+    def _primary_context(self, storage: RunStorage, clip_uid: str) -> Any:
+        from r2v_data_v2.v3.pair import _validate_pair_inputs
+
+        frozen = self._frozen_pair_inputs(storage, clip_uid)
+        if frozen is None:
+            return None
+        frames, masks = frozen
+        clip = storage.read_clip(clip_uid)
+        try:
             _validate_pair_inputs(clip, frames, masks)
         except Exception:  # noqa: BLE001 - not eligible for Pair
             return None
@@ -746,6 +804,9 @@ class PairEpochRunner:
                 continue
             job = self._entity_job(shard, storage, clip_uid, entity, index, prepared)
             entity_jobs.append(job)
+            # Seeding has already prepared this entity, so the model call can
+            # reuse it instead of preparing a second time.
+            self._remember_prepared(job, prepared)
             result = self._committed(job)
             if result is None:
                 if not stop_at_unresolved:
@@ -2351,15 +2412,18 @@ class PairEpochRunner:
             return JobResult(OUTCOME_RETRYABLE_FAILED, detail=str(exc))
         index = int(dict(job.target)["entity_index"])
         entity = clip.annotation.entities[index]
-        prepared = prepare_entity_reference(
-            self.config,
-            storage,
-            clip_uid=job.clip_uid,
-            entity=entity,
-            frames=frames,
-            masks=masks,
-            counters=self._scratch(job.canonical_shard),
-        )
+        prepared = self._prepared_for_job(job)
+        if prepared is None:
+            prepared = prepare_entity_reference(
+                self.config,
+                storage,
+                clip_uid=job.clip_uid,
+                entity=entity,
+                frames=frames,
+                masks=masks,
+                counters=self._scratch(job.canonical_shard),
+            )
+            self._remember_prepared(job, prepared)
         if not isinstance(prepared, PreparedEntityReferenceDecision):
             return JobResult(
                 OUTCOME_RETRYABLE_FAILED,

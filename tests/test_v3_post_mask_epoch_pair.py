@@ -3584,3 +3584,88 @@ def test_restart_after_all_receipts_publishes_once_with_no_extra_qwen(
     assert clip.pairing.retained_entity_ids == ["e1", "e2", "e3"]
     assert _temporary_pair_pngs(storage) == []
     assert resumed.primary_unresolved_job_ids() == ()
+
+
+# --------------------------------------------------------------------------
+# Invocation-local caches
+# --------------------------------------------------------------------------
+
+
+def _counting_prepare(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    import r2v_data_v2.v3.post_mask_epoch_pair as pm
+
+    real = pm.prepare_entity_reference
+    calls: list[str] = []
+
+    def counting(*args: Any, **kwargs: Any) -> Any:
+        calls.append(str(kwargs["entity"].entity_id))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(pm, "prepare_entity_reference", counting)
+    return calls
+
+
+def test_prepared_decision_cache_avoids_a_second_prepare(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Seeding already prepared the entity; the model call reuses it."""
+    calls = _counting_prepare(monkeypatch)
+    config = _pair_config(tmp_path, monkeypatch)
+    storage = _storage(config, entity_types=("subject",))
+
+    runner = _runner(tmp_path, config, storage)
+    (job,) = runner.seed_primary_jobs()
+    assert len(calls) == 1
+
+    result = _run_one(runner, job, _Judge())
+    assert result.committed
+    assert len(calls) == 1, "the prepared decision was reused"
+
+
+def test_cold_cache_rederives_the_same_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fresh runner with an empty cache derives the same job and outcome."""
+    config = _pair_config(tmp_path, monkeypatch)
+    storage = _storage(config, entity_types=("subject",))
+
+    warm_runner = _runner(tmp_path / "warm", config, storage)
+    (job,) = warm_runner.seed_primary_jobs()
+    warm = _run_one(warm_runner, job, _Judge())
+
+    # Nothing is carried over: no cached preparation at all.
+    cold_runner = _runner(tmp_path / "cold", config, storage)
+    assert cold_runner._prepared == {}
+    cold = _run_one(cold_runner, job, _Judge())
+
+    assert cold.committed and warm.committed
+    assert dict(cold.payload) == dict(warm.payload), "same decision from a cold cache"
+
+
+def test_prepared_cache_eviction_does_not_change_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Evicted entries are re-prepared; semantic output is unaffected."""
+    import r2v_data_v2.v3.post_mask_epoch_pair as pm
+
+    monkeypatch.setattr(pm, "_PREPARED_CACHE_LIMIT", 2)
+    calls = _counting_prepare(monkeypatch)
+    config = _pair_config(tmp_path, monkeypatch)
+    storage = _storage(config, entity_types=("subject", "object", "object"))
+
+    runner = _runner(tmp_path, config, storage)
+    seeded = _seeded_by_entity(runner)
+    after_seed = len(calls)
+    assert after_seed == 3
+
+    for entity_id in ("e1", "e2", "e3"):
+        result = _run_one(runner, seeded[entity_id], _Judge())
+        assert result.committed
+    # The cache only holds two, so at least one entity was prepared again.
+    assert len(calls) > after_seed, "evicted entries are re-prepared"
+
+    runner.finalize(seeded["e3"], runner._committed(seeded["e3"]))
+    clip = storage.read_clip("clip-1")
+    assert clip.pairing is not None and clip.pairing.status == "ready"
+    assert clip.pairing.retained_entity_ids == ["e1", "e2", "e3"]
+    assert [item.entity_id for item in clip.references.entities] == ["e1", "e2", "e3"]
