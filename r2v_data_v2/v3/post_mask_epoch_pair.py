@@ -94,6 +94,30 @@ _PRIMARY_INDEX_LIMIT = 32
 _PRIMARY_CONTEXT_LIMIT = 32
 _PREPARED_CACHE_LIMIT = 16
 
+#: How many clips may keep their prepared primary row for the hot finalizer.
+#: The row holds the SAME prepared decision objects the job cache already
+#: holds, so it duplicates no image buffer; the bound keeps at most this many
+#: clips' worth of decisions alive in one invocation.
+_PREPARED_CLIP_LIMIT = 32
+
+
+@dataclass(frozen=True)
+class _PreparedPrimaryClip:
+    """One clip's prepared primary row, kept for its own finalizer.
+
+    Execution-only. It reuses the very objects ``_prepared`` already holds, so
+    it never duplicates a decoded mask or a PIL image, and it carries the
+    identity a finalizer needs to prove the row still belongs to the current
+    frozen clip: the shard, the clip, the annotation entity order and the exact
+    primary job ids that row produced.
+    """
+
+    shard: str
+    clip_uid: str
+    entity_ids: tuple[str, ...]
+    job_ids: tuple[str, ...]
+    row: tuple[Any, ...]
+
 
 class PairEpochError(RuntimeError):
     """Raised when the Pair epoch cannot proceed without changing semantics."""
@@ -384,12 +408,20 @@ class PairEpochRunner:
         #: Execution-only seed-preparation telemetry. Never part of PairStats,
         #: stage counts, ModelJob identity, receipts or any public schema.
         self._prepare_counters_lock = threading.Lock()
+        #: Prepared primary row per clip, for the hot finalizer. Execution-only:
+        #: a miss, an eviction or a new runner falls back to the strict replay.
+        self._prepared_clips: dict[tuple[str, str], _PreparedPrimaryClip] = {}
+        self._prepared_clips_lock = threading.Lock()
+        self._prepared_clip_limit = _PREPARED_CLIP_LIMIT
         self.prepare_counters: dict[str, int] = {
             "primary_prepare_tasks": 0,
             "primary_prepare_parallel_tasks": 0,
             "primary_prepare_peak_inflight": 0,
             "primary_prepare_peak_buffered_results": 0,
             "primary_prepare_commit_batches": 0,
+            "primary_hot_finalize_cache_hits": 0,
+            "primary_hot_finalize_cache_misses": 0,
+            "primary_hot_finalize_replay_fallbacks": 0,
         }
 
     def _remember_primary_jobs(
@@ -806,6 +838,62 @@ class PairEpochRunner:
                 buffered,
             )
 
+    def _remember_prepared_primary_clip(
+        self,
+        shard: str,
+        clip_uid: str,
+        entity_ids: Sequence[str],
+        jobs: Sequence[ModelJob],
+        row: Sequence[Any],
+    ) -> None:
+        """Keep one clip's prepared row for its hot finalizer. Bounded."""
+        entry = _PreparedPrimaryClip(
+            shard=shard,
+            clip_uid=clip_uid,
+            entity_ids=tuple(entity_ids),
+            job_ids=tuple(job.job_id() for job in jobs),
+            row=tuple(row),
+        )
+        with self._prepared_clips_lock:
+            if (
+                len(self._prepared_clips) >= self._prepared_clip_limit
+                and (shard, clip_uid) not in self._prepared_clips
+            ):
+                # Bounded: drop the oldest insertion. Losing an entry only costs
+                # the CPU of one strict replay.
+                self._prepared_clips.pop(next(iter(self._prepared_clips)), None)
+            self._prepared_clips[(shard, clip_uid)] = entry
+
+    def _prepared_primary_clip_row(
+        self, shard: str, clip_uid: str, clip: Any
+    ) -> tuple[Any, ...] | None:
+        """The cached prepared row, only if it still belongs to this clip.
+
+        A miss, an eviction, another runner, a changed annotation order or a
+        changed expected-job set returns ``None``, and the caller replays
+        strictly. The cache is never repaired and never treated as authority:
+        a disagreement is not corruption, it is a cache miss.
+        """
+        with self._prepared_clips_lock:
+            cached = self._prepared_clips.get((shard, clip_uid))
+        if cached is None:
+            return None
+        if cached.shard != shard or cached.clip_uid != clip_uid:
+            return None
+        if cached.entity_ids != tuple(
+            str(entity.entity_id) for entity in clip.annotation.entities
+        ):
+            return None
+        with self._primary_jobs_lock:
+            recorded = self._primary_jobs.get((shard, clip_uid))
+        if recorded is None:
+            return None
+        if cached.job_ids != tuple(job.job_id() for job in recorded):
+            return None
+        if len(cached.row) != len(cached.entity_ids):
+            return None
+        return cached.row
+
     def _prepare_primary_batch_tasks(
         self,
         pool: Any,
@@ -1073,6 +1161,15 @@ class PairEpochRunner:
         # Every entity that needs a judge is now known, so the clip's receipt
         # barrier can be answered without preparing anything again.
         self._remember_primary_jobs(shard, clip_uid, entity_jobs)
+        # The clip's own finalizer will need exactly this row; keep it so the
+        # last receipt does not prepare the whole clip a second time.
+        self._remember_prepared_primary_clip(
+            shard,
+            clip_uid,
+            [str(entity.entity_id) for _index, entity in entities],
+            entity_jobs,
+            prepared_by_entity,
+        )
         if pending:
             # Rebuilt temporaries are not progress: only receipts are, and the
             # clip cannot be published until every entity has one.
@@ -2876,9 +2973,29 @@ class PairEpochRunner:
         context = self._primary_context(storage, job.clip_uid)
         if context is None:
             return ()
-        states, temporary, pending = self._replay_primary_clip(
-            shard, storage, job.clip_uid, context, stop_at_unresolved=True
+        prepared_row = self._prepared_primary_clip_row(
+            shard, job.clip_uid, context[0]
         )
+        if prepared_row is None:
+            # No usable row for this invocation: the strict replay stays the
+            # semantic authority and prepares again exactly as before.
+            self._bump_prepare_counter("primary_hot_finalize_cache_misses")
+            self._bump_prepare_counter("primary_hot_finalize_replay_fallbacks")
+            states, temporary, pending = self._replay_primary_clip(
+                shard, storage, job.clip_uid, context, stop_at_unresolved=True
+            )
+        else:
+            # This invocation already prepared every entity of this clip, so the
+            # last receipt finalizes from that row instead of preparing again.
+            self._bump_prepare_counter("primary_hot_finalize_cache_hits")
+            states, temporary, pending = self._apply_prepared_primary_clip(
+                shard,
+                storage,
+                job.clip_uid,
+                context,
+                prepared_row,
+                stop_at_unresolved=True,
+            )
         if pending:
             # Other entities still need Qwen: nothing is published yet, and
             # every one of them is independent so all go back to the pool.

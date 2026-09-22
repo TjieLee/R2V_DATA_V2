@@ -1314,12 +1314,14 @@ def _temporary_pair_pngs(storage: Any, clip_uid: str = "clip-1") -> list[str]:
 def test_intermediate_entity_completion_does_not_replay_the_clip(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Only the last primary receipt reconstructs and publishes the clip.
+    """Only the last primary receipt publishes the clip, and it prepares nothing.
 
     An intermediate completion has nothing to do: replaying the clip would
     re-run every entity's prepare, crop and PNG encode and then throw the PNGs
     away again, once per sibling. The barrier is answered from the
-    execution-only index, so the prepare count must not move at all.
+    execution-only index, so the prepare count must not move at all. The
+    terminal pass finalizes from the row this same invocation already prepared,
+    so it must not prepare the clip a second time either.
     """
     import r2v_data_v2.v3.post_mask_epoch_pair as pm
 
@@ -1356,8 +1358,12 @@ def test_intermediate_entity_completion_does_not_replay_the_clip(
     before_finalize = len(prepared)
     runner.finalize(seeded["e3"], last)
 
-    # One reconstruction on the terminal pass: three entities, prepared once.
-    assert len(prepared) == before_finalize + 3
+    # The terminal pass reuses this invocation's prepared row: zero re-prepare.
+    assert len(prepared) == before_finalize, (
+        "the hot finalizer must not prepare the clip again"
+    )
+    assert runner.prepare_counters["primary_hot_finalize_cache_hits"] == 1
+    assert runner.prepare_counters["primary_hot_finalize_replay_fallbacks"] == 0
     clip = storage.read_clip("clip-1")
     assert clip.pairing is not None and clip.pairing.status == "ready"
     assert clip.pairing.retained_entity_ids == ["e1", "e2", "e3"]
@@ -3992,3 +3998,171 @@ def test_parallel_primary_seed_matches_serial_exactly(
     assert all(
         payload is not None for payload in snapshots["serial"]["pairing"].values()
     ), "every clip reached a Pair terminal state"
+
+
+def _counting_primary_prepare(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[str]:
+    """Record every real entity preparation, whichever path calls it."""
+    import r2v_data_v2.v3.post_mask_epoch_pair as pm
+
+    prepared: list[str] = []
+    real_prepare = pm.prepare_entity_reference
+
+    def counting_prepare(*args: Any, **kwargs: Any) -> Any:
+        prepared.append(str(kwargs["entity"].entity_id))
+        return real_prepare(*args, **kwargs)
+
+    monkeypatch.setattr(pm, "prepare_entity_reference", counting_prepare)
+    return prepared
+
+
+def test_hot_finalizer_prepares_nothing_and_a_cold_runner_replays(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One judged clip: seed prepares once per entity, nothing else prepares."""
+    config = _pair_config(tmp_path, monkeypatch)
+    storage = _storage(config, entity_types=("subject", "object"))
+    runner = _runner(tmp_path, config, storage)
+    prepared = _counting_primary_prepare(monkeypatch)
+
+    seeded = _seeded_by_entity(runner)
+    seed_calls = len(prepared)
+    assert seed_calls == 2, f"one prepare per entity: {prepared}"
+
+    results = {
+        entity_id: _run_one(runner, job, _Judge()) for entity_id, job in seeded.items()
+    }
+    assert all(result.committed for result in results.values())
+    assert len(prepared) == seed_calls, "the model run must not prepare again"
+
+    runner.finalize(seeded["e2"], results["e2"])
+    assert len(prepared) == seed_calls, (
+        "the hot finalizer must finalize from the seed's prepared row"
+    )
+    assert runner.prepare_counters["primary_hot_finalize_cache_hits"] == 1
+    assert runner.prepare_counters["primary_hot_finalize_replay_fallbacks"] == 0
+    clip = storage.read_clip("clip-1")
+    assert clip.pairing is not None and clip.pairing.status == "ready"
+
+    # A second runner on the same durable state has an empty cache: it must
+    # take the strict replay rather than trusting anything in memory.
+    cold = _runner(tmp_path, config, storage)
+    assert cold._prepared_clips == {}
+    before = len(prepared)
+    cold.finalize(seeded["e2"], results["e2"])
+
+    assert len(prepared) > before, "a cold runner replays strictly"
+    assert cold.prepare_counters["primary_hot_finalize_replay_fallbacks"] >= 1
+    assert cold.prepare_counters["primary_hot_finalize_cache_hits"] == 0
+    assert storage.read_clip("clip-1").pairing == clip.pairing
+
+
+def test_hot_finalizer_does_not_reprepare_a_deterministic_sibling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A clip with one CPU-terminal entity and one judged entity, the common case."""
+    config = _pair_config(tmp_path, monkeypatch)
+    storage = _storage(
+        config,
+        entity_types=("subject", "object"),
+        tracking_status={"e1": "failed"},
+    )
+    runner = _runner(tmp_path, config, storage)
+    prepared = _counting_primary_prepare(monkeypatch)
+
+    seeded = _seeded_by_entity(runner)
+    assert "e1" not in seeded, "the failed-tracking entity is CPU terminal"
+    assert "e2" in seeded
+    after_seed = list(prepared)
+    assert sorted(after_seed) == ["e1", "e2"], after_seed
+
+    result = _run_one(runner, seeded["e2"], _Judge())
+    assert result.committed
+    runner.finalize(seeded["e2"], result)
+
+    # Neither the deterministic sibling nor the judged entity is prepared again.
+    assert prepared == after_seed, prepared
+    assert runner.prepare_counters["primary_hot_finalize_cache_hits"] == 1
+    assert runner.prepare_counters["primary_hot_finalize_replay_fallbacks"] == 0
+    clip = storage.read_clip("clip-1")
+    assert clip.pairing is not None, "the clip was published"
+
+    # The hot path must publish exactly what the strict replay publishes: a cold
+    # runner on the same durable state has no row and replays.
+    cold = _runner(tmp_path, config, storage)
+    before = len(prepared)
+    cold.finalize(seeded["e2"], result)
+    assert len(prepared) > before, "the cold runner replayed strictly"
+    assert storage.read_clip("clip-1").pairing == clip.pairing
+
+
+def test_evicted_prepared_clip_falls_back_to_the_strict_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real eviction only costs CPU: the strict replay still publishes."""
+    clip_uids = ("clip-1", "clip-2")
+    _unused_config, storage, runner = _primary_clips_fixture(
+        tmp_path, monkeypatch, "run-evict", clip_uids, cpu_workers=1
+    )
+    monkeypatch.setattr(runner, "_prepared_clip_limit", 1)
+    prepared = _counting_primary_prepare(monkeypatch)
+
+    seeded = runner.seed_primary_jobs()
+    by_clip = {job.clip_uid: job for job in seeded}
+    assert sorted(by_clip) == ["clip-1", "clip-2"]
+    after_seed = list(prepared)
+
+    # clip-2's row evicted clip-1's: a real eviction, not a manual clear.
+    assert sorted(runner._prepared_clips) == [(SHARD, "clip-2")]
+
+    for clip_uid in clip_uids:
+        job = by_clip[clip_uid]
+        result = _run_one(runner, job, _Judge())
+        assert result.committed
+        runner.finalize(job, result)
+
+    assert len(prepared) > len(after_seed), "the evicted clip replayed strictly"
+    assert runner.prepare_counters["primary_hot_finalize_replay_fallbacks"] >= 1
+    for clip_uid in clip_uids:
+        clip = storage.read_clip(clip_uid)
+        assert clip.pairing is not None and clip.pairing.status == "ready"
+        assert clip.pairing.retained_entity_ids
+
+
+@pytest.mark.parametrize("mismatch", ("job_ids", "entity_ids"))
+def test_mismatched_prepared_clip_row_falls_back_to_the_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mismatch: str
+) -> None:
+    """A row that no longer matches the frozen clip is a miss, never authority."""
+    config = _pair_config(tmp_path, monkeypatch)
+    storage = _storage(config, entity_types=("subject", "object"))
+    runner = _runner(tmp_path, config, storage)
+    prepared = _counting_primary_prepare(monkeypatch)
+
+    seeded = _seeded_by_entity(runner)
+    results = {
+        entity_id: _run_one(runner, job, _Judge()) for entity_id, job in seeded.items()
+    }
+    after_seed = len(prepared)
+
+    cached = runner._prepared_clips[(SHARD, "clip-1")]
+    runner._prepared_clips[(SHARD, "clip-1")] = replace(
+        cached,
+        job_ids=("stale-job",) if mismatch == "job_ids" else cached.job_ids,
+        # Same length, different order: the row must be rejected on identity,
+        # not merely on a length mismatch.
+        entity_ids=(
+            tuple(f"stale-{index}" for index in range(len(cached.entity_ids)))
+            if mismatch == "entity_ids"
+            else cached.entity_ids
+        ),
+    )
+
+    runner.finalize(seeded["e2"], results["e2"])
+
+    assert len(prepared) > after_seed, "a mismatched row must replay strictly"
+    assert runner.prepare_counters["primary_hot_finalize_replay_fallbacks"] == 1
+    assert runner.prepare_counters["primary_hot_finalize_cache_hits"] == 0
+    clip = storage.read_clip("clip-1")
+    assert clip.pairing is not None and clip.pairing.status == "ready"
