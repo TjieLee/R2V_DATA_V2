@@ -658,18 +658,28 @@ class PairEpochRunner:
         *,
         stop_at_unresolved: bool,
     ) -> tuple[
-        list[EntityReferenceState], dict[str, tuple[Path, Image.Image]], ModelJob | None
+        list[EntityReferenceState],
+        dict[str, tuple[Path, Image.Image]],
+        list[ModelJob],
     ]:
         """Rebuild a clip's primary prefix from committed results only.
 
         Deterministic entities are recomputed; entity judge outcomes are read
         back from their receipts. Nothing lives only in memory, so a crash
         before publication costs zero extra Qwen calls.
+
+        CPU preparation covers *every* annotated entity before anything is
+        handed back. A primary entity judge depends only on the clip, its
+        frames and masks, that entity and its own candidates - never on another
+        entity's Qwen outcome - so the whole clip's independent judges can be
+        seeded at once instead of one entity at a time. The per-entity results
+        keep annotation order, and the clip is still published as one unit.
         """
         clip, frames, masks = context
         counters = self._scratch(shard)
         entity_states: list[EntityReferenceState] = []
         temporary_images: dict[str, tuple[Path, Image.Image]] = {}
+        pending: list[ModelJob] = []
         for index, entity in enumerate(clip.annotation.entities):
             prepared = prepare_entity_reference(
                 self.config,
@@ -690,8 +700,8 @@ class PairEpochRunner:
                     raise PairEpochError(
                         f"primary entity {entity.entity_id} has no committed result"
                     )
-                self._discard_temporary(temporary_images)
-                return entity_states, {}, job
+                pending.append(job)
+                continue
             finalization = finalize_entity_reference(
                 self.config,
                 storage,
@@ -701,7 +711,12 @@ class PairEpochRunner:
             entity_states.append(finalization.state)
             if finalization.temporary is not None:
                 temporary_images[entity.entity_id] = finalization.temporary
-        return entity_states, temporary_images, None
+        if pending:
+            # Rebuilt temporaries are not progress: only receipts are, and the
+            # clip cannot be published until every entity has one.
+            self._discard_temporary(temporary_images)
+            return entity_states, {}, pending
+        return entity_states, temporary_images, []
 
     # -- background guard -------------------------------------------------
 
@@ -936,9 +951,9 @@ class PairEpochRunner:
                 context = self._primary_context(storage, clip_uid)
                 if context is None:
                     continue
-                pending = self._advance_primary_clip(shard, storage, clip_uid, context)
-                if pending is not None:
-                    jobs.append(pending)
+                jobs.extend(
+                    self._advance_primary_clip(shard, storage, clip_uid, context)
+                )
         jobs.sort(key=lambda job: job.job_id())
         self.phase.write_plan(jobs)
         return jobs
@@ -949,23 +964,23 @@ class PairEpochRunner:
         storage: RunStorage,
         clip_uid: str,
         context: Any,
-    ) -> ModelJob | None:
+    ) -> list[ModelJob]:
         """CPU -> MODEL -> CPU until a fixed point is reached.
 
-        Returns the single job the scheduler still has to run, or ``None`` when
-        the clip's primary Pair is terminal.
+        Returns every independent model job the clip still needs - one per
+        annotated entity that requires a judge - or an empty list when the
+        clip's primary Pair is terminal. The clip is only published once all of
+        them have receipts.
         """
         states, temporary, pending = self._replay_primary_clip(
             shard, storage, clip_uid, context, stop_at_unresolved=True
         )
-        if pending is not None:
-            # Rebuilt temporaries are not progress: only receipts are.
-            self._discard_temporary(temporary)
+        if pending:
             return pending
         guard = self._publish_primary(
             shard, storage, clip_uid, context[1], states, temporary
         )
-        return guard
+        return [guard] if guard is not None else []
 
     # -- durable primary PairStats reconciliation (4c1) -------------------
 
@@ -1483,9 +1498,10 @@ class PairEpochRunner:
                 context = self._primary_context(storage, clip_uid)
                 if context is None:
                     continue
-                pending = self._advance_primary_clip(shard, storage, clip_uid, context)
-                if pending is not None:
-                    unresolved.append(pending.job_id())
+                unresolved.extend(
+                    job.job_id()
+                    for job in self._advance_primary_clip(shard, storage, clip_uid, context)
+                )
         return tuple(unresolved)
 
     # -- frozen donor snapshot --------------------------------------------
@@ -1528,7 +1544,7 @@ class PairEpochRunner:
             )
             self._discard_temporary(temporary)
             known = self._clip_job_ids(shard, clip_uid)
-            if pending is not None and (
+            if pending and (
                 not unresolved_job_ids or not known & set(unresolved_job_ids)
             ) or known & set(unresolved_job_ids):
                 blocked.append(clip_uid)
@@ -2418,13 +2434,22 @@ class PairEpochRunner:
         states, temporary, pending = self._replay_primary_clip(
             shard, storage, job.clip_uid, context, stop_at_unresolved=True
         )
-        if pending is not None:
-            # A later entity still needs Qwen: nothing is published yet.
-            return (pending,)
+        if pending:
+            # Other entities still need Qwen: nothing is published yet, and
+            # every one of them is independent so all go back to the pool.
+            return tuple(pending)
         guard = self._publish_primary(
             shard, storage, job.clip_uid, context[1], states, temporary
         )
-        return (guard,) if guard is not None else ()
+        if guard is None:
+            return ()
+        if guard.job_id() in self._clip_job_ids(shard, job.clip_uid):
+            # Clip-level work, already handed to the graph by whichever entity
+            # reached publication first. Every entity shares one publication, so
+            # the guard is unlocked once, not once per entity.
+            return ()
+        self.phase.write_plan([guard])
+        return (guard,)
 
 
 # ---------------------------------------------------------------------------

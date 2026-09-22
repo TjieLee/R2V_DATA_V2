@@ -1280,34 +1280,47 @@ def test_pair_epoch_requires_reference_edit_enabled(
         )
 
 
-def test_seed_primary_jobs_seeds_only_the_first_qwen_entity(
+def test_seed_primary_jobs_seeds_every_independent_qwen_entity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """One clip's entity judges are independent: all of them are seeded."""
     config = _pair_config(tmp_path, monkeypatch)
     storage = _storage(config, entity_types=("subject", "object", "object"))
     runner = _runner(tmp_path, config, storage)
 
     jobs = runner.seed_primary_jobs()
 
-    assert len(jobs) == 1, "a clip holds at most one primary Qwen job"
-    assert dict(jobs[0].target)["entity_id"] == "e1"
-    assert jobs[0].job_type == "pair_entity_reference_judge"
-    assert jobs[0].resource == "qwen"
+    # A primary entity judge depends only on the clip, its frames and masks,
+    # that entity and its own candidates, so nothing here is serialised. The
+    # seed is sorted by job id, so the entity order is compared as a set.
+    assert sorted(dict(job.target)["entity_id"] for job in jobs) == ["e1", "e2", "e3"]
+    assert {job.job_type for job in jobs} == {"pair_entity_reference_judge"}
+    assert {job.resource for job in jobs} == {"qwen"}
+    assert len({job.job_id() for job in jobs}) == 3
 
 
-def test_finalize_unlocks_one_entity_at_a_time(
+def test_publication_waits_for_every_primary_entity_receipt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Seeding is parallel, but the clip is still published as one unit."""
     config = _pair_config(tmp_path, monkeypatch)
     storage = _storage(config, entity_types=("subject", "object", "object"))
     runner = _runner(tmp_path, config, storage)
     judge = _Judge()
 
-    (first,) = runner.seed_primary_jobs()
+    seeded = {
+        str(dict(job.target)["entity_id"]): job for job in runner.seed_primary_jobs()
+    }
+    first = seeded["e1"]
     result = _run_one(runner, first, judge)
-    (second,) = runner.finalize(first, result)
+    # e1 committed: e2 and e3 are still outstanding, so nothing is published.
+    remaining = runner.finalize(first, result)
 
-    assert [dict(job.target)["entity_id"] for job in (first, second)] == ["e1", "e2"]
+    assert sorted(dict(job.target)["entity_id"] for job in remaining) == ["e2", "e3"]
+    assert {job.job_id() for job in remaining} == {
+        seeded["e2"].job_id(),
+        seeded["e3"].job_id(),
+    }
     assert storage.read_clip("clip-1").pairing is None, "not published mid-chain"
 
 
@@ -1320,20 +1333,21 @@ def test_entity_judge_failure_leaves_no_receipt_and_no_pairing(
     storage = _storage(config, entity_types=("subject", "object", "object"))
     runner = _runner(tmp_path, config, storage)
 
-    (e1,) = runner.seed_primary_jobs()
-    assert _run_one(runner, e1, _Judge()).committed
+    seeded = _seeded_by_entity(runner)
+    assert _run_one(runner, seeded["e1"], _Judge()).committed
     pending = runner.seed_primary_jobs()
-    assert [dict(job.target)["entity_id"] for job in pending] == ["e2"]
+    assert sorted(dict(job.target)["entity_id"] for job in pending) == ["e2", "e3"]
 
     failing = _FailingEntityJudge(fail_on="e2")
-    (e2,) = pending
-    result = runner.run(e2, failing)
+    result = runner.run(seeded["e2"], failing)
 
     assert result.outcome == OUTCOME_RETRYABLE_FAILED
     assert not result.committed, "a judge failure must not leave a receipt"
+    # One unresolved entity is enough to hold the whole clip un-published.
     assert storage.read_clip("clip-1").pairing is None
-    # e3 is never planned while e2 is unresolved.
-    assert [dict(job.target)["entity_id"] for job in runner.seed_primary_jobs()] == ["e2"]
+    assert sorted(
+        dict(job.target)["entity_id"] for job in runner.seed_primary_jobs()
+    ) == ["e2", "e3"]
 
 
 def test_primary_replay_does_not_repeat_qwen_calls(
@@ -1344,8 +1358,10 @@ def test_primary_replay_does_not_repeat_qwen_calls(
     storage = _storage(config, entity_types=("subject", "object"))
     runner = _runner(tmp_path, config, storage)
 
-    (e1,) = runner.seed_primary_jobs()
-    _run_one(runner, e1, _Judge())
+    seeded = {
+        str(dict(job.target)["entity_id"]): job for job in runner.seed_primary_jobs()
+    }
+    _run_one(runner, seeded["e1"], _Judge())
     # Crash here: no finalize.
 
     resumed = _runner(tmp_path, config, storage)
@@ -1358,6 +1374,7 @@ def test_primary_replay_does_not_repeat_qwen_calls(
 
     (again,) = resumed.seed_primary_jobs()
     assert dict(again.target)["entity_id"] == "e2", "e1 receipt is reused"
+    assert again.job_id() == seeded["e2"].job_id()
     replayed = _run_one(resumed, again, _CountingJudge())
     resumed.finalize(again, replayed)
 
@@ -3380,3 +3397,116 @@ def test_frozen_donor_index_is_scoped_per_shard_inside_one_group(
     assert "donor-b" not in in_a, "a shard-B donor leaked into shard-A's frozen index"
     assert "donor-a" not in in_b, "a shard-A donor leaked into shard-B's frozen index"
     assert not (in_a & in_b), "the two frozen donor indexes must be disjoint"
+
+
+# --------------------------------------------------------------------------
+# Parallel primary seeding: restart barrier, single publication, legacy parity
+# --------------------------------------------------------------------------
+
+
+def _seeded_by_entity(runner: Any) -> dict[str, Any]:
+    return {
+        str(dict(job.target)["entity_id"]): job for job in runner.seed_primary_jobs()
+    }
+
+
+def test_restart_seeds_only_the_missing_primary_entity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """e1 and e2 committed, e3 missing: only e3 is seeded and nothing publishes."""
+    config = _pair_config(tmp_path, monkeypatch)
+    storage = _storage(config, entity_types=("subject", "object", "object"))
+    runner = _runner(tmp_path, config, storage)
+    seeded = _seeded_by_entity(runner)
+    assert sorted(seeded) == ["e1", "e2", "e3"]
+
+    for entity_id in ("e1", "e2"):
+        assert _run_one(runner, seeded[entity_id], _Judge()).committed
+    # Crash here: no finalize, so nothing is published.
+
+    resumed = _runner(tmp_path, config, storage)
+    pending = resumed.seed_primary_jobs()
+
+    assert [str(dict(job.target)["entity_id"]) for job in pending] == ["e3"]
+    assert pending[0].job_id() == seeded["e3"].job_id()
+    assert storage.read_clip("clip-1").pairing is None, "one missing receipt holds it"
+
+
+def test_last_primary_receipt_publishes_the_clip_in_annotation_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The whole clip publishes exactly once, entities in annotation order."""
+    config = _pair_config(tmp_path, monkeypatch)
+    storage = _storage(config, entity_types=("subject", "object", "object"))
+    runner = _runner(tmp_path, config, storage)
+
+    # Seeded and unlocked jobs are deduplicated by job id, as the scheduler does.
+    judge = _Judge()
+    pending = list(runner.seed_primary_jobs())
+    done: dict[str, Any] = {}
+    while pending:
+        job = pending.pop(0)
+        if job.job_id() in done:
+            continue
+        done[job.job_id()] = job
+        result = _run_one(runner, job, judge)
+        assert result.committed
+        pending.extend(runner.finalize(job, result))
+
+    assert sorted(str(dict(job.target)["entity_id"]) for job in done.values()) == [
+        "e1",
+        "e2",
+        "e3",
+    ]
+
+    clip = storage.read_clip("clip-1")
+    assert clip.pairing is not None and clip.pairing.status == "ready"
+    assert clip.pairing.retained_entity_ids == ["e1", "e2", "e3"]
+    # Publication order is annotation order, not completion order.
+    assert [item.entity_id for item in clip.references.entities] == ["e1", "e2", "e3"]
+    assert runner.primary_unresolved_job_ids() == ()
+
+
+def test_primary_publication_matches_legacy_pair_clips(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The parallel seed produces exactly the legacy Pair state and pixels.
+
+    Each side gets its own independent fixture built from the same inputs. The
+    legacy authority runs first and its outcome is captured as plain data,
+    because the fixture owns the allowed-root monkeypatches and rebuilding it
+    for the epoch would invalidate the legacy config.
+    """
+    legacy_dir = tmp_path / "legacy"
+    legacy_dir.mkdir()
+    legacy_config = _pair_config(legacy_dir, monkeypatch)
+    legacy_storage = _storage(
+        legacy_config, entity_types=("subject", "object", "object")
+    )
+    pair_clips(legacy_config, legacy_storage, judge=_Judge())
+    legacy_clip = legacy_storage.read_clip("clip-1")
+    legacy_pairing = legacy_clip.pairing
+    legacy_references = legacy_clip.references
+    legacy_png = {
+        entity_id: _png_sha(
+            legacy_storage.selected_entity_path("clip-1", entity_id).read_bytes()
+        )
+        for entity_id in ("e1", "e2", "e3")
+    }
+
+    epoch_dir = tmp_path / "epoch"
+    epoch_dir.mkdir()
+    config = _pair_config(epoch_dir, monkeypatch)
+    epoch_storage = _storage(config, entity_types=("subject", "object", "object"))
+    runner = _runner(epoch_dir / "ledger", config, epoch_storage)
+    _drain(runner, _Judge())
+    epoch_clip = epoch_storage.read_clip("clip-1")
+
+    assert epoch_clip.pairing == legacy_pairing
+    assert epoch_clip.references == legacy_references
+    assert {
+        entity_id: _png_sha(
+            epoch_storage.selected_entity_path("clip-1", entity_id).read_bytes()
+        )
+        for entity_id in ("e1", "e2", "e3")
+    } == legacy_png
