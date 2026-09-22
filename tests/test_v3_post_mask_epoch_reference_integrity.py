@@ -13,7 +13,7 @@ import inspect
 import json
 import os
 import threading
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -38,6 +38,12 @@ from r2v_data_v2.v3.post_mask_epoch_reference_integrity import (
 )
 from r2v_data_v2.v3.post_mask_epoch_state import GroupLedger
 from r2v_data_v2.v3.reference_integrity import reference_integrity_clips
+from r2v_data_v2.v3.schemas import (
+    ExportState,
+    InstructionLegendEntry,
+    InstructionState,
+    render_inline_instruction_text,
+)
 
 SHARD = "shard-000000000-000000000"
 CLEAN_OBJECT_PHRASE = "a black camera"
@@ -3479,23 +3485,21 @@ def test_inherited_marker_is_verified_before_it_is_trusted(
 # ---------------------------------------------------------------------------
 
 
-def _extended_clip_fixture(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    run_name: str,
+def _write_clip_state(
+    storage: Any,
+    clip_uid: str,
+    entity_ids: Sequence[str],
     *,
-    review_entity_ids: tuple[str, ...] = ("e2", "e3"),
-    cpu_workers: int | None = None,
-) -> tuple[Any, Any, Any]:
-    """One clip: ``e1`` CPU-terminal plus ``review_entity_ids`` needing review.
+    first_scope: str = "full",
+) -> None:
+    """Write one clip's full ready state: frames, masks, coverage, references.
 
-    Extends the shared ready-pair fixture - already a validated clip - with the
-    extra entities. Nothing is mocked: the extra entities go through the real
-    plan builder, the real CPU policy and the real review derivation.
+    Generalises the shared ready-pair fixture to any entity count on any clip.
+    Re-annotating invalidates downstream artifacts, so the frames are rebuilt
+    after the annotation, and coverage is written after the masks.
 
-    Re-annotating a clip invalidates its downstream artifacts, so the frames,
-    masks, coverage and references are all rebuilt here in the order the shared
-    fixture uses.
+    ``first_scope`` decides whether the first entity terminates on the CPU
+    branch (``full``) or needs the model review (``local``).
     """
     import hashlib as _hashlib
 
@@ -3514,9 +3518,6 @@ def _extended_clip_fixture(
         TrackedMasksArtifact,
     )
 
-    config, storage = _storage_variant(tmp_path, monkeypatch, run_name)
-    entity_ids = ("e1", *review_entity_ids)
-
     annotation = [
         AnnotationEntity(
             entity_id="e1",
@@ -3525,7 +3526,7 @@ def _extended_clip_fixture(
             grounding_prompt="person in orange cap near center",
         )
     ]
-    for entity_id in review_entity_ids:
+    for entity_id in entity_ids[1:]:
         annotation.append(
             AnnotationEntity(
                 entity_id=entity_id,
@@ -3534,16 +3535,28 @@ def _extended_clip_fixture(
                 grounding_prompt=f"{CLEAN_OBJECT_PHRASE} beside the person",
             )
         )
+    # Both templates track the entity count: the instruction legend must match
+    # the final pairing order, one entry per retained entity.
+    entity_placeholders = [
+        f"{{{{entity_{index}}}}}" for index in range(1, len(entity_ids) + 1)
+    ]
+    image_placeholders = [
+        f"{{{{image_{index}}}}}" for index in range(1, len(entity_ids) + 1)
+    ]
+    verb = "is" if len(entity_ids) == 1 else "are"
+    annotation_template = f"{' and '.join(entity_placeholders)} {verb} shown."
+    instruction_body = f"{' and '.join(image_placeholders)} {verb} shown."
+
     storage.write_annotation(
-        "clip-1",
+        clip_uid,
         AnnotationState(
             status="ready",
-            instruction_template="{{entity_1}} holds {{entity_2}}.",
+            instruction_template=annotation_template,
             entities=annotation,
         ),
     )
 
-    frames_dir = storage.frames_dir("clip-1")
+    frames_dir = storage.frames_dir(clip_uid)
     frames_dir.mkdir(parents=True, exist_ok=True)
     frame_records = []
     for slot in range(10):
@@ -3559,9 +3572,9 @@ def _extended_clip_fixture(
             )
         )
     write_json_atomic(
-        storage.frames_manifest_path("clip-1"),
+        storage.frames_manifest_path(clip_uid),
         SampledFramesArtifact(
-            clip_uid="clip-1", width=32, height=24, frames=frame_records
+            clip_uid=clip_uid, width=32, height=24, frames=frame_records
         ).model_dump(mode="json"),
     )
 
@@ -3591,11 +3604,11 @@ def _extended_clip_fixture(
             ],
         )
     storage.write_masks(
-        "clip-1",
-        TrackedMasksArtifact(clip_uid="clip-1", width=32, height=24, entities=tracks),
+        clip_uid,
+        TrackedMasksArtifact(clip_uid=clip_uid, width=32, height=24, entities=tracks),
     )
     storage.write_coverage(
-        "clip-1",
+        clip_uid,
         CoverageState(
             passed=True,
             qualifying_entity_ids=list(entity_ids),
@@ -3608,7 +3621,7 @@ def _extended_clip_fixture(
 
     references = []
     for index, entity_id in enumerate(entity_ids, start=1):
-        path = storage.selected_path("clip-1", f"{entity_id}.png")
+        path = storage.selected_path(clip_uid, f"{entity_id}.png")
         rgba = np.zeros((64, 64, 4), dtype=np.uint8)
         rgba[..., :3] = (30 * index, 90, 140)
         rgba[..., 3] = 255
@@ -3617,11 +3630,11 @@ def _extended_clip_fixture(
             legacy_integrity._ready_reference(
                 entity_id,
                 storage.relative_artifact_path(path),
-                reference_scope="full" if entity_id == "e1" else "local",
+                reference_scope=first_scope if entity_id == "e1" else "local",
             )
         )
     storage.write_references_and_pairing(
-        "clip-1",
+        clip_uid,
         ReferencesState(entities=references),
         PairingState(
             status="ready",
@@ -3638,11 +3651,107 @@ def _extended_clip_fixture(
             },
         ),
     )
+    storage.write_instruction(
+        clip_uid,
+        InstructionState(
+            status="ready",
+            instruction_body_template=instruction_body,
+            reference_legend=[
+                InstructionLegendEntry(
+                    image_id=f"image_{index}",
+                    description="person" if entity_id == "e1" else "bracket",
+                )
+                for index, entity_id in enumerate(entity_ids, start=1)
+            ],
+            r2v_instruction=render_inline_instruction_text(instruction_body),
+        ),
+    )
+    storage.write_export(clip_uid, ExportState(accepted=True, reason=None))
+
+
+def _create_clip(storage: Any, clip_uid: str, *, source_index: int) -> None:
+    from r2v_data_v2.v3.schemas import ClipSource
+
+    video = storage.config.dataset_json.parent / "clip.mp4"
+    if not video.is_file():
+        video.write_bytes(b"video")
+    storage.create_clip(
+        clip_uid=clip_uid,
+        source=ClipSource(
+            video_path=str(video),
+            parent_video_id="parent",
+            clip_suffix=f"{source_index}_1",
+            source_index=source_index,
+            caption_raw="",
+            metadata={},
+        ),
+    )
+
+
+def _extended_clip_fixture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    run_name: str,
+    *,
+    review_entity_ids: tuple[str, ...] = ("e2", "e3"),
+    cpu_workers: int | None = None,
+) -> tuple[Any, Any, Any]:
+    """One clip: ``e1`` CPU-terminal plus ``review_entity_ids`` needing review.
+
+    Extends the shared ready-pair fixture - already a validated clip - with the
+    extra entities. Nothing is mocked: the extra entities go through the real
+    plan builder, the real CPU policy and the real review derivation.
+    """
+    config, storage = _storage_variant(tmp_path, monkeypatch, run_name)
+    _write_clip_state(storage, "clip-1", ("e1", *review_entity_ids))
     return config, storage, _runner(config, storage, tmp_path, cpu_workers=cpu_workers)
 
 
+def _multi_clip_fixture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    run_name: str,
+    *,
+    entity_ids_by_clip: Mapping[str, tuple[str, ...]],
+    cpu_workers: int | None = None,
+    ledger_name: str = "ledger",
+    first_scope: str = "full",
+) -> tuple[Any, Any, Any, tuple[str, ...]]:
+    """Many fresh clips in one shard, each with its own entities.
+
+    ``clip-1`` is the shared fixture's clip; every other key is created fresh.
+    All but the first entity of a clip are local-scope references, so they need
+    the review and therefore produce the heavy prepared results; ``first_scope``
+    extends that to the first entity.
+    """
+    config, storage = _storage_variant(tmp_path, monkeypatch, run_name)
+    clip_uids = tuple(entity_ids_by_clip)
+    for index, clip_uid in enumerate(clip_uids):
+        if clip_uid != "clip-1":
+            _create_clip(storage, clip_uid, source_index=index)
+        _write_clip_state(
+            storage,
+            clip_uid,
+            entity_ids_by_clip[clip_uid],
+            first_scope=first_scope,
+        )
+    runner = _epoch_runner(
+        config,
+        storage,
+        tmp_path / ledger_name,
+        clip_uids=clip_uids,
+        cpu_workers=cpu_workers,
+    )
+    return config, storage, runner, clip_uids
+
+
 def _epoch_runner(
-    config: Any, storage: Any, ledger_root: Path, *, cpu_workers: int | None = None
+    config: Any,
+    storage: Any,
+    ledger_root: Path,
+    *,
+    clip_uids: Sequence[str] = ("clip-1",),
+    cpu_workers: int | None = None,
 ) -> Any:
     """A runner on its own ledger root, so two runs stay independent."""
     ledger_root.parent.mkdir(parents=True, exist_ok=True)
@@ -3650,7 +3759,7 @@ def _epoch_runner(
         config,
         {SHARD: storage},
         GroupLedger(ledger_root),
-        eligible_clip_uids_by_shard={SHARD: ["clip-1"]},
+        eligible_clip_uids_by_shard={SHARD: list(clip_uids)},
         cpu_workers=cpu_workers,
     )
 
@@ -3663,28 +3772,32 @@ def _job_snapshot(jobs: Sequence[Any]) -> list[tuple[str, str, str]]:
 
 
 def _seed_snapshot(
-    runner: Any, storage: Any, entity_ids: Sequence[str]
+    runner: Any,
+    storage: Any,
+    entity_ids: Sequence[str],
+    *,
+    clip_uid: str = "clip-1",
 ) -> dict[str, Any]:
-    """Every durable artifact one seed invocation can produce."""
+    """Every durable artifact one seed invocation can produce for one clip."""
     anchors: dict[str, Any] = {}
     contexts: dict[str, Any] = {}
     markers: dict[str, Any] = {}
     for entity_id in entity_ids:
-        anchor_path = runner._review_input_path(SHARD, "clip-1", entity_id, "final")
+        anchor_path = runner._review_input_path(SHARD, clip_uid, entity_id, "final")
         anchors[entity_id] = (
             json.loads(anchor_path.read_text(encoding="utf-8"))
             if anchor_path.is_file()
             else None
         )
         context_path = storage.selected_path(
-            "clip-1", f"integrity_context_{entity_id}.png"
+            clip_uid, f"integrity_context_{entity_id}.png"
         )
         contexts[entity_id] = (
             hashlib.sha256(context_path.read_bytes()).hexdigest()
             if context_path.is_file()
             else None
         )
-        markers[entity_id] = runner._entity_outcome(SHARD, "clip-1", entity_id)
+        markers[entity_id] = runner._entity_outcome(SHARD, clip_uid, entity_id)
     return {"anchors": anchors, "contexts": contexts, "markers": markers}
 
 
@@ -3706,8 +3819,8 @@ def _failing_review_derivation(
     return derive
 
 
-def _clip_outcome(runner: Any) -> Any:
-    path = runner._clip_outcome_path(SHARD, "clip-1")
+def _clip_outcome(runner: Any, *, clip_uid: str = "clip-1") -> Any:
+    path = runner._clip_outcome_path(SHARD, clip_uid)
     return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
 
 
@@ -4037,3 +4150,199 @@ def test_parallel_preparation_window_and_thread_spread(
     assert counters["seed_prepare_new_review"] == 3
     assert len(set(idents)) >= 2, f"distinct worker threads: {set(idents)}"
     assert len(jobs) == 3, jobs
+
+
+def _single_entity_clips(count: int) -> dict[str, tuple[str, ...]]:
+    """``count`` one-entity clips: the realistic production shape."""
+    return {f"clip-{index}": ("e1",) for index in range(1, count + 1)}
+
+
+def _multi_clip_snapshot(
+    runner: Any, storage: Any, entity_ids_by_clip: Mapping[str, tuple[str, ...]]
+) -> dict[str, Any]:
+    """Every durable artifact one seed invocation can produce, per clip."""
+    return {
+        clip_uid: _seed_snapshot(runner, storage, entity_ids, clip_uid=clip_uid)
+        for clip_uid, entity_ids in entity_ids_by_clip.items()
+    }
+
+
+def test_prepared_seed_residency_stays_within_the_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Prepared results never accumulate beyond the residency budget.
+
+    Thirteen one-entity clips against a budget of four: the whole invocation's
+    prepared results must never be held at once.
+    """
+    _config, _storage, runner, _clip_uids = _multi_clip_fixture(
+        tmp_path,
+        monkeypatch,
+        "run-residency",
+        entity_ids_by_clip=_single_entity_clips(13),
+        cpu_workers=2,
+        first_scope="local",
+    )
+    budget = runner._prepared_seed_residency_budget()
+    assert budget == 4
+
+    heavy: list[int] = []
+    real_prepare = runner._prepare_seed_entity
+
+    def record(*args: Any, **kwargs: Any) -> Any:
+        prepared = real_prepare(*args, **kwargs)
+        derived = prepared.derived_review_input
+        heavy.append(0 if derived is None else len(derived.context_png_bytes))
+        return prepared
+
+    monkeypatch.setattr(runner, "_prepare_seed_entity", record)
+    jobs = runner.seed_jobs()
+
+    counters = runner.seed_prepare_counters
+    assert counters["seed_prepare_new_review"] == 13
+    assert counters["seed_prepare_tasks"] == 13
+    assert counters["seed_prepare_tasks"] > 3 * budget
+    assert counters["seed_prepare_peak_buffered_results"] <= budget
+    assert counters["seed_prepare_peak_buffered_results"] >= 1
+    # The bound is real because the batches carry heavy objects.
+    assert sum(1 for size in heavy if size > 0) == 13, heavy
+    assert len(jobs) == 13, jobs
+
+
+def test_seed_commits_a_batch_before_the_last_one_prepares(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Preparation and commit interleave, so commit starts before the end.
+
+    A single invocation-wide preparation list would emit every preparation
+    first and only then the commits.
+    """
+    _config, _storage, runner, _clip_uids = _multi_clip_fixture(
+        tmp_path,
+        monkeypatch,
+        "run-streaming",
+        entity_ids_by_clip=_single_entity_clips(13),
+        cpu_workers=2,
+        first_scope="local",
+    )
+    events: list[str] = []
+    real_prepare = runner._prepare_seed_entities
+    real_commit = runner._commit_seed_record
+
+    def prepare(tasks: Any, pool: Any = None) -> Any:
+        events.append("prepare_start")
+        out = real_prepare(tasks, pool)
+        events.append("prepare_done")
+        return out
+
+    def commit(record: Any, row: Any) -> Any:
+        events.append("commit")
+        return real_commit(record, row)
+
+    monkeypatch.setattr(runner, "_prepare_seed_entities", prepare)
+    monkeypatch.setattr(runner, "_commit_seed_record", commit)
+    jobs = runner.seed_jobs()
+
+    starts = [index for index, event in enumerate(events) if event == "prepare_start"]
+    commits = [index for index, event in enumerate(events) if event == "commit"]
+    assert len(commits) == 13, events
+    assert events[0] == "prepare_start"
+    assert len(starts) >= 2, events
+    # The decisive property: a commit happened before the final preparation.
+    assert commits[0] < starts[-1], events
+    assert (
+        len(starts) == runner.seed_prepare_counters["seed_prepare_commit_batches"]
+    )
+    assert len(jobs) == 13
+
+
+def test_single_entity_clips_prepare_concurrently_across_clips(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Four one-entity clips share one pool, so different clips overlap.
+
+    This is the reason preparation is batched flat across clips instead of run
+    per clip: a per-clip pool would leave three workers idle and never satisfy
+    the gate.
+    """
+    _config, _storage, runner, _clip_uids = _multi_clip_fixture(
+        tmp_path,
+        monkeypatch,
+        "run-cross-clip",
+        entity_ids_by_clip=_single_entity_clips(4),
+        cpu_workers=4,
+        first_scope="local",
+    )
+    barrier = threading.Barrier(2, timeout=30.0)
+    entered: list[tuple[str, int]] = []
+    lock = threading.Lock()
+    real_encode = runner._encode_review_context
+
+    def gated(
+        storage: Any, clip_uid: str, entity_id: str, context: Any, *, variant: str
+    ) -> Any:
+        with lock:
+            entered.append((clip_uid, threading.get_ident()))
+        barrier.wait()
+        return real_encode(storage, clip_uid, entity_id, context, variant=variant)
+
+    monkeypatch.setattr(runner, "_encode_review_context", gated)
+    jobs = runner.seed_jobs()
+
+    assert len(entered) == 4, entered
+    assert len({clip_uid for clip_uid, _tid in entered}) >= 2, (
+        f"preparations from different clips overlapped: {entered}"
+    )
+    assert len({tid for _clip_uid, tid in entered}) >= 2
+    assert len(jobs) == 4
+
+
+def test_parallel_seed_matches_serial_across_batches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Crossing several batches still reproduces the serial result exactly."""
+    entity_ids_by_clip = {f"clip-{index}": ("e1", "e2") for index in range(1, 5)}
+    results = tuple(
+        legacy_integrity._review(accept=True, reason="usable reference")
+        for _ in range(8)
+    )
+    snapshots: dict[str, Any] = {}
+    clips: dict[str, Any] = {}
+    outcomes: dict[str, Any] = {}
+    jobs_by_tag: dict[str, Any] = {}
+    batches: dict[str, int] = {}
+    for tag, workers in (("serial", 1), ("parallel", 2)):
+        # The ledger is per tag, so the two runs stay independent.
+        _config, storage, runner, _clip_uids = _multi_clip_fixture(
+            tmp_path,
+            monkeypatch,
+            f"run-multi-batch-{tag}",
+            entity_ids_by_clip=entity_ids_by_clip,
+            cpu_workers=workers,
+            ledger_name=f"ledger-{tag}",
+        )
+        judge = _FakeEpochJudge(results, ())
+        jobs = runner.seed_jobs()
+        if jobs:
+            _epoch_scheduler(runner, _SerialQwenExecutor(runner, judge)).run(jobs)
+        jobs_by_tag[tag] = _job_snapshot(jobs)
+        snapshots[tag] = _multi_clip_snapshot(runner, storage, entity_ids_by_clip)
+        clips[tag] = {
+            clip_uid: storage.read_clip(clip_uid).model_dump(mode="json")
+            for clip_uid in entity_ids_by_clip
+        }
+        outcomes[tag] = {
+            clip_uid: _clip_outcome(runner, clip_uid=clip_uid)
+            for clip_uid in entity_ids_by_clip
+        }
+        batches[tag] = runner.seed_prepare_counters["seed_prepare_commit_batches"]
+
+    assert batches["parallel"] >= 2, "the run really crossed several batches"
+    assert batches["serial"] >= 2, "the serial reference also crosses batches"
+    assert jobs_by_tag["serial"] == jobs_by_tag["parallel"]
+    assert snapshots["serial"] == snapshots["parallel"]
+    assert clips["serial"] == clips["parallel"]
+    assert outcomes["serial"] == outcomes["parallel"]
+    assert all(outcome is not None for outcome in outcomes["serial"].values()), (
+        "every clip reached a terminal state"
+    )

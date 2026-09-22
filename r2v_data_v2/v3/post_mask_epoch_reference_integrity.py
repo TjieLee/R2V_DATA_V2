@@ -610,6 +610,8 @@ class ReferenceIntegrityEpochRunner:
             "seed_prepare_cpu_terminal": 0,
             "seed_prepare_existing_review": 0,
             "seed_prepare_new_review": 0,
+            "seed_prepare_commit_batches": 0,
+            "seed_prepare_peak_buffered_results": 0,
         }
         self.entity_verify_counters: dict[str, int] = {
             "entity_verify_cache_hit": 0,
@@ -2249,6 +2251,23 @@ class ReferenceIntegrityEpochRunner:
     def _bump_seed_prepare_counter(self, key: str, delta: int = 1) -> None:
         with self._seed_prepare_lock:
             self.seed_prepare_counters[key] += delta
+
+    def _prepared_seed_residency_budget(self) -> int:
+        """How many prepared entity results may wait for commit at once.
+
+        Preparation is streaming: a batch never carries more prepared results
+        than this, so residency stays O(cpu_workers) rather than O(entities in
+        the invocation). A single clip with more entities than the budget is
+        processed alone, which is the one explicit exception.
+        """
+        return max(self.cpu_workers, self.cpu_workers * 2)
+
+    def _note_seed_prepare_buffered_results(self, buffered: int) -> None:
+        with self._seed_prepare_lock:
+            self.seed_prepare_counters["seed_prepare_peak_buffered_results"] = max(
+                self.seed_prepare_counters["seed_prepare_peak_buffered_results"],
+                buffered,
+            )
 
     def _note_seed_prepare_inflight(self, inflight: int) -> None:
         with self._seed_prepare_lock:
@@ -4217,19 +4236,21 @@ class ReferenceIntegrityEpochRunner:
     def _prepare_seed_entities(
         self,
         tasks: Sequence[tuple[str, Any, str, Mapping[str, Any], Any, Any]],
+        pool: Any = None,
     ) -> list[Any]:
-        """Prepare every task with bounded concurrency, in submission order.
+        """Prepare one batch's tasks, in submission order.
 
         Returns one slot per task - the prepared entity, or the exception its
         preparation raised - always ordered by task, never by completion, so the
-        caller commits deterministically. The window is bounded so a large shard
-        cannot retain an unbounded number of derived context PNG buffers.
+        caller commits deterministically.
 
-        ``cpu_workers <= 1`` takes the direct serial path, which produces exactly
-        the single-threaded result without creating a pool.
+        ``pool`` is the invocation's single executor, passed in so a batch never
+        creates or destroys one of its own; the outstanding-future window is
+        still bounded by the residency budget. ``pool is None`` is the direct
+        serial path, which produces exactly the single-threaded result.
         """
         results: list[Any] = [None] * len(tasks)
-        if self.cpu_workers <= 1:
+        if pool is None:
             for index, task in enumerate(tasks):
                 self._bump_seed_prepare_counter("seed_prepare_tasks")
                 try:
@@ -4237,31 +4258,80 @@ class ReferenceIntegrityEpochRunner:
                 except Exception as exc:  # noqa: BLE001 - re-raised in order
                     results[index] = exc
             return results
-        max_pending = max(self.cpu_workers, self.cpu_workers * 2)
-        with ThreadPoolExecutor(
-            max_workers=self.cpu_workers, thread_name_prefix="ri-seed"
-        ) as pool:
-            pending: dict[Any, int] = {}
-            next_index = 0
-            while next_index < len(tasks) or pending:
-                while next_index < len(tasks) and len(pending) < max_pending:
-                    future = pool.submit(
-                        self._prepare_seed_entity, *tasks[next_index]
-                    )
-                    pending[future] = next_index
-                    next_index += 1
-                    self._bump_seed_prepare_counter("seed_prepare_tasks")
-                    self._bump_seed_prepare_counter("seed_prepare_parallel_tasks")
-                self._note_seed_prepare_inflight(len(pending))
-                done, _ = wait(pending, return_when=FIRST_COMPLETED)
-                self._bump_seed_prepare_counter("seed_prepare_batches")
-                for future in done:
-                    index = pending.pop(future)
-                    try:
-                        results[index] = future.result()
-                    except Exception as exc:  # noqa: BLE001 - re-raised in order
-                        results[index] = exc
+        max_pending = self._prepared_seed_residency_budget()
+        pending: dict[Any, int] = {}
+        next_index = 0
+        while next_index < len(tasks) or pending:
+            while next_index < len(tasks) and len(pending) < max_pending:
+                future = pool.submit(self._prepare_seed_entity, *tasks[next_index])
+                pending[future] = next_index
+                next_index += 1
+                self._bump_seed_prepare_counter("seed_prepare_tasks")
+                self._bump_seed_prepare_counter("seed_prepare_parallel_tasks")
+            self._note_seed_prepare_inflight(len(pending))
+            done, _ = wait(pending, return_when=FIRST_COMPLETED)
+            self._bump_seed_prepare_counter("seed_prepare_batches")
+            for future in done:
+                index = pending.pop(future)
+                try:
+                    results[index] = future.result()
+                except Exception as exc:  # noqa: BLE001 - re-raised in order
+                    results[index] = exc
         return results
+
+    def _commit_seed_record(
+        self, record: _SeedClipPlan, row: Sequence[Any]
+    ) -> list[ModelJob]:
+        """MAIN THREAD ONLY: commit one clip's prepared row.
+
+        Owns the clip-failure decision exactly as the serial seed did: a durable
+        error propagates immediately, any other failure makes the clip terminal
+        and the clip contributes no ModelJob.
+        """
+        try:
+            return self._commit_prepared_clip(
+                record.shard, record.storage, record.clip_uid, row
+            )
+        except ReferenceIntegrityDurableError:
+            # Durable corruption is never a semantic clip failure.
+            raise
+        except Exception as exc:  # noqa: BLE001 - legacy clip isolation
+            self._fail_clip_terminal(
+                record.shard, record.storage, record.clip_uid, exc
+            )
+            return []
+
+    def _prepare_and_commit_seed_batch(
+        self,
+        pool: Any,
+        batch: Sequence[_SeedClipPlan],
+        jobs: list[ModelJob],
+    ) -> None:
+        """Prepare one batch, then commit it in canonical order and release it.
+
+        The batch's prepared results are dropped as soon as it is committed, so
+        residency never grows with the size of the invocation.
+        """
+        tasks = [
+            (
+                record.shard,
+                record.storage,
+                record.clip_uid,
+                record.entry,
+                entity,
+                reference,
+            )
+            for record in batch
+            for _entity_id, entity, reference in record.entities
+        ]
+        prepared = self._prepare_seed_entities(tasks, pool)
+        self._note_seed_prepare_buffered_results(len(prepared))
+        self._bump_seed_prepare_counter("seed_prepare_commit_batches")
+        cursor = 0
+        for record in batch:
+            row = prepared[cursor : cursor + len(record.entities)]
+            cursor += len(record.entities)
+            jobs.extend(self._commit_seed_record(record, row))
 
     def _advance_clip(
         self,
@@ -4340,34 +4410,36 @@ class ReferenceIntegrityEpochRunner:
                     )
                 )
 
-        # Phase 1b: the expensive CPU half, on a bounded pool, read-only.
-        tasks = [
-            (record.shard, record.storage, record.clip_uid, record.entry, entity, reference)
-            for record in records
-            for _entity_id, entity, reference in record.entities
-        ]
-        prepared = self._prepare_seed_entities(tasks)
-
-        # Phase 2, main thread: commit in canonical order and own every durable
-        # write, including the clip-failure decision.
+        # Phase 1b + 2, streaming: preparation and commit alternate over batches
+        # of consecutive canonical clips, so prepared results - which carry the
+        # derived context PNG bytes - never accumulate for more than one batch.
         jobs: list[ModelJob] = []
-        cursor = 0
-        for record in records:
-            row = prepared[cursor : cursor + len(record.entities)]
-            cursor += len(record.entities)
-            try:
-                jobs.extend(
-                    self._commit_prepared_clip(
-                        record.shard, record.storage, record.clip_uid, row
-                    )
-                )
-            except ReferenceIntegrityDurableError:
-                # Durable corruption is never a semantic clip failure.
-                raise
-            except Exception as exc:  # noqa: BLE001 - legacy clip isolation
-                self._fail_clip_terminal(
-                    record.shard, record.storage, record.clip_uid, exc
-                )
+        if self.cpu_workers <= 1:
+            # Direct serial path: no executor, and residency is one clip.
+            for record in records:
+                self._prepare_and_commit_seed_batch(None, [record], jobs)
+            return sorted(jobs, key=lambda job: job.job_id())
+
+        budget = self._prepared_seed_residency_budget()
+        # One executor for the whole invocation: a batch never builds its own,
+        # and single-entity clips still fan out across clips.
+        with ThreadPoolExecutor(
+            max_workers=self.cpu_workers, thread_name_prefix="ri-seed"
+        ) as pool:
+            batch: list[_SeedClipPlan] = []
+            buffered = 0
+            for record in records:
+                count = len(record.entities)
+                if batch and buffered + count > budget:
+                    # Flush before the batch would exceed the residency budget.
+                    # A clip larger than the budget therefore goes alone.
+                    self._prepare_and_commit_seed_batch(pool, batch, jobs)
+                    batch = []
+                    buffered = 0
+                batch.append(record)
+                buffered += count
+            if batch:
+                self._prepare_and_commit_seed_batch(pool, batch, jobs)
         return sorted(jobs, key=lambda job: job.job_id())
 
     # -- publication -----------------------------------------------------------
