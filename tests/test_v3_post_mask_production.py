@@ -292,7 +292,7 @@ def test_historical_commit_and_physical_remap_keep_identity(case):
     )
 
 
-@pytest.mark.parametrize("change", ["policy", "source", "model", "attributes", "shard"])
+@pytest.mark.parametrize("change", ["policy", "source", "model", "attributes"])
 def test_restart_identity_mismatch_fails_closed(case, change):
     _write_rows(case, [_ready(case)])
     api, paths, storage = _start(case)
@@ -308,7 +308,7 @@ def test_restart_identity_mismatch_fails_closed(case, change):
                 cfg.sam3, model_path=cfg.sam3.model_path.with_name("other.pt")
             ),
         )
-    elif change == "attributes":
+    else:
         cfg = replace(
             cfg,
             subject_attributes=replace(
@@ -316,11 +316,59 @@ def test_restart_identity_mismatch_fails_closed(case, change):
                 completion=replace(cfg.subject_attributes.completion, enabled=True),
             ),
         )
-    else:
-        case[2].write_text(case[2].read_text() + "\n")
     with pytest.raises(ValueError):
         api.initialize_shard(cfg, paths, git_commit="new")
     assert storage.read_run().git_commit == "first"
+
+
+def test_restart_identity_rejects_a_malformed_shard_digest(case):
+    """The bound digest is re-checked structurally, never recomputed."""
+    _write_rows(case, [_ready(case)])
+    api, paths, storage = _start(case)
+    payload = json.loads(paths.identity_path.read_text())
+    assert len(payload["shard_sha256"]) == 64
+    for broken in ("0" * 63, "A" * 64, "not-a-digest", 1234, None):
+        payload["shard_sha256"] = broken
+        paths.identity_path.write_text(json.dumps(payload))
+        with pytest.raises(ValueError, match="identity mismatch"):
+            api.initialize_shard(case[0], paths, git_commit="new")
+    assert storage.read_run().git_commit == "first"
+
+
+def test_post_initialization_shard_edit_is_not_rehashed_on_restart(
+    case, monkeypatch
+):
+    """The shard digest is bound once at initialization and is the authority.
+
+    Re-hashing the canonical shard on every restart would duplicate the one hash
+    that has to happen exactly once per shard, so a restart trusts
+    ``identity.json``. A later edit of the frozen shard JSONL is therefore not
+    re-detected at this layer: it is the frozen input's own contract that it does
+    not change underneath a run.
+    """
+    _write_rows(case, [_ready(case)])
+    api, paths, storage = _start(case)
+    case[2].write_text(case[2].read_text() + "\n")
+
+    monkeypatch.setattr(
+        api, "_digest", lambda path: pytest.fail("restart re-hashed the shard")
+    )
+    restarted = api.initialize_shard(case[0], paths, git_commit="new-code")
+    assert restarted.read_run() == storage.read_run()
+    assert restarted.read_run().git_commit == "first"
+
+
+def test_identity_sidecar_without_its_run_fails_closed(case, monkeypatch):
+    """An identity sidecar with no run is a half state, never adopted."""
+    _write_rows(case, [_ready(case)])
+    api, paths, storage = _start(case)
+    storage.run_path.unlink()
+
+    monkeypatch.setattr(
+        api, "_digest", lambda path: pytest.fail("restart re-hashed the shard")
+    )
+    with pytest.raises(ValueError, match="no matching run"):
+        api.initialize_shard(case[0], paths, git_commit="new")
 
 
 def test_enumeration_is_canonical_sorted_and_excludes_nonparts(case):
@@ -548,12 +596,17 @@ def test_minimal_hydration_rejects_required_manifest_symlink(case, relative):
     assert not storage.clip_path("clip-0").exists()
 
 
-@pytest.mark.parametrize(
-    "asset", ["frames/00.jpg", "frames/frames.json", "masks.rle.json", "source_mask"]
-)
+@pytest.mark.parametrize("asset", ["frames/frames.json", "masks.rle.json"])
 def test_resume_restores_immutable_inputs_without_resetting_durable_state(
     case, asset, monkeypatch
 ):
+    """A *missing* key manifest still declines to the restoring path.
+
+    Individual frame and reference assets are deliberately no longer re-walked on
+    restart (see test_resume_does_not_rewalk_or_reject_damaged_assets), so the
+    repair path is entered through a missing manifest, which is the case that
+    still has to rebuild from the frozen input without touching durable state.
+    """
     row = _ready(case, background="pending_remove")
     _write_rows(case, [row])
     api, paths, storage = _start(case)
@@ -609,20 +662,34 @@ def test_resume_restores_immutable_inputs_without_resetting_durable_state(
 
 
 @pytest.mark.parametrize("asset", ["frames/frames.json", "masks.rle.json"])
-def test_resume_repairs_corrupt_small_manifest(case, asset):
+def test_corrupt_small_manifest_is_left_to_its_consumer(case, asset):
+    """A present-but-corrupt manifest is not re-validated by the resume path.
+
+    The resume contract is existence, not content: re-parsing every clip's
+    manifests on every restart is the metadata storm the fast path removes. The
+    stage that actually consumes the manifest fails closed, which is asserted
+    here so the guarantee is relocated rather than lost.
+    """
     _write_rows(case, [_ready(case)])
     api, paths, storage = _start(case)
     _hydrate(case, api, paths, storage)
     target = storage.clip_dir("clip-0") / asset
-    expected = target.read_bytes()
     target.write_text("broken JSON")
+
     assert _hydrate(case, api, paths, storage).ready == 1
-    assert target.read_bytes() == expected
+    assert target.read_text() == "broken JSON"
+    reader = (
+        storage.read_frames if asset == "frames/frames.json" else storage.read_masks
+    )
+    with pytest.raises(ValueError):
+        reader("clip-0")
 
 
 def test_interrupted_mirror_restore_never_leaves_partial_published_image(
     case, monkeypatch
 ):
+    # The repair path is entered through a *missing* key manifest, which is what
+    # still declines to the slow path now that assets are no longer re-walked.
     _write_rows(case, [_ready(case)])
     api, paths, storage = _start(case)
     _hydrate(case, api, paths, storage)
@@ -630,6 +697,7 @@ def test_interrupted_mirror_restore_never_leaves_partial_published_image(
     expected = target.read_bytes()
     clip_bytes = storage.clip_path("clip-0").read_bytes()
     target.unlink()
+    (storage.clip_dir("clip-0") / "masks.rle.json").unlink()
 
     def interrupted(source, destination):
         Path(destination).write_bytes(b"partial")
@@ -647,33 +715,63 @@ def test_interrupted_mirror_restore_never_leaves_partial_published_image(
 
 @pytest.mark.parametrize(
     "damage",
-    ["missing_clip", "corrupt_clip", "symlink", "directory", "missing_provenance"],
+    ["missing_clip", "corrupt_clip", "missing_provenance"],
 )
 def test_resume_never_resets_mutable_or_unsafe_destination(case, damage):
     _write_rows(case, [_ready(case)])
     api, paths, storage = _start(case)
     _hydrate(case, api, paths, storage)
     clip = storage.clip_path("clip-0")
-    frame = storage.frame_path("clip-0", 0)
     if damage == "missing_clip":
         clip.unlink()
     elif damage == "corrupt_clip":
         clip.write_text("broken")
-    elif damage == "missing_provenance":
-        (clip.parent / ".post_mask_hydration.json").unlink()
     else:
-        frame.unlink()
-        if damage == "symlink":
-            frame.symlink_to(case[0].dataset_json)
-        else:
-            frame.mkdir()
+        (clip.parent / ".post_mask_hydration.json").unlink()
     assert _hydrate(case, api, paths, storage).corrupt == 1
     if damage == "missing_clip":
         assert not clip.exists()
     elif damage == "corrupt_clip":
         assert clip.read_text() == "broken"
+    else:
+        assert clip.is_file()
+
+
+@pytest.mark.parametrize("damage", ["deleted", "symlink", "directory"])
+def test_resume_does_not_rewalk_or_reject_damaged_assets(case, damage):
+    """Losing one asset is not re-discovered at hydration.
+
+    The first atomic hydration publication is the authority for the assets
+    beneath it, and the stage that consumes a damaged asset is what fails
+    closed. Re-walking every frame and reference of every clip on every restart
+    is exactly the metadata storm this contract removes, so the resume path
+    accepts a clip whose durable mirror is otherwise complete.
+    """
+    _write_rows(case, [_ready(case)])
+    api, paths, storage = _start(case)
+    _hydrate(case, api, paths, storage)
+    frame = storage.frame_path("clip-0", 0)
+    clip_bytes = storage.clip_path("clip-0").read_bytes()
+    frame.unlink()
+    if damage == "symlink":
+        frame.symlink_to(case[0].dataset_json)
+    elif damage == "directory":
+        frame.mkdir()
+
+    restarted = _hydrate(case, api, paths, storage)
+    assert (restarted.clip_uids, restarted.ready, restarted.corrupt) == (
+        ("clip-0",),
+        1,
+        0,
+    )
+    # Nothing was rewritten, and the damage is left for the consuming stage.
+    assert storage.clip_path("clip-0").read_bytes() == clip_bytes
+    if damage == "deleted":
+        assert not frame.exists()
     elif damage == "symlink":
         assert frame.is_symlink()
+    else:
+        assert frame.is_dir()
 
 
 # ---------------------------------------------------------------------------
@@ -836,3 +934,151 @@ def test_missing_durable_clip_still_fails_closed(case):
 
     assert _hydrate(case, api, paths, storage).corrupt == 1
     assert not storage.clip_path("clip-0").exists()
+
+
+def _count_path_calls(monkeypatch, *, prefix):
+    """Record read and stat calls whose receiver starts with one prefix."""
+    counts = {"reads": [], "probes": []}
+    real_read_bytes = Path.read_bytes
+    real_read_text = Path.read_text
+    real_is_file = Path.is_file
+    real_is_symlink = Path.is_symlink
+
+    def record(bucket, original):
+        def wrapper(self, *args, **kwargs):
+            if str(self).startswith(prefix):
+                counts[bucket].append(str(self))
+            return original(self, *args, **kwargs)
+
+        return wrapper
+
+    monkeypatch.setattr(Path, "read_bytes", record("reads", real_read_bytes))
+    monkeypatch.setattr(Path, "read_text", record("reads", real_read_text))
+    monkeypatch.setattr(Path, "is_file", record("probes", real_is_file))
+    monkeypatch.setattr(Path, "is_symlink", record("probes", real_is_symlink))
+    return counts
+
+
+def test_initialize_binds_the_shard_identity_exactly_once(case, monkeypatch):
+    """Fresh hashes the shard once and publishes the sidecar; restart does neither."""
+    _write_rows(case, [_ready(case)])
+    api = importlib.import_module("r2v_data_v2.v3.post_mask_production")
+    config, _root, shard = case
+    paths = api.ShardPaths.for_shard(config.run_root.parent / "campaign", shard)
+
+    digests = {"n": 0}
+    real_digest = api._digest
+
+    def counting_digest(path):
+        if Path(path) == shard:
+            digests["n"] += 1
+        return real_digest(path)
+
+    monkeypatch.setattr(api, "_digest", counting_digest)
+    writes: list[Path] = []
+    real_write = api.write_json_atomic
+
+    def counting_write(path, payload):
+        writes.append(Path(path))
+        return real_write(path, payload)
+
+    monkeypatch.setattr(api, "write_json_atomic", counting_write)
+
+    first = api.initialize_shard(config, paths, git_commit="first")
+    assert digests["n"] == 1
+    assert writes == [paths.identity_path]
+
+    # Restart: neither the shard bytes nor any sidecar may be touched.
+    monkeypatch.setattr(
+        api, "_digest", lambda path: pytest.fail("restart re-hashed the shard")
+    )
+    monkeypatch.setattr(
+        api,
+        "write_json_atomic",
+        lambda path, payload: pytest.fail("restart rewrote a sidecar"),
+    )
+    restarted = api.initialize_shard(config, paths, git_commit="new-code")
+    assert restarted.read_run() == first.read_run()
+    assert restarted.read_run().git_commit == "first"
+
+
+def test_restart_hydration_proves_completeness_without_touching_assets(
+    case, monkeypatch
+):
+    """Existence is the contract: no manifest is parsed and no asset is stat-ed."""
+    row = _ready(case)
+    _write_rows(case, [row])
+    api, paths, storage = _start(case)
+    assert _hydrate(case, api, paths, storage).ready == 1
+    frames_dir = storage.clip_dir("clip-0") / "frames"
+
+    monkeypatch.setattr(
+        api,
+        "_validate_input",
+        lambda *a, **k: pytest.fail("restart reopened the frozen Stage2 input"),
+    )
+
+    class _ExplodingFrames:
+        @staticmethod
+        def model_validate_json(*a, **k):
+            pytest.fail("frames.json was parsed on restart")
+
+    class _ExplodingMasks:
+        @staticmethod
+        def model_validate_json(*a, **k):
+            pytest.fail("masks.rle.json was parsed on restart")
+
+    monkeypatch.setattr(api, "SampledFramesArtifact", _ExplodingFrames)
+    monkeypatch.setattr(api, "TrackedMasksArtifact", _ExplodingMasks)
+
+    counts = _count_path_calls(monkeypatch, prefix=str(frames_dir))
+    stage2 = _count_reads_under(monkeypatch, case[1])
+    restarted = _hydrate(case, api, paths, storage)
+
+    assert (restarted.clip_uids, restarted.ready, restarted.corrupt) == (
+        ("clip-0",),
+        1,
+        0,
+    )
+    # Stage2: the shard JSONL rows only, never an artifact.
+    assert stage2["reads"] == 1, stage2
+    # Destination: no manifest content, and no per-frame metadata probe. The only
+    # probes allowed are the symlink+existence pair on the manifest itself.
+    assert counts["reads"] == [], counts
+    manifest = str(frames_dir / "frames.json")
+    assert set(counts["probes"]) == {manifest}, counts
+    assert len(counts["probes"]) == 2, counts
+
+
+def test_inventory_rewrite_is_skipped_when_unchanged(case, monkeypatch):
+    """Reproducing the identical inventory must not rewrite it."""
+    _write_rows(case, [_ready(case)])
+    # A malformed line gives the failure inventory real content to compare.
+    case[2].write_text("{bad\n" + case[2].read_text())
+    api, paths, storage = _start(case)
+    first = _hydrate(case, api, paths, storage)
+    assert (first.ready, first.corrupt) == (1, 1)
+    inventories = (paths.exclusions_path, paths.input_failures_path)
+    before = {path: path.read_bytes() for path in inventories}
+    assert any(before.values()), "the failure inventory must not be empty"
+
+    replaced: list[Path] = []
+    real_replace = Path.replace
+
+    def counting_replace(self, target):
+        replaced.append(Path(target))
+        return real_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", counting_replace)
+    second = _hydrate(case, api, paths, storage)
+    assert (second.ready, second.corrupt) == (1, 1)
+    assert replaced == [], replaced
+    assert {path: path.read_bytes() for path in inventories} == before
+
+    # A changed inventory is still republished, and only that one.
+    paths.exclusions_path.write_text("stale\n")
+    third = _hydrate(case, api, paths, storage)
+    assert third.corrupt == 1
+    assert replaced == [paths.exclusions_path], replaced
+    assert paths.exclusions_path.read_bytes() == b""
+    assert paths.input_failures_path.read_bytes() == before[paths.input_failures_path]

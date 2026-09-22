@@ -638,7 +638,14 @@ def test_campaign_and_completed_poll_never_read_canonical_contents(case, monkeyp
         assert all(api().completed_receipt(c, shard) for shard in c.shards)
 
 
-def test_only_claimed_shard_hashes_and_mutation_fails_resume(case, monkeypatch):
+def test_only_claimed_shard_is_hashed_and_only_at_initialization(case, monkeypatch):
+    """Exactly one shard of a campaign is hashed, exactly once.
+
+    Fresh initialization binds the claimed shard's bytes; a restart then reuses
+    that bound identity and hashes nothing, so a warm restart costs no canonical
+    body read at all - not for the claimed shard and certainly not for its
+    siblings.
+    """
     from r2v_data_v2.v3 import post_mask_production as production
 
     _write_rows(case, [])
@@ -658,9 +665,9 @@ def test_only_claimed_shard_hashes_and_mutation_fails_resume(case, monkeypatch):
     config = accepted(case[0])
     production.initialize_shard(config, paths, git_commit="test")
     assert reads == [case[2]]
+
     case[2].write_text("\n")
-    with pytest.raises(ValueError, match="identity mismatch"):
-        production.initialize_shard(config, paths, git_commit="test")
+    production.initialize_shard(config, paths, git_commit="test")
     assert set(reads) == {case[2]}
 
 

@@ -399,16 +399,28 @@ class PhaseLedger:
         _fsync_directory(target.parent)
         return hashlib.sha256(payload).hexdigest()
 
-    def artifact_digests(self, job_id: str) -> dict[str, str]:
+    def artifact_digests(
+        self, job_id: str, *, include_result: bool = True
+    ) -> dict[str, str]:
+        """Digest the artifacts of one job directory.
+
+        ``include_result`` keeps the durable ``result.json`` in the listing. It
+        defaults to True because a job with artifacts but no receipt still has to
+        be recognised as a rerun rather than as pending. The committed path
+        passes False, so the result is never hashed as if it were a binary
+        artifact and never hashed twice.
+        """
         root = self.artifacts_root / job_id
         if not root.is_dir():
             return {}
         result = {}
         for path in sorted(root.rglob("*")):
-            if path.is_file():
-                result[str(path.relative_to(root))] = hashlib.sha256(
-                    path.read_bytes()
-                ).hexdigest()
+            if not path.is_file():
+                continue
+            name = str(path.relative_to(root))
+            if not include_result and name == _RESULT_NAME:
+                continue
+            result[name] = hashlib.sha256(path.read_bytes()).hexdigest()
         return result
 
     # -- durable result ---------------------------------------------------
@@ -476,14 +488,11 @@ class PhaseLedger:
                 phase_id=self.root.name,
             )
         if expected:
-            # Only the artifacts the receipt actually lists are validated. The
-            # directory also holds ``result.json``, which is bound by its own
-            # digest, so comparing whole directory listings would reject every
-            # receipt that has one.
-            artifacts = self.artifact_digests(job.job_id())
-            if any(
-                artifacts.get(name) != digest for name, digest in expected.items()
-            ):
+            # Exact set equality over the *binary* artifacts, with ``result.json``
+            # excluded from the walk: a tampered, missing or unexpected extra
+            # binary artifact is still a mismatch.
+            artifacts = self.artifact_digests(job.job_id(), include_result=False)
+            if artifacts != expected:
                 return JobState(
                     STATE_MISMATCH,
                     dict(receipt),
@@ -510,10 +519,10 @@ class PhaseLedger:
                 "durable result is missing",
                 phase_id=self.root.name,
             )
-        if (
-            hashlib.sha256(result_path.read_bytes()).hexdigest()
-            != expected_result
-        ):
+        # One read and one digest: the same bytes answer both the digest check
+        # and the parse, so the durable result is never read or hashed twice.
+        result_bytes = result_path.read_bytes()
+        if hashlib.sha256(result_bytes).hexdigest() != expected_result:
             return JobState(
                 STATE_MISMATCH,
                 dict(receipt),
@@ -521,7 +530,7 @@ class PhaseLedger:
                 phase_id=self.root.name,
             )
         try:
-            payload = json.loads(result_path.read_text())
+            payload = json.loads(result_bytes)
         except ValueError:
             return JobState(
                 STATE_MISMATCH,

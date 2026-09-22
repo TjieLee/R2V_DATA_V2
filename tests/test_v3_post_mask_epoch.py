@@ -1541,3 +1541,79 @@ def test_partial_group_restart_matches_an_uninterrupted_run(tmp_path: Path):
 
     # The durable outcome converges on the uninterrupted one, job for job.
     assert receipts_by_phase(partial_root) == receipts_by_phase(clean_root)
+
+
+# --------------------------------------------------------------------------
+# 14. resume read cost: one scan at most, one result read at most
+# --------------------------------------------------------------------------
+
+
+def _count_resume_io(monkeypatch, ledger, job):
+    """Count artifact_digests() calls and per-file reads for one job's dir."""
+    seen: dict[str, list[Any]] = {"digests_calls": [], "reads": []}
+    real_digests = PhaseLedger.artifact_digests
+
+    def counting_digests(self, job_id, **kwargs):
+        seen["digests_calls"].append(kwargs.get("include_result", True))
+        return real_digests(self, job_id, **kwargs)
+
+    monkeypatch.setattr(PhaseLedger, "artifact_digests", counting_digests)
+    root = ledger.artifacts_root / job.job_id()
+    real_read_bytes = Path.read_bytes
+
+    def counting_read(self, *args, **kwargs):
+        if str(self).startswith(str(root)):
+            seen["reads"].append(Path(self).name)
+        return real_read_bytes(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_bytes", counting_read)
+    return seen
+
+
+def test_result_only_resume_reads_the_result_once_and_never_scans(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A result-only job pays for exactly one read: its own result."""
+    ledger = PhaseLedger(tmp_path / "phase")
+    job = _job(job_type="judge")
+    _commit_result(ledger, job, JobResult(OUTCOME_COMPLETED, payload={"ok": True}))
+
+    seen = _count_resume_io(monkeypatch, ledger, job)
+    state = ledger.classify(job)
+
+    assert state.state == STATE_COMPLETED
+    assert seen["digests_calls"] == [], "a result-only job must not scan its directory"
+    assert seen["reads"] == ["result.json"], seen
+
+
+def test_binary_artifact_resume_scans_once_and_reads_the_result_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """One directory scan, each artifact once, and the result read exactly once."""
+    ledger = PhaseLedger(tmp_path / "phase")
+    job = _job()
+    result = JobResult(
+        OUTCOME_COMPLETED, {"a.bin": b"a", "b.bin": b"b"}, payload={"ok": True}
+    )
+    _commit_result(ledger, job, result)
+
+    seen = _count_resume_io(monkeypatch, ledger, job)
+    state = ledger.classify(job)
+
+    assert state.state == STATE_COMPLETED
+    assert seen["digests_calls"] == [False], "exactly one scan, result excluded"
+    assert sorted(seen["reads"]) == ["a.bin", "b.bin", "result.json"], seen
+
+
+def test_unexpected_extra_binary_artifact_fails_closed(tmp_path: Path):
+    """The binary artifact set is exact: an unlisted file is corruption."""
+    ledger = PhaseLedger(tmp_path / "phase")
+    job = _job()
+    _commit_result(ledger, job, JobResult(OUTCOME_COMPLETED, {"a.bin": b"a"}))
+    assert ledger.classify(job).state == STATE_COMPLETED
+
+    ledger.publish_artifact(job.job_id(), "extra.bin", b"surprise")
+
+    state = ledger.classify(job)
+    assert state.state == STATE_MISMATCH
+    assert not state.skippable

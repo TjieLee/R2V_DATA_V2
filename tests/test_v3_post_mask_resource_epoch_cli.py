@@ -520,3 +520,65 @@ def test_mismatched_complete_marker_fails_closed(
     )
     assert seen["calls"] == 0
     assert "completion marker identity mismatch" in capsys.readouterr().out
+
+
+def test_group_completed_after_the_resume_scan_is_not_rerun(
+    launcher: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The resume plan is lock-free, so completion must be rechecked under the lock.
+
+    Another node can finish a group between this node's resume scan and its lock
+    acquisition. Trusting the stale plan would re-run a group that is already
+    done, so the completion marker is consulted again *after* the lock is held,
+    still as metadata only, and the group never reaches the runner.
+    """
+    from contextlib import contextmanager
+
+    import r2v_data_v2.v3.post_mask_epoch_groups as groups_module
+
+    root = _stage2_root(tmp_path, shards=1)
+    campaign_root = tmp_path / "campaign"
+    seen = _install_recorder(monkeypatch, launcher)
+    _explode_ledger(monkeypatch)
+
+    real_ownership = groups_module.group_ownership
+    raced: list[str] = []
+
+    @contextmanager
+    def racing_ownership(state_root: Path, group: Any):
+        # The simulated peer publishes its completion before we take the lock.
+        marker = groups_module.group_completed_marker(state_root, group)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(
+            json.dumps(
+                {"group_id": group.group_id, "group_identity": group.identity()}
+            )
+        )
+        raced.append(group.group_id)
+        with real_ownership(state_root, group) as held:
+            yield held
+
+    monkeypatch.setattr(groups_module, "group_ownership", racing_ownership)
+
+    assert (
+        launcher.main(
+            [
+                "--base-config",
+                str(tmp_path / "cfg.yaml"),
+                "--entity-mask-root",
+                str(root),
+                "--post-mask-root",
+                str(campaign_root),
+                "--job-runner",
+                "pkg.module:callable",
+            ]
+        )
+        == 0
+    )
+    assert raced == ["group-000000"]
+    assert seen["calls"] == 0, "a group completed elsewhere never reaches the runner"
+    summary = _summary(campaign_root)
+    assert summary["groups_attempted"] == 0, "it is not counted as attempted"
+    assert summary["groups_complete_skipped"] == 1
+    assert summary["groups_complete_skipped_after_lock"] == 1
+    assert summary["group_completed"] == 0

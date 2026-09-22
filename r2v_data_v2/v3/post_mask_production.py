@@ -31,6 +31,7 @@ from r2v_data_v2.v3.storage import RunStorage
 
 _COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _SHARD = re.compile(r"shard-[0-9]{9}-[0-9]{9}\.jsonl")
+_HEX64 = re.compile(r"[0-9a-f]{64}")
 _PROVENANCE = ".post_mask_hydration.json"
 
 
@@ -200,12 +201,12 @@ def _identity(config: V3Config, paths: ShardPaths) -> dict[str, Any]:
 def _verify_shard_identity(storage: RunStorage, paths: ShardPaths) -> None:
     """Re-verify a shard's identity without re-hashing its canonical JSONL.
 
-    ``initialize_shard`` already bound ``shard_sha256`` into ``identity.json``,
-    and once initialization succeeded that file *is* the authority. A restart
-    therefore only has to re-derive the cheap semantic fields, confirm the run
-    root is the one this identity describes and check the digest field is still
-    a well-formed digest. Reading the whole shard again to recompute the same
-    value would be duplicated I/O on every restart.
+    A fresh initialization hashed the canonical shard bytes once and published
+    the digest into ``identity.json``. From then on that sidecar *is* the
+    authority: a restart only re-derives the cheap semantic fields, confirms the
+    run root is the one this identity describes and checks that the digest field
+    is still a well-formed digest. Reading the whole shard again to recompute a
+    value that is already durable would be duplicated I/O on every restart.
     """
     if storage.root != paths.run_root or not paths.identity_path.is_file():
         raise ValueError("Post-Mask source/config identity mismatch")
@@ -218,18 +219,30 @@ def _verify_shard_identity(storage: RunStorage, paths: ShardPaths) -> None:
     semantic = _semantic_identity(storage.config, paths)
     recorded = {key: persisted.get(key) for key in semantic}
     shard_sha256 = persisted.get("shard_sha256")
-    if (
-        recorded != semantic
-        or not isinstance(shard_sha256, str)
-        or len(shard_sha256) != 64
-    ):
+    if recorded != semantic or not isinstance(shard_sha256, str):
+        raise ValueError("Post-Mask source/config identity mismatch")
+    if _HEX64.fullmatch(shard_sha256) is None:
         raise ValueError("Post-Mask source/config identity mismatch")
 
 
 def initialize_shard(
     base_config: V3Config, paths: ShardPaths, *, git_commit: str
 ) -> RunStorage:
-    """Initialize strict V3 identity, retaining a historical commit on restart."""
+    """Initialize strict V3 identity, retaining a historical commit on restart.
+
+    Two strictly separated paths:
+
+    * **fresh** - no ``identity.json`` yet, so the canonical shard bytes are
+      hashed exactly once, the run is initialized and the sidecar is published;
+    * **restart** - ``identity.json`` exists and is the authority. The shard is
+      never re-read, the shard digest is never recomputed and the sidecar is
+      never rewritten; only the cheap semantic fields and the run identity are
+      re-verified, and the historical commit is reused.
+
+    Neither path repairs a partially initialized run root. A populated run
+    without its identity sidecar, and an identity sidecar without its run, are
+    both corruption and both fail closed.
+    """
     frozen_root = paths.shard_path.parent.parent.resolve()
     for destination in (paths.run_root, paths.export_root, paths.state_root):
         resolved = destination.resolve()
@@ -238,34 +251,56 @@ def initialize_shard(
         if not resolved.is_relative_to(config_module.ALLOWED_WRITABLE_ROOT.resolve()):
             raise ValueError("Post-Mask writes must stay inside allowed writable root")
     config = prepare_shard_config(base_config, paths)
-    expected = _identity(config, paths)
-    if (
-        paths.identity_path.exists()
-        and json.loads(paths.identity_path.read_text()) != expected
-    ):
-        raise ValueError("Post-Mask shard/config identity mismatch")
     storage = RunStorage(config)
-    if storage.run_path.exists():
-        git_commit = storage.read_run().git_commit
-        # An interrupted fresh initialization may leave only run.json.
-        if not paths.identity_path.exists() and any(
-            path.name != "run.json" for path in storage.root.iterdir()
-        ):
-            raise ValueError("populated Post-Mask run is missing identity sidecar")
-    storage.initialize(git_commit=git_commit)
-    write_json_atomic(paths.identity_path, expected)
+
+    if not paths.identity_path.is_file():
+        if storage.run_path.exists():
+            # An interrupted fresh initialization can leave run.json behind.
+            # Reuse its commit so the run keeps one identity, but any *other*
+            # file means the run was populated without ever binding its
+            # identity, which is exactly the state that must not be adopted.
+            git_commit = storage.read_run().git_commit
+            if any(
+                path.name != "run.json" for path in storage.root.iterdir()
+            ):
+                raise ValueError("populated Post-Mask run is missing identity sidecar")
+        expected = _identity(config, paths)
+        storage.initialize(git_commit=git_commit)
+        write_json_atomic(paths.identity_path, expected)
+        return storage
+
+    _verify_shard_identity(storage, paths)
+    if not storage.run_path.exists():
+        raise ValueError("Post-Mask shard identity has no matching run")
+    # Run identity already pinned at initialization; reuse it, never a new one.
+    storage.initialize(git_commit=storage.read_run().git_commit)
     return storage
 
 
 def _write_inventory(path: Path, records: list[dict[str, Any]]) -> None:
+    """Publish one inventory, atomically, only when its bytes actually changed.
+
+    A restart normally reproduces the identical failures/exclusions list, so the
+    tmp+fsync+rename dance would rewrite the same bytes on every launch. Plain
+    byte equality is enough here - the file is a small JSONL and there is nothing
+    to gain from hashing it - and it keeps a shared filesystem from seeing a
+    pointless duplicate write and directory entry churn.
+    """
+    payload = "".join(
+        json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
+        for record in records
+    ).encode("utf-8")
+    try:
+        if path.is_file() and path.read_bytes() == payload:
+            return
+    except OSError:
+        # Unreadable is not "unchanged"; fall through and republish it.
+        pass
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
-        with temporary.open("w", encoding="utf-8") as handle:
-            for record in records:
-                handle.write(
-                    json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
-                )
+        with temporary.open("wb") as handle:
+            handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
         temporary.replace(path)
@@ -389,48 +424,10 @@ def _make_staging_writable(root: Path) -> None:
             path.chmod(path.stat().st_mode | stat.S_IRUSR | stat.S_IWUSR)
 
 
-#: The three small manifests that make a hydrated destination readable at all.
-#: Their presence is what lets a restart answer "is this clip already hydrated?"
-#: from the destination alone.
+#: The three manifests that make a hydrated destination readable at all. Their
+#: presence is what lets a restart answer "is this clip already hydrated?" from
+#: the destination alone.
 _RESUME_MANIFESTS = ("clip.json", "frames/frames.json", "masks.rle.json")
-
-
-def _resume_destination_assets(destination: Path, clip: ClipRecord) -> bool:
-    """Whether every asset the hydrated copy references is still present.
-
-    The expected inventory is read from the destination's own manifests, never
-    from Stage2, so a restart still notices a deleted or replaced frame or
-    reference (and declines to the repairing path) without touching the frozen
-    input. A manifest that no longer parses is itself the answer: it is not a
-    destination this fast path may trust.
-    """
-    try:
-        frames = SampledFramesArtifact.model_validate_json(
-            (destination / "frames/frames.json").read_text()
-        )
-        masks = TrackedMasksArtifact.model_validate_json(
-            (destination / "masks.rle.json").read_text()
-        )
-    except (OSError, ValueError):
-        return False
-    if frames.clip_uid != clip.clip_uid or masks.clip_uid != clip.clip_uid:
-        return False
-    relatives = [str(frame.image_path) for frame in frames.frames]
-    for relative in _reference_paths(clip.references.model_dump(mode="json")):
-        if relative.startswith("clips/"):
-            prefix = f"clips/{clip.clip_uid}/"
-            if not relative.startswith(prefix):
-                return False
-            relative = relative[len(prefix) :]
-        relatives.append(relative)
-    for relative in relatives:
-        try:
-            path = _beneath(destination, relative)
-        except ValueError:
-            return False
-        if path.is_symlink() or not path.is_file():
-            return False
-    return True
 
 
 def _resume_destination_is_complete(
@@ -442,17 +439,29 @@ def _resume_destination_is_complete(
     row: dict[str, Any],
     uid: str,
 ) -> bool:
-    """Whether an existing destination is provably the mirror this row describes.
+    """Whether an existing destination is the mirror this row describes.
 
-    ``True`` means the hydration of this row is already done, so the row is
-    eligible without re-reading Stage2 at all: no source clip/frame/mask
-    manifest, no source frame or reference path walk, no shard re-hash and no
-    copy. Everything consulted is the destination plus the provenance marker
-    that hydration itself wrote.
+    ``True`` means hydration of this row is already done, so the row is eligible
+    without touching the frozen Stage2 tree at all. Everything consulted is the
+    destination plus the provenance marker hydration itself wrote: the marker
+    must be a regular file naming this exact row, shard and artifact root, the
+    three key manifests must be present as regular files, and the durable clip
+    must carry this uid and source index. No manifest is parsed, no frame or
+    reference path is walked or stat-ed, no shard is re-hashed and nothing is
+    copied.
+
+    The first atomic hydration publication is the durable authority for the
+    assets beneath it. Losing one frame or reference afterwards is deliberately
+    not discovered here - the stage that consumes it fails closed - because
+    re-walking every asset of every clip is precisely the metadata storm this
+    path exists to remove.
 
     ``False`` is always safe: the caller then runs the original full validation
     and repair path, which is what a restart used to do unconditionally. So this
-    can only ever skip work the slow path would have gone on to discard.
+    can only ever skip work the slow path would have gone on to discard. A
+    missing ``frames/frames.json`` or ``masks.rle.json`` takes that slow path and
+    is repaired from the frozen input; a missing ``clip.json`` does not, because
+    the durable clip is mutable downstream state and is never regenerated.
     """
     marker = destination / _PROVENANCE
     if marker.is_symlink() or not marker.is_file():
@@ -480,9 +489,7 @@ def _resume_destination_is_complete(
         clip = storage.read_clip(uid)
     except (OSError, ValueError):
         return False
-    if clip.clip_uid != uid or clip.source.source_index != row.get("source_index"):
-        return False
-    return _resume_destination_assets(destination, clip)
+    return clip.clip_uid == uid and clip.source.source_index == row.get("source_index")
 
 
 def hydrate_shard(

@@ -154,6 +154,7 @@ def main(argv=None) -> int:
         GROUP_INCOMPLETE,
         assigned_groups,
         build_groups,
+        group_is_completed,
         group_ownership,
         record_group_outcome,
         resource_epoch_root,
@@ -229,12 +230,27 @@ def main(argv=None) -> int:
         )
 
         planned, completed, incomplete, skipped = 0, 0, 0, 0
+        late_complete_skipped = 0
         for group in resume.ordered:
             with group_ownership(state_root, group) as held:
                 if not held:
                     skipped += 1
                     _emit(
                         "post_mask_resource_epoch_group_locked_elsewhere",
+                        group_id=group.group_id,
+                    )
+                    continue
+                # Authoritative recheck *after* the lock. The resume plan was a
+                # lock-free scan, so another node may have completed this group
+                # in between; taking the lock and then trusting the stale plan
+                # would re-run a group that is already done. This is still a
+                # metadata-only question - one stat and one small marker - and it
+                # runs before the descriptor is written, so a group that turns out
+                # to be complete is never counted as attempted.
+                if group_is_completed(state_root, group):
+                    late_complete_skipped += 1
+                    _emit(
+                        "post_mask_resource_epoch_group_completed_elsewhere",
                         group_id=group.group_id,
                     )
                     continue
@@ -289,7 +305,8 @@ def main(argv=None) -> int:
             "group_completed": completed,
             "group_incomplete": incomplete,
             "groups_locked_elsewhere": skipped,
-            "groups_complete_skipped": len(resume.complete),
+            "groups_complete_skipped": len(resume.complete) + late_complete_skipped,
+            "groups_complete_skipped_after_lock": late_complete_skipped,
             "groups_unfinished": len(resume.unfinished),
             "groups_fresh": len(resume.fresh),
         }
