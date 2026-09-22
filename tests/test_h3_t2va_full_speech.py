@@ -448,10 +448,18 @@ def test_factories_load_once_and_use_frozen_crops(
 
 
 def test_worker_runtime_metadata_mismatch_is_not_fatal(
-    speech, diar_jobs, asr_jobs, tmp_path, ffmpeg, monkeypatch
+    speech, finalized, tmp_path, ffmpeg, monkeypatch
 ):
     from tools import run_h3_diarization_binding as diar_cli
     from tools import run_h3_stem_qwen3_asr_shadow as asr_cli
+
+    audio, run_id = finalized
+    executor = Executor()
+    args = (audio, run_id, tmp_path / "workers", ["2", "7"], True)
+    speech.run_diarizen(*args, ffmpeg=ffmpeg, execute=executor)
+    diar_jobs = executor.batches[-1][1]
+    speech.run_asr(*args, ffmpeg=ffmpeg, execute=executor)
+    asr_jobs = executor.batches[-1][1]
 
     db = _Diarization()
     db._process = SimpleNamespace(poll=lambda: None)
