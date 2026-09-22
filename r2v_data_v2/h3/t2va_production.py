@@ -1013,35 +1013,36 @@ def prepare_shard(
             selection_path.read_text(encoding="utf-8")
         )
 
+    print(f"shard={shard_id} downstream_inventory_build_start", flush=True)
     try:
         inventory = build(
             manifest,
             preselected=preselected,
             verify_audio_files=preselected is None,
         )
-    except (ValueError, TypeError, KeyError, OSError):
-        inventory = None
-    if inventory is not None:
-        write_json(prepared / "inventory.json", inventory)
-        contexts = {job.clip_uid: (job, inventory) for job in inventory.jobs}
+    except (ValueError, TypeError, KeyError, OSError) as exc:
+        print(
+            f"shard={shard_id} downstream_inventory_build_failed "
+            f"{type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        raise
+    print(
+        f"shard={shard_id} downstream_inventory_build_ready "
+        f"jobs={len(inventory.jobs)}",
+        flush=True,
+    )
+    write_json(prepared / "inventory.json", inventory)
+    contexts = {job.clip_uid: (job, inventory) for job in inventory.jobs}
     for row in rows:
         uid = row["clip_uid"]
         if row.get("preparation_error"):
             continue
         if uid not in contexts:
-            # Exceptional path isolates one broken media/ASR row from its neighbors.
-            # Normal preparation loads the upstream inventory only once per shard.
-            path = prepared / f"{uid}.jsonl"
-            path.write_text(json.dumps(raw_by_uid[uid]) + "\n", encoding="utf-8")
-            try:
-                single = build(path)
-                if len(single.jobs) != 1 or single.jobs[0].clip_uid != uid:
-                    raise ValueError("source row is not a valid T2VA shot")
-                write_json(prepared / f"{uid}.inventory.json", single)
-                contexts[uid] = (single.jobs[0], single)
-            except (ValueError, TypeError, KeyError, OSError) as exc:
-                row["preparation_error"] = f"{type(exc).__name__}: {exc}"
-                continue
+            row["preparation_error"] = (
+                "ValueError: valid source row is absent from bulk T2VA inventory"
+            )
+            continue
         job, _ = contexts[uid]
         if job.upstream_failure:
             row["upstream_failure"] = job.upstream_failure
