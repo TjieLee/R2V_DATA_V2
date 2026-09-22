@@ -3311,7 +3311,7 @@ def _count_selection_replays(monkeypatch: pytest.MonkeyPatch) -> list[str]:
         SubjectAttributeEpochRunner,
     )
 
-    real = SubjectAttributeEpochRunner._replay_attribute_selection
+    real = SubjectAttributeEpochRunner._replay_attribute_selection_prepared
     calls: list[str] = []
 
     def counting(
@@ -3325,6 +3325,7 @@ def _count_selection_replays(monkeypatch: pytest.MonkeyPatch) -> list[str]:
         attribute_index,
         attribute_id,
         discovery_job_id,
+        **kwargs,
     ):
         calls.append(str(attribute_id))
         return real(
@@ -3338,10 +3339,13 @@ def _count_selection_replays(monkeypatch: pytest.MonkeyPatch) -> list[str]:
             attribute_index,
             attribute_id,
             discovery_job_id,
+            **kwargs,
         )
 
     monkeypatch.setattr(
-        SubjectAttributeEpochRunner, "_replay_attribute_selection", counting
+        SubjectAttributeEpochRunner,
+        "_replay_attribute_selection_prepared",
+        counting,
     )
     return calls
 
@@ -3371,7 +3375,9 @@ def test_terminal_attribute_selection_is_not_rebuilt_at_every_receipt(
     outcome = scheduler.run(runner.seed_jobs())
 
     assert outcome["completed"] is True
-    assert len(calls) <= 20, (
+    # Non-zero guards against a vacuous pass: the instrumentation must really be
+    # observing the replay it claims to measure.
+    assert 0 < len(calls) <= 20, (
         f"attribute selections rebuilt {len(calls)} times; a receipt is "
         "re-deriving attributes that are already terminal"
     )
@@ -3431,38 +3437,254 @@ def test_completion_job_context_reuses_a_terminal_selection(
     )
 
 
-def test_cold_runner_rederives_without_any_cache(
+def test_same_ledger_restart_after_publication_crash(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A fresh runner with empty caches produces the same durable outcome."""
+    """Crash after every receipt but before publication: resume on the SAME ledger.
+
+    A restart is a new runner over the *same* ledger, not a different ledger -
+    a different one would simply reuse the already-published artifact and prove
+    nothing about replaying from receipts with cold Python caches.
+    """
     monkeypatch.setattr(time, "perf_counter", lambda: 1.0)
     config, storage, runner, qwen, sam = _two_completion_owner(tmp_path, monkeypatch)
+    boogu = _BooguBackend(_generated_png())
+
+    # Crash window: receipts are committed, the terminal publication is not.
+    real_publish = SubjectAttributeEpochRunner._publish_owner_artifact
+
+    def crashing_publish(self, *args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("simulated owner publication crash")
+
+    monkeypatch.setattr(
+        SubjectAttributeEpochRunner, "_publish_owner_artifact", crashing_publish
+    )
     scheduler = _scheduler(
         runner,
         _SerialQwenExecutor(runner, qwen),
         runner.finalize,
         _SerialQwenExecutor(runner, sam),
-        _SerialQwenExecutor(runner, _BooguBackend(_generated_png())),
+        _SerialQwenExecutor(runner, boogu),
     )
-    outcome = scheduler.run(runner.seed_jobs())
-    assert outcome["completed"] is True
-    artifact = _read_artifact(storage)
+    first = scheduler.run(runner.seed_jobs())
 
-    # A brand new runner over the same durable state: every cache starts cold.
-    fresh = _runner(config, storage, tmp_path, ledger_name="cold-ledger")
-    assert fresh.replay_counters["owner_context_cache_hit"] == 0
-    assert fresh.replay_counters["attribute_selection_cache_hit"] == 0
+    assert first["completed"] is False, "publication crashed"
+    assert not _owner_artifact_file(storage).exists(), "artifact not published"
+    # Every model receipt is already durable, and the caches were populated.
+    assert runner.replay_counters["attribute_selection_cache_hit"] > 0
+    assert qwen.discovery_calls == 1
+    assert boogu.calls == 2, "both completions were generated"
+    assert sam.calls > 0, "the probes were paid"
+
+    monkeypatch.setattr(
+        SubjectAttributeEpochRunner, "_publish_owner_artifact", real_publish
+    )
+    # A new runner over the SAME ledger: Python caches start empty.
+    fresh = SubjectAttributeEpochRunner(
+        config,
+        {SHARD: storage},
+        GroupLedger(runner.ledger.root),
+        eligible_clip_uids_by_shard={SHARD: [CLIP_UID]},
+    )
+    assert fresh.ledger.root == runner.ledger.root
     assert fresh._owner_context_cache == {}
     assert fresh._attribute_selection_cache == {}
+    assert fresh.replay_counters["attribute_selection_cache_hit"] == 0
 
-    fresh_scheduler = _scheduler(
-        fresh,
-        _SerialQwenExecutor(fresh, qwen),
-        fresh.finalize,
-        _SerialQwenExecutor(fresh, sam),
-        _SerialQwenExecutor(fresh, _BooguBackend(_generated_png())),
+    fresh_qwen = _QwenClient(
+        discoveries=[], reviews=[], completion_reviews=[]
     )
-    fresh_outcome = fresh_scheduler.run(fresh.seed_jobs())
-    assert fresh_outcome["completed"] is True
-    # Nothing is owed and the published artifact is byte-identical.
-    assert _read_artifact(storage) == artifact
+    fresh_sam = _SamBackend(by_prompt={})
+    fresh_boogu = _BooguBackend(_generated_png())
+    outcome = _scheduler(
+        fresh,
+        _SerialQwenExecutor(fresh, fresh_qwen),
+        fresh.finalize,
+        _SerialQwenExecutor(fresh, fresh_sam),
+        _SerialQwenExecutor(fresh, fresh_boogu),
+    ).run(fresh.seed_jobs())
+
+    assert outcome["completed"] is True
+    # Zero repeated model calls: everything is served from committed receipts.
+    assert fresh_qwen.discovery_calls == 0
+    assert fresh_qwen.review_calls + fresh_qwen.completion_review_calls == 0
+    assert fresh_sam.calls == 0
+    assert fresh_boogu.calls == 0
+    # The CPU replay reconstructs the terminal owner and publishes it once.
+    assert _owner_artifact_file(storage).exists()
+    artifact = _read_artifact(storage)
+    assert [record.attribute_id for record in artifact.records] == ["a1", "a2"]
+
+
+def test_attribute_plan_is_never_written_from_a_worker_thread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Creating a durable attribute plan must stay on the calling thread.
+
+    The parallel replay region is pure CPU. If a plan creation ever moves back
+    into a worker, publication order stops being deterministic.
+    """
+    import threading
+
+    import r2v_data_v2.v3.post_mask_epoch_subject_attributes as pm
+
+    monkeypatch.setattr(time, "perf_counter", lambda: 1.0)
+    real_write = pm._write_json_once
+    real_prepared = SubjectAttributeEpochRunner._replay_attribute_selection_prepared
+    in_replay = {"active": False}
+    plan_writes: list[str] = []
+    writes_during_replay: list[str] = []
+
+    def recording_write(path: Any, payload: Any) -> Any:
+        if Path(path).name == "plan.json":
+            plan_writes.append(threading.current_thread().name)
+            if in_replay["active"]:
+                writes_during_replay.append(str(path))
+        return real_write(path, payload)
+
+    def prepared(self: Any, *args: Any, **kwargs: Any) -> Any:
+        in_replay["active"] = True
+        try:
+            return real_prepared(self, *args, **kwargs)
+        finally:
+            in_replay["active"] = False
+
+    monkeypatch.setattr(pm, "_write_json_once", recording_write)
+    monkeypatch.setattr(
+        SubjectAttributeEpochRunner,
+        "_replay_attribute_selection_prepared",
+        prepared,
+    )
+
+    _, _, runner, qwen, sam = _two_completion_owner(tmp_path, monkeypatch)
+    outcome = _scheduler(
+        runner,
+        _SerialQwenExecutor(runner, qwen),
+        runner.finalize,
+        _SerialQwenExecutor(runner, sam),
+        _SerialQwenExecutor(runner, _BooguBackend(_generated_png())),
+    ).run(runner.seed_jobs())
+
+    assert outcome["completed"] is True
+    # At least one plan was really created, so the assertion is not vacuous.
+    assert plan_writes, "no attribute plan was created"
+    off_thread = [name for name in plan_writes if name != "MainThread"]
+    assert not off_thread, f"attribute plan written off the main thread: {off_thread}"
+    # The pure replay helper performs no durable write at all, on any thread.
+    assert writes_during_replay == [], (
+        f"durable write inside the replay region: {writes_during_replay}"
+    )
+
+
+def test_owner_candidates_are_prewarmed_before_the_parallel_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The owner candidate set is built once, on the caller thread.
+
+    Without the prewarm every attribute worker would rebuild the same JPEG/RLE
+    candidate evidence at once, which is the expensive part of the replay.
+    """
+    import threading
+
+    monkeypatch.setattr(time, "perf_counter", lambda: 1.0)
+    in_parallel = {"active": False}
+    real_selections = SubjectAttributeEpochRunner._replay_attribute_selections
+    real_candidates = SubjectAttributeEpochRunner._owner_candidate_objects
+    real_prepared = SubjectAttributeEpochRunner._replay_attribute_selection_prepared
+    replay_threads: list[str] = []
+    leaks: list[str] = []
+
+    def selections(self: Any, *args: Any, **kwargs: Any) -> Any:
+        in_parallel["active"] = True
+        try:
+            return real_selections(self, *args, **kwargs)
+        finally:
+            in_parallel["active"] = False
+
+    def prepared(self: Any, *args: Any, **kwargs: Any) -> Any:
+        replay_threads.append(threading.current_thread().name)
+        return real_prepared(self, *args, **kwargs)
+
+    def candidates(self: Any, *args: Any, **kwargs: Any) -> Any:
+        # Recorded rather than raised: the scheduler swallows finalizer
+        # exceptions, which would hide a leak instead of failing the test.
+        if (
+            in_parallel["active"]
+            and threading.current_thread() is not threading.main_thread()
+        ):
+            leaks.append(threading.current_thread().name)
+        return real_candidates(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        SubjectAttributeEpochRunner, "_replay_attribute_selections", selections
+    )
+    monkeypatch.setattr(
+        SubjectAttributeEpochRunner, "_owner_candidate_objects", candidates
+    )
+    monkeypatch.setattr(
+        SubjectAttributeEpochRunner,
+        "_replay_attribute_selection_prepared",
+        prepared,
+    )
+
+    _, _, runner, qwen, sam = _two_completion_owner(tmp_path, monkeypatch)
+    outcome = _scheduler(
+        runner,
+        _SerialQwenExecutor(runner, qwen),
+        runner.finalize,
+        _SerialQwenExecutor(runner, sam),
+        _SerialQwenExecutor(runner, _BooguBackend(_generated_png())),
+    ).run(runner.seed_jobs())
+
+    assert outcome["completed"] is True
+    # The guard is only meaningful if the replay really ran off the main thread.
+    assert any(name != "MainThread" for name in replay_threads), (
+        f"selection replay never ran on a worker: {replay_threads}"
+    )
+    assert leaks == [], f"owner candidate build leaked into workers: {leaks}"
+    # One owner, one heavy candidate build, reused by every attribute worker.
+    assert runner.replay_counters["owner_candidate_rebuilds"] == 1
+    assert runner.replay_counters["owner_candidate_cache_hit"] > 0
+
+
+def test_selection_cache_access_is_lock_guarded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Concurrent reads, inserts and evictions keep the bound and the counters.
+
+    The scheduler overlaps a model job's context lookup on a worker with the main
+    thread replaying the previous receipt, so the cache and the counters are both
+    exercised from several threads at once.
+    """
+    import threading
+
+    monkeypatch.setattr(time, "perf_counter", lambda: 1.0)
+    _, _, runner, _, _ = _two_completion_owner(tmp_path, monkeypatch)
+
+    def hammer() -> None:
+        for index in range(200):
+            key = ("s", "c", "o", f"a{index % 40}")
+            with runner._attribute_selection_cache_lock:
+                runner._attribute_selection_cache[key] = object()
+                while (
+                    len(runner._attribute_selection_cache)
+                    > runner._attribute_selection_cache_limit
+                ):
+                    runner._attribute_selection_cache.pop(
+                        next(iter(runner._attribute_selection_cache))
+                    )
+                _ = len(runner._attribute_selection_cache)
+            runner._bump_replay_counter("attribute_selection_cache_hit")
+
+    threads = [threading.Thread(target=hammer) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert (
+        len(runner._attribute_selection_cache)
+        <= runner._attribute_selection_cache_limit
+    )
+    # No lost updates: every increment is visible.
+    assert runner.replay_counters["attribute_selection_cache_hit"] == 4 * 200
