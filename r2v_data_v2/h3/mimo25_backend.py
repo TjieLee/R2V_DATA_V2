@@ -29,7 +29,8 @@ from r2v_data_v2.structured_output import (
     parse_structured_json_issues,
 )
 
-MIMO25_MODEL = "mimo-v2.5"
+MIMO_MODEL = "mimo-v2.6-flash-rl"
+MIMO25_MODEL = MIMO_MODEL
 MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
 MIMO25_PROMPT_VERSION = "h3_mimo25_speech_assembly_v49"
 MIMO25_SPEAKER_PROFILE_PROMPT_VERSION = "h3_mimo25_speaker_profile_v2"
@@ -1016,7 +1017,7 @@ class MimoBackendProvenance(SchemaModel):
         "xiaomi_openai_compatible", "sglang_openai_compatible"
     ]
     transport: MimoTransport
-    model: Literal["mimo-v2.5"] = MIMO25_MODEL
+    model: StrictStr = MIMO_MODEL
     base_url: str
     video_fps: Literal[4.0] = 4.0
     media_resolution: Literal["default"] = "default"
@@ -1304,7 +1305,7 @@ class MimoBackendConfig:
             or self.thinking not in {"disabled", "enabled"}
             or self.icl not in {"none", "official_ref2va_v1"}
             or not self.base_url.strip()
-            or self.model != MIMO25_MODEL
+            or not self.model.strip()
             or self.video_fps != 4.0
             or self.media_resolution != "default"
             or not math.isfinite(self.temperature)
@@ -3671,6 +3672,7 @@ __all__ = [
     "DEFAULT_BASE64_LIMIT_BYTES",
     "MIMO25_MATERIALIZER_VERSION",
     "MIMO25_MODEL",
+    "MIMO_MODEL",
     "MIMO25_POLICY_VERSION",
     "MIMO25_PROMPT_VERSION",
     "MIMO25_SCHEMA_VERSION",
