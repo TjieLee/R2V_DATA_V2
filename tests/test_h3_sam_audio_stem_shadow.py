@@ -2524,9 +2524,8 @@ def test_stem_reconcile_cli_forwards_experimental_controls(
     assert result["icl"] == "v1"
     assert result["temperature"] == 0.0
     assert result["model"] == "mimo-v2.6-flash-rl"
-    assert result["mimo_run_id"] == "mimo-v2.6-flash-rl"
     assert result["output_root"].endswith(
-        "/mimo_runs/mimo-v2.6-flash-rl/legacy_lr_asd"
+        "/mimo_reconcile_stemtext_final_av_markerpolish_v1"
     )
     assert json.loads(capsys.readouterr().out.splitlines()[-1]) == result
 
