@@ -447,6 +447,51 @@ def test_factories_load_once_and_use_frozen_crops(
     assert (ab.starts, ab.closes, ab.calls) == (1, 1, 2)
 
 
+def test_worker_runtime_metadata_mismatch_is_not_fatal(
+    speech, diar_jobs, asr_jobs, tmp_path, ffmpeg, monkeypatch
+):
+    from tools import run_h3_diarization_binding as diar_cli
+    from tools import run_h3_stem_qwen3_asr_shadow as asr_cli
+
+    db = _Diarization()
+    db._process = SimpleNamespace(poll=lambda: None)
+    db.provenance = db.provenance.model_copy(
+        update={"model_fingerprint": "f" * 64}
+    )
+    db.environment = {}
+
+    class ASRBackend(_Qwen):
+        def __init__(self):
+            super().__init__()
+            self._process = SimpleNamespace(poll=lambda: None)
+            self.configuration = self.configuration.model_copy(
+                update={"dtype": "float32"}
+            )
+
+        def close(self, **kwargs):
+            pass
+
+    ab = ASRBackend()
+
+    monkeypatch.setattr(
+        diar_cli,
+        "_runtime_backend",
+        lambda **kwargs: (db, kwargs["output_root"]),
+    )
+    monkeypatch.setattr(asr_cli, "_isolated_backend", lambda: ab)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "7")
+
+    diar_config = speech._diar_configuration()
+    diar_config["provenance"]["model_fingerprint"] = "0" * 64
+    with speech.diarizen_worker(diar_config) as worker:
+        assert worker.process(diar_jobs[0], tmp_path)["segments"]
+
+    asr_config = {**speech._asr_configuration(), "ffmpeg": ffmpeg}
+    asr_config["configuration"]["dtype"] = "bfloat16"
+    with speech.asr_worker(asr_config) as worker:
+        assert worker.process(asr_jobs[0], tmp_path)["text"]
+
+
 def test_invalid_diarization_not_cacheable(speech, finalized, tmp_path, ffmpeg):
     audio, run_id = finalized
     executor = Executor()
