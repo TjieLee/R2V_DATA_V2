@@ -701,8 +701,42 @@ def test_reference_edit_defaults_select_boogu() -> None:
         "Boogu-Image-0.1-Edit-Turbo-hotfix-1k-20260708"
     )
     assert edit.target_area == 1024 * 1024
-    assert edit.alignment == 32
+    assert edit.alignment == 16
     assert edit.completion_instruction_rewrite_enabled is True
+
+
+def test_reference_edit_alignment_is_backend_specific(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = load_config(
+        _write_config(
+            tmp_path,
+            monkeypatch,
+            candidate_judge=True,
+            background_remove_judge=True,
+            reference_edit_enabled=True,
+            reference_edit_judge=True,
+        )
+    )
+    assert config.reference_edit.backend == "boogu_image_0_1_edit_turbo"
+    assert config.reference_edit.alignment == 16
+
+    qwen_image = replace(
+        config,
+        reference_edit=replace(
+            config.reference_edit,
+            backend="qwen_image_2_1",
+            alignment=32,
+        ),
+    )
+    qwen_image.validate()
+
+    with pytest.raises(ValueError, match="alignment must be 32 for qwen_image_2_1"):
+        replace(
+            qwen_image,
+            reference_edit=replace(qwen_image.reference_edit, alignment=16),
+        ).validate()
 
 
 def test_generator_implementation_changes_do_not_gate_or_reidentify_campaign(

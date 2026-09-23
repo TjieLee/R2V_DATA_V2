@@ -187,7 +187,7 @@ class ReferenceEditConfig:
     cuda_visible_devices: str = "0"
     num_inference_steps: int = 40
     target_area: int = 1024 * 1024
-    alignment: int = 32
+    alignment: int = 16
     timeout_seconds: int = 3600
     completion_instruction_rewrite_enabled: bool = True
     background_instruction_rewrite_enabled: bool = False
@@ -1045,8 +1045,28 @@ class V3Config:
             or self.reference_edit.target_area < 1
         ):
             raise ValueError("reference_edit.target_area must be a positive integer")
-        if self.reference_edit.alignment != 32:
-            raise ValueError("reference_edit.alignment must be 32")
+        alignment = self.reference_edit.alignment
+        backend = self.reference_edit.backend
+        if backend == BOOGU_REMOVE_BACKEND and alignment != 16:
+            raise ValueError(
+                "reference_edit.alignment must be 16 for "
+                "boogu_image_0_1_edit_turbo"
+            )
+        if backend == "qwen_image_2_1" and alignment != 32:
+            raise ValueError(
+                "reference_edit.alignment must be 32 for qwen_image_2_1"
+            )
+        if (
+            backend not in {BOOGU_REMOVE_BACKEND, "qwen_image_2_1"}
+            and (
+                not isinstance(alignment, int)
+                or isinstance(alignment, bool)
+                or alignment < 1
+            )
+        ):
+            raise ValueError(
+                "reference_edit.alignment must be a positive integer"
+            )
         if (
             not isinstance(self.reference_edit.timeout_seconds, int)
             or isinstance(self.reference_edit.timeout_seconds, bool)
