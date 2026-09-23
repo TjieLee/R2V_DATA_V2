@@ -188,7 +188,7 @@ class ReferenceEditConfig:
     target_area: int = 1024 * 1024
     alignment: int = 32
     timeout_seconds: int = 3600
-    completion_instruction_rewrite_enabled: bool = True
+    completion_instruction_rewrite_enabled: bool = False
     background_instruction_rewrite_enabled: bool = False
     add_background_to_complete: bool = True
     fallback_policy: str = "keep_source"

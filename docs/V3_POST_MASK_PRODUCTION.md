@@ -816,6 +816,7 @@ reference_edit:
   num_inference_steps: 40
   target_area: 1048576
   alignment: 32
+  completion_instruction_rewrite_enabled: false
 ```
 
 These paths describe the future server smoke, not files required on a Mac.

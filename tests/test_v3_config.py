@@ -702,6 +702,7 @@ def test_reference_edit_defaults_select_local_qwen_image_and_pe_i2i() -> None:
     assert edit.num_inference_steps == 40
     assert edit.target_area == 1024 * 1024
     assert edit.alignment == 32
+    assert edit.completion_instruction_rewrite_enabled is False
 
 
 def test_generator_implementation_changes_do_not_gate_or_reidentify_campaign(
