@@ -1390,7 +1390,6 @@ def run_removal_pair_epochs(
             "post_mask_epoch_pair_primary_seeded",
             seeded_jobs=result["pair_primary_job_count"],
         )
-    _emit_pair_cpu_diagnostics(emit, pair)
     primary_unresolved = tuple(primary_outcome.get("unresolved_job_ids", ()))
     _emit(
         emit,
@@ -1433,6 +1432,11 @@ def run_removal_pair_epochs(
             payload = stats.to_dict()
             pair.storages[shard].update_stage_counts("pair", payload)
             pair_stats[shard] = payload
+    # Exactly one final Pair CPU diagnostics event per invocation, emitted after
+    # reconcile so it reflects every counter this invocation updated - including
+    # the reconcile-owned ones. When Pair is incomplete and reconcile is skipped
+    # it is still emitted once, so the execution diagnostics are never lost.
+    _emit_pair_cpu_diagnostics(emit, pair)
     result.update(
         {
             "pair_primary_completed":pair_primary_completed,

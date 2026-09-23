@@ -4141,3 +4141,82 @@ def test_pipeline_reports_seeded_pair_jobs_and_cpu_diagnostics(
         assert key in payload, (key, sorted(payload))
     assert payload["primary_prepare_wall_seconds"] >= 0.0
     assert payload["primary_prepare_tasks"] >= 1
+
+
+def test_pair_cpu_diagnostics_reflect_the_final_reconcile_counters(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one diagnostics event must be emitted AFTER reconcile updates it.
+
+    Reconcile owns counters such as hot_prefilter_cache_hits and
+    primary_reconcile_cache_hits, so emitting before it would report a stale
+    snapshot of the invocation's own CPU work.
+    """
+    config = _config(tmp_path, monkeypatch, "run-a")
+    removal_storage = _pending_storage(config, clip_uids=("clip-1",))
+    pair_config = _config(tmp_path, monkeypatch, "run-b")
+    pair_config = replace(
+        pair_config,
+        pair=replace(
+            pair_config.pair, reference_prefilter_mode="conservative_v1"
+        ),
+    )
+    pair_storage = _storage(pair_config, entity_types=("subject",))
+    storages = {SHARD: removal_storage, PAIR_SHARD: pair_storage}
+    eligible = {SHARD: ("clip-1",), PAIR_SHARD: ("clip-1",)}
+    ledger = GroupLedger(tmp_path / "ledger")
+    log: list[str] = []
+    events: list[dict[str, Any]] = []
+    runners: dict[str, Any] = {}
+
+    def removal_factory(runner: Any) -> Any:
+        return ResourceEpochScheduler(
+            ledger=ledger,
+            finalize=runner.finalize,
+            executors=_removal_executors(runner, log),
+        )
+
+    def pair_factory(runner: Any) -> Any:
+        return ResourceEpochScheduler(
+            ledger=ledger,
+            finalize=runner.finalize,
+            executors={
+                RESOURCE_QWEN: _RecordingExecutor(runner, _EntityJudge(), "pair", log)
+            },
+        )
+
+    def pair_runner_factory(**kwargs: Any) -> Any:
+        runner = default_pair_runner_factory(**kwargs)
+        runners["pair"] = runner
+        return runner
+
+    outcome = run_removal_pair_epochs(
+        config=pair_config,
+        storages=storages,
+        eligible_clip_uids_by_shard=eligible,
+        ledger=ledger,
+        removal_scheduler_factory=removal_factory,
+        pair_scheduler_factory=pair_factory,
+        pair_runner_factory=pair_runner_factory,
+        emit=_collecting_emit(events),
+    )
+    assert outcome["pair_completed"] is True, "reconcile really ran"
+
+    diagnostics = [
+        entry
+        for entry in events
+        if entry["event"] == "post_mask_epoch_pair_cpu_diagnostics"
+    ]
+    assert len(diagnostics) == 1, "exactly one final diagnostics event"
+    payload = diagnostics[0]
+    runner = runners["pair"]
+
+    # The event is the runner's own counters, as they stand after reconcile.
+    assert {key: payload[key] for key in runner.prepare_counters} == dict(
+        runner.prepare_counters
+    )
+    # Reconcile-owned counters are only non-zero once reconcile has run, which
+    # is exactly what emitting before it would miss.
+    assert payload["hot_prefilter_cache_hits"] > 0, payload
+    assert payload["primary_reconcile_cache_hits"] > 0, payload
+    assert payload["primary_plan_validation_cache_hits"] > 0, payload
