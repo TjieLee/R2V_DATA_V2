@@ -23,9 +23,13 @@ from r2v_data_v2.h3.t2va_shadow import (
     T2VAJob,
     T2VAMimoDraft,
     T2VARawResponse,
+    T2VASingleCallBackendProvenance,
+    T2VASingleCallDraft,
     check_audio_files,
     fingerprint,
+    parse_t2va_completion,
     parse_t2va_semantic,
+    validate_t2va_draft,
 )
 
 # No-reference adaptation of visual_only_v5, speech_assembly_v48,
@@ -57,6 +61,15 @@ Place each speech part among the surrounding visual/action prose at its observed
 Describe each stable visual fact once. After the initial composition, describe only meaningful new actions, state, camera or shot changes. Do not repeatedly restate unchanged posture, gaze, composition, atmosphere, silence or relationship merely to extend the description. Stop once the observed clip progression has been covered.
 Only localized diegetic or shot-synchronized sounds that need a specific playback position belong in prose; do not append general ambience or background score summaries. Return warnings only for genuinely uncertain observations."""
 
+T2VA_SINGLE_CALL_SYSTEM_PROMPT = T2VA_SYSTEM_PROMPT.replace(
+    "return one T2VAMimoDraft JSON object",
+    "return one T2VASingleCallDraft JSON object",
+) + """
+
+NON-DIALOGUE AUDIO IN THE SAME RESPONSE
+Also return overall_soundscape and non_diegetic_music. Listen to the original target AV together with the separated music and SFX views of that SAME target. The original AV remains primary authority; the stems help recall quiet musical, environmental and physical sounds, but their labels are not automatically true.
+overall_soundscape describes audible ambience and physical/environmental sound, excluding dialogue and non-diegetic music. non_diegetic_music describes audience-only score when established; use N/A only when none is established. A coherent quiet musical layer in the original AV can be supported by the music stem. Do not repeat continuous ambience or audience-only score in integrated_sequence."""
+
 
 @dataclass(frozen=True)
 class T2VAMimoConfig:
@@ -65,6 +78,7 @@ class T2VAMimoConfig:
     api_key: str
     model: str = MIMO_MODEL
     transport: Literal["sglang", "xiaomi"] = "sglang"
+    call_mode: Literal["multi", "single"] = "multi"
     max_completion_tokens: int = 32768
     timeout_seconds: float = 900.0
 
@@ -74,15 +88,20 @@ class T2VAMimoConfig:
             or not self.base_url.strip()
             or not self.model.strip()
             or self.transport not in {"sglang", "xiaomi"}
+            or self.call_mode not in {"multi", "single"}
             or self.max_completion_tokens <= 0
             or self.timeout_seconds <= 0
         ):
             raise ValueError("invalid T2VA backend configuration")
 
-    def provenance(self) -> T2VABackendProvenance:
-        return T2VABackendProvenance(
-            prompt_sha256=hashlib.sha256(T2VA_SYSTEM_PROMPT.encode()).hexdigest(),
-            response_schema_sha256=fingerprint(T2VAMimoDraft.model_json_schema()),
+    def provenance(self) -> T2VABackendProvenance | T2VASingleCallBackendProvenance:
+        single = self.call_mode == "single"
+        provenance = T2VASingleCallBackendProvenance if single else T2VABackendProvenance
+        prompt = T2VA_SINGLE_CALL_SYSTEM_PROMPT if single else T2VA_SYSTEM_PROMPT
+        draft = T2VASingleCallDraft if single else T2VAMimoDraft
+        return provenance(
+            prompt_sha256=hashlib.sha256(prompt.encode()).hexdigest(),
+            response_schema_sha256=fingerprint(draft.model_json_schema()),
             transport=self.transport,
             model=self.model,
             base_url=self.base_url,
@@ -352,5 +371,71 @@ class T2VAMimoBackend:
             if self.verify_media:
                 check_audio_files(job.audio_evidence)
         except Exception as exc:  # noqa: BLE001 - persist both stages, never retry.
+            raw.error = f"{type(exc).__name__}: {exc}"
+        return raw
+
+
+class T2VASingleCallBackend(T2VAMimoBackend):
+    """Optional one-request AV draft; the existing renderer still owns exact ASR."""
+
+    def __init__(self, config: T2VAMimoConfig, **kwargs: Any) -> None:
+        if config.call_mode != "single" or config.transport != "sglang":
+            raise ValueError("single-call T2VA requires explicit SGLang call mode")
+        super().__init__(config, **kwargs)
+
+    def build_request(self, job: T2VAJob) -> dict:
+        if job.audio_evidence is None:
+            raise ValueError("T2VA requires resolved music/sfx evidence")
+        request = super().build_request(job)
+        request["messages"][0]["content"] = T2VA_SINGLE_CALL_SYSTEM_PROMPT
+        content = request["messages"][1]["content"]
+        for kind in ("music", "sfx"):
+            content.extend(
+                [
+                    {"type": "text", "text": f"{kind} stem: separated audio of the SAME target"},
+                    {
+                        "type": "audio_url",
+                        "audio_url": {
+                            "url": self.config.media_resolver.resolve(
+                                Path(getattr(job.audio_evidence, f"{kind}_path"))
+                            )
+                        },
+                    },
+                ]
+            )
+        request["response_format"]["json_schema"] = {
+            "name": "T2VASingleCallDraft",
+            "schema": T2VASingleCallDraft.model_json_schema(),
+            "strict": True,
+        }
+        return request
+
+    def annotate(self, job: T2VAJob, request_fingerprint: str) -> T2VARawResponse:
+        raw = T2VARawResponse(
+            schema_version="r2v.h3.t2va_raw_response.3",
+            clip_uid=job.clip_uid,
+            request_fingerprint=request_fingerprint,
+            model_call_count=0,
+            response=None,
+            finish_reason=None,
+            usage={},
+            warnings=[],
+            error=None,
+        )
+        try:
+            if job.audio_evidence is None:
+                raise ValueError("T2VA requires resolved music/sfx evidence")
+            if self.verify_media:
+                check_audio_files(job.audio_evidence)
+            completion = self._complete(self.build_request(job))
+            for key, value in completion.model_dump().items():
+                setattr(raw, key, value)
+            raw.semantic_model_call_count = completion.model_call_count
+            if raw.error:
+                return raw
+            draft, audio, corrections = parse_t2va_completion(job, raw)
+            validate_t2va_draft(job, draft, audio)
+            raw.deterministic_corrections = corrections
+        except Exception as exc:  # noqa: BLE001 - preserve the sole raw request.
             raw.error = f"{type(exc).__name__}: {exc}"
         return raw

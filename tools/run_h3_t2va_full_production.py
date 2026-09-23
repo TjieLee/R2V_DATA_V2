@@ -48,6 +48,7 @@ def main(argv=None):
         default=Path("/mnt/workspace/public/pretrained/MiMo/MiMo-V2.5"),
     )
     parser.add_argument("--mimo-model", default="mimo-v2.5")
+    parser.add_argument("--mimo-call-mode", choices=("multi", "single"), default="multi")
     parser.add_argument("--mimo-mem-fraction-static", type=float, default=0.65)
     parser.add_argument("--mimo-startup-polls", type=int, default=360)
     parser.add_argument("--mimo-poll-interval", type=float, default=5.0)
@@ -123,6 +124,7 @@ def main(argv=None):
             "canonical_workers": args.canonical_workers,
             "resume_schedule": resume_schedule,
             "mimo_model": args.mimo_model,
+            "mimo_call_mode": args.mimo_call_mode,
             "model_call_count": 0,
         }
     print(
@@ -145,12 +147,16 @@ def main(argv=None):
     from r2v_data_v2.h3.auk_speech_shadow import auk_configuration
     from r2v_data_v2.h3.mimo25_backend import MimoMediaResolver
     from r2v_data_v2.h3.sam_audio_stem_shadow import sam_audio_configuration
-    from r2v_data_v2.h3.t2va_mimo_backend import T2VAMimoBackend, T2VAMimoConfig
-    from r2v_data_v2.h3.ta2va_shadow import TA2VAProfileBackend
+    from r2v_data_v2.h3.t2va_mimo_backend import (
+        T2VAMimoBackend,
+        T2VAMimoConfig,
+        T2VASingleCallBackend,
+    )
     from r2v_data_v2.h3.t2va_mimo_stage_server import (
         StageMimoClient,
         build_mimo_serve_command,
     )
+    from r2v_data_v2.h3.ta2va_shadow import TA2VAProfileBackend
 
     sam_config = sam_audio_configuration(
         implementation_root=required_path("SAM_AUDIO_CODE_ROOT"),
@@ -177,6 +183,7 @@ def main(argv=None):
         api_key=os.environ.get("MIMO_API_KEY", "local-no-key"),
         model=args.mimo_model,
         transport="sglang",
+        call_mode=args.mimo_call_mode,
     )
     mimo_client = StageMimoClient(
         api_key=config.api_key,
@@ -205,7 +212,7 @@ def main(argv=None):
         gpu_ids=gpu_ids,
         sam_configuration=sam_config,
         auk_configuration=auk_config,
-        backend=T2VAMimoBackend(
+        backend=(T2VASingleCallBackend if args.mimo_call_mode == "single" else T2VAMimoBackend)(
             config,
             client=mimo_client,
             verify_media=False,

@@ -306,6 +306,19 @@ def test_dry_run_exact_accepted_server_and_full_cli(sandbox):
     assert not any((root / name).exists() for name in ("sourced", "out", "events"))
 
 
+def test_v26_single_call_dry_run_preserves_official_serving(sandbox):
+    script, env, _ = sandbox
+    result = invoke(
+        script,
+        {**env, "MIMO_MODEL": "mimo-v2.6-flash-rl", "MIMO_CALL_MODE": "single"},
+        "--dry-run",
+    )
+    assert result.returncode == 0, result.stderr
+    serve, run = map(shlex.split, result.stdout.splitlines())
+    assert serve[serve.index("--speculative-algorithm") + 1] == "EAGLE"
+    assert run[run.index("--mimo-call-mode") + 1] == "single"
+
+
 @pytest.mark.parametrize(
     "gpu_ids", ["0,0", "-1", "0,,1", "x", "0,1,2,3,4,5,6,7,8", "01,1", ""]
 )

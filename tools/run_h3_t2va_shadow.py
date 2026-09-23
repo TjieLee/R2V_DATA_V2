@@ -11,7 +11,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from r2v_data_v2.h3.mimo25_backend import MimoMediaResolver
-from r2v_data_v2.h3.t2va_mimo_backend import T2VAMimoBackend, T2VAMimoConfig
+from r2v_data_v2.h3.t2va_mimo_backend import (
+    T2VAMimoBackend,
+    T2VAMimoConfig,
+    T2VASingleCallBackend,
+)
 from r2v_data_v2.h3.t2va_shadow import build_t2va_inventory, run_t2va_shadow, t2va_root
 
 
@@ -32,7 +36,8 @@ def main(argv: list[str] | None = None) -> dict:
         type=Path,
         help="Writable JSONL offset cache (outside source directory)",
     )
-    parser.add_argument("--model", default="mimo-v2.5", choices=["mimo-v2.5"])
+    parser.add_argument("--model", default="mimo-v2.5")
+    parser.add_argument("--call-mode", choices=("multi", "single"), default="multi")
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--transport", choices=["sglang", "xiaomi"], default="sglang")
     parser.add_argument("--media-root", type=Path, required=True)
@@ -52,6 +57,7 @@ def main(argv: list[str] | None = None) -> dict:
         api_key=os.environ.get("MIMO_API_KEY", "local-no-key"),
         transport=args.transport,
         model=args.model,
+        call_mode=args.call_mode,
         max_completion_tokens=args.max_completion_tokens,
     )
     inventory = build_t2va_inventory(
@@ -78,8 +84,9 @@ def main(argv: list[str] | None = None) -> dict:
             "model_call_count": 0,
             "output_root": str(t2va_root(args.audio_production_root, args.t2va_run_id)),
         }
+    backend_class = T2VASingleCallBackend if args.call_mode == "single" else T2VAMimoBackend
     return run_t2va_shadow(
-        inventory, T2VAMimoBackend(config), overwrite=args.overwrite
+        inventory, backend_class(config), overwrite=args.overwrite
     ).model_dump(mode="json")
 
 

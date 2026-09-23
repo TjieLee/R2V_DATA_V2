@@ -421,6 +421,35 @@ def build(finalized, tmp_path, **kwargs):
     )
 
 
+def test_single_call_inventory_and_frozen_shadow_roundtrip(finalized, tmp_path):
+    from r2v_data_v2.h3.t2va_mimo_backend import T2VASingleCallBackend
+
+    production_root, audio_run_id = finalized
+    single_config = T2VAMimoConfig(
+        **{**config(tmp_path).__dict__, "call_mode": "single"}
+    )
+    inventory = t2va.build_t2va_inventory(
+        shot_manifest=tmp_path / "shots_f03_motion.jsonl",
+        audio_production_root=production_root,
+        audio_shadow_run_id=audio_run_id,
+        t2va_run_id="one-call-test",
+        backend=single_config.provenance(),
+    )
+    responses = [
+        json.dumps({**draft_for(j).model_dump(mode="json"), **audio_for().model_dump(mode="json")})
+        for j in inventory.jobs
+        if not j.upstream_failure
+    ]
+    summary = t2va.run_t2va_shadow(
+        inventory, T2VASingleCallBackend(single_config, client=Client(responses))
+    )
+    root = t2va.t2va_root(production_root, "one-call-test")
+    loaded, records, loaded_summary = t2va.load_t2va_shadow(root)
+    assert loaded.backend.schema_version == "r2v.h3.t2va_mimo_backend.8"
+    assert summary == loaded_summary
+    assert all(r.model_call_count == 1 and r.schema_version.endswith(".3") for r in records if r.status == "ready")
+
+
 def test_preselected_inventory_skips_media_reselection_and_audio_rehash(
     finalized, tmp_path, monkeypatch
 ):
@@ -554,6 +583,22 @@ def test_case_manifest_order_and_dry_run_no_client(finalized, tmp_path, monkeypa
     )
     assert report["clip_uids"] == [ids[2], ids[1]] and report["model_call_count"] == 0
     assert not Path(report["output_root"]).exists()
+    single = cli.main(
+        [
+            "--shot-manifest", str(tmp_path / "shots_f03_motion.jsonl"),
+            "--audio-production-root", str(finalized[0]),
+            "--audio-shadow-run-id", finalized[1],
+            "--t2va-run-id", "dry-single",
+            "--case-manifest", str(manifest),
+            "--media-root", str(tmp_path),
+            "--base-url", "http://localhost/v1",
+            "--model", "mimo-v2.6-flash-rl",
+            "--call-mode", "single",
+            "--dry-run",
+        ]
+    )
+    assert single["clip_uids"] == report["clip_uids"]
+    assert single["model_call_count"] == 0
 
 
 def test_one_failed_clip_does_not_stop_next(finalized, tmp_path):

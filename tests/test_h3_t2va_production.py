@@ -244,7 +244,7 @@ def test_ready_resume_does_not_grow_journal(tmp_path):
     assert path.read_bytes() == before
 
 
-def test_full_t2va_pending_sample_verifies_media_once(
+def test_full_t2va_pending_sample_reuses_published_media_hashes(
     tmp_path, finalized, monkeypatch
 ):
     from r2v_data_v2.h3 import t2va_shadow as t
@@ -293,7 +293,7 @@ def test_full_t2va_pending_sample_verifies_media_once(
         output,
     )
     assert result["model_call_count"] == 2
-    assert calls == {"video": 1, "audio": 1}
+    assert calls == {"video": 0, "audio": 0}
 
 
 def test_prevalidated_processor_skips_repeated_source_hashes(
@@ -335,6 +335,33 @@ def test_prevalidated_processor_skips_repeated_source_hashes(
         output,
     )
     assert result["model_call_count"] == 2
+
+
+def test_full_production_recovery_does_not_rehash_published_files(tmp_path, monkeypatch):
+    stage = tmp_path / "t2va"
+    stage.mkdir()
+    (stage / "core.json").write_text("{}")
+    production.atomic_json(
+        stage / "stage.json",
+        {
+            "identity": "old-model-fingerprint",
+            "files": {"core.json": "a" * 64},
+            "result": {"model_call_count": 1},
+        },
+    )
+    monkeypatch.setattr(
+        production,
+        "_sha",
+        lambda path: pytest.fail("full production rehashed a published stage"),
+    )
+    assert production._recover_stage(
+        stage, "new-model-fingerprint", allow_identity_mismatch=True
+    ) == {"model_call_count": 1}
+    (stage / "core.json").unlink()
+    with pytest.raises(ValueError, match="missing"):
+        production._recover_stage(
+            stage, "new-model-fingerprint", allow_identity_mismatch=True
+        )
 
 
 def test_t2va_shadow_equivalence(tmp_path, finalized):

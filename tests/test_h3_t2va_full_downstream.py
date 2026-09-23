@@ -229,6 +229,31 @@ def test_ready_t2va_failed_ta_retries_only_ta(tmp_path, finalized, ffmpeg):
     assert len(client.calls) == calls
 
 
+def test_ready_artifacts_survive_mimo_model_and_call_mode_swap(tmp_path, finalized):
+    from r2v_data_v2.h3.t2va_mimo_backend import T2VAMimoConfig, T2VASingleCallBackend
+
+    backend, profiles, old_client, profile_client = clients(tmp_path, finalized)
+    first = invoke(tmp_path, finalized, backend, profiles)
+    original_calls = len(old_client.calls), len(profile_client.calls)
+    config = T2VAMimoConfig(
+        **{
+            **shared.config(tmp_path).__dict__,
+            "model": "mimo-v2.6-flash-rl",
+            "call_mode": "single",
+        }
+    )
+    new_client = shared.Client([])
+    second = invoke(
+        tmp_path,
+        finalized,
+        T2VASingleCallBackend(config, client=new_client),
+        profiles,
+    )
+    assert second == first
+    assert not new_client.calls
+    assert (len(old_client.calls), len(profile_client.calls)) == original_calls
+
+
 @pytest.mark.parametrize("damage", ["video", "receipt"])
 def test_ready_evidence_changes_fail_closed(tmp_path, finalized, damage):
     backend, profiles, client, profile = clients(tmp_path, finalized)

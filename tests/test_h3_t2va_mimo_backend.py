@@ -8,15 +8,89 @@ from r2v_data_v2.h3.mimo25_backend import (
     MimoAudioFinalizeDraft,
 )
 from r2v_data_v2.h3.t2va_mimo_backend import (
+    T2VA_SINGLE_CALL_SYSTEM_PROMPT,
     T2VA_SYSTEM_PROMPT,
     T2VAMimoBackend,
     T2VAMimoConfig,
+    T2VASingleCallBackend,
 )
-from r2v_data_v2.h3.t2va_shadow import T2VAMimoDraft
+from r2v_data_v2.h3.t2va_shadow import (
+    T2VAMimoDraft,
+    T2VASingleCallDraft,
+    parse_t2va_completion,
+    validate_t2va_draft,
+)
 from tests import test_h3_t2va_shadow as shadow_tests
 from tests.test_h3_t2va_shadow import Client, config, draft_for
 
 job = shadow_tests.job
+
+
+def test_single_call_uses_existing_t2va_contract_and_renders_exact_asr(job, tmp_path):
+    semantic = shadow_tests.draft_for(job)
+    combined = {
+        **semantic.model_dump(mode="json"),
+        "overall_soundscape": "A soft room hum is audible.",
+        "non_diegetic_music": "N/A",
+    }
+    config_single = T2VAMimoConfig(**{**config(tmp_path).__dict__, "call_mode": "single"})
+    client = shadow_tests.Client([json.dumps(combined)])
+    backend = T2VASingleCallBackend(config_single, client=client)
+    raw = backend.annotate(job, "a" * 64)
+    assert raw.error is None
+    assert raw.model_call_count == raw.semantic_model_call_count == len(client.calls) == 1
+    assert raw.audio_finalize is None
+    request = client.calls[0]
+    assert request["messages"][0]["content"] == T2VA_SINGLE_CALL_SYSTEM_PROMPT
+    assert request["response_format"]["json_schema"]["schema"] == T2VASingleCallDraft.model_json_schema()
+    assert request["extra_body"]["use_audio_in_video"] is True
+    content = request["messages"][1]["content"]
+    assert [part["type"] for part in content] == [
+        "video_url", "text", "text", "audio_url", "text", "audio_url"
+    ]
+    assert all(fact.text not in json.dumps(request, ensure_ascii=False) for fact in job.speech_facts)
+    draft, audio, corrections = parse_t2va_completion(job, raw)
+    assert corrections == {}
+    core = validate_t2va_draft(job, draft, audio)
+    assert core.overall_soundscape == "A soft room hum is audible."
+    assert "<d>[Chinese] 你好。</d>" in core.integrated_multimodal_description
+    assert "<d>[Chinese] 好的！</d>" in core.integrated_multimodal_description
+    assert backend.provenance().schema_version == "r2v.h3.t2va_mimo_backend.8"
+
+
+def test_single_call_missing_audio_field_fails_without_second_call(job, tmp_path):
+    config_single = T2VAMimoConfig(**{**config(tmp_path).__dict__, "call_mode": "single"})
+    client = shadow_tests.Client([shadow_tests.draft_for(job).model_dump_json()])
+    raw = T2VASingleCallBackend(config_single, client=client).annotate(job, "a" * 64)
+    assert raw.error and raw.model_call_count == len(client.calls) == 1
+
+
+def test_single_call_provenance_does_not_change_multicall_contract(tmp_path):
+    multi = config(tmp_path).provenance()
+    single = T2VAMimoConfig(**{**config(tmp_path).__dict__, "call_mode": "single"}).provenance()
+    assert multi.schema_version == "r2v.h3.t2va_mimo_backend.7"
+    assert multi.prompt_version == "h3_t2va_joint_av_v7"
+    assert "call_mode" not in multi.model_dump()
+    assert single.prompt_version == "h3_t2va_single_av_v1"
+    assert single.model != ""
+
+
+def test_single_call_uses_existing_production_writer(job, tmp_path):
+    from r2v_data_v2.h3.t2va_production import t2va_stage
+
+    payload = {
+        **shadow_tests.draft_for(job).model_dump(mode="json"),
+        **shadow_tests.audio_for().model_dump(mode="json"),
+    }
+    cfg = T2VAMimoConfig(**{**config(tmp_path).__dict__, "call_mode": "single"})
+    client = shadow_tests.Client([json.dumps(payload)])
+    output = tmp_path / "one-call-stage"
+    output.mkdir()
+    result = t2va_stage(job, T2VASingleCallBackend(cfg, client=client), output)
+    assert result["model_call_count"] == len(client.calls) == 1
+    assert set(result["exports"]["t2va"]) == {"video", "images", "audios", "caption"}
+    assert result["exports"]["t2va"]["caption"] == (output / "prompt.txt").read_text()
+    assert json.loads((output / "raw.json").read_text())["response"] == json.dumps(payload)
 
 
 @pytest.mark.parametrize("transport", ["sglang", "xiaomi"])

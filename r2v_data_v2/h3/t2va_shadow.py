@@ -199,6 +199,11 @@ class T2VAMimoDraft(SchemaModel):
         return self
 
 
+class T2VASingleCallDraft(T2VAMimoDraft):
+    overall_soundscape: Text
+    non_diegetic_music: Text
+
+
 def _validate_repetition(parts: list[str]) -> None:
     sentences = [
         " ".join(s.casefold().split())
@@ -585,6 +590,17 @@ class T2VABackendProvenance(SchemaModel):
     maximum_attempts: Literal[1] = 1
 
 
+class T2VASingleCallBackendProvenance(T2VABackendProvenance):
+    schema_version: Literal["r2v.h3.t2va_mimo_backend.8"] = (
+        "r2v.h3.t2va_mimo_backend.8"
+    )
+    prompt_version: Literal["h3_t2va_single_av_v1"] = "h3_t2va_single_av_v1"
+    audio_finalize_prompt_version: None = None
+    audio_finalize_prompt_sha256: None = None
+    audio_finalize_schema_sha256: None = None
+    call_mode: Literal["single"] = "single"
+
+
 class T2VAInventory(SchemaModel):
     schema_version: Literal["r2v.h3.t2va_inventory.3"] = "r2v.h3.t2va_inventory.3"
     shot_selection: T2VAShotSelection
@@ -596,7 +612,10 @@ class T2VAInventory(SchemaModel):
     sample_seed: int | None
     clip_uids: list[SafeID] = Field(min_length=1)
     jobs: list[T2VAJob]
-    backend: T2VABackendProvenance
+    backend: Annotated[
+        T2VABackendProvenance | T2VASingleCallBackendProvenance,
+        Field(discriminator="schema_version"),
+    ]
     inventory_fingerprint: Hash
 
     @model_validator(mode="after")
@@ -919,7 +938,9 @@ class T2VACompletion(SchemaModel):
 
 
 class T2VARawResponse(T2VACompletion):
-    schema_version: Literal["r2v.h3.t2va_raw_response.2"] = "r2v.h3.t2va_raw_response.2"
+    schema_version: Literal[
+        "r2v.h3.t2va_raw_response.2", "r2v.h3.t2va_raw_response.3"
+    ] = "r2v.h3.t2va_raw_response.2"
     clip_uid: SafeID
     request_fingerprint: Hash
     model_call_count: int = Field(ge=0, le=2)
@@ -936,8 +957,44 @@ class T2VARawResponse(T2VACompletion):
         return self
 
 
+def parse_t2va_completion(
+    job: T2VAJob, raw: T2VARawResponse
+) -> tuple[T2VAMimoDraft, MimoAudioFinalizeDraft, dict[str, int]]:
+    from r2v_data_v2.structured_output import (
+        normalize_structured_json_envelope,
+        parse_structured_json_response,
+    )
+
+    if raw.audio_finalize is not None:
+        if raw.audio_finalize.error:
+            raise ValueError(raw.audio_finalize.error)
+        draft, corrections = parse_t2va_semantic(job, raw.response or "")
+        audio = parse_structured_json_response(
+            raw.audio_finalize.response or "", MimoAudioFinalizeDraft
+        )
+        return draft, audio, corrections
+    if raw.model_call_count != 1 or raw.error:
+        raise ValueError("T2VA single-call response is unavailable")
+    payload = json.loads(normalize_structured_json_envelope(raw.response or ""))
+    if not isinstance(payload, dict):
+        raise TypeError("T2VA single-call response must be a JSON object")
+    audio = MimoAudioFinalizeDraft.model_validate(
+        {key: payload[key] for key in MimoAudioFinalizeDraft.model_fields if key in payload}
+    )
+    semantic = {
+        key: payload[key] for key in T2VAMimoDraft.model_fields if key in payload
+    }
+    draft, corrections = parse_t2va_semantic(job, json.dumps(semantic, ensure_ascii=False))
+    T2VASingleCallDraft.model_validate(
+        {**draft.model_dump(mode="json"), **audio.model_dump(mode="json")}
+    )
+    return draft, audio, corrections
+
+
 class T2VARecord(SchemaModel):
-    schema_version: Literal["r2v.h3.t2va_record.2"] = "r2v.h3.t2va_record.2"
+    schema_version: Literal[
+        "r2v.h3.t2va_record.2", "r2v.h3.t2va_record.3"
+    ] = "r2v.h3.t2va_record.2"
     clip_uid: SafeID
     inventory_fingerprint: Hash
     request_fingerprint: Hash
@@ -956,10 +1013,11 @@ class T2VARecord(SchemaModel):
                 self.failure_reason
                 or not self.core_sha256
                 or not self.prompt_sha256
-                or self.model_call_count != 2
+                or self.model_call_count
+                != (1 if self.schema_version == "r2v.h3.t2va_record.3" else 2)
             ):
                 raise ValueError(
-                    "ready T2VA record requires a validated two-call core/prompt"
+                    "ready T2VA record requires a validated core/prompt"
                 )
         elif not self.failure_reason or self.core_sha256 or self.prompt_sha256:
             raise ValueError("unavailable T2VA cannot publish core/prompt")
@@ -1043,8 +1101,6 @@ def validate_t2va_audio_lineage(inventory: T2VAInventory) -> None:
 def run_t2va_shadow(
     inventory: T2VAInventory, backend: T2VABackend, *, overwrite: bool = False
 ) -> T2VASummary:
-    from r2v_data_v2.structured_output import parse_structured_json_response
-
     inventory = T2VAInventory.model_validate(inventory.model_dump())
     if inventory.backend != backend.provenance():
         raise ValueError("T2VA backend differs from inventory")
@@ -1111,18 +1167,11 @@ def run_t2va_shadow(
                         raise ValueError("T2VA raw response ownership differs")
                     if raw.error:
                         raise ValueError(raw.error)
-                    draft, corrections = parse_t2va_semantic(job, raw.response or "")
-                    if (
-                        corrections != raw.deterministic_corrections
-                        or raw.audio_finalize is None
-                        or raw.audio_finalize.error
-                    ):
+                    draft, audio, corrections = parse_t2va_completion(job, raw)
+                    if corrections != raw.deterministic_corrections:
                         raise ValueError(
-                            "T2VA audio-finalize/correction provenance differs"
+                            "T2VA correction provenance differs"
                         )
-                    audio = parse_structured_json_response(
-                        raw.audio_finalize.response or "", MimoAudioFinalizeDraft
-                    )
                     core = validate_t2va_draft(job, draft, audio)
                     if (
                         sha256_file(Path(job.target_video_path))
@@ -1150,6 +1199,11 @@ def run_t2va_shadow(
                 )
             records.append(
                 T2VARecord(
+                    schema_version=(
+                        "r2v.h3.t2va_record.3"
+                        if raw.schema_version == "r2v.h3.t2va_raw_response.3"
+                        else "r2v.h3.t2va_record.2"
+                    ),
                     clip_uid=job.clip_uid,
                     inventory_fingerprint=inventory.inventory_fingerprint,
                     request_fingerprint=identity,

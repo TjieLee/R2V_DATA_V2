@@ -1,8 +1,9 @@
 # Target-Side T2VA / TA2VA Production
 
 This orchestration is independent of Visual and writes only its owned production
-root. It calls the frozen T2VA v7/backend .7/core .6 and TA2VA .2/profile v2
-implementations; the reused audio finalizer remains v6. The standalone downstream
+root. Default multi-call uses frozen T2VA v7/backend .7/core .6 and TA2VA .2/profile v2;
+the reused audio finalizer remains v6. Optional single-call T2VA uses backend .8
+with the same core .6, exact-ASR renderer and TA2VA semantics. The standalone downstream
 runner does not preprocess Audio. The optional full launcher below adds upstream
 stage orchestration without migrating legacy outputs or changing eligibility.
 
@@ -48,6 +49,49 @@ generated artifacts keep their content hashes.
 MiMo V2.6 uses the same OpenAI-compatible multimodal request format. The existing
 multi-call prompts/turns stay unchanged, while V2.6 always uses the official
 EAGLE/MTP speculative serving configuration for best runtime performance.
+
+### Optional multi-call / single-call use
+
+For a controlled T2VA comparison, start the same V2.6 endpoint once using the
+existing serving command, then use the same explicit T2VA-compatible case manifest
+and upstream Audio shadow run in two separate shadow runs. Set `SHOT_MANIFEST`,
+`AUDIO_PRODUCTION_ROOT`, `AUDIO_SHADOW_RUN_ID`, `CASE_MANIFEST`,
+`JEA_CLIPS_ROOT`, `JEA_SOURCE_VIDEOS_ROOT` and `SHOT_INDEX_ROOT` as in the
+T2VA/TA2VA server runbook. These commands do not start a model themselves:
+
+```bash
+for mode in multi single; do
+  python tools/run_h3_t2va_shadow.py \
+    --shot-manifest "$SHOT_MANIFEST" \
+    --clips-root "$JEA_CLIPS_ROOT" \
+    --source-videos-root "$JEA_SOURCE_VIDEOS_ROOT" \
+    --shot-index-root "$SHOT_INDEX_ROOT" \
+    --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
+    --audio-shadow-run-id "$AUDIO_SHADOW_RUN_ID" \
+    --case-manifest "$CASE_MANIFEST" \
+    --t2va-run-id "v26-t2va-${mode}-ab" \
+    --base-url http://127.0.0.1:8092/v1 \
+    --transport sglang --model mimo-v2.6-flash-rl \
+    --media-root /mnt/workspace --call-mode "$mode"
+done
+```
+
+`multi` retains the existing semantic AV plus audio-finalize requests (two MiMo
+calls per ready T2VA clip). `single` sends the original AV plus resolved music/SFX
+views in one strict-schema request and still delegates exact dialogue to the
+deterministic renderer (one MiMo call per ready T2VA clip). TA2VA speaker profiling
+may make its own later call; `single` does not mean one call for the entire
+T2VA+TA2VA pipeline. Compare raw responses, failures and human-reviewed output
+before treating single-call as a quality-validated replacement. The historical
+`random20-refgraph-v1` Ref2VA run is a different reference-conditioned workflow,
+not a no-reference T2VA baseline.
+
+Full-production invocation uses `MIMO_CALL_MODE=multi` by default. An explicitly
+selected V2.6 single-call run uses `MIMO_CHECKPOINT=.../MiMo-V2.6-Flash-RL`,
+`MIMO_MODEL=mimo-v2.6-flash-rl`, and `MIMO_CALL_MODE=single` with the same
+`PRODUCTION_ROOT`; already ready samples are reused, so this production switch is
+not an A/B experiment. No real V2.6 model comparison was run during the CPU-only
+implementation.
 
 ## Full Raw-Video Production
 
@@ -438,9 +482,9 @@ The supervisor prints:
 A long gap between a *_config_start and *_config_ready marker indicates model
 configuration/fingerprint work, not GPU inference.
 
-Within an ASR worker, multiple transcript segments from the same speech stem also
-reuse one successful source-audio hash validation instead of hashing the same stem
-for every segment.
+DiariZen and ASR workers consume already published canonical/stem audio directly.
+They do not rehash each source file before decoding it; unreadable media remains
+a sample failure.
 
 ### Downstream source projection and shared-path metadata
 
@@ -562,14 +606,12 @@ prevalidated path.
 
 Integrity checks that remain in the hot path are intentionally local:
 
-- each pending full-production T2VA sample validates its target video and four
-  Audio inputs once before use; the backend/stage do not repeat the same hashes
-  before and after the request;
+- each pending full-production T2VA sample checks that its target video and four
+  Audio inputs exist; their publication hashes are not recomputed per sample;
 - TA2VA does not repeat a whole-media start/end _verify pass in full production;
   the full-audio/stem readers still validate the exact media they actually read;
 - published stage artifacts retain their recorded file hashes;
-- resume performs one authoritative artifact recovery/hash validation, not a
-  duplicate preflight hash pass;
+- resume checks declared stage files exist without rehashing every ready artifact;
 - source/config/inventory fingerprints remain part of durable identity.
 
 Standalone/frozen paths keep their original stronger repeated verification by
@@ -738,7 +780,8 @@ This preserves the frozen runner's per-variant availability semantics.
 
 Stages publish a complete directory before appending ready state. A crash in
 between is recovered from the directory's completion envelope and file hashes.
-The source/config identity must remain unchanged for resume. Orphan temporary
+The source population must remain unchanged for resume; MiMo runtime identity
+may change without replaying ready stages. Orphan temporary
 directories are never considered ready. Export lines are written in full,
 flushed and fsynced. A torn final line is repaired by its shard writer before
 appending; readers ignore non-newline-terminated tails.

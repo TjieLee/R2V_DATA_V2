@@ -262,7 +262,10 @@ def _recover_stage(
     if receipt["identity"] != identity and not allow_identity_mismatch:
         raise ValueError("production stage identity changed; use a fresh root")
     for relative, digest in receipt["files"].items():
-        if _sha(destination / relative) != digest:
+        artifact = destination / relative
+        if not artifact.is_file():
+            raise ValueError("published stage artifact is missing")
+        if not allow_identity_mismatch and _sha(artifact) != digest:
             raise ValueError("published stage artifact changed")
     return receipt["result"]
 
@@ -373,9 +376,7 @@ def process_shard(
                 }
             )
             if state["identity"] != identity:
-                if allow_existing_identity_mismatch:
-                    state["identity"] = identity
-                elif (
+                if allow_existing_identity_mismatch or (
                     state.get("preparation_failed")
                     and not (shard / "artifacts" / uid / "t2va").exists()
                 ):
@@ -549,7 +550,6 @@ def training_row(video, caption, audios=()):
 def t2va_stage(job, backend, temporary: Path, *, verify_video: bool = True):
     """Mirror shadow orchestration using the frozen parser/validator/renderer."""
     from r2v_data_v2.h3 import t2va_shadow as frozen
-    from r2v_data_v2.structured_output import parse_structured_json_response
 
     identity = frozen.request_fingerprint(job, backend.provenance())
     if verify_video and _sha(Path(job.target_video_path)) != job.target_video_sha256:
@@ -565,16 +565,9 @@ def t2va_stage(job, backend, temporary: Path, *, verify_video: bool = True):
     if raw.error:
         _endpoint_error(raw.error)
         raise ValueError(raw.error)
-    draft, corrections = frozen.parse_t2va_semantic(job, raw.response or "")
-    if (
-        corrections != raw.deterministic_corrections
-        or raw.audio_finalize is None
-        or raw.audio_finalize.error
-    ):
-        raise ValueError("T2VA audio-finalize/correction provenance differs")
-    audio = parse_structured_json_response(
-        raw.audio_finalize.response or "", frozen.MimoAudioFinalizeDraft
-    )
+    draft, audio, corrections = frozen.parse_t2va_completion(job, raw)
+    if corrections != raw.deterministic_corrections:
+        raise ValueError("T2VA correction provenance differs")
     core = frozen.validate_t2va_draft(job, draft, audio)
     if verify_video and _sha(Path(job.target_video_path)) != job.target_video_sha256:
         raise ValueError("original target video changed during annotation")
@@ -585,7 +578,11 @@ def t2va_stage(job, backend, temporary: Path, *, verify_video: bool = True):
     return {
         "model_call_count": raw.model_call_count,
         "exports": {"t2va": training_row(job.target_video_path, prompt)},
-        "warnings": [*raw.warnings, *raw.audio_finalize.warnings, *core.warnings],
+        "warnings": [
+            *raw.warnings,
+            *(raw.audio_finalize.warnings if raw.audio_finalize else []),
+            *core.warnings,
+        ],
     }
 
 
@@ -1186,9 +1183,13 @@ class FrozenProductionProcessor:
                 result = t2va_stage(job, self.backend, temporary)
                 _verify(inventory.source_hashes)
                 return result
-            if _sha(Path(job.target_video_path)) != job.target_video_sha256:
-                raise ValueError("original target video hash differs")
-            t.check_audio_files(job.audio_evidence)
+            if not Path(job.target_video_path).is_file():
+                raise ValueError("original target video is missing")
+            if job.audio_evidence is None or any(
+                not Path(getattr(job.audio_evidence, f"{kind}_path")).is_file()
+                for kind in ("full_audio", "speech", "music", "sfx")
+            ):
+                raise ValueError("T2VA audio evidence is missing")
             return t2va_stage(
                 job,
                 self.backend,
@@ -1200,8 +1201,8 @@ class FrozenProductionProcessor:
         t.validate_t2va_draft(job, core)
         if self.verify_sources_per_sample:
             t.check_audio_files(job.audio_evidence)
-        elif _sha(Path(job.target_video_path)) != job.target_video_sha256:
-            raise ValueError("original target video hash differs")
+        elif not Path(job.target_video_path).is_file():
+            raise ValueError("original target video is missing")
         root = t.stem_shadow_root(
             Path(inventory.audio_production_root), inventory.audio_shadow_run_id
         )

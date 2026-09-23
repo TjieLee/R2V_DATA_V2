@@ -485,6 +485,20 @@ def test_full_cli_dry_run_does_not_require_models(tmp_path):
     assert result["mimo_model"] == "mimo-v2.5"
     assert result["gpu_ids"] == [str(i) for i in range(8)]
     assert result["model_call_count"] == 0
+    single = main(
+        [
+            "--shot-manifest", str(manifest),
+            "--clips-root", str(tmp_path),
+            "--source-videos-root", str(tmp_path),
+            "--production-root", str(tmp_path / "out"),
+            "--media-root", str(tmp_path),
+            "--shards", "0", "--dry-run",
+            "--mimo-model", "mimo-v2.6-flash-rl",
+            "--mimo-call-mode", "single",
+        ]
+    )
+    assert single["mimo_model"] == "mimo-v2.6-flash-rl"
+    assert single["mimo_call_mode"] == "single"
 
 
 def test_full_supervisor_worker_crash_stops_next_stage(tmp_path):
