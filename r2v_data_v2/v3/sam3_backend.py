@@ -957,6 +957,26 @@ class Sam3SegmentationBackend:
         selector_close = getattr(self._anchor_selector, "close", None)
         if callable(selector_close):
             selector_close()
+
+        predictor, self._predictor = self._predictor, None
         with self._device_context():
-            self._shutdown_predictor(self._predictor)
-        self._predictor = None
+            self._shutdown_predictor(predictor)
+        del predictor
+
+        # SAM3 runs in the long-lived orchestrator process rather than a model
+        # subprocess. Dropping the predictor therefore does not release PyTorch's
+        # CUDA caching allocator by itself. A later Qwen epoch on the same node
+        # must not inherit those reserved blocks, especially when one process
+        # handles several shard groups sequentially.
+        import gc
+
+        gc.collect()
+        device = self.config.device.strip()
+        if device == "cuda" or (
+            device.startswith("cuda:") and device[5:].isdigit()
+        ):
+            import torch
+
+            if torch.cuda.is_available():
+                with self._device_context():
+                    torch.cuda.empty_cache()

@@ -1128,16 +1128,34 @@ class ResourceEpochManager:
             return
         resource = self._open
         self._open = None
+        executor = self._executor
+        owned_resource = self._resource
+        executor_error: BaseException | None = None
+        resource_error: BaseException | None = None
         try:
-            if self._resource is not None:
-                self._resource.stop()
-                # Snapshot after the stop so shutdown time and stop_count are
-                # included; unloading must not discard the measurements.
-                self._accumulate(resource, self._resource.counters())
+            close = getattr(executor, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except BaseException as exc:  # cleanup must still unload the GPU model
+                    executor_error = exc
+            if owned_resource is not None:
+                try:
+                    owned_resource.stop()
+                except BaseException as exc:
+                    resource_error = exc
+                else:
+                    # Snapshot after the stop so shutdown time and stop_count are
+                    # included; unloading must not discard the measurements.
+                    self._accumulate(resource, owned_resource.counters())
         finally:
             self.timeline.append(("stop", resource))
             self._resource = None
             self._executor = None
+        if resource_error is not None:
+            raise resource_error
+        if executor_error is not None:
+            raise executor_error
 
     _ACCUMULATED = (
         "start_count",

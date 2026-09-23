@@ -72,6 +72,31 @@ def _config(tmp_path: Path) -> Sam3Config:
     return Sam3Config(model_path=checkpoint)
 
 
+def test_close_releases_cuda_allocator_cache(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    predictor = _Predictor()
+    backend = Sam3SegmentationBackend(
+        _config(tmp_path),
+        predictor=predictor,
+    )
+
+    calls: list[str] = []
+    monkeypatch.setattr("gc.collect", lambda: calls.append("gc") or 0)
+
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append("empty_cache"))
+
+    backend.close()
+
+    assert predictor.shutdown_called is True
+    assert backend._predictor is None
+    assert calls == ["gc", "empty_cache"]
+
+
 def _track(backend: Sam3SegmentationBackend, frame_paths: list[Path]) -> None:
     result = backend.track(
         frame_paths=frame_paths,

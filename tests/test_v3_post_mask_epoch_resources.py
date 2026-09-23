@@ -715,6 +715,34 @@ def test_manager_keeps_at_most_one_resource_open():
     assert manager.max_open_observed == 1
 
 
+def test_manager_closes_executor_before_unloading_resource():
+    events: list[str] = []
+
+    class _Executor:
+        def close(self) -> None:
+            events.append("executor_close")
+
+    class _Resource(EpochResource):
+        def _start(self) -> None:
+            return None
+
+        def _stop(self) -> None:
+            events.append("resource_stop")
+
+    manager = ResourceEpochManager(
+        {
+            RESOURCE_SAM: lambda: (
+                _Resource(RESOURCE_SAM, process_manager=_FakeProcessManager()),
+                _Executor(),
+            )
+        }
+    )
+    manager.enter(RESOURCE_SAM)
+    manager.close()
+
+    assert events == ["executor_close", "resource_stop"]
+
+
 def test_manager_reuses_an_open_resource():
     manager = ResourceEpochManager(
         {
