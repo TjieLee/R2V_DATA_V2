@@ -1155,6 +1155,27 @@ def test_prompt_distinguishes_repairable_from_stable_local_views() -> None:
         assert phrase in lowered
 
 
+@pytest.mark.parametrize("prompt", [SYSTEM_PROMPT, COMPACT_SYSTEM_PROMPT])
+def test_subject_prompt_rejects_front_face_when_identity_is_extremely_blurred(
+    prompt: str,
+) -> None:
+    normalized = " ".join(prompt.casefold().split())
+    for phrase in (
+        "front or near-front face is not sufficient by itself",
+        "blur, defocus, motion smear, pixelation, compression, or low resolution",
+        "eyes, nose, mouth, and facial contour",
+        "indistinguishable",
+        "even when the face is large and front-facing",
+        "image_quality=poor",
+        "identity_features_visible=false",
+        "primary_identity_region_visible=false",
+        "reference_scope=reject",
+        "completeness=severely_incomplete",
+        "selected_candidate_id=null",
+    ):
+        assert phrase in normalized
+
+
 def test_request_payload_contains_only_required_evidence() -> None:
     payload = build_entity_reference_request_payload(
         _entity(),

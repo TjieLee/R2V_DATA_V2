@@ -11,6 +11,7 @@ from PIL import Image
 from r2v_data_v2.v3.reference_quality import cheap_foreground_technical_metrics
 
 NEAR_SILHOUETTE_RULE = "subject_near_silhouette_v1"
+SUBJECT_EXTREME_BLUR_RULE = "subject_extreme_blur_v1"
 RELATIVE_BLUR_V2_RULE = "subject_relative_blur_v2"
 
 
@@ -159,6 +160,13 @@ def prefilter_entity_reference_candidates[CandidateT: CandidateLike](
         flagged_by: list[str] = []
         if entity.reference_type == "subject" and _subject_near_silhouette(metrics):
             flagged_by.append(NEAR_SILHOUETTE_RULE)
+        if (
+            entity.reference_type == "subject"
+            and laplacian <= 5
+            and tenengrad <= 100
+            and _finite_metric(metrics, "edge_density") <= 0.05
+        ):
+            flagged_by.append(SUBJECT_EXTREME_BLUR_RULE)
         if relative_blur_applicable and _subject_relative_blur_v2(
             metrics,
             laplacian_ratio=laplacian_ratio,
