@@ -44,6 +44,7 @@ from r2v_data_v2.v3.pair import (
     _donors_for_target,
     _GuardFailClosed,
     _publish_pair_result,
+    _rejected_reference,
     finalize_cross_pair_judge,
     finalize_entity_reference,
     prepare_cross_pair_attempt,
@@ -66,7 +67,10 @@ from r2v_data_v2.v3.post_mask_epoch_state import (
     GroupLedger,
     atomic_write_json,
 )
-from r2v_data_v2.v3.reference_judge import build_entity_reference_request_payload
+from r2v_data_v2.v3.reference_judge import (
+    EntityReferenceJudgeFailure,
+    build_entity_reference_request_payload,
+)
 from r2v_data_v2.v3.schemas import (
     AnnotationEntity,
     PairingState,
@@ -318,6 +322,21 @@ def _attempt_from_result(result: JobResult) -> Any:
         decision=RawEntityReferenceDecision.model_validate(result.payload["decision"]),
         raw_responses=tuple(result.payload.get("raw_responses", ())),
         repair_attempts=int(result.payload.get("repair_attempts", 0)),
+    )
+
+
+def _entity_structured_failure_is_retryable(
+    failure: EntityReferenceJudgeFailure,
+) -> bool:
+    """Only infrastructure/request failures remain retryable.
+
+    Once Qwen returned model output, exhausting bounded structured-output repair
+    is a semantic fail-closed result. It must not strand the clip or the whole
+    resource epoch waiting for a receipt that can never be guaranteed.
+    """
+    return (
+        not failure.raw_responses
+        or any(issue.code == "qwen_request_failed" for issue in failure.issues)
     )
 
 
@@ -1351,6 +1370,14 @@ class PairEpochRunner:
                         f"primary entity {entity.entity_id} has no committed result"
                     )
                 pending.append(job)
+                continue
+            if str(result.payload.get("status", "")) == "failed_closed":
+                entity_states.append(
+                    _rejected_reference(
+                        entity.entity_id,
+                        "entity_reference_judge_structured_output_exhausted",
+                    )
+                )
                 continue
             finalization = finalize_entity_reference(
                 self.config,
@@ -3183,7 +3210,19 @@ class PairEpochRunner:
         )
         try:
             attempt = run_entity_reference_judge(prepared, resolved.judge)
-        except Exception as exc:  # noqa: BLE001 - retryable, no receipt
+        except EntityReferenceJudgeFailure as exc:
+            if _entity_structured_failure_is_retryable(exc):
+                return JobResult(OUTCOME_RETRYABLE_FAILED, detail=str(exc))
+            return JobResult(
+                OUTCOME_COMPLETED,
+                payload={
+                    "status": "failed_closed",
+                    "reason_kind": "structured_output_exhausted",
+                    "failure": exc.to_dict(),
+                    "error": str(exc),
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - infrastructure, not semantic
             return JobResult(OUTCOME_RETRYABLE_FAILED, detail=str(exc))
         finally:
             if resolved.owned:
@@ -3191,6 +3230,7 @@ class PairEpochRunner:
         return JobResult(
             OUTCOME_COMPLETED,
             payload={
+                "status": "decision",
                 "decision": attempt.decision.model_dump(mode="json"),
                 "raw_responses": list(attempt.raw_responses),
                 "repair_attempts": int(attempt.repair_attempts),

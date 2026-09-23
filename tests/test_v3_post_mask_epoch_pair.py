@@ -5,8 +5,10 @@ pass unchanged: they record behaviour, they do not propose any. The resource
 epoch Pair adapter has to reproduce exactly what is captured here, including
 the parts that look unattractive:
 
-* a per-entity judge failure aborts the whole clip, so later entities are
-  never called;
+* legacy pair_clips() still aborts a clip on a per-entity judge failure;
+  the resource-epoch adapter instead commits exhausted structured output as a
+  fail-closed rejected reference so one model-format failure cannot strand the
+  pipeline;
 * a cross-pair judge failure aborts that target clip's whole fallback, so
   later donors *and* later entities are never called;
 * the background final guard is not de-duplicated across the primary pass,
@@ -71,6 +73,22 @@ def _judge_failure(message: str = "structured output invalid") -> Exception:
     )
 
 
+def _request_failure(message: str = "request failed") -> Exception:
+    from r2v_data_v2.structured_output import ValidationIssue
+
+    return EntityReferenceJudgeFailure(
+        raw_responses=[],
+        issues=[
+            ValidationIssue(
+                code="qwen_request_failed",
+                field=None,
+                message=message,
+            )
+        ],
+        attempt_count=1,
+    )
+
+
 def _cross_failure(message: str = "structured output invalid") -> Exception:
     return CrossPairJudgeFailure(
         raw_responses=["{not json}"],
@@ -87,9 +105,11 @@ class _FailingEntityJudge:
         scopes: dict[str, str] | None = None,
         *,
         fail_on: str | None = None,
+        failure_factory: Any = _judge_failure,
     ) -> None:
         self.scopes = scopes or {}
         self.fail_on = fail_on
+        self.failure_factory = failure_factory
         self.calls: list[tuple[str, list[str]]] = []
         self.close_calls = 0
 
@@ -98,7 +118,7 @@ class _FailingEntityJudge:
             (entity.entity_id, [item.candidate_id for item in candidates])
         )
         if entity.entity_id == self.fail_on:
-            raise _judge_failure()
+            raise self.failure_factory()
         return EntityReferenceDecisionAttempt(
             decision=_decision(
                 self.scopes.get(entity.entity_id, "full"),
@@ -1376,30 +1396,60 @@ def test_intermediate_entity_completion_does_not_replay_the_clip(
     assert runner.primary_unresolved_job_ids() == ()
 
 
-def test_entity_judge_failure_leaves_no_receipt_and_no_pairing(
+def test_entity_judge_structured_failure_is_durable_fail_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from r2v_data_v2.v3.post_mask_epoch_jobs import OUTCOME_RETRYABLE_FAILED
-
     config = _pair_config(tmp_path, monkeypatch)
     storage = _storage(config, entity_types=("subject", "object", "object"))
     runner = _runner(tmp_path, config, storage)
 
     seeded = _seeded_by_entity(runner)
     assert _run_one(runner, seeded["e1"], _Judge()).committed
-    pending = runner.seed_primary_jobs()
-    assert sorted(dict(job.target)["entity_id"] for job in pending) == ["e2", "e3"]
 
     failing = _FailingEntityJudge(fail_on="e2")
-    result = runner.run(seeded["e2"], failing)
+    failed_closed = _run_one(runner, seeded["e2"], failing)
+    assert failed_closed.committed
+    assert failed_closed.payload["status"] == "failed_closed"
+    assert failed_closed.payload["reason_kind"] == "structured_output_exhausted"
+    assert failed_closed.payload["failure"]["raw_responses"] == ["{not json}"]
+    runner.finalize(seeded["e2"], failed_closed)
+
+    last = _run_one(runner, seeded["e3"], _Judge())
+    assert last.committed
+    runner.finalize(seeded["e3"], last)
+
+    clip = storage.read_clip("clip-1")
+    assert clip.pairing is not None, "structured-output exhaustion must not strand Pair"
+    by_id = {state.entity_id: state for state in clip.references.entities}
+    assert by_id["e2"].status == "rejected"
+    assert (
+        by_id["e2"].scope_reason
+        == "entity_reference_judge_structured_output_exhausted"
+    )
+    assert runner.primary_unresolved_job_ids() == ()
+
+
+def test_entity_judge_request_failure_remains_retryable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from r2v_data_v2.v3.post_mask_epoch_jobs import OUTCOME_RETRYABLE_FAILED
+
+    config = _pair_config(tmp_path, monkeypatch)
+    storage = _storage(config, entity_types=("subject",))
+    runner = _runner(tmp_path, config, storage)
+    (job,) = runner.seed_primary_jobs()
+
+    result = runner.run(
+        job,
+        _FailingEntityJudge(
+            fail_on="e1",
+            failure_factory=_request_failure,
+        ),
+    )
 
     assert result.outcome == OUTCOME_RETRYABLE_FAILED
-    assert not result.committed, "a judge failure must not leave a receipt"
-    # One unresolved entity is enough to hold the whole clip un-published.
+    assert not result.committed
     assert storage.read_clip("clip-1").pairing is None
-    assert sorted(
-        dict(job.target)["entity_id"] for job in runner.seed_primary_jobs()
-    ) == ["e2", "e3"]
 
 
 def test_primary_replay_does_not_repeat_qwen_calls(
@@ -2250,7 +2300,13 @@ def test_unresolved_primary_is_excluded_from_snapshot_and_targets(
     while pending:
         job = pending.pop(0)
         if job.clip_uid == "clip-b":
-            result = runner.run(job, _FailingEntityJudge(fail_on="e1"))
+            result = runner.run(
+                job,
+                _FailingEntityJudge(
+                    fail_on="e1",
+                    failure_factory=_request_failure,
+                ),
+            )
             assert not result.committed
             continue
         result = _run_one(runner, job, _Judge())
