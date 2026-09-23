@@ -64,7 +64,9 @@ def test_t2va_ready_survives_ta_failure_in_snapshot(tmp_path):
 def test_snapshot_during_partial_rename(tmp_path, monkeypatch):
     processor = FakeProcessor()
     processor.fail.add(("clip0", "ta2va"))
-    production.process_shard(tmp_path, 0, sample_rows(1), processor)
+    processor.interrupt = ("clip1", "t2va")
+    with pytest.raises(KeyboardInterrupt):
+        production.process_shard(tmp_path, 0, sample_rows(2), processor)
     original = production.complete_rows
     renamed = False
 

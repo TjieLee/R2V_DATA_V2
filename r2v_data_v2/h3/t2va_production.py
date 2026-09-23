@@ -19,6 +19,7 @@ DEFAULT_ROOT = Path(
     "/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/T2VA"
 )
 TASKS = ("t2va", "ta2va_full_audio", "ta2va_speech_bgm")
+TERMINAL_STATUSES = frozenset({"ready", "failed", "skipped"})
 
 
 def shard_bounds(shard_id: int) -> tuple[int, int]:
@@ -245,6 +246,83 @@ def load_states(shard: Path) -> dict:
     return {r["clip_uid"]: r for r in complete_rows(shard / "state.jsonl.partial")}
 
 
+def seal_export(shard: Path, task: str) -> None:
+    """Seal complete JSONL rows; recover an interrupted final/partial overlap."""
+    if task not in TASKS:
+        raise ValueError("unknown training task")
+    partial = shard / "exports" / f"{task}.jsonl.partial"
+    final = partial.with_suffix("")
+    if not partial.exists():
+        return
+    if not final.exists():
+        _repair_tail(partial)
+        os.replace(partial, final)
+        _sync_directory(final.parent)
+        return
+    rows = {}
+    for path in (final, partial):
+        for row in complete_rows(path):
+            if set(row) != {"video", "images", "audios", "caption"}:
+                raise ValueError("invalid published training row")
+            video = row["video"]
+            if video in rows and rows[video] != row:
+                raise ValueError("conflicting published training rows")
+            rows[video] = row
+    temporary = final.with_name(f".{final.name}.tmp-{uuid.uuid4().hex}")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            for row in rows.values():
+                handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, final)
+        _sync_directory(final.parent)
+        partial.unlink()
+        _sync_directory(final.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def seal_terminal_shard(shard: Path) -> dict | None:
+    """Use only durable source/state JSON to finish attempted shard stages."""
+    if (shard / "COMPLETE").exists():
+        return load_states(shard)
+    source_path = shard / "sources.json"
+    if not source_path.is_file():
+        return None
+    sources = json.loads(source_path.read_text())
+    source_ids = [row["clip_uid"] for row in sources]
+    if len(source_ids) != len(set(source_ids)):
+        raise ValueError("duplicate shard source clip identity")
+    _repair_tail(shard / "state.jsonl.partial")
+    states = load_states(shard)
+    if set(states) - set(source_ids):
+        raise ValueError("state contains a clip outside the shard source population")
+    if len(states) != len(sources):
+        return None
+    t2va_done = all(
+        states[uid]["t2va_status"] in TERMINAL_STATUSES for uid in source_ids
+    )
+    ta2va_done = all(
+        states[uid]["ta2va_status"] in TERMINAL_STATUSES for uid in source_ids
+    )
+    if t2va_done:
+        seal_export(shard, "t2va")
+    if not (t2va_done and ta2va_done):
+        return None
+    for task in TASKS[1:]:
+        seal_export(shard, task)
+    counters = {
+        f"{stage}_{status}": sum(
+            states[uid][f"{stage}_status"] == status for uid in source_ids
+        )
+        for stage in ("t2va", "ta2va")
+        for status in ("ready", "failed", "skipped")
+    }
+    atomic_json(shard / "COMPLETE", {"source_count": len(sources), **counters})
+    return states
+
+
 def _sha(path: Path) -> str:
     with path.open("rb") as handle:
         return hashlib.file_digest(handle, "sha256").hexdigest()
@@ -317,6 +395,9 @@ def process_shard(
         if not source_path.exists():
             atomic_json(source_path, sources)
         journal = shard / "state.jsonl.partial"
+        completed = seal_terminal_shard(shard)
+        if completed is not None:
+            return completed
         _repair_tail(journal)
         states = load_states(shard)
         writer = threading.Lock()
@@ -362,9 +443,18 @@ def process_shard(
             uid = row["clip_uid"]
             if Path(uid).name != uid or uid in {".", ".."}:
                 raise ValueError("unsafe clip identity")
+            previous = states.get(uid)
+            if previous and (
+                previous["t2va_status"] in {"failed", "skipped"}
+                or (
+                    previous["t2va_status"] in TERMINAL_STATUSES
+                    and previous["ta2va_status"] in TERMINAL_STATUSES
+                )
+            ):
+                return
             identity = processor.identity(row)
             state = dict(
-                states.get(uid)
+                previous
                 or {
                     "source_index": row["source_index"],
                     "clip_uid": uid,
@@ -384,9 +474,7 @@ def process_shard(
                 else:
                     raise ValueError("production source/config identity changed")
             state["preparation_failed"] = bool(row.get("preparation_error"))
-            if state["t2va_status"] == "skipped":
-                return
-            if row.get("upstream_failure"):
+            if row.get("upstream_failure") and state["t2va_status"] == "pending":
                 state.update(
                     t2va_status="skipped",
                     ta2va_status="skipped",
@@ -398,6 +486,8 @@ def process_shard(
             for stage in ("t2va", "ta2va"):
                 if stopped.is_set():
                     return
+                if state[f"{stage}_status"] in TERMINAL_STATUSES:
+                    continue
                 destination = shard / "artifacts" / uid / stage
                 failed_destination = destination.with_name(f"{stage}_failed")
                 previous_partial = _recover_stage(
@@ -517,16 +607,7 @@ def process_shard(
             pool.shutdown(wait=True, cancel_futures=True)
         if stopped.is_set():
             raise EndpointUnavailable("endpoint unavailable; resume after recovery")
-        if len(states) == len(rows) and all(
-            s["t2va_status"] == "skipped"
-            or (s["t2va_status"] == "ready" and s["ta2va_status"] == "ready")
-            for s in states.values()
-        ):
-            for task in TASKS:
-                partial = shard / "exports" / f"{task}.jsonl.partial"
-                if partial.exists():
-                    os.replace(partial, partial.with_suffix(""))
-            atomic_json(shard / "COMPLETE", {"source_count": len(rows)})
+        seal_terminal_shard(shard)
         return states
 
 

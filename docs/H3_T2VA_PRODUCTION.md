@@ -29,8 +29,9 @@ automatically enables the official EAGLE/MTP speculative decoder parameters.
 There is no separate speculative on/off operator switch.
 
 Existing V2.5-ready artifacts remain valid at their original
-`<PRODUCTION_ROOT>/shards/.../artifacts` paths. Pending/failed samples continue
-in the same shard/state/export layout using the currently configured MiMo model.
+`<PRODUCTION_ROOT>/shards/.../artifacts` paths. Pending samples continue in
+the same shard/state/export layout using the currently configured MiMo model;
+failed and skipped sample states are terminal and are not retried on resume.
 The model name is runtime observability/provenance only; it is not a path or
 resume-cache key in full production.
 
@@ -372,11 +373,12 @@ for a resumed run; use a fresh production root only when changing source
 identity, shard size, or incompatible upstream semantics. Changing the MiMo
 model continues in the same downstream shard/artifact layout.
 
-Upstream aggregate manifests can expand after failed clips recover. The full
-downstream adapter binds ready outputs to validated per-clip dependencies;
-unrelated aggregate hash changes cannot trigger repeat inference. Previously
-upstream-skipped clips can reopen when their own inputs become available.
-Published data remains available to the existing snapshot builder.
+Upstream aggregate manifests can expand while an unfinished shard is being
+prepared. The full downstream adapter binds ready outputs to per-clip
+dependencies; unrelated aggregate changes cannot trigger repeat inference.
+Once a downstream clip is `skipped` or `failed`, ordinary resume does not reopen
+it even if an upstream input later becomes available. Published data remains
+available to the existing snapshot builder.
 
 ### Pre-submit checklist
 
@@ -791,18 +793,29 @@ Each shard has:
 - prepared/: frozen inventory adapter provenance;
 - artifacts/<clip_uid>/{t2va,ta2va}/: complete atomic stage directories;
 - exports/{t2va,ta2va_full_audio,ta2va_speech_bgm}.jsonl.partial;
-- COMPLETE once all rows are ready or upstream-skipped.
+- COMPLETE once every source clip has terminal T2VA and TA2VA states
+  (`ready`, `failed`, or `skipped`), including shards with failed samples.
 
 An unavailable or malformed sample does not stop its neighbors. A T2VA failure
-skips TA2VA; a TA2VA failure retains the T2VA artifact and export. Each failed stage
-gets one attempt per invocation. Repeat the same command to retry failed stages.
-Already ready T2VA is not called again when only TA2VA failed. An ineligible
+skips TA2VA; a TA2VA failure retains the T2VA artifact and export. Normal
+resume runs pending stages only; it never automatically retries failed or
+skipped stages. Already ready T2VA is not called again when only TA2VA is
+pending. An ineligible
 speech track yields a successful full-audio-only TA2VA stage.
 
 If speech profiling fails, the independently valid full-audio variant is still
-published. Its receipt/diagnostics live in ta2va_failed/ until a later successful
-TA stage is available. The TA status remains failed and only that stage is retried.
+published. Its receipt/diagnostics live in ta2va_failed/. The TA status remains
+failed; a separate explicit regeneration workflow is needed to retry it.
 This preserves the frozen runner's per-variant availability semantics.
+
+At shard entry, `sources.json` and the latest state per clip in the append-only
+`state.jsonl.partial` determine completion. A historical fully terminal shard
+without `COMPLETE` is sealed from JSON metadata before upstream or MiMo setup.
+T2VA exports seal independently when all T2VA states are terminal, even if
+some TA2VA states remain pending. Final export row counts, especially
+`ta2va_speech_bgm`, do not determine completion. An interrupted final/partial
+export overlap is deduplicated by video from complete JSONL rows; conflicting
+rows fail rather than being guessed away.
 
 Stages publish a complete directory before appending ready state. A crash in
 between is recovered from the directory's completion envelope and file hashes.

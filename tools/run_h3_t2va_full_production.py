@@ -87,7 +87,15 @@ def main(argv=None):
     if not args.mimo_model.strip():
         raise ValueError("MiMo model name must be non-empty")
     print("source_index_start", flush=True)
-    index = production.build_source_index(args.shot_manifest, root)
+    cached_index_path = root / "manifests/source_index.json"
+    cached_index = (
+        json.loads(cached_index_path.read_text())
+        if not args.dry_run and cached_index_path.is_file()
+        else None
+    )
+    if cached_index is not None and cached_index["shard_size"] != production.SHARD_SIZE:
+        raise ValueError("source index shard size mismatch; use a fresh production root")
+    index = cached_index or production.build_source_index(args.shot_manifest, root)
     print(
         f"source_index_ready shards={len(index['shards'])} "
         f"records={index['source_record_count']}",
@@ -127,6 +135,12 @@ def main(argv=None):
             "mimo_call_mode": args.mimo_call_mode,
             "model_call_count": 0,
         }
+    order = full.seal_terminal_assigned_shards(root, order)
+    if not order:
+        print("all assigned shards are terminal or locked", flush=True)
+        return {}
+    if cached_index is not None:
+        index = production.build_source_index(args.shot_manifest, root)
     print(
         "schedule "
         + json.dumps(

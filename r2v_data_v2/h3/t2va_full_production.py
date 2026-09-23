@@ -77,6 +77,30 @@ def resume_first_assigned_shards(root, shard_ids):
     }
 
 
+def seal_terminal_assigned_shards(root, shard_ids):
+    """Seal historical attempted shards before upstream or model setup."""
+    remaining = []
+    for shard_id in shard_ids:
+        shard = Path(root) / "shards" / production.shard_name(shard_id)
+        if not shard.is_dir():
+            remaining.append(shard_id)
+            continue
+        try:
+            with (
+                production.file_lock(shard / "invocation.lock"),
+                production.file_lock(shard / "shard.lock"),
+            ):
+                completed = production.seal_terminal_shard(shard)
+        except production.ShardLockedError:
+            print(f"shard={shard_id} locked; skipped", flush=True)
+            continue
+        if completed is None:
+            remaining.append(shard_id)
+        else:
+            print(f"shard={shard_id} terminal; sealed", flush=True)
+    return remaining
+
+
 def run_assigned_shards(root, shard_ids, pipeline):
     """One node owns a shard through all barriers, including downstream writes."""
     results = {}

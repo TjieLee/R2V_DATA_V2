@@ -12,7 +12,7 @@ ffmpeg = auk_fixtures.ffmpeg
 
 
 @pytest.mark.parametrize("failure_count", [1, 3])
-def test_raw_video_to_snapshot_and_retry_without_repeat_models(
+def test_raw_video_to_snapshot_keeps_terminal_failures_without_repeat_models(
     tmp_path, monkeypatch, setup, ffmpeg, failure_count
 ):
     from collections import Counter
@@ -173,15 +173,17 @@ def test_raw_video_to_snapshot_and_retry_without_repeat_models(
     )
     full.run_assigned_shards(root, [0], pipeline)
     assert sum(v for (k, _), v in calls.items() if k == "t2va") == 3 - failure_count
+    shard = root / "shards" / production.shard_name(0)
+    assert (shard / "COMPLETE").exists()
     failed.clear()
     full.run_assigned_shards(root, [0], pipeline)
-    assert sum(v for (k, _), v in calls.items() if k == "t2va") == 3
+    assert sum(v for (k, _), v in calls.items() if k == "t2va") == 3 - failure_count
     before = calls.copy()
     full.run_assigned_shards(root, [0], pipeline)
     assert calls == before
     snapshot = production.build_snapshot(root, "ready")
-    assert len(list(production.complete_rows(snapshot / "t2va.jsonl"))) == 3
-    assert len(list(production.complete_rows(snapshot / "ta2va_full_audio.jsonl"))) == 3
+    assert len(list(production.complete_rows(snapshot / "t2va.jsonl"))) == 3 - failure_count
+    assert len(list(production.complete_rows(snapshot / "ta2va_full_audio.jsonl"))) == 3 - failure_count
 
 
 def test_resume_first_schedule_uses_only_shard_directory_metadata(tmp_path):
@@ -398,6 +400,87 @@ def test_downstream_dependency_sidecar_is_audit_only(tmp_path):
     _preflight(shard, [row], Processor())
 
     assert json.loads((sidecars / "clip.json").read_text()) == current
+
+
+def test_preflight_never_reopens_complete_exports(tmp_path):
+    from r2v_data_v2.h3.t2va_full_downstream import _preflight
+
+    shard = tmp_path / "shard"
+    row = {"source_index": 0, "clip_uid": "clip", "video": "/video.mp4"}
+    production.atomic_json(shard / "sources.json", [row])
+    production.atomic_json(shard / "COMPLETE", {"source_count": 1})
+    export = production.training_row(row["video"], "caption")
+    production.append_row(shard / "exports/t2va.jsonl", export)
+
+    class Processor:
+        def evidence(self, _row):
+            return {"source": row, "policy": {}}
+
+        def identity(self, _row):
+            return "identity"
+
+    _preflight(shard, [row], Processor())
+    assert (shard / "COMPLETE").exists()
+    assert list(production.complete_rows(shard / "exports/t2va.jsonl")) == [export]
+    assert not (shard / "exports/t2va.jsonl.partial").exists()
+
+
+def test_downstream_terminal_fast_path_skips_preparation(tmp_path, monkeypatch):
+    from r2v_data_v2.h3 import t2va_full_downstream as downstream
+    from tests.test_h3_t2va_production import _historical_states
+
+    rows, shard = _historical_states(
+        tmp_path, [("ready", "failed"), ("failed", "skipped")]
+    )
+    monkeypatch.setattr(
+        production,
+        "prepare_shard",
+        lambda *args, **kwargs: pytest.fail("terminal shard prepared upstream media"),
+    )
+    states = downstream.run_downstream(
+        tmp_path, {}, 0, tmp_path / "audio", tmp_path, tmp_path,
+        backend=None, profiles=None,
+    )
+    assert set(states) == {row["clip_uid"] for row in rows}
+    assert (shard / "COMPLETE").exists()
+
+
+def test_full_launcher_filters_historical_terminal_shard_before_workers(tmp_path):
+    from tests.test_h3_t2va_production import _historical_states
+
+    _, shard = _historical_states(tmp_path, [("failed", "skipped")])
+    remaining = full.seal_terminal_assigned_shards(tmp_path, [0, 1])
+    assert remaining == [1]
+    assert (shard / "COMPLETE").exists()
+
+
+def test_full_cli_terminal_shard_needs_no_model_dependencies(tmp_path, monkeypatch):
+    from tests.test_h3_t2va_production import _historical_states
+    from tools import run_h3_t2va_full_production as cli
+
+    root = tmp_path / "production"
+    _, shard = _historical_states(root, [("failed", "skipped")])
+    production.atomic_json(
+        root / "manifests/source_index.json",
+        {"shard_size": production.SHARD_SIZE, "shards": [{}], "source_record_count": 1},
+    )
+    monkeypatch.setattr(
+        production,
+        "build_source_index",
+        lambda *_: pytest.fail("terminal shard revalidated source manifest SHA"),
+    )
+    result = cli.main([
+        "--shot-manifest", str(tmp_path / "shots.jsonl"),
+        "--clips-root", str(tmp_path / "clips"),
+        "--source-videos-root", str(tmp_path / "videos"),
+        "--media-root", str(tmp_path),
+        "--production-root", str(root),
+        "--shards", "0",
+        "--mimo-sglang", str(tmp_path / "missing-sglang"),
+        "--mimo-checkpoint", str(tmp_path / "missing-checkpoint"),
+    ])
+    assert result == {}
+    assert (shard / "COMPLETE").exists()
 
 
 def test_mimo_stage_is_wrapped_by_per_shard_lifecycle(tmp_path, monkeypatch):

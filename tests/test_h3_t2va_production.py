@@ -107,6 +107,150 @@ def sample_rows(n=3):
     ]
 
 
+def _historical_states(root, statuses):
+    rows = sample_rows(len(statuses))
+    shard = root / "shards" / production.shard_name(0)
+    production.atomic_json(shard / "sources.json", rows)
+    for row, (t2va, ta2va) in zip(rows, statuses, strict=True):
+        production.append_row(
+            shard / "state.jsonl.partial",
+            {
+                **row,
+                "identity": "old-model",
+                "t2va_status": t2va,
+                "ta2va_status": ta2va,
+            },
+        )
+    return rows, shard
+
+
+def test_historical_terminal_shard_seals_without_processor_or_media(tmp_path):
+    rows, shard = _historical_states(
+        tmp_path,
+        [("ready", "ready"), ("ready", "failed"),
+         ("failed", "skipped"), ("skipped", "skipped")],
+    )
+    # Latest journal state, not raw line count, controls completion.
+    production.append_row(
+        shard / "state.jsonl.partial",
+        {**rows[0], "identity": "old-model", "t2va_status": "ready", "ta2va_status": "ready"},
+    )
+    production.append_row(
+        shard / "exports/t2va.jsonl.partial",
+        production.training_row(rows[0]["video"], "caption"),
+    )
+    production.append_row(
+        shard / "exports/ta2va_full_audio.jsonl.partial",
+        production.training_row(rows[0]["video"], "audio", ["/audio.flac"]),
+    )
+
+    class NoWork:
+        def identity(self, row):
+            pytest.fail("terminal resume evaluated model identity")
+
+        def process(self, *args):
+            pytest.fail("terminal resume ran a model")
+
+    states = production.process_shard(tmp_path, 0, rows, NoWork())
+    assert len(states) == 4
+    complete = json.loads((shard / "COMPLETE").read_text())
+    assert complete == {
+        "source_count": 4,
+        "t2va_ready": 2,
+        "t2va_failed": 1,
+        "t2va_skipped": 1,
+        "ta2va_ready": 1,
+        "ta2va_failed": 1,
+        "ta2va_skipped": 2,
+    }
+    assert (shard / "exports/t2va.jsonl").exists()
+    assert (shard / "exports/ta2va_full_audio.jsonl").exists()
+    assert not list((shard / "exports").glob("*.partial"))
+    assert not (shard / "exports/ta2va_speech_bgm.jsonl").exists()
+
+
+def test_historical_shard_uses_latest_state_per_clip(tmp_path):
+    rows, shard = _historical_states(tmp_path, [("ready", "pending")])
+    assert production.seal_terminal_shard(shard) is None
+    assert not (shard / "COMPLETE").exists()
+    production.append_row(
+        shard / "state.jsonl.partial",
+        {
+            **rows[0],
+            "identity": "old-model",
+            "t2va_status": "ready",
+            "ta2va_status": "failed",
+        },
+    )
+    production.seal_terminal_shard(shard)
+    assert (shard / "COMPLETE").exists()
+    assert json.loads((shard / "COMPLETE").read_text())["ta2va_failed"] == 1
+
+
+def test_t2va_seals_independently_and_only_pending_ta2va_runs(tmp_path):
+    rows, shard = _historical_states(
+        tmp_path, [("ready", "pending"), ("failed", "skipped")]
+    )
+    production.append_row(
+        shard / "exports/t2va.jsonl.partial",
+        production.training_row(rows[0]["video"], "caption"),
+    )
+    processor = FakeProcessor()
+    states = production.process_shard(
+        tmp_path, 0, rows, processor, request_workers=1,
+        allow_existing_identity_mismatch=True,
+    )
+    assert processor.calls == {("clip0", "ta2va"): 1}
+    assert states["clip0"]["ta2va_status"] == "ready"
+    assert (shard / "exports/t2va.jsonl").exists()
+    assert (shard / "COMPLETE").exists()
+
+
+def test_export_seal_merges_identical_final_and_partial_rows(tmp_path):
+    rows, shard = _historical_states(tmp_path, [("ready", "ready")])
+    export = production.training_row(rows[0]["video"], "caption")
+    production.append_row(shard / "exports/t2va.jsonl", export)
+    production.append_row(shard / "exports/t2va.jsonl.partial", export)
+    production.process_shard(tmp_path, 0, rows, FakeProcessor())
+    assert list(production.complete_rows(shard / "exports/t2va.jsonl")) == [export]
+    assert not (shard / "exports/t2va.jsonl.partial").exists()
+
+
+def test_new_pending_export_merges_with_historical_final(tmp_path):
+    rows, shard = _historical_states(
+        tmp_path, [("ready", "ready"), ("pending", "pending")]
+    )
+    production.append_row(
+        shard / "exports/t2va.jsonl",
+        production.training_row(rows[0]["video"], "old"),
+    )
+    processor = FakeProcessor()
+    production.process_shard(
+        tmp_path, 0, rows, processor, request_workers=1,
+        allow_existing_identity_mismatch=True,
+    )
+    assert processor.calls == {("clip1", "t2va"): 1, ("clip1", "ta2va"): 1}
+    assert [row["video"] for row in production.complete_rows(
+        shard / "exports/t2va.jsonl"
+    )] == [rows[0]["video"], rows[1]["video"]]
+    assert not (shard / "exports/t2va.jsonl.partial").exists()
+
+
+def test_export_seal_rejects_conflicting_final_and_partial_rows(tmp_path):
+    rows, shard = _historical_states(tmp_path, [("ready", "ready")])
+    production.append_row(
+        shard / "exports/t2va.jsonl",
+        production.training_row(rows[0]["video"], "original"),
+    )
+    production.append_row(
+        shard / "exports/t2va.jsonl.partial",
+        production.training_row(rows[0]["video"], "changed"),
+    )
+    with pytest.raises(ValueError, match="conflicting"):
+        production.process_shard(tmp_path, 0, rows, FakeProcessor())
+    assert not (shard / "COMPLETE").exists()
+
+
 def test_failure_isolation_and_stage_resume(tmp_path):
     processor = FakeProcessor()
     processor.fail = {("clip1", "t2va"), ("clip2", "ta2va")}
@@ -117,12 +261,38 @@ def test_failure_isolation_and_stage_resume(tmp_path):
     assert states["clip1"]["ta2va_status"] == "skipped"
     assert states["clip2"]["t2va_status"] == "ready"
     assert states["clip2"]["ta2va_status"] == "failed"
+    shard = tmp_path / "shards" / production.shard_name(0)
+    assert (shard / "COMPLETE").exists()
     processor.fail.clear()
     production.process_shard(tmp_path, 0, sample_rows(), processor, request_workers=1)
     assert processor.calls["clip0", "t2va"] == 1
-    assert processor.calls["clip1", "t2va"] == 2
+    assert processor.calls["clip1", "t2va"] == 1
     assert processor.calls["clip2", "t2va"] == 1
-    assert processor.calls["clip2", "ta2va"] == 2
+    assert processor.calls["clip2", "ta2va"] == 1
+
+
+def test_fresh_mixed_ready_failed_skipped_shard_completes(tmp_path):
+    processor = FakeProcessor()
+    processor.fail.add(("clip1", "t2va"))
+    rows = sample_rows()
+    rows[2]["upstream_failure"] = "synthetic_unavailable"
+    states = production.process_shard(tmp_path, 0, rows, processor, request_workers=1)
+    assert [states[f"clip{i}"]["t2va_status"] for i in range(3)] == [
+        "ready", "failed", "skipped"
+    ]
+    shard = tmp_path / "shards" / production.shard_name(0)
+    assert json.loads((shard / "COMPLETE").read_text()) == {
+        "source_count": 3,
+        "t2va_ready": 1,
+        "t2va_failed": 1,
+        "t2va_skipped": 1,
+        "ta2va_ready": 1,
+        "ta2va_failed": 0,
+        "ta2va_skipped": 2,
+    }
+    assert list(production.complete_rows(shard / "exports/t2va.jsonl")) == [
+        production.training_row(rows[0]["video"], "('clip0', 't2va')")
+    ]
 
 
 def test_interrupt_and_artifact_recovery(tmp_path):
@@ -184,15 +354,15 @@ def test_incremental_exports_and_complete(tmp_path):
     processor.fail.add(("clip1", "ta2va"))
     production.process_shard(tmp_path, 0, sample_rows(), processor, request_workers=1)
     shard = tmp_path / "shards" / production.shard_name(0)
-    assert not (shard / "COMPLETE").exists()
-    rows = list(production.complete_rows(shard / "exports/t2va.jsonl.partial"))
+    assert (shard / "COMPLETE").exists()
+    rows = list(production.complete_rows(shard / "exports/t2va.jsonl"))
     assert len(rows) == 3
     assert all(set(r) == {"video", "images", "audios", "caption"} for r in rows)
     assert (
         len(
             list(
                 production.complete_rows(
-                    shard / "exports/ta2va_full_audio.jsonl.partial"
+                    shard / "exports/ta2va_full_audio.jsonl"
                 )
             )
         )
@@ -204,6 +374,7 @@ def test_incremental_exports_and_complete(tmp_path):
     assert (shard / "exports/t2va.jsonl").exists()
     assert not (shard / "exports/t2va.jsonl.partial").exists()
     assert len(list(production.complete_rows(shard / "exports/t2va.jsonl"))) == 3
+    assert processor.calls["clip1", "ta2va"] == 1
 
 
 def test_model_agnostic_resume_reuses_existing_artifacts(tmp_path):
@@ -600,7 +771,7 @@ def test_outage_retains_completed_partial_variant(tmp_path):
     assert len(list(production.complete_rows(snapshot / "ta2va_full_audio.jsonl"))) == 1
 
 
-def test_partial_stage_exports_survive_retry(tmp_path):
+def test_partial_stage_exports_survive_terminal_failure(tmp_path):
     class PartialProcessor(FakeProcessor):
         def process(self, stage, row, temporary, destination):
             result = super().process(stage, row, temporary, destination)
@@ -614,7 +785,7 @@ def test_partial_stage_exports_survive_retry(tmp_path):
     assert len(list(production.complete_rows(snapshot / "ta2va_full_audio.jsonl"))) == 1
     production.process_shard(tmp_path, 0, sample_rows(1), processor)
     assert processor.calls["clip0", "t2va"] == 1
-    assert processor.calls["clip0", "ta2va"] == 2
+    assert processor.calls["clip0", "ta2va"] == 1
 
 
 def test_full_preselected_inventory_matches_legacy_inventory(tmp_path, finalized):
@@ -883,7 +1054,7 @@ def test_bulk_preparation_failure_is_not_replayed_per_clip(
     assert not list(prepared.glob("*.jsonl"))
 
 
-def test_retry_after_preparation_failure(tmp_path):
+def test_preparation_failure_is_terminal_on_resume(tmp_path):
     class PreparationProcessor(FakeProcessor):
         def identity(self, row):
             return str(bool(row.get("preparation_error")))
@@ -899,7 +1070,9 @@ def test_retry_after_preparation_failure(tmp_path):
     production.process_shard(tmp_path, 0, rows, processor)
     del rows[0]["preparation_error"]
     states = production.process_shard(tmp_path, 0, rows, processor)
-    assert states["clip0"]["ta2va_status"] == "ready"
+    assert states["clip0"]["t2va_status"] == "failed"
+    assert states["clip0"]["ta2va_status"] == "skipped"
+    assert not processor.calls
 
 
 def test_missing_video_keeps_source_identity_for_resume(tmp_path, finalized):
