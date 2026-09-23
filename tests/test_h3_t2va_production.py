@@ -449,6 +449,62 @@ def test_ta2va_shadow_equivalence(tmp_path, finalized):
             ]
 
 
+def test_single_av_call_production_reuses_profiles_without_second_request(
+    tmp_path, finalized
+):
+    from r2v_data_v2.h3 import ta2va_shadow as ta
+    from r2v_data_v2.h3.t2va_mimo_backend import T2VAMimoConfig, T2VASingleCallBackend
+    from tests.test_h3_ta2va_shadow import ProfileClient
+
+    config = T2VAMimoConfig(
+        **{**shared.config(tmp_path).__dict__, "call_mode": "single"}
+    )
+    inventory = shared.t2va.build_t2va_inventory(
+        shot_manifest=tmp_path / "shots_f03_motion.jsonl",
+        audio_production_root=finalized[0],
+        audio_shadow_run_id=finalized[1],
+        t2va_run_id="t2va-test",
+        backend=config.provenance(),
+    )
+    item = next(j for j in inventory.jobs if not j.upstream_failure and j.speech_facts)
+    draft = shared.draft_for(item)
+    response = json.dumps({
+        **draft.model_dump(mode="json"),
+        **shared.audio_for().model_dump(mode="json"),
+        "speaker_voice_profiles": [
+            {
+                "speaker_group": speaker,
+                "voice_characteristics": "A low resonant register with measured cadence.",
+            }
+            for speaker in dict.fromkeys(a.speaker_id for a in draft.speaker_assignments)
+        ],
+    })
+    av_client = shared.Client([response])
+    profile_client = ProfileClient(fail=True)
+    processor = production.FrozenProductionProcessor(
+        {item.clip_uid: (item, inventory)},
+        T2VASingleCallBackend(config, client=av_client, verify_media=False),
+        ta.TA2VAProfileBackend(shared.config(tmp_path), client=profile_client),
+        allow_unverified=True,
+        verify_sources_per_sample=False,
+    )
+    stage = tmp_path / "production-single" / item.clip_uid
+    t2va_dir = stage / "t2va"
+    t2va_dir.mkdir(parents=True)
+    first = processor.process("t2va", {"clip_uid": item.clip_uid}, t2va_dir, t2va_dir)
+    ta2va_dir = stage / "ta2va"
+    ta2va_dir.mkdir()
+    second = processor.process("ta2va", {"clip_uid": item.clip_uid}, ta2va_dir, ta2va_dir)
+
+    assert first["model_call_count"] == 1
+    assert second["model_call_count"] == 0
+    assert len(av_client.calls) == 1
+    assert profile_client.calls == []
+    products = ta.read_rows(ta2va_dir / "records.jsonl", ta.TA2VAProduct)
+    assert {p.variant for p in products} == {"full_audio_reuse", "target_speech_reuse"}
+    assert all(p.model_call_count == 0 for p in products)
+
+
 @pytest.mark.parametrize("change_source", [False, True, "outage"])
 def test_ta_profile_failure_and_source_mutation(tmp_path, finalized, change_source):
     from r2v_data_v2.h3 import ta2va_shadow as ta

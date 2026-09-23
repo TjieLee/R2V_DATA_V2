@@ -20,11 +20,11 @@ from r2v_data_v2.h3.mimo25_backend import (
 from r2v_data_v2.h3.t2va_shadow import (
     T2VABackendProvenance,
     T2VACompletion,
+    T2VAEndToEndBackendProvenance,
+    T2VAEndToEndDraft,
     T2VAJob,
     T2VAMimoDraft,
     T2VARawResponse,
-    T2VASingleCallBackendProvenance,
-    T2VASingleCallDraft,
     check_audio_files,
     fingerprint,
     parse_t2va_completion,
@@ -63,12 +63,15 @@ Only localized diegetic or shot-synchronized sounds that need a specific playbac
 
 T2VA_SINGLE_CALL_SYSTEM_PROMPT = T2VA_SYSTEM_PROMPT.replace(
     "return one T2VAMimoDraft JSON object",
-    "return one T2VASingleCallDraft JSON object",
+    "return one T2VAEndToEndDraft JSON object",
 ) + """
 
 NON-DIALOGUE AUDIO IN THE SAME RESPONSE
 Also return overall_soundscape and non_diegetic_music. Listen to the original target AV together with the separated music and SFX views of that SAME target. The original AV remains primary authority; the stems help recall quiet musical, environmental and physical sounds, but their labels are not automatically true.
-overall_soundscape describes audible ambience and physical/environmental sound, excluding dialogue and non-diegetic music. non_diegetic_music describes audience-only score when established; use N/A only when none is established. A coherent quiet musical layer in the original AV can be supported by the music stem. Do not repeat continuous ambience or audience-only score in integrated_sequence."""
+overall_soundscape describes audible ambience and physical/environmental sound, excluding dialogue and non-diegetic music. non_diegetic_music describes audience-only score when established; use N/A only when none is established. A coherent quiet musical layer in the original AV can be supported by the music stem. Do not repeat continuous ambience or audience-only score in integrated_sequence.
+
+SPEAKER VOICE PROFILES FOR AUDIO REUSE
+The full separated speech stem is additional acoustic evidence from the SAME target. Its supplied segment IDs, source clusters and intervals locate the voices; speaker_assignments still owns the final Sx mapping. Return one speaker_voice_profiles item per distinct assigned Sx in first vocal appearance order. Describe only supported audible pitch/register, timbre/texture, cadence/rate, energy/delivery and articulation for that voice. Use voice_characteristics=null when the original AV and speech stem do not support a stable acoustic description. Do not infer identity, demographics, personality or emotion, copy dialogue, compare speakers, or include Sx tokens inside voice_characteristics. These profiles are internal TA2VA conditioning facts, not public T2VA prose."""
 
 
 @dataclass(frozen=True)
@@ -94,11 +97,11 @@ class T2VAMimoConfig:
         ):
             raise ValueError("invalid T2VA backend configuration")
 
-    def provenance(self) -> T2VABackendProvenance | T2VASingleCallBackendProvenance:
+    def provenance(self) -> T2VABackendProvenance | T2VAEndToEndBackendProvenance:
         single = self.call_mode == "single"
-        provenance = T2VASingleCallBackendProvenance if single else T2VABackendProvenance
+        provenance = T2VAEndToEndBackendProvenance if single else T2VABackendProvenance
         prompt = T2VA_SINGLE_CALL_SYSTEM_PROMPT if single else T2VA_SYSTEM_PROMPT
-        draft = T2VASingleCallDraft if single else T2VAMimoDraft
+        draft = T2VAEndToEndDraft if single else T2VAMimoDraft
         return provenance(
             prompt_sha256=hashlib.sha256(prompt.encode()).hexdigest(),
             response_schema_sha256=fingerprint(draft.model_json_schema()),
@@ -389,7 +392,7 @@ class T2VASingleCallBackend(T2VAMimoBackend):
         request = super().build_request(job)
         request["messages"][0]["content"] = T2VA_SINGLE_CALL_SYSTEM_PROMPT
         content = request["messages"][1]["content"]
-        for kind in ("music", "sfx"):
+        for kind in ("speech", "music", "sfx"):
             content.extend(
                 [
                     {"type": "text", "text": f"{kind} stem: separated audio of the SAME target"},
@@ -404,15 +407,15 @@ class T2VASingleCallBackend(T2VAMimoBackend):
                 ]
             )
         request["response_format"]["json_schema"] = {
-            "name": "T2VASingleCallDraft",
-            "schema": T2VASingleCallDraft.model_json_schema(),
+            "name": "T2VAEndToEndDraft",
+            "schema": T2VAEndToEndDraft.model_json_schema(),
             "strict": True,
         }
         return request
 
     def annotate(self, job: T2VAJob, request_fingerprint: str) -> T2VARawResponse:
         raw = T2VARawResponse(
-            schema_version="r2v.h3.t2va_raw_response.3",
+            schema_version="r2v.h3.t2va_raw_response.4",
             clip_uid=job.clip_uid,
             request_fingerprint=request_fingerprint,
             model_call_count=0,

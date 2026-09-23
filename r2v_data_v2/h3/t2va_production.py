@@ -1172,16 +1172,16 @@ class FrozenProductionProcessor:
 
     def process(self, stage, row, temporary, destination):
         from r2v_data_v2.h3 import t2va_shadow as t
-        from r2v_data_v2.h3.ta2va_shadow import _verify
+        from r2v_data_v2.h3 import ta2va_shadow as ta
 
         if row.get("preparation_error"):
             raise ValueError(row["preparation_error"])
         job, inventory = self.contexts[row["clip_uid"]]
         if stage == "t2va":
             if self.verify_sources_per_sample:
-                _verify(inventory.source_hashes)
+                ta._verify(inventory.source_hashes)
                 result = t2va_stage(job, self.backend, temporary)
-                _verify(inventory.source_hashes)
+                ta._verify(inventory.source_hashes)
                 return result
             if not Path(job.target_video_path).is_file():
                 raise ValueError("original target video is missing")
@@ -1237,7 +1237,9 @@ class FrozenProductionProcessor:
             stems[job.clip_uid],
             inventory.inventory_fingerprint,
             _sha(core_path),
-            self.profile_backend,
+            ta.profile_backend_for_t2va_raw(
+                destination.parent / "t2va/raw.json", self.profile_backend
+            ),
             temporary,
             destination,
             allow_unverified=self.allow_unverified,

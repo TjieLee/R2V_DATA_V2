@@ -2,8 +2,8 @@
 
 This orchestration is independent of Visual and writes only its owned production
 root. Default multi-call uses frozen T2VA v7/backend .7/core .6 and TA2VA .2/profile v2;
-the reused audio finalizer remains v6. Optional single-call T2VA uses backend .8
-with the same core .6, exact-ASR renderer and TA2VA semantics. The standalone downstream
+the reused audio finalizer remains v6. Optional end-to-end single-call uses backend .9
+with the same core .6, exact-ASR renderer and TA2VA reuse semantics. The standalone downstream
 runner does not preprocess Audio. The optional full launcher below adds upstream
 stage orchestration without migrating legacy outputs or changing eligibility.
 
@@ -77,11 +77,15 @@ done
 ```
 
 `multi` retains the existing semantic AV plus audio-finalize requests (two MiMo
-calls per ready T2VA clip). `single` sends the original AV plus resolved music/SFX
-views in one strict-schema request and still delegates exact dialogue to the
-deterministic renderer (one MiMo call per ready T2VA clip). TA2VA speaker profiling
-may make its own later call; `single` does not mean one call for the entire
-T2VA+TA2VA pipeline. Compare raw responses, failures and human-reviewed output
+calls per ready T2VA clip); eligible TA2VA speech reuse adds its existing profile
+call, for three total. New `single` sends the original AV plus resolved speech,
+music and SFX views in one strict-schema request. It returns the final sound fields
+and acoustic Sx profiles alongside AV semantics. Exact dialogue remains renderer-owned.
+TA2VA reads those frozen profiles without another MiMo request, so a ready
+T2VA+TA2VA clip uses one call in total. Older single-call T2VA `.8` artifacts
+still use the separate TA2VA profile call when needed. An unusable profile does
+not trigger a fallback request; speech reuse fails closed while full-audio reuse
+remains available. Compare raw responses, failures and human-reviewed output
 before treating single-call as a quality-validated replacement. The historical
 `random20-refgraph-v1` Ref2VA run is a different reference-conditioned workflow,
 not a no-reference T2VA baseline.

@@ -685,6 +685,93 @@ def test_real_lineage_pcm_products_and_qa(source, tmp_path):
         build_ta2va_qa(root, overwrite=True)
 
 
+def test_single_av_call_supplies_ta2va_profiles_without_profile_request(
+    playable_manifest, finalized, tmp_path
+):
+    from r2v_data_v2.h3.t2va_mimo_backend import T2VAMimoConfig, T2VASingleCallBackend
+
+    config = T2VAMimoConfig(
+        **{**shared.config(tmp_path).__dict__, "call_mode": "single"}
+    )
+    inventory = shared.t2va.build_t2va_inventory(
+        shot_manifest=tmp_path / "shots_f03_motion.jsonl",
+        audio_production_root=finalized[0],
+        audio_shadow_run_id=finalized[1],
+        t2va_run_id="t2va-test",
+        backend=config.provenance(),
+    )
+    payloads = []
+    for item in inventory.jobs:
+        if item.upstream_failure:
+            continue
+        draft = shared.draft_for(item)
+        payloads.append(json.dumps({
+            **draft.model_dump(mode="json"),
+            **shared.audio_for().model_dump(mode="json"),
+            "speaker_voice_profiles": [
+                {
+                    "speaker_group": speaker,
+                    "voice_characteristics": "A low resonant register with measured cadence.",
+                }
+                for speaker in dict.fromkeys(
+                    a.speaker_id for a in draft.speaker_assignments
+                )
+            ],
+        }))
+    av_client = shared.Client(payloads)
+    shared.t2va.run_t2va_shadow(
+        inventory, T2VASingleCallBackend(config, client=av_client)
+    )
+    t2va_root = shared.t2va.t2va_root(finalized[0], "t2va-test")
+    profile_client = ProfileClient(fail=True)
+    ta_root = ta.run_ta2va_shadow(
+        t2va_root,
+        "ta-single",
+        ta.TA2VAProfileBackend(shared.config(tmp_path), client=profile_client),
+        allow_unverified=True,
+    )
+    products = ta.read_rows(ta_root / "records.jsonl", ta.TA2VAProduct)
+    assert len(av_client.calls) == 2
+    assert profile_client.calls == []
+    assert all(p.status == "ready" and p.model_call_count == 0 for p in products)
+    assert any(
+        p.variant == "target_speech_reuse" and p.speaker_profiles
+        for p in products
+    )
+
+
+def test_single_av_null_profile_does_not_fallback_to_another_model_call(tmp_path):
+    source = shared.t2va.T2VARawResponse(
+        schema_version="r2v.h3.t2va_raw_response.4",
+        clip_uid="clip1",
+        request_fingerprint="a" * 64,
+        model_call_count=1,
+        semantic_model_call_count=1,
+        response=json.dumps({
+            "speaker_voice_profiles": [
+                {"speaker_group": "S1", "voice_characteristics": None}
+            ]
+        }),
+        finish_reason="stop",
+        usage={},
+        warnings=[],
+        error=None,
+    )
+    path = tmp_path / "raw.json"
+    path.write_text(source.model_dump_json())
+    client = ProfileClient(fail=True)
+    fallback = ta.TA2VAProfileBackend(shared.config(tmp_path), client=client)
+    backend = ta.profile_backend_for_t2va_raw(path, fallback)
+    assert isinstance(backend, ta.RecordedTA2VAProfileBackend)
+    with pytest.raises(ValueError, match="voice_characteristics"):
+        backend.profile([{"speaker_group": "S1"}], [])
+    assert client.calls == []
+
+    legacy = source.model_copy(update={"schema_version": "r2v.h3.t2va_raw_response.3"})
+    path.write_text(legacy.model_dump_json())
+    assert ta.profile_backend_for_t2va_raw(path, fallback) is fallback
+
+
 def test_changed_source_fails_before_profile(source, tmp_path):
     inventory = json.loads((source / "inventory.json").read_text())
     path = Path(

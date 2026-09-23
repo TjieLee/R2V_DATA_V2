@@ -436,7 +436,20 @@ def test_single_call_inventory_and_frozen_shadow_roundtrip(finalized, tmp_path):
         backend=single_config.provenance(),
     )
     responses = [
-        json.dumps({**draft_for(j).model_dump(mode="json"), **audio_for().model_dump(mode="json")})
+        json.dumps({
+            **draft_for(j).model_dump(mode="json"),
+            **audio_for().model_dump(mode="json"),
+            "speaker_voice_profiles": [
+                {
+                    "speaker_group": speaker,
+                    "voice_characteristics": "A clear, steady speaking voice.",
+                }
+                for speaker in dict.fromkeys(
+                    assignment.speaker_id
+                    for assignment in draft_for(j).speaker_assignments
+                )
+            ],
+        })
         for j in inventory.jobs
         if not j.upstream_failure
     ]
@@ -445,9 +458,9 @@ def test_single_call_inventory_and_frozen_shadow_roundtrip(finalized, tmp_path):
     )
     root = t2va.t2va_root(production_root, "one-call-test")
     loaded, records, loaded_summary = t2va.load_t2va_shadow(root)
-    assert loaded.backend.schema_version == "r2v.h3.t2va_mimo_backend.8"
+    assert loaded.backend.schema_version == "r2v.h3.t2va_mimo_backend.9"
     assert summary == loaded_summary
-    assert all(r.model_call_count == 1 and r.schema_version.endswith(".3") for r in records if r.status == "ready")
+    assert all(r.model_call_count == 1 and r.schema_version.endswith(".4") for r in records if r.status == "ready")
 
 
 def test_preselected_inventory_skips_media_reselection_and_audio_rehash(

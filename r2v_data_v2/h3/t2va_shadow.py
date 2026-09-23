@@ -204,6 +204,15 @@ class T2VASingleCallDraft(T2VAMimoDraft):
     non_diegetic_music: Text
 
 
+class T2VASpeakerVoiceProfile(SchemaModel):
+    speaker_group: SpeakerID
+    voice_characteristics: Text | None
+
+
+class T2VAEndToEndDraft(T2VASingleCallDraft):
+    speaker_voice_profiles: list[T2VASpeakerVoiceProfile]
+
+
 def _validate_repetition(parts: list[str]) -> None:
     sentences = [
         " ".join(s.casefold().split())
@@ -601,6 +610,13 @@ class T2VASingleCallBackendProvenance(T2VABackendProvenance):
     call_mode: Literal["single"] = "single"
 
 
+class T2VAEndToEndBackendProvenance(T2VASingleCallBackendProvenance):
+    schema_version: Literal["r2v.h3.t2va_mimo_backend.9"] = (
+        "r2v.h3.t2va_mimo_backend.9"
+    )
+    prompt_version: Literal["h3_t2va_single_av_v2"] = "h3_t2va_single_av_v2"
+
+
 class T2VAInventory(SchemaModel):
     schema_version: Literal["r2v.h3.t2va_inventory.3"] = "r2v.h3.t2va_inventory.3"
     shot_selection: T2VAShotSelection
@@ -613,7 +629,9 @@ class T2VAInventory(SchemaModel):
     clip_uids: list[SafeID] = Field(min_length=1)
     jobs: list[T2VAJob]
     backend: Annotated[
-        T2VABackendProvenance | T2VASingleCallBackendProvenance,
+        T2VABackendProvenance
+        | T2VASingleCallBackendProvenance
+        | T2VAEndToEndBackendProvenance,
         Field(discriminator="schema_version"),
     ]
     inventory_fingerprint: Hash
@@ -939,7 +957,9 @@ class T2VACompletion(SchemaModel):
 
 class T2VARawResponse(T2VACompletion):
     schema_version: Literal[
-        "r2v.h3.t2va_raw_response.2", "r2v.h3.t2va_raw_response.3"
+        "r2v.h3.t2va_raw_response.2",
+        "r2v.h3.t2va_raw_response.3",
+        "r2v.h3.t2va_raw_response.4",
     ] = "r2v.h3.t2va_raw_response.2"
     clip_uid: SafeID
     request_fingerprint: Hash
@@ -985,15 +1005,23 @@ def parse_t2va_completion(
         key: payload[key] for key in T2VAMimoDraft.model_fields if key in payload
     }
     draft, corrections = parse_t2va_semantic(job, json.dumps(semantic, ensure_ascii=False))
-    T2VASingleCallDraft.model_validate(
-        {**draft.model_dump(mode="json"), **audio.model_dump(mode="json")}
-    )
+    combined = {**draft.model_dump(mode="json"), **audio.model_dump(mode="json")}
+    if raw.schema_version == "r2v.h3.t2va_raw_response.4":
+        combined["speaker_voice_profiles"] = payload.get("speaker_voice_profiles")
+        parsed = T2VAEndToEndDraft.model_validate(combined)
+        groups = list(dict.fromkeys(a.speaker_id for a in draft.speaker_assignments))
+        if [p.speaker_group for p in parsed.speaker_voice_profiles] != groups:
+            raise ValueError("T2VA single-call speaker profile inventory differs")
+    else:
+        T2VASingleCallDraft.model_validate(combined)
     return draft, audio, corrections
 
 
 class T2VARecord(SchemaModel):
     schema_version: Literal[
-        "r2v.h3.t2va_record.2", "r2v.h3.t2va_record.3"
+        "r2v.h3.t2va_record.2",
+        "r2v.h3.t2va_record.3",
+        "r2v.h3.t2va_record.4",
     ] = "r2v.h3.t2va_record.2"
     clip_uid: SafeID
     inventory_fingerprint: Hash
@@ -1014,7 +1042,7 @@ class T2VARecord(SchemaModel):
                 or not self.core_sha256
                 or not self.prompt_sha256
                 or self.model_call_count
-                != (1 if self.schema_version == "r2v.h3.t2va_record.3" else 2)
+                != (2 if self.schema_version == "r2v.h3.t2va_record.2" else 1)
             ):
                 raise ValueError(
                     "ready T2VA record requires a validated core/prompt"
@@ -1200,9 +1228,13 @@ def run_t2va_shadow(
             records.append(
                 T2VARecord(
                     schema_version=(
-                        "r2v.h3.t2va_record.3"
-                        if raw.schema_version == "r2v.h3.t2va_raw_response.3"
-                        else "r2v.h3.t2va_record.2"
+                        "r2v.h3.t2va_record.4"
+                        if raw.schema_version == "r2v.h3.t2va_raw_response.4"
+                        else (
+                            "r2v.h3.t2va_record.3"
+                            if raw.schema_version == "r2v.h3.t2va_raw_response.3"
+                            else "r2v.h3.t2va_record.2"
+                        )
                     ),
                     clip_uid=job.clip_uid,
                     inventory_fingerprint=inventory.inventory_fingerprint,

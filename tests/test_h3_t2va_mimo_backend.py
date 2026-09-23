@@ -15,9 +15,10 @@ from r2v_data_v2.h3.t2va_mimo_backend import (
     T2VASingleCallBackend,
 )
 from r2v_data_v2.h3.t2va_shadow import (
+    T2VAEndToEndDraft,
     T2VAMimoDraft,
-    T2VASingleCallDraft,
     parse_t2va_completion,
+    render_t2va_prompt,
     validate_t2va_draft,
 )
 from tests import test_h3_t2va_shadow as shadow_tests
@@ -32,6 +33,10 @@ def test_single_call_uses_existing_t2va_contract_and_renders_exact_asr(job, tmp_
         **semantic.model_dump(mode="json"),
         "overall_soundscape": "A soft room hum is audible.",
         "non_diegetic_music": "N/A",
+        "speaker_voice_profiles": [
+            {"speaker_group": "S1", "voice_characteristics": "A low, steady voice."},
+            {"speaker_group": "S2", "voice_characteristics": "A higher, brisk voice."},
+        ],
     }
     config_single = T2VAMimoConfig(**{**config(tmp_path).__dict__, "call_mode": "single"})
     client = shadow_tests.Client([json.dumps(combined)])
@@ -42,11 +47,11 @@ def test_single_call_uses_existing_t2va_contract_and_renders_exact_asr(job, tmp_
     assert raw.audio_finalize is None
     request = client.calls[0]
     assert request["messages"][0]["content"] == T2VA_SINGLE_CALL_SYSTEM_PROMPT
-    assert request["response_format"]["json_schema"]["schema"] == T2VASingleCallDraft.model_json_schema()
+    assert request["response_format"]["json_schema"]["schema"] == T2VAEndToEndDraft.model_json_schema()
     assert request["extra_body"]["use_audio_in_video"] is True
     content = request["messages"][1]["content"]
     assert [part["type"] for part in content] == [
-        "video_url", "text", "text", "audio_url", "text", "audio_url"
+        "video_url", "text", "text", "audio_url", "text", "audio_url", "text", "audio_url"
     ]
     assert all(fact.text not in json.dumps(request, ensure_ascii=False) for fact in job.speech_facts)
     draft, audio, corrections = parse_t2va_completion(job, raw)
@@ -55,7 +60,8 @@ def test_single_call_uses_existing_t2va_contract_and_renders_exact_asr(job, tmp_
     assert core.overall_soundscape == "A soft room hum is audible."
     assert "<d>[Chinese] 你好。</d>" in core.integrated_multimodal_description
     assert "<d>[Chinese] 好的！</d>" in core.integrated_multimodal_description
-    assert backend.provenance().schema_version == "r2v.h3.t2va_mimo_backend.8"
+    assert "A low, steady voice." not in render_t2va_prompt(core)
+    assert backend.provenance().schema_version == "r2v.h3.t2va_mimo_backend.9"
 
 
 def test_single_call_missing_audio_field_fails_without_second_call(job, tmp_path):
@@ -65,13 +71,28 @@ def test_single_call_missing_audio_field_fails_without_second_call(job, tmp_path
     assert raw.error and raw.model_call_count == len(client.calls) == 1
 
 
+def test_single_call_profile_inventory_is_required_without_retry(job, tmp_path):
+    payload = {
+        **draft_for(job).model_dump(mode="json"),
+        **shadow_tests.audio_for().model_dump(mode="json"),
+        "speaker_voice_profiles": [
+            {"speaker_group": "S1", "voice_characteristics": "A low, steady voice."}
+        ],
+    }
+    cfg = T2VAMimoConfig(**{**config(tmp_path).__dict__, "call_mode": "single"})
+    client = shadow_tests.Client([json.dumps(payload)])
+    raw = T2VASingleCallBackend(cfg, client=client).annotate(job, "a" * 64)
+    assert raw.error and "speaker profile inventory differs" in raw.error
+    assert len(client.calls) == 1
+
+
 def test_single_call_provenance_does_not_change_multicall_contract(tmp_path):
     multi = config(tmp_path).provenance()
     single = T2VAMimoConfig(**{**config(tmp_path).__dict__, "call_mode": "single"}).provenance()
     assert multi.schema_version == "r2v.h3.t2va_mimo_backend.7"
     assert multi.prompt_version == "h3_t2va_joint_av_v7"
     assert "call_mode" not in multi.model_dump()
-    assert single.prompt_version == "h3_t2va_single_av_v1"
+    assert single.prompt_version == "h3_t2va_single_av_v2"
     assert single.model != ""
 
 
@@ -81,6 +102,10 @@ def test_single_call_uses_existing_production_writer(job, tmp_path):
     payload = {
         **shadow_tests.draft_for(job).model_dump(mode="json"),
         **shadow_tests.audio_for().model_dump(mode="json"),
+        "speaker_voice_profiles": [
+            {"speaker_group": "S1", "voice_characteristics": "A low, steady voice."},
+            {"speaker_group": "S2", "voice_characteristics": "A higher, brisk voice."},
+        ],
     }
     cfg = T2VAMimoConfig(**{**config(tmp_path).__dict__, "call_mode": "single"})
     client = shadow_tests.Client([json.dumps(payload)])

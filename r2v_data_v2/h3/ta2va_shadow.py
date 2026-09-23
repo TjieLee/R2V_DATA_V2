@@ -47,6 +47,7 @@ from r2v_data_v2.h3.t2va_mimo_backend import T2VAMimoBackend, T2VAMimoConfig
 from r2v_data_v2.h3.t2va_shadow import (
     H3NoReferenceAVCore,
     T2VAJob,
+    T2VARawResponse,
     _check_sources,
     fingerprint,
     load_t2va_shadow,
@@ -55,7 +56,10 @@ from r2v_data_v2.h3.t2va_shadow import (
     validate_t2va_audio_lineage,
     validate_t2va_dialogue,
 )
-from r2v_data_v2.structured_output import parse_structured_json_response
+from r2v_data_v2.structured_output import (
+    normalize_structured_json_envelope,
+    parse_structured_json_response,
+)
 
 VERSION = "r2v.h3.ta2va_shadow.2"
 PROFILE_PROMPT_VERSION = "h3_ta2va_speaker_profile_v2"
@@ -592,6 +596,43 @@ class TA2VAProfileBackend:
         return profiles, raw
 
 
+class RecordedTA2VAProfileBackend:
+    """Use the acoustic Sx profiles from the already published one-call AV result."""
+
+    def __init__(self, source: T2VARawResponse):
+        if source.schema_version != "r2v.h3.t2va_raw_response.4" or source.error:
+            raise ValueError("TA2VA requires a ready end-to-end T2VA response")
+        self.source = source
+
+    def profile(self, targets, snippets):
+        del snippets
+        payload = json.loads(normalize_structured_json_envelope(self.source.response or ""))
+        traits = {
+            row["speaker_group"]: row["voice_characteristics"]
+            for row in payload["speaker_voice_profiles"]
+        }
+        groups = [target["speaker_group"] for target in targets]
+        profiles = [
+            TA2VAProfile(speaker_group=group, voice_characteristics=traits[group])
+            for group in groups
+        ]
+        return profiles, {
+            "response": None,
+            "diagnostic": None,
+            "model_call_count": 0,
+            "error": None,
+            "required_speaker_groups": groups,
+            "source": "t2va_single_call",
+        }
+
+
+def profile_backend_for_t2va_raw(path: Path, fallback: TA2VAProfileBackend):
+    source = T2VARawResponse.model_validate_json(path.read_text())
+    if source.schema_version == "r2v.h3.t2va_raw_response.4":
+        return RecordedTA2VAProfileBackend(source)
+    return fallback
+
+
 def _verify(hashes):
     for path, digest in hashes.items():
         if not Path(path).is_absolute() or sha256_file(Path(path)) != digest:
@@ -803,7 +844,10 @@ def run_ta2va_shadow(
                     }
                 )
             try:
-                profiles, raw = backend.profile(targets, snippets)
+                profile_backend = profile_backend_for_t2va_raw(
+                    t2va / "raw" / f"{job.clip_uid}.json", backend
+                )
+                profiles, raw = profile_backend.profile(targets, snippets)
             except Exception as exc:  # noqa: BLE001 - pre-call media/config failure only.
                 profiles, raw = (
                     [],
