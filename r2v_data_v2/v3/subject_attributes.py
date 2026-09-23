@@ -1377,13 +1377,14 @@ class Sam3AttributeFrameSegmenter:
             raise FileNotFoundError(f"attribute candidate frame is missing: {resolved}")
         if not grounding_prompt.strip():
             raise ValueError("attribute grounding prompt must not be empty")
-        predictor = self._backend._load_predictor()
-        observations = self._backend._prompt_frame(
-            predictor,
-            frames_dir=resolved.parent,
-            slot=frame_slot,
-            grounding_prompt=grounding_prompt,
-        )
+        with self._backend._device_context():
+            predictor = self._backend._load_predictor()
+            observations = self._backend._prompt_frame(
+                predictor,
+                frames_dir=resolved.parent,
+                slot=frame_slot,
+                grounding_prompt=grounding_prompt,
+            )
         return tuple(
             np.asarray(observation.mask, dtype=bool).copy()
             for observation in observations
