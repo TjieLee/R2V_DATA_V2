@@ -187,7 +187,7 @@ class ReferenceEditConfig:
     cuda_visible_devices: str = "0"
     num_inference_steps: int = 40
     target_area: int = 1024 * 1024
-    alignment: int = 16
+    alignment: int = 32
     timeout_seconds: int = 3600
     completion_instruction_rewrite_enabled: bool = True
     background_instruction_rewrite_enabled: bool = False

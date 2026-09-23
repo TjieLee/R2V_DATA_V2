@@ -701,7 +701,7 @@ def test_reference_edit_defaults_select_boogu() -> None:
         "Boogu-Image-0.1-Edit-Turbo-hotfix-1k-20260708"
     )
     assert edit.target_area == 1024 * 1024
-    assert edit.alignment == 16
+    assert edit.alignment == 32
     assert edit.completion_instruction_rewrite_enabled is True
 
 
