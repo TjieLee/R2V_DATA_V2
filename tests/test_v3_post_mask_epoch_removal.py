@@ -109,6 +109,7 @@ from r2v_data_v2.v3.schemas import (
     AnnotationState,
     BackgroundAnnotation,
     BackgroundReferenceState,
+    BackgroundRemovalAttempt,
     BackgroundRemovalReview,
     ClipSource,
     CoverageState,
@@ -2486,3 +2487,115 @@ def test_rejected_candidate_debug_artifacts_match_legacy(
     assert "candidate_seed_202.png" not in legacy_debug, "accepted candidates do not"
     for name in sorted(legacy_debug):
         assert legacy_debug[name] == epoch_debug[name], f"debug mismatch: {name}"
+
+
+# ---------------------------------------------------------------------------
+# attempt context reuse
+# ---------------------------------------------------------------------------
+
+
+def _count_attempt_context_preparations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, int]:
+    """Count the real preparations behind the runner's reuse entry point.
+
+    The patch is on the module the runner calls through and pytest undoes it, so
+    the count is exact and no other test inherits the wrapper.
+    """
+    import r2v_data_v2.v3.post_mask_epoch_removal as removal_module
+
+    counts = {"prepared": 0}
+    original = removal_module.prepare_removal_attempt_context
+
+    def counted(config: Any, storage: Any, clip_uid: str, state: Any) -> Any:
+        counts["prepared"] += 1
+        return original(config, storage, clip_uid, state)
+
+    monkeypatch.setattr(
+        removal_module, "prepare_removal_attempt_context", counted
+    )
+    return counts
+
+
+def test_attempt_context_is_prepared_once_per_pending_clip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One accepted flow needs the same context six times and must pay once.
+
+    Seeding the first candidate, running and finalizing the generation, running
+    and finalizing the judge and rebuilding the cycle's attempts all prepare the
+    identical context from the identical pending state, so the clip pays one
+    preparation and five reuses instead of six whole preparations.
+    """
+    config = _fixture_config(tmp_path, monkeypatch)
+    clip_uids = ("clip-1", "clip-2", "clip-3")
+    storage = _pending_storage(config, clip_uids=clip_uids)
+    ledger = GroupLedger(tmp_path / "group")
+    runner = _runner(
+        config, storage, ledger, seed_allocator=_SeedAllocator([101, 202, 303])
+    )
+
+    counts = _count_attempt_context_preparations(monkeypatch)
+    _scheduler(ledger, runner, _BooguWorker(), _Judge()).run(runner.seed_jobs())
+
+    for clip_uid in clip_uids:
+        assert _state(storage, clip_uid).status == "ready_removed"
+    assert counts["prepared"] == len(clip_uids)
+    assert runner._attempt_context_counters["attempt_context_strict_preparations"] == len(
+        clip_uids
+    )
+    assert runner._attempt_context_counters["attempt_context_reuse_hits"] == 5 * len(
+        clip_uids
+    )
+
+
+def test_attempt_context_reuse_is_bound_to_the_exact_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reuse is keyed by the state, and a cold runner never reuses.
+
+    The context is a pure function of the clip and this exact state, so the same
+    state hands back the same object while a state that moved on - an attempt
+    appended, a status change - is prepared strictly again. A fresh runner starts
+    with nothing, which is what keeps a restart strict.
+    """
+    config = _fixture_config(tmp_path, monkeypatch)
+    storage = _pending_storage(config)
+    ledger = GroupLedger(tmp_path / "group")
+    runner = _runner(config, storage, ledger)
+
+    state = _state(storage)
+    first = runner._attempt_context(SHARD, storage, "clip-1", state)
+    second = runner._attempt_context(SHARD, storage, "clip-1", state)
+    assert first is second
+    assert runner._attempt_context_counters == {
+        "attempt_context_reuse_hits": 1,
+        "attempt_context_strict_preparations": 1,
+    }
+
+    moved_on = state.model_copy(
+        update={
+            "removal_attempts": [
+                *state.removal_attempts,
+                BackgroundRemovalAttempt(
+                    seed=101,
+                    status="failed",
+                    runtime_seconds=0.0,
+                    candidate_sha256=None,
+                    reason="boom",
+                    review=None,
+                ),
+            ]
+        }
+    )
+    third = runner._attempt_context(SHARD, storage, "clip-1", moved_on)
+    assert third is not first
+    assert runner._attempt_context_counters["attempt_context_strict_preparations"] == 2
+
+    cold = _runner(config, storage, ledger)
+    fourth = cold._attempt_context(SHARD, storage, "clip-1", state)
+    assert fourth is not first
+    assert cold._attempt_context_counters == {
+        "attempt_context_reuse_hits": 0,
+        "attempt_context_strict_preparations": 1,
+    }

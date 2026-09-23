@@ -46,6 +46,7 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+import threading
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass, replace
@@ -667,6 +668,68 @@ class RemovalEpochRunner:
         self.stats: dict[str, dict[str, int]] = {
             shard: new_counters() for shard in self.storages
         }
+        #: Attempt contexts this invocation already prepared, keyed by the clip
+        #: and the exact background state they were prepared from. Execution
+        #: only: the context is a pure function of that state, model execution may
+        #: run on a worker, and a miss - or a state that changed - prepares
+        #: strictly again. Never part of a job identity, a receipt or a schema.
+        #: Bounded like the Pair prepared-clip rows, because a context holds a
+        #: full-resolution source image and two full-resolution masks: a shard of
+        #: ten thousand clips must never be resident.
+        self._attempt_contexts: dict[tuple[str, str, str], RemovalAttemptContext] = {}
+        self._attempt_contexts_lock = threading.Lock()
+        self._attempt_contexts_limit = 32
+        self._attempt_context_counters: dict[str, int] = {
+            "attempt_context_reuse_hits": 0,
+            "attempt_context_strict_preparations": 0,
+        }
+
+    # -- attempt context ---------------------------------------------------
+
+    def _attempt_context(
+        self,
+        shard: str,
+        storage: RunStorage,
+        clip_uid: str,
+        state: BackgroundReferenceState,
+    ) -> RemovalAttemptContext:
+        """Prepare one attempt context, reusing this invocation's own.
+
+        One pending clip needs the same context at six places - seeding its first
+        candidate, running and finalizing the generation, running and finalizing
+        the judge, and rebuilding the cycle's attempts - and preparing it
+        re-reads the clip, decodes the tracked masks, rebuilds the foreground
+        union, re-reads and validates the source image and mask and dilates the
+        generation mask every time. The context is a pure function of the clip
+        and this exact state, so the same state reuses it; a state that moved on
+        (an attempt appended, a status change) is a different key and prepares
+        strictly again.
+
+        This does not replace any semantic check: the callers that bind a job
+        still compare ``semantic_input_digest(actual) == job.input_digest``
+        before any model call, and a reused context has to pass that same check.
+        """
+        key = (shard, clip_uid, self._state_fingerprint(state))
+        with self._attempt_contexts_lock:
+            cached = self._attempt_contexts.get(key)
+            if cached is not None:
+                # Refresh insertion order for a tiny LRU without another dependency.
+                self._attempt_contexts.pop(key)
+                self._attempt_contexts[key] = cached
+                self._attempt_context_counters["attempt_context_reuse_hits"] += 1
+                return cached
+        context = prepare_removal_attempt_context(self.config, storage, clip_uid, state)
+        with self._attempt_contexts_lock:
+            self._attempt_context_counters["attempt_context_strict_preparations"] += 1
+            if len(self._attempt_contexts) >= self._attempt_contexts_limit:
+                self._attempt_contexts.pop(next(iter(self._attempt_contexts)))
+            self._attempt_contexts[key] = context
+        return context
+
+    @staticmethod
+    def _state_fingerprint(state: BackgroundReferenceState) -> str:
+        """Exact identity of the state one context is a function of."""
+        return semantic_input_digest(state.model_dump(mode="json"))
 
     # -- CPU seeding ------------------------------------------------------
     def seed_jobs(self) -> list[ModelJob]:
@@ -708,8 +771,8 @@ class RemovalEpochRunner:
                     counters["skipped_disabled"] += 1
                     continue
                 try:
-                    context = prepare_removal_attempt_context(
-                        self.config, storage, clip_uid, state
+                    context = self._attempt_context(
+                        shard, storage, clip_uid, state
                     )
                 except Exception as exc:  # noqa: BLE001 - report, never crash
                     storage.append_failure(
@@ -756,9 +819,7 @@ class RemovalEpochRunner:
         attempt_index = job.attempt_index
         storage = self._storage_for(job)
         state = self._pending_state(storage, clip_uid)
-        context = prepare_removal_attempt_context(
-            self.config, storage, clip_uid, state
-        )
+        context = self._attempt_context(shard, storage, clip_uid, state)
         seed = self._seed_for(
             shard, clip_uid, context, attempt_index, cycle_index
         )
@@ -857,9 +918,7 @@ class RemovalEpochRunner:
             )
         storage = self._storage_for(job)
         state = self._pending_state(storage, clip_uid)
-        context = prepare_removal_attempt_context(
-            self.config, storage, clip_uid, state
-        )
+        context = self._attempt_context(shard, storage, clip_uid, state)
         seed = self._seed_for(shard, clip_uid, context, attempt_index, cycle_index)
         actual = judge_semantic_inputs(
             self.config,
@@ -939,9 +998,7 @@ class RemovalEpochRunner:
             # Published by an earlier invocation that crashed after publishing.
             return ()
         if result.payload.get(PAYLOAD_ATTEMPT_STATUS) == ATTEMPT_STATUS_READY:
-            context = prepare_removal_attempt_context(
-                self.config, storage, clip_uid, state
-            )
+            context = self._attempt_context(shard, storage, clip_uid, state)
             seed = self._seed_for(
                 shard, clip_uid, context, job.attempt_index, cycle_index
             )
@@ -982,9 +1039,7 @@ class RemovalEpochRunner:
             return ()
         status = result.payload.get(PAYLOAD_ATTEMPT_STATUS)
         if status == "accepted":
-            context = prepare_removal_attempt_context(
-                self.config, storage, clip_uid, state
-            )
+            context = self._attempt_context(shard, storage, clip_uid, state)
             attempts = self.collect_current_cycle_attempts(
                 shard=shard,
                 clip_uid=clip_uid,
@@ -1010,9 +1065,7 @@ class RemovalEpochRunner:
             counters["ready_removed"] += 1
             return ()
         if _debug_enabled(self.config):
-            context = prepare_removal_attempt_context(
-                self.config, storage, clip_uid, state
-            )
+            context = self._attempt_context(shard, storage, clip_uid, state)
             attempt = BackgroundRemovalAttempt.model_validate(
                 result.payload[PAYLOAD_ATTEMPT]
             )
@@ -1057,9 +1110,7 @@ class RemovalEpochRunner:
         counters = self.stats[shard]
         next_cycle = cycle_index + 1
         if next_cycle < len(tuple(self.config.remove.candidate_seeds)):
-            context = prepare_removal_attempt_context(
-                self.config, storage, clip_uid, state
-            )
+            context = self._attempt_context(shard, storage, clip_uid, state)
             return (
                 self._generate_job(
                     shard,
@@ -1111,9 +1162,7 @@ class RemovalEpochRunner:
         """
         storage = self.storages[shard]
         state = self._current_state(storage, clip_uid)
-        context = prepare_removal_attempt_context(
-            self.config, storage, clip_uid, state
-        )
+        context = self._attempt_context(shard, storage, clip_uid, state)
         attempts: list[BackgroundRemovalAttempt] = []
         for cycle_index in range(len(tuple(self.config.remove.candidate_seeds))):
             attempt_index = base_attempt_index + cycle_index
