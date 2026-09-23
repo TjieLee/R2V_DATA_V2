@@ -4434,6 +4434,42 @@ def test_hot_reconcile_reuses_plan_and_prefilter_accounting(
     assert stats.ready + stats.rejected == len(clip_uids)
 
 
+def test_hot_finalizer_preserves_prefilter_projection_for_reconcile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Hot finalization must not erase the seed's prefilter accounting."""
+    _unused_config, storage, runner, clip_uids = _four_clip_pair_storage(
+        tmp_path, monkeypatch, "run-finalize-prefilter-preserve", cpu_workers=4
+    )
+    seeded = runner.seed_primary_jobs()
+    before = {
+        clip_uid: runner._prepared_clips[(SHARD, clip_uid)].prefilter_counts
+        for clip_uid in clip_uids
+    }
+    assert all(before.values()), "conservative_v1 seed must record prefilter stats"
+
+    results: dict[str, Any] = {}
+    for job in seeded:
+        result = _run_one(runner, job, _Judge())
+        assert result.committed
+        results[job.job_id()] = result
+    for job in seeded:
+        runner.finalize(job, results[job.job_id()])
+
+    after = {
+        clip_uid: runner._prepared_clips[(SHARD, clip_uid)].prefilter_counts
+        for clip_uid in clip_uids
+    }
+    assert after == before, "the hot finalizer must preserve the projection"
+
+    counts = _counting_reconcile_probe(monkeypatch)
+    runner.reconcile_stats(SHARD)
+    assert counts["candidates"] == 0
+    assert counts["prefilter"] == 0
+    assert runner.prepare_counters["hot_prefilter_cache_hits"] == len(clip_uids)
+    assert runner.prepare_counters["strict_prefilter_replay_clips"] == 0
+
+
 def test_cold_reconcile_replays_strictly_and_matches_hot_stats(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

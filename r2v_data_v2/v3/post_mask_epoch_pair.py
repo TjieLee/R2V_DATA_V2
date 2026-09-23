@@ -3296,10 +3296,10 @@ class PairEpochRunner:
         context = self._primary_context(storage, job.clip_uid)
         if context is None:
             return ()
-        prepared_row = self._prepared_primary_clip_row(
+        prepared_entry = self._validated_prepared_clip_entry(
             shard, job.clip_uid, context[0]
         )
-        if prepared_row is None:
+        if prepared_entry is None:
             # No usable row for this invocation: the strict replay stays the
             # semantic authority and prepares again exactly as before.
             self._bump_prepare_counter("primary_hot_finalize_cache_misses")
@@ -3308,16 +3308,20 @@ class PairEpochRunner:
                 shard, storage, job.clip_uid, context, stop_at_unresolved=True
             )
         else:
-            # This invocation already prepared every entity of this clip, so the
-            # last receipt finalizes from that row instead of preparing again.
+            # This invocation already prepared every entity of this clip. Keep
+            # the full entry, not only its row: the finalizer re-applies the row
+            # and therefore rewrites the bounded cache entry, so dropping the
+            # prefilter projection here would force terminal reconcile to replay
+            # candidate construction/prefilter for every otherwise-hot clip.
             self._bump_prepare_counter("primary_hot_finalize_cache_hits")
             states, temporary, pending = self._apply_prepared_primary_clip(
                 shard,
                 storage,
                 job.clip_uid,
                 context,
-                prepared_row,
+                prepared_entry.row,
                 stop_at_unresolved=True,
+                prefilter_counts=dict(prepared_entry.prefilter_counts),
             )
         if pending:
             # Other entities still need Qwen: nothing is published yet, and
