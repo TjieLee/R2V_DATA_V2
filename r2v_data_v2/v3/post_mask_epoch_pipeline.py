@@ -228,6 +228,26 @@ def _emit_pair_cpu_diagnostics(emit: Any, pair: Any) -> None:
     _emit(emit, "post_mask_epoch_pair_cpu_diagnostics", **counters)
 
 
+def _emit_subject_attributes_cpu_diagnostics(
+    emit: Any, subject_attributes: Any
+) -> None:
+    """Emit the runner's execution-only Subject Attributes CPU counters.
+
+    Clip-plan derivation is pure read-only CPU, so the stage now fans it out
+    across clips and the seed timing alone no longer says how much of the stage
+    was derivation versus durable owner advancement. These counters do:
+    ``clip_plan_derive_wall_seconds`` sums the derivation windows,
+    ``clip_plan_derive_tasks`` counts the derived plans and
+    ``clip_plan_derive_peak_inflight`` proves the fan-out stayed bounded. Never
+    durable: never in ``SubjectAttributeEpochStats``, a ModelJob identity, a
+    receipt, the durable stage counts, a schema or the config fingerprint.
+    """
+    counters = dict(getattr(subject_attributes, "seed_counters", None) or {})
+    if not counters:
+        return
+    _emit(emit, "post_mask_epoch_subject_attributes_cpu_diagnostics", **counters)
+
+
 def _run_staged_scheduler(
     emit: Any, scheduler: Any, jobs: Any, *, stage: str, phase: str
 ) -> dict[str, Any]:
@@ -715,6 +735,7 @@ def run_subject_attributes_stage(
         "post_mask_epoch_subject_attributes_seeded",
         seeded_jobs=len(seeded),
     )
+    _emit_subject_attributes_cpu_diagnostics(emit, subject_attributes)
     outcome = _run_staged_scheduler(
         emit,
         subject_attributes_scheduler_factory(subject_attributes),

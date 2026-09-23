@@ -14,6 +14,8 @@ from __future__ import annotations
 import io
 import itertools
 import json
+import shutil
+import threading
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
@@ -3688,3 +3690,342 @@ def test_selection_cache_access_is_lock_guarded(
     )
     # No lost updates: every increment is visible.
     assert runner.replay_counters["attribute_selection_cache_hit"] == 4 * 200
+
+
+# ---------------------------------------------------------------------------
+# clip-plan derivation fan-out
+# ---------------------------------------------------------------------------
+
+
+def _clone_clip(storage: Any, new_uid: str, source_uid: str = CLIP_UID) -> None:
+    """Clone one ready clip under a new uid.
+
+    Only the clip's own identity is rewritten: the directory name, every
+    embedded ``clip_uid`` and every run-relative artifact path that carries it.
+    Frames, masks, annotation, coverage, references and pairing are copied
+    verbatim, so the clone is a genuine second eligible clip with exactly the
+    same single subject owner.
+    """
+    root = Path(storage.root)
+    target = root / "clips" / new_uid
+    shutil.copytree(root / "clips" / source_uid, target)
+    for name in ("clip.json", "masks.rle.json", "frames/frames.json"):
+        path = target / name
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        rewritten = json.dumps(payload).replace(
+            f"clips/{source_uid}/", f"clips/{new_uid}/"
+        )
+        payload = json.loads(rewritten)
+        if "clip_uid" in payload:
+            payload["clip_uid"] = new_uid
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _multi_clip_fixture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    run_name: str,
+    count: int,
+    owner_frame: bool = False,
+) -> tuple[Any, Any, list[str]]:
+    """One shard holding ``count`` clips, each with one eligible subject owner."""
+    config, storage = _storage_variant(tmp_path, monkeypatch, run_name)
+    if owner_frame:
+        _add_owner_frame(storage, slot=1)
+    uids = [CLIP_UID] + [f"clip-{index}" for index in range(2, count + 1)]
+    for uid in uids[1:]:
+        _clone_clip(storage, uid)
+    return config, storage, uids
+
+
+def _multi_runner(
+    tmp_path: Path,
+    config: Any,
+    storage: Any,
+    uids: Sequence[str],
+    *,
+    cpu_workers: int,
+    ledger_name: str,
+) -> Any:
+    return SubjectAttributeEpochRunner(
+        config,
+        {SHARD: storage},
+        GroupLedger(tmp_path / ledger_name),
+        eligible_clip_uids_by_shard={SHARD: list(uids)},
+        cpu_workers=cpu_workers,
+    )
+
+
+def _plan_digests(root: Path) -> dict[str, str]:
+    """The frozen plan files only: the pure output of the derivation itself."""
+    return {
+        str(path.relative_to(root)): _sha256_bytes(path.read_bytes())
+        for path in sorted(root.rglob("*.json"))
+        if "/plans/" in f"/{path}" or path.name == "plan.json"
+    }
+
+
+#: The two fields that bind the run root by construction. The enriched sample
+#: records the run root it was built in, and the clip outcome binds that sample
+#: by digest, so both legitimately differ between two runs on two run roots.
+#: Every other value - plans, artifacts, counts, remaining digests - must not.
+_RUN_BOUND_KEYS = frozenset({"enriched_sample_sha256", "source_run_root"})
+
+
+def _run_bound_projection(payload: Any) -> Any:
+    if isinstance(payload, dict):
+        return {
+            key: _run_bound_projection(value)
+            for key, value in sorted(payload.items())
+            if key not in _RUN_BOUND_KEYS
+        }
+    if isinstance(payload, list):
+        return [_run_bound_projection(item) for item in payload]
+    return payload
+
+
+def _durable_payloads(root: Path) -> dict[str, Any]:
+    """Every durable artifact under one root, minus the run-root-bound fields.
+
+    JSON payloads are compared structurally, so the two fields that bind the run
+    root can be dropped; every other file keeps its content digest.
+    """
+    payloads: dict[str, Any] = {}
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        key = str(path.relative_to(root))
+        if path.suffix == ".json":
+            payloads[key] = _run_bound_projection(
+                json.loads(path.read_text(encoding="utf-8"))
+            )
+        else:
+            payloads[key] = _sha256_bytes(path.read_bytes())
+    return payloads
+
+
+def test_clip_plan_derivation_fans_out_across_clips(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Four clips, four workers: the derivation really runs concurrently.
+
+    The gate is inside the real derivation, so a fan-out that only *looks*
+    parallel - or a pool replaced by a serial loop - blocks on the barrier and
+    breaks it instead of passing.
+    """
+    config, storage, uids = _multi_clip_fixture(
+        tmp_path, monkeypatch, run_name="run-fanout", count=4
+    )
+    runner = _multi_runner(
+        tmp_path, config, storage, uids, cpu_workers=4, ledger_name="ledger-fanout"
+    )
+    barrier = threading.Barrier(4, timeout=30.0)
+    original = runner._derive_clip_plan
+    seen: list[tuple[str, int]] = []
+
+    def gated(storage_arg: Any, clip_uid_arg: str) -> dict[str, Any]:
+        seen.append((clip_uid_arg, threading.get_ident()))
+        barrier.wait()
+        return original(storage_arg, clip_uid_arg)
+
+    monkeypatch.setattr(runner, "_derive_clip_plan", gated)
+
+    jobs = runner.seed_jobs()
+
+    assert sorted(uid for uid, _ in seen) == sorted(uids)
+    assert len({thread for _, thread in seen}) >= 2
+    assert len(jobs) == len(uids)
+    counters = runner.seed_counters
+    assert counters["clip_plan_derive_tasks"] == len(uids)
+    assert counters["clip_plan_derive_batches"] == 1
+    assert counters["clip_plan_derive_peak_inflight"] == len(uids)
+    assert counters["clip_plan_derive_wall_seconds"] > 0.0
+
+
+def test_clip_plan_derivation_stays_bounded_on_a_long_shard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nine clips on two workers: canonical batches, bounded residency."""
+    config, storage, uids = _multi_clip_fixture(
+        tmp_path, monkeypatch, run_name="run-bounded", count=9
+    )
+    runner = _multi_runner(
+        tmp_path, config, storage, uids, cpu_workers=2, ledger_name="ledger-bounded"
+    )
+
+    jobs = runner.seed_jobs()
+
+    counters = runner.seed_counters
+    assert runner._clip_plan_derive_budget() == 4
+    assert counters["clip_plan_derive_tasks"] == 9
+    assert counters["clip_plan_derive_batches"] == 3
+    assert counters["clip_plan_derive_peak_inflight"] == 4
+    assert len(jobs) == 9
+
+
+def test_clip_plan_is_derived_once_off_the_main_thread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every derivation belongs to the fan-out, and none is repeated at apply.
+
+    The derivation count is exact, every derivation happens on a worker and
+    every one of them runs before its own durable plan exists. A seeding loop
+    that reaches for ``_clip_plan()`` instead of consuming the derived plan
+    re-derives on the main thread, after the plan file was written, and fails
+    both observations.
+    """
+    config, storage, uids = _multi_clip_fixture(
+        tmp_path, monkeypatch, run_name="run-once", count=4
+    )
+    runner = _multi_runner(
+        tmp_path, config, storage, uids, cpu_workers=4, ledger_name="ledger-once"
+    )
+    main_thread = threading.get_ident()
+    original = runner._derive_clip_plan
+    derivations: list[tuple[str, int, bool]] = []
+
+    def counted(storage_arg: Any, clip_uid_arg: str) -> dict[str, Any]:
+        derivations.append(
+            (
+                clip_uid_arg,
+                threading.get_ident(),
+                runner._clip_plan_path(SHARD, clip_uid_arg).is_file(),
+            )
+        )
+        return original(storage_arg, clip_uid_arg)
+
+    monkeypatch.setattr(runner, "_derive_clip_plan", counted)
+
+    jobs = runner.seed_jobs()
+
+    assert sorted(uid for uid, _, _ in derivations) == sorted(uids)
+    assert len(derivations) == len(uids)
+    assert all(thread != main_thread for _, thread, _ in derivations)
+    assert all(not written for _, _, written in derivations)
+    assert len({thread for _, thread, _ in derivations}) >= 2
+    assert len(jobs) == len(uids)
+
+
+def test_a_failing_clip_publishes_nothing_after_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A speculative derivation behind the failing clip must stay unpublished.
+
+    All four clips are derived in the same batch, so clips three and four are
+    genuinely finished before the second clip's failure surfaces. Only what is
+    canonically before the failure may be durable.
+    """
+    config, storage, uids = _multi_clip_fixture(
+        tmp_path, monkeypatch, run_name="run-failure", count=4
+    )
+    runner = _multi_runner(
+        tmp_path, config, storage, uids, cpu_workers=4, ledger_name="ledger-failure"
+    )
+    barrier = threading.Barrier(4, timeout=30.0)
+    original = runner._derive_clip_plan
+    entered: list[str] = []
+
+    def failing(storage_arg: Any, clip_uid_arg: str) -> dict[str, Any]:
+        entered.append(clip_uid_arg)
+        barrier.wait()
+        if clip_uid_arg == uids[1]:
+            raise RuntimeError("clip plan derivation exploded")
+        return original(storage_arg, clip_uid_arg)
+
+    monkeypatch.setattr(runner, "_derive_clip_plan", failing)
+
+    with pytest.raises(SubjectAttributeDurableError, match="cannot derive"):
+        runner.seed_jobs()
+
+    assert sorted(entered) == sorted(uids)
+    assert runner._clip_plan_path(SHARD, uids[0]).is_file()
+    assert runner._owner_dir(SHARD, uids[0], OWNER).is_dir()
+    for clip_uid in uids[1:]:
+        assert not runner._clip_plan_path(SHARD, clip_uid).is_file()
+        assert not runner._clip_outcome_path(SHARD, clip_uid).is_file()
+        assert not runner._owner_dir(SHARD, clip_uid, OWNER).exists()
+
+
+def test_clip_plan_fan_out_is_byte_identical_to_the_serial_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """cpu_workers=1 and cpu_workers=4 publish the exact same durable state.
+
+    Both runs build the same four-clip shard on the same tmp root and drain the
+    same scripted human owner through SAM probes and a raw review, so the frozen
+    plans can be compared digest for digest and everything downstream - artifacts,
+    samples, clip counts - payload for payload. The measured model durations are
+    pinned, because they are receipt noise that varies between any two runs, and
+    the two fields that bind the run root are dropped, because the two runs
+    necessarily live on two run roots. ``reconcile_stats`` re-derives and
+    re-verifies every published sample digest, so the dropped
+    ``enriched_sample_sha256`` is still proven self-consistent in both runs.
+    """
+    monkeypatch.setattr(time, "perf_counter", lambda: 1.0)
+
+    def drained(
+        run_name: str, cpu_workers: int, ledger_name: str
+    ) -> tuple[Any, Any, Any, Any, list[Any]]:
+        config, storage, uids = _multi_clip_fixture(
+            tmp_path,
+            monkeypatch,
+            run_name=run_name,
+            count=4,
+            owner_frame=True,
+        )
+        runner = _multi_runner(
+            tmp_path,
+            config,
+            storage,
+            uids,
+            cpu_workers=cpu_workers,
+            ledger_name=ledger_name,
+        )
+        qwen = _QwenClient(
+            discoveries=[_human_discovery(attributes=(ACCESSORY,))],
+            reviews=[
+                SubjectAttributeReviewBatch(
+                    owner_entity_id=OWNER, reviews=[_raw_review("a1")]
+                )
+            ],
+        )
+        sam = _SamBackend(by_slot={1: [], 0: _usable_sam(storage, slot=0)})
+        _executor, seeded = _drain(runner, qwen, sam=sam)
+        return runner, storage, qwen, sam, seeded
+
+    serial, serial_storage, serial_qwen, serial_sam, serial_jobs = drained(
+        "run-serial", 1, "ledger-serial"
+    )
+    parallel, parallel_storage, parallel_qwen, parallel_sam, parallel_jobs = drained(
+        "run-parallel", 4, "ledger-parallel"
+    )
+
+    # The serial path builds no executor at all.
+    assert serial.seed_counters["clip_plan_derive_tasks"] == 0
+    assert serial.seed_counters["clip_plan_derive_peak_inflight"] == 0
+    assert parallel.seed_counters["clip_plan_derive_tasks"] == 4
+    assert parallel.seed_counters["clip_plan_derive_peak_inflight"] == 4
+
+    assert [job.job_id() for job in serial_jobs] == [
+        job.job_id() for job in parallel_jobs
+    ]
+    assert serial_qwen.discovery_calls == parallel_qwen.discovery_calls == 4
+    assert serial_qwen.review_calls == parallel_qwen.review_calls == 4
+    assert serial_sam.calls == parallel_sam.calls == 8
+    assert serial_qwen.review_requests == parallel_qwen.review_requests
+
+    serial_semantic = Path(serial.ledger.root) / "semantic"
+    parallel_semantic = Path(parallel.ledger.root) / "semantic"
+    serial_plans = _plan_digests(serial_semantic)
+    assert len(serial_plans) == 12, "4 clip plans, 4 owner plans, 4 attribute plans"
+    assert serial_plans == _plan_digests(parallel_semantic)
+    assert _durable_payloads(serial_semantic) == _durable_payloads(parallel_semantic)
+    assert _durable_payloads(_output_root(serial_storage)) == _durable_payloads(
+        _output_root(parallel_storage)
+    )
+    serial_stats = serial.reconcile_stats(SHARD)
+    parallel_stats = parallel.reconcile_stats(SHARD)
+    assert serial_stats.to_dict() == parallel_stats.to_dict()
+    assert serial_stats.terminal_clips == parallel_stats.terminal_clips == 4
+    assert serial_stats.no_work_clips == parallel_stats.no_work_clips == 0

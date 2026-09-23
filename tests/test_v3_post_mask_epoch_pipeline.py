@@ -3056,6 +3056,48 @@ def test_production_reaches_subject_attributes_and_publishes_receipts(
     assert payload == _expected_attribute_receipt(storage, "clip-1")
 
 
+def test_production_run_emits_the_subject_attributes_cpu_diagnostics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one Subject Attributes CPU diagnostics event reaches the run's emit.
+
+    The stage seeds through the real fan-out code path, and the event must carry
+    the runner's own execution-only counters unmodified. This run has a single
+    eligible clip, so seeding takes the serial path and the fan-out counters are
+    all zero - which is exactly what a benchmark reading the server log needs to
+    be able to see, instead of a missing or hand-built event.
+    """
+    outcome, events, _handle, _storage, _ledger = (
+        _production_reference_integrity_outcome(tmp_path, monkeypatch, cpu_workers=4)
+    )
+
+    assert outcome["subject_attributes_completed"] is True
+    diagnostics = [
+        event
+        for event in events
+        if event["event"] == "post_mask_epoch_subject_attributes_cpu_diagnostics"
+    ]
+    assert len(diagnostics) == 1, [event["event"] for event in events]
+    payload = diagnostics[0]
+    assert set(payload) == {
+        "event",
+        "clip_plan_derive_tasks",
+        "clip_plan_derive_peak_inflight",
+        "clip_plan_derive_batches",
+        "clip_plan_derive_wall_seconds",
+    }
+    assert payload["clip_plan_derive_tasks"] == 0
+    assert payload["clip_plan_derive_batches"] == 0
+    assert payload["clip_plan_derive_peak_inflight"] == 0
+    assert payload["clip_plan_derive_wall_seconds"] == 0.0
+
+    emitted = [event["event"] for event in events]
+    seeded = emitted.index("post_mask_epoch_subject_attributes_seeded")
+    assert emitted[seeded + 1] == (
+        "post_mask_epoch_subject_attributes_cpu_diagnostics"
+    )
+
+
 def test_subject_attributes_incomplete_blocks_the_export(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

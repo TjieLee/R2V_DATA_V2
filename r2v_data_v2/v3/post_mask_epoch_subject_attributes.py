@@ -32,7 +32,7 @@ import math
 import threading
 import time
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -1381,10 +1381,51 @@ class SubjectAttributeEpochRunner:
             "owner_candidate_cache_miss": 0,
             "owner_candidate_rebuilds": 0,
         }
+        #: Execution-only seed counters for the clip-plan derivation fan-out.
+        #: ``clip_plan_derive_wall_seconds`` is a float, so this mapping stays
+        #: separate from the int-only replay counters. Never part of
+        #: ``SubjectAttributeEpochStats``, a ModelJob identity, a receipt, the
+        #: durable stage counts, a public schema or the config fingerprint.
+        self._seed_counters_lock = threading.Lock()
+        self.seed_counters: dict[str, int | float] = {
+            "clip_plan_derive_tasks": 0,
+            "clip_plan_derive_peak_inflight": 0,
+            "clip_plan_derive_batches": 0,
+            "clip_plan_derive_wall_seconds": 0.0,
+        }
 
     def _bump_replay_counter(self, key: str, delta: int = 1) -> None:
         with self._replay_counter_lock:
             self.replay_counters[key] += delta
+
+    def _bump_seed_counter(self, key: str, delta: int = 1) -> None:
+        with self._seed_counters_lock:
+            self.seed_counters[key] = int(self.seed_counters.get(key, 0)) + delta
+
+    def _note_seed_wall(self, seconds: float) -> None:
+        with self._seed_counters_lock:
+            self.seed_counters["clip_plan_derive_wall_seconds"] = float(
+                self.seed_counters.get("clip_plan_derive_wall_seconds", 0.0)
+            ) + float(seconds)
+
+    def _note_seed_inflight(self, inflight: int) -> None:
+        with self._seed_counters_lock:
+            self.seed_counters["clip_plan_derive_peak_inflight"] = max(
+                int(self.seed_counters.get("clip_plan_derive_peak_inflight", 0)),
+                int(inflight),
+            )
+
+    def _clip_plan_derive_budget(self) -> int:
+        """How many clip plans may be in flight before the batch is applied.
+
+        Derivation is pure read-only CPU, so the only thing that grows with the
+        dataset is how many derived plans wait for their canonical application
+        slot. Keeping that at ``max(cpu_workers, 2 * cpu_workers)`` makes
+        residency O(cpu_workers) instead of O(eligible clips), which is what a
+        ten-thousand-clip shard needs.
+        """
+        workers = int(self.cpu_workers)
+        return max(workers, workers * 2)
 
     # -- durable paths ---------------------------------------------------------
 
@@ -1582,34 +1623,59 @@ class SubjectAttributeEpochRunner:
         )
         return base
 
-    def _clip_plan(self, shard: str, clip_uid: str) -> dict[str, Any]:
-        """Create once, validate once per invocation, then reuse while locked."""
-        cache_key = (shard, clip_uid)
-        cached = self._clip_plan_cache.get(cache_key)
-        if cached is not None:
-            return cached
+    def _checked_derive_clip_plan(
+        self, storage: RunStorage, clip_uid: str
+    ) -> dict[str, Any]:
+        """``_derive_clip_plan`` plus the frozen error envelope.
 
-        storage = self._storage_for(shard)
-        existing = _read_json(self._clip_plan_path(shard, clip_uid))
+        The derivation itself is pure read-only CPU (live upstream reads, no
+        durable or debug write at any point), so any thread may run it; only the
+        envelope that turns an unexpected failure into a durable error has to be
+        identical on the serial path, on the worker path and on a restart.
+        """
         try:
-            expected = self._derive_clip_plan(storage, clip_uid)
+            return self._derive_clip_plan(storage, clip_uid)
         except SubjectAttributeDurableError:
             raise
         except Exception as exc:
             raise SubjectAttributeDurableError(
                 f"cannot derive the Subject Attributes clip plan for {clip_uid!r}"
             ) from exc
+
+    def _apply_derived_clip_plan(
+        self, shard: str, clip_uid: str, expected_plan: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Main-thread durable authority for one already derived clip plan.
+
+        Everything that writes - the durable plan file and the invocation cache
+        - happens here, on the caller's thread, in canonical clip order. A
+        derived plan may therefore never be published speculatively.
+        """
+        cache_key = (shard, clip_uid)
+        cached = self._clip_plan_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        existing = _read_json(self._clip_plan_path(shard, clip_uid))
         if existing is None:
-            _write_json_once(self._clip_plan_path(shard, clip_uid), expected)
-            self._clip_plan_cache[cache_key] = expected
-            return expected
-        if existing != expected:
+            _write_json_once(self._clip_plan_path(shard, clip_uid), expected_plan)
+            self._clip_plan_cache[cache_key] = expected_plan
+            return expected_plan
+        if existing != expected_plan:
             # Whole-plan equality: an extra, missing or changed field is drift.
             raise SubjectAttributeDurableError(
                 f"frozen Subject Attributes clip plan drifted for {clip_uid!r}"
             )
         self._clip_plan_cache[cache_key] = existing
         return existing
+
+    def _clip_plan(self, shard: str, clip_uid: str) -> dict[str, Any]:
+        """Create once, validate once per invocation, then reuse while locked."""
+        cached = self._clip_plan_cache.get((shard, clip_uid))
+        if cached is not None:
+            return cached
+        storage = self._storage_for(shard)
+        expected = self._checked_derive_clip_plan(storage, clip_uid)
+        return self._apply_derived_clip_plan(shard, clip_uid, expected)
 
     def _eligible_owners(self, plan: Mapping[str, Any]) -> list[dict[str, Any]]:
         return [
@@ -2193,6 +2259,22 @@ class SubjectAttributeEpochRunner:
         self, shard: str, storage: RunStorage, clip_uid: str
     ) -> list[ModelJob]:
         plan = self._clip_plan(shard, clip_uid)
+        return self._advance_clip_with_plan(shard, storage, clip_uid, plan)
+
+    def _advance_clip_with_plan(
+        self,
+        shard: str,
+        storage: RunStorage,
+        clip_uid: str,
+        plan: Mapping[str, Any],
+    ) -> list[ModelJob]:
+        """Advance one clip from an already derived and applied clip plan.
+
+        The owner walk below is deliberately serial and canonical per clip: an
+        owner's ``attribute_id_start`` depends on every earlier terminal owner's
+        ``record_count``, and the walk stops at the first unresolved owner. Only
+        the clip-plan derivation above it fans out across clips.
+        """
         if plan["classification"] == CLIP_NO_WORK:
             self._publish_clip_outcome(shard, storage, clip_uid, plan)
             return []
@@ -2294,13 +2376,86 @@ class SubjectAttributeEpochRunner:
             )
         return artifact
 
+    def _seed_targets(self) -> list[tuple[str, str]]:
+        """Canonical seed order: sorted shard, then the declared clip order."""
+        return [
+            (shard, clip_uid)
+            for shard in sorted(self.storages)
+            for clip_uid in self.eligible.get(shard, ())
+        ]
+
+    @staticmethod
+    def _seed_batches(
+        targets: Sequence[tuple[str, str]], budget: int
+    ) -> Iterator[list[tuple[str, str]]]:
+        """Consecutive canonical batches of at most ``budget`` targets."""
+        size = max(1, int(budget))
+        for start in range(0, len(targets), size):
+            yield list(targets[start : start + size])
+
+    def _timed_derive_clip_plan(
+        self, storage: RunStorage, clip_uid: str
+    ) -> dict[str, Any]:
+        """One fan-out derivation task, with its own execution-only duration."""
+        started = time.perf_counter()
+        try:
+            return self._checked_derive_clip_plan(storage, clip_uid)
+        finally:
+            self._note_seed_wall(time.perf_counter() - started)
+
     def seed_jobs(self) -> list[ModelJob]:
-        """CPU fixed point, then the deterministic pending discovery jobs."""
+        """CPU fixed point, then the deterministic pending discovery jobs.
+
+        Deriving a clip plan is pure read-only CPU over live upstream artifacts,
+        so it fans out across clips on one executor per invocation, in bounded
+        canonical batches. Everything that writes - the durable plan, the owner
+        advancement, the clip outcome - stays on this thread, in canonical clip
+        order, exactly as the serial path did: a batch is applied and advanced
+        clip by clip as its canonical derivation becomes available, so the first
+        failure is raised at the position the serial path would raise it, with
+        everything before it already published and nothing after it published at
+        all. ``cpu_workers <= 1`` therefore takes that serial path and builds no
+        executor at all.
+        """
+        targets = self._seed_targets()
         jobs: list[ModelJob] = []
-        for shard in sorted(self.storages):
-            storage = self._storage_for(shard)
-            for clip_uid in self.eligible.get(shard, ()):
-                jobs.extend(self._advance_clip(shard, storage, clip_uid))
+        if int(self.cpu_workers) <= 1 or len(targets) <= 1:
+            for shard, clip_uid in targets:
+                jobs.extend(
+                    self._advance_clip(shard, self._storage_for(shard), clip_uid)
+                )
+            return sorted(jobs, key=lambda job: job.job_id())
+        with ThreadPoolExecutor(max_workers=int(self.cpu_workers)) as pool:
+            for batch in self._seed_batches(targets, self._clip_plan_derive_budget()):
+                futures: dict[tuple[str, str], Any] = {}
+                for shard, clip_uid in batch:
+                    target = (shard, clip_uid)
+                    # A clip whose plan this invocation already derived is not
+                    # re-derived: the serial path short-circuits on the same
+                    # cache, and deriving again would add a drift check the
+                    # serial path never performs.
+                    if self._clip_plan_cache.get(target) is None:
+                        futures[target] = pool.submit(
+                            self._timed_derive_clip_plan,
+                            self._storage_for(shard),
+                            clip_uid,
+                        )
+                if futures:
+                    self._bump_seed_counter("clip_plan_derive_batches")
+                    self._note_seed_inflight(len(futures))
+                for shard, clip_uid in batch:
+                    plan = self._clip_plan_cache.get((shard, clip_uid))
+                    if plan is None:
+                        expected = futures[(shard, clip_uid)].result()
+                        self._bump_seed_counter("clip_plan_derive_tasks")
+                        plan = self._apply_derived_clip_plan(
+                            shard, clip_uid, expected
+                        )
+                    jobs.extend(
+                        self._advance_clip_with_plan(
+                            shard, self._storage_for(shard), clip_uid, plan
+                        )
+                    )
         return sorted(jobs, key=lambda job: job.job_id())
 
     def finalize(self, job: ModelJob, result: JobResult) -> Sequence[ModelJob]:
