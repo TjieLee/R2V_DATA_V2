@@ -4997,3 +4997,97 @@ def test_scheduler_separates_seeded_jobs_from_unlocked_guard_jobs(
     assert outcome["job_count"] == 2, outcome
     assert outcome["seed_job_count"] < outcome["job_count"]
     assert len(judges[PAIR_BACKGROUND_GUARD_JOB].calls) == 1
+
+
+def _scheduler_for(runner: Any, judges: Mapping[str, Any]) -> Any:
+    """A real scheduler whose Qwen executor drives this runner's jobs."""
+    from r2v_data_v2.v3.post_mask_epoch_jobs import RESOURCE_QWEN
+    from r2v_data_v2.v3.post_mask_epoch_scheduler import (
+        JobExecution,
+        ResourceEpochScheduler,
+    )
+
+    class _Executor:
+        def execute_batch(self, jobs: Any) -> Any:
+            outcomes: dict[str, Any] = {}
+            for job in sorted(jobs, key=lambda item: item.job_id()):
+                result = runner.run(job, judges[job.job_type])
+                if result.committed:
+                    _commit(runner, job, result)
+                outcomes[job.job_id()] = JobExecution(job, result, None)
+            return outcomes
+
+    return ResourceEpochScheduler(
+        ledger=runner.ledger,
+        finalize=runner.finalize,
+        executors={RESOURCE_QWEN: _Executor()},
+    )
+
+
+def test_streamed_restart_through_the_real_scheduler(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A new scheduler resumes from the real rXXX-qwen receipts.
+
+    The interrupted run commits its first batch under the real phase machinery,
+    the stream is dropped mid-flight, and a completely new runner, ledger and
+    scheduler pick the same durable state up through ``run_batches`` again. The
+    committed model calls must not be repeated and the phase directories must be
+    reusable: the plan is monotonic per job, so re-planning an already committed
+    job under the same phase id is safe.
+    """
+    clip_uids = ("clip-1", "clip-2", "clip-3", "clip-4")
+
+    def build(run_name: str) -> tuple[Any, Any, Any]:
+        config, storage = _restart_pair_fixture(
+            tmp_path, monkeypatch, run_name, clip_uids
+        )
+        runner = _runner(
+            tmp_path, config, storage, clip_uids=clip_uids,
+            ledger_dir=f"ledger-{run_name}", cpu_workers=2,
+        )
+        runner._prepared_clip_limit = 2
+        return config, storage, runner
+
+    # Control: one uninterrupted streaming run through the real scheduler.
+    _ctrl_config, ctrl_storage, ctrl_runner = build("run-rs-control")
+    ctrl_judges = _pair_judges()
+    ctrl_outcome = _scheduler_for(ctrl_runner, ctrl_judges).run_batches(
+        ctrl_runner.iter_primary_seed_batches()
+    )
+    ctrl_calls = len(ctrl_judges[PAIR_ENTITY_JUDGE_JOB].calls)
+    ctrl_state = _pair_publication(ctrl_storage, ctrl_runner, clip_uids)
+    assert ctrl_outcome["completed"] is True
+    assert ctrl_calls == len(clip_uids)
+
+    # Interrupted: only the first batch goes through the real scheduler.
+    config, storage, runner_a = build("run-rs-resume")
+    judges_a = _pair_judges()
+    stream = runner_a.iter_primary_seed_batches()
+    first_batch = next(stream)
+    _scheduler_for(runner_a, judges_a).run_batches([first_batch])
+    first_calls = len(judges_a[PAIR_ENTITY_JUDGE_JOB].calls)
+    assert first_calls == 2, f"the first batch is bounded to two clips: {first_calls}"
+    first_job = first_batch[0]
+    stream.close()
+
+    # A brand new runner, ledger and scheduler on the same durable state.
+    resumed = _runner(
+        tmp_path, config, storage, clip_uids=clip_uids,
+        ledger_dir="ledger-run-rs-resume", cpu_workers=2,
+    )
+    resumed._prepared_clip_limit = 2
+    state = resumed.ledger.classify(first_job)
+    assert state.state != "pending", f"batch 1 is durably committed: {state}"
+
+    judges_b = _pair_judges()
+    resumed_outcome = _scheduler_for(resumed, judges_b).run_batches(
+        resumed.iter_primary_seed_batches()
+    )
+    resumed_calls = len(judges_b[PAIR_ENTITY_JUDGE_JOB].calls)
+
+    assert resumed_outcome["completed"] is True
+    assert first_calls + resumed_calls == ctrl_calls, (
+        first_calls, resumed_calls, ctrl_calls
+    )
+    assert _pair_publication(storage, resumed, clip_uids) == ctrl_state

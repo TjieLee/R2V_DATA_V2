@@ -1685,6 +1685,12 @@ class PairEpochRunner:
                 for clip_uid in plan["eligible_clip_uids"]:
                     if plan["clips"][clip_uid]["classification"] != CLIP_FRESH_TARGET:
                         continue
+                    if self._clip_primary_settled(shard, clip_uid) is True:
+                        # A streaming consumer drains each batch before asking
+                        # for the next one, so a clip seeded in an earlier batch
+                        # can already be terminal here. Re-visiting it would
+                        # re-derive and re-publish work that is already durable.
+                        continue
                     context = self._primary_context(storage, clip_uid)
                     if context is None:
                         continue

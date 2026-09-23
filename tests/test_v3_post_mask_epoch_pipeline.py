@@ -4015,3 +4015,129 @@ def test_resource_lifecycle_event_reports_the_shared_session(
     assert lifecycle[0]["counters"] == result["resource_lifecycle"]
     assert lifecycle[0]["counters"], "the manager reported something"
     assert result["pair_completed"] is True
+
+
+def _seed_count_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Any, dict[str, Any], dict[str, Any], list[str]]:
+    """A Pair shard whose finalizer really unlocks one guard job.
+
+    One judged entity is seeded and the background final guard is enabled, so the
+    scheduler sees two jobs - the seeded one and the unlocked one - while Pair
+    Primary only seeded one. That is exactly where the two counts differ.
+    """
+    from tests.test_v3_pair import _FinalBackgroundJudge, _install_clean_background
+
+    config = _config(tmp_path, monkeypatch, "run-a")
+    removal_storage = _pending_storage(config, clip_uids=("clip-1",))
+    pair_config = _config(tmp_path, monkeypatch, "run-b")
+    pair_config = replace(
+        pair_config,
+        pair=replace(pair_config.pair, background_final_guard_mode="qwen_v1"),
+    )
+    pair_storage = _storage(pair_config, entity_types=("subject",))
+    _install_clean_background(pair_storage)
+    storages = {SHARD: removal_storage, PAIR_SHARD: pair_storage}
+    eligible = {SHARD: ("clip-1",), PAIR_SHARD: ("clip-1",)}
+    handles = {
+        "pair_config": pair_config,
+        "storages": storages,
+        "eligible": eligible,
+        "handle": _PairDispatchHandle(_EntityJudge(), _FinalBackgroundJudge(accepted=True)),
+    }
+    del pair_storage
+    return config, handles, {}, []
+
+
+class _PairDispatchHandle:
+    """One Pair handle serving both the entity judge and the background guard."""
+
+    def __init__(self, entity: Any, guard: Any) -> None:
+        self.entity = entity
+        self.guard = guard
+
+    def decide(self, **kwargs: Any) -> Any:
+        return self.entity.decide(**kwargs)
+
+    def review(self, **kwargs: Any) -> Any:
+        return self.guard.review(**kwargs)
+
+
+def test_pipeline_reports_seeded_pair_jobs_and_cpu_diagnostics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pipeline must report seeded jobs and emit the runner's CPU counters."""
+    config, handles, _a, _b = _seed_count_fixture(tmp_path, monkeypatch)
+    del config
+    pair_config = handles["pair_config"]
+    storages = handles["storages"]
+    eligible = handles["eligible"]
+    handle = handles["handle"]
+    ledger = GroupLedger(tmp_path / "ledger")
+    log: list[str] = []
+    events: list[dict[str, Any]] = []
+
+    def removal_factory(runner: Any) -> Any:
+        return ResourceEpochScheduler(
+            ledger=ledger,
+            finalize=runner.finalize,
+            executors=_removal_executors(runner, log),
+        )
+
+    def pair_factory(runner: Any) -> Any:
+        return ResourceEpochScheduler(
+            ledger=ledger,
+            finalize=runner.finalize,
+            executors={
+                RESOURCE_QWEN: _RecordingExecutor(runner, handle, "pair", log)
+            },
+        )
+
+    outcome = run_removal_pair_epochs(
+        config=pair_config,
+        storages=storages,
+        eligible_clip_uids_by_shard=eligible,
+        ledger=ledger,
+        removal_scheduler_factory=removal_factory,
+        pair_scheduler_factory=pair_factory,
+        emit=_collecting_emit(events),
+    )
+
+    # The Pair runner sees both shards, so seeding produces one judged job per
+    # shard; each finalizer then unlocks its own guard job. The two counts
+    # therefore differ, which is the whole point of this test.
+    assert outcome["pair_primary_job_count"] == 2, outcome["pair_primary_job_count"]
+    seeded_events = [
+        entry
+        for entry in events
+        if entry["event"] == "post_mask_epoch_pair_primary_seeded"
+    ]
+    assert seeded_events, events
+    assert seeded_events[-1]["seeded_jobs"] == 2
+
+    primary = outcome["pair_outcome"]["primary"]
+    assert primary["seed_job_count"] == 2, primary
+    assert primary["job_count"] == 4, primary
+    assert primary["seed_job_count"] != primary["job_count"]
+
+    # The CPU diagnostics event carries the runner's own counters verbatim.
+    diagnostics = [
+        entry
+        for entry in events
+        if entry["event"] == "post_mask_epoch_pair_cpu_diagnostics"
+    ]
+    assert diagnostics, [entry["event"] for entry in events]
+    payload = diagnostics[-1]
+    for key in (
+        "primary_prepare_wall_seconds",
+        "primary_prepare_tasks",
+        "primary_prepare_peak_inflight",
+        "primary_prepare_peak_buffered_results",
+        "primary_model_prepare_cache_misses",
+        "primary_hot_finalize_replay_fallbacks",
+        "hot_prefilter_cache_hits",
+        "strict_prefilter_replay_clips",
+    ):
+        assert key in payload, (key, sorted(payload))
+    assert payload["primary_prepare_wall_seconds"] >= 0.0
+    assert payload["primary_prepare_tasks"] >= 1

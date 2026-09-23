@@ -212,6 +212,22 @@ def _emit_scheduler_diagnostics(
     )
 
 
+def _emit_pair_cpu_diagnostics(emit: Any, pair: Any) -> None:
+    """Emit the runner's execution-only Pair CPU counters, unmodified.
+
+    Streaming moved Pair CPU preparation lazily inside the scheduler, so the
+    stage timing no longer separates preparation from model execution. These
+    counters do: ``primary_prepare_wall_seconds`` measures the entity/reference
+    preparation itself (not all plan or context filesystem work), and the rest
+    show whether prepared work was reused or re-derived. Never durable, never
+    part of PairStats, a ModelJob, a receipt, a schema or the config fingerprint.
+    """
+    counters = dict(getattr(pair, "prepare_counters", None) or {})
+    if not counters:
+        return
+    _emit(emit, "post_mask_epoch_pair_cpu_diagnostics", **counters)
+
+
 def _run_staged_scheduler(
     emit: Any, scheduler: Any, jobs: Any, *, stage: str, phase: str
 ) -> dict[str, Any]:
@@ -1374,6 +1390,7 @@ def run_removal_pair_epochs(
             "post_mask_epoch_pair_primary_seeded",
             seeded_jobs=result["pair_primary_job_count"],
         )
+    _emit_pair_cpu_diagnostics(emit, pair)
     primary_unresolved = tuple(primary_outcome.get("unresolved_job_ids", ()))
     _emit(
         emit,
