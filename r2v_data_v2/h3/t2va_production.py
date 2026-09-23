@@ -1270,8 +1270,6 @@ class FrozenProductionProcessor:
                 result = t2va_stage(job, self.backend, temporary)
                 ta._verify(inventory.source_hashes)
                 return result
-            if not Path(job.target_video_path).is_file():
-                raise ValueError("original target video is missing")
             if job.audio_evidence is None or any(
                 not Path(getattr(job.audio_evidence, f"{kind}_path")).is_file()
                 for kind in ("full_audio", "speech", "music", "sfx")
@@ -1288,8 +1286,6 @@ class FrozenProductionProcessor:
         t.validate_t2va_draft(job, core)
         if self.verify_sources_per_sample:
             t.check_audio_files(job.audio_evidence)
-        elif not Path(job.target_video_path).is_file():
-            raise ValueError("original target video is missing")
         root = t.stem_shadow_root(
             Path(inventory.audio_production_root), inventory.audio_shadow_run_id
         )

@@ -27,6 +27,9 @@ from r2v_data_v2.h3.t2va_shot_index import indexed_rows, random_indices
 from r2v_data_v2.manifest import iter_source_records
 from r2v_data_v2.v3.production_source import JeaVideoMotionAdapter
 
+# Legacy Audio/SAM/AuK schemas require a digest-shaped field; this is not a file hash.
+VIDEO_HASH_NOT_COMPUTED = "0" * 64
+
 
 class T2VAShot(SchemaModel):
     clip_uid: str
@@ -200,7 +203,10 @@ def validate_cached_target(shot: T2VAShot, clip: CanonicalAudioClip) -> None:
     if (
         shot.clip_uid != clip.clip_uid
         or shot.video_path != clip.target_video_path
-        or shot.video_sha256 != clip.target_video_sha256
+        or (
+            shot.video_sha256 != VIDEO_HASH_NOT_COMPUTED
+            and shot.video_sha256 != clip.target_video_sha256
+        )
         or abs(shot.duration_seconds - clip.target_duration_seconds)
         > AUDIO_TIMELINE_DURATION_TOLERANCE_SECONDS
     ):
@@ -235,6 +241,7 @@ def prepare_t2va_audio(
         for shot in selection.shots:
             if (
                 verify_source_videos
+                and shot.video_sha256 != VIDEO_HASH_NOT_COMPUTED
                 and sha256_file(Path(shot.video_path)) != shot.video_sha256
             ):
                 raise ValueError("selected JEA target video changed")
@@ -330,7 +337,11 @@ def prepare_t2va_audio(
         ):
             raise ValueError("JEA shot manifest changed during Audio preparation")
         for shot in selection.shots:
-            if sha256_file(Path(shot.video_path)) != shot.video_sha256:
+            if (
+                verify_source_videos
+                and shot.video_sha256 != VIDEO_HASH_NOT_COMPUTED
+                and sha256_file(Path(shot.video_path)) != shot.video_sha256
+            ):
                 raise ValueError("selected JEA target video changed")
         _publish_directory(temporary, destination, overwrite=False)
         return destination

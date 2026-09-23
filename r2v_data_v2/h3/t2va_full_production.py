@@ -21,6 +21,7 @@ from r2v_data_v2.h3.diarization_binding import (
 from r2v_data_v2.h3.jea_audio_production import CanonicalAudioClip
 from r2v_data_v2.h3.sam_audio_stem_shadow import sha256_file
 from r2v_data_v2.h3.t2va_source import (
+    VIDEO_HASH_NOT_COMPUTED,
     T2VAShot,
     T2VAShotSelection,
     prepare_t2va_audio,
@@ -484,7 +485,9 @@ def shard_selection(root, index, shard_id, clips_root, source_videos_root):
                         }
                     )
                     continue
-                item = adapter.parse(raw, source_index=source_index)
+                item = adapter.parse(
+                    raw, source_index=source_index, require_clip_file=False
+                )
                 if item["clip_uid"] in seen:
                     raise ValueError("duplicate clip identity")
                 shot = T2VAShot(
@@ -499,7 +502,7 @@ def shard_selection(root, index, shard_id, clips_root, source_videos_root):
                         ).with_suffix("")
                     ),
                     video_path=item["video_path"],
-                    video_sha256=sha256_file(Path(item["video_path"])),
+                    video_sha256=VIDEO_HASH_NOT_COMPUTED,
                     duration_seconds=duration,
                 )
                 shots.append(shot)

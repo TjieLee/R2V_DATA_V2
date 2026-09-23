@@ -550,18 +550,20 @@ def test_shard_selection_skips_over_200_seconds_before_video_hash(
     for row, duration in zip(rows, (199.9, 200.0, overlong_duration), strict=True):
         row["duration"] = duration
     manifest.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    (tmp_path / "movie_1.mp4").unlink()
     root = tmp_path / "out"
     index = production.build_source_index(manifest, root)
     original_hash = full.sha256_file
 
-    def no_rejected_video_hash(path):
-        if __import__("pathlib").Path(path).name == "movie_3.mp4":
-            pytest.fail("over-200-second video was hashed")
+    def no_original_video_hash(path):
+        if __import__("pathlib").Path(path).suffix == ".mp4":
+            pytest.fail("source video was hashed during selection")
         return original_hash(path)
 
-    monkeypatch.setattr(full, "sha256_file", no_rejected_video_hash)
+    monkeypatch.setattr(full, "sha256_file", no_original_video_hash)
     selection = full.shard_selection(root, index, 0, tmp_path, tmp_path)
     assert [shot.duration_seconds for shot in selection.shots] == [199.9, 200.0]
+    assert [shot.video_sha256 for shot in selection.shots] == ["0" * 64] * 2
     assert selection.excluded_rows == [
         {"source_index": 2, "reason": "clip_duration_over_200s"}
     ]
@@ -803,13 +805,23 @@ def test_bootstrap_resume_does_not_rehash_cached_media(tmp_path, monkeypatch):
     assert resumed == audio
 
 
-def test_bootstrap_from_index_and_resume(tmp_path):
+def test_bootstrap_from_index_and_resume(tmp_path, monkeypatch):
+    from r2v_data_v2.h3 import t2va_source
+
     manifest = shot_manifest(tmp_path)
     root = tmp_path / "out"
     index = production.build_source_index(manifest, root)
     selection = full.shard_selection(root, index, 0, tmp_path, tmp_path)
     assert [s.source_index for s in selection.shots] == [0, 1, 2]
     calls = []
+    original_hash = t2va_source.sha256_file
+
+    def no_original_video_hash(path):
+        if __import__("pathlib").Path(path).suffix == ".mp4":
+            pytest.fail("canonical preparation hashed an original video")
+        return original_hash(path)
+
+    monkeypatch.setattr(t2va_source, "sha256_file", no_original_video_hash)
 
     class Media(Audio):
         def materialize_full_audio(self, **kwargs):
@@ -828,6 +840,20 @@ def test_bootstrap_from_index_and_resume(tmp_path):
     inventory = json.loads((audio / "diarization/inventory.json").read_text())
     assert inventory["source_inventory_kind"] == "jea_shot_manifest"
     assert all(t["visual_references"] == [] for t in inventory["targets"])
+
+    item = (
+        root
+        / "shards"
+        / production.shard_name(0)
+        / "audio_production/canonical_items"
+        / selection.shots[0].clip_uid
+        / "audio/canonical_clips.jsonl"
+    )
+    cached = json.loads(item.read_text())
+    cached["target_video_sha256"] = "a" * 64
+    item.write_text(json.dumps(cached) + "\n")
+    full.bootstrap_audio(root / "shards" / production.shard_name(0), selection, Media())
+    assert len(calls) == 3
 
 
 def test_all_canonical_failures_are_local(tmp_path):

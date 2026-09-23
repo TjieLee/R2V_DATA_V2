@@ -98,6 +98,7 @@ class JeaVideoMotionAdapter:
         raw: dict[str, Any],
         *,
         source_index: int,
+        require_clip_file: bool = True,
     ) -> dict[str, object]:
         if (
             not isinstance(source_index, int)
@@ -105,7 +106,9 @@ class JeaVideoMotionAdapter:
             or source_index < 0
         ):
             raise ValueError("source_index must be a non-negative integer")
-        video_path, source_relative_video_path = self.resolve_clip_path(raw)
+        video_path, source_relative_video_path = self.resolve_clip_path(
+            raw, require_file=require_clip_file
+        )
         _, source_relative_source_video_path = self.resolve_source_video_path(
             raw,
             require_file=False,
@@ -159,12 +162,14 @@ class JeaVideoMotionAdapter:
             "clip_suffix": identity.clip_suffix,
         }
 
-    def resolve_clip_path(self, raw: dict[str, Any]) -> tuple[Path, str]:
+    def resolve_clip_path(
+        self, raw: dict[str, Any], *, require_file: bool = True
+    ) -> tuple[Path, str]:
         return _path_below_root(
             raw.get("video_path"),
             root=self.clips_root,
             field_name="video_path",
-            require_file=True,
+            require_file=require_file,
         )
 
     def resolve_source_video_path(
