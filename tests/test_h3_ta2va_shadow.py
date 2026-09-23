@@ -627,6 +627,9 @@ def test_request_specific_profile_slots_schema_and_provenance(tmp_path):
 def test_real_lineage_pcm_products_and_qa(source, tmp_path):
     before = {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
     root, products, client = run(source, tmp_path)
+    t2va_records = ta.read_rows(source / "records.jsonl", shared.t2va.T2VARecord)
+    assert sum(r.model_call_count for r in t2va_records) == 4
+    assert sum(p.model_call_count for p in products) == 2
     assert len(products) == 4 and all(p.status == "ready" for p in products)
     assert len(client.calls) == 2
     for product in products:
@@ -685,8 +688,11 @@ def test_real_lineage_pcm_products_and_qa(source, tmp_path):
         build_ta2va_qa(root, overwrite=True)
 
 
+@pytest.mark.parametrize("voice_traits", [
+    "A low resonant register with measured cadence.", None,
+])
 def test_single_av_call_supplies_ta2va_profiles_without_profile_request(
-    playable_manifest, finalized, tmp_path
+    playable_manifest, finalized, tmp_path, voice_traits
 ):
     from r2v_data_v2.h3.t2va_mimo_backend import T2VAMimoConfig, T2VASingleCallBackend
 
@@ -711,7 +717,7 @@ def test_single_av_call_supplies_ta2va_profiles_without_profile_request(
             "speaker_voice_profiles": [
                 {
                     "speaker_group": speaker,
-                    "voice_characteristics": "A low resonant register with measured cadence.",
+                    "voice_characteristics": voice_traits,
                 }
                 for speaker in dict.fromkeys(
                     a.speaker_id for a in draft.speaker_assignments
@@ -733,11 +739,15 @@ def test_single_av_call_supplies_ta2va_profiles_without_profile_request(
     products = ta.read_rows(ta_root / "records.jsonl", ta.TA2VAProduct)
     assert len(av_client.calls) == 2
     assert profile_client.calls == []
-    assert all(p.status == "ready" and p.model_call_count == 0 for p in products)
-    assert any(
-        p.variant == "target_speech_reuse" and p.speaker_profiles
-        for p in products
+    assert all(p.model_call_count == 0 for p in products)
+    assert all(
+        p.status == "ready" for p in products if p.variant == "full_audio_reuse"
     )
+    speech = [p for p in products if p.variant == "target_speech_reuse"]
+    assert speech
+    assert all(p.status == ("ready" if voice_traits else "failed") for p in speech)
+    if voice_traits:
+        assert all(p.speaker_profiles for p in speech)
 
 
 def test_single_av_null_profile_does_not_fallback_to_another_model_call(tmp_path):
@@ -770,6 +780,36 @@ def test_single_av_null_profile_does_not_fallback_to_another_model_call(tmp_path
     legacy = source.model_copy(update={"schema_version": "r2v.h3.t2va_raw_response.3"})
     path.write_text(legacy.model_dump_json())
     assert ta.profile_backend_for_t2va_raw(path, fallback) is fallback
+    legacy_v2 = source.model_copy(update={"schema_version": "r2v.h3.t2va_raw_response.2"})
+    path.write_text(legacy_v2.model_dump_json())
+    assert ta.profile_backend_for_t2va_raw(path, fallback) is fallback
+
+
+def test_ta2va_dry_run_accepts_v26_model(source, tmp_path):
+    from tools import run_h3_ta2va_shadow as cli
+
+    report = cli.main([
+        "--t2va-root", str(source),
+        "--ta2va-run-id", "ta-v26-dry",
+        "--base-url", "http://127.0.0.1:8092/v1",
+        "--model", "mimo-v2.6-flash-rl",
+        "--media-root", str(tmp_path),
+        "--dry-run",
+    ])
+    assert report["clip_uids"]
+    assert report["model_call_count"] == 0
+
+
+def test_ab_report_loaders_read_frozen_shadow_records(source, tmp_path):
+    from tools import plan_h3_t2va_mimo_ab as ab
+
+    ta_root, expected, _ = run(source, tmp_path, name="ta-ab-read")
+    inventory, records = ab._load_t2va(source)
+    products = ab._load_ta2va(ta_root, inventory, source)
+    assert [p.record_fingerprint for p in products] == [
+        p.record_fingerprint for p in expected
+    ]
+    assert [r.clip_uid for r in records] == inventory.clip_uids
 
 
 def test_changed_source_fails_before_profile(source, tmp_path):
@@ -791,6 +831,23 @@ def test_changed_source_fails_before_profile(source, tmp_path):
             allow_unverified=True,
         )
     assert not client.calls
+
+
+def test_ta2va_run_does_not_recheck_newly_loaded_source(source, tmp_path, monkeypatch):
+    original = ta.load_source
+    loads = []
+
+    def one_load(root):
+        loads.append(root)
+        return original(root)
+
+    monkeypatch.setattr(ta, "load_source", one_load)
+    monkeypatch.setattr(
+        ta, "_verify", lambda *args: pytest.fail("redundant source rehash")
+    )
+    root, products, _ = run(source, tmp_path, name="ta-once")
+    assert root.exists() and products
+    assert loads == [source]
 
 
 def test_qa_browser_playback(source, tmp_path):

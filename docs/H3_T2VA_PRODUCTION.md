@@ -57,24 +57,51 @@ existing serving command, then use the same explicit T2VA-compatible case manife
 and upstream Audio shadow run in two separate shadow runs. Set `SHOT_MANIFEST`,
 `AUDIO_PRODUCTION_ROOT`, `AUDIO_SHADOW_RUN_ID`, `CASE_MANIFEST`,
 `JEA_CLIPS_ROOT`, `JEA_SOURCE_VIDEOS_ROOT` and `SHOT_INDEX_ROOT` as in the
-T2VA/TA2VA server runbook. These commands do not start a model themselves:
+T2VA/TA2VA server runbook. `CASE_MANIFEST` must be the exact existing ordered
+case list; do not substitute the historical reference-conditioned random20 list
+or draw a new random sample. The planner reads it but does not run a model:
 
 ```bash
-for mode in multi single; do
-  python tools/run_h3_t2va_shadow.py \
-    --shot-manifest "$SHOT_MANIFEST" \
-    --clips-root "$JEA_CLIPS_ROOT" \
-    --source-videos-root "$JEA_SOURCE_VIDEOS_ROOT" \
-    --shot-index-root "$SHOT_INDEX_ROOT" \
-    --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
-    --audio-shadow-run-id "$AUDIO_SHADOW_RUN_ID" \
-    --case-manifest "$CASE_MANIFEST" \
-    --t2va-run-id "v26-t2va-${mode}-ab" \
-    --base-url http://127.0.0.1:8092/v1 \
-    --transport sglang --model mimo-v2.6-flash-rl \
-    --media-root /mnt/workspace --call-mode "$mode"
-done
+export SGLANG_ENV=/mnt/workspace/litengjie/data/audio_deps/qwen38-sglang-env
+export MIMO_CHECKPOINT=/mnt/workspace/public/pretrained/MiMo/MiMo-V2.6-Flash-RL
+python tools/plan_h3_t2va_mimo_ab.py plan \
+  --shot-manifest "$SHOT_MANIFEST" \
+  --clips-root "$JEA_CLIPS_ROOT" \
+  --source-videos-root "$JEA_SOURCE_VIDEOS_ROOT" \
+  --shot-index-root "$SHOT_INDEX_ROOT" \
+  --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
+  --audio-shadow-run-id "$AUDIO_SHADOW_RUN_ID" \
+  --case-manifest "$CASE_MANIFEST" \
+  --sglang-bin "$SGLANG_ENV/bin/sglang" \
+  --checkpoint "$MIMO_CHECKPOINT" \
+  --media-root /mnt/workspace \
+  --model mimo-v2.6-flash-rl \
+  --run-prefix v26-random20 \
+  --allow-unverified
 ```
+
+The printed `endpoint` command comes from `build_mimo_serve_command()` (including
+V2.6 EAGLE flags); start it in one terminal and wait for `/v1/models`. Then run
+the four printed commands in order: `multi_t2va`, `multi_ta2va`, `single_t2va`,
+`single_ta2va`. Both T2VA commands use the same `CASE_MANIFEST` and upstream
+paths; only call mode and run IDs differ. `--allow-unverified` is an explicit
+shadow-pilot opt-in, not a production policy change. The planner's run-prefix
+is an experiment label, not a model-specific production namespace.
+
+After both pairs of shadow runs complete, print a read-only per-clip comparison:
+
+```bash
+python tools/plan_h3_t2va_mimo_ab.py report \
+  --case-manifest "$CASE_MANIFEST" \
+  --multi-t2va-root "$AUDIO_PRODUCTION_ROOT/t2va_shadow_v1/runs/v26-random20-multi-t2va" \
+  --multi-ta2va-root "$AUDIO_PRODUCTION_ROOT/ta2va_shadow_v1/runs/v26-random20-multi-ta2va" \
+  --single-t2va-root "$AUDIO_PRODUCTION_ROOT/t2va_shadow_v1/runs/v26-random20-single-t2va" \
+  --single-ta2va-root "$AUDIO_PRODUCTION_ROOT/ta2va_shadow_v1/runs/v26-random20-single-ta2va" \
+  > v26-random20-ab-report.json
+```
+
+The report checks ordered population and upstream identity, then lists actual
+status, call counts and artifact paths. It does not assign a quality score.
 
 `multi` retains the existing semantic AV plus audio-finalize requests (two MiMo
 calls per ready T2VA clip); eligible TA2VA speech reuse adds its existing profile

@@ -1201,14 +1201,6 @@ def run_t2va_shadow(
                             "T2VA correction provenance differs"
                         )
                     core = validate_t2va_draft(job, draft, audio)
-                    if (
-                        sha256_file(Path(job.target_video_path))
-                        != job.target_video_sha256
-                    ):
-                        core = None
-                        raise ValueError(
-                            "original target video changed during annotation"
-                        )
                     status = "ready"
                 except (ValueError, TypeError, OSError) as exc:
                     error = f"{type(exc).__name__}: {exc}"
@@ -1257,8 +1249,6 @@ def run_t2va_shadow(
         )
         summary = _summary(inventory, records)
         write_json(temporary / "summary.json", summary)
-        load_t2va_shadow(temporary)
-        _check_sources(inventory)
         _publish_directory(temporary, destination, overwrite=overwrite)
         return summary
     finally:

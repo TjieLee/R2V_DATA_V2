@@ -25,7 +25,7 @@ def main(argv=None):
     parser.add_argument("--ta2va-run-id", required=True)
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--transport", choices=["sglang", "xiaomi"], default="sglang")
-    parser.add_argument("--model", choices=["mimo-v2.5"], default="mimo-v2.5")
+    parser.add_argument("--model", default="mimo-v2.5")
     parser.add_argument("--media-root", type=Path, required=True)
     parser.add_argument("--max-completion-tokens", type=int, default=32768)
     parser.add_argument("--allow-unverified", action="store_true")

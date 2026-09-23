@@ -612,6 +612,22 @@ def test_case_manifest_order_and_dry_run_no_client(finalized, tmp_path, monkeypa
     )
     assert single["clip_uids"] == report["clip_uids"]
     assert single["model_call_count"] == 0
+    multi_v26 = cli.main(
+        [
+            "--shot-manifest", str(tmp_path / "shots_f03_motion.jsonl"),
+            "--audio-production-root", str(finalized[0]),
+            "--audio-shadow-run-id", finalized[1],
+            "--t2va-run-id", "dry-multi-v26",
+            "--case-manifest", str(manifest),
+            "--media-root", str(tmp_path),
+            "--base-url", "http://localhost/v1",
+            "--model", "mimo-v2.6-flash-rl",
+            "--call-mode", "multi",
+            "--dry-run",
+        ]
+    )
+    assert multi_v26["clip_uids"] == single["clip_uids"]
+    assert multi_v26["model_call_count"] == 0
 
 
 def test_one_failed_clip_does_not_stop_next(finalized, tmp_path):
@@ -647,6 +663,47 @@ def test_lineage_mismatch_before_call(finalized, tmp_path):
             inventory, T2VAMimoBackend(config(tmp_path), client=client)
         )
     assert client.calls == []
+
+
+def test_shadow_publish_does_not_repeat_current_run_source_checks(
+    finalized, tmp_path, monkeypatch
+):
+    inventory = build(finalized, tmp_path)
+    checks = []
+    original = t2va._check_sources
+
+    def checked_sources(value):
+        checks.append(1)
+        original(value)
+
+    monkeypatch.setattr(t2va, "_check_sources", checked_sources)
+    video_hashes = []
+    original_hash = t2va.sha256_file
+    videos = {j.target_video_path for j in inventory.jobs if not j.upstream_failure}
+
+    def counted_hash(path):
+        if str(path) in videos:
+            video_hashes.append(str(path))
+        return original_hash(path)
+
+    monkeypatch.setattr(t2va, "sha256_file", counted_hash)
+    monkeypatch.setattr(
+        t2va, "load_t2va_shadow",
+        lambda *args: pytest.fail("newly written shadow reloaded before publication"),
+    )
+    client = Client(
+        [
+            draft_for(j).model_dump_json()
+            for j in inventory.jobs
+            if not j.upstream_failure
+        ]
+    )
+    result = t2va.run_t2va_shadow(
+        inventory, T2VAMimoBackend(config(tmp_path), client=client)
+    )
+    assert result.ready_count == 2
+    assert checks == [1]
+    assert sorted(video_hashes) == sorted(videos)
 
 
 def test_atomic_overwrite_keeps_old_stage_on_exception(

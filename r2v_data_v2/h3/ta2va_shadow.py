@@ -658,7 +658,6 @@ def run_ta2va_shadow(
         raise ValueError("TA2VA output overlaps/redirects source")
     if output.exists():
         raise FileExistsError("TA2VA requires a fresh run ID")
-    _verify(hashes)
     values = {
         "schema_version": VERSION,
         "source_t2va_root": str(t2va.resolve()),
@@ -913,8 +912,6 @@ def run_ta2va_shadow(
                 warnings,
                 raw["model_call_count"],
             )
-        _verify(hashes)
-        load_source(t2va)
         summary = {
             "schema_version": VERSION,
             "inventory_fingerprint": values["inventory_fingerprint"],
