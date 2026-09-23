@@ -15,7 +15,7 @@ export OMP_NUM_THREADS=1
 export NO_PROXY="127.0.0.1,localhost,${NO_PROXY:-}"
 export no_proxy="$NO_PROXY"
 
-run=("$repo/.venv/bin/python" tools/run_v3_post_mask_full_production.py
+run=("$repo/.venv/bin/python" "$repo/tools/run_v3_post_mask_full_production.py"
   --base-config "$config" --entity-mask-root "$entity_mask"
   --rank "$rank" --world-size "$world_size" --group-size 8)
 printf 'host=%s rank=%s world_size=%s\n' "$(hostname)" "$rank" "$world_size"
@@ -29,6 +29,9 @@ fi
 cd "$repo"
 source "$repo/.venv/bin/activate"
 source "$repo/server_env.sh"
+# server_env.sh is allowed to alter the shell environment, but production must
+# continue from this frozen worktree even if that file changes the cwd.
+cd "$repo"
 export TORCH_HOME=/mnt/workspace/public/.cache/
 export OMP_NUM_THREADS=1
 export NO_PROXY="127.0.0.1,localhost,${NO_PROXY:-}"
