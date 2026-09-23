@@ -161,6 +161,49 @@ def test_formal_shard_paths_write_exports_under_official_root(tmp_path, monkeypa
     assert paths.run_root.is_relative_to(writable)
 
 
+def test_formal_initialize_shard_allows_only_official_public_output(
+    tmp_path, monkeypatch
+):
+    from r2v_data_v2.v3 import post_mask_production as api
+
+    writable = tmp_path / "private"
+    official = tmp_path / "public" / "in_pair_reference"
+    entity_mask = tmp_path / "entity_mask"
+    shard = "shard-000000000-000009999"
+    shard_path = entity_mask / "parts" / f"{shard}.jsonl"
+    shard_path.parent.mkdir(parents=True)
+    shard_path.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(config_module, "ALLOWED_WRITABLE_ROOT", writable)
+    monkeypatch.setattr(config_module, "OFFICIAL_POST_MASK_EXPORT_ROOT", official)
+
+    config = config_module.load_config(
+        REPO / "configs/v3_post_mask_resource_epoch_production.yaml"
+    )
+    config = replace(
+        config,
+        run_root=writable / "base",
+        export_root=official / "shards",
+    )
+    paths = ShardPaths.for_shard(
+        official / "state",
+        shard_path,
+        runs_root=writable / "r2v_v3_runs/production/jea_motion_v1/in_pair_reference",
+        exports_root=official / "shards",
+    )
+
+    storage = api.initialize_shard(config, paths, git_commit="test")
+    assert storage.root == paths.run_root
+    assert paths.run_root.is_relative_to(writable)
+    assert paths.export_root.is_relative_to(official)
+    assert paths.state_root.is_relative_to(official)
+
+    outside = tmp_path / "other"
+    bad = replace(paths, export_root=outside / shard)
+    with pytest.raises(ValueError, match="official Post-Mask output root"):
+        api.initialize_shard(config, bad, git_commit="test")
+
+
 def test_formal_export_completed_fast_skip_does_not_rehash(tmp_path, monkeypatch):
     marker = tmp_path / "state" / "shard-000000000-000009999" / "completed.json"
     marker.parent.mkdir(parents=True)

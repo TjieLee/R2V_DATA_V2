@@ -252,12 +252,19 @@ def initialize_shard(
     both corruption and both fail closed.
     """
     frozen_root = paths.shard_path.parent.parent.resolve()
+    writable_roots = (
+        config_module.ALLOWED_WRITABLE_ROOT.resolve(),
+        config_module.OFFICIAL_POST_MASK_EXPORT_ROOT.resolve(),
+    )
     for destination in (paths.run_root, paths.export_root, paths.state_root):
         resolved = destination.resolve()
         if resolved.is_relative_to(frozen_root) or frozen_root.is_relative_to(resolved):
             raise ValueError("Post-Mask destination overlaps frozen input")
-        if not resolved.is_relative_to(config_module.ALLOWED_WRITABLE_ROOT.resolve()):
-            raise ValueError("Post-Mask writes must stay inside allowed writable root")
+        if not any(resolved.is_relative_to(root) for root in writable_roots):
+            raise ValueError(
+                "Post-Mask writes must stay inside the private writable root "
+                "or official Post-Mask output root"
+            )
     config = prepare_shard_config(base_config, paths)
     storage = RunStorage(config)
 

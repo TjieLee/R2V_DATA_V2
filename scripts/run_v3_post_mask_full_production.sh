@@ -36,7 +36,7 @@ export no_proxy="$NO_PROXY"
 export PYTHONPATH="/mnt/workspace/litengjie/data/vendor/sam3${PYTHONPATH:+:$PYTHONPATH}"
 # Pin after server_env.sh; stale shell values cannot choose a different model.
 export POST_MASK_QWEN_MODEL_PATH="$qwen"
-export POST_MASK_CPU_WORKERS=16
+export POST_MASK_CPU_WORKERS="${POST_MASK_CPU_WORKERS:-32}"
 export POST_MASK_FORMAL_PRODUCTION=1
 mkdir -p "$production"
 test -w "$production" || { echo "Output not writable: $production" >&2; exit 2; }
