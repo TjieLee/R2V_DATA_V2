@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
@@ -465,6 +466,10 @@ class PairEpochRunner:
             "primary_model_prepare_cache_hits": 0,
             "primary_model_prepare_clip_fallback_hits": 0,
             "primary_model_prepare_cache_misses": 0,
+            #: Execution-only wall time spent on Pair CPU preparation, so a
+            #: benchmark can separate preparation from Qwen execution once
+            #: seeding streams lazily inside the scheduler.
+            "primary_prepare_wall_seconds": 0.0,
             "primary_hot_finalize_cache_hits": 0,
             "primary_hot_finalize_cache_misses": 0,
             "primary_hot_finalize_replay_fallbacks": 0,
@@ -950,6 +955,13 @@ class PairEpochRunner:
         with self._prepare_counters_lock:
             self.prepare_counters[key] += delta
 
+    def _note_prepare_wall(self, seconds: float) -> None:
+        with self._prepare_counters_lock:
+            self.prepare_counters["primary_prepare_wall_seconds"] = (
+                float(self.prepare_counters.get("primary_prepare_wall_seconds", 0.0))
+                + float(seconds)
+            )
+
     def _note_prepare_inflight(self, inflight: int) -> None:
         with self._prepare_counters_lock:
             self.prepare_counters["primary_prepare_peak_inflight"] = max(
@@ -1130,7 +1142,9 @@ class PairEpochRunner:
         position, so a speculative result from a later clip is never applied
         ahead of it.
         """
+        started = time.perf_counter()
         results, tasks = self._prepare_primary_batch_tasks(pool, batch)
+        self._note_prepare_wall(time.perf_counter() - started)
         self._note_prepare_buffered(len(results))
         self._bump_prepare_counter("primary_prepare_commit_batches")
         jobs: list[ModelJob] = []
@@ -1273,9 +1287,11 @@ class PairEpochRunner:
         clip, frames, masks = context
         counters = self._scratch(shard)
         entities = list(enumerate(clip.annotation.entities))
+        started = time.perf_counter()
         prepared_by_entity = self._prepare_entities(
             shard, storage, clip_uid, entities, frames, masks, counters
         )
+        self._note_prepare_wall(time.perf_counter() - started)
         return self._apply_prepared_primary_clip(
             shard,
             storage,

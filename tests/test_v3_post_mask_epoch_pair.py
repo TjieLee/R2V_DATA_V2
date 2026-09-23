@@ -31,6 +31,10 @@ import pytest
 from r2v_data_v2.v3.config import PairConfig, V3Config
 from r2v_data_v2.v3.cross_pair_judge import CrossPairJudgeFailure
 from r2v_data_v2.v3.pair import pair_clips
+from r2v_data_v2.v3.post_mask_epoch_pair import (
+    PAIR_BACKGROUND_GUARD_JOB,
+    PAIR_ENTITY_JUDGE_JOB,
+)
 from r2v_data_v2.v3.reference_judge import (
     EntityReferenceDecisionAttempt,
     EntityReferenceJudgeFailure,
@@ -4739,3 +4743,257 @@ def test_batch_drains_enter_the_resource_once_and_take_increasing_phases(
     # what would turn N batches into N model-server startups.
     assert entered.count(RESOURCE_QWEN) == len(distinct), entered
     assert manager.closes == 1, manager.counters()
+
+
+def _pair_judges() -> dict[str, Any]:
+    """One judge per Pair job type, so a batch can be driven end to end."""
+    from tests.test_v3_pair import _FinalBackgroundJudge
+
+    return {
+        PAIR_ENTITY_JUDGE_JOB: _Judge(),
+        PAIR_BACKGROUND_GUARD_JOB: _FinalBackgroundJudge(accepted=True),
+    }
+
+
+def _drive_batch(runner: Any, batch: Sequence[Any], judges: Mapping[str, Any]) -> None:
+    """Run, commit and finalize one batch, exactly as the scheduler would."""
+    for job in sorted(batch, key=lambda item: item.job_id()):
+        result = runner.run(job, judges[job.job_type])
+        if result.committed:
+            _commit(runner, job, result)
+        runner.finalize(job, result)
+
+
+def _pair_publication(storage: Any, runner: Any, clip_uids: Sequence[str]) -> Any:
+    import hashlib
+
+    return {
+        "references": {
+            uid: storage.read_clip(uid).references.model_dump(mode="json")
+            for uid in clip_uids
+        },
+        "pairing": {
+            uid: storage.read_clip(uid).pairing.model_dump(mode="json")
+            for uid in clip_uids
+        },
+        "selected": {
+            f"{uid}/{entity_id}": hashlib.sha256(
+                storage.selected_entity_path(uid, entity_id).read_bytes()
+            ).hexdigest()
+            for uid in clip_uids
+            for entity_id in ("e1",)
+        },
+        "stats": runner.reconcile_stats(SHARD).to_dict(),
+        "unresolved": runner.primary_unresolved_job_ids(),
+    }
+
+
+def _restart_pair_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, run_name: str, clip_uids: Sequence[str]
+) -> tuple[Any, Any]:
+    config = _pair_config(tmp_path, monkeypatch)
+    run_config = replace(config, run_root=config.run_root.parent / run_name)
+    storage = _storage(run_config, entity_types=("subject",))
+    for clip_uid in clip_uids[1:]:
+        _add_ready_clip(run_config, storage, clip_uid=clip_uid, entity_types=("subject",))
+    return run_config, storage
+
+
+def test_streamed_restart_does_not_repeat_committed_model_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Crashing between batches must not re-run a committed model call."""
+    clip_uids = ("clip-1", "clip-2", "clip-3", "clip-4")
+
+    # Control: one uninterrupted streaming run.
+    ctrl_config, ctrl_storage = _restart_pair_fixture(
+        tmp_path, monkeypatch, "run-restart-control", clip_uids
+    )
+    ctrl_runner = _runner(
+        tmp_path, ctrl_config, ctrl_storage, clip_uids=clip_uids,
+        ledger_dir="ledger-restart-control", cpu_workers=2,
+    )
+    ctrl_runner._prepared_clip_limit = 2
+    ctrl_judges = _pair_judges()
+    for batch in ctrl_runner.iter_primary_seed_batches():
+        _drive_batch(ctrl_runner, batch, ctrl_judges)
+    control_calls = len(ctrl_judges[PAIR_ENTITY_JUDGE_JOB].calls)
+    control_state = _pair_publication(ctrl_storage, ctrl_runner, clip_uids)
+    assert control_calls == len(clip_uids)
+
+    # Interrupted: batch 1 only, then a brand new runner resumes.
+    config, storage = _restart_pair_fixture(
+        tmp_path, monkeypatch, "run-restart-resume", clip_uids
+    )
+    first_runner = _runner(
+        tmp_path, config, storage, clip_uids=clip_uids,
+        ledger_dir="ledger-restart-resume", cpu_workers=2,
+    )
+    first_runner._prepared_clip_limit = 2
+    first_judges = _pair_judges()
+    batches = first_runner.iter_primary_seed_batches()
+    first_batch = next(batches)
+    _drive_batch(first_runner, first_batch, first_judges)
+    first_calls = len(first_judges[PAIR_ENTITY_JUDGE_JOB].calls)
+    assert first_calls == 2, (
+        f"the first batch is bounded to two clips, so it committed two calls: "
+        f"{first_calls}"
+    )
+    # Crash: stop consuming the stream.
+    batches.close()
+
+    resumed = _runner(
+        tmp_path, config, storage, clip_uids=clip_uids,
+        ledger_dir="ledger-restart-resume", cpu_workers=2,
+    )
+    resumed._prepared_clip_limit = 2
+    resumed_judges = _pair_judges()
+    for batch in resumed.iter_primary_seed_batches():
+        _drive_batch(resumed, batch, resumed_judges)
+    resumed_calls = len(resumed_judges[PAIR_ENTITY_JUDGE_JOB].calls)
+
+    # No model call is paid twice, and the resumed run reaches the same state.
+    assert first_calls + resumed_calls == control_calls, (
+        first_calls, resumed_calls, control_calls
+    )
+    assert _pair_publication(storage, resumed, clip_uids) == control_state
+
+
+def test_real_manager_starts_qwen_once_for_many_pair_batches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Many scheduler batches must still be exactly one Qwen lifecycle."""
+    from r2v_data_v2.v3.post_mask_epoch_jobs import RESOURCE_QWEN
+    from r2v_data_v2.v3.post_mask_epoch_resources import ResourceEpochManager
+    from r2v_data_v2.v3.post_mask_epoch_scheduler import (
+        JobExecution,
+        ResourceEpochScheduler,
+    )
+
+    _unused_config, _unused_storage, runner, _unused_clip_uids = _many_clip_pair_storage(
+        tmp_path, monkeypatch, "run-real-manager", clip_count=6, cpu_workers=2
+    )
+    judges = _pair_judges()
+    phases: list[str] = []
+    real_phase = runner.ledger.phase
+
+    def record_phase(phase_id: str) -> Any:
+        phases.append(phase_id)
+        return real_phase(phase_id)
+
+    class _RealCounterResource:
+        def __init__(self) -> None:
+            self.started = 0
+            self.stopped = 0
+
+        def start(self) -> None:
+            self.started += 1
+
+        def stop(self) -> None:
+            self.stopped += 1
+
+        def counters(self) -> dict[str, Any]:
+            return {
+                "start_count": self.started,
+                "stop_count": self.stopped,
+                "startup_wall_seconds": 0.0,
+                "shutdown_wall_seconds": 0.0,
+                "service_seconds": 0.0,
+                "gpu_slot_job_counts": {},
+            }
+
+    class _Executor:
+        def execute_batch(self, jobs: Any) -> Any:
+            outcomes: dict[str, Any] = {}
+            for job in sorted(jobs, key=lambda item: item.job_id()):
+                result = runner.run(job, judges[job.job_type])
+                if result.committed:
+                    _commit(runner, job, result)
+                outcomes[job.job_id()] = JobExecution(job, result, None)
+            return outcomes
+
+    manager = ResourceEpochManager({RESOURCE_QWEN: lambda: (_RealCounterResource(), _Executor())})
+    scheduler = ResourceEpochScheduler(
+        ledger=runner.ledger, finalize=runner.finalize, resource_manager=manager
+    )
+    monkeypatch.setattr(runner.ledger, "phase", record_phase)
+    monkeypatch.setattr(runner, "finalize", scheduler_finalize := runner.finalize)
+
+    outcome = scheduler.run_batches(runner.iter_primary_seed_batches())
+
+    qwen_phases = sorted({phase for phase in phases if phase.endswith("-qwen")})
+    assert len(qwen_phases) > 1, f"several scheduler batches really ran: {qwen_phases}"
+    assert outcome["completed"] is True
+
+    counters = manager.counters()
+    assert counters["resources"]["qwen"]["start_count"] == 1, counters
+    assert counters["resources"]["qwen"]["stop_count"] == 1, counters
+    assert counters["timeline"].count("start:qwen") == 1, counters["timeline"]
+    assert counters["timeline"].count("stop:qwen") == 1, counters["timeline"]
+    assert scheduler_finalize is not None
+
+
+def test_streaming_exposes_pair_prepare_wall_seconds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Preparation wall time is reported separately from Qwen execution."""
+    _unused_config, _unused_storage, runner, clip_uids = _many_clip_pair_storage(
+        tmp_path, monkeypatch, "run-prepare-wall", clip_count=4, cpu_workers=2
+    )
+    assert runner.prepare_counters["primary_prepare_wall_seconds"] == 0.0
+
+    judges = _pair_judges()
+    for batch in runner.iter_primary_seed_batches():
+        _drive_batch(runner, batch, judges)
+
+    wall = runner.prepare_counters["primary_prepare_wall_seconds"]
+    assert isinstance(wall, float)
+    assert wall > 0.0, "preparation really ran and was measured"
+    assert runner.prepare_counters["primary_prepare_tasks"] == len(clip_uids)
+
+
+def test_scheduler_separates_seeded_jobs_from_unlocked_guard_jobs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The log's seeded count must exclude jobs a finalizer unlocked.
+
+    ``pair_primary_job_count`` has always meant "jobs Pair Primary seeded", and
+    the scheduler's ``job_count`` also contains dynamically unlocked work (the
+    background-final guard here). The two must stay separate.
+    """
+    from r2v_data_v2.v3.post_mask_epoch_jobs import RESOURCE_QWEN
+    from r2v_data_v2.v3.post_mask_epoch_scheduler import (
+        JobExecution,
+        ResourceEpochScheduler,
+    )
+
+    config = _pair_config(
+        tmp_path, monkeypatch, background_final_guard_mode="qwen_v1"
+    )
+    storage = _storage(config, entity_types=("subject",))
+    _install_clean_background(storage)
+    runner = _runner(tmp_path, config, storage)
+    judges = _pair_judges()
+    assert PAIR_BACKGROUND_GUARD_JOB in judges
+
+    class _Executor:
+        def execute_batch(self, jobs: Any) -> Any:
+            outcomes: dict[str, Any] = {}
+            for job in sorted(jobs, key=lambda item: item.job_id()):
+                result = runner.run(job, judges[job.job_type])
+                if result.committed:
+                    _commit(runner, job, result)
+                outcomes[job.job_id()] = JobExecution(job, result, None)
+            return outcomes
+
+    scheduler = ResourceEpochScheduler(
+        ledger=runner.ledger, finalize=runner.finalize,
+        executors={RESOURCE_QWEN: _Executor()},
+    )
+    outcome = scheduler.run_batches(runner.iter_primary_seed_batches())
+
+    # One seeded entity job, plus the guard job its finalizer unlocked.
+    assert outcome["seed_job_count"] == 1, outcome
+    assert outcome["job_count"] == 2, outcome
+    assert outcome["seed_job_count"] < outcome["job_count"]
+    assert len(judges[PAIR_BACKGROUND_GUARD_JOB].calls) == 1

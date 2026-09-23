@@ -1363,8 +1363,11 @@ def run_removal_pair_epochs(
         with _stage_timing(emit, "pair", "primary_scheduler"):
             primary_outcome = run_batches(pair.iter_primary_seed_batches())
         _emit_scheduler_diagnostics(emit, "pair", primary_outcome)
+        # Only the jobs Pair Primary seeded. ``job_count`` also includes jobs a
+        # finalizer unlocked (for example background-guard jobs), which is not
+        # what this log field has always meant.
         result["pair_primary_job_count"] = int(
-            primary_outcome.get("job_count", 0) or 0
+            primary_outcome.get("seed_job_count", 0) or 0
         )
         _emit(
             emit,

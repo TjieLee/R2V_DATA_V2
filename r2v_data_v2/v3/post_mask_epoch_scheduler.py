@@ -179,12 +179,17 @@ class _SchedulerRun:
     #: successful sibling must not cause a second attempt here.
     finalize_attempted: set[str] = field(default_factory=set)
     resolved: set[str] = field(default_factory=set)
+    #: Jobs handed to this invocation by its caller. Jobs a finalizer unlocks
+    #: later are pending work but NOT seeded work, so this stays the count of
+    #: what the stage actually seeded.
+    seed_job_ids: set[str] = field(default_factory=set)
     current: str | None = None
     round_index: int = 0
 
     def add(self, jobs: Iterable[ModelJob]) -> None:
         for job in jobs:
             self.pending.setdefault(job.job_id(), job)
+            self.seed_job_ids.add(job.job_id())
 
 
 class SchedulerError(RuntimeError):
@@ -405,7 +410,11 @@ class ResourceEpochScheduler:
         return {
             "completed": not unresolved,
             "unresolved_job_ids": unresolved,
+            #: Every job the scheduler observed, seeded or unlocked.
             "job_count": len(run.pending),
+            #: Only the jobs the caller seeded; additive, so ``job_count`` keeps
+            #: its existing meaning for every current caller.
+            "seed_job_count": len(run.seed_job_ids),
             "resolved_job_count": len(run.resolved),
             "attempted_job_count": len(run.attempted),
             "resource_lifecycle": self.diagnostics.resource_lifecycle,
