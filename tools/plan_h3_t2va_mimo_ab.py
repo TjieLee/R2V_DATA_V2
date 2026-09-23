@@ -31,10 +31,6 @@ def _case_ids(path: Path) -> list[str]:
 
 def build_plan(
     *,
-    shot_manifest: Path,
-    clips_root: Path,
-    source_videos_root: Path,
-    shot_index_root: Path,
     audio_production_root: Path,
     audio_shadow_run_id: str,
     case_manifest: Path,
@@ -49,14 +45,7 @@ def build_plan(
     clip_uids = _case_ids(case_manifest)
     endpoint = build_mimo_serve_command(sglang_bin, checkpoint, served_model_name=model)
     common = [
-        "--shot-manifest",
-        str(shot_manifest),
-        "--clips-root",
-        str(clips_root),
-        "--source-videos-root",
-        str(source_videos_root),
-        "--shot-index-root",
-        str(shot_index_root),
+        "--existing-audio-cases",
         "--audio-production-root",
         str(audio_production_root),
         "--audio-shadow-run-id",
@@ -170,6 +159,34 @@ def _side(root: Path, ta_root: Path, records, products) -> dict:
     return clips
 
 
+def _v25_side(root: Path, ids: list[str]) -> dict:
+    """Frozen V2.5 records contain their raw model output; no replay is needed."""
+    records_path = root / "records.jsonl"
+    by_uid = {}
+    for line_number, line in enumerate(records_path.read_text().splitlines(), 1):
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        uid = record["clip_uid"]
+        if uid in ids:
+            if uid in by_uid:
+                raise ValueError("A/B V2.5 baseline contains duplicate case clip")
+            by_uid[uid] = (line_number, record)
+    result = {}
+    for uid in ids:
+        found = by_uid.get(uid)
+        prompt = root / "prompts" / f"{uid}.txt"
+        result[uid] = {
+            "status": found[1]["status"] if found else "not_published",
+            "artifact_root": str(root),
+            "records_path": str(records_path),
+            "record_line": found[0] if found else None,
+            "model_output_path": str(records_path) if found else None,
+            "prompt_path": str(prompt) if prompt.is_file() else None,
+        }
+    return result
+
+
 def build_report(
     *,
     case_manifest: Path,
@@ -177,8 +194,10 @@ def build_report(
     multi_ta2va_root: Path,
     single_t2va_root: Path,
     single_ta2va_root: Path,
+    v25_baseline_root: Path | None = None,
 ) -> dict:
     ids = _case_ids(case_manifest)
+    case_hash = sha256_file(case_manifest)
     roots = {
         "multi": (multi_t2va_root, multi_ta2va_root),
         "single": (single_t2va_root, single_ta2va_root),
@@ -192,7 +211,7 @@ def build_report(
             or inventory.shot_selection.case_manifest_path
             != str(case_manifest.resolve())
             or inventory.shot_selection.case_manifest_sha256
-            != sha256_file(case_manifest)
+            != case_hash
         ):
             raise ValueError("A/B ordered case manifest differs from T2VA inventory")
         expected_mode = "single" if mode == "single" else "multi"
@@ -212,10 +231,19 @@ def build_report(
         or multi.backend.model != single.backend.model
     ):
         raise ValueError("A/B upstream source, model, or ordered jobs differ")
-    clips = [
-        {"clip_uid": uid, "multi": sides["multi"][uid], "single": sides["single"][uid]}
-        for uid in ids
-    ]
+    baseline = _v25_side(v25_baseline_root, ids) if v25_baseline_root else None
+    clips = []
+    for uid in ids:
+        row = {
+            "clip_uid": uid,
+            "multi": sides["multi"][uid],
+            "single": sides["single"][uid],
+            "v26_multi": sides["multi"][uid],
+            "v26_single": sides["single"][uid],
+        }
+        if baseline is not None:
+            row["v25"] = baseline[uid]
+        clips.append(row)
     totals = {}
     for mode in ("multi", "single"):
         rows = [row[mode] for row in clips]
@@ -250,10 +278,6 @@ def main(argv: list[str] | None = None) -> dict:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="action", required=True)
     plan = sub.add_parser("plan")
-    plan.add_argument("--shot-manifest", type=Path, required=True)
-    plan.add_argument("--clips-root", type=Path, required=True)
-    plan.add_argument("--source-videos-root", type=Path, required=True)
-    plan.add_argument("--shot-index-root", type=Path, required=True)
     plan.add_argument("--audio-production-root", type=Path, required=True)
     plan.add_argument("--audio-shadow-run-id", required=True)
     plan.add_argument("--base-url", default="http://127.0.0.1:8092/v1")
@@ -268,6 +292,7 @@ def main(argv: list[str] | None = None) -> dict:
     report.add_argument("--multi-ta2va-root", type=Path, required=True)
     report.add_argument("--single-t2va-root", type=Path, required=True)
     report.add_argument("--single-ta2va-root", type=Path, required=True)
+    report.add_argument("--v25-baseline-root", type=Path)
     for command in (plan, report):
         command.add_argument("--case-manifest", type=Path, required=True)
     args = parser.parse_args(argv)

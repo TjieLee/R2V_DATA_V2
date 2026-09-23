@@ -11,6 +11,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from r2v_data_v2.h3.mimo25_backend import MimoMediaResolver
+from r2v_data_v2.h3.t2va_existing_audio import (
+    build_t2va_inventory_from_existing_audio,
+)
 from r2v_data_v2.h3.t2va_mimo_backend import (
     T2VAMimoBackend,
     T2VAMimoConfig,
@@ -21,7 +24,8 @@ from r2v_data_v2.h3.t2va_shadow import build_t2va_inventory, run_t2va_shadow, t2
 
 def main(argv: list[str] | None = None) -> dict:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--shot-manifest", type=Path, required=True)
+    parser.add_argument("--shot-manifest", type=Path)
+    parser.add_argument("--existing-audio-cases", action="store_true")
     parser.add_argument("--clips-root", type=Path)
     parser.add_argument("--source-videos-root", type=Path)
     parser.add_argument("--audio-production-root", type=Path, required=True)
@@ -47,6 +51,21 @@ def main(argv: list[str] | None = None) -> dict:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args(argv)
+    if args.existing_audio_cases:
+        if args.case_manifest is None or any(
+            value is not None
+            for value in (
+                args.shot_manifest,
+                args.clips_root,
+                args.source_videos_root,
+                args.shot_index_root,
+                args.sample_size,
+                args.sample_seed,
+            )
+        ):
+            parser.error("existing Audio cases require only --case-manifest for selection")
+    elif args.shot_manifest is None:
+        parser.error("--shot-manifest is required unless --existing-audio-cases is set")
     config = T2VAMimoConfig(
         media_resolver=MimoMediaResolver(
             mode=args.media_mode,
@@ -60,19 +79,28 @@ def main(argv: list[str] | None = None) -> dict:
         call_mode=args.call_mode,
         max_completion_tokens=args.max_completion_tokens,
     )
-    inventory = build_t2va_inventory(
-        shot_manifest=args.shot_manifest,
-        clips_root=args.clips_root,
-        source_videos_root=args.source_videos_root,
-        audio_production_root=args.audio_production_root,
-        audio_shadow_run_id=args.audio_shadow_run_id,
-        t2va_run_id=args.t2va_run_id,
-        backend=config.provenance(),
-        case_manifest=args.case_manifest,
-        sample_size=args.sample_size,
-        sample_seed=args.sample_seed,
-        shot_index_root=args.shot_index_root,
-    )
+    if args.existing_audio_cases:
+        inventory = build_t2va_inventory_from_existing_audio(
+            audio_production_root=args.audio_production_root,
+            audio_shadow_run_id=args.audio_shadow_run_id,
+            case_manifest=args.case_manifest,
+            t2va_run_id=args.t2va_run_id,
+            backend=config.provenance(),
+        )
+    else:
+        inventory = build_t2va_inventory(
+            shot_manifest=args.shot_manifest,
+            clips_root=args.clips_root,
+            source_videos_root=args.source_videos_root,
+            audio_production_root=args.audio_production_root,
+            audio_shadow_run_id=args.audio_shadow_run_id,
+            t2va_run_id=args.t2va_run_id,
+            backend=config.provenance(),
+            case_manifest=args.case_manifest,
+            sample_size=args.sample_size,
+            sample_seed=args.sample_seed,
+            shot_index_root=args.shot_index_root,
+        )
     if args.dry_run:
         return {
             "dry_run": True,
@@ -86,7 +114,10 @@ def main(argv: list[str] | None = None) -> dict:
         }
     backend_class = T2VASingleCallBackend if args.call_mode == "single" else T2VAMimoBackend
     return run_t2va_shadow(
-        inventory, backend_class(config), overwrite=args.overwrite
+        inventory,
+        backend_class(config),
+        overwrite=args.overwrite,
+        verify_source_media=not args.existing_audio_cases,
     ).model_dump(mode="json")
 
 

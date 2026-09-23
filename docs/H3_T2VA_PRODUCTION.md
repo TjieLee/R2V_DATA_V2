@@ -52,23 +52,16 @@ EAGLE/MTP speculative serving configuration for best runtime performance.
 
 ### Optional multi-call / single-call use
 
-For a controlled T2VA comparison, start the same V2.6 endpoint once using the
-existing serving command, then use the same explicit T2VA-compatible case manifest
-and upstream Audio shadow run in two separate shadow runs. Set `SHOT_MANIFEST`,
-`AUDIO_PRODUCTION_ROOT`, `AUDIO_SHADOW_RUN_ID`, `CASE_MANIFEST`,
-`JEA_CLIPS_ROOT`, `JEA_SOURCE_VIDEOS_ROOT` and `SHOT_INDEX_ROOT` as in the
-T2VA/TA2VA server runbook. `CASE_MANIFEST` must be the exact existing ordered
-case list; do not substitute the historical reference-conditioned random20 list
-or draw a new random sample. The planner reads it but does not run a model:
+For a fixed-case comparison, start the same V2.6 endpoint once, then run the
+existing ordered `CASE_MANIFEST` against the already-published Audio population.
+Set `AUDIO_PRODUCTION_ROOT` and `AUDIO_SHADOW_RUN_ID` to the run containing those
+cases. This path does not select from the full JEA shot manifest or build a UID
+index. The planner reads the case list but does not run a model:
 
 ```bash
 export SGLANG_ENV=/mnt/workspace/litengjie/data/audio_deps/qwen38-sglang-env
 export MIMO_CHECKPOINT=/mnt/workspace/public/pretrained/MiMo/MiMo-V2.6-Flash-RL
 python tools/plan_h3_t2va_mimo_ab.py plan \
-  --shot-manifest "$SHOT_MANIFEST" \
-  --clips-root "$JEA_CLIPS_ROOT" \
-  --source-videos-root "$JEA_SOURCE_VIDEOS_ROOT" \
-  --shot-index-root "$SHOT_INDEX_ROOT" \
   --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
   --audio-shadow-run-id "$AUDIO_SHADOW_RUN_ID" \
   --case-manifest "$CASE_MANIFEST" \
@@ -93,6 +86,7 @@ After both pairs of shadow runs complete, print a read-only per-clip comparison:
 ```bash
 python tools/plan_h3_t2va_mimo_ab.py report \
   --case-manifest "$CASE_MANIFEST" \
+  --v25-baseline-root "$AUDIO_PRODUCTION_ROOT/sam_audio_stem_shadow_v1/runs/$AUDIO_SHADOW_RUN_ID/mimo_reconcile_stemtext_final_av_markerpolish_v1" \
   --multi-t2va-root "$AUDIO_PRODUCTION_ROOT/t2va_shadow_v1/runs/v26-random20-multi-t2va" \
   --multi-ta2va-root "$AUDIO_PRODUCTION_ROOT/ta2va_shadow_v1/runs/v26-random20-multi-ta2va" \
   --single-t2va-root "$AUDIO_PRODUCTION_ROOT/t2va_shadow_v1/runs/v26-random20-single-t2va" \
@@ -100,8 +94,9 @@ python tools/plan_h3_t2va_mimo_ab.py report \
   > v26-random20-ab-report.json
 ```
 
-The report checks ordered population and upstream identity, then lists actual
-status, call counts and artifact paths. It does not assign a quality score.
+The report checks ordered population and upstream identity, then lists V2.6
+status, call counts and artifact paths alongside the read-only existing V2.5
+baseline. It does not rerun V2.5 or assign a quality score.
 
 `multi` retains the existing semantic AV plus audio-finalize requests (two MiMo
 calls per ready T2VA clip); eligible TA2VA speech reuse adds its existing profile

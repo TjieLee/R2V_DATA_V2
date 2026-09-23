@@ -10,10 +10,6 @@ def test_plan_uses_one_ordered_case_manifest_and_existing_serve_builder(tmp_path
     case = tmp_path / "cases.json"
     case.write_text(json.dumps({"clip_uids": ["b", "a"]}))
     plan = ab.build_plan(
-        shot_manifest=tmp_path / "shots.jsonl",
-        clips_root=tmp_path / "clips",
-        source_videos_root=tmp_path / "videos",
-        shot_index_root=tmp_path / "index",
         audio_production_root=tmp_path / "audio",
         audio_shadow_run_id="resolved",
         case_manifest=case,
@@ -36,8 +32,13 @@ def test_plan_uses_one_ordered_case_manifest_and_existing_serve_builder(tmp_path
         command = plan[name]
         assert command[command.index("--case-manifest") + 1] == str(case)
         assert command[command.index("--audio-shadow-run-id") + 1] == "resolved"
-        assert command[command.index("--shot-manifest") + 1] == str(
-            tmp_path / "shots.jsonl"
+        assert "--existing-audio-cases" in command
+        assert all(
+            flag not in command
+            for flag in (
+                "--shot-manifest", "--clips-root", "--source-videos-root",
+                "--shot-index-root",
+            )
         )
     assert plan["multi_t2va"][-2:] == ["--call-mode", "multi"]
     assert plan["single_t2va"][-2:] == ["--call-mode", "single"]
@@ -152,6 +153,64 @@ def test_report_preserves_case_order_and_sums_actual_calls(tmp_path, monkeypatch
             single_t2va_root=tmp_path / "single",
             single_ta2va_root=tmp_path / "single-ta",
         )
+
+
+def test_report_reads_existing_v25_baseline_without_rerun(tmp_path, monkeypatch):
+    case = tmp_path / "cases.json"
+    case.write_text(json.dumps({"clip_uids": ["b", "a"]}))
+    baseline = tmp_path / "v25"
+    baseline.mkdir()
+    (baseline / "records.jsonl").write_text(
+        json.dumps({"clip_uid": "a", "status": "failed", "raw_responses": []})
+        + "\n"
+        + json.dumps({"clip_uid": "b", "status": "ready", "raw_responses": ["raw"]})
+        + "\n"
+    )
+    (baseline / "prompts").mkdir()
+    (baseline / "prompts/b.txt").write_text("frozen output")
+    selection = SimpleNamespace(
+        case_manifest_path=str(case.resolve()),
+        case_manifest_sha256=ab.sha256_file(case),
+    )
+    inventory = SimpleNamespace(
+        clip_uids=["b", "a"],
+        jobs=[SimpleNamespace(clip_uid=uid) for uid in ("b", "a")],
+        shot_selection=selection,
+        source_hashes={"published": "hash"},
+        audio_production_root="/audio",
+        audio_shadow_run_id="resolved",
+        backend=SimpleNamespace(model="v26", call_mode="multi"),
+    )
+
+    def load(root):
+        mode = root.name
+        backend = SimpleNamespace(model="v26", call_mode=mode)
+        return SimpleNamespace(**{**inventory.__dict__, "backend": backend}), [
+            SimpleNamespace(clip_uid=uid, status="ready", model_call_count=1)
+            for uid in ("b", "a")
+        ]
+
+    monkeypatch.setattr(ab, "_load_t2va", load)
+    monkeypatch.setattr(ab, "_load_ta2va", lambda *args: [])
+    report = ab.build_report(
+        case_manifest=case,
+        multi_t2va_root=tmp_path / "multi",
+        multi_ta2va_root=tmp_path / "multi-ta",
+        single_t2va_root=tmp_path / "single",
+        single_ta2va_root=tmp_path / "single-ta",
+        v25_baseline_root=baseline,
+    )
+    assert [row["clip_uid"] for row in report["clips"]] == ["b", "a"]
+    assert [row["v25"]["status"] for row in report["clips"]] == ["ready", "failed"]
+    assert report["clips"][0]["v25"]["model_output_path"] == str(
+        baseline / "records.jsonl"
+    )
+    assert report["clips"][0]["v25"]["prompt_path"] == str(
+        baseline / "prompts/b.txt"
+    )
+    assert report["clips"][1]["v25"]["prompt_path"] is None
+    assert report["clips"][0]["v26_multi"] == report["clips"][0]["multi"]
+    assert report["clips"][0]["v26_single"] == report["clips"][0]["single"]
 
 
 def test_report_rejects_different_ordered_population(tmp_path, monkeypatch):

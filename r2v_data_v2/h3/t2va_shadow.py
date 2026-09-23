@@ -1127,7 +1127,11 @@ def validate_t2va_audio_lineage(inventory: T2VAInventory) -> None:
 
 
 def run_t2va_shadow(
-    inventory: T2VAInventory, backend: T2VABackend, *, overwrite: bool = False
+    inventory: T2VAInventory,
+    backend: T2VABackend,
+    *,
+    overwrite: bool = False,
+    verify_source_media: bool = True,
 ) -> T2VASummary:
     inventory = T2VAInventory.model_validate(inventory.model_dump())
     if inventory.backend != backend.provenance():
@@ -1152,7 +1156,8 @@ def run_t2va_shadow(
             inventory.t2va_run_id,
         ):
             raise ValueError("T2VA overwrite ownership differs")
-    _check_sources(inventory)
+    if verify_source_media:
+        _check_sources(inventory)
     if any(
         destination == Path(p).resolve() or destination in Path(p).resolve().parents
         for p in [
@@ -1182,7 +1187,7 @@ def run_t2va_shadow(
             if error is None:
                 status = "failed"
                 try:
-                    if (
+                    if verify_source_media and (
                         sha256_file(Path(job.target_video_path))
                         != job.target_video_sha256
                     ):
