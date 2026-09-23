@@ -462,3 +462,380 @@ Subject Attribute failure events now include `failures` and
 `retryable_pending` counters. No prompts/responses are logged. Missing durable
 outcomes remain retryable, without suppression, auto-retry or conversion to
 terminal outcomes. This patch claims no real GPU V2.1 throughput result.
+
+## Resource epoch execution mode (`resource_epoch_v3`, opt-in, unvalidated)
+
+Status: **development only**. No real GPU run, no throughput result and no
+production acceptance is claimed. The formal launcher remains
+`scripts/run_v3_post_mask_visual_cluster.sh`; this mode is never its default and
+existing `legacy_serial`, `wavefront_v2` and `parallel_review_v21` behaviour is
+unchanged.
+
+Existing production keeps long-lived fixed GPU roles (GPU0-3 Qwen, GPU4/6
+SAM/main, GPU5/7 Boogu). clean20 profiling showed long SAM/Boogu idle gaps, so
+`resource_epoch_v3` instead schedules by **resource type**: a group of 8
+canonical shards is processed by one node using all 8 GPUs, and the node loads
+one model class at a time.
+
+| Epoch | Layout |
+| --- | --- |
+| Qwen | one managed vLLM server, TP1 x DP8, GPU0-7, `127.0.0.1:8000/v1` |
+| Image edit (`RESOURCE_BOOGU` legacy slot) | 8 persistent Qwen-Image-2.1 workers, one per GPU, loaded once per epoch |
+| SAM | 8 persistent SAM3 workers, one per GPU, loaded once per epoch |
+
+### Modules
+
+| Module | Responsibility |
+| --- | --- |
+| `post_mask_epoch_jobs.py` | deterministic model-job identity |
+| `post_mask_epoch_state.py` | immutable plans, append-only receipts, resume |
+| `post_mask_epoch_groups.py` | 8-shard group identity, static ownership, lock |
+| `post_mask_epoch_resources.py` | owned Qwen/Boogu/SAM lifecycles |
+| `post_mask_epoch_scheduler.py` | fixed-point ready-job orchestration |
+
+### Invariants
+
+* **No speculative model calls.** A job enters the ready set only when an
+  earlier CPU finalizer creates it, so conditional second attempts (background
+  candidate2, reference completion candidate2, attribute completion/source
+  candidate2) cannot be executed before policy unlocks them.
+* **Execution-free identity.** Job and group identities bind schema version,
+  job type, resource, canonical shard, clip, owner/entity/attribute target,
+  attempt index, seed, semantic input digest, dependency digests, model
+  identity, ordered canonical shards, campaign semantic identity and group
+  size. They never contain hostname, `RANK`, `WORLD_SIZE`, physical GPU id, PID
+  or concurrency, so a campaign may resume under a different topology.
+* **Durable commit.** model call -> unique same-directory tmp -> fsync -> atomic
+  rename -> validate -> append receipt -> flush + fsync. Resume classifies each
+  job as completed (skip), terminal reject (never pay again),
+  artifact-without-receipt (rerun) or digest mismatch (fail closed). Only a torn
+  final JSONL line is truncated; diagnostics are append-only.
+* **Monotonic phase plan, immutable per-job record.** A phase's ready set can
+  grow across a restart, so the plan's job set only ever grows and is never
+  rejected for being a superset or subset. The invariant is per job: a job's
+  ``plan_record`` may never change once written.
+* **Every committed outcome is fully validated.** ``completed`` and
+  ``terminal_reject`` run the identical check, with no exemption: job identity,
+  outcome, all internal artifact digests, ``result.json`` presence, its SHA256
+  against ``result_digest``, JSON parseability, outcome agreement between result
+  and receipt, and external-artifact agreement. A malformed existing plan
+  (bad hash, wrong job_count, non-list jobs, non-dict or duplicate records,
+  missing job_id) fails closed and is never repaired or overwritten. ``result.json`` is mandatory; a
+  receipt without a durable result fails closed instead of being treated as
+  legacy state. External artifacts are verified (absolute path, existence, size,
+  chunked streaming SHA256) rather than merely recorded —
+  ``ArtifactReference.path`` is an internal ledger-facing absolute path, and
+  public relative paths belong in ``JobResult.payload``.
+* **Schema version.** ``JOB_SCHEMA_VERSION`` is ``post_mask_resource_epoch_v3/2``.
+  There is deliberately no migration for pre-v2 development receipts; start the
+  campaign under a new tag/root.
+* **Skip model call never skips the finalizer.** A downstream job exists only
+  because some finalizer ran, so a crash between receipt and finalize would
+  otherwise strand every dependent job. Committed jobs persist a small
+  `result.json`; resume reloads it and replays the CPU finalizer. Finalizers
+  must be model-free, deterministic and idempotent.
+* **No in-launch automatic retry.** Restart is the retry. A job gets at most
+  one real model attempt per invocation; a retryable outcome leaves the group
+  incomplete rather than being retried inside the same run.
+* **No in-launch retry, for models or finalizers.** Restart is the retry. A job
+  gets at most one real model attempt per invocation, and a committed job's CPU
+  finalizer is replayed at most once per invocation: a successful sibling must
+  not cause a second attempt on a job whose finalizer already failed.
+* **Shutdown is best-effort and all-or-nothing.** Every worker is asked to
+  close even if an earlier close raises, and the failure is reported
+  afterwards; a failed unload also blocks the next resource from loading, so
+  two heavy resources can never be resident because a stop half-succeeded.
+  Partial *startup* rollback follows the same rule: when some of the eight
+  workers load and one fails, every successfully built worker is asked to
+  close, a cleanup exception never aborts the remaining closes, and the raised
+  error still names the slot whose startup failed, with the cleanup failures
+  appended as a chained diagnostic.
+* **Control-flow exceptions propagate.** Model executors catch `Exception`, so
+  `KeyboardInterrupt`, `SystemExit` and `GeneratorExit` are never turned into a
+  per-job failure record.
+* **One heavy resource at a time.** The scheduler loads the Qwen judge, image
+  editor or SAM,
+  drains that resource to a fixed point, then unloads it completely. Enter/exit
+  is guarded by `try/finally`, so an executor exception or interrupt still
+  unloads. Resource switches never reload a resource that still has ready work.
+* **Concurrency is confined to model calls.** Same-resource jobs run through a
+  bounded window with all GPU slots busy: Boogu/SAM keep one sequential queue
+  per slot (a slot never overlaps itself), Qwen sends many requests at once to
+  the single TP1 x DP8 endpoint. Receipt appends, artifact publication,
+  finalizers and pending-map mutation stay on the scheduler thread in
+  deterministic order, so durable state never races.
+* **Owned processes only.** Resource switches terminate only PIDs/process
+  groups this launcher created, and only while that child is owned and alive;
+  an unowned PID is never signalled and an already-exited child is only reaped.
+  A pre-flight port check makes an unmanaged server on `8000` fail fast instead
+  of being adopted or killed.
+* **The semantic layer never sees GPU topology.** Runners receive a live backend
+  handle (`QwenImage21SubprocessBackend`, `Sam3SegmentationBackend`, or the Qwen
+  endpoint), never a GPU slot id. Worker slots are loaded concurrently and
+  re-ordered by slot, so an image-edit epoch's model load is not serialised eight
+  times; any startup failure closes every already-created worker before raising.
+* **Lifecycle diagnostics survive unload.** Startup, shutdown and per-slot
+  counters are accumulated per resource and reported separately from model-job
+  counters. A resource entered twice reports both epochs.
+* **No work stealing.** Ownership is `group_index % WORLD_SIZE == RANK`, one
+  shared `flock` per group. An incomplete group does not block later assigned
+  groups on the same rank; the global shard-receipt barrier is unchanged.
+* **Internal only.** Resource groups never enter the public
+  `r2v.v3.production_sample.1` schema; export, compaction and H3 consumption
+  are untouched.
+
+### Background removal phase semantics (`post_mask_epoch_removal`)
+
+`r2v_data_v2/v3/post_mask_epoch_removal.py` is the real Visual semantic split for
+the remove stage. It reuses the shared helpers in `remove.py`
+(`prepare_removal_attempt_context`, `generate_removal_candidate`,
+`review_removal_candidate`, `removal_attempts_are_all_rejected`) and the existing
+publication helpers, so there is still exactly one implementation of the prompt,
+the candidate preparation, the judge call, the attempt record and the
+accept/reject rule.
+
+The original remove-only development topology was:
+
+```
+BOOGU epoch   GPU0-7, eight persistent image-edit workers -> generation
+QWEN epoch    one managed Qwen3-VL server, TP1 x DP8      -> judging
+```
+
+`RESOURCE_BOOGU` and the epoch name remain as durable legacy slot names. The
+current resource factory selects Qwen-Image-2.1 beneath that slot for Removal,
+Reference Edit and Subject Attribute completion; it does not select the old
+Boogu worker. The legacy `remove_backgrounds()` path is outside this migration.
+Removal's persisted legacy Boogu backend label still denotes its full-frame
+candidate layout for the existing artifact validator; it is not a claim that
+the Resource Epoch loaded a Boogu generator.
+
+The split is three-sided:
+
+| Side | Owner | Runs where |
+| --- | --- | --- |
+| seed | `RemovalEpochRunner.seed_jobs` | CPU, once per launch |
+| model job | `RemovalEpochRunner.run` | inside a resource epoch |
+| finalize | `RemovalEpochRunner.finalize` | CPU, scheduler thread |
+
+Job graph for one clip with two configured candidate seeds:
+
+```
+generate(c0) -> judge(c0) -> accepted -> publish ready_removed
+                          \-> rejected -> generate(c1) -> judge(c1) -> ...
+                          \-> failed   -> generate(c1) -> ...
+
+exhausted, all rejected -> publish rejected (this cycle's attempts only)
+exhausted, any failed   -> publish retryable (carried-over attempts), clip stays pending_remove
+```
+
+Attempt semantics are legacy-equivalent, not "retry on restart":
+
+* **Boogu seeds are random and durable-once.** The first plan of an attempt draws
+  `new_boogu_seed()` once and writes it to
+  `<group>/semantic/background_remove/<shard>/<clip>/attempt-<n>.json`; a restart
+  reads the same seed instead of re-randomising, so job identity is stable.
+  `candidate_seeds` only decides how many candidates a cycle has.
+* **A semantic failure is a committed attempt.** A generation or judge exception
+  produces a durable `BackgroundRemovalAttempt(status="failed")` with
+  `OUTCOME_COMPLETED`, and the finalizer walks to the next candidate. Only the
+  inability to form a legal semantic result -- missing artifact, digest mismatch,
+  unreadable committed result -- is `retryable_failed` at the scheduler level.
+* **`attempt_index` is global and monotonic**
+  (`len(state.removal_attempts) + cycle_index`), so a second launch plans new jobs
+  instead of colliding with the previous cycle's receipts. `cycle_index` (0/1)
+  alone decides `background_removal_generate` vs `background_removal_candidate2`.
+* **Finalizers are idempotent** and reconstruction is ledger-only: a restart
+  rebuilds the current cycle's attempts from committed `JobResult`s and the seed
+  plan, never from in-memory state.
+* **Every model job re-validates its own identity before calling a model.** The
+  semantic inputs are recomputed and compared with `job.input_digest`; the judge
+  additionally compares the job's `candidate_sha256`, the generation result's
+  digest and the actual artifact bytes. Any disagreement makes the job
+  retryable **without** a model call.
+* The candidate PNG is published as a ledger artifact
+  (`artifacts/<job-id>/candidate.png`), never into the production run tree, so
+  production cleanup can never invalidate a receipt. Candidate retention is a
+  future disk optimisation, not a correctness issue.
+* Before seeding, each canonical shard is initialized and hydrated through the
+  existing production helpers (`initialize_shard`, `hydrate_shard`) under the
+  production shard lock, so a fresh run root produces real Stage2 clips instead
+  of silently planning zero removal jobs.
+
+The only intentional metric difference: per-attempt `runtime_seconds` measures
+generation active seconds plus judge active seconds, while the legacy loop
+measured one wall interval spanning both plus candidate preparation. Queue wait,
+resource-switch and epoch wait were never included and still are not.
+
+### Production wiring hardening (`post_mask_epoch_removal`)
+
+Four wiring properties the remove stage now guarantees.
+
+**Shard locks are held for the whole epoch.** The legacy worker acquires
+`<state>/shards/<shard>/shard.lock` and holds it across hydrate, remove, pair,
+reference edit and export. The resource-epoch runner uses that exact path and
+that exact scope: it acquires every canonical shard's lock, in lexical shard
+order, *before* initializing or hydrating anything, and releases them only after
+the scheduler drained, publication finished and the stage counts were updated.
+Acquisition is all-or-nothing: if one shard is locked elsewhere, every
+already-acquired lock is released and there are zero hydrate calls, zero model
+calls and zero clip mutations. Lexical ordering is mandatory on every node so
+two groups cannot deadlock. The group ownership lock is still taken as well; it
+protects group ownership, which the legacy worker knows nothing about, and does
+not replace the per-shard lock.
+
+**Eligibility is the hydration result, never the run root.** `prepare_shard_storage`
+returns a `PreparedRemovalShard` carrying `hydrate_shard`'s `clip_uids`, `ready`,
+`excluded` and `corrupt`. `RemovalEpochRunner.seed_jobs` seeds exactly that
+explicit view. `storage.iter_clips()` is not used, because it also lists clips a
+previous run hydrated but this run excluded or judged corrupt; those must not
+reach a model.
+
+**Endpoint judges are closed, shared judges are not.** `resolve_removal_judge`
+returns `(judge, owned)`. A handle that already implements `review()` is shared
+and is never closed by the runner. An endpoint string makes the runner build an
+`QwenBackgroundRemovalJudge`, which it then closes in a `finally`, so a review
+exception still releases the client.
+
+**Launcher and runner roots cannot drift.** The shell wrapper only turns an
+environment value into a CLI option when that variable actually exists, so a
+CLI override is never shadowed. The Python parser is then the single authority:
+before it imports or calls an external job runner it mirrors its resolved
+`--base-config`, `--tag`, `--entity-mask-root`, `--post-mask-root` and
+`--job-runner` back into the environment the runner reads. Without an explicit
+Post-Mask root the variable is removed, so the launcher's tag-derived default
+and the runner's tag-derived default are the same directory instead of the
+runner inheriting a stale shell value. `validate_removal_roots` additionally
+fails closed, before any lock, hydrate or model call, when the ledger the
+launcher handed over is not `resource_epoch_root(post_mask_root)/<group_id>`.
+
+**The runner re-derives the campaign identity itself.** A job runner is called
+as `runner(group, ledger, emit)` and receives no campaign argument, so it
+rebuilds the launcher's campaign semantic payload from what it is actually
+about to read -- `config.fingerprint()`, `dataset_json`, `entity_mask_root` and
+the live canonical shard count from `enumerate_shards` -- and refuses to
+continue unless `campaign_identity(...)` equals `group.campaign_identity`. A
+drift in any one of those four fields fails before the first shard lock, before
+any initialize/hydrate and before any model call. `tools/run_v3_post_mask_resource_epoch.build_campaign`
+and the runner's reconstruction are the same payload; a test asserts the two
+agree so they cannot silently diverge.
+
+**`--dry-run` can never execute a job runner.** `--dry-run` and `--job-runner`
+are mutually exclusive at the parser, so the combination exits `2` before any
+import. `--dry-run` alone only plans groups; `--job-runner` alone executes;
+neither is a clear usage error. The shell adds `--dry-run` only when no runner
+came from the environment or the CLI, and resolves the mode strictly CLI
+first, environment second, plan-only default last, so it never emits both and
+never overrides an explicit CLI choice.
+
+**Group completion requires downstream closure.** The runner wires Removal,
+Pair, Reference Edit, Reference Integrity, Instruction, Subject Attributes and
+export. It reports `completed=True` only when the remove, attribute and export
+closure succeeds; a remove-only success is not `GROUP_COMPLETED`.
+
+Run it as the launcher's job runner:
+
+```bash
+POST_MASK_BASE_CONFIG=/mnt/workspace/litengjie/data/r2v_v3_configs/<accepted>.local.yaml \
+POST_MASK_JOB_RUNNER=r2v_data_v2.v3.post_mask_epoch_removal:run_removal_epoch \
+bash scripts/run_v3_post_mask_resource_epoch.sh
+```
+
+The managed Qwen judge server is the foundation `QwenEpochResource` (`TP1`,
+`DP8`, port 8000) with
+`served_model_name == config.qwen.background_remove_judge.model`, so
+`/v1/models` and the judge request agree. Image editing uses the separate
+Qwen-Image-2.1 worker epoch, not the legacy Qwen-Image-Edit-2511 remover.
+
+### Running it
+
+```bash
+POST_MASK_BASE_CONFIG=/mnt/workspace/litengjie/data/r2v_v3_configs/<accepted>.local.yaml \
+bash scripts/run_v3_post_mask_resource_epoch.sh
+```
+
+Without `POST_MASK_JOB_RUNNER` the launcher runs `--dry-run`: it enumerates
+shards, builds and locks groups, publishes immutable descriptors and reports the
+plan, without any model call. Real phase semantics must be supplied as
+`package.module:callable` receiving `(group, ledger, emit)`; that runner owns
+every prompt, seed, threshold and accept/reject rule, reusing the existing
+semantic modules rather than duplicating them.
+
+Diagnostics are emitted as `post_mask_resource_epoch_summary` and written to
+`<state>/resource_epochs/summary-rank<N>.json`, including per-resource planned /
+skipped / executed / terminal-rejected / retryable-failed counts, epoch wall
+seconds, GPU slot job counts, resource switches, window count,
+conditional-attempt counts and resume counters (receipts reused, finalizers
+replayed, finalizer failures, jobs rerun after an incomplete commit).
+
+The managed Qwen server is started as:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+vllm serve /mnt/workspace/public/pretrained/Qwen/Qwen3-VL-32B-Instruct \
+  --host 127.0.0.1 --port 8000 \
+  --tensor-parallel-size 1 --data-parallel-size 8 \
+  --max-model-len 49152 --gpu-memory-utilization 0.90 --dtype bfloat16 \
+  --allowed-local-media-path /mnt/workspace/public/dataset \
+  --served-model-name /mnt/workspace/public/pretrained/Qwen/Qwen3-VL-32B-Instruct
+```
+
+The executable resolves through `PATH` (`shutil.which("vllm")`) and is never
+taken from the R2V `.venv`. This server advertises the **full model path**, not
+its basename, so health checking matches the served id against
+`--served-model-name` (or `str(model_path)`) across every `/v1/models` entry,
+and `--served-model-name` can be overridden explicitly.
+
+Startup health polling uses `health_poll_interval_seconds`, default **1.0s**
+(execution-only, not part of semantic identity): a DP8 cold start can take many
+minutes and `/v1/models` must not be hit ~20 times a second.
+
+Resource lifecycle counters (start/stop counts, startup/shutdown/service wall
+seconds, per-slot job counts) are reported under `resource_lifecycle`, separate
+from the model-job `resources` counters.
+
+### Qwen-Image-2.1 worker setup and smoke boundary
+
+Resource Epoch now has Removal, Reference Edit and Subject Attribute completion
+runners. This migration changes only their shared image-edit generator, not
+their prompts, seeds, selection or review rules. It is still unvalidated on a
+real CUDA server; Mac tests using fake models are not production acceptance.
+
+The image-edit subprocess uses its own configured Python environment. That
+environment needs CUDA-enabled PyTorch, Transformers with PE-I2I support,
+Diffusers with `QwenImage21Pipeline`, Accelerate and Pillow. It loads both
+models once per GPU worker from **local** paths, keeps both resident, optionally
+runs PE-I2I before generation, and never uses PE-T2I. The intended server
+configuration is:
+
+```yaml
+reference_edit:
+  backend: qwen_image_2_1
+  python_executable: /mnt/workspace/litengjie/data/venvs/qwen-image21/bin/python
+  model_path: /mnt/workspace/public/pretrained/Qwen/Qwen-Image-2.1
+  prompt_enhancer_i2i_path: /mnt/workspace/public/pretrained/Qwen/Qwen-Image-2.1-PE-I2I
+  num_inference_steps: 40
+  target_area: 1048576
+  alignment: 32
+  completion_instruction_rewrite_enabled: false
+```
+
+These paths describe the future server smoke, not files required on a Mac.
+Create an isolated, operator-reviewed Resource Epoch YAML and output tag/root;
+do not reuse an existing production output root for the first GPU smoke.
+Historical Boogu reference images and metadata remain readable without
+rewriting them, but pre-migration `run.json` and frozen epoch plans contain
+opaque legacy config hashes; this migration does not authorize resuming those
+old output roots under the new generator.
+Use the existing launcher and full job runner only after verifying that YAML
+and its image-edit environment on the server:
+
+```bash
+POST_MASK_BASE_CONFIG=/mnt/workspace/litengjie/data/r2v_v3_configs/qwen-image21-resource-epoch.local.yaml \
+POST_MASK_TAG=qwen-image21-smoke-v1 \
+POST_MASK_JOB_RUNNER=r2v_data_v2.v3.post_mask_epoch_removal:run_removal_epoch \
+bash scripts/run_v3_post_mask_resource_epoch.sh
+```
+
+Omit `POST_MASK_JOB_RUNNER` for the launcher's model-free dry run. The exact
+server YAML and Python environment must be prepared and accepted there first;
+this document does not claim a successful CUDA run or throughput measurement.

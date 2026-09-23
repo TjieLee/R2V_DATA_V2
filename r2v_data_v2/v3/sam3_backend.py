@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import math
 import time
+from contextlib import nullcontext
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -333,6 +334,17 @@ class Sam3SegmentationBackend:
         self._compile_effective = False
         self._compile_failure_reason = self._concise_compile_failure(exc)
 
+    def _device_context(self) -> Any:
+        """Bind indexed CUDA workers when the installed builder only uses "cuda"."""
+        device = self.config.device.strip()
+        if device == "cuda":
+            return nullcontext()
+        if device.startswith("cuda:") and device[5:].isdigit():
+            import torch
+
+            return torch.cuda.device(int(device[5:]))
+        return nullcontext()
+
     def _build_predictor(self, *, compile_enabled: bool) -> object:
         assert self.config.model_path is not None
         model_path = self.config.model_path.expanduser().resolve()
@@ -352,10 +364,12 @@ class Sam3SegmentationBackend:
         if "device" in parameters:
             arguments["device"] = self.config.device
         elif self.config.device != "cuda":
-            raise ValueError(
-                "installed SAM3 builder does not expose a device parameter; "
-                "only its verified default cuda device can be requested"
-            )
+            device = self.config.device.strip()
+            if not (device.startswith("cuda:") and device[5:].isdigit()):
+                raise ValueError(
+                    "installed SAM3 builder does not expose a device parameter; "
+                    "only cuda or an indexed cuda device can be requested"
+                )
         if compile_enabled:
             if "compile" not in parameters and not accepts_keywords:
                 raise TypeError(
@@ -364,7 +378,8 @@ class Sam3SegmentationBackend:
             arguments["compile"] = True
         started = self._clock()
         try:
-            return builder(**arguments)
+            with self._device_context():
+                return builder(**arguments)
         finally:
             self._predictor_startup_seconds += max(0.0, self._clock() - started)
 
@@ -749,7 +764,7 @@ class Sam3SegmentationBackend:
         finally:
             self._close_session(predictor, session_id)
 
-    def _track_once(
+    def _track_once_on_active_device(
         self,
         *,
         frame_paths: list[Path],
@@ -875,6 +890,24 @@ class Sam3SegmentationBackend:
             group_tracks_verified=False,
         )
 
+    def _track_once(
+        self,
+        *,
+        frame_paths: list[Path],
+        entity_id: str,
+        reference_type: str,
+        grounding_prompt: str,
+        entity_phrase: str | None = None,
+    ) -> EntityTrackResult:
+        with self._device_context():
+            return self._track_once_on_active_device(
+                frame_paths=frame_paths,
+                entity_id=entity_id,
+                reference_type=reference_type,
+                grounding_prompt=grounding_prompt,
+                entity_phrase=entity_phrase,
+            )
+
     def track(
         self,
         *,
@@ -924,5 +957,26 @@ class Sam3SegmentationBackend:
         selector_close = getattr(self._anchor_selector, "close", None)
         if callable(selector_close):
             selector_close()
-        self._shutdown_predictor(self._predictor)
-        self._predictor = None
+
+        predictor, self._predictor = self._predictor, None
+        with self._device_context():
+            self._shutdown_predictor(predictor)
+        del predictor
+
+        # SAM3 runs in the long-lived orchestrator process rather than a model
+        # subprocess. Dropping the predictor therefore does not release PyTorch's
+        # CUDA caching allocator by itself. A later Qwen epoch on the same node
+        # must not inherit those reserved blocks, especially when one process
+        # handles several shard groups sequentially.
+        import gc
+
+        gc.collect()
+        device = self.config.device.strip()
+        if device == "cuda" or (
+            device.startswith("cuda:") and device[5:].isdigit()
+        ):
+            import torch
+
+            if torch.cuda.is_available():
+                with self._device_context():
+                    torch.cuda.empty_cache()

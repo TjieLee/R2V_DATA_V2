@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections import deque
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -2152,6 +2153,70 @@ def test_qwen_source_bbox_reviewer_describes_variant_review_honestly(
     assert "accepted alpha reference" in text
     assert "materialized raw source bbox candidate" in text
     assert "target remains dominant" in text
+
+
+def _legacy_component_areas(mask: np.ndarray) -> tuple[list[int], list[bool]]:
+    """Reference implementation retained only for native-labeling equivalence."""
+    binary = np.asarray(mask, dtype=bool)
+    height, width = binary.shape
+    visited = np.zeros_like(binary)
+    areas: list[int] = []
+    touches_border: list[bool] = []
+    for y, x in np.argwhere(binary):
+        if visited[y, x]:
+            continue
+        queue = deque([(int(y), int(x))])
+        visited[y, x] = True
+        area = 0
+        border = False
+        while queue:
+            cy, cx = queue.popleft()
+            area += 1
+            border = border or cy in {0, height - 1} or cx in {0, width - 1}
+            for ny, nx in (
+                (cy - 1, cx),
+                (cy + 1, cx),
+                (cy, cx - 1),
+                (cy, cx + 1),
+            ):
+                if (
+                    0 <= ny < height
+                    and 0 <= nx < width
+                    and binary[ny, nx]
+                    and not visited[ny, nx]
+                ):
+                    visited[ny, nx] = True
+                    queue.append((ny, nx))
+        areas.append(area)
+        touches_border.append(border)
+    return areas, touches_border
+
+
+def test_native_component_areas_matches_legacy_four_connectivity() -> None:
+    rng = np.random.default_rng(20260922)
+    masks = [
+        np.zeros((17, 23), dtype=bool),
+        np.ones((17, 23), dtype=bool),
+        np.eye(31, dtype=bool),
+        rng.random((73, 91)) < 0.08,
+        rng.random((73, 91)) < 0.55,
+    ]
+    # Exercise deterministic border and enclosed components as well as random
+    # topology. Ordering is not semantic; pair each component's area with its
+    # own border flag before comparing the multisets.
+    structured = np.zeros((64, 80), dtype=bool)
+    structured[0:7, 2:9] = True
+    structured[20:50, 25:60] = True
+    structured[30:36, 35:45] = False
+    structured[55:64, 70:80] = True
+    masks.append(structured)
+
+    for mask in masks:
+        expected_areas, expected_border = _legacy_component_areas(mask)
+        actual_areas, actual_border = integrity_module._component_areas(mask)
+        assert sorted(zip(actual_areas, actual_border, strict=True)) == sorted(
+            zip(expected_areas, expected_border, strict=True)
+        )
 
 
 def test_large_enclosed_alpha_hole_is_review_suspicion_not_rejection() -> None:

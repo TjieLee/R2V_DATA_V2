@@ -6,11 +6,11 @@ import io
 import json
 import math
 import re
-from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
+import cv2
 import numpy as np
 from openai import BadRequestError, OpenAI
 from PIL import Image, ImageFilter
@@ -778,34 +778,49 @@ class QwenSourceBboxFallbackJudge:
 
 
 def _component_areas(mask: np.ndarray) -> tuple[list[int], list[bool]]:
+    """Return 4-connected component areas and border-contact flags.
+
+    The legacy implementation performed the exact same labeling with a Python
+    deque and four-neighbour flood fill. On 720p/1080p alpha masks that turns a
+    tiny deterministic integrity check into millions of Python operations, and
+    Resource Epoch may re-derive the same frozen policy during finalize and
+    publication verification. OpenCV is already a pinned production dependency;
+    its native 4-connected labeling preserves the legacy topology semantics
+    while moving the pixel walk out of Python.
+    """
     binary = np.asarray(mask, dtype=bool)
-    height, width = binary.shape
-    visited = np.zeros_like(binary)
-    areas: list[int] = []
-    touches_border: list[bool] = []
-    for y, x in np.argwhere(binary):
-        if visited[y, x]:
-            continue
-        queue = deque([(int(y), int(x))])
-        visited[y, x] = True
-        area = 0
-        border = False
-        while queue:
-            cy, cx = queue.popleft()
-            area += 1
-            border = border or cy in {0, height - 1} or cx in {0, width - 1}
-            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
-                if (
-                    0 <= ny < height
-                    and 0 <= nx < width
-                    and binary[ny, nx]
-                    and not visited[ny, nx]
-                ):
-                    visited[ny, nx] = True
-                    queue.append((ny, nx))
-        areas.append(area)
-        touches_border.append(border)
-    return areas, touches_border
+    if binary.ndim != 2:
+        raise ValueError("component mask must be two-dimensional")
+    if binary.size == 0 or not binary.any():
+        return [], []
+
+    foreground = np.ascontiguousarray(binary, dtype=np.uint8)
+    label_count, labels, stats, _centroids = cv2.connectedComponentsWithStats(
+        foreground,
+        connectivity=4,
+        ltype=cv2.CV_32S,
+    )
+    # Label zero is background. The returned stats are indexed by label.
+    if label_count <= 1:
+        return [], []
+
+    areas = stats[1:, cv2.CC_STAT_AREA].astype(np.int64, copy=False)
+
+    border_labels = np.unique(
+        np.concatenate(
+            (
+                labels[0, :],
+                labels[-1, :],
+                labels[:, 0],
+                labels[:, -1],
+            )
+        )
+    )
+    touches = np.zeros(label_count, dtype=bool)
+    touches[border_labels] = True
+    touches[0] = False
+
+    return areas.tolist(), touches[1:].tolist()
 
 
 def reference_topology_diagnostics(image: Image.Image) -> ReferenceTopologyDiagnostics:

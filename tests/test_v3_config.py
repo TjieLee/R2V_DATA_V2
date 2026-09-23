@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 import r2v_data_v2.v3.config as config_module
-from r2v_data_v2.v3.config import load_config
+from r2v_data_v2.v3.config import ReferenceEditConfig, load_config
 
 
 def _write_config(
@@ -172,6 +173,30 @@ def test_load_config_requires_background_remove_judge_when_remove_enabled(
         ),
     ):
         load_config(path)
+
+
+def test_load_config_round_trips_prompt_enhancer_i2i_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = _write_config(
+        tmp_path,
+        monkeypatch,
+        candidate_judge=True,
+        background_remove_judge=True,
+        reference_edit_enabled=True,
+        reference_edit_judge=True,
+    )
+    prompt_enhancer = tmp_path / "public" / "pretrained" / "Qwen" / "PE-I2I"
+    path.write_text(
+        path.read_text(encoding="utf-8")
+        + f"\n  prompt_enhancer_i2i_path: {prompt_enhancer}\n",
+        encoding="utf-8",
+    )
+
+    loaded = load_config(path)
+
+    assert loaded.reference_edit.prompt_enhancer_i2i_path == prompt_enhancer
 
 
 def test_load_config_requires_candidate_judge_when_pair_enabled(
@@ -663,6 +688,128 @@ def test_reference_edit_config_participates_in_fingerprint(
     assert first.reference_edit.enabled is True
     assert first.qwen.reference_edit_judge is not None
     assert first.fingerprint() != second.fingerprint()
+
+
+def test_reference_edit_defaults_select_boogu() -> None:
+    edit = ReferenceEditConfig()
+    assert edit.backend == "boogu_image_0_1_edit_turbo"
+    assert edit.python_executable == Path(
+        "/mnt/workspace/litengjie/data/venvs/boogu-image/bin/python"
+    )
+    assert edit.model_path == Path(
+        "/mnt/workspace/litengjie/data/models/"
+        "Boogu-Image-0.1-Edit-Turbo-hotfix-1k-20260708"
+    )
+    assert edit.target_area == 1024 * 1024
+    assert edit.alignment == 16
+    assert edit.completion_instruction_rewrite_enabled is True
+
+
+def test_reference_edit_alignment_is_backend_specific(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = load_config(
+        _write_config(
+            tmp_path,
+            monkeypatch,
+            candidate_judge=True,
+            background_remove_judge=True,
+            reference_edit_enabled=True,
+            reference_edit_judge=True,
+        )
+    )
+    assert config.reference_edit.backend == "boogu_image_0_1_edit_turbo"
+    assert config.reference_edit.alignment == 16
+
+    qwen_image = replace(
+        config,
+        reference_edit=replace(
+            config.reference_edit,
+            backend="qwen_image_2_1",
+            alignment=32,
+        ),
+    )
+    qwen_image.validate()
+
+    with pytest.raises(ValueError, match="alignment must be 32 for qwen_image_2_1"):
+        replace(
+            qwen_image,
+            reference_edit=replace(qwen_image.reference_edit, alignment=16),
+        ).validate()
+
+
+def test_generator_implementation_changes_do_not_gate_or_reidentify_campaign(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = load_config(
+        _write_config(
+            tmp_path,
+            monkeypatch,
+            candidate_judge=True,
+            background_remove_judge=True,
+            reference_edit_enabled=True,
+            reference_edit_judge=True,
+        )
+    )
+    alternate = replace(
+        config,
+        reference_edit=replace(
+            config.reference_edit,
+            backend="another_image_edit_backend",
+            python_executable=Path("/another/venv/bin/python"),
+            code_root=Path("/another/vendor"),
+            model_path=Path("/another/checkpoint"),
+            prompt_enhancer_i2i_path=Path("/another/pe-i2i"),
+            model_revision="another-revision",
+            cuda_visible_devices="7",
+        ),
+    )
+    alternate.validate()
+    assert alternate.fingerprint() == config.fingerprint()
+    assert alternate.model_identifiers() == config.model_identifiers()
+
+
+def test_generation_step_count_remains_policy_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = load_config(
+        _write_config(
+            tmp_path,
+            monkeypatch,
+            candidate_judge=True,
+            background_remove_judge=True,
+        )
+    )
+    changed = replace(
+        config,
+        reference_edit=replace(config.reference_edit, num_inference_steps=41),
+    )
+    changed.validate()
+    assert changed.fingerprint() != config.fingerprint()
+
+
+def test_remove_generator_backend_label_is_not_a_config_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = load_config(
+        _write_config(
+            tmp_path,
+            monkeypatch,
+            candidate_judge=True,
+            background_remove_judge=True,
+        )
+    )
+    changed = replace(
+        config,
+        remove=replace(config.remove, backend="qwen_image_2_1"),
+    )
+    changed.validate()
+    assert changed.fingerprint() == config.fingerprint()
+    assert changed.model_identifiers() == config.model_identifiers()
 
 
 def test_scale_collapse_fallback_guard_defaults_off_and_affects_fingerprint(

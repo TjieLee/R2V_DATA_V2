@@ -1,0 +1,336 @@
+#!/usr/bin/env python3
+"""Opt-in resource-epoch launcher for Post-Mask Visual production.
+
+This entrypoint is deliberately separate from
+``scripts/run_v3_post_mask_visual_cluster.sh``. The existing production launcher
+and all of ``legacy_serial`` / ``wavefront_v2`` / ``parallel_review_v21`` keep
+their current behaviour; nothing here is wired into them.
+
+What it does today:
+
+* enumerate the canonical shards of the campaign;
+* build deterministic 8-shard resource-epoch groups whose identity excludes
+  hostname, RANK, WORLD_SIZE, GPU, PID and concurrency;
+* take each statically assigned group's shared lock
+  (``group_index % world_size == rank``), never stealing work;
+* publish/validate the immutable group descriptor and durable plan;
+* run the group through the resource-epoch scheduler when a job runner is
+  supplied, otherwise report the plan and exit.
+
+What it does NOT do: it contains no Visual/Post-Mask semantic logic. The
+per-phase model-job semantics (background removal, reference edit, subject
+attributes) must be supplied as an external runner, because those call graphs
+live in the frozen semantic modules and must be reused, never duplicated.
+
+    --job-runner package.module:callable
+
+Background removal now has a real runner:
+``r2v_data_v2.v3.post_mask_epoch_removal:run_removal_epoch``. It reuses the
+shared ``remove.py`` semantics and always returns ``completed=False``, because
+the downstream phases (pair, reference edit, reference integrity, instruction,
+subject attributes, export) are not wired yet; a group is therefore recorded
+incomplete even when the remove stage finished. Use ``--dry-run`` to plan only.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+DEFAULT_ENTITY_MASK_ROOT = (
+    "/mnt/workspace/public/dataset/jea-video/"
+    "moive-183t-0808_processed/entity_mask"
+)
+DEFAULT_TAG = "post-mask-v1"
+
+
+def _emit(event: str, **details: Any) -> None:
+    print(json.dumps({"event": event, **details}, sort_keys=True), flush=True)
+
+
+def build_campaign(
+    config: Any, *, entity_mask_root: Path, canonical_shard_count: int
+) -> dict[str, Any]:
+    """The campaign semantic identity the launcher bakes into every group.
+
+    A real job runner must be able to rebuild exactly this payload from its own
+    resolved inputs, so the key set and construction stay a single explicit
+    definition rather than an inline literal.
+    """
+    return {
+        "config_hash": config.fingerprint(),
+        "dataset_json": str(getattr(config, "dataset_json", "")),
+        "entity_mask_root": str(Path(entity_mask_root)),
+        "canonical_shard_count": int(canonical_shard_count),
+    }
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--base-config", required=True)
+    parser.add_argument("--entity-mask-root", default=DEFAULT_ENTITY_MASK_ROOT)
+    parser.add_argument("--post-mask-root", default=None)
+    parser.add_argument("--tag", default=DEFAULT_TAG)
+    parser.add_argument("--group-size", type=int, default=8)
+    parser.add_argument("--rank", type=int, default=0)
+    parser.add_argument("--world-size", type=int, default=1)
+    # A dry run must be structurally incapable of calling a model runner, so
+    # the two are mutually exclusive instead of "dry run wins silently".
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--job-runner",
+        default=None,
+        help="package.module:callable owning real phase semantics",
+    )
+    mode.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="plan and report groups without executing any job runner",
+    )
+    return parser
+
+
+def _load_runner(spec: str):
+    module_name, _, attribute = spec.partition(":")
+    if not module_name or not attribute:
+        raise ValueError("--job-runner must be package.module:callable")
+    from importlib import import_module
+
+    module = import_module(module_name)
+    runner = getattr(module, attribute)
+    if not callable(runner):
+        raise TypeError(f"--job-runner {spec} is not callable")
+    return runner
+
+
+def _publish_resolved_environment(
+    args: argparse.Namespace, *, canonical_shard_count: int
+) -> None:
+    """Mirror the resolved CLI values into the runner's environment.
+
+    An external job runner such as ``run_removal_epoch`` resolves its roots
+    from the environment, while the launcher resolved the group identity from
+    parsed CLI values. Rewriting the environment from the *final* parsed values
+    makes parser output the single authority, so ``--base-config B`` overriding
+    an environment ``A`` cannot leave the runner writing under ``A``.
+
+    ``POST_MASK_CANONICAL_SHARD_COUNT`` is the same idea for campaign identity:
+    the launcher already enumerated the canonical shards to build the groups, so
+    it publishes that count instead of making every group runner rescan the
+    entity-mask root. A standalone runner that never saw a launcher falls back
+    to enumerating the root itself, so the identity is unchanged either way.
+    """
+    os.environ["POST_MASK_BASE_CONFIG"] = str(args.base_config)
+    os.environ["POST_MASK_TAG"] = str(args.tag)
+    os.environ["POST_MASK_ENTITY_MASK_ROOT"] = str(args.entity_mask_root)
+    os.environ["POST_MASK_CANONICAL_SHARD_COUNT"] = str(int(canonical_shard_count))
+    if args.post_mask_root:
+        os.environ["POST_MASK_ROOT"] = str(args.post_mask_root)
+    else:
+        # No explicit root: the launcher derives the state root from the tag,
+        # and the runner must derive the same default instead of inheriting a
+        # stale POST_MASK_ROOT from the shell.
+        os.environ.pop("POST_MASK_ROOT", None)
+    if args.job_runner:
+        os.environ["POST_MASK_JOB_RUNNER"] = str(args.job_runner)
+    else:
+        os.environ.pop("POST_MASK_JOB_RUNNER", None)
+
+
+def main(argv=None) -> int:
+    args = _build_parser().parse_args(argv)
+    repo = Path(__file__).resolve().parents[1]
+    sys.path.insert(0, str(repo))
+
+    from r2v_data_v2.v3 import config as config_module
+    from r2v_data_v2.v3.config import load_config
+    from r2v_data_v2.v3.post_mask_epoch_groups import (
+        GROUP_COMPLETED,
+        GROUP_INCOMPLETE,
+        assigned_groups,
+        build_groups,
+        group_is_completed,
+        group_ownership,
+        record_group_outcome,
+        resource_epoch_root,
+        resume_first_assigned_groups,
+        write_group_completed,
+        write_group_descriptor,
+    )
+    from r2v_data_v2.v3.post_mask_epoch_resources import (
+        limit_process_native_threads,
+        resolve_cpu_workers,
+    )
+    from r2v_data_v2.v3.post_mask_epoch_state import GroupLedger
+    from r2v_data_v2.v3.post_mask_production import enumerate_shards
+
+    try:
+        config = load_config(Path(args.base_config))
+        # The orchestrator is about to run many CPU threads. Contain native
+        # library pools in *this* process only; model subprocesses keep their own
+        # CPU policy. Both values are execution-only and never reach the config
+        # fingerprint, a job identity or a receipt.
+        limit_process_native_threads()
+        cpu_workers = resolve_cpu_workers(config)
+        entity_mask_root = Path(args.entity_mask_root)
+        shards = enumerate_shards(entity_mask_root)
+        if not shards:
+            raise ValueError("campaign has no canonical shards")
+
+        state_root = (
+            Path(args.post_mask_root)
+            if args.post_mask_root
+            else config_module.ALLOWED_WRITABLE_ROOT
+            / "r2v_v3_post_mask"
+            / "jea_motion_v1"
+            / args.tag
+        )
+        campaign = build_campaign(
+            config,
+            entity_mask_root=entity_mask_root,
+            canonical_shard_count=len(shards),
+        )
+        groups = build_groups(
+            [shard.stem for shard in shards],
+            campaign=campaign,
+            group_size=args.group_size,
+        )
+        owned = assigned_groups(groups, rank=args.rank, world_size=args.world_size)
+        # Completed groups are skipped from top-level metadata alone: no runner,
+        # no ledger, no shard storage. The remaining work is ordered
+        # unfinished-before-fresh so a restart finishes what it already began
+        # before it starts anything new.
+        resume = resume_first_assigned_groups(state_root, owned)
+        # --dry-run and --job-runner are mutually exclusive at the parser, so
+        # reaching here with neither is a real usage error, not a silent plan.
+        if not args.job_runner and not args.dry_run:
+            raise ValueError(
+                "resource_epoch_v3 needs --job-runner for real phase semantics; "
+                "use --dry-run to plan only"
+            )
+        # The job runner reads its roots from the environment, so publish the
+        # resolved values before anything can import or call it.
+        _publish_resolved_environment(args, canonical_shard_count=len(shards))
+        runner = _load_runner(args.job_runner) if args.job_runner else None
+
+        try:
+            git_commit = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=repo, text=True
+            ).strip()
+        except (OSError, subprocess.CalledProcessError):
+            git_commit = "unknown"
+
+        _emit(
+            "post_mask_resource_epoch_started",
+            rank=args.rank,
+            world_size=args.world_size,
+            group_count=len(groups),
+            assigned_groups=len(owned),
+            groups_complete_skipped=len(resume.complete),
+            groups_unfinished=len(resume.unfinished),
+            groups_fresh=len(resume.fresh),
+            group_size=args.group_size,
+            git_commit=git_commit,
+            dry_run=bool(args.dry_run),
+            cpu_workers=cpu_workers,
+        )
+
+        planned, completed, incomplete, skipped = 0, 0, 0, 0
+        late_complete_skipped = 0
+        for group in resume.ordered:
+            with group_ownership(state_root, group) as held:
+                if not held:
+                    skipped += 1
+                    _emit(
+                        "post_mask_resource_epoch_group_locked_elsewhere",
+                        group_id=group.group_id,
+                    )
+                    continue
+                # Authoritative recheck *after* the lock. The resume plan was a
+                # lock-free scan, so another node may have completed this group
+                # in between; taking the lock and then trusting the stale plan
+                # would re-run a group that is already done. This is still a
+                # metadata-only question - one stat and one small marker - and it
+                # runs before the descriptor is written, so a group that turns out
+                # to be complete is never counted as attempted.
+                if group_is_completed(state_root, group):
+                    late_complete_skipped += 1
+                    _emit(
+                        "post_mask_resource_epoch_group_completed_elsewhere",
+                        group_id=group.group_id,
+                    )
+                    continue
+                write_group_descriptor(state_root, group)
+                planned += 1
+                _emit(
+                    "post_mask_resource_epoch_group_started",
+                    group_id=group.group_id,
+                    group_identity=group.identity(),
+                    shards=list(group.canonical_shards),
+                )
+                if runner is None:
+                    _emit(
+                        "post_mask_resource_epoch_group_planned",
+                        group_id=group.group_id,
+                    )
+                    continue
+                ledger = GroupLedger(
+                    resource_epoch_root(state_root) / group.group_id
+                )
+                outcome = runner(group, ledger, _emit) or {}
+                if outcome.get("completed"):
+                    completed += 1
+                    # History first, then the create-once completion marker: the
+                    # marker is what the next restart skips on, so it may only
+                    # exist once the completion is durably recorded.
+                    record_group_outcome(state_root, group, outcome=GROUP_COMPLETED)
+                    write_group_completed(state_root, group)
+                    _emit(
+                        "post_mask_resource_epoch_group_completed",
+                        group_id=group.group_id,
+                    )
+                else:
+                    incomplete += 1
+                    record_group_outcome(
+                        state_root,
+                        group,
+                        outcome=GROUP_INCOMPLETE,
+                        reason=str(outcome.get("reason", "")),
+                    )
+                    _emit(
+                        "post_mask_resource_epoch_group_incomplete",
+                        group_id=group.group_id,
+                        reason=str(outcome.get("reason", "")),
+                    )
+
+        summary = {
+            "rank": args.rank,
+            "world_size": args.world_size,
+            "group_count": len(groups),
+            "groups_attempted": planned,
+            "group_completed": completed,
+            "group_incomplete": incomplete,
+            "groups_locked_elsewhere": skipped,
+            "groups_complete_skipped": len(resume.complete) + late_complete_skipped,
+            "groups_complete_skipped_after_lock": late_complete_skipped,
+            "groups_unfinished": len(resume.unfinished),
+            "groups_fresh": len(resume.fresh),
+        }
+        state_root.mkdir(parents=True, exist_ok=True)
+        (resource_epoch_root(state_root) / f"summary-rank{args.rank}.json").write_text(
+            json.dumps(summary, indent=2, sort_keys=True) + "\n"
+        )
+        _emit("post_mask_resource_epoch_summary", **summary)
+        return 0 if incomplete == 0 else 1
+    except (Exception, KeyboardInterrupt) as exc:  # noqa: BLE001 - CLI boundary
+        _emit("post_mask_resource_epoch_failed", reason=str(exc))
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

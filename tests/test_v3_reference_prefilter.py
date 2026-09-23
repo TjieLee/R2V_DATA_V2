@@ -11,11 +11,14 @@ from r2v_data_v2.v3.pair import EntityReferenceCandidate
 from r2v_data_v2.v3.reference_prefilter import (
     NEAR_SILHOUETTE_RULE,
     RELATIVE_BLUR_V2_RULE,
+    _subject_extreme_blur,
     _subject_near_silhouette,
     _subject_relative_blur_v2,
     prefilter_entity_reference_candidates,
 )
 from r2v_data_v2.v3.schemas import AnnotationEntity
+
+EXTREME_BLUR_RULE = "subject_extreme_blur_v1"
 
 
 def _entity(reference_type: str = "subject") -> AnnotationEntity:
@@ -51,6 +54,7 @@ def _metrics(
     dark_fraction: float = 0.0,
     laplacian: float = 100.0,
     tenengrad: float = 2000.0,
+    edge_density: float = 0.5,
 ) -> dict[str, object]:
     return {
         "status": "succeeded",
@@ -59,6 +63,7 @@ def _metrics(
         "dark_fraction_32": dark_fraction,
         "laplacian_variance": laplacian,
         "tenengrad_mean": tenengrad,
+        "edge_density": edge_density,
     }
 
 
@@ -99,6 +104,113 @@ def test_near_silhouette_v1_keeps_frozen_conjunction(
     expected: bool,
 ) -> None:
     assert _subject_near_silhouette(metrics) is expected
+
+
+@pytest.mark.parametrize(
+    ("laplacian", "tenengrad", "edge_density", "expected"),
+    [
+        (5.0, 100.0, 0.05, True),
+        (5.01, 100.0, 0.05, False),
+        (5.0, 100.01, 0.05, False),
+        (5.0, 100.0, 0.051, False),
+    ],
+)
+def test_extreme_blur_thresholds_are_unchanged(
+    laplacian: float,
+    tenengrad: float,
+    edge_density: float,
+    expected: bool,
+) -> None:
+    assert (
+        _subject_extreme_blur(
+            _metrics(
+                laplacian=laplacian,
+                tenengrad=tenengrad,
+                edge_density=edge_density,
+            )
+        )
+        is expected
+    )
+
+
+def test_extreme_blur_filters_only_when_a_clearer_subject_candidate_exists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_metrics(
+        monkeypatch,
+        {
+            1: _metrics(laplacian=4, tenengrad=80, edge_density=0.03),
+            2: _metrics(laplacian=100, tenengrad=2000, edge_density=0.5),
+        },
+    )
+    candidates = [_candidate(1), _candidate(2)]
+
+    result = prefilter_entity_reference_candidates(
+        _entity(), candidates, _source_images(2)
+    )
+
+    assert result.decisions[0].flagged_by == (EXTREME_BLUR_RULE,)
+    assert result.decisions[1].flagged_by == ()
+    assert [item.candidate_id for item in result.retained_candidates] == [
+        "candidate_2"
+    ]
+
+
+@pytest.mark.parametrize("candidate_count", [1, 3])
+def test_extreme_blur_fails_open_when_every_subject_candidate_is_extreme(
+    monkeypatch: pytest.MonkeyPatch,
+    candidate_count: int,
+) -> None:
+    _install_metrics(
+        monkeypatch,
+        {
+            index: _metrics(
+                laplacian=2.0 + index * 0.1,
+                tenengrad=80 + index,
+                edge_density=0.03,
+            )
+            for index in range(1, candidate_count + 1)
+        },
+    )
+    candidates = [_candidate(index) for index in range(1, candidate_count + 1)]
+
+    result = prefilter_entity_reference_candidates(
+        _entity(), candidates, _source_images(candidate_count)
+    )
+
+    assert result.retained_candidates == tuple(candidates)
+    assert all(
+        EXTREME_BLUR_RULE not in decision.flagged_by
+        for decision in result.decisions
+    )
+
+
+def test_extreme_blur_remains_subject_only_and_combines_with_near_silhouette(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_metrics(
+        monkeypatch,
+        {
+            1: _metrics(
+                luma=10,
+                dark_fraction=0.99,
+                laplacian=4,
+                tenengrad=40,
+                edge_density=0.02,
+            )
+        },
+    )
+    candidate = [_candidate(1)]
+    source_images = _source_images(1)
+
+    subject = prefilter_entity_reference_candidates(_entity(), candidate, source_images)
+    object_result = prefilter_entity_reference_candidates(
+        _entity("object"), candidate, source_images
+    )
+
+    assert subject.decisions[0].flagged_by == (NEAR_SILHOUETTE_RULE,)
+    assert object_result.retained_candidates == tuple(candidate)
+    assert object_result.decisions[0].flagged_by == ()
 
 
 @pytest.mark.parametrize(

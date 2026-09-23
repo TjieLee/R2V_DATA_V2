@@ -635,6 +635,270 @@ def _exception_reason(exc: BaseException) -> str:
     return message or type(exc).__name__
 
 
+# ---------------------------------------------------------------------------
+# Shared attempt semantics
+#
+# The legacy remove_backgrounds() loop and the resource-epoch remove adapter
+# both drive these helpers, so there is exactly one implementation of the
+# prompt, candidate preparation, review rule, attempt classification and
+# runtime measurement. Nothing here knows about GPU slots, ranks, epoch groups
+# or scheduler state.
+# ---------------------------------------------------------------------------
+
+CANDIDATE_READY = "candidate_ready"
+GENERATION_FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class RemovalAttemptContext:
+    """Canonical semantic inputs for one background-removal attempt.
+
+    Execution-only concerns (GPU, worker slot, rank, epoch group) are absent by
+    design, so a job identity built from this context is stable across
+    restarts and topologies.
+    """
+
+    clip_uid: str
+    original: BackgroundReferenceState
+    inputs: _RemovalInputs
+    candidate_mode: RemovalCandidateMode
+    prompt: str
+    generation_width: int
+    generation_height: int
+    profile_component: str
+    profile_model: str
+
+
+@dataclass(frozen=True)
+class RemovalGenerationResult:
+    """Outcome of one Boogu/Qwen-remover generation attempt.
+
+    A semantic generation failure is still a *durable* attempt outcome, not an
+    execution-layer failure: the CPU policy decides whether to run the next
+    configured candidate.
+    """
+
+    status: str
+    generated: bool
+    seed: int
+    candidate: Image.Image | None
+    candidate_bytes: bytes | None
+    candidate_sha256: str | None
+    generation_seconds: float
+    reason: str | None
+
+
+@dataclass(frozen=True)
+class RemovalReviewOutcome:
+    """Outcome of the Qwen removal judge for one prepared candidate."""
+
+    status: str
+    attempt: BackgroundRemovalAttempt
+    candidate: Image.Image | None
+    candidate_bytes: bytes | None
+    candidate_sha256: str | None
+    judge_seconds: float
+
+
+def prepare_removal_attempt_context(
+    config: V3Config,
+    storage: RunStorage,
+    clip_uid: str,
+    state: BackgroundReferenceState,
+) -> RemovalAttemptContext:
+    """Build every semantic input one removal attempt needs."""
+    inputs = _prepare_inputs(config, storage, clip_uid, state)
+    candidate_mode = removal_candidate_mode(config.remove.backend)
+    if config.remove.backend == BOOGU_REMOVE_BACKEND:
+        prompt = build_boogu_background_removal_prompt(inputs.removal_phrases)
+        generation_width, generation_height = resolve_boogu_1k_size(
+            inputs.source_image.width,
+            inputs.source_image.height,
+            target_area=config.reference_edit.target_area,
+            alignment=config.reference_edit.alignment,
+        )
+        profile_component = "boogu_background_remove"
+        profile_model = str(config.reference_edit.model_path)
+    else:
+        prompt = build_background_removal_prompt(
+            removal_phrases=inputs.removal_phrases,
+            background_phrase=inputs.background_phrase,
+        )
+        generation_width, generation_height = inputs.source_image.size
+        profile_component = "qwen_image_edit_object_remover"
+        profile_model = str(config.remove.base_model_path)
+    return RemovalAttemptContext(
+        clip_uid=clip_uid,
+        original=state,
+        inputs=inputs,
+        candidate_mode=candidate_mode,
+        prompt=prompt,
+        generation_width=generation_width,
+        generation_height=generation_height,
+        profile_component=profile_component,
+        profile_model=profile_model,
+    )
+
+
+def generate_removal_candidate(
+    *,
+    context: RemovalAttemptContext,
+    backend: BackgroundRemovalBackend,
+    seed: int,
+    retry_index: int,
+) -> RemovalGenerationResult:
+    """Run one generation attempt and prepare its candidate image.
+
+    Only Exception is caught, so KeyboardInterrupt/SystemExit propagate. A
+    failing attempt still returns a durable result for the CPU policy.
+    """
+    inputs = context.inputs
+    started = time.monotonic()
+    generated = False
+    try:
+        with profile_model_call(
+            component=context.profile_component,
+            operation="background_remove",
+            retry_index=retry_index,
+            model=context.profile_model,
+            input_text_chars=len(context.prompt),
+            input_image_count=1,
+            metadata={
+                "clip_uid": context.clip_uid,
+                "seed": seed,
+                "source_width": inputs.source_image.width,
+                "source_height": inputs.source_image.height,
+                "generation_width": context.generation_width,
+                "generation_height": context.generation_height,
+                "thinking_enabled": False,
+            },
+        ):
+            edited = backend.remove(
+                image=inputs.source_image,
+                removal_phrases=inputs.removal_phrases,
+                background_phrase=inputs.background_phrase,
+                prompt=context.prompt,
+                seed=seed,
+            )
+        if not isinstance(edited, Image.Image):
+            raise TypeError("background removal backend did not return a PIL image")
+        generated = True
+        candidate = prepare_candidate(
+            mode=context.candidate_mode,
+            source_image=inputs.source_image,
+            edited_image=edited,
+            generation_mask=inputs.generation_mask,
+        )
+        candidate_bytes = _png_bytes(candidate)
+        candidate_sha = _sha256_bytes(candidate_bytes)
+        return RemovalGenerationResult(
+            status=CANDIDATE_READY,
+            generated=True,
+            seed=seed,
+            candidate=candidate,
+            candidate_bytes=candidate_bytes,
+            candidate_sha256=candidate_sha,
+            generation_seconds=time.monotonic() - started,
+            reason=None,
+        )
+    except Exception as exc:
+        return RemovalGenerationResult(
+            status=GENERATION_FAILED,
+            generated=generated,
+            seed=seed,
+            candidate=None,
+            candidate_bytes=None,
+            candidate_sha256=None,
+            generation_seconds=time.monotonic() - started,
+            reason=_exception_reason(exc),
+        )
+
+
+def review_removal_candidate(
+    *,
+    context: RemovalAttemptContext,
+    candidate: Image.Image,
+    candidate_bytes: bytes,
+    candidate_sha256: str,
+    judge: BackgroundRemovalJudge,
+    seed: int,
+    generation_seconds: float,
+) -> RemovalReviewOutcome:
+    """Judge one prepared candidate and build its BackgroundRemovalAttempt."""
+    inputs = context.inputs
+    source_mask_image = Image.fromarray(
+        inputs.source_mask.astype(np.uint8) * 255, mode="L"
+    )
+    generation_mask_image = Image.fromarray(
+        inputs.generation_mask.astype(np.uint8) * 255, mode="L"
+    )
+    started = time.monotonic()
+    try:
+        review = judge.review(
+            source_image=inputs.source_image,
+            candidate_image=candidate,
+            source_mask=source_mask_image,
+            generation_mask=generation_mask_image,
+            removal_phrases=inputs.removal_phrases,
+            background_phrase=inputs.background_phrase,
+            candidate_mode=context.candidate_mode,
+        )
+    except Exception as exc:
+        judge_seconds = time.monotonic() - started
+        return RemovalReviewOutcome(
+            status=GENERATION_FAILED,
+            attempt=BackgroundRemovalAttempt(
+                seed=seed,
+                status="failed",
+                runtime_seconds=generation_seconds + judge_seconds,
+                candidate_sha256=candidate_sha256,
+                reason=_exception_reason(exc),
+                review=None,
+            ),
+            candidate=candidate,
+            candidate_bytes=candidate_bytes,
+            candidate_sha256=candidate_sha256,
+            judge_seconds=judge_seconds,
+        )
+    judge_seconds = time.monotonic() - started
+    runtime = generation_seconds + judge_seconds
+    if review.verdict == "accept":
+        attempt = BackgroundRemovalAttempt(
+            seed=seed,
+            status="accepted",
+            runtime_seconds=runtime,
+            candidate_sha256=candidate_sha256,
+            reason=None,
+            review=review,
+        )
+        status = "accepted"
+    else:
+        attempt = BackgroundRemovalAttempt(
+            seed=seed,
+            status="rejected",
+            runtime_seconds=runtime,
+            candidate_sha256=candidate_sha256,
+            reason=review.reason,
+            review=review,
+        )
+        status = "rejected"
+    return RemovalReviewOutcome(
+        status=status,
+        attempt=attempt,
+        candidate=candidate,
+        candidate_bytes=candidate_bytes,
+        candidate_sha256=candidate_sha256,
+        judge_seconds=judge_seconds,
+    )
+
+
+def removal_attempts_are_all_rejected(
+    attempts: list[BackgroundRemovalAttempt],
+) -> bool:
+    """Legacy terminal rule: every attempt rejected, no failures, none accepted."""
+    return bool(attempts) and {attempt.status for attempt in attempts} == {"rejected"}
+
+
 def remove_backgrounds(
     config: V3Config,
     storage: RunStorage,
@@ -689,13 +953,14 @@ def remove_backgrounds(
                 continue
 
             try:
-                inputs = _prepare_inputs(
+                context = prepare_removal_attempt_context(
                     config,
                     storage,
                     clip_uid,
                     state,
                 )
-                candidate_mode = removal_candidate_mode(config.remove.backend)
+                inputs = context.inputs
+                candidate_mode = context.candidate_mode
                 generation_pixels = int(
                     np.count_nonzero(inputs.generation_mask)
                 )
@@ -729,34 +994,6 @@ def remove_backgrounds(
                     active_judge = QwenBackgroundRemovalJudge(service)
                     owned_judge = True
 
-                if config.remove.backend == BOOGU_REMOVE_BACKEND:
-                    prompt = build_boogu_background_removal_prompt(
-                        inputs.removal_phrases
-                    )
-                    generation_width, generation_height = resolve_boogu_1k_size(
-                        inputs.source_image.width,
-                        inputs.source_image.height,
-                        target_area=config.reference_edit.target_area,
-                        alignment=config.reference_edit.alignment,
-                    )
-                    profile_component = "boogu_background_remove"
-                    profile_model = str(config.reference_edit.model_path)
-                else:
-                    prompt = build_background_removal_prompt(
-                        removal_phrases=inputs.removal_phrases,
-                        background_phrase=inputs.background_phrase,
-                    )
-                    generation_width, generation_height = inputs.source_image.size
-                    profile_component = "qwen_image_edit_object_remover"
-                    profile_model = str(config.remove.base_model_path)
-                source_mask_image = Image.fromarray(
-                    inputs.source_mask.astype(np.uint8) * 255,
-                    mode="L",
-                )
-                generation_mask_image = Image.fromarray(
-                    inputs.generation_mask.astype(np.uint8) * 255,
-                    mode="L",
-                )
                 attempts: list[BackgroundRemovalAttempt] = []
                 accepted: tuple[Image.Image, bytes, str, int] | None = None
                 for retry_index, configured_seed in enumerate(
@@ -767,120 +1004,65 @@ def remove_backgrounds(
                         if config.remove.backend == BOOGU_REMOVE_BACKEND
                         else configured_seed
                     )
-                    started = time.monotonic()
-                    candidate: Image.Image | None = None
-                    candidate_sha: str | None = None
-                    review: BackgroundRemovalReview | None = None
-                    try:
-                        with profile_model_call(
-                            component=profile_component,
-                            operation="background_remove",
-                            retry_index=retry_index,
-                            model=profile_model,
-                            input_text_chars=len(prompt),
-                            input_image_count=1,
-                            metadata={
-                                "clip_uid": clip_uid,
-                                "seed": seed,
-                                "source_width": inputs.source_image.width,
-                                "source_height": inputs.source_image.height,
-                                "generation_width": generation_width,
-                                "generation_height": generation_height,
-                                "thinking_enabled": False,
-                            },
-                        ):
-                            edited = active_backend.remove(
-                                image=inputs.source_image,
-                                removal_phrases=inputs.removal_phrases,
-                                background_phrase=inputs.background_phrase,
-                                prompt=prompt,
-                                seed=seed,
-                            )
-                        if not isinstance(edited, Image.Image):
-                            raise TypeError(
-                                "background removal backend did not return a PIL image"
-                            )
+                    generation = generate_removal_candidate(
+                        context=context,
+                        backend=active_backend,
+                        seed=seed,
+                        retry_index=retry_index,
+                    )
+                    if generation.generated:
                         counters["candidates_generated"] += 1
-                        candidate = prepare_candidate(
-                            mode=candidate_mode,
-                            source_image=inputs.source_image,
-                            edited_image=edited,
-                            generation_mask=inputs.generation_mask,
-                        )
-                        candidate_bytes = _png_bytes(candidate)
-                        candidate_sha = _sha256_bytes(candidate_bytes)
-                        review = active_judge.review(
-                            source_image=inputs.source_image,
-                            candidate_image=candidate,
-                            source_mask=source_mask_image,
-                            generation_mask=generation_mask_image,
-                            removal_phrases=inputs.removal_phrases,
-                            background_phrase=inputs.background_phrase,
-                            candidate_mode=candidate_mode,
-                        )
-                        runtime = time.monotonic() - started
-                        if review.verdict == "accept":
-                            attempt = BackgroundRemovalAttempt(
-                                seed=seed,
-                                status="accepted",
-                                runtime_seconds=runtime,
-                                candidate_sha256=candidate_sha,
-                                reason=None,
-                                review=review,
-                            )
-                            attempts.append(attempt)
-                            accepted = (
-                                candidate,
-                                candidate_bytes,
-                                candidate_sha,
-                                seed,
-                            )
-                            break
-                        attempt = BackgroundRemovalAttempt(
-                            seed=seed,
-                            status="rejected",
-                            runtime_seconds=runtime,
-                            candidate_sha256=candidate_sha,
-                            reason=review.reason,
-                            review=review,
-                        )
-                        attempts.append(attempt)
-                        counters["candidates_rejected"] += 1
-                        if _debug_enabled(config):
-                            _write_candidate_debug(
-                                storage,
-                                clip_uid=clip_uid,
-                                seed=seed,
-                                candidate=candidate,
-                                review=review,
-                                inputs=inputs,
-                            )
-                    except Exception as exc:
-                        runtime = time.monotonic() - started
+                    if generation.status != CANDIDATE_READY:
                         attempts.append(
                             BackgroundRemovalAttempt(
                                 seed=seed,
                                 status="failed",
-                                runtime_seconds=runtime,
-                                candidate_sha256=candidate_sha,
-                                reason=_exception_reason(exc),
+                                runtime_seconds=generation.generation_seconds,
+                                candidate_sha256=generation.candidate_sha256,
+                                reason=generation.reason,
                                 review=None,
                             )
                         )
                         counters["candidates_failed"] += 1
-                        if candidate is not None and _debug_enabled(config):
-                            _write_candidate_debug(
-                                storage,
-                                clip_uid=clip_uid,
-                                seed=seed,
-                                candidate=candidate,
-                                review=None,
-                                inputs=inputs,
-                            )
+                        continue
+                    candidate = generation.candidate
+                    assert candidate is not None
+                    assert generation.candidate_bytes is not None
+                    assert generation.candidate_sha256 is not None
+                    outcome = review_removal_candidate(
+                        context=context,
+                        candidate=candidate,
+                        candidate_bytes=generation.candidate_bytes,
+                        candidate_sha256=generation.candidate_sha256,
+                        judge=active_judge,
+                        seed=seed,
+                        generation_seconds=generation.generation_seconds,
+                    )
+                    attempts.append(outcome.attempt)
+                    if outcome.status == "accepted":
+                        accepted = (
+                            outcome.candidate,
+                            outcome.candidate_bytes,
+                            outcome.candidate_sha256,
+                            seed,
+                        )
+                        break
+                    if outcome.status == "rejected":
+                        counters["candidates_rejected"] += 1
+                    else:
+                        counters["candidates_failed"] += 1
+                    if _debug_enabled(config):
+                        _write_candidate_debug(
+                            storage,
+                            clip_uid=clip_uid,
+                            seed=seed,
+                            candidate=candidate,
+                            review=outcome.attempt.review,
+                            inputs=inputs,
+                        )
 
                 if accepted is None:
-                    statuses = {attempt.status for attempt in attempts}
-                    if statuses == {"rejected"}:
+                    if removal_attempts_are_all_rejected(attempts):
                         reason = "all_removal_candidates_rejected"
                         _publish_rejected(
                             storage,

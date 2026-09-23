@@ -56,6 +56,14 @@ still meets that near-front standard. Reject a strong three-quarter or
 near-side human view below that standard, a side-profile human, a rear human,
 or a human whose head or face is completely hidden. Do not invent a numeric
 ratio; make this a semantic judgment from visible evidence.
+For a human subject, a front or near-front face is not sufficient by itself.
+If blur, defocus, motion smear, pixelation, compression, or low resolution
+makes stable facial identity features such as the eyes, nose, mouth, and facial
+contour indistinguishable, reject even when the face is large and front-facing.
+Set image_quality=poor, identity_features_visible=false,
+primary_identity_region_visible=false, and reference_scope=reject.
+For this identity-loss rejection, set completeness=severely_incomplete and
+selected_candidate_id=null, even if the physical face is fully in frame.
 
 independent_reference_value means the isolated visual content is independently
 useful as a generation condition. Reject wall patches, scenery fragments,
@@ -195,16 +203,20 @@ only minor truncation, while major truncation rejects.
 
 Subject and viewpoint rules
 Subjects use front, three_quarter, side, or rear. Objects and groups use
-not_applicable. Reject a rear subject. A human subject must show a front or
-near-front face with roughly at least 50% of the frontal facial identity region
-visible. A
-three-quarter human view is usable only when it still meets that near-front
-standard. Reject a strong three-quarter or near-side human view below that
-standard, a side-profile human, a rear human, or a human whose head or face is
-completely hidden. Do not invent a numeric ratio; judge visible evidence
-semantically. For objects and groups, primary_identity_region_visible means the
-main recognizable region is present. major_structure_visible means most
-coherent structure remains.
+not_applicable. Reject a rear subject. Humans require a front or near-front face
+with roughly at least 50% of the frontal facial identity region visible;
+three-quarter views must meet this near-front standard. Reject strong
+three-quarter or near-side views below that standard, side profiles, rear views,
+and hidden faces. Judge semantically; do not invent a numeric ratio.
+A front or near-front face is not sufficient by itself. If blur,
+defocus, motion smear, pixelation, compression, or low resolution makes stable
+facial identity features such as the eyes, nose, mouth, and facial contour
+indistinguishable, reject even when the face is large and front-facing. Set
+image_quality=poor, identity_features_visible=false,
+primary_identity_region_visible=false, reference_scope=reject,
+completeness=severely_incomplete, selected_candidate_id=null. For objects
+and groups, primary_identity_region_visible means the main recognizable region
+is present. major_structure_visible means most coherent structure remains.
 
 Detached fragments
 Detached fragments are non-trivial same-target pieces separated from the main

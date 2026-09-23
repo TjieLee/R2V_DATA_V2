@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -70,6 +72,31 @@ def _config(tmp_path: Path) -> Sam3Config:
     return Sam3Config(model_path=checkpoint)
 
 
+def test_close_releases_cuda_allocator_cache(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    predictor = _Predictor()
+    backend = Sam3SegmentationBackend(
+        _config(tmp_path),
+        predictor=predictor,
+    )
+
+    calls: list[str] = []
+    monkeypatch.setattr("gc.collect", lambda: calls.append("gc") or 0)
+
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append("empty_cache"))
+
+    backend.close()
+
+    assert predictor.shutdown_called is True
+    assert backend._predictor is None
+    assert calls == ["gc", "empty_cache"]
+
+
 def _track(backend: Sam3SegmentationBackend, frame_paths: list[Path]) -> None:
     result = backend.track(
         frame_paths=frame_paths,
@@ -95,6 +122,33 @@ def test_eager_builder_arguments_remain_unchanged(tmp_path: Path) -> None:
 
     assert calls == [{"checkpoint_path": str(config.model_path.resolve())}]
     assert backend.performance_counters()["sam3_compile_requested"] is False
+
+
+def test_indexed_cuda_uses_device_context_when_builder_has_no_device_parameter(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    entered: list[int] = []
+    calls: list[str] = []
+
+    @contextmanager
+    def fake_cuda_device(index: int):
+        entered.append(index)
+        yield
+
+    monkeypatch.setattr("torch.cuda.device", fake_cuda_device)
+
+    def builder(checkpoint_path: str) -> _Predictor:
+        calls.append(checkpoint_path)
+        return _Predictor()
+
+    config = replace(_config(tmp_path), device="cuda:3")
+    backend = Sam3SegmentationBackend(config, builder=builder)
+
+    backend._load_predictor()
+
+    assert entered == [3]
+    assert calls == [str(config.model_path.resolve())]
 
 
 def test_compile_uses_official_builder_option_and_reports_effective(

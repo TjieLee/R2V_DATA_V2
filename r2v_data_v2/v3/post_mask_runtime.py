@@ -15,7 +15,7 @@ import shutil
 import threading
 import time
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
@@ -190,11 +190,62 @@ def _attribute_receipt(storage: RunStorage, uid: str) -> Path:
     return storage.clip_dir(uid) / ".post_mask_attributes.json"
 
 
+#: Every final image one accepted attribute record can point at. The record's
+#: own crop, its accepted base and every published variant are all part of the
+#: final attribute authority, so the receipt digests the pixels, not just the
+#: JSON that names them.
+_ATTRIBUTE_RECORD_IMAGE_FIELDS = (
+    "image_path",
+    "accepted_base_image_path",
+    "default_image_path",
+)
+_ATTRIBUTE_VARIANT_NAMES = ("alpha", "bbox", "generated_background")
+
+
+def _attribute_record_images(record: Any) -> list[str]:
+    """Every non-null final image path one attribute record references."""
+    paths: list[str] = []
+    for field in _ATTRIBUTE_RECORD_IMAGE_FIELDS:
+        value = getattr(record, field, None)
+        if isinstance(value, str) and value:
+            paths.append(value)
+    variants = getattr(record, "variants", None)
+    if variants is not None:
+        for name in _ATTRIBUTE_VARIANT_NAMES:
+            variant = getattr(variants, name, None)
+            value = getattr(variant, "image_path", None) if variant is not None else None
+            if isinstance(value, str) and value:
+                paths.append(value)
+    return paths
+
+
+def _contained_attribute_path(root: Path, relative: str) -> tuple[str, Path]:
+    """Validate one final attribute artifact path and return its owner form."""
+    candidate = Path(relative)
+    if candidate.is_absolute():
+        raise ValueError("attribute artifact path must be relative")
+    if ".." in candidate.parts:
+        raise ValueError("attribute artifact path must not escape its root")
+    resolved_root = root.resolve(strict=False)
+    resolved = (resolved_root / candidate).resolve(strict=False)
+    resolved.relative_to(resolved_root)
+    if not resolved.is_file():
+        raise ValueError(f"attribute artifact is missing: {relative}")
+    return candidate.as_posix(), resolved
+
+
 def _attribute_artifacts(storage: RunStorage, clip: ClipRecord) -> dict[str, str]:
+    """Digest every durable artifact one clip's Subject Attributes published.
+
+    The owner JSONs, the enriched sample and every final image the accepted
+    records reference: the attribute crop, the accepted base and each variant
+    PNG. Paths are validated as relative, contained and present, and the mapping
+    is deduplicated and sorted so the digest is deterministic.
+    """
     from r2v_data_v2.v3.subject_attributes import _load_durable_owner_artifact
 
     root = storage.root / "subject_attributes"
-    result = {}
+    collected: dict[str, Path] = {}
     for path in sorted((root / "owners" / clip.clip_uid).glob("*.json")):
         artifact = _load_durable_owner_artifact(
             path,
@@ -204,15 +255,126 @@ def _attribute_artifacts(storage: RunStorage, clip: ClipRecord) -> dict[str, str
         )
         if artifact is None:
             raise ValueError("invalid durable attribute owner artifact")
-        result[str(path.relative_to(root))] = hashlib.sha256(
-            path.read_bytes()
-        ).hexdigest()
+        collected[str(path.relative_to(root))] = path
+        for record in artifact.records:
+            for relative in _attribute_record_images(record):
+                key, resolved = _contained_attribute_path(root, relative)
+                collected[key] = resolved
     sample = root / "samples" / f"{clip.clip_uid}.json"
     if sample.exists():
-        result[str(sample.relative_to(root))] = hashlib.sha256(
-            sample.read_bytes()
-        ).hexdigest()
-    return result
+        collected[str(sample.relative_to(root))] = sample
+    return {
+        key: hashlib.sha256(collected[key].read_bytes()).hexdigest()
+        for key in sorted(collected)
+    }
+
+
+def _expected_attribute_receipt(storage: RunStorage, uid: str) -> dict[str, Any]:
+    """The exact final attribute receipt of one clip, recomputed from disk."""
+    clip = storage.read_clip(uid)
+    return {
+        "clip": _clip_digest(clip),
+        "artifacts": _attribute_artifacts(storage, clip),
+    }
+
+
+def _attribute_receipt_state(
+    storage: RunStorage, uid: str, expected: Mapping[str, Any]
+) -> bool:
+    """``True`` when the receipt is already published and exact, ``False`` when
+    it is missing, and a hard failure for anything else.
+
+    Splitting the read from the write is what lets a caller preflight every clip
+    before it writes any of them, so one drifted receipt cannot leave its
+    siblings published.
+    """
+    path = _attribute_receipt(storage, uid)
+    if not path.is_file():
+        return False
+    try:
+        existing = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        raise ValueError(
+            f"final attribute receipt is unreadable: {path}"
+        ) from exc
+    if existing != dict(expected):
+        raise ValueError(f"final attribute receipt drifted: {path}")
+    return True
+
+
+def _write_attribute_receipt(
+    storage: RunStorage, uid: str, expected: Mapping[str, Any]
+) -> None:
+    """Publish one missing final attribute receipt, verifying any existing one."""
+    if _attribute_receipt_state(storage, uid, expected):
+        return
+    write_json_atomic(_attribute_receipt(storage, uid), dict(expected))
+
+
+def _publish_attribute_receipt(
+    storage: RunStorage, uid: str, expected: Mapping[str, Any]
+) -> None:
+    """Create-or-verify one final attribute receipt; never silently overwrite."""
+    _write_attribute_receipt(storage, uid, expected)
+
+
+def _export_tree_sha256(paths: ShardPaths) -> str:
+    """Combined digest of every published export file and its relative path."""
+    digest = hashlib.sha256()
+    for path in sorted(
+        item for item in paths.export_root.rglob("*") if item.is_file()
+    ):
+        digest.update(path.relative_to(paths.export_root).as_posix().encode())
+        digest.update(b"\0")
+        digest.update(hashlib.sha256(path.read_bytes()).hexdigest().encode())
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+#: The run-local aggregate sidecars ``reconcile_subject_attribute_outputs``
+#: always writes. The campaign-level compact reads the enriched samples straight
+#: from the run root, so they are part of the sealed source authority.
+_SUBJECT_ATTRIBUTE_SIDECAR_NAMES = (
+    "attributes.jsonl",
+    "enriched_samples.jsonl",
+    "summary.json",
+)
+
+
+def _subject_attribute_sidecars_sha256(storage: RunStorage) -> str:
+    """Combined digest of the run-local Subject Attributes sidecars.
+
+    All three must exist, because the reconciler writes them even when their
+    content is empty, and the digest covers the bytes so a later edit is durable
+    corruption rather than something a restart may quietly rewrite.
+    """
+    root = storage.root / "subject_attributes"
+    digest = hashlib.sha256()
+    for name in _SUBJECT_ATTRIBUTE_SIDECAR_NAMES:
+        path = root / name
+        if not path.is_file():
+            raise ValueError(f"subject attribute sidecar is missing: {path}")
+        digest.update(name.encode())
+        digest.update(b"\0")
+        digest.update(hashlib.sha256(path.read_bytes()).hexdigest().encode())
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _subject_attribute_receipts_sha256(
+    storage: RunStorage, clip_uids: Sequence[str]
+) -> str:
+    """Combined digest of one shard's final attribute receipts."""
+    digest = hashlib.sha256()
+    for uid in sorted(str(item) for item in clip_uids):
+        path = _attribute_receipt(storage, uid)
+        if not path.is_file():
+            raise ValueError(f"final attribute receipt is missing: {path}")
+        digest.update(uid.encode())
+        digest.update(b"\0")
+        digest.update(hashlib.sha256(path.read_bytes()).hexdigest().encode())
+        digest.update(b"\n")
+    return digest.hexdigest()
 
 
 def _attributes_complete(storage: RunStorage, clip: ClipRecord) -> bool:

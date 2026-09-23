@@ -62,13 +62,13 @@ from r2v_data_v2.v3.reference_edit_boogu import (
     BooguEditOutput,
     BooguSamReview,
 )
-from r2v_data_v2.v3.reference_judge import (
-    EntityReferenceDecisionAttempt,
-    subject_has_nontrivial_detached_component,
-)
 from r2v_data_v2.v3.reference_integrity import (
     SourceBboxFallbackJudgeFailure,
     SourceBboxFallbackReviewAttempt,
+)
+from r2v_data_v2.v3.reference_judge import (
+    EntityReferenceDecisionAttempt,
+    subject_has_nontrivial_detached_component,
 )
 from r2v_data_v2.v3.reference_prefilter import (
     NEAR_SILHOUETTE_RULE,
@@ -101,9 +101,9 @@ from r2v_data_v2.v3.schemas import (
     RawCrossPairDecision,
     RawEntityReferenceDecision,
     ReferencesState,
-    SourceBboxFallbackReview,
     SampledFrame,
     SampledFramesArtifact,
+    SourceBboxFallbackReview,
     TrackedEntityMasks,
     TrackedMaskFrame,
     TrackedMasksArtifact,
@@ -464,6 +464,113 @@ class _Judge:
 
     def close(self) -> None:
         self.close_calls += 1
+
+
+def _legacy_foreground_components(mask: np.ndarray):
+    """Test-only copy of the pre-native run/union implementation."""
+    binary = np.asarray(mask, dtype=bool)
+    if binary.ndim != 2 or not binary.any():
+        raise ValueError("component diagnostics require a non-empty 2D mask")
+
+    parents: list[int] = []
+    run_areas: list[int] = []
+    run_bboxes: list[tuple[int, int, int, int]] = []
+
+    def make_set(area: int, bbox_xyxy: tuple[int, int, int, int]) -> int:
+        label = len(parents)
+        parents.append(label)
+        run_areas.append(area)
+        run_bboxes.append(bbox_xyxy)
+        return label
+
+    def find(label: int) -> int:
+        root = label
+        while parents[root] != root:
+            root = parents[root]
+        while parents[label] != label:
+            parent = parents[label]
+            parents[label] = root
+            label = parent
+        return root
+
+    def union(first: int, second: int) -> None:
+        first_root = find(first)
+        second_root = find(second)
+        if first_root != second_root:
+            parents[max(first_root, second_root)] = min(first_root, second_root)
+
+    previous_runs: list[tuple[int, int, int]] = []
+    for row_index, row in enumerate(binary):
+        padded = np.pad(row.astype(np.int8, copy=False), (1, 1))
+        transitions = np.diff(padded)
+        starts = np.flatnonzero(transitions == 1)
+        ends = np.flatnonzero(transitions == -1)
+        current_runs: list[tuple[int, int, int]] = []
+        previous_index = 0
+        for start, end in zip(starts.tolist(), ends.tolist()):
+            label = make_set(end - start, (start, row_index, end, row_index + 1))
+            while (
+                previous_index < len(previous_runs)
+                and previous_runs[previous_index][1] < start
+            ):
+                previous_index += 1
+            overlap_index = previous_index
+            while (
+                overlap_index < len(previous_runs)
+                and previous_runs[overlap_index][0] <= end
+            ):
+                union(label, previous_runs[overlap_index][2])
+                overlap_index += 1
+            current_runs.append((start, end, label))
+        previous_runs = current_runs
+
+    component_areas: dict[int, int] = {}
+    component_bboxes: dict[int, tuple[int, int, int, int]] = {}
+    for label, area in enumerate(run_areas):
+        root = find(label)
+        component_areas[root] = component_areas.get(root, 0) + area
+        x1, y1, x2, y2 = run_bboxes[label]
+        previous = component_bboxes.get(root)
+        if previous is not None:
+            x1 = min(x1, previous[0])
+            y1 = min(y1, previous[1])
+            x2 = max(x2, previous[2])
+            y2 = max(y2, previous[3])
+        component_bboxes[root] = (x1, y1, x2, y2)
+
+    return tuple(
+        sorted(
+            (
+                pair_module.MaskComponent(
+                    area_pixels=area,
+                    bbox_xyxy=component_bboxes[root],
+                )
+                for root, area in component_areas.items()
+            ),
+            key=lambda component: (-component.area_pixels, component.bbox_xyxy),
+        )
+    )
+
+
+def test_native_foreground_components_matches_legacy_eight_connectivity() -> None:
+    rng = np.random.default_rng(20260922)
+    masks = [
+        np.ones((17, 23), dtype=bool),
+        np.eye(31, dtype=bool),
+        rng.random((73, 91)) < 0.08,
+        rng.random((73, 91)) < 0.55,
+    ]
+    structured = np.zeros((64, 80), dtype=bool)
+    structured[1:9, 1:9] = True
+    structured[9:17, 9:17] = True  # diagonal touch: legacy merges these
+    structured[30:50, 40:70] = True
+    masks.append(structured)
+
+    for mask in masks:
+        assert pair_module._foreground_components(mask) == _legacy_foreground_components(
+            mask
+        )
+
 
 
 @pytest.mark.parametrize(
@@ -5530,6 +5637,41 @@ def test_repairable_completion_accept_is_canonical_without_background_edit(
     )
     assert clip.references.entities[0].completion_needed_for_reference_use is True
     assert clip.references.entities[0].detached_target_fragments_present is True
+
+
+def test_generated_rgb_reference_reader_uses_layout_not_backend_label(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch, reference_edit_enabled=True)
+    storage = _storage(config, entity_types=("subject",))
+    pair_clips(config, storage, judge=_Judge({"e1": "repairable"}))
+    reference_edit_clips(
+        config,
+        storage,
+        backend=_ReferenceEditBackend(),
+        judge=_ReferenceEditJudge(),
+        sam_reviewer=_ReferenceEditSamReviewer(),
+    )
+    clip = storage.read_clip("clip-1")
+    reference = clip.references.entities[0]
+    metadata_path = storage.root / reference.generation_metadata_path
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert reference.synthetic is True
+    assert Path(reference.image_path).name == "final_reference_1k.png"
+
+    for backend in ("boogu_image_0_1_edit_turbo", "qwen_image_2_1", "custom"):
+        metadata["backend"] = backend
+        metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+        validate_entity_reference_artifact(
+            config,
+            storage,
+            "clip-1",
+            clip.annotation.entities[0],
+            reference,
+            storage.read_frames("clip-1"),
+            storage.read_masks("clip-1"),
+        )
 
 
 def test_repairable_completion_rejection_falls_back_to_source_alpha(
