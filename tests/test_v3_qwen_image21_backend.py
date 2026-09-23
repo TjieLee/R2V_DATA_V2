@@ -109,7 +109,7 @@ def _request(
         "instruction": "change the light",
         "thinking_enabled": False,
         "instruction_rewrite_enabled": rewrite,
-        "width": 48,
+        "width": 64,
         "height": 32,
         "seed": seed,
     }
@@ -131,7 +131,7 @@ def test_loaded_worker_skips_pe_when_rewrite_disabled(tmp_path: Path) -> None:
     assert processor.messages is None
     assert response["effective_instruction"] == "change the light"
     assert response["rewritten_instruction"] is None
-    assert response["returned_size"] == [48, 32]
+    assert response["returned_size"] == [64, 32]
     assert response["seed"] == 19
     assert pipe.calls[0]["prompt"] == "change the light"
     assert pipe.calls[0]["image"].mode == "RGB"
@@ -139,7 +139,7 @@ def test_loaded_worker_skips_pe_when_rewrite_disabled(tmp_path: Path) -> None:
     assert pipe.calls[0]["num_inference_steps"] == 40
     with Image.open(tmp_path / "a-out.png") as image:
         assert image.mode == "RGB"
-        assert image.size == (48, 32)
+        assert image.size == (64, 32)
 
 
 def test_loaded_worker_rewrites_with_source_image_before_generation(
@@ -163,7 +163,7 @@ def test_loaded_worker_rewrites_with_source_image_before_generation(
     assert user_content[0]["image"].mode == "RGB"
     assert user_content[1]["text"] == "change the light"
     assert pipe.calls[0]["prompt"] == "add soft light"
-    assert pipe.calls[0]["width"] == 48
+    assert pipe.calls[0]["width"] == 64
     assert pipe.calls[0]["height"] == 32
     assert pipe.calls[0]["generator"].seed == 27
     assert response["original_instruction"] == "change the light"
@@ -336,7 +336,7 @@ def test_subprocess_backend_reuses_one_process_and_preserves_contract(
                 source_rgb=Image.new("RGB", (32, 32)),
                 instruction="keep the subject",
                 width=32,
-                height=48,
+                height=64,
                 thinking_enabled=False,
                 instruction_rewrite_enabled=False,
                 seed=seed,
@@ -347,10 +347,10 @@ def test_subprocess_backend_reuses_one_process_and_preserves_contract(
         assert [item.worker_metadata["request_index"] for item in outputs] == [1, 2]
         assert outputs[0].original_instruction == "keep the subject"
         assert outputs[0].effective_instruction == "keep the subject"
-        assert outputs[0].returned_size == (32, 48)
+        assert outputs[0].returned_size == (32, 64)
         with Image.open(io.BytesIO(outputs[0].png_bytes)) as image:
             assert image.mode == "RGB"
-            assert image.size == (32, 48)
+            assert image.size == (32, 64)
     finally:
         backend.close()
     assert not backend.started

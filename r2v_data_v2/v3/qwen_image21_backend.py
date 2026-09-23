@@ -162,8 +162,8 @@ class QwenImage21SubprocessBackend:
         if seed is not None and (type(seed) is not int or seed < 0):
             raise ValueError("seed must be a non-negative integer")
         for name, value in (("width", width), ("height", height)):
-            if type(value) is not int or value <= 0 or value % 16:
-                raise ValueError(f"{name} must be a positive multiple of 16")
+            if type(value) is not int or value <= 0 or value % 32:
+                raise ValueError(f"{name} must be a positive multiple of 32")
         if not self.started:
             raise RuntimeError("Qwen-Image-2.1 worker must be started before editing")
         temporary_root = self.config.temporary_root

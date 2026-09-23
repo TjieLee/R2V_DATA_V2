@@ -104,8 +104,8 @@ def _validate_request(payload: object) -> dict[str, Any]:
     if type(rewrite) is not bool:
         raise TypeError("instruction_rewrite_enabled must be a boolean")
     for name in ("width", "height"):
-        if _positive_int(payload[name], name) % 16:
-            raise ValueError(f"{name} must be aligned to 16 pixels")
+        if _positive_int(payload[name], name) % 32:
+            raise ValueError(f"{name} must be aligned to 32 pixels")
     seed = payload.get("seed")
     if seed is not None and (type(seed) is not int or seed < 0):
         raise ValueError("seed must be a non-negative integer")

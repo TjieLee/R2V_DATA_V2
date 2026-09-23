@@ -815,7 +815,7 @@ reference_edit:
   prompt_enhancer_i2i_path: /mnt/workspace/public/pretrained/Qwen/Qwen-Image-2.1-PE-I2I
   num_inference_steps: 40
   target_area: 1048576
-  alignment: 16
+  alignment: 32
 ```
 
 These paths describe the future server smoke, not files required on a Mac.
