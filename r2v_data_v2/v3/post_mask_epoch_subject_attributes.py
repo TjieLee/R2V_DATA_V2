@@ -84,6 +84,7 @@ from r2v_data_v2.v3.subject_attributes import (
     OwnerEnrichmentMetrics,
     QwenSubjectAttributeClient,
     QwenSubjectAttributeCompletionJudge,
+    Sam3AttributeFrameSegmenter,
     SubjectAttributeBboxReview,
     SubjectAttributeCompletionReview,
     SubjectAttributeDiscovery,
@@ -235,6 +236,32 @@ class SubjectAttributeEpochError(RuntimeError):
 
 class SubjectAttributeDurableError(SubjectAttributeEpochError):
     """Raised when durable Subject Attributes state cannot be trusted."""
+
+
+def _resolve_attribute_segmentation_backend(handle: Any) -> Any:
+    """Adapt the shared raw SAM3 resource to the frame-local SAT surface.
+
+    Resource Epoch owns ``Sam3SegmentationBackend`` because Reference Edit needs
+    its temporal ``track`` API. Subject Attributes instead needs the existing
+    frame-local ``segment_frame`` / ``segment_generated_frame`` adapter. Reuse
+    the same live backend and predictor; never create or close another SAM3
+    model here.
+    """
+    if handle is None:
+        raise SubjectAttributeEpochError("subject attribute SAM epoch supplied no handle")
+    if callable(getattr(handle, "segment_frame", None)) and callable(
+        getattr(handle, "segment_generated_frame", None)
+    ):
+        return handle
+
+    from r2v_data_v2.v3.sam3_backend import Sam3SegmentationBackend
+
+    if isinstance(handle, Sam3SegmentationBackend):
+        return Sam3AttributeFrameSegmenter(handle.config, backend=handle)
+    raise SubjectAttributeEpochError(
+        "subject attribute SAM handle implements neither the attribute probe "
+        "surface nor Sam3SegmentationBackend"
+    )
 
 
 @dataclass(frozen=True)
@@ -3340,9 +3367,10 @@ class SubjectAttributeEpochRunner:
         frame_path = (context["storage"].root / candidate.image_path).resolve(
             strict=False
         )
+        segmenter = _resolve_attribute_segmentation_backend(handle)
         started = time.perf_counter()
         try:
-            returned = handle.segment_frame(
+            returned = segmenter.segment_frame(
                 frame_path=frame_path,
                 frame_slot=int(candidate.frame_slot),
                 grounding_prompt=str(
@@ -5982,9 +6010,10 @@ class SubjectAttributeEpochRunner:
                 str(payload.get("generated_png_path", "")),
             ),
         )
+        segmenter = _resolve_attribute_segmentation_backend(handle)
         started = time.perf_counter()
         try:
-            returned = handle.segment_generated_frame(
+            returned = segmenter.segment_generated_frame(
                 frame_path=output_path,
                 grounding_prompt=str(
                     context["attribute_plan"]["discovered"]["grounding_prompt"]
@@ -6358,5 +6387,6 @@ __all__ = [
     "SubjectAttributeEpochError",
     "SubjectAttributeEpochRunner",
     "SubjectAttributeEpochStats",
+    "_resolve_attribute_segmentation_backend",
     "resolve_subject_attribute_discovery_client",
 ]

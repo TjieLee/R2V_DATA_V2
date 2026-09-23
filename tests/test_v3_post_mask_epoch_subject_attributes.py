@@ -49,9 +49,12 @@ from r2v_data_v2.v3.post_mask_epoch_subject_attributes import (
     SubjectAttributeEpochError,
     SubjectAttributeEpochRunner,
     _image_png_sha256,
+    _resolve_attribute_segmentation_backend,
     _ReplaySegmentationBackend,
     _sha256_bytes,
 )
+from r2v_data_v2.v3.sam3_backend import Sam3SegmentationBackend
+from r2v_data_v2.v3.config import Sam3Config
 from r2v_data_v2.v3.subject_attributes import (
     ATTRIBUTE_COMPLETION_REVIEW_SYSTEM_PROMPT,
     DiscoveredSubjectAttribute,
@@ -62,6 +65,7 @@ from r2v_data_v2.v3.subject_attributes import (
     SubjectAttributeDiscovery,
     SubjectAttributeReview,
     SubjectAttributeReviewBatch,
+    Sam3AttributeFrameSegmenter,
     _owner_artifact_path,
     process_subject_attribute_clip,
 )
@@ -330,6 +334,17 @@ class _SamBackend:
         if isinstance(result, Exception):
             raise result
         return list(result)
+
+
+def test_resource_epoch_adapts_raw_sam3_backend_for_attribute_probes() -> None:
+    raw = Sam3SegmentationBackend(Sam3Config())
+    resolved = _resolve_attribute_segmentation_backend(raw)
+
+    assert isinstance(resolved, Sam3AttributeFrameSegmenter)
+    assert resolved._backend is raw
+
+    scripted = _SamBackend()
+    assert _resolve_attribute_segmentation_backend(scripted) is scripted
 
 
 class _QwenClient:
