@@ -5039,7 +5039,7 @@ def test_repairable_reference_runs_completion_only_with_one_worker(
     assert [call["thinking_enabled"] for call in backend.calls] == [True]
     assert [
         call["instruction_rewrite_enabled"] for call in backend.calls
-    ] == [False]
+    ] == [True]
     entity_phrase = storage.read_clip("clip-1").annotation.entities[0].phrase
     expected_instruction = (
         f'Complete the missing or broken parts of the same target entity: "{entity_phrase}".\n'
@@ -5104,7 +5104,7 @@ def test_complete_reference_does_not_start_boogu_runtime(
 
     assert backend.calls == []
     assert backend.start_calls == 0
-    assert config.reference_edit.completion_instruction_rewrite_enabled is False
+    assert config.reference_edit.completion_instruction_rewrite_enabled is True
     assert config.reference_edit.background_instruction_rewrite_enabled is False
 
 

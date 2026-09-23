@@ -169,7 +169,7 @@ _COUNTER_NAMES = (
 )
 
 DEFAULT_QWEN_JUDGE_MODEL = Path(
-    "/mnt/workspace/public/pretrained/Qwen/Qwen3-VL-32B-Instruct"
+    "/mnt/workspace/public/pretrained/Qwen/Qwen3-VL-8B-Instruct"
 )
 
 

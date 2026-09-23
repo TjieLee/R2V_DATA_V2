@@ -19,7 +19,7 @@ REMOVE_MODEL_RELATIVE_PATH = Path("Qwen/Qwen-Image-Edit-2511")
 REMOVE_ADAPTER_NAME = "Qwen-Image-Edit-2511-Object-Remover"
 REMOVE_BACKEND = "qwen_image_edit_2511_object_remover"
 BOOGU_REMOVE_BACKEND = "boogu_image_0_1_edit_turbo"
-REFERENCE_EDIT_BACKEND = "qwen_image_2_1"
+REFERENCE_EDIT_BACKEND = "boogu_image_0_1_edit_turbo"
 REFERENCE_EDIT_MODEL_REVISION = "hotfix-1k-20260708"
 SUBJECT_ATTRIBUTE_GME_BACKEND = "gme_qwen2_vl_2b_v1"
 SUBJECT_ATTRIBUTE_GME_MODEL_NAME = "Alibaba-NLP/gme-Qwen2-VL-2B-Instruct"
@@ -173,11 +173,12 @@ class ReferenceEditConfig:
     enabled: bool = False
     backend: str = REFERENCE_EDIT_BACKEND
     python_executable: Path = Path(
-        "/mnt/workspace/litengjie/data/venvs/qwen-image21/bin/python"
+        "/mnt/workspace/litengjie/data/venvs/boogu-image/bin/python"
     )
     code_root: Path = Path("/mnt/workspace/litengjie/data/vendor/Boogu-Image")
     model_path: Path = Path(
-        "/mnt/workspace/public/pretrained/Qwen/Qwen-Image-2.1"
+        "/mnt/workspace/litengjie/data/models/"
+        "Boogu-Image-0.1-Edit-Turbo-hotfix-1k-20260708"
     )
     prompt_enhancer_i2i_path: Path = Path(
         "/mnt/workspace/public/pretrained/Qwen/Qwen-Image-2.1-PE-I2I"
@@ -186,9 +187,9 @@ class ReferenceEditConfig:
     cuda_visible_devices: str = "0"
     num_inference_steps: int = 40
     target_area: int = 1024 * 1024
-    alignment: int = 32
+    alignment: int = 16
     timeout_seconds: int = 3600
-    completion_instruction_rewrite_enabled: bool = False
+    completion_instruction_rewrite_enabled: bool = True
     background_instruction_rewrite_enabled: bool = False
     add_background_to_complete: bool = True
     fallback_policy: str = "keep_source"

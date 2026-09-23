@@ -1117,6 +1117,9 @@ def test_qwen_factory_builds_the_managed_judge_server_epoch(
     assert not hasattr(resource, "workers"), "no remover worker pool may be loaded"
     assert qwen_config.tensor_parallel_size == 1
     assert qwen_config.data_parallel_size == 8
+    assert qwen_config.model_path == Path(
+        "/mnt/workspace/public/pretrained/Qwen/Qwen3-VL-8B-Instruct"
+    )
     assert qwen_config.served_model_name == str(
         config.qwen.background_remove_judge.model
     )

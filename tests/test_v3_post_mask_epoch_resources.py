@@ -380,6 +380,7 @@ def test_image_edit_worker_factory_selects_qwen_for_each_physical_gpu(
     model_path = Path("/mnt/workspace/public/pretrained/Qwen/Qwen-Image-2.1")
     pe_path = Path("/mnt/workspace/public/pretrained/Qwen/Qwen-Image-2.1-PE-I2I")
     config = SimpleNamespace(
+        backend="qwen_image_2_1",
         python_executable=python,
         model_path=model_path,
         prompt_enhancer_i2i_path=pe_path,
@@ -414,6 +415,52 @@ def test_image_edit_worker_factory_selects_qwen_for_each_physical_gpu(
     assert all(item.model_path == model_path for item in captured)
     assert all(item.prompt_enhancer_i2i_path == pe_path for item in captured)
     assert all(item.num_inference_steps == 40 for item in captured)
+
+
+def test_image_edit_worker_factory_selects_boogu_for_default_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    import r2v_data_v2.v3.reference_edit_boogu as boogu_module
+
+    allowed = (tmp_path / "workspace" / "data").resolve()
+    python = allowed / "venv" / "python"
+    code_root = allowed / "vendor" / "Boogu-Image"
+    model_path = allowed / "models" / "Boogu"
+    config = SimpleNamespace(
+        backend="boogu_image_0_1_edit_turbo",
+        python_executable=python,
+        code_root=code_root,
+        model_path=model_path,
+        model_revision="revision",
+        timeout_seconds=3600,
+    )
+    captured: list[Any] = []
+
+    class _Backend:
+        def __init__(self, worker_config: Any) -> None:
+            worker_config.validate()
+            captured.append(worker_config)
+
+        def start(self, *, stderr_log_path: Path) -> None:
+            pass
+
+    monkeypatch.setattr(boogu_module, "BooguSubprocessBackend", _Backend)
+
+    factory = boogu_worker_factory(
+        config=config,
+        temporary_root=allowed / "tmp",
+        allowed_server_root=allowed,
+        pool=WorkerPoolConfig(gpu_ids=(1, 3), timeout_seconds=900.0),
+    )
+    first = factory(0, 1)
+    second = factory(1, 3)
+
+    assert isinstance(first, _Backend) and isinstance(second, _Backend)
+    assert [item.cuda_visible_devices for item in captured] == ["1", "3"]
+    assert all(item.timeout_seconds == 900 for item in captured)
+    assert all(item.model_path == model_path for item in captured)
 
 
 def test_worker_epoch_loads_one_worker_per_gpu_once(tmp_path: Path):
