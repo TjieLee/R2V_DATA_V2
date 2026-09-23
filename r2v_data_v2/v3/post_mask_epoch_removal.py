@@ -1481,10 +1481,30 @@ class PreparedRemovalShard:
 
 
 def removal_shard_paths(
-    *, post_mask_root: Path, entity_mask_root: Path, shard: str
+    *,
+    post_mask_root: Path,
+    entity_mask_root: Path,
+    shard: str,
+    formal_production: bool = False,
 ) -> ShardPaths:
     """Stable Post-Mask paths for one canonical shard. Touches nothing."""
     shard_path = Path(entity_mask_root) / "parts" / f"{shard}.jsonl"
+    if formal_production:
+        from r2v_data_v2.v3 import config as config_module
+
+        if Path(post_mask_root).resolve() != (
+            config_module.OFFICIAL_POST_MASK_EXPORT_ROOT / "state"
+        ).resolve():
+            raise ValueError("formal Post-Mask state must use the official root")
+        return ShardPaths.for_shard(
+            Path(post_mask_root),
+            shard_path,
+            runs_root=(
+                config_module.ALLOWED_WRITABLE_ROOT
+                / "r2v_v3_runs/production/jea_motion_v1/in_pair_reference"
+            ),
+            exports_root=config_module.OFFICIAL_POST_MASK_EXPORT_ROOT / "shards",
+        )
     return ShardPaths.for_shard(Path(post_mask_root), shard_path)
 
 
@@ -1506,6 +1526,7 @@ def prepare_shard_storage(
     entity_mask_root: Path,
     shard: str,
     git_commit: str,
+    formal_production: bool = False,
 ) -> PreparedRemovalShard:
     """Initialize and hydrate one canonical shard.
 
@@ -1519,7 +1540,8 @@ def prepare_shard_storage(
     shard lock *before* any shard is mutated.
     """
     paths = removal_shard_paths(
-        post_mask_root=post_mask_root, entity_mask_root=entity_mask_root, shard=shard
+        post_mask_root=post_mask_root, entity_mask_root=entity_mask_root, shard=shard,
+        formal_production=formal_production,
     )
     storage = initialize_shard(config, paths, git_commit=git_commit)
     hydrated = hydrate_shard(
@@ -1685,7 +1707,11 @@ def expected_shard_completion(
 
 
 def export_shard(
-    storage: Any, paths: Any, clip_uids: Sequence[str]
+    storage: Any,
+    paths: Any,
+    clip_uids: Sequence[str],
+    *,
+    formal_production: bool = False,
 ) -> dict[str, Any]:
     """Publish or re-verify one shard's export under the Resource Epoch rules.
 
@@ -1702,6 +1728,17 @@ def export_shard(
     )
     from r2v_data_v2.v3.storage import DatasetExporter
     from r2v_data_v2.v3.subject_attributes import reconcile_subject_attribute_outputs
+
+    if formal_production:
+        from r2v_data_v2.v3.post_mask_epoch_production import (
+            cleanup_export_backups,
+            production_shard_completed,
+            write_production_shard_complete,
+        )
+
+        count = production_shard_completed(paths, clip_uids)
+        if count is not None:
+            return {"sample_count": count, "rebuilt": False}
 
     selected = _ShardStorage(storage, tuple(str(uid) for uid in clip_uids))
     marker = _shard_state_root(paths) / "completed.json"
@@ -1737,9 +1774,13 @@ def export_shard(
         _shard_state_root(paths) / "export_identity.json",
         _export_identity(selected, paths),
     )
-    DatasetExporter(storage.config, selected).export(
+    dataset = DatasetExporter(storage.config, selected).export(
         overwrite=Path(paths.export_root).exists()
     )
+    if formal_production:
+        cleanup_export_backups(paths)
+        write_production_shard_complete(paths, clip_uids, int(dataset.sample_count))
+        return {"sample_count": int(dataset.sample_count), "rebuilt": True}
     expected = expected_shard_completion(selected, paths, clip_uids)
     atomic_write_json(marker, expected)
     return {"sample_count": expected["sample_count"], "rebuilt": True}
@@ -1762,6 +1803,7 @@ def build_removal_epoch_runner(
     campaign: Mapping[str, Any] | None = None,
     canonical_shard_count: int | None = None,
     cpu_workers: int | None = None,
+    formal_production: bool = False,
 ) -> Callable[[Any, GroupLedger, Any], dict[str, Any]]:
     """Build the ``--job-runner`` callable for one removal resource epoch.
 
@@ -1827,6 +1869,7 @@ def build_removal_epoch_runner(
                 post_mask_root=post_mask_root,
                 entity_mask_root=entity_mask_root,
                 shard=shard,
+                formal_production=formal_production,
             )
             for shard in ordered_shards
         }
@@ -1843,12 +1886,16 @@ def build_removal_epoch_runner(
                     )
             # Only now, with every shard lock held, may anything be mutated.
             for shard in ordered_shards:
+                production_kwargs = (
+                    {"formal_production": True} if formal_production else {}
+                )
                 prepared_shard = prepare_shard_storage(
                     config,
                     post_mask_root=post_mask_root,
                     entity_mask_root=entity_mask_root,
                     shard=shard,
                     git_commit=git_commit,
+                    **production_kwargs,
                 )
                 prepared[shard] = prepared_shard
                 hydration[shard] = {
@@ -2104,8 +2151,12 @@ def build_removal_epoch_runner(
             if bool(outcome.get("subject_attributes_completed")):
                 try:
                     for shard in ordered_shards:
+                        production_kwargs = (
+                            {"formal_production": True} if formal_production else {}
+                        )
                         export_stats[shard] = export_shard(
-                            storages[shard], paths_by_shard[shard], eligible[shard]
+                            storages[shard], paths_by_shard[shard], eligible[shard],
+                            **production_kwargs,
                         )
                 except Exception as exc:  # noqa: BLE001 - never fake a completion
                     export_completed = False
@@ -2275,6 +2326,7 @@ def run_removal_epoch(
         repo_root=repo_root,
         canonical_shard_count=canonical_shard_count,
         cpu_workers=cpu_workers,
+        formal_production=os.environ.get("POST_MASK_FORMAL_PRODUCTION") == "1",
     )
     emit("post_mask_resource_epoch_cpu_workers", cpu_workers=cpu_workers)
     return runner(group, ledger, emit)

@@ -1,0 +1,51 @@
+# Fixed full-population Post-Mask Resource Epoch campaign.
+dataset_json: /mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/shots_f03_motion.jsonl
+run_root: /mnt/workspace/litengjie/data/r2v_v3_runs/production/jea_motion_v1/in_pair_reference/base
+export_root: /mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/in_pair_reference/shards
+source:
+  allow_full_run: true
+qwen:
+  annotation:
+    model: /mnt/workspace/public/pretrained/Qwen/Qwen3-VL-8B-Instruct
+    entity_selection_mode: reference_dense_v1
+  instruction_writer:
+    model: /mnt/workspace/public/pretrained/Qwen/Qwen3-VL-8B-Instruct
+  candidate_judge:
+    model: /mnt/workspace/public/pretrained/Qwen/Qwen3-VL-8B-Instruct
+  background_remove_judge:
+    model: /mnt/workspace/public/pretrained/Qwen/Qwen3-VL-8B-Instruct
+  background_final_judge:
+    model: /mnt/workspace/public/pretrained/Qwen/Qwen3-VL-8B-Instruct
+  cross_pair_judge:
+    model: /mnt/workspace/public/pretrained/Qwen/Qwen3-VL-8B-Instruct
+  reference_edit_judge:
+    model: /mnt/workspace/public/pretrained/Qwen/Qwen3-VL-8B-Instruct
+  reference_integrity_judge:
+    model: /mnt/workspace/public/pretrained/Qwen/Qwen3-VL-8B-Instruct
+sam3:
+  model_path: /mnt/workspace/public/pretrained/facebook/sam3/sam3.pt
+  object_rescue_mode: phrase_retry_v1
+coverage:
+  required_visible_frames: 7
+pair:
+  entity_geometry_mode: type_aware_v1
+  reference_prefilter_mode: conservative_v1
+  background_final_guard_mode: qwen_v1
+remove:
+  backend: boogu_image_0_1_edit_turbo
+  inference_profile: boogu_4step_v1
+  # Unused legacy field for Boogu; never select the Qwen-Image default.
+  base_model_path: /mnt/workspace/public/pretrained/Qwen/Qwen3-VL-8B-Instruct
+  adapter_path: null
+reference_edit:
+  enabled: true
+  scale_collapse_fallback_guard_mode: qwen_v1
+reference_integrity:
+  enabled: true
+subject_attribute_gme:
+  enabled: false
+subject_attributes:
+  completion:
+    enabled: true
+runtime:
+  cpu_workers: 16

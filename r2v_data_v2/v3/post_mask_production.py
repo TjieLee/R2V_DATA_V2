@@ -123,11 +123,19 @@ class ShardPaths:
             Path(exports).resolve() / shard.stem,
             state / "shards" / shard.stem,
         )
-        for path in (paths.run_root, paths.export_root, paths.state_root):
-            if not path.is_relative_to(writable.resolve()):
-                raise ValueError(
-                    "Post-Mask writes must stay inside allowed writable root"
-                )
+        official = config_module.OFFICIAL_POST_MASK_EXPORT_ROOT.resolve()
+        if not paths.run_root.is_relative_to(writable.resolve()):
+            raise ValueError("Post-Mask run root must stay private")
+        if not (
+            paths.export_root.is_relative_to(writable.resolve())
+            or paths.export_root.is_relative_to(official / "shards")
+        ):
+            raise ValueError("Post-Mask export path is outside allowed roots")
+        if not (
+            paths.state_root.is_relative_to(writable.resolve())
+            or paths.state_root.is_relative_to(official / "state")
+        ):
+            raise ValueError("Post-Mask state path is outside allowed roots")
         return paths
 
     @property

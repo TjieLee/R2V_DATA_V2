@@ -11,6 +11,10 @@ import yaml
 
 ALLOWED_WRITABLE_ROOT = Path("/mnt/workspace/litengjie/data").resolve()
 ALLOWED_DATASET_ROOT = Path("/mnt/workspace/public/dataset").resolve()
+OFFICIAL_POST_MASK_EXPORT_ROOT = (
+    ALLOWED_DATASET_ROOT
+    / "jea-video/moive-183t-0808_processed/in_pair_reference"
+).resolve()
 ALLOWED_PRETRAINED_ROOT = Path("/mnt/workspace/public/pretrained").resolve()
 ALLOWED_USER_MODEL_ROOT = Path("/mnt/workspace/litengjie/data/models").resolve()
 
@@ -442,14 +446,17 @@ class V3Config:
                 raise ValueError(
                     "source.limit is required for parent_stratified_random_v1"
                 )
-        for field_name, path in (
-            ("run_root", run_root),
-            ("export_root", export_root),
+        if not _is_strictly_below(run_root, ALLOWED_WRITABLE_ROOT):
+            raise ValueError("run_root must be inside /mnt/workspace/litengjie/data")
+        if not (
+            _is_strictly_below(export_root, ALLOWED_WRITABLE_ROOT)
+            or _is_at_or_below(
+                export_root, OFFICIAL_POST_MASK_EXPORT_ROOT / "shards"
+            )
         ):
-            if not _is_strictly_below(path, ALLOWED_WRITABLE_ROOT):
-                raise ValueError(
-                    f"{field_name} must be inside /mnt/workspace/litengjie/data"
-                )
+            raise ValueError(
+                "export_root must be in the writable or official Post-Mask tree"
+            )
         if (
             run_root == export_root
             or run_root in export_root.parents

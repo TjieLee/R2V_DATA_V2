@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Stream and atomically publish compact V3 production export manifests."""
 
 from __future__ import annotations
@@ -15,7 +14,7 @@ import sys
 import tempfile
 import uuid
 from contextlib import nullcontext
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TextIO
 
@@ -163,6 +162,9 @@ def _validate_roots(
     export_root = (
         config_module.ALLOWED_WRITABLE_ROOT / "r2v_v3_exports" / "production"
     ).resolve(strict=False)
+    official = config_module.OFFICIAL_POST_MASK_EXPORT_ROOT.resolve(strict=False)
+    if shards == official / "shards" and output == official:
+        return shards, output
     if export_root not in shards.parents or export_root not in output.parents:
         raise ValueError("production export paths must remain below r2v_v3_exports")
     return shards, output
@@ -189,7 +191,7 @@ def _validate_attribute_png(
             image_format = image.format
             image_mode = image.mode
             image.verify()
-    except Exception as exc:  # noqa: BLE001 - normalize decoder failures
+    except Exception as exc:
         raise ValueError(f"attribute reference is not a decodable image: {path}") from exc
     expected_modes = (
         {"RGB"}
@@ -726,7 +728,7 @@ def compact_production_exports(
                                 for reference in production.references
                             )
                     if enriched_by_id:
-                        orphan = sorted(enriched_by_id)[0]
+                        orphan = min(enriched_by_id)
                         raise ValueError(
                             f"orphan enriched sample_id in {shard_id}: {orphan}"
                         )
@@ -770,7 +772,7 @@ def compact_production_exports(
             "base_config_fingerprint": source_descriptor[
                 "base_config_fingerprint"
             ],
-            "created_at": created_at or datetime.now(timezone.utc).isoformat(),
+            "created_at": created_at or datetime.now(UTC).isoformat(),
             "samples_jsonl_sha256": samples_sha256,
             "included_shards": shard_catalog,
             "source_ranges": [
