@@ -10,15 +10,10 @@ import r2v_data_v2.v3.reference_prefilter as prefilter_module
 from r2v_data_v2.v3.pair import EntityReferenceCandidate
 from r2v_data_v2.v3.reference_prefilter import (
     NEAR_SILHOUETTE_RULE,
-    RELATIVE_BLUR_V2_RULE,
-    _subject_extreme_blur,
     _subject_near_silhouette,
-    _subject_relative_blur_v2,
     prefilter_entity_reference_candidates,
 )
 from r2v_data_v2.v3.schemas import AnnotationEntity
-
-EXTREME_BLUR_RULE = "subject_extreme_blur_v1"
 
 
 def _entity(reference_type: str = "subject") -> AnnotationEntity:
@@ -106,240 +101,74 @@ def test_near_silhouette_v1_keeps_frozen_conjunction(
     assert _subject_near_silhouette(metrics) is expected
 
 
-@pytest.mark.parametrize(
-    ("laplacian", "tenengrad", "edge_density", "expected"),
-    [
-        (5.0, 100.0, 0.05, True),
-        (5.01, 100.0, 0.05, False),
-        (5.0, 100.01, 0.05, False),
-        (5.0, 100.0, 0.051, False),
-    ],
-)
-def test_extreme_blur_thresholds_are_unchanged(
-    laplacian: float,
-    tenengrad: float,
-    edge_density: float,
-    expected: bool,
-) -> None:
-    assert (
-        _subject_extreme_blur(
-            _metrics(
-                laplacian=laplacian,
-                tenengrad=tenengrad,
-                edge_density=edge_density,
-            )
-        )
-        is expected
-    )
-
-
-def test_extreme_blur_filters_only_when_a_clearer_subject_candidate_exists(
+def test_relative_blur_is_disabled_even_for_three_subject_candidates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    candidates = [_candidate(index) for index in range(1, 4)]
     _install_metrics(
         monkeypatch,
         {
-            1: _metrics(laplacian=4, tenengrad=80, edge_density=0.03),
-            2: _metrics(laplacian=100, tenengrad=2000, edge_density=0.5),
+            1: _metrics(laplacian=100, tenengrad=2000),
+            2: _metrics(laplacian=1, tenengrad=10, edge_density=0.001),
+            3: _metrics(laplacian=90, tenengrad=1900),
         },
     )
+
+    result = prefilter_entity_reference_candidates(
+        _entity(), candidates, _source_images(3)
+    )
+
+    assert result.retained_candidates == tuple(candidates)
+    assert all(not decision.flagged for decision in result.decisions)
+    assert all(decision.laplacian_ratio is None for decision in result.decisions)
+    assert all(decision.tenengrad_ratio is None for decision in result.decisions)
+    assert all(
+        decision.relative_blur_v2_applicable is False
+        for decision in result.decisions
+    )
+    assert all(
+        decision.relative_blur_v2_inapplicable_reason == "relative_blur_disabled"
+        for decision in result.decisions
+    )
+
+
+def test_near_silhouette_still_filters_subject(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     candidates = [_candidate(1), _candidate(2)]
+    _install_metrics(
+        monkeypatch,
+        {
+            1: _metrics(
+                luma=10,
+                dark_fraction=0.99,
+                laplacian=4,
+                tenengrad=40,
+                edge_density=0.01,
+            ),
+            2: _metrics(laplacian=100, tenengrad=2000),
+        },
+    )
 
     result = prefilter_entity_reference_candidates(
         _entity(), candidates, _source_images(2)
     )
 
-    assert result.decisions[0].flagged_by == (EXTREME_BLUR_RULE,)
+    assert [item.candidate_id for item in result.retained_candidates] == [
+        "candidate_2"
+    ]
+    assert result.decisions[0].flagged_by == (NEAR_SILHOUETTE_RULE,)
     assert result.decisions[1].flagged_by == ()
-    assert [item.candidate_id for item in result.retained_candidates] == [
-        "candidate_2"
-    ]
 
 
-@pytest.mark.parametrize("candidate_count", [1, 3])
-def test_extreme_blur_fails_open_when_every_subject_candidate_is_extreme(
+@pytest.mark.parametrize("reference_type", ["object", "group"])
+def test_object_and_group_are_never_measured_or_filtered(
     monkeypatch: pytest.MonkeyPatch,
-    candidate_count: int,
-) -> None:
-    _install_metrics(
-        monkeypatch,
-        {
-            index: _metrics(
-                laplacian=2.0 + index * 0.1,
-                tenengrad=80 + index,
-                edge_density=0.03,
-            )
-            for index in range(1, candidate_count + 1)
-        },
-    )
-    candidates = [_candidate(index) for index in range(1, candidate_count + 1)]
-
-    result = prefilter_entity_reference_candidates(
-        _entity(), candidates, _source_images(candidate_count)
-    )
-
-    assert result.retained_candidates == tuple(candidates)
-    assert all(
-        EXTREME_BLUR_RULE not in decision.flagged_by
-        for decision in result.decisions
-    )
-
-
-def test_extreme_blur_remains_subject_only_and_combines_with_near_silhouette(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _install_metrics(
-        monkeypatch,
-        {
-            1: _metrics(
-                luma=10,
-                dark_fraction=0.99,
-                laplacian=4,
-                tenengrad=40,
-                edge_density=0.02,
-            )
-        },
-    )
-    candidate = [_candidate(1)]
-    source_images = _source_images(1)
-
-    subject = prefilter_entity_reference_candidates(_entity(), candidate, source_images)
-    object_result = prefilter_entity_reference_candidates(
-        _entity("object"), candidate, source_images
-    )
-
-    assert subject.decisions[0].flagged_by == (NEAR_SILHOUETTE_RULE,)
-    assert object_result.retained_candidates == tuple(candidate)
-    assert object_result.decisions[0].flagged_by == ()
-
-
-@pytest.mark.parametrize(
-    ("metrics", "laplacian_ratio", "tenengrad_ratio", "expected"),
-    [
-        (_metrics(laplacian=50, tenengrad=1500), 0.35, 0.50, True),
-        (_metrics(laplacian=51, tenengrad=1500), 0.35, 0.50, False),
-        (_metrics(laplacian=50, tenengrad=1501), 0.35, 0.50, False),
-        (_metrics(laplacian=50, tenengrad=1500), 0.36, 0.50, False),
-        (_metrics(laplacian=50, tenengrad=1500), 0.35, 0.51, False),
-    ],
-)
-def test_relative_blur_v2_keeps_frozen_relative_and_absolute_thresholds(
-    metrics: dict[str, object],
-    laplacian_ratio: float,
-    tenengrad_ratio: float,
-    expected: bool,
-) -> None:
-    assert (
-        _subject_relative_blur_v2(
-            metrics,
-            laplacian_ratio=laplacian_ratio,
-            tenengrad_ratio=tenengrad_ratio,
-        )
-        is expected
-    )
-
-
-def test_three_candidate_relative_blur_filters_without_renumbering(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    candidates = [_candidate(index) for index in range(1, 4)]
-    _install_metrics(
-        monkeypatch,
-        {
-            1: _metrics(laplacian=100, tenengrad=1000),
-            2: _metrics(laplacian=30, tenengrad=400),
-            3: _metrics(laplacian=90, tenengrad=900),
-        },
-    )
-
-    result = prefilter_entity_reference_candidates(
-        _entity(),
-        candidates,
-        _source_images(3),
-    )
-
-    assert [item.candidate_id for item in result.original_candidates] == [
-        "candidate_1",
-        "candidate_2",
-        "candidate_3",
-    ]
-    assert [item.candidate_id for item in result.retained_candidates] == [
-        "candidate_1",
-        "candidate_3",
-    ]
-    assert result.decisions[1].flagged_by == (RELATIVE_BLUR_V2_RULE,)
-    assert result.decisions[1].laplacian_ratio == pytest.approx(0.30)
-    assert result.decisions[1].tenengrad_ratio == pytest.approx(0.40)
-    assert candidates[1].candidate_id == "candidate_2"
-
-
-def test_two_candidate_near_silhouette_applies_but_relative_blur_does_not(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    candidates = [_candidate(1), _candidate(2)]
-    _install_metrics(
-        monkeypatch,
-        {
-            1: _metrics(
-                luma=10,
-                dark_fraction=0.99,
-                laplacian=4,
-                tenengrad=40,
-            ),
-            2: _metrics(laplacian=100, tenengrad=100),
-        },
-    )
-
-    result = prefilter_entity_reference_candidates(
-        _entity(),
-        candidates,
-        _source_images(2),
-    )
-
-    assert [item.candidate_id for item in result.retained_candidates] == [
-        "candidate_2"
-    ]
-    first = result.decisions[0]
-    assert first.flagged_by == (NEAR_SILHOUETTE_RULE,)
-    assert first.laplacian_ratio == pytest.approx(0.04)
-    assert first.tenengrad_ratio == pytest.approx(0.40)
-    assert first.relative_blur_v2_applicable is False
-    assert first.relative_blur_v2_inapplicable_reason == "requires_three_candidates"
-    assert RELATIVE_BLUR_V2_RULE not in first.flagged_by
-
-
-def test_object_candidates_are_measured_and_relative_blur_is_filtered(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _install_metrics(
-        monkeypatch,
-        {
-            1: _metrics(laplacian=100, tenengrad=2000),
-            2: _metrics(laplacian=30, tenengrad=800),
-            3: _metrics(laplacian=90, tenengrad=1900),
-        },
-    )
-    candidates = [_candidate(index) for index in range(1, 4)]
-
-    result = prefilter_entity_reference_candidates(
-        _entity("object"),
-        candidates,
-        _source_images(3),
-    )
-
-    assert [item.candidate_id for item in result.retained_candidates] == [
-        "candidate_1",
-        "candidate_3",
-    ]
-    assert result.decisions[1].flagged_by == (RELATIVE_BLUR_V2_RULE,)
-
-
-def test_group_candidates_are_never_measured_or_filtered(
-    monkeypatch: pytest.MonkeyPatch,
+    reference_type: str,
 ) -> None:
     def unexpected_metrics(*args: object) -> dict[str, object]:
         del args
-        raise AssertionError("group technical metrics must not run")
+        raise AssertionError("object/group technical metrics must not run")
 
     monkeypatch.setattr(
         prefilter_module,
@@ -349,45 +178,14 @@ def test_group_candidates_are_never_measured_or_filtered(
     candidates = [_candidate(index) for index in range(1, 4)]
 
     result = prefilter_entity_reference_candidates(
-        _entity("group"),
-        candidates,
-        _source_images(3),
+        _entity(reference_type), candidates, _source_images(3)
     )
 
     assert result.retained_candidates == tuple(candidates)
     assert all(not decision.flagged for decision in result.decisions)
     assert all(
-        decision.relative_blur_v2_inapplicable_reason == "subject_or_object_only"
+        decision.relative_blur_v2_inapplicable_reason == "subject_only"
         for decision in result.decisions
-    )
-
-
-def test_near_silhouette_rule_remains_subject_only(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    candidates = [_candidate(index) for index in range(1, 4)]
-    _install_metrics(
-        monkeypatch,
-        {
-            index: _metrics(
-                luma=10,
-                dark_fraction=0.99,
-                laplacian=4,
-                tenengrad=40,
-            )
-            for index in range(1, 4)
-        },
-    )
-
-    result = prefilter_entity_reference_candidates(
-        _entity("object"),
-        candidates,
-        _source_images(3),
-    )
-
-    assert result.retained_candidates == tuple(candidates)
-    assert all(
-        NEAR_SILHOUETTE_RULE not in item.flagged_by for item in result.decisions
     )
 
 
@@ -416,9 +214,7 @@ def test_prefilter_does_not_mutate_candidate_objects(
     _install_metrics(monkeypatch, {1: _metrics()})
 
     prefilter_entity_reference_candidates(
-        _entity(),
-        [candidate],
-        _source_images(1),
+        _entity(), [candidate], _source_images(1)
     )
 
     assert candidate == snapshot

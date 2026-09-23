@@ -11,7 +11,8 @@ from PIL import Image
 from r2v_data_v2.v3.reference_quality import cheap_foreground_technical_metrics
 
 NEAR_SILHOUETTE_RULE = "subject_near_silhouette_v1"
-SUBJECT_EXTREME_BLUR_RULE = "subject_extreme_blur_v1"
+# Legacy stats/debug key kept for compatibility. Production no longer applies
+# relative-blur filtering.
 RELATIVE_BLUR_V2_RULE = "subject_relative_blur_v2"
 
 
@@ -61,15 +62,6 @@ def _finite_metric(metrics: Mapping[str, object], field: str) -> float:
     return result
 
 
-def _safe_ratio(value: float, maximum: float) -> float | None:
-    if maximum <= 0:
-        return None
-    ratio = value / maximum
-    if not math.isfinite(ratio):
-        raise ValueError("relative blur ratio must be finite")
-    return ratio
-
-
 def _subject_near_silhouette(metrics: Mapping[str, object]) -> bool:
     return (
         _finite_metric(metrics, "luma_mean") <= 15
@@ -79,35 +71,16 @@ def _subject_near_silhouette(metrics: Mapping[str, object]) -> bool:
     )
 
 
-def _subject_extreme_blur(metrics: Mapping[str, object]) -> bool:
-    return (
-        _finite_metric(metrics, "laplacian_variance") <= 5
-        and _finite_metric(metrics, "tenengrad_mean") <= 100
-        and _finite_metric(metrics, "edge_density") <= 0.05
-    )
-
-
-def _subject_relative_blur_v2(
-    metrics: Mapping[str, object],
-    *,
-    laplacian_ratio: float | None,
-    tenengrad_ratio: float | None,
-) -> bool:
-    return bool(
-        laplacian_ratio is not None
-        and tenengrad_ratio is not None
-        and laplacian_ratio <= 0.35
-        and tenengrad_ratio <= 0.50
-        and _finite_metric(metrics, "laplacian_variance") <= 50
-        and _finite_metric(metrics, "tenengrad_mean") <= 1500
-    )
-
-
 def prefilter_entity_reference_candidates[CandidateT: CandidateLike](
     entity: EntityLike,
     candidates: Sequence[CandidateT],
     source_images: Mapping[str, Image.Image],
 ) -> ReferencePrefilterResult[CandidateT]:
+    """Apply only the frozen near-silhouette subject prefilter.
+
+    Relative sharpness/blur comparisons and the later extreme-blur filter are
+    intentionally disabled. Objects and groups bypass technical measurement.
+    """
     original = tuple(candidates)
     if not original:
         raise ValueError("reference prefilter requires candidates")
@@ -115,7 +88,7 @@ def prefilter_entity_reference_candidates[CandidateT: CandidateLike](
     if len(set(candidate_ids)) != len(candidate_ids):
         raise ValueError("reference prefilter candidate IDs must be unique")
 
-    if entity.reference_type not in {"subject", "object"}:
+    if entity.reference_type != "subject":
         decisions = tuple(
             ReferencePrefilterDecision(
                 candidate_id=candidate.candidate_id,
@@ -125,7 +98,7 @@ def prefilter_entity_reference_candidates[CandidateT: CandidateLike](
                 laplacian_ratio=None,
                 tenengrad_ratio=None,
                 relative_blur_v2_applicable=False,
-                relative_blur_v2_inapplicable_reason="subject_or_object_only",
+                relative_blur_v2_inapplicable_reason="subject_only",
             )
             for candidate in original
         )
@@ -135,76 +108,34 @@ def prefilter_entity_reference_candidates[CandidateT: CandidateLike](
             decisions=decisions,
         )
 
-    technical_metrics: list[dict[str, object]] = []
-    laplacians: list[float] = []
-    tenengrads: list[float] = []
+    decisions: list[ReferencePrefilterDecision] = []
+    retained: list[CandidateT] = []
     for candidate in original:
         source_image = source_images.get(candidate.image_path)
         if source_image is None:
             raise ValueError("reference prefilter source image is missing")
         source_rgb = np.asarray(source_image.convert("RGB"), dtype=np.uint8)
         metrics = cheap_foreground_technical_metrics(source_rgb, candidate.mask)
-        technical_metrics.append(metrics)
-        laplacians.append(_finite_metric(metrics, "laplacian_variance"))
-        tenengrads.append(_finite_metric(metrics, "tenengrad_mean"))
-
-    relative_blur_applicable = len(original) == 3
-    inapplicable_reason = (
-        None if relative_blur_applicable else "requires_three_candidates"
-    )
-    extreme_blur = [
-        entity.reference_type == "subject" and _subject_extreme_blur(metrics)
-        for metrics in technical_metrics
-    ]
-    # Whole-subject sharpness is only a safe deterministic filter when at
-    # least one candidate provides a clearly better alternative. If every
-    # candidate looks "extreme" to these coarse mask-wide metrics, keep them
-    # all and let the VLM judge facial identity/recognizability semantically.
-    extreme_blur_filter_applicable = (
-        entity.reference_type == "subject" and any(not flagged for flagged in extreme_blur)
-    )
-    max_laplacian = max(laplacians)
-    max_tenengrad = max(tenengrads)
-    decisions_list: list[ReferencePrefilterDecision] = []
-    retained: list[CandidateT] = []
-    for candidate, metrics, laplacian, tenengrad, extreme_blur_flag in zip(
-        original,
-        technical_metrics,
-        laplacians,
-        tenengrads,
-        extreme_blur,
-        strict=True,
-    ):
-        laplacian_ratio = _safe_ratio(laplacian, max_laplacian)
-        tenengrad_ratio = _safe_ratio(tenengrad, max_tenengrad)
-        flagged_by: list[str] = []
-        if entity.reference_type == "subject" and _subject_near_silhouette(metrics):
-            flagged_by.append(NEAR_SILHOUETTE_RULE)
-        if extreme_blur_filter_applicable and extreme_blur_flag:
-            flagged_by.append(SUBJECT_EXTREME_BLUR_RULE)
-        if relative_blur_applicable and _subject_relative_blur_v2(
-            metrics,
-            laplacian_ratio=laplacian_ratio,
-            tenengrad_ratio=tenengrad_ratio,
-        ):
-            flagged_by.append(RELATIVE_BLUR_V2_RULE)
-        flagged = bool(flagged_by)
-        if not flagged:
+        flagged_by = (
+            (NEAR_SILHOUETTE_RULE,) if _subject_near_silhouette(metrics) else ()
+        )
+        if not flagged_by:
             retained.append(candidate)
-        decisions_list.append(
+        decisions.append(
             ReferencePrefilterDecision(
                 candidate_id=candidate.candidate_id,
-                flagged=flagged,
-                flagged_by=tuple(flagged_by),
+                flagged=bool(flagged_by),
+                flagged_by=flagged_by,
                 technical_metrics=metrics,
-                laplacian_ratio=laplacian_ratio,
-                tenengrad_ratio=tenengrad_ratio,
-                relative_blur_v2_applicable=relative_blur_applicable,
-                relative_blur_v2_inapplicable_reason=inapplicable_reason,
+                laplacian_ratio=None,
+                tenengrad_ratio=None,
+                relative_blur_v2_applicable=False,
+                relative_blur_v2_inapplicable_reason="relative_blur_disabled",
             )
         )
+
     return ReferencePrefilterResult(
         original_candidates=original,
         retained_candidates=tuple(retained),
-        decisions=tuple(decisions_list),
+        decisions=tuple(decisions),
     )
