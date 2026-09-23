@@ -25,7 +25,10 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+import threading
+import time
 from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -266,6 +269,15 @@ class ReferenceEditEpochRunner:
         }
         self.emit = emit or (lambda *args, **kwargs: None)
         self.review_execution = review_execution
+        self._seed_counter_lock = threading.Lock()
+        self._seed_active = 0
+        self.seed_counters: dict[str, int | float] = {
+            "prepare_tasks": 0,
+            "prepare_parallel_tasks": 0,
+            "prepare_peak_inflight": 0,
+            "prepare_batches": 0,
+            "prepare_wall_seconds": 0.0,
+        }
 
     # -- durable roots -----------------------------------------------------
 
@@ -1076,9 +1088,55 @@ class ReferenceEditEpochRunner:
 
     # -- chain replay ----------------------------------------------------------
 
+    def _prepare_seed_clip(
+        self, target: tuple[str, RunStorage, str, Mapping[str, Any]]
+    ) -> tuple[Any, dict[str, tuple[Any, Any, Any] | Exception], float]:
+        shard, storage, clip_uid, plan = target
+        started = time.perf_counter()
+        with self._seed_counter_lock:
+            self._seed_active += 1
+            self.seed_counters["prepare_peak_inflight"] = max(
+                int(self.seed_counters["prepare_peak_inflight"]), self._seed_active
+            )
+        try:
+            clip = self._clip(storage, clip_uid)
+            references = {item.entity_id: item for item in clip.references.entities}
+            contexts: dict[str, tuple[Any, Any, Any] | Exception] = {}
+            for entity_id in plan["clips"][clip_uid]["chain_entity_ids"]:
+                try:
+                    if self._entity_outcome(shard, clip_uid, entity_id) is not None:
+                        continue
+                    contexts[entity_id] = self._entity_route_context(
+                        storage, clip, references[entity_id]
+                    )
+                except Exception as exc:  # noqa: BLE001 - re-raised in entity order
+                    contexts[entity_id] = exc
+            return clip, contexts, time.perf_counter() - started
+        finally:
+            with self._seed_counter_lock:
+                self._seed_active -= 1
+
+    def _commit_seed_clip(
+        self,
+        target: tuple[str, RunStorage, str, Mapping[str, Any]],
+        prepared: tuple[Any, dict[str, tuple[Any, Any, Any] | Exception], float],
+        jobs: list[ModelJob],
+    ) -> None:
+        shard, storage, clip_uid, plan = target
+        clip, contexts, wall_seconds = prepared
+        self.seed_counters["prepare_tasks"] += 1
+        self.seed_counters["prepare_wall_seconds"] += wall_seconds
+        jobs.extend(
+            self._advance_clip(
+                shard, storage, clip_uid, plan,
+                prepared_clip=clip, prepared_contexts=contexts,
+            )
+        )
+
     def seed_jobs(self) -> list[ModelJob]:
         """CPU fixed point over every fresh clip, then pending model jobs."""
         jobs: list[ModelJob] = []
+        targets: list[tuple[str, RunStorage, str, Mapping[str, Any]]] = []
         for shard in sorted(self.storages):
             plan = self._plan(shard)
             storage = self._storage_for(shard)
@@ -1088,15 +1146,45 @@ class ReferenceEditEpochRunner:
                     continue
                 if self._clip_outcome_path(shard, clip_uid).is_file():
                     continue
+                targets.append((shard, storage, clip_uid, plan))
+
+        def commit(target, prepared):
+            shard, storage, clip_uid, _plan = target
+            try:
+                self._commit_seed_clip(target, prepared, jobs)
+            except ReferenceEditDurableError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - legacy clip isolation
+                self._fail_clip_terminal(shard, storage, clip_uid, exc)
+
+        workers = max(1, int(self.cpu_workers))
+        if workers == 1 or len(targets) <= 1:
+            for target in targets:
                 try:
-                    jobs.extend(self._advance_clip(shard, storage, clip_uid, plan))
+                    prepared = self._prepare_seed_clip(target)
                 except ReferenceEditDurableError:
-                    # Durable corruption is never a semantic clip failure.
                     raise
                 except Exception as exc:  # noqa: BLE001 - legacy clip isolation
-                    # Ordinary legacy CPU failure: terminal for THIS clip,
-                    # other clips continue.
-                    self._fail_clip_terminal(shard, storage, clip_uid, exc)
+                    self._fail_clip_terminal(target[0], target[1], target[2], exc)
+                    continue
+                commit(target, prepared)
+        else:
+            budget = workers * 2
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                for start in range(0, len(targets), budget):
+                    batch = targets[start : start + budget]
+                    self.seed_counters["prepare_batches"] += 1
+                    self.seed_counters["prepare_parallel_tasks"] += len(batch)
+                    futures = [pool.submit(self._prepare_seed_clip, target) for target in batch]
+                    for target, future in zip(batch, futures, strict=True):
+                        try:
+                            prepared = future.result()
+                        except ReferenceEditDurableError:
+                            raise
+                        except Exception as exc:  # noqa: BLE001 - legacy clip isolation
+                            self._fail_clip_terminal(target[0], target[1], target[2], exc)
+                            continue
+                        commit(target, prepared)
         jobs.sort(key=lambda job: job.job_id())
         self.ledger.phase(REFERENCE_EDIT_PHASE).write_plan(jobs)
         return jobs
@@ -1112,6 +1200,9 @@ class ReferenceEditEpochRunner:
         storage: RunStorage,
         clip_uid: str,
         plan: Mapping[str, Any],
+        *,
+        prepared_clip: Any | None = None,
+        prepared_contexts: Mapping[str, tuple[Any, Any, Any] | Exception] | None = None,
     ) -> list[ModelJob]:
         """Chain every entity of one clip; publish the clip when terminal.
 
@@ -1120,7 +1211,7 @@ class ReferenceEditEpochRunner:
         reads, parses or re-verifies the shard plan again - which is what used to
         cost O(clips^2) whole-shard rescans per shard.
         """
-        clip = self._clip(storage, clip_uid)
+        clip = prepared_clip if prepared_clip is not None else self._clip(storage, clip_uid)
         entities = {entity.entity_id: entity for entity in clip.annotation.entities}
         jobs: list[ModelJob] = []
         for entity_id in plan["clips"][clip_uid]["chain_entity_ids"]:
@@ -1136,8 +1227,17 @@ class ReferenceEditEpochRunner:
             )
             entity = entities[entity_id]
             assert reference is not None
+            route_context = (
+                prepared_contexts[entity_id]
+                if prepared_contexts is not None else None
+            )
+            if isinstance(route_context, Exception):
+                raise route_context
             jobs.extend(
-                self._advance_entity(shard, storage, clip_uid, entity, reference)
+                self._advance_entity(
+                    shard, storage, clip_uid, entity, reference,
+                    route_context=route_context,
+                )
             )
         if not jobs:
             self._publish_clip_if_terminal(shard, storage, clip_uid)
@@ -1161,11 +1261,14 @@ class ReferenceEditEpochRunner:
         clip_uid: str,
         entity: Any,
         reference: Any,
+        *,
+        route_context: tuple[Any, Any, Any] | None = None,
     ) -> list[ModelJob]:
-        clip = self._clip(storage, clip_uid)
-        source_geometry, gate_reason, route = self._entity_route_context(
-            storage, clip, reference
-        )
+        if route_context is None:
+            route_context = self._entity_route_context(
+                storage, self._clip(storage, clip_uid), reference
+            )
+        source_geometry, gate_reason, route = route_context
         entity_variant_route = bool(
             entity.reference_type in {"subject", "object"}
             and route in {"complete", "local_usable", "repairable"}

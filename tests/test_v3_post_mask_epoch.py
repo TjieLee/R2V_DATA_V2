@@ -629,7 +629,9 @@ def test_scheduler_fails_clearly_when_a_ready_resource_has_no_executor(tmp_path:
         scheduler.run([_job(resource=RESOURCE_SAM)])
 
 
-def test_scheduler_fails_closed_on_receipt_mismatch(tmp_path: Path):
+def test_scheduler_fails_closed_on_receipt_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     job = _job()
     ledger = GroupLedger(tmp_path / "group")
     executor = _FakeBatchExecutor()
@@ -637,6 +639,10 @@ def test_scheduler_fails_closed_on_receipt_mismatch(tmp_path: Path):
     ledger.phase(ledger.phase_ids()[0]).publish_artifact(
         job.job_id(), "out.png", b"tampered"
     )
+    def no_plan_write(self, jobs):
+        raise AssertionError("a mismatched receipt must fail before plan mutation")
+
+    monkeypatch.setattr(PhaseLedger, "write_plan", no_plan_write)
     with pytest.raises(SchedulerError):
         _scheduler(tmp_path, {RESOURCE_BOOGU: executor}, lambda j, r: ()).run([job])
 
@@ -1690,6 +1696,97 @@ def _stream_scheduler(tmp_path: Path, executor: Any, finalize: Any) -> Any:
         finalize=finalize,
         executors={RESOURCE_BOOGU: executor, RESOURCE_QWEN: executor},
     )
+
+
+def test_global_ready_frontier_and_execution_telemetry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    jobs = [
+        _job(clip_uid=f"clip-{index:06d}", resource=RESOURCE_SAM)
+        for index in range(1000)
+    ]
+    executor = _ScriptedExecutor(
+        capacity=8, completions=[[jobs[0].job_id()]]
+    )
+    writes = []
+    original_write_plan = PhaseLedger.write_plan
+
+    def counted_write_plan(self, current_jobs):
+        writes.append(len(current_jobs))
+        return original_write_plan(self, current_jobs)
+
+    monkeypatch.setattr(PhaseLedger, "write_plan", counted_write_plan)
+    original_submit = executor.submit
+
+    def checked_submit(job):
+        assert writes == [1000], "the full ready frontier must be planned first"
+        original_submit(job)
+
+    monkeypatch.setattr(executor, "submit", checked_submit)
+    outcome = ResourceEpochScheduler(
+        ledger=GroupLedger(tmp_path / "frontier"),
+        finalize=lambda job, result: (),
+        executors={RESOURCE_SAM: executor},
+    ).run(jobs)
+
+    counters = outcome["diagnostics"]["resources"][RESOURCE_SAM]
+    assert outcome["completed"] is True
+    assert counters["executor_capacity"] == 8
+    assert counters["peak_ready_jobs"] == 1000
+    assert counters["peak_inflight"] == 8
+    assert counters["refill_count"] >= 1
+    assert counters["jobs_per_epoch"] == [1000]
+    assert executor.submit_order[8] == jobs[8].job_id()
+    assert writes == [1000], "ready work is planned once, not rehashed per refill"
+
+
+def test_independent_completion_chains_fill_each_resource_without_speculation(
+    tmp_path: Path,
+):
+    clips = [f"clip-{index:06d}" for index in range(32)]
+    generations = [
+        _job(job_type="attribute_completion_generate", clip_uid=uid)
+        for uid in clips
+    ]
+    postchecks = {
+        uid: _job(job_type="attribute_completion_postcheck", resource=RESOURCE_SAM,
+                  clip_uid=uid)
+        for uid in clips
+    }
+    reviews = {
+        uid: _job(job_type="attribute_completion_review", resource=RESOURCE_QWEN,
+                  clip_uid=uid)
+        for uid in clips
+    }
+    boogu = _ScriptedExecutor(capacity=8)
+    sam = _ScriptedExecutor(capacity=8)
+    qwen = _ScriptedExecutor(capacity=32)
+
+    def finalize(job: ModelJob, result: JobResult):
+        if job.resource == RESOURCE_BOOGU:
+            return (postchecks[job.clip_uid],)
+        if job.resource == RESOURCE_SAM:
+            return (reviews[job.clip_uid],)
+        return ()
+
+    outcome = ResourceEpochScheduler(
+        ledger=GroupLedger(tmp_path / "completion"),
+        finalize=finalize,
+        executors={
+            RESOURCE_BOOGU: boogu,
+            RESOURCE_SAM: sam,
+            RESOURCE_QWEN: qwen,
+        },
+    ).run(generations)
+    assert outcome["completed"] is True
+    assert outcome["job_count"] == 96
+    assert len(boogu.submit_order) == len(sam.submit_order) == len(qwen.submit_order) == 32
+    for resource, capacity in ((RESOURCE_BOOGU, 8), (RESOURCE_SAM, 8),
+                               (RESOURCE_QWEN, 32)):
+        counters = outcome["diagnostics"]["resources"][resource]
+        assert counters["peak_ready_jobs"] == 32
+        assert counters["peak_inflight"] == capacity
+        assert counters["jobs_per_epoch"] == [32]
 
 
 def test_streaming_refills_a_freed_slot_before_slow_siblings_settle(tmp_path: Path):

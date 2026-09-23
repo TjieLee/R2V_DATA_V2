@@ -54,6 +54,7 @@ from r2v_data_v2.v3.post_mask_epoch_scheduler import (
 #: for a pure execution decision. It never reaches a ModelJob, an input digest, a
 #: semantic plan, a receipt or any public schema.
 CPU_WORKERS_ENV = "POST_MASK_CPU_WORKERS"
+QWEN_MAX_INFLIGHT_ENV = "POST_MASK_QWEN_MAX_INFLIGHT"
 
 #: Kept for compatibility with callers that never set the environment.
 DEFAULT_CPU_WORKERS = 8
@@ -88,6 +89,24 @@ def resolve_cpu_workers(config: Any = None) -> int:
     if isinstance(fallback, int) and not isinstance(fallback, bool) and fallback >= 1:
         return fallback
     return DEFAULT_CPU_WORKERS
+
+
+def resolve_qwen_max_inflight() -> int:
+    """Execution-only Qwen request concurrency; absent override keeps DP8 default."""
+    raw = os.environ.get(QWEN_MAX_INFLIGHT_ENV, "").strip()
+    if not raw:
+        return 8
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise EpochResourceError(
+            f"{QWEN_MAX_INFLIGHT_ENV} must be a positive integer"
+        ) from exc
+    if value < 1:
+        raise EpochResourceError(
+            f"{QWEN_MAX_INFLIGHT_ENV} must be a positive integer"
+        )
+    return value
 
 
 def resolve_hash_workers(config: Any = None, *, tasks: int | None = None) -> int:
@@ -1137,12 +1156,12 @@ class ResourceEpochManager:
             if callable(close):
                 try:
                     close()
-                except BaseException as exc:  # cleanup must still unload the GPU model
+                except BaseException as exc:  # noqa: BLE001 - cleanup must unload the GPU model
                     executor_error = exc
             if owned_resource is not None:
                 try:
                     owned_resource.stop()
-                except BaseException as exc:
+                except BaseException as exc:  # noqa: BLE001 - cleanup must finish
                     resource_error = exc
                 else:
                     # Snapshot after the stop so shutdown time and stop_count are

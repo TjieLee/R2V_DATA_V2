@@ -248,6 +248,12 @@ def _emit_subject_attributes_cpu_diagnostics(
     _emit(emit, "post_mask_epoch_subject_attributes_cpu_diagnostics", **counters)
 
 
+def _emit_seed_cpu_diagnostics(emit: Any, stage: str, runner: Any) -> None:
+    counters = dict(getattr(runner, "seed_counters", None) or {})
+    if counters:
+        _emit(emit, "post_mask_epoch_seed_cpu_diagnostics", stage=stage, **counters)
+
+
 def _run_staged_scheduler(
     emit: Any, scheduler: Any, jobs: Any, *, stage: str, phase: str
 ) -> dict[str, Any]:
@@ -1040,6 +1046,7 @@ def run_removal_pair_epochs(
     try:
         with _stage_timing(emit, "removal", "seed"):
             removal_seed = removal.seed_jobs()
+        _emit_seed_cpu_diagnostics(emit, "removal", removal)
         _emit(emit,"post_mask_epoch_removal_seeded",seeded_jobs=len(removal_seed))
         removal_outcome = _run_staged_scheduler(
             emit,
@@ -1304,6 +1311,7 @@ def run_removal_pair_epochs(
         reference_edit = reference_edit_runner_factory(**shared)
         with _stage_timing(emit, "reference_edit", "seed"):
             reference_edit_seed = reference_edit.seed_jobs()
+        _emit_seed_cpu_diagnostics(emit, "reference_edit", reference_edit)
         result["reference_edit_job_count"] = len(reference_edit_seed)
         reference_edit_outcome = _run_staged_scheduler(
             emit,

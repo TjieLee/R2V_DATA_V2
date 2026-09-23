@@ -43,6 +43,7 @@ from r2v_data_v2.v3.post_mask_epoch_resources import (
     port_in_use,
     resolve_cpu_workers,
     resolve_hash_workers,
+    resolve_qwen_max_inflight,
     served_model_ids,
 )
 from r2v_data_v2.v3.post_mask_epoch_scheduler import ResourceEpochScheduler
@@ -627,6 +628,113 @@ def test_qwen_executor_sends_requests_concurrently():
     results = executor.execute_batch(jobs)
     assert len(results) == 8
     assert tracker.max_active == 8
+
+
+def test_qwen_execution_only_inflight_32_exceeds_dp8(monkeypatch):
+    monkeypatch.setenv("POST_MASK_QWEN_MAX_INFLIGHT", "32")
+    assert resolve_qwen_max_inflight() == 32
+    tracker = _Tracker(parties=32)
+
+    def runner(job: ModelJob, endpoint: object) -> JobResult:
+        tracker.enter()
+        try:
+            tracker.barrier.wait(timeout=10)
+            return JobResult(OUTCOME_COMPLETED, payload={})
+        finally:
+            tracker.exit()
+
+    jobs = [_qwen_job(f"clip-{i:03d}") for i in range(32)]
+    ids = [job.job_id() for job in jobs]
+    results = QwenConcurrentExecutor(
+        runner, max_inflight=resolve_qwen_max_inflight()
+    ).execute_batch(jobs)
+    assert len(results) == 32
+    assert tracker.max_active == 32
+    assert [job.job_id() for job in jobs] == ids
+
+
+def test_qwen_inflight_override_is_not_semantic_config(monkeypatch, tmp_path):
+    from tests.test_v3_pair import _config
+
+    config = _config(tmp_path, monkeypatch)
+    fingerprint = config.fingerprint()
+    monkeypatch.setenv("POST_MASK_QWEN_MAX_INFLIGHT", "8")
+    assert resolve_qwen_max_inflight() == 8
+    job_id = _qwen_job("clip-identity").job_id()
+    monkeypatch.setenv("POST_MASK_QWEN_MAX_INFLIGHT", "64")
+    assert resolve_qwen_max_inflight() == 64
+    assert config.fingerprint() == fingerprint
+    assert _qwen_job("clip-identity").job_id() == job_id
+    monkeypatch.setenv("POST_MASK_QWEN_MAX_INFLIGHT", "0")
+    with pytest.raises(EpochResourceError, match="POST_MASK_QWEN_MAX_INFLIGHT"):
+        resolve_qwen_max_inflight()
+
+
+@pytest.mark.parametrize("resource", [RESOURCE_SAM, RESOURCE_BOOGU])
+def test_eight_gpu_slots_refill_from_thirty_two_ready_jobs(resource):
+    first_wave_ready = threading.Event()
+    release_slow = threading.Event()
+    ninth_started = threading.Event()
+    lock = threading.Lock()
+    active = 0
+    peak = 0
+    started = 0
+    slots: set[int] = set()
+
+    def runner(job: ModelJob, slot: int) -> JobResult:
+        nonlocal active, peak, started
+        with lock:
+            active += 1
+            started += 1
+            peak = max(peak, active)
+            slots.add(slot)
+            if started == 8:
+                first_wave_ready.set()
+            if job.clip_uid == "clip-08":
+                ninth_started.set()
+        try:
+            if job.clip_uid == "clip-00":
+                assert first_wave_ready.wait(5)
+            elif job.clip_uid in {f"clip-{i:02d}" for i in range(1, 8)}:
+                assert release_slow.wait(5)
+            return JobResult(OUTCOME_COMPLETED, payload={})
+        finally:
+            with lock:
+                active -= 1
+
+    jobs = [
+        ModelJob.create(
+            job_type="probe", resource=resource,
+            canonical_shard="shard-000000000-000000999",
+            clip_uid=f"clip-{i:02d}", semantic_inputs={"x": 1},
+            model_identity="fake",
+        )
+        for i in range(32)
+    ]
+    executor = WorkerSlotExecutor(runner, slot_count=8)
+    try:
+        for job in jobs[:8]:
+            executor.submit(job)
+        assert first_wave_ready.wait(5)
+        first = executor.collect()
+        assert [item.job.clip_uid for item in first] == ["clip-00"]
+        executor.submit(jobs[8])
+        assert ninth_started.wait(5), "free slot must refill before slow siblings"
+        release_slow.set()
+        completed = 1
+        next_index = 9
+        while completed < len(jobs):
+            results = executor.collect()
+            completed += len(results)
+            for _ in results:
+                if next_index < len(jobs):
+                    executor.submit(jobs[next_index])
+                    next_index += 1
+        assert peak == 8
+        assert slots == set(range(8))
+    finally:
+        release_slow.set()
+        executor.close()
 
 
 def test_qwen_executor_respects_max_inflight():

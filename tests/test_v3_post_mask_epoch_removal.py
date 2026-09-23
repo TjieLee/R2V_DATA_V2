@@ -17,6 +17,8 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
+import threading
+import time
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -1974,6 +1976,54 @@ def test_seed_jobs_only_reads_the_explicit_eligible_view(
     assert {job.clip_uid for job in jobs} == {"clip-A"}
     assert {clip.clip_uid for clip in storage.iter_clips()} == {"clip-A", "clip-B"}
     assert _state(storage, "clip-B").status == "pending_remove"
+
+
+def test_removal_seed_prepares_independent_clips_in_parallel_without_job_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _fixture_config(tmp_path, monkeypatch)
+    uids = tuple(f"clip-{index:02d}" for index in range(6))
+    storage = _pending_storage(config, clip_uids=uids)
+    original = RemovalEpochRunner._attempt_context
+    lock = threading.Lock()
+    active = 0
+    peak = 0
+
+    def slow_context(self, shard, current_storage, uid, state):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        try:
+            time.sleep(0.05)
+            return original(self, shard, current_storage, uid, state)
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(RemovalEpochRunner, "_attempt_context", slow_context)
+    serial = RemovalEpochRunner(
+        config, {SHARD: storage}, GroupLedger(tmp_path / "serial"),
+        eligible_clip_uids_by_shard={SHARD: uids}, cpu_workers=1,
+        seed_allocator=lambda: 17,
+    )
+    started = time.perf_counter()
+    serial_ids = [job.job_id() for job in serial.seed_jobs()]
+    serial_wall = time.perf_counter() - started
+    assert peak == 1
+    parallel = RemovalEpochRunner(
+        config, {SHARD: storage}, GroupLedger(tmp_path / "parallel"),
+        eligible_clip_uids_by_shard={SHARD: uids}, cpu_workers=4,
+        seed_allocator=lambda: 17,
+    )
+    started = time.perf_counter()
+    parallel_ids = [job.job_id() for job in parallel.seed_jobs()]
+    parallel_wall = time.perf_counter() - started
+    assert peak > 1
+    assert parallel_ids == serial_ids
+    assert parallel_wall < serial_wall
+    assert parallel.seed_counters["prepare_parallel_tasks"] == len(uids)
+    assert parallel.seed_counters["prepare_peak_inflight"] <= 8
 
 
 def test_corrupt_historical_clip_is_never_seeded(

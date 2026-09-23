@@ -28,6 +28,7 @@ import pytest
 from PIL import Image
 
 import tests.test_v3_reference_integrity as legacy_integrity
+from r2v_data_v2.v3.config import Sam3Config
 from r2v_data_v2.v3.mask_codec import decode_binary_mask, encode_binary_mask
 from r2v_data_v2.v3.pair import build_entity_reference_candidates
 from r2v_data_v2.v3.post_mask_epoch_jobs import (
@@ -49,23 +50,22 @@ from r2v_data_v2.v3.post_mask_epoch_subject_attributes import (
     SubjectAttributeEpochError,
     SubjectAttributeEpochRunner,
     _image_png_sha256,
-    _resolve_attribute_segmentation_backend,
     _ReplaySegmentationBackend,
+    _resolve_attribute_segmentation_backend,
     _sha256_bytes,
 )
 from r2v_data_v2.v3.sam3_backend import Sam3SegmentationBackend
-from r2v_data_v2.v3.config import Sam3Config
 from r2v_data_v2.v3.subject_attributes import (
     ATTRIBUTE_COMPLETION_REVIEW_SYSTEM_PROMPT,
     DiscoveredSubjectAttribute,
     OwnerEnrichmentArtifact,
     OwnerEnrichmentMetrics,
+    Sam3AttributeFrameSegmenter,
     SubjectAttributeBboxReview,
     SubjectAttributeCompletionReview,
     SubjectAttributeDiscovery,
     SubjectAttributeReview,
     SubjectAttributeReviewBatch,
-    Sam3AttributeFrameSegmenter,
     _owner_artifact_path,
     process_subject_attribute_clip,
 )
@@ -4062,6 +4062,23 @@ def test_clip_plan_derivation_stays_bounded_on_a_long_shard(
     assert counters["clip_plan_derive_batches"] == 3
     assert counters["clip_plan_derive_peak_inflight"] == 4
     assert len(jobs) == 9
+
+
+def test_independent_subject_attribute_discoveries_form_global_frontier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, storage, uids = _multi_clip_fixture(
+        tmp_path, monkeypatch, run_name="run-global-frontier", count=24
+    )
+    runner = _multi_runner(
+        tmp_path, config, storage, uids, cpu_workers=4,
+        ledger_name="ledger-global-frontier",
+    )
+    jobs = runner.seed_jobs()
+    assert len(jobs) == 24
+    assert {job.clip_uid for job in jobs} == set(uids)
+    assert {job.resource for job in jobs} == {RESOURCE_QWEN}
+    assert runner.seed_counters["clip_plan_derive_peak_inflight"] <= 8
 
 
 def test_clip_plan_is_derived_once_off_the_main_thread(

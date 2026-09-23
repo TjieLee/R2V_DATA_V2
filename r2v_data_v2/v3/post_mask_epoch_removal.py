@@ -46,7 +46,9 @@ import hashlib
 import json
 import subprocess
 import threading
+import time
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from io import BytesIO
@@ -84,6 +86,7 @@ from r2v_data_v2.v3.post_mask_epoch_resources import (
     WorkerSlotExecutor,
     build_boogu_epoch,
     resolve_cpu_workers,
+    resolve_qwen_max_inflight,
 )
 from r2v_data_v2.v3.post_mask_epoch_scheduler import (
     DEFAULT_WINDOW_SIZE,
@@ -693,6 +696,15 @@ class RemovalEpochRunner:
             "attempt_context_reuse_hits": 0,
             "attempt_context_strict_preparations": 0,
         }
+        self._seed_counter_lock = threading.Lock()
+        self._seed_active = 0
+        self.seed_counters: dict[str, int | float] = {
+            "prepare_tasks": 0,
+            "prepare_parallel_tasks": 0,
+            "prepare_peak_inflight": 0,
+            "prepare_batches": 0,
+            "prepare_wall_seconds": 0.0,
+        }
 
     # -- attempt context ---------------------------------------------------
 
@@ -744,6 +756,83 @@ class RemovalEpochRunner:
         return semantic_input_digest(state.model_dump(mode="json"))
 
     # -- CPU seeding ------------------------------------------------------
+    def _prepare_seed_clip(
+        self, target: tuple[str, RunStorage, str]
+    ) -> tuple[Any, RemovalAttemptContext | None, Exception | None, float]:
+        shard, storage, clip_uid = target
+        started = time.perf_counter()
+        with self._seed_counter_lock:
+            self._seed_active += 1
+            self.seed_counters["prepare_peak_inflight"] = max(
+                int(self.seed_counters["prepare_peak_inflight"]), self._seed_active
+            )
+        try:
+            state = storage.read_clip(clip_uid).references.background
+            context = None
+            error = None
+            if (
+                state is not None
+                and state.status not in _TERMINAL_STATUSES
+                and state.status != "ready_removed"
+                and self.config.remove.enabled
+            ):
+                try:
+                    context = self._attempt_context(shard, storage, clip_uid, state)
+                except Exception as exc:  # noqa: BLE001 - committed per clip below
+                    error = exc
+            return state, context, error, time.perf_counter() - started
+        finally:
+            with self._seed_counter_lock:
+                self._seed_active -= 1
+
+    def _commit_seed_clip(
+        self,
+        target: tuple[str, RunStorage, str],
+        prepared: tuple[Any, RemovalAttemptContext | None, Exception | None, float],
+        jobs: list[ModelJob],
+    ) -> None:
+        shard, storage, clip_uid = target
+        state, context, error, wall_seconds = prepared
+        self.seed_counters["prepare_tasks"] += 1
+        self.seed_counters["prepare_wall_seconds"] += wall_seconds
+        counters = self.stats[shard]
+        if state is None or state.status in _TERMINAL_STATUSES:
+            counters["skipped_not_pending"] += 1
+            return
+        if state.status == "ready_removed":
+            try:
+                validate_background_reference(storage, clip_uid, state)
+            except Exception as exc:  # noqa: BLE001 - report, never crash
+                storage.append_failure(
+                    clip_uid=clip_uid, stage="remove", reason=_exception_reason(exc)
+                )
+                counters["failed"] += 1
+            else:
+                counters["skipped_existing"] += 1
+            return
+        if not self.config.remove.enabled:
+            counters["skipped_disabled"] += 1
+            return
+        if error is not None:
+            storage.append_failure(
+                clip_uid=clip_uid, stage="remove", reason=_exception_reason(error)
+            )
+            counters["failed"] += 1
+            return
+        assert context is not None
+        mask = context.inputs.generation_mask
+        ratio = float(np.count_nonzero(mask)) / float(mask.size)
+        if ratio > self.config.remove.max_generation_mask_area_ratio:
+            _publish_rejected(
+                storage, clip_uid=clip_uid, original=state, reason=REJECT_REASON_MASK
+            )
+            counters["processed"] += 1
+            counters["rejected"] += 1
+            return
+        jobs.append(
+            self._generate_job(shard, clip_uid, state, context, cycle_index=0)
+        )
+
     def seed_jobs(self) -> list[ModelJob]:
         """Plan the unconditional first candidate of every pending clip.
 
@@ -757,64 +846,26 @@ class RemovalEpochRunner:
         hydration excluded or judged corrupt, and those must not enter a model.
         """
         jobs: list[ModelJob] = []
-        for shard in sorted(self.storages):
-            storage = self.storages[shard]
-            counters = self.stats[shard]
-            for clip_uid in self.eligible_clip_uids_by_shard[shard]:
-                listed = storage.read_clip(clip_uid)
-                state = listed.references.background
-                if state is None or state.status in _TERMINAL_STATUSES:
-                    counters["skipped_not_pending"] += 1
-                    continue
-                if state.status == "ready_removed":
-                    try:
-                        validate_background_reference(storage, clip_uid, state)
-                    except Exception as exc:  # noqa: BLE001 - report, never crash
-                        storage.append_failure(
-                            clip_uid=clip_uid,
-                            stage="remove",
-                            reason=_exception_reason(exc),
-                        )
-                        counters["failed"] += 1
-                    else:
-                        counters["skipped_existing"] += 1
-                    continue
-                if not self.config.remove.enabled:
-                    counters["skipped_disabled"] += 1
-                    continue
-                try:
-                    context = self._attempt_context(
-                        shard, storage, clip_uid, state
-                    )
-                except Exception as exc:  # noqa: BLE001 - report, never crash
-                    storage.append_failure(
-                        clip_uid=clip_uid,
-                        stage="remove",
-                        reason=_exception_reason(exc),
-                    )
-                    counters["failed"] += 1
-                    continue
-                mask = context.inputs.generation_mask
-                ratio = float(np.count_nonzero(mask)) / float(mask.size)
-                if ratio > self.config.remove.max_generation_mask_area_ratio:
-                    _publish_rejected(
-                        storage,
-                        clip_uid=clip_uid,
-                        original=state,
-                        reason=REJECT_REASON_MASK,
-                    )
-                    counters["processed"] += 1
-                    counters["rejected"] += 1
-                    continue
-                jobs.append(
-                    self._generate_job(
-                        shard,
-                        clip_uid,
-                        state,
-                        context,
-                        cycle_index=0,
-                    )
-                )
+        targets = [
+            (shard, self.storages[shard], clip_uid)
+            for shard in sorted(self.storages)
+            for clip_uid in self.eligible_clip_uids_by_shard[shard]
+        ]
+        workers = max(1, int(self.cpu_workers))
+        if workers == 1 or len(targets) <= 1:
+            for target in targets:
+                self._commit_seed_clip(target, self._prepare_seed_clip(target), jobs)
+            return jobs
+        budget = workers * 2
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for start in range(0, len(targets), budget):
+                batch = targets[start : start + budget]
+                self.seed_counters["prepare_batches"] += 1
+                self.seed_counters["prepare_parallel_tasks"] += len(batch)
+                for target, prepared in zip(
+                    batch, pool.map(self._prepare_seed_clip, batch), strict=True
+                ):
+                    self._commit_seed_clip(target, prepared, jobs)
         return jobs
 
     # -- model jobs -------------------------------------------------------
@@ -2292,6 +2343,7 @@ def run_removal_epoch(
     # happens in subprocesses, whose CPU policy is untouched.
     limit_process_native_threads()
     cpu_workers = resolve_cpu_workers(config)
+    qwen_max_inflight = resolve_qwen_max_inflight()
     entity_mask_root = Path(
         os.environ.get("POST_MASK_ENTITY_MASK_ROOT") or DEFAULT_ENTITY_MASK_ROOT
     )
@@ -2326,7 +2378,9 @@ def run_removal_epoch(
         repo_root=repo_root,
         canonical_shard_count=canonical_shard_count,
         cpu_workers=cpu_workers,
+        qwen_max_inflight=qwen_max_inflight,
         formal_production=os.environ.get("POST_MASK_FORMAL_PRODUCTION") == "1",
     )
     emit("post_mask_resource_epoch_cpu_workers", cpu_workers=cpu_workers)
+    emit("post_mask_resource_epoch_qwen_max_inflight", max_inflight=qwen_max_inflight)
     return runner(group, ledger, emit)

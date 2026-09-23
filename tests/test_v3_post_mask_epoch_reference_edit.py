@@ -7,8 +7,11 @@ epoch really pays Boogu/Qwen/SAM calls through the real scheduler.
 from __future__ import annotations
 
 import json
+import threading
+import time
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -2370,6 +2373,81 @@ def test_seed_validates_the_frozen_plan_once_per_seed(
     runner._existing_plan_for_reconcile(SHARD)
     assert counts["entries"] == 3 * len(uids)
     assert counts["shard_reads"] == 1
+
+
+def test_seed_parallel_read_only_geometry_keeps_canonical_jobs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, storage, uids = _fresh_target_shard(tmp_path, monkeypatch, count=6)
+    original = ReferenceEditEpochRunner._entity_route_context
+    lock = threading.Lock()
+    active = 0
+    peak = 0
+
+    def slow_route(self, current_storage, clip, reference):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        try:
+            time.sleep(0.05)
+            return original(self, current_storage, clip, reference)
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(ReferenceEditEpochRunner, "_entity_route_context", slow_route)
+    serial = _plan_runner(config, storage, tmp_path, uids)
+    serial.cpu_workers = 1
+    started = time.perf_counter()
+    serial_ids = [job.job_id() for job in serial.seed_jobs()]
+    serial_wall = time.perf_counter() - started
+    assert peak == 1
+    parallel = _plan_runner(config, storage, tmp_path, uids)
+    parallel.cpu_workers = 4
+    started = time.perf_counter()
+    parallel_ids = [job.job_id() for job in parallel.seed_jobs()]
+    parallel_wall = time.perf_counter() - started
+    assert peak > 1
+    assert parallel_ids == serial_ids
+    assert parallel_wall < serial_wall
+    assert parallel.seed_counters["prepare_parallel_tasks"] == len(uids)
+    assert parallel.seed_counters["prepare_peak_inflight"] <= 4
+
+
+def test_later_geometry_failure_does_not_preempt_earlier_entity_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, storage, uids = _fresh_target_shard(tmp_path, monkeypatch, count=1)
+    runner = _plan_runner(config, storage, tmp_path, uids)
+    entities = [SimpleNamespace(entity_id="e1"), SimpleNamespace(entity_id="e2")]
+    clip = SimpleNamespace(
+        annotation=SimpleNamespace(entities=entities),
+        references=SimpleNamespace(entities=entities),
+    )
+    plan = {"clips": {"clip-1": {"chain_entity_ids": ["e1", "e2"]}}}
+    committed = []
+
+    def route(_storage, _clip, reference):
+        if reference.entity_id == "e2":
+            raise ValueError("later geometry failed")
+        return ("geometry", None, "complete")
+
+    monkeypatch.setattr(runner, "_clip", lambda _storage, _uid: clip)
+    monkeypatch.setattr(runner, "_entity_outcome", lambda *args: None)
+    monkeypatch.setattr(runner, "_entity_route_context", route)
+    monkeypatch.setattr(
+        runner, "_advance_entity",
+        lambda _shard, _storage, _uid, entity, _reference, **kwargs:
+            committed.append(entity.entity_id) or [],
+    )
+    prepared = runner._prepare_seed_clip((SHARD, storage, "clip-1", plan))
+    with pytest.raises(ValueError, match="later geometry failed"):
+        runner._advance_clip(
+            SHARD, storage, "clip-1", plan,
+            prepared_clip=prepared[0], prepared_contexts=prepared[1],
+        )
+    assert committed == ["e1"]
 
 
 def test_a_changed_frozen_plan_is_revalidated_and_rejected(
