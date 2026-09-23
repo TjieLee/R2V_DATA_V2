@@ -541,6 +541,104 @@ def test_shard_selection_preserves_bad_row_positions(tmp_path):
     assert [r["source_index"] for r in selection.excluded_rows] == [1, 2]
 
 
+@pytest.mark.parametrize("overlong_duration", [200.000001, 200.1])
+def test_shard_selection_skips_over_200_seconds_before_video_hash(
+    tmp_path, monkeypatch, overlong_duration
+):
+    manifest = shot_manifest(tmp_path)
+    rows = [json.loads(line) for line in manifest.read_text().splitlines()]
+    for row, duration in zip(rows, (199.9, 200.0, overlong_duration), strict=True):
+        row["duration"] = duration
+    manifest.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    root = tmp_path / "out"
+    index = production.build_source_index(manifest, root)
+    original_hash = full.sha256_file
+
+    def no_rejected_video_hash(path):
+        if __import__("pathlib").Path(path).name == "movie_3.mp4":
+            pytest.fail("over-200-second video was hashed")
+        return original_hash(path)
+
+    monkeypatch.setattr(full, "sha256_file", no_rejected_video_hash)
+    selection = full.shard_selection(root, index, 0, tmp_path, tmp_path)
+    assert [shot.duration_seconds for shot in selection.shots] == [199.9, 200.0]
+    assert selection.excluded_rows == [
+        {"source_index": 2, "reason": "clip_duration_over_200s"}
+    ]
+
+
+def test_cached_shard_selection_migrates_long_clip_to_terminal_skip(
+    tmp_path, monkeypatch
+):
+    from types import SimpleNamespace
+
+    from r2v_data_v2.h3 import t2va_shadow
+    from r2v_data_v2.h3.t2va_source import select_t2va_shots
+
+    manifest = shot_manifest(tmp_path)
+    rows = [json.loads(line) for line in manifest.read_text().splitlines()[:2]]
+    rows[0]["duration"] = 100.0
+    rows[1]["duration"] = 314.0
+    manifest.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    root = tmp_path / "out"
+    index = production.build_source_index(manifest, root)
+    shard_manifest = production.materialize_shard(index, 0, root)
+    initial = select_t2va_shots(
+        shard_manifest, clips_root=tmp_path, source_videos_root=tmp_path
+    )
+    assert len(initial.shots) == 2
+    cached = root / "shards" / production.shard_name(0) / "source/selection.json"
+    production.atomic_json(cached, initial.model_dump(mode="json"))
+    original_hash = full.sha256_file
+
+    def no_video_rehash(path):
+        if __import__("pathlib").Path(path).suffix == ".mp4":
+            pytest.fail("cached selection migration rehashed a video")
+        return original_hash(path)
+
+    monkeypatch.setattr(full, "sha256_file", no_video_rehash)
+    selection = full.shard_selection(root, index, 0, tmp_path, tmp_path)
+    assert [shot.source_index for shot in selection.shots] == [0]
+    assert selection.excluded_rows == [
+        {"source_index": 1, "reason": "clip_duration_over_200s"}
+    ]
+    assert json.loads(cached.read_text())["shots"] == [
+        selection.shots[0].model_dump(mode="json")
+    ]
+
+    monkeypatch.setattr(
+        t2va_shadow,
+        "build_t2va_inventory",
+        lambda **_kwargs: SimpleNamespace(jobs=[]),
+    )
+    monkeypatch.setattr(t2va_shadow, "write_json", lambda *_args: None)
+    projected, _ = production.prepare_shard(
+        root,
+        index,
+        0,
+        audio_production_root=tmp_path / "audio",
+        audio_shadow_run_id="test",
+        clips_root=tmp_path,
+        source_videos_root=tmp_path,
+        backend=None,
+    )
+    skipped = projected[1]
+    assert skipped["upstream_failure"] == "clip_duration_over_200s"
+    assert "preparation_error" not in skipped
+
+    class Processor:
+        def identity(self, _row):
+            return "test-identity"
+
+        def process(self, *_args):
+            pytest.fail("duration-excluded clip reached a model stage")
+
+    state = production.process_shard(root, 0, [skipped], Processor())[skipped["clip_uid"]]
+    assert (state["t2va_status"], state["ta2va_status"]) == ("skipped", "skipped")
+    assert state["failure_stage"] == "upstream"
+    assert state["failure_reason"] == "clip_duration_over_200s"
+
+
 def test_full_cli_dry_run_does_not_require_models(tmp_path):
     from tools.run_h3_t2va_full_production import main
 

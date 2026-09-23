@@ -15,6 +15,8 @@ from contextlib import contextmanager
 from pathlib import Path
 
 SHARD_SIZE = 2_000
+MAX_CLIP_DURATION_SECONDS = 200.0
+CLIP_DURATION_EXCLUSION_REASON = "clip_duration_over_200s"
 DEFAULT_ROOT = Path(
     "/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/T2VA"
 )
@@ -1087,9 +1089,13 @@ def prepare_shard(
                             "cached T2VA selection does not cover source row "
                             f"{source_index}"
                         )
-                    row["preparation_error"] = (
-                        "ValueError: canonical selection excluded source row: " + reason
-                    )
+                    if reason == CLIP_DURATION_EXCLUSION_REASON:
+                        row["upstream_failure"] = reason
+                    else:
+                        row["preparation_error"] = (
+                            "ValueError: canonical selection excluded source row: "
+                            + reason
+                        )
                 rows.append(row)
         expected = len(preselected.shots) + len(preselected.excluded_rows)
         if len(rows) != expected:
@@ -1171,7 +1177,7 @@ def prepare_shard(
     contexts = {job.clip_uid: (job, inventory) for job in inventory.jobs}
     for row in rows:
         uid = row["clip_uid"]
-        if row.get("preparation_error"):
+        if row.get("preparation_error") or row.get("upstream_failure"):
             continue
         if uid not in contexts:
             row["preparation_error"] = (

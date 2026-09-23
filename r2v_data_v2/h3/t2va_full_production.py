@@ -430,6 +430,38 @@ def shard_selection(root, index, shard_id, clips_root, source_videos_root):
             )
         ):
             raise ValueError("cached shard selection identity differs")
+        overlong = [
+            shot
+            for shot in selection.shots
+            if shot.duration_seconds > production.MAX_CLIP_DURATION_SECONDS
+        ]
+        if overlong:
+            shots = [
+                shot
+                for shot in selection.shots
+                if shot.duration_seconds <= production.MAX_CLIP_DURATION_SECONDS
+            ]
+            excluded = sorted(
+                [
+                    *selection.excluded_rows,
+                    *(
+                        {
+                            "source_index": shot.source_index,
+                            "reason": production.CLIP_DURATION_EXCLUSION_REASON,
+                        }
+                        for shot in overlong
+                    ),
+                ],
+                key=lambda row: row["source_index"],
+            )
+            selection = selection.model_copy(
+                update={
+                    "shots": shots,
+                    "excluded_rows": excluded,
+                    "valid_row_count": len(shots),
+                }
+            )
+            production.atomic_json(cached, selection.model_dump(mode="json"))
         return selection
     start = shard_id * production.SHARD_SIZE
     adapter = JeaVideoMotionAdapter(
@@ -443,6 +475,15 @@ def shard_selection(root, index, shard_id, clips_root, source_videos_root):
                 raw = json.loads(line)
                 if not isinstance(raw, dict):
                     raise TypeError("shot row must be an object")
+                duration = float(raw["duration"])
+                if duration > production.MAX_CLIP_DURATION_SECONDS:
+                    excluded.append(
+                        {
+                            "source_index": source_index,
+                            "reason": production.CLIP_DURATION_EXCLUSION_REASON,
+                        }
+                    )
+                    continue
                 item = adapter.parse(raw, source_index=source_index)
                 if item["clip_uid"] in seen:
                     raise ValueError("duplicate clip identity")
@@ -459,7 +500,7 @@ def shard_selection(root, index, shard_id, clips_root, source_videos_root):
                     ),
                     video_path=item["video_path"],
                     video_sha256=sha256_file(Path(item["video_path"])),
-                    duration_seconds=float(raw["duration"]),
+                    duration_seconds=duration,
                 )
                 shots.append(shot)
                 seen.add(shot.clip_uid)
