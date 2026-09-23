@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import shutil
 import uuid
@@ -24,11 +23,7 @@ from r2v_data_v2.h3.jea_target_audio_caption import (
 )
 from r2v_data_v2.h3.sam_audio_stem_shadow import _publish_directory, sha256_file
 from r2v_data_v2.h3.schemas import SchemaModel
-from r2v_data_v2.h3.t2va_shot_index import (
-    indexed_rows,
-    indexed_uid_rows,
-    random_indices,
-)
+from r2v_data_v2.h3.t2va_shot_index import indexed_rows, random_indices
 from r2v_data_v2.manifest import iter_source_records
 from r2v_data_v2.v3.production_source import JeaVideoMotionAdapter
 
@@ -72,11 +67,7 @@ def select_t2va_shots(
     sample_seed: int | None = None,
     shot_index_root: Path | None = None,
 ) -> T2VAShotSelection:
-    from r2v_data_v2.h3.t2va_shadow import (
-        T2VACaseManifest,
-        fingerprint,
-        select_clip_uids,
-    )
+    from r2v_data_v2.h3.t2va_shadow import fingerprint, select_clip_uids
 
     path = shot_manifest.expanduser().resolve(strict=True)
     if case_manifest is not None and (
@@ -115,7 +106,6 @@ def select_t2va_shots(
         }
 
     rows, excluded = {}, []
-    case_hash = None
     if sample_size is not None:
         if path.suffix.lower() != ".jsonl":
             raise ValueError("indexed random sampling requires a JSONL shot manifest")
@@ -143,28 +133,6 @@ def select_t2va_shots(
             if len(shots) != sample_size:
                 raise ValueError("not enough valid unique JEA shots for sample size")
         # Unvisited rows have not been validated; never report an invented total.
-        valid_row_count = None
-    elif case_manifest is not None and path.suffix.lower() == ".jsonl":
-        case_bytes = case_manifest.read_bytes()
-        selected = T2VACaseManifest.model_validate_json(case_bytes).clip_uids
-        case_hash = hashlib.sha256(case_bytes).hexdigest()
-        if len(set(selected)) != len(selected):
-            raise ValueError(
-                "selected clips must be unique members of source inventory"
-            )
-        shots = []
-        with indexed_uid_rows(path, shot_index_root, clips) as (metadata, lookup):
-            source_hash = metadata["manifest_sha256"]
-            for uid in selected:
-                index, line = lookup(uid)
-                row = parse_row(index, json.loads(line))
-                if row["clip_uid"] != uid:
-                    raise ValueError(
-                        "selected JEA shot clip identity differs from index"
-                    )
-                shots.append(
-                    T2VAShot(**row, video_sha256=sha256_file(Path(row["video_path"])))
-                )
         valid_row_count = None
     else:
         source_hash = sha256_file(path)
@@ -209,8 +177,6 @@ def select_t2va_shots(
         if sha256_file(path) != source_hash:
             raise ValueError("JEA shot manifest changed during selection")
         valid_row_count = len(rows)
-    if case_manifest is not None and case_hash is None:
-        case_hash = sha256_file(case_manifest)
     return T2VAShotSelection(
         shot_manifest_path=str(path),
         shot_manifest_sha256=source_hash,
@@ -223,7 +189,7 @@ def select_t2va_shots(
         else "all",
         sample_seed=sample_seed,
         case_manifest_path=str(case_manifest.resolve()) if case_manifest else None,
-        case_manifest_sha256=case_hash,
+        case_manifest_sha256=sha256_file(case_manifest) if case_manifest else None,
         valid_row_count=valid_row_count,
         excluded_rows=excluded,
         shots=shots,
