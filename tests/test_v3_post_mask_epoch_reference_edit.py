@@ -669,6 +669,42 @@ def test_crash_after_generation_commit_resumes_without_extra_boogu(
     assert fresh_routing.sam.calls == 0
 
 
+def test_generation_identity_ignores_generator_checkpoint_and_legacy_revision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, storage, runner, _scheduler, _routing = _build(tmp_path, monkeypatch)
+    changed_config = replace(
+        config,
+        reference_edit=replace(
+            config.reference_edit,
+            backend="alternate_image_edit",
+            model_path=Path("/alternate/checkpoint"),
+            model_revision="alternate-revision",
+        ),
+    )
+    changed = ReferenceEditEpochRunner(
+        changed_config,
+        {SHARD: storage},
+        GroupLedger(tmp_path / "alternate-ledger"),
+        eligible_clip_uids_by_shard={SHARD: ["clip-1"]},
+    )
+    clip = storage.read_clip("clip-1")
+    entity = clip.annotation.entities[0]
+    reference = clip.references.entities[0]
+    anchor = runner._entity_anchor(storage, "clip-1", entity, reference, 1)
+    changed_anchor = changed._entity_anchor(storage, "clip-1", entity, reference, 1)
+    first = runner._generation_job(
+        SHARD, "clip-1", entity, reference, 1, seed=7, anchor=anchor
+    )
+    second = changed._generation_job(
+        SHARD, "clip-1", entity, reference, 1, seed=7, anchor=changed_anchor
+    )
+    assert runner._policy_identity() == changed._policy_identity()
+    assert first.job_id() == second.job_id()
+    assert first.model_identity == "image_edit_generator"
+    assert anchor["source_sha256"] == changed_anchor["source_sha256"]
+
+
 def test_review_identity_drift_is_retryable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

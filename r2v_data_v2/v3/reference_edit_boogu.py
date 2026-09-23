@@ -1831,11 +1831,18 @@ def finalize_boogu_reference_edit_attempt(
         rejection_reason = None
     output = generation.output if generation is not None else None
     output_sha256 = generation.output_sha256 if generation is not None else None
+    # Provenance is emitted by the active worker, not used to admit/read an
+    # artifact. Older Boogu workers did not echo a backend field.
+    backend_name = (
+        output.worker_metadata.get("backend", "boogu_image_0_1_edit_turbo")
+        if output is not None
+        else "boogu_image_0_1_edit_turbo"
+    )
     source_ratio = prepared.source_rgba.width / prepared.source_rgba.height
     output_ratio = prepared.width / prepared.height
     metadata: dict[str, Any] = {
         "schema_version": 1,
-        "backend": "boogu_image_0_1_edit_turbo",
+        "backend": backend_name,
         "clip_uid": prepared.clip_uid,
         "entity_id": prepared.entity_id,
         "status": "accepted" if accepted else "rejected",
@@ -1859,8 +1866,6 @@ def finalize_boogu_reference_edit_attempt(
         "output_aspect_ratio": output_ratio,
         "aspect_ratio_error": abs(output_ratio - source_ratio) / source_ratio,
         "output_pixel_count": prepared.width * prepared.height,
-        "model_name": BOOGU_MODEL_NAME,
-        "model_revision": prepared.model_revision,
         "original_instruction": prepared.instruction,
         "rewritten_instruction": (
             output.rewritten_instruction if output is not None else None
@@ -1917,6 +1922,9 @@ def finalize_boogu_reference_edit_attempt(
         ),
         **geometry_metadata,
     }
+    if backend_name == "boogu_image_0_1_edit_turbo":
+        metadata["model_name"] = BOOGU_MODEL_NAME
+        metadata["model_revision"] = prepared.model_revision
     write_json_atomic(prepared.metadata_path, metadata)
 
     canonical_path = (

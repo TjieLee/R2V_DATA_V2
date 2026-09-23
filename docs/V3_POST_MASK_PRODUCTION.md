@@ -480,7 +480,7 @@ one model class at a time.
 | Epoch | Layout |
 | --- | --- |
 | Qwen | one managed vLLM server, TP1 x DP8, GPU0-7, `127.0.0.1:8000/v1` |
-| Boogu | 8 persistent workers, one per GPU, loaded once per epoch |
+| Image edit (`RESOURCE_BOOGU` legacy slot) | 8 persistent Qwen-Image-2.1 workers, one per GPU, loaded once per epoch |
 | SAM | 8 persistent SAM3 workers, one per GPU, loaded once per epoch |
 
 ### Modules
@@ -553,7 +553,8 @@ one model class at a time.
 * **Control-flow exceptions propagate.** Model executors catch `Exception`, so
   `KeyboardInterrupt`, `SystemExit` and `GeneratorExit` are never turned into a
   per-job failure record.
-* **One heavy resource at a time.** The scheduler loads Qwen, Boogu or SAM,
+* **One heavy resource at a time.** The scheduler loads the Qwen judge, image
+  editor or SAM,
   drains that resource to a fixed point, then unloads it completely. Enter/exit
   is guarded by `try/finally`, so an executor exception or interrupt still
   unloads. Resource switches never reload a resource that still has ready work.
@@ -569,9 +570,9 @@ one model class at a time.
   A pre-flight port check makes an unmanaged server on `8000` fail fast instead
   of being adopted or killed.
 * **The semantic layer never sees GPU topology.** Runners receive a live backend
-  handle (`BooguSubprocessBackend`, `Sam3SegmentationBackend`, or the Qwen
+  handle (`QwenImage21SubprocessBackend`, `Sam3SegmentationBackend`, or the Qwen
   endpoint), never a GPU slot id. Worker slots are loaded concurrently and
-  re-ordered by slot, so a Boogu epoch's model load is not serialised eight
+  re-ordered by slot, so an image-edit epoch's model load is not serialised eight
   times; any startup failure closes every already-created worker before raising.
 * **Lifecycle diagnostics survive unload.** Startup, shutdown and per-slot
   counters are accumulated per resource and reported separately from model-job
@@ -593,16 +594,20 @@ publication helpers, so there is still exactly one implementation of the prompt,
 the candidate preparation, the judge call, the attempt record and the
 accept/reject rule.
 
-v1 supports one topology only and refuses anything else:
+The original remove-only development topology was:
 
 ```
-BOOGU epoch   GPU0-7, eight persistent Boogu workers      -> generation
+BOOGU epoch   GPU0-7, eight persistent image-edit workers -> generation
 QWEN epoch    one managed Qwen3-VL server, TP1 x DP8      -> judging
 ```
 
-`config.remove.backend` must be `boogu_image_0_1_edit_turbo`. The legacy
-`remove_backgrounds()` still supports the Qwen Image Edit remover unchanged;
-the epoch adapter raises instead of loading a second heavy remover.
+`RESOURCE_BOOGU` and the epoch name remain as durable legacy slot names. The
+current resource factory selects Qwen-Image-2.1 beneath that slot for Removal,
+Reference Edit and Subject Attribute completion; it does not select the old
+Boogu worker. The legacy `remove_backgrounds()` path is outside this migration.
+Removal's persisted legacy Boogu backend label still denotes its full-frame
+candidate layout for the existing artifact validator; it is not a claim that
+the Resource Epoch loaded a Boogu generator.
 
 The split is three-sided:
 
@@ -722,12 +727,10 @@ came from the environment or the CLI, and resolves the mode strictly CLI
 first, environment second, plan-only default last, so it never emits both and
 never overrides an explicit CLI choice.
 
-**The remove stage can complete; a group cannot.** Downstream phases (pair,
-reference edit, reference integrity, instruction, subject attributes, export) are
-not wired, so the runner always returns `completed=False` with
-`remove_completed=True` and a reason; the generic launcher therefore never
-records `GROUP_COMPLETED`. The remove stage emits
-`post_mask_removal_epoch_completed` as a stage event instead.
+**Group completion requires downstream closure.** The runner wires Removal,
+Pair, Reference Edit, Reference Integrity, Instruction, Subject Attributes and
+export. It reports `completed=True` only when the remove, attribute and export
+closure succeeds; a remove-only success is not `GROUP_COMPLETED`.
 
 Run it as the launcher's job runner:
 
@@ -737,10 +740,11 @@ POST_MASK_JOB_RUNNER=r2v_data_v2.v3.post_mask_epoch_removal:run_removal_epoch \
 bash scripts/run_v3_post_mask_resource_epoch.sh
 ```
 
-The managed Qwen server is the foundation `QwenEpochResource` (`TP1`, `DP8`,
-port 8000) with `served_model_name == config.qwen.background_remove_judge.model`,
-so `/v1/models` and the judge request agree on one model identity. No image-edit
-remover is ever loaded by the epoch.
+The managed Qwen judge server is the foundation `QwenEpochResource` (`TP1`,
+`DP8`, port 8000) with
+`served_model_name == config.qwen.background_remove_judge.model`, so
+`/v1/models` and the judge request agree. Image editing uses the separate
+Qwen-Image-2.1 worker epoch, not the legacy Qwen-Image-Edit-2511 remover.
 
 ### Running it
 
@@ -789,14 +793,48 @@ Resource lifecycle counters (start/stop counts, startup/shutdown/service wall
 seconds, per-slot job counts) are reported under `resource_lifecycle`, separate
 from the model-job `resources` counters.
 
-### Not yet done
+### Qwen-Image-2.1 worker setup and smoke boundary
 
-The semantic split of `remove.py`, `reference_edit*.py` and
-`subject_attributes.py` into prepare -> model job -> durable result -> CPU
-finalize is **not** implemented, so no real model job runner exists yet and no
-equivalence run has been performed. Do not infer throughput from unit tests.
+Resource Epoch now has Removal, Reference Edit and Subject Attribute completion
+runners. This migration changes only their shared image-edit generator, not
+their prompts, seeds, selection or review rules. It is still unvalidated on a
+real CUDA server; Mac tests using fake models are not production acceptance.
 
-The foundation API is ready for that runner: seed jobs, `BatchJobExecutor`
-implementations, a CPU finalizer contract, `ResourceEpochManager` and resume are
-all exercised by fake tests, but no code has been pointed at real Visual
-semantics yet.
+The image-edit subprocess uses its own configured Python environment. That
+environment needs CUDA-enabled PyTorch, Transformers with PE-I2I support,
+Diffusers with `QwenImage21Pipeline`, Accelerate and Pillow. It loads both
+models once per GPU worker from **local** paths, keeps both resident, optionally
+runs PE-I2I before generation, and never uses PE-T2I. The intended server
+configuration is:
+
+```yaml
+reference_edit:
+  backend: qwen_image_2_1
+  python_executable: /mnt/workspace/litengjie/data/venvs/qwen-image21/bin/python
+  model_path: /mnt/workspace/public/pretrained/Qwen/Qwen-Image-2.1
+  prompt_enhancer_i2i_path: /mnt/workspace/public/pretrained/Qwen/Qwen-Image-2.1-PE-I2I
+  num_inference_steps: 40
+  target_area: 1048576
+  alignment: 16
+```
+
+These paths describe the future server smoke, not files required on a Mac.
+Create an isolated, operator-reviewed Resource Epoch YAML and output tag/root;
+do not reuse an existing production output root for the first GPU smoke.
+Historical Boogu reference images and metadata remain readable without
+rewriting them, but pre-migration `run.json` and frozen epoch plans contain
+opaque legacy config hashes; this migration does not authorize resuming those
+old output roots under the new generator.
+Use the existing launcher and full job runner only after verifying that YAML
+and its image-edit environment on the server:
+
+```bash
+POST_MASK_BASE_CONFIG=/mnt/workspace/litengjie/data/r2v_v3_configs/qwen-image21-resource-epoch.local.yaml \
+POST_MASK_TAG=qwen-image21-smoke-v1 \
+POST_MASK_JOB_RUNNER=r2v_data_v2.v3.post_mask_epoch_removal:run_removal_epoch \
+bash scripts/run_v3_post_mask_resource_epoch.sh
+```
+
+Omit `POST_MASK_JOB_RUNNER` for the launcher's model-free dry run. The exact
+server YAML and Python environment must be prepared and accepted there first;
+this document does not claim a successful CUDA run or throughput measurement.

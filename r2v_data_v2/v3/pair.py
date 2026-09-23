@@ -924,17 +924,17 @@ def _validate_reference_png(
         raise ValueError("ready entity reference transparent RGB must be white")
 
 
-def _validate_boogu_reference_png(path: Path) -> None:
+def _validate_generated_rgb_reference_png(path: Path) -> None:
     if not path.is_file():
-        raise ValueError("ready Boogu reference artifact is missing")
+        raise ValueError("ready generated RGB reference artifact is missing")
     with Image.open(path) as opened:
         opened.load()
         if opened.format != "PNG":
-            raise ValueError("ready Boogu reference must be a PNG")
+            raise ValueError("ready generated RGB reference must be a PNG")
         if opened.mode != "RGB":
-            raise ValueError("ready Boogu reference must be native RGB")
+            raise ValueError("ready generated RGB reference must be native RGB")
         if opened.width <= 0 or opened.height <= 0:
-            raise ValueError("ready Boogu reference dimensions are invalid")
+            raise ValueError("ready generated RGB reference dimensions are invalid")
 
 
 def _selected_candidate_for_state(
@@ -1009,23 +1009,17 @@ def validate_entity_reference_artifact(
             raise ValueError("generated fallback metadata path is missing")
         metadata_path = _resolve_run_artifact(storage, metadata_value)
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        if metadata.get("backend") == "boogu_image_0_1_edit_turbo":
-            expected_path = (
-                storage.reference_edit_dir(clip_uid)
-                / annotation_entity.entity_id
-                / "final_reference_1k.png"
-            ).resolve(strict=False)
-            if state_path != expected_path:
-                raise ValueError(
-                    "ready Boogu reference path must use final_reference_1k.png"
-                )
-            _validate_boogu_reference_png(state_path)
-        else:
-            if state_path != final_path:
-                raise ValueError(
-                    "legacy generated reference path must be selected/eN.png"
-                )
+        generated_rgb_path = (
+            storage.reference_edit_dir(clip_uid)
+            / annotation_entity.entity_id
+            / "final_reference_1k.png"
+        ).resolve(strict=False)
+        if state_path == generated_rgb_path:
+            _validate_generated_rgb_reference_png(state_path)
+        elif state_path == final_path:
             _validate_reference_png(state_path, expected=None)
+        else:
+            raise ValueError("generated reference path has unsupported layout")
         output_sha256 = hashlib.sha256(state_path.read_bytes()).hexdigest()
         if output_sha256 != reference_state.generation_output_sha256:
             raise ValueError("generated fallback output hash changed")

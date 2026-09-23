@@ -19,7 +19,7 @@ REMOVE_MODEL_RELATIVE_PATH = Path("Qwen/Qwen-Image-Edit-2511")
 REMOVE_ADAPTER_NAME = "Qwen-Image-Edit-2511-Object-Remover"
 REMOVE_BACKEND = "qwen_image_edit_2511_object_remover"
 BOOGU_REMOVE_BACKEND = "boogu_image_0_1_edit_turbo"
-REFERENCE_EDIT_BACKEND = "boogu_image_0_1_edit_turbo"
+REFERENCE_EDIT_BACKEND = "qwen_image_2_1"
 REFERENCE_EDIT_MODEL_REVISION = "hotfix-1k-20260708"
 SUBJECT_ATTRIBUTE_GME_BACKEND = "gme_qwen2_vl_2b_v1"
 SUBJECT_ATTRIBUTE_GME_MODEL_NAME = "Alibaba-NLP/gme-Qwen2-VL-2B-Instruct"
@@ -173,15 +173,18 @@ class ReferenceEditConfig:
     enabled: bool = False
     backend: str = REFERENCE_EDIT_BACKEND
     python_executable: Path = Path(
-        "/mnt/workspace/litengjie/data/venvs/boogu-image/bin/python"
+        "/mnt/workspace/litengjie/data/venvs/qwen-image21/bin/python"
     )
     code_root: Path = Path("/mnt/workspace/litengjie/data/vendor/Boogu-Image")
     model_path: Path = Path(
-        "/mnt/workspace/litengjie/data/models/"
-        "Boogu-Image-0.1-Edit-Turbo-hotfix-1k-20260708"
+        "/mnt/workspace/public/pretrained/Qwen/Qwen-Image-2.1"
+    )
+    prompt_enhancer_i2i_path: Path = Path(
+        "/mnt/workspace/public/pretrained/Qwen/Qwen-Image-2.1-PE-I2I"
     )
     model_revision: str = REFERENCE_EDIT_MODEL_REVISION
     cuda_visible_devices: str = "0"
+    num_inference_steps: int = 40
     target_area: int = 1024 * 1024
     alignment: int = 16
     timeout_seconds: int = 3600
@@ -655,8 +658,8 @@ class V3Config:
             raise ValueError(
                 "qwen.background_remove_judge is required when remove.enabled is true"
             )
-        if self.remove.backend not in {REMOVE_BACKEND, BOOGU_REMOVE_BACKEND}:
-            raise ValueError(f"unsupported V3 remove backend: {self.remove.backend}")
+        if not isinstance(self.remove.backend, str) or not self.remove.backend.strip():
+            raise ValueError("remove.backend must be a non-empty string")
         if self.remove.fallback_to_raw:
             raise ValueError("V3 remove.fallback_to_raw must be false")
         if not self.remove.preserve_unmasked_pixels:
@@ -710,10 +713,7 @@ class V3Config:
         if (
             self.remove.backend == REMOVE_BACKEND
             and self.remove.inference_profile
-            not in {
-                "object_remover_4step_v1",
-                "experimental_override",
-            }
+            not in {"object_remover_4step_v1", "experimental_override"}
         ):
             raise ValueError(
                 "remove.backend=qwen_image_edit_2511_object_remover is incompatible "
@@ -785,10 +785,11 @@ class V3Config:
                 )
         if not isinstance(self.reference_edit.enabled, bool):
             raise TypeError("reference_edit.enabled must be a boolean")
-        if self.reference_edit.backend != REFERENCE_EDIT_BACKEND:
-            raise ValueError(
-                f"unsupported V3 reference_edit backend: {self.reference_edit.backend}"
-            )
+        if (
+            not isinstance(self.reference_edit.backend, str)
+            or not self.reference_edit.backend.strip()
+        ):
+            raise ValueError("reference_edit.backend must be a non-empty string")
         if self.reference_edit.enabled and self.qwen.reference_edit_judge is None:
             raise ValueError(
                 "qwen.reference_edit_judge is required when "
@@ -1015,29 +1016,23 @@ class V3Config:
                 "runtime.mode=streaming_v1 does not support "
                 "pair.same_parent_fallback_enabled=true"
             )
-        boogu_remove_enabled = (
-            self.remove.enabled and self.remove.backend == BOOGU_REMOVE_BACKEND
-        )
-        if (
-            self.reference_edit.enabled
-            or boogu_remove_enabled
-            or completion.enabled
-        ):
+        if self.reference_edit.enabled or completion.enabled:
             for name, path in (
                 ("python_executable", self.reference_edit.python_executable),
-                ("code_root", self.reference_edit.code_root),
                 ("model_path", self.reference_edit.model_path),
+                (
+                    "prompt_enhancer_i2i_path",
+                    self.reference_edit.prompt_enhancer_i2i_path,
+                ),
             ):
                 if not isinstance(path, Path):
                     raise TypeError(f"reference_edit.{name} must be a pathlib.Path")
-                resolved = path.expanduser().resolve(strict=False)
-                if not _is_at_or_below(resolved, ALLOWED_WRITABLE_ROOT):
-                    raise ValueError(
-                        f"reference_edit.{name} must be inside "
-                        "/mnt/workspace/litengjie/data"
-                    )
-        if self.reference_edit.model_revision != REFERENCE_EDIT_MODEL_REVISION:
-            raise ValueError("reference_edit.model_revision must be hotfix-1k-20260708")
+        if (
+            not isinstance(self.reference_edit.num_inference_steps, int)
+            or isinstance(self.reference_edit.num_inference_steps, bool)
+            or self.reference_edit.num_inference_steps < 1
+        ):
+            raise ValueError("reference_edit.num_inference_steps must be positive")
         if (
             not isinstance(self.reference_edit.cuda_visible_devices, str)
             or not self.reference_edit.cuda_visible_devices.strip()
@@ -1173,21 +1168,8 @@ class V3Config:
         visual_gpu_workers.pop("subject_attributes_completion", None)
         identifiers: dict[str, str | None] = {
             **{f"qwen.{name}": service.model for name, service in self.qwen_services()},
-            "remove.backend": self.remove.backend,
             "remove.inference_profile": self.remove.inference_profile,
-            "remove.base_model": str(self.remove.base_model_path),
-            "remove.adapter": (
-                str(self.remove.adapter_path)
-                if self.remove.adapter_path is not None
-                else None
-            ),
-            "remove.adapter_weight_name": self.remove.adapter_weight_name,
-            "remove.device": self.remove.device,
-            "remove.dtype": self.remove.dtype,
             "remove.num_inference_steps": str(self.remove.num_inference_steps),
-            "remove.true_cfg_scale": str(self.remove.true_cfg_scale),
-            "remove.guidance_scale": str(self.remove.guidance_scale),
-            "remove.negative_prompt": self.remove.negative_prompt,
             "remove.generation_mask_dilation_pixels": str(
                 self.remove.generation_mask_dilation_pixels
             ),
@@ -1197,9 +1179,9 @@ class V3Config:
             "remove.save_rejected_candidates": str(
                 self.remove.save_rejected_candidates
             ).lower(),
-            "reference_edit.backend": self.reference_edit.backend,
-            "reference_edit.model": str(self.reference_edit.model_path),
-            "reference_edit.model_revision": self.reference_edit.model_revision,
+            "reference_edit.num_inference_steps": str(
+                self.reference_edit.num_inference_steps
+            ),
             "reference_edit.completion_instruction_rewrite_enabled": str(
                 self.reference_edit.completion_instruction_rewrite_enabled
             ).lower(),
@@ -1242,6 +1224,33 @@ class V3Config:
 
     def fingerprint(self) -> str:
         value = _json_compatible(asdict(self))
+        reference_edit = value.get("reference_edit")
+        if isinstance(reference_edit, dict):
+            for key in (
+                "backend",
+                "python_executable",
+                "code_root",
+                "model_path",
+                "prompt_enhancer_i2i_path",
+                "model_revision",
+                "cuda_visible_devices",
+                "timeout_seconds",
+            ):
+                reference_edit.pop(key, None)
+        remove = value.get("remove")
+        if isinstance(remove, dict):
+            for key in (
+                "backend",
+                "base_model_path",
+                "adapter_path",
+                "adapter_weight_name",
+                "device",
+                "dtype",
+                "true_cfg_scale",
+                "guidance_scale",
+                "negative_prompt",
+            ):
+                remove.pop(key, None)
         runtime = value.get("runtime")
         if isinstance(runtime, dict):
             runtime.pop("sam3_compile_enabled", None)
@@ -1507,7 +1516,12 @@ def load_config(path: str | Path) -> V3Config:
         if not isinstance(seeds, list):
             raise TypeError("remove.candidate_seeds must be a list")
         remove_values["candidate_seeds"] = tuple(seeds)
-    for name in ("python_executable", "code_root", "model_path"):
+    for name in (
+        "python_executable",
+        "code_root",
+        "model_path",
+        "prompt_enhancer_i2i_path",
+    ):
         if name in reference_edit_values:
             reference_edit_values[name] = Path(
                 str(reference_edit_values[name])

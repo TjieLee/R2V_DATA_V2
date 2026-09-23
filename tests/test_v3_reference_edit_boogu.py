@@ -109,9 +109,11 @@ class _Backend:
         *,
         returned_size: tuple[int, int] | None = None,
         events: list[str] | None = None,
+        backend_name: str | None = None,
     ) -> None:
         self.returned_size = returned_size
         self.events = events
+        self.backend_name = backend_name
         self.calls: list[dict[str, object]] = []
         self.output_bytes: bytes | None = None
 
@@ -137,7 +139,10 @@ class _Backend:
             effective_instruction=(
                 "rewritten" if rewrite_enabled else instruction
             ),
-            worker_metadata={"returned_size": list(output_size)},
+            worker_metadata={
+                "returned_size": list(output_size),
+                **({"backend": self.backend_name} if self.backend_name else {}),
+            },
         )
 
 
@@ -320,6 +325,31 @@ def test_completion_publishes_native_1k_output_without_paste_back(
         assert final.getpixel((10, 10)) == (191, 22, 43)
     assert sam.calls
     assert "candidate_rgb" in sam.calls[0]
+
+
+def test_new_reference_edit_metadata_records_qwen_worker_provenance(
+    tmp_path: Path,
+) -> None:
+    run_root, _, _ = _environment(tmp_path)
+    backend = _Backend(backend_name="qwen_image_2_1")
+
+    result = run_boogu_reference_edit(
+        run_root=run_root,
+        clip_uid="clip-1",
+        entity_id="e1",
+        operation="complete_entity",
+        instruction="Complete the same entity.",
+        entity_phrase="green object",
+        reference_type="object",
+        backend=backend,
+        judge=_Judge(),
+        sam_reviewer=_SamReviewer(),
+    )
+
+    metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
+    assert metadata["backend"] == "qwen_image_2_1"
+    assert "model_name" not in metadata
+    assert "model_revision" not in metadata
 
 
 def test_tiny_source_fails_before_backend_generation(tmp_path: Path) -> None:

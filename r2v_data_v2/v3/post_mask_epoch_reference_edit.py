@@ -341,8 +341,7 @@ class ReferenceEditEpochRunner:
             "min_source_content_long_side_pixels": (
                 reference_edit.min_source_content_long_side_pixels
             ),
-            "model_revision": reference_edit.model_revision,
-            "model_path": str(reference_edit.model_path),
+            "num_inference_steps": reference_edit.num_inference_steps,
             "fallback_policy": reference_edit.fallback_policy,
             "completion_instruction_rewrite_enabled": (
                 reference_edit.completion_instruction_rewrite_enabled
@@ -565,8 +564,7 @@ class ReferenceEditEpochRunner:
             ),
             "target_area": self.config.reference_edit.target_area,
             "alignment": self.config.reference_edit.alignment,
-            "boogu_model_revision": self.config.reference_edit.model_revision,
-            "boogu_model_path": str(self.config.reference_edit.model_path),
+            "num_inference_steps": self.config.reference_edit.num_inference_steps,
         }
 
     def _resolved_size(self, storage: RunStorage, reference: Any) -> tuple[int, int]:
@@ -897,10 +895,7 @@ class ReferenceEditEpochRunner:
                 "seed": seed,
                 "attempt_index": attempt_index,
             },
-            model_identity=(
-                f"boogu:{self.config.reference_edit.model_revision}:"
-                f"{self.config.reference_edit.model_path}"
-            ),
+            model_identity="image_edit_generator",
             target={
                 "entity_id": entity.entity_id,
                 "attempt_index": str(attempt_index),

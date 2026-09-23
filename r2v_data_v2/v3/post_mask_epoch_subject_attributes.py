@@ -4830,12 +4830,11 @@ class SubjectAttributeEpochRunner:
         }
 
     def _completion_generate_policy_identity(self) -> dict[str, Any]:
-        """Semantic identity of one Boogu completion request."""
+        """Semantic identity of one image-edit completion request."""
         edit = self.config.reference_edit
         return {
             "policy_version": SUBJECT_ATTRIBUTE_COMPLETION_GENERATE_POLICY_VERSION,
-            "model_path": str(edit.model_path),
-            "model_revision": str(edit.model_revision),
+            "num_inference_steps": int(edit.num_inference_steps),
             "target_area": int(edit.target_area),
             "alignment": int(edit.alignment),
             "thinking_enabled": False,
@@ -4949,7 +4948,7 @@ class SubjectAttributeEpochRunner:
                     self._completion_generate_policy_identity()
                 ),
             },
-            model_identity=f"boogu:{self.config.reference_edit.model_revision}",
+            model_identity="image_edit_generator",
             target={
                 "owner_entity_id": owner_entity_id,
                 "attribute_id": attribute_id,

@@ -32,7 +32,10 @@ import r2v_data_v2.v3.config as config_module
 import r2v_data_v2.v3.post_mask_epoch_removal as epoch_removal_module
 import r2v_data_v2.v3.remove as remove_module
 from r2v_data_v2.reconciliation import write_json_atomic
-from r2v_data_v2.v3.background import build_background_candidates
+from r2v_data_v2.v3.background import (
+    build_background_candidates,
+    validate_background_reference,
+)
 from r2v_data_v2.v3.boogu_remove_backend import BooguBackgroundRemovalBackend
 from r2v_data_v2.v3.config import (
     BOOGU_REMOVE_BACKEND,
@@ -78,10 +81,12 @@ from r2v_data_v2.v3.post_mask_epoch_removal import (
     build_removal_epoch_runner,
     build_removal_generate_job,
     build_removal_judge_job,
+    prepare_epoch_removal_context,
     prepare_shard_storage,
     removal_generation_resource,
     removal_seed_anchor_inputs,
     removal_shard_paths,
+    resolve_removal_backend,
     resolve_removal_judge,
     seed_plan_path,
     shard_lock_path,
@@ -677,19 +682,82 @@ def test_seed_anchor_excludes_the_seed_but_binds_the_semantics(
     assert semantic_input_digest(first) != semantic_input_digest(second)
 
 
-def test_non_boogu_backend_is_refused(
+def test_legacy_remove_backend_label_does_not_gate_image_edit_epoch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = _base_config(tmp_path, monkeypatch)
     storage = _pending_storage(config)
 
-    with pytest.raises(RemovalEpochError, match="requires Boogu"):
-        RemovalEpochRunner(
-            config,
-            {SHARD: storage},
-            GroupLedger(tmp_path / "group"),
-            eligible_clip_uids_by_shard={SHARD: _eligible(storage)},
-        )
+    runner = RemovalEpochRunner(
+        config,
+        {SHARD: storage},
+        GroupLedger(tmp_path / "group"),
+        eligible_clip_uids_by_shard={SHARD: _eligible(storage)},
+        seed_allocator=_SeedAllocator([17]),
+    )
+    assert removal_generation_resource(config) == RESOURCE_BOOGU
+    assert runner.config is config
+    context = prepare_epoch_removal_context(
+        config, storage, "clip-1", _state(storage)
+    )
+    assert context.candidate_mode == "full_frame"
+    assert context.prompt.startswith("Remove the following foreground entities")
+    assert context.generation_width * context.generation_height > 0
+    job = runner.seed_jobs()[0]
+    assert job.seed == 17
+    assert job.model_identity == "image_edit_generator"
+    assert "backend" not in removal_seed_anchor_inputs(
+        config, context, attempt_index=0, cycle_index=0
+    )
+
+    # The worker selected by the shared factory is Qwen; Removal needs only
+    # its edit() surface and keeps the same prompt, geometry and seed policy.
+    qwen_handle = _BooguWorker()
+    adapter = resolve_removal_backend(qwen_handle, config)
+    assert adapter.backend is qwen_handle
+    adapter.remove(
+        image=context.inputs.source_image,
+        removal_phrases=list(context.inputs.removal_phrases),
+        background_phrase=context.inputs.background_phrase,
+        prompt=context.prompt,
+        seed=17,
+    )
+    assert qwen_handle.calls[0]["instruction"] == context.prompt
+    assert qwen_handle.calls[0]["seed"] == 17
+    assert (
+        qwen_handle.calls[0]["width"], qwen_handle.calls[0]["height"]
+    ) == (context.generation_width, context.generation_height)
+
+
+def test_non_boogu_label_publishes_readable_full_frame_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _base_config(tmp_path, monkeypatch)
+    assert config.remove.backend != BOOGU_REMOVE_BACKEND
+    storage = _pending_storage(config)
+    ledger = GroupLedger(tmp_path / "group")
+    runner = _runner(
+        config, storage, ledger, seed_allocator=_SeedAllocator([17])
+    )
+    qwen_shaped_worker = _BooguWorker()
+    judge = _Judge([_accept("clean")])
+
+    outcome = _scheduler(
+        ledger, runner, qwen_shaped_worker, judge
+    ).run(runner.seed_jobs())
+
+    assert outcome["completed"] is True
+    assert qwen_shaped_worker.calls[0]["seed"] == 17
+    assert qwen_shaped_worker.calls[0]["instruction"].startswith(
+        "Remove the following foreground entities"
+    )
+    state = _state(storage)
+    assert state.status == "ready_removed"
+    # This legacy field is also the frozen reader's candidate-mode marker.
+    # The configured label remains unchanged; the marker describes layout.
+    assert state.removal_backend == BOOGU_REMOVE_BACKEND
+    assert config.remove.backend != state.removal_backend
+    validate_background_reference(storage, "clip-1", state)
 
 
 def test_seed_jobs_rejects_an_oversized_generation_mask(
@@ -1080,10 +1148,10 @@ def test_boogu_factory_builds_the_worker_slot_epoch(
     assert executor.slot_count == 8
 
 
-def test_boogu_factory_passes_reference_edit_runtime_config(
+def test_image_edit_factory_passes_reference_edit_runtime_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The persistent Boogu worker consumes ReferenceEditConfig, not V3Config."""
+    """The persistent Qwen worker consumes ReferenceEditConfig, not V3Config."""
     config = _fixture_config(tmp_path, monkeypatch)
     storage = _pending_storage(config)
     ledger = GroupLedger(tmp_path / "group")
@@ -1124,8 +1192,11 @@ def test_boogu_factory_passes_reference_edit_runtime_config(
         captured["config"].python_executable
         == config.reference_edit.python_executable
     )
-    assert captured["config"].code_root == config.reference_edit.code_root
     assert captured["config"].model_path == config.reference_edit.model_path
+    assert (
+        captured["config"].prompt_enhancer_i2i_path
+        == config.reference_edit.prompt_enhancer_i2i_path
+    )
 
 
 # ---------------------------------------------------------------------------

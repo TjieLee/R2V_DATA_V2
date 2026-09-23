@@ -2811,6 +2811,51 @@ def test_policy_identities_bind_prompts_schemas_and_every_threshold(
     assert sam_job_id(runner) != sam_job_id(mutated)
 
 
+def test_completion_generation_identity_ignores_generator_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, storage = _storage_variant(tmp_path, monkeypatch, "run-generator-id")
+    runner = _runner(config, storage, tmp_path)
+    changed = _runner(
+        replace(
+            config,
+            reference_edit=replace(
+                config.reference_edit,
+                backend="alternate_image_edit",
+                model_path=Path("/alternate/checkpoint"),
+                model_revision="alternate-revision",
+            ),
+        ),
+        storage,
+        tmp_path,
+        ledger_name="ledger-alternate-generator-id",
+    )
+    plan = runner._clip_plan(SHARD, CLIP_UID)
+    owner_plan = runner._owner_plan_for(SHARD, plan, OWNER)
+    reference = runner._owner_reference(storage, CLIP_UID, OWNER)
+    discovery = _human_discovery(attributes=(COMPLETION_ATTRIBUTE,))
+    discovery_job_id = runner._expected_discovery_job(
+        SHARD, CLIP_UID, owner_plan
+    ).job_id()
+    attribute_plan = runner._attribute_plan(
+        SHARD, storage, CLIP_UID, owner_plan, reference,
+        discovery, 0, "a1", discovery_job_id,
+    )
+    candidate = SimpleNamespace(
+        crop=Image.new("RGBA", (8, 8), (10, 20, 30, 255)),
+        owner_candidate=SimpleNamespace(candidate_id="candidate_1"),
+    )
+    first = runner._expected_completion_generate_job(
+        SHARD, CLIP_UID, owner_plan, attribute_plan, candidate, 0, 7
+    )
+    second = changed._expected_completion_generate_job(
+        SHARD, CLIP_UID, owner_plan, attribute_plan, candidate, 0, 7
+    )
+    assert first.job_id() == second.job_id()
+    assert first.model_identity == "image_edit_generator"
+    assert runner._completion_generate_policy_identity()["target_area"] == 1024 * 1024
+
+
 def test_rank1_completion_outcome_marker_is_published_and_checked(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

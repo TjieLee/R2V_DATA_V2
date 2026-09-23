@@ -9,14 +9,13 @@ This module reuses the shared helpers in :mod:`r2v_data_v2.v3.remove`
 existing publication helpers. Nothing here re-describes a prompt, a candidate
 preparation rule, a judge call or an accept/reject rule.
 
-v1 supports exactly one topology:
+The Resource Epoch supports exactly one heavy generator topology:
 
-    BOOGU epoch   GPU0-7, eight persistent Boogu workers, one generation each
+    BOOGU epoch   GPU0-7, eight persistent Qwen-Image workers; legacy slot name
     QWEN epoch    one managed Qwen3-VL server, TP1 x DP8, judging over HTTP
 
-``config.remove.backend`` must be the Boogu backend. The legacy
-``remove_backgrounds()`` still supports the Qwen Image Edit remover unchanged;
-this adapter refuses anything else instead of loading a second heavy remover.
+The legacy ``remove_backgrounds()`` keeps its separate backend selection;
+this adapter always uses the shared Resource Epoch image-edit slot.
 
 Attempt semantics are legacy-equivalent
 ---------------------------------------
@@ -190,18 +189,34 @@ class RemovalEpochError(RuntimeError):
     """The removal adapter could not run a job safely; fail closed."""
 
 
-def require_boogu_backend(config: V3Config) -> None:
-    """resource-epoch remove v1 supports the Boogu remover only."""
-    if config.remove.backend != BOOGU_REMOVE_BACKEND:
-        raise RemovalEpochError(
-            "resource_epoch_v3 background remove requires Boogu remove backend"
-        )
-
-
 def removal_generation_resource(config: V3Config) -> str:
     """Which epoch owns one background-removal generation."""
-    require_boogu_backend(config)
     return RESOURCE_BOOGU
+
+
+def _full_frame_removal_policy_config(config: V3Config) -> V3Config:
+    """Select the frozen full-frame policy without gating generator choice.
+
+    The legacy label also tells the frozen background reader how to validate
+    the published candidate. It is a layout marker in Resource Epoch state,
+    not a claim that the generation worker still runs Boogu.
+    """
+    return replace(
+        config,
+        remove=replace(config.remove, backend=BOOGU_REMOVE_BACKEND),
+    )
+
+
+def prepare_epoch_removal_context(
+    config: V3Config,
+    storage: RunStorage,
+    clip_uid: str,
+    state: BackgroundReferenceState,
+) -> RemovalAttemptContext:
+    """Keep the established full-frame Removal policy for this epoch."""
+    return prepare_removal_attempt_context(
+        _full_frame_removal_policy_config(config), storage, clip_uid, state
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -239,7 +254,6 @@ def removal_seed_anchor_inputs(
     """
     inputs = context.inputs
     return {
-        "backend": config.remove.backend,
         "candidate_mode": context.candidate_mode,
         "prompt": context.prompt,
         "source_image": _image_digest(inputs.source_image),
@@ -254,7 +268,6 @@ def removal_seed_anchor_inputs(
         ),
         "target_area": config.reference_edit.target_area,
         "alignment": config.reference_edit.alignment,
-        "model_identity": context.profile_model,
         "attempt_index": attempt_index,
         "cycle_index": cycle_index,
     }
@@ -402,7 +415,6 @@ def generation_semantic_inputs(
     inputs = context.inputs
     return {
         "kind": "generation",
-        "backend": config.remove.backend,
         "candidate_mode": context.candidate_mode,
         "prompt": context.prompt,
         "seed": seed,
@@ -470,8 +482,7 @@ def build_removal_generate_job(
     attempt_index: int,
     seed: int,
 ) -> ModelJob:
-    """One Boogu generation call for one clip, cycle and attempt."""
-    require_boogu_backend(config)
+    """One image-edit generation call for one clip, cycle and attempt."""
     return ModelJob.create(
         job_type=(
             REMOVAL_GENERATE_JOB if cycle_index == 0 else REMOVAL_CANDIDATE2_JOB
@@ -486,7 +497,7 @@ def build_removal_generate_job(
             attempt_index=attempt_index,
             cycle_index=cycle_index,
         ),
-        model_identity=context.profile_model,
+        model_identity="image_edit_generator",
         target={"cycle_index": str(cycle_index)},
         attempt_index=attempt_index,
         seed=seed,
@@ -550,7 +561,7 @@ class _JobRef:
 def resolve_removal_backend(handle: Any, config: V3Config) -> Any:
     """Return a ``BackgroundRemovalBackend`` for one generation job.
 
-    A persistent Boogu worker is wrapped, never adapted twice, so the shared
+    A persistent image-edit worker is wrapped, never adapted twice, so the shared
     prompt and generation-size rules stay the only implementation.
     """
     if handle is None:
@@ -643,7 +654,6 @@ class RemovalEpochRunner:
         seed_allocator: Callable[[], int] = new_boogu_seed,
         cpu_workers: int | None = None,
     ) -> None:
-        require_boogu_backend(config)
         self.config = config
         # Execution-only CPU budget; never part of any identity or schema.
         self.cpu_workers = resolve_cpu_workers(config) if cpu_workers is None else int(
@@ -718,7 +728,9 @@ class RemovalEpochRunner:
                 self._attempt_contexts[key] = cached
                 self._attempt_context_counters["attempt_context_reuse_hits"] += 1
                 return cached
-        context = prepare_removal_attempt_context(self.config, storage, clip_uid, state)
+        context = prepare_epoch_removal_context(
+            self.config, storage, clip_uid, state
+        )
         with self._attempt_contexts_lock:
             self._attempt_context_counters["attempt_context_strict_preparations"] += 1
             if len(self._attempt_contexts) >= self._attempt_contexts_limit:
@@ -1049,7 +1061,7 @@ class RemovalEpochRunner:
                 str(dict(job.dependency_digests)["candidate"]), CANDIDATE_ARTIFACT
             )
             _publish_ready(
-                self.config,
+                _full_frame_removal_policy_config(self.config),
                 storage,
                 clip_uid=clip_uid,
                 original=state,
@@ -1381,16 +1393,15 @@ def build_removal_epoch_factories(
     job_runner: Callable[[Any, Any], Any] | None = None,
     with_sam_epoch: bool = False,
 ) -> dict[str, Callable[[], tuple[Any, Any]]]:
-    """Resource-epoch factories for the Boogu and Qwen epochs.
+    """Resource-epoch factories for the image-edit and Qwen epochs.
 
     The Qwen epoch is the managed TP1 x DP8 judge server. No image-edit remover
-    is ever loaded here: generation belongs to the Boogu worker epoch.
+    is ever loaded here: generation belongs to the legacy Boogu-named worker epoch.
 
     ``job_runner`` lets a shared 4b session hand in a stage dispatch that
     rebinds Removal -> Pair behind the same cached Qwen executor. Without it the
     behaviour is exactly the current one: both executors call ``runner.run``.
     """
-    require_boogu_backend(config)
     slot_count = len(pool.gpu_ids)
     if job_runner is None:
         if runner is None:
@@ -1777,7 +1788,6 @@ def build_removal_epoch_runner(
     launcher already enumerated and published; when it is absent the identity
     falls back to enumerating the Stage2 root, which is the same number.
     """
-    require_boogu_backend(config)
     require_subject_attribute_gme_disabled(config)
     worker_pool = pool or WorkerPoolConfig()
     # Execution-only CPU budget, resolved once here and passed explicitly down
@@ -2226,7 +2236,6 @@ def run_removal_epoch(
             "run_removal_epoch needs POST_MASK_BASE_CONFIG in the environment"
         )
     config = load_config(Path(base_config))
-    require_boogu_backend(config)
     # The orchestrator runs dozens of CPU threads; native libraries in this
     # process must not each spawn their own pool on top of that. Model work
     # happens in subprocesses, whose CPU policy is untouched.

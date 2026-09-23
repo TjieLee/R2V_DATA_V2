@@ -9,7 +9,8 @@ accept/reject rule; each epoch only hands the semantic layer a live handle.
 Three epochs are supported:
 
     Qwen   one locally managed vLLM server, TP1 x DP8 across GPU0-7
-    Boogu  eight persistent Boogu worker processes, one per GPU
+    Boogu  eight persistent Qwen-Image worker processes, one per GPU; the
+           resource name is retained for durable scheduler compatibility
     SAM    eight persistent SAM3 workers, one per GPU
 
 Exactly one heavy GPU resource is loaded at a time. :class:`ResourceEpochManager`
@@ -634,30 +635,29 @@ def boogu_worker_factory(
     allowed_server_root: Path,
     pool: WorkerPoolConfig,
 ) -> Callable[[int, int], Any]:
-    """Build one persistent Boogu subprocess pinned to a single GPU."""
+    """Build one persistent Qwen-Image subprocess in the legacy resource slot."""
 
     def factory(slot: int, gpu_id: int) -> Any:
-        from r2v_data_v2.v3.reference_edit_boogu import (
-            BooguSubprocessBackend,
-            BooguWorkerConfig,
+        from r2v_data_v2.v3.qwen_image21_backend import (
+            QwenImage21SubprocessBackend,
+            QwenImage21WorkerConfig,
         )
 
-        worker_config = BooguWorkerConfig(
+        worker_config = QwenImage21WorkerConfig(
             python_executable=config.python_executable,
-            code_root=config.code_root,
             model_path=config.model_path,
-            model_revision=config.model_revision,
+            prompt_enhancer_i2i_path=config.prompt_enhancer_i2i_path,
+            num_inference_steps=config.num_inference_steps,
             device="cuda:0",
             cuda_visible_devices=str(gpu_id),
             timeout_seconds=int(
                 min(config.timeout_seconds, pool.timeout_seconds)
             ),
             temporary_root=Path(temporary_root) / f"slot-{slot}",
-            allowed_server_root=allowed_server_root,
         )
-        backend = BooguSubprocessBackend(worker_config)
+        backend = QwenImage21SubprocessBackend(worker_config)
         backend.start(
-            stderr_log_path=Path(temporary_root) / f"boogu-slot-{slot}.log"
+            stderr_log_path=Path(temporary_root) / f"image-edit-slot-{slot}.log"
         )
         return backend
 

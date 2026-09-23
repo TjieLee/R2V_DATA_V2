@@ -62,13 +62,13 @@ from r2v_data_v2.v3.reference_edit_boogu import (
     BooguEditOutput,
     BooguSamReview,
 )
-from r2v_data_v2.v3.reference_judge import (
-    EntityReferenceDecisionAttempt,
-    subject_has_nontrivial_detached_component,
-)
 from r2v_data_v2.v3.reference_integrity import (
     SourceBboxFallbackJudgeFailure,
     SourceBboxFallbackReviewAttempt,
+)
+from r2v_data_v2.v3.reference_judge import (
+    EntityReferenceDecisionAttempt,
+    subject_has_nontrivial_detached_component,
 )
 from r2v_data_v2.v3.reference_prefilter import (
     NEAR_SILHOUETTE_RULE,
@@ -101,9 +101,9 @@ from r2v_data_v2.v3.schemas import (
     RawCrossPairDecision,
     RawEntityReferenceDecision,
     ReferencesState,
-    SourceBboxFallbackReview,
     SampledFrame,
     SampledFramesArtifact,
+    SourceBboxFallbackReview,
     TrackedEntityMasks,
     TrackedMaskFrame,
     TrackedMasksArtifact,
@@ -5637,6 +5637,41 @@ def test_repairable_completion_accept_is_canonical_without_background_edit(
     )
     assert clip.references.entities[0].completion_needed_for_reference_use is True
     assert clip.references.entities[0].detached_target_fragments_present is True
+
+
+def test_generated_rgb_reference_reader_uses_layout_not_backend_label(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch, reference_edit_enabled=True)
+    storage = _storage(config, entity_types=("subject",))
+    pair_clips(config, storage, judge=_Judge({"e1": "repairable"}))
+    reference_edit_clips(
+        config,
+        storage,
+        backend=_ReferenceEditBackend(),
+        judge=_ReferenceEditJudge(),
+        sam_reviewer=_ReferenceEditSamReviewer(),
+    )
+    clip = storage.read_clip("clip-1")
+    reference = clip.references.entities[0]
+    metadata_path = storage.root / reference.generation_metadata_path
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert reference.synthetic is True
+    assert Path(reference.image_path).name == "final_reference_1k.png"
+
+    for backend in ("boogu_image_0_1_edit_turbo", "qwen_image_2_1", "custom"):
+        metadata["backend"] = backend
+        metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+        validate_entity_reference_artifact(
+            config,
+            storage,
+            "clip-1",
+            clip.annotation.entities[0],
+            reference,
+            storage.read_frames("clip-1"),
+            storage.read_masks("clip-1"),
+        )
 
 
 def test_repairable_completion_rejection_falls_back_to_source_alpha(
