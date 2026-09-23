@@ -174,12 +174,13 @@ def test_formal_initialize_shard_allows_only_official_public_output(
     shard_path.parent.mkdir(parents=True)
     shard_path.write_text("", encoding="utf-8")
 
-    monkeypatch.setattr(config_module, "ALLOWED_WRITABLE_ROOT", writable)
-    monkeypatch.setattr(config_module, "OFFICIAL_POST_MASK_EXPORT_ROOT", official)
-
     config = config_module.load_config(
         REPO / "configs/v3_post_mask_resource_epoch_production.yaml"
     )
+
+    monkeypatch.setattr(config_module, "ALLOWED_WRITABLE_ROOT", writable)
+    monkeypatch.setattr(config_module, "OFFICIAL_POST_MASK_EXPORT_ROOT", official)
+
     config = replace(
         config,
         run_root=writable / "base",
