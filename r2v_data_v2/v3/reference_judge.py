@@ -200,8 +200,7 @@ with roughly at least 50% of the frontal facial identity region visible;
 three-quarter views must meet this near-front standard. Reject strong
 three-quarter or near-side views below that standard, side profiles, rear views,
 and hidden faces. Judge semantically; do not invent a numeric ratio.
-For objects
-and groups, primary_identity_region_visible means the main recognizable region
+For objects and groups, primary_identity_region_visible means the main recognizable region
 is present. major_structure_visible means most coherent structure remains.
 
 Detached fragments
