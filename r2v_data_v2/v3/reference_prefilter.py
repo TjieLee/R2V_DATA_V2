@@ -79,6 +79,14 @@ def _subject_near_silhouette(metrics: Mapping[str, object]) -> bool:
     )
 
 
+def _subject_extreme_blur(metrics: Mapping[str, object]) -> bool:
+    return (
+        _finite_metric(metrics, "laplacian_variance") <= 5
+        and _finite_metric(metrics, "tenengrad_mean") <= 100
+        and _finite_metric(metrics, "edge_density") <= 0.05
+    )
+
+
 def _subject_relative_blur_v2(
     metrics: Mapping[str, object],
     *,
@@ -144,15 +152,27 @@ def prefilter_entity_reference_candidates[CandidateT: CandidateLike](
     inapplicable_reason = (
         None if relative_blur_applicable else "requires_three_candidates"
     )
+    extreme_blur = [
+        entity.reference_type == "subject" and _subject_extreme_blur(metrics)
+        for metrics in technical_metrics
+    ]
+    # Whole-subject sharpness is only a safe deterministic filter when at
+    # least one candidate provides a clearly better alternative. If every
+    # candidate looks "extreme" to these coarse mask-wide metrics, keep them
+    # all and let the VLM judge facial identity/recognizability semantically.
+    extreme_blur_filter_applicable = (
+        entity.reference_type == "subject" and any(not flagged for flagged in extreme_blur)
+    )
     max_laplacian = max(laplacians)
     max_tenengrad = max(tenengrads)
     decisions_list: list[ReferencePrefilterDecision] = []
     retained: list[CandidateT] = []
-    for candidate, metrics, laplacian, tenengrad in zip(
+    for candidate, metrics, laplacian, tenengrad, extreme_blur_flag in zip(
         original,
         technical_metrics,
         laplacians,
         tenengrads,
+        extreme_blur,
         strict=True,
     ):
         laplacian_ratio = _safe_ratio(laplacian, max_laplacian)
@@ -160,12 +180,7 @@ def prefilter_entity_reference_candidates[CandidateT: CandidateLike](
         flagged_by: list[str] = []
         if entity.reference_type == "subject" and _subject_near_silhouette(metrics):
             flagged_by.append(NEAR_SILHOUETTE_RULE)
-        if (
-            entity.reference_type == "subject"
-            and laplacian <= 5
-            and tenengrad <= 100
-            and _finite_metric(metrics, "edge_density") <= 0.05
-        ):
+        if extreme_blur_filter_applicable and extreme_blur_flag:
             flagged_by.append(SUBJECT_EXTREME_BLUR_RULE)
         if relative_blur_applicable and _subject_relative_blur_v2(
             metrics,
