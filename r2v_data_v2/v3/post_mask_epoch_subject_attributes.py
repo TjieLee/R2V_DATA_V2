@@ -45,6 +45,8 @@ from r2v_data_v2.reconciliation import write_json_atomic
 from r2v_data_v2.v3.boogu_seed import new_boogu_seed
 from r2v_data_v2.v3.config import V3Config
 from r2v_data_v2.v3.pair import (
+    EntityReferenceCandidate,
+    _decode_candidate_mask,
     build_entity_reference_candidates,
     build_reference_crop,
     mask_component_diagnostics,
@@ -1902,15 +1904,134 @@ class SubjectAttributeEpochRunner:
             target={"owner_entity_id": str(owner_plan["owner_entity_id"])},
         )
 
+    def _materialize_frozen_candidate(
+        self,
+        storage: RunStorage,
+        masks: Any,
+        tracked_frames: Mapping[int, Any],
+        descriptor: Mapping[str, Any],
+    ) -> EntityReferenceCandidate:
+        """One frozen candidate object, rebuilt from the plan and upstream data.
+
+        Only two of its inputs cannot be serialized into the plan - the mask
+        pixels and the source image the model is shown - so those are read again
+        and required to hash exactly what the plan froze. Everything else is the
+        frozen value: the candidate was already selected, ranked and numbered
+        when the plan was derived, and re-deriving those metrics can only ever
+        reproduce them or fail.
+        """
+        frame_slot = int(descriptor["frame_slot"])
+        tracked_frame = tracked_frames.get(frame_slot)
+        if (
+            tracked_frame is None
+            or not bool(tracked_frame.present)
+            or not bool(tracked_frame.track_valid)
+            or int(tracked_frame.area_pixels) <= 0
+        ):
+            raise ValueError("frozen candidate frame is no longer trackable")
+        binary = _decode_candidate_mask(
+            tracked_frame,
+            expected_shape=(int(masks.height), int(masks.width)),
+        )
+        if _mask_sha256(binary) != str(descriptor["mask_sha256"]):
+            raise ValueError("frozen candidate mask pixels changed")
+        image_path = str(descriptor["image_path"])
+        if _file_sha256(storage.root / image_path) != str(
+            descriptor["source_image_sha256"]
+        ):
+            raise ValueError("frozen candidate source image changed")
+        return EntityReferenceCandidate(
+            candidate_id=str(descriptor["candidate_id"]),
+            entity_id=str(descriptor["entity_id"]),
+            frame_slot=frame_slot,
+            source_frame_index=int(descriptor["source_frame_index"]),
+            image_path=image_path,
+            mask=binary,
+            bbox_xyxy=tuple(int(value) for value in descriptor["bbox_xyxy"]),
+            area_pixels=int(descriptor["area_pixels"]),
+            area_ratio=float(descriptor["area_ratio"]),
+            bbox_fill_ratio=float(descriptor["bbox_fill_ratio"]),
+            border_contact_count=int(descriptor["border_contact_count"]),
+            normalized_center_distance=float(
+                descriptor["normalized_center_distance"]
+            ),
+            sharpness_score=float(descriptor["sharpness_score"]),
+            significant_component_count=int(descriptor["significant_component_count"]),
+            largest_component_ratio=float(descriptor["largest_component_ratio"]),
+            second_largest_component_ratio=float(
+                descriptor["second_largest_component_ratio"]
+            ),
+        )
+
+    def _materialize_frozen_candidates(
+        self, shard: str, clip_uid: str, owner_plan: Mapping[str, Any]
+    ) -> list[EntityReferenceCandidate]:
+        """The frozen owner candidates, without re-running the live selection.
+
+        The clip plan already froze which candidates exist, in which order, with
+        which identity, geometry and metrics, and the live selection that
+        produced them ran once for this clip plan. Re-running it at every receipt
+        boundary re-encoded every discovery context the model is shown - for
+        evidence that has to come out identical or fail. This materializes the
+        same objects from the plan plus the two upstream inputs that are checked
+        by digest instead, so the model can only ever be shown the frozen
+        evidence and a drifted upstream artifact still fails closed.
+        """
+        owner_entity_id = str(owner_plan["owner_entity_id"])
+        frozen = [dict(item) for item in owner_plan.get("candidates", [])]
+        try:
+            storage = self._storage_for(shard)
+            clip = storage.read_clip(clip_uid)
+            owner = next(
+                (
+                    item
+                    for item in clip.annotation.entities
+                    if item.entity_id == owner_entity_id
+                ),
+                None,
+            )
+            if owner is None:
+                raise SubjectAttributeDurableError(
+                    f"owner {clip_uid}/{owner_entity_id} is missing from the "
+                    "annotation"
+                )
+            masks = storage.read_masks(clip_uid)
+            tracked = masks.entities.get(owner_entity_id)
+            if tracked is None:
+                raise ValueError("mask artifact has no tracked owner entity")
+            if (
+                tracked.reference_type != owner.reference_type
+                or tracked.grounding_prompt != owner.grounding_prompt
+            ):
+                raise ValueError("mask artifact entity semantics changed")
+            if tracked.status != "ready":
+                raise ValueError("tracked owner entity is no longer ready")
+            if [int(item.slot) for item in tracked.frames] != list(range(10)):
+                raise ValueError("tracked entity slots are no longer ordered")
+            tracked_frames = {int(item.slot): item for item in tracked.frames}
+            return [
+                self._materialize_frozen_candidate(
+                    storage, masks, tracked_frames, descriptor
+                )
+                for descriptor in frozen
+            ]
+        except SubjectAttributeDurableError:
+            raise
+        except (OSError, ValueError):
+            raise SubjectAttributeDurableError(
+                f"frozen Subject Attributes candidate evidence drifted for "
+                f"{clip_uid}/{owner_entity_id}"
+            ) from None
+
     def _owner_candidate_objects(
         self, shard: str, clip_uid: str, owner_plan: Mapping[str, Any]
     ) -> list[Any]:
-        """Validate owner candidates once per invocation, then reuse them."""
+        """Materialize the frozen owner candidates once per invocation."""
         owner_entity_id = str(owner_plan["owner_entity_id"])
         cache_key = (shard, clip_uid, owner_entity_id)
         # Attribute replays can run on several threads, so the bounded cache is
-        # guarded: losing an entry would only cost a rebuild, but the bound and
-        # the drift check must stay coherent.
+        # guarded: losing an entry would only cost a materialization, but the
+        # bound and the drift check must stay coherent.
         with self._candidate_cache_lock:
             cached = self._owner_candidate_cache.get(cache_key)
             if cached is not None:
@@ -1922,30 +2043,7 @@ class SubjectAttributeEpochRunner:
             self._bump_replay_counter("owner_candidate_cache_miss")
             self._bump_replay_counter("owner_candidate_rebuilds")
 
-        storage = self._storage_for(shard)
-        clip = storage.read_clip(clip_uid)
-        owner = next(
-            (
-                item
-                for item in clip.annotation.entities
-                if item.entity_id == owner_entity_id
-            ),
-            None,
-        )
-        if owner is None:
-            raise SubjectAttributeDurableError(
-                f"owner {clip_uid}/{owner_entity_id} is missing from the annotation"
-            )
-        frames = storage.read_frames(clip_uid)
-        masks = storage.read_masks(clip_uid)
-        candidates = self._owner_candidates(storage, clip_uid, owner, frames, masks)
-        descriptors = [_candidate_descriptor(storage, item) for item in candidates]
-        frozen = [dict(item) for item in owner_plan.get("candidates", [])]
-        if descriptors != frozen:
-            raise SubjectAttributeDurableError(
-                f"frozen Subject Attributes candidate evidence drifted for "
-                f"{clip_uid}/{owner_entity_id}"
-            )
+        candidates = self._materialize_frozen_candidates(shard, clip_uid, owner_plan)
 
         with self._candidate_cache_lock:
             if len(self._owner_candidate_cache) >= self._owner_candidate_cache_limit:

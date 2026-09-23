@@ -28,6 +28,8 @@ import pytest
 from PIL import Image
 
 import tests.test_v3_reference_integrity as legacy_integrity
+from r2v_data_v2.v3.mask_codec import decode_binary_mask, encode_binary_mask
+from r2v_data_v2.v3.pair import build_entity_reference_candidates
 from r2v_data_v2.v3.post_mask_epoch_jobs import (
     RESOURCE_BOOGU,
     RESOURCE_QWEN,
@@ -1153,9 +1155,18 @@ def _usable_sam(storage: Any, *, slot: int) -> list[Any]:
     return [_attribute_mask(storage, slot=slot, band=0)]
 
 
-def test_owner_candidates_are_validated_once_per_runner_invocation(
+def test_owner_candidates_are_never_reselected_at_a_receipt_boundary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """The live candidate selection runs for the clip plan and never again.
+
+    The clip plan froze which candidates exist and everything about them, so the
+    replay boundaries materialize those objects from the plan and the two
+    upstream inputs instead of re-running the selection, re-selecting the
+    candidates, re-encoding every discovery context and then having to throw all
+    of it away. The plan is the authority; the objects are built once per
+    invocation and cached after that.
+    """
     config, storage = _storage_variant(tmp_path, monkeypatch, "run-owner-cache")
     runner = _runner(config, storage, tmp_path)
     plan = runner._clip_plan(SHARD, CLIP_UID)
@@ -1175,10 +1186,139 @@ def test_owner_candidates_are_validated_once_per_runner_invocation(
     second = runner._owner_candidate_objects(SHARD, CLIP_UID, owner_plan)
     third = runner._owner_candidate_objects(SHARD, CLIP_UID, owner_plan)
 
-    assert calls == 1
-    assert [item.candidate_id for item in first] == [
-        item.candidate_id for item in second
-    ] == [item.candidate_id for item in third]
+    assert calls == 0, "the replay path must never re-run the live selection"
+    assert runner.replay_counters["owner_candidate_rebuilds"] == 1
+    assert runner.replay_counters["owner_candidate_cache_hit"] == 2
+    frozen_ids = [item["candidate_id"] for item in owner_plan["candidates"]]
+    assert [item.candidate_id for item in first] == frozen_ids
+    assert [item.candidate_id for item in second] == frozen_ids
+    assert [item.candidate_id for item in third] == frozen_ids
+
+
+def test_materialized_candidates_match_a_live_rebuild_field_for_field(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Materializing from the plan is exactly what the live rebuild produced.
+
+    The frozen plan is the authority, so this compares it against the real live
+    selection on the same clip: every field of every candidate, plus the mask
+    bytes themselves, must be equal - which is also why the replay no longer has
+    to pay for the selection again.
+    """
+    config, storage = _storage_variant(tmp_path, monkeypatch, "run-materialize")
+    runner = _runner(config, storage, tmp_path)
+    plan = runner._clip_plan(SHARD, CLIP_UID)
+    owner = runner._eligible_owners(plan)[0]
+    owner_plan = runner._owner_plan(SHARD, CLIP_UID, owner, 0, 1)
+
+    clip = storage.read_clip(CLIP_UID)
+    annotation_owner = next(
+        item for item in clip.annotation.entities if item.entity_id == OWNER
+    )
+    live = build_entity_reference_candidates(
+        config,
+        storage,
+        clip_uid=CLIP_UID,
+        entity=annotation_owner,
+        frames=storage.read_frames(CLIP_UID),
+        masks=storage.read_masks(CLIP_UID),
+    )
+    materialized = runner._owner_candidate_objects(SHARD, CLIP_UID, owner_plan)
+
+    assert len(materialized) == len(live) > 0
+    assert any(
+        item.area_pixels > 0 and item.area_ratio > 0.0 and item.bbox_xyxy != (0, 0, 0, 0)
+        for item in materialized
+    ), "the field-for-field comparison would be vacuous on this fixture"
+    for frozen, rebuilt in zip(materialized, live):
+        assert frozen.candidate_id == rebuilt.candidate_id
+        assert frozen.entity_id == rebuilt.entity_id
+        assert frozen.frame_slot == rebuilt.frame_slot
+        assert frozen.source_frame_index == rebuilt.source_frame_index
+        assert frozen.image_path == rebuilt.image_path
+        assert frozen.bbox_xyxy == rebuilt.bbox_xyxy
+        assert frozen.area_pixels == rebuilt.area_pixels
+        assert frozen.area_ratio == rebuilt.area_ratio
+        assert frozen.bbox_fill_ratio == rebuilt.bbox_fill_ratio
+        assert frozen.border_contact_count == rebuilt.border_contact_count
+        assert (
+            frozen.normalized_center_distance == rebuilt.normalized_center_distance
+        )
+        assert frozen.sharpness_score == rebuilt.sharpness_score
+        assert frozen.significant_component_count == rebuilt.significant_component_count
+        assert frozen.largest_component_ratio == rebuilt.largest_component_ratio
+        assert (
+            frozen.second_largest_component_ratio
+            == rebuilt.second_largest_component_ratio
+        )
+        assert np.array_equal(frozen.mask, rebuilt.mask)
+        assert frozen.mask.dtype == rebuilt.mask.dtype
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "source_image_bytes",
+        "source_image_missing",
+        "mask_pixels",
+        "mask_owner_missing",
+        "tracked_entity_not_ready",
+        "slot_order",
+    ],
+)
+def test_drifted_upstream_candidate_evidence_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tamper: str
+) -> None:
+    """Anything the frozen candidate evidence binds must still fail closed.
+
+    The replay materializes the candidates from the plan instead of re-running
+    the live selection, so this proves the drift check that used to fall out of
+    that re-selection is still enforced on the inputs the model is actually
+    shown: the source image bytes and the mask pixels.
+    """
+    config, storage = _storage_variant(tmp_path, monkeypatch, "run-drift")
+    runner = _runner(config, storage, tmp_path)
+    plan = runner._clip_plan(SHARD, CLIP_UID)
+    owner = runner._eligible_owners(plan)[0]
+    owner_plan = runner._owner_plan(SHARD, CLIP_UID, owner, 0, 1)
+    frozen = owner_plan["candidates"][0]
+    masks_path = Path(storage.root) / "clips" / CLIP_UID / "masks.rle.json"
+    image_path = Path(storage.root) / frozen["image_path"]
+
+    if tamper == "source_image_bytes":
+        image_path.write_bytes(image_path.read_bytes() + b"tampered")
+    elif tamper == "source_image_missing":
+        image_path.unlink()
+    else:
+        payload = json.loads(masks_path.read_text(encoding="utf-8"))
+        track = payload["entities"][OWNER]
+        slot = int(frozen["frame_slot"])
+        if tamper == "mask_pixels":
+            frame = track["frames"][slot]
+            binary = decode_binary_mask(frame["rle"])
+            # Same shape, same area, same presence and every other tracked
+            # diagnostic unchanged, so the frozen mask digest is the only thing
+            # that can see this: a decoder-side area check must not be what
+            # answers.
+            frame["rle"] = encode_binary_mask(
+                np.roll(binary, 1, axis=1)
+            ).model_dump(mode="json")
+        elif tamper == "mask_owner_missing":
+            payload["entities"].pop(OWNER)
+        elif tamper == "tracked_entity_not_ready":
+            track["status"] = "failed"
+        else:
+            track["frames"] = list(reversed(track["frames"]))
+        masks_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    # A fresh runner must still see the same plan, so the tamper cannot be
+    # reported by the plan check: it is the replay evidence check that answers.
+    with pytest.raises(
+        SubjectAttributeDurableError, match="candidate evidence drifted"
+    ):
+        _runner(config, storage, tmp_path, ledger_name="ledger-drift")._owner_candidate_objects(
+            SHARD, CLIP_UID, owner_plan
+        )
 
 
 def test_clip_plan_is_rederived_once_per_runner_invocation(
