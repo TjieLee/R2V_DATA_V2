@@ -112,17 +112,12 @@ def test_asr_prefetch_overlaps_only_next_load_and_preserves_results(
     assert [worker.process(job, tmp_path) for job in asr_jobs] == results
 
 
-def test_asr_worker_hashes_each_source_audio_once(
+def test_asr_worker_does_not_rehash_published_source_audio(
     speech, asr_jobs, tmp_path, monkeypatch
 ):
-    original = frozen.sha256_file
-    calls = Counter()
-
-    def counted(path):
-        calls[str(path)] += 1
-        return original(path)
-
-    monkeypatch.setattr(frozen, "sha256_file", counted)
+    monkeypatch.setattr(
+        frozen, "sha256_file", lambda path: pytest.fail(f"unexpected hash: {path}")
+    )
     monkeypatch.setattr(
         speech.asr,
         "load_qwen3_asr_model_input",
@@ -137,19 +132,14 @@ def test_asr_worker_hashes_each_source_audio_once(
     )
     with worker.batch_jobs(asr_jobs):
         [worker.process(job, tmp_path) for job in asr_jobs]
-    source = asr_jobs[0]["segment"]["source_audio_path"]
-    assert calls[source] == 1
 
 
-@pytest.mark.parametrize("failure", ["loader", "hash", "inference"])
+@pytest.mark.parametrize("failure", ["loader", "inference"])
 def test_asr_prefetch_failure_belongs_to_current_job(
     speech, asr_jobs, tmp_path, monkeypatch, failure
 ):
     failed = threading.Event()
     inferred = []
-    if failure == "hash":
-        asr_jobs[1]["source_audio_sha256"] = "0" * 64
-
     def load(path, start, end, *, ffmpeg):
         if start == 1 and failure == "loader":
             failed.set()
@@ -173,13 +163,30 @@ def test_asr_prefetch_failure_belongs_to_current_job(
         assert worker.process(asr_jobs[0], tmp_path) == {"text": "0", "language": None}
         expected = {
             "loader": "crop failed",
-            "hash": "audio changed",
             "inference": "bad sample",
         }
         with pytest.raises(ValueError, match=expected[failure]):
             worker.process(asr_jobs[1], tmp_path)
         assert worker.process(asr_jobs[2], tmp_path) == {"text": "2", "language": None}
     assert inferred == ([0, 1, 2] if failure == "inference" else [0, 2])
+
+
+def test_diar_worker_does_not_rehash_published_source_audio(
+    speech, finalized, tmp_path, ffmpeg, monkeypatch
+):
+    audio, run_id = finalized
+    executor = Executor()
+    speech.run_diarizen(
+        audio, run_id, tmp_path / "workers", ["2", "7"], True,
+        ffmpeg=ffmpeg, execute=executor,
+    )
+    job = executor.batches[-1][1][0]
+    monkeypatch.setattr(
+        frozen, "sha256_file", lambda path: pytest.fail(f"unexpected hash: {path}")
+    )
+    backend = _Diarization()
+    backend._process = SimpleNamespace(poll=lambda: None)
+    assert speech._DiarWorker(backend).process(job, tmp_path)["segments"]
 
 
 @pytest.mark.parametrize("error", [SystemExit, KeyboardInterrupt])

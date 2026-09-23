@@ -9,7 +9,7 @@ import subprocess
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from functools import lru_cache
+from functools import cache
 from pathlib import Path
 
 import numpy as np
@@ -72,7 +72,7 @@ def _logical_model_fingerprint(path: Path, identifier: str) -> str:
     ).hexdigest()
 
 
-@lru_cache(maxsize=None)
+@cache
 def _diar_configuration_cached(environment_key):
     from tools.run_h3_diarization_binding import _configuration_fingerprint
 
@@ -110,7 +110,7 @@ def _diar_configuration():
     return _diar_configuration_cached(_environment_key(_environment("DIARIZEN")))
 
 
-@lru_cache(maxsize=None)
+@cache
 def _asr_configuration_cached(environment_key):
     environment = dict(environment_key)
     configuration = asr.Qwen3ASRConfiguration.from_environment().model_copy(
@@ -190,8 +190,6 @@ class _DiarWorker:
         del output_dir
         target = diar.DiarizationTargetClip.model_validate(job["target"])
         path = Path(target.source_audio_path)
-        if frozen.sha256_file(path) != target.source_audio_sha256:
-            raise ValueError("DiariZen source audio changed")
         segments = _inference(
             self.backend,
             lambda: self.backend.diarize(
@@ -211,7 +209,6 @@ class _ASRWorker:
         self._loader = None
         self._jobs = None
         self._prefetched = None
-        self._validated_source_hashes = set()
 
     @contextmanager
     def batch_jobs(self, jobs):
@@ -241,11 +238,6 @@ class _ASRWorker:
     def _load_waveform(self, job):
         row = asr._ReadableDiarizationSegment.model_validate(job["segment"])
         path = Path(row.source_audio_path)
-        source_identity = (str(path), job["source_audio_sha256"])
-        if source_identity not in self._validated_source_hashes:
-            if frozen.sha256_file(path) != job["source_audio_sha256"]:
-                raise ValueError("ASR source audio changed")
-            self._validated_source_hashes.add(source_identity)
         return asr.load_qwen3_asr_model_input(
             path,
             row.start_time,

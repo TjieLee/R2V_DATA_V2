@@ -64,9 +64,7 @@ def _stage_receipts(shard, uid, identity, state):
         if directory.is_symlink():
             raise ValueError("redirected downstream stage")
         if directory.exists():
-            if not directory.is_dir() or any(
-                p.is_symlink() for p in directory.rglob("*")
-            ):
+            if not directory.is_dir():
                 raise ValueError("invalid downstream stage artifacts")
             receipt = json.loads((directory / "stage.json").read_text())
             for relative in receipt["files"]:
@@ -76,7 +74,8 @@ def _stage_receipts(shard, uid, identity, state):
             # Historical stage identities may include runtime/model provenance.
             # Published artifact presence, not model metadata, is the resume gate.
             for relative in receipt["files"]:
-                if not (directory / relative).is_file():
+                artifact = directory / relative
+                if artifact.is_symlink() or not artifact.is_file():
                     raise ValueError("published stage artifact is missing")
             found = True
         elif state and state.get(f"{stage}_status") == "ready":

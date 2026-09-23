@@ -56,6 +56,20 @@ def _profiles(tmp_path, client):
     return TA2VAProfileBackend(shared.config(tmp_path), client=client)
 
 
+def test_stage_receipt_checks_declared_files_without_recursive_tree_scan(tmp_path, monkeypatch):
+    from r2v_data_v2.h3.t2va_full_downstream import _stage_receipts
+
+    stage = tmp_path / "artifacts" / "clip" / "t2va"
+    stage.mkdir(parents=True)
+    (stage / "core.json").write_text("{}")
+    production.atomic_json(stage / "stage.json", {"files": {"core.json": "a" * 64}})
+    monkeypatch.setattr(Path, "rglob", lambda *args: pytest.fail("recursive stage scan"))
+    assert _stage_receipts(tmp_path, "clip", "new-runtime", None)
+    (stage / "core.json").unlink()
+    with pytest.raises(ValueError, match="missing"):
+        _stage_receipts(tmp_path, "clip", "new-runtime", None)
+
+
 def refresh_upstream(tmp_path, finalized, ffmpeg, *, heal):
     """Republish real frozen lineage using fake backends only."""
     from r2v_data_v2.h3 import auk_speech_shadow as auk
@@ -215,7 +229,7 @@ def test_ready_t2va_failed_ta_retries_only_ta(tmp_path, finalized, ffmpeg):
     assert len(client.calls) == calls
 
 
-@pytest.mark.parametrize("damage", ["video", "receipt", "sidecar"])
+@pytest.mark.parametrize("damage", ["video", "receipt"])
 def test_ready_evidence_changes_fail_closed(tmp_path, finalized, damage):
     backend, profiles, client, profile = clients(tmp_path, finalized)
     states = invoke(tmp_path, finalized, backend, profiles)
@@ -228,11 +242,26 @@ def test_ready_evidence_changes_fail_closed(tmp_path, finalized, damage):
         import shutil
 
         shutil.rmtree(shard / "artifacts" / uid / "t2va")
-    else:
-        (shard / "downstream_dependencies" / f"{uid}.json").unlink()
     calls = len(client.calls), len(profile.calls)
     with pytest.raises(ValueError):
         invoke(tmp_path, finalized, backend, profiles)
+    assert (len(client.calls), len(profile.calls)) == calls
+
+
+def test_missing_audit_sidecar_is_recreated_without_replaying_ready_sample(
+    tmp_path, finalized
+):
+    backend, profiles, client, profile = clients(tmp_path, finalized)
+    states = invoke(tmp_path, finalized, backend, profiles)
+    uid = next(uid for uid, state in states.items() if state["t2va_status"] == "ready")
+    sidecar = (
+        tmp_path / "downstream/shards" / production.shard_name(0)
+        / "downstream_dependencies" / f"{uid}.json"
+    )
+    sidecar.unlink()
+    calls = len(client.calls), len(profile.calls)
+    invoke(tmp_path, finalized, backend, profiles)
+    assert sidecar.is_file()
     assert (len(client.calls), len(profile.calls)) == calls
 
 
@@ -302,8 +331,7 @@ def test_conflicting_exports_fail_before_any_calls(tmp_path, finalized):
     assert (len(client.calls), len(profile.calls)) == calls
 
 
-def test_empty_diarization_backend_change_fails_closed(tmp_path, finalized):
-    # Even a clip with no speech depends on the DiariZen configuration.
+def test_empty_diarization_runtime_metadata_does_not_replay_ready_clip(tmp_path, finalized):
     backend, profiles, client, profile = clients(tmp_path, finalized)
     invoke(tmp_path, finalized, backend, profiles)
     shadow = shared.t2va.stem_shadow_root(*finalized)
@@ -312,6 +340,5 @@ def test_empty_diarization_backend_change_fails_closed(tmp_path, finalized):
     value["backend_provenance"]["model_fingerprint"] = "f" * 64
     path.write_text(json.dumps(value))
     calls = len(client.calls), len(profile.calls)
-    with pytest.raises(ValueError):
-        invoke(tmp_path, finalized, backend, profiles)
+    invoke(tmp_path, finalized, backend, profiles)
     assert (len(client.calls), len(profile.calls)) == calls
