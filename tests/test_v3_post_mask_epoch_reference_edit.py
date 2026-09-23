@@ -2225,3 +2225,141 @@ def test_ordinary_clip_failure_reason_and_exception_type_match_legacy(
     )
     assert fresh.seed_jobs() == []
     assert fresh.reconcile_stats(SHARD).to_dict() == stats.to_dict()
+
+
+# ---------------------------------------------------------------------------
+# frozen plan validation: once per seed, not once per clip
+# ---------------------------------------------------------------------------
+
+
+def _fresh_target_shard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, count: int
+) -> tuple[Any, Any, list[str]]:
+    """One shard of ``count`` clips that all need a Reference Edit repair."""
+    from tests.test_v3_pair import _add_ready_clip
+    from tests.test_v3_post_mask_epoch_pair import _ScopedJudge
+
+    config = _reference_edit_config(
+        tmp_path, monkeypatch, "run-plan-once", same_parent_fallback_enabled=True
+    )
+    storage = _pair_storage(config, entity_types=("subject",))
+    uids = ["clip-1"]
+    for index in range(2, count + 1):
+        uid = f"clip-{index}"
+        _add_ready_clip(
+            config,
+            storage,
+            clip_uid=uid,
+            clip_suffix=str(index),
+            entity_types=("subject",),
+        )
+        uids.append(uid)
+    _pair_clips()(
+        config,
+        storage,
+        judge=_ScopedJudge(scopes={(uid, "e1"): "repairable" for uid in uids}),
+    )
+    return config, storage, uids
+
+
+def _plan_runner(config: Any, storage: Any, tmp_path: Path, uids: list[str]) -> Any:
+    return ReferenceEditEpochRunner(
+        config,
+        {SHARD: storage},
+        GroupLedger(tmp_path / "ledger"),
+        eligible_clip_uids_by_shard={SHARD: uids},
+    )
+
+
+def _count_plan_validations(runner: Any) -> dict[str, int]:
+    """Count plan-entry validations, their clip digests, and shard plan reads.
+
+    The patches are on the instance and call through to the real validators, so
+    the counters stay exact rather than estimated.
+    """
+    counts = {"entries": 0, "digests": 0, "shard_reads": 0}
+    original_entry = runner._verify_plan_entry
+    original_digest = runner._clip_digest
+    original_existing = runner._existing_plan_for_reconcile
+
+    def counted_entry(shard: str, storage: Any, clip_uid: str, entry: Any) -> None:
+        counts["entries"] += 1
+        return original_entry(shard, storage, clip_uid, entry)
+
+    def counted_digest(storage: Any, clip: Any) -> str:
+        counts["digests"] += 1
+        return original_digest(storage, clip)
+
+    def counted_existing(shard: str) -> Any:
+        counts["shard_reads"] += 1
+        return original_existing(shard)
+
+    runner._verify_plan_entry = counted_entry
+    runner._clip_digest = counted_digest
+    runner._existing_plan_for_reconcile = counted_existing
+    return counts
+
+
+def test_seed_validates_the_frozen_plan_once_per_seed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Seeding N clips must not verify the shard plan N extra times.
+
+    Advancing clip by clip re-read and re-verified the whole shard plan - every
+    clip's digest over its frames and masks manifests - so a shard cost
+    O(clips^2) validations while ``_plan()`` had just validated the very same
+    payload. The seed now spends exactly one pass, and reconcile keeps its own
+    full pass because it verifies the state the stage actually published.
+    """
+    config, storage, uids = _fresh_target_shard(tmp_path, monkeypatch, count=6)
+    # Freeze the plan first, so the seed under test reads it from disk.
+    _plan_runner(config, storage, tmp_path, uids)._plan(SHARD)
+
+    runner = _plan_runner(config, storage, tmp_path, uids)
+    counts = _count_plan_validations(runner)
+
+    jobs = runner.seed_jobs()
+
+    assert len(jobs) == len(uids), "every clip is a fresh target with one job"
+    assert counts["entries"] == len(uids), "one validation pass, not one per clip"
+    assert counts["digests"] == len(uids)
+    assert counts["shard_reads"] == 0, "the seed must not re-fetch the shard plan"
+
+    # A second seed round validates the shard once more, not once per clip.
+    runner.seed_jobs()
+    assert counts["entries"] == 2 * len(uids)
+    assert counts["shard_reads"] == 0
+
+    # Reconcile is the opposite: it re-reads and re-verifies every entry.
+    runner._existing_plan_for_reconcile(SHARD)
+    assert counts["entries"] == 3 * len(uids)
+    assert counts["shard_reads"] == 1
+
+
+def test_a_changed_frozen_plan_is_revalidated_and_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The seed's validated plan must not become reconcile's authority.
+
+    Reconcile verifies the state the stage published, so it re-reads the frozen
+    plan and re-runs every entry check: an entry edited after the seed validated
+    it is still durable corruption.
+    """
+    config, storage, uids = _fresh_target_shard(tmp_path, monkeypatch, count=3)
+    runner = _plan_runner(config, storage, tmp_path, uids)
+    runner.seed_jobs()
+
+    path = runner._plan_path(SHARD)
+    before = path.read_bytes()
+    text = before.decode("utf-8")
+    payload = json.loads(text)
+    target = sorted(payload["clips"])[1]
+    digest = payload["clips"][target]["digest"]
+    # Edit the digest in place, so the byte length cannot be what sees it.
+    assert text.count(digest) == 1
+    replacement = ("f" if digest[0] != "f" else "0") + digest[1:]
+    path.write_text(text.replace(digest, replacement), encoding="utf-8")
+    assert len(path.read_bytes()) == len(before)
+
+    with pytest.raises(ReferenceEditDurableError, match="input drifted"):
+        runner._existing_plan_for_reconcile(SHARD)

@@ -446,20 +446,7 @@ class ReferenceEditEpochRunner:
     def _plan(self, shard: str) -> dict[str, Any]:
         existing = _read_json(self._plan_path(shard))
         if existing is not None:
-            expected = {
-                "schema": REFERENCE_EDIT_PLAN_SCHEMA,
-                "canonical_shard": shard,
-                "eligible_clip_uids": list(self.eligible.get(shard, ())),
-                "policy": self._policy_identity(),
-            }
-            for key, value in expected.items():
-                if existing.get(key) != value:
-                    raise ReferenceEditDurableError(
-                        f"frozen Reference Edit plan {key} drifted for {shard!r}"
-                    )
-            storage = self._storage_for(shard)
-            for clip_uid, entry in existing.get("clips", {}).items():
-                self._verify_plan_entry(shard, storage, clip_uid, entry)
+            self._verify_plan_payload(shard, existing)
             return existing
 
         storage = self._storage_for(shard)
@@ -477,12 +464,8 @@ class ReferenceEditEpochRunner:
         _write_json_once(self._plan_path(shard), payload)
         return payload
 
-    def _existing_plan_for_reconcile(self, shard: str) -> dict[str, Any]:
-        payload = _read_json(self._plan_path(shard))
-        if payload is None:
-            raise ReferenceEditEpochError(
-                f"reconcile_stats needs a frozen Reference Edit plan for {shard!r}"
-            )
+    def _verify_plan_payload(self, shard: str, payload: dict[str, Any]) -> None:
+        """The full frozen-plan validation, without reading the file again."""
         expected = {
             "schema": REFERENCE_EDIT_PLAN_SCHEMA,
             "canonical_shard": shard,
@@ -497,6 +480,23 @@ class ReferenceEditEpochRunner:
         storage = self._storage_for(shard)
         for clip_uid, entry in payload.get("clips", {}).items():
             self._verify_plan_entry(shard, storage, clip_uid, entry)
+
+    def _existing_plan_for_reconcile(self, shard: str) -> dict[str, Any]:
+        """Read and fully validate the frozen shard plan.
+
+        Reconcile runs once per shard and re-verifies every entry against the
+        live state the stage actually published, so this stays a real read and a
+        real validation. The seed must not call it per clip: that re-verified the
+        whole shard - every clip's digest over its frames and masks manifests -
+        for every single clip, so seeding a shard cost O(clips^2) validations
+        while ``_plan()`` had already validated the very same payload.
+        """
+        payload = _read_json(self._plan_path(shard))
+        if payload is None:
+            raise ReferenceEditEpochError(
+                f"reconcile_stats needs a frozen Reference Edit plan for {shard!r}"
+            )
+        self._verify_plan_payload(shard, payload)
         return payload
 
     def _entity_anchor(
@@ -1094,7 +1094,7 @@ class ReferenceEditEpochRunner:
                 if self._clip_outcome_path(shard, clip_uid).is_file():
                     continue
                 try:
-                    jobs.extend(self._advance_clip(shard, storage, clip_uid))
+                    jobs.extend(self._advance_clip(shard, storage, clip_uid, plan))
                 except ReferenceEditDurableError:
                     # Durable corruption is never a semantic clip failure.
                     raise
@@ -1111,9 +1111,20 @@ class ReferenceEditEpochRunner:
         assert clip.annotation is not None
         return clip
 
-    def _advance_clip(self, shard: str, storage: RunStorage, clip_uid: str) -> list[ModelJob]:
-        """Chain every entity of one clip; publish the clip when terminal."""
-        plan = self._existing_plan_for_reconcile(shard)
+    def _advance_clip(
+        self,
+        shard: str,
+        storage: RunStorage,
+        clip_uid: str,
+        plan: Mapping[str, Any],
+    ) -> list[ModelJob]:
+        """Chain every entity of one clip; publish the clip when terminal.
+
+        ``plan`` is the shard plan ``_plan()`` validated for this seed. A clip
+        only needs its own ``chain_entity_ids`` entry from it, so the seed never
+        reads, parses or re-verifies the shard plan again - which is what used to
+        cost O(clips^2) whole-shard rescans per shard.
+        """
         clip = self._clip(storage, clip_uid)
         entities = {entity.entity_id: entity for entity in clip.annotation.entities}
         jobs: list[ModelJob] = []
