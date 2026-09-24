@@ -142,7 +142,11 @@ TA2VA uses the RA2VA six-section names/order:
 
 `subject_definitions` contains only canonical Audio definitions; no Picture or
 Subject labels are fabricated. `detailed_description` starts from frozen T2VA
-`integrated_multimodal_description` and is never model-rewritten. The deterministic
+`integrated_multimodal_description` and is never model-rewritten. When the frozen
+T2VA opening contains a separable first visual-style sentence followed by additional
+Shot 1 content, the deterministic TA2VA renderer promotes that sentence immediately
+before `[Shot 1]`, matching the H3 detailed-description style-opening layout while
+preserving all original prose. The deterministic
 materializer inserts only the canonical first-use Sx Audio relationship and,
 when present, the canonical music-reuse relationship.
 
