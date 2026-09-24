@@ -49,7 +49,7 @@ was inspected, but is not copied here.
 The local system-prompt version is:
 
 ```text
-h3_qwen38_ref2va_recaption_v6
+h3_qwen38_ref2va_recaption_v7
 ```
 
 The deterministic renderer publishes these exact sections in this exact order:

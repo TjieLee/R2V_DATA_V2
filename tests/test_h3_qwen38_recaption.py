@@ -1219,7 +1219,7 @@ def test_full_manifest_fails_closed_without_required_voice_contract(
 
 
 def test_prompt_version_is_frozen() -> None:
-    assert QWEN38_RECAPTION_PROMPT_VERSION == "h3_qwen38_ref2va_recaption_v6"
+    assert QWEN38_RECAPTION_PROMPT_VERSION == "h3_qwen38_ref2va_recaption_v7"
     assert QWEN38_RECAPTION_POLICY_VERSION == "h3_qwen38_ref2va_contract_v4"
     assert QWEN38_RECAPTION_DRAFT_VERSION == "r2v.h3.qwen38_recaption_draft.1"
     assert QWEN38_RECAPTION_MATERIALIZER_VERSION == "h3_qwen38_materializer_v2"

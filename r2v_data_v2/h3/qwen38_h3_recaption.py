@@ -34,7 +34,7 @@ from r2v_data_v2.structured_output import (
     parse_structured_json_issues,
 )
 
-QWEN38_RECAPTION_PROMPT_VERSION = "h3_qwen38_ref2va_recaption_v6"
+QWEN38_RECAPTION_PROMPT_VERSION = "h3_qwen38_ref2va_recaption_v7"
 QWEN38_RECAPTION_POLICY_VERSION = "h3_qwen38_ref2va_contract_v4"
 QWEN38_RECAPTION_DRAFT_VERSION = "r2v.h3.qwen38_recaption_draft.1"
 QWEN38_RECAPTION_MATERIALIZER_VERSION = "h3_qwen38_materializer_v2"
@@ -491,7 +491,7 @@ class Qwen38BackendProvenance(SchemaModel):
         "target_video_observation_plus_frozen_reference_images_plus_audio_text"
     ] = "target_video_observation_plus_frozen_reference_images_plus_audio_text"
     output_modalities: list[Literal["text"]] = Field(default_factory=lambda: ["text"])
-    prompt_version: Literal["h3_qwen38_ref2va_recaption_v6"] = (
+    prompt_version: Literal["h3_qwen38_ref2va_recaption_v7"] = (
         QWEN38_RECAPTION_PROMPT_VERSION
     )
     policy_version: Literal["h3_qwen38_ref2va_contract_v4"] = (
@@ -582,7 +582,7 @@ class Qwen38RecaptionRecord(SchemaModel):
     audio_fact_provenance: dict[str, str] = Field(default_factory=dict)
     audio_grounding_complete: bool
     backend_provenance: Qwen38BackendProvenance
-    prompt_version: Literal["h3_qwen38_ref2va_recaption_v6"] = (
+    prompt_version: Literal["h3_qwen38_ref2va_recaption_v7"] = (
         QWEN38_RECAPTION_PROMPT_VERSION
     )
     official_h3_source_files: list[str] = Field(
@@ -1006,7 +1006,7 @@ retention_analysis:
 shots:
 - shot_index: 1
   start_time: null
-  description_template: The target uses a natural daylight documentary style. <Subject 1> stops beside <Subject 2> and looks across the river. [[speech_1]]
+  description_template: Late-afternoon daylight washes over <Subject 2> as <Subject 1> stops beside the river and looks across the water. [[speech_1]]
 overall_soundscape:
 The supplied upstream Audio facts establish light riverside ambience under the speech.
 non_diegetic_music:
@@ -1033,8 +1033,21 @@ you, materializes the final detailed_description from shots. Write English excep
 lyrics and visible scene text.
 
 Treat every shot description_template as a generation-quality dense video
-description, not an ordinary caption or plot summary. For each observed shot,
-systematically cover every applicable dimension in this visual checklist:
+description, not an ordinary caption or plot summary. For shot_index=1, start
+description_template directly with concrete observable content: visual style,
+framing/composition, a salient subject or object, the environment, or an action
+already underway. Do not use generic meta-narration such as "The video opens",
+"The scene opens", "The clip begins", "We see", "The video shows", or equivalent
+boilerplate. Vary the grammatical entry point according to what is most informative
+in the actual shot rather than repeatedly using one preferred sentence pattern.
+Valid partial openings include "Live-action with warm indoor lighting, a waist-up
+composition frames ...", "Against a dim corridor lined with hanging lanterns, a
+bald man in a dark robe stands ...", "Walking quickly across a crowded platform, a
+young woman turns ...", "From a high-angle static view, several diners sit ...",
+and "Soft blue underwater light filters through the windows of ...". These are
+structural examples only, not templates to copy or preferred phrasings.
+For each observed shot, systematically cover every applicable dimension in this
+visual checklist:
 - visual style
 - shot scale and framing
 - camera angle
