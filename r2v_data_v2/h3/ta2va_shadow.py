@@ -404,28 +404,6 @@ def _ta2va_task_prefix(audios):
     return "[" + " + ".join(tasks) + "]"
 
 
-def _ta2va_detailed_description(caption: str) -> str:
-    """Promote T2VA's first style sentence before [Shot 1] for TA2VA H3 format."""
-    prefix = "[Shot 1] "
-    if not caption.startswith(prefix):
-        raise ValueError("TA2VA source description must begin with [Shot 1]")
-    body = caption[len(prefix) :]
-    boundary = re.search(r"(?<=[.!?])\s+", body)
-    if boundary is None:
-        return caption
-    opening = body[: boundary.start()].strip()
-    remainder = body[boundary.end() :].lstrip()
-    if (
-        not opening
-        or not remainder
-        or "<d>" in opening
-        or "</d>" in opening
-        or remainder.startswith("[Shot 2]")
-    ):
-        return caption
-    return f"{opening}\n[Shot 1] {remainder}"
-
-
 def render_product(core, variant, audios):
     validate_references(variant, audios)
     original = core.integrated_multimodal_description
@@ -466,7 +444,7 @@ def render_product(core, variant, audios):
         subject_definitions=[_canonical_audio_definition(a) for a in audios],
         summary=_ta2va_task_prefix(audios) + " " + core.summary,
         retention_analysis=[_canonical_audio_retention(a) for a in audios],
-        detailed_description=_ta2va_detailed_description(caption),
+        detailed_description=caption,
         overall_soundscape=core.overall_soundscape,
         non_diegetic_music=music,
     )

@@ -413,22 +413,6 @@ def test_profiles_reject_frozen_identity_claims_and_null(value):
         ta.TA2VAProfile(speaker_group="S1", voice_characteristics=value)
 
 
-def test_ta2va_promotes_first_t2va_style_sentence_before_shot1(job):
-    core = shared.materialize(job, shared.draft_for(job))
-    core.integrated_sequence[0].text = (
-        "[Shot 1] Warm window light and muted colors create a naturalistic interior. "
-        "A young man turns toward the doorway while the camera remains steady."
-    )
-    rendered = ta.render_product(core, "full_audio_reuse", [audio("full_audio_reuse")])
-    detailed = rendered.split("detailed_description:\n", 1)[1].split(
-        "\n\noverall_soundscape:", 1
-    )[0]
-    assert detailed.startswith(
-        "Warm window light and muted colors create a naturalistic interior.\n"
-        "[Shot 1] A young man turns toward the doorway"
-    )
-
-
 @pytest.mark.parametrize("variant", ["full_audio_reuse", "target_speech_reuse"])
 def test_six_sections_preserve_prose_and_exact_dialogue(job, variant, monkeypatch):
     core = shared.materialize(job, shared.draft_for(job))
@@ -467,18 +451,15 @@ def test_six_sections_preserve_prose_and_exact_dialogue(job, variant, monkeypatc
     caption = result.split("detailed_description:\n", 1)[1].split(
         "\n\noverall_soundscape:", 1
     )[0]
-    expected_caption = ta._ta2va_detailed_description(
-        core.integrated_multimodal_description
-    )
     if variant == "full_audio_reuse":
-        assert caption == expected_caption
+        assert caption == core.integrated_multimodal_description
         assert "fully_copy" in result
     else:
         for i in (1, 2):
             relation = f", with the synchronized speech signal copied directly from <Audio {i}>,"
             assert caption.count(relation) == 1
             caption = caption.replace(relation, "", 1)
-        assert caption == expected_caption
+        assert caption == core.integrated_multimodal_description
         assert (
             "The audience-only score uses the synchronized music signal copied directly from <Audio 3>. A piano melody."
             in result
