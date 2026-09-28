@@ -1238,9 +1238,9 @@ class PairEpochRunner:
     ) -> dict[str, int] | None:
         """This invocation's own prefilter accounting for one clip, if valid.
 
-        ``None`` means the caller must replay strictly. The projection is only
-        ever the counts this invocation produced while preparing this exact
-        clip, so it can never be a stale or partial answer for another state.
+        ``None`` means diagnostic counters are unavailable for this clip. The
+        projection is only the counts this invocation produced while preparing
+        this exact clip, never a historical media replay.
         """
         entry = self._validated_prepared_clip_entry(shard, clip_uid, clip)
         if entry is None or not entry.prefilter_counts:
@@ -2173,7 +2173,13 @@ class PairEpochRunner:
             return None
         return dict(result.payload)
 
-    def reconcile_primary_stats(self, shard: str) -> Any:
+    def reconcile_primary_stats(
+        self,
+        shard: str,
+        *,
+        _terminal_plan: Mapping[str, Any] | None = None,
+        _terminal_records: Sequence[Mapping[str, Any]] | None = None,
+    ) -> Any:
         """Primary PairStats rebuilt from durable state only (4c1).
 
         Authority is the frozen primary plan, durable committed receipts and
@@ -2189,7 +2195,17 @@ class PairEpochRunner:
 
         storage = self._storage_for(shard)
         # Read-only: reconciliation must never create the plan it reads.
-        plan = self._existing_primary_plan_for_reconcile(shard)
+        plan = (
+            _terminal_plan
+            if _terminal_plan is not None
+            else self._existing_primary_plan_for_reconcile(shard)
+        )
+        records = (
+            _terminal_records
+            if _terminal_records is not None
+            else self._planned_jobs(shard)
+        )
+        terminal = _terminal_plan is not None
         # PairStats is frozen, so reconciliation accumulates into a plain dict.
         counts: dict[str, int] = {field: 0 for field in PairStats.__dataclass_fields__}
         stats = _MutableStats(counts)
@@ -2201,17 +2217,27 @@ class PairEpochRunner:
                 stats.skipped_not_ready += 1
                 continue
             if classification == CLIP_EXISTING_PAIRING:
-                if self._existing_pairing_valid(storage, clip_uid):
+                if terminal or self._existing_pairing_valid(storage, clip_uid):
                     stats.skipped_existing += 1
                 else:
                     stats.failed += 1
                 continue
-            if not self._pair_inputs_valid(storage, clip_uid, shard=shard):
+            if terminal:
+                if not self._primary_published(shard, clip_uid):
+                    raise PairEpochError(
+                        f"fresh Pair target {clip_uid!r} has no durable primary "
+                        "publication; reconcile_stats refuses an incomplete Pair stage"
+                    )
+            elif not self._pair_inputs_valid(storage, clip_uid, shard=shard):
                 stats.skipped_not_ready += 1
                 continue
             stats.processed += 1
             pairing = self._reconcile_primary_pairing(shard, storage, clip_uid)
             if pairing is None:
+                if terminal:
+                    raise PairEpochError(
+                        f"published Pair target {clip_uid!r} has no primary pairing"
+                    )
                 continue
             status = str(pairing.get("status", ""))
             if status == "ready":
@@ -2227,7 +2253,7 @@ class PairEpochRunner:
                     stats.entities_rejected += 1
 
         # Repairs: one per committed primary entity decision, never the raw sum.
-        for record in self._planned_jobs(shard):
+        for record in records:
             if self._quarantined(shard, str(record.get("clip_uid", ""))):
                 continue
             if record.get("job_type") != PAIR_ENTITY_JUDGE_JOB:
@@ -2239,7 +2265,7 @@ class PairEpochRunner:
 
         # Primary background guard counters, rebuilt from durable markers.
         if self.config.pair.background_final_guard_mode != "off":
-            for record in self._planned_jobs(shard):
+            for record in records:
                 if record.get("job_type") != PAIR_BACKGROUND_GUARD_JOB:
                     continue
                 if dict(record.get("target") or {}).get("call_site") != "primary":
@@ -2268,27 +2294,30 @@ class PairEpochRunner:
                     stats.background_final_guard_failed_closed += 1
         return PairStats(**counts)
 
-    # -- full legacy-equivalent PairStats reconciliation (4c2) -------------
+    # -- terminal PairStats reconciliation (4c2) ---------------------------
 
     def reconcile_stats(self, shard: str) -> Any:
-        """Complete legacy-equivalent PairStats for a TERMINAL Pair stage.
+        """PairStats for a TERMINAL Pair stage without historical input replay.
 
         Authorities: the frozen primary plan, receipt-validated scheduler
         commits, the frozen cross baseline / cross terminal markers, the final
-        published live Pair state and a read-only prefilter replay. The
+        published live Pair state and invocation-local prefilter accounting. The
         invocation-local ``self.stats`` and ``_guard_counters`` are never read.
 
         Refuses incomplete work instead of guessing: any planned Pair job that
         is still pending, or any frozen cross target without a durable cross
-        terminal marker, raises ``PairEpochError``.
+        terminal marker, raises ``PairEpochError``. Prefilter diagnostics are
+        counted only for prepared clips retained by this invocation.
         """
         from r2v_data_v2.v3.pair import PairStats
 
-        primary = self.reconcile_primary_stats(shard)
-        counts = primary.to_dict()
-        storage = self._storage_for(shard)
         plan = self._existing_primary_plan_for_reconcile(shard)
         records = self._planned_jobs(shard)
+        primary = self.reconcile_primary_stats(
+            shard, _terminal_plan=plan, _terminal_records=records
+        )
+        counts = primary.to_dict()
+        storage = self._storage_for(shard)
 
         # Refuse incomplete: every planned Pair job must be committed.
         for record in records:
@@ -2306,7 +2335,7 @@ class PairEpochRunner:
                     "reconcile_stats refuses an incomplete Pair stage"
                 )
 
-        # Read-only prefilter replay for fresh targets with valid inputs.
+        # Only this invocation's prepared clips have diagnostic prefilter counts.
         if self.config.pair.reference_prefilter_mode == "conservative_v1":
             self._reconcile_prefilter(shard, storage, plan, counts)
 
@@ -2326,11 +2355,11 @@ class PairEpochRunner:
                 continue
             if plan["clips"][clip_uid]["classification"] != CLIP_FRESH_TARGET:
                 continue
-            if not self._pair_inputs_valid(storage, clip_uid, shard=shard):
-                continue
             clip = storage.read_clip(clip_uid)
             if clip.pairing is None:
-                continue
+                raise PairEpochError(
+                    f"published Pair target {clip_uid!r} has no final pairing"
+                )
             if clip.pairing.status == "ready":
                 counts["ready"] += 1
             elif clip.pairing.status == "rejected":
@@ -2357,104 +2386,23 @@ class PairEpochRunner:
         plan: Mapping[str, Any],
         counts: dict[str, int],
     ) -> None:
-        """Replay the legacy primary prefilter counters. Never writes debug."""
+        """Reuse this invocation's prefilter diagnostics; never audit old media."""
 
-        pending: list[tuple[str, Any]] = []
         for clip_uid in sorted(plan.get("clips", {})):
             if self._quarantined(shard, clip_uid):
                 continue
             if plan["clips"][clip_uid]["classification"] != CLIP_FRESH_TARGET:
                 continue
-            if not self._pair_inputs_valid(storage, clip_uid, shard=shard):
+            with self._prepared_clips_lock:
+                prepared = (shard, clip_uid) in self._prepared_clips
+            if not prepared:
                 continue
             clip = storage.read_clip(clip_uid)
-            # This invocation already ran exactly this prefilter for exactly
-            # this clip while preparing it, so its own accounting can be merged
-            # instead of rebuilding candidates and loading source images again.
             projection = self._hot_prefilter_projection(shard, clip_uid, clip)
             if projection is not None:
                 for key, value in projection.items():
                     counts[key] = counts.get(key, 0) + value
                 self._bump_prepare_counter("hot_prefilter_cache_hits")
-                continue
-            pending.append((clip_uid, clip))
-        if not pending:
-            return
-        self._bump_prepare_counter("strict_prefilter_replay_clips", len(pending))
-        # Merged in canonical clip order, never in completion order.
-        for _clip_uid, projection in self._replay_prefilter_clips(storage, pending):
-            for key, value in projection.items():
-                counts[key] = counts.get(key, 0) + value
-
-    def _replay_prefilter_clip(
-        self, storage: RunStorage, clip: Any, counts: dict[str, int]
-    ) -> dict[str, int]:
-        """Strict per-clip prefilter replay. Read-only; never writes debug."""
-        from r2v_data_v2.v3.pair import (
-            _build_entity_reference_candidates,
-            _load_source_images,
-            _record_prefilter_stats,
-            prefilter_entity_reference_candidates,
-        )
-
-        clip_uid = clip.clip_uid
-        frames = _validate_frames(storage, clip_uid)
-        masks = storage.read_masks(clip_uid)
-        assert clip.annotation is not None
-        for entity in clip.annotation.entities:
-            tracked = masks.entities[entity.entity_id]
-            if tracked.status != "ready":
-                continue
-            candidates, _tiny, _fragmented = _build_entity_reference_candidates(
-                self.config,
-                storage,
-                clip_uid=clip_uid,
-                entity=entity,
-                frames=frames,
-                masks=masks,
-            )
-            if not candidates:
-                continue
-            source_images = _load_source_images(storage, candidates)
-            try:
-                result = prefilter_entity_reference_candidates(
-                    entity, candidates, source_images
-                )
-            except Exception:  # noqa: BLE001 - legacy fail-open semantics
-                counts["prefilter_candidates_examined"] += len(candidates)
-                counts["prefilter_fail_open_entities"] += 1
-            else:
-                _record_prefilter_stats(counts, result)
-        return counts
-
-    def _replay_prefilter_clips(
-        self, storage: RunStorage, pending: Sequence[tuple[str, Any]]
-    ) -> list[tuple[str, dict[str, int]]]:
-        """Strict replay for the clips without hot accounting, flat across clips.
-
-        Read-only on every worker - the legacy path never writes debug - so a
-        clip's replay is independent of any other clip's. Results are merged in
-        canonical clip order by the caller, and a worker failure is the same
-        ordinary failure the serial loop raised.
-        """
-        workers = self._primary_cpu_workers()
-        per_clip = [self._empty_stats() for _ in pending]
-        if workers <= 1 or len(pending) < 2:
-            for position, (_clip_uid, clip) in enumerate(pending):
-                self._replay_prefilter_clip(storage, clip, per_clip[position])
-        else:
-
-            def replay(position: int) -> dict[str, int]:
-                return self._replay_prefilter_clip(
-                    storage, pending[position][1], per_clip[position]
-                )
-
-            with ThreadPoolExecutor(max_workers=min(workers, len(pending))) as pool:
-                list(pool.map(replay, range(len(pending))))
-        return [
-            (pending[position][0], per_clip[position])
-            for position in range(len(pending))
-        ]
 
     def _reconcile_cross(
         self,
