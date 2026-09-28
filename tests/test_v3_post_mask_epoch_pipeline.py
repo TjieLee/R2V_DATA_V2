@@ -314,6 +314,114 @@ def test_completed_handoff_skips_upstream_runners_and_receipt_audit(
     assert result["subject_attributes_job_count"] == 0
 
 
+@pytest.mark.parametrize(
+    ("stage", "expected_route"),
+    [
+        (PAIR_STARTED, "pair"),
+        (REFERENCE_EDIT_STARTED, "reference_edit"),
+        (REFERENCE_INTEGRITY_STARTED, "reference_integrity"),
+        (INSTRUCT_STARTED, "instruct"),
+        (SUBJECT_ATTRIBUTES_STARTED, "subject_attributes"),
+        (SUBJECT_ATTRIBUTES_COMPLETED, "export"),
+    ],
+)
+def test_handoff_routes_directly_without_upstream_runners(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    expected_route: str,
+) -> None:
+    """The selected barrier enters only its stage; earlier runners stay absent."""
+    import r2v_data_v2.v3.post_mask_epoch_pipeline as pipeline
+
+    config, storages, eligible, _, _ = _fixture(tmp_path, monkeypatch)
+    ledger = GroupLedger(tmp_path / "ledger")
+    order = (
+        PAIR_STARTED,
+        REFERENCE_EDIT_STARTED,
+        REFERENCE_INTEGRITY_STARTED,
+        INSTRUCT_STARTED,
+        SUBJECT_ATTRIBUTES_STARTED,
+        SUBJECT_ATTRIBUTES_COMPLETED,
+    )
+    count_stage = {
+        REFERENCE_EDIT_STARTED: "pair",
+        REFERENCE_INTEGRITY_STARTED: "reference_edit",
+        INSTRUCT_STARTED: "reference_integrity",
+        SUBJECT_ATTRIBUTES_STARTED: "instruct",
+        SUBJECT_ATTRIBUTES_COMPLETED: "subject_attributes",
+    }
+    for prior in order[1 : order.index(stage) + 1]:
+        for storage in storages.values():
+            storage.update_stage_counts(count_stage[prior], {"completed": 1})
+    write_composition_handoff(ledger, stage, eligible_clip_uids_by_shard=eligible)
+
+    entered: list[str] = []
+
+    def forbidden(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("an upstream runner or scheduler was constructed")
+
+    for storage in storages.values():
+        monkeypatch.setattr(storage, "read_clip", forbidden)
+
+    class IncompleteRunner:
+        def __init__(self, name: str) -> None:
+            entered.append(name)
+
+        def legacy_cross_in_progress(self) -> bool:
+            return False
+
+        def seed_primary_jobs(self) -> list[Any]:
+            return []
+
+        def seed_jobs(self) -> list[Any]:
+            return []
+
+    class IncompleteScheduler:
+        def run(self, _jobs: Any) -> dict[str, Any]:
+            return {"completed": False, "unresolved_job_ids": ("pending",)}
+
+    def stage_factory(name: str) -> Any:
+        return lambda **_kwargs: IncompleteRunner(name)
+
+    def scheduler_factory(_runner: Any) -> Any:
+        return IncompleteScheduler()
+
+    def route(name: str) -> Any:
+        def record(**kwargs: Any) -> dict[str, Any]:
+            entered.append(name)
+            return kwargs["result"]
+        return record
+
+    monkeypatch.setattr(pipeline, "_continue_with_reference_integrity", route("reference_integrity"))
+    monkeypatch.setattr(pipeline, "run_instruct_stage", route("instruct"))
+    monkeypatch.setattr(pipeline, "run_subject_attributes_stage", route("subject_attributes"))
+    result = run_removal_pair_epochs(
+        config=config,
+        storages=storages,
+        eligible_clip_uids_by_shard=eligible,
+        ledger=ledger,
+        removal_runner_factory=forbidden,
+        removal_scheduler_factory=forbidden,
+        pair_runner_factory=stage_factory("pair") if stage == PAIR_STARTED else forbidden,
+        pair_scheduler_factory=scheduler_factory if stage == PAIR_STARTED else forbidden,
+        reference_edit_runner_factory=(
+            stage_factory("reference_edit") if stage == REFERENCE_EDIT_STARTED else forbidden
+        ),
+        reference_edit_scheduler_factory=(
+            scheduler_factory if stage == REFERENCE_EDIT_STARTED else forbidden
+        ),
+        reference_integrity_runner_factory=forbidden,
+        reference_integrity_scheduler_factory=forbidden,
+        subject_attributes_runner_factory=forbidden,
+        subject_attributes_scheduler_factory=forbidden,
+    )
+    assert entered == ([] if expected_route == "export" else [expected_route])
+    if stage == SUBJECT_ATTRIBUTES_COMPLETED:
+        assert result["subject_attributes_completed"] is True
+        assert result["reason"] == EXPORT_PENDING_REASON
+
+
 def test_reference_edit_handoff_requires_pair_counts_on_every_shard(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

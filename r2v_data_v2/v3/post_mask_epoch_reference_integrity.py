@@ -1227,13 +1227,13 @@ class ReferenceIntegrityEpochRunner:
         return cached
 
     def _hot_plan_entry(
-        self, shard: str, storage: RunStorage, clip_uid: str
+        self, shard: str, storage: RunStorage, clip_uid: str, *, verify_live: bool = True
     ) -> dict[str, Any]:
         """The frozen plan entry for one clip, validated for THIS invocation.
 
         The hot path never reads, parses or hashes the whole plan. It stats the
         durable file and, when the signature is the one this invocation already
-        validated, validates only the current clip against live state. The plan
+        validated, optionally validates only the current clip against live state. The plan
         is read only when the file actually changed, and then the existing rules
         decide: an equivalent rewrite keeps the validated entries and only
         refreshes the signature, while a real change goes to the original full
@@ -1245,12 +1245,14 @@ class ReferenceIntegrityEpochRunner:
             cached = self._validated_plan_entries.get((shard, clip_uid))
         if signature is None:
             self._bump_plan_counter("plan_cache_miss")
-            return self._full_plan_entry(shard, storage, clip_uid)
+            return self._full_plan_entry(shard, storage, clip_uid, verify_live=verify_live)
 
         current = self._file_signature(path)
         if current is not None and current == signature:
             self._bump_plan_counter("plan_stat_hit")
-            return self._serve_cached_plan_entry(shard, storage, clip_uid, cached)
+            return self._serve_cached_plan_entry(
+                shard, storage, clip_uid, cached, verify_live=verify_live
+            )
         self._bump_plan_counter("plan_stat_miss")
 
         # The durable file is not the one validated. Read it once and let the
@@ -1261,7 +1263,7 @@ class ReferenceIntegrityEpochRunner:
             # Missing or malformed: the original strict path owns the error, so
             # a deleted plan can never be served from cache.
             self._bump_plan_counter("plan_cache_miss")
-            return self._full_plan_entry(shard, storage, clip_uid)
+            return self._full_plan_entry(shard, storage, clip_uid, verify_live=verify_live)
         with self._plan_cache_lock:
             digest = self._validated_plan_digests.get(shard)
         self._bump_plan_counter("plan_semantic_digest_count")
@@ -1269,11 +1271,13 @@ class ReferenceIntegrityEpochRunner:
             # Case A: the same plan, rewritten. The entries already validated
             # this exact content, so only the signature is refreshed.
             self._refresh_plan_signature(shard)
-            return self._serve_cached_plan_entry(shard, storage, clip_uid, cached)
+            return self._serve_cached_plan_entry(
+                shard, storage, clip_uid, cached, verify_live=verify_live
+            )
         # Case B: the content really changed. The existing validator decides
         # whether the new plan is valid, and refreshes everything if it is.
         self._bump_plan_counter("plan_cache_miss")
-        return self._full_plan_entry(shard, storage, clip_uid)
+        return self._full_plan_entry(shard, storage, clip_uid, verify_live=verify_live)
 
     def _serve_cached_plan_entry(
         self,
@@ -1281,27 +1285,30 @@ class ReferenceIntegrityEpochRunner:
         storage: RunStorage,
         clip_uid: str,
         cached: dict[str, Any] | None,
+        *,
+        verify_live: bool = True,
     ) -> dict[str, Any]:
-        """Serve a cached entry after validating this clip against live state."""
+        """Serve a cached entry, with optional active-clip live validation."""
         self._bump_plan_counter("plan_cache_hit")
         if cached is None:
             raise ReferenceIntegrityDurableError(
                 f"frozen Reference Integrity plan has no entry for {clip_uid!r}"
             )
-        # The entry came from a structurally validated plan, but this active
-        # clip's live state may still have drifted: verify only this clip.
-        self._verify_plan_entry(shard, storage, clip_uid, cached)
-        self._bump_plan_counter("plan_entry_hot_validation_count")
+        # Explicit live-audit callers may still validate this clip; normal
+        # resume and model jobs use the frozen plan and their own input chain.
+        if verify_live:
+            self._verify_plan_entry(shard, storage, clip_uid, cached)
+            self._bump_plan_counter("plan_entry_hot_validation_count")
         return cached
 
     def _full_plan_entry(
-        self, shard: str, storage: RunStorage, clip_uid: str
+        self, shard: str, storage: RunStorage, clip_uid: str, *, verify_live: bool = True
     ) -> dict[str, Any]:
-        """Fallback: reload the plan, then strictly check the active clip.
+        """Fallback: reload the plan, optionally checking the active clip.
 
         Used on a cache miss (a direct caller that never seeded, or a plan whose
         durable content changed since validation). Plan structure is validated
-        for the shard; only this clip is compared with its live input.
+        for the shard; model-job callers compare only this clip with live input.
         """
         plan = self._existing_plan_for_reconcile(shard)
         self._remember_validated_plan(shard, plan)
@@ -1310,7 +1317,8 @@ class ReferenceIntegrityEpochRunner:
             raise ReferenceIntegrityDurableError(
                 f"frozen Reference Integrity plan has no entry for {clip_uid!r}"
             )
-        self._verify_plan_entry(shard, storage, clip_uid, entry)
+        if verify_live:
+            self._verify_plan_entry(shard, storage, clip_uid, entry)
         return entry
 
     def _validate_existing_plan(
@@ -2716,7 +2724,12 @@ class ReferenceIntegrityEpochRunner:
     ) -> tuple[str, RunStorage, Any, Any, Any, dict[str, Any], Any]:
         """Resolve one review job to its live entity and its frozen plan entry."""
         shard, storage, clip, entity, reference = self._job_entity_reference(job)
-        plan_entry = self._hot_plan_entry(shard, storage, job.clip_uid)
+        # The frozen plan and this job's frozen model-input chain are the
+        # authorities. A whole-clip live digest would reject unrelated
+        # post-plan baseline changes during a legitimate cold resume.
+        plan_entry = self._hot_plan_entry(
+            shard, storage, job.clip_uid, verify_live=False
+        )
         pre_edit_dump = plan_entry.get("pre_reference_edit")
         pre_edit = (
             ReferenceEditState.model_validate(pre_edit_dump)
@@ -4393,7 +4406,19 @@ class ReferenceIntegrityEpochRunner:
             return None
         if verify_input:
             try:
-                self._verify_plan_entry(shard, storage, clip_uid, entry)
+                # A restored frozen plan is structural authority. Only a clip
+                # with a terminal live publication but no outcome marker needs
+                # the expensive per-clip crash-window verifier here. An
+                # unpublished clip is ordinary pending work, even if another
+                # stage changed a live baseline after the plan was frozen.
+                clip = storage.read_clip(clip_uid)
+                integrity = clip.reference_integrity
+                if integrity is not None and (
+                    integrity.status == "ready"
+                    or integrity.model_dump(mode="json")
+                    != entry.get("pre_reference_integrity")
+                ):
+                    self._verify_published_clip(shard, storage, clip_uid, entry)
             except _ClipArtifactReadError as exc:
                 if self._quarantine_local(
                     shard, storage, clip_uid, exc.cause, known_clip_artifact_read=True
@@ -5123,8 +5148,11 @@ class ReferenceIntegrityEpochRunner:
     ) -> None:
         # The clip's own frozen entry, through the same stat-only invocation
         # cache the job context uses: publication must not re-read and re-parse
-        # the whole shard plan just to reach one entry.
-        plan_entry = self._hot_plan_entry(shard, storage, clip_uid)
+        # the whole shard plan just to reach one entry. Publication checks
+        # durable plan identity, not a historical digest of live clip inputs.
+        plan_entry = self._hot_plan_entry(
+            shard, storage, clip_uid, verify_live=False
+        )
         if any(
             self._entity_outcome(shard, clip_uid, entity_id) is None
             for entity_id in plan_entry.get("retained_entity_ids", [])

@@ -2433,9 +2433,9 @@ def test_seed_validates_the_shard_plan_once_not_once_per_clip(
 
     assert jobs, "the fixture still seeds its review job"
     assert runner.plan_counters["plan_full_validation_count"] == 1
-    # Every clip check during seeding belongs to this shard's single clip: the
-    # one from the full validation, plus the publication's own hot check.
-    assert set(per_clip) == {"clip-1"}, per_clip
+    # Frozen-plan restore and seed publication do not perform a historical
+    # live-input audit. The active model job retains its own strict check.
+    assert per_clip == []
     # Neither the seed loop nor _advance_clip re-reads the shard plan.
     assert reconciles == [], reconciles
 
@@ -2459,7 +2459,7 @@ def test_advance_clip_does_not_revalidate_the_shard(
     assert [dict(job.target)["variant"] for job in jobs] == ["final"]
 
 
-def test_model_job_validates_only_its_own_clip(
+def test_model_job_uses_frozen_plan_without_whole_clip_audit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _config, _storage, runner, judge = _seeded_review_fixture(
@@ -2481,8 +2481,9 @@ def test_model_job_validates_only_its_own_clip(
     assert runner.plan_counters["plan_full_validation_count"] == before, (
         "the hot path must not run a full-shard validation"
     )
-    # Exactly one per-clip validation, for the clip that owns this job.
-    assert per_clip == ["clip-1"], per_clip
+    # The job's required model-input chain is checked separately; no historical
+    # whole-clip digest is replayed.
+    assert per_clip == []
     assert runner.plan_counters["plan_cache_hit"] >= 1
 
 
@@ -2541,19 +2542,19 @@ def test_equivalent_plan_rewrite_keeps_its_semantics() -> None:
     )
 
 
-def test_current_clip_live_drift_is_still_detected(
+def test_current_job_required_entity_drift_is_still_detected(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The cache is per-plan, never blind trust in the clip's live state."""
+    """A job checks its own frozen input, not unrelated whole-clip fields."""
     _config, storage, runner, judge = _seeded_review_fixture(
         tmp_path, monkeypatch, "run-plan-live-drift"
     )
     job = _runnable_job(runner, "final")
 
-    # Drift the live annotation of the very clip this job belongs to.
+    # Drift the entity whose frozen model input this job actually owns.
     clip_path = storage.clip_path("clip-1")
     payload = json.loads(clip_path.read_text(encoding="utf-8"))
-    payload["annotation"]["entities"][0]["phrase"] = "a different phrase"
+    payload["annotation"]["entities"][1]["phrase"] = "a different phrase"
     clip_path.write_text(json.dumps(payload), encoding="utf-8")
 
     with pytest.raises(ReferenceIntegrityDurableError):
@@ -2689,20 +2690,57 @@ def test_existing_plan_done_clip_skips_historical_artifact_reads(
     assert cold.reconcile_stats(SHARD).processed == 1
 
 
-def test_existing_plan_pending_clip_checks_live_input_before_seeding(
+def test_existing_plan_pending_clip_ignores_changed_live_baseline_on_restore(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _config, storage, runner, _judge = _seeded_review_fixture(
+    _config, storage, runner, judge = _seeded_review_fixture(
         tmp_path, monkeypatch, "run-plan-pending-resume"
     )
     runner._plan(SHARD)
     clip_path = storage.clip_path("clip-1")
     payload = json.loads(clip_path.read_text(encoding="utf-8"))
-    payload["annotation"]["entities"][0]["phrase"] = "drifted phrase"
+    assert payload["reference_integrity"] is None
+    payload["export"] = {"accepted": False, "reason": "changed after plan freeze"}
     clip_path.write_text(json.dumps(payload), encoding="utf-8")
 
-    with pytest.raises(ReferenceIntegrityDurableError, match="input drifted"):
-        runner.seed_jobs()
+    def forbidden(*_args: Any, **_kwargs: Any) -> Any:
+        pytest.fail("cold pending restore ran a historical live audit")
+
+    monkeypatch.setattr(runner, "_clip_digest", forbidden)
+    monkeypatch.setattr(runner, "_live_baselines", forbidden)
+    monkeypatch.setattr(runner, "_verify_published_clip", forbidden)
+    jobs = runner.seed_jobs()
+    assert jobs, "the clip remains pending for its model review"
+    assert runner.run(jobs[0], judge).payload["status"] == "review"
+
+
+def test_existing_plan_cpu_pending_clip_publishes_without_live_audit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, storage = _storage_variant(
+        tmp_path,
+        monkeypatch,
+        "run-plan-cpu-pending-resume",
+        second_scope="full",
+        second_phrase=CLEAN_OBJECT_PHRASE,
+    )
+    runner = _runner(config, storage, tmp_path)
+    runner._plan(SHARD)
+    clip_path = storage.clip_path("clip-1")
+    payload = json.loads(clip_path.read_text(encoding="utf-8"))
+    assert payload["reference_integrity"] is None
+    payload["export"] = {"accepted": False, "reason": "changed after plan freeze"}
+    clip_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    def forbidden(*_args: Any, **_kwargs: Any) -> Any:
+        pytest.fail("CPU pending processing ran a historical live audit")
+
+    monkeypatch.setattr(runner, "_clip_digest", forbidden)
+    monkeypatch.setattr(runner, "_live_baselines", forbidden)
+    monkeypatch.setattr(runner, "_verify_published_clip", forbidden)
+    assert runner.seed_jobs() == []
+    assert runner._clip_outcome_path(SHARD, "clip-1").is_file()
+    assert runner.reconcile_stats(SHARD).processed == 1
 
 
 def test_existing_plan_pending_missing_clip_is_quarantined(
@@ -2786,7 +2824,7 @@ def test_hot_job_never_reads_the_whole_plan(
     assert seen["reads"] == [], "the hot path must not read the plan"
     assert seen["digests"] == [], "the hot path must not hash the plan"
     assert seen["reconciles"] == [], "the hot path must not full-validate"
-    assert per_clip == ["clip-1"], per_clip
+    assert per_clip == []
     assert runner.plan_counters["plan_stat_hit"] == 1
     assert runner.plan_counters["plan_content_read_count"] == 0
     assert runner.plan_counters["plan_semantic_digest_count"] == 0
@@ -2819,8 +2857,8 @@ def test_hot_finalize_never_reads_the_whole_plan(
     assert seen["reads"] == [], "finalize must not read the whole plan"
     assert seen["digests"] == [], "finalize must not hash the whole plan"
     assert seen["reconciles"] == [], "finalize must not full-validate"
-    # Only this clip is ever verified, never the rest of the shard.
-    assert set(per_clip) == {"clip-1"}, per_clip
+    # Finalize checks the committed input chain without a whole-clip audit.
+    assert per_clip == []
 
 
 def test_plan_content_tamper_is_detected_from_the_signature(
@@ -2873,7 +2911,7 @@ def test_equivalent_plan_rewrite_keeps_the_validated_entries(
     assert seen["reads"] == [plan_path], "the changed file is read once"
     assert seen["digests"] != [], "the canonical digest is compared"
     assert seen["reconciles"] == [], "an equivalent rewrite is not re-validated"
-    assert per_clip == ["clip-1"], "only the current clip is verified"
+    assert per_clip == [], "a reformat must not trigger a live clip audit"
     # The signature was refreshed, so the next lookup is stat-only again.
     assert runner._validated_plan_signatures[SHARD] == runner._file_signature(
         plan_path
@@ -3637,11 +3675,11 @@ def test_inherited_marker_is_verified_before_it_is_trusted(
     assert inherited.entity_verify_counters["entity_verify_cache_miss"] >= 2
     assert inherited._verified_entity_markers
 
-    # Round two in the same runner: both trusted markers are reused.
+    # Round two sees the clip outcome marker and is DONE without a live audit.
     verified_once = list(seen["branch_entities"])
     inherited._publish_clip_if_terminal(SHARD, storage, "clip-1")
     assert seen["branch_entities"] == verified_once, "round two must not re-verify"
-    assert inherited.entity_verify_counters["entity_verify_cache_hit"] >= 2
+    assert inherited.entity_verify_counters["entity_verify_cache_hit"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -4128,6 +4166,32 @@ def test_unidentified_current_clip_reference_quarantines_only_that_clip(
         ("reference_integrity", uids[1])
     ]
     assert "UnidentifiedImageError" in failures[0]["reason"]
+
+
+def test_cold_plan_pending_corrupt_reference_keeps_sibling_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, storage, runner, uids = _multi_clip_fixture(
+        tmp_path,
+        monkeypatch,
+        "run-cold-corrupt-reference",
+        entity_ids_by_clip={"clip-1": ("e1",), "clip-2": ("e1",)},
+        cpu_workers=1,
+    )
+    runner._plan(SHARD)
+    storage.selected_path(uids[1], "e1.png").write_bytes(b"not a PNG")
+    cold = _epoch_runner(
+        config, storage, runner.ledger.root, clip_uids=uids, cpu_workers=1
+    )
+    cold.clip_quarantine = ClipQuarantine()
+
+    assert cold.seed_jobs() == []
+    assert json.loads(
+        cold._clip_outcome_path(SHARD, uids[0]).read_text(encoding="utf-8")
+    )["terminal"] == "ready"
+    assert cold.clip_quarantine.contains(SHARD, uids[1])
+    assert cold.reconcile_stats(SHARD).processed == 2
+    assert cold.reconcile_stats(SHARD).failed == 1
 
 
 def test_unidentified_nonlocal_reference_is_not_clip_quarantined(
