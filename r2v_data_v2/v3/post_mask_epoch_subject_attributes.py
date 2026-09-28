@@ -1411,6 +1411,12 @@ class SubjectAttributeEpochRunner:
         # completion outcomes, routes, the owner outcome - is still read from
         # the ledger every time. A restart starts cold and re-derives it all.
         self._owner_context_cache: dict[tuple[str, str, str], dict[str, Any]] = {}
+        # Pending rank-0 selections are mutable only in this invocation. A
+        # committed SAM probe changes its own attribute, never its siblings;
+        # the first access still takes the full strict durable replay path.
+        self._rank0_working_cache: dict[tuple[str, str, str], dict[str, Any]] = {}
+        self._rank0_working_cache_lock = threading.Lock()
+        self._rank0_working_cache_limit = 256
         # Once every rank-0 probe and the raw review are committed, later
         # completion receipts cannot change this context. Keep it only for
         # this invocation; receipt-driven completion routes stay uncached.
@@ -1461,6 +1467,12 @@ class SubjectAttributeEpochRunner:
             "sam_mask_ram_hits": 0,
             "sam_mask_disk_loads": 0,
             "fresh_reconcile_cache_hits": 0,
+            "rank0_working_cache_hits": 0,
+            "rank0_working_cache_misses": 0,
+            "rank0_attribute_replays": 0,
+            "rank0_full_owner_replays": 0,
+            "rank0_unchanged_attribute_reuses": 0,
+            "rank0_terminal_context_hits": 0,
         }
         #: Execution-only seed counters for the clip-plan derivation fan-out.
         #: ``clip_plan_derive_wall_seconds`` is a float, so this mapping stays
@@ -1484,6 +1496,8 @@ class SubjectAttributeEpochRunner:
         with self._candidate_cache_lock:
             self._owner_candidate_cache.clear()
         self._owner_context_cache.clear()
+        with self._rank0_working_cache_lock:
+            self._rank0_working_cache.clear()
         with self._settled_rank0_cache_lock:
             self._settled_rank0_cache.clear()
         with self._attribute_selection_cache_lock:
@@ -2972,12 +2986,31 @@ class SubjectAttributeEpochRunner:
                 outcomes[job_id] = []
         for (shard, clip_uid, owner_entity_id), jobs in groups.items():
             if any(outcomes[job.job_id()] is None for job in jobs):
+                key = (shard, clip_uid, owner_entity_id)
+                with self._rank0_working_cache_lock:
+                    self._rank0_working_cache.pop(key, None)
+                with self._settled_rank0_cache_lock:
+                    self._settled_rank0_cache.pop(key, None)
                 continue
             try:
+                changed_attribute_ids = {
+                    str(dict(job.target).get("attribute_id", ""))
+                    for job in jobs
+                    if job.job_type == SUBJECT_ATTRIBUTE_SAM_PROBE_JOB
+                }
                 unlocked = self._advance_attributes(
-                    shard, self._storage_for(shard), clip_uid, owner_entity_id
+                    shard,
+                    self._storage_for(shard),
+                    clip_uid,
+                    owner_entity_id,
+                    changed_attribute_ids=(changed_attribute_ids or None),
                 )
             except Exception:  # noqa: BLE001 - replay this owner's receipts later
+                key = (shard, clip_uid, owner_entity_id)
+                with self._rank0_working_cache_lock:
+                    self._rank0_working_cache.pop(key, None)
+                with self._settled_rank0_cache_lock:
+                    self._settled_rank0_cache.pop(key, None)
                 for job in jobs:
                     outcomes[job.job_id()] = None
             else:
@@ -4189,6 +4222,7 @@ class SubjectAttributeEpochRunner:
         self._bump_replay_counter("attribute_selection_cache_miss")
         self._bump_replay_counter("attribute_selection_rebuilds")
         if prepared is not None:
+            self._bump_replay_counter("rank0_attribute_replays")
             attribute_plan = prepared["attribute_plan"]
             ordered = prepared["ordered"]
             owner_candidates = prepared["owner_candidates"]
@@ -4342,8 +4376,10 @@ class SubjectAttributeEpochRunner:
         owner_plan: Mapping[str, Any],
         discovery: SubjectAttributeDiscovery,
         discovery_job_id: str,
+        *,
+        changed_attribute_ids: set[str] | None = None,
     ) -> dict[str, Any]:
-        """Replay every attribute selection, the duplicate CPU pass and the batch."""
+        """Strictly build rank-0 once, then replay only committed probe siblings."""
         owner_entity_id = str(owner_plan["owner_entity_id"])
         cache_key = (shard, clip_uid, owner_entity_id)
         with self._settled_rank0_cache_lock:
@@ -4351,16 +4387,95 @@ class SubjectAttributeEpochRunner:
         if cached is not None:
             job = cached["job"]
             receipt = self._committed_payload_or_none(job) if job is not None else None
-            if receipt == cached["review"]:
+            if cached["review"] is None or receipt == cached["review"]:
                 for state in cached["states"]:
                     self._verify_or_write_selection_marker(
                         shard, clip_uid, owner_plan, state.attribute_id, state
                     )
+                if receipt != cached["review"]:
+                    reviews, failure = self._rank0_review_result(receipt)
+                    cached = {
+                        **cached,
+                        "review": receipt,
+                        "reviews": reviews,
+                        "failure": failure,
+                    }
+                    with self._settled_rank0_cache_lock:
+                        if (
+                            cache_key not in self._settled_rank0_cache
+                            and len(self._settled_rank0_cache)
+                            >= self._settled_rank0_cache_limit
+                        ):
+                            self._settled_rank0_cache.pop(
+                                next(iter(self._settled_rank0_cache))
+                            )
+                        self._settled_rank0_cache[cache_key] = cached
                 self._bump_replay_counter("settled_rank0_cache_hit")
+                self._bump_replay_counter("rank0_terminal_context_hits")
                 return cached
             with self._settled_rank0_cache_lock:
                 self._settled_rank0_cache.pop(cache_key, None)
         self._bump_replay_counter("settled_rank0_cache_miss")
+        if changed_attribute_ids:
+            with self._rank0_working_cache_lock:
+                working = self._rank0_working_cache.get(cache_key)
+            if working is not None:
+                self._bump_replay_counter("rank0_working_cache_hits")
+                attribute_ids = working["attribute_ids"]
+                unknown = changed_attribute_ids.difference(attribute_ids)
+                if unknown:
+                    raise SubjectAttributeDurableError(
+                        f"SAM probe names non-frozen attributes of "
+                        f"{clip_uid}/{owner_entity_id}: {sorted(unknown)}"
+                    )
+                try:
+                    states_by_id = dict(working["states_by_id"])
+                    for index, attribute_id in enumerate(attribute_ids):
+                        if attribute_id not in changed_attribute_ids:
+                            continue
+                        prepared = working["prepared"][attribute_id]
+                        replay = self._replay_attribute_selection_prepared(
+                            shard,
+                            storage,
+                            clip_uid,
+                            owner_plan,
+                            working["owner_reference"],
+                            discovery,
+                            index,
+                            attribute_id,
+                            discovery_job_id,
+                            **prepared,
+                        )
+                        self._bump_replay_counter("rank0_attribute_replays")
+                        self._verify_or_write_selection_marker(
+                            shard, clip_uid, owner_plan, attribute_id, replay
+                        )
+                        states_by_id[attribute_id] = replay
+                    states = [states_by_id[attribute_id] for attribute_id in attribute_ids]
+                    context = self._rank0_context_from_states(
+                        shard,
+                        clip_uid,
+                        owner_plan,
+                        discovery,
+                        discovery_job_id,
+                        states,
+                    )
+                except Exception:
+                    with self._rank0_working_cache_lock:
+                        self._rank0_working_cache.pop(cache_key, None)
+                    raise
+                self._bump_replay_counter(
+                    "rank0_unchanged_attribute_reuses",
+                    len(attribute_ids) - len(changed_attribute_ids),
+                )
+                with self._rank0_working_cache_lock:
+                    if context["pending"]:
+                        working["states_by_id"] = states_by_id
+                    else:
+                        self._rank0_working_cache.pop(cache_key, None)
+                return context
+        self._bump_replay_counter("rank0_working_cache_misses")
+        self._bump_replay_counter("rank0_full_owner_replays")
         owner_reference = self._owner_reference(storage, clip_uid, owner_entity_id)
         # Main thread phase 1: build the owner's candidate set exactly once, so
         # the attribute workers never race to rebuild the same JPEG/RLE evidence.
@@ -4419,6 +4534,45 @@ class SubjectAttributeEpochRunner:
             self._verify_or_write_selection_marker(
                 shard, clip_uid, owner_plan, attribute_id, replay
             )
+        context = self._rank0_context_from_states(
+            shard,
+            clip_uid,
+            owner_plan,
+            discovery,
+            discovery_job_id,
+            states,
+        )
+        if context["pending"]:
+            working = {
+                "owner_reference": owner_reference,
+                "owner_candidates": owner_candidates,
+                "ordered": ordered,
+                "attribute_ids": tuple(attribute_ids),
+                "prepared": prepared,
+                "states_by_id": dict(zip(attribute_ids, states)),
+            }
+            with self._rank0_working_cache_lock:
+                if (
+                    cache_key not in self._rank0_working_cache
+                    and len(self._rank0_working_cache)
+                    >= self._rank0_working_cache_limit
+                ):
+                    self._rank0_working_cache.pop(
+                        next(iter(self._rank0_working_cache))
+                    )
+                self._rank0_working_cache[cache_key] = working
+        return context
+
+    def _rank0_context_from_states(
+        self,
+        shard: str,
+        clip_uid: str,
+        owner_plan: Mapping[str, Any],
+        discovery: SubjectAttributeDiscovery,
+        discovery_job_id: str,
+        states: Sequence[_AttributeReplay],
+    ) -> dict[str, Any]:
+        """Derive the unchanged rank-0 batch from current selection states."""
         pending = [
             state.pending_job for state in states if state.pending_job is not None
         ]
@@ -4467,6 +4621,35 @@ class SubjectAttributeEpochRunner:
             else None
         )
         payload = self._committed_payload_or_none(job) if job is not None else None
+        reviews, failure = self._rank0_review_result(payload)
+        context = {
+            "states": states,
+            "pending": [],
+            "conflicts": conflicts,
+            "batch": batch,
+            "job": job,
+            "review": payload,
+            "reviews": reviews,
+            "failure": failure,
+            "discovery": discovery,
+            "discovery_job_id": discovery_job_id,
+        }
+        cache_key = (shard, clip_uid, str(owner_plan["owner_entity_id"]))
+        with self._settled_rank0_cache_lock:
+            if (
+                cache_key not in self._settled_rank0_cache
+                and len(self._settled_rank0_cache)
+                >= self._settled_rank0_cache_limit
+            ):
+                self._settled_rank0_cache.pop(next(iter(self._settled_rank0_cache)))
+            self._settled_rank0_cache[cache_key] = context
+        return context
+
+    @staticmethod
+    def _rank0_review_result(
+        payload: Mapping[str, Any] | None,
+    ) -> tuple[dict[str, Any], str | None]:
+        """Parse only the raw-review receipt; selections are already terminal."""
         reviews: dict[str, Any] = {}
         failure: str | None = None
         if payload is not None:
@@ -4489,28 +4672,7 @@ class SubjectAttributeEpochRunner:
                 raise SubjectAttributeDurableError(
                     "committed raw review has an unknown payload status"
                 )
-        context = {
-            "states": states,
-            "pending": [],
-            "conflicts": conflicts,
-            "batch": batch,
-            "job": job,
-            "review": payload,
-            "reviews": reviews,
-            "failure": failure,
-            "discovery": discovery,
-            "discovery_job_id": discovery_job_id,
-        }
-        if job is None or payload is not None:
-            with self._settled_rank0_cache_lock:
-                if (
-                    cache_key not in self._settled_rank0_cache
-                    and len(self._settled_rank0_cache)
-                    >= self._settled_rank0_cache_limit
-                ):
-                    self._settled_rank0_cache.pop(next(iter(self._settled_rank0_cache)))
-                self._settled_rank0_cache[cache_key] = context
-        return context
+        return reviews, failure
 
     def _raw_review_semantic_inputs(
         self,
@@ -4844,7 +5006,13 @@ class SubjectAttributeEpochRunner:
         return payload
 
     def _advance_attributes(
-        self, shard: str, storage: RunStorage, clip_uid: str, owner_entity_id: str
+        self,
+        shard: str,
+        storage: RunStorage,
+        clip_uid: str,
+        owner_entity_id: str,
+        *,
+        changed_attribute_ids: set[str] | None = None,
     ) -> list[ModelJob]:
         """Advance one human owner's semantic graph as far as receipts allow.
 
@@ -4859,7 +5027,13 @@ class SubjectAttributeEpochRunner:
         discovery = prefix["discovery"]
         discovery_job_id = prefix["discovery_job_id"]
         context = self._rank0_context(
-            shard, storage, clip_uid, owner_plan, discovery, discovery_job_id
+            shard,
+            storage,
+            clip_uid,
+            owner_plan,
+            discovery,
+            discovery_job_id,
+            changed_attribute_ids=changed_attribute_ids,
         )
         if context["pending"]:
             return sorted(context["pending"], key=lambda job: job.job_id())
@@ -4918,6 +5092,7 @@ class SubjectAttributeEpochRunner:
             context["storage"],
             job.clip_uid,
             str(dict(job.target).get("owner_entity_id", "")),
+            changed_attribute_ids={str(dict(job.target).get("attribute_id", ""))},
         )
 
     def _validate_sam_probe(

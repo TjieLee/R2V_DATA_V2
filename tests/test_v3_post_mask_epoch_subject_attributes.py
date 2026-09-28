@@ -3551,6 +3551,33 @@ def _two_completion_owner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     return config, storage, runner, qwen, sam
 
 
+def _three_rank0_owner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Three independent probes; only a1 needs the owner-batched review."""
+    config, storage = _storage_variant(tmp_path, monkeypatch, "run-three-rank0")
+    attributes = (
+        ("accessory", "a leather belt", "belt around the waist"),
+        ("upper_clothing", "a denim jacket", "jacket over the torso"),
+        ("headwear", "a red cap", "cap on the head"),
+    )
+    runner = _runner(config, storage, tmp_path)
+    qwen = _QwenClient(
+        discoveries=[_human_discovery(attributes=attributes)],
+        reviews=[
+            SubjectAttributeReviewBatch(
+                owner_entity_id=OWNER, reviews=[_raw_review("a1")]
+            )
+        ],
+    )
+    sam = _SamBackend(
+        by_prompt={
+            attributes[0][2]: [_attribute_mask(storage)],
+            attributes[1][2]: [],
+            attributes[2][2]: [],
+        }
+    )
+    return storage, runner, qwen, sam
+
+
 def _count_selection_replays(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     from r2v_data_v2.v3.post_mask_epoch_subject_attributes import (
         SubjectAttributeEpochRunner,
@@ -3593,6 +3620,129 @@ def _count_selection_replays(monkeypatch: pytest.MonkeyPatch) -> list[str]:
         counting,
     )
     return calls
+
+
+def test_pending_rank0_replays_only_the_receipt_attribute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A SAM receipt must not re-run the pending selections of its siblings."""
+    monkeypatch.setattr(time, "perf_counter", lambda: 1.0)
+    calls = _count_selection_replays(monkeypatch)
+    storage, runner, qwen, sam = _three_rank0_owner(tmp_path, monkeypatch)
+    initial: list[str] = []
+    per_probe: list[tuple[str, list[str]]] = []
+
+    def finalize(job: Any, result: Any) -> Sequence[Any]:
+        before = len(calls)
+        unlocked = runner.finalize(job, result)
+        new_calls = calls[before:]
+        if job.job_type == SUBJECT_ATTRIBUTE_DISCOVERY_JOB:
+            initial.extend(new_calls)
+        elif job.job_type == SUBJECT_ATTRIBUTE_SAM_PROBE_JOB:
+            per_probe.append((str(dict(job.target)["attribute_id"]), new_calls))
+        return unlocked
+
+    outcome = _scheduler(
+        runner,
+        _SerialQwenExecutor(runner, qwen),
+        finalize,
+        _SerialQwenExecutor(runner, sam),
+    ).run(runner.seed_jobs())
+
+    assert outcome["completed"] is True
+    assert initial == ["a1", "a2", "a3"]
+    assert len(per_probe) == 3
+    assert all(replayed == [attribute_id] for attribute_id, replayed in per_probe)
+    assert sam.calls == 3
+    assert qwen.review_requests == [["a1"]]
+    assert [record.attribute_id for record in _read_artifact(storage).records] == [
+        "a1", "a2", "a3"
+    ]
+
+
+def test_rank0_wave_replays_only_its_changed_attributes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A wave advances one owner after replaying only its committed probes."""
+    monkeypatch.setattr(time, "perf_counter", lambda: 1.0)
+    calls = _count_selection_replays(monkeypatch)
+    _, runner, qwen, sam = _three_rank0_owner(tmp_path, monkeypatch)
+    waves: list[tuple[list[str], list[str]]] = []
+    real_wave = runner.finalize_wave
+
+    def finalize_wave(committed: Sequence[tuple[Any, Any]]) -> Any:
+        before = len(calls)
+        outcome = real_wave(committed)
+        changed = [
+            str(dict(job.target)["attribute_id"])
+            for job, _ in committed
+            if job.job_type == SUBJECT_ATTRIBUTE_SAM_PROBE_JOB
+        ]
+        if changed:
+            waves.append((changed, calls[before:]))
+        return outcome
+
+    outcome = ResourceEpochScheduler(
+        ledger=runner.ledger,
+        finalize=runner.finalize,
+        finalize_wave=finalize_wave,
+        window_size=2,
+        executors={
+            RESOURCE_QWEN: _SerialQwenExecutor(runner, qwen),
+            RESOURCE_SAM: _SerialQwenExecutor(runner, sam),
+        },
+    ).run(runner.seed_jobs())
+
+    assert outcome["completed"] is True
+    assert sorted(len(changed) for changed, _ in waves) == [1, 2]
+    assert all(sorted(replayed) == sorted(changed) for changed, replayed in waves)
+
+
+def test_terminal_rank0_context_waits_for_review_without_full_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The review worker and its finalizer reuse terminal rank-0 selections."""
+    monkeypatch.setattr(time, "perf_counter", lambda: 1.0)
+    _, runner, qwen, sam = _three_rank0_owner(tmp_path, monkeypatch)
+    full_replays: list[str] = []
+    real_replay = runner._replay_attribute_selections
+
+    def count_full_replay(*args: Any, **kwargs: Any) -> Any:
+        full_replays.append("rank0")
+        return real_replay(*args, **kwargs)
+
+    runner._replay_attribute_selections = count_full_replay  # type: ignore[method-assign]
+    review_run_replays: list[int] = []
+    review_finalize_replays: list[int] = []
+    real_run = runner.run
+
+    def run(job: Any, handle: Any) -> Any:
+        before = len(full_replays)
+        result = real_run(job, handle)
+        if job.job_type == SUBJECT_ATTRIBUTE_RAW_REVIEW_JOB:
+            review_run_replays.append(len(full_replays) - before)
+        return result
+
+    def finalize(job: Any, result: Any) -> Sequence[Any]:
+        before = len(full_replays)
+        unlocked = runner.finalize(job, result)
+        if job.job_type == SUBJECT_ATTRIBUTE_RAW_REVIEW_JOB:
+            review_finalize_replays.append(len(full_replays) - before)
+        return unlocked
+
+    runner.run = run  # type: ignore[method-assign]
+    outcome = _scheduler(
+        runner,
+        _SerialQwenExecutor(runner, qwen),
+        finalize,
+        _SerialQwenExecutor(runner, sam),
+    ).run(runner.seed_jobs())
+
+    assert outcome["completed"] is True
+    assert full_replays, "the initial strict replay must still run"
+    assert review_run_replays == [0]
+    assert review_finalize_replays == [0]
+    assert qwen.review_requests == [["a1"]]
 
 
 def test_terminal_attribute_selection_is_not_rebuilt_at_every_receipt(
@@ -3751,9 +3901,11 @@ def test_finalize_wave_advances_same_owner_once_after_individual_validation(
     advances: list[str] = []
     real_advance = runner._advance_attributes
 
-    def counting_advance(shard: str, storage: Any, clip_uid: str, owner: str) -> Any:
+    def counting_advance(
+        shard: str, storage: Any, clip_uid: str, owner: str, **kwargs: Any
+    ) -> Any:
         advances.append(owner)
-        return real_advance(shard, storage, clip_uid, owner)
+        return real_advance(shard, storage, clip_uid, owner, **kwargs)
 
     runner._advance_attributes = counting_advance  # type: ignore[method-assign]
     results = runner.finalize_wave(committed)
@@ -3800,7 +3952,7 @@ def test_finalize_wave_caches_all_committed_siblings_before_validation(
             ),
         )
         patch.setattr(runner, "_validate_owner_chain", validate)
-        patch.setattr(runner, "_advance_attributes", lambda *args: [])
+        patch.setattr(runner, "_advance_attributes", lambda *args, **kwargs: [])
         outcomes = runner.finalize_wave(committed)
     assert list(outcomes.values()) == [[], []]
 
@@ -3837,9 +3989,11 @@ def test_scheduler_commits_two_owner_completions_then_advances_once(
     advances: list[str] = []
     real_advance = runner._advance_attributes
 
-    def counting_advance(shard: str, run_storage: Any, clip_uid: str, owner: str) -> Any:
+    def counting_advance(
+        shard: str, run_storage: Any, clip_uid: str, owner: str, **kwargs: Any
+    ) -> Any:
         advances.append(owner)
-        return real_advance(shard, run_storage, clip_uid, owner)
+        return real_advance(shard, run_storage, clip_uid, owner, **kwargs)
 
     runner._advance_attributes = counting_advance  # type: ignore[method-assign]
     paired_waves: list[tuple[int, int]] = []
@@ -3900,7 +4054,7 @@ def test_finalize_wave_does_not_advance_owner_when_a_sibling_is_invalid(
     bad_result = replace(invalid[1], payload={"status": "not_a_completion"})
     advances: list[str] = []
     runner._advance_attributes = (  # type: ignore[method-assign]
-        lambda shard, storage, clip_uid, owner: advances.append(owner)
+        lambda shard, storage, clip_uid, owner, **kwargs: advances.append(owner)
     )
 
     results = runner.finalize_wave([valid, (invalid[0], bad_result)])
