@@ -345,6 +345,124 @@ def _drain(
     raise AssertionError("the Reference Edit chain did not terminate")
 
 
+def _tiny_source_runner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    run_name: str,
+) -> tuple[Any, Any, ReferenceEditEpochRunner]:
+    config = _reference_edit_config(tmp_path, monkeypatch, run_name)
+    storage = _prepared_storage(config, monkeypatch, run_name=run_name)
+    from PIL import Image
+
+    reference = storage.read_clip("clip-1").references.entities[0]
+    assert reference.image_path is not None
+    Image.new("RGBA", (32, 32), (80, 90, 100, 255)).save(
+        storage.root / reference.image_path
+    )
+    # Pair's fixture lowers the source gate to 1 px. Restore the production
+    # threshold only after pairing so this existing ready reference is tiny.
+    config = replace(
+        config,
+        reference_edit=replace(
+            config.reference_edit,
+            min_source_content_area_pixels=128 * 128,
+            min_source_content_long_side_pixels=128,
+        ),
+    )
+    runner = ReferenceEditEpochRunner(
+        config,
+        {SHARD: storage},
+        GroupLedger(tmp_path / f"ledger-{run_name}"),
+        eligible_clip_uids_by_shard={SHARD: ["clip-1"]},
+    )
+    return config, storage, runner
+
+
+def test_tiny_source_fallback_publishes_without_variants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _config, storage, runner = _tiny_source_runner(
+        tmp_path, monkeypatch, run_name="run-tiny"
+    )
+    source = storage.read_clip("clip-1").references.entities[0]
+
+    assert runner.seed_jobs() == []
+
+    clip = storage.read_clip("clip-1")
+    assert clip.reference_edit is not None
+    assert clip.reference_edit.status == "ready"
+    state = clip.reference_edit.entities[0]
+    assert state.status == "fallback"
+    assert state.fallback_policy == "keep_source"
+    assert state.reason == "tiny_source_entity"
+    assert state.output_image_path == source.image_path
+    assert state.variants is None
+    assert state.default_variant is None
+    assert state.default_image_path is None
+    assert state.default_reason is None
+    assert state.accepted_base_image_path is None
+    assert clip.references.entities[0] == source
+    assert runner._clip_outcome_path(SHARD, "clip-1").is_file()
+
+
+def test_tiny_source_durable_entity_outcome_resumes_publication_without_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, storage, runner = _tiny_source_runner(
+        tmp_path, monkeypatch, run_name="run-tiny"
+    )
+    runner._plan(SHARD)
+    clip = storage.read_clip("clip-1")
+    assert runner._advance_entity(
+        SHARD, storage, "clip-1", clip.annotation.entities[0],
+        clip.references.entities[0],
+    ) == []
+    entity_outcome_path = runner._entity_outcome_path(SHARD, "clip-1", "e1")
+    entity_outcome_bytes = entity_outcome_path.read_bytes()
+    assert not runner._clip_outcome_path(SHARD, "clip-1").exists()
+
+    fresh = ReferenceEditEpochRunner(
+        config,
+        {SHARD: storage},
+        GroupLedger(tmp_path / "ledger-run-tiny"),
+        eligible_clip_uids_by_shard={SHARD: ["clip-1"]},
+    )
+    def no_generation(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("durable tiny-source outcome must not call a model")
+
+    monkeypatch.setattr(fresh, "_generation_job", no_generation)
+    assert fresh.seed_jobs() == []
+    assert entity_outcome_path.read_bytes() == entity_outcome_bytes
+    assert storage.read_clip("clip-1").reference_edit.status == "ready"
+    assert fresh._clip_outcome_path(SHARD, "clip-1").is_file()
+
+
+def test_tiny_source_epoch_state_matches_legacy_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from r2v_data_v2.v3.reference_edit import reference_edit_clips
+
+    legacy_config, legacy_storage, _legacy_runner = _tiny_source_runner(
+        tmp_path, monkeypatch, run_name="run-legacy-tiny"
+    )
+    backend = _FakeBoogu()
+    judge = _FakeQwen()
+    reference_edit_clips(
+        legacy_config, legacy_storage, backend=backend,
+        judge=judge, sam_reviewer=_LegacySamReviewer(),
+    )
+    assert (backend.calls, judge.calls) == (0, 0)
+
+    _config, storage, runner = _tiny_source_runner(
+        tmp_path, monkeypatch, run_name="run-epoch-tiny"
+    )
+    assert runner.seed_jobs() == []
+    epoch_state = storage.read_clip("clip-1").reference_edit.entities[0]
+    legacy_state = legacy_storage.read_clip("clip-1").reference_edit.entities[0]
+    assert epoch_state.model_dump(mode="json") == legacy_state.model_dump(mode="json")
+
+
 def test_repairable_chain_matches_legacy_and_uses_three_resources(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

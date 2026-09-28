@@ -2591,6 +2591,50 @@ class ReferenceEditEpochRunner:
                         source_geometry.touches_canvas_boundary
                     ),
                 )
+            if (
+                entity is not None
+                and entity.reference_type not in {"subject", "object"}
+                and reference.completeness is not None
+                and not _operations(_route(reference))
+            ):
+                final_references.append(reference)
+                edit_states.append(
+                    ReferenceEditEntityState(
+                        entity_id=entity_id,
+                        route=initial_route,
+                        status="not_required",
+                        source_reference=reference,
+                        source_image_path=reference.image_path,
+                        output_image_path=reference.image_path,
+                    )
+                )
+                continue
+            if outcome["outcome"] == "fallback" and outcome.get("reason") == (
+                "tiny_source_entity"
+            ):
+                metadata_path = _write_source_selection_metadata(
+                    storage,
+                    clip_uid=clip_uid,
+                    reference=reference,
+                    geometry=source_geometry,
+                    source_gate_reason=gate_reason,
+                    reason="tiny_source_entity",
+                )
+                final_references.append(reference)
+                edit_states.append(
+                    ReferenceEditEntityState(
+                        entity_id=entity_id,
+                        route=route,
+                        status="fallback",
+                        source_reference=reference,
+                        source_image_path=reference.image_path,
+                        output_image_path=reference.image_path,
+                        metadata_path=storage.relative_artifact_path(metadata_path),
+                        fallback_policy="keep_source",
+                        reason="tiny_source_entity",
+                    )
+                )
+                continue
             entity_variant_route = bool(
                 entity is not None
                 and entity.reference_type in {"subject", "object"}
@@ -2655,51 +2699,6 @@ class ReferenceEditEpochRunner:
                 and generated_variant is not None
                 else None
             )
-            if (
-                entity is not None
-                and entity.reference_type not in {"subject", "object"}
-                and reference.completeness is not None
-                and not _operations(_route(reference))
-            ):
-                final_references.append(reference)
-                edit_states.append(
-                    ReferenceEditEntityState(
-                        entity_id=entity_id,
-                        route=initial_route,
-                        status="not_required",
-                        source_reference=reference,
-                        source_image_path=reference.image_path,
-                        output_image_path=reference.image_path,
-                    )
-                )
-                continue
-            if outcome["outcome"] == "fallback" and outcome.get("reason") == (
-                "tiny_source_entity"
-            ):
-                metadata_path = _write_source_selection_metadata(
-                    storage,
-                    clip_uid=clip_uid,
-                    reference=reference,
-                    geometry=source_geometry,
-                    source_gate_reason=gate_reason,
-                    reason="tiny_source_entity",
-                )
-                final_references.append(reference)
-                edit_states.append(
-                    ReferenceEditEntityState(
-                        entity_id=entity_id,
-                        route=route,
-                        status="fallback",
-                        source_reference=reference,
-                        source_image_path=reference.image_path,
-                        output_image_path=reference.image_path,
-                        variants=variants,
-                        metadata_path=storage.relative_artifact_path(metadata_path),
-                        fallback_policy="keep_source",
-                        reason="tiny_source_entity",
-                    )
-                )
-                continue
             if outcome["outcome"] == "not_required":
                 final_references.append(reference)
                 edit_states.append(
