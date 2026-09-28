@@ -3105,6 +3105,101 @@ def _production_reference_integrity_outcome(
     return outcome, events, handle, storage, ledger
 
 
+@pytest.mark.parametrize("legacy_bootstrap", (False, True))
+def test_pair_started_cold_resume_skips_hydration_removal_and_historical_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, legacy_bootstrap: bool
+) -> None:
+    from r2v_data_v2.v3.post_mask_epoch_pipeline import latest_composition_handoff
+
+    class _FailFirstPairQwen(_CompositionQwenHandle):
+        def decide(self, **kwargs: Any) -> Any:
+            self.pair_decisions += 1
+            raise RuntimeError("one retryable Pair model failure")
+
+    first, _events, _handle, storage, ledger = (
+        _production_reference_integrity_outcome(
+            tmp_path, monkeypatch, qwen=_FailFirstPairQwen()
+        )
+    )
+    assert first["pair_primary_unresolved"]
+    assert latest_composition_handoff(ledger, (SHARD,))[0] == PAIR_STARTED
+    plan_path = ledger.root / "semantic" / "pair" / "primary" / f"{SHARD}.json"
+    original_plan = plan_path.read_bytes()
+    original_stat = plan_path.stat()
+    if legacy_bootstrap:
+        # Simulate an older campaign with a complete Pair plan but no newer
+        # composition marker. This is test-local fixture setup, never a repair.
+        (ledger.root / "composition" / f"{PAIR_STARTED}.json").unlink()
+        assert latest_composition_handoff(ledger, (SHARD,)) is None
+
+    clip = storage.read_clip("clip-1")
+    background = clip.references.background
+    assert background is not None
+    assert background.removal_attempts
+    storage.write_references(
+        "clip-1",
+        clip.references.model_copy(
+            update={
+                "background": background.model_copy(
+                    update={
+                        "removal_attempts": [
+                            attempt.model_copy(
+                                update={"runtime_seconds": attempt.runtime_seconds + 0.01}
+                            )
+                            for attempt in background.removal_attempts
+                        ]
+                    }
+                )
+            }
+        ),
+    )
+
+    def forbidden(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("cold Pair resume must not rederive historical inputs")
+
+    monkeypatch.setattr(
+        "r2v_data_v2.v3.post_mask_epoch_pair.PairEpochRunner._frozen_input_digest",
+        forbidden,
+    )
+    monkeypatch.setattr(
+        "r2v_data_v2.v3.post_mask_epoch_removal.hydrate_shard", forbidden
+    )
+    monkeypatch.setattr(
+        "r2v_data_v2.v3.post_mask_epoch_removal.RemovalEpochRunner", forbidden
+    )
+    qwen = _CompositionQwenHandle()
+    resumed, events, _handle, _storage, _ledger = (
+        _production_reference_integrity_outcome(
+            tmp_path,
+            monkeypatch,
+            qwen=qwen,
+            storage=storage,
+            forbid_prepare=True,
+        )
+    )
+
+    assert resumed["pair_primary_completed"] is True, (
+        resumed["pair_primary_unresolved"], resumed.get("pair_outcome"), events,
+        qwen.pair_decisions,
+    )
+    assert qwen.pair_decisions > 0
+    assert qwen.removal_reviews == 0
+    assert any(
+        item["event"] == "post_mask_resume_selected"
+        and item["stage"] == PAIR_STARTED
+        and item["source"] == (
+            "legacy_plan" if legacy_bootstrap else "composition_handoff"
+        )
+        and item["hydrated_shards"] == 0
+        for item in events
+    )
+    assert plan_path.read_bytes() == original_plan
+    assert (plan_path.stat().st_ino, plan_path.stat().st_mtime_ns) == (
+        original_stat.st_ino,
+        original_stat.st_mtime_ns,
+    )
+
+
 def test_production_export_excludes_clip_quarantined_after_hydration(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

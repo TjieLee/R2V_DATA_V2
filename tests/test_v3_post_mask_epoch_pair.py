@@ -1630,6 +1630,47 @@ def test_cold_existing_primary_plan_does_not_read_historic_clip_inputs(
 
 
 @pytest.mark.parametrize("cpu_workers", (1, 2))
+def test_cold_pending_pair_uses_frozen_plan_without_historical_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cpu_workers: int
+) -> None:
+    config = _pair_config(tmp_path, monkeypatch)
+    storage = _storage(config, entity_types=("subject",))
+    original = _runner(tmp_path, config, storage)
+    original.freeze_primary_plans()
+    plan_path = original._plan_path(SHARD)
+    frozen = plan_path.read_bytes()
+    original_stat = plan_path.stat()
+
+    # This field belongs to live Removal publication, not to a cold Pair
+    # historical audit. Its legitimate update must not invalidate the plan.
+    background = BackgroundReferenceState(
+        status="clean_raw",
+        source_image_path="clips/clip-1/frames/00.jpg",
+        output_image_path="clips/clip-1/frames/00.jpg",
+        source_frame_slot=0,
+        source_frame_index=0,
+        source_foreground_area_pixels=0,
+        source_foreground_area_ratio=0.0,
+    )
+    storage.write_references("clip-1", ReferencesState(background=background))
+
+    restarted = _runner(tmp_path, config, storage, cpu_workers=cpu_workers)
+
+    def forbidden(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("cold Pair resume must not rederive historical frozen inputs")
+
+    monkeypatch.setattr(restarted, "_frozen_input_digest", forbidden)
+    pending = restarted.seed_primary_jobs()
+
+    assert pending and all(job.clip_uid == "clip-1" for job in pending)
+    assert plan_path.read_bytes() == frozen
+    assert (plan_path.stat().st_ino, plan_path.stat().st_mtime_ns) == (
+        original_stat.st_ino,
+        original_stat.st_mtime_ns,
+    )
+
+
+@pytest.mark.parametrize("cpu_workers", (1, 2))
 def test_cold_published_primary_clip_skips_input_reads(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cpu_workers: int
 ) -> None:
@@ -1981,7 +2022,7 @@ def test_scheduler_resumes_after_publication_crash_on_guard_receipt(
     assert storage.selected_entity_path("clip-1", "e1").is_file()
 
 
-def test_frozen_plan_input_drift_fails_closed(
+def test_freshly_frozen_plan_input_drift_fails_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from r2v_data_v2.v3.post_mask_epoch_pair import PairEpochError
@@ -1990,7 +2031,7 @@ def test_frozen_plan_input_drift_fails_closed(
     storage = _storage(config, entity_types=("subject",))
     root = tmp_path / "ledger"
     runner = _runner(root, config, storage)
-    runner.seed_primary_jobs()
+    runner.freeze_primary_plans()
 
     # Mutate a frozen pre-Pair input: the annotation semantics.
     clip = storage.read_clip("clip-1")
@@ -2006,10 +2047,9 @@ def test_frozen_plan_input_drift_fails_closed(
     )
     storage.write_annotation("clip-1", drifted)
 
-    restarted = _runner(root, config, storage)
     judge = _Judge()
     with pytest.raises(PairEpochError, match="frozen primary input drifted"):
-        restarted.seed_primary_jobs()
+        runner.seed_primary_jobs()
     assert judge.calls == []
 
 
@@ -4018,6 +4058,53 @@ def test_pair_quarantines_missing_clip_after_primary_plan_was_frozen(
     assert runner.clip_quarantine.count == 1
     assert len(storage.failures_path.read_text().splitlines()) == 1
     assert runner.reconcile_primary_stats(SHARD).processed == 1
+
+
+@pytest.mark.parametrize("cpu_workers", (1, 2))
+def test_cold_pending_pair_quarantines_broken_clip_and_seeds_sibling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cpu_workers: int
+) -> None:
+    from r2v_data_v2.v3.post_mask_epoch_quarantine import ClipQuarantine
+
+    run_name = f"run-quarantine-cold-pending-{cpu_workers}"
+    config, storage, original = _primary_clips_fixture(
+        tmp_path,
+        monkeypatch,
+        run_name,
+        ("clip-1", "clip-2"),
+        cpu_workers=cpu_workers,
+    )
+    original.freeze_primary_plans()
+    plan_path = original._plan_path(SHARD)
+    frozen = plan_path.read_bytes()
+    storage.clip_path("clip-2").unlink()
+
+    cold = _runner(
+        tmp_path,
+        config,
+        storage,
+        clip_uids=("clip-1", "clip-2"),
+        ledger_dir=f"ledger-{run_name}",
+        cpu_workers=cpu_workers,
+    )
+    cold.clip_quarantine = ClipQuarantine()
+
+    def forbidden(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("cold Pair resume must not audit historical inputs")
+
+    monkeypatch.setattr(cold, "_frozen_input_digest", forbidden)
+    seeded = cold.seed_primary_jobs()
+
+    assert seeded and {job.clip_uid for job in seeded} == {"clip-1"}
+    assert cold.clip_quarantine.count == 1
+    assert plan_path.read_bytes() == frozen
+    failures = [json.loads(line) for line in storage.failures_path.read_text().splitlines()]
+    assert len(failures) == 1
+    assert failures[0]["clip_uid"] == "clip-2"
+    assert failures[0]["stage"] == "pair"
+    for job in seeded:
+        cold.finalize(job, _run_one(cold, job, _Judge()))
+    assert storage.read_clip("clip-1").pairing is not None
 
 
 def test_pair_quarantine_does_not_hide_frozen_primary_plan_drift(

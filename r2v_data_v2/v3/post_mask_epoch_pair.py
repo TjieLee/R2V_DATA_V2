@@ -477,6 +477,11 @@ class PairEpochRunner:
         #: a changed signature falls back to the strict validation.
         self._validated_plans: dict[str, tuple[dict[str, Any], _PlanFileSignature]] = {}
         self._validated_plans_lock = threading.Lock()
+        # Fresh plans can still detect an input change between freezing and
+        # preparation. A cold runner instead trusts an existing frozen plan;
+        # re-deriving its historical digest from mutable live publication is
+        # neither safe nor required to resume pending Pair work.
+        self._created_primary_plans: set[str] = set()
         self.prepare_counters: dict[str, int] = {
             "primary_plan_validation_cache_hits": 0,
             "primary_plan_validation_cache_misses": 0,
@@ -857,6 +862,7 @@ class PairEpochRunner:
                 {"clip_uids": excluded},
             )
         _write_json_once(self._plan_path(shard), payload)
+        self._created_primary_plans.add(shard)
         self._remember_validated_plan(shard, payload)
         return payload
 
@@ -1889,7 +1895,7 @@ class PairEpochRunner:
                         continue
                     if already_published(shard, clip_uid):
                         continue
-                    if not self._pending_primary_input_valid(
+                    if shard in self._created_primary_plans and not self._pending_primary_input_valid(
                         shard, storage, clip_uid, plan["clips"][clip_uid]
                     ):
                         continue
@@ -1943,7 +1949,7 @@ class PairEpochRunner:
                         # can already be terminal here. Re-visiting it would
                         # re-derive and re-publish work that is already durable.
                         continue
-                    if not self._pending_primary_input_valid(
+                    if shard in self._created_primary_plans and not self._pending_primary_input_valid(
                         shard, storage, clip_uid, plan["clips"][clip_uid]
                     ):
                         continue
