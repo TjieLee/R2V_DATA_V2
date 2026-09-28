@@ -3762,6 +3762,73 @@ def test_finalize_wave_advances_same_owner_once_after_individual_validation(
     assert advances == [OWNER]
 
 
+def test_finalize_wave_caches_all_committed_siblings_before_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The first sibling's validation can reuse the second committed result."""
+    monkeypatch.setattr(time, "perf_counter", lambda: 1.0)
+    _, _, runner, qwen, sam = _two_completion_owner(tmp_path, monkeypatch)
+    committed: list[tuple[Any, Any]] = []
+
+    def recording_finalize(job: Any, result: Any) -> Sequence[Any]:
+        if job.job_type == SUBJECT_ATTRIBUTE_COMPLETION_GENERATE_JOB:
+            committed.append((job, result))
+        return runner.finalize(job, result)
+
+    _scheduler(
+        runner,
+        _SerialQwenExecutor(runner, qwen),
+        recording_finalize,
+        _SerialQwenExecutor(runner, sam),
+        _SerialQwenExecutor(runner, _BooguBackend(_generated_png())),
+    ).run(runner.seed_jobs())
+    assert len(committed) == 2
+    runner.clear_execution_hot_caches()
+    real_validate = runner._validate_owner_chain
+
+    def validate(job: Any, result: Any) -> None:
+        for sibling, expected in committed:
+            assert runner._committed_payload_or_none(sibling) == dict(expected.payload)
+        real_validate(job, result)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            runner.ledger,
+            "classify",
+            lambda job: (_ for _ in ()).throw(
+                AssertionError("the committed wave must be cached before validation")
+            ),
+        )
+        patch.setattr(runner, "_validate_owner_chain", validate)
+        patch.setattr(runner, "_advance_attributes", lambda *args: [])
+        outcomes = runner.finalize_wave(committed)
+    assert list(outcomes.values()) == [[], []]
+
+
+def test_fresh_completion_sam_masks_use_ram_without_reopening_npy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Generated-frame SAM takes the same committed-only RAM route as raw SAM."""
+    monkeypatch.setattr(time, "perf_counter", lambda: 1.0)
+    _, _, runner, qwen, sam = _two_completion_owner(tmp_path, monkeypatch)
+    sam_executor = _SerialQwenExecutor(runner, sam)
+    outcome = _scheduler(
+        runner,
+        _SerialQwenExecutor(runner, qwen),
+        runner.finalize,
+        sam_executor,
+        _SerialQwenExecutor(runner, _BooguBackend(_generated_png())),
+    ).run(runner.seed_jobs())
+
+    assert outcome["completed"] is True
+    assert any(
+        job.job_type == SUBJECT_ATTRIBUTE_COMPLETION_SAM_JOB
+        for job in sam_executor.executed
+    )
+    assert runner.replay_counters["sam_mask_ram_hits"] > 0
+    assert runner.replay_counters["sam_mask_disk_loads"] == 0
+
+
 def test_scheduler_commits_two_owner_completions_then_advances_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4656,9 +4723,9 @@ def test_clip_plan_fan_out_is_byte_identical_to_the_serial_path(
     samples, clip counts - payload for payload. The measured model durations are
     pinned, because they are receipt noise that varies between any two runs, and
     the two fields that bind the run root are dropped, because the two runs
-    necessarily live on two run roots. ``reconcile_stats`` re-derives and
-    re-verifies every published sample digest, so the dropped
-    ``enriched_sample_sha256`` is still proven self-consistent in both runs.
+    necessarily live on two run roots. The sidecar bytes and their recorded
+    digests are compared directly; fresh reconciliation uses their just-
+    published in-memory terminal counts.
     """
     monkeypatch.setattr(time, "perf_counter", lambda: 1.0)
 
@@ -4727,3 +4794,154 @@ def test_clip_plan_fan_out_is_byte_identical_to_the_serial_path(
     assert serial_stats.to_dict() == parallel_stats.to_dict()
     assert serial_stats.terminal_clips == parallel_stats.terminal_clips == 4
     assert serial_stats.no_work_clips == parallel_stats.no_work_clips == 0
+
+
+def test_fresh_committed_payload_is_reused_until_batch_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fresh committed result is not read from the ledger on each replay."""
+    config, storage = _storage_variant(tmp_path, monkeypatch, "run-hot-payload")
+    runner = _runner(config, storage, tmp_path)
+    qwen = _QwenClient(discoveries=[_nonhuman_discovery()])
+    _executor, jobs = _drain(runner, qwen)
+    assert len(jobs) == 1
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            runner.ledger,
+            "classify",
+            lambda job: (_ for _ in ()).throw(
+                AssertionError("fresh committed payload must remain in RAM")
+            ),
+        )
+        assert runner._committed_payload_or_none(jobs[0])["status"] == "discovery"
+    assert runner.replay_counters["committed_payload_cache_hits"] > 0
+
+    runner.clear_execution_hot_caches()
+    assert runner._committed_payload_or_none(jobs[0])["status"] == "discovery"
+    assert runner.replay_counters["committed_payload_cache_misses"] > 0
+
+    cold = _runner(config, storage, tmp_path)
+    assert cold._committed_payload_or_none(jobs[0])["status"] == "discovery"
+    assert cold.replay_counters["committed_payload_cache_hits"] == 0
+    assert cold.replay_counters["committed_payload_cache_misses"] == 1
+
+
+def test_fresh_sam_mask_is_reused_from_ram_and_cold_runner_reads_durable_npy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a receipt-finalized fresh SAM probe may bypass durable mask I/O."""
+    config, storage = _storage_variant(tmp_path, monkeypatch, "run-hot-sam")
+    runner = _runner(config, storage, tmp_path)
+    qwen = _QwenClient(
+        discoveries=[_human_discovery(attributes=(ACCESSORY,))],
+        reviews=[
+            SubjectAttributeReviewBatch(
+                owner_entity_id=OWNER, reviews=[_raw_review("a1")]
+            )
+        ],
+    )
+    expected_mask = _attribute_mask(storage, slot=0)
+    _drain(runner, qwen, sam=_SamBackend([expected_mask]))
+
+    plan = runner._clip_plan(SHARD, CLIP_UID)
+    owner_plan = runner._owner_plan_for(SHARD, plan, OWNER)
+    reference = runner._owner_reference(storage, CLIP_UID, OWNER)
+    ordered = runner._ordered_owner_candidates(
+        SHARD, storage, CLIP_UID, owner_plan, reference
+    )
+    discovery_job = runner._expected_discovery_job(SHARD, CLIP_UID, owner_plan)
+    attribute_plan = runner._attribute_plan(
+        SHARD,
+        storage,
+        CLIP_UID,
+        owner_plan,
+        reference,
+        _human_discovery(attributes=(ACCESSORY,)),
+        0,
+        "a1",
+        discovery_job.job_id(),
+    )
+    sam_job = runner._sam_probe_chain(
+        SHARD, CLIP_UID, owner_plan, attribute_plan, ordered
+    )[0]
+    payload = runner._committed_payload_or_none(sam_job)
+    assert payload is not None
+    real_read_bytes = Path.read_bytes
+
+    def no_fresh_npy_read(path: Path) -> bytes:
+        if path.suffix == ".npy":
+            raise AssertionError("fresh SAM mask must remain in RAM")
+        return real_read_bytes(path)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "read_bytes", no_fresh_npy_read)
+        masks = runner._load_sam_masks(payload, job_id=sam_job.job_id())
+    assert len(masks) == 1
+    assert np.array_equal(masks[0], expected_mask)
+    assert runner.replay_counters["sam_mask_ram_hits"] > 0
+
+    cold = _runner(config, storage, tmp_path)
+    cold_masks = cold._load_sam_masks(payload, job_id=sam_job.job_id())
+    assert np.array_equal(cold_masks[0], expected_mask)
+    assert cold.replay_counters["sam_mask_ram_hits"] == 0
+    assert cold.replay_counters["sam_mask_disk_loads"] == 1
+
+
+def test_uncommitted_sam_masks_keep_legacy_npy_bytes_and_are_not_ram_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Writing a fresh mask alone does not make its staged RAM copy usable."""
+    config, storage = _storage_variant(tmp_path, monkeypatch, "run-pending-sam")
+    runner = _runner(config, storage, tmp_path)
+    mask = np.arange(48, dtype=np.uint8).reshape(6, 8)[:, ::2]
+    legacy_bytes = io.BytesIO()
+    np.save(legacy_bytes, np.asarray(mask), allow_pickle=False)
+
+    records = runner._publish_masks("uncommitted-probe", [mask])
+    assert len(records) == 1
+    assert (Path(runner.ledger.root) / records[0]["path"]).read_bytes() == (
+        legacy_bytes.getvalue()
+    )
+    assert records[0]["dtype"] == "uint8"
+    assert records[0]["shape"] == [6, 4]
+
+    masks = runner._load_sam_masks(
+        {"mask_count": 1, "masks": records}, job_id="uncommitted-probe"
+    )
+    assert np.array_equal(masks[0], mask)
+    assert runner.replay_counters["sam_mask_ram_hits"] == 0
+    assert runner.replay_counters["sam_mask_disk_loads"] == 1
+
+
+def test_fresh_reconcile_uses_durably_published_clip_outcome_without_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fresh terminal accounting reuses the just-published outcome marker."""
+    config, storage = _storage_variant(tmp_path, monkeypatch, "run-hot-reconcile")
+    _preexisting_nonhuman_artifact(storage)
+    runner = _runner(config, storage, tmp_path)
+    assert runner.seed_jobs() == []
+    assert runner._clip_outcome_path(SHARD, CLIP_UID).is_file()
+    runner.clear_execution_hot_caches()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            runner,
+            "_clip_plan",
+            lambda *args: (_ for _ in ()).throw(
+                AssertionError("fresh reconcile must not rederive the clip plan")
+            ),
+        )
+        patch.setattr(
+            runner,
+            "_verified_clip_outcome",
+            lambda *args: (_ for _ in ()).throw(
+                AssertionError("fresh reconcile must not replay the clip graph")
+            ),
+        )
+        stats = runner.reconcile_stats(SHARD)
+    assert stats.terminal_clips == 1
+    assert stats.no_work_clips == 0
+    assert stats.to_dict()["skipped_existing_owners"] == 1
+    assert runner.replay_counters["fresh_reconcile_cache_hits"] == 1

@@ -611,7 +611,7 @@ class _OwnerReplay:
             raise _PendingModelCall(sam_job)
         if str(sam_payload.get("status")) == "sam_failed":
             raise _sam_failure_exception(sam_payload)
-        masks = epoch._load_sam_masks(sam_payload)
+        masks = epoch._load_sam_masks(sam_payload, job_id=sam_job.job_id())
         return {
             "generated": generated,
             "masks": masks,
@@ -795,7 +795,7 @@ class _OwnerSegmentationBackend:
         if str(payload.get("status")) == "sam_failed":
             raise _sam_failure_exception(payload)
         r.add_sam_seconds(payload)
-        return list(r.epoch._load_sam_masks(payload))
+        return list(r.epoch._load_sam_masks(payload, job_id=job.job_id()))
 
     def segment_generated_frame(
         self, *, frame_path: Path, grounding_prompt: str
@@ -1124,7 +1124,9 @@ class _ReplaySegmentationBackend:
             raise self._pending(index)
         if str(payload.get("status")) == "sam_failed":
             raise _sam_failure_exception(payload)
-        return self._epoch._load_sam_masks(payload)
+        return self._epoch._load_sam_masks(
+            payload, job_id=self._chain[index].job_id()
+        )
 
     def segment_generated_frame(
         self, *, frame_path: Path, grounding_prompt: str
@@ -1393,16 +1395,15 @@ class SubjectAttributeEpochRunner:
         self._completed_clip_cache: dict[
             tuple[str, str], tuple[dict[str, Any], dict[str, Any]]
         ] = {}
+        self._fresh_completed_clips: set[tuple[str, str]] = set()
         self._cold_completed_clips: set[tuple[str, str]] = set()
         self._resume_policy: dict[str, Any] | None = None
-        # Candidate masks are full-resolution, so keep this invocation cache
-        # deliberately bounded. It exists only to avoid rebuilding the same
-        # owner evidence at every receipt boundary; a restart rebuilds and
-        # revalidates everything from durable inputs.
+        # These invocation caches span one active execution batch (normally
+        # 128 clips); a drained batch clears them before the next starts.
         self._owner_candidate_cache: dict[
             tuple[str, str, str], tuple[Any, ...]
         ] = {}
-        self._owner_candidate_cache_limit = 16
+        self._owner_candidate_cache_limit = 256
         # Receipt-boundary replay caches. Both hold only what a newly arriving
         # receipt cannot change: the frozen owner prefix, and an attribute
         # selection that is already terminal and whose durable marker still
@@ -1418,14 +1419,28 @@ class SubjectAttributeEpochRunner:
         self._attribute_selection_cache: dict[
             tuple[str, str, str, str], Any
         ] = {}
-        self._owner_context_cache_limit = 32
-        self._settled_rank0_cache_limit = 16
-        self._attribute_selection_cache_limit = 32
+        self._owner_context_cache_limit = 256
+        self._settled_rank0_cache_limit = 256
+        self._attribute_selection_cache_limit = 1024
         self._candidate_cache_lock = threading.Lock()
         # The selection cache is read by model-execution workers while the main
         # thread replays the previous receipt, so every access is guarded. The
         # heavy replay itself always happens outside the lock.
         self._attribute_selection_cache_lock = threading.Lock()
+        # Only a scheduler-committed result entering finalize may populate this
+        # cache. Cold runners still use the ordinary ledger/receipt path.
+        self._committed_payload_cache: dict[str, dict[str, Any]] = {}
+        self._committed_payload_cache_lock = threading.Lock()
+        # SAM workers stage copies only after durable .npy writes. Finalization
+        # promotes a staged entry after the scheduler has committed its receipt;
+        # pending entries can never answer _load_sam_masks().
+        self._pending_fresh_sam_masks: dict[
+            str, tuple[list[dict[str, Any]], tuple[np.ndarray, ...]]
+        ] = {}
+        self._committed_sam_masks: dict[
+            str, tuple[list[dict[str, Any]], tuple[np.ndarray, ...]]
+        ] = {}
+        self._sam_mask_cache_lock = threading.Lock()
         self._replay_counter_lock = threading.Lock()
         #: Execution-only counters. They measure how much CPU replay was skipped
         #: and are never part of any job identity, receipt or public schema.
@@ -1441,6 +1456,11 @@ class SubjectAttributeEpochRunner:
             "owner_candidate_cache_hit": 0,
             "owner_candidate_cache_miss": 0,
             "owner_candidate_rebuilds": 0,
+            "committed_payload_cache_hits": 0,
+            "committed_payload_cache_misses": 0,
+            "sam_mask_ram_hits": 0,
+            "sam_mask_disk_loads": 0,
+            "fresh_reconcile_cache_hits": 0,
         }
         #: Execution-only seed counters for the clip-plan derivation fan-out.
         #: ``clip_plan_derive_wall_seconds`` is a float, so this mapping stays
@@ -1458,6 +1478,21 @@ class SubjectAttributeEpochRunner:
     def _bump_replay_counter(self, key: str, delta: int = 1) -> None:
         with self._replay_counter_lock:
             self.replay_counters[key] += delta
+
+    def clear_execution_hot_caches(self) -> None:
+        """Drop one drained batch's RAM-only replay state, never durable plans."""
+        with self._candidate_cache_lock:
+            self._owner_candidate_cache.clear()
+        self._owner_context_cache.clear()
+        with self._settled_rank0_cache_lock:
+            self._settled_rank0_cache.clear()
+        with self._attribute_selection_cache_lock:
+            self._attribute_selection_cache.clear()
+        with self._committed_payload_cache_lock:
+            self._committed_payload_cache.clear()
+        with self._sam_mask_cache_lock:
+            self._pending_fresh_sam_masks.clear()
+            self._committed_sam_masks.clear()
 
     def _bump_seed_counter(self, key: str, delta: int = 1) -> None:
         with self._seed_counters_lock:
@@ -2809,8 +2844,30 @@ class SubjectAttributeEpochRunner:
                     advance(shard, clip_uid, plan)
         return sorted(jobs, key=lambda job: job.job_id())
 
+    def _cache_committed_result(self, job: ModelJob, result: JobResult) -> None:
+        """Remember a result only after the scheduler has committed its receipt."""
+        job_id = job.job_id()
+        payload = dict(result.payload)
+        with self._committed_payload_cache_lock:
+            self._committed_payload_cache[job_id] = payload
+        if job.job_type not in {
+            SUBJECT_ATTRIBUTE_SAM_PROBE_JOB,
+            SUBJECT_ATTRIBUTE_COMPLETION_SAM_JOB,
+        }:
+            return
+        with self._sam_mask_cache_lock:
+            pending = self._pending_fresh_sam_masks.pop(job_id, None)
+            if (
+                pending is not None
+                and payload.get("status") == "sam"
+                and payload.get("mask_count") == len(pending[1])
+                and payload.get("masks") == pending[0]
+            ):
+                self._committed_sam_masks[job_id] = pending
+
     def finalize(self, job: ModelJob, result: JobResult) -> Sequence[ModelJob]:
         """CPU continuation of one committed model receipt."""
+        self._cache_committed_result(job, result)
         if job.job_type == SUBJECT_ATTRIBUTE_SAM_PROBE_JOB:
             return self._finalize_sam_probe(job, result)
         if job.job_type in {
@@ -2878,6 +2935,8 @@ class SubjectAttributeEpochRunner:
         Validation remains per job; an invalid sibling prevents that owner's
         shared advancement, and its receipt is left for restart replay.
         """
+        for job, result in committed:
+            self._cache_committed_result(job, result)
         grouped_types = {
             SUBJECT_ATTRIBUTE_SAM_PROBE_JOB,
             SUBJECT_ATTRIBUTE_RAW_REVIEW_JOB,
@@ -3254,6 +3313,9 @@ class SubjectAttributeEpochRunner:
             if not target.is_file() or target.read_bytes() != expected_bytes:
                 write_json_atomic(target, sample.model_dump(mode="json"))
         _write_json_once(path, expected)
+        key = (shard, clip_uid)
+        self._completed_clip_cache[key] = (dict(plan), expected)
+        self._fresh_completed_clips.add(key)
 
     # -- attribute plans -------------------------------------------------------
 
@@ -3335,6 +3397,12 @@ class SubjectAttributeEpochRunner:
         """The committed receipt payload of one job, or ``None`` if it is pending."""
         from r2v_data_v2.v3.post_mask_epoch_state import STATE_MISMATCH
 
+        with self._committed_payload_cache_lock:
+            cached = self._committed_payload_cache.get(job.job_id())
+        if cached is not None:
+            self._bump_replay_counter("committed_payload_cache_hits")
+            return dict(cached)
+        self._bump_replay_counter("committed_payload_cache_misses")
         state = self.ledger.classify(job)
         if state.state == STATE_MISMATCH:
             raise SubjectAttributeDurableError(
@@ -3611,8 +3679,22 @@ class SubjectAttributeEpochRunner:
             chain.append(previous)
         return chain
 
-    def _load_sam_masks(self, payload: Mapping[str, Any]) -> list[Any]:
+    def _load_sam_masks(
+        self, payload: Mapping[str, Any], *, job_id: str | None = None
+    ) -> list[Any]:
         """Read the ledger ``.npy`` mask artifacts of one committed probe."""
+        if job_id is not None:
+            with self._sam_mask_cache_lock:
+                cached = self._committed_sam_masks.get(job_id)
+            if (
+                cached is not None
+                and payload.get("mask_count") == len(cached[1])
+                and payload.get("masks") == cached[0]
+            ):
+                self._bump_replay_counter("sam_mask_ram_hits")
+                # Disk replay returns new writable arrays on every call. Keep
+                # the cached source immutable and preserve that caller contract.
+                return [mask.copy() for mask in cached[1]]
         masks: list[Any] = []
         for record in payload.get("masks", []):
             path = Path(self.ledger.root) / str(record["path"])
@@ -3627,6 +3709,7 @@ class SubjectAttributeEpochRunner:
                 )
             try:
                 masks.append(np.load(io.BytesIO(data), allow_pickle=False))
+                self._bump_replay_counter("sam_mask_disk_loads")
             except (OSError, ValueError) as exc:
                 raise SubjectAttributeDurableError(
                     f"SAM probe mask artifact is unreadable: {record['path']}"
@@ -3669,22 +3752,7 @@ class SubjectAttributeEpochRunner:
                     "model_call_time_seconds": time.perf_counter() - started,
                 },
             )
-        records: list[dict[str, Any]] = []
-        for index, mask in enumerate(returned):
-            array = np.asarray(mask)
-            buffer = io.BytesIO()
-            np.save(buffer, array, allow_pickle=False)
-            data = buffer.getvalue()
-            path = self._sam_mask_path(job.job_id(), index)
-            atomic_write_bytes(path, data)
-            records.append(
-                {
-                    "path": path.relative_to(Path(self.ledger.root)).as_posix(),
-                    "sha256": _sha256_bytes(data),
-                    "dtype": str(array.dtype),
-                    "shape": [int(value) for value in array.shape],
-                }
-            )
+        records = self._publish_masks(job.job_id(), returned)
         return JobResult(
             OUTCOME_COMPLETED,
             payload={
@@ -3997,7 +4065,9 @@ class SubjectAttributeEpochRunner:
                 raise SubjectAttributeDurableError(
                     "selected attribute candidate has no committed SAM masks"
                 )
-            masks = self._load_sam_masks(payload)
+            masks = self._load_sam_masks(
+                payload, job_id=probe_jobs[index].job_id()
+            )
             mask_index = next(
                 (
                     position
@@ -4862,7 +4932,7 @@ class SubjectAttributeEpochRunner:
         context = self._sam_probe_context(job)
         if status == "sam":
             # The masks are this probe's durable artifact; verify them now.
-            self._load_sam_masks(payload)
+            self._load_sam_masks(payload, job_id=job.job_id())
         return context
 
     def _finalize_owner_chain(
@@ -4910,7 +4980,7 @@ class SubjectAttributeEpochRunner:
                     f"committed raw review {job.job_id()} has an invalid batch"
                 ) from exc
         if status == "sam":
-            self._load_sam_masks(payload)
+            self._load_sam_masks(payload, job_id=job.job_id())
         if status == "completion":
             storage = self._storage_for(job.canonical_shard)
             self._generated_png_bytes(storage, payload)
@@ -5575,7 +5645,7 @@ class SubjectAttributeEpochRunner:
                 completed_crop_sha256=None,
                 **base,
             )
-        masks = self._load_sam_masks(sam_payload)
+        masks = self._load_sam_masks(sam_payload, job_id=sam_job.job_id())
         cpu = self._completion_cpu_result(generated, masks)
         if cpu["status"] == COMPLETION_POSTCHECK_REJECTED:
             return _CompletionChain(
@@ -6403,7 +6473,7 @@ class SubjectAttributeEpochRunner:
                 f"completion review {job.job_id()} has no committed SAM"
             )
         cpu = self._completion_cpu_result(
-            generated, self._load_sam_masks(sam_payload)
+            generated, self._load_sam_masks(sam_payload, job_id=sam_job.job_id())
         )
         if cpu["status"] != COMPLETION_REVIEW_REQUIRED:
             raise SubjectAttributeDurableError(
@@ -6531,8 +6601,10 @@ class SubjectAttributeEpochRunner:
     def _publish_masks(self, job_id: str, masks: Sequence[Any]) -> list[dict[str, Any]]:
         """Store returned masks as durable ledger ``.npy`` artifacts."""
         records: list[dict[str, Any]] = []
+        fresh: list[np.ndarray] = []
         for index, mask in enumerate(masks):
-            array = np.asarray(mask)
+            array = np.array(mask, copy=True)
+            array.setflags(write=False)
             buffer = io.BytesIO()
             np.save(buffer, array, allow_pickle=False)
             data = buffer.getvalue()
@@ -6545,6 +6617,11 @@ class SubjectAttributeEpochRunner:
                     "dtype": str(array.dtype),
                     "shape": [int(value) for value in array.shape],
                 }
+            )
+            fresh.append(array)
+        with self._sam_mask_cache_lock:
+            self._pending_fresh_sam_masks[job_id] = (
+                [dict(record) for record in records], tuple(fresh)
             )
         return records
 
@@ -6619,13 +6696,14 @@ class SubjectAttributeEpochRunner:
         for clip_uid in self.eligible.get(shard, ()):
             if self._skip_preplan_quarantine(shard, clip_uid):
                 continue
-            completed = (
-                self._completed_clip_checkpoint(shard, clip_uid)
-                if (shard, clip_uid) in self._cold_completed_clips
-                else None
-            )
+            key = (shard, clip_uid)
+            completed = self._completed_clip_cache.get(key)
+            if completed is None and key in self._cold_completed_clips:
+                completed = self._completed_clip_checkpoint(shard, clip_uid)
             if completed is not None:
                 plan, verified = completed
+                if key in self._fresh_completed_clips:
+                    self._bump_replay_counter("fresh_reconcile_cache_hits")
                 for key, value in verified["counts"].items():
                     counts[key] += value
                 terminal_clips += 1

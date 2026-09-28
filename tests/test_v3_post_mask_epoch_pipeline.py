@@ -3718,6 +3718,126 @@ def test_production_run_emits_the_subject_attributes_cpu_diagnostics(
     )
 
 
+@pytest.mark.parametrize(
+    ("override", "expected_batch_sizes"),
+    [(None, [128, 128, 44]), ("64", [64, 64, 64, 64, 44])],
+)
+def test_subject_attributes_execution_batches_follow_eligible_clip_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    override: str | None,
+    expected_batch_sizes: list[int],
+) -> None:
+    import r2v_data_v2.v3.post_mask_epoch_pipeline as pipeline
+    from r2v_data_v2.v3.post_mask_epoch_jobs import ModelJob
+
+    shard = "shard-000000000-000000299"
+    if override is None:
+        monkeypatch.delenv("POST_MASK_SUBJECT_ATTRIBUTES_CLIP_BATCH_SIZE", raising=False)
+    else:
+        monkeypatch.setenv("POST_MASK_SUBJECT_ATTRIBUTES_CLIP_BATCH_SIZE", override)
+    uids = tuple(f"clip-{index:03d}" for index in range(300))
+    jobs = [
+        ModelJob.create(
+            job_type="attribute_discovery",
+            resource=RESOURCE_QWEN,
+            canonical_shard=shard,
+            clip_uid=uid,
+            semantic_inputs={"clip_uid": uid},
+            model_identity="stub",
+        )
+        for uid in reversed(uids)
+    ]
+    events: list[dict[str, Any]] = []
+    runner_events: list[str] = []
+
+    class Runner:
+        def __init__(self) -> None:
+            self.storages: dict[str, Any] = {}
+            self.seed_counters: dict[str, Any] = {}
+
+        def seed_jobs(self) -> list[ModelJob]:
+            runner_events.append("seed")
+            return jobs
+
+        def clear_execution_hot_caches(self) -> None:
+            runner_events.append("clear")
+
+    runner = Runner()
+    batches: list[tuple[str, ...]] = []
+
+    class Scheduler:
+        def run_batches(self, job_batches: Any) -> dict[str, Any]:
+            for batch in job_batches:
+                batches.append(tuple(job.clip_uid for job in batch))
+                runner_events.append(f"drain-{len(batches)}")
+            return {"unresolved_job_ids": ()}
+
+    schedulers: list[Scheduler] = []
+
+    def scheduler_factory(_runner: Any) -> Scheduler:
+        scheduler = Scheduler()
+        schedulers.append(scheduler)
+        return scheduler
+
+    monkeypatch.setattr(
+        pipeline,
+        "_reconcile_and_publish_subject_attribute_stats",
+        lambda **_kwargs: (True, {}, None),
+    )
+    outcome = pipeline.run_subject_attributes_stage(
+        config=object(),
+        storages={},
+        eligible={shard: uids},
+        ledger=GroupLedger(tmp_path / "ledger"),
+        result={},
+        subject_attributes_runner_factory=lambda **_kwargs: runner,
+        subject_attributes_scheduler_factory=scheduler_factory,
+        emit=lambda event, **fields: events.append({"event": event, **fields}),
+    )
+
+    assert outcome["subject_attributes_completed"] is True
+    assert len(schedulers) == 1
+    assert [len(batch) for batch in batches] == expected_batch_sizes
+    assert tuple(uid for batch in batches for uid in batch) == uids
+    assert runner_events[:5] == [
+        "seed", "drain-1", "clear", "drain-2", "clear"
+    ]
+    execution = [
+        event for event in events
+        if event["event"] == "post_mask_epoch_subject_attributes_execution_diagnostics"
+    ]
+    assert len(execution) == 1
+    assert execution[0]["execution_batches"] == len(expected_batch_sizes)
+    assert execution[0]["execution_batch_size"] == int(override or "128")
+    assert execution[0]["execution_batch_peak_seed_jobs"] == int(override or "128")
+
+
+@pytest.mark.parametrize("override", ["0", "invalid"])
+def test_invalid_subject_attribute_batch_override_writes_no_handoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, override: str
+) -> None:
+    import r2v_data_v2.v3.post_mask_epoch_pipeline as pipeline
+
+    monkeypatch.setenv("POST_MASK_SUBJECT_ATTRIBUTES_CLIP_BATCH_SIZE", override)
+    ledger = GroupLedger(tmp_path / "ledger")
+
+    def forbidden(**_kwargs: Any) -> Any:
+        raise AssertionError("invalid batch size must fail before constructing the runner")
+
+    with pytest.raises(ValueError):
+        pipeline.run_subject_attributes_stage(
+            config=object(),
+            storages={},
+            eligible={},
+            ledger=ledger,
+            result={},
+            subject_attributes_runner_factory=forbidden,
+            subject_attributes_scheduler_factory=forbidden,
+        )
+    assert not (Path(ledger.root) / "composition" / f"{SUBJECT_ATTRIBUTES_STARTED}.json").exists()
+
+
 def test_subject_attributes_incomplete_blocks_the_export(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

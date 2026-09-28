@@ -38,6 +38,7 @@ publication for corruption.
 from __future__ import annotations
 
 import json
+import os
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -771,6 +772,11 @@ def run_subject_attributes_stage(
     written last, after every shard reconciled and every final attribute receipt
     was published, so it is the barrier the export is allowed to trust.
     """
+    batch_size = int(
+        os.environ.get("POST_MASK_SUBJECT_ATTRIBUTES_CLIP_BATCH_SIZE", "128")
+    )
+    if batch_size <= 0:
+        raise ValueError("POST_MASK_SUBJECT_ATTRIBUTES_CLIP_BATCH_SIZE must be positive")
     resuming = read_composition_handoff(
         ledger,
         SUBJECT_ATTRIBUTES_STARTED,
@@ -800,13 +806,54 @@ def run_subject_attributes_stage(
         seeded_jobs=len(seeded),
     )
     _emit_subject_attributes_cpu_diagnostics(emit, subject_attributes)
-    outcome = _run_staged_scheduler(
-        emit,
-        subject_attributes_scheduler_factory(subject_attributes),
-        seeded,
-        stage="subject_attributes",
-        phase="scheduler",
-    )
+    eligible_keys = {
+        (shard, clip_uid)
+        for shard, clip_uids in eligible.items()
+        for clip_uid in clip_uids
+    }
+    jobs_by_clip: dict[tuple[str, str], list[Any]] = {}
+    for job in seeded:
+        key = (job.canonical_shard, job.clip_uid)
+        if key not in eligible_keys:
+            raise StageHandoffError(
+                "Subject Attributes seeded jobs are outside the eligible clip scope"
+            )
+        jobs_by_clip.setdefault(key, []).append(job)
+    execution_batches = 0
+    peak_seed_jobs = 0
+
+    def batches() -> Iterator[list[Any]]:
+        nonlocal execution_batches, peak_seed_jobs
+        batch: list[Any] = []
+        active_clips = 0
+        for shard in sorted(eligible):
+            for clip_uid in eligible[shard]:
+                clip_jobs = jobs_by_clip.pop((shard, clip_uid), ())
+                if not clip_jobs:
+                    continue
+                batch.extend(clip_jobs)
+                active_clips += 1
+                if active_clips == batch_size:
+                    execution_batches += 1
+                    peak_seed_jobs = max(peak_seed_jobs, len(batch))
+                    yield batch
+                    clear = getattr(subject_attributes, "clear_execution_hot_caches", None)
+                    if clear is not None:
+                        clear()
+                    batch = []
+                    active_clips = 0
+        if batch:
+            execution_batches += 1
+            peak_seed_jobs = max(peak_seed_jobs, len(batch))
+            yield batch
+            clear = getattr(subject_attributes, "clear_execution_hot_caches", None)
+            if clear is not None:
+                clear()
+
+    scheduler = subject_attributes_scheduler_factory(subject_attributes)
+    with _stage_timing(emit, "subject_attributes", "scheduler"):
+        outcome = scheduler.run_batches(batches())
+    _emit_scheduler_diagnostics(emit, "subject_attributes", outcome)
     unresolved = tuple(outcome.get("unresolved_job_ids", ()))
     completed = False
     stats: dict[str, Any] = {}
@@ -822,6 +869,26 @@ def run_subject_attributes_stage(
             eligible=eligible,
             clip_quarantine=clip_quarantine,
         )
+    _emit(
+        emit,
+        "post_mask_epoch_subject_attributes_execution_diagnostics",
+        execution_batches=execution_batches,
+        execution_batch_size=batch_size,
+        execution_batch_peak_seed_jobs=peak_seed_jobs,
+        **{
+            key: value
+            for key, value in dict(
+                getattr(subject_attributes, "replay_counters", None) or {}
+            ).items()
+            if key in {
+                "committed_payload_cache_hits",
+                "committed_payload_cache_misses",
+                "sam_mask_ram_hits",
+                "sam_mask_disk_loads",
+                "fresh_reconcile_cache_hits",
+            }
+        },
+    )
     result.update(
         {
             "subject_attributes_job_count": len(seeded),

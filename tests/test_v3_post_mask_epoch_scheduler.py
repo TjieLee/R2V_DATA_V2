@@ -395,3 +395,77 @@ def test_run_batches_keeps_plans_and_receipt_syncs_without_duplicate_enqueue():
     assert [len(batch) for batch in ledger.phases["r001-qwen"].plan_writes] == [1]
     assert all(phase.syncs == 1 for phase in ledger.phases.values())
     assert set(ledger.classifications.values()) == {1}
+
+
+def test_three_hundred_initial_jobs_drain_each_batch_with_one_resource_session():
+    """A later batch is requested only after every current clip reaches its final job."""
+    initial = [_Job(f"clip-{index:04d}", "discovery") for index in range(300)]
+    completed: set[str] = set()
+    batch_sizes: list[int] = []
+
+    class LiveExecutor(_Executor):
+        def __init__(self) -> None:
+            super().__init__(8)
+            self.closed = False
+
+        def submit(self, job: _Job) -> None:
+            assert not self.closed, "resource closed across a batch boundary"
+            super().submit(job)
+
+        def close(self) -> None:
+            self.closed = True
+
+    class SharedManager:
+        def __init__(self) -> None:
+            self.executors: dict[str, LiveExecutor] = {}
+            self.starts: Counter[str] = Counter()
+            self.close_count = 0
+
+        def enter(self, resource: str) -> LiveExecutor:
+            if resource not in self.executors:
+                self.executors[resource] = LiveExecutor()
+                self.starts[resource] += 1
+            return self.executors[resource]
+
+        def close(self) -> None:
+            self.close_count += 1
+            for executor in self.executors.values():
+                executor.close()
+
+        def counters(self) -> dict[str, Any]:
+            return {}
+
+    manager = SharedManager()
+
+    def batches():
+        for start in range(0, len(initial), 128):
+            assert len(completed) == start
+            assert manager.close_count == 0
+            batch = initial[start : start + 128]
+            batch_sizes.append(len(batch))
+            yield batch
+
+    def finalize(job: _Job, _result: JobResult) -> tuple[_Job, ...]:
+        if job.job_type == "discovery":
+            return (_Job(job.clip_uid, "sam_probe", RESOURCE_SAM),)
+        if job.job_type == "sam_probe":
+            return (_Job(job.clip_uid, "completion", RESOURCE_BOOGU),)
+        if job.job_type == "completion":
+            return (_Job(job.clip_uid, "final_review", RESOURCE_QWEN),)
+        assert job.job_type == "final_review"
+        completed.add(job.clip_uid)
+        return ()
+
+    outcome = ResourceEpochScheduler(
+        ledger=_Ledger(), finalize=finalize, resource_manager=manager
+    ).run_batches(batches())
+
+    assert outcome["completed"] is True
+    assert outcome["seed_job_count"] == 300
+    assert outcome["job_count"] == 1_200
+    assert batch_sizes == [128, 128, 44]
+    assert len(completed) == 300
+    assert manager.starts == Counter(
+        {RESOURCE_QWEN: 1, RESOURCE_SAM: 1, RESOURCE_BOOGU: 1}
+    )
+    assert manager.close_count == 1
