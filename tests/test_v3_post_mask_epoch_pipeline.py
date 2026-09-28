@@ -48,6 +48,8 @@ from r2v_data_v2.v3.post_mask_epoch_pipeline import (
     StageDispatchError,
     StageHandoffError,
     default_pair_runner_factory,
+    publish_subject_attribute_receipts,
+    run_deterministic_instruct,
     run_removal_pair_epochs,
     run_removal_pair_resource_session,
     shared_qwen_model_identities,
@@ -219,6 +221,104 @@ def test_remove_complete_then_pair_primary_then_cross(tmp_path: Path, monkeypatc
     assert outcome["pair_completed"] is True
     assert outcome["completed"] is False
     assert outcome["reason"] == DOWNSTREAM_REASON
+
+
+def test_removed_clip_after_hydration_is_quarantined_once_across_stages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, storages, eligible, _, log = _fixture(tmp_path, monkeypatch)
+    ledger = GroupLedger(tmp_path / "ledger")
+    events: list[tuple[str, dict[str, Any]]] = []
+    storages[SHARD].clip_path("clip-1").unlink()
+
+    def removal_factory(runner: Any) -> Any:
+        return ResourceEpochScheduler(
+            ledger=ledger,
+            finalize=runner.finalize,
+            executors=_removal_executors(runner, log),
+        )
+
+    def pair_factory(runner: Any) -> Any:
+        return ResourceEpochScheduler(
+            ledger=ledger,
+            finalize=runner.finalize,
+            executors={
+                RESOURCE_QWEN: _RecordingExecutor(runner, _EntityJudge(), "pair", log)
+            },
+        )
+
+    outcome = run_removal_pair_epochs(
+        config=config,
+        storages=storages,
+        eligible_clip_uids_by_shard=eligible,
+        ledger=ledger,
+        removal_scheduler_factory=removal_factory,
+        pair_scheduler_factory=pair_factory,
+        emit=lambda event, **fields: events.append((event, fields)),
+    )
+
+    assert outcome["quarantined_clips"] == 1
+    assert outcome["pair_completed"] is True
+    assert outcome["pair_primary_job_count"] >= 1
+    assert sum(event == "post_mask_clip_quarantined" for event, _ in events) == 1
+    assert any(entry.startswith("pair:") for entry in log)
+    assert len((storages[SHARD].root / "failures.jsonl").read_text().splitlines()) == 1
+
+
+def test_instruct_skips_clip_already_quarantined_by_prior_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from r2v_data_v2.v3.post_mask_epoch_quarantine import ClipQuarantine
+
+    config, storages, eligible, _, _log = _fixture(tmp_path, monkeypatch)
+    quarantine = ClipQuarantine()
+    bad_storage = storages[SHARD]
+    bad_storage.clip_path("clip-1").unlink()
+    missing = FileNotFoundError(
+        2, "No such file", str(bad_storage.clip_path("clip-1"))
+    )
+    assert quarantine.record_if_local(SHARD, bad_storage, "clip-1", "remove", missing)
+
+    completed, stats, error = run_deterministic_instruct(
+        config=config,
+        storages=storages,
+        eligible_clip_uids_by_shard=eligible,
+        clip_quarantine=quarantine,
+    )
+
+    assert completed is True
+    assert error is None
+    assert stats[SHARD]["processed"] == 0
+    assert quarantine.count == 1
+
+
+def test_attribute_receipt_publication_skips_quarantined_clip_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from r2v_data_v2.v3 import post_mask_runtime
+    from r2v_data_v2.v3.post_mask_epoch_quarantine import ClipQuarantine
+
+    _config, storages, eligible, _, _log = _fixture(tmp_path, monkeypatch)
+    quarantine = ClipQuarantine()
+    bad_storage = storages[SHARD]
+    bad_storage.clip_path("clip-1").unlink()
+    missing = FileNotFoundError(
+        2, "No such file", str(bad_storage.clip_path("clip-1"))
+    )
+    assert quarantine.record_if_local(SHARD, bad_storage, "clip-1", "remove", missing)
+    monkeypatch.setattr(
+        post_mask_runtime,
+        "_expected_attribute_receipt",
+        lambda _storage, uid: {"clip_uid": uid},
+    )
+
+    publish_subject_attribute_receipts(
+        storages, eligible, clip_quarantine=quarantine
+    )
+
+    assert not (bad_storage.clip_dir("clip-1") / ".post_mask_attributes.json").exists()
+    good = storages[PAIR_SHARD].clip_dir("clip-1") / ".post_mask_attributes.json"
+    assert json.loads(good.read_text(encoding="utf-8")) == {"clip_uid": "clip-1"}
 
 
 def test_removal_retryable_blocks_every_pair_stage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1700,6 +1800,11 @@ class _CompositionSamHandle:
              width // 3 : width // 3 + width // 8] = True
         return [mask]
 
+    def segment_generated_frame(self, **kwargs: Any) -> Any:
+        self.generated_calls += 1
+        self.generated_requests.append(kwargs)
+        raise AssertionError("this production wiring fixture does not complete attributes")
+
     def _owner_mask(self, slot: int) -> Any:
         from r2v_data_v2.v3.subject_attributes import _decode_owner_mask
 
@@ -2641,6 +2746,8 @@ def _production_reference_integrity_outcome(
     storage: Any = None,
     paths: Any = None,
     cpu_workers: int | None = None,
+    clip_uids: tuple[str, ...] = ("clip-1",),
+    damage_after_hydration: str | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], Any, Any, Any]:
     """Run the real ``build_removal_epoch_runner`` with Reference Integrity on.
 
@@ -2718,7 +2825,7 @@ def _production_reference_integrity_outcome(
             shard_paths.identity_path, _shard_identity(shard_config, shard_paths)
         )
     else:
-        storage = _pending_storage(config, clip_uids=("clip-1",))
+        storage = _pending_storage(config, clip_uids=clip_uids)
     handle = qwen if qwen is not None else _CompositionQwenHandle()
     boogu = _CompositionBooguHandle()
     sam = sam if sam is not None else _CompositionSamHandle(
@@ -2727,6 +2834,8 @@ def _production_reference_integrity_outcome(
     )
 
     def prepare(*args: Any, **kwargs: Any) -> Any:
+        if damage_after_hydration is not None:
+            storage.clip_path(damage_after_hydration).unlink()
         return PreparedRemovalShard(
             shard=kwargs["shard"],
             paths=removal_shard_paths(
@@ -2735,8 +2844,8 @@ def _production_reference_integrity_outcome(
                 shard=kwargs["shard"],
             ),
             storage=storage,
-            clip_uids=("clip-1",),
-            ready=1,
+            clip_uids=clip_uids,
+            ready=len(clip_uids),
             excluded=0,
             corrupt=0,
         )
@@ -2790,6 +2899,116 @@ def _production_reference_integrity_outcome(
         lambda event, **payload: events.append({"event": event, **payload}),
     )
     return outcome, events, handle, storage, ledger
+
+
+def test_production_export_excludes_clip_quarantined_after_hydration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import r2v_data_v2.v3.post_mask_epoch_removal as removal_module
+
+    published: list[tuple[str, ...]] = []
+
+    def publish(_storage: Any, _paths: Any, clip_uids: Any, **_kwargs: Any) -> dict[str, Any]:
+        published.append(tuple(clip_uids))
+        return {"sample_count": len(clip_uids), "rebuilt": True}
+
+    monkeypatch.setattr(removal_module, "export_shard", publish)
+    outcome, events, _handle, storage, _ledger = (
+        _production_reference_integrity_outcome(
+            tmp_path,
+            monkeypatch,
+            clip_uids=("clip-1", "clip-B"),
+            damage_after_hydration="clip-B",
+        )
+    )
+
+    assert outcome["completed"] is True, outcome
+    assert outcome["quarantined_clips"] == 1
+    assert published == [("clip-1",)]
+    assert sum(event["event"] == "post_mask_clip_quarantined" for event in events) == 1
+    failures = (storage.root / "failures.jsonl").read_text().splitlines()
+    assert len(failures) == 1
+    assert json.loads(failures[0])["clip_uid"] == "clip-B"
+
+
+def test_quarantined_clip_restart_keeps_original_scope_and_export_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import r2v_data_v2.v3.post_mask_epoch_removal as removal_module
+
+    published: list[tuple[str, ...]] = []
+
+    def publish(_storage: Any, _paths: Any, clip_uids: Any, **_kwargs: Any) -> dict[str, Any]:
+        published.append(tuple(clip_uids))
+        return {"sample_count": len(clip_uids), "rebuilt": True}
+
+    monkeypatch.setattr(removal_module, "export_shard", publish)
+    first, _events, _handle, storage, _ledger = (
+        _production_reference_integrity_outcome(
+            tmp_path,
+            monkeypatch,
+            clip_uids=("clip-1", "clip-B"),
+            damage_after_hydration="clip-B",
+        )
+    )
+    assert first["completed"] is True
+
+    # On restart hydration excludes the missing mutable clip.json. Its prior
+    # quarantine must still define the original plan/handoff scope and export.
+    second, events, _handle, _storage, _ledger = (
+        _production_reference_integrity_outcome(
+            tmp_path,
+            monkeypatch,
+            clip_uids=("clip-1",),
+            storage=storage,
+        )
+    )
+
+    assert second["completed"] is True
+    assert second["quarantined_clips"] == 1
+    assert published == [("clip-1",), ("clip-1",)]
+    assert not any(event["event"] == "post_mask_clip_quarantined" for event in events)
+    assert len((storage.root / "failures.jsonl").read_text().splitlines()) == 1
+
+
+def test_completed_handoff_rejects_changed_quarantine_exclusions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import r2v_data_v2.v3.post_mask_epoch_removal as removal_module
+
+    monkeypatch.setattr(
+        removal_module,
+        "export_shard",
+        lambda _storage, _paths, clip_uids, **_kwargs: {
+            "sample_count": len(clip_uids), "rebuilt": True
+        },
+    )
+    first, _events, _handle, storage, ledger = (
+        _production_reference_integrity_outcome(
+            tmp_path,
+            monkeypatch,
+            clip_uids=("clip-1", "clip-B"),
+            damage_after_hydration="clip-B",
+        )
+    )
+    assert first["completed"] is True
+    marker_path = ledger.root / "composition" / "clip_quarantine.json"
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker["quarantined"].append(
+        {
+            "shard": SHARD, "clip_uid": "clip-1", "stage": "pair",
+            "reason": "forged exclusion",
+        }
+    )
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="without failure record"):
+        _production_reference_integrity_outcome(
+            tmp_path,
+            monkeypatch,
+            clip_uids=("clip-1",),
+            storage=storage,
+        )
 
 
 def test_production_runner_wires_reference_integrity_and_instruct(

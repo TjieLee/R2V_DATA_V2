@@ -52,7 +52,11 @@ from r2v_data_v2.v3.post_mask_epoch_jobs import (
     canonical_json,
     semantic_input_digest,
 )
-from r2v_data_v2.v3.post_mask_epoch_resources import resolve_cpu_workers
+from r2v_data_v2.v3.post_mask_epoch_resources import (
+    EpochResourceError,
+    resolve_cpu_workers,
+)
+from r2v_data_v2.v3.post_mask_epoch_state import LedgerError
 from r2v_data_v2.v3.reference_integrity import (
     SOURCE_BBOX_FALLBACK_SYSTEM_PROMPT,
     QwenReferenceIntegrityJudge,
@@ -94,6 +98,13 @@ from r2v_data_v2.v3.schemas import (
 from r2v_data_v2.v3.storage import RunStorage
 
 REFERENCE_INTEGRITY_PLAN_SCHEMA = "post_mask_epoch_reference_integrity_plan/1"
+
+
+class _ClipArtifactReadError(Exception):
+    def __init__(self, cause: Exception) -> None:
+        self.cause = cause
+
+
 REFERENCE_INTEGRITY_ENTITY_OUTCOME_SCHEMA = (
     "post_mask_epoch_reference_integrity_entity_outcome/4"
 )
@@ -570,6 +581,7 @@ class ReferenceIntegrityEpochRunner:
         self.eligible = {
             shard: tuple(uids) for shard, uids in eligible_clip_uids_by_shard.items()
         }
+        self.clip_quarantine: Any = None
         self.emit = emit
         # Invocation-local execution state: the frozen plan entries this
         # invocation has already fully validated, plus the canonical digest of
@@ -772,6 +784,13 @@ class ReferenceIntegrityEpochRunner:
         excluded: this stage legitimately rewrites them on publication, so they
         are frozen as baselines and compared only while the clip is unpublished.
         """
+        try:
+            frames = storage.read_frames(clip.clip_uid)
+            masks = storage.read_masks(clip.clip_uid)
+        except (OSError, ValueError) as exc:
+            if self.clip_quarantine is None:
+                raise
+            raise _ClipArtifactReadError(exc) from exc
         projection = {
             "annotation": (
                 clip.annotation.model_dump(mode="json")
@@ -783,10 +802,8 @@ class ReferenceIntegrityEpochRunner:
                 if clip.coverage is not None
                 else None
             ),
-            "sampled_frames": storage.read_frames(clip.clip_uid).model_dump(
-                mode="json"
-            ),
-            "tracked_masks": storage.read_masks(clip.clip_uid).model_dump(mode="json"),
+            "sampled_frames": frames.model_dump(mode="json"),
+            "tracked_masks": masks.model_dump(mode="json"),
             "policy": self._policy_identity(),
         }
         return semantic_input_digest(projection)
@@ -877,7 +894,16 @@ class ReferenceIntegrityEpochRunner:
         classification are re-derived; a tampered plan may never silently change
         which clips or entities this stage executes.
         """
-        clip = storage.read_clip(clip_uid)
+        try:
+            clip = storage.read_clip(clip_uid)
+        except (OSError, ValueError) as exc:
+            if self._quarantine_local(
+                shard, storage, clip_uid, exc, known_clip_artifact_read=True
+            ):
+                raise ReferenceIntegrityDurableError(
+                    f"cannot validate frozen Reference Integrity input for {clip_uid!r}"
+                ) from exc
+            raise
         actual = self._clip_digest(storage, clip)
         if actual != entry.get("digest"):
             raise ReferenceIntegrityDurableError(
@@ -1259,7 +1285,23 @@ class ReferenceIntegrityEpochRunner:
                 f"frozen Reference Integrity plan clips map is malformed for "
                 f"{shard!r}"
             )
-        if set(clips) != set(self.eligible.get(shard, ())):
+        scope = set(self.eligible.get(shard, ()))
+        omitted = scope - set(clips)
+        excluded = [uid for uid in self.eligible.get(shard, ()) if uid in omitted]
+        if payload.get("preplan_quarantined_clip_uids", []) != excluded:
+            raise ReferenceIntegrityDurableError(
+                f"frozen Reference Integrity plan scope drifted for {shard!r}"
+            )
+        witness = _read_json(self._plan_path(shard).with_suffix(".exclusions.json"))
+        if (witness if witness is not None else {"clip_uids": []}) != {
+            "clip_uids": excluded
+        }:
+            raise ReferenceIntegrityDurableError(
+                f"frozen Reference Integrity plan scope drifted for {shard!r}"
+            )
+        if set(clips) - scope or any(
+            not self._is_quarantined(shard, clip_uid) for clip_uid in omitted
+        ):
             raise ReferenceIntegrityDurableError(
                 f"frozen Reference Integrity plan scope drifted for {shard!r}"
             )
@@ -1270,7 +1312,16 @@ class ReferenceIntegrityEpochRunner:
                     f"frozen Reference Integrity plan entry is malformed for "
                     f"{clip_uid!r}"
                 )
-            self._verify_plan_entry(shard, storage, clip_uid, entry)
+            try:
+                self._verify_plan_entry(shard, storage, clip_uid, entry)
+            except _ClipArtifactReadError as exc:
+                if not self._quarantine_local(
+                    shard, storage, clip_uid, exc.cause, known_clip_artifact_read=True
+                ):
+                    raise exc.cause
+                raise ReferenceIntegrityDurableError(
+                    f"cannot validate frozen Reference Integrity input for {clip_uid!r}"
+                ) from exc
         self._bump_plan_counter("plan_full_validation_count")
         return dict(payload)
 
@@ -1282,8 +1333,23 @@ class ReferenceIntegrityEpochRunner:
         storage = self._storage_for(shard)
         clips: dict[str, dict[str, Any]] = {}
         for clip_uid in self.eligible.get(shard, ()):
-            clip = storage.read_clip(clip_uid)
-            clips[clip_uid] = self._plan_entry(storage, clip)
+            if self._is_quarantined(shard, clip_uid):
+                continue
+            try:
+                clip = storage.read_clip(clip_uid)
+            except (OSError, ValueError) as exc:
+                if not self._quarantine_local(
+                    shard, storage, clip_uid, exc, known_clip_artifact_read=True
+                ):
+                    raise
+                continue
+            try:
+                clips[clip_uid] = self._plan_entry(storage, clip)
+            except _ClipArtifactReadError as exc:
+                if not self._quarantine_local(
+                    shard, storage, clip_uid, exc.cause, known_clip_artifact_read=True
+                ):
+                    raise exc.cause
         payload = {
             "schema": REFERENCE_INTEGRITY_PLAN_SCHEMA,
             "canonical_shard": shard,
@@ -1291,8 +1357,38 @@ class ReferenceIntegrityEpochRunner:
             "policy": self._policy_identity(),
             "clips": clips,
         }
+        excluded = [uid for uid in self.eligible.get(shard, ()) if uid not in clips]
+        if excluded:
+            payload["preplan_quarantined_clip_uids"] = excluded
+            _write_json_once(
+                self._plan_path(shard).with_suffix(".exclusions.json"),
+                {"clip_uids": excluded},
+            )
         _write_json_once(self._plan_path(shard), payload)
         return payload
+
+    def _is_quarantined(self, shard: str, clip_uid: str) -> bool:
+        return self.clip_quarantine is not None and self.clip_quarantine.contains(
+            shard, clip_uid
+        )
+
+    def _quarantine_local(
+        self,
+        shard: str,
+        storage: RunStorage,
+        clip_uid: str,
+        exc: Exception,
+        *,
+        known_clip_artifact_read: bool = False,
+    ) -> bool:
+        return self.clip_quarantine is not None and self.clip_quarantine.record_if_local(
+            shard,
+            storage,
+            clip_uid,
+            "reference_integrity",
+            exc,
+            known_clip_artifact_read=known_clip_artifact_read,
+        )
 
     def _existing_plan_for_reconcile(self, shard: str) -> dict[str, Any]:
         payload = _read_json(self._plan_path(shard))
@@ -4295,7 +4391,13 @@ class ReferenceIntegrityEpochRunner:
         except ReferenceIntegrityDurableError:
             # Durable corruption is never a semantic clip failure.
             raise
-        except Exception as exc:  # noqa: BLE001 - legacy clip isolation
+        except Exception as exc:
+            if isinstance(exc, (EpochResourceError, LedgerError, PermissionError)):
+                raise
+            if self._quarantine_local(record.shard, record.storage, record.clip_uid, exc):
+                return []
+            if self.clip_quarantine is not None and isinstance(exc, (OSError, ValueError)):
+                raise
             self._fail_clip_terminal(
                 record.shard, record.storage, record.clip_uid, exc
             )
@@ -4388,8 +4490,15 @@ class ReferenceIntegrityEpochRunner:
             storage = self._storage_for(shard)
             clips = plan.get("clips", {})
             for clip_uid in sorted(clips):
+                if self._is_quarantined(shard, clip_uid):
+                    continue
                 entry = clips[clip_uid]
-                targets = self._clip_seed_targets(shard, storage, clip_uid, entry)
+                try:
+                    targets = self._clip_seed_targets(shard, storage, clip_uid, entry)
+                except (OSError, ValueError) as exc:
+                    if not self._quarantine_local(shard, storage, clip_uid, exc):
+                        raise
+                    continue
                 if targets is None:
                     continue
                 entities_by_id, references_by_id, retained = targets
@@ -5130,6 +5239,10 @@ class ReferenceIntegrityEpochRunner:
         plan = self._existing_plan_for_reconcile(shard)
         counts = {field: 0 for field in ReferenceIntegrityStats.__dataclass_fields__}
         for clip_uid, entry in sorted(plan.get("clips", {}).items()):
+            if self._is_quarantined(shard, clip_uid):
+                counts["processed"] += 1
+                counts["failed"] += 1
+                continue
             classification = entry.get("classification")
             if classification == CLIP_INELIGIBLE:
                 counts["skipped_not_ready"] += 1
@@ -5146,4 +5259,11 @@ class ReferenceIntegrityEpochRunner:
             self._validated_clip_outcome(clip_uid, marker)
             for key, value in marker.get("delta", {}).items():
                 counts[key] = counts.get(key, 0) + int(value)
+        for clip_uid in set(self.eligible.get(shard, ())) - set(plan.get("clips", {})):
+            if not self._is_quarantined(shard, clip_uid):
+                raise ReferenceIntegrityDurableError(
+                    f"frozen Reference Integrity plan scope drifted for {shard!r}"
+                )
+            counts["processed"] += 1
+            counts["failed"] += 1
         return ReferenceIntegrityStats(**counts)

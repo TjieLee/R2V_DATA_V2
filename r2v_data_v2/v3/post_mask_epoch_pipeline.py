@@ -46,6 +46,7 @@ from typing import Any
 
 from r2v_data_v2.v3.config import V3Config
 from r2v_data_v2.v3.post_mask_epoch_pair import PairEpochRunner
+from r2v_data_v2.v3.post_mask_epoch_quarantine import ClipQuarantine
 from r2v_data_v2.v3.post_mask_epoch_reference_edit import (
     ReferenceEditEpochError,
 )
@@ -269,6 +270,12 @@ def _emit(emit: Any, event: str, **payload: Any) -> None:
         emit(event, **payload)
 
 
+def _bind_clip_quarantine(runner: Any, quarantine: ClipQuarantine | None) -> None:
+    """Give a real stage runner the invocation's clip-local skip state."""
+    if quarantine is not None and hasattr(runner, "clip_quarantine"):
+        runner.clip_quarantine = quarantine
+
+
 def _reference_edit_completion_evidence(
     ledger: GroupLedger, storages: Mapping[str, Any]
 ) -> bool:
@@ -414,9 +421,11 @@ def _handoff_path(ledger: GroupLedger, stage: str) -> Path:
 
 
 def _expected_handoff(
-    stage: str, eligible_clip_uids_by_shard: Mapping[str, Sequence[str]]
+    stage: str,
+    eligible_clip_uids_by_shard: Mapping[str, Sequence[str]],
+    clip_quarantine: ClipQuarantine | None = None,
 ) -> dict[str, Any]:
-    return {
+    payload = {
         "schema": COMPOSITION_HANDOFF_SCHEMA,
         "stage": stage,
         "canonical_shards": sorted(
@@ -427,6 +436,11 @@ def _expected_handoff(
             for shard in sorted(eligible_clip_uids_by_shard)
         },
     }
+    if stage == SUBJECT_ATTRIBUTES_COMPLETED and clip_quarantine is not None:
+        excluded = clip_quarantine.excluded_by_shard()
+        if excluded:
+            payload["quarantined_clip_uids_by_shard"] = excluded
+    return payload
 
 
 def read_composition_handoff(
@@ -434,6 +448,7 @@ def read_composition_handoff(
     stage: str,
     *,
     eligible_clip_uids_by_shard: Mapping[str, Sequence[str]],
+    clip_quarantine: ClipQuarantine | None = None,
 ) -> dict[str, Any] | None:
     """The create-once handoff marker of one stage, or ``None`` if unwritten.
 
@@ -456,7 +471,7 @@ def read_composition_handoff(
         raise StageHandoffError(
             f"composition handoff marker is not an object: {path}"
         )
-    expected = _expected_handoff(stage, eligible_clip_uids_by_shard)
+    expected = _expected_handoff(stage, eligible_clip_uids_by_shard, clip_quarantine)
     if payload != expected:
         raise StageHandoffError(
             f"composition handoff marker drifted: {path}"
@@ -469,15 +484,17 @@ def write_composition_handoff(
     stage: str,
     *,
     eligible_clip_uids_by_shard: Mapping[str, Sequence[str]],
+    clip_quarantine: ClipQuarantine | None = None,
 ) -> None:
     """Create-once handoff write; an existing exact marker is a no-op."""
     path = _handoff_path(ledger, stage)
-    payload = _expected_handoff(stage, eligible_clip_uids_by_shard)
+    payload = _expected_handoff(stage, eligible_clip_uids_by_shard, clip_quarantine)
     if path.is_file():
         read_composition_handoff(
             ledger,
             stage,
             eligible_clip_uids_by_shard=eligible_clip_uids_by_shard,
+            clip_quarantine=clip_quarantine,
         )
         return
     atomic_write_json(path, payload)
@@ -540,6 +557,7 @@ def run_deterministic_instruct(
     config: V3Config,
     storages: Mapping[str, Any],
     eligible_clip_uids_by_shard: Mapping[str, Sequence[str]],
+    clip_quarantine: ClipQuarantine | None = None,
 ) -> tuple[bool, dict[str, Any], str | None]:
     """Deterministic per-clip Instruct over every eligible clip.
 
@@ -567,6 +585,10 @@ def run_deterministic_instruct(
             storage = storages[shard]
             totals = {field: 0 for field in fields}
             for clip_uid in eligible_clip_uids_by_shard.get(shard, ()):
+                if clip_quarantine is not None and clip_quarantine.contains(
+                    shard, clip_uid
+                ):
+                    continue
                 scoped = ClipScopedStorage(storage, clip_uid)
                 stats = instruct_clips(config, scoped, overwrite=False, client=None)
                 payload = stats.to_dict()
@@ -581,7 +603,9 @@ def run_deterministic_instruct(
 
 
 def _expected_subject_attribute_receipts(
-    storages: Mapping[str, Any], eligible: Mapping[str, Sequence[str]]
+    storages: Mapping[str, Any],
+    eligible: Mapping[str, Sequence[str]],
+    clip_quarantine: ClipQuarantine | None = None,
 ) -> dict[tuple[str, str], dict[str, Any]]:
     """Recompute every expected final attribute receipt before writing any.
 
@@ -593,6 +617,8 @@ def _expected_subject_attribute_receipts(
     expected: dict[tuple[str, str], dict[str, Any]] = {}
     for shard in sorted(storages):
         for uid in eligible.get(shard, ()):
+            if clip_quarantine is not None and clip_quarantine.contains(shard, uid):
+                continue
             expected[(str(shard), str(uid))] = _expected_attribute_receipt(
                 storages[shard], str(uid)
             )
@@ -600,7 +626,9 @@ def _expected_subject_attribute_receipts(
 
 
 def publish_subject_attribute_receipts(
-    storages: Mapping[str, Any], eligible: Mapping[str, Sequence[str]]
+    storages: Mapping[str, Any],
+    eligible: Mapping[str, Sequence[str]],
+    clip_quarantine: ClipQuarantine | None = None,
 ) -> None:
     """Publish the final attribute receipts of every eligible clip, or fail.
 
@@ -614,7 +642,9 @@ def publish_subject_attribute_receipts(
         _write_attribute_receipt,
     )
 
-    expected = _expected_subject_attribute_receipts(storages, eligible)
+    expected = _expected_subject_attribute_receipts(
+        storages, eligible, clip_quarantine
+    )
     pending: list[tuple[str, str]] = []
     for (shard, uid), payload in expected.items():
         if not _attribute_receipt_state(storages[shard], uid, payload):
@@ -624,7 +654,9 @@ def publish_subject_attribute_receipts(
 
 
 def verify_subject_attribute_receipts(
-    storages: Mapping[str, Any], eligible: Mapping[str, Sequence[str]]
+    storages: Mapping[str, Any],
+    eligible: Mapping[str, Sequence[str]],
+    clip_quarantine: ClipQuarantine | None = None,
 ) -> None:
     """Verify every final attribute receipt and its pixels, or fail closed.
 
@@ -637,6 +669,8 @@ def verify_subject_attribute_receipts(
     for shard in sorted(storages):
         storage = storages[shard]
         for uid in eligible.get(shard, ()):
+            if clip_quarantine is not None and clip_quarantine.contains(shard, uid):
+                continue
             path = storage.clip_dir(uid) / ".post_mask_attributes.json"
             if not path.is_file():
                 raise StageHandoffError(
@@ -665,6 +699,7 @@ def _reconcile_and_publish_subject_attribute_stats(
     subject_attributes: Any,
     storages: Mapping[str, Any],
     eligible: Mapping[str, Sequence[str]],
+    clip_quarantine: ClipQuarantine | None = None,
 ) -> tuple[bool, dict[str, Any], str | None]:
     """Reconcile every shard, publish the final receipts, then the counts.
 
@@ -692,7 +727,7 @@ def _reconcile_and_publish_subject_attribute_stats(
     except SubjectAttributeEpochError as exc:
         return False, {}, str(exc)
     try:
-        publish_subject_attribute_receipts(storages, eligible)
+        publish_subject_attribute_receipts(storages, eligible, clip_quarantine)
     except (OSError, ValueError) as exc:
         return False, {}, str(exc)
     for shard, payload in reconciled.items():
@@ -713,6 +748,7 @@ def run_subject_attributes_stage(
     subject_attributes_scheduler_factory: SubjectAttributesSchedulerFactory,
     emit: Any = None,
     cpu_workers: int | None = None,
+    clip_quarantine: ClipQuarantine | None = None,
 ) -> dict[str, Any]:
     """Subject Attributes, then its receipt publication and completed handoff.
 
@@ -734,6 +770,7 @@ def run_subject_attributes_stage(
         emit=emit,
         cpu_workers=cpu_workers,
     )
+    _bind_clip_quarantine(subject_attributes, clip_quarantine)
     with _stage_timing(emit, "subject_attributes", "seed"):
         seeded = subject_attributes.seed_jobs()
     _emit(
@@ -762,6 +799,7 @@ def run_subject_attributes_stage(
             subject_attributes=subject_attributes,
             storages=storages,
             eligible=eligible,
+            clip_quarantine=clip_quarantine,
         )
     result.update(
         {
@@ -788,6 +826,7 @@ def run_subject_attributes_stage(
             ledger,
             SUBJECT_ATTRIBUTES_COMPLETED,
             eligible_clip_uids_by_shard=eligible,
+            clip_quarantine=clip_quarantine,
         )
     return result
 
@@ -807,6 +846,7 @@ def _after_reference_edit(
     subject_attributes_scheduler_factory: Any = None,
     emit: Any = None,
     cpu_workers: int | None = None,
+    clip_quarantine: ClipQuarantine | None = None,
 ) -> dict[str, Any]:
     """Continue into Reference Integrity only when Reference Edit completed.
 
@@ -829,6 +869,7 @@ def _after_reference_edit(
         subject_attributes_scheduler_factory=subject_attributes_scheduler_factory,
         emit=emit,
         cpu_workers=cpu_workers,
+        clip_quarantine=clip_quarantine,
     )
 
 
@@ -845,6 +886,7 @@ def _continue_with_reference_integrity(
     subject_attributes_scheduler_factory: Any = None,
     emit: Any = None,
     cpu_workers: int | None = None,
+    clip_quarantine: ClipQuarantine | None = None,
 ) -> dict[str, Any]:
     """Reference Integrity, deterministic Instruct, then Subject Attributes.
 
@@ -865,6 +907,7 @@ def _continue_with_reference_integrity(
         emit=emit,
         cpu_workers=cpu_workers,
     )
+    _bind_clip_quarantine(reference_integrity, clip_quarantine)
     with _stage_timing(emit, "reference_integrity", "seed"):
         reference_integrity_seed = reference_integrity.seed_jobs()
     _emit(
@@ -935,6 +978,7 @@ def _continue_with_reference_integrity(
         subject_attributes_scheduler_factory=subject_attributes_scheduler_factory,
         emit=emit,
         cpu_workers=cpu_workers,
+        clip_quarantine=clip_quarantine,
     )
 
 
@@ -950,6 +994,7 @@ def run_instruct_stage(
     | None = None,
     emit: Any = None,
     cpu_workers: int | None = None,
+    clip_quarantine: ClipQuarantine | None = None,
 ) -> dict[str, Any]:
     """Run the deterministic Instruct stage and record it in the result.
 
@@ -966,6 +1011,7 @@ def run_instruct_stage(
         config=config,
         storages=storages,
         eligible_clip_uids_by_shard=eligible,
+        clip_quarantine=clip_quarantine,
     )
     result.update(
         {
@@ -1002,6 +1048,7 @@ def run_instruct_stage(
         subject_attributes_scheduler_factory=subject_attributes_scheduler_factory,
         emit=emit,
         cpu_workers=cpu_workers,
+        clip_quarantine=clip_quarantine,
     )
 
 
@@ -1024,6 +1071,7 @@ def run_removal_pair_epochs(
     | None = None,
     emit: Any = None,
     cpu_workers: int | None = None,
+    clip_quarantine: ClipQuarantine | None = None,
 ) -> dict[str, Any]:
     """Drain Removal, then Pair primary, then the frozen Pair cross pass.
 
@@ -1033,6 +1081,13 @@ def run_removal_pair_epochs(
     eligible = {
         shard: tuple(uids) for shard, uids in eligible_clip_uids_by_shard.items()
     }
+    if clip_quarantine is None:
+        clip_quarantine = ClipQuarantine(emit=emit, eligible=eligible)
+
+    def finish(outcome: dict[str, Any]) -> dict[str, Any]:
+        outcome["quarantined_clips"] = clip_quarantine.count
+        return outcome
+
     shared = {
         "config":config,
         "storages":dict(storages),
@@ -1043,6 +1098,7 @@ def run_removal_pair_epochs(
     }
 
     removal = removal_runner_factory(**shared)
+    _bind_clip_quarantine(removal, clip_quarantine)
     try:
         with _stage_timing(emit, "removal", "seed"):
             removal_seed = removal.seed_jobs()
@@ -1097,7 +1153,7 @@ def run_removal_pair_epochs(
     if not remove_completed:
         # Hard stage barrier: no Pair seeding, no donor snapshot, no cross
         # baseline, no Pair Qwen call, no Reference Edit work at all.
-        return result
+        return finish(result)
 
     # A handoff marker is the durable restart barrier: it says, for the whole
     # group, which upstream stages already completed and published their stage
@@ -1105,7 +1161,10 @@ def run_removal_pair_epochs(
     # never replayed -- their live-state verification would otherwise mistake a
     # publication that a downstream stage legitimately rewrote for corruption.
     subject_attributes_completed = read_composition_handoff(
-        ledger, SUBJECT_ATTRIBUTES_COMPLETED, eligible_clip_uids_by_shard=eligible
+        ledger,
+        SUBJECT_ATTRIBUTES_COMPLETED,
+        eligible_clip_uids_by_shard=eligible,
+        clip_quarantine=clip_quarantine,
     )
     subject_attributes_started = read_composition_handoff(
         ledger, SUBJECT_ATTRIBUTES_STARTED, eligible_clip_uids_by_shard=eligible
@@ -1164,13 +1223,13 @@ def run_removal_pair_epochs(
                 "reason": EXPORT_PENDING_REASON,
             }
         )
-        verify_subject_attribute_receipts(storages, eligible)
+        verify_subject_attribute_receipts(storages, eligible, clip_quarantine)
         _emit(
             emit,
             "post_mask_epoch_subject_attributes_verified",
             completed=True,
         )
-        return result
+        return finish(result)
     if subject_attributes_started is not None:
         if (
             subject_attributes_runner_factory is None
@@ -1207,7 +1266,7 @@ def run_removal_pair_epochs(
                 "instruct_error": None,
             }
         )
-        return run_subject_attributes_stage(
+        return finish(run_subject_attributes_stage(
             config=config,
             storages=storages,
             eligible=eligible,
@@ -1217,7 +1276,8 @@ def run_removal_pair_epochs(
             subject_attributes_scheduler_factory=subject_attributes_scheduler_factory,
             emit=emit,
             cpu_workers=cpu_workers,
-        )
+            clip_quarantine=clip_quarantine,
+        ))
     if instruct_started is not None:
         result.update(
             {
@@ -1241,7 +1301,7 @@ def run_removal_pair_epochs(
                 ),
             }
         )
-        return run_instruct_stage(
+        return finish(run_instruct_stage(
             config=config,
             storages=storages,
             eligible=eligible,
@@ -1253,7 +1313,8 @@ def run_removal_pair_epochs(
             ),
             emit=emit,
             cpu_workers=cpu_workers,
-        )
+            clip_quarantine=clip_quarantine,
+        ))
     if reference_integrity_started is not None:
         if not reference_integrity_wired:
             raise StageHandoffError(
@@ -1276,7 +1337,7 @@ def run_removal_pair_epochs(
                 ),
             }
         )
-        return _continue_with_reference_integrity(
+        return finish(_continue_with_reference_integrity(
             config=config,
             storages=storages,
             eligible=eligible,
@@ -1288,7 +1349,8 @@ def run_removal_pair_epochs(
             ),
             emit=emit,
             cpu_workers=cpu_workers,
-        )
+            clip_quarantine=clip_quarantine,
+        ))
 
     if _reference_edit_completion_evidence(ledger, storages):
         # Post-Reference-Edit restart: the barrier already proved Pair
@@ -1307,8 +1369,9 @@ def run_removal_pair_epochs(
             }
         )
         if reference_edit_runner_factory is None:
-            return result
+            return finish(result)
         reference_edit = reference_edit_runner_factory(**shared)
+        _bind_clip_quarantine(reference_edit, clip_quarantine)
         with _stage_timing(emit, "reference_edit", "seed"):
             reference_edit_seed = reference_edit.seed_jobs()
         _emit_seed_cpu_diagnostics(emit, "reference_edit", reference_edit)
@@ -1351,7 +1414,7 @@ def run_removal_pair_epochs(
                 ),
             }
         )
-        return _after_reference_edit(
+        return finish(_after_reference_edit(
             config=config,
             storages=storages,
             eligible=eligible,
@@ -1369,9 +1432,11 @@ def run_removal_pair_epochs(
             ),
             emit=emit,
             cpu_workers=cpu_workers,
-        )
+            clip_quarantine=clip_quarantine,
+        ))
 
     pair = pair_runner_factory(**shared)
+    _bind_clip_quarantine(pair, clip_quarantine)
     if pair.legacy_cross_in_progress():
         # This composition does not own Cross Pair, so it must not resume one:
         # silently treating an interrupted legacy Cross pass as complete would
@@ -1486,15 +1551,16 @@ def run_removal_pair_epochs(
         }
     )
     if reference_edit_runner_factory is None:
-        return result
+        return finish(result)
     if not pair_completed:
         # Hard stage barrier: no Reference Edit plan, seed or model call.
         result["reference_edit_completed"] = False
         result["reference_edit_job_count"] = 0
         result["reference_edit_unresolved"] = ()
         result["reference_edit_stats"] = {}
-        return result
+        return finish(result)
     reference_edit = reference_edit_runner_factory(**shared)
+    _bind_clip_quarantine(reference_edit, clip_quarantine)
     with _stage_timing(emit, "reference_edit", "seed"):
         reference_edit_seed = reference_edit.seed_jobs()
     result["reference_edit_job_count"] = len(reference_edit_seed)
@@ -1543,7 +1609,7 @@ def run_removal_pair_epochs(
             ),
         }
     )
-    return _after_reference_edit(
+    return finish(_after_reference_edit(
         config=config,
         storages=storages,
         eligible=eligible,
@@ -1557,7 +1623,8 @@ def run_removal_pair_epochs(
         subject_attributes_scheduler_factory=subject_attributes_scheduler_factory,
         emit=emit,
         cpu_workers=cpu_workers,
-    )
+        clip_quarantine=clip_quarantine,
+    ))
 
 
 # ---------------------------------------------------------------------------

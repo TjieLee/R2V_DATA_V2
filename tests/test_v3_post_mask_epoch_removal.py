@@ -1978,6 +1978,76 @@ def test_seed_jobs_only_reads_the_explicit_eligible_view(
     assert _state(storage, "clip-B").status == "pending_remove"
 
 
+def test_seed_quarantines_missing_clip_after_hydration_and_keeps_sibling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from r2v_data_v2.v3.post_mask_epoch_quarantine import ClipQuarantine
+
+    config = _fixture_config(tmp_path, monkeypatch)
+    storage = _pending_storage(config, clip_uids=("clip-A", "clip-B"))
+    runner = _runner(
+        config,
+        storage,
+        GroupLedger(tmp_path / "group"),
+        eligible_clip_uids=("clip-A", "clip-B"),
+    )
+    runner.clip_quarantine = ClipQuarantine()
+    storage.clip_path("clip-B").unlink()
+
+    jobs = runner.seed_jobs()
+
+    assert {job.clip_uid for job in jobs} == {"clip-A"}
+    assert runner.clip_quarantine.contains(SHARD, "clip-B")
+    failures = (storage.root / "failures.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(failures) == 1
+    assert json.loads(failures[0])["stage"] == "remove"
+    assert json.loads(failures[0])["clip_uid"] == "clip-B"
+
+
+def test_seed_does_not_quarantine_epoch_resource_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from r2v_data_v2.v3.post_mask_epoch_quarantine import ClipQuarantine
+    from r2v_data_v2.v3.post_mask_epoch_resources import EpochResourceError
+
+    config = _fixture_config(tmp_path, monkeypatch)
+    storage = _pending_storage(config)
+    runner = _runner(config, storage, GroupLedger(tmp_path / "group"))
+    runner.clip_quarantine = ClipQuarantine()
+
+    def broken_context(*_args, **_kwargs):
+        raise EpochResourceError("Boogu worker unavailable")
+
+    monkeypatch.setattr(runner, "_attempt_context", broken_context)
+    with pytest.raises(EpochResourceError, match="Boogu worker unavailable"):
+        runner.seed_jobs()
+    assert runner.clip_quarantine.count == 0
+    assert not (storage.root / "failures.jsonl").exists()
+
+
+def test_seed_quarantines_corrupt_clip_json_without_blocking_sibling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from r2v_data_v2.v3.post_mask_epoch_quarantine import ClipQuarantine
+
+    config = _fixture_config(tmp_path, monkeypatch)
+    storage = _pending_storage(config, clip_uids=("clip-A", "clip-B"))
+    runner = _runner(
+        config,
+        storage,
+        GroupLedger(tmp_path / "group"),
+        eligible_clip_uids=("clip-A", "clip-B"),
+    )
+    runner.clip_quarantine = ClipQuarantine()
+    storage.clip_path("clip-B").write_bytes(b"\xff")
+
+    assert {job.clip_uid for job in runner.seed_jobs()} == {"clip-A"}
+    assert runner.clip_quarantine.contains(SHARD, "clip-B")
+    failures = (storage.root / "failures.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(failures) == 1
+    assert "UnicodeDecodeError" in json.loads(failures[0])["reason"]
+
+
 def test_removal_seed_prepares_independent_clips_in_parallel_without_job_drift(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

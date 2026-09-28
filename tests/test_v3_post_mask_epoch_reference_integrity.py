@@ -28,6 +28,7 @@ from r2v_data_v2.v3.post_mask_epoch_jobs import (
     RESOURCE_QWEN,
     ModelJob,
 )
+from r2v_data_v2.v3.post_mask_epoch_quarantine import ClipQuarantine
 from r2v_data_v2.v3.post_mask_epoch_reference_integrity import (
     REFERENCE_INTEGRITY_BBOX_REVIEW_JOB,
     REFERENCE_INTEGRITY_ENTITY_OUTCOME_SCHEMA,
@@ -36,6 +37,7 @@ from r2v_data_v2.v3.post_mask_epoch_reference_integrity import (
     ReferenceIntegrityEpochRunner,
     _FileSignature,
 )
+from r2v_data_v2.v3.post_mask_epoch_resources import EpochResourceError
 from r2v_data_v2.v3.post_mask_epoch_state import GroupLedger
 from r2v_data_v2.v3.reference_integrity import reference_integrity_clips
 from r2v_data_v2.v3.schemas import (
@@ -3762,6 +3764,120 @@ def _epoch_runner(
         eligible_clip_uids_by_shard={SHARD: list(clip_uids)},
         cpu_workers=cpu_workers,
     )
+
+
+def test_missing_clip_after_hydration_does_not_block_integrity_sibling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lost mutable clip cannot abort an independent review seed."""
+    _config, storage, runner, uids = _multi_clip_fixture(
+        tmp_path,
+        monkeypatch,
+        "run-quarantine",
+        entity_ids_by_clip={"clip-1": ("e1",), "clip-2": ("e1",)},
+        cpu_workers=1,
+    )
+    events: list[tuple[str, dict[str, Any]]] = []
+    runner.clip_quarantine = ClipQuarantine(
+        emit=lambda event, **fields: events.append((event, fields))
+    )
+    storage.clip_path(uids[1]).unlink()
+
+    jobs = runner.seed_jobs()
+
+    assert {job.clip_uid for job in jobs} <= {uids[0]}
+    sibling_outcome = json.loads(
+        runner._clip_outcome_path(SHARD, uids[0]).read_text(encoding="utf-8")
+    )
+    assert sibling_outcome["terminal"] == "ready"
+    assert runner.clip_quarantine.contains(SHARD, uids[1])
+    failures = [
+        json.loads(line)
+        for line in (Path(storage.root) / "failures.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert [(failure["stage"], failure["clip_uid"]) for failure in failures] == [
+        ("reference_integrity", uids[1])
+    ]
+    assert len(events) == 1
+    assert events[0][0] == "post_mask_clip_quarantined"
+    assert events[0][1]["stage"] == "reference_integrity"
+    stats = runner.reconcile_stats(SHARD)
+    assert stats.processed == 2
+    assert stats.failed == 1
+
+
+def test_integrity_frozen_plan_does_not_skip_quarantined_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from r2v_data_v2.v3.post_mask_epoch_reference_integrity import (
+        ReferenceIntegrityDurableError,
+    )
+
+    _config, storage, runner, uids = _multi_clip_fixture(
+        tmp_path,
+        monkeypatch,
+        "run-frozen-quarantine",
+        entity_ids_by_clip={"clip-1": ("e1",), "clip-2": ("e1",)},
+        cpu_workers=1,
+    )
+    runner._plan(SHARD)
+    runner.clip_quarantine = ClipQuarantine()
+    storage.clip_path(uids[1]).unlink()
+
+    with pytest.raises(ReferenceIntegrityDurableError, match="frozen Reference Integrity input"):
+        runner.seed_jobs()
+
+
+def test_integrity_quarantine_cannot_hide_removed_plan_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from r2v_data_v2.v3.post_mask_epoch_reference_integrity import (
+        ReferenceIntegrityDurableError,
+    )
+
+    _config, storage, runner, uids = _multi_clip_fixture(
+        tmp_path,
+        monkeypatch,
+        "run-removed-entry-quarantine",
+        entity_ids_by_clip={"clip-1": ("e1",), "clip-2": ("e1",)},
+        cpu_workers=1,
+    )
+    runner.clip_quarantine = ClipQuarantine()
+    runner._plan(SHARD)
+    plan_path = runner._plan_path(SHARD)
+    payload = json.loads(plan_path.read_text())
+    payload["clips"].pop(uids[1])
+    payload["preplan_quarantined_clip_uids"] = [uids[1]]
+    plan_path.write_text(json.dumps(payload))
+    storage.clip_path(uids[1]).unlink()
+    assert runner.clip_quarantine.record_if_local(
+        SHARD, storage, uids[1], "pair",
+        FileNotFoundError(f"clip.json does not exist for {uids[1]}"),
+    )
+
+    with pytest.raises(ReferenceIntegrityDurableError, match="scope drifted"):
+        runner.seed_jobs()
+
+
+def test_reference_integrity_seed_resource_error_still_propagates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _config, _storage, runner, _uids = _multi_clip_fixture(
+        tmp_path,
+        monkeypatch,
+        "run-resource-failure",
+        entity_ids_by_clip={"clip-1": ("e1",)},
+        cpu_workers=1,
+    )
+    runner.clip_quarantine = ClipQuarantine()
+
+    def fail_prepare(*_args: Any) -> Any:
+        raise EpochResourceError("Qwen worker unavailable")
+
+    monkeypatch.setattr(runner, "_prepare_seed_entity", fail_prepare)
+    with pytest.raises(EpochResourceError, match="Qwen worker unavailable"):
+        runner.seed_jobs()
+    assert runner.clip_quarantine.count == 0
 
 
 def _job_snapshot(jobs: Sequence[Any]) -> list[tuple[str, str, str]]:

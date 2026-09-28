@@ -6,6 +6,7 @@ epoch really pays Boogu/Qwen/SAM calls through the real scheduler.
 
 from __future__ import annotations
 
+import errno
 import json
 import threading
 import time
@@ -16,6 +17,7 @@ from typing import Any
 
 import pytest
 
+from r2v_data_v2.v3 import post_mask_epoch_reference_edit as reference_edit_epoch
 from r2v_data_v2.v3.config import PairConfig
 from r2v_data_v2.v3.post_mask_epoch_jobs import (
     OUTCOME_RETRYABLE_FAILED,
@@ -23,12 +25,14 @@ from r2v_data_v2.v3.post_mask_epoch_jobs import (
     RESOURCE_QWEN,
     RESOURCE_SAM,
 )
+from r2v_data_v2.v3.post_mask_epoch_quarantine import ClipQuarantine
 from r2v_data_v2.v3.post_mask_epoch_reference_edit import (
     ReferenceEditDurableError,
     ReferenceEditEpochError,
     ReferenceEditEpochRunner,
     resolve_reference_edit_judge,
 )
+from r2v_data_v2.v3.post_mask_epoch_resources import EpochResourceError
 from r2v_data_v2.v3.post_mask_epoch_scheduler import ResourceEpochScheduler
 from r2v_data_v2.v3.post_mask_epoch_state import GroupLedger
 from tests.test_v3_pair import _config as _pair_base_config
@@ -2308,6 +2312,186 @@ def _plan_runner(config: Any, storage: Any, tmp_path: Path, uids: list[str]) -> 
         GroupLedger(tmp_path / "ledger"),
         eligible_clip_uids_by_shard={SHARD: uids},
     )
+
+
+def test_missing_clip_after_hydration_does_not_block_reference_edit_sibling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lost mutable clip cannot abort the sibling's seed pass."""
+    config, storage, uids = _fresh_target_shard(tmp_path, monkeypatch, count=2)
+    events: list[tuple[str, dict[str, Any]]] = []
+    runner = _plan_runner(config, storage, tmp_path, uids)
+    runner.clip_quarantine = ClipQuarantine(
+        emit=lambda event, **fields: events.append((event, fields))
+    )
+    storage.clip_path("clip-2").unlink()
+
+    jobs = runner.seed_jobs()
+
+    assert [job.clip_uid for job in jobs] == ["clip-1"]
+    assert runner.clip_quarantine.contains(SHARD, "clip-2")
+    assert runner.clip_quarantine.count == 1
+    failures = [
+        json.loads(line)
+        for line in (Path(storage.root) / "failures.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert [(failure["stage"], failure["clip_uid"]) for failure in failures] == [
+        ("reference_edit", "clip-2")
+    ]
+    assert len(events) == 1
+    assert events[0][0] == "post_mask_clip_quarantined"
+    assert events[0][1]["stage"] == "reference_edit"
+
+
+def test_reference_edit_frozen_plan_does_not_skip_quarantined_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from r2v_data_v2.v3.post_mask_epoch_reference_edit import ReferenceEditDurableError
+
+    config, storage, uids = _fresh_target_shard(tmp_path, monkeypatch, count=2)
+    runner = _plan_runner(config, storage, tmp_path, uids)
+    runner._plan(SHARD)
+    runner.clip_quarantine = ClipQuarantine()
+    storage.clip_path(uids[1]).unlink()
+
+    with pytest.raises(ReferenceEditDurableError, match="frozen Reference Edit input"):
+        runner.seed_jobs()
+
+
+def test_reference_edit_quarantine_cannot_hide_removed_plan_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from r2v_data_v2.v3.post_mask_epoch_reference_edit import ReferenceEditDurableError
+
+    config, storage, uids = _fresh_target_shard(tmp_path, monkeypatch, count=2)
+    runner = _plan_runner(config, storage, tmp_path, uids)
+    runner.clip_quarantine = ClipQuarantine()
+    runner._plan(SHARD)
+    plan_path = runner._plan_path(SHARD)
+    payload = json.loads(plan_path.read_text())
+    payload["clips"].pop(uids[1])
+    payload["preplan_quarantined_clip_uids"] = [uids[1]]
+    plan_path.write_text(json.dumps(payload))
+    storage.clip_path(uids[1]).unlink()
+    assert runner.clip_quarantine.record_if_local(
+        SHARD, storage, uids[1], "pair",
+        FileNotFoundError(f"clip.json does not exist for {uids[1]}"),
+    )
+
+    with pytest.raises(ReferenceEditDurableError, match="scope drifted"):
+        runner.seed_jobs()
+
+
+@pytest.mark.parametrize("pathless_error", [False, True])
+def test_corrupt_reference_image_after_hydration_quarantines_only_its_clip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pathless_error: bool
+) -> None:
+    config, storage, uids = _fresh_target_shard(tmp_path, monkeypatch, count=2)
+    reference = storage.read_clip("clip-2").references.entities[0]
+    if pathless_error:
+        original = reference_edit_epoch._reference_content_geometry
+
+        def geometry(current_storage: Any, current_reference: Any) -> Any:
+            if current_reference.image_path == reference.image_path:
+                raise OSError("broken image data")
+            return original(current_storage, current_reference)
+
+        monkeypatch.setattr(reference_edit_epoch, "_reference_content_geometry", geometry)
+    else:
+        image_path = Path(storage.root) / reference.image_path
+        image_path.write_bytes(b"not a PNG")
+    runner = _plan_runner(config, storage, tmp_path, uids)
+    runner.clip_quarantine = ClipQuarantine()
+
+    jobs = runner.seed_jobs()
+
+    assert jobs
+    assert {job.clip_uid for job in jobs} == {"clip-1"}
+    assert runner.clip_quarantine.contains(SHARD, "clip-2")
+    assert runner.clip_quarantine.count == 1
+    failures = [
+        json.loads(line)
+        for line in (Path(storage.root) / "failures.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert [(failure["stage"], failure["clip_uid"]) for failure in failures] == [
+        ("reference_edit", "clip-2")
+    ]
+
+
+@pytest.mark.parametrize(
+    "error", [PermissionError("access denied"), OSError(errno.EIO, "I/O failure")]
+)
+def test_reference_image_infrastructure_failure_is_not_quarantined(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: OSError
+) -> None:
+    config, storage, uids = _fresh_target_shard(tmp_path, monkeypatch, count=2)
+    runner = _plan_runner(config, storage, tmp_path, uids)
+    runner.clip_quarantine = ClipQuarantine()
+    original = reference_edit_epoch._reference_content_geometry
+
+    def geometry(current_storage: Any, reference: Any) -> Any:
+        if reference.image_path == storage.read_clip("clip-2").references.entities[0].image_path:
+            raise error
+        return original(current_storage, reference)
+
+    monkeypatch.setattr(reference_edit_epoch, "_reference_content_geometry", geometry)
+    with pytest.raises(type(error), match="access denied|I/O failure"):
+        runner.seed_jobs()
+    assert runner.clip_quarantine.count == 0
+
+
+def test_reference_image_outside_current_clip_is_not_local_quarantine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, storage, uids = _fresh_target_shard(tmp_path, monkeypatch, count=2)
+    runner = _plan_runner(config, storage, tmp_path, uids)
+    runner.clip_quarantine = ClipQuarantine()
+
+    def invalid_image(_storage: Any, _reference: Any) -> Any:
+        raise ValueError("reference edit input must be an existing run artifact")
+
+    monkeypatch.setattr(reference_edit_epoch, "_reference_content_geometry", invalid_image)
+    with pytest.raises(ValueError, match="existing run artifact"):
+        runner._entity_route_context(
+            storage,
+            SimpleNamespace(clip_uid="clip-2"),
+            SimpleNamespace(image_path="clips/other/reference.png"),
+        )
+
+
+def test_reference_edit_permission_failure_is_not_quarantined(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, storage, uids = _fresh_target_shard(tmp_path, monkeypatch, count=2)
+    runner = _plan_runner(config, storage, tmp_path, uids)
+    runner.clip_quarantine = ClipQuarantine()
+    original = storage.read_clip
+
+    def read_clip(clip_uid: str) -> Any:
+        if clip_uid == "clip-2":
+            raise PermissionError("shared filesystem access denied")
+        return original(clip_uid)
+
+    monkeypatch.setattr(storage, "read_clip", read_clip)
+    with pytest.raises(PermissionError, match="shared filesystem"):
+        runner.seed_jobs()
+    assert runner.clip_quarantine.count == 0
+
+
+def test_reference_edit_seed_resource_error_still_propagates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, storage, uids = _fresh_target_shard(tmp_path, monkeypatch, count=2)
+    runner = _plan_runner(config, storage, tmp_path, uids)
+    runner.clip_quarantine = ClipQuarantine()
+
+    def fail_prepare(_target: Any) -> Any:
+        raise EpochResourceError("Qwen worker unavailable")
+
+    monkeypatch.setattr(runner, "_prepare_seed_clip", fail_prepare)
+    with pytest.raises(EpochResourceError, match="Qwen worker unavailable"):
+        runner.seed_jobs()
+    assert runner.clip_quarantine.count == 0
 
 
 def _count_plan_validations(runner: Any) -> dict[str, int]:

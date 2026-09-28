@@ -77,6 +77,7 @@ from r2v_data_v2.v3.post_mask_epoch_jobs import (
     ModelJob,
     semantic_input_digest,
 )
+from r2v_data_v2.v3.post_mask_epoch_quarantine import ClipQuarantine
 from r2v_data_v2.v3.post_mask_epoch_resources import (
     QwenConcurrentExecutor,
     QwenEpochConfig,
@@ -677,6 +678,8 @@ class RemovalEpochRunner:
                     f"canonical shard {shard!r} has no eligible clip view"
                 )
         self.emit = emit or (lambda *args, **kwargs: None)
+        # Bound by the composition for this invocation only; never durable.
+        self.clip_quarantine = None
         self.seed_allocator = seed_allocator
         self.stats: dict[str, dict[str, int]] = {
             shard: new_counters() for shard in self.storages
@@ -767,7 +770,10 @@ class RemovalEpochRunner:
                 int(self.seed_counters["prepare_peak_inflight"]), self._seed_active
             )
         try:
-            state = storage.read_clip(clip_uid).references.background
+            try:
+                state = storage.read_clip(clip_uid).references.background
+            except (OSError, ValueError) as exc:  # only the current clip's local read
+                return None, None, exc, time.perf_counter() - started
             context = None
             error = None
             if (
@@ -796,13 +802,40 @@ class RemovalEpochRunner:
         self.seed_counters["prepare_tasks"] += 1
         self.seed_counters["prepare_wall_seconds"] += wall_seconds
         counters = self.stats[shard]
+        if error is not None and (
+            self.clip_quarantine is not None
+            and self.clip_quarantine.record_if_local(
+                shard,
+                storage,
+                clip_uid,
+                "remove",
+                error,
+                known_clip_artifact_read=state is None,
+            )
+        ):
+            counters["failed"] += 1
+            return
+        if state is None and error is not None:
+            raise error
         if state is None or state.status in _TERMINAL_STATUSES:
             counters["skipped_not_pending"] += 1
             return
         if state.status == "ready_removed":
             try:
                 validate_background_reference(storage, clip_uid, state)
-            except Exception as exc:  # noqa: BLE001 - report, never crash
+            except Exception as exc:  # report, never crash
+                if self.clip_quarantine is not None:
+                    if self.clip_quarantine.record_if_local(
+                        shard,
+                        storage,
+                        clip_uid,
+                        "remove",
+                        exc,
+                        known_clip_artifact_read=True,
+                    ):
+                        counters["failed"] += 1
+                        return
+                    raise
                 storage.append_failure(
                     clip_uid=clip_uid, stage="remove", reason=_exception_reason(exc)
                 )
@@ -814,6 +847,8 @@ class RemovalEpochRunner:
             counters["skipped_disabled"] += 1
             return
         if error is not None:
+            if self.clip_quarantine is not None:
+                raise error
             storage.append_failure(
                 clip_uid=clip_uid, stage="remove", reason=_exception_reason(error)
             )
@@ -850,6 +885,8 @@ class RemovalEpochRunner:
             (shard, self.storages[shard], clip_uid)
             for shard in sorted(self.storages)
             for clip_uid in self.eligible_clip_uids_by_shard[shard]
+            if self.clip_quarantine is None
+            or not self.clip_quarantine.contains(shard, clip_uid)
         ]
         workers = max(1, int(self.cpu_workers))
         if workers == 1 or len(targets) <= 1:
@@ -1955,7 +1992,13 @@ def build_removal_epoch_runner(
                     "hydrated_corrupt": prepared_shard.corrupt,
                 }
             storages = {shard: item.storage for shard, item in prepared.items()}
-            eligible = {shard: item.clip_uids for shard, item in prepared.items()}
+            clip_quarantine = ClipQuarantine.for_group(
+                ledger.root,
+                {shard: item.clip_uids for shard, item in prepared.items()},
+                emit=emit,
+                storages=storages,
+            )
+            eligible = clip_quarantine.eligible
             pair_enabled = bool(config.pair.enabled and config.reference_edit.enabled)
             if pair_enabled:
                 # 4b: one shared resource session spans Removal -> Pair, and the
@@ -2124,6 +2167,7 @@ def build_removal_epoch_runner(
                         )
                     ),
                     emit=emit,
+                    clip_quarantine=clip_quarantine,
                 )
                 removal = created["removal"]
                 # Every scheduler's unresolved work counts. The hard stage
@@ -2151,6 +2195,7 @@ def build_removal_epoch_runner(
                     emit=emit,
                     eligible_clip_uids_by_shard=eligible,
                 )
+                removal.clip_quarantine = clip_quarantine
                 seed_jobs = removal.seed_jobs()
                 emit(
                     "post_mask_removal_epoch_planned",
@@ -2206,7 +2251,13 @@ def build_removal_epoch_runner(
                             {"formal_production": True} if formal_production else {}
                         )
                         export_stats[shard] = export_shard(
-                            storages[shard], paths_by_shard[shard], eligible[shard],
+                            storages[shard],
+                            paths_by_shard[shard],
+                            tuple(
+                                uid
+                                for uid in eligible[shard]
+                                if not clip_quarantine.contains(shard, uid)
+                            ),
                             **production_kwargs,
                         )
                 except Exception as exc:  # noqa: BLE001 - never fake a completion
@@ -2266,6 +2317,7 @@ def build_removal_epoch_runner(
             reason = "post-mask export incomplete"
         return {
             **outcome,
+            "quarantined_clips": clip_quarantine.count,
             "remove_completed": remove_completed,
             "export_completed": export_completed,
             "export_stats": export_stats,
