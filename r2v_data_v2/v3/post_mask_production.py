@@ -596,27 +596,11 @@ def hydrate_shard(
                 marker = _beneath(destination, _PROVENANCE)
                 if not marker.is_file() or json.loads(marker.read_text()) != provenance:
                     raise ValueError("published clip hydration provenance mismatch")
-                durable_clip = _beneath(destination, "clip.json")
-                source_clip = source / "clip.json"
-                if not durable_clip.is_file():
-                    # A vanished mutable clip record cannot be trusted, but the
-                    # frozen Stage2 clip is a safe restart baseline. Restore only
-                    # this one file; committed Resource-Epoch receipts will replay
-                    # Removal/Pair/etc. finalizers and reconstruct downstream state.
-                    temporary = durable_clip.with_name(
-                        f".{durable_clip.name}.post-mask-{uuid.uuid4().hex}.tmp"
-                    )
-                    try:
-                        shutil.copy2(source_clip, temporary)
-                        temporary.chmod(
-                            temporary.stat().st_mode | stat.S_IRUSR | stat.S_IWUSR
-                        )
-                        temporary.replace(durable_clip)
-                    finally:
-                        temporary.unlink(missing_ok=True)
+                if not _beneath(destination, "clip.json").is_file():
+                    raise ValueError("missing durable Post-Mask clip.json")
                 current = storage.read_clip(uid)
                 original = ClipRecord.model_validate_json(
-                    source_clip.read_text()
+                    (source / "clip.json").read_text()
                 )
                 if current.clip_uid != uid or current.source != original.source:
                     raise ValueError("published clip source identity mismatch")
