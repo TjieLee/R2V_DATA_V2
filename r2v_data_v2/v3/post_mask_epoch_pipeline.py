@@ -213,6 +213,8 @@ def _emit_scheduler_diagnostics(
         job_count=int(outcome.get("job_count", 0) or 0),
         attempted_job_count=int(outcome.get("attempted_job_count", 0) or 0),
         resolved_job_count=int(outcome.get("resolved_job_count", 0) or 0),
+        receipt_appends=int(diagnostics.get("receipt_appends", 0) or 0),
+        receipt_syncs=int(diagnostics.get("receipt_syncs", 0) or 0),
         resources=dict(diagnostics.get("resources", {}) or {}),
     )
 

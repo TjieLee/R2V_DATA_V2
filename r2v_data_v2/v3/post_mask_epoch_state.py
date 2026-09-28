@@ -10,16 +10,18 @@ Layout below the existing Post-Mask campaign state root:
             artifacts/<job-id>/<...>
             artifacts/<job-id>/result.json
 
-The commit protocol is deliberately strict so that an interruption at any point
-can only ever lose *one* job's worth of work, never corrupt a finished one:
+The commit protocol never treats an artifact without a receipt as committed.
+Receipts are appended per job and synced at scheduler resource boundaries, so
+an interruption before that barrier may lose several recent receipts; those
+jobs are ordinary pending work on restart:
 
     model call
     -> write output to a unique same-directory .tmp
     -> fsync
     -> atomic rename
     -> validate output
-    -> append durable receipt
-    -> flush + fsync
+    -> append receipt + close
+    -> fsync receipts at the resource boundary
 
 Consequences used by :meth:`GroupLedger.classify`:
 
@@ -366,11 +368,18 @@ class PhaseLedger:
         with self.receipts_path.open("a", encoding="utf-8") as handle:
             handle.write(line)
             handle.flush()
-            os.fsync(handle.fileno())
         if was_new:
             # A newly created file needs its directory entry durable too,
             # otherwise a crash can lose the file itself, not just its tail.
             _fsync_directory(self.receipts_path.parent)
+
+    def sync_receipts(self) -> bool:
+        """Make this phase's closed receipt appends durable before a barrier."""
+        if not self.receipts_path.exists():
+            return False
+        with self.receipts_path.open("r+b") as handle:
+            os.fsync(handle.fileno())
+        return True
 
     # -- artifacts --------------------------------------------------------
     def artifact_path(self, job_id: str, name: str) -> Path:

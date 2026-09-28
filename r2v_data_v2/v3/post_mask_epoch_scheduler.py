@@ -206,6 +206,8 @@ class EpochDiagnostics:
     resource_switches: int = 0
     phase_count: int = 0
     window_count: int = 0
+    receipt_appends: int = 0
+    receipt_syncs: int = 0
     conditional_attempts: dict[str, int] = field(default_factory=dict)
     resume: dict[str, int] = field(default_factory=dict)
     resources: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -257,6 +259,8 @@ class EpochDiagnostics:
             "group_incomplete": self.group_incomplete,
             "phase_count": self.phase_count,
             "window_count": self.window_count,
+            "receipt_appends": self.receipt_appends,
+            "receipt_syncs": self.receipt_syncs,
             "resource_switches": self.resource_switches,
             "conditional_attempts": dict(sorted(self.conditional_attempts.items())),
             "resume": dict(sorted(self.resume.items())),
@@ -382,10 +386,12 @@ class ResourceEpochScheduler:
             epoch_started = time.perf_counter()
             epoch_jobs_before = counters["jobs_executed"]
             phase_id = f"r{run.round_index:03d}-{resource}"
+            phase = self.ledger.phase(phase_id)
+            appends_before = self.diagnostics.receipt_appends
             try:
                 epochs_progressed = self._drain_resource(
                     phase_id,
-                    self.ledger.phase(phase_id),
+                    phase,
                     resource,
                     executor,
                     counters,
@@ -394,6 +400,12 @@ class ResourceEpochScheduler:
                     run.attempted,
                     run.finalize_attempted,
                 )
+                if phase.sync_receipts():
+                    self.diagnostics.receipt_syncs += 1
+                elif self.diagnostics.receipt_appends > appends_before:
+                    raise SchedulerError(
+                        f"phase {phase_id!r} committed jobs but has no receipts"
+                    )
             finally:
                 executor.close()
             counters["epoch_wall_seconds"] += time.perf_counter() - epoch_started
@@ -695,6 +707,7 @@ class ResourceEpochScheduler:
                 result_digest=result_digest,
                 external_artifacts=result.external_artifacts,
             )
+            self.diagnostics.receipt_appends += 1
             self.ledger.note_commit(phase_id, receipt)
             if result.outcome == OUTCOME_TERMINAL_REJECT:
                 counters["jobs_terminal_rejected"] += 1

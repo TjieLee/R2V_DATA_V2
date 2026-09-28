@@ -42,15 +42,18 @@ from r2v_data_v2.v3.post_mask_epoch_pipeline import (
     DOWNSTREAM_REASON,
     EXPORT_PENDING_REASON,
     INSTRUCT_STARTED,
+    PAIR_STARTED,
     REFERENCE_EDIT_STARTED,
     REFERENCE_INTEGRITY_STARTED,
     SUBJECT_ATTRIBUTES_COMPLETED,
     SUBJECT_ATTRIBUTES_STARTED,
     StageDispatchError,
     StageHandoffError,
+    _emit_scheduler_diagnostics,
     _emit_seed_cpu_diagnostics,
     default_pair_runner_factory,
     publish_subject_attribute_receipts,
+    read_composition_handoff,
     run_deterministic_instruct,
     run_removal_pair_epochs,
     run_removal_pair_resource_session,
@@ -63,7 +66,7 @@ from r2v_data_v2.v3.post_mask_epoch_scheduler import (
     JobExecution,
     ResourceEpochScheduler,
 )
-from r2v_data_v2.v3.post_mask_epoch_state import GroupLedger
+from r2v_data_v2.v3.post_mask_epoch_state import GroupLedger, PhaseLedger
 from tests.test_v3_pair import _decision, _storage
 from tests.test_v3_pair import _Judge as _EntityJudge
 from tests.test_v3_post_mask_epoch_removal import (
@@ -102,6 +105,24 @@ def test_seed_cpu_diagnostics_include_plan_derivation_counters() -> None:
             },
         )
     ]
+
+
+def test_scheduler_diagnostics_expose_receipt_barrier_counts() -> None:
+    events: list[tuple[str, dict[str, Any]]] = []
+    _emit_scheduler_diagnostics(
+        lambda event, **fields: events.append((event, fields)),
+        "reference_edit",
+        {
+            "diagnostics": {
+                "resources": {},
+                "receipt_appends": 100,
+                "receipt_syncs": 1,
+            }
+        },
+    )
+
+    assert events[0][1]["receipt_appends"] == 100
+    assert events[0][1]["receipt_syncs"] == 1
 
 
 def _config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, run_name: str = "run") -> V3Config:
@@ -527,6 +548,42 @@ def test_removal_retryable_blocks_every_pair_stage(tmp_path: Path, monkeypatch: 
     assert outcome["completed"] is False
     assert "removal" in outcome["reason"]
     assert not any(entry.startswith("pair:") for entry in log)
+
+
+def test_receipt_sync_failure_prevents_pair_handoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, storages, eligible, _, log = _fixture(tmp_path, monkeypatch)
+    ledger = GroupLedger(tmp_path / "ledger")
+
+    def fail_sync(_phase: PhaseLedger) -> bool:
+        raise OSError("receipt sync failed")
+
+    monkeypatch.setattr(PhaseLedger, "sync_receipts", fail_sync)
+
+    def removal_factory(runner: Any) -> ResourceEpochScheduler:
+        return ResourceEpochScheduler(
+            ledger=ledger,
+            finalize=runner.finalize,
+            executors=_removal_executors(runner, log),
+        )
+
+    def pair_factory(_runner: Any) -> Any:
+        raise AssertionError("Pair must not start before receipt sync")
+
+    with pytest.raises(OSError, match="receipt sync failed"):
+        run_removal_pair_epochs(
+            config=config,
+            storages=storages,
+            eligible_clip_uids_by_shard=eligible,
+            ledger=ledger,
+            removal_scheduler_factory=removal_factory,
+            pair_scheduler_factory=pair_factory,
+        )
+
+    assert read_composition_handoff(
+        ledger, PAIR_STARTED, eligible_clip_uids_by_shard=eligible
+    ) is None
 
 
 def test_pair_primary_retryable_blocks_only_its_own_clip(

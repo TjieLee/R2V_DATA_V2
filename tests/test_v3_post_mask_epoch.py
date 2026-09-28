@@ -572,6 +572,134 @@ def test_scheduler_runs_ready_jobs_and_commits_receipts(tmp_path: Path):
     assert GroupLedger(tmp_path / "group").classify(job).state == STATE_COMPLETED
 
 
+def test_receipt_fsync_is_batched_per_resource_drain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import os
+
+    import r2v_data_v2.v3.post_mask_epoch_state as state_module
+
+    jobs = [_job(clip_uid=f"clip-{index:06d}") for index in range(100)]
+    receipts_path = (
+        tmp_path / "group" / "phases" / "r000-boogu" / "receipts.jsonl"
+    )
+    real_fsync = os.fsync
+    receipt_syncs = 0
+
+    def record_fsync(fd: int) -> None:
+        nonlocal receipt_syncs
+        if receipts_path.is_file():
+            actual = os.fstat(fd)
+            expected = receipts_path.stat()
+            if (actual.st_dev, actual.st_ino) == (expected.st_dev, expected.st_ino):
+                receipt_syncs += 1
+        real_fsync(fd)
+
+    monkeypatch.setattr(state_module.os, "fsync", record_fsync)
+    scheduler = _scheduler(
+        tmp_path,
+        {RESOURCE_BOOGU: _FakeBatchExecutor()},
+        lambda job, result: (),
+        window_size=10,
+    )
+    outcome = scheduler.run(jobs)
+
+    assert outcome["completed"] is True
+    assert len(scheduler.ledger.phase("r000-boogu").load_receipts()[0]) == 100
+    assert receipt_syncs == 1
+    assert outcome["diagnostics"]["receipt_appends"] == 100
+    assert outcome["diagnostics"]["receipt_syncs"] == 1
+
+
+def test_receipts_sync_before_resource_switch_and_scheduler_return(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[str] = []
+    original_sync = PhaseLedger.sync_receipts
+
+    def record_sync(phase: PhaseLedger) -> bool:
+        events.append(f"sync:{phase.root.name}")
+        return original_sync(phase)
+
+    class RecordingExecutor(_FakeBatchExecutor):
+        def execute_batch(self, jobs: Sequence[ModelJob]):
+            events.append(f"run:{jobs[0].resource}")
+            return super().execute_batch(jobs)
+
+    monkeypatch.setattr(PhaseLedger, "sync_receipts", record_sync)
+    scheduler = _scheduler(
+        tmp_path,
+        {
+            RESOURCE_QWEN: RecordingExecutor(),
+            RESOURCE_BOOGU: RecordingExecutor(),
+        },
+        lambda job, result: (),
+    )
+    outcome = scheduler.run(
+        [
+            _job(resource=RESOURCE_QWEN, clip_uid="clip-qwen"),
+            _job(resource=RESOURCE_BOOGU, clip_uid="clip-boogu"),
+        ]
+    )
+
+    assert outcome["completed"] is True
+    assert events == [
+        "run:qwen",
+        "sync:r000-qwen",
+        "run:boogu",
+        "sync:r001-boogu",
+    ]
+    assert outcome["diagnostics"]["receipt_appends"] == 2
+    assert outcome["diagnostics"]["receipt_syncs"] == 2
+
+
+def test_run_batches_syncs_receipts_at_each_phase_boundary(tmp_path: Path) -> None:
+    scheduler = _scheduler(
+        tmp_path, {RESOURCE_BOOGU: _FakeBatchExecutor()}, lambda job, result: ()
+    )
+    first = _job(clip_uid="clip-first")
+    second = _job(clip_uid="clip-second")
+    outcome = scheduler.run_batches(([first], [second]))
+
+    assert outcome["completed"] is True
+    assert scheduler.ledger.phase_ids() == ("r000-boogu", "r001-boogu")
+    assert outcome["diagnostics"]["receipt_appends"] == 2
+    assert outcome["diagnostics"]["receipt_syncs"] == 2
+
+
+def test_receipt_sync_failure_prevents_stage_completion_and_unsynced_tail_reruns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job = _job()
+    executor = _FakeBatchExecutor()
+    original_sync = PhaseLedger.sync_receipts
+
+    def fail_sync(_phase: PhaseLedger) -> bool:
+        raise OSError("simulated receipt durability failure")
+
+    monkeypatch.setattr(PhaseLedger, "sync_receipts", fail_sync)
+    scheduler = _scheduler(
+        tmp_path, {RESOURCE_BOOGU: executor}, lambda job, result: ()
+    )
+    stage_completed = False
+    with pytest.raises(OSError, match="receipt durability failure"):
+        scheduler.run([job])
+        stage_completed = True
+    assert stage_completed is False
+
+    # Simulate loss of the unsynced tail after a crash. A fresh invocation
+    # sees no receipt and reruns, without scanning orphan result/artifact files.
+    phase = scheduler.ledger.phase("r000-boogu")
+    phase.receipts_path.write_bytes(b"")
+    assert GroupLedger(tmp_path / "group").classify(job).state == STATE_PENDING
+    monkeypatch.setattr(PhaseLedger, "sync_receipts", original_sync)
+    resumed = _scheduler(
+        tmp_path, {RESOURCE_BOOGU: executor}, lambda job, result: ()
+    )
+    assert resumed.run([job])["completed"] is True
+    assert executor.call_ids() == [job.job_id(), job.job_id()]
+
+
 def test_scheduler_never_creates_conditional_second_attempt_speculatively(tmp_path: Path):
     boogu = _FakeBatchExecutor()
     qwen = _FakeBatchExecutor()
