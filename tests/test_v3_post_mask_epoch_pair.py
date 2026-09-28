@@ -4169,6 +4169,55 @@ def test_pair_quarantines_local_artifact_loss_during_entity_preparation(
     assert len(storage.failures_path.read_text().splitlines()) == 1
 
 
+@pytest.mark.parametrize("cpu_workers", (1, 2))
+def test_pair_quarantines_unidentified_current_clip_frame_during_preparation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cpu_workers: int
+) -> None:
+    from PIL import UnidentifiedImageError
+
+    import r2v_data_v2.v3.pair as pair_module
+    from r2v_data_v2.v3.post_mask_epoch_quarantine import ClipQuarantine
+
+    _config, storage, runner = _primary_clips_fixture(
+        tmp_path,
+        monkeypatch,
+        f"run-quarantine-corrupt-frame-{cpu_workers}",
+        ("clip-1", "clip-2", "clip-3"),
+        cpu_workers=cpu_workers,
+    )
+    runner.clip_quarantine = ClipQuarantine()
+    runner.freeze_primary_plans()
+    unreadable = storage.frame_path("clip-2", 0)
+    real_open = pair_module.Image.open
+    real_prepare = runner._prepare_primary_entity
+    in_preparation = threading.local()
+
+    def prepare(current_storage: Any, clip_uid: str, *args: Any) -> Any:
+        in_preparation.active = clip_uid == "clip-2"
+        try:
+            return real_prepare(current_storage, clip_uid, *args)
+        finally:
+            in_preparation.active = False
+
+    def open_with_corrupt_frame(path: Any, *args: Any, **kwargs: Any) -> Any:
+        if getattr(in_preparation, "active", False) and Path(path) == unreadable:
+            raise UnidentifiedImageError(f"cannot identify image file {path!r}")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(runner, "_prepare_primary_entity", prepare)
+    monkeypatch.setattr(pair_module.Image, "open", open_with_corrupt_frame)
+
+    seeded = runner.seed_primary_jobs()
+
+    assert {job.clip_uid for job in seeded} == {"clip-1", "clip-3"}
+    assert runner.clip_quarantine.contains(SHARD, "clip-2")
+    failures = [json.loads(line) for line in storage.failures_path.read_text().splitlines()]
+    assert len(failures) == 1
+    assert failures[0]["clip_uid"] == "clip-2"
+    assert failures[0]["stage"] == "pair"
+    assert "UnidentifiedImageError" in failures[0]["reason"]
+
+
 @pytest.mark.parametrize("cpu_workers", (1, 4))
 def test_primary_prepare_failure_is_stage_level_and_canonical(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cpu_workers: int

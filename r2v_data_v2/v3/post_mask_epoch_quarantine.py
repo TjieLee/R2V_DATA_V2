@@ -14,6 +14,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Any
 
+from PIL import UnidentifiedImageError
 from pydantic import ValidationError
 
 from r2v_data_v2.v3.post_mask_epoch_state import atomic_write_json
@@ -31,7 +32,7 @@ def _local_artifact_error(
     if isinstance(exc, PermissionError):
         return False
     if known_clip_artifact_read and isinstance(
-        exc, (ValidationError, json.JSONDecodeError, ValueError)
+        exc, (ValidationError, json.JSONDecodeError, ValueError, UnidentifiedImageError)
     ):
         return True
     if not isinstance(exc, OSError):

@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import pytest
+from PIL import UnidentifiedImageError
 from pydantic import BaseModel, ValidationError
 
 from r2v_data_v2.v3.post_mask_epoch_quarantine import ClipQuarantine
@@ -94,6 +95,37 @@ def test_plain_value_error_requires_explicit_current_clip_read_context(tmp_path)
         known_clip_artifact_read=True,
     )
     assert quarantine.count == 1
+
+
+def test_unidentified_image_requires_explicit_current_clip_read_context(tmp_path):
+    storage = _Storage(tmp_path)
+    quarantine = ClipQuarantine()
+    corrupt = UnidentifiedImageError("cannot identify image file")
+    assert corrupt.filename is None
+
+    assert not quarantine.record_if_local("shard-1", storage, "bad", "remove", corrupt)
+    assert quarantine.record_if_local(
+        "shard-1", storage, "bad", "remove", corrupt,
+        known_clip_artifact_read=True,
+    )
+    assert quarantine.count == 1
+    assert len(storage.failures) == 1
+
+
+@pytest.mark.parametrize(
+    "error",
+    [PermissionError("permission denied"), OSError(errno.EIO, "shared filesystem I/O failure")],
+)
+def test_known_clip_read_still_propagates_infrastructure_io(tmp_path, error):
+    storage = _Storage(tmp_path)
+    quarantine = ClipQuarantine()
+
+    assert not quarantine.record_if_local(
+        "shard-1", storage, "bad", "remove", error,
+        known_clip_artifact_read=True,
+    )
+    assert quarantine.count == 0
+    assert storage.failures == []
 
 
 def test_group_quarantine_restores_scope_but_not_unrecorded_missing_clip(tmp_path):

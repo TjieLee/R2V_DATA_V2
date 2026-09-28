@@ -20,7 +20,7 @@ from typing import Any
 
 import numpy as np
 import pytest
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
 import r2v_data_v2.v3.storage as storage_module
 import tests.test_v3_reference_integrity as legacy_integrity
@@ -3804,6 +3804,70 @@ def test_missing_clip_after_hydration_does_not_block_integrity_sibling(
     stats = runner.reconcile_stats(SHARD)
     assert stats.processed == 2
     assert stats.failed == 1
+
+
+@pytest.mark.parametrize("cpu_workers", (1, 2))
+def test_unidentified_current_clip_reference_quarantines_only_that_clip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cpu_workers: int
+) -> None:
+    _config, storage, runner, uids = _multi_clip_fixture(
+        tmp_path,
+        monkeypatch,
+        f"run-corrupt-reference-{cpu_workers}",
+        entity_ids_by_clip={"clip-1": ("e1",), "clip-2": ("e1",)},
+        cpu_workers=cpu_workers,
+    )
+    runner.clip_quarantine = ClipQuarantine()
+    storage.selected_path(uids[1], "e1.png").write_bytes(b"not a PNG")
+
+    assert runner.seed_jobs() == []
+    assert runner.clip_quarantine.contains(SHARD, uids[1])
+    assert not runner.clip_quarantine.contains(SHARD, uids[0])
+    assert json.loads(
+        runner._clip_outcome_path(SHARD, uids[0]).read_text(encoding="utf-8")
+    )["terminal"] == "ready"
+    failures = [
+        json.loads(line)
+        for line in (Path(storage.root) / "failures.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert [(failure["stage"], failure["clip_uid"]) for failure in failures] == [
+        ("reference_integrity", uids[1])
+    ]
+    assert "UnidentifiedImageError" in failures[0]["reason"]
+
+
+def test_unidentified_nonlocal_reference_is_not_clip_quarantined(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _config, storage, runner, _uids = _multi_clip_fixture(
+        tmp_path,
+        monkeypatch,
+        "run-nonlocal-reference",
+        entity_ids_by_clip={"clip-1": ("e1",)},
+        cpu_workers=1,
+    )
+    runner.clip_quarantine = ClipQuarantine()
+    nonlocal_path = Path(storage.root) / "nonlocal-reference.png"
+    nonlocal_path.write_bytes(b"not a PNG")
+    clip = storage.read_clip("clip-1")
+    reference = clip.references.entities[0].model_copy(
+        update={"image_path": storage.relative_artifact_path(nonlocal_path)}
+    )
+    storage_module.write_json_atomic(
+        storage.clip_path("clip-1"),
+        clip.model_copy(
+            update={
+                "references": clip.references.model_copy(update={"entities": [reference]})
+            }
+        ).model_dump(mode="json"),
+    )
+
+    with pytest.raises(UnidentifiedImageError):
+        runner.seed_jobs()
+    assert runner.clip_quarantine.count == 0
+    assert not (Path(storage.root) / "failures.jsonl").exists()
 
 
 def test_integrity_frozen_plan_does_not_skip_quarantined_entry(

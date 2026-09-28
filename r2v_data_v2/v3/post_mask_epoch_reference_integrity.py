@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
 from r2v_data_v2.reconciliation import write_json_atomic
 from r2v_data_v2.v3.config import V3Config
@@ -2420,7 +2420,13 @@ class ReferenceIntegrityEpochRunner:
                 reference=reference,
                 job=job,
             )
-        final_image = _load_reference_image(storage, str(reference.image_path))
+        try:
+            final_image = _load_reference_image(storage, str(reference.image_path))
+        except UnidentifiedImageError as exc:
+            image_path = _resolve_run_artifact(storage, str(reference.image_path))
+            if storage.clip_dir(clip_uid).resolve(strict=False) in image_path.parents:
+                raise _ClipArtifactReadError(exc) from exc
+            raise
         diagnostics = reference_topology_diagnostics(final_image)
         expected = self._expected_entity_marker(
             clip_uid, entity, reference, diagnostics
@@ -4391,6 +4397,17 @@ class ReferenceIntegrityEpochRunner:
         except ReferenceIntegrityDurableError:
             # Durable corruption is never a semantic clip failure.
             raise
+        except _ClipArtifactReadError as caught:
+            exc = caught.cause
+            if self._quarantine_local(
+                record.shard,
+                record.storage,
+                record.clip_uid,
+                exc,
+                known_clip_artifact_read=True,
+            ):
+                return []
+            raise exc
         except Exception as exc:
             if isinstance(exc, (EpochResourceError, LedgerError, PermissionError)):
                 raise

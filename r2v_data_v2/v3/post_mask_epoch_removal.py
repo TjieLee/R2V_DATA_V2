@@ -56,7 +56,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 from pydantic import ValidationError
 
 from r2v_data_v2.v3.background import validate_background_reference
@@ -812,7 +812,9 @@ class RemovalEpochRunner:
                 "remove",
                 error,
                 known_clip_artifact_read=state is None
-                or isinstance(error, (ValidationError, json.JSONDecodeError)),
+                or isinstance(
+                    error, (ValidationError, json.JSONDecodeError, UnidentifiedImageError)
+                ),
             )
         ):
             counters["failed"] += 1
@@ -834,7 +836,7 @@ class RemovalEpochRunner:
                         "remove",
                         exc,
                         known_clip_artifact_read=isinstance(
-                            exc, (ValidationError, json.JSONDecodeError)
+                            exc, (ValidationError, json.JSONDecodeError, UnidentifiedImageError)
                         ),
                     ):
                         counters["failed"] += 1

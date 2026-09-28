@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
 from r2v_data_v2.v3.config import V3Config
 from r2v_data_v2.v3.pair import (
@@ -1324,7 +1324,11 @@ class PairEpochRunner:
             for item in row:
                 if isinstance(item, BaseException):
                     if isinstance(item, (OSError, ValueError)) and self._quarantine_local(
-                        shard, storage, clip_uid, item
+                        shard,
+                        storage,
+                        clip_uid,
+                        item,
+                        known_clip_artifact_read=isinstance(item, UnidentifiedImageError),
                     ):
                         quarantined = True
                         break
@@ -1467,7 +1471,13 @@ class PairEpochRunner:
                 shard, storage, clip_uid, entities, frames, masks, counters
             )
         except (OSError, ValueError) as exc:
-            if self._quarantine_local(shard, storage, clip_uid, exc):
+            if self._quarantine_local(
+                shard,
+                storage,
+                clip_uid,
+                exc,
+                known_clip_artifact_read=isinstance(exc, UnidentifiedImageError),
+            ):
                 raise _QuarantinedPreparation from exc
             raise
         self._note_prepare_wall(time.perf_counter() - started)
