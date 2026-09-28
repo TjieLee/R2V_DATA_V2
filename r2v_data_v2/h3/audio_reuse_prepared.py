@@ -279,6 +279,7 @@ def prepare_audio_reuse_sources(
     base_inventory = builder(
         visual_production_root=visual_production_root, visual_runs_root=visual_runs_root,
         audio_production_root=audio_production_root, case_manifest=manifest,
+        **({"verify_video": False, "verify_audio": False} if binding_evidence_mode == "none" else {}),
     )
     if (binding_evidence_mode == "legacy_lr_asd"
         and sha256_file(source_h3_root / "samples.jsonl") != base_inventory.source_h3_samples_sha256):
@@ -292,6 +293,7 @@ def prepare_audio_reuse_sources(
         source_samples, _ = load_mimo25_reference_sources(
             visual_production_root=visual_production_root, visual_runs_root=visual_runs_root,
             audio_production_root=audio_production_root,
+            verify_video=False, verify_audio=False,
         )
         source_text = "".join(s.model_dump_json() + "\n" for s in source_samples)
         if hashlib.sha256(source_text.encode()).hexdigest() != base_inventory.source_h3_samples_sha256:

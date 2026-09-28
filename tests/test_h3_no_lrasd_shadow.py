@@ -182,6 +182,26 @@ def test_reference_builder_never_reads_speaker_evidence(tmp_path, monkeypatch):
         visual_production_root=args["visual_production_root"],
         visual_runs_root=args["visual_runs_root"], audio_production_root=args["audio_production_root"],
     )
+    original_sha = reconcile.sha256_file
+    original_resolve = Path.resolve
+
+    def no_video_digest(path):
+        assert Path(path).suffix.lower() not in {".mp4", ".flac"}
+        return original_sha(path)
+
+    def no_original_media_resolve(path, *args, **kwargs):
+        assert Path(path).suffix.lower() not in {".mp4", ".flac"}
+        return original_resolve(path, *args, **kwargs)
+
+    with monkeypatch.context() as context:
+        context.setattr(reconcile, "sha256_file", no_video_digest)
+        context.setattr(Path, "resolve", no_original_media_resolve)
+        without_video_scan = reconcile.build_mimo25_reference_inventory(
+            visual_production_root=args["visual_production_root"],
+            visual_runs_root=args["visual_runs_root"], audio_production_root=args["audio_production_root"],
+            verify_video=False, verify_audio=False,
+        )
+    assert without_video_scan == inventory
     assert inventory.binding_evidence_mode == "none"
     assert inventory.schema_version == "r2v.h3.mimo25_inventory.6"
     assert all(j.segments == [] and j.reference_subjects for j in inventory.jobs)
@@ -228,13 +248,15 @@ def test_reference_builder_never_reads_speaker_evidence(tmp_path, monkeypatch):
     assert contract["binding_evidence_mode"] == "none"
     assert contract["jobs"] == [j.model_dump(mode="json") for j in jobs]
     prepared = shadow / "prepared_no_lrasd_v1"
-    summary = prepare_audio_reuse_sources(
-        audio_production_root=args["audio_production_root"],
-        visual_production_root=args["visual_production_root"], visual_runs_root=args["visual_runs_root"],
-        stem_shadow_root=shadow, base_reconcile_root=output, override_reconcile_root=None,
-        prepared_root=prepared,
-        binding_evidence_mode="none", stem_diarization_root=diari, stem_asr_root=asr,
-    )
+    with monkeypatch.context() as context:
+        context.setattr(reconcile, "sha256_file", no_video_digest)
+        summary = prepare_audio_reuse_sources(
+            audio_production_root=args["audio_production_root"],
+            visual_production_root=args["visual_production_root"], visual_runs_root=args["visual_runs_root"],
+            stem_shadow_root=shadow, base_reconcile_root=output, override_reconcile_root=None,
+            prepared_root=prepared,
+            binding_evidence_mode="none", stem_diarization_root=diari, stem_asr_root=asr,
+        )
     assert not summary.production_artifacts_modified
     published = reconcile.MimoInventory.model_validate_json((prepared / "inventory.json").read_text())
     assert published.binding_evidence_mode == "none"

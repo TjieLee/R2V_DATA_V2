@@ -1128,6 +1128,8 @@ def build_mimo25_inventory(
 def load_mimo25_reference_sources(
     *, visual_production_root: Path, visual_runs_root: Path,
     audio_production_root: Path,
+    verify_video: bool = True,
+    verify_audio: bool = True,
 ) -> tuple[list[FinalH3SampleV2], dict[str, CanonicalAudioClip]]:
     """Construct canonical shadow bases directly from frozen Visual and Audio."""
     paths = jea_production_paths(audio_production_root)
@@ -1146,9 +1148,17 @@ def load_mimo25_reference_sources(
     for clip in visual.canonical_clips:
         uid = clip.identity.clip_uid
         audio = canonical_by_clip[uid]
-        if (Path(clip.sample.target_video).resolve(strict=True) != Path(audio.target_video_path).resolve(strict=True)
-            or sha256_file(Path(audio.target_video_path)) != audio.target_video_sha256
-            or sha256_file(Path(audio.target_full_audio_path)) != audio.target_full_audio_sha256):
+        visual_video = Path(clip.sample.target_video)
+        canonical_video = Path(audio.target_video_path)
+        if verify_video:
+            visual_video = visual_video.resolve(strict=True)
+            canonical_video = canonical_video.resolve(strict=True)
+        else:
+            visual_video = visual_video.absolute()
+            canonical_video = canonical_video.absolute()
+        if (visual_video != canonical_video
+            or (verify_video and sha256_file(Path(audio.target_video_path)) != audio.target_video_sha256)
+            or (verify_audio and sha256_file(Path(audio.target_full_audio_path)) != audio.target_full_audio_sha256)):
             raise ValueError(f"MiMo target media provenance differs: {uid}")
         samples.append(FinalH3SampleV2(
             **clip.identity.model_dump(mode="python"),
@@ -1167,6 +1177,8 @@ def build_mimo25_reference_inventory(
     *, visual_production_root: Path, visual_runs_root: Path,
     audio_production_root: Path, case_manifest_path: Path | None = None,
     case_manifest: MimoCaseManifest | None = None,
+    verify_video: bool = True,
+    verify_audio: bool = True,
 ) -> MimoInventory:
     """Reference-only source adapter; no production H3 or speaker evidence."""
     if case_manifest_path is not None and case_manifest is not None:
@@ -1174,6 +1186,8 @@ def build_mimo25_reference_inventory(
     samples, canonical_by_clip = load_mimo25_reference_sources(
         visual_production_root=visual_production_root, visual_runs_root=visual_runs_root,
         audio_production_root=audio_production_root,
+        verify_video=verify_video,
+        verify_audio=verify_audio,
     )
     by_clip = {s.clip_uid: s for s in samples}
     canonical_path = jea_production_paths(audio_production_root).audio / "canonical_clips.jsonl"
@@ -1186,8 +1200,10 @@ def build_mimo25_reference_inventory(
     for clip_uid in selected:
         canonical_clip = canonical_by_clip[clip_uid]
         representative = by_clip[clip_uid]
-        video = Path(representative.target_video).resolve(strict=True)
-        audio = Path(representative.target_full_audio_path).resolve(strict=True)
+        video_path = Path(representative.target_video)
+        audio_path = Path(representative.target_full_audio_path)
+        video = video_path.resolve(strict=True) if verify_video else video_path.absolute()
+        audio = audio_path.resolve(strict=True) if verify_audio else audio_path.absolute()
         selection, images = select_mimo_reference_projection(clip_uid, representative.visual_references)
         projected = project_mimo_h3_sample_references(
             representative, reference_images=images, reference_selection=selection,
