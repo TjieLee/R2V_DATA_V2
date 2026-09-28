@@ -9,8 +9,9 @@ import socket
 import subprocess
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
+from queue import Queue
 from urllib.parse import urlparse
 
 
@@ -20,11 +21,23 @@ def build_mimo_serve_command(
     *,
     served_model_name: str = "mimo-v2.5",
     mem_fraction_static: float = 0.65,
+    port: int = 8092,
 ) -> list[str]:
     if not 0 < mem_fraction_static <= 1:
         raise ValueError("MiMo mem fraction must be in (0, 1]")
     if not served_model_name.strip():
         raise ValueError("MiMo served model name must be non-empty")
+    if not 1 <= port <= 65535:
+        raise ValueError("MiMo port must be valid")
+    if served_model_name == "mimo-v2.6-flash-rl":
+        return [
+            str(sglang), "serve", "--model-path", str(checkpoint),
+            "--served-model-name", served_model_name,
+            "--host", "127.0.0.1", "--port", str(port),
+            "--tp", "4", "--moe-runner-backend", "marlin",
+            "--disable-custom-all-reduce", "--trust-remote-code",
+            "--reasoning-parser", "mimo", "--tool-call-parser", "mimo",
+        ]
     command = [
         str(sglang),
         "serve",
@@ -35,7 +48,7 @@ def build_mimo_serve_command(
         "--host",
         "127.0.0.1",
         "--port",
-        "8092",
+        str(port),
         "--trust-remote-code",
         "--tp",
         "8",
@@ -65,21 +78,20 @@ def build_mimo_serve_command(
         "--constrained-json-disable-any-whitespace",
         "--enable-deterministic-inference",
     ]
-    if served_model_name == "mimo-v2.6-flash-rl":
-        command.extend(
-            [
-                "--speculative-algorithm",
-                "EAGLE",
-                "--speculative-num-steps",
-                "3",
-                "--speculative-eagle-topk",
-                "1",
-                "--speculative-num-draft-tokens",
-                "4",
-                "--enable-multi-layer-eagle",
-            ]
-        )
     return command
+
+
+def mimo_v26_server_env(gpu_group: str) -> dict[str, str]:
+    if not gpu_group:
+        raise ValueError("MiMo GPU group must be non-empty")
+    return {
+        **os.environ,
+        "CUDA_VISIBLE_DEVICES": gpu_group,
+        "SGLANG_ENABLE_JIT_DEEPGEMM": "0",
+        "SGLANG_DEEPGEMM_PDL": "0",
+        "NO_PROXY": "127.0.0.1,localhost",
+        "no_proxy": "127.0.0.1,localhost",
+    }
 
 
 def _descendants(parent: int) -> set[int]:
@@ -104,7 +116,7 @@ def _signal(pid: int, sig: int) -> None:
 
 
 class _Completions:
-    def __init__(self, owner: "StageMimoClient") -> None:
+    def __init__(self, owner: StageMimoClient | StageMimoPoolClient) -> None:
         self.owner = owner
 
     def create(self, **kwargs):
@@ -112,7 +124,7 @@ class _Completions:
 
 
 class _Chat:
-    def __init__(self, owner: "StageMimoClient") -> None:
+    def __init__(self, owner: StageMimoClient | StageMimoPoolClient) -> None:
         self.completions = _Completions(owner)
 
 
@@ -130,6 +142,7 @@ class StageMimoClient:
         startup_polls: int = 360,
         poll_interval: float = 5.0,
         cleanup_grace_seconds: float = 30.0,
+        serve_env: dict[str, str] | None = None,
     ) -> None:
         parsed = urlparse(base_url)
         if (
@@ -152,6 +165,7 @@ class StageMimoClient:
         self.startup_polls = startup_polls
         self.poll_interval = poll_interval
         self.cleanup_grace_seconds = cleanup_grace_seconds
+        self.serve_env = serve_env
         self.host = parsed.hostname
         self.port = parsed.port
         self.chat = _Chat(self)
@@ -212,6 +226,10 @@ class StageMimoClient:
             max_retries=0,
         )
 
+    def start(self) -> None:
+        with self._lock:
+            self._ensure_started_locked()
+
     def _ensure_started_locked(self) -> None:
         if self._stage_shard is None:
             raise RuntimeError("MiMo request made outside a shard MiMo stage")
@@ -239,6 +257,7 @@ class StageMimoClient:
                 stdin=subprocess.DEVNULL,
                 stdout=self._log_handle,
                 stderr=subprocess.STDOUT,
+                **({"env": self.serve_env} if self.serve_env is not None else {}),
             )
         except OSError as exc:
             self._close_log_locked()
@@ -327,3 +346,43 @@ class StageMimoClient:
             self._ensure_started_locked()
             client = self._client
         return client.chat.completions.create(**kwargs)
+
+
+class StageMimoPoolClient:
+    """Lease any idle stage-local MiMo endpoint for one synchronous request."""
+
+    def __init__(self, endpoints: list[StageMimoClient]) -> None:
+        if not endpoints:
+            raise ValueError("MiMo pool needs at least one endpoint")
+        self.endpoints = list(endpoints)
+        self.chat = _Chat(self)
+        self._available: Queue[StageMimoClient] = Queue()
+        self._active = False
+
+    @contextmanager
+    def stage(self, shard_id: int):
+        if self._active:
+            raise RuntimeError("MiMo pool stage is already active")
+        with ExitStack() as stack:
+            self._available = Queue()
+            for endpoint in self.endpoints:
+                stack.enter_context(endpoint.stage(shard_id))
+                endpoint.start()
+            for endpoint in self.endpoints:
+                self._available.put(endpoint)
+            self._active = True
+            try:
+                yield self
+            finally:
+                self._active = False
+                for _ in self.endpoints:
+                    self._available.get_nowait()
+
+    def _create(self, **kwargs):
+        if not self._active:
+            raise RuntimeError("MiMo request made outside a shard MiMo stage")
+        endpoint = self._available.get()
+        try:
+            return endpoint.chat.completions.create(**kwargs)
+        finally:
+            self._available.put(endpoint)
