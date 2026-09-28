@@ -1378,6 +1378,44 @@ def test_clip_plan_is_rederived_once_per_runner_invocation(
     assert fresh_calls == 1
 
 
+def test_completed_clip_checkpoint_skips_cold_upstream_derivation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A completed SAT clip cannot reopen historical frames/masks on restart."""
+    config, storage = _storage_variant(tmp_path, monkeypatch, "run-completed-resume")
+    original = _runner(config, storage, tmp_path)
+    _drain(original, _DiscoveryClient(_nonhuman_discovery()))
+    expected = original.reconcile_stats(SHARD).to_dict()
+
+    fresh = _runner(config, storage, tmp_path)
+    fresh.checkpoint_first_resume = True
+
+    def forbidden(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("completed clip must not derive live upstream input")
+
+    monkeypatch.setattr(fresh, "_derive_clip_plan", forbidden)
+    assert fresh.seed_jobs() == []
+    assert fresh.reconcile_stats(SHARD).to_dict() == expected
+
+
+def test_completed_clip_checkpoint_rejects_changed_counter_shape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A terminal marker cannot inject arbitrary durable stage counters."""
+    config, storage = _storage_variant(tmp_path, monkeypatch, "run-counter-shape")
+    original = _runner(config, storage, tmp_path)
+    _drain(original, _DiscoveryClient(_nonhuman_discovery()))
+    marker_path = original._clip_outcome_path(SHARD, CLIP_UID)
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker["counts"] = {"bogus": 0}
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+
+    fresh = _runner(config, storage, tmp_path)
+    fresh.checkpoint_first_resume = True
+    with pytest.raises(SubjectAttributeDurableError, match="clip outcome drifted"):
+        fresh.seed_jobs()
+
+
 
 @pytest.mark.parametrize(
     ("mutation", "expected"),

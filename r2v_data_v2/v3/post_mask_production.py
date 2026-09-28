@@ -7,6 +7,7 @@ replaced. Physical placement belongs to the caller, not the semantic V3 config.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -33,6 +34,7 @@ _COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _SHARD = re.compile(r"shard-[0-9]{9}-[0-9]{9}\.jsonl")
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 _PROVENANCE = ".post_mask_hydration.json"
+_HYDRATION_CHECKPOINT_SCHEMA = "post_mask_hydration_checkpoint/1"
 
 
 def _component(value: object) -> str:
@@ -155,6 +157,10 @@ class ShardPaths:
     def identity_path(self) -> Path:
         return self.state_root / "identity.json"
 
+    @property
+    def hydration_checkpoint_path(self) -> Path:
+        return self.state_root / "hydration_completed.json"
+
 
 @dataclass(frozen=True)
 class HydrationResult:
@@ -162,6 +168,62 @@ class HydrationResult:
     ready: int
     excluded: int
     corrupt: int
+
+
+def _read_hydration_checkpoint(paths: ShardPaths) -> HydrationResult | None:
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate hydration checkpoint field")
+            value[key] = item
+        return value
+
+    marker = paths.hydration_checkpoint_path
+    if marker.is_symlink():
+        raise ValueError("invalid Post-Mask hydration checkpoint")
+    if not marker.exists():
+        return None
+    if not marker.is_file():
+        raise ValueError("invalid Post-Mask hydration checkpoint")
+    try:
+        payload = json.loads(marker.read_text(), object_pairs_hook=unique_object)
+    except (OSError, ValueError) as exc:
+        raise ValueError("invalid Post-Mask hydration checkpoint") from exc
+    expected_keys = {
+        "schema",
+        "canonical_shard",
+        "clip_uids",
+        "ready",
+        "excluded",
+        "corrupt",
+    }
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != expected_keys
+        or payload["schema"] != _HYDRATION_CHECKPOINT_SCHEMA
+        or payload["canonical_shard"] != str(paths.shard_path)
+        or not isinstance(payload["clip_uids"], list)
+    ):
+        raise ValueError("invalid Post-Mask hydration checkpoint")
+    uids = payload["clip_uids"]
+    try:
+        for uid in uids:
+            _component(uid)
+    except ValueError as exc:
+        raise ValueError("invalid Post-Mask hydration checkpoint") from exc
+    if (
+        len(set(uids)) != len(uids)
+        or any(
+            type(payload[key]) is not int or payload[key] < 0
+            for key in ("ready", "excluded", "corrupt")
+        )
+        or payload["ready"] != len(uids)
+    ):
+        raise ValueError("invalid Post-Mask hydration checkpoint")
+    return HydrationResult(
+        tuple(uids), payload["ready"], payload["excluded"], payload["corrupt"]
+    )
 
 
 def prepare_shard_config(base_config: V3Config, paths: ShardPaths) -> V3Config:
@@ -510,10 +572,10 @@ def _resume_destination_is_complete(
 def hydrate_shard(
     storage: RunStorage, *, entity_mask_root: Path, shard_path: Path, paths: ShardPaths
 ) -> HydrationResult:
-    """Isolate bad ready rows, copy good clips atomically, preserve published work.
+    """Resume from a shard checkpoint or hydrate legacy rows once.
 
-    Returns input-order eligible clip IDs and deterministic row counts. Rewrites
-    inventories atomically, so restart never duplicates input-failure records.
+    Returns input-order eligible clip IDs and deterministic row counts. A fresh
+    or legacy hydration publishes inventories and then a checkpoint atomically.
     Requires initialize_shard and an external exclusive shard lock.
     """
     root = Path(entity_mask_root).resolve()
@@ -528,6 +590,9 @@ def hydrate_shard(
     for destination in (paths.run_root, paths.export_root, paths.state_root):
         if destination.resolve().is_relative_to(root):
             raise ValueError("Post-Mask destination overlaps frozen input")
+    checkpoint = _read_hydration_checkpoint(paths)
+    if checkpoint is not None:
+        return checkpoint
     rows: list[dict[str, Any]] = []
     for line_number, line in enumerate(shard.read_text().splitlines(), 1):
         if not line.strip():
@@ -645,7 +710,23 @@ def hydrate_shard(
                 staging.replace(destination)
             ready.append(uid)
         except (ValueError, TypeError, OSError) as exc:
+            if isinstance(exc, PermissionError) or (
+                isinstance(exc, OSError) and exc.errno == errno.EIO
+            ):
+                raise
             failures.append({**record, "failure_reason": str(exc), "stage": "hydrate"})
     _write_inventory(paths.exclusions_path, excluded)
     _write_inventory(paths.input_failures_path, failures)
-    return HydrationResult(tuple(ready), len(ready), len(excluded), len(failures))
+    result = HydrationResult(tuple(ready), len(ready), len(excluded), len(failures))
+    write_json_atomic(
+        paths.hydration_checkpoint_path,
+        {
+            "schema": _HYDRATION_CHECKPOINT_SCHEMA,
+            "canonical_shard": str(shard),
+            "clip_uids": list(result.clip_uids),
+            "ready": result.ready,
+            "excluded": result.excluded,
+            "corrupt": result.corrupt,
+        },
+    )
+    return result

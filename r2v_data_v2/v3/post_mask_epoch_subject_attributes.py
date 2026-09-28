@@ -1375,6 +1375,10 @@ class SubjectAttributeEpochRunner:
         }
         self.emit = emit
         self.clip_quarantine = None
+        # Only the composition's pre-existing SAT_STARTED barrier authorizes
+        # production checkpoint-first replay. Standalone/fresh runners retain
+        # their historical strict plan/artifact verification behavior.
+        self.checkpoint_first_resume = False
         # Invocation-local execution cache only. The first access still
         # re-derives and validates the complete frozen clip plan from live
         # upstream artifacts. Subsequent accesses in the same locked resource-
@@ -1383,6 +1387,14 @@ class SubjectAttributeEpochRunner:
         # A restart constructs a fresh runner and therefore revalidates from
         # disk, preserving fail-closed durable semantics.
         self._clip_plan_cache: dict[tuple[str, str], dict[str, Any]] = {}
+        # A terminal clip outcome is the SAT restart checkpoint. Keep only its
+        # small frozen plan and counts in memory; do not re-open historical
+        # clip/frames/masks merely to discover that it is already complete.
+        self._completed_clip_cache: dict[
+            tuple[str, str], tuple[dict[str, Any], dict[str, Any]]
+        ] = {}
+        self._cold_completed_clips: set[tuple[str, str]] = set()
+        self._resume_policy: dict[str, Any] | None = None
         # Candidate masks are full-resolution, so keep this invocation cache
         # deliberately bounded. It exists only to avoid rebuilding the same
         # owner evidence at every receipt boundary; a restart rebuilds and
@@ -1741,6 +1753,97 @@ class SubjectAttributeEpochRunner:
                 ) from exc
             raise
         return self._apply_derived_clip_plan(shard, clip_uid, expected, existing)
+
+    def _completed_clip_checkpoint(
+        self, shard: str, clip_uid: str
+    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        """Validate a completed clip's small durable authority, without pixels.
+
+        Pending clips still take the existing strict live derivation path. The
+        completed marker is only a restart barrier, not an artifact audit.
+        """
+        key = (shard, clip_uid)
+        cached = self._completed_clip_cache.get(key)
+        if cached is not None:
+            return cached
+        marker = _read_json(self._clip_outcome_path(shard, clip_uid))
+        if marker is None:
+            return None
+        plan = _read_json(self._clip_plan_path(shard, clip_uid))
+        if plan is None:
+            raise SubjectAttributeDurableError(
+                f"completed Subject Attributes clip has no frozen plan for {clip_uid!r}"
+            )
+        if self._resume_policy is None:
+            self._resume_policy = self._policy_identity()
+        plan_keys = {
+            "schema", "clip_uid", "policy", "clip_digest", "effective_export",
+            "frames_sha256", "masks_sha256", "classification", "subject_owners",
+        }
+        if (
+            set(plan) != plan_keys
+            or plan.get("schema") != SUBJECT_ATTRIBUTE_CLIP_PLAN_SCHEMA
+            or plan.get("clip_uid") != clip_uid
+            or plan.get("policy") != self._resume_policy
+            or plan.get("classification") not in {CLIP_NO_WORK, CLIP_OWNERS}
+            or not isinstance(plan.get("subject_owners"), list)
+            or not isinstance(plan.get("effective_export"), dict)
+            or not isinstance(plan.get("clip_digest"), str)
+        ):
+            raise SubjectAttributeDurableError(
+                f"frozen Subject Attributes clip plan drifted for {clip_uid!r}"
+            )
+        owners = plan["subject_owners"]
+        if any(
+            not isinstance(owner, dict)
+            or not isinstance(owner.get("owner_entity_id"), str)
+            or not isinstance(owner.get("eligible"), bool)
+            for owner in owners
+        ) or (plan["classification"] == CLIP_NO_WORK and owners):
+            raise SubjectAttributeDurableError(
+                f"frozen Subject Attributes owners drifted for {clip_uid!r}"
+            )
+        marker_keys = {
+            "schema", "clip_uid", "terminal", "counts", "owner_outcome_ids",
+            "enriched_sample_path", "enriched_sample_sha256",
+        }
+        counts = marker.get("counts")
+        empty_counts = ClipEnrichmentResult(
+            clip_uid=clip_uid,
+            totals=EnrichmentTotals(),
+            owner_limit_reached=False,
+            enriched_sample=None,
+        ).to_counts()
+        if (
+            set(marker) != marker_keys
+            or marker.get("schema") != SUBJECT_ATTRIBUTE_CLIP_OUTCOME_SCHEMA
+            or marker.get("clip_uid") != clip_uid
+            or marker.get("terminal") != "ready"
+            or not isinstance(counts, dict)
+            or set(counts) != set(empty_counts)
+            or any(
+                not isinstance(name, str)
+                or type(value) is not type(empty_counts[name])
+                or not math.isfinite(value)
+                or value < 0
+                for name, value in counts.items()
+            )
+            or (plan["classification"] == CLIP_NO_WORK and counts != empty_counts)
+            or marker.get("owner_outcome_ids") != [
+                owner["owner_entity_id"] for owner in owners if owner["eligible"]
+            ]
+            or marker.get("enriched_sample_path") is not None
+            and not isinstance(marker["enriched_sample_path"], str)
+            or marker.get("enriched_sample_sha256") is not None
+            and not isinstance(marker["enriched_sample_sha256"], str)
+            or (marker.get("enriched_sample_path") is None)
+            != (marker.get("enriched_sample_sha256") is None)
+        ):
+            raise SubjectAttributeDurableError(
+                f"completed Subject Attributes clip outcome drifted for {clip_uid!r}"
+            )
+        self._completed_clip_cache[key] = (plan, marker)
+        return plan, marker
 
     def _eligible_owners(self, plan: Mapping[str, Any]) -> list[dict[str, Any]]:
         return [
@@ -2543,7 +2646,17 @@ class SubjectAttributeEpochRunner:
             (shard, clip_uid)
             for shard in sorted(self.storages)
             for clip_uid in self.eligible.get(shard, ())
+            if not self._skip_preplan_quarantine(shard, clip_uid)
+            and not self._cold_terminal_at_seed(shard, clip_uid)
         ]
+
+    def _cold_terminal_at_seed(self, shard: str, clip_uid: str) -> bool:
+        if not self.checkpoint_first_resume:
+            return False
+        if self._completed_clip_checkpoint(shard, clip_uid) is None:
+            return False
+        self._cold_completed_clips.add((shard, clip_uid))
+        return True
 
     def _skip_preplan_quarantine(self, shard: str, clip_uid: str) -> bool:
         quarantine = self.clip_quarantine
@@ -6406,6 +6519,18 @@ class SubjectAttributeEpochRunner:
         no_work_clips = 0
         for clip_uid in self.eligible.get(shard, ()):
             if self._skip_preplan_quarantine(shard, clip_uid):
+                continue
+            completed = (
+                self._completed_clip_checkpoint(shard, clip_uid)
+                if (shard, clip_uid) in self._cold_completed_clips
+                else None
+            )
+            if completed is not None:
+                plan, verified = completed
+                for key, value in verified["counts"].items():
+                    counts[key] += value
+                terminal_clips += 1
+                no_work_clips += int(plan["classification"] == CLIP_NO_WORK)
                 continue
             plan = self._clip_plan(shard, clip_uid)
             marker = _read_json(self._clip_outcome_path(shard, clip_uid))

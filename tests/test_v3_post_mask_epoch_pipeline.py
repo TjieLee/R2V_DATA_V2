@@ -42,6 +42,7 @@ from r2v_data_v2.v3.post_mask_epoch_pipeline import (
     DOWNSTREAM_REASON,
     EXPORT_PENDING_REASON,
     INSTRUCT_STARTED,
+    REFERENCE_EDIT_STARTED,
     REFERENCE_INTEGRITY_STARTED,
     SUBJECT_ATTRIBUTES_COMPLETED,
     SUBJECT_ATTRIBUTES_STARTED,
@@ -54,6 +55,8 @@ from r2v_data_v2.v3.post_mask_epoch_pipeline import (
     run_removal_pair_resource_session,
     shared_qwen_model_identities,
     validate_shared_qwen_models,
+    verify_subject_attribute_receipts,
+    write_composition_handoff,
 )
 from r2v_data_v2.v3.post_mask_epoch_scheduler import (
     JobExecution,
@@ -221,6 +224,147 @@ def test_remove_complete_then_pair_primary_then_cross(tmp_path: Path, monkeypatc
     assert outcome["pair_completed"] is True
     assert outcome["completed"] is False
     assert outcome["reason"] == DOWNSTREAM_REASON
+
+
+def test_completed_handoff_skips_upstream_runners_and_receipt_audit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A durable terminal barrier selects export without replaying earlier work."""
+    import r2v_data_v2.v3.post_mask_epoch_pipeline as pipeline
+
+    config, storages, eligible, _, _log = _fixture(tmp_path, monkeypatch)
+    ledger = GroupLedger(tmp_path / "ledger")
+    for storage in storages.values():
+        for stage in (
+            "pair", "reference_edit", "reference_integrity", "instruct",
+            "subject_attributes",
+        ):
+            storage.update_stage_counts(stage, {"completed": 1})
+    write_composition_handoff(
+        ledger,
+        SUBJECT_ATTRIBUTES_COMPLETED,
+        eligible_clip_uids_by_shard=eligible,
+    )
+
+    def forbidden(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("completed handoff must not replay or audit clips")
+
+    monkeypatch.setattr(pipeline, "verify_subject_attribute_receipts", forbidden)
+    result = run_removal_pair_epochs(
+        config=config,
+        storages=storages,
+        eligible_clip_uids_by_shard=eligible,
+        ledger=ledger,
+        removal_runner_factory=forbidden,
+        removal_scheduler_factory=forbidden,
+        pair_runner_factory=forbidden,
+        pair_scheduler_factory=forbidden,
+        subject_attributes_runner_factory=forbidden,
+        subject_attributes_scheduler_factory=forbidden,
+    )
+    assert result["subject_attributes_completed"] is True
+    assert result["subject_attributes_job_count"] == 0
+
+
+def test_reference_edit_handoff_requires_pair_counts_on_every_shard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A partial stage-count publication cannot claim a completed Pair group."""
+    config, storages, eligible, _, _log = _fixture(tmp_path, monkeypatch)
+    ledger = GroupLedger(tmp_path / "ledger")
+    storages[SHARD].update_stage_counts("pair", {"completed": 1})
+    write_composition_handoff(
+        ledger, REFERENCE_EDIT_STARTED, eligible_clip_uids_by_shard=eligible
+    )
+
+    def forbidden(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("no model stage should start with missing Pair counts")
+
+    with pytest.raises(StageHandoffError, match="no pair stage counts"):
+        run_removal_pair_epochs(
+            config=config,
+            storages=storages,
+            eligible_clip_uids_by_shard=eligible,
+            ledger=ledger,
+            removal_runner_factory=forbidden,
+            removal_scheduler_factory=forbidden,
+            pair_runner_factory=forbidden,
+            pair_scheduler_factory=forbidden,
+            reference_edit_runner_factory=forbidden,
+        )
+
+
+def test_cold_completed_attribute_receipts_skip_historical_artifact_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SAT_STARTED resume trusts a present final receipt, without rehashing PNGs."""
+    import r2v_data_v2.v3.post_mask_runtime as runtime
+
+    _config_value, storages, eligible, _, _log = _fixture(tmp_path, monkeypatch)
+    for storage in storages.values():
+        path = storage.clip_dir("clip-1") / ".post_mask_attributes.json"
+        path.write_text(
+            json.dumps({"clip": "a" * 64, "artifacts": {}}), encoding="utf-8"
+        )
+
+    def forbidden(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("cold completed receipt must not reopen clip artifacts")
+
+    monkeypatch.setattr(runtime, "_expected_attribute_receipt", forbidden)
+    publish_subject_attribute_receipts(
+        storages,
+        eligible,
+        trust_completed={(shard, "clip-1") for shard in storages},
+    )
+
+
+def test_cold_completed_attribute_missing_receipt_derives_only_that_clip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import r2v_data_v2.v3.post_mask_runtime as runtime
+
+    _config_value, storages, eligible, _, _log = _fixture(tmp_path, monkeypatch)
+    shards = sorted(storages)
+    existing = storages[shards[0]].clip_dir("clip-1") / ".post_mask_attributes.json"
+    existing.write_text(
+        json.dumps({"clip": "a" * 64, "artifacts": {}}), encoding="utf-8"
+    )
+    derived: list[str] = []
+
+    def expected(_storage: Any, uid: str) -> dict[str, Any]:
+        derived.append(uid)
+        return {"clip": "b" * 64, "artifacts": {}}
+
+    monkeypatch.setattr(runtime, "_expected_attribute_receipt", expected)
+    publish_subject_attribute_receipts(
+        storages,
+        eligible,
+        trust_completed={(shard, "clip-1") for shard in storages},
+    )
+
+    assert derived == ["clip-1"]
+    missing_shard = shards[1]
+    receipt = storages[missing_shard].clip_dir("clip-1") / ".post_mask_attributes.json"
+    assert json.loads(receipt.read_text(encoding="utf-8")) == {
+        "clip": "b" * 64,
+        "artifacts": {},
+    }
+
+
+def test_cold_completed_attribute_malformed_receipt_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _config_value, storages, eligible, _, _log = _fixture(tmp_path, monkeypatch)
+    for storage in storages.values():
+        path = storage.clip_dir("clip-1") / ".post_mask_attributes.json"
+        path.write_text('{"clip":"existing","artifacts":[]}', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="receipt is malformed"):
+        publish_subject_attribute_receipts(
+            storages,
+            eligible,
+            trust_completed={(shard, "clip-1") for shard in storages},
+        )
 
 
 def test_removed_clip_after_hydration_is_quarantined_once_across_stages(
@@ -2748,6 +2892,7 @@ def _production_reference_integrity_outcome(
     cpu_workers: int | None = None,
     clip_uids: tuple[str, ...] = ("clip-1",),
     damage_after_hydration: str | None = None,
+    forbid_prepare: bool = False,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], Any, Any, Any]:
     """Run the real ``build_removal_epoch_runner`` with Reference Integrity on.
 
@@ -2826,6 +2971,17 @@ def _production_reference_integrity_outcome(
         )
     else:
         storage = _pending_storage(config, clip_uids=clip_uids)
+    if not shard_paths.identity_path.is_file():
+        # The mocked preparation may bypass normal identity publication.
+        # Supply that fixture file so the downstream handoff presence guard
+        # can be exercised before the injected reopen.
+        shard_paths.state_root.mkdir(parents=True, exist_ok=True)
+        shard_paths.identity_path.write_text("{}", encoding="utf-8")
+    if not (shard_paths.run_root / "run.json").is_file():
+        shard_paths.run_root.mkdir(parents=True, exist_ok=True)
+        (shard_paths.run_root / "run.json").write_bytes(
+            (storage.root / "run.json").read_bytes()
+        )
     handle = qwen if qwen is not None else _CompositionQwenHandle()
     boogu = _CompositionBooguHandle()
     sam = sam if sam is not None else _CompositionSamHandle(
@@ -2834,6 +2990,8 @@ def _production_reference_integrity_outcome(
     )
 
     def prepare(*args: Any, **kwargs: Any) -> Any:
+        if forbid_prepare:
+            raise AssertionError("checkpoint resume must not hydrate this shard")
         if damage_after_hydration is not None:
             storage.clip_path(damage_after_hydration).unlink()
         return PreparedRemovalShard(
@@ -2869,6 +3027,10 @@ def _production_reference_integrity_outcome(
 
     monkeypatch.setattr(
         "r2v_data_v2.v3.post_mask_epoch_removal.prepare_shard_storage", prepare
+    )
+    monkeypatch.setattr(
+        "r2v_data_v2.v3.post_mask_epoch_removal.initialize_shard",
+        lambda *_args, **_kwargs: storage,
     )
     monkeypatch.setattr(
         "r2v_data_v2.v3.post_mask_epoch_removal.build_removal_epoch_factories",
@@ -3582,7 +3744,7 @@ def test_completed_handoff_restart_reuses_receipts_and_sealed_export(
     )
     fresh_qwen = _CompositionQwenHandle()
     fresh_sam = _CompositionSamHandle(attribute_ready=True)
-    fresh_outcome, _events, fresh_handle, _storage, _ledger = (
+    fresh_outcome, events, fresh_handle, _storage, _ledger = (
         _production_reference_integrity_outcome(
             tmp_path,
             monkeypatch,
@@ -3590,6 +3752,7 @@ def test_completed_handoff_restart_reuses_receipts_and_sealed_export(
             qwen=fresh_qwen,
             sam=fresh_sam,
             storage=storage,
+            forbid_prepare=True,
         )
     )
 
@@ -3598,6 +3761,13 @@ def test_completed_handoff_restart_reuses_receipts_and_sealed_export(
     assert fresh_outcome["export_completed"] is True
     assert fresh_outcome["completed"] is True
     assert fresh_outcome["reason"] == "complete"
+    assert any(
+        event["event"] == "post_mask_resume_selected"
+        and event["stage"] == SUBJECT_ATTRIBUTES_COMPLETED
+        and event["source"] == "composition_handoff"
+        and event["hydrated_shards"] == 0
+        for event in events
+    )
     assert fresh_qwen.discovery_calls == 0
     assert fresh_qwen.attribute_reviews == 0
     assert fresh_sam.attribute_calls == 0
@@ -3624,9 +3794,11 @@ def test_tampered_accepted_attribute_png_fails_closed(
     tampered = attribute_png.read_bytes()
     assert tampered != original
 
+    # Normal restart trusts the completed handoff; explicit audit retains the
+    # ability to detect historical pixel tampering without repairing it.
     with pytest.raises(Exception, match="final attribute"):
-        _attribute_ready_outcome(
-            tmp_path, monkeypatch, storage=storage
+        verify_subject_attribute_receipts(
+            {SHARD: storage}, {SHARD: ("clip-1",)}
         )
     assert attribute_png.read_bytes() == tampered
     assert (paths.state_root / "completed.json").is_file()
@@ -4047,7 +4219,7 @@ def test_cpu_budget_survives_the_reference_integrity_restart(
     # branch and must still carry the resolved budget.
     assert seen["reference_integrity"] == 32
     # And the Recovery path did not fall back to the config default.
-    assert seen["removal"] == 32
+    assert "removal" not in seen
 
 
 def test_shared_qwen_identities_do_not_require_the_cross_judge(

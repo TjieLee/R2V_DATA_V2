@@ -1656,6 +1656,30 @@ def prepare_shard_storage(
     )
 
 
+def _legacy_pair_plan_scope(ledger: GroupLedger, shard: str) -> tuple[str, ...] | None:
+    """Read only the frozen plan's eligible scope for pre-handoff restarts."""
+    from r2v_data_v2.v3.post_mask_epoch_pair import PAIR_PRIMARY_PLAN_SCHEMA
+
+    path = Path(ledger.root) / "semantic" / "pair" / "primary" / f"{shard}.json"
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RemovalEpochError(f"invalid frozen Pair plan: {path}") from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema") != PAIR_PRIMARY_PLAN_SCHEMA
+        or payload.get("canonical_shard") != shard
+        or not isinstance(payload.get("eligible_clip_uids"), list)
+    ):
+        raise RemovalEpochError(f"invalid frozen Pair plan: {path}")
+    uids = payload["eligible_clip_uids"]
+    if any(not isinstance(uid, str) or not uid for uid in uids) or len(uids) != len(set(uids)):
+        raise RemovalEpochError(f"invalid frozen Pair eligible scope: {path}")
+    return tuple(uids)
+
+
 def build_removal_campaign(
     config: V3Config,
     *,
@@ -1979,19 +2003,154 @@ def build_removal_epoch_runner(
                     raise RemovalEpochError(
                         f"canonical shard {shard} is locked elsewhere"
                     )
+            # The composition marker is a small group-level restart barrier.
+            # Probe it before touching Stage2 JSONL or any clip-local artifact.
+            from r2v_data_v2.v3.post_mask_epoch_pipeline import (
+                PAIR_STARTED,
+                REFERENCE_EDIT_STARTED,
+                REFERENCE_INTEGRITY_STARTED,
+                latest_composition_handoff,
+                write_composition_handoff,
+            )
+
+            selected = latest_composition_handoff(ledger, ordered_shards)
+            resume_stage = selected[0] if selected is not None else None
+            if selected is not None:
+                for shard in ordered_shards:
+                    paths = paths_by_shard[shard]
+                    if (
+                        not paths.identity_path.is_file()
+                        or not (paths.run_root / "run.json").is_file()
+                    ):
+                        raise RemovalEpochError(
+                            f"composition handoff has no initialized run identity for {shard!r}"
+                        )
+            legacy_pair_plans: dict[str, tuple[str, ...]] = {}
+            legacy_checkpoint_scopes: dict[str, Any] = {}
+            reopened: dict[str, RunStorage] = {}
+            legacy_source = "fresh"
+            if selected is None:
+                # Read the eight small run identities/counts before considering
+                # any shard hydration. Completed legacy stages are barriers too.
+                reopened = {
+                    shard: initialize_shard(
+                        config, paths_by_shard[shard], git_commit=git_commit
+                    )
+                    for shard in ordered_shards
+                }
+                counts = {
+                    shard: reopened[shard].read_run().counts
+                    for shard in ordered_shards
+                }
+                if all(
+                    any(key.startswith("reference_edit.") for key in counts[shard])
+                    for shard in ordered_shards
+                ):
+                    resume_stage = REFERENCE_INTEGRITY_STARTED
+                    legacy_source = "stage_counts"
+                elif all(
+                    any(key.startswith("pair.") for key in counts[shard])
+                    for shard in ordered_shards
+                ):
+                    resume_stage = REFERENCE_EDIT_STARTED
+                    legacy_source = "stage_counts"
+                for shard in ordered_shards:
+                    try:
+                        scope = _legacy_pair_plan_scope(ledger, shard)
+                    except RemovalEpochError:
+                        if legacy_source != "stage_counts":
+                            raise
+                        # Completed downstream counts outrank an obsolete
+                        # upstream plan; only a separate small durable scope
+                        # may replace it. Never hydrate historical clips here.
+                        scope = None
+                    if scope is not None:
+                        legacy_pair_plans[shard] = scope
+                    elif legacy_source == "stage_counts":
+                        from r2v_data_v2.v3.post_mask_production import (
+                            _read_hydration_checkpoint,
+                        )
+
+                        checkpoint = _read_hydration_checkpoint(paths_by_shard[shard])
+                        if checkpoint is None:
+                            raise RemovalEpochError(
+                                f"completed legacy stage lacks durable eligible scope for {shard!r}"
+                            )
+                        legacy_checkpoint_scopes[shard] = checkpoint
+                if resume_stage is None and legacy_pair_plans:
+                    resume_stage = PAIR_STARTED
+                    legacy_source = "legacy_plan"
             # Only now, with every shard lock held, may anything be mutated.
+            hydrated_shards = 0
             for shard in ordered_shards:
-                production_kwargs = (
-                    {"formal_production": True} if formal_production else {}
-                )
-                prepared_shard = prepare_shard_storage(
-                    config,
-                    post_mask_root=post_mask_root,
-                    entity_mask_root=entity_mask_root,
-                    shard=shard,
-                    git_commit=git_commit,
-                    **production_kwargs,
-                )
+                paths = paths_by_shard[shard]
+                if (
+                    selected is not None
+                    or shard in legacy_pair_plans
+                    or shard in legacy_checkpoint_scopes
+                ):
+                    storage = reopened.get(shard)
+                    if storage is None:
+                        storage = initialize_shard(config, paths, git_commit=git_commit)
+                    scope = (
+                        selected[1][shard]
+                        if selected is not None
+                        else (
+                            legacy_pair_plans[shard]
+                            if shard in legacy_pair_plans
+                            else legacy_checkpoint_scopes[shard].clip_uids
+                        )
+                    )
+                    prepared_shard = PreparedRemovalShard(
+                        shard=shard,
+                        paths=paths,
+                        storage=storage,
+                        clip_uids=tuple(scope),
+                        ready=(
+                            legacy_checkpoint_scopes[shard].ready
+                            if shard in legacy_checkpoint_scopes
+                            else len(scope)
+                        ),
+                        excluded=(
+                            legacy_checkpoint_scopes[shard].excluded
+                            if shard in legacy_checkpoint_scopes else 0
+                        ),
+                        corrupt=(
+                            legacy_checkpoint_scopes[shard].corrupt
+                            if shard in legacy_checkpoint_scopes else 0
+                        ),
+                    )
+                elif resume_stage is not None:
+                    storage = reopened[shard]
+                    hydrated = hydrate_shard(
+                        storage,
+                        entity_mask_root=Path(entity_mask_root),
+                        shard_path=paths.shard_path,
+                        paths=paths,
+                    )
+                    hydrated_shards += 1
+                    prepared_shard = PreparedRemovalShard(
+                        shard=shard,
+                        paths=paths,
+                        storage=storage,
+                        clip_uids=tuple(hydrated.clip_uids),
+                        ready=hydrated.ready,
+                        excluded=hydrated.excluded,
+                        corrupt=hydrated.corrupt,
+                    )
+                else:
+                    production_kwargs = (
+                        {"formal_production": True} if formal_production else {}
+                    )
+                    prepared_shard = prepare_shard_storage(
+                        config,
+                        post_mask_root=post_mask_root,
+                        entity_mask_root=entity_mask_root,
+                        shard=shard,
+                        git_commit=git_commit,
+                        **production_kwargs,
+                    )
+                    hydrated_shards += 1
                 prepared[shard] = prepared_shard
                 hydration[shard] = {
                     "hydrated_ready": prepared_shard.ready,
@@ -2006,6 +2165,19 @@ def build_removal_epoch_runner(
                 storages=storages,
             )
             eligible = clip_quarantine.eligible
+            if selected is None and resume_stage is not None:
+                write_composition_handoff(
+                    ledger,
+                    resume_stage,
+                    eligible_clip_uids_by_shard=eligible,
+                )
+            emit(
+                "post_mask_resume_selected",
+                group_id=getattr(group, "group_id", ""),
+                stage=resume_stage or "removal",
+                source="composition_handoff" if selected is not None else legacy_source,
+                hydrated_shards=hydrated_shards,
+            )
             pair_enabled = bool(config.pair.enabled and config.reference_edit.enabled)
             if pair_enabled:
                 # 4b: one shared resource session spans Removal -> Pair, and the
@@ -2175,8 +2347,9 @@ def build_removal_epoch_runner(
                     ),
                     emit=emit,
                     clip_quarantine=clip_quarantine,
+                    resume_stage=resume_stage,
                 )
-                removal = created["removal"]
+                removal = created.get("removal")
                 # Every scheduler's unresolved work counts. The hard stage
                 # barrier guarantees only one of these can be non-zero, so
                 # there is no double counting.
@@ -2289,17 +2462,23 @@ def build_removal_epoch_runner(
         remove_completed = bool(
             outcome.get("remove_completed", outcome.get("completed", False))
         )
-        summary = {
-            shard: {
-                "ready_removed": counters["ready_removed"],
-                "rejected": counters["rejected"],
-                "retryable_pending": counters["retryable_pending"],
-                "failed": counters["failed"],
-                "candidates_generated": counters["candidates_generated"],
-                **hydration.get(shard, {}),
-            }
-            for shard, counters in sorted(removal.stats.items())
-        }
+        summary = {}
+        for shard in ordered_shards:
+            if removal is None:
+                counts = storages[shard].read_run().counts
+                counters = {
+                    key[len("remove."):]: value
+                    for key, value in counts.items() if key.startswith("remove.")
+                }
+            else:
+                counters = removal.stats[shard]
+            summary[shard] = {
+                key: counters.get(key, 0)
+                for key in (
+                    "ready_removed", "rejected", "retryable_pending",
+                    "failed", "candidates_generated",
+                )
+            } | hydration.get(shard, {})
         if remove_completed:
             emit(
                 "post_mask_removal_epoch_completed",

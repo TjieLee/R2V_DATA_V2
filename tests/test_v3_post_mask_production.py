@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import importlib
 import json
 from dataclasses import replace
@@ -138,6 +139,12 @@ def _hydrate(case, api, paths, storage):
     return api.hydrate_shard(
         storage, entity_mask_root=case[1], shard_path=case[2], paths=paths
     )
+
+
+def _legacy_hydrate(case, api, paths, storage):
+    """Exercise old-run fallback without the newly published shard checkpoint."""
+    paths.hydration_checkpoint_path.unlink()
+    return _hydrate(case, api, paths, storage)
 
 
 @pytest.mark.parametrize("background", ["none", "rejected", "pending_remove"])
@@ -600,12 +607,12 @@ def test_minimal_hydration_rejects_required_manifest_symlink(case, relative):
 def test_resume_restores_immutable_inputs_without_resetting_durable_state(
     case, asset, monkeypatch
 ):
-    """A *missing* key manifest still declines to the restoring path.
+    """Legacy hydration can still restore a missing key manifest.
 
     Individual frame and reference assets are deliberately no longer re-walked on
-    restart (see test_resume_does_not_rewalk_or_reject_damaged_assets), so the
-    repair path is entered through a missing manifest, which is the case that
-    still has to rebuild from the frozen input without touching durable state.
+    restart (see test_resume_does_not_rewalk_or_reject_damaged_assets). Without
+    the shard checkpoint, a missing manifest enters the legacy repair path,
+    which must not touch durable downstream state.
     """
     row = _ready(case, background="pending_remove")
     _write_rows(case, [row])
@@ -651,7 +658,7 @@ def test_resume_restores_immutable_inputs_without_resetting_durable_state(
             function,
             lambda *a, **kw: pytest.fail("Stage2 regeneration during mirror restore"),
         )
-    assert _hydrate(case, api, paths, storage).ready == 1
+    assert _legacy_hydrate(case, api, paths, storage).ready == 1
     assert target.read_bytes() == expected
     assert clip.read_bytes() == durable
     assert generated.read_bytes() == b"keep generated output"
@@ -688,8 +695,7 @@ def test_corrupt_small_manifest_is_left_to_its_consumer(case, asset):
 def test_interrupted_mirror_restore_never_leaves_partial_published_image(
     case, monkeypatch
 ):
-    # The repair path is entered through a *missing* key manifest, which is what
-    # still declines to the slow path now that assets are no longer re-walked.
+    # An old run without the shard checkpoint can still enter the repair path.
     _write_rows(case, [_ready(case)])
     api, paths, storage = _start(case)
     _hydrate(case, api, paths, storage)
@@ -705,11 +711,11 @@ def test_interrupted_mirror_restore_never_leaves_partial_published_image(
 
     with monkeypatch.context() as patch:
         patch.setattr(api.shutil, "copy2", interrupted)
-        assert _hydrate(case, api, paths, storage).corrupt == 1
+        assert _legacy_hydrate(case, api, paths, storage).corrupt == 1
     assert not target.exists()
     assert not list(target.parent.glob("*.tmp"))
     assert storage.clip_path("clip-0").read_bytes() == clip_bytes
-    assert _hydrate(case, api, paths, storage).ready == 1
+    assert _legacy_hydrate(case, api, paths, storage).ready == 1
     assert target.read_bytes() == expected
 
 
@@ -728,7 +734,7 @@ def test_resume_never_resets_mutable_or_unsafe_destination(case, damage):
         clip.write_text("broken")
     else:
         (clip.parent / ".post_mask_hydration.json").unlink()
-    assert _hydrate(case, api, paths, storage).corrupt == 1
+    assert _legacy_hydrate(case, api, paths, storage).corrupt == 1
     if damage == "missing_clip":
         assert not clip.exists()
     elif damage == "corrupt_clip":
@@ -799,7 +805,7 @@ def _count_reads_under(monkeypatch, root):
 
 
 def test_restart_hydration_never_reopens_stage2(case, monkeypatch):
-    """A restart answers "already hydrated" from the destination alone."""
+    """A checkpoint restart never reads the canonical Stage2 tree."""
     row = _ready(case)
     _write_rows(case, [row])
     api, paths, storage = _start(case)
@@ -825,8 +831,136 @@ def test_restart_hydration_never_reopens_stage2(case, monkeypatch):
         restarted.excluded,
         restarted.corrupt,
     ) == (fresh.clip_uids, fresh.ready, fresh.excluded, fresh.corrupt)
-    # The shard JSONL rows are the only frozen input a restart may still open.
-    assert reads["reads"] == 1, reads
+    assert reads["reads"] == 0, reads
+
+
+def test_hydration_checkpoint_returns_without_stage2_or_clip_reads(case, monkeypatch):
+    rows = [_ready(case, uid="clip-0", index=0), _ready(case, uid="clip-1", index=1)]
+    rows.append(
+        {
+            "source_index": 2,
+            "clip_uid": "clip-2",
+            "status": "coverage_rejected",
+            "reason": "coverage",
+            "artifact_root": "missing",
+        }
+    )
+    _write_rows(case, rows)
+    api, paths, storage = _start(case)
+    first = _hydrate(case, api, paths, storage)
+    assert first == api.HydrationResult(("clip-0", "clip-1"), 2, 1, 0)
+    marker = paths.state_root / "hydration_completed.json"
+    assert json.loads(marker.read_text()) == {
+        "schema": "post_mask_hydration_checkpoint/1",
+        "canonical_shard": str(case[2]),
+        "clip_uids": ["clip-0", "clip-1"],
+        "ready": 2,
+        "excluded": 1,
+        "corrupt": 0,
+    }
+
+    real_read_text = Path.read_text
+
+    def no_stage2_read(path, *args, **kwargs):
+        if path == case[2]:
+            pytest.fail("checkpoint restart reopened Stage2 JSONL")
+        return real_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", no_stage2_read)
+    restarted_storage = api.initialize_shard(case[0], paths, git_commit="later")
+    assert restarted_storage.read_run().git_commit == "first"
+    monkeypatch.setattr(
+        restarted_storage,
+        "read_clip",
+        lambda *args, **kwargs: pytest.fail("per-clip read"),
+    )
+    monkeypatch.setattr(
+        api,
+        "_resume_destination_is_complete",
+        lambda *args, **kwargs: pytest.fail("per-clip hydration probe"),
+    )
+    assert _hydrate(case, api, paths, restarted_storage) == first
+
+
+def test_legacy_hydration_without_checkpoint_runs_once_then_publishes(
+    case, monkeypatch
+):
+    _write_rows(case, [_ready(case)])
+    api, paths, storage = _start(case)
+    first = _hydrate(case, api, paths, storage)
+    paths.hydration_checkpoint_path.unlink()  # Simulate an old production run.
+
+    reads = _count_reads_under(monkeypatch, case[1])
+    assert _hydrate(case, api, paths, storage) == first
+    assert reads["reads"] == 1
+    assert paths.hydration_checkpoint_path.is_file()
+    assert _hydrate(case, api, paths, storage) == first
+    assert reads["reads"] == 1
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        PermissionError(errno.EACCES, "transient permission denial"),
+        OSError(errno.EIO, "transient input/output failure"),
+    ],
+)
+def test_hydration_transient_io_failure_does_not_publish_checkpoint(
+    case, monkeypatch, failure
+):
+    _write_rows(case, [_ready(case)])
+    api, paths, storage = _start(case)
+
+    def fail_input(*_args, **_kwargs):
+        raise failure
+
+    monkeypatch.setattr(api, "_validate_input", fail_input)
+    with pytest.raises(type(failure), match="transient"):
+        _hydrate(case, api, paths, storage)
+    assert not paths.hydration_checkpoint_path.exists()
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "invalid_json",
+        "wrong_shard",
+        "duplicate_uid",
+        "boolean_count",
+        "extra_key",
+        "duplicate_key",
+    ],
+)
+def test_malformed_hydration_checkpoint_fails_closed(case, monkeypatch, damage):
+    _write_rows(case, [_ready(case)])
+    api, paths, storage = _start(case)
+    _hydrate(case, api, paths, storage)
+    marker = paths.hydration_checkpoint_path
+    payload = json.loads(marker.read_text())
+    if damage == "invalid_json":
+        marker.write_text("{")
+    elif damage == "duplicate_key":
+        marker.write_text(
+            marker.read_text().replace('"ready": 1', '"ready": 1, "ready": 1')
+        )
+    else:
+        if damage == "wrong_shard":
+            payload["canonical_shard"] = "/elsewhere/shard.jsonl"
+        elif damage == "duplicate_uid":
+            payload["clip_uids"].append("clip-0")
+            payload["ready"] = 2
+        elif damage == "boolean_count":
+            payload["excluded"] = True
+        else:
+            payload["unexpected"] = "not allowed"
+        marker.write_text(json.dumps(payload))
+    monkeypatch.setattr(
+        api,
+        "_validate_input",
+        lambda *args, **kwargs: pytest.fail("malformed marker fell back to Stage2"),
+    )
+    with pytest.raises(ValueError, match="hydration checkpoint"):
+        _hydrate(case, api, paths, storage)
 
 
 def test_restart_eligible_clips_match_the_first_hydration(case, monkeypatch):
@@ -892,7 +1026,7 @@ def test_shard_hydration_never_enumerates_the_campaign(case, monkeypatch):
 
 @pytest.mark.parametrize("field", ["row", "canonical_shard", "artifact_root"])
 def test_resume_marker_mismatch_fails_closed(case, field):
-    """A marker that does not describe this row is never trusted."""
+    """Legacy hydration never trusts mismatched per-clip provenance."""
     row = _ready(case)
     _write_rows(case, [row])
     api, paths, storage = _start(case)
@@ -908,12 +1042,12 @@ def test_resume_marker_mismatch_fails_closed(case, field):
         payload["artifact_root"] = "/elsewhere/artifacts"
     marker.write_text(json.dumps(payload))
 
-    assert _hydrate(case, api, paths, storage).corrupt == 1
+    assert _legacy_hydrate(case, api, paths, storage).corrupt == 1
 
 
 @pytest.mark.parametrize("relative", ["frames/frames.json", "masks.rle.json"])
 def test_missing_key_manifest_falls_back_to_the_repairing_path(case, relative):
-    """A missing small manifest declines to the full path, which repairs it."""
+    """Legacy hydration repairs a missing small manifest."""
     _write_rows(case, [_ready(case)])
     api, paths, storage = _start(case)
     assert _hydrate(case, api, paths, storage).ready == 1
@@ -921,18 +1055,18 @@ def test_missing_key_manifest_falls_back_to_the_repairing_path(case, relative):
     expected = target.read_bytes()
     target.unlink()
 
-    assert _hydrate(case, api, paths, storage).ready == 1
+    assert _legacy_hydrate(case, api, paths, storage).ready == 1
     assert target.read_bytes() == expected
 
 
 def test_missing_durable_clip_still_fails_closed(case):
-    """The durable clip is never rebuilt from the source: it is authority."""
+    """Legacy hydration never rebuilds a missing durable clip from Stage2."""
     _write_rows(case, [_ready(case)])
     api, paths, storage = _start(case)
     assert _hydrate(case, api, paths, storage).ready == 1
     storage.clip_path("clip-0").unlink()
 
-    assert _hydrate(case, api, paths, storage).corrupt == 1
+    assert _legacy_hydrate(case, api, paths, storage).corrupt == 1
     assert not storage.clip_path("clip-0").exists()
 
 
@@ -1005,7 +1139,7 @@ def test_initialize_binds_the_shard_identity_exactly_once(case, monkeypatch):
 def test_restart_hydration_proves_completeness_without_touching_assets(
     case, monkeypatch
 ):
-    """Existence is the contract: no manifest is parsed and no asset is stat-ed."""
+    """The shard checkpoint skips every per-clip manifest and asset probe."""
     row = _ready(case)
     _write_rows(case, [row])
     api, paths, storage = _start(case)
@@ -1040,14 +1174,9 @@ def test_restart_hydration_proves_completeness_without_touching_assets(
         1,
         0,
     )
-    # Stage2: the shard JSONL rows only, never an artifact.
-    assert stage2["reads"] == 1, stage2
-    # Destination: no manifest content, and no per-frame metadata probe. The only
-    # probes allowed are the symlink+existence pair on the manifest itself.
+    assert stage2["reads"] == 0, stage2
     assert counts["reads"] == [], counts
-    manifest = str(frames_dir / "frames.json")
-    assert set(counts["probes"]) == {manifest}, counts
-    assert len(counts["probes"]) == 2, counts
+    assert counts["probes"] == [], counts
 
 
 def test_inventory_rewrite_is_skipped_when_unchanged(case, monkeypatch):
@@ -1079,6 +1208,16 @@ def test_inventory_rewrite_is_skipped_when_unchanged(case, monkeypatch):
     paths.exclusions_path.write_text("stale\n")
     third = _hydrate(case, api, paths, storage)
     assert third.corrupt == 1
-    assert replaced == [paths.exclusions_path], replaced
+    assert replaced == [], replaced
+    assert paths.exclusions_path.read_bytes() == b"stale\n"
+
+    # An old run without the shard checkpoint still reconciles inventories.
+    paths.hydration_checkpoint_path.unlink()
+    fourth = _hydrate(case, api, paths, storage)
+    assert fourth.corrupt == 1
+    assert replaced == [
+        paths.exclusions_path,
+        paths.hydration_checkpoint_path,
+    ], replaced
     assert paths.exclusions_path.read_bytes() == b""
     assert paths.input_failures_path.read_bytes() == before[paths.input_failures_path]

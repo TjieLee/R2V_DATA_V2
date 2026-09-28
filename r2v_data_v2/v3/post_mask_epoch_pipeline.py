@@ -80,11 +80,15 @@ SUBJECT_ATTRIBUTES_INCOMPLETE_REASON = (
 #: Create-once composition handoff markers. They are the restart barrier
 #: authority only: they never take part in any model job identity.
 COMPOSITION_HANDOFF_SCHEMA = "post_mask_resource_epoch_handoff/1"
+PAIR_STARTED = "pair_started"
+REFERENCE_EDIT_STARTED = "reference_edit_started"
 REFERENCE_INTEGRITY_STARTED = "reference_integrity_started"
 INSTRUCT_STARTED = "instruct_started"
 SUBJECT_ATTRIBUTES_STARTED = "subject_attributes_started"
 SUBJECT_ATTRIBUTES_COMPLETED = "subject_attributes_completed"
 COMPOSITION_HANDOFF_STAGES = (
+    PAIR_STARTED,
+    REFERENCE_EDIT_STARTED,
     REFERENCE_INTEGRITY_STARTED,
     INSTRUCT_STARTED,
     SUBJECT_ATTRIBUTES_STARTED,
@@ -276,91 +280,6 @@ def _bind_clip_quarantine(runner: Any, quarantine: ClipQuarantine | None) -> Non
         runner.clip_quarantine = quarantine
 
 
-def _reference_edit_completion_evidence(
-    ledger: GroupLedger, storages: Mapping[str, Any]
-) -> bool:
-    """True when the Reference Edit stage durably completed for these storages.
-
-    This is a RESTART OPTIMIZATION, never a semantic authority: it only decides
-    whether the Pair CPU replay may be skipped, and the Reference Edit stage
-    itself still runs its full plan/seed_jobs/reconcile verification right
-    after. Malformed or wrongly-shaped durable files therefore report False
-    instead of steering the session into the fast path.
-
-    Evidence is a well-formed frozen Reference Edit plan plus a well-formed
-    terminal clip outcome marker for every fresh clip it planned. The
-    composition barrier guarantees Pair completed before any of that could be
-    written, so on a full-session restart the Pair replay -- which compares
-    live published state against the Pair-only reconstruction and cannot know
-    that Reference Edit legitimately rewrote references afterwards -- must not
-    run again.
-    """
-    from r2v_data_v2.v3.post_mask_epoch_reference_edit import (
-        CLIP_FRESH_TARGET,
-        REFERENCE_EDIT_CLIP_OUTCOME_SCHEMA,
-        REFERENCE_EDIT_PLAN_SCHEMA,
-    )
-
-    semantic_root = Path(ledger.root) / "semantic" / "reference_edit"
-    plan_root = semantic_root / "primary"
-    outcomes_root = semantic_root / "outcomes"
-    if not plan_root.is_dir() or not outcomes_root.is_dir():
-        return False
-    for shard in storages:
-        plan_path = plan_root / f"{shard}.json"
-        if not plan_path.is_file():
-            return False
-        try:
-            plan = json.loads(plan_path.read_text(encoding="utf-8"))
-        except (ValueError, OSError):
-            return False
-        if not isinstance(plan, dict):
-            return False
-        if plan.get("schema") != REFERENCE_EDIT_PLAN_SCHEMA:
-            return False
-        if plan.get("canonical_shard") != shard:
-            return False
-        clips = plan.get("clips")
-        if not isinstance(clips, dict):
-            return False
-        for clip_uid, entry in clips.items():
-            if not isinstance(entry, dict):
-                return False
-            if entry.get("classification") != CLIP_FRESH_TARGET:
-                continue
-            marker_path = outcomes_root / shard / f"{clip_uid}.json"
-            if not marker_path.is_file():
-                return False
-            try:
-                marker = json.loads(marker_path.read_text(encoding="utf-8"))
-            except (ValueError, OSError):
-                return False
-            if not isinstance(marker, dict):
-                return False
-            if marker.get("schema") != REFERENCE_EDIT_CLIP_OUTCOME_SCHEMA:
-                return False
-            if marker.get("clip_uid") != clip_uid:
-                return False
-            if marker.get("terminal") not in {"ready", "failed"}:
-                return False
-    return True
-
-
-def _pair_stats_from_stage_counts(storages: Mapping[str, Any]) -> dict[str, Any]:
-    """Recover the durable Pair stage counts written by a previous session."""
-    stats: dict[str, Any] = {}
-    for shard, storage in storages.items():
-        counts = storage.read_run().counts
-        recovered = {
-            key[len("pair.") :]: value
-            for key, value in counts.items()
-            if key.startswith("pair.")
-        }
-        if recovered:
-            stats[shard] = recovered
-    return stats
-
-
 def _reconcile_and_publish_reference_edit_stats(
     reference_edit: Any,
 ) -> tuple[bool, dict[str, Any], str | None]:
@@ -418,6 +337,52 @@ def default_reference_integrity_runner_factory(
 
 def _handoff_path(ledger: GroupLedger, stage: str) -> Path:
     return Path(ledger.root) / "composition" / f"{stage}.json"
+
+
+def latest_composition_handoff(
+    ledger: GroupLedger, canonical_shards: Sequence[str]
+) -> tuple[str, dict[str, tuple[str, ...]]] | None:
+    """Select the furthest durable barrier without reading clip artifacts.
+
+    The caller has already validated the campaign and owns the shard locks.
+    This probe reads at most one small marker; the selected marker's scope is
+    checked again against the restored quarantine view in the stage runner.
+    """
+    shards = sorted(canonical_shards)
+    for stage in reversed(COMPOSITION_HANDOFF_STAGES):
+        path = _handoff_path(ledger, stage)
+        if not path.exists():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise StageHandoffError(f"invalid composition handoff marker: {path}") from exc
+        if not isinstance(payload, dict) or payload.get("schema") != COMPOSITION_HANDOFF_SCHEMA or payload.get("stage") != stage or payload.get("canonical_shards") != shards:
+            raise StageHandoffError(f"composition handoff marker drifted: {path}")
+        raw_eligible = payload.get("eligible_clip_uids_by_shard")
+        if not isinstance(raw_eligible, dict) or sorted(raw_eligible) != shards:
+            raise StageHandoffError(f"composition handoff marker drifted: {path}")
+        eligible: dict[str, tuple[str, ...]] = {}
+        for shard in shards:
+            uids = raw_eligible[shard]
+            if not isinstance(uids, list) or any(not isinstance(uid, str) or not uid for uid in uids) or len(uids) != len(set(uids)):
+                raise StageHandoffError(f"invalid composition eligible scope: {path}")
+            eligible[shard] = tuple(uids)
+        expected = _expected_handoff(stage, eligible)
+        if stage == SUBJECT_ATTRIBUTES_COMPLETED and "quarantined_clip_uids_by_shard" in payload:
+            exclusions = payload["quarantined_clip_uids_by_shard"]
+            if not isinstance(exclusions, dict) or not set(exclusions).issubset(shards) or any(
+                not isinstance(uids, list)
+                or any(not isinstance(uid, str) or uid not in eligible[shard] for uid in uids)
+                or len(uids) != len(set(uids))
+                for shard, uids in exclusions.items()
+            ):
+                raise StageHandoffError(f"invalid composition quarantine scope: {path}")
+            expected["quarantined_clip_uids_by_shard"] = exclusions
+        if payload != expected:
+            raise StageHandoffError(f"composition handoff marker drifted: {path}")
+        return stage, eligible
+    return None
 
 
 def _expected_handoff(
@@ -629,21 +594,62 @@ def publish_subject_attribute_receipts(
     storages: Mapping[str, Any],
     eligible: Mapping[str, Sequence[str]],
     clip_quarantine: ClipQuarantine | None = None,
+    *,
+    trust_completed: set[tuple[str, str]] | None = None,
 ) -> None:
     """Publish the final attribute receipts of every eligible clip, or fail.
 
-    Phase A inspects every expected receipt with zero writes: an exact existing
-    receipt passes, a missing one is queued and a malformed or drifted one fails
-    immediately. Phase B then writes only the queued ones, so a drift on one clip
-    can never leave another clip with a published receipt.
+    A cold completed clip trusts its structurally valid final receipt. For all
+    other clips, phase A derives every expected receipt with zero writes; phase
+    B writes only missing receipts after the group-wide preflight succeeds.
     """
     from r2v_data_v2.v3.post_mask_runtime import (
         _attribute_receipt_state,
         _write_attribute_receipt,
     )
 
+    def recorded_digest(value: Any) -> bool:
+        return (
+            isinstance(value, str)
+            and len(value) == 64
+            and all(character in "0123456789abcdef" for character in value)
+        )
+
+    # A cold SAT terminal was already reconciled before the previous process
+    # stopped. Its final receipt is the durable barrier; only clips missing that
+    # barrier need artifact derivation on this restart.
+    pending_eligible: dict[str, list[str]] = {}
+    for shard in sorted(storages):
+        for uid in eligible.get(shard, ()):
+            if clip_quarantine is not None and clip_quarantine.contains(shard, uid):
+                continue
+            key = (str(shard), str(uid))
+            if trust_completed is not None and key in trust_completed:
+                path = storages[shard].clip_dir(uid) / ".post_mask_attributes.json"
+                if path.is_file():
+                    try:
+                        payload = json.loads(path.read_text(encoding="utf-8"))
+                    except (OSError, ValueError) as exc:
+                        raise ValueError(
+                            f"final attribute receipt is unreadable: {path}"
+                        ) from exc
+                    if (
+                        not isinstance(payload, dict)
+                        or set(payload) != {"clip", "artifacts"}
+                        or not recorded_digest(payload["clip"])
+                        or not isinstance(payload["artifacts"], dict)
+                        or any(
+                            not isinstance(name, str)
+                            or not recorded_digest(value)
+                            for name, value in payload["artifacts"].items()
+                        )
+                    ):
+                        raise ValueError(f"final attribute receipt is malformed: {path}")
+                    continue
+            pending_eligible.setdefault(str(shard), []).append(str(uid))
+
     expected = _expected_subject_attribute_receipts(
-        storages, eligible, clip_quarantine
+        storages, pending_eligible, clip_quarantine
     )
     pending: list[tuple[str, str]] = []
     for (shard, uid), payload in expected.items():
@@ -727,7 +733,12 @@ def _reconcile_and_publish_subject_attribute_stats(
     except SubjectAttributeEpochError as exc:
         return False, {}, str(exc)
     try:
-        publish_subject_attribute_receipts(storages, eligible, clip_quarantine)
+        publish_subject_attribute_receipts(
+            storages,
+            eligible,
+            clip_quarantine,
+            trust_completed=getattr(subject_attributes, "_cold_completed_clips", set()),
+        )
     except (OSError, ValueError) as exc:
         return False, {}, str(exc)
     for shard, payload in reconciled.items():
@@ -757,6 +768,11 @@ def run_subject_attributes_stage(
     written last, after every shard reconciled and every final attribute receipt
     was published, so it is the barrier the export is allowed to trust.
     """
+    resuming = read_composition_handoff(
+        ledger,
+        SUBJECT_ATTRIBUTES_STARTED,
+        eligible_clip_uids_by_shard=eligible,
+    ) is not None
     write_composition_handoff(
         ledger,
         SUBJECT_ATTRIBUTES_STARTED,
@@ -771,6 +787,8 @@ def run_subject_attributes_stage(
         cpu_workers=cpu_workers,
     )
     _bind_clip_quarantine(subject_attributes, clip_quarantine)
+    if resuming and hasattr(subject_attributes, "checkpoint_first_resume"):
+        subject_attributes.checkpoint_first_resume = True
     with _stage_timing(emit, "subject_attributes", "seed"):
         seeded = subject_attributes.seed_jobs()
     _emit(
@@ -1072,6 +1090,7 @@ def run_removal_pair_epochs(
     emit: Any = None,
     cpu_workers: int | None = None,
     clip_quarantine: ClipQuarantine | None = None,
+    resume_stage: str | None = None,
 ) -> dict[str, Any]:
     """Drain Removal, then Pair primary, then the frozen Pair cross pass.
 
@@ -1097,24 +1116,47 @@ def run_removal_pair_epochs(
         "cpu_workers":cpu_workers,
     }
 
-    removal = removal_runner_factory(**shared)
-    _bind_clip_quarantine(removal, clip_quarantine)
-    try:
-        with _stage_timing(emit, "removal", "seed"):
-            removal_seed = removal.seed_jobs()
-        _emit_seed_cpu_diagnostics(emit, "removal", removal)
-        _emit(emit,"post_mask_epoch_removal_seeded",seeded_jobs=len(removal_seed))
-        removal_outcome = _run_staged_scheduler(
-            emit,
-            removal_scheduler_factory(removal),
-            removal_seed,
-            stage="removal",
-            phase="scheduler",
+    selected = latest_composition_handoff(ledger, tuple(eligible))
+    if selected is not None:
+        selected_stage, selected_eligible = selected
+        if selected_eligible != eligible or (
+            resume_stage is not None and resume_stage != selected_stage
+        ):
+            raise StageHandoffError("composition handoff eligible scope drifted")
+        resume_stage = selected_stage
+        read_composition_handoff(
+            ledger,
+            resume_stage,
+            eligible_clip_uids_by_shard=eligible,
+            clip_quarantine=clip_quarantine,
         )
-    finally:
-        removal.close()
-    remove_completed = bool(removal_outcome.get("completed"))
-    _emit(emit,"post_mask_epoch_removal_finished",remove_completed=remove_completed)
+    elif resume_stage is not None:
+        raise StageHandoffError("selected composition handoff is missing")
+
+    if resume_stage is None:
+        removal = removal_runner_factory(**shared)
+        _bind_clip_quarantine(removal, clip_quarantine)
+        try:
+            with _stage_timing(emit, "removal", "seed"):
+                removal_seed = removal.seed_jobs()
+            _emit_seed_cpu_diagnostics(emit, "removal", removal)
+            _emit(emit,"post_mask_epoch_removal_seeded",seeded_jobs=len(removal_seed))
+            removal_outcome = _run_staged_scheduler(
+                emit,
+                removal_scheduler_factory(removal),
+                removal_seed,
+                stage="removal",
+                phase="scheduler",
+            )
+        finally:
+            removal.close()
+        remove_completed = bool(removal_outcome.get("completed"))
+        _emit(emit,"post_mask_epoch_removal_finished",remove_completed=remove_completed)
+    else:
+        # A durable downstream barrier makes upstream semantic replay unsafe:
+        # later stages may already have rewritten the same clip publication.
+        removal_outcome = {"completed": True, "unresolved_job_ids": ()}
+        remove_completed = True
 
     result: dict[str, Any] = {
         "remove_completed":remove_completed,
@@ -1160,34 +1202,11 @@ def run_removal_pair_epochs(
     # counts. The most downstream marker wins, and the upstream stages are then
     # never replayed -- their live-state verification would otherwise mistake a
     # publication that a downstream stage legitimately rewrote for corruption.
-    subject_attributes_completed = read_composition_handoff(
-        ledger,
-        SUBJECT_ATTRIBUTES_COMPLETED,
-        eligible_clip_uids_by_shard=eligible,
-        clip_quarantine=clip_quarantine,
-    )
-    subject_attributes_started = read_composition_handoff(
-        ledger, SUBJECT_ATTRIBUTES_STARTED, eligible_clip_uids_by_shard=eligible
-    )
-    instruct_started = read_composition_handoff(
-        ledger, INSTRUCT_STARTED, eligible_clip_uids_by_shard=eligible
-    )
-    reference_integrity_started = read_composition_handoff(
-        ledger, REFERENCE_INTEGRITY_STARTED, eligible_clip_uids_by_shard=eligible
-    )
-    if subject_attributes_completed is not None:
+    if resume_stage == SUBJECT_ATTRIBUTES_COMPLETED:
         # The most downstream marker there is. Subject Attributes semantic is
         # terminal, so the runner may not be constructed at all: re-deriving a
-        # processed owner would rerun the legacy materialisers and silently
-        # repair a tampered final PNG. Only the receipts are verified.
-        if (
-            subject_attributes_runner_factory is None
-            or subject_attributes_scheduler_factory is None
-        ):
-            raise StageHandoffError(
-                "composition handoff claims Subject Attributes completed but no "
-                "Subject Attributes runner is wired"
-            )
+        # processed owner would rerun the legacy materialisers. Export owns
+        # its own publication check; no model runner is needed here.
         result.update(
             {
                 "pair_primary_completed": True,
@@ -1223,14 +1242,13 @@ def run_removal_pair_epochs(
                 "reason": EXPORT_PENDING_REASON,
             }
         )
-        verify_subject_attribute_receipts(storages, eligible, clip_quarantine)
         _emit(
             emit,
-            "post_mask_epoch_subject_attributes_verified",
+            "post_mask_epoch_subject_attributes_checkpoint_reused",
             completed=True,
         )
         return finish(result)
-    if subject_attributes_started is not None:
+    if resume_stage == SUBJECT_ATTRIBUTES_STARTED:
         if (
             subject_attributes_runner_factory is None
             or subject_attributes_scheduler_factory is None
@@ -1278,7 +1296,7 @@ def run_removal_pair_epochs(
             cpu_workers=cpu_workers,
             clip_quarantine=clip_quarantine,
         ))
-    if instruct_started is not None:
+    if resume_stage == INSTRUCT_STARTED:
         result.update(
             {
                 "pair_primary_completed": True,
@@ -1315,7 +1333,7 @@ def run_removal_pair_epochs(
             cpu_workers=cpu_workers,
             clip_quarantine=clip_quarantine,
         ))
-    if reference_integrity_started is not None:
+    if resume_stage == REFERENCE_INTEGRITY_STARTED:
         if not reference_integrity_wired:
             raise StageHandoffError(
                 "composition handoff claims Reference Integrity completed but "
@@ -1352,11 +1370,11 @@ def run_removal_pair_epochs(
             clip_quarantine=clip_quarantine,
         ))
 
-    if _reference_edit_completion_evidence(ledger, storages):
+    if resume_stage == REFERENCE_EDIT_STARTED:
         # Post-Reference-Edit restart: the barrier already proved Pair
         # completed, and the Pair replay would compare live state that
         # Reference Edit legitimately rewrote. Reuse the durable stage counts.
-        pair_stats = _pair_stats_from_stage_counts(storages)
+        pair_stats = _stage_stats_from_stage_counts(storages, "pair")
         result.update(
             {
                 "pair_primary_completed": True,
@@ -1435,6 +1453,9 @@ def run_removal_pair_epochs(
             clip_quarantine=clip_quarantine,
         ))
 
+    write_composition_handoff(
+        ledger, PAIR_STARTED, eligible_clip_uids_by_shard=eligible
+    )
     pair = pair_runner_factory(**shared)
     _bind_clip_quarantine(pair, clip_quarantine)
     if pair.legacy_cross_in_progress():
@@ -1559,6 +1580,9 @@ def run_removal_pair_epochs(
         result["reference_edit_unresolved"] = ()
         result["reference_edit_stats"] = {}
         return finish(result)
+    write_composition_handoff(
+        ledger, REFERENCE_EDIT_STARTED, eligible_clip_uids_by_shard=eligible
+    )
     reference_edit = reference_edit_runner_factory(**shared)
     _bind_clip_quarantine(reference_edit, clip_quarantine)
     with _stage_timing(emit, "reference_edit", "seed"):
