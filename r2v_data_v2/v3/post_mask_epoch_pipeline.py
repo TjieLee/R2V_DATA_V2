@@ -906,6 +906,9 @@ def run_subject_attributes_stage(
                 "fresh_owner_verify_skips",
                 "fresh_owner_artifact_hits",
                 "owner_replay_calls",
+                "completion_chain_cache_hits",
+                "completion_chain_rebuilds",
+                "completion_chain_unchanged_reuses",
             }
         },
         **{

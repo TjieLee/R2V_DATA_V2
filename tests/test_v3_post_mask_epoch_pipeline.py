@@ -3738,6 +3738,9 @@ def test_production_run_emits_the_subject_attributes_cpu_diagnostics(
         "fresh_owner_artifact_hits",
         "owner_replay_calls",
         "owner_replay_wall_seconds",
+        "completion_chain_cache_hits",
+        "completion_chain_rebuilds",
+        "completion_chain_unchanged_reuses",
     } <= set(execution)
     assert execution["owner_replay_wall_seconds"] >= 0.0
     timings = {

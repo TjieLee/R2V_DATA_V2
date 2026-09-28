@@ -3551,6 +3551,173 @@ def _two_completion_owner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     return config, storage, runner, qwen, sam
 
 
+def _three_completion_graph(
+    runner: Any, monkeypatch: pytest.MonkeyPatch
+) -> tuple[dict[str, Any], dict[str, Any], list[tuple[str, int]]]:
+    """A small owner graph that exposes which completion chains were derived."""
+    states = [
+        SimpleNamespace(
+            attribute_id=attribute_id,
+            attribute_plan={"attribute_id": attribute_id},
+            options=(SimpleNamespace(),),
+        )
+        for attribute_id in ("a1", "a2", "a3")
+    ]
+    context = {
+        "states": states,
+        "discovery": None,
+        "discovery_job_id": "unused",
+    }
+    owner_plan = {"owner_entity_id": OWNER}
+    calls: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        runner,
+        "_owner_routes",
+        lambda _: {state.attribute_id: "completion_required" for state in states},
+    )
+
+    def derive(
+        shard: str,
+        storage: Any,
+        clip_uid: str,
+        plan: Mapping[str, Any],
+        attribute_plan: Mapping[str, Any],
+        candidate: Any,
+        rank: int,
+    ) -> Any:
+        del shard, storage, clip_uid, plan, candidate
+        calls.append((str(attribute_plan["attribute_id"]), rank))
+        return SimpleNamespace(accepted=True, next_job=None, terminal=False)
+
+    monkeypatch.setattr(runner, "_completion_chain", derive)
+    return owner_plan, context, calls
+
+
+def test_completion_graph_rebuilds_only_dirty_rank0_chains(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One committed stage of a1 must not rebuild the unchanged a2/a3 chains."""
+    _, storage, runner, _, _ = _two_completion_owner(tmp_path, monkeypatch)
+    owner_plan, context, calls = _three_completion_graph(runner, monkeypatch)
+
+    def graph(*, dirty: set[tuple[str, int]] | None = None) -> None:
+        runner._owner_graph(
+            SHARD, storage, CLIP_UID, owner_plan, context,
+            use_completion_cache=True,
+            dirty_completion_keys=dirty,
+        )
+
+    graph()
+    assert calls == [("a1", 0), ("a2", 0), ("a3", 0)]
+    for dirty in ({("a1", 0)}, {("a1", 0)}, {("a2", 0)}, {("a1", 0), ("a3", 0)}):
+        before = len(calls)
+        graph(dirty=dirty)
+        assert calls[before:] == [
+            (attribute_id, 0) for attribute_id in ("a1", "a2", "a3")
+            if (attribute_id, 0) in dirty
+        ]
+    assert runner.replay_counters["completion_chain_unchanged_reuses"] == 7
+
+
+def test_completion_graph_cold_calls_and_batch_clear_rebuild_all_chains(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cold authority call and the next batch cannot trust a hot chain."""
+    _, storage, runner, _, _ = _two_completion_owner(tmp_path, monkeypatch)
+    owner_plan, context, calls = _three_completion_graph(runner, monkeypatch)
+    runner._owner_graph(
+        SHARD, storage, CLIP_UID, owner_plan, context,
+        use_completion_cache=True,
+    )
+    assert len(calls) == 3
+    runner._owner_graph(SHARD, storage, CLIP_UID, owner_plan, context)
+    assert len(calls) == 6, "the default cold graph must replay all three chains"
+    runner.clear_execution_hot_caches()
+    runner._owner_graph(
+        SHARD, storage, CLIP_UID, owner_plan, context,
+        use_completion_cache=True,
+    )
+    assert len(calls) == 9, "a drained batch discards invocation-only chains"
+
+
+def test_rank1_review_keeps_rank0_chain_and_rank1_receipt_dirties_only_rank1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Candidate-2 routing keeps the settled first chain unchanged."""
+    _, storage, runner, _, _ = _two_completion_owner(tmp_path, monkeypatch)
+    state = SimpleNamespace(
+        attribute_id="a1",
+        attribute_plan={"attribute_id": "a1"},
+        options=(SimpleNamespace(), SimpleNamespace()),
+    )
+    context = {"states": [state], "discovery": None, "discovery_job_id": "unused"}
+    owner_plan = {"owner_entity_id": OWNER}
+    calls: list[tuple[str, int]] = []
+    review_job = object()
+    rank1_payload: dict[str, Any] | None = None
+    monkeypatch.setattr(runner, "_owner_routes", lambda _: {"a1": "completion_required"})
+    monkeypatch.setattr(
+        runner, "_rank0_route", lambda *args, **kwargs: "completion_required"
+    )
+    monkeypatch.setattr(runner, "_expected_raw_review_job", lambda *args, **kwargs: review_job)
+    monkeypatch.setattr(
+        runner, "_committed_payload_or_none",
+        lambda job: rank1_payload if job is review_job else None,
+    )
+
+    def derive(*args: Any) -> Any:
+        rank = int(args[-1])
+        calls.append(("a1", rank))
+        return SimpleNamespace(accepted=(rank == 1), next_job=None, terminal=False)
+
+    monkeypatch.setattr(runner, "_completion_chain", derive)
+
+    def graph(*, dirty: set[tuple[str, int]] | None = None) -> None:
+        runner._owner_graph(
+            SHARD, storage, CLIP_UID, owner_plan, context,
+            use_completion_cache=True, dirty_completion_keys=dirty,
+        )
+
+    graph()
+    assert calls == [("a1", 0)]
+    rank1_payload = {
+        "status": "review",
+        "review_batch": SubjectAttributeReviewBatch(
+            owner_entity_id=OWNER,
+            reviews=[
+                _raw_review(
+                    "a1", structure_complete=False, completion_recommended=True
+                )
+            ],
+        ).model_dump(mode="json"),
+    }
+    graph()
+    assert calls == [("a1", 0), ("a1", 1)], "rank1 review reuses rank0"
+    graph(dirty={("a1", 1)})
+    assert calls == [("a1", 0), ("a1", 1), ("a1", 1)]
+
+
+def test_early_owner_advancement_exception_discards_completion_chains(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Even a failure before graph construction leaves no reusable owner chain."""
+    _, storage, runner, _, _ = _two_completion_owner(tmp_path, monkeypatch)
+    owner_plan, context, calls = _three_completion_graph(runner, monkeypatch)
+    runner._owner_graph(
+        SHARD, storage, CLIP_UID, owner_plan, context, use_completion_cache=True
+    )
+    assert len(calls) == 3
+    monkeypatch.setattr(
+        runner, "_owner_prefix", lambda *args: (_ for _ in ()).throw(RuntimeError("prefix failed"))
+    )
+    with pytest.raises(RuntimeError, match="prefix failed"):
+        runner._advance_attributes(SHARD, storage, CLIP_UID, OWNER)
+    runner._owner_graph(
+        SHARD, storage, CLIP_UID, owner_plan, context, use_completion_cache=True
+    )
+    assert calls[3:] == [("a1", 0), ("a2", 0), ("a3", 0)]
+
+
 def _three_rank0_owner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Three independent probes; only a1 needs the owner-batched review."""
     config, storage = _storage_variant(tmp_path, monkeypatch, "run-three-rank0")
@@ -3912,6 +4079,107 @@ def test_finalize_wave_advances_same_owner_once_after_individual_validation(
     assert set(results) == {job.job_id() for job, _ in committed}
     assert list(results.values()) == [[], []]
     assert advances == [OWNER]
+
+
+def _committed_two_completion_results(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Any, list[tuple[Any, Any]]]:
+    """Drive real receipts for both independent completion attributes."""
+    monkeypatch.setattr(time, "perf_counter", lambda: 1.0)
+    _, _, runner, qwen, sam = _two_completion_owner(tmp_path, monkeypatch)
+    committed: list[tuple[Any, Any]] = []
+
+    def recording_finalize(job: Any, result: Any) -> Sequence[Any]:
+        if job.job_type in {
+            SUBJECT_ATTRIBUTE_COMPLETION_GENERATE_JOB,
+            SUBJECT_ATTRIBUTE_COMPLETION_SAM_JOB,
+            SUBJECT_ATTRIBUTE_COMPLETION_REVIEW_JOB,
+        }:
+            committed.append((job, result))
+        return runner.finalize(job, result)
+
+    outcome = _scheduler(
+        runner,
+        _SerialQwenExecutor(runner, qwen),
+        recording_finalize,
+        _SerialQwenExecutor(runner, sam),
+        _SerialQwenExecutor(runner, _BooguBackend(_generated_png())),
+    ).run(runner.seed_jobs())
+    assert outcome["completed"] is True
+    return runner, committed
+
+
+def test_completion_finalizers_dirty_only_their_committed_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Generate, SAM and review receipts each identify their own chain key."""
+    runner, committed = _committed_two_completion_results(tmp_path, monkeypatch)
+    observed: list[set[tuple[str, int]] | None] = []
+
+    def advance(*args: Any, **kwargs: Any) -> list[Any]:
+        observed.append(kwargs.get("dirty_completion_keys"))
+        return []
+
+    monkeypatch.setattr(runner, "_advance_attributes", advance)
+    for job_type in (
+        SUBJECT_ATTRIBUTE_COMPLETION_GENERATE_JOB,
+        SUBJECT_ATTRIBUTE_COMPLETION_SAM_JOB,
+        SUBJECT_ATTRIBUTE_COMPLETION_REVIEW_JOB,
+    ):
+        job, result = next(pair for pair in committed if pair[0].job_type == job_type)
+        runner.finalize(job, result)
+        assert observed[-1] == {
+            (str(dict(job.target)["attribute_id"]), int(dict(job.target)["candidate_rank"]))
+        }
+
+
+def test_completion_wave_unions_dirty_keys_before_owner_advancement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A committed sibling wave advances once with both chain keys dirty."""
+    runner, committed = _committed_two_completion_results(tmp_path, monkeypatch)
+    generated = [
+        pair for pair in committed
+        if pair[0].job_type == SUBJECT_ATTRIBUTE_COMPLETION_GENERATE_JOB
+    ]
+    assert {dict(job.target)["attribute_id"] for job, _ in generated} == {"a1", "a2"}
+    observed: list[set[tuple[str, int]] | None] = []
+
+    def advance(*args: Any, **kwargs: Any) -> list[Any]:
+        observed.append(kwargs.get("dirty_completion_keys"))
+        return []
+
+    monkeypatch.setattr(runner, "_advance_attributes", advance)
+    outcomes = runner.finalize_wave(generated)
+    assert list(outcomes.values()) == [[], []]
+    assert observed == [{("a1", 0), ("a2", 0)}]
+
+
+def test_invalid_completion_wave_sibling_discards_owner_chain_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed sibling may not leave an old chain reusable on later replay."""
+    runner, committed = _committed_two_completion_results(tmp_path, monkeypatch)
+    generated = [
+        pair for pair in committed
+        if pair[0].job_type == SUBJECT_ATTRIBUTE_COMPLETION_GENERATE_JOB
+    ]
+    runner.clear_execution_hot_caches()
+    owner_plan, context, calls = _three_completion_graph(runner, monkeypatch)
+    storage = runner._storage_for(SHARD)
+    runner._owner_graph(
+        SHARD, storage, CLIP_UID, owner_plan, context, use_completion_cache=True
+    )
+    assert len(calls) == 3
+    valid, invalid = generated
+    bad_result = replace(invalid[1], payload={"status": "not_a_completion"})
+    outcomes = runner.finalize_wave([valid, (invalid[0], bad_result)])
+    assert outcomes[valid[0].job_id()] == []
+    assert outcomes[invalid[0].job_id()] is None
+    runner._owner_graph(
+        SHARD, storage, CLIP_UID, owner_plan, context, use_completion_cache=True
+    )
+    assert calls[3:] == [("a1", 0), ("a2", 0), ("a3", 0)]
 
 
 def test_finalize_wave_caches_all_committed_siblings_before_validation(

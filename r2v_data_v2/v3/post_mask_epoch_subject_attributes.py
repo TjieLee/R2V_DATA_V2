@@ -1429,6 +1429,13 @@ class SubjectAttributeEpochRunner:
         # this invocation; receipt-driven completion routes stay uncached.
         self._settled_rank0_cache: dict[tuple[str, str, str], dict[str, Any]] = {}
         self._settled_rank0_cache_lock = threading.Lock()
+        # A completion receipt changes only its own attribute/rank chain. The
+        # owner graph still derives all routing on each advancement; only the
+        # expensive chain objects are reused within this execution batch.
+        self._completion_chain_cache: dict[
+            tuple[str, str, str, str, int], _CompletionChain
+        ] = {}
+        self._completion_chain_cache_lock = threading.Lock()
         self._attribute_selection_cache: dict[
             tuple[str, str, str, str], Any
         ] = {}
@@ -1484,6 +1491,11 @@ class SubjectAttributeEpochRunner:
             "fresh_owner_verify_skips": 0,
             "fresh_owner_artifact_hits": 0,
             "owner_replay_calls": 0,
+            "completion_chain_cache_hits": 0,
+            "completion_chain_rebuilds": 0,
+            "completion_chain_unchanged_reuses": 0,
+            "completion_chain_rank0_rebuilds": 0,
+            "completion_chain_rank1_rebuilds": 0,
         }
         self.replay_timing_seconds: dict[str, float] = {
             "owner_replay_wall_seconds": 0.0,
@@ -1519,6 +1531,8 @@ class SubjectAttributeEpochRunner:
             self._rank0_working_cache.clear()
         with self._settled_rank0_cache_lock:
             self._settled_rank0_cache.clear()
+        with self._completion_chain_cache_lock:
+            self._completion_chain_cache.clear()
         with self._attribute_selection_cache_lock:
             self._attribute_selection_cache.clear()
         with self._committed_payload_cache_lock:
@@ -1526,6 +1540,17 @@ class SubjectAttributeEpochRunner:
         with self._sam_mask_cache_lock:
             self._pending_fresh_sam_masks.clear()
             self._committed_sam_masks.clear()
+
+    def _drop_owner_chain_hot_caches(self, key: tuple[str, str, str]) -> None:
+        """Discard mutable owner replay state after a failed finalization."""
+        with self._rank0_working_cache_lock:
+            self._rank0_working_cache.pop(key, None)
+        with self._settled_rank0_cache_lock:
+            self._settled_rank0_cache.pop(key, None)
+        with self._completion_chain_cache_lock:
+            for chain_key in tuple(self._completion_chain_cache):
+                if chain_key[:3] == key:
+                    self._completion_chain_cache.pop(chain_key, None)
 
     def _bump_seed_counter(self, key: str, delta: int = 1) -> None:
         with self._seed_counters_lock:
@@ -2936,6 +2961,35 @@ class SubjectAttributeEpochRunner:
             ):
                 self._committed_sam_masks[job_id] = pending
 
+    @staticmethod
+    def _completion_dirty_key(job: ModelJob) -> tuple[str, int] | None:
+        """Identify the single completion chain changed by a committed job."""
+        if job.job_type not in {
+            SUBJECT_ATTRIBUTE_COMPLETION_GENERATE_JOB,
+            SUBJECT_ATTRIBUTE_COMPLETION_SAM_JOB,
+            SUBJECT_ATTRIBUTE_COMPLETION_REVIEW_JOB,
+        }:
+            return None
+        target = dict(job.target)
+        try:
+            attribute_id = target["attribute_id"]
+            rank_text = target["candidate_rank"]
+        except KeyError as exc:
+            raise SubjectAttributeDurableError(
+                f"completion job {job.job_id()} has no valid chain target"
+            ) from exc
+        if (
+            not isinstance(attribute_id, str)
+            or not attribute_id
+            or attribute_id == "None"
+            or not isinstance(rank_text, str)
+            or rank_text not in ("0", "1")
+        ):
+            raise SubjectAttributeDurableError(
+                f"completion job {job.job_id()} has no valid chain target"
+            )
+        return attribute_id, int(rank_text)
+
     def finalize(self, job: ModelJob, result: JobResult) -> Sequence[ModelJob]:
         """CPU continuation of one committed model receipt."""
         self._cache_committed_result(job, result)
@@ -3019,6 +3073,9 @@ class SubjectAttributeEpochRunner:
         }
         outcomes: dict[str, Sequence[ModelJob] | None] = {}
         groups: dict[tuple[str, str, str], list[ModelJob]] = {}
+        completion_dirty_by_owner: dict[
+            tuple[str, str, str], set[tuple[str, int]]
+        ] = {}
         for job, result in committed:
             job_id = job.job_id()
             if job.job_type not in grouped_types:
@@ -3038,6 +3095,9 @@ class SubjectAttributeEpochRunner:
                     self._validate_sam_probe(job, result)
                 else:
                     self._validate_owner_chain(job, result)
+                dirty = self._completion_dirty_key(job)
+                if dirty is not None:
+                    completion_dirty_by_owner.setdefault(key, set()).add(dirty)
             except Exception:  # noqa: BLE001 - isolate finalizer failures per job
                 outcomes[job_id] = None
             else:
@@ -3045,10 +3105,7 @@ class SubjectAttributeEpochRunner:
         for (shard, clip_uid, owner_entity_id), jobs in groups.items():
             if any(outcomes[job.job_id()] is None for job in jobs):
                 key = (shard, clip_uid, owner_entity_id)
-                with self._rank0_working_cache_lock:
-                    self._rank0_working_cache.pop(key, None)
-                with self._settled_rank0_cache_lock:
-                    self._settled_rank0_cache.pop(key, None)
+                self._drop_owner_chain_hot_caches(key)
                 continue
             try:
                 changed_attribute_ids = {
@@ -3062,13 +3119,13 @@ class SubjectAttributeEpochRunner:
                     clip_uid,
                     owner_entity_id,
                     changed_attribute_ids=(changed_attribute_ids or None),
+                    dirty_completion_keys=completion_dirty_by_owner.get(
+                        (shard, clip_uid, owner_entity_id)
+                    ),
                 )
             except Exception:  # noqa: BLE001 - replay this owner's receipts later
                 key = (shard, clip_uid, owner_entity_id)
-                with self._rank0_working_cache_lock:
-                    self._rank0_working_cache.pop(key, None)
-                with self._settled_rank0_cache_lock:
-                    self._settled_rank0_cache.pop(key, None)
+                self._drop_owner_chain_hot_caches(key)
                 for job in jobs:
                     outcomes[job.job_id()] = None
             else:
@@ -5099,6 +5156,7 @@ class SubjectAttributeEpochRunner:
         owner_entity_id: str,
         *,
         changed_attribute_ids: set[str] | None = None,
+        dirty_completion_keys: set[tuple[str, int]] | None = None,
     ) -> list[ModelJob]:
         """Advance one human owner's semantic graph as far as receipts allow.
 
@@ -5108,68 +5166,82 @@ class SubjectAttributeEpochRunner:
         is the next job, and once every call is paid the legacy artifact is
         published together with the processed owner outcome.
         """
-        prefix = self._owner_prefix(shard, clip_uid, owner_entity_id)
-        owner_plan = prefix["owner_plan"]
-        discovery = prefix["discovery"]
-        discovery_job_id = prefix["discovery_job_id"]
-        context = self._rank0_context(
-            shard,
-            storage,
-            clip_uid,
-            owner_plan,
-            discovery,
-            discovery_job_id,
-            changed_attribute_ids=changed_attribute_ids,
-        )
-        if context["pending"]:
-            return sorted(context["pending"], key=lambda job: job.job_id())
-        if context["job"] is not None and context["review"] is None:
-            # The owner's rank-0 raw review is still owed; the boundary marker is
-            # only meaningful once every rank-0 verdict exists.
-            return [context["job"]]
-        self._verified_raw_state(shard, storage, clip_uid, owner_plan, context)
-        outcome = self._owner_outcome(shard, clip_uid, owner_entity_id)
-        if outcome is not None:
-            self._verify_owner_outcome(
-                shard, storage, clip_uid, owner_entity_id, owner_plan, outcome
+        try:
+            prefix = self._owner_prefix(shard, clip_uid, owner_entity_id)
+            owner_plan = prefix["owner_plan"]
+            discovery = prefix["discovery"]
+            discovery_job_id = prefix["discovery_job_id"]
+            context = self._rank0_context(
+                shard,
+                storage,
+                clip_uid,
+                owner_plan,
+                discovery,
+                discovery_job_id,
+                changed_attribute_ids=changed_attribute_ids,
+            )
+            if context["pending"]:
+                return sorted(context["pending"], key=lambda job: job.job_id())
+            if context["job"] is not None and context["review"] is None:
+                # The owner's rank-0 raw review is still owed; the boundary marker is
+                # only meaningful once every rank-0 verdict exists.
+                return [context["job"]]
+            self._verified_raw_state(shard, storage, clip_uid, owner_plan, context)
+            outcome = self._owner_outcome(shard, clip_uid, owner_entity_id)
+            if outcome is not None:
+                self._verify_owner_outcome(
+                    shard, storage, clip_uid, owner_entity_id, owner_plan, outcome
+                )
+                return self._advance_clip(shard, storage, clip_uid)
+        except Exception:
+            self._drop_owner_chain_hot_caches((shard, clip_uid, owner_entity_id))
+            raise
+        try:
+            self._bump_replay_counter("owner_graph_rebuilds")
+            graph = self._owner_graph(
+                shard,
+                storage,
+                clip_uid,
+                owner_plan,
+                context,
+                use_completion_cache=True,
+                dirty_completion_keys=dirty_completion_keys,
+            )
+            self._publish_owner_markers(
+                shard, storage, clip_uid, owner_plan, graph
+            )
+            # The owner graph already knows every independent model call this owner
+            # owes, so hand all of them to the pool at once instead of letting the
+            # legacy replay abort on the first one it reaches. The replay is only run
+            # once the graph owes nothing, which is when it can produce the final
+            # owner artifact without aborting.
+            owed = self._owner_owed_jobs(graph)
+            if owed:
+                return owed
+            result = self._owner_artifact_from_receipts(
+                shard, storage, clip_uid, owner_plan, context["states"]
+            )
+            if isinstance(result, _PendingModelCall):
+                return [result.job]
+            self._publish_owner_artifact(shard, clip_uid, owner_plan, result)
+            self._write_owner_outcome(
+                shard,
+                clip_uid,
+                owner_entity_id,
+                self._expected_owner_outcome(
+                    clip_uid=clip_uid,
+                    owner_entity_id=owner_entity_id,
+                    owner_plan=owner_plan,
+                    artifact=result,
+                    source=OWNER_SOURCE_PROCESSED,
+                    discovery_job_id=discovery_job_id,
+                ),
+                artifact=result,
             )
             return self._advance_clip(shard, storage, clip_uid)
-        self._bump_replay_counter("owner_graph_rebuilds")
-        graph = self._owner_graph(
-            shard, storage, clip_uid, owner_plan, context
-        )
-        self._publish_owner_markers(
-            shard, storage, clip_uid, owner_plan, graph
-        )
-        # The owner graph already knows every independent model call this owner
-        # owes, so hand all of them to the pool at once instead of letting the
-        # legacy replay abort on the first one it reaches. The replay is only run
-        # once the graph owes nothing, which is when it can produce the final
-        # owner artifact without aborting.
-        owed = self._owner_owed_jobs(graph)
-        if owed:
-            return owed
-        result = self._owner_artifact_from_receipts(
-            shard, storage, clip_uid, owner_plan, context["states"]
-        )
-        if isinstance(result, _PendingModelCall):
-            return [result.job]
-        self._publish_owner_artifact(shard, clip_uid, owner_plan, result)
-        self._write_owner_outcome(
-            shard,
-            clip_uid,
-            owner_entity_id,
-            self._expected_owner_outcome(
-                clip_uid=clip_uid,
-                owner_entity_id=owner_entity_id,
-                owner_plan=owner_plan,
-                artifact=result,
-                source=OWNER_SOURCE_PROCESSED,
-                discovery_job_id=discovery_job_id,
-            ),
-            artifact=result,
-        )
-        return self._advance_clip(shard, storage, clip_uid)
+        except Exception:
+            self._drop_owner_chain_hot_caches((shard, clip_uid, owner_entity_id))
+            raise
 
     def _finalize_sam_probe(self, job: ModelJob, result: JobResult) -> Sequence[ModelJob]:
         """CPU continuation of one committed SAM probe."""
@@ -5206,13 +5278,22 @@ class SubjectAttributeEpochRunner:
         fails closed, and the owner's graph is then re-derived from the receipts:
         whatever the next missing call is becomes the next job.
         """
-        self._validate_owner_chain(job, result)
-        return self._advance_attributes(
-            job.canonical_shard,
-            self._storage_for(job.canonical_shard),
-            job.clip_uid,
-            str(dict(job.target).get("owner_entity_id", "")),
-        )
+        owner_entity_id = str(dict(job.target).get("owner_entity_id", ""))
+        try:
+            self._validate_owner_chain(job, result)
+            dirty = self._completion_dirty_key(job)
+            return self._advance_attributes(
+                job.canonical_shard,
+                self._storage_for(job.canonical_shard),
+                job.clip_uid,
+                owner_entity_id,
+                dirty_completion_keys={dirty} if dirty is not None else None,
+            )
+        except Exception:
+            self._drop_owner_chain_hot_caches(
+                (job.canonical_shard, job.clip_uid, owner_entity_id)
+            )
+            raise
 
     def _validate_owner_chain(self, job: ModelJob, result: JobResult) -> None:
         payload = dict(result.payload)
@@ -6176,6 +6257,51 @@ class SubjectAttributeEpochRunner:
                 routes[state.attribute_id] = self._rank0_route(state, route_context)
         return routes
 
+    def _graph_completion_chain(
+        self,
+        shard: str,
+        storage: RunStorage,
+        clip_uid: str,
+        owner_plan: Mapping[str, Any],
+        state: _AttributeReplay,
+        rank: int,
+        *,
+        use_cache: bool,
+        dirty_keys: set[tuple[str, int]] | None,
+    ) -> _CompletionChain:
+        """Reuse only an unchanged chain in the advancing invocation."""
+        attribute_id = state.attribute_id
+        key = (
+            shard,
+            clip_uid,
+            str(owner_plan["owner_entity_id"]),
+            attribute_id,
+            rank,
+        )
+        if use_cache:
+            with self._completion_chain_cache_lock:
+                cached = self._completion_chain_cache.get(key)
+            if cached is not None and (attribute_id, rank) not in (dirty_keys or ()):
+                self._bump_replay_counter("completion_chain_cache_hits")
+                if dirty_keys:
+                    self._bump_replay_counter("completion_chain_unchanged_reuses")
+                return cached
+        chain = self._completion_chain(
+            shard,
+            storage,
+            clip_uid,
+            owner_plan,
+            state.attribute_plan,
+            state.options[rank],
+            rank,
+        )
+        self._bump_replay_counter("completion_chain_rebuilds")
+        self._bump_replay_counter(f"completion_chain_rank{rank}_rebuilds")
+        if use_cache:
+            with self._completion_chain_cache_lock:
+                self._completion_chain_cache[key] = chain
+        return chain
+
     def _owner_graph(
         self,
         shard: str,
@@ -6183,6 +6309,9 @@ class SubjectAttributeEpochRunner:
         clip_uid: str,
         owner_plan: Mapping[str, Any],
         context: Mapping[str, Any],
+        *,
+        use_completion_cache: bool = False,
+        dirty_completion_keys: set[tuple[str, int]] | None = None,
     ) -> dict[str, Any]:
         """Derive the whole owner graph from the receipts, in legacy order.
 
@@ -6195,14 +6324,15 @@ class SubjectAttributeEpochRunner:
         for state in context["states"]:
             if routes0[state.attribute_id] != ROUTE_COMPLETION_REQUIRED:
                 continue
-            chains0[state.attribute_id] = self._completion_chain(
+            chains0[state.attribute_id] = self._graph_completion_chain(
                 shard,
                 storage,
                 clip_uid,
                 owner_plan,
-                state.attribute_plan,
-                state.options[0],
+                state,
                 0,
+                use_cache=use_completion_cache,
+                dirty_keys=dirty_completion_keys,
             )
         rank1_states: list[_AttributeReplay] = []
         for state in context["states"]:
@@ -6261,14 +6391,15 @@ class SubjectAttributeEpochRunner:
             for state in rank1_states:
                 if routes1.get(state.attribute_id) != ROUTE_COMPLETION_REQUIRED:
                     continue
-                chains1[state.attribute_id] = self._completion_chain(
+                chains1[state.attribute_id] = self._graph_completion_chain(
                     shard,
                     storage,
                     clip_uid,
                     owner_plan,
-                    state.attribute_plan,
-                    state.options[1],
+                    state,
                     1,
+                    use_cache=use_completion_cache,
+                    dirty_keys=dirty_completion_keys,
                 )
         bbox: list[tuple[_AttributeReplay, int, Any]] = []
         for state in context["states"]:
