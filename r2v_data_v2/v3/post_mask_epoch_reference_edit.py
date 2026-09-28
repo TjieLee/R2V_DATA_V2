@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import threading
 import time
@@ -46,8 +47,11 @@ from r2v_data_v2.v3.post_mask_epoch_jobs import (
     ModelJob,
     semantic_input_digest,
 )
-from r2v_data_v2.v3.post_mask_epoch_resources import resolve_cpu_workers
-from r2v_data_v2.v3.post_mask_epoch_state import GroupLedger
+from r2v_data_v2.v3.post_mask_epoch_resources import (
+    EpochResourceError,
+    resolve_cpu_workers,
+)
+from r2v_data_v2.v3.post_mask_epoch_state import GroupLedger, LedgerError
 from r2v_data_v2.v3.reference_edit import (
     _alternate_completion_source,
     _disabled_entity_background_variant,
@@ -222,6 +226,11 @@ def _sha256_bytes(payload: bytes) -> str:
 BOOGU_SEED_UPPER_BOUND = 2**31
 
 
+class _ClipArtifactReadError(Exception):
+    def __init__(self, cause: Exception) -> None:
+        self.cause = cause
+
+
 def _validated_boogu_seed(seed: Any, *, clip_uid: str, entity_id: str) -> int:
     """Validate one durable seed. A malformed seed is durable corruption."""
     if isinstance(seed, bool) or not isinstance(seed, int):
@@ -267,6 +276,7 @@ class ReferenceEditEpochRunner:
         self.eligible = {
             shard: tuple(uids) for shard, uids in eligible_clip_uids_by_shard.items()
         }
+        self.clip_quarantine: Any = None
         self.emit = emit or (lambda *args, **kwargs: None)
         self.review_execution = review_execution
         self._seed_counter_lock = threading.Lock()
@@ -378,6 +388,13 @@ class ReferenceEditEpochRunner:
         completion publication legitimately rewrites them, so restart must not
         compare them here (see ``_verify_plan_entry``).
         """
+        try:
+            frames = storage.read_frames(clip.clip_uid)
+            masks = storage.read_masks(clip.clip_uid)
+        except (OSError, ValueError) as exc:
+            if self.clip_quarantine is None:
+                raise
+            raise _ClipArtifactReadError(exc) from exc
         projection = {
             "annotation": (
                 clip.annotation.model_dump(mode="json")
@@ -389,10 +406,8 @@ class ReferenceEditEpochRunner:
                 if clip.coverage is not None
                 else None
             ),
-            "sampled_frames": storage
-            .read_frames(clip.clip_uid)
-            .model_dump(mode="json"),
-            "tracked_masks": storage.read_masks(clip.clip_uid).model_dump(mode="json"),
+            "sampled_frames": frames.model_dump(mode="json"),
+            "tracked_masks": masks.model_dump(mode="json"),
             "policy": self._policy_identity(),
         }
         return semantic_input_digest(projection)
@@ -424,7 +439,16 @@ class ReferenceEditEpochRunner:
         against its durable outcome instead of the pre-edit baseline: the
         publication legitimately rewrites ``references``/``pairing``.
         """
-        clip = storage.read_clip(clip_uid)
+        try:
+            clip = storage.read_clip(clip_uid)
+        except (OSError, ValueError) as exc:
+            if self._quarantine_local(
+                shard, storage, clip_uid, exc, known_clip_artifact_read=True
+            ):
+                raise ReferenceEditDurableError(
+                    f"cannot validate frozen Reference Edit input for {clip_uid!r}"
+                ) from exc
+            raise
         actual = self._clip_digest(storage, clip)
         if actual != entry.get("digest"):
             raise ReferenceEditDurableError(
@@ -463,8 +487,23 @@ class ReferenceEditEpochRunner:
         storage = self._storage_for(shard)
         clips: dict[str, dict[str, Any]] = {}
         for clip_uid in self.eligible.get(shard, ()):
-            clip = storage.read_clip(clip_uid)
-            clips[clip_uid] = self._plan_entry(storage, clip)
+            if self._is_quarantined(shard, clip_uid):
+                continue
+            try:
+                clip = storage.read_clip(clip_uid)
+            except (OSError, ValueError) as exc:
+                if not self._quarantine_local(
+                    shard, storage, clip_uid, exc, known_clip_artifact_read=True
+                ):
+                    raise
+                continue
+            try:
+                clips[clip_uid] = self._plan_entry(storage, clip)
+            except _ClipArtifactReadError as exc:
+                if not self._quarantine_local(
+                    shard, storage, clip_uid, exc.cause, known_clip_artifact_read=True
+                ):
+                    raise exc.cause
         payload = {
             "schema": REFERENCE_EDIT_PLAN_SCHEMA,
             "canonical_shard": shard,
@@ -472,6 +511,13 @@ class ReferenceEditEpochRunner:
             "policy": self._policy_identity(),
             "clips": clips,
         }
+        excluded = [uid for uid in self.eligible.get(shard, ()) if uid not in clips]
+        if excluded:
+            payload["preplan_quarantined_clip_uids"] = excluded
+            _write_json_once(
+                self._plan_path(shard).with_suffix(".exclusions.json"),
+                {"clip_uids": excluded},
+            )
         _write_json_once(self._plan_path(shard), payload)
         return payload
 
@@ -489,8 +535,80 @@ class ReferenceEditEpochRunner:
                     f"frozen Reference Edit plan {key} drifted for {shard!r}"
                 )
         storage = self._storage_for(shard)
-        for clip_uid, entry in payload.get("clips", {}).items():
-            self._verify_plan_entry(shard, storage, clip_uid, entry)
+        clips = payload.get("clips")
+        scope = set(self.eligible.get(shard, ()))
+        if not isinstance(clips, dict) or set(clips) - scope:
+            raise ReferenceEditDurableError(
+                f"frozen Reference Edit plan clip scope drifted for {shard!r}"
+            )
+        missing = scope - set(clips)
+        excluded = [uid for uid in self.eligible.get(shard, ()) if uid in missing]
+        if payload.get("preplan_quarantined_clip_uids", []) != excluded:
+            raise ReferenceEditDurableError(
+                f"frozen Reference Edit plan clip scope drifted for {shard!r}"
+            )
+        witness = _read_json(self._plan_path(shard).with_suffix(".exclusions.json"))
+        if (witness if witness is not None else {"clip_uids": []}) != {
+            "clip_uids": excluded
+        }:
+            raise ReferenceEditDurableError(
+                f"frozen Reference Edit plan clip scope drifted for {shard!r}"
+            )
+        if not all(self._is_quarantined(shard, uid) for uid in missing):
+            raise ReferenceEditDurableError(
+                f"frozen Reference Edit plan clip scope drifted for {shard!r}"
+            )
+        for clip_uid, entry in clips.items():
+            try:
+                self._verify_plan_entry(shard, storage, clip_uid, entry)
+            except _ClipArtifactReadError as exc:
+                if not self._quarantine_local(
+                    shard, storage, clip_uid, exc.cause, known_clip_artifact_read=True
+                ):
+                    raise exc.cause
+                raise ReferenceEditDurableError(
+                    f"cannot validate frozen Reference Edit input for {clip_uid!r}"
+                ) from exc
+
+    def _is_quarantined(self, shard: str, clip_uid: str) -> bool:
+        return self.clip_quarantine is not None and self.clip_quarantine.contains(
+            shard, clip_uid
+        )
+
+    def _quarantine_local(
+        self,
+        shard: str,
+        storage: RunStorage,
+        clip_uid: str,
+        exc: Exception,
+        *,
+        known_clip_artifact_read: bool = False,
+    ) -> bool:
+        return self.clip_quarantine is not None and self.clip_quarantine.record_if_local(
+            shard,
+            storage,
+            clip_uid,
+            "reference_edit",
+            exc,
+            known_clip_artifact_read=known_clip_artifact_read,
+        )
+
+    def _seed_failure(
+        self, shard: str, storage: RunStorage, clip_uid: str, exc: Exception
+    ) -> None:
+        if isinstance(exc, _ClipArtifactReadError):
+            if self._quarantine_local(
+                shard, storage, clip_uid, exc.cause, known_clip_artifact_read=True
+            ):
+                return
+            raise exc.cause
+        if isinstance(exc, (EpochResourceError, LedgerError, PermissionError)):
+            raise exc
+        if self._quarantine_local(shard, storage, clip_uid, exc):
+            return
+        if self.clip_quarantine is not None and isinstance(exc, (OSError, ValueError)):
+            raise exc
+        self._fail_clip_terminal(shard, storage, clip_uid, exc)
 
     def _existing_plan_for_reconcile(self, shard: str) -> dict[str, Any]:
         """Read and fully validate the frozen shard plan.
@@ -1141,6 +1259,8 @@ class ReferenceEditEpochRunner:
             plan = self._plan(shard)
             storage = self._storage_for(shard)
             for clip_uid in sorted(plan.get("clips", {})):
+                if self._is_quarantined(shard, clip_uid):
+                    continue
                 entry = plan["clips"][clip_uid]
                 if entry["classification"] != CLIP_FRESH_TARGET:
                     continue
@@ -1155,7 +1275,7 @@ class ReferenceEditEpochRunner:
             except ReferenceEditDurableError:
                 raise
             except Exception as exc:  # noqa: BLE001 - legacy clip isolation
-                self._fail_clip_terminal(shard, storage, clip_uid, exc)
+                self._seed_failure(shard, storage, clip_uid, exc)
 
         workers = max(1, int(self.cpu_workers))
         if workers == 1 or len(targets) <= 1:
@@ -1165,7 +1285,7 @@ class ReferenceEditEpochRunner:
                 except ReferenceEditDurableError:
                     raise
                 except Exception as exc:  # noqa: BLE001 - legacy clip isolation
-                    self._fail_clip_terminal(target[0], target[1], target[2], exc)
+                    self._seed_failure(target[0], target[1], target[2], exc)
                     continue
                 commit(target, prepared)
         else:
@@ -1182,7 +1302,7 @@ class ReferenceEditEpochRunner:
                         except ReferenceEditDurableError:
                             raise
                         except Exception as exc:  # noqa: BLE001 - legacy clip isolation
-                            self._fail_clip_terminal(target[0], target[1], target[2], exc)
+                            self._seed_failure(target[0], target[1], target[2], exc)
                             continue
                         commit(target, prepared)
         jobs.sort(key=lambda job: job.job_id())
@@ -1246,7 +1366,27 @@ class ReferenceEditEpochRunner:
     def _entity_route_context(
         self, storage: RunStorage, clip: Any, reference: Any
     ) -> tuple[Any, Any, Any]:
-        source_geometry = _reference_content_geometry(storage, reference)
+        try:
+            source_geometry = _reference_content_geometry(storage, reference)
+        except (OSError, ValueError) as exc:
+            if self.clip_quarantine is None:
+                raise
+            if reference.image_path is not None:
+                image_path = Path(os.path.abspath(storage.root / reference.image_path))
+                clip_dir = Path(os.path.abspath(storage.clip_dir(clip.clip_uid)))
+                if clip_dir not in image_path.parents:
+                    raise
+            if (
+                isinstance(exc, OSError)
+                and not isinstance(exc, PermissionError)
+                and exc.errno is None
+                and exc.filename is None
+                and reference.image_path is not None
+            ):
+                exc = ValueError(
+                    f"cannot read clip-local reference image {image_path}: {exc}"
+                )
+            raise _ClipArtifactReadError(exc) from exc
         gate_reason = _source_gate_reason(self.config, source_geometry)
         route = _route(
             reference,
@@ -2753,6 +2893,10 @@ class ReferenceEditEpochRunner:
         plan = self._existing_plan_for_reconcile(shard)
         counts = {field: 0 for field in ReferenceEditStats.__dataclass_fields__}
         for clip_uid, entry in sorted(plan.get("clips", {}).items()):
+            if self._is_quarantined(shard, clip_uid):
+                counts["processed"] += 1
+                counts["failed"] += 1
+                continue
             classification = entry["classification"]
             if classification == CLIP_INELIGIBLE:
                 counts["skipped_not_ready"] += 1
@@ -2812,6 +2956,13 @@ class ReferenceEditEpochRunner:
                     self._verify_entity_attempt_consistency(
                         shard, clip_uid, entity_id, entity_outcome, markers
                     )
+        for clip_uid in set(self.eligible.get(shard, ())) - set(plan.get("clips", {})):
+            if not self._is_quarantined(shard, clip_uid):
+                raise ReferenceEditDurableError(
+                    f"frozen Reference Edit plan clip scope drifted for {shard!r}"
+                )
+            counts["processed"] += 1
+            counts["failed"] += 1
         return ReferenceEditStats(**counts)
 
 

@@ -247,12 +247,8 @@ def auk_stage_root(audio_production_root: Path, shadow_run_id: str) -> Path:
 
 
 def check_source(job: AukJob) -> None:
-    for path, expected in (
-        (job.source_audio_path, job.source_audio_sha256),
-        (job.target_video_path, job.target_video_sha256),
-    ):
-        if sha256_file(_file(Path(path))) != expected:
-            raise ValueError("AuK source hash differs")
+    if sha256_file(_file(Path(job.source_audio_path))) != job.source_audio_sha256:
+        raise ValueError("AuK source audio hash differs")
     info = sf.info(job.source_audio_path)
     if (info.format, info.samplerate, info.channels, info.frames) != (
         "FLAC",

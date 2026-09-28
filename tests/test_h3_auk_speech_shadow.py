@@ -484,6 +484,12 @@ def test_source_tamper_rejected_before_model(setup, ffmpeg):
     assert backend.calls == []
 
 
+def test_source_check_does_not_hash_target_video(setup):
+    job = setup.jobs[0]
+    Path(job.target_video_path).write_bytes(b"changed video content")
+    auk.check_source(job)
+
+
 def test_cli_preflight_before_worker_startup(setup, monkeypatch):
     stage(setup).mkdir(parents=True)
 

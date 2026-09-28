@@ -171,6 +171,27 @@ def test_node_maps_four_nonoverlapping_pairs_without_barrier(tmp_path, monkeypat
     assert all(x["command"][x["command"].index("--ulysses-degree")+1] == "2" for x in calls)
 
 
+def test_node_pair_count_limits_partial_final_wave(tmp_path, monkeypatch):
+    from tools.person_replacement import run_h3_pdd_node as cli
+
+    calls = []
+    monkeypatch.setattr(cli,"run_children",lambda specs,*a,**k:calls.extend(specs) or [0])
+    assert cli.main([
+        "--gpus","0,1,2,3,4,5,6,7",
+        "--pair-start","20",
+        "--pair-count","1",
+        "--output-root",str(tmp_path),
+        "--pair-size","2000",
+        "--resume",
+        "--group-size","4",
+        "--ulysses-degree","2",
+    ]) == 0
+    assert len(calls) == 1
+    assert calls[0]["env"]["CUDA_VISIBLE_DEVICES"] == "0,1,2,3"
+    command = calls[0]["command"]
+    assert command[command.index("--pair-id")+1] == "20"
+
+
 @pytest.mark.parametrize(
     ("codes","expected"),
     [

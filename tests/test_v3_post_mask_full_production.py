@@ -348,6 +348,31 @@ def _load_full_tool():
     return module
 
 
+def test_full_tool_namespaces_resource_temp_root_per_node(tmp_path, monkeypatch):
+    tool = _load_full_tool()
+    official = tmp_path / "public" / "in_pair_reference"
+    stage2 = tmp_path / "entity_mask"
+    (stage2 / "parts").mkdir(parents=True)
+    (stage2 / "parts/shard-000000000-000009999.jsonl").write_text("", encoding="utf-8")
+    config = config_module.load_config(
+        REPO / "configs/v3_post_mask_resource_epoch_production.yaml"
+    )
+    monkeypatch.setattr(config_module, "OFFICIAL_POST_MASK_EXPORT_ROOT", official)
+    monkeypatch.setattr(tool, "load_config", lambda _: replace(config, export_root=official / "shards"))
+    monkeypatch.setattr(tool.socket, "gethostname", lambda: "node-a")
+    monkeypatch.setattr(tool, "run_elastic_groups", lambda *a, **k: None)
+    monkeypatch.setattr(tool, "compact_if_complete", lambda *a, **k: None)
+
+    assert tool.main([
+        "--base-config", str(REPO / "configs/v3_post_mask_resource_epoch_production.yaml"),
+        "--entity-mask-root", str(stage2), "--rank", "7", "--world-size", "10",
+    ]) == 0
+
+    assert os.environ["POST_MASK_EPOCH_TEMP_ROOT"].endswith(
+        "/tmp/resource_epoch/node-a-rank-7"
+    )
+
+
 def test_full_tool_publishes_one_official_root_and_pins_qwen(tmp_path, monkeypatch):
     tool = _load_full_tool()
     official = tmp_path / "public" / "in_pair_reference"

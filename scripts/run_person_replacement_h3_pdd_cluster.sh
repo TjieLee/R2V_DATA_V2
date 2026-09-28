@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-set -euo pipefail
 
 # One command per 8xH200 node. The platform injects zero-based RANK and WORLD_SIZE.
 # Every node runs this same script against the same shared input/output roots.
@@ -7,9 +6,10 @@ set -euo pipefail
 # Mapping with the production defaults:
 #   group_size=4, 8 GPUs/node -> 2 independent pair shards per node
 #   pair_size=2000
-#   RANK=0 -> pair 0,1 -> rows [0,3999]
-#   RANK=1 -> pair 2,3 -> rows [4000,7999]
-#   ...
+#   first wave: RANK=0 -> pair 0,1; RANK=1 -> pair 2,3; ...
+#   next wave advances by WORLD_SIZE * pairs_per_node:
+#     RANK=0 -> pair 10,11; RANK=1 -> pair 12,13; ... when WORLD_SIZE=5.
+#   Each node continues wave-by-wave until the input JSONL is exhausted.
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_REPO="$(cd -- "$SCRIPT_DIR/.." && pwd)"
@@ -65,10 +65,10 @@ if (( GPU_COUNT == 0 || GPU_COUNT % GROUP_SIZE != 0 )); then
 fi
 
 PAIRS_PER_NODE=$(( GPU_COUNT / GROUP_SIZE ))
-PAIR_START=$(( RANK * PAIRS_PER_NODE ))
-FIRST_ROW=$(( PAIR_START * PAIR_SIZE ))
-LAST_ROW=$(( (PAIR_START + PAIRS_PER_NODE) * PAIR_SIZE - 1 ))
-TOTAL_CLUSTER_CAPACITY=$(( WORLD_SIZE * PAIRS_PER_NODE * PAIR_SIZE ))
+FIRST_PAIR_START=$(( RANK * PAIRS_PER_NODE ))
+PAIR_STRIDE=$(( WORLD_SIZE * PAIRS_PER_NODE ))
+TOTAL_ROWS="$(awk 'NF {n++} END {print n+0}' "$INPUT_JSONL")"
+TOTAL_PAIRS=$(( (TOTAL_ROWS + PAIR_SIZE - 1) / PAIR_SIZE ))
 
 mkdir -p "$OUTPUT_ROOT/cluster_logs"
 NODE_LOG="$OUTPUT_ROOT/cluster_logs/node-rank-$(printf '%06d' "$RANK").log"
@@ -78,9 +78,8 @@ echo "repo=$REPO"
 echo "code_sha=$CODE_SHA"
 echo "rank=$RANK world_size=$WORLD_SIZE"
 echo "gpus=$GPUS group_size=$GROUP_SIZE ulysses_degree=$ULYSSES_DEGREE"
-echo "pairs_per_node=$PAIRS_PER_NODE pair_start=$PAIR_START pair_size=$PAIR_SIZE"
-echo "nominal_rows=$FIRST_ROW..$LAST_ROW"
-echo "cluster_nominal_capacity_rows=$TOTAL_CLUSTER_CAPACITY"
+echo "pairs_per_node=$PAIRS_PER_NODE first_pair_start=$FIRST_PAIR_START pair_stride=$PAIR_STRIDE pair_size=$PAIR_SIZE"
+echo "input_rows=$TOTAL_ROWS total_pairs=$TOTAL_PAIRS"
 echo "input=$INPUT_JSONL"
 echo "output=$OUTPUT_ROOT"
 echo "log=$NODE_LOG"
@@ -90,33 +89,62 @@ case "${PERSON_REPLACEMENT_RETRY_FAILED:-0}" in
   1|true|TRUE|yes|YES) EXTRA_ARGS+=(--retry-failed) ;;
 esac
 
-env \
-  -u PYTHONPATH \
-  -u PYTHONHOME \
-  -u VIRTUAL_ENV \
-  -u CONDA_PREFIX \
-  -u CONDA_DEFAULT_ENV \
-  -u PYTHONUSERBASE \
-  PYTHONNOUSERSITE=1 \
-  "$PAIR_PYTHON" tools/person_replacement/run_h3_pdd_node.py \
-  --gpus "$GPUS" \
-  --pair-start "$PAIR_START" \
-  --group-size "$GROUP_SIZE" \
-  --output-root "$OUTPUT_ROOT" \
-  --input-jsonl "$INPUT_JSONL" \
-  --clips-root "$CLIPS_ROOT" \
-  --pair-size "$PAIR_SIZE" \
-  --seed "$SEED" \
-  --resume \
-  --variant text \
-  --ulysses-degree "$ULYSSES_DEGREE" \
-  --prompt-writer-python "$PROMPT_WRITER_PYTHON" \
-  --prompt-writer-model "$PROMPT_WRITER_MODEL" \
-  --h3-python "$H3_PYTHON" \
-  --h3-model-root "$H3_MODEL_ROOT" \
-  --pdd-code-root "$H3_PDD_CODE_ROOT" \
-  --pdd-lora "$H3_PDD_LORA" \
-  --max-prepare-attempts "$MAX_PREPARE_ATTEMPTS" \
-  --max-generate-attempts "$MAX_GENERATE_ATTEMPTS" \
-  "${EXTRA_ARGS[@]}" \
-  2>&1 | tee -a "$NODE_LOG"
+PAIR_START="$FIRST_PAIR_START"
+while (( PAIR_START < TOTAL_PAIRS )); do
+  REMAINING_PAIRS=$(( TOTAL_PAIRS - PAIR_START ))
+  ACTIVE_PAIRS="$PAIRS_PER_NODE"
+  if (( REMAINING_PAIRS < ACTIVE_PAIRS )); then
+    ACTIVE_PAIRS="$REMAINING_PAIRS"
+  fi
+  FIRST_ROW=$(( PAIR_START * PAIR_SIZE ))
+  LAST_ROW=$(( (PAIR_START + ACTIVE_PAIRS) * PAIR_SIZE - 1 ))
+  if (( LAST_ROW >= TOTAL_ROWS )); then
+    LAST_ROW=$(( TOTAL_ROWS - 1 ))
+  fi
+
+  echo "=== shard wave ==="
+  echo "pair_start=$PAIR_START active_pairs=$ACTIVE_PAIRS rows=$FIRST_ROW..$LAST_ROW"
+
+  env \
+    -u PYTHONPATH \
+    -u PYTHONHOME \
+    -u VIRTUAL_ENV \
+    -u CONDA_PREFIX \
+    -u CONDA_DEFAULT_ENV \
+    -u PYTHONUSERBASE \
+    PYTHONNOUSERSITE=1 \
+    "$PAIR_PYTHON" tools/person_replacement/run_h3_pdd_node.py \
+    --gpus "$GPUS" \
+    --pair-start "$PAIR_START" \
+    --pair-count "$ACTIVE_PAIRS" \
+    --group-size "$GROUP_SIZE" \
+    --output-root "$OUTPUT_ROOT" \
+    --input-jsonl "$INPUT_JSONL" \
+    --clips-root "$CLIPS_ROOT" \
+    --pair-size "$PAIR_SIZE" \
+    --seed "$SEED" \
+    --resume \
+    --variant text \
+    --ulysses-degree "$ULYSSES_DEGREE" \
+    --prompt-writer-python "$PROMPT_WRITER_PYTHON" \
+    --prompt-writer-model "$PROMPT_WRITER_MODEL" \
+    --h3-python "$H3_PYTHON" \
+    --h3-model-root "$H3_MODEL_ROOT" \
+    --pdd-code-root "$H3_PDD_CODE_ROOT" \
+    --pdd-lora "$H3_PDD_LORA" \
+    --max-prepare-attempts "$MAX_PREPARE_ATTEMPTS" \
+    --max-generate-attempts "$MAX_GENERATE_ATTEMPTS" \
+    "${EXTRA_ARGS[@]}" \
+    2>&1 | tee -a "$NODE_LOG"
+
+  NODE_RC=${PIPESTATUS[0]}
+  if (( NODE_RC != 0 )); then
+    echo "Fatal node wave failure: pair_start=$PAIR_START rc=$NODE_RC" >&2
+    exit "$NODE_RC"
+  fi
+
+  PAIR_START=$(( PAIR_START + PAIR_STRIDE ))
+done
+
+echo "All assigned pair shards are settled for rank=$RANK."
+exit 0

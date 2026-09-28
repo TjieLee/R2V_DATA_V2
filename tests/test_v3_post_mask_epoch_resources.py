@@ -160,6 +160,33 @@ def test_qwen_epoch_uses_all_eight_gpus_with_tp1_dp8():
     assert config.environment()["CUDA_VISIBLE_DEVICES"] == "0,1,2,3,4,5,6,7"
 
 
+def test_qwen_epoch_strips_outer_multinode_rendezvous(monkeypatch):
+    for key, value in (
+        ("MASTER_ADDR", "scheduler-master"),
+        ("MASTER_PORT", "29506"),
+        ("RANK", "7"),
+        ("WORLD_SIZE", "10"),
+        ("LOCAL_RANK", "0"),
+        ("LOCAL_WORLD_SIZE", "1"),
+        ("TORCHELASTIC_RUN_ID", "outer-job"),
+    ):
+        monkeypatch.setenv(key, value)
+
+    env = _qwen_config().environment()
+
+    for key in (
+        "MASTER_ADDR",
+        "MASTER_PORT",
+        "RANK",
+        "WORLD_SIZE",
+        "LOCAL_RANK",
+        "LOCAL_WORLD_SIZE",
+        "TORCHELASTIC_RUN_ID",
+    ):
+        assert key not in env
+    assert env["CUDA_VISIBLE_DEVICES"] == "0,1,2,3,4,5,6,7"
+
+
 def test_qwen_argv_matches_server_verified_invocation():
     config = _qwen_config(
         allowed_local_media_path=Path("/mnt/workspace/public/dataset"),

@@ -307,9 +307,13 @@ Production defaults are:
 
 - 8 visible GPUs/node;
 - `group_size=4`, `ulysses_degree=2`;
-- two pair shards/node;
+- two pair shards are processed concurrently per node;
 - `pair_size=2000`;
-- rank 0 -> pair 0,1 -> rows 0..3999; rank 1 -> pair 2,3 -> rows 4000..7999;
+- with five nodes, wave 1 assigns pairs 0..9, wave 2 assigns 10..19, wave 3
+  assigns 20..29, and so on until the input JSONL is exhausted;
+- each rank advances by `WORLD_SIZE * pairs_per_node`, so shard ownership is
+  deterministic and non-overlapping without a global barrier;
+- the last partial wave can launch only one 4-GPU group when one shard remains;
 - local Qwen3.5-27B writer, 8 FPS, maximum 120 sampled frames;
 - `--resume`, two prepare attempts, two generation attempts;
 - output root `/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/multi_person_replace`.

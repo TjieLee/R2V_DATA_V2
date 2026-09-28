@@ -63,7 +63,10 @@ from r2v_data_v2.v3.post_mask_epoch_jobs import (
 from r2v_data_v2.v3.post_mask_epoch_jobs import (
     RESOURCE_SAM as RESOURCE_SAM_NAME,
 )
-from r2v_data_v2.v3.post_mask_epoch_resources import resolve_cpu_workers
+from r2v_data_v2.v3.post_mask_epoch_resources import (
+    EpochResourceError,
+    resolve_cpu_workers,
+)
 from r2v_data_v2.v3.post_mask_epoch_state import atomic_write_bytes, atomic_write_json
 from r2v_data_v2.v3.storage import RunStorage, evaluate_export_state
 from r2v_data_v2.v3.subject_attributes import (
@@ -236,6 +239,14 @@ class SubjectAttributeEpochError(RuntimeError):
 
 class SubjectAttributeDurableError(SubjectAttributeEpochError):
     """Raised when durable Subject Attributes state cannot be trusted."""
+
+
+class _ClipArtifactReadFailure(Exception):
+    """Preserve provenance of one explicit current-clip artifact read."""
+
+    def __init__(self, cause: Exception) -> None:
+        super().__init__(str(cause))
+        self.cause = cause
 
 
 def _resolve_attribute_segmentation_backend(handle: Any) -> Any:
@@ -1363,6 +1374,7 @@ class SubjectAttributeEpochRunner:
             shard: tuple(uids) for shard, uids in eligible_clip_uids_by_shard.items()
         }
         self.emit = emit
+        self.clip_quarantine = None
         # Invocation-local execution cache only. The first access still
         # re-derives and validates the complete frozen clip plan from live
         # upstream artifacts. Subsequent accesses in the same locked resource-
@@ -1584,12 +1596,19 @@ class SubjectAttributeEpochRunner:
                 frames=frames,
                 masks=masks,
             )[:MAX_ATTRIBUTES_PER_OWNER]
-        except (OSError, ValueError):
+        except (OSError, ValueError) as exc:
+            if self.clip_quarantine is not None and isinstance(exc, OSError):
+                raise _ClipArtifactReadFailure(exc) from exc
             return []
 
     def _derive_clip_plan(self, storage: RunStorage, clip_uid: str) -> dict[str, Any]:
         """Derive the whole frozen clip plan from live state."""
-        clip = storage.read_clip(clip_uid)
+        try:
+            clip = storage.read_clip(clip_uid)
+        except (OSError, ValueError) as exc:
+            if self.clip_quarantine is not None:
+                raise _ClipArtifactReadFailure(exc) from exc
+            raise
         effective_clip = self._effective_clip(clip)
         base: dict[str, Any] = {
             "schema": SUBJECT_ATTRIBUTE_CLIP_PLAN_SCHEMA,
@@ -1615,7 +1634,9 @@ class SubjectAttributeEpochRunner:
         try:
             frames = storage.read_frames(clip_uid)
             masks = storage.read_masks(clip_uid)
-        except (OSError, ValueError):
+        except (OSError, ValueError) as exc:
+            if self.clip_quarantine is not None:
+                raise _ClipArtifactReadFailure(exc) from exc
             return base
         owners: list[dict[str, Any]] = []
         for owner in clip.annotation.entities:
@@ -1664,7 +1685,11 @@ class SubjectAttributeEpochRunner:
         """
         try:
             return self._derive_clip_plan(storage, clip_uid)
-        except SubjectAttributeDurableError:
+        except (
+            SubjectAttributeDurableError,
+            EpochResourceError,
+            _ClipArtifactReadFailure,
+        ):
             raise
         except Exception as exc:
             raise SubjectAttributeDurableError(
@@ -1672,7 +1697,11 @@ class SubjectAttributeEpochRunner:
             ) from exc
 
     def _apply_derived_clip_plan(
-        self, shard: str, clip_uid: str, expected_plan: dict[str, Any]
+        self,
+        shard: str,
+        clip_uid: str,
+        expected_plan: dict[str, Any],
+        existing: dict[str, Any] | None,
     ) -> dict[str, Any]:
         """Main-thread durable authority for one already derived clip plan.
 
@@ -1684,7 +1713,6 @@ class SubjectAttributeEpochRunner:
         cached = self._clip_plan_cache.get(cache_key)
         if cached is not None:
             return cached
-        existing = _read_json(self._clip_plan_path(shard, clip_uid))
         if existing is None:
             _write_json_once(self._clip_plan_path(shard, clip_uid), expected_plan)
             self._clip_plan_cache[cache_key] = expected_plan
@@ -1702,9 +1730,17 @@ class SubjectAttributeEpochRunner:
         cached = self._clip_plan_cache.get((shard, clip_uid))
         if cached is not None:
             return cached
+        existing = _read_json(self._clip_plan_path(shard, clip_uid))
         storage = self._storage_for(shard)
-        expected = self._checked_derive_clip_plan(storage, clip_uid)
-        return self._apply_derived_clip_plan(shard, clip_uid, expected)
+        try:
+            expected = self._checked_derive_clip_plan(storage, clip_uid)
+        except _ClipArtifactReadFailure as exc:
+            if existing is not None:
+                raise SubjectAttributeDurableError(
+                    f"cannot derive the Subject Attributes clip plan for {clip_uid!r}"
+                ) from exc
+            raise
+        return self._apply_derived_clip_plan(shard, clip_uid, expected, existing)
 
     def _eligible_owners(self, plan: Mapping[str, Any]) -> list[dict[str, Any]]:
         return [
@@ -2509,6 +2545,22 @@ class SubjectAttributeEpochRunner:
             for clip_uid in self.eligible.get(shard, ())
         ]
 
+    def _skip_preplan_quarantine(self, shard: str, clip_uid: str) -> bool:
+        quarantine = self.clip_quarantine
+        if quarantine is None or not quarantine.contains(shard, clip_uid):
+            return False
+        # A pre-plan clip loss may be excluded. Once this stage has frozen any
+        # authority for it, skipping would hide plan or outcome drift.
+        if (
+            (shard, clip_uid) in self._clip_plan_cache
+            or self._clip_plan_path(shard, clip_uid).exists()
+            or self._clip_outcome_path(shard, clip_uid).exists()
+        ):
+            raise SubjectAttributeDurableError(
+                f"frozen Subject Attributes authority cannot be skipped for {clip_uid!r}"
+            )
+        return True
+
     @staticmethod
     def _seed_batches(
         targets: Sequence[tuple[str, str]], budget: int
@@ -2544,22 +2596,57 @@ class SubjectAttributeEpochRunner:
         """
         targets = self._seed_targets()
         jobs: list[ModelJob] = []
+        quarantine = self.clip_quarantine
+
+        def advance(shard: str, clip_uid: str, plan: dict[str, Any] | None = None) -> None:
+            if self._skip_preplan_quarantine(shard, clip_uid):
+                return
+            storage = self._storage_for(shard)
+            try:
+                if plan is None:
+                    jobs.extend(self._advance_clip(shard, storage, clip_uid))
+                else:
+                    jobs.extend(
+                        self._advance_clip_with_plan(shard, storage, clip_uid, plan)
+                    )
+            except (_ClipArtifactReadFailure, OSError) as caught:
+                exc = (
+                    caught.cause
+                    if isinstance(caught, _ClipArtifactReadFailure)
+                    else caught
+                )
+                if quarantine is None or not quarantine.record_if_local(
+                    shard,
+                    storage,
+                    clip_uid,
+                    "subject_attributes",
+                    exc,
+                    known_clip_artifact_read=isinstance(
+                        caught, _ClipArtifactReadFailure
+                    ),
+                ):
+                    raise exc
+
         if int(self.cpu_workers) <= 1 or len(targets) <= 1:
             for shard, clip_uid in targets:
-                jobs.extend(
-                    self._advance_clip(shard, self._storage_for(shard), clip_uid)
-                )
+                advance(shard, clip_uid)
             return sorted(jobs, key=lambda job: job.job_id())
         with ThreadPoolExecutor(max_workers=int(self.cpu_workers)) as pool:
             for batch in self._seed_batches(targets, self._clip_plan_derive_budget()):
                 futures: dict[tuple[str, str], Any] = {}
+                existing_plans: dict[tuple[str, str], dict[str, Any] | None] = {}
                 for shard, clip_uid in batch:
+                    if self._skip_preplan_quarantine(shard, clip_uid):
+                        continue
                     target = (shard, clip_uid)
                     # A clip whose plan this invocation already derived is not
                     # re-derived: the serial path short-circuits on the same
                     # cache, and deriving again would add a drift check the
                     # serial path never performs.
                     if self._clip_plan_cache.get(target) is None:
+                        existing_plans[target] = _read_json(
+                            self._clip_plan_path(shard, clip_uid)
+                        )
                         futures[target] = pool.submit(
                             self._timed_derive_clip_plan,
                             self._storage_for(shard),
@@ -2569,18 +2656,36 @@ class SubjectAttributeEpochRunner:
                     self._bump_seed_counter("clip_plan_derive_batches")
                     self._note_seed_inflight(len(futures))
                 for shard, clip_uid in batch:
+                    if self._skip_preplan_quarantine(shard, clip_uid):
+                        continue
                     plan = self._clip_plan_cache.get((shard, clip_uid))
                     if plan is None:
-                        expected = futures[(shard, clip_uid)].result()
+                        try:
+                            expected = futures[(shard, clip_uid)].result()
+                        except _ClipArtifactReadFailure as caught:
+                            if existing_plans[(shard, clip_uid)] is not None:
+                                raise SubjectAttributeDurableError(
+                                    "cannot derive the Subject Attributes clip "
+                                    f"plan for {clip_uid!r}"
+                                ) from caught
+                            storage = self._storage_for(shard)
+                            exc = caught.cause
+                            if quarantine is None or not quarantine.record_if_local(
+                                shard,
+                                storage,
+                                clip_uid,
+                                "subject_attributes",
+                                exc,
+                                known_clip_artifact_read=True,
+                            ):
+                                raise exc
+                            continue
                         self._bump_seed_counter("clip_plan_derive_tasks")
                         plan = self._apply_derived_clip_plan(
-                            shard, clip_uid, expected
+                            shard, clip_uid, expected,
+                            existing_plans[(shard, clip_uid)],
                         )
-                    jobs.extend(
-                        self._advance_clip_with_plan(
-                            shard, self._storage_for(shard), clip_uid, plan
-                        )
-                    )
+                    advance(shard, clip_uid, plan)
         return sorted(jobs, key=lambda job: job.job_id())
 
     def finalize(self, job: ModelJob, result: JobResult) -> Sequence[ModelJob]:
@@ -6300,6 +6405,8 @@ class SubjectAttributeEpochRunner:
         terminal_clips = 0
         no_work_clips = 0
         for clip_uid in self.eligible.get(shard, ()):
+            if self._skip_preplan_quarantine(shard, clip_uid):
+                continue
             plan = self._clip_plan(shard, clip_uid)
             marker = _read_json(self._clip_outcome_path(shard, clip_uid))
             if marker is None:

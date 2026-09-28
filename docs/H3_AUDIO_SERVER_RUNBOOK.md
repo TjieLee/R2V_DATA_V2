@@ -1,6 +1,6 @@
 # H3 Audio Server Runbook
 
-Last updated: 2026-09-11
+Last updated: 2026-09-28
 
 This is the server operating runbook for Audio/H3 development on
 `feature/h3-audio-jea-qwen3-v1`. It complements the Visual-focused
@@ -31,6 +31,52 @@ validated one-clip legacy/default SAM shadow root:
 named pilot root example:
   <audio-production-root>/sam_audio_stem_shadow_v1/runs/random10-v1/
 ```
+
+## Fixed random20 no-LR-ASD lineage — do not rediscover paths
+
+The accepted RA2VA no-LR-ASD fixed-random20 run is a frozen regression baseline.
+After a server restart, do **not** infer its Visual roots from `server_env.sh`, do
+not search the whole `/mnt/workspace/litengjie/data` tree, and do not create a
+new random20 upstream merely to switch the MiMo model.
+
+Frozen roots and baseline:
+
+```text
+Audio production root:
+  /mnt/workspace/litengjie/data/r2v_audio_runs/random200/random200-src10000-19999-seed20260831-20260831-124415
+
+Frozen no-LR-ASD shadow run:
+  <audio-production-root>/sam_audio_stem_shadow_v1/runs/ra2va-no-lrasd-random20-v1
+
+Accepted MiMo V2.5 no-LR-ASD baseline:
+  <shadow-run>/mimo_reconcile_no_lrasd_http_final_v4
+
+Frozen Visual runs root used by the reference artifacts:
+  /mnt/workspace/litengjie/data/r2v_v3_runs/random200/random200-src10000-19999-seed20260831-20260831-124415
+```
+
+The accepted baseline summary is exactly 20 clips, 19 ready, 1 failed,
+77 total calls = 20 visual + 40 AV + 17 audio + 0 text, with
+`binding_evidence_mode=none`. Its `source_contract.json` is the frozen
+Picture/Subject/reference-selection authority for quality A/B review.
+
+Recover the matching Visual production root from the frozen no-LR-ASD DiariZen
+inventory instead of guessing it:
+
+```bash
+export AUDIO_PRODUCTION_ROOT=/mnt/workspace/litengjie/data/r2v_audio_runs/random200/random200-src10000-19999-seed20260831-20260831-124415
+export FIXED20_SHADOW="$AUDIO_PRODUCTION_ROOT/sam_audio_stem_shadow_v1/runs/ra2va-no-lrasd-random20-v1"
+export VISUAL_PRODUCTION_ROOT="$(jq -r '.source_visual_production_root' "$FIXED20_SHADOW/diarization_no_lrasd_v1/inventory.json")"
+export VISUAL_RUNS_ROOT=/mnt/workspace/litengjie/data/r2v_v3_runs/random200/random200-src10000-19999-seed20260831-20260831-124415
+```
+
+For a MiMo-version A/B, reuse that same shadow run's `resolved_stems_v1`,
+`diarization_no_lrasd_v1`, `asr_no_lrasd_v1`, case manifest order, Pictures,
+Subjects and reference-selection policy. The intended experimental variable is
+the MiMo model/runtime only. Do not reuse an unrelated `random20-voicefirst-v1`
+run and do not silently pair the Audio root with a different Visual universe.
+A Visual/Audio canonical-set intersection of zero is a path mismatch, not a
+reason to rebuild no-LR-ASD data.
 
 The validated one-clip smoke under the legacy/default root is retained as a
 regression baseline. New pilots should use `--shadow-run-id`; do not overwrite

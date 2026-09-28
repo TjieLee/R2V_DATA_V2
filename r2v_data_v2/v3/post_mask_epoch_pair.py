@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
 from r2v_data_v2.v3.config import V3Config
 from r2v_data_v2.v3.pair import (
@@ -158,6 +158,10 @@ class _PreparedPrimaryClip:
 
 class PairEpochError(RuntimeError):
     """Raised when the Pair epoch cannot proceed without changing semantics."""
+
+
+class _QuarantinedPreparation(RuntimeError):
+    """Current clip's local preparation failed; no Pair result was applied."""
 
 
 # ---------------------------------------------------------------------------
@@ -434,6 +438,8 @@ class PairEpochRunner:
             shard: tuple(uids) for shard, uids in eligible_clip_uids_by_shard.items()
         }
         self.emit = emit or (lambda *args, **kwargs: None)
+        # Execution-only; the pipeline shares one quarantine across stages.
+        self.clip_quarantine: Any = None
         self.phase = ledger.phase(PAIR_PHASE)
         self.stats: dict[str, dict[str, int]] = {
             shard: self._empty_stats() for shard in self.storages
@@ -610,13 +616,45 @@ class PairEpochRunner:
     def _eligible_for(self, shard: str) -> tuple[str, ...]:
         return self.eligible.get(shard, ())
 
+    def _quarantined(self, shard: str, clip_uid: str) -> bool:
+        return self.clip_quarantine is not None and self.clip_quarantine.contains(
+            shard, clip_uid
+        )
+
+    def _quarantine_local(
+        self,
+        shard: str,
+        storage: RunStorage,
+        clip_uid: str,
+        exc: Exception,
+        *,
+        known_clip_artifact_read: bool = False,
+    ) -> bool:
+        return self.clip_quarantine is not None and self.clip_quarantine.record_if_local(
+            shard,
+            storage,
+            clip_uid,
+            "pair",
+            exc,
+            known_clip_artifact_read=known_clip_artifact_read,
+        )
+
     # -- durable primary plan -------------------------------------------
 
     def _plan_path(self, shard: str) -> Path:
         return _semantic_root(self.ledger) / "primary" / f"{shard}.json"
 
-    def _clip_classification(self, storage: RunStorage, clip_uid: str) -> str:
-        clip = storage.read_clip(clip_uid)
+    def _clip_classification(
+        self, storage: RunStorage, clip_uid: str, *, shard: str | None = None
+    ) -> str:
+        try:
+            clip = storage.read_clip(clip_uid)
+        except (OSError, ValueError) as exc:
+            if shard is not None and self.clip_quarantine is not None:
+                self._quarantine_local(
+                    shard, storage, clip_uid, exc, known_clip_artifact_read=True
+                )
+            raise
         if clip.pairing is not None:
             return CLIP_EXISTING_PAIRING
         if (
@@ -628,22 +666,41 @@ class PairEpochRunner:
             return CLIP_INELIGIBLE
         return CLIP_FRESH_TARGET
 
-    def _frozen_input_digest(self, storage: RunStorage, clip_uid: str) -> str:
+    def _frozen_input_digest(
+        self, storage: RunStorage, clip_uid: str, *, shard: str | None = None
+    ) -> str:
         """Digest of every pre-Pair input the primary pass depends on.
 
         Pairing, Pair-produced entity states, instruction and reference_edit
         are outputs of this invocation and are deliberately NOT bound: a fresh
         target that has since published its pairing is legal, not a mismatch.
         """
-        clip = storage.read_clip(clip_uid)
+        try:
+            clip = storage.read_clip(clip_uid)
+        except (OSError, ValueError) as exc:
+            if shard is not None and self.clip_quarantine is not None:
+                self._quarantine_local(
+                    shard, storage, clip_uid, exc, known_clip_artifact_read=True
+                )
+            raise
         try:
             frames = _validate_frames(storage, clip_uid)
             frames_payload = frames.model_dump(mode="json")
-        except Exception:  # noqa: BLE001 - ineligible inputs are frozen as such
+        except Exception as exc:
+            if shard is not None and self.clip_quarantine is not None:
+                self._quarantine_local(
+                    shard, storage, clip_uid, exc, known_clip_artifact_read=True
+                )
+                raise
             frames_payload = None
         try:
             masks_payload = storage.read_masks(clip_uid).model_dump(mode="json")
-        except Exception:  # noqa: BLE001
+        except Exception as exc:
+            if shard is not None and self.clip_quarantine is not None:
+                self._quarantine_local(
+                    shard, storage, clip_uid, exc, known_clip_artifact_read=True
+                )
+                raise
             masks_payload = None
         projection = {
             "annotation": (
@@ -724,6 +781,8 @@ class PairEpochRunner:
             self._remember_validated_plan(shard, payload)
             storage = self._storage_for(shard)
             for clip_uid, entry in payload.get("clips", {}).items():
+                if self._quarantined(shard, clip_uid):
+                    continue
                 if entry.get("classification") == CLIP_EXISTING_PAIRING:
                     # Legacy validates an existing pairing instead of
                     # regenerating it; a corrupt reference is a Pair failure.
@@ -734,10 +793,22 @@ class PairEpochRunner:
         eligible = self._eligible_for(shard)
         clips: dict[str, dict[str, Any]] = {}
         for clip_uid in eligible:
-            classification = self._clip_classification(storage, clip_uid)
+            if self._quarantined(shard, clip_uid):
+                continue
+            try:
+                classification = self._clip_classification(
+                    storage, clip_uid, shard=shard
+                )
+                digest = self._frozen_input_digest(storage, clip_uid, shard=shard)
+            except (OSError, ValueError) as exc:
+                if self._quarantined(shard, clip_uid) or self._quarantine_local(
+                    shard, storage, clip_uid, exc
+                ):
+                    continue
+                raise
             clips[clip_uid] = {
                 "classification": classification,
-                "digest": self._frozen_input_digest(storage, clip_uid),
+                "digest": digest,
             }
             if classification == CLIP_EXISTING_PAIRING:
                 # Legacy validates an existing pairing instead of regenerating
@@ -751,12 +822,23 @@ class PairEpochRunner:
             "eligible_clip_uids": list(eligible),
             "clips": clips,
         }
+        excluded = [clip_uid for clip_uid in eligible if clip_uid not in clips]
+        if excluded:
+            payload["preplan_quarantined_clip_uids"] = excluded
+            _write_json_once(
+                self._plan_path(shard).with_suffix(".exclusions.json"),
+                {"clip_uids": excluded},
+            )
         _write_json_once(self._plan_path(shard), payload)
         self._remember_validated_plan(shard, payload)
         return payload
 
     def _validate_primary_plan(self, shard: str, payload: Mapping[str, Any]) -> dict[str, Any]:
         """Validate an existing frozen plan. Read-only; never writes it back."""
+        # A damaged clip cannot prove its stored digest on a cold runner. Only
+        # this invocation's earlier full validation of the unchanged plan may
+        # justify skipping that clip after it becomes quarantined.
+        prior = self._reuse_validated_plan(shard) if self.clip_quarantine is not None else None
         if payload.get("schema") != PAIR_PRIMARY_PLAN_SCHEMA:
             raise PairEpochError(f"unsupported primary plan schema for {shard!r}")
         expected = {
@@ -770,11 +852,63 @@ class PairEpochRunner:
                 raise PairEpochError(
                     f"frozen primary plan {key} drifted for {shard!r}"
                 )
+        clips = payload.get("clips")
+        if not isinstance(clips, dict):
+            raise PairEpochError(f"frozen primary plan clips are invalid for {shard!r}")
+        eligible = set(self._eligible_for(shard))
+        if set(clips) - eligible:
+            raise PairEpochError(f"frozen primary plan has unknown clip for {shard!r}")
+        for clip_uid in self._eligible_for(shard):
+            if clip_uid not in clips and not self._quarantined(shard, clip_uid):
+                raise PairEpochError(
+                    f"frozen primary plan missing clip {clip_uid!r} in {shard!r}"
+                )
+        excluded = [uid for uid in self._eligible_for(shard) if uid not in clips]
+        if payload.get("preplan_quarantined_clip_uids", []) != excluded:
+            raise PairEpochError(
+                f"frozen primary plan exclusion drifted for {shard!r}"
+            )
+        witness = _read_json(self._plan_path(shard).with_suffix(".exclusions.json"))
+        if (witness if witness is not None else {"clip_uids": []}) != {
+            "clip_uids": excluded
+        }:
+            raise PairEpochError(
+                f"frozen primary plan exclusion witness drifted for {shard!r}"
+            )
         # The stored per-clip input digests are the whole point of the
         # plan: re-derive them and fail closed on any pre-Pair drift.
         storage = self._storage_for(shard)
         for clip_uid, entry in payload.get("clips", {}).items():
-            actual = self._frozen_input_digest(storage, clip_uid)
+            if (
+                not isinstance(entry, dict)
+                or set(entry) != {"classification", "digest"}
+                or entry["classification"] not in {
+                    CLIP_FRESH_TARGET, CLIP_EXISTING_PAIRING, CLIP_INELIGIBLE
+                }
+                or not isinstance(entry["digest"], str)
+                or not entry["digest"]
+            ):
+                raise PairEpochError(
+                    f"frozen primary plan entry is malformed for {clip_uid!r}"
+                )
+            if self._quarantined(shard, clip_uid):
+                if prior is None or prior.get("clips", {}).get(clip_uid) != entry:
+                    raise PairEpochError(
+                        f"cannot validate frozen primary input for {clip_uid!r} in {shard!r}"
+                    )
+                continue
+            try:
+                actual = self._frozen_input_digest(storage, clip_uid, shard=shard)
+            except (OSError, ValueError) as exc:
+                if self._quarantined(shard, clip_uid) or self._quarantine_local(
+                    shard, storage, clip_uid, exc
+                ):
+                    if prior is None or prior.get("clips", {}).get(clip_uid) != entry:
+                        raise PairEpochError(
+                            f"cannot validate frozen primary input for {clip_uid!r} in {shard!r}"
+                        ) from exc
+                    continue
+                raise
             if actual != entry.get("digest"):
                 raise PairEpochError(
                     f"frozen primary input drifted for {clip_uid!r} in {shard!r}"
@@ -909,7 +1043,9 @@ class PairEpochRunner:
 
     # -- primary replay ---------------------------------------------------
 
-    def _frozen_pair_inputs(self, storage: RunStorage, clip_uid: str) -> Any:
+    def _frozen_pair_inputs(
+        self, storage: RunStorage, clip_uid: str, *, shard: str | None = None
+    ) -> Any:
         """The clip's frames and masks, cached per invocation.
 
         Both are frozen by the time Pair runs: the epoch Pair pass only ever
@@ -925,7 +1061,15 @@ class PairEpochRunner:
         try:
             frames = _validate_frames(storage, clip_uid)
             masks = storage.read_masks(clip_uid)
-        except Exception:  # noqa: BLE001 - not eligible for Pair
+        except Exception as exc:
+            if (
+                shard is not None
+                and self.clip_quarantine is not None
+                and not self._quarantine_local(
+                    shard, storage, clip_uid, exc, known_clip_artifact_read=True
+                )
+            ):
+                raise
             return None
         if len(self._frozen_inputs) >= _PRIMARY_CONTEXT_LIMIT:
             # Bounded: drop the oldest entry. A miss only costs a re-read.
@@ -933,10 +1077,12 @@ class PairEpochRunner:
         self._frozen_inputs[key] = (frames, masks)
         return self._frozen_inputs[key]
 
-    def _primary_context(self, storage: RunStorage, clip_uid: str) -> Any:
+    def _primary_context(
+        self, storage: RunStorage, clip_uid: str, *, shard: str | None = None
+    ) -> Any:
         from r2v_data_v2.v3.pair import _validate_pair_inputs
 
-        frozen = self._frozen_pair_inputs(storage, clip_uid)
+        frozen = self._frozen_pair_inputs(storage, clip_uid, shard=shard)
         if frozen is None:
             return None
         frames, masks = frozen
@@ -1174,9 +1320,22 @@ class PairEpochRunner:
             count = len(clip.annotation.entities)
             row = results[cursor : cursor + count]
             cursor += count
+            quarantined = False
             for item in row:
                 if isinstance(item, BaseException):
+                    if isinstance(item, (OSError, ValueError)) and self._quarantine_local(
+                        shard,
+                        storage,
+                        clip_uid,
+                        item,
+                        known_clip_artifact_read=isinstance(item, UnidentifiedImageError),
+                    ):
+                        quarantined = True
+                        break
                     raise item
+            if quarantined:
+                task_cursor += count
+                continue
             # Sum this clip's own task counters in annotation order.
             projection = self._empty_stats()
             for _offset in range(count):
@@ -1307,9 +1466,20 @@ class PairEpochRunner:
         counters = self._scratch(shard)
         entities = list(enumerate(clip.annotation.entities))
         started = time.perf_counter()
-        prepared_by_entity = self._prepare_entities(
-            shard, storage, clip_uid, entities, frames, masks, counters
-        )
+        try:
+            prepared_by_entity = self._prepare_entities(
+                shard, storage, clip_uid, entities, frames, masks, counters
+            )
+        except (OSError, ValueError) as exc:
+            if self._quarantine_local(
+                shard,
+                storage,
+                clip_uid,
+                exc,
+                known_clip_artifact_read=isinstance(exc, UnidentifiedImageError),
+            ):
+                raise _QuarantinedPreparation from exc
+            raise
         self._note_prepare_wall(time.perf_counter() - started)
         return self._apply_prepared_primary_clip(
             shard,
@@ -1678,14 +1848,24 @@ class PairEpochRunner:
                 plan = self._frozen_primary_plan(shard)
                 storage = self._storage_for(shard)
                 for clip_uid in plan["eligible_clip_uids"]:
-                    if plan["clips"][clip_uid]["classification"] != CLIP_FRESH_TARGET:
+                    if self._quarantined(shard, clip_uid):
                         continue
-                    context = self._primary_context(storage, clip_uid)
+                    if plan["clips"].get(clip_uid, {}).get("classification") != CLIP_FRESH_TARGET:
+                        continue
+                    try:
+                        context = self._primary_context(storage, clip_uid, shard=shard)
+                    except (OSError, ValueError) as exc:
+                        if self._quarantine_local(shard, storage, clip_uid, exc):
+                            continue
+                        raise
                     if context is None:
                         continue
-                    batch_jobs = self._advance_primary_clip(
-                        shard, storage, clip_uid, context
-                    )
+                    try:
+                        batch_jobs = self._advance_primary_clip(
+                            shard, storage, clip_uid, context
+                        )
+                    except _QuarantinedPreparation:
+                        continue
                     self.phase.write_plan(batch_jobs)
                     yield batch_jobs
             return
@@ -1710,7 +1890,9 @@ class PairEpochRunner:
                 plan = self._frozen_primary_plan(shard)
                 storage = self._storage_for(shard)
                 for clip_uid in plan["eligible_clip_uids"]:
-                    if plan["clips"][clip_uid]["classification"] != CLIP_FRESH_TARGET:
+                    if self._quarantined(shard, clip_uid):
+                        continue
+                    if plan["clips"].get(clip_uid, {}).get("classification") != CLIP_FRESH_TARGET:
                         continue
                     if self._clip_primary_settled(shard, clip_uid) is True:
                         # A streaming consumer drains each batch before asking
@@ -1718,7 +1900,12 @@ class PairEpochRunner:
                         # can already be terminal here. Re-visiting it would
                         # re-derive and re-publish work that is already durable.
                         continue
-                    context = self._primary_context(storage, clip_uid)
+                    try:
+                        context = self._primary_context(storage, clip_uid, shard=shard)
+                    except (OSError, ValueError) as exc:
+                        if self._quarantine_local(shard, storage, clip_uid, exc):
+                            continue
+                        raise
                     if context is None:
                         continue
                     count = len(context[0].annotation.entities)
@@ -1794,16 +1981,25 @@ class PairEpochRunner:
 
 
 
-    def _pair_inputs_valid(self, storage: RunStorage, clip_uid: str) -> bool:
+    def _pair_inputs_valid(
+        self, storage: RunStorage, clip_uid: str, *, shard: str | None = None
+    ) -> bool:
         """Read-only legacy input validation. Never mutates, never appends."""
         from r2v_data_v2.v3.pair import _validate_pair_inputs as legacy_inputs
 
-        clip = storage.read_clip(clip_uid)
+        try:
+            clip = storage.read_clip(clip_uid)
+        except (OSError, ValueError) as exc:
+            if shard is not None and self._quarantine_local(
+                shard, storage, clip_uid, exc, known_clip_artifact_read=True
+            ):
+                return False
+            raise
         # Frames and masks are frozen for the whole Pair pass - the epoch only
         # ever writes references, pairing and selected images - so the bounded
         # frozen-input cache this invocation already populated can answer the
         # read. A cold runner has an empty cache and reads exactly as before.
-        frozen = self._frozen_pair_inputs(storage, clip_uid)
+        frozen = self._frozen_pair_inputs(storage, clip_uid, shard=shard)
         if frozen is None:
             return False
         frames, masks = frozen
@@ -1945,6 +2141,8 @@ class PairEpochRunner:
         counts: dict[str, int] = {field: 0 for field in PairStats.__dataclass_fields__}
         stats = _MutableStats(counts)
         for clip_uid in sorted(plan.get("clips", {})):
+            if self._quarantined(shard, clip_uid):
+                continue
             classification = plan["clips"][clip_uid]["classification"]
             if classification == CLIP_INELIGIBLE:
                 stats.skipped_not_ready += 1
@@ -1955,7 +2153,7 @@ class PairEpochRunner:
                 else:
                     stats.failed += 1
                 continue
-            if not self._pair_inputs_valid(storage, clip_uid):
+            if not self._pair_inputs_valid(storage, clip_uid, shard=shard):
                 stats.skipped_not_ready += 1
                 continue
             stats.processed += 1
@@ -1977,6 +2175,8 @@ class PairEpochRunner:
 
         # Repairs: one per committed primary entity decision, never the raw sum.
         for record in self._planned_jobs(shard):
+            if self._quarantined(shard, str(record.get("clip_uid", ""))):
+                continue
             if record.get("job_type") != PAIR_ENTITY_JUDGE_JOB:
                 continue
             payload = self._committed_payload(str(record.get("job_id", "")))
@@ -2045,6 +2245,8 @@ class PairEpochRunner:
                 raise PairEpochError(
                     f"pair job {job.job_id()} receipt mismatch: {state.detail or ''}"
                 )
+            if self._quarantined(shard, job.clip_uid):
+                continue
             if not state.skippable:
                 raise PairEpochError(
                     f"pair job {job.job_id()} is not terminal; "
@@ -2067,9 +2269,11 @@ class PairEpochRunner:
         counts["entities_rejected"] = 0
         counts["backgrounds_bound"] = 0
         for clip_uid in sorted(plan.get("clips", {})):
+            if self._quarantined(shard, clip_uid):
+                continue
             if plan["clips"][clip_uid]["classification"] != CLIP_FRESH_TARGET:
                 continue
-            if not self._pair_inputs_valid(storage, clip_uid):
+            if not self._pair_inputs_valid(storage, clip_uid, shard=shard):
                 continue
             clip = storage.read_clip(clip_uid)
             if clip.pairing is None:
@@ -2104,9 +2308,11 @@ class PairEpochRunner:
 
         pending: list[tuple[str, Any]] = []
         for clip_uid in sorted(plan.get("clips", {})):
+            if self._quarantined(shard, clip_uid):
+                continue
             if plan["clips"][clip_uid]["classification"] != CLIP_FRESH_TARGET:
                 continue
-            if not self._pair_inputs_valid(storage, clip_uid):
+            if not self._pair_inputs_valid(storage, clip_uid, shard=shard):
                 continue
             clip = storage.read_clip(clip_uid)
             # This invocation already ran exactly this prefilter for exactly
@@ -2362,9 +2568,16 @@ class PairEpochRunner:
             plan = self._primary_plan(shard)
             storage = self._storage_for(shard)
             for clip_uid in plan["eligible_clip_uids"]:
-                if plan["clips"][clip_uid]["classification"] != CLIP_FRESH_TARGET:
+                if self._quarantined(shard, clip_uid):
                     continue
-                context = self._primary_context(storage, clip_uid)
+                if plan["clips"].get(clip_uid, {}).get("classification") != CLIP_FRESH_TARGET:
+                    continue
+                try:
+                    context = self._primary_context(storage, clip_uid, shard=shard)
+                except (OSError, ValueError) as exc:
+                    if self._quarantine_local(shard, storage, clip_uid, exc):
+                        continue
+                    raise
                 if context is None:
                     continue
                 unresolved.extend(
@@ -2403,9 +2616,16 @@ class PairEpochRunner:
         storage = self._storage_for(shard)
         blocked: list[str] = []
         for clip_uid in plan["eligible_clip_uids"]:
-            if plan["clips"][clip_uid]["classification"] != CLIP_FRESH_TARGET:
+            if self._quarantined(shard, clip_uid):
                 continue
-            context = self._primary_context(storage, clip_uid)
+            if plan["clips"].get(clip_uid, {}).get("classification") != CLIP_FRESH_TARGET:
+                continue
+            try:
+                context = self._primary_context(storage, clip_uid, shard=shard)
+            except (OSError, ValueError) as exc:
+                if self._quarantine_local(shard, storage, clip_uid, exc):
+                    continue
+                raise
             if context is None:
                 continue
             _, temporary, pending = self._replay_primary_clip(
@@ -2434,7 +2654,9 @@ class PairEpochRunner:
         skip = set(blocked)
         targets: list[str] = []
         for clip_uid in plan["eligible_clip_uids"]:
-            if plan["clips"][clip_uid]["classification"] != CLIP_FRESH_TARGET:
+            if self._quarantined(shard, clip_uid):
+                continue
+            if plan["clips"].get(clip_uid, {}).get("classification") != CLIP_FRESH_TARGET:
                 continue
             if clip_uid in skip:
                 continue

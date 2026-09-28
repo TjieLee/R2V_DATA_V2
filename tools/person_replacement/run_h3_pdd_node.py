@@ -18,18 +18,24 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gpus",default="0,1,2,3,4,5,6,7")
     parser.add_argument("--pair-start",type=int,default=0)
+    parser.add_argument("--pair-count",type=int,default=None,
+                        help="Number of consecutive pair shards to launch; defaults to all GPU groups")
     parser.add_argument("--group-size",type=int,choices=(2,4,8),default=2)
     parser.add_argument("--output-root",type=Path,required=True)
     args, remaining = parser.parse_known_args(argv)
     devices = [device.strip() for device in args.gpus.split(",")]
     if len(devices) % args.group_size or len(set(devices)) != len(devices) or not all(devices) or args.pair_start < 0:
         parser.error("Distinct GPUs divisible by group-size and nonnegative pair-start required")
+    group_count = len(devices)//args.group_size
+    pair_count = group_count if args.pair_count is None else args.pair_count
+    if pair_count < 1 or pair_count > group_count:
+        parser.error("--pair-count must be between 1 and the number of GPU groups")
     if any(arg == "--pair-id" or arg.startswith("--pair-id=") for arg in remaining):
         parser.error("Use --pair-start, not --pair-id")
     root = validate_output_root(args.output_root)
     specs = []
     session = uuid.uuid4().hex
-    for i in range(len(devices)//args.group_size):
+    for i in range(pair_count):
         options = ["--output-root",str(root),"--pair-id",str(args.pair_start+i),
                    "--group-size",str(args.group_size),*remaining]
         if "--status" in remaining or "--dry-run" in remaining:
