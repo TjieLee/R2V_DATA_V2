@@ -652,6 +652,8 @@ class ReferenceIntegrityEpochRunner:
             "plan_stat_miss": 0,
             "plan_content_read_count": 0,
             "plan_semantic_digest_count": 0,
+            "reconcile_plan_cache_hits": 0,
+            "reconcile_plan_cache_fallbacks": 0,
         }
         # Invocation-only diagnostics for fresh frozen-plan derivation. These
         # are never serialized into a plan, job, receipt or stage count.
@@ -5366,9 +5368,47 @@ class ReferenceIntegrityEpochRunner:
 
     def reconcile_stats(self, shard: str) -> ReferenceIntegrityStats:
         """Stats rebuilt from the frozen plan, clip markers and entity markers."""
-        plan = self._existing_plan_for_reconcile(shard)
+        # Seed already validated and remembered every entry for this shard.
+        # Reconcile needs only those classifications plus the durable outcome
+        # markers; it need not read or validate the whole plan a second time.
+        # A standalone reconcile has no invocation cache and keeps the strict
+        # durable-plan fallback.
+        with self._plan_cache_lock:
+            cached = shard in self._validated_plan_digests
+            clips = (
+                {
+                    clip_uid: entry
+                    for (entry_shard, clip_uid), entry in self._validated_plan_entries.items()
+                    if entry_shard == shard
+                }
+                if cached
+                else {}
+            )
+        if cached:
+            self._bump_plan_counter("reconcile_plan_cache_hits")
+        else:
+            self._bump_plan_counter("reconcile_plan_cache_fallbacks")
+            clips = self._existing_plan_for_reconcile(shard).get("clips", {})
+        _LOGGER.info(
+            "reference_integrity_reconcile_plan shard=%s cache_hits=%d "
+            "cache_fallbacks=%d",
+            shard,
+            self.plan_counters["reconcile_plan_cache_hits"],
+            self.plan_counters["reconcile_plan_cache_fallbacks"],
+        )
+        if self.emit is not None:
+            self.emit(
+                "post_mask_epoch_reference_integrity_reconcile_plan_diagnostics",
+                shard=shard,
+                reconcile_plan_cache_hits=self.plan_counters[
+                    "reconcile_plan_cache_hits"
+                ],
+                reconcile_plan_cache_fallbacks=self.plan_counters[
+                    "reconcile_plan_cache_fallbacks"
+                ],
+            )
         counts = {field: 0 for field in ReferenceIntegrityStats.__dataclass_fields__}
-        for clip_uid, entry in sorted(plan.get("clips", {}).items()):
+        for clip_uid, entry in sorted(clips.items()):
             if self._is_quarantined(shard, clip_uid):
                 counts["processed"] += 1
                 counts["failed"] += 1
@@ -5389,7 +5429,7 @@ class ReferenceIntegrityEpochRunner:
             self._validated_clip_outcome(clip_uid, marker)
             for key, value in marker.get("delta", {}).items():
                 counts[key] = counts.get(key, 0) + int(value)
-        for clip_uid in set(self.eligible.get(shard, ())) - set(plan.get("clips", {})):
+        for clip_uid in set(self.eligible.get(shard, ())) - set(clips):
             if not self._is_quarantined(shard, clip_uid):
                 raise ReferenceIntegrityDurableError(
                     f"frozen Reference Integrity plan scope drifted for {shard!r}"

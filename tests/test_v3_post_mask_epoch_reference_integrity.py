@@ -2577,10 +2577,96 @@ def test_cold_runner_still_validates_plan_structure(
     assert cold.plan_counters["plan_full_validation_count"] == 1
     assert cold._validated_plan_digests.get(SHARD)
 
-    # Reconcile still validates the durable plan's own fields.
+    # Seed already validated this plan in this invocation; reconcile reuses it.
     before = cold.plan_counters["plan_full_validation_count"]
     cold.reconcile_stats(SHARD)
-    assert cold.plan_counters["plan_full_validation_count"] == before + 1
+    assert cold.plan_counters["plan_full_validation_count"] == before
+
+
+def test_reconcile_reuses_seed_plan_without_plan_or_live_artifact_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, storage, runner, judge = _seeded_review_fixture(
+        tmp_path, monkeypatch, "run-reconcile-plan-reuse"
+    )
+    _epoch_scheduler(runner, _SerialQwenExecutor(runner, judge)).run(runner.seed_jobs())
+    expected = _runner(config, storage, tmp_path).reconcile_stats(SHARD).to_dict()
+    before = runner.plan_counters["plan_full_validation_count"]
+
+    def unexpected(*args: Any, **kwargs: Any) -> Any:
+        pytest.fail("hot reconcile must use the plan already validated by seed")
+
+    monkeypatch.setattr(runner, "_existing_plan_for_reconcile", unexpected)
+    monkeypatch.setattr(storage, "read_clip", unexpected)
+    monkeypatch.setattr(storage, "read_frames", unexpected)
+    monkeypatch.setattr(storage, "read_masks", unexpected)
+    events: list[tuple[str, dict[str, Any]]] = []
+    runner.emit = lambda event, **fields: events.append((event, fields))
+
+    assert runner.reconcile_stats(SHARD).to_dict() == expected
+    assert runner.plan_counters["plan_full_validation_count"] == before
+    assert runner.plan_counters["reconcile_plan_cache_hits"] == 1
+    assert runner.plan_counters["reconcile_plan_cache_fallbacks"] == 0
+    assert events == [
+        (
+            "post_mask_epoch_reference_integrity_reconcile_plan_diagnostics",
+            {
+                "shard": SHARD,
+                "reconcile_plan_cache_hits": 1,
+                "reconcile_plan_cache_fallbacks": 0,
+            },
+        )
+    ]
+
+
+def test_direct_cold_reconcile_preserves_durable_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, storage, _runner_with_plan, judge = _seeded_review_fixture(
+        tmp_path, monkeypatch, "run-reconcile-cold"
+    )
+    _run_epoch(config, storage, tmp_path, judge)
+    cold = _runner(config, storage, tmp_path)
+    reads: list[str] = []
+    real_read = cold._existing_plan_for_reconcile
+
+    def read_plan(shard: str) -> Any:
+        reads.append(shard)
+        return real_read(shard)
+
+    monkeypatch.setattr(cold, "_existing_plan_for_reconcile", read_plan)
+    assert cold.reconcile_stats(SHARD).processed == 1
+    assert reads == [SHARD]
+    assert cold.plan_counters["plan_full_validation_count"] == 1
+    assert cold.plan_counters["reconcile_plan_cache_hits"] == 0
+    assert cold.plan_counters["reconcile_plan_cache_fallbacks"] == 1
+
+
+def test_cached_reconcile_keeps_excluded_quarantine_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, storage, runner, clip_uids = _multi_clip_fixture(
+        tmp_path,
+        monkeypatch,
+        "run-reconcile-excluded",
+        entity_ids_by_clip={"clip-1": ("e1",), "clip-2": ("e1",)},
+        cpu_workers=2,
+    )
+    runner.clip_quarantine = ClipQuarantine()
+    storage.clip_path(clip_uids[1]).unlink()
+    assert runner.seed_jobs() == []
+
+    hot = runner.reconcile_stats(SHARD).to_dict()
+    cold = _epoch_runner(
+        config, storage, runner.ledger.root,
+        clip_uids=clip_uids, cpu_workers=2,
+    )
+    cold.clip_quarantine = runner.clip_quarantine
+    assert hot == cold.reconcile_stats(SHARD).to_dict()
+    assert hot["processed"] == 2
+    assert hot["failed"] == 1
+    assert runner.plan_counters["reconcile_plan_cache_hits"] == 1
+    assert cold.plan_counters["reconcile_plan_cache_fallbacks"] == 1
 
 
 def test_existing_plan_done_clip_skips_historical_artifact_reads(

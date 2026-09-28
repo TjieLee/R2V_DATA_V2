@@ -2410,32 +2410,21 @@ def test_two_shard_reconcile_failure_writes_zero_partial_stage_counts(
     )
     pair_shards = [shard for shard in storages if shard != SHARD]
     snapshot: dict[str, dict[str, int]] = {}
+    ledger_root = Path(storages[SHARD].root).parent.parent / "epoch-ledger"
+    marker_path = (
+        ledger_root / "semantic" / "reference_edit" / "outcomes"
+        / "shard-b" / "clip-1.json"
+    )
+    original_marker: list[bytes] = []
 
     def corrupt_shard_b() -> None:
-        """Snapshot both shards, then corrupt shard B's publication."""
-        import r2v_data_v2.v3.storage as storage_module
-
+        """Snapshot both shards, then corrupt a marker reconcile must read."""
         for shard in pair_shards:
             snapshot[shard] = dict(storages[shard].read_run().counts)
-        storage_b = storages["shard-b"]
-        clip = storage_b.read_clip("clip-1")
-        assert clip.reference_edit is not None
-        tampered = [
-            entity.model_copy(update={"metadata_path": "clips/tampered.json"})
-            if index == 0
-            else entity
-            for index, entity in enumerate(clip.reference_edit.entities)
-        ]
-        storage_module.write_json_atomic(
-            storage_b.clip_path("clip-1"),
-            clip.model_copy(
-                update={
-                    "reference_edit": clip.reference_edit.model_copy(
-                        update={"entities": tampered}
-                    )
-                }
-            ).model_dump(mode="json"),
-        )
+        original_marker.append(marker_path.read_bytes())
+        marker = json.loads(original_marker[0])
+        marker["terminal"] = "invalid"
+        marker_path.write_text(json.dumps(marker), encoding="utf-8")
 
     result = _run_two_shard_composition(
         config, storages, eligible, after_reference_edit=corrupt_shard_b
@@ -2453,39 +2442,8 @@ def test_two_shard_reconcile_failure_writes_zero_partial_stage_counts(
             key.startswith("reference_edit.") for key in after
         ), f"{shard} has partial reference_edit keys"
 
-    # Restart with the shard repaired: both shards are written atomically.
-    import r2v_data_v2.v3.storage as storage_module
-    from r2v_data_v2.v3.post_mask_epoch_reference_edit import (
-        ReferenceEditEpochRunner,
-    )
-
-    storage_b = storages["shard-b"]
-    stored = storage_b.read_clip("clip-1")
-    ledger_root = Path(storages[SHARD].root).parent.parent / "epoch-ledger"
-    repair = ReferenceEditEpochRunner(
-        config,
-        {"shard-b": storage_b},
-        GroupLedger(ledger_root),
-        eligible_clip_uids_by_shard={"shard-b": ["clip-1"]},
-    )
-    # Read the frozen plan directly: the strict verifier intentionally refuses
-    # the tampered state we are about to repair.
-    plan = json.loads(
-        Path(repair._plan_path("shard-b")).read_text(encoding="utf-8")
-    )
-    expected = repair._reconstruct_clip_publication(
-        "shard-b", storage_b, "clip-1", plan["clips"]["clip-1"]
-    )
-    storage_module.write_json_atomic(
-        storage_b.clip_path("clip-1"),
-        stored.model_copy(
-            update={
-                "references": expected[0],
-                "pairing": expected[1],
-                "reference_edit": expected[2],
-            }
-        ).model_dump(mode="json"),
-    )
+    # Restart with the durable outcome marker repaired: both shards publish.
+    marker_path.write_bytes(original_marker[0])
 
     second = _run_two_shard_composition(config, storages, eligible)
     assert second["reference_edit_completed"] is True, second.get(

@@ -1532,7 +1532,7 @@ def test_explicit_audit_detects_published_clip_tamper(
         fresh._verify_published_clip(SHARD, storage, "clip-1", plan_entry)
 
 
-def test_fresh_reconcile_still_audits_published_clip_before_stage_counts(
+def test_hot_reconcile_skips_live_publication_audit_but_explicit_audit_detects_tamper(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _config, storage, runner, scheduler, _routing = _build(tmp_path, monkeypatch)
@@ -1553,11 +1553,13 @@ def test_fresh_reconcile_still_audits_published_clip_before_stage_counts(
         clip.model_copy(update={"reference_edit": tampered}).model_dump(mode="json"),
     )
 
+    assert runner.reconcile_stats(SHARD).processed == 1
+    plan_entry = runner._plan(SHARD)["clips"]["clip-1"]
     with pytest.raises(ReferenceEditDurableError, match="does not match"):
-        runner.reconcile_stats(SHARD)
+        runner._verify_published_clip(SHARD, storage, "clip-1", plan_entry)
 
 
-def test_resumed_pending_clip_is_audited_after_current_run_publishes_it(
+def test_resumed_hot_reconcile_skips_audit_but_explicit_audit_detects_tamper(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config, storage, initial, _scheduler, _routing = _build(tmp_path, monkeypatch)
@@ -1592,8 +1594,10 @@ def test_resumed_pending_clip_is_audited_after_current_run_publishes_it(
         clip.model_copy(update={"reference_edit": tampered}).model_dump(mode="json"),
     )
 
+    assert runner.reconcile_stats(SHARD).processed == 1
+    plan_entry = runner._plan(SHARD)["clips"]["clip-1"]
     with pytest.raises(ReferenceEditDurableError, match="does not match"):
-        runner.reconcile_stats(SHARD)
+        runner._verify_published_clip(SHARD, storage, "clip-1", plan_entry)
 
 
 # ---------------------------------------------------------------------------
@@ -2686,12 +2690,12 @@ def test_reference_edit_seed_resource_error_still_propagates(
 
 
 def _count_plan_validations(runner: Any) -> dict[str, int]:
-    """Count plan-entry validations, their clip digests, and shard plan reads.
+    """Count plan-entry validations, clip digests, and reconcile calls.
 
     The patches are on the instance and call through to the real validators, so
     the counters stay exact rather than estimated.
     """
-    counts = {"entries": 0, "digests": 0, "shard_reads": 0}
+    counts = {"entries": 0, "digests": 0, "reconcile_calls": 0}
     original_entry = runner._verify_plan_entry
     original_digest = runner._clip_digest
     original_existing = runner._existing_plan_for_reconcile
@@ -2705,7 +2709,7 @@ def _count_plan_validations(runner: Any) -> dict[str, int]:
         return original_digest(storage, clip)
 
     def counted_existing(shard: str) -> Any:
-        counts["shard_reads"] += 1
+        counts["reconcile_calls"] += 1
         return original_existing(shard)
 
     runner._verify_plan_entry = counted_entry
@@ -2720,7 +2724,7 @@ def test_seed_validates_the_frozen_plan_once_per_seed(
     """Seeding N clips must not verify the shard plan N extra times.
 
     Each still-pending clip gets one live input check before execution.
-    Reconcile audits active clips once, not the whole shard per clip.
+    Reconcile reuses the invocation's validated plan without another audit.
     """
     config, storage, uids = _fresh_target_shard(tmp_path, monkeypatch, count=6)
     # Freeze the plan first, so the seed under test reads it from disk.
@@ -2734,18 +2738,95 @@ def test_seed_validates_the_frozen_plan_once_per_seed(
     assert len(jobs) == len(uids), "every clip is a fresh target with one job"
     assert counts["entries"] == len(uids), "one validation pass, not one per clip"
     assert counts["digests"] == len(uids)
-    assert counts["shard_reads"] == 0, "the seed must not re-fetch the shard plan"
+    assert counts["reconcile_calls"] == 0
 
     # A second seed round validates the shard once more, not once per clip.
     runner.seed_jobs()
     assert counts["entries"] == 2 * len(uids)
-    assert counts["shard_reads"] == 0
+    assert counts["reconcile_calls"] == 0
 
-    # Reconcile re-reads the plan and audits only current-invocation clips.
+    # Reconcile uses the validated plan without another live input audit.
     runner._existing_plan_for_reconcile(SHARD)
-    assert counts["entries"] == 3 * len(uids)
-    assert counts["digests"] == 3 * len(uids)
-    assert counts["shard_reads"] == 1
+    assert counts["entries"] == 2 * len(uids)
+    assert counts["digests"] == 2 * len(uids)
+    assert counts["reconcile_calls"] == 1
+
+
+def test_reconcile_reuses_invocation_plan_without_revalidation_or_clip_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, storage, runner, scheduler, _routing = _build(tmp_path, monkeypatch)
+    _drain(runner, scheduler)
+    cold = _plan_runner(config, storage, tmp_path, ["clip-1"])
+    expected = cold.reconcile_stats(SHARD).to_dict()
+    plan_path = runner._plan_path(SHARD)
+    original_read_json = reference_edit_epoch._read_json
+    diagnostics: list[tuple[str, dict[str, Any]]] = []
+    runner.emit = lambda event, **fields: diagnostics.append((event, fields))
+
+    def marker_only_read(path: Path) -> Any:
+        if path == plan_path:
+            raise AssertionError("hot reconcile re-read the frozen plan")
+        return original_read_json(path)
+
+    def no_revalidation(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("hot reconcile revalidated plan or clip inputs")
+
+    monkeypatch.setattr(reference_edit_epoch, "_read_json", marker_only_read)
+    monkeypatch.setattr(runner, "_verify_plan_payload", no_revalidation)
+    monkeypatch.setattr(runner, "_verify_plan_entry", no_revalidation)
+    monkeypatch.setattr(storage, "read_clip", no_revalidation)
+    monkeypatch.setattr(storage, "read_frames", no_revalidation)
+    monkeypatch.setattr(storage, "read_masks", no_revalidation)
+
+    assert runner.reconcile_stats(SHARD).to_dict() == expected
+    assert runner.seed_counters["reconcile_plan_cache_hits"] == 1
+    assert runner.seed_counters["reconcile_plan_cache_fallbacks"] == 0
+    assert diagnostics == [
+        (
+            "post_mask_epoch_reference_edit_reconcile_plan_diagnostics",
+            {
+                "shard": SHARD,
+                "reconcile_plan_cache_hits": 1,
+                "reconcile_plan_cache_fallbacks": 0,
+            },
+        )
+    ]
+
+
+def test_direct_reconcile_without_invocation_plan_uses_strict_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, storage, runner, scheduler, _routing = _build(tmp_path, monkeypatch)
+    _drain(runner, scheduler)
+    expected = runner.reconcile_stats(SHARD).to_dict()
+    cold = _plan_runner(config, storage, tmp_path, ["clip-1"])
+    original_verify = cold._verify_plan_payload
+    verified = 0
+    diagnostics: list[tuple[str, dict[str, Any]]] = []
+    cold.emit = lambda event, **fields: diagnostics.append((event, fields))
+
+    def count_verify(shard: str, payload: dict[str, Any]) -> None:
+        nonlocal verified
+        verified += 1
+        original_verify(shard, payload)
+
+    monkeypatch.setattr(cold, "_verify_plan_payload", count_verify)
+
+    assert cold.reconcile_stats(SHARD).to_dict() == expected
+    assert verified == 1
+    assert cold.seed_counters["reconcile_plan_cache_hits"] == 0
+    assert cold.seed_counters["reconcile_plan_cache_fallbacks"] == 1
+    assert diagnostics == [
+        (
+            "post_mask_epoch_reference_edit_reconcile_plan_diagnostics",
+            {
+                "shard": SHARD,
+                "reconcile_plan_cache_hits": 0,
+                "reconcile_plan_cache_fallbacks": 1,
+            },
+        )
+    ]
 
 
 def test_seed_parallel_read_only_geometry_keeps_canonical_jobs(

@@ -279,9 +279,11 @@ class ReferenceEditEpochRunner:
         self.clip_quarantine: Any = None
         self.emit = emit or (lambda *args, **kwargs: None)
         self.review_execution = review_execution
-        # Clips pending in this runner's invocation need a live publication
-        # check before stage counts; completed clips on cold resume do not.
+        # Retained for the strict cold reconcile fallback. The hot path trusts
+        # this invocation's validated plan and seed/finalization checks.
         self._active_clip_uids_by_shard: dict[str, set[str]] = {}
+        # Invocation-local only: never serialized or used as durable authority.
+        self._validated_plans: dict[str, dict[str, Any]] = {}
         self._seed_counter_lock = threading.Lock()
         self._seed_active = 0
         self.seed_counters: dict[str, int | float] = {
@@ -289,6 +291,8 @@ class ReferenceEditEpochRunner:
             "plan_derive_batches": 0,
             "plan_derive_peak_inflight": 0,
             "plan_derive_wall_seconds": 0.0,
+            "reconcile_plan_cache_hits": 0,
+            "reconcile_plan_cache_fallbacks": 0,
             "prepare_tasks": 0,
             "prepare_parallel_tasks": 0,
             "prepare_peak_inflight": 0,
@@ -491,9 +495,11 @@ class ReferenceEditEpochRunner:
         return clip
 
     def _plan(self, shard: str) -> dict[str, Any]:
+        self._validated_plans.pop(shard, None)
         existing = _read_json(self._plan_path(shard))
         if existing is not None:
             self._verify_plan_payload(shard, existing)
+            self._validated_plans[shard] = existing
             return existing
 
         storage = self._storage_for(shard)
@@ -564,6 +570,7 @@ class ReferenceEditEpochRunner:
                 {"clip_uids": excluded},
             )
         _write_json_once(self._plan_path(shard), payload)
+        self._validated_plans[shard] = payload
         return payload
 
     def _verify_plan_payload(self, shard: str, payload: dict[str, Any]) -> None:
@@ -668,8 +675,28 @@ class ReferenceEditEpochRunner:
             raise exc
         self._fail_clip_terminal(shard, storage, clip_uid, exc)
 
+    def _note_reconcile_plan_cache(self, shard: str, *, hit: bool) -> None:
+        key = (
+            "reconcile_plan_cache_hits"
+            if hit else "reconcile_plan_cache_fallbacks"
+        )
+        self.seed_counters[key] += 1
+        self.emit(
+            "post_mask_epoch_reference_edit_reconcile_plan_diagnostics",
+            shard=shard,
+            reconcile_plan_cache_hits=self.seed_counters["reconcile_plan_cache_hits"],
+            reconcile_plan_cache_fallbacks=(
+                self.seed_counters["reconcile_plan_cache_fallbacks"]
+            ),
+        )
+
     def _existing_plan_for_reconcile(self, shard: str) -> dict[str, Any]:
-        """Validate the plan; audit clips actively processed by this runner."""
+        """Reuse this invocation's validated plan, or strictly validate cold state."""
+        cached = self._validated_plans.get(shard)
+        if cached is not None:
+            self._note_reconcile_plan_cache(shard, hit=True)
+            return cached
+        self._note_reconcile_plan_cache(shard, hit=False)
         payload = _read_json(self._plan_path(shard))
         if payload is None:
             raise ReferenceEditEpochError(
@@ -698,6 +725,7 @@ class ReferenceEditEpochRunner:
                     raise ReferenceEditDurableError(
                         f"cannot validate frozen Reference Edit input for {clip_uid!r}"
                     ) from exc
+        self._validated_plans[shard] = payload
         return payload
 
     def _entity_anchor(
