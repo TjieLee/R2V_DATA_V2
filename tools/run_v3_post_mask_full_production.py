@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import socket
 import sys
 from pathlib import Path
 
@@ -158,6 +159,7 @@ def main(argv: list[str] | None = None) -> int:
         POST_MASK_EPOCH_TEMP_ROOT=str(
             config_module.ALLOWED_WRITABLE_ROOT
             / "r2v_v3_runs/production/jea_motion_v1/in_pair_reference/tmp/resource_epoch"
+            / f"{socket.gethostname()}-rank-{args.rank}"
         ),
     )
     run_elastic_groups(

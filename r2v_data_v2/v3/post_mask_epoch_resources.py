@@ -409,6 +409,24 @@ class QwenEpochConfig:
 
     def environment(self) -> dict[str, str]:
         env = dict(os.environ)
+        # The outer production launcher may run under a multi-node scheduler
+        # that exports torch.distributed rendezvous variables. This managed
+        # vLLM service is deliberately local to one 8-GPU node (TP1 x DP8);
+        # leaking the outer rank/world/master values can make independent node
+        # services join the same rendezvous or start with an impossible rank.
+        for key in (
+            "MASTER_ADDR",
+            "MASTER_PORT",
+            "RANK",
+            "WORLD_SIZE",
+            "LOCAL_RANK",
+            "LOCAL_WORLD_SIZE",
+            "GROUP_RANK",
+            "ROLE_RANK",
+            "ROLE_WORLD_SIZE",
+            "TORCHELASTIC_RUN_ID",
+        ):
+            env.pop(key, None)
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(gpu) for gpu in self.gpu_ids)
         return env
 

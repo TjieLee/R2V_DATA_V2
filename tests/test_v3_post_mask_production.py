@@ -1002,6 +1002,24 @@ def test_initialize_binds_the_shard_identity_exactly_once(case, monkeypatch):
     assert restarted.read_run().git_commit == "first"
 
 
+def test_restart_hydration_restores_missing_clip_json(case):
+    row = _ready(case)
+    _write_rows(case, [row])
+    api, paths, storage = _start(case)
+
+    first = _hydrate(case, api, paths, storage)
+    assert first.ready == 1
+
+    original = storage.read_clip("clip-0")
+    storage.clip_path("clip-0").unlink()
+    assert not storage.clip_path("clip-0").exists()
+
+    restarted = _hydrate(case, api, paths, storage)
+    assert restarted.ready == 1
+    assert restarted.corrupt == 0
+    assert storage.read_clip("clip-0") == original
+
+
 def test_restart_hydration_proves_completeness_without_touching_assets(
     case, monkeypatch
 ):
