@@ -269,6 +269,10 @@ def test_publication_before_marker_crash_backfills_on_restart(
     before_failures = failures_path.read_text(encoding="utf-8") if failures_path.is_file() else ""
 
     fresh = _runner(config, storage, tmp_path)
+    def no_preparation(*_args: Any, **_kwargs: Any) -> Any:
+        pytest.fail("published clip was prepared before crash-window recovery")
+
+    monkeypatch.setattr(fresh, "_prepare_seed_entity", no_preparation)
     assert fresh.seed_jobs() == []
     assert marker_path.is_file()
     assert fresh.reconcile_stats(SHARD).to_dict() == expected_stats
@@ -2712,6 +2716,33 @@ def test_existing_plan_pending_clip_ignores_changed_live_baseline_on_restore(
     jobs = runner.seed_jobs()
     assert jobs, "the clip remains pending for its model review"
     assert runner.run(jobs[0], judge).payload["status"] == "review"
+
+
+def test_cold_seed_enumeration_keeps_marker_absent_ready_clip_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, storage, runner, _judge = _seeded_review_fixture(
+        tmp_path, monkeypatch, "run-plan-marker-absent-ready"
+    )
+    runner._plan(SHARD)
+    clip_path = storage.clip_path("clip-1")
+    payload = json.loads(clip_path.read_text(encoding="utf-8"))
+    payload["reference_integrity"] = {"status": "ready", "entities": []}
+    clip_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    cold = _runner(config, storage, tmp_path)
+    plan = cold._plan(SHARD)
+    assert not cold._clip_outcome_path(SHARD, "clip-1").exists()
+
+    def forbidden(*_args: Any, **_kwargs: Any) -> Any:
+        pytest.fail("marker-absent seed enumeration audited live publication")
+
+    monkeypatch.setattr(cold, "_verify_published_clip", forbidden)
+    targets = cold._clip_seed_targets(
+        SHARD, storage, "clip-1", plan["clips"]["clip-1"]
+    )
+    assert targets is not None
+    assert targets[2] == ["e1", "e2"]
 
 
 def test_existing_plan_cpu_pending_clip_publishes_without_live_audit(

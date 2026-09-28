@@ -338,6 +338,7 @@ class _SeedClipPlan:
     clip_uid: str
     entry: Mapping[str, Any]
     entities: tuple[tuple[str, Any, Any], ...]
+    verify_publication: bool = False
 
 
 @dataclass(frozen=True)
@@ -4389,8 +4390,6 @@ class ReferenceIntegrityEpochRunner:
         storage: RunStorage,
         clip_uid: str,
         entry: Mapping[str, Any],
-        *,
-        verify_input: bool = True,
     ) -> tuple[dict[str, Any], dict[str, Any], list[str]] | None:
         """MAIN THREAD ONLY: the entities one fresh clip still needs seeded.
 
@@ -4404,33 +4403,9 @@ class ReferenceIntegrityEpochRunner:
             return None
         if self._clip_outcome_path(shard, clip_uid).is_file():
             return None
-        if verify_input:
-            try:
-                # A restored frozen plan is structural authority. Only a clip
-                # with a terminal live publication but no outcome marker needs
-                # the expensive per-clip crash-window verifier here. An
-                # unpublished clip is ordinary pending work, even if another
-                # stage changed a live baseline after the plan was frozen.
-                clip = storage.read_clip(clip_uid)
-                integrity = clip.reference_integrity
-                if integrity is not None and (
-                    integrity.status == "ready"
-                    or integrity.model_dump(mode="json")
-                    != entry.get("pre_reference_integrity")
-                ):
-                    self._verify_published_clip(shard, storage, clip_uid, entry)
-            except _ClipArtifactReadError as exc:
-                if self._quarantine_local(
-                    shard, storage, clip_uid, exc.cause, known_clip_artifact_read=True
-                ):
-                    return None
-                raise exc.cause
-            except ReferenceIntegrityDurableError:
-                if self._is_quarantined(shard, clip_uid):
-                    return None
-                raise
-            if self._clip_outcome_path(shard, clip_uid).is_file():
-                return None
+        # A missing outcome marker means PENDING during enumeration. Do not
+        # infer publication from mutable live fields here: the specific clip's
+        # crash window is checked only when its queued seed work is processed.
         clip = storage.read_clip(clip_uid)
         references_by_id = {item.entity_id: item for item in clip.references.entities}
         entities_by_id = {
@@ -4569,6 +4544,37 @@ class ReferenceIntegrityEpochRunner:
         The batch's prepared results are dropped as soon as it is committed, so
         residency never grows with the size of the invocation.
         """
+        active_batch: list[_SeedClipPlan] = []
+        for record in batch:
+            if record.verify_publication:
+                try:
+                    clip = record.storage.read_clip(record.clip_uid)
+                    integrity = clip.reference_integrity
+                    if integrity is not None and (
+                        integrity.status == "ready"
+                        or integrity.model_dump(mode="json")
+                        != record.entry.get("pre_reference_integrity")
+                    ):
+                        self._verify_published_clip(
+                            record.shard, record.storage, record.clip_uid, record.entry
+                        )
+                except _ClipArtifactReadError as exc:
+                    if self._quarantine_local(
+                        record.shard,
+                        record.storage,
+                        record.clip_uid,
+                        exc.cause,
+                        known_clip_artifact_read=True,
+                    ):
+                        continue
+                    raise exc.cause
+                except ReferenceIntegrityDurableError:
+                    if self._is_quarantined(record.shard, record.clip_uid):
+                        continue
+                    raise
+            if self._clip_outcome_path(record.shard, record.clip_uid).is_file():
+                continue
+            active_batch.append(record)
         tasks = [
             (
                 record.shard,
@@ -4578,14 +4584,14 @@ class ReferenceIntegrityEpochRunner:
                 entity,
                 reference,
             )
-            for record in batch
+            for record in active_batch
             for _entity_id, entity, reference in record.entities
         ]
         prepared = self._prepare_seed_entities(tasks, pool)
         self._note_seed_prepare_buffered_results(len(prepared))
         self._bump_seed_prepare_counter("seed_prepare_commit_batches")
         cursor = 0
-        for record in batch:
+        for record in active_batch:
             row = prepared[cursor : cursor + len(record.entities)]
             cursor += len(record.entities)
             jobs.extend(self._commit_seed_record(record, row))
@@ -4649,9 +4655,7 @@ class ReferenceIntegrityEpochRunner:
                     continue
                 entry = clips[clip_uid]
                 try:
-                    targets = self._clip_seed_targets(
-                        shard, storage, clip_uid, entry, verify_input=plan_existed
-                    )
+                    targets = self._clip_seed_targets(shard, storage, clip_uid, entry)
                 except (OSError, ValueError) as exc:
                     if not self._quarantine_local(shard, storage, clip_uid, exc):
                         raise
@@ -4665,6 +4669,7 @@ class ReferenceIntegrityEpochRunner:
                         storage=storage,
                         clip_uid=clip_uid,
                         entry=entry,
+                        verify_publication=plan_existed,
                         entities=tuple(
                             (
                                 entity_id,
