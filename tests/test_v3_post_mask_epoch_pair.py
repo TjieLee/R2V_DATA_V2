@@ -3893,6 +3893,282 @@ def _primary_clip_snapshot(storage: Any, clip_uids: Sequence[str]) -> dict[str, 
     }
 
 
+@pytest.mark.parametrize("cpu_workers", (1, 2))
+def test_pair_quarantines_missing_clip_during_primary_plan_freeze(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cpu_workers: int
+) -> None:
+    from r2v_data_v2.v3.post_mask_epoch_quarantine import ClipQuarantine
+
+    _config, storage, runner = _primary_clips_fixture(
+        tmp_path,
+        monkeypatch,
+        f"run-quarantine-freeze-{cpu_workers}",
+        ("clip-1", "clip-2"),
+        cpu_workers=cpu_workers,
+    )
+    events: list[tuple[str, dict[str, Any]]] = []
+    runner.clip_quarantine = ClipQuarantine(
+        lambda event, **payload: events.append((event, payload))
+    )
+    storage.clip_path("clip-2").unlink()
+
+    seeded = runner.seed_primary_jobs()
+
+    assert seeded and {job.clip_uid for job in seeded} == {"clip-1"}
+    assert runner.clip_quarantine.count == 1
+    assert len(events) == 1
+    assert events[0][0] == "post_mask_clip_quarantined"
+    assert events[0][1]["stage"] == "pair"
+    assert events[0][1]["clip_uid"] == "clip-2"
+    failures = [json.loads(line) for line in storage.failures_path.read_text().splitlines()]
+    assert len(failures) == 1
+    assert failures[0]["clip_uid"] == "clip-2"
+    assert failures[0]["stage"] == "pair"
+    for job in seeded:
+        result = _run_one(runner, job, _Judge())
+        runner.finalize(job, result)
+    assert storage.read_clip("clip-1").pairing is not None
+
+
+def test_pair_quarantines_missing_clip_after_primary_plan_was_frozen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from r2v_data_v2.v3.post_mask_epoch_quarantine import ClipQuarantine
+
+    _config, storage, runner = _primary_clips_fixture(
+        tmp_path,
+        monkeypatch,
+        "run-quarantine-existing-plan",
+        ("clip-1", "clip-2"),
+        cpu_workers=1,
+    )
+    runner.clip_quarantine = ClipQuarantine()
+    runner.freeze_primary_plans()
+    before = runner._plan_path(SHARD).read_bytes()
+    storage.clip_path("clip-2").unlink()
+
+    seeded = runner.seed_primary_jobs()
+
+    assert seeded and {job.clip_uid for job in seeded} == {"clip-1"}
+    assert runner._plan_path(SHARD).read_bytes() == before
+    assert runner.clip_quarantine.count == 1
+    assert len(storage.failures_path.read_text().splitlines()) == 1
+    assert runner.reconcile_primary_stats(SHARD).processed == 1
+
+
+def test_pair_quarantine_does_not_hide_frozen_primary_plan_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from r2v_data_v2.v3.post_mask_epoch_pair import PairEpochError
+    from r2v_data_v2.v3.post_mask_epoch_quarantine import ClipQuarantine
+
+    _config, storage, runner = _primary_clips_fixture(
+        tmp_path,
+        monkeypatch,
+        "run-quarantine-plan-drift",
+        ("clip-1", "clip-2"),
+        cpu_workers=1,
+    )
+    runner.clip_quarantine = ClipQuarantine()
+    runner.freeze_primary_plans()
+    plan_path = runner._plan_path(SHARD)
+    payload = json.loads(plan_path.read_text())
+    payload["clips"]["clip-1"]["digest"] = "incorrect-durable-digest"
+    plan_path.write_text(json.dumps(payload))
+    storage.clip_path("clip-2").unlink()
+
+    with pytest.raises(PairEpochError, match="frozen primary input drifted"):
+        runner.seed_primary_jobs()
+
+
+def test_pair_cold_plan_cannot_skip_unverified_quarantined_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from r2v_data_v2.v3.post_mask_epoch_pair import PairEpochError
+    from r2v_data_v2.v3.post_mask_epoch_quarantine import ClipQuarantine
+
+    config, storage, runner = _primary_clips_fixture(
+        tmp_path,
+        monkeypatch,
+        "run-quarantine-cold-plan",
+        ("clip-1", "clip-2"),
+        cpu_workers=1,
+    )
+    runner.freeze_primary_plans()
+    plan_path = runner._plan_path(SHARD)
+    payload = json.loads(plan_path.read_text())
+    payload["clips"]["clip-2"]["digest"] = "incorrect-durable-digest"
+    plan_path.write_text(json.dumps(payload))
+    storage.clip_path("clip-2").unlink()
+
+    cold = _runner(
+        tmp_path,
+        config,
+        storage,
+        clip_uids=("clip-1", "clip-2"),
+        ledger_dir="ledger-run-quarantine-cold-plan",
+        cpu_workers=1,
+    )
+    cold.clip_quarantine = ClipQuarantine()
+
+    with pytest.raises(PairEpochError, match="cannot validate frozen primary input"):
+        cold.seed_primary_jobs()
+    assert cold.clip_quarantine.count == 1
+
+
+def test_pair_quarantine_cannot_hide_removed_frozen_plan_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from r2v_data_v2.v3.post_mask_epoch_pair import PairEpochError
+    from r2v_data_v2.v3.post_mask_epoch_quarantine import ClipQuarantine
+
+    _config, storage, runner = _primary_clips_fixture(
+        tmp_path, monkeypatch, "run-quarantine-removed-entry", ("clip-1", "clip-2")
+    )
+    runner.clip_quarantine = ClipQuarantine()
+    runner.freeze_primary_plans()
+    plan_path = runner._plan_path(SHARD)
+    payload = json.loads(plan_path.read_text())
+    payload["clips"].pop("clip-2")
+    payload["preplan_quarantined_clip_uids"] = ["clip-2"]
+    plan_path.write_text(json.dumps(payload))
+    storage.clip_path("clip-2").unlink()
+    assert runner.clip_quarantine.record_if_local(
+        SHARD, storage, "clip-2", "pair",
+        FileNotFoundError("clip.json does not exist for clip-2"),
+    )
+
+    with pytest.raises(PairEpochError, match="exclusion|missing clip"):
+        runner.seed_primary_jobs()
+
+
+def test_pair_quarantine_does_not_hide_malformed_frozen_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from r2v_data_v2.v3.post_mask_epoch_pair import PairEpochError
+    from r2v_data_v2.v3.post_mask_epoch_quarantine import ClipQuarantine
+
+    _config, storage, runner = _primary_clips_fixture(
+        tmp_path,
+        monkeypatch,
+        "run-quarantine-malformed-entry",
+        ("clip-1", "clip-2"),
+        cpu_workers=1,
+    )
+    runner.clip_quarantine = ClipQuarantine()
+    runner.freeze_primary_plans()
+    plan_path = runner._plan_path(SHARD)
+    payload = json.loads(plan_path.read_text())
+    payload["clips"]["clip-2"] = "bad frozen entry"
+    plan_path.write_text(json.dumps(payload))
+    storage.clip_path("clip-2").unlink()
+
+    with pytest.raises(PairEpochError, match="frozen primary plan entry"):
+        runner.seed_primary_jobs()
+
+
+def test_pair_quarantined_clip_with_preplanned_job_does_not_block_reconcile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from r2v_data_v2.v3.post_mask_epoch_quarantine import ClipQuarantine
+
+    _config, storage, runner = _primary_clips_fixture(
+        tmp_path,
+        monkeypatch,
+        "run-quarantine-planned-job",
+        ("clip-1", "clip-2"),
+        cpu_workers=1,
+    )
+    runner.clip_quarantine = ClipQuarantine()
+    initial = runner.seed_primary_jobs()
+    assert {job.clip_uid for job in initial} == {"clip-1", "clip-2"}
+    storage.clip_path("clip-2").unlink()
+
+    current = runner.seed_primary_jobs()
+    assert {job.clip_uid for job in current} == {"clip-1"}
+    for job in current:
+        result = _run_one(runner, job, _Judge())
+        runner.finalize(job, result)
+
+    assert runner.reconcile_stats(SHARD).ready == 1
+    assert runner.clip_quarantine.count == 1
+
+
+def test_pair_quarantine_propagates_epoch_resource_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import r2v_data_v2.v3.post_mask_epoch_pair as pair_module
+    from r2v_data_v2.v3.post_mask_epoch_quarantine import ClipQuarantine
+    from r2v_data_v2.v3.post_mask_epoch_resources import EpochResourceError
+
+    _config, storage, runner = _primary_clips_fixture(
+        tmp_path, monkeypatch, "run-quarantine-infra", ("clip-1",), cpu_workers=1
+    )
+    runner.clip_quarantine = ClipQuarantine()
+    runner.freeze_primary_plans()
+
+    def fail_frames(_storage: Any, _clip_uid: str) -> Any:
+        raise EpochResourceError("shared worker unavailable")
+
+    monkeypatch.setattr(pair_module, "_validate_frames", fail_frames)
+    with pytest.raises(EpochResourceError, match="shared worker unavailable"):
+        runner.seed_primary_jobs()
+    assert runner.clip_quarantine.count == 0
+    assert not storage.failures_path.exists()
+
+
+def test_pair_quarantine_does_not_hide_missing_unquarantined_plan_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from r2v_data_v2.v3.post_mask_epoch_pair import PairEpochError
+    from r2v_data_v2.v3.post_mask_epoch_quarantine import ClipQuarantine
+
+    _config, _storage, runner = _primary_clips_fixture(
+        tmp_path, monkeypatch, "run-quarantine-missing-entry", ("clip-1",), cpu_workers=1
+    )
+    runner.clip_quarantine = ClipQuarantine()
+    runner.freeze_primary_plans()
+    plan_path = runner._plan_path(SHARD)
+    payload = json.loads(plan_path.read_text())
+    payload["clips"].pop("clip-1")
+    plan_path.write_text(json.dumps(payload))
+
+    with pytest.raises(PairEpochError, match="missing clip"):
+        runner.seed_primary_jobs()
+
+
+@pytest.mark.parametrize("cpu_workers", (1, 2))
+def test_pair_quarantines_local_artifact_loss_during_entity_preparation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cpu_workers: int
+) -> None:
+    from r2v_data_v2.v3.post_mask_epoch_quarantine import ClipQuarantine
+
+    _config, storage, runner = _primary_clips_fixture(
+        tmp_path,
+        monkeypatch,
+        f"run-quarantine-prepare-{cpu_workers}",
+        ("clip-1", "clip-2", "clip-3"),
+        cpu_workers=cpu_workers,
+    )
+    runner.clip_quarantine = ClipQuarantine()
+    real_prepare = runner._prepare_primary_entity
+
+    def prepare(current_storage: Any, clip_uid: str, *args: Any) -> Any:
+        if clip_uid == "clip-2":
+            raise FileNotFoundError(
+                2, "missing source frame", str(current_storage.frame_path(clip_uid, 0))
+            )
+        return real_prepare(current_storage, clip_uid, *args)
+
+    monkeypatch.setattr(runner, "_prepare_primary_entity", prepare)
+
+    seeded = runner.seed_primary_jobs()
+
+    assert seeded and {job.clip_uid for job in seeded} == {"clip-1", "clip-3"}
+    assert runner.clip_quarantine.count == 1
+    assert len(storage.failures_path.read_text().splitlines()) == 1
+
+
 @pytest.mark.parametrize("cpu_workers", (1, 4))
 def test_primary_prepare_failure_is_stage_level_and_canonical(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cpu_workers: int

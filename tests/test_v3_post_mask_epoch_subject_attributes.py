@@ -26,6 +26,7 @@ from typing import Any
 import numpy as np
 import pytest
 from PIL import Image
+from pydantic import ValidationError
 
 import tests.test_v3_reference_integrity as legacy_integrity
 from r2v_data_v2.v3.config import Sam3Config
@@ -36,6 +37,8 @@ from r2v_data_v2.v3.post_mask_epoch_jobs import (
     RESOURCE_QWEN,
     RESOURCE_SAM,
 )
+from r2v_data_v2.v3.post_mask_epoch_quarantine import ClipQuarantine
+from r2v_data_v2.v3.post_mask_epoch_resources import EpochResourceError
 from r2v_data_v2.v3.post_mask_epoch_scheduler import (
     JobExecution,
     ResourceEpochScheduler,
@@ -3955,6 +3958,212 @@ def _multi_runner(
         eligible_clip_uids_by_shard={SHARD: list(uids)},
         cpu_workers=cpu_workers,
     )
+
+
+@pytest.mark.parametrize("cpu_workers", (1, 4))
+@pytest.mark.parametrize("damage", ("missing", "invalid_utf8"))
+def test_seed_quarantines_lost_or_corrupt_clip_without_blocking_sibling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cpu_workers: int, damage: str
+) -> None:
+    config, storage, uids = _multi_clip_fixture(
+        tmp_path, monkeypatch, run_name=f"run-quarantine-{cpu_workers}-{damage}", count=2
+    )
+    runner = _multi_runner(
+        tmp_path,
+        config,
+        storage,
+        uids,
+        cpu_workers=cpu_workers,
+        ledger_name=f"ledger-quarantine-{cpu_workers}-{damage}",
+    )
+    events: list[tuple[str, dict[str, Any]]] = []
+    quarantine = ClipQuarantine(
+        emit=lambda event, **details: events.append((event, details))
+    )
+    runner.clip_quarantine = quarantine
+    if damage == "missing":
+        storage.clip_path(uids[0]).unlink()
+    else:
+        storage.clip_path(uids[0]).write_bytes(b"\xff")
+
+    jobs = runner.seed_jobs()
+
+    assert [job.clip_uid for job in jobs] == [uids[1]]
+    assert quarantine.contains(SHARD, uids[0])
+    failures = [
+        json.loads(line)
+        for line in (Path(storage.root) / "failures.jsonl").read_text().splitlines()
+    ]
+    assert len(failures) == 1
+    assert failures[0]["clip_uid"] == uids[0]
+    assert failures[0]["stage"] == "subject_attributes"
+    assert (
+        "clip.json" if damage == "missing" else "UnicodeDecodeError"
+    ) in failures[0]["reason"]
+    assert len(events) == 1
+    assert events[0][0] == "post_mask_clip_quarantined"
+    assert events[0][1]["clip_uid"] == uids[0]
+
+    runner.seed_jobs()
+    assert len((Path(storage.root) / "failures.jsonl").read_text().splitlines()) == 1
+
+
+def test_seed_quarantines_missing_masks_without_turning_clip_into_no_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, storage, uids = _multi_clip_fixture(
+        tmp_path, monkeypatch, run_name="run-missing-masks", count=2
+    )
+    runner = _multi_runner(
+        tmp_path,
+        config,
+        storage,
+        uids,
+        cpu_workers=4,
+        ledger_name="ledger-missing-masks",
+    )
+    quarantine = ClipQuarantine()
+    runner.clip_quarantine = quarantine
+    storage.masks_path(uids[0]).unlink()
+
+    jobs = runner.seed_jobs()
+
+    assert [job.clip_uid for job in jobs] == [uids[1]]
+    assert quarantine.contains(SHARD, uids[0])
+    assert not runner._clip_plan_path(SHARD, uids[0]).exists()
+    failures = [
+        json.loads(line)
+        for line in (Path(storage.root) / "failures.jsonl").read_text().splitlines()
+    ]
+    assert len(failures) == 1
+    assert failures[0]["stage"] == "subject_attributes"
+    assert failures[0]["clip_uid"] == uids[0]
+
+
+def test_reconcile_skips_quarantined_clip_without_faking_an_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, storage, uids = _multi_clip_fixture(
+        tmp_path, monkeypatch, run_name="run-reconcile-quarantine", count=1
+    )
+    runner = _multi_runner(
+        tmp_path,
+        config,
+        storage,
+        uids,
+        cpu_workers=1,
+        ledger_name="ledger-reconcile-quarantine",
+    )
+    runner.clip_quarantine = ClipQuarantine()
+    storage.clip_path(uids[0]).unlink()
+
+    assert runner.seed_jobs() == []
+    assert not runner._clip_outcome_path(SHARD, uids[0]).exists()
+    assert runner.reconcile_stats(SHARD).terminal_clips == 0
+
+
+def test_seed_resource_failure_is_not_quarantined(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, storage, uids = _multi_clip_fixture(
+        tmp_path, monkeypatch, run_name="run-resource-failure", count=2
+    )
+    runner = _multi_runner(
+        tmp_path, config, storage, uids, cpu_workers=4,
+        ledger_name="ledger-resource-failure",
+    )
+    quarantine = ClipQuarantine()
+    runner.clip_quarantine = quarantine
+
+    def failed_resource(_storage: Any, _clip_uid: str) -> dict[str, Any]:
+        raise EpochResourceError("SAM worker unavailable")
+
+    monkeypatch.setattr(runner, "_derive_clip_plan", failed_resource)
+
+    with pytest.raises(EpochResourceError, match="SAM worker unavailable"):
+        runner.seed_jobs()
+    assert quarantine.count == 0
+
+
+def test_missing_clip_behind_existing_clip_plan_remains_durable_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, storage, uids = _multi_clip_fixture(
+        tmp_path, monkeypatch, run_name="run-frozen-loss", count=2
+    )
+    original = _multi_runner(
+        tmp_path, config, storage, uids, cpu_workers=1,
+        ledger_name="ledger-frozen-loss",
+    )
+    original._clip_plan(SHARD, uids[0])
+    restarted = _multi_runner(
+        tmp_path, config, storage, uids, cpu_workers=4,
+        ledger_name="ledger-frozen-loss",
+    )
+    quarantine = ClipQuarantine()
+    restarted.clip_quarantine = quarantine
+    storage.clip_path(uids[0]).unlink()
+
+    with pytest.raises(SubjectAttributeDurableError, match="cannot derive"):
+        restarted.seed_jobs()
+    assert quarantine.count == 0
+
+
+def test_quarantine_cannot_skip_existing_subject_attribute_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, storage, uids = _multi_clip_fixture(
+        tmp_path, monkeypatch, run_name="run-frozen-quarantine", count=2
+    )
+    runner = _multi_runner(
+        tmp_path, config, storage, uids, cpu_workers=1,
+        ledger_name="ledger-frozen-quarantine",
+    )
+    runner._clip_plan(SHARD, uids[0])
+    runner.clip_quarantine = ClipQuarantine()
+    storage.clip_path(uids[0]).unlink()
+    assert runner.clip_quarantine.record_if_local(
+        SHARD,
+        storage,
+        uids[0],
+        "pair",
+        FileNotFoundError(f"clip.json does not exist for {uids[0]}"),
+    )
+
+    with pytest.raises(SubjectAttributeDurableError, match="frozen Subject Attributes"):
+        runner.seed_jobs()
+
+
+def test_nonartifact_validation_error_is_not_quarantined(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, storage, uids = _multi_clip_fixture(
+        tmp_path, monkeypatch, run_name="run-policy-error", count=2
+    )
+    runner = _multi_runner(
+        tmp_path, config, storage, uids, cpu_workers=1,
+        ledger_name="ledger-policy-error",
+    )
+    quarantine = ClipQuarantine()
+    runner.clip_quarantine = quarantine
+    validation = ValidationError.from_exception_data(
+        "PolicyError",
+        [{
+            "type": "value_error",
+            "loc": ("policy",),
+            "input": "invalid",
+            "ctx": {"error": ValueError("policy mismatch")},
+        }],
+    )
+
+    def invalid_policy(_clip: Any) -> Any:
+        raise validation
+
+    monkeypatch.setattr(runner, "_effective_clip", invalid_policy)
+
+    with pytest.raises(SubjectAttributeDurableError, match="cannot derive"):
+        runner.seed_jobs()
+    assert quarantine.count == 0
 
 
 def _plan_digests(root: Path) -> dict[str, str]:
