@@ -25,10 +25,12 @@ from r2v_data_v2.h3.mimo25_backend import (
     _normalize_speaker_annotation,
     protect_direct_dialogue,
 )
+from r2v_data_v2.h3.mimo25_single_backend import SingleCallOpenAIMimo25Backend
 from r2v_data_v2.h3.mimo25_stem_shadow import (
     MIMO25_STEM_RECONCILE_STAGE,
     MimoStemReconcileRecord,
     StemAwareOpenAIMimo25Backend,
+    _validated_auxiliary_stems,
     build_stem_reconcile_jobs,
     run_mimo25_stem_reconcile_shadow,
 )
@@ -347,6 +349,130 @@ def _run(shadow, backend, stems, jobs):
 def _records(shadow):
     path = shadow / MIMO25_STEM_RECONCILE_STAGE / "records.jsonl"
     return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+def test_single_ra2va_one_request_uses_full_annotation_and_no_binding_proposals(tmp_path, monkeypatch):
+    _, shadow = _fixture(tmp_path, monkeypatch)
+    stems = load_stem_shadow(shadow / "separation")[1]
+    base = qa.build_mimo25_inventory()
+    jobs = build_stem_reconcile_jobs(
+        base_inventory=base, stem_diarization_root=shadow / "diarization",
+        stem_asr_root=shadow / "asr", route="music_first",
+    )
+    completions = _Completions([(_raw(), 8)])
+    backend = SingleCallOpenAIMimo25Backend(
+        MimoBackendConfig(
+            api_key="fake", transport="sglang", model="mimo-v2.6-flash-rl",
+            media_resolver=MimoMediaResolver(
+                mode="http", media_root=tmp_path, media_base_url="http://media.invalid",
+            ),
+        ),
+        stem_records_by_clip={record.clip_uid: record for record in stems},
+        client=SimpleNamespace(chat=SimpleNamespace(completions=completions)),
+    )
+    result = backend.reconcile(
+        jobs[0], segment_ids=[s.segment_id for s in jobs[0].segments],
+        transcribed_segment_ids=[s.segment_id for s in jobs[0].segments if s.asr_status == "transcribed"],
+        allowed_entity_ids={"e1"},
+        allowed_reference_labels={r.picture_label for r in jobs[0].reference_images}
+        | {s.subject_label for s in jobs[0].reference_subjects},
+        auxiliary_audio_paths=_validated_auxiliary_stems(stems[0]),
+    )
+    assert result.model_call_count == 1
+    assert result.visual_model_call_count == 0
+    assert result.audio_model_call_count == 0
+    assert result.text_model_call_count == 0
+    assert result.annotation == MimoAVAnnotationDraft.model_validate_json(_raw())
+    assert len(completions.requests) == 1
+    request = completions.requests[0]
+    assert request["response_format"]["json_schema"]["name"] == "MimoAVAnnotationDraft"
+    content = request["messages"][-1]["content"]
+    assert any(item["type"] == "video_url" for item in content)
+    assert any(item["type"] == "image_url" for item in content)
+    assert sum(item["type"] == "audio_url" for item in content) == 3
+    task = next(item["text"] for item in content if item["type"] == "text" and "allowed_segment_ids" in item["text"])
+    assert "current_entity_id" not in task
+    assert "direct_anchor_present" not in task
+
+
+def test_single_ra2va_invalid_output_never_falls_back_or_polishes(tmp_path, monkeypatch):
+    _, shadow = _fixture(tmp_path, monkeypatch)
+    stems = load_stem_shadow(shadow / "separation")[1]
+    completions = _Completions([("{}", 8)])
+    backend = SingleCallOpenAIMimo25Backend(
+        MimoBackendConfig(
+            api_key="fake", transport="sglang", model="mimo-v2.6-flash-rl",
+            media_resolver=MimoMediaResolver(
+                mode="http", media_root=tmp_path, media_base_url="http://media.invalid",
+            ),
+        ),
+        stem_records_by_clip={record.clip_uid: record for record in stems},
+        client=SimpleNamespace(chat=SimpleNamespace(completions=completions)),
+    )
+    base = qa.build_mimo25_inventory()
+    jobs = build_stem_reconcile_jobs(
+        base_inventory=base, stem_diarization_root=shadow / "diarization",
+        stem_asr_root=shadow / "asr", route="music_first",
+    )
+    with pytest.raises(MimoBackendFailure) as error:
+        backend.reconcile(
+            jobs[0], segment_ids=[s.segment_id for s in jobs[0].segments],
+            transcribed_segment_ids=[s.segment_id for s in jobs[0].segments if s.asr_status == "transcribed"],
+            allowed_entity_ids={"e1"},
+            allowed_reference_labels={r.picture_label for r in jobs[0].reference_images}
+            | {s.subject_label for s in jobs[0].reference_subjects},
+            auxiliary_audio_paths=_validated_auxiliary_stems(stems[0]),
+        )
+    assert error.value.model_call_count == 1
+    assert len(completions.requests) == 1
+
+
+def test_single_ra2va_record_keeps_clip_failure_isolated(tmp_path, monkeypatch):
+    from r2v_data_v2.h3.audio_reuse_prepared import load_reconcile_sources
+
+    _, shadow = _fixture(tmp_path, monkeypatch)
+    stems = load_stem_shadow(shadow / "separation")[1]
+    base = qa.build_mimo25_inventory()
+    jobs = build_stem_reconcile_jobs(
+        base_inventory=base, stem_diarization_root=shadow / "diarization",
+        stem_asr_root=shadow / "asr", route="music_first",
+    )
+    completions = _Completions([(_raw(), 8), ("{}", 8), (_raw(), 8)])
+    backend = SingleCallOpenAIMimo25Backend(
+        MimoBackendConfig(
+            api_key="fake", transport="sglang", model="mimo-v2.6-flash-rl",
+            media_resolver=MimoMediaResolver(
+                mode="http", media_root=tmp_path, media_base_url="http://media.invalid",
+            ),
+        ),
+        stem_records_by_clip={record.clip_uid: record for record in stems},
+        client=SimpleNamespace(chat=SimpleNamespace(completions=completions)),
+    )
+    root = shadow / "single-reconcile"
+    summary = run_mimo25_stem_reconcile_shadow(
+        jobs=jobs, stem_records=stems, backend=backend, output_root=root,
+        route="music_first", allow_unverified=True,
+    )
+    records = [MimoStemReconcileRecord.model_validate_json(line) for line in (root / "records.jsonl").read_text().splitlines()]
+    assert [record.status for record in records] == ["ready", "failed", "ready"]
+    assert [record.model_call_count for record in records] == [1, 1, 1]
+    assert summary.model_call_count == 3
+    assert len(completions.requests) == 3
+    assert all(record.backend_provenance.prompt_version == "h3_mimo26_ra2va_single_v1" for record in records)
+    assert [item.status for item in load_reconcile_sources(root)] == ["ready", "failed", "ready"]
+
+
+def test_single_cli_requires_explicit_no_lr_mode_and_v26(tmp_path, monkeypatch):
+    kwargs, _ = _fixture(tmp_path, monkeypatch)
+    argv = [
+        part for key, value in kwargs.items()
+        for part in ("--" + key.replace("_", "-"), str(value))
+    ]
+    assert cli._parse_arguments([*argv, "--dry-run"]).call_mode == "multi"
+    with pytest.raises(ValueError, match="no-LR-ASD"):
+        cli.main([*argv, "--dry-run", "--call-mode", "single", "--model", "mimo-v2.6-flash-rl"])
+    with pytest.raises(ValueError, match="V2.6"):
+        cli.main([*argv, "--dry-run", "--call-mode", "single", "--binding-evidence-mode", "none"])
 
 
 def test_cd694_shaped_final_backend_downgrades_anchor_conflict_without_extra_calls(tmp_path, monkeypatch):

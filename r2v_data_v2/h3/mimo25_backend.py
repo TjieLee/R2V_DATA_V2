@@ -1002,7 +1002,7 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.66"] = MIMO25_BACKEND_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.66", "r2v.h3.mimo25_backend.67"] = MIMO25_BACKEND_VERSION
     audio_finalize_prompt_version: Literal["h3_mimo25_audio_finalize_v6"] = (
         MIMO25_AUDIO_FINALIZE_PROMPT_VERSION
     )
@@ -1030,7 +1030,7 @@ class MimoBackendProvenance(SchemaModel):
     media_mode: Literal["base64", "http"]
     media_root: str
     media_base_url: str | None = None
-    prompt_version: Literal["h3_mimo25_speech_assembly_v49"] = (
+    prompt_version: Literal["h3_mimo25_speech_assembly_v49", "h3_mimo26_ra2va_single_v1"] = (
         MIMO25_PROMPT_VERSION
     )
     policy_version: Literal["h3_mimo25_av_authority_contract_v18"] = (
@@ -1068,6 +1068,10 @@ class MimoBackendProvenance(SchemaModel):
 
     @model_validator(mode="after")
     def validate_provenance(self) -> MimoBackendProvenance:
+        if (self.schema_version.endswith(".67")) != (
+            self.prompt_version == "h3_mimo26_ra2va_single_v1"
+        ):
+            raise ValueError("MiMo single-call provenance differs from backend version")
         if not self.base_url.strip() or not self.media_root.strip():
             raise ValueError("MiMo endpoint and media root are required")
         expected_backend = f"{self.transport}_openai_compatible"
@@ -3534,6 +3538,8 @@ class OpenAIMimo25Backend:
         )
         visual_raw, speech_av_raw, profile_raw, audio_finalize_raw = raw_responses
         raw_responses = tuple(raw for raw in raw_responses if raw is not None)
+        single_call = bool(diagnostics and diagnostics[0].input_modality == "target_av_with_auxiliary_raw_audio")
+        visual_calls = 0 if single_call else 1
         audio_calls = int(profile_raw is not None)
         diagnostic = diagnostics[-1]
         canonical_raw, raw_corrections = _canonicalize_raw_annotation_payload(raw)
@@ -3637,7 +3643,7 @@ class OpenAIMimo25Backend:
                 issues=tuple(issues),
                 model_call_count=len(raw_responses) + text_calls,
                 http_attempt_count=len(raw_responses) + text_calls,
-                visual_model_call_count=1,
+                visual_model_call_count=visual_calls,
                 visual_raw_response=visual_raw,
                 speech_av_raw_response=speech_av_raw,
                 speaker_profile_raw_response=profile_raw,
@@ -3653,7 +3659,7 @@ class OpenAIMimo25Backend:
             diagnostics=tuple(diagnostics),
             model_call_count=len(raw_responses) + text_calls,
             http_attempt_count=len(raw_responses) + text_calls,
-            visual_model_call_count=1,
+            visual_model_call_count=visual_calls,
             visual_raw_response=visual_raw,
             speech_av_raw_response=speech_av_raw,
             speaker_profile_raw_response=profile_raw,
@@ -3672,10 +3678,10 @@ __all__ = [
     "DEFAULT_BASE64_LIMIT_BYTES",
     "MIMO25_MATERIALIZER_VERSION",
     "MIMO25_MODEL",
-    "MIMO_MODEL",
     "MIMO25_POLICY_VERSION",
     "MIMO25_PROMPT_VERSION",
     "MIMO25_SCHEMA_VERSION",
+    "MIMO_MODEL",
     "SYSTEM_PROMPT",
     "MimoAVAnnotationDraft",
     "MimoAVGrounding",

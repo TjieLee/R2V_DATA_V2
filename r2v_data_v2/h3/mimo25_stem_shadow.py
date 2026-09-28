@@ -1716,21 +1716,41 @@ class MimoStemReconcileRecord(SchemaModel):
             self.visual_raw_response, self.speech_av_raw_response,
             self.speaker_profile_raw_response, self.audio_finalize_raw_response,
         ), strict=True))
-        if (
-            turns != expected_turns[:len(turns)]
-            or self.visual_model_call_count != turns.count("target_video_visual_only")
-            or self.audio_model_call_count != turns.count("speaker_profile_audio_only")
-            or self.av_model_call_count != sum(
-                m in {"target_video_speech_assembly", "target_video_audio_finalize"} for m in turns
+        single_call = self.backend_provenance.prompt_version == "h3_mimo26_ra2va_single_v1"
+        if single_call:
+            invalid_calls = (
+                self.model_call_count not in {0, 1}
+                or self.av_model_call_count != self.model_call_count
+                or self.visual_model_call_count != 0 or self.audio_model_call_count != 0
+                or self.text_model_call_count != 0
+                or len(self.diagnostics) != self.model_call_count
+                or any(d.input_modality != "target_av_with_auxiliary_raw_audio" for d in self.diagnostics)
+                or self.visual_raw_response is not None
+                or self.speaker_profile_raw_response is not None
+                or self.audio_finalize_raw_response is not None
+                or self.raw_responses != (
+                    [self.speech_av_raw_response] if self.speech_av_raw_response is not None else []
+                )
+                or (self.status == "ready" and self.speech_av_raw_response is None)
+                or (self.model_call_count == 0 and self.status != "failed")
             )
-            or (self.status == "ready" and (
-                turns != expected_turns or any(raw_by_modality[m] is None for m in expected_turns)
-            ))
-            or any(raw is not None and m not in turns for m, raw in raw_by_modality.items())
-            or any(raw_by_modality[m] is None for m in turns[:-1])
-            or self.raw_responses != [raw for raw in raw_by_modality.values() if raw is not None]
-            or len(self.diagnostics) != self.model_call_count
-        ):
+        else:
+            invalid_calls = (
+                turns != expected_turns[:len(turns)]
+                or self.visual_model_call_count != turns.count("target_video_visual_only")
+                or self.audio_model_call_count != turns.count("speaker_profile_audio_only")
+                or self.av_model_call_count != sum(
+                    m in {"target_video_speech_assembly", "target_video_audio_finalize"} for m in turns
+                )
+                or (self.status == "ready" and (
+                    turns != expected_turns or any(raw_by_modality[m] is None for m in expected_turns)
+                ))
+                or any(raw is not None and m not in turns for m, raw in raw_by_modality.items())
+                or any(raw_by_modality[m] is None for m in turns[:-1])
+                or self.raw_responses != [raw for raw in raw_by_modality.values() if raw is not None]
+                or len(self.diagnostics) != self.model_call_count
+            )
+        if invalid_calls:
             raise ValueError("stem reconcile staged raw/diagnostic counts differ")
         if (
             self.text_model_call_count != int(self.speaker_marker_polish_attempted)
@@ -1803,7 +1823,10 @@ class MimoStemReconcileSummary(SchemaModel):
                 self.visual_model_call_count + self.av_model_call_count
                 + self.audio_model_call_count + self.text_model_call_count
             )
-            or self.av_model_call_count > 2 * self.visual_model_call_count
+            or self.av_model_call_count > (
+                2 * self.visual_model_call_count
+                if self.visual_model_call_count else self.processed_clip_count
+            )
             or self.audio_model_call_count > self.visual_model_call_count
             or self.visual_model_call_count > self.processed_clip_count
             or self.text_model_call_count > self.av_model_call_count // 2

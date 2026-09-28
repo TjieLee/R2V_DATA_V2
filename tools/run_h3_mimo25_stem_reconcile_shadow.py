@@ -17,7 +17,12 @@ from r2v_data_v2.h3.mimo25_av_reconcile import (
     build_mimo25_inventory,
     build_mimo25_reference_inventory,
 )
-from r2v_data_v2.h3.mimo25_backend import MIMO_MODEL, MimoBackendConfig, MimoMediaResolver
+from r2v_data_v2.h3.mimo25_backend import (
+    MIMO_MODEL,
+    MimoBackendConfig,
+    MimoMediaResolver,
+)
+from r2v_data_v2.h3.mimo25_single_backend import SingleCallOpenAIMimo25Backend
 from r2v_data_v2.h3.mimo25_stem_shadow import (
     MIMO25_STEM_RECONCILE_STAGE,
     StemAwareOpenAIMimo25Backend,
@@ -80,6 +85,7 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
     )
     parser.add_argument("--model", default=MIMO_MODEL)
+    parser.add_argument("--call-mode", choices=("multi", "single"), default="multi")
     parser.add_argument("--base-url", default="http://127.0.0.1:8092/v1")
     parser.add_argument("--media-mode", choices=("base64", "http"))
     parser.add_argument("--media-root", type=Path, default=Path("/mnt/workspace"))
@@ -107,6 +113,11 @@ def _parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> dict[str, object]:
     arguments = _parse_arguments(argv)
+    if arguments.call_mode == "single":
+        if arguments.binding_evidence_mode != "none":
+            raise ValueError("single RA2VA requires no-LR-ASD binding evidence mode")
+        if arguments.model != "mimo-v2.6-flash-rl":
+            raise ValueError("single RA2VA requires explicit MiMo V2.6 model")
     paths = jea_production_paths(arguments.audio_production_root)
     route = downstream_stem_route(arguments.shadow_run_id, arguments.sam_route)
     shadow = stem_shadow_root(paths.root, arguments.shadow_run_id)
@@ -184,6 +195,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         "output_root": str(output),
         "clip_count": len(jobs),
         "binding_evidence_mode": arguments.binding_evidence_mode,
+        "call_mode": arguments.call_mode,
         "model": arguments.model,
         "clip_uids": [item.clip_uid for item in jobs],
         "temperature": arguments.temperature,
@@ -192,7 +204,11 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         "original_target_av_is_highest_authority": True,
     }
     if not arguments.dry_run:
-        backend = StemAwareOpenAIMimo25Backend(
+        backend_class = (
+            SingleCallOpenAIMimo25Backend
+            if arguments.call_mode == "single" else StemAwareOpenAIMimo25Backend
+        )
+        backend = backend_class(
             MimoBackendConfig(
                 media_resolver=MimoMediaResolver(
                     mode=arguments.media_mode,
