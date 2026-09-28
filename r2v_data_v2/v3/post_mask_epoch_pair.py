@@ -64,6 +64,7 @@ from r2v_data_v2.v3.post_mask_epoch_jobs import (
 )
 from r2v_data_v2.v3.post_mask_epoch_resources import resolve_cpu_workers
 from r2v_data_v2.v3.post_mask_epoch_state import (
+    STATE_MISMATCH,
     GroupLedger,
     atomic_write_json,
 )
@@ -599,6 +600,18 @@ class PairEpochRunner:
     def _marker_exists(self, key: str) -> bool:
         return self._marker_path(key).is_file()
 
+    def _primary_published(self, shard: str, clip_uid: str) -> bool:
+        """Check the shape of an existing post-publication marker."""
+        key = f"published-{shard}-{clip_uid}"
+        marker = _read_json(self._marker_path(key))
+        if marker is None:
+            return False
+        if marker != {"key": key}:
+            raise PairEpochError(
+                f"durable primary publication marker drifted for {clip_uid!r}"
+            )
+        return True
+
     def _mark_once(self, key: str) -> bool:
         """Durable, idempotent 'account this exactly once' marker."""
         path = self._marker_path(key)
@@ -723,6 +736,28 @@ class PairEpochRunner:
         }
         return semantic_input_digest(projection)
 
+    def _pending_primary_input_valid(
+        self,
+        shard: str,
+        storage: RunStorage,
+        clip_uid: str,
+        entry: Mapping[str, Any],
+    ) -> bool:
+        """Check frozen inputs only for a clip about to execute Pair work."""
+        try:
+            actual = self._frozen_input_digest(storage, clip_uid, shard=shard)
+        except (OSError, ValueError) as exc:
+            if self._quarantined(shard, clip_uid) or self._quarantine_local(
+                shard, storage, clip_uid, exc
+            ):
+                return False
+            raise
+        if actual != entry["digest"]:
+            raise PairEpochError(
+                f"frozen primary input drifted for {clip_uid!r} in {shard!r}"
+            )
+        return True
+
     @staticmethod
     def _plan_signature(path: Path) -> _PlanFileSignature | None:
         """Cheap identity of the plan file, or ``None`` when it is unreadable."""
@@ -739,7 +774,7 @@ class PairEpochRunner:
         )
 
     def _remember_validated_plan(self, shard: str, payload: Mapping[str, Any]) -> None:
-        """Record the plan this invocation just strictly validated."""
+        """Record the plan structure this invocation just validated."""
         signature = self._plan_signature(self._plan_path(shard))
         if signature is None:
             return
@@ -750,7 +785,7 @@ class PairEpochRunner:
         """The already validated plan, only if it is still the same generation.
 
         A miss, a changed signature or another runner returns ``None`` and the
-        caller runs the strict validation. The cache is never authoritative and
+        caller validates the durable plan again. The cache is never authoritative and
         path existence alone is never trusted: the signature has to match.
         """
         current = self._plan_signature(self._plan_path(shard))
@@ -779,14 +814,6 @@ class PairEpochRunner:
         if existing is not None:
             payload = self._validate_primary_plan(shard, existing)
             self._remember_validated_plan(shard, payload)
-            storage = self._storage_for(shard)
-            for clip_uid, entry in payload.get("clips", {}).items():
-                if self._quarantined(shard, clip_uid):
-                    continue
-                if entry.get("classification") == CLIP_EXISTING_PAIRING:
-                    # Legacy validates an existing pairing instead of
-                    # regenerating it; a corrupt reference is a Pair failure.
-                    self._validate_existing_pairing(shard, storage, clip_uid)
             return payload
 
         storage = self._storage_for(shard)
@@ -834,11 +861,9 @@ class PairEpochRunner:
         return payload
 
     def _validate_primary_plan(self, shard: str, payload: Mapping[str, Any]) -> dict[str, Any]:
-        """Validate an existing frozen plan. Read-only; never writes it back."""
-        # A damaged clip cannot prove its stored digest on a cold runner. Only
-        # this invocation's earlier full validation of the unchanged plan may
-        # justify skipping that clip after it becomes quarantined.
-        prior = self._reuse_validated_plan(shard) if self.clip_quarantine is not None else None
+        """Validate only an existing frozen plan's own structure and identity."""
+        if not isinstance(payload, dict):
+            raise PairEpochError(f"frozen primary plan is malformed for {shard!r}")
         if payload.get("schema") != PAIR_PRIMARY_PLAN_SCHEMA:
             raise PairEpochError(f"unsupported primary plan schema for {shard!r}")
         expected = {
@@ -852,6 +877,10 @@ class PairEpochRunner:
                 raise PairEpochError(
                     f"frozen primary plan {key} drifted for {shard!r}"
                 )
+        required_keys = {"schema", "clips", *expected}
+        allowed_keys = required_keys | {"preplan_quarantined_clip_uids"}
+        if set(payload) not in (required_keys, allowed_keys):
+            raise PairEpochError(f"frozen primary plan keyset drifted for {shard!r}")
         clips = payload.get("clips")
         if not isinstance(clips, dict):
             raise PairEpochError(f"frozen primary plan clips are invalid for {shard!r}")
@@ -875,54 +904,31 @@ class PairEpochRunner:
             raise PairEpochError(
                 f"frozen primary plan exclusion witness drifted for {shard!r}"
             )
-        # The stored per-clip input digests are the whole point of the
-        # plan: re-derive them and fail closed on any pre-Pair drift.
-        storage = self._storage_for(shard)
         for clip_uid, entry in payload.get("clips", {}).items():
             if (
                 not isinstance(entry, dict)
                 or set(entry) != {"classification", "digest"}
+                or not isinstance(entry["classification"], str)
                 or entry["classification"] not in {
                     CLIP_FRESH_TARGET, CLIP_EXISTING_PAIRING, CLIP_INELIGIBLE
                 }
                 or not isinstance(entry["digest"], str)
-                or not entry["digest"]
+                or len(entry["digest"]) != 64
+                or any(ch not in "0123456789abcdef" for ch in entry["digest"])
             ):
                 raise PairEpochError(
                     f"frozen primary plan entry is malformed for {clip_uid!r}"
-                )
-            if self._quarantined(shard, clip_uid):
-                if prior is None or prior.get("clips", {}).get(clip_uid) != entry:
-                    raise PairEpochError(
-                        f"cannot validate frozen primary input for {clip_uid!r} in {shard!r}"
-                    )
-                continue
-            try:
-                actual = self._frozen_input_digest(storage, clip_uid, shard=shard)
-            except (OSError, ValueError) as exc:
-                if self._quarantined(shard, clip_uid) or self._quarantine_local(
-                    shard, storage, clip_uid, exc
-                ):
-                    if prior is None or prior.get("clips", {}).get(clip_uid) != entry:
-                        raise PairEpochError(
-                            f"cannot validate frozen primary input for {clip_uid!r} in {shard!r}"
-                        ) from exc
-                    continue
-                raise
-            if actual != entry.get("digest"):
-                raise PairEpochError(
-                    f"frozen primary input drifted for {clip_uid!r} in {shard!r}"
                 )
         return dict(payload)
 
     def _existing_primary_plan_for_reconcile(self, shard: str) -> dict[str, Any]:
         """Load the frozen plan for reconciliation without ever creating it.
 
-        This invocation has already created or strictly validated this very
+        This invocation has already created or structurally validated this very
         plan, and the plan file is written once and never rewritten, so when the
         signature still matches the validated payload is reused instead of
-        re-deriving every clip's frozen input digest again. A cold runner, an
-        eviction or a replaced plan file falls back to the strict validation.
+        reopening the plan. A cold runner, an eviction or a replaced plan file
+        falls back to structural validation without reading clip inputs.
         """
         reused = self._reuse_validated_plan(shard)
         if reused is not None:
@@ -1842,6 +1848,35 @@ class PairEpochRunner:
         generator, so there is exactly one preparation and application policy.
         """
         self.freeze_primary_plans()
+        published_jobs_by_shard: dict[str, dict[str, list[dict[str, Any]]]] = {}
+
+        def already_published(shard: str, clip_uid: str) -> bool:
+            """Skip only a published clip whose planned jobs have receipts."""
+            if not self._primary_published(shard, clip_uid):
+                return False
+            if shard not in published_jobs_by_shard:
+                grouped: dict[str, list[dict[str, Any]]] = {}
+                for record in self._planned_jobs(shard):
+                    job_type = record.get("job_type")
+                    if job_type == PAIR_BACKGROUND_GUARD_JOB and dict(
+                        record.get("target") or []
+                    ).get("call_site") != CALL_SITE_PRIMARY:
+                        continue
+                    if job_type not in {PAIR_ENTITY_JUDGE_JOB, PAIR_BACKGROUND_GUARD_JOB}:
+                        continue
+                    grouped.setdefault(str(record["clip_uid"]), []).append(record)
+                published_jobs_by_shard[shard] = grouped
+            for record in published_jobs_by_shard[shard].get(clip_uid, ()):
+                job = self._job_from_plan_record(record)
+                state = self.ledger.classify(job)
+                if state.state == STATE_MISMATCH:
+                    raise PairEpochError(
+                        f"pair job {job.job_id()} receipt mismatch: {state.detail or ''}"
+                    )
+                if not state.skippable:
+                    return False
+            return True
+
         if self._primary_cpu_workers() <= 1:
             # Direct serial path: one clip at a time, no executor.
             for shard in sorted(self.storages):
@@ -1851,6 +1886,12 @@ class PairEpochRunner:
                     if self._quarantined(shard, clip_uid):
                         continue
                     if plan["clips"].get(clip_uid, {}).get("classification") != CLIP_FRESH_TARGET:
+                        continue
+                    if already_published(shard, clip_uid):
+                        continue
+                    if not self._pending_primary_input_valid(
+                        shard, storage, clip_uid, plan["clips"][clip_uid]
+                    ):
                         continue
                     try:
                         context = self._primary_context(storage, clip_uid, shard=shard)
@@ -1894,11 +1935,17 @@ class PairEpochRunner:
                         continue
                     if plan["clips"].get(clip_uid, {}).get("classification") != CLIP_FRESH_TARGET:
                         continue
+                    if already_published(shard, clip_uid):
+                        continue
                     if self._clip_primary_settled(shard, clip_uid) is True:
                         # A streaming consumer drains each batch before asking
                         # for the next one, so a clip seeded in an earlier batch
                         # can already be terminal here. Re-visiting it would
                         # re-derive and re-publish work that is already durable.
+                        continue
+                    if not self._pending_primary_input_valid(
+                        shard, storage, clip_uid, plan["clips"][clip_uid]
+                    ):
                         continue
                     try:
                         context = self._primary_context(storage, clip_uid, shard=shard)

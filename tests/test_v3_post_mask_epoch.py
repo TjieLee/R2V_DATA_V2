@@ -50,7 +50,6 @@ from r2v_data_v2.v3.post_mask_epoch_state import (
     STATE_COMPLETED,
     STATE_MISMATCH,
     STATE_PENDING,
-    STATE_RERUN_NO_RECEIPT,
     STATE_TERMINAL_REJECT,
     GroupLedger,
     LedgerError,
@@ -89,6 +88,10 @@ def _job(
         attempt_index=attempt_index,
         seed=seed,
     )
+
+
+def _audit_committed(ledger: PhaseLedger, job: ModelJob):
+    return ledger.verify_committed(job, ledger.receipts()[job.job_id()])
 
 
 class _FakeBatchExecutor:
@@ -301,7 +304,7 @@ def test_artifact_without_receipt_is_treated_as_incomplete(tmp_path: Path):
     ledger = PhaseLedger(tmp_path / "phase")
     job = _job()
     ledger.publish_artifact(job.job_id(), "out.png", b"payload")
-    assert ledger.classify(job).state == STATE_RERUN_NO_RECEIPT
+    assert ledger.classify(job).state == STATE_PENDING
     assert not ledger.classify(job).skippable
 
 
@@ -322,7 +325,7 @@ def test_digest_mismatch_fails_closed(tmp_path: Path):
     digest = ledger.publish_artifact(job.job_id(), "out.png", b"payload")
     ledger.commit(job, outcome=OUTCOME_COMPLETED, artifact_digests={"out.png": digest})
     ledger.publish_artifact(job.job_id(), "out.png", b"tampered")
-    state = ledger.classify(job)
+    state = _audit_committed(ledger, job)
     assert state.state == STATE_MISMATCH
     assert not state.skippable
 
@@ -337,7 +340,7 @@ def test_missing_durable_result_fails_closed(tmp_path: Path):
         artifact_digests={"out.png": digest},
         result_digest="deadbeef",
     )
-    assert ledger.classify(job).state == STATE_MISMATCH
+    assert _audit_committed(ledger, job).state == STATE_MISMATCH
 
 
 def test_durable_result_round_trips(tmp_path: Path):
@@ -350,6 +353,25 @@ def test_durable_result_round_trips(tmp_path: Path):
     assert loaded is not None
     assert loaded.outcome == OUTCOME_COMPLETED
     assert loaded.payload == {"accepted": True, "score": 0.5}
+
+
+def test_committed_replay_rejects_result_outcome_disagreement_without_artifact_audit(
+    tmp_path: Path,
+) -> None:
+    ledger = GroupLedger(tmp_path / "group")
+    job = _job()
+    phase = ledger.phase("phase")
+    _commit_result(phase, job, JobResult(OUTCOME_COMPLETED, payload={"ok": True}))
+    ledger.refresh(force=True)
+    result_path = phase.artifact_path(job.job_id(), "result.json")
+    result_path.write_text(
+        json.dumps(JobResult(OUTCOME_TERMINAL_REJECT, payload={"ok": False}).durable()),
+        encoding="utf-8",
+    )
+
+    assert ledger.classify(job).state == STATE_COMPLETED
+    with pytest.raises(LedgerError, match="outcome disagrees"):
+        ledger.load_committed_result(job)
 
 
 def test_torn_final_receipt_line_is_repaired_and_earlier_lines_kept(tmp_path: Path):
@@ -388,11 +410,80 @@ def test_group_ledger_locates_receipt_across_phases(tmp_path: Path):
     assert group.classify(job).state == STATE_TERMINAL_REJECT
 
 
-def test_group_ledger_reports_artifact_without_receipt(tmp_path: Path):
+def test_group_ledger_treats_orphan_artifact_as_pending(tmp_path: Path):
     group = GroupLedger(tmp_path / "group")
     job = _job()
     group.phase("r000-boogu").publish_artifact(job.job_id(), "out.png", b"x")
-    assert group.classify(job).state == STATE_RERUN_NO_RECEIPT
+    assert group.classify(job).state == STATE_PENDING
+
+
+def test_group_refresh_never_enumerates_artifact_tree(tmp_path: Path, monkeypatch):
+    group = GroupLedger(tmp_path / "group")
+    job = _job()
+    group.phase("r000-boogu").publish_artifact(job.job_id(), "out.png", b"x")
+    real_iterdir = Path.iterdir
+    real_rglob = Path.rglob
+
+    def forbid_artifact_enumeration(path):
+        if path.name == "artifacts":
+            raise AssertionError("normal refresh enumerated artifacts")
+        return real_iterdir(path)
+
+    def forbid_artifact_recursion(path, pattern):
+        if path.name == "artifacts":
+            raise AssertionError("normal refresh recursed into artifacts")
+        return real_rglob(path, pattern)
+
+    monkeypatch.setattr(Path, "iterdir", forbid_artifact_enumeration)
+    monkeypatch.setattr(Path, "rglob", forbid_artifact_recursion)
+    fresh = GroupLedger(group.root)
+    fresh.refresh()
+    assert fresh.classify(job).state == STATE_PENDING
+
+
+@pytest.mark.parametrize(
+    ("outcome", "expected_state"),
+    [
+        (OUTCOME_COMPLETED, STATE_COMPLETED),
+        (OUTCOME_TERMINAL_REJECT, STATE_TERMINAL_REJECT),
+    ],
+)
+def test_normal_resume_classifies_receipt_without_artifact_audit(
+    tmp_path: Path, monkeypatch, outcome: str, expected_state: str
+):
+    import r2v_data_v2.v3.post_mask_epoch_state as state_module
+
+    group = GroupLedger(tmp_path / "group")
+    job = _job()
+    phase = group.phase("r000-boogu")
+    _commit_result(
+        phase,
+        job,
+        JobResult(
+            outcome,
+            {"out.png": b"payload"},
+            external_artifacts=(
+                ArtifactReference(str(tmp_path / "missing.png"), "0" * 64),
+            ),
+            payload={"ok": True},
+        ),
+    )
+    real_read_bytes = Path.read_bytes
+
+    def forbid_artifact_reads(path):
+        if "artifacts" in path.parts:
+            raise AssertionError("normal classify read a committed artifact")
+        return real_read_bytes(path)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("normal classify invoked artifact audit")
+
+    monkeypatch.setattr(Path, "read_bytes", forbid_artifact_reads)
+    monkeypatch.setattr(PhaseLedger, "artifact_digests", forbidden)
+    monkeypatch.setattr(state_module, "verify_external_artifact", forbidden)
+
+    assert phase.classify(job).state == expected_state
+    assert GroupLedger(group.root).classify(job).state == expected_state
 
 
 def test_group_ledger_classify_does_not_rescan_jsonl_per_job(tmp_path, monkeypatch):
@@ -636,9 +727,12 @@ def test_scheduler_fails_closed_on_receipt_mismatch(
     ledger = GroupLedger(tmp_path / "group")
     executor = _FakeBatchExecutor()
     _scheduler(tmp_path, {RESOURCE_BOOGU: executor}, lambda j, r: ()).run([job])
-    ledger.phase(ledger.phase_ids()[0]).publish_artifact(
-        job.job_id(), "out.png", b"tampered"
+    phase = ledger.phase(ledger.phase_ids()[0])
+    receipt = phase.receipts()[job.job_id()]
+    phase.receipts_path.write_text(
+        json.dumps({**receipt, "job_identity": "wrong"}) + "\n"
     )
+
     def no_plan_write(self, jobs):
         raise AssertionError("a mismatched receipt must fail before plan mutation")
 
@@ -987,7 +1081,7 @@ def test_missing_result_digest_fails_closed(tmp_path: Path):
         result_digest="",
     )
     # No migration path: a receipt without a durable result is not accepted.
-    assert ledger.classify(job).state == STATE_MISMATCH
+    assert _audit_committed(ledger, job).state == STATE_MISMATCH
 
 
 def test_terminal_reject_validates_result_digest(tmp_path: Path):
@@ -1000,7 +1094,7 @@ def test_terminal_reject_validates_result_digest(tmp_path: Path):
     target = ledger.artifact_path(job.job_id(), "result.json")
     tampered = JobResult(OUTCOME_TERMINAL_REJECT, payload={"rejected": False})
     target.write_text(json.dumps(tampered.durable(), sort_keys=True))
-    assert ledger.classify(job).state == STATE_MISMATCH
+    assert _audit_committed(ledger, job).state == STATE_MISMATCH
 
 
 def test_terminal_reject_result_outcome_mismatch_fails_closed(tmp_path: Path):
@@ -1041,7 +1135,7 @@ def test_missing_external_artifact_fails_closed(tmp_path: Path):
     _commit_result(
         ledger, job, JobResult(OUTCOME_COMPLETED, external_artifacts=(reference,))
     )
-    assert ledger.classify(job).state == STATE_MISMATCH
+    assert _audit_committed(ledger, job).state == STATE_MISMATCH
 
 
 def test_external_artifact_size_mismatch_fails_closed(tmp_path: Path):
@@ -1055,7 +1149,7 @@ def test_external_artifact_size_mismatch_fails_closed(tmp_path: Path):
     _commit_result(
         ledger, job, JobResult(OUTCOME_COMPLETED, external_artifacts=(reference,))
     )
-    assert ledger.classify(job).state == STATE_MISMATCH
+    assert _audit_committed(ledger, job).state == STATE_MISMATCH
 
 
 def test_external_artifact_sha_mismatch_fails_closed(tmp_path: Path):
@@ -1069,7 +1163,7 @@ def test_external_artifact_sha_mismatch_fails_closed(tmp_path: Path):
     _commit_result(
         ledger, job, JobResult(OUTCOME_COMPLETED, external_artifacts=(reference,))
     )
-    assert ledger.classify(job).state == STATE_MISMATCH
+    assert _audit_committed(ledger, job).state == STATE_MISMATCH
 
 
 def test_relative_external_artifact_path_fails_closed(tmp_path: Path):
@@ -1079,7 +1173,7 @@ def test_relative_external_artifact_path_fails_closed(tmp_path: Path):
     _commit_result(
         ledger, job, JobResult(OUTCOME_COMPLETED, external_artifacts=(reference,))
     )
-    assert ledger.classify(job).state == STATE_MISMATCH
+    assert _audit_committed(ledger, job).state == STATE_MISMATCH
 
 
 def test_result_external_refs_must_match_receipt(tmp_path: Path):
@@ -1101,10 +1195,10 @@ def test_result_external_refs_must_match_receipt(tmp_path: Path):
         result_digest=digests["result.json"],
         external_artifacts=(),  # receipt disagrees with result.json
     )
-    assert ledger.classify(job).state == STATE_MISMATCH
+    assert _audit_committed(ledger, job).state == STATE_MISMATCH
 
 
-def test_scheduler_refuses_tampered_terminal_result(tmp_path: Path):
+def test_scheduler_refuses_missing_terminal_result(tmp_path: Path):
     job = _job(job_type="judge", resource=RESOURCE_QWEN)
     seen: list[dict] = []
 
@@ -1122,13 +1216,12 @@ def test_scheduler_refuses_tampered_terminal_result(tmp_path: Path):
     phase_id = ledger.phase_for(job)
     assert phase_id is not None
     target = ledger.phase(phase_id).artifact_path(job.job_id(), "result.json")
-    tampered = JobResult(OUTCOME_TERMINAL_REJECT, payload={"rejected": False})
-    target.write_text(json.dumps(tampered.durable(), sort_keys=True))
+    target.unlink()
 
     seen.clear()
     with pytest.raises(SchedulerError):
         _scheduler(tmp_path, {RESOURCE_QWEN: executor}, finalize).run([job])
-    # The finalizer must never observe the tampered payload.
+    # A committed receipt still needs its small result for finalizer replay.
     assert seen == []
 
 
@@ -1192,7 +1285,7 @@ def test_terminal_reject_internal_artifact_tamper_fails_closed(tmp_path: Path):
     assert ledger.classify(job).state == STATE_TERMINAL_REJECT
     # Tamper an internal artifact, leaving result.json untouched.
     ledger.publish_artifact(job.job_id(), "diagnostic.json", b"tampered")
-    assert ledger.classify(job).state == STATE_MISMATCH
+    assert _audit_committed(ledger, job).state == STATE_MISMATCH
 
 
 def test_terminal_reject_missing_internal_artifact_fails_closed(tmp_path: Path):
@@ -1206,7 +1299,7 @@ def test_terminal_reject_missing_internal_artifact_fails_closed(tmp_path: Path):
     _commit_result(ledger, job, result)
     assert ledger.classify(job).state == STATE_TERMINAL_REJECT
     (ledger.artifacts_root / job.job_id() / "diagnostic.json").unlink()
-    assert ledger.classify(job).state == STATE_MISMATCH
+    assert _audit_committed(ledger, job).state == STATE_MISMATCH
 
 
 def test_external_artifact_filesystem_error_fails_closed(tmp_path, monkeypatch):
@@ -1424,11 +1517,11 @@ def test_legacy_receipt_with_disagreeing_result_artifact_fails_closed(tmp_path: 
         artifact_digests={"out.png": digest, "result.json": "0" * 64},
         result_digest=result_digest,
     )
-    assert ledger.classify(job).state == STATE_MISMATCH
+    assert _audit_committed(ledger, job).state == STATE_MISMATCH
 
 
 def test_result_tamper_still_fails_closed(tmp_path: Path):
-    """The result digest remains the authority for the result bytes."""
+    """Explicit audit still detects a changed durable result."""
     ledger = PhaseLedger(tmp_path / "phase")
     job = _job()
     _commit_result(ledger, job, JobResult(OUTCOME_COMPLETED, payload={"ok": True}))
@@ -1436,7 +1529,7 @@ def test_result_tamper_still_fails_closed(tmp_path: Path):
 
     path = ledger.artifact_path(job.job_id(), "result.json")
     path.write_text(json.dumps({"outcome": "completed", "payload": {"ok": False}}))
-    assert ledger.classify(job).state == STATE_MISMATCH
+    assert _audit_committed(ledger, job).state == STATE_MISMATCH
 
 
 # --------------------------------------------------------------------------
@@ -1577,10 +1670,10 @@ def _count_resume_io(monkeypatch, ledger, job):
     return seen
 
 
-def test_result_only_resume_reads_the_result_once_and_never_scans(
+def test_result_only_resume_never_reads_artifacts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    """A result-only job pays for exactly one read: its own result."""
+    """Receipt classification does not need the durable result."""
     ledger = PhaseLedger(tmp_path / "phase")
     job = _job(job_type="judge")
     _commit_result(ledger, job, JobResult(OUTCOME_COMPLETED, payload={"ok": True}))
@@ -1590,13 +1683,13 @@ def test_result_only_resume_reads_the_result_once_and_never_scans(
 
     assert state.state == STATE_COMPLETED
     assert seen["digests_calls"] == [], "a result-only job must not scan its directory"
-    assert seen["reads"] == ["result.json"], seen
+    assert seen["reads"] == [], seen
 
 
-def test_binary_artifact_resume_scans_once_and_reads_the_result_once(
+def test_binary_artifact_resume_never_reads_artifacts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    """One directory scan, each artifact once, and the result read exactly once."""
+    """A binary-artifact receipt is still classified without an audit."""
     ledger = PhaseLedger(tmp_path / "phase")
     job = _job()
     result = JobResult(
@@ -1608,8 +1701,8 @@ def test_binary_artifact_resume_scans_once_and_reads_the_result_once(
     state = ledger.classify(job)
 
     assert state.state == STATE_COMPLETED
-    assert seen["digests_calls"] == [False], "exactly one scan, result excluded"
-    assert sorted(seen["reads"]) == ["a.bin", "b.bin", "result.json"], seen
+    assert seen["digests_calls"] == [], seen
+    assert seen["reads"] == [], seen
 
 
 def test_unexpected_extra_binary_artifact_fails_closed(tmp_path: Path):
@@ -1621,7 +1714,7 @@ def test_unexpected_extra_binary_artifact_fails_closed(tmp_path: Path):
 
     ledger.publish_artifact(job.job_id(), "extra.bin", b"surprise")
 
-    state = ledger.classify(job)
+    state = _audit_committed(ledger, job)
     assert state.state == STATE_MISMATCH
     assert not state.skippable
 

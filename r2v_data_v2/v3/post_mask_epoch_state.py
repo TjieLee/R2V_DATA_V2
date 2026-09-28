@@ -23,14 +23,16 @@ can only ever lose *one* job's worth of work, never corrupt a finished one:
 
 Consequences used by :meth:`GroupLedger.classify`:
 
-* valid receipt whose artifacts still match -> completed, skip the model call
-  but still replay the CPU finalizer;
+* committed receipt with matching job identity -> completed, skip the model
+  call but still replay the CPU finalizer;
 * ``terminal_reject`` receipt -> durable quality outcome, never paid for again,
   finalizer still replayed;
-* artifact present but no valid receipt -> the job did not commit, rerun it;
-* receipt/artifact digest mismatch -> fail closed with a diagnostic, never
-  silently accept;
-* absent receipt and absent artifact -> ordinary pending job.
+* absent receipt, including an orphan artifact -> ordinary pending job;
+* receipt identity mismatch -> fail closed with a diagnostic.
+
+Normal resume trusts the durable receipt. Explicit artifact auditing remains
+available through :meth:`PhaseLedger.verify_committed`, but is not part of
+normal classification.
 
 Skipping a model call is **not** the same as skipping the finalizer. A
 downstream job only exists because some finalizer created it, so a crash
@@ -402,14 +404,7 @@ class PhaseLedger:
     def artifact_digests(
         self, job_id: str, *, include_result: bool = True
     ) -> dict[str, str]:
-        """Digest the artifacts of one job directory.
-
-        ``include_result`` keeps the durable ``result.json`` in the listing. It
-        defaults to True because a job with artifacts but no receipt still has to
-        be recognised as a rerun rather than as pending. The committed path
-        passes False, so the result is never hashed as if it were a binary
-        artifact and never hashed twice.
-        """
+        """Digest one job directory for explicit auditing, not normal resume."""
         root = self.artifacts_root / job_id
         if not root.is_dir():
             return {}
@@ -443,13 +438,26 @@ class PhaseLedger:
         return JobResult.from_durable(payload)
 
     # -- resume -----------------------------------------------------------
-    def verify_committed(self, job: Any, receipt: Mapping[str, Any]) -> JobState:
-        """Validate a receipt already held in memory.
+    def classify_receipt(self, job: Any, receipt: Mapping[str, Any]) -> JobState:
+        """Classify a durable receipt without inspecting historical artifacts."""
+        if receipt.get("job_identity") != job.identity():
+            return JobState(
+                STATE_MISMATCH,
+                dict(receipt),
+                "receipt job identity does not match the planned job",
+                phase_id=self.root.name,
+            )
+        outcome = receipt.get("outcome")
+        if outcome == OUTCOME_COMPLETED:
+            state = STATE_COMPLETED
+        elif outcome in COMMITTED_OUTCOMES:
+            state = STATE_TERMINAL_REJECT
+        else:
+            state = STATE_PENDING
+        return JobState(state, dict(receipt), phase_id=self.root.name)
 
-        Separate from :meth:`classify` so the group ledger can resolve resume
-        decisions from its index without re-parsing ``receipts.jsonl`` for every
-        job. Only this job's own artifact directory is touched.
-        """
+    def verify_committed(self, job: Any, receipt: Mapping[str, Any]) -> JobState:
+        """Explicitly audit one receipt and its artifacts outside normal resume."""
         if receipt.get("job_identity") != job.identity():
             return JobState(
                 STATE_MISMATCH,
@@ -581,15 +589,8 @@ class PhaseLedger:
         """Resolve one job's resume state against this phase."""
         receipt = self.receipts().get(job.job_id())
         if receipt is None:
-            # One directory scan, not two: the artifact listing answers both the
-            # state and its detail.
-            artifacts = self.artifact_digests(job.job_id())
-            return JobState(
-                STATE_RERUN_NO_RECEIPT if artifacts else STATE_PENDING,
-                detail="artifact without receipt" if artifacts else "",
-                phase_id=self.root.name,
-            )
-        return self.verify_committed(job, receipt)
+            return JobState(STATE_PENDING, phase_id=self.root.name)
+        return self.classify_receipt(job, receipt)
 
     def commit(
         self,
@@ -621,11 +622,10 @@ class GroupLedger:
     unlocked it, so resume has to locate a receipt without knowing in advance
     which phase produced it.
 
-    A group can contain tens of thousands of model jobs, so the expensive part
-    (walking phases and parsing ``receipts.jsonl``) happens **once** during
-    :meth:`refresh`. Afterwards :meth:`classify` is an in-memory lookup plus an
-    artifact check scoped to that one job. Commits update the index
-    incrementally, so a long run never re-scans.
+    A group can contain tens of thousands of model jobs, so phase discovery
+    and ``receipts.jsonl`` parsing happen **once** during :meth:`refresh`.
+    Afterwards :meth:`classify` is an in-memory lookup and receipt identity
+    check. Commits update the index incrementally, so a long run never re-scans.
     """
 
     def __init__(self, root: Path) -> None:
@@ -635,7 +635,6 @@ class GroupLedger:
         self._torn_receipts_repaired = 0
         self._receipt_index: dict[str, dict[str, Any]] = {}
         self._job_phase_index: dict[str, str] = {}
-        self._artifact_owners: dict[str, str] = {}
         self._dirty = True
 
     # -- indexing ---------------------------------------------------------
@@ -660,7 +659,6 @@ class GroupLedger:
         self.refresh_calls += 1
         receipt_index: dict[str, dict[str, Any]] = {}
         job_phase: dict[str, str] = {}
-        artifact_owners: dict[str, str] = {}
         for phase_id in self.phase_ids():
             ledger = self.phase(phase_id)
             records, repaired = ledger.load_receipts()
@@ -672,24 +670,17 @@ class GroupLedger:
                 if isinstance(job_id, str):
                     receipt_index[job_id] = record
                     job_phase[job_id] = phase_id
-            artifacts_root = ledger.artifacts_root
-            if artifacts_root.is_dir():
-                for entry in artifacts_root.iterdir():
-                    if entry.is_dir():
-                        artifact_owners[entry.name] = phase_id
         self._receipt_index = receipt_index
         self._job_phase_index = job_phase
-        self._artifact_owners = artifact_owners
         self._dirty = False
 
     def note_commit(self, phase_id: str, receipt: Receipt) -> None:
         """Keep the index current without re-reading every phase."""
         self._receipt_index[receipt.job_id] = receipt.record()
         self._job_phase_index[receipt.job_id] = phase_id
-        self._artifact_owners[receipt.job_id] = phase_id
 
     def note_artifact(self, phase_id: str, job_id: str) -> None:
-        self._artifact_owners[job_id] = phase_id
+        """Compatibility hook; uncommitted artifacts do not affect resume."""
 
     # -- lookup -----------------------------------------------------------
     def phase_for(self, job: Any) -> str | None:
@@ -701,23 +692,9 @@ class GroupLedger:
         job_id = job.job_id()
         receipt = self._receipt_index.get(job_id)
         if receipt is None:
-            owner = self._artifact_owners.get(job_id)
-            # No rebuild here on purpose. During a run the scheduler registers
-            # every artifact via note_artifact(), so after refresh() an unknown
-            # job genuinely has no artifact yet: it is simply pending. A crash
-            # between an artifact rename and note_artifact() also kills the
-            # process, so the next restart's refresh() picks it up anyway.
-            # Rebuilding per miss would rescan every phase dir for every new
-            # pending job, which is O(N^2) on an 80k-row group.
-            if owner is None:
-                return JobState(STATE_PENDING)
-            return JobState(
-                STATE_RERUN_NO_RECEIPT,
-                detail="artifact without receipt",
-                phase_id=owner,
-            )
+            return JobState(STATE_PENDING)
         phase_id = self._job_phase_index.get(job_id) or ""
-        return self.phase(phase_id).verify_committed(job, receipt)
+        return self.phase(phase_id).classify_receipt(job, receipt)
 
     def load_committed_result(self, job: Any) -> JobResult | None:
         """Rebuild the result of an already-committed job for finalizer replay."""
@@ -725,7 +702,17 @@ class GroupLedger:
         phase_id = self._job_phase_index.get(job.job_id())
         if phase_id is None:
             return None
-        return self.phase(phase_id).load_result(job)
+        result = self.phase(phase_id).load_result(job)
+        if result is None:
+            return None
+        receipt = self._receipt_index[job.job_id()]
+        if result.outcome != receipt.get("outcome"):
+            raise LedgerError("durable result outcome disagrees with its receipt")
+        if [item.record() for item in result.external_artifacts] != receipt.get(
+            "external_artifacts", []
+        ):
+            raise LedgerError("durable result external artifacts disagree with its receipt")
+        return result
 
     @property
     def torn_receipts_repaired(self) -> int:

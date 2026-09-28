@@ -1609,6 +1609,70 @@ def test_frozen_plan_keeps_fresh_classification_after_publication(
     assert restarted.seed_primary_jobs() == []
 
 
+def test_cold_existing_primary_plan_does_not_read_historic_clip_inputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _pair_config(tmp_path, monkeypatch)
+    storage = _storage(config, entity_types=("subject",))
+    original = _runner(tmp_path, config, storage)
+    original.freeze_primary_plans()
+    frozen = json.loads(original._plan_path(SHARD).read_text(encoding="utf-8"))
+    restarted = _runner(tmp_path, config, storage)
+
+    def forbidden(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("existing plan validation read a historic clip input")
+
+    monkeypatch.setattr(storage, "read_clip", forbidden)
+    monkeypatch.setattr(storage, "read_frames", forbidden)
+    monkeypatch.setattr(storage, "read_masks", forbidden)
+
+    assert restarted._primary_plan(SHARD) == frozen
+
+
+@pytest.mark.parametrize("cpu_workers", (1, 2))
+def test_cold_published_primary_clip_skips_input_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cpu_workers: int
+) -> None:
+    config = _pair_config(tmp_path, monkeypatch)
+    storage = _storage(config, entity_types=("subject",))
+    original = _runner(tmp_path, config, storage)
+    (job,) = original.seed_primary_jobs()
+    result = _run_one(original, job, _Judge())
+    original.finalize(job, result)
+    assert original._marker_exists(f"published-{SHARD}-clip-1")
+    restarted = _runner(tmp_path, config, storage, cpu_workers=cpu_workers)
+
+    def forbidden(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("completed Pair clip input was read on restart")
+
+    monkeypatch.setattr(storage, "read_clip", forbidden)
+    monkeypatch.setattr(storage, "read_frames", forbidden)
+    monkeypatch.setattr(storage, "read_masks", forbidden)
+    monkeypatch.setattr(restarted, "_primary_context", forbidden)
+    monkeypatch.setattr(restarted, "_frozen_input_digest", forbidden)
+
+    assert restarted.seed_primary_jobs() == []
+
+
+def test_published_primary_marker_without_receipt_reseeds_pending_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _pair_config(tmp_path, monkeypatch)
+    storage = _storage(config, entity_types=("subject",))
+    original = _runner(tmp_path, config, storage)
+    (job,) = original.seed_primary_jobs()
+    result = _run_one(original, job, _Judge())
+    original.finalize(job, result)
+    assert original._marker_exists(f"published-{SHARD}-clip-1")
+    assert original.ledger.phase("pair").receipts_path.is_file()
+    original.ledger.phase("pair").receipts_path.write_text("", encoding="utf-8")
+
+    restarted = _runner(tmp_path, config, storage)
+    pending = restarted.seed_primary_jobs()
+
+    assert [item.job_id() for item in pending] == [job.job_id()]
+
+
 def test_deterministic_only_primary_publishes_rejected_with_zero_qwen(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2038,21 +2102,16 @@ def test_guard_failure_counters_count_one_failure_once(
     assert clip.pairing.background_token is None
 
 
-def test_existing_pairing_is_revalidated_after_plan_creation(
+def test_existing_pairing_is_validated_on_creation_but_not_plan_restart(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Validation must run every time; only the diagnostic is de-duplicated."""
+    """Fresh freeze is strict; a cold plan read trusts its frozen decision."""
     import r2v_data_v2.v3.pair as pair_module
 
     config = _pair_config(tmp_path, monkeypatch)
     storage = _storage(config, entity_types=("subject",))
     pair_clips(config, storage, judge=_Judge())
     root = tmp_path / "ledger"
-
-    runner = _runner(root, config, storage)
-    plan = runner._primary_plan(SHARD)
-    assert plan["clips"]["clip-1"]["classification"] == "existing_pairing"
-    assert runner.stats[SHARD]["failed"] == 0
 
     real_validate = pair_module._validate_existing_pairing
     seen: list[str] = []
@@ -2063,19 +2122,24 @@ def test_existing_pairing_is_revalidated_after_plan_creation(
 
     monkeypatch.setattr(pair_module, "_validate_existing_pairing", spy)
 
-    # The clip is still healthy: validation runs and passes again.
+    runner = _runner(root, config, storage)
+    plan = runner._primary_plan(SHARD)
+    assert plan["clips"]["clip-1"]["classification"] == "existing_pairing"
+    assert seen == ["clip-1"], "fresh plan creation validates legacy pairing"
+    assert runner.stats[SHARD]["failed"] == 0
+
     revalidated = _runner(root, config, storage)
     revalidated._primary_plan(SHARD)
-    assert seen == ["clip-1"], "existing pairing is validated on every load"
+    assert seen == ["clip-1"], "plan restart does not re-read pairing artifacts"
     assert revalidated.stats[SHARD]["failed"] == 0
 
-    # Now corrupt the published reference after the plan already exists.
+    # A changed historic binary is not audited during normal plan restart.
     storage.selected_entity_path("clip-1", "e1").write_bytes(b"not a png")
 
     after = _runner(root, config, storage)
     after._primary_plan(SHARD)
-    assert len(seen) == 2, "validation is not skipped by any success marker"
-    assert after.stats[SHARD]["failed"] == 1
+    assert seen == ["clip-1"]
+    assert after.stats[SHARD]["failed"] == 0
     assert after.seed_primary_jobs() == [], "no primary Qwen for an existing pairing"
 
 
@@ -3973,7 +4037,7 @@ def test_pair_quarantine_does_not_hide_frozen_primary_plan_drift(
     runner.freeze_primary_plans()
     plan_path = runner._plan_path(SHARD)
     payload = json.loads(plan_path.read_text())
-    payload["clips"]["clip-1"]["digest"] = "incorrect-durable-digest"
+    payload["clips"]["clip-1"]["digest"] = "0" * 64
     plan_path.write_text(json.dumps(payload))
     storage.clip_path("clip-2").unlink()
 
@@ -3981,10 +4045,9 @@ def test_pair_quarantine_does_not_hide_frozen_primary_plan_drift(
         runner.seed_primary_jobs()
 
 
-def test_pair_cold_plan_cannot_skip_unverified_quarantined_digest(
+def test_pair_cold_plan_skips_previously_quarantined_clip_inputs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from r2v_data_v2.v3.post_mask_epoch_pair import PairEpochError
     from r2v_data_v2.v3.post_mask_epoch_quarantine import ClipQuarantine
 
     config, storage, runner = _primary_clips_fixture(
@@ -3996,10 +4059,14 @@ def test_pair_cold_plan_cannot_skip_unverified_quarantined_digest(
     )
     runner.freeze_primary_plans()
     plan_path = runner._plan_path(SHARD)
-    payload = json.loads(plan_path.read_text())
-    payload["clips"]["clip-2"]["digest"] = "incorrect-durable-digest"
-    plan_path.write_text(json.dumps(payload))
     storage.clip_path("clip-2").unlink()
+    quarantine = ClipQuarantine.for_group(
+        runner.ledger.root, {SHARD: ("clip-1", "clip-2")}
+    )
+    assert quarantine.record_if_local(
+        SHARD, storage, "clip-2", "pair",
+        FileNotFoundError("clip.json does not exist for clip-2"),
+    )
 
     cold = _runner(
         tmp_path,
@@ -4009,11 +4076,22 @@ def test_pair_cold_plan_cannot_skip_unverified_quarantined_digest(
         ledger_dir="ledger-run-quarantine-cold-plan",
         cpu_workers=1,
     )
-    cold.clip_quarantine = ClipQuarantine()
+    cold.clip_quarantine = ClipQuarantine.for_group(
+        runner.ledger.root, {SHARD: ("clip-1", "clip-2")}
+    )
+    real_digest = cold._frozen_input_digest
 
-    with pytest.raises(PairEpochError, match="cannot validate frozen primary input"):
-        cold.seed_primary_jobs()
+    def no_quarantined_digest(
+        storage_arg: Any, clip_uid: str, *, shard: str | None = None
+    ) -> str:
+        if clip_uid == "clip-2":
+            raise AssertionError("quarantined clip input digest was rederived")
+        return real_digest(storage_arg, clip_uid, shard=shard)
+
+    monkeypatch.setattr(cold, "_frozen_input_digest", no_quarantined_digest)
+    assert [job.clip_uid for job in cold.seed_primary_jobs()] == ["clip-1"]
     assert cold.clip_quarantine.count == 1
+    assert plan_path.is_file()
 
 
 def test_pair_quarantine_cannot_hide_removed_frozen_plan_entry(
@@ -4819,7 +4897,7 @@ def test_hot_finalizer_preserves_prefilter_projection_for_reconcile(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Hot finalization must not erase the seed's prefilter accounting."""
-    _unused_config, storage, runner, clip_uids = _four_clip_pair_storage(
+    _unused_config, _storage, runner, clip_uids = _four_clip_pair_storage(
         tmp_path, monkeypatch, "run-finalize-prefilter-preserve", cpu_workers=4
     )
     seeded = runner.seed_primary_jobs()
@@ -4905,7 +4983,7 @@ def test_replaced_primary_plan_cannot_be_hidden_by_the_cache(
     plan_path.write_text(json.dumps(payload), encoding="utf-8")
 
     from r2v_data_v2.v3.post_mask_epoch_pair import PairEpochError
-    with pytest.raises(PairEpochError, match="frozen primary input drifted"):
+    with pytest.raises(PairEpochError, match="frozen primary plan entry is malformed"):
         runner.reconcile_stats(SHARD)
     assert runner.prepare_counters["primary_plan_validation_cache_misses"] >= 1
 

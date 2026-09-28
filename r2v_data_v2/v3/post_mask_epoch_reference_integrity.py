@@ -888,12 +888,13 @@ class ReferenceIntegrityEpochRunner:
     def _verify_plan_entry(
         self, shard: str, storage: RunStorage, clip_uid: str, entry: Mapping[str, Any]
     ) -> None:
-        """Strictly validate one frozen plan entry against the live clip.
+        """Strictly validate one active plan entry against the live clip.
 
         A plan entry is durable authority, so both its structure and its
         classification are re-derived; a tampered plan may never silently change
         which clips or entities this stage executes.
         """
+        self._verify_plan_entry_structure(clip_uid, entry)
         try:
             clip = storage.read_clip(clip_uid)
         except (OSError, ValueError) as exc:
@@ -908,6 +909,64 @@ class ReferenceIntegrityEpochRunner:
         if actual != entry.get("digest"):
             raise ReferenceIntegrityDurableError(
                 f"frozen Reference Integrity input drifted for {clip_uid!r}"
+            )
+        if entry.get("classification") != CLIP_FRESH_TARGET:
+            return
+
+        marker = _read_json(self._clip_outcome_path(shard, clip_uid))
+        if marker is not None:
+            # The clip outcome marker is the durable terminal authority: verify
+            # the live publication against it. Live state may legitimately equal
+            # the frozen baseline here, because a re-run can republish the very
+            # same failed state (same clip, same reason) as a no-op write.
+            self._verify_published_clip(shard, storage, clip_uid, entry)
+            return
+        # No marker yet: the live state decides whether this epoch has published
+        # anything. Equality with the frozen baseline means it has not, even when
+        # that baseline already carries a failed Reference Integrity state
+        # (legacy re-runs a failed clip as a fresh target). Any other state is a
+        # publication-before-marker crash candidate that must verify exactly.
+        baselines = self._live_baselines(clip)
+        if all(entry.get(key) == value for key, value in baselines.items()):
+            return
+        self._verify_published_clip(shard, storage, clip_uid, entry)
+
+    def _verify_plan_entry_structure(
+        self, clip_uid: str, entry: Mapping[str, Any]
+    ) -> None:
+        """Validate one frozen entry using only fields in the plan file."""
+        required = {
+            "classification",
+            "digest",
+            "retained_entity_ids",
+            "pre_references",
+            "pre_pairing",
+            "pre_reference_edit",
+            "pre_reference_integrity",
+            "pre_instruction",
+            "pre_export",
+        }
+        if not required.issubset(entry) or not isinstance(entry["digest"], str):
+            raise ReferenceIntegrityDurableError(
+                f"frozen Reference Integrity plan entry is malformed for {clip_uid!r}"
+            )
+        if not isinstance(entry["pre_references"], dict) or not isinstance(
+            entry["pre_export"], dict
+        ):
+            raise ReferenceIntegrityDurableError(
+                f"frozen Reference Integrity plan entry is malformed for {clip_uid!r}"
+            )
+        if any(
+            entry[key] is not None and not isinstance(entry[key], dict)
+            for key in (
+                "pre_pairing",
+                "pre_reference_edit",
+                "pre_reference_integrity",
+                "pre_instruction",
+            )
+        ):
+            raise ReferenceIntegrityDurableError(
+                f"frozen Reference Integrity plan entry is malformed for {clip_uid!r}"
             )
         classification = entry.get("classification")
         if classification not in (CLIP_FRESH_TARGET, CLIP_EXISTING, CLIP_INELIGIBLE):
@@ -940,26 +999,6 @@ class ReferenceIntegrityEpochRunner:
             raise ReferenceIntegrityDurableError(
                 f"non-fresh clip {clip_uid!r} must not retain review entities"
             )
-        if classification != CLIP_FRESH_TARGET:
-            return
-
-        marker = _read_json(self._clip_outcome_path(shard, clip_uid))
-        if marker is not None:
-            # The clip outcome marker is the durable terminal authority: verify
-            # the live publication against it. Live state may legitimately equal
-            # the frozen baseline here, because a re-run can republish the very
-            # same failed state (same clip, same reason) as a no-op write.
-            self._verify_published_clip(shard, storage, clip_uid, entry)
-            return
-        # No marker yet: the live state decides whether this epoch has published
-        # anything. Equality with the frozen baseline means it has not, even when
-        # that baseline already carries a failed Reference Integrity state
-        # (legacy re-runs a failed clip as a fresh target). Any other state is a
-        # publication-before-marker crash candidate that must verify exactly.
-        baselines = self._live_baselines(clip)
-        if all(entry.get(key) == value for key, value in baselines.items()):
-            return
-        self._verify_published_clip(shard, storage, clip_uid, entry)
 
     @staticmethod
     def _plan_semantic_digest(payload: Mapping[str, Any]) -> str:
@@ -1011,7 +1050,7 @@ class ReferenceIntegrityEpochRunner:
     def _remember_validated_plan(
         self, shard: str, payload: Mapping[str, Any]
     ) -> None:
-        """Remember a fully validated shard plan for this invocation.
+        """Remember a structurally validated shard plan for this invocation.
 
         Entries, canonical digest and file signature are stored together, under
         one lock, so all three always describe the same validated generation.
@@ -1236,8 +1275,8 @@ class ReferenceIntegrityEpochRunner:
             raise ReferenceIntegrityDurableError(
                 f"frozen Reference Integrity plan has no entry for {clip_uid!r}"
             )
-        # The entry came from a fully validated plan, but this clip's LIVE state
-        # may still have drifted: verify this clip, and only this clip.
+        # The entry came from a structurally validated plan, but this active
+        # clip's live state may still have drifted: verify only this clip.
         self._verify_plan_entry(shard, storage, clip_uid, cached)
         self._bump_plan_counter("plan_entry_hot_validation_count")
         return cached
@@ -1245,11 +1284,11 @@ class ReferenceIntegrityEpochRunner:
     def _full_plan_entry(
         self, shard: str, storage: RunStorage, clip_uid: str
     ) -> dict[str, Any]:
-        """Fallback: the original full strict validation of the whole shard.
+        """Fallback: reload the plan, then strictly check the active clip.
 
         Used on a cache miss (a direct caller that never seeded, or a plan whose
-        durable content changed since validation). The cache is then refreshed
-        from the newly validated payload, which already verified every clip.
+        durable content changed since validation). Plan structure is validated
+        for the shard; only this clip is compared with its live input.
         """
         plan = self._existing_plan_for_reconcile(shard)
         self._remember_validated_plan(shard, plan)
@@ -1258,15 +1297,17 @@ class ReferenceIntegrityEpochRunner:
             raise ReferenceIntegrityDurableError(
                 f"frozen Reference Integrity plan has no entry for {clip_uid!r}"
             )
+        self._verify_plan_entry(shard, storage, clip_uid, entry)
         return entry
 
     def _validate_existing_plan(
         self, shard: str, payload: Mapping[str, Any]
     ) -> dict[str, Any]:
-        """The single strict validation of one frozen plan, used by every reader.
+        """Validate one frozen plan using only its own durable fields.
 
         The seed path and the reconcile path must never disagree about what a
-        valid plan is, so both go through this helper.
+        valid plan is, so both go through this helper. Live inputs are checked
+        only when an active clip is about to be processed.
         """
         expected = {
             "schema": REFERENCE_INTEGRITY_PLAN_SCHEMA,
@@ -1305,23 +1346,13 @@ class ReferenceIntegrityEpochRunner:
             raise ReferenceIntegrityDurableError(
                 f"frozen Reference Integrity plan scope drifted for {shard!r}"
             )
-        storage = self._storage_for(shard)
         for clip_uid, entry in clips.items():
             if not isinstance(entry, dict):
                 raise ReferenceIntegrityDurableError(
                     f"frozen Reference Integrity plan entry is malformed for "
                     f"{clip_uid!r}"
                 )
-            try:
-                self._verify_plan_entry(shard, storage, clip_uid, entry)
-            except _ClipArtifactReadError as exc:
-                if not self._quarantine_local(
-                    shard, storage, clip_uid, exc.cause, known_clip_artifact_read=True
-                ):
-                    raise exc.cause
-                raise ReferenceIntegrityDurableError(
-                    f"cannot validate frozen Reference Integrity input for {clip_uid!r}"
-                ) from exc
+            self._verify_plan_entry_structure(clip_uid, entry)
         self._bump_plan_counter("plan_full_validation_count")
         return dict(payload)
 
@@ -4280,6 +4311,8 @@ class ReferenceIntegrityEpochRunner:
         storage: RunStorage,
         clip_uid: str,
         entry: Mapping[str, Any],
+        *,
+        verify_input: bool = True,
     ) -> tuple[dict[str, Any], dict[str, Any], list[str]] | None:
         """MAIN THREAD ONLY: the entities one fresh clip still needs seeded.
 
@@ -4293,6 +4326,21 @@ class ReferenceIntegrityEpochRunner:
             return None
         if self._clip_outcome_path(shard, clip_uid).is_file():
             return None
+        if verify_input:
+            try:
+                self._verify_plan_entry(shard, storage, clip_uid, entry)
+            except _ClipArtifactReadError as exc:
+                if self._quarantine_local(
+                    shard, storage, clip_uid, exc.cause, known_clip_artifact_read=True
+                ):
+                    return None
+                raise exc.cause
+            except ReferenceIntegrityDurableError:
+                if self._is_quarantined(shard, clip_uid):
+                    return None
+                raise
+            if self._clip_outcome_path(shard, clip_uid).is_file():
+                return None
         clip = storage.read_clip(clip_uid)
         references_by_id = {item.entity_id: item for item in clip.references.entities}
         entities_by_id = {
@@ -4499,9 +4547,9 @@ class ReferenceIntegrityEpochRunner:
         # invocation across all clips, so single-entity clips still fan out.
         records: list[_SeedClipPlan] = []
         for shard in sorted(self.storages):
-            # _plan already fully validates an existing durable plan and
-            # constructs a new one from live validated inputs, so re-reading and
-            # re-validating it here would duplicate that work per shard.
+            # Fresh creation already validates live inputs. Existing plans are
+            # checked structurally, then only active clips verify live inputs.
+            plan_existed = self._plan_path(shard).is_file()
             plan = self._plan(shard)
             self._remember_validated_plan(shard, plan)
             storage = self._storage_for(shard)
@@ -4511,7 +4559,9 @@ class ReferenceIntegrityEpochRunner:
                     continue
                 entry = clips[clip_uid]
                 try:
-                    targets = self._clip_seed_targets(shard, storage, clip_uid, entry)
+                    targets = self._clip_seed_targets(
+                        shard, storage, clip_uid, entry, verify_input=plan_existed
+                    )
                 except (OSError, ValueError) as exc:
                     if not self._quarantine_local(shard, storage, clip_uid, exc):
                         raise

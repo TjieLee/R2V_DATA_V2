@@ -111,6 +111,12 @@ def _runner(
     )
 
 
+def _audit_published_clip(runner: Any, storage: Any, clip_uid: str = "clip-1") -> None:
+    """Run the retained explicit audit, outside the normal resume path."""
+    plan = json.loads(runner._plan_path(SHARD).read_text(encoding="utf-8"))
+    runner._verify_published_clip(SHARD, storage, clip_uid, plan["clips"][clip_uid])
+
+
 def _edit_dump(clip: Any) -> Any:
     return (
         clip.reference_edit.model_dump(mode="json")
@@ -273,7 +279,7 @@ def test_publication_before_marker_crash_backfills_on_restart(
 def test_live_publication_tamper_fails_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A tampered published state must fail closed, never become a clip failure."""
+    """The explicit audit detects tampered published state."""
     config, storage = _storage_variant(
         tmp_path,
         monkeypatch,
@@ -304,7 +310,7 @@ def test_live_publication_tamper_fails_closed(
 
     fresh = _runner(config, storage, tmp_path)
     with pytest.raises(ReferenceIntegrityDurableError, match="does not match"):
-        fresh.seed_jobs()
+        _audit_published_clip(fresh, storage)
 
 
 @pytest.mark.parametrize(
@@ -319,7 +325,7 @@ def test_live_publication_tamper_fails_closed(
 def test_durable_corruption_fails_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tamper: str
 ) -> None:
-    """Artifact drift and malformed markers are durable errors, not clip failures."""
+    """Explicit audit detects artifact drift and malformed markers."""
     config, storage = _storage_variant(
         tmp_path,
         monkeypatch,
@@ -357,7 +363,7 @@ def test_durable_corruption_fails_closed(
 
     fresh = _runner(config, storage, tmp_path)
     with pytest.raises(ReferenceIntegrityDurableError):
-        fresh.seed_jobs()
+        _audit_published_clip(fresh, storage)
     after_failures = failures_path.read_text(encoding="utf-8") if failures_path.is_file() else ""
     assert after_failures == before_failures
     # The clip keeps its verified publication, never a semantic failure.
@@ -412,7 +418,7 @@ def test_pre_existing_failed_state_is_reprocessed(
 def test_entity_delta_tamper_fails_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A schema-valid but wrong entity counter must never reach the stats."""
+    """Explicit audit detects a schema-valid but wrong entity counter."""
     config, storage = _storage_variant(
         tmp_path,
         monkeypatch,
@@ -431,7 +437,7 @@ def test_entity_delta_tamper_fails_closed(
 
     fresh = _runner(config, storage, tmp_path)
     with pytest.raises(ReferenceIntegrityDurableError, match="entity outcome drifted"):
-        fresh.reconcile_stats(SHARD)
+        _audit_published_clip(fresh, storage)
 
 
 @pytest.mark.parametrize(
@@ -528,7 +534,7 @@ def test_failed_publication_drift_fails_closed(
     with pytest.raises(
         ReferenceIntegrityDurableError, match="failed publication drifted"
     ):
-        fresh.seed_jobs()
+        _audit_published_clip(fresh, storage)
     after = [
         json.loads(line)
         for line in failures_path.read_text(encoding="utf-8").splitlines()
@@ -890,7 +896,7 @@ def test_committed_review_receipt_restart_pays_no_qwen(
 def test_reviewed_marker_tamper_fails_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, variant: str
 ) -> None:
-    """A tampered reviewed marker must fail closed against its receipts."""
+    """Explicit audit catches reviewed marker tampering against receipts."""
     if variant == "final":
         config, storage = _main_review_fixture(tmp_path, monkeypatch, "run-epoch")
         results: tuple[Any, ...] = (
@@ -914,7 +920,7 @@ def test_reviewed_marker_tamper_fails_closed(
 
     fresh = _runner(config, storage, tmp_path)
     with pytest.raises(ReferenceIntegrityDurableError, match="reviewed entity outcome"):
-        fresh.reconcile_stats(SHARD)
+        _audit_published_clip(fresh, storage)
 
 
 # ---------------------------------------------------------------------------
@@ -1596,7 +1602,7 @@ def test_finalized_bbox_metadata_tamper_fails_closed(
         ReferenceIntegrityDurableError,
         match="final Reference Integrity bbox metadata drifted",
     ):
-        fresh.reconcile_stats(SHARD)
+        _audit_published_clip(fresh, storage)
 
     after = storage.read_clip("clip-1")
     assert after.reference_integrity is not None
@@ -2500,6 +2506,26 @@ def test_semantic_plan_tamper_is_not_hidden_by_the_cache(
     assert len(judge.calls) == 0, "no model call on a tampered plan"
 
 
+def test_hot_plan_cache_miss_rechecks_active_clip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _config, storage, runner, _judge = _seeded_review_fixture(
+        tmp_path, monkeypatch, "run-plan-cache-miss-active"
+    )
+    _runnable_job(runner, "final")
+    plan_path = runner._plan_path(SHARD)
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    plan["clips"]["clip-1"]["diagnostic_note"] = "structurally valid change"
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+    clip_path = storage.clip_path("clip-1")
+    clip = json.loads(clip_path.read_text(encoding="utf-8"))
+    clip["annotation"]["entities"][0]["phrase"] = "drifted phrase"
+    clip_path.write_text(json.dumps(clip), encoding="utf-8")
+
+    with pytest.raises(ReferenceIntegrityDurableError, match="input drifted"):
+        runner._hot_plan_entry(SHARD, storage, "clip-1")
+
+
 def test_equivalent_plan_rewrite_keeps_its_semantics() -> None:
     """The identity is canonical semantics, never raw file bytes."""
     compact = {"schema": "s", "clips": {"clip-1": {"a": 1, "b": [1, 2]}}}
@@ -2535,7 +2561,7 @@ def test_current_clip_live_drift_is_still_detected(
     assert len(judge.calls) == 0, "no model call on a drifted clip"
 
 
-def test_cold_runner_still_fully_validates(
+def test_cold_runner_still_validates_plan_structure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config, storage, _seed_runner, judge = _seeded_review_fixture(
@@ -2551,10 +2577,60 @@ def test_cold_runner_still_fully_validates(
     assert cold.plan_counters["plan_full_validation_count"] == 1
     assert cold._validated_plan_digests.get(SHARD)
 
-    # And reconcile keeps its own fully strict validation.
+    # Reconcile still validates the durable plan's own fields.
     before = cold.plan_counters["plan_full_validation_count"]
     cold.reconcile_stats(SHARD)
     assert cold.plan_counters["plan_full_validation_count"] == before + 1
+
+
+def test_existing_plan_done_clip_skips_historical_artifact_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, storage, _unused, judge = _seeded_review_fixture(
+        tmp_path, monkeypatch, "run-plan-done-resume"
+    )
+    _run_epoch(config, storage, tmp_path, judge)
+    cold = _runner(config, storage, tmp_path)
+    assert cold._clip_outcome_path(SHARD, "clip-1").is_file()
+
+    def forbidden(*_args: Any, **_kwargs: Any) -> Any:
+        pytest.fail("completed clip was re-read during plan resume")
+
+    monkeypatch.setattr(storage, "read_clip", forbidden)
+    monkeypatch.setattr(storage, "read_frames", forbidden)
+    monkeypatch.setattr(storage, "read_masks", forbidden)
+    assert cold.seed_jobs() == []
+    assert cold.reconcile_stats(SHARD).processed == 1
+
+
+def test_existing_plan_pending_clip_checks_live_input_before_seeding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _config, storage, runner, _judge = _seeded_review_fixture(
+        tmp_path, monkeypatch, "run-plan-pending-resume"
+    )
+    runner._plan(SHARD)
+    clip_path = storage.clip_path("clip-1")
+    payload = json.loads(clip_path.read_text(encoding="utf-8"))
+    payload["annotation"]["entities"][0]["phrase"] = "drifted phrase"
+    clip_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ReferenceIntegrityDurableError, match="input drifted"):
+        runner.seed_jobs()
+
+
+def test_existing_plan_pending_missing_clip_is_quarantined(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _config, storage, runner, _judge = _seeded_review_fixture(
+        tmp_path, monkeypatch, "run-plan-pending-missing"
+    )
+    runner.clip_quarantine = ClipQuarantine()
+    runner._plan(SHARD)
+    storage.clip_path("clip-1").unlink()
+
+    assert runner.seed_jobs() == []
+    assert runner.clip_quarantine.contains(SHARD, "clip-1")
 
 
 # ---------------------------------------------------------------------------
@@ -3870,13 +3946,9 @@ def test_unidentified_nonlocal_reference_is_not_clip_quarantined(
     assert not (Path(storage.root) / "failures.jsonl").exists()
 
 
-def test_integrity_frozen_plan_does_not_skip_quarantined_entry(
+def test_integrity_existing_plan_skips_quarantined_entry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from r2v_data_v2.v3.post_mask_epoch_reference_integrity import (
-        ReferenceIntegrityDurableError,
-    )
-
     _config, storage, runner, uids = _multi_clip_fixture(
         tmp_path,
         monkeypatch,
@@ -3887,9 +3959,27 @@ def test_integrity_frozen_plan_does_not_skip_quarantined_entry(
     runner._plan(SHARD)
     runner.clip_quarantine = ClipQuarantine()
     storage.clip_path(uids[1]).unlink()
+    assert runner.clip_quarantine.record_if_local(
+        SHARD,
+        storage,
+        uids[1],
+        "reference_integrity",
+        FileNotFoundError(f"clip.json does not exist for {uids[1]}"),
+    )
 
-    with pytest.raises(ReferenceIntegrityDurableError, match="frozen Reference Integrity input"):
-        runner.seed_jobs()
+    for method_name in ("read_clip", "read_frames", "read_masks"):
+        original = getattr(storage, method_name)
+
+        def read(uid: str, *args: Any, _original: Any = original, **kwargs: Any) -> Any:
+            if uid == uids[1]:
+                pytest.fail("quarantined clip was re-read during plan resume")
+            return _original(uid, *args, **kwargs)
+
+        monkeypatch.setattr(storage, method_name, read)
+
+    assert runner.seed_jobs() == []
+    assert runner.clip_quarantine.contains(SHARD, uids[1])
+    assert runner.reconcile_stats(SHARD).failed == 1
 
 
 def test_integrity_quarantine_cannot_hide_removed_plan_entry(

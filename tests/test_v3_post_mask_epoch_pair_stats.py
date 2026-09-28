@@ -1065,10 +1065,10 @@ def test_malformed_phase_plan_fails_closed(
         runner.reconcile_stats(SHARD)
 
 
-def test_tampered_committed_result_fails_closed(
+def test_tampered_committed_result_requires_explicit_audit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from r2v_data_v2.v3.post_mask_epoch_pair import PairEpochError
+    from r2v_data_v2.v3.post_mask_epoch_state import STATE_COMPLETED, STATE_MISMATCH
 
     config = _epoch_config(tmp_path, monkeypatch, "run-epoch")
     storage = _storage(config, entity_types=("subject",))
@@ -1080,8 +1080,13 @@ def test_tampered_committed_result_fails_closed(
     result_path = Path(runner.ledger.root) / "phases" / phase_id / "artifacts" / job.job_id() / "result.json"
     assert result_path.is_file()
     result_path.write_text('{"outcome":"completed","detail":"","result_payload":{"repair_attempts":99}}', encoding="utf-8")
-    with pytest.raises(PairEpochError, match="receipt mismatch|does not rebuild"):
-        runner.reconcile_stats(SHARD)
+    # Normal resume trusts the durable receipt. A deliberate content audit
+    # still detects this historical artifact mutation.
+    assert runner.ledger.classify(job).state == STATE_COMPLETED
+    phase = runner.ledger.phase(phase_id)
+    records, _repaired = phase.load_receipts()
+    receipt = next(item for item in records if item["job_id"] == job.job_id())
+    assert phase.verify_committed(job, receipt).state == STATE_MISMATCH
 
 
 def test_full_stats_restart_stability_and_purity(

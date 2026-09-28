@@ -1499,10 +1499,10 @@ def test_publication_before_marker_crash_repairs(
     del routing
 
 
-def test_marker_exists_live_state_tamper_fails_closed(
+def test_explicit_audit_detects_published_clip_tamper(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Marker present but the live published state was tampered: fail closed."""
+    """Normal resume trusts the marker; an explicit audit still detects drift."""
     config, storage, runner, scheduler, routing = _build(tmp_path, monkeypatch)
     _drain(runner, scheduler)
     del routing
@@ -1526,8 +1526,74 @@ def test_marker_exists_live_state_tamper_fails_closed(
         config, {SHARD: storage}, GroupLedger(tmp_path / "ledger"),
         eligible_clip_uids_by_shard={SHARD: ["clip-1"]},
     )
+    assert fresh.seed_jobs() == []
+    plan_entry = fresh._plan(SHARD)["clips"]["clip-1"]
     with pytest.raises(ReferenceEditEpochError, match="does not match"):
-        fresh.seed_jobs()
+        fresh._verify_published_clip(SHARD, storage, "clip-1", plan_entry)
+
+
+def test_fresh_reconcile_still_audits_published_clip_before_stage_counts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _config, storage, runner, scheduler, _routing = _build(tmp_path, monkeypatch)
+    _drain(runner, scheduler)
+    clip = storage.read_clip("clip-1")
+    tampered = clip.reference_edit.model_copy(
+        update={
+            "entities": [
+                entity.model_copy(update={"metadata_path": "clips/tampered.json"})
+                for entity in clip.reference_edit.entities
+            ]
+        }
+    )
+    import r2v_data_v2.v3.storage as storage_module
+
+    storage_module.write_json_atomic(
+        storage.clip_path("clip-1"),
+        clip.model_copy(update={"reference_edit": tampered}).model_dump(mode="json"),
+    )
+
+    with pytest.raises(ReferenceEditDurableError, match="does not match"):
+        runner.reconcile_stats(SHARD)
+
+
+def test_resumed_pending_clip_is_audited_after_current_run_publishes_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, storage, initial, _scheduler, _routing = _build(tmp_path, monkeypatch)
+    initial._plan(SHARD)
+    runner = ReferenceEditEpochRunner(
+        config, {SHARD: storage}, GroupLedger(tmp_path / "ledger"),
+        eligible_clip_uids_by_shard={SHARD: ["clip-1"]},
+    )
+    routing = _RoutingExecutor(runner)
+    scheduler = ResourceEpochScheduler(
+        ledger=runner.ledger,
+        finalize=runner.finalize,
+        executors={
+            resource: routing.executor_for(resource)
+            for resource in (RESOURCE_BOOGU, RESOURCE_QWEN, RESOURCE_SAM)
+        },
+    )
+    _drain(runner, scheduler)
+    clip = storage.read_clip("clip-1")
+    tampered = clip.reference_edit.model_copy(
+        update={
+            "entities": [
+                entity.model_copy(update={"metadata_path": "clips/tampered.json"})
+                for entity in clip.reference_edit.entities
+            ]
+        }
+    )
+    import r2v_data_v2.v3.storage as storage_module
+
+    storage_module.write_json_atomic(
+        storage.clip_path("clip-1"),
+        clip.model_copy(update={"reference_edit": tampered}).model_dump(mode="json"),
+    )
+
+    with pytest.raises(ReferenceEditDurableError, match="does not match"):
+        runner.reconcile_stats(SHARD)
 
 
 # ---------------------------------------------------------------------------
@@ -1705,7 +1771,15 @@ def _candidate_path(runner: ReferenceEditEpochRunner, job_id: str) -> Path:
     )
 
 
-def test_generation_result_tamper_fails_closed(
+def _audit_committed_receipt(runner: ReferenceEditEpochRunner, job_id: str) -> str:
+    job = runner._job_from_plan_record(runner._planned_record(job_id))
+    phase_id = runner.ledger.phase_for(job)
+    assert phase_id is not None
+    phase = runner.ledger.phase(phase_id)
+    return phase.verify_committed(job, phase.receipts()[job_id]).state
+
+
+def test_explicit_audit_detects_generation_result_tamper(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _config, _storage, runner, _scheduler, routing = _build(tmp_path, monkeypatch)
@@ -1719,11 +1793,10 @@ def test_generation_result_tamper_fails_closed(
     payload = json.loads(path.read_text(encoding="utf-8"))
     payload["result_payload"]["candidate_sha256"] = "0" * 64
     path.write_text(json.dumps(payload), encoding="utf-8")
-    with pytest.raises(ReferenceEditEpochError, match="receipt mismatch|drifted"):
-        runner._validated_committed(job_id)
+    assert _audit_committed_receipt(runner, job_id) == "mismatch"
 
 
-def test_candidate_artifact_tamper_fails_closed(
+def test_explicit_audit_detects_candidate_artifact_tamper(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _config, _storage, runner, _scheduler, routing = _build(tmp_path, monkeypatch)
@@ -1734,8 +1807,7 @@ def test_candidate_artifact_tamper_fails_closed(
     job_id = _committed_job_id(runner, "reference_edit_boogu_generate")
     path = _candidate_path(runner, job_id)
     path.write_bytes(b"tampered")
-    with pytest.raises(ReferenceEditEpochError, match="receipt mismatch|drifted"):
-        runner._validated_committed(job_id)
+    assert _audit_committed_receipt(runner, job_id) == "mismatch"
 
 
 def _tamper_review_result(
@@ -1759,12 +1831,11 @@ def _tamper_review_result(
     payload = json.loads(path.read_text(encoding="utf-8"))
     payload["result_payload"]["status"] = "tampered"
     path.write_text(json.dumps(payload), encoding="utf-8")
-    with pytest.raises(ReferenceEditEpochError, match="receipt mismatch|drifted"):
-        runner._validated_committed(job_id)
+    assert _audit_committed_receipt(runner, job_id) == "mismatch"
     del config, storage, scheduler
 
 
-def test_qwen_result_tamper_fails_closed(
+def test_explicit_audit_detects_qwen_result_tamper(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _tamper_review_result(
@@ -1772,7 +1843,7 @@ def test_qwen_result_tamper_fails_closed(
     )
 
 
-def test_sam_result_tamper_fails_closed(
+def test_explicit_audit_detects_sam_result_tamper(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _tamper_review_result(
@@ -1893,7 +1964,7 @@ def test_seed_plan_tamper_through_seed_jobs_fails_closed(
     assert clip.pairing is not None
 
 
-def test_failure_marker_reason_tamper_fails_closed(
+def test_explicit_audit_detects_failure_marker_reason_tamper(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A failure marker must bind terminal + reason + delta, not just status."""
@@ -1941,10 +2012,12 @@ def test_failure_marker_reason_tamper_fails_closed(
         GroupLedger(tmp_path / "ledger"),
         eligible_clip_uids_by_shard={SHARD: ["clip-1", "clip-2"]},
     )
+    assert fresh.seed_jobs() == []
+    plan_entry = fresh._plan(SHARD)["clips"]["clip-1"]
     with pytest.raises(
         ReferenceEditDurableError, match="failure outcome marker does not match"
     ):
-        fresh.seed_jobs()
+        fresh._verify_published_clip(SHARD, storage, "clip-1", plan_entry)
 
 
 # ---------------------------------------------------------------------------
@@ -2010,7 +2083,8 @@ def test_malformed_outcome_json_fails_closed_not_semantic(
     )
     with pytest.raises(ReferenceEditDurableError, match="durable Reference Edit JSON"):
         if reader == "seed":
-            fresh.seed_jobs()
+            assert fresh.seed_jobs() == []
+            fresh._entity_outcome(SHARD, "clip-1", "e1")
         else:
             fresh.reconcile_stats(SHARD)
     after = failures_path.read_text(encoding="utf-8") if failures_path.is_file() else ""
@@ -2042,7 +2116,7 @@ def _published_clip_marker(
         ("terminal", "tampered"),
     ),
 )
-def test_ready_marker_tamper_fails_closed(
+def test_explicit_audit_detects_ready_marker_tamper(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     field: str,
@@ -2061,8 +2135,10 @@ def test_ready_marker_tamper_fails_closed(
         GroupLedger(tmp_path / "ledger"),
         eligible_clip_uids_by_shard={SHARD: ["clip-1"]},
     )
+    assert fresh.seed_jobs() == []
+    plan_entry = fresh._plan(SHARD)["clips"]["clip-1"]
     with pytest.raises(ReferenceEditDurableError):
-        fresh.reconcile_stats(SHARD)
+        fresh._verify_published_clip(SHARD, storage, "clip-1", plan_entry)
 
 
 # ---------------------------------------------------------------------------
@@ -2314,6 +2390,121 @@ def _plan_runner(config: Any, storage: Any, tmp_path: Path, uids: list[str]) -> 
     )
 
 
+def test_existing_plan_done_clip_never_reopens_historical_inputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, storage, runner, scheduler, _routing = _build(tmp_path, monkeypatch)
+    _drain(runner, scheduler)
+
+    def forbidden(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("completed Reference Edit clip reopened")
+
+    monkeypatch.setattr(storage, "read_clip", forbidden)
+    monkeypatch.setattr(storage, "read_frames", forbidden)
+    monkeypatch.setattr(storage, "read_masks", forbidden)
+    fresh = _plan_runner(config, storage, tmp_path, ["clip-1"])
+
+    assert fresh.seed_jobs() == []
+    assert fresh.reconcile_stats(SHARD).processed == 1
+
+
+def test_existing_plan_quarantined_clip_never_reopens_historical_inputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, storage, uids = _fresh_target_shard(tmp_path, monkeypatch, count=2)
+    runner = _plan_runner(config, storage, tmp_path, uids)
+    runner._plan(SHARD)
+    quarantined = uids[1]
+    storage.clip_path(quarantined).unlink()
+    quarantine = ClipQuarantine()
+    assert quarantine.record_if_local(
+        SHARD,
+        storage,
+        quarantined,
+        "pair",
+        FileNotFoundError(f"clip.json does not exist for {quarantined}"),
+    )
+    real_read_clip = storage.read_clip
+    real_read_frames = storage.read_frames
+    real_read_masks = storage.read_masks
+
+    def read_clip(clip_uid: str) -> Any:
+        if clip_uid == quarantined:
+            raise AssertionError("quarantined Reference Edit clip reopened")
+        return real_read_clip(clip_uid)
+
+    def read_frames(clip_uid: str) -> Any:
+        if clip_uid == quarantined:
+            raise AssertionError("quarantined Reference Edit frames reopened")
+        return real_read_frames(clip_uid)
+
+    def read_masks(clip_uid: str) -> Any:
+        if clip_uid == quarantined:
+            raise AssertionError("quarantined Reference Edit masks reopened")
+        return real_read_masks(clip_uid)
+
+    monkeypatch.setattr(storage, "read_clip", read_clip)
+    monkeypatch.setattr(storage, "read_frames", read_frames)
+    monkeypatch.setattr(storage, "read_masks", read_masks)
+    fresh = _plan_runner(config, storage, tmp_path, uids)
+    fresh.clip_quarantine = quarantine
+
+    assert [job.clip_uid for job in fresh.seed_jobs()] == [uids[0]]
+
+
+def test_current_run_quarantined_pending_clip_skips_live_reconcile_audit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, storage, uids = _fresh_target_shard(tmp_path, monkeypatch, count=1)
+    runner = _plan_runner(config, storage, tmp_path, uids)
+    runner.clip_quarantine = ClipQuarantine()
+    runner._plan(SHARD)
+    storage.clip_path(uids[0]).unlink()
+
+    assert runner.seed_jobs() == []
+    assert runner.clip_quarantine.contains(SHARD, uids[0])
+    stats = runner.reconcile_stats(SHARD)
+    assert stats.processed == 1
+    assert stats.failed == 1
+
+
+def test_existing_plan_rejects_malformed_clip_entry_without_input_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, storage, uids = _fresh_target_shard(tmp_path, monkeypatch, count=1)
+    runner = _plan_runner(config, storage, tmp_path, uids)
+    runner._plan(SHARD)
+    path = runner._plan_path(SHARD)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["clips"][uids[0]]["chain_entity_ids"] = "not-a-list"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    def forbidden(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("malformed plan read a clip")
+
+    monkeypatch.setattr(storage, "read_clip", forbidden)
+    with pytest.raises(ReferenceEditDurableError, match="entry"):
+        _plan_runner(config, storage, tmp_path, uids)._plan(SHARD)
+
+
+def test_fresh_plan_creation_does_not_repeat_input_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, storage, uids = _fresh_target_shard(tmp_path, monkeypatch, count=1)
+    runner = _plan_runner(config, storage, tmp_path, uids)
+    calls = 0
+    real_digest = runner._clip_digest
+
+    def count_digest(current_storage: Any, clip: Any) -> str:
+        nonlocal calls
+        calls += 1
+        return real_digest(current_storage, clip)
+
+    monkeypatch.setattr(runner, "_clip_digest", count_digest)
+    assert len(runner.seed_jobs()) == 1
+    assert calls == 1
+
+
 def test_missing_clip_after_hydration_does_not_block_reference_edit_sibling(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2343,19 +2534,17 @@ def test_missing_clip_after_hydration_does_not_block_reference_edit_sibling(
     assert events[0][1]["stage"] == "reference_edit"
 
 
-def test_reference_edit_frozen_plan_does_not_skip_quarantined_entry(
+def test_reference_edit_frozen_plan_quarantines_missing_pending_entry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from r2v_data_v2.v3.post_mask_epoch_reference_edit import ReferenceEditDurableError
-
     config, storage, uids = _fresh_target_shard(tmp_path, monkeypatch, count=2)
     runner = _plan_runner(config, storage, tmp_path, uids)
     runner._plan(SHARD)
     runner.clip_quarantine = ClipQuarantine()
     storage.clip_path(uids[1]).unlink()
 
-    with pytest.raises(ReferenceEditDurableError, match="frozen Reference Edit input"):
-        runner.seed_jobs()
+    assert [job.clip_uid for job in runner.seed_jobs()] == [uids[0]]
+    assert runner.clip_quarantine.contains(SHARD, uids[1])
 
 
 def test_reference_edit_quarantine_cannot_hide_removed_plan_entry(
@@ -2427,6 +2616,7 @@ def test_reference_image_infrastructure_failure_is_not_quarantined(
     config, storage, uids = _fresh_target_shard(tmp_path, monkeypatch, count=2)
     runner = _plan_runner(config, storage, tmp_path, uids)
     runner.clip_quarantine = ClipQuarantine()
+    runner._plan(SHARD)
     original = reference_edit_epoch._reference_content_geometry
 
     def geometry(current_storage: Any, reference: Any) -> Any:
@@ -2465,6 +2655,7 @@ def test_reference_edit_permission_failure_is_not_quarantined(
     config, storage, uids = _fresh_target_shard(tmp_path, monkeypatch, count=2)
     runner = _plan_runner(config, storage, tmp_path, uids)
     runner.clip_quarantine = ClipQuarantine()
+    runner._plan(SHARD)
     original = storage.read_clip
 
     def read_clip(clip_uid: str) -> Any:
@@ -2528,11 +2719,8 @@ def test_seed_validates_the_frozen_plan_once_per_seed(
 ) -> None:
     """Seeding N clips must not verify the shard plan N extra times.
 
-    Advancing clip by clip re-read and re-verified the whole shard plan - every
-    clip's digest over its frames and masks manifests - so a shard cost
-    O(clips^2) validations while ``_plan()`` had just validated the very same
-    payload. The seed now spends exactly one pass, and reconcile keeps its own
-    full pass because it verifies the state the stage actually published.
+    Each still-pending clip gets one live input check before execution.
+    Reconcile audits active clips once, not the whole shard per clip.
     """
     config, storage, uids = _fresh_target_shard(tmp_path, monkeypatch, count=6)
     # Freeze the plan first, so the seed under test reads it from disk.
@@ -2553,9 +2741,10 @@ def test_seed_validates_the_frozen_plan_once_per_seed(
     assert counts["entries"] == 2 * len(uids)
     assert counts["shard_reads"] == 0
 
-    # Reconcile is the opposite: it re-reads and re-verifies every entry.
+    # Reconcile re-reads the plan and audits only current-invocation clips.
     runner._existing_plan_for_reconcile(SHARD)
     assert counts["entries"] == 3 * len(uids)
+    assert counts["digests"] == 3 * len(uids)
     assert counts["shard_reads"] == 1
 
 
@@ -2625,7 +2814,7 @@ def test_later_geometry_failure_does_not_preempt_earlier_entity_commit(
         lambda _shard, _storage, _uid, entity, _reference, **kwargs:
             committed.append(entity.entity_id) or [],
     )
-    prepared = runner._prepare_seed_clip((SHARD, storage, "clip-1", plan))
+    prepared = runner._prepare_seed_clip((SHARD, storage, "clip-1", plan, False))
     with pytest.raises(ValueError, match="later geometry failed"):
         runner._advance_clip(
             SHARD, storage, "clip-1", plan,
@@ -2637,12 +2826,7 @@ def test_later_geometry_failure_does_not_preempt_earlier_entity_commit(
 def test_a_changed_frozen_plan_is_revalidated_and_rejected(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The seed's validated plan must not become reconcile's authority.
-
-    Reconcile verifies the state the stage published, so it re-reads the frozen
-    plan and re-runs every entry check: an entry edited after the seed validated
-    it is still durable corruption.
-    """
+    """A pending clip's live input must still match its frozen plan entry."""
     config, storage, uids = _fresh_target_shard(tmp_path, monkeypatch, count=3)
     runner = _plan_runner(config, storage, tmp_path, uids)
     runner.seed_jobs()
@@ -2660,4 +2844,4 @@ def test_a_changed_frozen_plan_is_revalidated_and_rejected(
     assert len(path.read_bytes()) == len(before)
 
     with pytest.raises(ReferenceEditDurableError, match="input drifted"):
-        runner._existing_plan_for_reconcile(SHARD)
+        runner.seed_jobs()
