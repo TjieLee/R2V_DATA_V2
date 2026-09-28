@@ -1308,7 +1308,7 @@ class ReferenceEditEpochRunner:
 
     def _prepare_seed_clip(
         self, target: tuple[str, RunStorage, str, Mapping[str, Any], bool]
-    ) -> tuple[Any, dict[str, tuple[Any, Any, Any] | Exception], float]:
+    ) -> tuple[Any, dict[str, tuple[Any, Any, Any] | Exception | None], float]:
         shard, storage, clip_uid, plan, existing_plan = target
         started = time.perf_counter()
         with self._seed_counter_lock:
@@ -1325,13 +1325,23 @@ class ReferenceEditEpochRunner:
                 else self._clip(storage, clip_uid)
             )
             references = {item.entity_id: item for item in clip.references.entities}
-            contexts: dict[str, tuple[Any, Any, Any] | Exception] = {}
+            entities = {item.entity_id: item for item in clip.annotation.entities}
+            contexts: dict[str, tuple[Any, Any, Any] | Exception | None] = {}
             for entity_id in plan["clips"][clip_uid]["chain_entity_ids"]:
                 try:
                     if self._entity_outcome(shard, clip_uid, entity_id) is not None:
                         continue
+                    reference = references[entity_id]
+                    entity = entities[entity_id]
+                    if (
+                        entity.reference_type not in {"subject", "object"}
+                        and reference.completeness is not None
+                        and not _operations(_route(reference))
+                    ):
+                        contexts[entity_id] = None
+                        continue
                     contexts[entity_id] = self._entity_route_context(
-                        storage, clip, references[entity_id]
+                        storage, clip, reference
                     )
                 except Exception as exc:  # noqa: BLE001 - re-raised in entity order
                     contexts[entity_id] = exc
@@ -1343,7 +1353,7 @@ class ReferenceEditEpochRunner:
     def _commit_seed_clip(
         self,
         target: tuple[str, RunStorage, str, Mapping[str, Any], bool],
-        prepared: tuple[Any, dict[str, tuple[Any, Any, Any] | Exception], float],
+        prepared: tuple[Any, dict[str, tuple[Any, Any, Any] | Exception | None], float],
         jobs: list[ModelJob],
     ) -> None:
         shard, storage, clip_uid, plan, _existing_plan = target
@@ -1430,7 +1440,9 @@ class ReferenceEditEpochRunner:
         plan: Mapping[str, Any],
         *,
         prepared_clip: Any | None = None,
-        prepared_contexts: Mapping[str, tuple[Any, Any, Any] | Exception] | None = None,
+        prepared_contexts: Mapping[
+            str, tuple[Any, Any, Any] | Exception | None
+        ] | None = None,
     ) -> list[ModelJob]:
         """Chain every entity of one clip; publish the clip when terminal.
 
@@ -1512,6 +1524,24 @@ class ReferenceEditEpochRunner:
         *,
         route_context: tuple[Any, Any, Any] | None = None,
     ) -> list[ModelJob]:
+        initial_route = _route(reference)
+        if (
+            entity.reference_type not in {"subject", "object"}
+            and reference.completeness is not None
+            and not _operations(initial_route)
+        ):
+            self._write_entity_outcome(
+                shard,
+                clip_uid,
+                {
+                    "entity_id": entity.entity_id,
+                    "outcome": "not_required",
+                    "reason": "no_operation_required",
+                    "route": initial_route,
+                    "delta": {},
+                },
+            )
+            return []
         if route_context is None:
             route_context = self._entity_route_context(
                 storage, self._clip(storage, clip_uid), reference
@@ -2580,17 +2610,6 @@ class ReferenceEditEpochRunner:
             outcome = dict(outcomes[entity_id])
             for field, value in outcome.get("delta", {}).items():
                 delta[field] = delta.get(field, 0) + int(value)
-            source_geometry, gate_reason, route = self._entity_route_context(
-                storage, clip, reference
-            )
-            initial_route = route
-            if gate_reason is None:
-                route = _route(
-                    reference,
-                    source_touches_boundary=(
-                        source_geometry.touches_canvas_boundary
-                    ),
-                )
             if (
                 entity is not None
                 and entity.reference_type not in {"subject", "object"}
@@ -2601,7 +2620,7 @@ class ReferenceEditEpochRunner:
                 edit_states.append(
                     ReferenceEditEntityState(
                         entity_id=entity_id,
-                        route=initial_route,
+                        route=_route(reference),
                         status="not_required",
                         source_reference=reference,
                         source_image_path=reference.image_path,
@@ -2609,6 +2628,16 @@ class ReferenceEditEpochRunner:
                     )
                 )
                 continue
+            source_geometry, gate_reason, route = self._entity_route_context(
+                storage, clip, reference
+            )
+            if gate_reason is None:
+                route = _route(
+                    reference,
+                    source_touches_boundary=(
+                        source_geometry.touches_canvas_boundary
+                    ),
+                )
             if outcome["outcome"] == "fallback" and outcome.get("reason") == (
                 "tiny_source_entity"
             ):
@@ -2756,13 +2785,21 @@ class ReferenceEditEpochRunner:
                         source_image_path=reference.image_path,
                         output_image_path=accepted.image_path,
                         variants=variants,
-                        default_variant="accepted_base",
-                        default_image_path=accepted.image_path,
+                        default_variant=(
+                            "accepted_base" if entity_variant_route else None
+                        ),
+                        default_image_path=(
+                            accepted.image_path if entity_variant_route else None
+                        ),
                         default_reason=(
                             "completion_candidate_"
                             f"{attempt_index}_review_accepted"
+                            if entity_variant_route
+                            else None
                         ),
-                        accepted_base_image_path=accepted.image_path,
+                        accepted_base_image_path=(
+                            accepted.image_path if entity_variant_route else None
+                        ),
                         operation="complete_entity",
                         metadata_path=accepted.generation_metadata_path,
                         operations=["complete_entity"],
@@ -2772,6 +2809,26 @@ class ReferenceEditEpochRunner:
                     )
                 )
                 continue
+            completion_metadata_path = (
+                storage.reference_edit_dir(clip_uid)
+                / entity_id
+                / (
+                    "completion_metadata.json"
+                    if int(outcome.get("attempt_index", 1)) == 1
+                    else "completion_metadata_2.json"
+                )
+                if outcome.get("attempt_index")
+                else None
+            )
+            final_metadata_path = _write_source_selection_metadata(
+                storage,
+                clip_uid=clip_uid,
+                reference=reference,
+                geometry=source_geometry,
+                source_gate_reason=None,
+                reason=str(outcome.get("reason", "")),
+                operation_metadata_path=completion_metadata_path,
+            )
             final_references.append(reference)
             edit_states.append(
                 ReferenceEditEntityState(
@@ -2796,22 +2853,14 @@ class ReferenceEditEpochRunner:
                     ),
                     operation="complete_entity",
                     metadata_path=storage.relative_artifact_path(
-                        storage.reference_edit_dir(clip_uid)
-                        / entity_id
-                        / "final_metadata.json"
+                        final_metadata_path
                     ),
                     operations=["complete_entity"],
                     completion_metadata_path=(
                         storage.relative_artifact_path(
-                            storage.reference_edit_dir(clip_uid)
-                            / entity_id
-                            / (
-                                "completion_metadata.json"
-                                if int(outcome.get("attempt_index", 1)) == 1
-                                else "completion_metadata_2.json"
-                            )
+                            completion_metadata_path
                         )
-                        if outcome.get("attempt_index")
+                        if completion_metadata_path is not None
                         else None
                     ),
                     fallback_policy="keep_source",

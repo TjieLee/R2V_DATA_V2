@@ -379,6 +379,153 @@ def _tiny_source_runner(
     return config, storage, runner
 
 
+def _paired_entity_storage(
+    config: Any, entity_type: str, scope: str, *, two_clips: bool = False
+) -> Any:
+    storage = _pair_storage(config, entity_types=(entity_type,))
+    if two_clips:
+        from tests.test_v3_pair import _add_ready_clip
+
+        _add_ready_clip(
+            config,
+            storage,
+            clip_uid="clip-2",
+            clip_suffix="2",
+            entity_types=(entity_type,),
+        )
+    _pair_clips()(config, storage, judge=_PairEntityJudge(scopes={"e1": scope}))
+    clip = storage.read_clip("clip-1")
+    assert clip.pairing is not None and clip.pairing.status == "ready"
+    assert clip.references.entities[0].completeness == (
+        "repairable" if scope == "repairable" else "complete"
+        if scope == "full" else "local_usable"
+    )
+    return storage
+
+
+@pytest.mark.parametrize(
+    ("entity_type", "scope", "expected_route", "skip_geometry"),
+    (
+        ("group", "full", "complete", True),
+        ("group", "local", "local_usable", True),
+        ("subject", "full", "complete", False),
+    ),
+)
+def test_no_operation_branches_match_legacy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entity_type: str,
+    scope: str,
+    expected_route: str,
+    skip_geometry: bool,
+) -> None:
+    from r2v_data_v2.v3 import reference_edit as legacy_module
+
+    legacy_config = _reference_edit_config(
+        tmp_path, monkeypatch, f"run-legacy-{entity_type}-{scope}"
+    )
+    legacy_storage = _paired_entity_storage(
+        legacy_config, entity_type, scope, two_clips=skip_geometry
+    )
+    config = _reference_edit_config(
+        tmp_path, monkeypatch, f"run-epoch-{entity_type}-{scope}"
+    )
+    storage = _paired_entity_storage(
+        config, entity_type, scope, two_clips=skip_geometry
+    )
+
+    def no_geometry(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("group no-op must not read source geometry")
+
+    if skip_geometry:
+        monkeypatch.setattr(legacy_module, "_reference_content_geometry", no_geometry)
+        monkeypatch.setattr(
+            reference_edit_epoch, "_reference_content_geometry", no_geometry
+        )
+    legacy_backend = _FakeBoogu()
+    legacy_judge = _FakeQwen()
+    legacy_stats = legacy_module.reference_edit_clips(
+        legacy_config, legacy_storage, backend=legacy_backend,
+        judge=legacy_judge, sam_reviewer=_LegacySamReviewer(),
+    )
+    runner = ReferenceEditEpochRunner(
+        config,
+        {SHARD: storage},
+        GroupLedger(tmp_path / f"ledger-{entity_type}-{scope}"),
+        eligible_clip_uids_by_shard={
+            SHARD: ["clip-1", "clip-2"] if skip_geometry else ["clip-1"]
+        },
+        cpu_workers=2,
+    )
+    assert runner.seed_jobs() == []
+    if skip_geometry:
+        assert runner.seed_counters["prepare_parallel_tasks"] == 2
+    assert runner.reconcile_stats(SHARD).to_dict() == legacy_stats.to_dict()
+    assert (legacy_backend.calls, legacy_judge.calls) == (0, 0)
+    for clip_uid in (["clip-1", "clip-2"] if skip_geometry else ["clip-1"]):
+        epoch_clip = storage.read_clip(clip_uid)
+        legacy_clip = legacy_storage.read_clip(clip_uid)
+        assert epoch_clip.reference_edit.status == "ready"
+        assert epoch_clip.reference_edit.entities[0].route == expected_route
+        for section in ("references", "pairing", "reference_edit"):
+            assert getattr(epoch_clip, section).model_dump(mode="json") == (
+                getattr(legacy_clip, section).model_dump(mode="json")
+            )
+
+
+@pytest.mark.parametrize("accepted", (True, False))
+def test_group_repairable_completion_matches_legacy_without_variants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, accepted: bool
+) -> None:
+    from r2v_data_v2.v3.reference_edit import reference_edit_clips
+
+    legacy_config = _reference_edit_config(tmp_path, monkeypatch, "run-legacy-group")
+    legacy_storage = _paired_entity_storage(legacy_config, "group", "repairable")
+    reference_edit_clips(
+        legacy_config,
+        legacy_storage,
+        backend=_FakeBoogu(),
+        judge=_FakeQwen(accept=accepted),
+        sam_reviewer=_LegacySamReviewer(),
+    )
+
+    config = _reference_edit_config(tmp_path, monkeypatch, "run-epoch-group")
+    storage = _paired_entity_storage(config, "group", "repairable")
+    ledger = GroupLedger(tmp_path / "ledger-group")
+    runner = ReferenceEditEpochRunner(
+        config,
+        {SHARD: storage},
+        ledger,
+        eligible_clip_uids_by_shard={SHARD: ["clip-1"]},
+    )
+    routing = _RoutingExecutor(runner)
+    routing.qwen.accept = accepted
+    scheduler = ResourceEpochScheduler(
+        ledger=ledger,
+        finalize=runner.finalize,
+        executors={
+            resource: routing.executor_for(resource)
+            for resource in (RESOURCE_BOOGU, RESOURCE_QWEN, RESOURCE_SAM)
+        },
+    )
+    _drain(runner, scheduler)
+
+    epoch_clip = storage.read_clip("clip-1")
+    legacy_clip = legacy_storage.read_clip("clip-1")
+    assert epoch_clip.reference_edit.status == "ready"
+    state = epoch_clip.reference_edit.entities[0]
+    assert state.status == ("accepted" if accepted else "fallback")
+    assert state.variants is None
+    assert state.default_variant is None
+    assert state.default_image_path is None
+    assert state.default_reason is None
+    assert state.accepted_base_image_path is None
+    for section in ("references", "pairing", "reference_edit"):
+        assert getattr(epoch_clip, section).model_dump(mode="json") == (
+            getattr(legacy_clip, section).model_dump(mode="json")
+        )
+
+
 def test_tiny_source_fallback_publishes_without_variants(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -458,9 +605,19 @@ def test_tiny_source_epoch_state_matches_legacy_json(
         tmp_path, monkeypatch, run_name="run-epoch-tiny"
     )
     assert runner.seed_jobs() == []
-    epoch_state = storage.read_clip("clip-1").reference_edit.entities[0]
-    legacy_state = legacy_storage.read_clip("clip-1").reference_edit.entities[0]
-    assert epoch_state.model_dump(mode="json") == legacy_state.model_dump(mode="json")
+    epoch_clip = storage.read_clip("clip-1")
+    legacy_clip = legacy_storage.read_clip("clip-1")
+    for section in ("references", "pairing", "reference_edit"):
+        assert getattr(epoch_clip, section).model_dump(mode="json") == (
+            getattr(legacy_clip, section).model_dump(mode="json")
+        )
+    metadata_path = epoch_clip.reference_edit.entities[0].metadata_path
+    assert metadata_path is not None
+    assert json.loads((storage.root / metadata_path).read_text(encoding="utf-8")) == (
+        json.loads(
+            (legacy_storage.root / metadata_path).read_text(encoding="utf-8")
+        )
+    )
 
 
 def test_repairable_chain_matches_legacy_and_uses_three_resources(
@@ -639,7 +796,7 @@ def test_candidate2_accept_matches_legacy(
     )
     assert legacy.completion_candidate2_accepted == 1
 
-    _config, _storage, runner, scheduler, routing = _build(
+    _config, storage, runner, scheduler, routing = _build(
         tmp_path, monkeypatch, run_name="run-epoch", with_alternate=True
     )
     routing.qwen.reject_candidate1 = True
@@ -650,6 +807,12 @@ def test_candidate2_accept_matches_legacy(
     assert stats.completion_candidate2_accepted == 1
     assert stats.completion_fallback_to_alpha == 0
     assert stats.to_dict() == legacy.to_dict()
+    epoch_clip = storage.read_clip("clip-1")
+    legacy_clip = legacy_storage.read_clip("clip-1")
+    for section in ("references", "pairing", "reference_edit"):
+        assert getattr(epoch_clip, section).model_dump(mode="json") == (
+            getattr(legacy_clip, section).model_dump(mode="json")
+        )
 
 
 def test_candidate2_reject_falls_back_to_alpha(
@@ -686,6 +849,73 @@ def test_candidate2_reject_falls_back_to_alpha(
     assert stats.completion_fallback_to_alpha == 1
     assert stats.entities_failed == 0
     assert stats.to_dict() == legacy.to_dict()
+
+
+@pytest.mark.parametrize("attempt_index", (1, 2))
+def test_completion_final_fallback_metadata_and_state_match_legacy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, attempt_index: int
+) -> None:
+    from r2v_data_v2.v3 import reference_edit as legacy_module
+
+    if attempt_index == 1:
+        def no_alternate(*_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        monkeypatch.setattr(legacy_module, "_alternate_completion_source", no_alternate)
+        monkeypatch.setattr(reference_edit_epoch, "_alternate_completion_source", no_alternate)
+
+    legacy_config = _reference_edit_config(
+        tmp_path, monkeypatch, "run-legacy-fallback",
+        same_parent_fallback_enabled=True,
+    )
+    legacy_storage = (
+        _with_alternate(legacy_config, monkeypatch, run_name="run-legacy-fallback")
+        if attempt_index == 2
+        else _prepared_storage(legacy_config, monkeypatch, run_name="run-legacy-fallback")
+    )
+    legacy_module.reference_edit_clips(
+        legacy_config,
+        legacy_storage,
+        backend=_FakeBoogu(),
+        judge=_FakeQwen(accept=False),
+        sam_reviewer=_LegacySamReviewer(),
+    )
+
+    _config, storage, runner, scheduler, routing = _build(
+        tmp_path,
+        monkeypatch,
+        run_name="run-epoch-fallback",
+        with_alternate=(attempt_index == 2),
+    )
+    routing.qwen.accept = False
+    _drain(runner, scheduler)
+    outcome = runner._entity_outcome(SHARD, "clip-1", "e1")
+    assert outcome["outcome"] == "fallback"
+    assert outcome["attempt_index"] == attempt_index
+
+    epoch_clip = storage.read_clip("clip-1")
+    legacy_clip = legacy_storage.read_clip("clip-1")
+    assert epoch_clip.reference_edit.status == "ready"
+    for section in ("references", "pairing", "reference_edit"):
+        assert getattr(epoch_clip, section).model_dump(mode="json") == (
+            getattr(legacy_clip, section).model_dump(mode="json")
+        )
+    state = epoch_clip.reference_edit.entities[0]
+    assert state.metadata_path == "clips/clip-1/reference_edit/e1/final_metadata.json"
+    expected_operation = (
+        "completion_metadata.json" if attempt_index == 1
+        else "completion_metadata_2.json"
+    )
+    assert state.completion_metadata_path == (
+        f"clips/clip-1/reference_edit/e1/{expected_operation}"
+    )
+    epoch_metadata = storage.root / state.metadata_path
+    legacy_metadata = legacy_storage.root / state.metadata_path
+    assert epoch_metadata.is_file()
+    assert legacy_metadata.is_file()
+    assert json.loads(epoch_metadata.read_text(encoding="utf-8")) == (
+        json.loads(legacy_metadata.read_text(encoding="utf-8"))
+    )
 
 
 def test_candidate2_metadata_provenance(
@@ -3087,7 +3317,10 @@ def test_later_geometry_failure_does_not_preempt_earlier_entity_commit(
 ) -> None:
     config, storage, uids = _fresh_target_shard(tmp_path, monkeypatch, count=1)
     runner = _plan_runner(config, storage, tmp_path, uids)
-    entities = [SimpleNamespace(entity_id="e1"), SimpleNamespace(entity_id="e2")]
+    entities = [
+        SimpleNamespace(entity_id="e1", reference_type="subject"),
+        SimpleNamespace(entity_id="e2", reference_type="subject"),
+    ]
     clip = SimpleNamespace(
         annotation=SimpleNamespace(entities=entities),
         references=SimpleNamespace(entities=entities),
