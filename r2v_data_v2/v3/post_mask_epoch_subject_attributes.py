@@ -32,9 +32,10 @@ import math
 import threading
 import time
 from collections import Counter
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -1485,6 +1486,9 @@ class SubjectAttributeEpochRunner:
             "clip_plan_derive_peak_inflight": 0,
             "clip_plan_derive_batches": 0,
             "clip_plan_derive_wall_seconds": 0.0,
+            "seed_execution_batches": 0,
+            "seed_execution_clips": 0,
+            "seed_execution_peak_clips": 0,
         }
 
     def _bump_replay_counter(self, key: str, delta: int = 1) -> None:
@@ -2697,15 +2701,19 @@ class SubjectAttributeEpochRunner:
             )
         return artifact
 
+    def _iter_seed_targets(self) -> Iterator[tuple[str, str]]:
+        """Canonical seed order, checked only as each clip is requested."""
+        for shard in sorted(self.storages):
+            for clip_uid in self.eligible.get(shard, ()):
+                if (
+                    not self._skip_preplan_quarantine(shard, clip_uid)
+                    and not self._cold_terminal_at_seed(shard, clip_uid)
+                ):
+                    yield shard, clip_uid
+
     def _seed_targets(self) -> list[tuple[str, str]]:
-        """Canonical seed order: sorted shard, then the declared clip order."""
-        return [
-            (shard, clip_uid)
-            for shard in sorted(self.storages)
-            for clip_uid in self.eligible.get(shard, ())
-            if not self._skip_preplan_quarantine(shard, clip_uid)
-            and not self._cold_terminal_at_seed(shard, clip_uid)
-        ]
+        """The eager compatibility path keeps its historical target snapshot."""
+        return list(self._iter_seed_targets())
 
     def _cold_terminal_at_seed(self, shard: str, clip_uid: str) -> bool:
         if not self.checkpoint_first_resume:
@@ -2733,12 +2741,13 @@ class SubjectAttributeEpochRunner:
 
     @staticmethod
     def _seed_batches(
-        targets: Sequence[tuple[str, str]], budget: int
+        targets: Iterable[tuple[str, str]], budget: int
     ) -> Iterator[list[tuple[str, str]]]:
         """Consecutive canonical batches of at most ``budget`` targets."""
         size = max(1, int(budget))
-        for start in range(0, len(targets), size):
-            yield list(targets[start : start + size])
+        source = iter(targets)
+        while batch := list(islice(source, size)):
+            yield batch
 
     def _timed_derive_clip_plan(
         self, storage: RunStorage, clip_uid: str
@@ -2751,6 +2760,30 @@ class SubjectAttributeEpochRunner:
             self._note_seed_wall(time.perf_counter() - started)
 
     def seed_jobs(self) -> list[ModelJob]:
+        """Eager compatibility path for standalone callers and tests."""
+        return self._seed_target_jobs(self._seed_targets())
+
+    def seed_job_batches(self, batch_size: int) -> Iterator[list[ModelJob]]:
+        """Seed one canonical clip batch only when its consumer requests it.
+
+        Each yield may be empty: deterministic clips still publish their CPU
+        outcomes, and no dummy model job or receipt is needed to advance.
+        """
+        if int(batch_size) <= 0:
+            raise ValueError("Subject Attributes seed batch size must be positive")
+        for targets in self._seed_batches(self._iter_seed_targets(), batch_size):
+            jobs = self._seed_target_jobs(targets)
+            with self._seed_counters_lock:
+                self.seed_counters["seed_execution_batches"] += 1
+                self.seed_counters["seed_execution_clips"] += len(targets)
+                self.seed_counters["seed_execution_peak_clips"] = max(
+                    self.seed_counters["seed_execution_peak_clips"], len(targets)
+                )
+            yield jobs
+
+    def _seed_target_jobs(
+        self, targets: Sequence[tuple[str, str]]
+    ) -> list[ModelJob]:
         """CPU fixed point, then the deterministic pending discovery jobs.
 
         Deriving a clip plan is pure read-only CPU over live upstream artifacts,
@@ -2764,7 +2797,6 @@ class SubjectAttributeEpochRunner:
         all. ``cpu_workers <= 1`` therefore takes that serial path and builds no
         executor at all.
         """
-        targets = self._seed_targets()
         jobs: list[ModelJob] = []
         quarantine = self.clip_quarantine
 

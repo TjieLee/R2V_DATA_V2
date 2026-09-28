@@ -4766,6 +4766,136 @@ def test_clip_plan_derivation_stays_bounded_on_a_long_shard(
     assert len(jobs) == 9
 
 
+def test_seed_job_batches_derives_only_the_requested_canonical_clips(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Requesting one batch must not start deriving the next eligible clips."""
+    config, storage, uids = _multi_clip_fixture(
+        tmp_path, monkeypatch, run_name="run-lazy-seed", count=300
+    )
+    runner = _multi_runner(
+        tmp_path, config, storage, uids, cpu_workers=4,
+        ledger_name="ledger-lazy-seed",
+    )
+    derived: list[str] = []
+    original = runner._derive_clip_plan
+
+    def counted(storage_arg: Any, clip_uid_arg: str) -> dict[str, Any]:
+        derived.append(clip_uid_arg)
+        return original(storage_arg, clip_uid_arg)
+
+    monkeypatch.setattr(runner, "_derive_clip_plan", counted)
+    batches = runner.seed_job_batches(128)
+    assert derived == []
+
+    first = next(batches)
+    assert {job.clip_uid for job in first} == set(uids[:128])
+    assert set(derived) == set(uids[:128])
+
+    second = next(batches)
+    assert {job.clip_uid for job in second} == set(uids[128:256])
+    assert set(derived) == set(uids[:256])
+
+    last = next(batches)
+    assert {job.clip_uid for job in last} == set(uids[256:])
+    assert set(derived) == set(uids)
+    with pytest.raises(StopIteration):
+        next(batches)
+    assert runner.seed_counters["seed_execution_batches"] == 3
+    assert runner.seed_counters["seed_execution_clips"] == 300
+    assert runner.seed_counters["seed_execution_peak_clips"] == 128
+
+
+def test_seed_job_batches_yields_empty_cpu_terminal_batch_then_continues(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A no-work clip batch publishes outcomes without inventing model jobs."""
+    config, storage, uids = _multi_clip_fixture(
+        tmp_path, monkeypatch, run_name="run-empty-lazy-batch", count=3
+    )
+    for uid in uids[:2]:
+        path = storage.clip_path(uid)
+        clip = json.loads(path.read_text(encoding="utf-8"))
+        clip["instruction"] = None
+        clip["export"] = {"accepted": False, "reason": "instruction_not_ready"}
+        path.write_text(json.dumps(clip), encoding="utf-8")
+    runner = _multi_runner(
+        tmp_path, config, storage, uids, cpu_workers=2,
+        ledger_name="ledger-empty-lazy-batch",
+    )
+
+    batches = runner.seed_job_batches(2)
+    assert next(batches) == []
+    assert all(runner._clip_outcome_path(SHARD, uid).is_file() for uid in uids[:2])
+    assert [job.clip_uid for job in next(batches)] == [uids[2]]
+    with pytest.raises(StopIteration):
+        next(batches)
+    assert runner.seed_counters["seed_execution_batches"] == 2
+    assert runner.seed_counters["seed_execution_clips"] == 3
+
+
+def test_seed_job_batches_quarantines_lost_clip_without_blocking_later_batches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, storage, uids = _multi_clip_fixture(
+        tmp_path, monkeypatch, run_name="run-lazy-quarantine", count=3
+    )
+    runner = _multi_runner(
+        tmp_path, config, storage, uids, cpu_workers=2,
+        ledger_name="ledger-lazy-quarantine",
+    )
+    runner.clip_quarantine = ClipQuarantine()
+    storage.clip_path(uids[0]).unlink()
+
+    batches = list(runner.seed_job_batches(1))
+
+    assert [len(batch) for batch in batches] == [0, 1, 1]
+    assert [batch[0].clip_uid for batch in batches[1:]] == uids[1:]
+    assert runner.clip_quarantine.contains(SHARD, uids[0])
+    assert not runner._clip_plan_path(SHARD, uids[0]).exists()
+
+
+def test_seed_job_batches_cold_restart_skips_completed_batch_and_seeds_rest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, storage, uids = _multi_clip_fixture(
+        tmp_path, monkeypatch, run_name="run-lazy-restart", count=4
+    )
+    runner = _multi_runner(
+        tmp_path, config, storage, uids, cpu_workers=2,
+        ledger_name="ledger-lazy-restart",
+    )
+    first = next(runner.seed_job_batches(2))
+    qwen = _QwenClient(
+        discoveries=[_nonhuman_discovery(), _nonhuman_discovery()]
+    )
+    outcome = _scheduler(runner, _SerialQwenExecutor(runner, qwen)).run(first)
+    assert outcome["completed"] is True
+    assert qwen.discovery_calls == 2
+    assert all(runner._clip_outcome_path(SHARD, uid).is_file() for uid in uids[:2])
+
+    fresh = _multi_runner(
+        tmp_path, config, storage, uids, cpu_workers=2,
+        ledger_name="ledger-lazy-restart",
+    )
+    fresh.checkpoint_first_resume = True
+    derived: list[str] = []
+    original = fresh._derive_clip_plan
+
+    def counted(storage_arg: Any, clip_uid_arg: str) -> dict[str, Any]:
+        derived.append(clip_uid_arg)
+        return original(storage_arg, clip_uid_arg)
+
+    monkeypatch.setattr(fresh, "_derive_clip_plan", counted)
+    remaining = list(fresh.seed_job_batches(2))
+
+    assert len(remaining) == 1
+    assert {job.clip_uid for job in remaining[0]} == set(uids[2:])
+    assert set(derived) == set(uids[2:])
+    assert fresh._cold_completed_clips == {(SHARD, uid) for uid in uids[:2]}
+    assert qwen.discovery_calls == 2
+
+
 def test_independent_subject_attribute_discoveries_form_global_frontier(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

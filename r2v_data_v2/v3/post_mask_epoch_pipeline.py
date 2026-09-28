@@ -241,9 +241,10 @@ def _emit_subject_attributes_cpu_diagnostics(
 ) -> None:
     """Emit the runner's execution-only Subject Attributes CPU counters.
 
-    Clip-plan derivation is pure read-only CPU, so the stage now fans it out
-    across clips and the seed timing alone no longer says how much of the stage
-    was derivation versus durable owner advancement. These counters do:
+    Clip-plan derivation is pure read-only CPU, and lazy seeding now runs
+    between scheduler drains. The seed timing accumulates only iterator
+    advancement; these counters distinguish derivation from durable owner
+    advancement and show the bounded execution clip batches:
     ``clip_plan_derive_wall_seconds`` sums the derivation windows,
     ``clip_plan_derive_tasks`` counts the derived plans and
     ``clip_plan_derive_peak_inflight`` proves the fan-out stayed bounded. Never
@@ -798,51 +799,34 @@ def run_subject_attributes_stage(
     _bind_clip_quarantine(subject_attributes, clip_quarantine)
     if resuming and hasattr(subject_attributes, "checkpoint_first_resume"):
         subject_attributes.checkpoint_first_resume = True
-    with _stage_timing(emit, "subject_attributes", "seed"):
-        seeded = subject_attributes.seed_jobs()
-    _emit(
-        emit,
-        "post_mask_epoch_subject_attributes_seeded",
-        seeded_jobs=len(seeded),
-    )
-    _emit_subject_attributes_cpu_diagnostics(emit, subject_attributes)
     eligible_keys = {
         (shard, clip_uid)
         for shard, clip_uids in eligible.items()
         for clip_uid in clip_uids
     }
-    jobs_by_clip: dict[tuple[str, str], list[Any]] = {}
-    for job in seeded:
-        key = (job.canonical_shard, job.clip_uid)
-        if key not in eligible_keys:
-            raise StageHandoffError(
-                "Subject Attributes seeded jobs are outside the eligible clip scope"
-            )
-        jobs_by_clip.setdefault(key, []).append(job)
+    seeded_job_count = 0
     execution_batches = 0
     peak_seed_jobs = 0
+    seed_wall_seconds = 0.0
 
     def batches() -> Iterator[list[Any]]:
-        nonlocal execution_batches, peak_seed_jobs
-        batch: list[Any] = []
-        active_clips = 0
-        for shard in sorted(eligible):
-            for clip_uid in eligible[shard]:
-                clip_jobs = jobs_by_clip.pop((shard, clip_uid), ())
-                if not clip_jobs:
-                    continue
-                batch.extend(clip_jobs)
-                active_clips += 1
-                if active_clips == batch_size:
-                    execution_batches += 1
-                    peak_seed_jobs = max(peak_seed_jobs, len(batch))
-                    yield batch
-                    clear = getattr(subject_attributes, "clear_execution_hot_caches", None)
-                    if clear is not None:
-                        clear()
-                    batch = []
-                    active_clips = 0
-        if batch:
+        nonlocal seeded_job_count, execution_batches, peak_seed_jobs
+        nonlocal seed_wall_seconds
+        seed_batches = iter(subject_attributes.seed_job_batches(batch_size))
+        while True:
+            started = time.perf_counter()
+            try:
+                batch = next(seed_batches)
+            except StopIteration:
+                return
+            finally:
+                seed_wall_seconds += time.perf_counter() - started
+            for job in batch:
+                if (job.canonical_shard, job.clip_uid) not in eligible_keys:
+                    raise StageHandoffError(
+                        "Subject Attributes seeded jobs are outside the eligible clip scope"
+                    )
+            seeded_job_count += len(batch)
             execution_batches += 1
             peak_seed_jobs = max(peak_seed_jobs, len(batch))
             yield batch
@@ -851,8 +835,23 @@ def run_subject_attributes_stage(
                 clear()
 
     scheduler = subject_attributes_scheduler_factory(subject_attributes)
-    with _stage_timing(emit, "subject_attributes", "scheduler"):
-        outcome = scheduler.run_batches(batches())
+    try:
+        with _stage_timing(emit, "subject_attributes", "scheduler"):
+            outcome = scheduler.run_batches(batches())
+    finally:
+        _emit(
+            emit,
+            "post_mask_epoch_stage_timing",
+            stage="subject_attributes",
+            phase="seed",
+            wall_seconds=seed_wall_seconds,
+        )
+        _emit(
+            emit,
+            "post_mask_epoch_subject_attributes_seeded",
+            seeded_jobs=seeded_job_count,
+        )
+        _emit_subject_attributes_cpu_diagnostics(emit, subject_attributes)
     _emit_scheduler_diagnostics(emit, "subject_attributes", outcome)
     unresolved = tuple(outcome.get("unresolved_job_ids", ()))
     completed = False
@@ -878,6 +877,17 @@ def run_subject_attributes_stage(
         **{
             key: value
             for key, value in dict(
+                getattr(subject_attributes, "seed_counters", None) or {}
+            ).items()
+            if key in {
+                "seed_execution_batches",
+                "seed_execution_clips",
+                "seed_execution_peak_clips",
+            }
+        },
+        **{
+            key: value
+            for key, value in dict(
                 getattr(subject_attributes, "replay_counters", None) or {}
             ).items()
             if key in {
@@ -886,12 +896,18 @@ def run_subject_attributes_stage(
                 "sam_mask_ram_hits",
                 "sam_mask_disk_loads",
                 "fresh_reconcile_cache_hits",
+                "rank0_working_cache_hits",
+                "rank0_working_cache_misses",
+                "rank0_attribute_replays",
+                "rank0_full_owner_replays",
+                "rank0_unchanged_attribute_reuses",
+                "rank0_terminal_context_hits",
             }
         },
     )
     result.update(
         {
-            "subject_attributes_job_count": len(seeded),
+            "subject_attributes_job_count": seeded_job_count,
             "subject_attributes_unresolved": unresolved,
             "subject_attributes_completed": completed,
             "subject_attributes_stats": stats,

@@ -3605,6 +3605,10 @@ def _install_stub_subject_attributes(
         def seed_jobs(self) -> list[Any]:
             return list(self.jobs)
 
+        def seed_job_batches(self, batch_size: int) -> Any:
+            for start in range(0, len(self.jobs), batch_size):
+                yield self.jobs[start : start + batch_size]
+
         def run(self, job: Any, handle: Any) -> Any:
             raise RuntimeError("stub subject attribute job never completes")
 
@@ -3705,11 +3709,39 @@ def test_production_run_emits_the_subject_attributes_cpu_diagnostics(
         "clip_plan_derive_peak_inflight",
         "clip_plan_derive_batches",
         "clip_plan_derive_wall_seconds",
+        "seed_execution_batches",
+        "seed_execution_clips",
+        "seed_execution_peak_clips",
     }
     assert payload["clip_plan_derive_tasks"] == 0
     assert payload["clip_plan_derive_batches"] == 0
     assert payload["clip_plan_derive_peak_inflight"] == 0
     assert payload["clip_plan_derive_wall_seconds"] == 0.0
+    assert payload["seed_execution_batches"] == 1
+    assert payload["seed_execution_clips"] == 1
+    assert payload["seed_execution_peak_clips"] == 1
+
+    execution = next(
+        event for event in events
+        if event["event"] == "post_mask_epoch_subject_attributes_execution_diagnostics"
+    )
+    assert execution["seed_execution_clips"] == 1
+    assert {
+        "rank0_working_cache_hits",
+        "rank0_working_cache_misses",
+        "rank0_attribute_replays",
+        "rank0_full_owner_replays",
+        "rank0_unchanged_attribute_reuses",
+        "rank0_terminal_context_hits",
+    } <= set(execution)
+    timings = {
+        event["phase"]: event["wall_seconds"]
+        for event in events
+        if event["event"] == "post_mask_epoch_stage_timing"
+        and event["stage"] == "subject_attributes"
+    }
+    assert timings["seed"] > 0.0
+    assert timings["scheduler"] >= timings["seed"]
 
     emitted = [event["event"] for event in events]
     seeded = emitted.index("post_mask_epoch_subject_attributes_seeded")
@@ -3746,7 +3778,7 @@ def test_subject_attributes_execution_batches_follow_eligible_clip_order(
             semantic_inputs={"clip_uid": uid},
             model_identity="stub",
         )
-        for uid in reversed(uids)
+        for uid in uids
     ]
     events: list[dict[str, Any]] = []
     runner_events: list[str] = []
@@ -3754,11 +3786,26 @@ def test_subject_attributes_execution_batches_follow_eligible_clip_order(
     class Runner:
         def __init__(self) -> None:
             self.storages: dict[str, Any] = {}
-            self.seed_counters: dict[str, Any] = {}
+            self.seed_counters: dict[str, Any] = {
+                "seed_execution_batches": 0,
+                "seed_execution_clips": 0,
+                "seed_execution_peak_clips": 0,
+            }
 
         def seed_jobs(self) -> list[ModelJob]:
-            runner_events.append("seed")
-            return jobs
+            raise AssertionError("production must not eagerly seed the group")
+
+        def seed_job_batches(self, batch_size: int) -> Any:
+            for start in range(0, len(jobs), batch_size):
+                assert len(batches) == start // batch_size
+                batch = jobs[start : start + batch_size]
+                runner_events.append(f"seed-{len(batches) + 1}")
+                self.seed_counters["seed_execution_batches"] += 1
+                self.seed_counters["seed_execution_clips"] += len(batch)
+                self.seed_counters["seed_execution_peak_clips"] = max(
+                    self.seed_counters["seed_execution_peak_clips"], len(batch)
+                )
+                yield batch
 
         def clear_execution_hot_caches(self) -> None:
             runner_events.append("clear")
@@ -3800,9 +3847,10 @@ def test_subject_attributes_execution_batches_follow_eligible_clip_order(
     assert len(schedulers) == 1
     assert [len(batch) for batch in batches] == expected_batch_sizes
     assert tuple(uid for batch in batches for uid in batch) == uids
-    assert runner_events[:5] == [
-        "seed", "drain-1", "clear", "drain-2", "clear"
+    assert runner_events[:6] == [
+        "seed-1", "drain-1", "clear", "seed-2", "drain-2", "clear"
     ]
+    assert outcome["subject_attributes_job_count"] == 300
     execution = [
         event for event in events
         if event["event"] == "post_mask_epoch_subject_attributes_execution_diagnostics"
@@ -3811,6 +3859,69 @@ def test_subject_attributes_execution_batches_follow_eligible_clip_order(
     assert execution[0]["execution_batches"] == len(expected_batch_sizes)
     assert execution[0]["execution_batch_size"] == int(override or "128")
     assert execution[0]["execution_batch_peak_seed_jobs"] == int(override or "128")
+    assert execution[0]["seed_execution_batches"] == len(expected_batch_sizes)
+    assert execution[0]["seed_execution_clips"] == 300
+    assert execution[0]["seed_execution_peak_clips"] == int(override or "128")
+
+
+def test_subject_attributes_seed_diagnostics_survive_scheduler_failure(
+    tmp_path: Path
+) -> None:
+    import r2v_data_v2.v3.post_mask_epoch_pipeline as pipeline
+    from r2v_data_v2.v3.post_mask_epoch_jobs import ModelJob
+
+    shard = "shard-000000000-000000000"
+    clip_uid = "clip-1"
+    job = ModelJob.create(
+        job_type="attribute_discovery",
+        resource=RESOURCE_QWEN,
+        canonical_shard=shard,
+        clip_uid=clip_uid,
+        semantic_inputs={"clip_uid": clip_uid},
+        model_identity="stub",
+    )
+    events: list[dict[str, Any]] = []
+
+    class Runner:
+        def __init__(self) -> None:
+            self.storages: dict[str, Any] = {}
+            self.seed_counters: dict[str, Any] = {"seed_execution_batches": 0}
+
+        def seed_job_batches(self, _batch_size: int) -> Any:
+            self.seed_counters["seed_execution_batches"] = 1
+            yield [job]
+
+    class Scheduler:
+        def run_batches(self, batches: Any) -> Any:
+            assert [item.job_id() for item in next(iter(batches))] == [job.job_id()]
+            raise RuntimeError("test scheduler failure")
+
+    with pytest.raises(RuntimeError, match="test scheduler failure"):
+        pipeline.run_subject_attributes_stage(
+            config=object(),
+            storages={},
+            eligible={shard: (clip_uid,)},
+            ledger=GroupLedger(tmp_path / "ledger"),
+            result={},
+            subject_attributes_runner_factory=lambda **_kwargs: Runner(),
+            subject_attributes_scheduler_factory=lambda _runner: Scheduler(),
+            emit=lambda event, **fields: events.append({"event": event, **fields}),
+        )
+
+    assert any(
+        event.get("phase") == "seed" and event.get("stage") == "subject_attributes"
+        for event in events
+    )
+    assert any(
+        event["event"] == "post_mask_epoch_subject_attributes_seeded"
+        and event["seeded_jobs"] == 1
+        for event in events
+    )
+    assert any(
+        event["event"] == "post_mask_epoch_subject_attributes_cpu_diagnostics"
+        and event["seed_execution_batches"] == 1
+        for event in events
+    )
 
 
 @pytest.mark.parametrize("override", ["0", "invalid"])
