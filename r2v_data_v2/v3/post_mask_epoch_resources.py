@@ -13,8 +13,8 @@ Three epochs are supported:
            resource name is retained for durable scheduler compatibility
     SAM    eight persistent SAM3 workers, one per GPU
 
-Exactly one heavy GPU resource is loaded at a time. :class:`ResourceEpochManager`
-owns that invariant: entering a resource fully exits the previous one.
+The shared :class:`ResourceEpochManager` starts each needed resource lazily and
+keeps it live across scheduler switches until the outer session closes.
 """
 
 from __future__ import annotations
@@ -355,7 +355,7 @@ class QwenEpochConfig:
     tensor_parallel_size: int = 1
     data_parallel_size: int = 8
     max_model_len: int = 49152
-    gpu_memory_utilization: float = 0.90
+    gpu_memory_utilization: float = 0.30
     dtype: str = "bfloat16"
     allowed_local_media_path: Path | None = None
     gpu_ids: tuple[int, ...] = (0, 1, 2, 3, 4, 5, 6, 7)
@@ -748,11 +748,17 @@ def sam_worker_factory(
     def factory(slot: int, gpu_id: int) -> Any:
         from dataclasses import replace
 
-        if backend_builder is not None:
-            return backend_builder(replace(config, device=f"cuda:{gpu_id}"))
         from r2v_data_v2.v3.sam3_backend import Sam3SegmentationBackend
 
-        return Sam3SegmentationBackend(replace(config, device=f"cuda:{gpu_id}"))
+        if backend_builder is not None:
+            backend = backend_builder(replace(config, device=f"cuda:{gpu_id}"))
+        else:
+            backend = Sam3SegmentationBackend(replace(config, device=f"cuda:{gpu_id}"))
+        if isinstance(backend, Sam3SegmentationBackend):
+            from r2v_data_v2.v3.pre_qwen_production import enable_sam3_session_reuse
+
+            enable_sam3_session_reuse(backend, mode="clip_reset_v1")
+        return backend
 
     return factory
 
@@ -1107,12 +1113,7 @@ class WorkerSlotExecutor:
 
 
 class ResourceEpochManager:
-    """Own at most one heavy GPU resource at a time for the scheduler.
-
-    The scheduler decides *when* to enter and exit; the manager owns loading,
-    unloading and the invariant that Qwen, Boogu and SAM are never resident
-    together.
-    """
+    """Lazily start and retain each owned resource for one shared session."""
 
     def __init__(
         self,
@@ -1127,11 +1128,8 @@ class ResourceEpochManager:
         self.timeline: list[tuple[str, str]] = []
         self.max_open_observed = 0
         self._open: str | None = None
-        self._resource: EpochResource | None = None
-        self._executor: BatchJobExecutor | None = None
-        #: Aggregated per-resource lifecycle counters. Unloading a resource
-        #: must not discard its startup/shutdown/load measurements, and a
-        #: resource entered twice (qwen -> boogu -> qwen) accumulates both.
+        self._resources: dict[str, EpochResource] = {}
+        self._executors: dict[str, BatchJobExecutor] = {}
         self._resource_counters: dict[str, dict[str, Any]] = {}
 
     @property
@@ -1140,59 +1138,60 @@ class ResourceEpochManager:
 
     @property
     def open_count(self) -> int:
-        return 1 if self._open is not None else 0
+        return len(self._resources)
 
     def enter(self, resource: str) -> BatchJobExecutor:
-        if self._open == resource and self._executor is not None:
-            return self._executor
-        self.exit_current()
+        if resource in self._executors:
+            self._open = resource
+            return self._executors[resource]
         factory = self._factories.get(resource)
         if factory is None:
             raise EpochResourceError(f"no resource factory for {resource!r}")
-        # exit_current() raises on a failed unload, so a broken resource can
-        # never be left half-unloaded while the next one loads.
-        built_resource, executor = factory()
-        built_resource.start()
-        self._resource = built_resource
-        self._executor = executor
+        try:
+            built_resource, executor = factory()
+            built_resource.start()
+        except BaseException:
+            # EpochResource.start() cleans its own partial startup. A failed
+            # lazy start must also release resources already owned by session.
+            self.close()
+            raise
+        self._resources[resource] = built_resource
+        self._executors[resource] = executor
         self._open = resource
         self.timeline.append(("start", resource))
-        self.max_open_observed = max(self.max_open_observed, 1)
+        self.max_open_observed = max(self.max_open_observed, self.open_count)
         return executor
 
     def exit_current(self) -> None:
-        if self._open is None:
+        """Release all owned resources; switches must not call this method."""
+        self.close()
+
+    def close(self) -> None:
+        if not self._resources:
+            self._open = None
             return
-        resource = self._open
         self._open = None
-        executor = self._executor
-        owned_resource = self._resource
-        executor_error: BaseException | None = None
-        resource_error: BaseException | None = None
-        try:
+        first_error: BaseException | None = None
+        for resource, owned_resource in reversed(tuple(self._resources.items())):
+            executor = self._executors[resource]
             close = getattr(executor, "close", None)
             if callable(close):
                 try:
                     close()
-                except BaseException as exc:  # noqa: BLE001 - cleanup must unload the GPU model
-                    executor_error = exc
-            if owned_resource is not None:
-                try:
-                    owned_resource.stop()
-                except BaseException as exc:  # noqa: BLE001 - cleanup must finish
-                    resource_error = exc
-                else:
-                    # Snapshot after the stop so shutdown time and stop_count are
-                    # included; unloading must not discard the measurements.
-                    self._accumulate(resource, owned_resource.counters())
-        finally:
+                except BaseException as exc:  # noqa: BLE001 - continue closing owned models
+                    if first_error is None:
+                        first_error = exc
+            try:
+                owned_resource.stop()
+            except BaseException as exc:  # noqa: BLE001 - continue closing owned models
+                if first_error is None:
+                    first_error = exc
+            self._accumulate(resource, owned_resource.counters())
             self.timeline.append(("stop", resource))
-            self._resource = None
-            self._executor = None
-        if resource_error is not None:
-            raise resource_error
-        if executor_error is not None:
-            raise executor_error
+            del self._resources[resource]
+            del self._executors[resource]
+        if first_error is not None:
+            raise first_error
 
     _ACCUMULATED = (
         "start_count",
@@ -1213,16 +1212,26 @@ class ResourceEpochManager:
         for slot, count in (snapshot.get("gpu_slot_job_counts") or {}).items():
             slots[slot] = slots.get(slot, 0) + count
 
-    def close(self) -> None:
-        self.exit_current()
-
     def counters(self) -> dict[str, Any]:
+        snapshots = {
+            name: dict(bucket) for name, bucket in self._resource_counters.items()
+        }
+        snapshots.update(
+            {name: resource.counters() for name, resource in self._resources.items()}
+        )
+        if RESOURCE_SAM in snapshots:
+            # This backend exposes single-session prompts, not a true batch
+            # inference API for four independent images. Keep batch1 explicit.
+            snapshots[RESOURCE_SAM]["sam_batch_size"] = 1
+            snapshots[RESOURCE_SAM]["sam_batch4_status"] = (
+                "unsupported_by_current_backend_api"
+            )
         return {
             "timeline": [f"{action}:{name}" for action, name in self.timeline],
             "max_open_observed": self.max_open_observed,
             "open_resource": self._open,
             "resources": {
                 name: dict(sorted(bucket.items()))
-                for name, bucket in sorted(self._resource_counters.items())
+                for name, bucket in sorted(snapshots.items())
             },
         }

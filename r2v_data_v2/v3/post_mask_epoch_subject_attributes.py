@@ -1410,10 +1410,16 @@ class SubjectAttributeEpochRunner:
         # completion outcomes, routes, the owner outcome - is still read from
         # the ledger every time. A restart starts cold and re-derives it all.
         self._owner_context_cache: dict[tuple[str, str, str], dict[str, Any]] = {}
+        # Once every rank-0 probe and the raw review are committed, later
+        # completion receipts cannot change this context. Keep it only for
+        # this invocation; receipt-driven completion routes stay uncached.
+        self._settled_rank0_cache: dict[tuple[str, str, str], dict[str, Any]] = {}
+        self._settled_rank0_cache_lock = threading.Lock()
         self._attribute_selection_cache: dict[
             tuple[str, str, str, str], Any
         ] = {}
         self._owner_context_cache_limit = 32
+        self._settled_rank0_cache_limit = 16
         self._attribute_selection_cache_limit = 32
         self._candidate_cache_lock = threading.Lock()
         # The selection cache is read by model-execution workers while the main
@@ -1429,6 +1435,8 @@ class SubjectAttributeEpochRunner:
             "attribute_selection_cache_hit": 0,
             "attribute_selection_cache_miss": 0,
             "owner_graph_rebuilds": 0,
+            "settled_rank0_cache_hit": 0,
+            "settled_rank0_cache_miss": 0,
             "attribute_selection_rebuilds": 0,
             "owner_candidate_cache_hit": 0,
             "owner_candidate_cache_miss": 0,
@@ -2861,6 +2869,62 @@ class SubjectAttributeEpochRunner:
         )
         return self._advance_clip(shard, storage, clip_uid)
 
+    def finalize_wave(
+        self, committed: Sequence[tuple[ModelJob, JobResult]]
+    ) -> Mapping[str, Sequence[ModelJob] | None]:
+        """Finalize a committed collect wave, advancing each owner once.
+
+        Receipts have already been published individually by the scheduler.
+        Validation remains per job; an invalid sibling prevents that owner's
+        shared advancement, and its receipt is left for restart replay.
+        """
+        grouped_types = {
+            SUBJECT_ATTRIBUTE_SAM_PROBE_JOB,
+            SUBJECT_ATTRIBUTE_RAW_REVIEW_JOB,
+            SUBJECT_ATTRIBUTE_COMPLETION_GENERATE_JOB,
+            SUBJECT_ATTRIBUTE_COMPLETION_SAM_JOB,
+            SUBJECT_ATTRIBUTE_COMPLETION_REVIEW_JOB,
+            SUBJECT_ATTRIBUTE_BBOX_REVIEW_JOB,
+        }
+        outcomes: dict[str, Sequence[ModelJob] | None] = {}
+        groups: dict[tuple[str, str, str], list[ModelJob]] = {}
+        for job, result in committed:
+            job_id = job.job_id()
+            if job.job_type not in grouped_types:
+                try:
+                    outcomes[job_id] = self.finalize(job, result)
+                except Exception:  # noqa: BLE001 - isolate finalizer failures per job
+                    outcomes[job_id] = None
+                continue
+            key = (
+                job.canonical_shard,
+                job.clip_uid,
+                str(dict(job.target).get("owner_entity_id", "")),
+            )
+            groups.setdefault(key, []).append(job)
+            try:
+                if job.job_type == SUBJECT_ATTRIBUTE_SAM_PROBE_JOB:
+                    self._validate_sam_probe(job, result)
+                else:
+                    self._validate_owner_chain(job, result)
+            except Exception:  # noqa: BLE001 - isolate finalizer failures per job
+                outcomes[job_id] = None
+            else:
+                outcomes[job_id] = []
+        for (shard, clip_uid, owner_entity_id), jobs in groups.items():
+            if any(outcomes[job.job_id()] is None for job in jobs):
+                continue
+            try:
+                unlocked = self._advance_attributes(
+                    shard, self._storage_for(shard), clip_uid, owner_entity_id
+                )
+            except Exception:  # noqa: BLE001 - replay this owner's receipts later
+                for job in jobs:
+                    outcomes[job.job_id()] = None
+            else:
+                outcomes[jobs[0].job_id()] = unlocked
+        return outcomes
+
     # -- owner outcome ---------------------------------------------------------
 
     def _expected_owner_outcome(
@@ -4211,6 +4275,22 @@ class SubjectAttributeEpochRunner:
     ) -> dict[str, Any]:
         """Replay every attribute selection, the duplicate CPU pass and the batch."""
         owner_entity_id = str(owner_plan["owner_entity_id"])
+        cache_key = (shard, clip_uid, owner_entity_id)
+        with self._settled_rank0_cache_lock:
+            cached = self._settled_rank0_cache.get(cache_key)
+        if cached is not None:
+            job = cached["job"]
+            receipt = self._committed_payload_or_none(job) if job is not None else None
+            if receipt == cached["review"]:
+                for state in cached["states"]:
+                    self._verify_or_write_selection_marker(
+                        shard, clip_uid, owner_plan, state.attribute_id, state
+                    )
+                self._bump_replay_counter("settled_rank0_cache_hit")
+                return cached
+            with self._settled_rank0_cache_lock:
+                self._settled_rank0_cache.pop(cache_key, None)
+        self._bump_replay_counter("settled_rank0_cache_miss")
         owner_reference = self._owner_reference(storage, clip_uid, owner_entity_id)
         # Main thread phase 1: build the owner's candidate set exactly once, so
         # the attribute workers never race to rebuild the same JPEG/RLE evidence.
@@ -4339,7 +4419,7 @@ class SubjectAttributeEpochRunner:
                 raise SubjectAttributeDurableError(
                     "committed raw review has an unknown payload status"
                 )
-        return {
+        context = {
             "states": states,
             "pending": [],
             "conflicts": conflicts,
@@ -4351,6 +4431,16 @@ class SubjectAttributeEpochRunner:
             "discovery": discovery,
             "discovery_job_id": discovery_job_id,
         }
+        if job is None or payload is not None:
+            with self._settled_rank0_cache_lock:
+                if (
+                    cache_key not in self._settled_rank0_cache
+                    and len(self._settled_rank0_cache)
+                    >= self._settled_rank0_cache_limit
+                ):
+                    self._settled_rank0_cache.pop(next(iter(self._settled_rank0_cache)))
+                self._settled_rank0_cache[cache_key] = context
+        return context
 
     def _raw_review_semantic_inputs(
         self,
@@ -4752,6 +4842,17 @@ class SubjectAttributeEpochRunner:
 
     def _finalize_sam_probe(self, job: ModelJob, result: JobResult) -> Sequence[ModelJob]:
         """CPU continuation of one committed SAM probe."""
+        context = self._validate_sam_probe(job, result)
+        return self._advance_attributes(
+            job.canonical_shard,
+            context["storage"],
+            job.clip_uid,
+            str(dict(job.target).get("owner_entity_id", "")),
+        )
+
+    def _validate_sam_probe(
+        self, job: ModelJob, result: JobResult
+    ) -> dict[str, Any]:
         payload = dict(result.payload)
         status = str(payload.get("status", ""))
         if status not in {"sam", "sam_failed"}:
@@ -4762,12 +4863,7 @@ class SubjectAttributeEpochRunner:
         if status == "sam":
             # The masks are this probe's durable artifact; verify them now.
             self._load_sam_masks(payload)
-        return self._advance_attributes(
-            job.canonical_shard,
-            context["storage"],
-            job.clip_uid,
-            str(dict(job.target).get("owner_entity_id", "")),
-        )
+        return context
 
     def _finalize_owner_chain(
         self, job: ModelJob, result: JobResult
@@ -4778,6 +4874,15 @@ class SubjectAttributeEpochRunner:
         fails closed, and the owner's graph is then re-derived from the receipts:
         whatever the next missing call is becomes the next job.
         """
+        self._validate_owner_chain(job, result)
+        return self._advance_attributes(
+            job.canonical_shard,
+            self._storage_for(job.canonical_shard),
+            job.clip_uid,
+            str(dict(job.target).get("owner_entity_id", "")),
+        )
+
+    def _validate_owner_chain(self, job: ModelJob, result: JobResult) -> None:
         payload = dict(result.payload)
         status = str(payload.get("status", ""))
         expected_statuses = {
@@ -4809,12 +4914,6 @@ class SubjectAttributeEpochRunner:
         if status == "completion":
             storage = self._storage_for(job.canonical_shard)
             self._generated_png_bytes(storage, payload)
-        return self._advance_attributes(
-            job.canonical_shard,
-            self._storage_for(job.canonical_shard),
-            job.clip_uid,
-            str(dict(job.target).get("owner_entity_id", "")),
-        )
 
     # -- 8c: completion seed, CPU postcheck and chain state ---------------------
 

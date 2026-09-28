@@ -20,10 +20,10 @@ Execution proceeds by resource epoch:
       -> deterministic serial publish + receipt + CPU finalize
       -> finalizers may unlock new same-resource jobs
       -> repeat until this resource reaches a fixed point
-    RESOURCE EXIT (stop/unload completely)
+    RESOURCE EXIT (standalone executor closes; shared resource stays live)
 
-Resource ENTER/EXIT is guarded by try/finally, so an executor exception or a
-KeyboardInterrupt still unloads the owned resource.
+Shared resources are closed by their outer session even on failure. Standalone
+executors close at each resource boundary.
 
 Concurrency is confined to the model calls. Receipt appends, artifact
 publication, finalizers and pending-map mutation all happen on the scheduler
@@ -316,6 +316,10 @@ class ResourceEpochScheduler:
         *,
         ledger: GroupLedger,
         finalize: Callable[[ModelJob, JobResult], Sequence[ModelJob]],
+        finalize_wave: Callable[
+            [Sequence[tuple[ModelJob, JobResult]]],
+            Mapping[str, Sequence[ModelJob] | None],
+        ] | None = None,
         executors: Mapping[str, BatchJobExecutor] | None = None,
         resource_manager: Any | None = None,
         resource_priority: Sequence[str] = DEFAULT_RESOURCE_PRIORITY,
@@ -336,6 +340,7 @@ class ResourceEpochScheduler:
             raise ValueError("window_size must be positive")
         self.ledger = ledger
         self.finalize = finalize
+        self.finalize_wave = finalize_wave
         self.executors = dict(executors or {})
         self.resource_manager = resource_manager
         self.resource_priority = tuple(resource_priority)
@@ -463,7 +468,10 @@ class ResourceEpochScheduler:
                         f"phase {phase_id!r} committed jobs but has no receipts"
                     )
             finally:
-                executor.close()
+                # A shared manager owns live executors across resource epochs.
+                # Only standalone executors end their lifetime here.
+                if self.resource_manager is None:
+                    executor.close()
             counters["epoch_wall_seconds"] += time.perf_counter() - epoch_started
             counters["jobs_per_epoch"].append(
                 counters["jobs_executed"] - epoch_jobs_before
@@ -535,9 +543,8 @@ class ResourceEpochScheduler:
         up instead of waiting for the slowest sibling in the batch.
 
         Jobs of any *other* resource unlocked here stay in ``pending``: they do
-        not switch the resource. The resource is exited only once it is genuinely
-        quiescent, which is what keeps a Qwen -> Boogu -> Qwen pattern from
-        thrashing the loaded model.
+        not switch the resource. This scheduling epoch ends only when its ready
+        and in-flight work is quiescent; a shared manager keeps its model live.
         """
         inflight: dict[str, ModelJob] = {}
         planned_ready: list[tuple[tuple[str, str, int, str], str]] = []
@@ -596,26 +603,43 @@ class ResourceEpochScheduler:
             )
             if counters["jobs_submitted"] > submitted_before:
                 counters["refill_count"] += 1
+            committed_wave: list[tuple[ModelJob, JobResult]] = []
             for execution in completions:
                 settling_started = time.perf_counter()
                 try:
-                    self._settle(phase_id, phase, counters, execution, run)
+                    committed = self._settle(
+                        phase_id, phase, counters, execution, run,
+                        finalize=self.finalize_wave is None,
+                    )
+                    if committed is not None:
+                        committed_wave.append(committed)
                 finally:
                     counters["settle_wall_seconds"] += (
                         time.perf_counter() - settling_started
                     )
-                # A finalizer is CPU work and can be slow. Anything it unlocked
-                # for this resource is submitted before the next sibling is
-                # settled, so one slow finalizer cannot idle every free slot.
+                if self.finalize_wave is None:
+                    # The serial path submits each finalizer's unlocks before
+                    # settling the next sibling; wave mode waits until all
+                    # receipts in this collect have been committed instead.
+                    submitted_before = counters["jobs_submitted"]
+                    self._refill(
+                        resource, executor, counters, phase, planned_ready,
+                        inflight, run,
+                    )
+                    if counters["jobs_submitted"] > submitted_before:
+                        counters["refill_count"] += 1
+            if self.finalize_wave is not None and committed_wave:
+                settling_started = time.perf_counter()
+                try:
+                    self._finalize_committed_wave(committed_wave, run)
+                finally:
+                    counters["settle_wall_seconds"] += (
+                        time.perf_counter() - settling_started
+                    )
                 submitted_before = counters["jobs_submitted"]
                 self._refill(
-                    resource,
-                    executor,
-                    counters,
-                    phase,
-                    planned_ready,
-                    inflight,
-                    run,
+                    resource, executor, counters, phase, planned_ready,
+                    inflight, run,
                 )
                 if counters["jobs_submitted"] > submitted_before:
                     counters["refill_count"] += 1
@@ -722,7 +746,9 @@ class ResourceEpochScheduler:
         counters: dict[str, Any],
         execution: JobExecution,
         run: _SchedulerRun,
-    ) -> None:
+        *,
+        finalize: bool = True,
+    ) -> tuple[ModelJob, JobResult] | None:
         """Publish, commit and finalize one settled job on the scheduler thread.
 
         Durable state is never touched by the worker: the executor only reports
@@ -737,10 +763,10 @@ class ResourceEpochScheduler:
             execution.exception is None and execution.result is None
         ):
             counters["jobs_retryable_failed"] += 1
-            return
+            return None
         if execution.exception is not None:
             counters["jobs_retryable_failed"] += 1
-            return
+            return None
         result = execution.result
         assert result is not None
         if result.committed:
@@ -766,8 +792,31 @@ class ResourceEpochScheduler:
                 counters["jobs_terminal_rejected"] += 1
         else:
             counters["jobs_retryable_failed"] += 1
-        if result.committed:
+        if result.committed and finalize:
             self._finalize(job, result, run)
+        return (job, result) if result.committed else None
+
+    def _finalize_committed_wave(
+        self,
+        committed: Sequence[tuple[ModelJob, JobResult]],
+        run: _SchedulerRun,
+    ) -> None:
+        """Opt-in CPU continuation after every receipt in a collect wave exists."""
+        assert self.finalize_wave is not None
+        for job, _ in committed:
+            run.finalize_attempted.add(job.job_id())
+        try:
+            unlocked_by_job = self.finalize_wave(committed)
+        except Exception:  # noqa: BLE001 - committed receipts replay next invocation
+            self.diagnostics.resume["finalizer_failures"] += len(committed)
+            return
+        for job, _ in committed:
+            unlocked = unlocked_by_job.get(job.job_id())
+            if unlocked is None:
+                self.diagnostics.resume["finalizer_failures"] += 1
+                continue
+            self._add_jobs(run, unlocked, seed=False)
+            run.resolved.add(job.job_id())
 
     def _replay_committed(
         self,

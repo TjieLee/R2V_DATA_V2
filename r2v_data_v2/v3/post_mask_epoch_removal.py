@@ -2331,6 +2331,7 @@ def build_removal_epoch_runner(
                         lambda runner, _dispatch: ResourceEpochScheduler(
                             ledger=ledger,
                             finalize=runner.finalize,
+                            finalize_wave=getattr(runner, "finalize_wave", None),
                             resource_manager=manager,
                             window_size=window_size,
                             close_resource_manager_on_exit=False,

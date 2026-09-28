@@ -46,6 +46,8 @@ from r2v_data_v2.v3.post_mask_epoch_scheduler import (
 from r2v_data_v2.v3.post_mask_epoch_state import GroupLedger
 from r2v_data_v2.v3.post_mask_epoch_subject_attributes import (
     SUBJECT_ATTRIBUTE_COMPLETION_GENERATE_JOB,
+    SUBJECT_ATTRIBUTE_COMPLETION_REVIEW_JOB,
+    SUBJECT_ATTRIBUTE_COMPLETION_SAM_JOB,
     SUBJECT_ATTRIBUTE_DISCOVERY_JOB,
     SUBJECT_ATTRIBUTE_RAW_REVIEW_JOB,
     SUBJECT_ATTRIBUTE_SAM_PROBE_JOB,
@@ -3678,6 +3680,238 @@ def test_completion_job_context_reuses_a_terminal_selection(
     assert dict(generate.target)["attribute_id"] == str(
         first["attribute_plan"]["attribute_id"]
     )
+
+
+def test_completion_receipts_reuse_settled_rank0_owner_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Completion receipts must not replay a rank-0 round that is already fixed."""
+    monkeypatch.setattr(time, "perf_counter", lambda: 1.0)
+    _, storage, runner, qwen, sam = _two_completion_owner(tmp_path, monkeypatch)
+    replayed: list[str] = []
+    real_replay = runner._replay_attribute_selections
+
+    def counting_replay(*args: Any, **kwargs: Any) -> Any:
+        replayed.append("rank0")
+        return real_replay(*args, **kwargs)
+
+    runner._replay_attribute_selections = counting_replay  # type: ignore[method-assign]
+    post_review_replays: list[int] = []
+
+    def recording_finalize(job: Any, result: Any) -> Sequence[Any]:
+        before = len(replayed)
+        unlocked = runner.finalize(job, result)
+        if job.job_type in {
+            SUBJECT_ATTRIBUTE_COMPLETION_GENERATE_JOB,
+            SUBJECT_ATTRIBUTE_COMPLETION_SAM_JOB,
+            SUBJECT_ATTRIBUTE_COMPLETION_REVIEW_JOB,
+        }:
+            post_review_replays.append(len(replayed) - before)
+        return unlocked
+
+    outcome = _scheduler(
+        runner,
+        _SerialQwenExecutor(runner, qwen),
+        recording_finalize,
+        _SerialQwenExecutor(runner, sam),
+        _SerialQwenExecutor(runner, _BooguBackend(_generated_png())),
+    ).run(runner.seed_jobs())
+
+    assert outcome["completed"] is True
+    assert len(post_review_replays) >= 4
+    assert post_review_replays == [0] * len(post_review_replays)
+    assert [record.attribute_id for record in _read_artifact(storage).records] == [
+        "a1", "a2"
+    ]
+
+
+def test_finalize_wave_advances_same_owner_once_after_individual_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A collect wave keeps both committed jobs but derives one owner graph."""
+    monkeypatch.setattr(time, "perf_counter", lambda: 1.0)
+    _, _, runner, qwen, sam = _two_completion_owner(tmp_path, monkeypatch)
+    committed: list[tuple[Any, Any]] = []
+
+    def recording_finalize(job: Any, result: Any) -> Sequence[Any]:
+        if job.job_type == SUBJECT_ATTRIBUTE_COMPLETION_GENERATE_JOB:
+            committed.append((job, result))
+        return runner.finalize(job, result)
+
+    outcome = _scheduler(
+        runner,
+        _SerialQwenExecutor(runner, qwen),
+        recording_finalize,
+        _SerialQwenExecutor(runner, sam),
+        _SerialQwenExecutor(runner, _BooguBackend(_generated_png())),
+    ).run(runner.seed_jobs())
+    assert outcome["completed"] is True
+    assert len(committed) == 2
+
+    advances: list[str] = []
+    real_advance = runner._advance_attributes
+
+    def counting_advance(shard: str, storage: Any, clip_uid: str, owner: str) -> Any:
+        advances.append(owner)
+        return real_advance(shard, storage, clip_uid, owner)
+
+    runner._advance_attributes = counting_advance  # type: ignore[method-assign]
+    results = runner.finalize_wave(committed)
+    assert set(results) == {job.job_id() for job, _ in committed}
+    assert list(results.values()) == [[], []]
+    assert advances == [OWNER]
+
+
+def test_scheduler_commits_two_owner_completions_then_advances_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(time, "perf_counter", lambda: 1.0)
+    _, storage, runner, qwen, sam = _two_completion_owner(tmp_path, monkeypatch)
+    advances: list[str] = []
+    real_advance = runner._advance_attributes
+
+    def counting_advance(shard: str, run_storage: Any, clip_uid: str, owner: str) -> Any:
+        advances.append(owner)
+        return real_advance(shard, run_storage, clip_uid, owner)
+
+    runner._advance_attributes = counting_advance  # type: ignore[method-assign]
+    paired_waves: list[tuple[int, int]] = []
+
+    def recording_wave(committed: Sequence[tuple[Any, Any]]) -> Any:
+        paired = [
+            job for job, _ in committed
+            if job.job_type == SUBJECT_ATTRIBUTE_COMPLETION_GENERATE_JOB
+        ]
+        before = len(advances)
+        result = runner.finalize_wave(committed)
+        if len(paired) == 2:
+            paired_waves.append((len(paired), len(advances) - before))
+        return result
+
+    outcome = ResourceEpochScheduler(
+        ledger=runner.ledger,
+        finalize=runner.finalize,
+        finalize_wave=recording_wave,
+        executors={
+            RESOURCE_QWEN: _SerialQwenExecutor(runner, qwen),
+            RESOURCE_SAM: _SerialQwenExecutor(runner, sam),
+            RESOURCE_BOOGU: _SerialQwenExecutor(
+                runner, _BooguBackend(_generated_png())
+            ),
+        },
+    ).run(runner.seed_jobs())
+
+    assert outcome["completed"] is True
+    assert paired_waves == [(2, 1)]
+    assert [record.attribute_id for record in _read_artifact(storage).records] == [
+        "a1", "a2"
+    ]
+
+
+def test_finalize_wave_does_not_advance_owner_when_a_sibling_is_invalid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bad committed result fails closed without hiding its valid sibling."""
+    monkeypatch.setattr(time, "perf_counter", lambda: 1.0)
+    _, _, runner, qwen, sam = _two_completion_owner(tmp_path, monkeypatch)
+    committed: list[tuple[Any, Any]] = []
+
+    def recording_finalize(job: Any, result: Any) -> Sequence[Any]:
+        if job.job_type == SUBJECT_ATTRIBUTE_COMPLETION_GENERATE_JOB:
+            committed.append((job, result))
+        return runner.finalize(job, result)
+
+    _scheduler(
+        runner,
+        _SerialQwenExecutor(runner, qwen),
+        recording_finalize,
+        _SerialQwenExecutor(runner, sam),
+        _SerialQwenExecutor(runner, _BooguBackend(_generated_png())),
+    ).run(runner.seed_jobs())
+    assert len(committed) == 2
+    valid, invalid = committed
+    bad_result = replace(invalid[1], payload={"status": "not_a_completion"})
+    advances: list[str] = []
+    runner._advance_attributes = (  # type: ignore[method-assign]
+        lambda shard, storage, clip_uid, owner: advances.append(owner)
+    )
+
+    results = runner.finalize_wave([valid, (invalid[0], bad_result)])
+    assert results[valid[0].job_id()] == []
+    assert results[invalid[0].job_id()] is None
+    assert advances == []
+
+
+def test_settled_rank0_cache_eviction_is_safe_for_concurrent_misses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two workers missing a full cache must not race its sole eviction."""
+    monkeypatch.setattr(time, "perf_counter", lambda: 1.0)
+    _, storage, runner, qwen, sam = _two_completion_owner(tmp_path, monkeypatch)
+    _scheduler(
+        runner,
+        _SerialQwenExecutor(runner, qwen),
+        runner.finalize,
+        _SerialQwenExecutor(runner, sam),
+        _SerialQwenExecutor(runner, _BooguBackend(_generated_png())),
+    ).run(runner.seed_jobs())
+    prefix = runner._owner_prefix(SHARD, CLIP_UID, OWNER)
+    both_replaying = threading.Barrier(2)
+    real_replay = runner._replay_attribute_selections
+
+    def together(*args: Any, **kwargs: Any) -> Any:
+        result = real_replay(*args, **kwargs)
+        both_replaying.wait(timeout=5)
+        return result
+
+    runner._replay_attribute_selections = together  # type: ignore[method-assign]
+    removed = threading.Event()
+
+    class PausingCache(dict):
+        def __init__(self) -> None:
+            super().__init__({("old", "clip", "owner"): {}})
+            self.first_length = True
+            self.first_pop = True
+
+        def __len__(self) -> int:
+            size = super().__len__()
+            if self.first_length:
+                self.first_length = False
+                removed.wait(timeout=0.25)
+            return size
+
+        def pop(self, key: Any, *args: Any) -> Any:
+            value = super().pop(key, *args)
+            if self.first_pop:
+                self.first_pop = False
+                removed.set()
+                time.sleep(0.1)
+            return value
+
+    runner._settled_rank0_cache = PausingCache()
+    runner._settled_rank0_cache_limit = 1
+    errors: list[Exception] = []
+
+    def replay() -> None:
+        try:
+            runner._rank0_context(
+                SHARD,
+                storage,
+                CLIP_UID,
+                prefix["owner_plan"],
+                prefix["discovery"],
+                prefix["discovery_job_id"],
+            )
+        except Exception as exc:  # noqa: BLE001 - report worker failures
+            errors.append(exc)
+
+    threads = [threading.Thread(target=replay) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == []
 
 
 def test_same_ledger_restart_after_publication_crash(

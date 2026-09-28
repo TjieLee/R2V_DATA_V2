@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import threading
 import types
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar
 
+import numpy as np
 import pytest
 
+from r2v_data_v2.v3.config import Sam3Config
 from r2v_data_v2.v3.post_mask_epoch_jobs import (
     OUTCOME_COMPLETED,
     RESOURCE_BOOGU,
@@ -44,10 +48,13 @@ from r2v_data_v2.v3.post_mask_epoch_resources import (
     resolve_cpu_workers,
     resolve_hash_workers,
     resolve_qwen_max_inflight,
+    sam_worker_factory,
     served_model_ids,
 )
 from r2v_data_v2.v3.post_mask_epoch_scheduler import ResourceEpochScheduler
 from r2v_data_v2.v3.post_mask_epoch_state import GroupLedger
+from r2v_data_v2.v3.sam3_backend import Sam3SegmentationBackend
+from r2v_data_v2.v3.subject_attributes import Sam3AttributeFrameSegmenter
 
 MODEL = Path("/mnt/workspace/public/pretrained/Qwen/Qwen3-VL-32B-Instruct")
 # Derived, not literal: str(Path(...)) is platform-normalised, and the health
@@ -158,6 +165,8 @@ def test_qwen_epoch_uses_all_eight_gpus_with_tp1_dp8():
     assert argv[argv.index("--tensor-parallel-size") + 1] == "1"
     assert argv[argv.index("--data-parallel-size") + 1] == "8"
     assert config.environment()["CUDA_VISIBLE_DEVICES"] == "0,1,2,3,4,5,6,7"
+    assert argv[argv.index("--gpu-memory-utilization") + 1] == "0.3"
+    assert argv[argv.index("--max-model-len") + 1] == "49152"
 
 
 def test_qwen_epoch_strips_outer_multinode_rendezvous(monkeypatch):
@@ -549,6 +558,121 @@ def test_sam_epoch_respects_non_contiguous_gpu_ids(tmp_path: Path):
     assert built == ["cuda:2", "cuda:4"]
 
 
+class _ResettablePromptPredictor:
+    def __init__(self) -> None:
+        self.requests: list[dict[str, object]] = []
+        self.sessions: dict[str, list[str]] = {}
+        self.shutdown_calls = 0
+
+    def handle_request(self, request: dict[str, object]) -> dict[str, object]:
+        self.requests.append(dict(request))
+        kind = request["type"]
+        if kind == "start_session":
+            session_id = f"session-{len(self.sessions) + 1}"
+            self.sessions[session_id] = []
+            return {"session_id": session_id}
+        session_id = str(request["session_id"])
+        if kind == "reset_session":
+            self.sessions[session_id].clear()
+            return {}
+        if kind == "close_session":
+            del self.sessions[session_id]
+            return {}
+        if kind == "add_prompt":
+            prompt = str(request["text"])
+            self.sessions[session_id].append(prompt)
+            slot = int(request["frame_index"])
+            mask = np.zeros((2, 2), dtype=bool)
+            mask[(slot + len(prompt) + len(self.sessions[session_id])) % 2, 0] = True
+            return {
+                "frame_index": slot,
+                "outputs": {
+                    "out_binary_masks": mask[None, ...],
+                    "out_probs": np.array([0.9]),
+                    "out_obj_ids": np.array([1]),
+                },
+            }
+        raise AssertionError(kind)
+
+    def shutdown(self) -> None:
+        self.shutdown_calls += 1
+
+
+def test_sam_worker_reuses_clip_sessions_without_changing_probe_masks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    predictor = _ResettablePromptPredictor()
+    baseline_predictor = _ResettablePromptPredictor()
+    config = Sam3Config()
+
+    def builder(worker_config: Sam3Config) -> Sam3SegmentationBackend:
+        backend = Sam3SegmentationBackend(worker_config, predictor=predictor)
+        backend._device_context = nullcontext  # type: ignore[method-assign]
+        return backend
+
+    worker = sam_worker_factory(
+        config=config,
+        pool=WorkerPoolConfig(gpu_ids=(0,)),
+        backend_builder=builder,
+    )(0, 0)
+    segmenter = Sam3AttributeFrameSegmenter(config, backend=worker)
+    baseline_backend = Sam3SegmentationBackend(config, predictor=baseline_predictor)
+    baseline_backend._device_context = nullcontext  # type: ignore[method-assign]
+    baseline = Sam3AttributeFrameSegmenter(config, backend=baseline_backend)
+    clip_a = tmp_path / "clip-a"
+    clip_b = tmp_path / "clip-b"
+    generated = tmp_path / "completion" / "candidate" / "generated"
+    for directory in (clip_a, clip_b, generated):
+        directory.mkdir(parents=True)
+        (directory / "00.jpg").write_bytes(b"frame")
+
+    probes = [
+        (clip_a / "00.jpg", 0, "hat"),
+        (clip_a / "00.jpg", 0, "red coat"),
+        (clip_b / "00.jpg", 0, "hat"),
+    ]
+    for frame_path, frame_slot, grounding_prompt in probes:
+        actual = segmenter.segment_frame(
+            frame_path=frame_path,
+            frame_slot=frame_slot,
+            grounding_prompt=grounding_prompt,
+        )
+        expected = baseline.segment_frame(
+            frame_path=frame_path,
+            frame_slot=frame_slot,
+            grounding_prompt=grounding_prompt,
+        )
+        assert len(actual) == len(expected) == 1
+        assert np.array_equal(actual[0], expected[0])
+
+    generated_path = generated / "00.jpg"
+    actual = segmenter.segment_generated_frame(
+        frame_path=generated_path, grounding_prompt="coat"
+    )
+    expected = baseline.segment_generated_frame(
+        frame_path=generated_path, grounding_prompt="coat"
+    )
+    assert len(actual) == len(expected) == 1
+    assert np.array_equal(actual[0], expected[0])
+
+    kinds = [str(request["type"]) for request in predictor.requests]
+    assert kinds.count("start_session") == 3
+    assert kinds.count("reset_session") == 4
+    assert kinds.count("close_session") == 2
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        types.SimpleNamespace(cuda=types.SimpleNamespace(is_available=lambda: False)),
+    )
+    worker.close()
+    assert [request["type"] for request in predictor.requests].count(
+        "close_session"
+    ) == 3
+    assert predictor.shutdown_calls == 1
+    baseline_backend.close()
+
+
 # --------------------------------------------------------------------------
 # True concurrency
 # --------------------------------------------------------------------------
@@ -819,7 +943,7 @@ def _factory(name: str, executor, log: list[str]):
     return build
 
 
-def test_manager_keeps_at_most_one_resource_open():
+def test_manager_reuses_each_live_resource_until_session_close():
     log: list[str] = []
     manager = ResourceEpochManager(
         {
@@ -833,21 +957,45 @@ def test_manager_keeps_at_most_one_resource_open():
                 SerialBatchExecutor(lambda j, h: JobResult(OUTCOME_COMPLETED)),
                 log,
             ),
+            RESOURCE_SAM: _factory(
+                RESOURCE_SAM,
+                SerialBatchExecutor(lambda j, h: JobResult(OUTCOME_COMPLETED)),
+                log,
+            ),
         }
     )
-    manager.enter(RESOURCE_QWEN)
+    first_qwen = manager.enter(RESOURCE_QWEN)
     assert manager.open_count == 1
+    first_sam = manager.enter(RESOURCE_SAM)
+    assert manager.open_count == 2
     manager.enter(RESOURCE_BOOGU)
-    assert manager.open_count == 1
+    assert manager.open_count == 3
+    assert manager.enter(RESOURCE_QWEN) is first_qwen
+    assert manager.enter(RESOURCE_SAM) is first_sam
     assert manager.timeline == [
         ("start", RESOURCE_QWEN),
-        ("stop", RESOURCE_QWEN),
+        ("start", RESOURCE_SAM),
         ("start", RESOURCE_BOOGU),
     ]
+    assert log == ["build:qwen", "build:sam", "build:boogu"]
+    manager.close()
     manager.close()
     assert manager.open_count == 0
-    assert manager.timeline[-1] == ("stop", RESOURCE_BOOGU)
-    assert manager.max_open_observed == 1
+    assert sorted(manager.timeline[3:]) == [
+        ("stop", RESOURCE_BOOGU),
+        ("stop", RESOURCE_QWEN),
+        ("stop", RESOURCE_SAM),
+    ]
+    assert manager.max_open_observed == 3
+    assert all(
+        manager.counters()["resources"][name]["start_count"] == 1
+        and manager.counters()["resources"][name]["stop_count"] == 1
+        for name in (RESOURCE_QWEN, RESOURCE_BOOGU, RESOURCE_SAM)
+    )
+    assert manager.counters()["resources"][RESOURCE_SAM]["sam_batch_size"] == 1
+    assert manager.counters()["resources"][RESOURCE_SAM]["sam_batch4_status"] == (
+        "unsupported_by_current_backend_api"
+    )
 
 
 def test_manager_closes_executor_before_unloading_resource():
@@ -934,13 +1082,11 @@ def test_scheduler_drives_resource_transitions_and_fixed_point(tmp_path: Path):
     assert manager.open_count == 0
     assert [f"{a}:{n}" for a, n in manager.timeline] == [
         "start:boogu",
-        "stop:boogu",
         "start:qwen",
         "stop:qwen",
-        "start:boogu",
         "stop:boogu",
     ]
-    assert manager.max_open_observed == 1
+    assert manager.max_open_observed == 2
 
 
 def test_scheduler_unloads_resource_when_executor_raises(tmp_path: Path):
@@ -989,7 +1135,7 @@ def test_scheduler_records_manager_counters(tmp_path: Path):
     ]
 
 
-def test_lifecycle_counters_survive_unload_and_accumulate(tmp_path: Path):
+def test_lifecycle_counters_reflect_one_start_and_stop_per_resource(tmp_path: Path):
     manager = ResourceEpochManager(
         {
             RESOURCE_BOOGU: _factory(
@@ -1009,17 +1155,14 @@ def test_lifecycle_counters_survive_unload_and_accumulate(tmp_path: Path):
     manager.enter(RESOURCE_QWEN)
     manager.close()
     counters = manager.counters()
-    # Qwen was entered twice; its counters must aggregate both epochs.
-    assert counters["resources"][RESOURCE_QWEN]["start_count"] == 2
-    assert counters["resources"][RESOURCE_QWEN]["stop_count"] == 2
+    assert counters["resources"][RESOURCE_QWEN]["start_count"] == 1
+    assert counters["resources"][RESOURCE_QWEN]["stop_count"] == 1
     assert counters["resources"][RESOURCE_BOOGU]["start_count"] == 1
     assert counters["resources"][RESOURCE_BOOGU]["stop_count"] == 1
     assert counters["timeline"] == [
         "start:qwen",
-        "stop:qwen",
         "start:boogu",
         "stop:boogu",
-        "start:qwen",
         "stop:qwen",
     ]
 
@@ -1325,35 +1468,31 @@ def test_worker_shutdown_closes_every_worker_even_on_failure(tmp_path: Path):
     assert resource.workers == []
 
 
-def test_failed_resource_stop_blocks_the_next_resource():
-    started: list[str] = []
+def test_failed_resource_start_closes_previously_owned_resources():
+    events: list[str] = []
 
-    class _BadResource(EpochResource):
+    class _Resource(EpochResource):
         def _start(self) -> None:
-            started.append(self.name)
+            events.append(f"start:{self.name}")
+            if self.name == RESOURCE_BOOGU:
+                raise RuntimeError("startup failed")
 
         def _stop(self) -> None:
-            raise RuntimeError("stop failed")
+            events.append(f"stop:{self.name}")
 
-    def bad_factory():
-        return _BadResource(RESOURCE_QWEN, process_manager=_FakeProcessManager()), SerialBatchExecutor(
-            lambda j, h: JobResult(OUTCOME_COMPLETED)
+    def factory(name):
+        return lambda: (
+            _Resource(name, process_manager=_FakeProcessManager()),
+            SerialBatchExecutor(lambda j, h: JobResult(OUTCOME_COMPLETED)),
         )
 
-    def next_factory():
-        started.append(RESOURCE_BOOGU)
-        return _TrackedResource(
-            RESOURCE_BOOGU, process_manager=_FakeProcessManager()
-        ), SerialBatchExecutor(lambda j, h: JobResult(OUTCOME_COMPLETED))
-
     manager = ResourceEpochManager(
-        {RESOURCE_QWEN: bad_factory, RESOURCE_BOOGU: next_factory}
+        {RESOURCE_QWEN: factory(RESOURCE_QWEN), RESOURCE_BOOGU: factory(RESOURCE_BOOGU)}
     )
     manager.enter(RESOURCE_QWEN)
-    with pytest.raises(RuntimeError, match="stop failed"):
+    with pytest.raises(RuntimeError, match="startup failed"):
         manager.enter(RESOURCE_BOOGU)
-    # Boogu must never be loaded after a failed Qwen unload.
-    assert RESOURCE_BOOGU not in started
+    assert events == ["start:qwen", "start:boogu", "stop:boogu", "stop:qwen"]
     assert manager.open_count == 0
 
 

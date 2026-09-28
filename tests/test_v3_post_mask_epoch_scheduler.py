@@ -252,6 +252,126 @@ def test_custom_priority_fallback_preserves_lowest_ready_job_id():
     assert executor.submitted == [sam_job.job_id(), boogu_job.job_id()]
 
 
+def test_shared_resource_executor_survives_resource_switch_until_session_close():
+    first = _Job("clip-0001", resource=RESOURCE_QWEN)
+    middle = _Job("clip-0001", job_type="sam_probe", resource=RESOURCE_SAM)
+    last = _Job("clip-0001", job_type="final_review", resource=RESOURCE_QWEN)
+
+    class LiveExecutor(_Executor):
+        def __init__(self) -> None:
+            super().__init__(1)
+            self.closed = False
+            self.close_count = 0
+
+        def submit(self, job: _Job) -> None:
+            assert not self.closed, "a shared executor closed before session shutdown"
+            super().submit(job)
+
+        def close(self) -> None:
+            self.closed = True
+            self.close_count += 1
+
+    class SharedManager:
+        def __init__(self) -> None:
+            self.executors = {
+                RESOURCE_QWEN: LiveExecutor(),
+                RESOURCE_SAM: LiveExecutor(),
+            }
+            self.close_count = 0
+
+        def enter(self, resource: str) -> LiveExecutor:
+            return self.executors[resource]
+
+        def close(self) -> None:
+            self.close_count += 1
+            for executor in self.executors.values():
+                executor.close()
+
+        def counters(self) -> dict[str, Any]:
+            return {}
+
+    manager = SharedManager()
+
+    def finalize(job: _Job, _result: JobResult) -> tuple[_Job, ...]:
+        if job == first:
+            return (middle,)
+        if job == middle:
+            return (last,)
+        return ()
+
+    outcome = ResourceEpochScheduler(
+        ledger=_Ledger(), finalize=finalize, resource_manager=manager
+    ).run([first])
+
+    assert outcome["completed"] is True
+    assert manager.executors[RESOURCE_QWEN].submitted == [
+        first.job_id(), last.job_id()
+    ]
+    assert manager.close_count == 1
+    assert {resource: executor.close_count for resource, executor in manager.executors.items()} == {
+        RESOURCE_QWEN: 1,
+        RESOURCE_SAM: 1,
+    }
+
+
+def test_opt_in_collect_wave_commits_each_receipt_before_owner_finalization():
+    first = _Job("clip-0001", "sam_probe_a1")
+    second = _Job("clip-0001", "sam_probe_a2")
+    ledger = _Ledger()
+
+    class WaveExecutor(_Executor):
+        def collect(self) -> list[JobExecution]:
+            jobs = list(self.inflight)
+            self.inflight.clear()
+            return [JobExecution(job, JobResult(OUTCOME_COMPLETED), None) for job in jobs]
+
+    advances: list[tuple[str, ...]] = []
+
+    def finalize_wave(committed: list[tuple[_Job, JobResult]]) -> dict[str, tuple[_Job, ...]]:
+        assert ledger.phases["r000-qwen"].commits == 2
+        advances.append(tuple(job.job_id() for job, _ in committed))
+        return {job.job_id(): () for job, _ in committed}
+
+    outcome = ResourceEpochScheduler(
+        ledger=ledger,
+        finalize=lambda job, result: pytest.fail("per-job finalize was called"),
+        finalize_wave=finalize_wave,
+        executors={RESOURCE_QWEN: WaveExecutor(2)},
+    ).run([first, second])
+
+    assert outcome["completed"] is True
+    assert ledger.phases["r000-qwen"].commits == 2
+    assert advances == [(first.job_id(), second.job_id())]
+
+
+def test_opt_in_collect_wave_failed_finalizer_preserves_committed_receipt():
+    good = _Job("clip-0001", "sam_probe_a1")
+    bad = _Job("clip-0001", "sam_probe_a2")
+    ledger = _Ledger()
+
+    class WaveExecutor(_Executor):
+        def collect(self) -> list[JobExecution]:
+            jobs = list(self.inflight)
+            self.inflight.clear()
+            return [JobExecution(job, JobResult(OUTCOME_COMPLETED), None) for job in jobs]
+
+    def finalize_wave(committed: list[tuple[_Job, JobResult]]) -> dict[str, tuple[_Job, ...] | None]:
+        return {good.job_id(): (), bad.job_id(): None}
+
+    outcome = ResourceEpochScheduler(
+        ledger=ledger,
+        finalize=lambda job, result: pytest.fail("per-job finalize was called"),
+        finalize_wave=finalize_wave,
+        executors={RESOURCE_QWEN: WaveExecutor(2)},
+    ).run([good, bad])
+
+    assert outcome["completed"] is False
+    assert outcome["resolved_job_count"] == 1
+    assert outcome["unresolved_job_ids"] == [bad.job_id()]
+    assert ledger.phases["r000-qwen"].commits == 2
+    assert outcome["diagnostics"]["resume"]["finalizer_failures"] == 1
+
+
 def test_run_batches_keeps_plans_and_receipt_syncs_without_duplicate_enqueue():
     first = _Job("clip-0001")
     unlocked = _Job("clip-0002")

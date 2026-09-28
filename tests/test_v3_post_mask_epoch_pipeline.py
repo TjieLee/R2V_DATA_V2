@@ -2350,18 +2350,12 @@ def test_composition_completes_reference_edit_with_three_resources(
     assert "PairEpochRunner:reference_edit_" not in dispatch_log
     assert "RemovalEpochRunner:reference_edit_" not in dispatch_log
 
-    # Resource lifecycle: at most one heavy resource open, all closed at end.
-    assert result["resource_lifecycle"]["max_open_observed"] == 1
+    # The shared session retains all three heavy resources and closes them once.
+    assert result["resource_lifecycle"]["max_open_observed"] == 3
     assert result["resource_lifecycle"]["open_resource"] is None
-    assert timeline.count("start:boogu") >= 1
-    assert timeline.count("start:qwen") >= 1
-    assert timeline.count("start:sam") >= 1
-    # boogu -> qwen -> sam switches actually happened during Reference Edit.
-    removal_qwen = timeline.index("start:qwen")
-    re_boogu = timeline.index("start:boogu", removal_qwen)
-    re_qwen = timeline.index("start:qwen", re_boogu)
-    re_sam = timeline.index("start:sam", re_qwen)
-    assert re_boogu < re_qwen < re_sam
+    for resource in ("qwen", "boogu", "sam"):
+        assert timeline.count(f"start:{resource}") == 1
+        assert timeline.count(f"stop:{resource}") == 1
     del ledger
 
 
