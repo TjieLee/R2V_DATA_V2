@@ -998,6 +998,13 @@ class BooguSubprocessBackend:
         environment = os.environ.copy()
         environment["PYTHONNOUSERSITE"] = "1"
         environment["CUDA_VISIBLE_DEVICES"] = config.cuda_visible_devices
+        if config.temporary_root is not None:
+            hf_modules_cache = (
+                config.temporary_root.expanduser().resolve(strict=False)
+                / "hf_modules"
+            )
+            hf_modules_cache.mkdir(parents=True, exist_ok=True)
+            environment["HF_MODULES_CACHE"] = str(hf_modules_cache)
         command = [
             str(config.python_executable),
             str(config.worker_script),

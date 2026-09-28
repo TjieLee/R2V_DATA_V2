@@ -5,6 +5,7 @@ import io
 import json
 import sys
 import types
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1209,6 +1210,95 @@ for line in sys.stdin:
     assert "seed" not in events[1]
     assert "seed" not in events[2]
     assert events[3]["seed"] == 17
+
+
+def test_parallel_boogu_workers_isolate_hf_modules_cache_without_splitting_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker = tmp_path / "worker.py"
+    worker.write_text(
+        """import json
+import os
+import sys
+import time
+from pathlib import Path
+
+events_root = Path(os.environ["FAKE_BOOGU_EVENTS_ROOT"])
+slot = os.environ["CUDA_VISIBLE_DEVICES"]
+(events_root / f"slot-{slot}.json").write_text(json.dumps({
+    "model_path": sys.argv[sys.argv.index("--model-path") + 1],
+    "hf_modules_cache": os.environ.get("HF_MODULES_CACHE"),
+    "hf_home": os.environ.get("HF_HOME"),
+    "torch_home": os.environ.get("TORCH_HOME"),
+}))
+deadline = time.monotonic() + 5
+while len(list(events_root.glob("slot-*.json"))) < 2:
+    if time.monotonic() > deadline:
+        raise SystemExit("workers did not start in parallel")
+    time.sleep(0.01)
+print(json.dumps({"schema_version": 1, "type": "ready", "status": "ok"}), flush=True)
+for line in sys.stdin:
+    request = json.loads(line)
+    if request["type"] == "shutdown":
+        print(json.dumps({"schema_version": 1, "type": "shutdown", "request_id": request["request_id"], "status": "ok"}), flush=True)
+        break
+""",
+        encoding="utf-8",
+    )
+    code_root = tmp_path / "vendor" / "Boogu-Image"
+    model_path = tmp_path / "models" / "boogu"
+    events_root = tmp_path / "events"
+    for path in (code_root, model_path, events_root):
+        path.mkdir(parents=True)
+    monkeypatch.setenv("FAKE_BOOGU_EVENTS_ROOT", str(events_root))
+    monkeypatch.setenv("HF_MODULES_CACHE", str(tmp_path / "shared-modules"))
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "shared-hf-home"))
+    monkeypatch.setenv("TORCH_HOME", str(tmp_path / "shared-torch-home"))
+    backends = [
+        BooguSubprocessBackend(
+            BooguWorkerConfig(
+                python_executable=Path(sys.executable).resolve(),
+                code_root=code_root.resolve(),
+                model_path=model_path.resolve(),
+                worker_script=worker.resolve(),
+                allowed_server_root=Path("/"),
+                temporary_root=(tmp_path / "workers" / f"slot-{slot}").resolve(),
+                cuda_visible_devices=str(slot),
+                timeout_seconds=8,
+            )
+        )
+        for slot in range(2)
+    ]
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(
+                    backend.start,
+                    stderr_log_path=tmp_path / f"slot-{slot}.stderr.log",
+                )
+                for slot, backend in enumerate(backends)
+            ]
+            for future in futures:
+                future.result(timeout=10)
+
+        events = [
+            json.loads((events_root / f"slot-{slot}.json").read_text())
+            for slot in range(2)
+        ]
+        assert [event["model_path"] for event in events] == [str(model_path.resolve())] * 2
+        assert [event["hf_modules_cache"] for event in events] == [
+            str((tmp_path / "workers" / f"slot-{slot}" / "hf_modules").resolve())
+            for slot in range(2)
+        ]
+        assert all(Path(event["hf_modules_cache"]).is_dir() for event in events)
+        assert [event["hf_home"] for event in events] == [str(tmp_path / "shared-hf-home")] * 2
+        assert [event["torch_home"] for event in events] == [str(tmp_path / "shared-torch-home")] * 2
+    finally:
+        for backend in backends:
+            if backend.started:
+                backend.close()
 
 
 @pytest.mark.parametrize(
