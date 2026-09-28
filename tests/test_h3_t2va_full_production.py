@@ -678,10 +678,32 @@ def test_full_cli_dry_run_does_not_require_models(tmp_path):
             "--shards", "0", "--dry-run",
             "--mimo-model", "mimo-v2.6-flash-rl",
             "--mimo-call-mode", "single",
+            "--mimo-gpu-groups", "0,1,2,3;4,5,6,7",
+            "--mimo-ports", "8094,8095",
         ]
     )
     assert single["mimo_model"] == "mimo-v2.6-flash-rl"
     assert single["mimo_call_mode"] == "single"
+    assert single["mimo_endpoints"] == [
+        {"gpu_group": "0,1,2,3", "port": 8094},
+        {"gpu_group": "4,5,6,7", "port": 8095},
+    ]
+
+
+def test_v26_requires_explicit_two_disjoint_gpu_endpoints(tmp_path):
+    from tools.run_h3_t2va_full_production import main
+
+    manifest = shot_manifest(tmp_path)
+    command = [
+        "--shot-manifest", str(manifest), "--clips-root", str(tmp_path),
+        "--source-videos-root", str(tmp_path), "--production-root", str(tmp_path / "out"),
+        "--media-root", str(tmp_path), "--shards", "0", "--dry-run",
+        "--mimo-model", "mimo-v2.6-flash-rl", "--mimo-call-mode", "single",
+    ]
+    with pytest.raises(ValueError, match="GPU groups and ports"):
+        main(command)
+    with pytest.raises(ValueError, match="disjoint"):
+        main(command + ["--mimo-gpu-groups", "0,1,2,3;3,5,6,7", "--mimo-ports", "8094,8095"])
 
 
 def test_full_supervisor_worker_crash_stops_next_stage(tmp_path):

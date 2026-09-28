@@ -306,16 +306,25 @@ def test_dry_run_exact_accepted_server_and_full_cli(sandbox):
     assert not any((root / name).exists() for name in ("sourced", "out", "events"))
 
 
-def test_v26_single_call_dry_run_preserves_official_serving(sandbox):
+def test_v26_single_call_dry_run_uses_two_tp4_marlin_endpoints(sandbox):
     script, env, _ = sandbox
     result = invoke(
         script,
-        {**env, "MIMO_MODEL": "mimo-v2.6-flash-rl", "MIMO_CALL_MODE": "single"},
+        {
+            **env, "MIMO_MODEL": "mimo-v2.6-flash-rl", "MIMO_CALL_MODE": "single",
+            "MIMO_GPU_GROUPS": "0,1,2,3;4,5,6,7", "MIMO_PORTS": "8094,8095",
+        },
         "--dry-run",
     )
     assert result.returncode == 0, result.stderr
-    serve, run = map(shlex.split, result.stdout.splitlines())
-    assert serve[serve.index("--speculative-algorithm") + 1] == "EAGLE"
+    first, second, run = map(shlex.split, result.stdout.splitlines())
+    assert [command[command.index("--port") + 1] for command in (first, second)] == ["8094", "8095"]
+    assert all(command[command.index("--tp") + 1] == "4" for command in (first, second))
+    assert all(command[command.index("--moe-runner-backend") + 1] == "marlin" for command in (first, second))
+    assert all("--speculative-algorithm" not in command for command in (first, second))
+    assert run[run.index("--request-workers") + 1] == "2"
+    assert run[run.index("--mimo-gpu-groups") + 1] == "0,1,2,3;4,5,6,7"
+    assert run[run.index("--mimo-ports") + 1] == "8094,8095"
     assert run[run.index("--mimo-call-mode") + 1] == "single"
 
 

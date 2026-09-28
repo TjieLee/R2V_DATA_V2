@@ -22,13 +22,38 @@ def required_path(name):
     return Path(value).expanduser().absolute()
 
 
+def mimo_endpoints(model, call_mode, gpu_ids, groups, ports):
+    if model != "mimo-v2.6-flash-rl":
+        return []
+    if call_mode != "single":
+        raise ValueError("MiMo V2.6 production requires explicit single call mode")
+    if not groups or not ports:
+        raise ValueError("MiMo V2.6 requires GPU groups and ports")
+    split_groups = [group.split(",") for group in groups.split(";")]
+    split_ports = ports.split(",")
+    if len(split_groups) != 2 or any(len(group) != 4 for group in split_groups):
+        raise ValueError("MiMo V2.6 requires two four-GPU groups")
+    flat = [gpu for group in split_groups for gpu in group]
+    if len(flat) != len(set(flat)) or set(flat) != set(gpu_ids):
+        raise ValueError("MiMo GPU groups must be disjoint and cover GPU IDs")
+    if len(split_ports) != 2 or any(not item.isdigit() for item in split_ports):
+        raise ValueError("MiMo V2.6 requires two numeric ports")
+    numbers = [int(item) for item in split_ports]
+    if len(set(numbers)) != 2 or any(not 1 <= port <= 65535 for port in numbers):
+        raise ValueError("MiMo V2.6 ports must be distinct and valid")
+    return [
+        {"gpu_group": ",".join(group), "port": port}
+        for group, port in zip(split_groups, numbers, strict=True)
+    ]
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("shot-manifest", "clips-root", "source-videos-root", "media-root"):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--production-root", type=Path, default=production.DEFAULT_ROOT)
     parser.add_argument("--gpu-ids", default="0,1,2,3,4,5,6,7")
-    parser.add_argument("--request-workers", type=int, default=1)
+    parser.add_argument("--request-workers", type=int)
     parser.add_argument("--canonical-workers", type=int, default=16)
     parser.add_argument("--shards")
     parser.add_argument("--shard-start", type=int, default=0)
@@ -49,6 +74,8 @@ def main(argv=None):
     )
     parser.add_argument("--mimo-model", default="mimo-v2.5")
     parser.add_argument("--mimo-call-mode", choices=("multi", "single"), default="multi")
+    parser.add_argument("--mimo-gpu-groups", default=os.environ.get("MIMO_GPU_GROUPS"))
+    parser.add_argument("--mimo-ports", default=os.environ.get("MIMO_PORTS"))
     parser.add_argument("--mimo-mem-fraction-static", type=float, default=0.65)
     parser.add_argument("--mimo-startup-polls", type=int, default=360)
     parser.add_argument("--mimo-poll-interval", type=float, default=5.0)
@@ -61,6 +88,12 @@ def main(argv=None):
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
     gpu_ids = args.gpu_ids.split(",")
+    endpoints = mimo_endpoints(
+        args.mimo_model, args.mimo_call_mode, gpu_ids,
+        args.mimo_gpu_groups, args.mimo_ports,
+    )
+    if args.request_workers is None:
+        args.request_workers = 2 if endpoints else 1
     if (
         not gpu_ids
         or len(set(gpu_ids)) != len(gpu_ids)
@@ -133,6 +166,7 @@ def main(argv=None):
             "resume_schedule": resume_schedule,
             "mimo_model": args.mimo_model,
             "mimo_call_mode": args.mimo_call_mode,
+            "mimo_endpoints": endpoints,
             "model_call_count": 0,
         }
     order = full.seal_terminal_assigned_shards(root, order)
@@ -168,7 +202,9 @@ def main(argv=None):
     )
     from r2v_data_v2.h3.t2va_mimo_stage_server import (
         StageMimoClient,
+        StageMimoPoolClient,
         build_mimo_serve_command,
+        mimo_v26_server_env,
     )
     from r2v_data_v2.h3.ta2va_shadow import TA2VAProfileBackend
 
@@ -187,32 +223,50 @@ def main(argv=None):
         qwen_path=required_path("AUK_QWEN_PATH"),
         device="cuda:0",
     )
+    active_base_url = (
+        f"http://127.0.0.1:{endpoints[0]['port']}/v1"
+        if endpoints else args.base_url
+    )
     config = T2VAMimoConfig(
         media_resolver=MimoMediaResolver(
             mode=args.media_mode,
             media_root=args.media_root,
             media_base_url=args.media_base_url,
         ),
-        base_url=args.base_url,
+        base_url=active_base_url,
         api_key=os.environ.get("MIMO_API_KEY", "local-no-key"),
         model=args.mimo_model,
         transport="sglang",
         call_mode=args.mimo_call_mode,
     )
-    mimo_client = StageMimoClient(
-        api_key=config.api_key,
-        base_url=config.base_url,
-        timeout_seconds=config.timeout_seconds,
-        serve_command=build_mimo_serve_command(
-            args.mimo_sglang,
-            args.mimo_checkpoint,
-            served_model_name=args.mimo_model,
-            mem_fraction_static=args.mimo_mem_fraction_static,
-        ),
-        log_root=root / "logs" / os.uname().nodename,
-        startup_polls=args.mimo_startup_polls,
-        poll_interval=args.mimo_poll_interval,
-        cleanup_grace_seconds=args.mimo_cleanup_grace_seconds,
+    def stage_client(base_url, port=8092, gpu_group=None):
+        return StageMimoClient(
+            api_key=config.api_key,
+            base_url=base_url,
+            timeout_seconds=config.timeout_seconds,
+            serve_command=build_mimo_serve_command(
+                args.mimo_sglang,
+                args.mimo_checkpoint,
+                served_model_name=args.mimo_model,
+                mem_fraction_static=args.mimo_mem_fraction_static,
+                port=port,
+            ),
+            log_root=root / "logs" / os.uname().nodename,
+            startup_polls=args.mimo_startup_polls,
+            poll_interval=args.mimo_poll_interval,
+            cleanup_grace_seconds=args.mimo_cleanup_grace_seconds,
+            serve_env=mimo_v26_server_env(gpu_group) if gpu_group else None,
+        )
+
+    mimo_client = (
+        StageMimoPoolClient([
+            stage_client(
+                f"http://127.0.0.1:{item['port']}/v1",
+                port=item["port"], gpu_group=item["gpu_group"],
+            )
+            for item in endpoints
+        ])
+        if endpoints else stage_client(config.base_url)
     )
     print(
         f"mimo_runtime model={args.mimo_model} checkpoint={args.mimo_checkpoint}",

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Full production: upstream stages run without MiMo; MiMo is lazy per shard.
-set -euo pipefail
+set -e
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PRODUCTION_ROOT="${PRODUCTION_ROOT:-/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/T2VA}"
 dry_run=false
@@ -45,10 +45,15 @@ if ! "$dry_run"; then
   export R2V_PYTHON="$(command -v python)"
 fi
 R2V_PYTHON="${R2V_PYTHON:-$REPO_ROOT/.venv/bin/python}"
-SGLANG_ENV="${SGLANG_ENV:-/mnt/workspace/litengjie/data/audio_deps/qwen38-sglang-env}"
-MIMO_CHECKPOINT="${MIMO_CHECKPOINT:-/mnt/workspace/public/pretrained/MiMo/MiMo-V2.5}"
 MIMO_MODEL="${MIMO_MODEL:-mimo-v2.5}"
 MIMO_CALL_MODE="${MIMO_CALL_MODE:-multi}"
+if [[ "$MIMO_MODEL" == "mimo-v2.6-flash-rl" ]]; then
+  SGLANG_ENV="${SGLANG_ENV:-/mnt/workspace/litengjie/data/audio_deps/mimo26-sglang-env}"
+  MIMO_CHECKPOINT="${MIMO_CHECKPOINT:-/mnt/workspace/public/pretrained/MiMo/MiMo-V2.6-Flash-RL}"
+else
+  SGLANG_ENV="${SGLANG_ENV:-/mnt/workspace/litengjie/data/audio_deps/qwen38-sglang-env}"
+  MIMO_CHECKPOINT="${MIMO_CHECKPOINT:-/mnt/workspace/public/pretrained/MiMo/MiMo-V2.5}"
+fi
 SHOT_MANIFEST="${SHOT_MANIFEST:-/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/shots_f03_motion.jsonl}"
 JEA_CLIPS_ROOT="${JEA_CLIPS_ROOT:-/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/clips_clean_cropped}"
 JEA_SOURCE_VIDEOS_ROOT="${JEA_SOURCE_VIDEOS_ROOT:-/mnt/workspace/public/dataset/jea-video/moive-183t-0808}"
@@ -67,7 +72,11 @@ for gpu in "${gpu_ids[@]}"; do
   fi
   seen+="$gpu,"
 done
-REQUEST_WORKERS="${REQUEST_WORKERS:-1}"
+if [[ "$MIMO_MODEL" == "mimo-v2.6-flash-rl" ]]; then
+  REQUEST_WORKERS="${REQUEST_WORKERS:-2}"
+else
+  REQUEST_WORKERS="${REQUEST_WORKERS:-1}"
+fi
 CANONICAL_WORKERS="${CANONICAL_WORKERS:-16}"
 MIMO_STARTUP_POLLS="${MIMO_STARTUP_POLLS:-360}"
 MIMO_POLL_INTERVAL="${MIMO_POLL_INTERVAL:-5}"
@@ -92,16 +101,34 @@ serve=("$SGLANG_ENV/bin/sglang" serve
   --reasoning-parser mimo --tool-call-parser mimo
   --constrained-json-disable-any-whitespace --enable-deterministic-inference)
 if [[ "$MIMO_MODEL" == "mimo-v2.6-flash-rl" ]]; then
-  serve+=(--speculative-algorithm EAGLE --speculative-num-steps 3
-    --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
-    --enable-multi-layer-eagle)
+  if [[ -z "${MIMO_GPU_GROUPS:-}" || -z "${MIMO_PORTS:-}" ]]; then
+    echo "MiMo V2.6 requires MIMO_GPU_GROUPS and MIMO_PORTS" >&2; exit 2
+  fi
+  IFS=';' read -r first_group second_group <<< "$MIMO_GPU_GROUPS"
+  IFS=, read -r first_port second_port <<< "$MIMO_PORTS"
+  serve=(env "CUDA_VISIBLE_DEVICES=$first_group" SGLANG_ENABLE_JIT_DEEPGEMM=0
+    SGLANG_DEEPGEMM_PDL=0 NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost
+    "$SGLANG_ENV/bin/sglang" serve --model-path "$MIMO_CHECKPOINT"
+    --served-model-name "$MIMO_MODEL" --host 127.0.0.1 --port "$first_port"
+    --tp 4 --moe-runner-backend marlin --disable-custom-all-reduce
+    --trust-remote-code --reasoning-parser mimo --tool-call-parser mimo)
+  serve_second=("${serve[@]}")
+  serve_second[1]="CUDA_VISIBLE_DEVICES=$second_group"
+  for ((i=0; i<${#serve_second[@]}; i++)); do
+    if [[ "${serve_second[$i]}" == "$first_port" && "${serve_second[$((i-1))]}" == "--port" ]]; then
+      serve_second[$i]="$second_port"
+    fi
+  done
+  base_url="http://127.0.0.1:$first_port/v1"
+else
+  base_url="http://127.0.0.1:8092/v1"
 fi
 
 run=("$R2V_PYTHON" "$REPO_ROOT/tools/run_h3_t2va_full_production.py"
   --shot-manifest "$SHOT_MANIFEST" --clips-root "$JEA_CLIPS_ROOT"
   --source-videos-root "$JEA_SOURCE_VIDEOS_ROOT"
   --production-root "$PRODUCTION_ROOT"
-  --base-url http://127.0.0.1:8092/v1 --media-root "${MEDIA_ROOT:-/mnt/workspace}"
+  --base-url "$base_url" --media-root "${MEDIA_ROOT:-/mnt/workspace}"
   --request-workers "$REQUEST_WORKERS" --gpu-ids "$GPU_IDS"
   --canonical-workers "$CANONICAL_WORKERS"
   --ffmpeg "${FFMPEG:-ffmpeg}"
@@ -113,6 +140,9 @@ run=("$R2V_PYTHON" "$REPO_ROOT/tools/run_h3_t2va_full_production.py"
   --mimo-startup-polls "$MIMO_STARTUP_POLLS"
   --mimo-poll-interval "$MIMO_POLL_INTERVAL"
   --mimo-cleanup-grace-seconds "$CLEANUP_GRACE_SECONDS")
+if [[ "$MIMO_MODEL" == "mimo-v2.6-flash-rl" ]]; then
+  run+=(--mimo-gpu-groups "$MIMO_GPU_GROUPS" --mimo-ports "$MIMO_PORTS")
+fi
 if [[ -n "${SHARDS:-}" ]]; then
   run+=(--shards "$SHARDS")
 else
@@ -124,6 +154,9 @@ if [[ "${ALLOW_UNVERIFIED:-0}" == 1 ]]; then run+=(--allow-unverified); fi
 run+=("$@")
 if "$dry_run"; then
   printf '%q ' "${serve[@]}"; printf '\n'
+  if [[ "$MIMO_MODEL" == "mimo-v2.6-flash-rl" ]]; then
+    printf '%q ' "${serve_second[@]}"; printf '\n'
+  fi
   printf '%q ' "${run[@]}"; printf '\n'
   exit 0
 fi
