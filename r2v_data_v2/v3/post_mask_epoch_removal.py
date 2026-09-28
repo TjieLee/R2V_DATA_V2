@@ -57,6 +57,7 @@ from typing import Any
 
 import numpy as np
 from PIL import Image
+from pydantic import ValidationError
 
 from r2v_data_v2.v3.background import validate_background_reference
 from r2v_data_v2.v3.boogu_remove_backend import BooguBackgroundRemovalBackend
@@ -810,7 +811,8 @@ class RemovalEpochRunner:
                 clip_uid,
                 "remove",
                 error,
-                known_clip_artifact_read=state is None,
+                known_clip_artifact_read=state is None
+                or isinstance(error, (ValidationError, json.JSONDecodeError)),
             )
         ):
             counters["failed"] += 1
@@ -831,11 +833,14 @@ class RemovalEpochRunner:
                         clip_uid,
                         "remove",
                         exc,
-                        known_clip_artifact_read=True,
+                        known_clip_artifact_read=isinstance(
+                            exc, (ValidationError, json.JSONDecodeError)
+                        ),
                     ):
                         counters["failed"] += 1
                         return
-                    raise
+                    if not isinstance(exc, ValueError):
+                        raise
                 storage.append_failure(
                     clip_uid=clip_uid, stage="remove", reason=_exception_reason(exc)
                 )
@@ -847,7 +852,7 @@ class RemovalEpochRunner:
             counters["skipped_disabled"] += 1
             return
         if error is not None:
-            if self.clip_quarantine is not None:
+            if self.clip_quarantine is not None and not isinstance(error, ValueError):
                 raise error
             storage.append_failure(
                 clip_uid=clip_uid, stage="remove", reason=_exception_reason(error)

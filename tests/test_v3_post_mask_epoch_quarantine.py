@@ -113,13 +113,45 @@ def test_group_quarantine_restores_scope_but_not_unrecorded_missing_clip(tmp_pat
     assert resumed.eligible == {"shard-1": ("good", "bad")}
     assert resumed.excluded_by_shard() == {"shard-1": ["bad"]}
     assert resumed.count == 1
+    without_storages = ClipQuarantine.for_group(group, {"shard-1": ("good",)})
+    assert without_storages.excluded_by_shard() == {"shard-1": ["bad"]}
     with pytest.raises(ValueError, match="eligible scope drifted"):
         ClipQuarantine.for_group(
             group, {"shard-1": ()}, storages={"shard-1": storage}
         )
 
 
-def test_group_quarantine_rejects_marker_without_failure_record(tmp_path):
+def test_group_quarantine_restores_marker_without_reading_failure_log(
+    tmp_path, monkeypatch
+):
+    storage = _Storage(tmp_path / "run")
+    group = tmp_path / "group"
+    first = ClipQuarantine.for_group(group, {"shard-1": ("good", "bad")})
+    missing = FileNotFoundError(
+        2, "No such file", str(storage.clip_dir("bad") / "clip.json")
+    )
+    assert first.record_if_local("shard-1", storage, "bad", "pair", missing)
+
+    failure_path = storage.root / "failures.jsonl"
+    failure_path.unlink()
+    original_open = Path.open
+
+    def guard_failure_log(path, *args, **kwargs):
+        if path == failure_path:
+            raise AssertionError("failures.jsonl must not be opened on resume")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", guard_failure_log)
+    resumed = ClipQuarantine.for_group(
+        group, {"shard-1": ("good",)}, storages={"shard-1": storage}
+    )
+
+    assert resumed.eligible == {"shard-1": ("good", "bad")}
+    assert resumed.excluded_by_shard() == {"shard-1": ["bad"]}
+    assert resumed.count == 1
+
+
+def test_group_quarantine_rejects_marker_outside_recorded_scope(tmp_path):
     storage = _Storage(tmp_path / "run")
     group = tmp_path / "group"
     first = ClipQuarantine.for_group(
@@ -133,13 +165,38 @@ def test_group_quarantine_rejects_marker_without_failure_record(tmp_path):
     marker = json.loads(marker_path.read_text(encoding="utf-8"))
     marker["quarantined"].append(
         {
-            "shard": "shard-1", "clip_uid": "good", "stage": "pair",
+            "shard": "shard-1", "clip_uid": "not-eligible", "stage": "pair",
             "reason": "forged failure",
         }
     )
     marker_path.write_text(json.dumps(marker), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="without failure record"):
+    with pytest.raises(ValueError, match="invalid clip quarantine marker"):
         ClipQuarantine.for_group(
             group, {"shard-1": ("good",)}, storages={"shard-1": storage}
         )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    (
+        ("schema", "wrong-schema", ValueError),
+        ("quarantined", {}, TypeError),
+    ),
+)
+def test_group_quarantine_keeps_marker_schema_and_type_validation(
+    tmp_path, field, value, error
+):
+    group = tmp_path / "group"
+    marker_path = group / "composition" / "clip_quarantine.json"
+    marker_path.parent.mkdir(parents=True)
+    marker = {
+        "schema": "post_mask_clip_quarantine/1",
+        "eligible_clip_uids_by_shard": {"shard-1": ["good"]},
+        "quarantined": [],
+    }
+    marker[field] = value
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+
+    with pytest.raises(error, match="invalid clip quarantine marker"):
+        ClipQuarantine.for_group(group, {"shard-1": ("good",)})

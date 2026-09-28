@@ -3002,7 +3002,7 @@ def test_completed_handoff_rejects_changed_quarantine_exclusions(
     )
     marker_path.write_text(json.dumps(marker), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="without failure record"):
+    with pytest.raises(StageHandoffError, match="composition handoff marker drifted"):
         _production_reference_integrity_outcome(
             tmp_path,
             monkeypatch,

@@ -78,7 +78,11 @@ class ClipQuarantine:
         emit: Any = None,
         storages: Mapping[str, Any] | None = None,
     ) -> ClipQuarantine:
-        """Restore only recorded local exclusions, never a changed healthy scope."""
+        """Restore marker exclusions, never a changed healthy scope.
+
+        ``storages`` remains accepted for caller compatibility, but the marker
+        alone is the durable restart state.
+        """
         path = Path(ledger_root) / "composition" / "clip_quarantine.json"
         current = {
             str(shard): tuple(str(uid) for uid in uids)
@@ -131,31 +135,6 @@ class ClipQuarantine:
                 raise ValueError(f"clip quarantine eligible scope drifted: {path}")
             if [uid for uid in uids if uid in current[shard]] != list(current[shard]):
                 raise ValueError(f"clip quarantine eligible scope drifted: {path}")
-        if storages is None or set(storages) != set(original):
-            raise ValueError(f"clip quarantine has no failure authority: {path}")
-        pending = {
-            (shard, uid, stage, reason)
-            for (shard, uid), (stage, reason) in instance._failures.items()
-        }
-        for shard in sorted({item[0] for item in pending}):
-            failure_path = Path(storages[shard].root) / "failures.jsonl"
-            try:
-                with failure_path.open(encoding="utf-8") as handle:
-                    for line in handle:
-                        record = json.loads(line)
-                        if record.get("details", {}).get("post_mask_quarantine") is True:
-                            pending.discard((
-                                shard,
-                                record.get("clip_uid"),
-                                record.get("stage"),
-                                record.get("reason"),
-                            ))
-            except (OSError, ValueError, AttributeError) as exc:
-                raise ValueError(
-                    f"clip quarantine failure record is unreadable: {failure_path}"
-                ) from exc
-        if pending:
-            raise ValueError(f"clip quarantine without failure record: {path}")
         return instance
 
     def excluded_by_shard(self) -> dict[str, list[str]]:
