@@ -1398,6 +1398,12 @@ class SubjectAttributeEpochRunner:
         ] = {}
         self._fresh_completed_clips: set[tuple[str, str]] = set()
         self._cold_completed_clips: set[tuple[str, str]] = set()
+        # Only owners published by this runner can enter this execution cache.
+        # A new runner has no entries and retains the strict durable replay.
+        self._fresh_owner_terminal_cache: dict[
+            tuple[str, str, str], tuple[dict[str, Any], OwnerEnrichmentArtifact]
+        ] = {}
+        self._fresh_owner_terminal_cache_lock = threading.Lock()
         self._resume_policy: dict[str, Any] | None = None
         # These invocation caches span one active execution batch (normally
         # 128 clips); a drained batch clears them before the next starts.
@@ -1474,6 +1480,13 @@ class SubjectAttributeEpochRunner:
             "rank0_full_owner_replays": 0,
             "rank0_unchanged_attribute_reuses": 0,
             "rank0_terminal_context_hits": 0,
+            "fresh_owner_outcome_hits": 0,
+            "fresh_owner_verify_skips": 0,
+            "fresh_owner_artifact_hits": 0,
+            "owner_replay_calls": 0,
+        }
+        self.replay_timing_seconds: dict[str, float] = {
+            "owner_replay_wall_seconds": 0.0,
         }
         #: Execution-only seed counters for the clip-plan derivation fan-out.
         #: ``clip_plan_derive_wall_seconds`` is a float, so this mapping stays
@@ -1497,6 +1510,8 @@ class SubjectAttributeEpochRunner:
 
     def clear_execution_hot_caches(self) -> None:
         """Drop one drained batch's RAM-only replay state, never durable plans."""
+        with self._fresh_owner_terminal_cache_lock:
+            self._fresh_owner_terminal_cache.clear()
         with self._candidate_cache_lock:
             self._owner_candidate_cache.clear()
         self._owner_context_cache.clear()
@@ -2441,6 +2456,14 @@ class SubjectAttributeEpochRunner:
         outcome: Mapping[str, Any],
     ) -> OwnerEnrichmentArtifact:
         """Rebuild one terminal owner artifact from its durable outcome."""
+        fresh = self._fresh_owner_terminal(shard, clip_uid, owner_entity_id)
+        if (
+            fresh is not None
+            and fresh[0] == dict(outcome)
+            and fresh[1].attribute_id_start == attribute_id_start
+        ):
+            self._bump_replay_counter("fresh_owner_artifact_hits")
+            return fresh[1]
         storage = self._storage_for(shard)
         path = _owner_artifact_path(
             self._output_root(storage),
@@ -2637,6 +2660,7 @@ class SubjectAttributeEpochRunner:
                         source=OWNER_SOURCE_PREEXISTING,
                         discovery_job_id=None,
                     ),
+                    artifact=artifact,
                 )
                 continue
             # The current active owner: freeze it and stop scanning this clip.
@@ -2674,6 +2698,7 @@ class SubjectAttributeEpochRunner:
                         source=OWNER_SOURCE_DISCOVERY,
                         discovery_job_id=discovery_job.job_id(),
                     ),
+                    artifact=terminal,
                 )
                 continue
             return [discovery_job]
@@ -2969,6 +2994,7 @@ class SubjectAttributeEpochRunner:
                 source=OWNER_SOURCE_DISCOVERY,
                 discovery_job_id=job.job_id(),
             ),
+            artifact=artifact,
         )
         return self._advance_clip(shard, storage, clip_uid)
 
@@ -3074,17 +3100,41 @@ class SubjectAttributeEpochRunner:
         }
 
     def _write_owner_outcome(
-        self, shard: str, clip_uid: str, owner_entity_id: str, payload: Mapping[str, Any]
+        self,
+        shard: str,
+        clip_uid: str,
+        owner_entity_id: str,
+        payload: Mapping[str, Any],
+        *,
+        artifact: OwnerEnrichmentArtifact | None = None,
     ) -> None:
+        marker = dict(payload)
         _write_json_once(
             self._owner_outcome_path(shard, clip_uid, owner_entity_id),
-            dict(payload),
+            marker,
         )
+        if artifact is not None:
+            with self._fresh_owner_terminal_cache_lock:
+                self._fresh_owner_terminal_cache[
+                    (shard, clip_uid, owner_entity_id)
+                ] = (marker, artifact)
+
+    def _fresh_owner_terminal(
+        self, shard: str, clip_uid: str, owner_entity_id: str
+    ) -> tuple[dict[str, Any], OwnerEnrichmentArtifact] | None:
+        with self._fresh_owner_terminal_cache_lock:
+            return self._fresh_owner_terminal_cache.get(
+                (shard, clip_uid, owner_entity_id)
+            )
 
     def _owner_outcome(
         self, shard: str, clip_uid: str, owner_entity_id: str
     ) -> dict[str, Any] | None:
         """Strictly validated owner outcome marker, or ``None`` if unresolved."""
+        fresh = self._fresh_owner_terminal(shard, clip_uid, owner_entity_id)
+        if fresh is not None:
+            self._bump_replay_counter("fresh_owner_outcome_hits")
+            return dict(fresh[0])
         path = self._owner_outcome_path(shard, clip_uid, owner_entity_id)
         marker = _read_json(path)
         if marker is None:
@@ -3152,6 +3202,10 @@ class SubjectAttributeEpochRunner:
         A discovery outcome additionally requires the exact committed receipt:
         the marker is never its own authority.
         """
+        fresh = self._fresh_owner_terminal(shard, clip_uid, owner_entity_id)
+        if fresh is not None and fresh[0] == dict(marker):
+            self._bump_replay_counter("fresh_owner_verify_skips")
+            return
         label = f"{clip_uid}/{owner_entity_id}"
         if marker["source"] == OWNER_SOURCE_PREEXISTING:
             self._verify_preexisting_artifact(shard, clip_uid, owner_plan)
@@ -5113,6 +5167,7 @@ class SubjectAttributeEpochRunner:
                 source=OWNER_SOURCE_PROCESSED,
                 discovery_job_id=discovery_job_id,
             ),
+            artifact=result,
         )
         return self._advance_clip(shard, storage, clip_uid)
 
@@ -6040,27 +6095,34 @@ class SubjectAttributeEpochRunner:
         the model graph and the recorded artifact are the legacy ones by
         construction rather than by transcription.
         """
-        replay = self._owner_replay(shard, storage, clip_uid, owner_plan, states)
+        started = time.perf_counter()
+        self._bump_replay_counter("owner_replay_calls")
         try:
-            artifact = _process_owner(
-                config=self.config,
-                storage=storage,
-                output_root=self._output_root(storage),
-                clip=replay.clip,
-                owner=replay.owner,
-                owner_candidates=replay.candidates,
-                masks=replay.masks,
-                attribute_id_start=int(owner_plan["attribute_id_start"]),
-                discovery_client=_OwnerDiscoveryClient(replay),
-                review_client=_OwnerReviewClient(replay),
-                segmentation_backend=_OwnerSegmentationBackend(replay),
-                gme_screener=None,
-                completion_backend=_OwnerCompletionBackend(replay),
-                completion_judge=_OwnerCompletionJudge(replay),
-            )
-        except _PendingModelCall as pending:
-            return pending
-        return self._reconcile_owner_artifact(replay, artifact)
+            replay = self._owner_replay(shard, storage, clip_uid, owner_plan, states)
+            try:
+                artifact = _process_owner(
+                    config=self.config,
+                    storage=storage,
+                    output_root=self._output_root(storage),
+                    clip=replay.clip,
+                    owner=replay.owner,
+                    owner_candidates=replay.candidates,
+                    masks=replay.masks,
+                    attribute_id_start=int(owner_plan["attribute_id_start"]),
+                    discovery_client=_OwnerDiscoveryClient(replay),
+                    review_client=_OwnerReviewClient(replay),
+                    segmentation_backend=_OwnerSegmentationBackend(replay),
+                    gme_screener=None,
+                    completion_backend=_OwnerCompletionBackend(replay),
+                    completion_judge=_OwnerCompletionJudge(replay),
+                )
+            except _PendingModelCall as pending:
+                return pending
+            return self._reconcile_owner_artifact(replay, artifact)
+        finally:
+            elapsed = time.perf_counter() - started
+            with self._replay_counter_lock:
+                self.replay_timing_seconds["owner_replay_wall_seconds"] += elapsed
 
     def _reconcile_owner_artifact(self, replay: _OwnerReplay, artifact: Any) -> Any:
         """Freeze the two execution-time-only legacy inputs.

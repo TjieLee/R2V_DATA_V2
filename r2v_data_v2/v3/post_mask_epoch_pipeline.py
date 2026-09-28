@@ -902,7 +902,18 @@ def run_subject_attributes_stage(
                 "rank0_full_owner_replays",
                 "rank0_unchanged_attribute_reuses",
                 "rank0_terminal_context_hits",
+                "fresh_owner_outcome_hits",
+                "fresh_owner_verify_skips",
+                "fresh_owner_artifact_hits",
+                "owner_replay_calls",
             }
+        },
+        **{
+            key: value
+            for key, value in dict(
+                getattr(subject_attributes, "replay_timing_seconds", None) or {}
+            ).items()
+            if key == "owner_replay_wall_seconds"
         },
     )
     result.update(

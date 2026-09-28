@@ -3733,7 +3733,13 @@ def test_production_run_emits_the_subject_attributes_cpu_diagnostics(
         "rank0_full_owner_replays",
         "rank0_unchanged_attribute_reuses",
         "rank0_terminal_context_hits",
+        "fresh_owner_outcome_hits",
+        "fresh_owner_verify_skips",
+        "fresh_owner_artifact_hits",
+        "owner_replay_calls",
+        "owner_replay_wall_seconds",
     } <= set(execution)
+    assert execution["owner_replay_wall_seconds"] >= 0.0
     timings = {
         event["phase"]: event["wall_seconds"]
         for event in events

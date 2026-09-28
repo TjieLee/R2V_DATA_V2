@@ -5229,3 +5229,213 @@ def test_fresh_reconcile_uses_durably_published_clip_outcome_without_replay(
     assert stats.no_work_clips == 0
     assert stats.to_dict()["skipped_existing_owners"] == 1
     assert runner.replay_counters["fresh_reconcile_cache_hits"] == 1
+
+
+def test_fresh_processed_owner_replays_once_before_clip_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Publishing a processed owner must not immediately replay it to finish the clip."""
+    config, storage = _storage_variant(tmp_path, monkeypatch, "run-fresh-owner")
+    runner = _runner(config, storage, tmp_path)
+    qwen = _QwenClient(discoveries=[_human_discovery()])
+    sam = _SamBackend(ValueError("sam exploded"))
+    replay = runner._owner_artifact_from_receipts
+    calls = 0
+
+    def once(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls != 1:
+            raise AssertionError("fresh processed owner was replayed again")
+        return replay(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "_owner_artifact_from_receipts", once)
+    outcome = _scheduler(
+        runner,
+        _SerialQwenExecutor(runner, qwen),
+        sam=_SerialQwenExecutor(runner, sam),
+    ).run(runner.seed_jobs())
+
+    assert outcome["completed"] is True
+    assert calls == 1
+    assert _owner_outcome_path(runner).is_file()
+    assert runner._clip_outcome_path(SHARD, CLIP_UID).is_file()
+    assert runner.replay_counters["owner_replay_calls"] == 1
+    assert runner.replay_timing_seconds["owner_replay_wall_seconds"] >= 0.0
+    published_paths = (
+        _owner_artifact_file(storage),
+        _owner_outcome_path(runner),
+        _sample_path(storage),
+    )
+    published_bytes = tuple(path.read_bytes() for path in published_paths)
+    cold = _runner(config, storage, tmp_path)
+    assert cold.reconcile_stats(SHARD).terminal_clips == 1
+    assert tuple(path.read_bytes() for path in published_paths) == published_bytes
+
+
+def test_fresh_clip_totals_uses_published_owner_without_disk_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A just-published owner supplies its marker and artifact to clip totals."""
+    config, storage = _storage_variant(tmp_path, monkeypatch, "run-owner-totals")
+    runner = _runner(config, storage, tmp_path)
+    _drain(
+        runner,
+        _QwenClient(discoveries=[_human_discovery()]),
+        sam=_SamBackend(ValueError("sam exploded")),
+    )
+    plan = runner._clip_plan(SHARD, CLIP_UID)
+    owner_outcome_path = _owner_outcome_path(runner)
+    owner_artifact_path = _owner_artifact_file(storage)
+    outcome_copy = runner._owner_outcome(SHARD, CLIP_UID, OWNER)
+    assert outcome_copy is not None
+    outcome_copy["record_count"] = 999
+    outcome_again = runner._owner_outcome(SHARD, CLIP_UID, OWNER)
+    assert outcome_again is not None
+    assert outcome_again["record_count"] == 1
+    from r2v_data_v2.v3 import post_mask_epoch_subject_attributes as module
+
+    read_json = module._read_json
+    file_sha256 = module._file_sha256
+
+    def read_without_owner_outcome(path: Path) -> Any:
+        if path == owner_outcome_path:
+            raise AssertionError("fresh owner outcome was read from disk")
+        return read_json(path)
+
+    def hash_without_owner_artifact(path: Path) -> str:
+        if path == owner_artifact_path:
+            raise AssertionError("fresh owner artifact was hashed from disk")
+        return file_sha256(path)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(module, "_read_json", read_without_owner_outcome)
+        patch.setattr(module, "_file_sha256", hash_without_owner_artifact)
+        patch.setattr(
+            runner,
+            "_owner_artifact_from_receipts",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("fresh owner was replayed from receipts")
+            ),
+        )
+        totals, records, enriched = runner._clip_totals(
+            SHARD, storage, CLIP_UID, plan
+        )
+        assert runner._attribute_id_start(
+            SHARD,
+            CLIP_UID,
+            [{"owner_entity_id": OWNER}, {"owner_entity_id": "e2"}],
+            1,
+        ) == 2
+
+    assert totals.discovery_calls == 1
+    assert len(records) == 1
+    assert enriched is True
+    assert runner.replay_counters["fresh_owner_outcome_hits"] > 0
+    assert runner.replay_counters["fresh_owner_verify_skips"] > 0
+    assert runner.replay_counters["fresh_owner_artifact_hits"] > 0
+
+    runner.clear_execution_hot_caches()
+    assert runner._attribute_id_start(
+        SHARD,
+        CLIP_UID,
+        [{"owner_entity_id": OWNER}, {"owner_entity_id": "e2"}],
+        1,
+    ) == 2
+
+
+def test_failed_owner_outcome_publication_does_not_create_fresh_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An artifact alone cannot become an in-RAM terminal owner."""
+    config, storage = _storage_variant(tmp_path, monkeypatch, "run-owner-write-fail")
+    runner = _runner(config, storage, tmp_path)
+    from r2v_data_v2.v3 import post_mask_epoch_subject_attributes as module
+
+    write_json_once = module._write_json_once
+
+    def fail_owner_outcome(path: Path, payload: Mapping[str, Any]) -> None:
+        if path == _owner_outcome_path(runner):
+            raise RuntimeError("simulated owner outcome write failure")
+        write_json_once(path, payload)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(module, "_write_json_once", fail_owner_outcome)
+        outcome = _scheduler(
+            runner,
+            _SerialQwenExecutor(
+                runner, _QwenClient(discoveries=[_human_discovery()])
+            ),
+            sam=_SerialQwenExecutor(runner, _SamBackend(ValueError("sam exploded"))),
+        ).run(runner.seed_jobs())
+    assert outcome["completed"] is False
+    assert _owner_artifact_file(storage).is_file()
+    assert runner._owner_outcome(SHARD, CLIP_UID, OWNER) is None
+    assert not _owner_outcome_path(runner).exists()
+
+    cold = _runner(config, storage, tmp_path)
+    assert cold.seed_jobs() == []
+    assert _owner_outcome_path(cold).is_file()
+    assert cold._clip_outcome_path(SHARD, CLIP_UID).is_file()
+
+
+def test_cold_owner_outcome_replays_after_clip_publication_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A new runner verifies the durable processed owner before finishing a clip."""
+    config, storage = _storage_variant(tmp_path, monkeypatch, "run-owner-cold")
+    runner = _runner(config, storage, tmp_path)
+    qwen = _QwenClient(discoveries=[_human_discovery()])
+    sam = _SamBackend(ValueError("sam exploded"))
+
+    def crash_clip(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("simulated clip publication crash")
+
+    monkeypatch.setattr(runner, "_publish_clip_outcome", crash_clip)
+    _scheduler(
+        runner,
+        _SerialQwenExecutor(runner, qwen),
+        sam=_SerialQwenExecutor(runner, sam),
+    ).run(runner.seed_jobs())
+    assert _owner_outcome_path(runner).is_file()
+    assert not runner._clip_outcome_path(SHARD, CLIP_UID).exists()
+
+    cold = _runner(config, storage, tmp_path)
+    replay = cold._owner_artifact_from_receipts
+    calls = 0
+
+    def counting_replay(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        return replay(*args, **kwargs)
+
+    monkeypatch.setattr(cold, "_owner_artifact_from_receipts", counting_replay)
+    assert cold.seed_jobs() == []
+    assert calls >= 1
+    assert cold._clip_outcome_path(SHARD, CLIP_UID).is_file()
+
+
+def test_fresh_owner_cache_does_not_accept_a_mismatched_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A caller-supplied marker must match the just-published terminal exactly."""
+    config, storage = _storage_variant(tmp_path, monkeypatch, "run-owner-mismatch")
+    _preexisting_nonhuman_artifact(storage)
+    runner = _runner(config, storage, tmp_path)
+    assert runner.seed_jobs() == []
+    plan = runner._clip_plan(SHARD, CLIP_UID)
+    owner_plan = runner._owner_plan_for(SHARD, plan, OWNER)
+    marker = runner._owner_outcome(SHARD, CLIP_UID, OWNER)
+    assert marker is not None
+
+    wrong_count = {**marker, "record_count": 1}
+    with pytest.raises(SubjectAttributeDurableError, match="owner outcome drifted"):
+        runner._verify_owner_outcome(
+            SHARD, storage, CLIP_UID, OWNER, owner_plan, wrong_count
+        )
+
+    wrong_digest = {**marker, "artifact_sha256": "0" * 64}
+    with pytest.raises(SubjectAttributeDurableError, match="artifact drifted"):
+        runner._terminal_artifact_for_owner(
+            SHARD, CLIP_UID, OWNER, 1, wrong_digest
+        )
