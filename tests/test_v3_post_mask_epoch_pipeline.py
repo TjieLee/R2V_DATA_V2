@@ -48,6 +48,7 @@ from r2v_data_v2.v3.post_mask_epoch_pipeline import (
     SUBJECT_ATTRIBUTES_STARTED,
     StageDispatchError,
     StageHandoffError,
+    _emit_seed_cpu_diagnostics,
     default_pair_runner_factory,
     publish_subject_attribute_receipts,
     run_deterministic_instruct,
@@ -75,6 +76,32 @@ from tests.test_v3_post_mask_epoch_removal import (
 )
 
 PAIR_SHARD = "shard-000000001-000000000"
+
+
+def test_seed_cpu_diagnostics_include_plan_derivation_counters() -> None:
+    events: list[tuple[str, dict[str, Any]]] = []
+    runner = type(
+        "Runner",
+        (),
+        {"plan_derive_counters": {"plan_derive_tasks": 3, "plan_derive_batches": 1}},
+    )()
+
+    _emit_seed_cpu_diagnostics(
+        lambda event, **fields: events.append((event, fields)),
+        "reference_integrity",
+        runner,
+    )
+
+    assert events == [
+        (
+            "post_mask_epoch_seed_cpu_diagnostics",
+            {
+                "stage": "reference_integrity",
+                "plan_derive_tasks": 3,
+                "plan_derive_batches": 1,
+            },
+        )
+    ]
 
 
 def _config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, run_name: str = "run") -> V3Config:

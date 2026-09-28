@@ -255,6 +255,7 @@ def _emit_subject_attributes_cpu_diagnostics(
 
 def _emit_seed_cpu_diagnostics(emit: Any, stage: str, runner: Any) -> None:
     counters = dict(getattr(runner, "seed_counters", None) or {})
+    counters.update(getattr(runner, "plan_derive_counters", None) or {})
     if counters:
         _emit(emit, "post_mask_epoch_seed_cpu_diagnostics", stage=stage, **counters)
 
@@ -933,6 +934,7 @@ def _continue_with_reference_integrity(
         "post_mask_epoch_reference_integrity_seeded",
         seeded_jobs=len(reference_integrity_seed),
     )
+    _emit_seed_cpu_diagnostics(emit, "reference_integrity", reference_integrity)
     reference_integrity_outcome = _run_staged_scheduler(
         emit,
         reference_integrity_scheduler_factory(reference_integrity),
@@ -1590,6 +1592,7 @@ def run_removal_pair_epochs(
     result["reference_edit_job_count"] = len(reference_edit_seed)
     _emit(emit, "post_mask_epoch_reference_edit_seeded",
           seeded_jobs=len(reference_edit_seed))
+    _emit_seed_cpu_diagnostics(emit, "reference_edit", reference_edit)
     reference_edit_outcome = _run_staged_scheduler(
         emit,
         reference_edit_scheduler_factory(reference_edit),

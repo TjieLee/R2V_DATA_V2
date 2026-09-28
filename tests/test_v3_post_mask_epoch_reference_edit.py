@@ -2788,6 +2788,101 @@ def test_seed_parallel_read_only_geometry_keeps_canonical_jobs(
     assert parallel.seed_counters["prepare_peak_inflight"] <= 4
 
 
+def test_fresh_plan_parallel_derivation_matches_serial_plan_and_jobs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(reference_edit_epoch, "_draw_boogu_seed", lambda: 7)
+    config, storage, uids = _fresh_target_shard(tmp_path, monkeypatch, count=6)
+    outcomes = []
+    for label, workers in (("serial", 1), ("parallel", 8)):
+        runner = _plan_runner(config, storage, tmp_path / label, uids)
+        runner.cpu_workers = workers
+        jobs = runner.seed_jobs()
+        outcomes.append(
+            (
+                runner._plan_path(SHARD).read_bytes(),
+                [job.job_id() for job in jobs],
+            )
+        )
+        assert runner.seed_counters["plan_derive_tasks"] == len(uids)
+        assert runner.seed_counters["plan_derive_peak_inflight"] <= 2 * workers
+    assert outcomes[0] == outcomes[1]
+
+
+def test_fresh_plan_derivation_is_bounded_and_actually_parallel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, storage, uids = _fresh_target_shard(tmp_path, monkeypatch, count=10)
+    runner = _plan_runner(config, storage, tmp_path, uids)
+    runner.cpu_workers = 3
+    original = runner._plan_entry
+    lock = threading.Lock()
+    active = 0
+    peak = 0
+
+    def slow_entry(current_storage: Any, clip: Any) -> dict[str, Any]:
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        try:
+            time.sleep(0.025)
+            return original(current_storage, clip)
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(runner, "_plan_entry", slow_entry)
+    runner._plan(SHARD)
+
+    assert 1 < peak <= 3
+    assert runner.seed_counters["plan_derive_tasks"] == len(uids)
+    assert runner.seed_counters["plan_derive_batches"] == 2
+    assert 1 < runner.seed_counters["plan_derive_peak_inflight"] <= 6
+    assert runner.seed_counters["plan_derive_wall_seconds"] > 0
+
+
+def test_fresh_plan_quarantines_in_canonical_order_despite_future_completion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, storage, uids = _fresh_target_shard(tmp_path, monkeypatch, count=3)
+    runner = _plan_runner(config, storage, tmp_path, uids)
+    runner.cpu_workers = 3
+    events: list[str] = []
+    lock = threading.Lock()
+    third_clip_completed = threading.Event()
+    original = storage.read_clip
+    for uid in uids[1:]:
+        storage.clip_path(uid).unlink()
+
+    def out_of_order_read(uid: str) -> Any:
+        if uid == uids[1]:
+            third_clip_completed.wait(timeout=1)
+        try:
+            return original(uid)
+        finally:
+            with lock:
+                events.append(f"derived:{uid}")
+            if uid == uids[2]:
+                third_clip_completed.set()
+
+    monkeypatch.setattr(storage, "read_clip", out_of_order_read)
+    runner.clip_quarantine = ClipQuarantine(
+        emit=lambda _event, **fields: events.append(
+            f"quarantined:{fields['clip_uid']}"
+        )
+    )
+
+    plan = runner._plan(SHARD)
+
+    assert events.index(f"derived:{uids[2]}") < events.index(f"derived:{uids[1]}")
+    assert [event for event in events if event.startswith("quarantined:")] == [
+        f"quarantined:{uids[1]}", f"quarantined:{uids[2]}"
+    ]
+    assert list(plan["clips"]) == [uids[0]]
+    assert plan["preplan_quarantined_clip_uids"] == uids[1:]
+
+
 def test_later_geometry_failure_does_not_preempt_earlier_entity_commit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

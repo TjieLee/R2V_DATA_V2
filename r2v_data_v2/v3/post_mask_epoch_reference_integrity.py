@@ -30,9 +30,11 @@ import copy
 import hashlib
 import io
 import json
+import logging
 import threading
+import time
 from collections import OrderedDict
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -98,6 +100,7 @@ from r2v_data_v2.v3.schemas import (
 from r2v_data_v2.v3.storage import RunStorage
 
 REFERENCE_INTEGRITY_PLAN_SCHEMA = "post_mask_epoch_reference_integrity_plan/1"
+_LOGGER = logging.getLogger(__name__)
 
 
 class _ClipArtifactReadError(Exception):
@@ -649,6 +652,14 @@ class ReferenceIntegrityEpochRunner:
             "plan_stat_miss": 0,
             "plan_content_read_count": 0,
             "plan_semantic_digest_count": 0,
+        }
+        # Invocation-only diagnostics for fresh frozen-plan derivation. These
+        # are never serialized into a plan, job, receipt or stage count.
+        self.plan_derive_counters: dict[str, int | float] = {
+            "plan_derive_tasks": 0,
+            "plan_derive_batches": 0,
+            "plan_derive_peak_inflight": 0,
+            "plan_derive_wall_seconds": 0.0,
         }
 
     # -- durable paths ---------------------------------------------------------
@@ -1356,6 +1367,16 @@ class ReferenceIntegrityEpochRunner:
         self._bump_plan_counter("plan_full_validation_count")
         return dict(payload)
 
+    def _derive_plan_entry(
+        self, storage: RunStorage, clip_uid: str
+    ) -> dict[str, Any]:
+        """Read one fresh clip and derive its entry without durable writes."""
+        try:
+            clip = storage.read_clip(clip_uid)
+        except (OSError, ValueError) as exc:
+            raise _ClipArtifactReadError(exc) from exc
+        return self._plan_entry(storage, clip)
+
     def _plan(self, shard: str) -> dict[str, Any]:
         existing = _read_json(self._plan_path(shard))
         if existing is not None:
@@ -1363,24 +1384,66 @@ class ReferenceIntegrityEpochRunner:
 
         storage = self._storage_for(shard)
         clips: dict[str, dict[str, Any]] = {}
-        for clip_uid in self.eligible.get(shard, ()):
-            if self._is_quarantined(shard, clip_uid):
-                continue
+        eligible = self.eligible.get(shard, ())
+        started = time.perf_counter()
+
+        def apply(clip_uid: str, derive: Callable[[], dict[str, Any]]) -> None:
             try:
-                clip = storage.read_clip(clip_uid)
-            except (OSError, ValueError) as exc:
+                clips[clip_uid] = derive()
+            except _ClipArtifactReadError as caught:
                 if not self._quarantine_local(
-                    shard, storage, clip_uid, exc, known_clip_artifact_read=True
+                    shard, storage, clip_uid, caught.cause,
+                    known_clip_artifact_read=True,
                 ):
-                    raise
-                continue
-            try:
-                clips[clip_uid] = self._plan_entry(storage, clip)
-            except _ClipArtifactReadError as exc:
-                if not self._quarantine_local(
-                    shard, storage, clip_uid, exc.cause, known_clip_artifact_read=True
-                ):
-                    raise exc.cause
+                    raise caught.cause
+
+        try:
+            if self.cpu_workers <= 1:
+                for clip_uid in eligible:
+                    if self._is_quarantined(shard, clip_uid):
+                        continue
+                    self.plan_derive_counters["plan_derive_tasks"] += 1
+                    self.plan_derive_counters["plan_derive_batches"] += 1
+                    self.plan_derive_counters["plan_derive_peak_inflight"] = 1
+                    apply(clip_uid, lambda uid=clip_uid: self._derive_plan_entry(storage, uid))
+            else:
+                budget = self.cpu_workers * 2
+                with ThreadPoolExecutor(
+                    max_workers=self.cpu_workers, thread_name_prefix="ri-plan"
+                ) as pool:
+                    for offset in range(0, len(eligible), budget):
+                        batch = [
+                            clip_uid
+                            for clip_uid in eligible[offset : offset + budget]
+                            if not self._is_quarantined(shard, clip_uid)
+                        ]
+                        if not batch:
+                            continue
+                        futures = [
+                            pool.submit(self._derive_plan_entry, storage, clip_uid)
+                            for clip_uid in batch
+                        ]
+                        self.plan_derive_counters["plan_derive_tasks"] += len(batch)
+                        self.plan_derive_counters["plan_derive_batches"] += 1
+                        self.plan_derive_counters["plan_derive_peak_inflight"] = max(
+                            int(self.plan_derive_counters["plan_derive_peak_inflight"]),
+                            len(futures),
+                        )
+                        for clip_uid, future in zip(batch, futures, strict=True):
+                            apply(clip_uid, future.result)
+        finally:
+            self.plan_derive_counters["plan_derive_wall_seconds"] += (
+                time.perf_counter() - started
+            )
+            _LOGGER.info(
+                "reference_integrity_plan_derive shard=%s tasks=%d batches=%d "
+                "peak_inflight=%d wall_seconds=%.3f",
+                shard,
+                self.plan_derive_counters["plan_derive_tasks"],
+                self.plan_derive_counters["plan_derive_batches"],
+                self.plan_derive_counters["plan_derive_peak_inflight"],
+                self.plan_derive_counters["plan_derive_wall_seconds"],
+            )
         payload = {
             "schema": REFERENCE_INTEGRITY_PLAN_SCHEMA,
             "canonical_shard": shard,

@@ -285,6 +285,10 @@ class ReferenceEditEpochRunner:
         self._seed_counter_lock = threading.Lock()
         self._seed_active = 0
         self.seed_counters: dict[str, int | float] = {
+            "plan_derive_tasks": 0,
+            "plan_derive_batches": 0,
+            "plan_derive_peak_inflight": 0,
+            "plan_derive_wall_seconds": 0.0,
             "prepare_tasks": 0,
             "prepare_parallel_tasks": 0,
             "prepare_peak_inflight": 0,
@@ -433,6 +437,16 @@ class ReferenceEditEpochRunner:
             "pre_references": clip.references.model_dump(mode="json"),
         }
 
+    def _derive_plan_entry(
+        self, storage: RunStorage, clip_uid: str
+    ) -> dict[str, Any]:
+        """Read-only derivation; quarantine and durable writes belong to the caller."""
+        try:
+            clip = storage.read_clip(clip_uid)
+        except (OSError, ValueError) as exc:
+            raise _ClipArtifactReadError(exc) from exc
+        return self._plan_entry(storage, clip)
+
     def _verify_plan_entry(
         self, shard: str, storage: RunStorage, clip_uid: str, entry: dict[str, Any]
     ) -> Any:
@@ -484,24 +498,57 @@ class ReferenceEditEpochRunner:
 
         storage = self._storage_for(shard)
         clips: dict[str, dict[str, Any]] = {}
-        for clip_uid in self.eligible.get(shard, ()):
-            if self._is_quarantined(shard, clip_uid):
-                continue
+        targets = [
+            uid for uid in self.eligible.get(shard, ())
+            if not self._is_quarantined(shard, uid)
+        ]
+
+        def derive_and_apply(clip_uid: str, future: Any = None) -> None:
             try:
-                clip = storage.read_clip(clip_uid)
-            except (OSError, ValueError) as exc:
-                if not self._quarantine_local(
-                    shard, storage, clip_uid, exc, known_clip_artifact_read=True
-                ):
-                    raise
-                continue
-            try:
-                clips[clip_uid] = self._plan_entry(storage, clip)
+                entry = (
+                    self._derive_plan_entry(storage, clip_uid)
+                    if future is None else future.result()
+                )
             except _ClipArtifactReadError as exc:
                 if not self._quarantine_local(
                     shard, storage, clip_uid, exc.cause, known_clip_artifact_read=True
                 ):
                     raise exc.cause
+                return
+            clips[clip_uid] = entry
+
+        started = time.perf_counter()
+        try:
+            workers = max(1, int(self.cpu_workers))
+            if workers == 1 or len(targets) <= 1:
+                for clip_uid in targets:
+                    self.seed_counters["plan_derive_tasks"] += 1
+                    self.seed_counters["plan_derive_batches"] += 1
+                    self.seed_counters["plan_derive_peak_inflight"] = max(
+                        int(self.seed_counters["plan_derive_peak_inflight"]), 1
+                    )
+                    derive_and_apply(clip_uid)
+            else:
+                budget = workers * 2
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    for start in range(0, len(targets), budget):
+                        batch = targets[start : start + budget]
+                        self.seed_counters["plan_derive_tasks"] += len(batch)
+                        self.seed_counters["plan_derive_batches"] += 1
+                        self.seed_counters["plan_derive_peak_inflight"] = max(
+                            int(self.seed_counters["plan_derive_peak_inflight"]),
+                            len(batch),
+                        )
+                        futures = [
+                            pool.submit(self._derive_plan_entry, storage, clip_uid)
+                            for clip_uid in batch
+                        ]
+                        for clip_uid, future in zip(batch, futures, strict=True):
+                            derive_and_apply(clip_uid, future)
+        finally:
+            self.seed_counters["plan_derive_wall_seconds"] += (
+                time.perf_counter() - started
+            )
         payload = {
             "schema": REFERENCE_EDIT_PLAN_SCHEMA,
             "canonical_shard": shard,

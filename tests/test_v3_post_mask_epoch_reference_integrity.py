@@ -3842,6 +3842,136 @@ def _epoch_runner(
     )
 
 
+def test_fresh_plan_parallel_derivation_preserves_json_and_jobs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Scheduling must not change the frozen plan or ModelJob identity."""
+    config, storage, _unused, clip_uids = _multi_clip_fixture(
+        tmp_path,
+        monkeypatch,
+        "run-plan-derive-equivalence",
+        entity_ids_by_clip={f"clip-{i}": ("e1", "e2") for i in range(1, 6)},
+    )
+    serial = _epoch_runner(
+        config, storage, tmp_path / "plan-serial", clip_uids=clip_uids, cpu_workers=1
+    )
+    parallel = _epoch_runner(
+        config, storage, tmp_path / "plan-parallel", clip_uids=clip_uids, cpu_workers=8
+    )
+
+    assert serial._plan(SHARD) == parallel._plan(SHARD)
+    assert serial._plan_path(SHARD).read_bytes() == parallel._plan_path(SHARD).read_bytes()
+    assert serial.seed_jobs() == parallel.seed_jobs()
+
+
+def test_fresh_plan_derives_off_main_and_applies_failures_in_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Out-of-order read failures must quarantine on the main thread in order."""
+    import r2v_data_v2.v3.post_mask_epoch_reference_integrity as module
+
+    _config, storage, runner, clip_uids = _multi_clip_fixture(
+        tmp_path,
+        monkeypatch,
+        "run-plan-derive-failures",
+        entity_ids_by_clip={f"clip-{i}": ("e1",) for i in range(1, 4)},
+        cpu_workers=3,
+    )
+    runner.clip_quarantine = ClipQuarantine()
+    storage.clip_path(clip_uids[1]).unlink()
+    storage.clip_path(clip_uids[2]).unlink()
+    real_read = storage.read_clip
+    third_finished = threading.Event()
+    finished: list[str] = []
+    workers: list[int] = []
+
+    def read_clip(clip_uid: str) -> Any:
+        workers.append(threading.get_ident())
+        if clip_uid == clip_uids[1]:
+            assert third_finished.wait(timeout=5)
+        try:
+            return real_read(clip_uid)
+        finally:
+            if clip_uid in clip_uids[1:]:
+                finished.append(clip_uid)
+                if clip_uid == clip_uids[2]:
+                    third_finished.set()
+
+    monkeypatch.setattr(storage, "read_clip", read_clip)
+    main_thread = threading.get_ident()
+    applications: list[tuple[str, int]] = []
+    real_quarantine = runner._quarantine_local
+
+    def quarantine(shard: str, store: Any, clip_uid: str, exc: Exception, **kwargs: Any) -> bool:
+        applications.append((clip_uid, threading.get_ident()))
+        return real_quarantine(shard, store, clip_uid, exc, **kwargs)
+
+    monkeypatch.setattr(runner, "_quarantine_local", quarantine)
+    plan_writes: list[int] = []
+    real_write = module._write_json_once
+
+    def write_plan(*args: Any, **kwargs: Any) -> Any:
+        plan_writes.append(threading.get_ident())
+        return real_write(*args, **kwargs)
+
+    monkeypatch.setattr(module, "_write_json_once", write_plan)
+    plan = runner._plan(SHARD)
+
+    assert finished == [clip_uids[2], clip_uids[1]]
+    assert applications == [(clip_uids[1], main_thread), (clip_uids[2], main_thread)]
+    assert main_thread not in workers
+    assert plan_writes and set(plan_writes) == {main_thread}
+    assert list(plan["clips"]) == [clip_uids[0]]
+    assert plan["preplan_quarantined_clip_uids"] == list(clip_uids[1:])
+
+
+def test_fresh_plan_derivation_uses_bounded_batches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Large shards cannot retain a future for every eligible clip."""
+    _config, _storage, runner, clip_uids = _multi_clip_fixture(
+        tmp_path,
+        monkeypatch,
+        "run-plan-derive-bounded",
+        entity_ids_by_clip={f"clip-{i}": ("e1",) for i in range(1, 14)},
+        cpu_workers=2,
+    )
+    plan = runner._plan(SHARD)
+
+    assert list(plan["clips"]) == list(clip_uids)
+    assert runner.plan_derive_counters["plan_derive_tasks"] == len(clip_uids)
+    assert runner.plan_derive_counters["plan_derive_batches"] >= 4
+    assert 1 < runner.plan_derive_counters["plan_derive_peak_inflight"] <= 4
+
+
+def test_existing_integrity_plan_does_not_rederive_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Resume reads the frozen structure, not all historical clip artifacts."""
+    _config, _storage, runner, _clip_uids = _multi_clip_fixture(
+        tmp_path,
+        monkeypatch,
+        "run-plan-no-rederive",
+        entity_ids_by_clip={"clip-1": ("e1",), "clip-2": ("e1",)},
+        cpu_workers=8,
+    )
+    frozen = runner._plan(SHARD)
+    resumed = _epoch_runner(
+        runner.config,
+        runner._storage_for(SHARD),
+        runner.ledger.root,
+        clip_uids=("clip-1", "clip-2"),
+        cpu_workers=8,
+    )
+
+    def unexpected(*args: Any, **kwargs: Any) -> Any:
+        pytest.fail("existing frozen plan re-derived a clip entry")
+
+    monkeypatch.setattr(resumed, "_derive_plan_entry", unexpected)
+    assert resumed._plan(SHARD) == frozen
+    assert resumed.plan_derive_counters["plan_derive_tasks"] == 0
+
+
 def test_missing_clip_after_hydration_does_not_block_integrity_sibling(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
