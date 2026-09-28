@@ -36,6 +36,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from heapq import heappop, heappush
 from typing import Any, Protocol
 
 from r2v_data_v2.v3.post_mask_epoch_jobs import (
@@ -171,6 +172,19 @@ class _SchedulerRun:
     """
 
     pending: dict[str, ModelJob] = field(default_factory=dict)
+    #: Newly observed jobs are kept in resource-local heaps until their phase
+    #: has durably planned the whole ready frontier. Neither queue is durable.
+    ready_unplanned: dict[str, list[tuple[tuple[str, str, int, str], str]]] = (
+        field(default_factory=lambda: {name: [] for name in RESOURCE_TYPES})
+    )
+    ready_members: set[str] = field(default_factory=set)
+    ready_counts: dict[str, int] = field(
+        default_factory=lambda: {name: 0 for name in RESOURCE_TYPES}
+    )
+    #: Preserve the old fallback for a custom priority that omits a resource:
+    #: the first ready job by job ID chooses that resource.
+    ready_by_id: list[tuple[str, str]] = field(default_factory=list)
+    classified: dict[str, JobState] = field(default_factory=dict)
     #: Jobs already given one real model attempt in *this* invocation. Post-Mask
     #: has no in-launch automatic retry; restart is the retry.
     attempted: set[str] = field(default_factory=set)
@@ -186,10 +200,24 @@ class _SchedulerRun:
     current: str | None = None
     round_index: int = 0
 
-    def add(self, jobs: Iterable[ModelJob]) -> None:
+    def add(
+        self, jobs: Iterable[ModelJob], *, seed: bool, track_by_id: bool
+    ) -> list[ModelJob]:
+        newly_added: list[ModelJob] = []
         for job in jobs:
-            self.pending.setdefault(job.job_id(), job)
-            self.seed_job_ids.add(job.job_id())
+            job_id = job.job_id()
+            if seed:
+                self.seed_job_ids.add(job_id)
+            if job_id in self.pending:
+                continue
+            self.pending[job_id] = job
+            heappush(self.ready_unplanned[job.resource], (job_order_key(job), job_id))
+            if track_by_id:
+                heappush(self.ready_by_id, (job_id, job.resource))
+            self.ready_members.add(job_id)
+            self.ready_counts[job.resource] += 1
+            newly_added.append(job)
+        return newly_added
 
 
 class SchedulerError(RuntimeError):
@@ -248,6 +276,17 @@ class EpochDiagnostics:
                 "peak_ready_jobs": 0,
                 "peak_inflight": 0,
                 "refill_count": 0,
+                "ready_queue_pushes": 0,
+                "ready_queue_pops": 0,
+                "ready_queue_peak": 0,
+                "classify_calls": 0,
+                "plan_write_calls": 0,
+                "plan_write_jobs": 0,
+                "refill_calls": 0,
+                "refill_wall_seconds": 0.0,
+                "settle_wall_seconds": 0.0,
+                "collect_wait_seconds": 0.0,
+                "capacity_starved_refills": 0,
                 "gpu_slot_job_counts": {},
             },
         )
@@ -300,6 +339,9 @@ class ResourceEpochScheduler:
         self.executors = dict(executors or {})
         self.resource_manager = resource_manager
         self.resource_priority = tuple(resource_priority)
+        self._needs_ready_id_fallback = bool(
+            set(RESOURCE_TYPES) - set(self.resource_priority)
+        )
         self.window_size = window_size
         self.diagnostics = diagnostics if diagnostics is not None else EpochDiagnostics()
         self.max_rounds = max_rounds
@@ -308,13 +350,33 @@ class ResourceEpochScheduler:
         self.close_resource_manager_on_exit = close_resource_manager_on_exit
 
     # -- planning ---------------------------------------------------------
-    def _pick_resource(self, ready: Sequence[ModelJob], current: str | None) -> str:
-        if current is not None and any(job.resource == current for job in ready):
-            return current
+    def _pick_resource(self, run: _SchedulerRun) -> str:
+        if run.current is not None and run.ready_counts[run.current]:
+            return run.current
         for name in self.resource_priority:
-            if any(job.resource == name for job in ready):
+            if run.ready_counts[name]:
                 return name
-        return ready[0].resource
+        while run.ready_by_id:
+            job_id, resource = run.ready_by_id[0]
+            if job_id in run.ready_members:
+                return resource
+            heappop(run.ready_by_id)
+        raise SchedulerError("ready resource index is empty")
+
+    def _add_jobs(
+        self, run: _SchedulerRun, jobs: Iterable[ModelJob], *, seed: bool
+    ) -> None:
+        for job in run.add(
+            jobs, seed=seed, track_by_id=self._needs_ready_id_fallback
+        ):
+            counters = self.diagnostics.resource(job.resource)
+            counters["ready_queue_pushes"] += 1
+            counters["ready_queue_peak"] = max(
+                counters["ready_queue_peak"], run.ready_counts[job.resource]
+            )
+            counters["peak_ready_jobs"] = max(
+                counters["peak_ready_jobs"], run.ready_counts[job.resource]
+            )
 
     def _executor_for(self, resource: str) -> BatchJobExecutor:
         if self.resource_manager is not None:
@@ -330,7 +392,7 @@ class ResourceEpochScheduler:
     def run(self, seed_jobs: Sequence[ModelJob]) -> dict[str, Any]:
         started = time.perf_counter()
         run = _SchedulerRun()
-        run.add(seed_jobs)
+        self._add_jobs(run, seed_jobs, seed=True)
         try:
             self._drain_to_fixed_point(run)
         finally:
@@ -358,7 +420,7 @@ class ResourceEpochScheduler:
         run = _SchedulerRun()
         try:
             for batch in batches:
-                run.add(batch)
+                self._add_jobs(run, batch, seed=True)
                 self._drain_to_fixed_point(run)
         finally:
             self._close_resource_manager()
@@ -367,12 +429,9 @@ class ResourceEpochScheduler:
     def _drain_to_fixed_point(self, run: _SchedulerRun) -> None:
         """Drain every ready job, taking the next phase id for each drain."""
         while run.round_index < self.max_rounds:
-            ready = self._ready(
-                run.pending, run.resolved, run.attempted, run.finalize_attempted
-            )
-            if not ready:
+            if not run.ready_members:
                 return
-            resource = self._pick_resource(ready, run.current)
+            resource = self._pick_resource(run)
             if run.current is not None and resource != run.current:
                 self.diagnostics.resource_switches += 1
             run.current = resource
@@ -395,10 +454,7 @@ class ResourceEpochScheduler:
                     resource,
                     executor,
                     counters,
-                    run.pending,
-                    run.resolved,
-                    run.attempted,
-                    run.finalize_attempted,
+                    run,
                 )
                 if phase.sync_receipts():
                     self.diagnostics.receipt_syncs += 1
@@ -467,10 +523,7 @@ class ResourceEpochScheduler:
         resource: str,
         executor: ResourceJobExecutor,
         counters: dict[str, Any],
-        pending: dict[str, ModelJob],
-        resolved: set[str],
-        attempted: set[str],
-        finalize_attempted: set[str],
+        run: _SchedulerRun,
     ) -> bool:
         """Run one resource to its completion-driven fixed point.
 
@@ -487,34 +540,37 @@ class ResourceEpochScheduler:
         thrashing the loaded model.
         """
         inflight: dict[str, ModelJob] = {}
-        planned: dict[str, JobState] = {}
+        planned_ready: list[tuple[tuple[str, str, int, str], str]] = []
         progressed = False
         while True:
-            before = (len(resolved), len(attempted), len(pending))
+            before = (len(run.resolved), len(run.attempted), len(run.pending))
             self._refill(
                 resource,
                 executor,
                 counters,
                 phase,
-                planned,
+                planned_ready,
                 inflight,
-                pending,
-                resolved,
-                attempted,
-                finalize_attempted,
+                run,
             )
             if not inflight:
                 # Nothing running and nothing ready: this resource is done. A
                 # refill that only replayed durable finalizers still counts as
                 # progress, because it can unlock work for the next resource.
                 progressed = progressed or (
-                    len(resolved),
-                    len(attempted),
-                    len(pending),
+                    len(run.resolved),
+                    len(run.attempted),
+                    len(run.pending),
                 ) != before
                 break
             self.diagnostics.window_count += 1
-            completions = executor.collect()
+            collecting_started = time.perf_counter()
+            try:
+                completions = executor.collect()
+            finally:
+                counters["collect_wait_seconds"] += (
+                    time.perf_counter() - collecting_started
+                )
             if not completions and inflight:
                 # ``collect`` promises to block until something settles. Anything
                 # else would spin here forever on work that can never finish.
@@ -534,26 +590,20 @@ class ResourceEpochScheduler:
                 executor,
                 counters,
                 phase,
-                planned,
+                planned_ready,
                 inflight,
-                pending,
-                resolved,
-                attempted,
-                finalize_attempted,
+                run,
             )
             if counters["jobs_submitted"] > submitted_before:
                 counters["refill_count"] += 1
             for execution in completions:
-                self._settle(
-                    phase_id,
-                    phase,
-                    counters,
-                    execution,
-                    pending,
-                    resolved,
-                    attempted,
-                    finalize_attempted,
-                )
+                settling_started = time.perf_counter()
+                try:
+                    self._settle(phase_id, phase, counters, execution, run)
+                finally:
+                    counters["settle_wall_seconds"] += (
+                        time.perf_counter() - settling_started
+                    )
                 # A finalizer is CPU work and can be slow. Anything it unlocked
                 # for this resource is submitted before the next sibling is
                 # settled, so one slow finalizer cannot idle every free slot.
@@ -563,16 +613,13 @@ class ResourceEpochScheduler:
                     executor,
                     counters,
                     phase,
-                    planned,
+                    planned_ready,
                     inflight,
-                    pending,
-                    resolved,
-                    attempted,
-                    finalize_attempted,
+                    run,
                 )
                 if counters["jobs_submitted"] > submitted_before:
                     counters["refill_count"] += 1
-            after = (len(resolved), len(attempted), len(pending))
+            after = (len(run.resolved), len(run.attempted), len(run.pending))
             if before != after:
                 progressed = True
         return progressed
@@ -583,81 +630,90 @@ class ResourceEpochScheduler:
         executor: ResourceJobExecutor,
         counters: dict[str, Any],
         phase: Any,
-        planned: dict[str, JobState],
+        planned_ready: list[tuple[tuple[str, str, int, str], str]],
         inflight: dict[str, ModelJob],
-        pending: dict[str, ModelJob],
-        resolved: set[str],
-        attempted: set[str],
-        finalize_attempted: set[str],
+        run: _SchedulerRun,
     ) -> None:
-        """Top up in-flight work for one resource from its ready set.
+        """Top up in-flight work without rescanning the pending map.
 
-        A job with a durable receipt is skipped here but still has its finalizer
-        replayed, which can unlock further ready jobs, so the ready set is
-        recomputed while capacity remains.
+        Newly unlocked jobs join the planned heap before this call takes its
+        first job. A durable replay can unlock more jobs while the current
+        ready wave is being consumed; as before, finish that snapshotted wave
+        before considering those unlocks.
         """
-        capacity = executor.capacity()
-        while True:
+        started = time.perf_counter()
+        counters["refill_calls"] += 1
+        try:
+            capacity = executor.capacity()
             if capacity > 0 and len(inflight) >= capacity:
                 return
-            ready = sorted(
-                (
-                    job
-                    for job in self._ready(
-                        pending, resolved, attempted, finalize_attempted
-                    )
-                    if job.resource == resource and job.job_id() not in inflight
-                ),
-                key=job_order_key,
-            )
-            if not ready:
-                return
-            counters["peak_ready_jobs"] = max(
-                counters["peak_ready_jobs"], len(ready)
-            )
-            newly_ready = [
-                job for job in ready if job.job_id() not in planned
-            ]
-            if newly_ready:
-                states = {
-                    job.job_id(): self.ledger.classify(job)
-                    for job in newly_ready
-                }
-                for job in newly_ready:
-                    if states[job.job_id()].state == STATE_MISMATCH:
-                        raise SchedulerError(
-                            f"{job.job_id()}: "
-                            f"{states[job.job_id()].detail or 'receipt mismatch'}"
-                        )
-                # Register the current ready frontier once, before any worker
-                # can finish. Later dependency unlocks extend this same plan.
-                phase.write_plan(newly_ready)
-                planned.update(states)
-                counters["jobs_planned"] += len(newly_ready)
-            handled = 0
-            for job in ready:
+            self._plan_frontier(resource, phase, counters, planned_ready, run)
+            while True:
                 if capacity > 0 and len(inflight) >= capacity:
                     return
-                handled += 1
-                state = planned[job.job_id()]
+                if not planned_ready:
+                    self._plan_frontier(resource, phase, counters, planned_ready, run)
+                if not planned_ready:
+                    if inflight:
+                        counters["capacity_starved_refills"] += 1
+                    return
+                _, job_id = heappop(planned_ready)
+                run.ready_members.remove(job_id)
+                run.ready_counts[resource] -= 1
+                counters["ready_queue_pops"] += 1
+                job = run.pending[job_id]
+                state = run.classified.pop(job_id)
                 if state.skippable:
                     counters["jobs_skipped_durable"] += 1
                     self.diagnostics.resume["receipts_reused"] += 1
                     if state.state == "rerun_no_receipt":
                         self.diagnostics.resume["jobs_rerun_after_incomplete_commit"] += 1
-                    self._replay_committed(job, pending, resolved, finalize_attempted)
+                    self._replay_committed(job, run)
                     continue
                 if state.state == "rerun_no_receipt":
                     self.diagnostics.resume["jobs_rerun_after_incomplete_commit"] += 1
-                attempted.add(job.job_id())
-                inflight[job.job_id()] = job
+                run.attempted.add(job_id)
+                inflight[job_id] = job
                 counters["jobs_submitted"] += 1
                 counters["peak_inflight"] = max(
                     counters["peak_inflight"], len(inflight)
                 )
                 executor.submit(job)
-            if not handled:
-                return
+        finally:
+            counters["refill_wall_seconds"] += time.perf_counter() - started
+
+    def _plan_frontier(
+        self,
+        resource: str,
+        phase: Any,
+        counters: dict[str, Any],
+        planned_ready: list[tuple[tuple[str, str, int, str], str]],
+        run: _SchedulerRun,
+    ) -> None:
+        """Plan one entire newly ready wave before submitting any of it."""
+        unplanned = run.ready_unplanned[resource]
+        if not unplanned:
+            return
+        frontier = [run.pending[heappop(unplanned)[1]] for _ in range(len(unplanned))]
+        states: dict[str, JobState] = {}
+        for job in frontier:
+            job_id = job.job_id()
+            state = run.classified.get(job_id)
+            if state is None:
+                state = self.ledger.classify(job)
+                counters["classify_calls"] += 1
+            if state.state == STATE_MISMATCH:
+                raise SchedulerError(
+                    f"{job_id}: {state.detail or 'receipt mismatch'}"
+                )
+            states[job_id] = state
+        phase.write_plan(frontier)
+        counters["plan_write_calls"] += 1
+        counters["plan_write_jobs"] += len(frontier)
+        counters["jobs_planned"] += len(frontier)
+        run.classified.update(states)
+        for job in frontier:
+            heappush(planned_ready, (job_order_key(job), job.job_id()))
 
     def _settle(
         self,
@@ -665,10 +721,7 @@ class ResourceEpochScheduler:
         phase: Any,
         counters: dict[str, Any],
         execution: JobExecution,
-        pending: dict[str, ModelJob],
-        resolved: set[str],
-        attempted: set[str],
-        finalize_attempted: set[str],
+        run: _SchedulerRun,
     ) -> None:
         """Publish, commit and finalize one settled job on the scheduler thread.
 
@@ -714,14 +767,12 @@ class ResourceEpochScheduler:
         else:
             counters["jobs_retryable_failed"] += 1
         if result.committed:
-            self._finalize(job, result, pending, resolved, finalize_attempted)
+            self._finalize(job, result, run)
 
     def _replay_committed(
         self,
         job: ModelJob,
-        pending: dict[str, ModelJob],
-        resolved: set[str],
-        finalize_attempted: set[str],
+        run: _SchedulerRun,
     ) -> None:
         """Re-run the CPU finalizer for an already-committed job.
 
@@ -735,19 +786,17 @@ class ResourceEpochScheduler:
                 f"{job.job_id()}: committed job has no replayable durable result"
             )
         self.diagnostics.resume["finalizers_replayed"] += 1
-        self._finalize(job, result, pending, resolved, finalize_attempted)
+        self._finalize(job, result, run)
 
     def _finalize(
         self,
         job: ModelJob,
         result: JobResult,
-        pending: dict[str, ModelJob],
-        resolved: set[str],
-        finalize_attempted: set[str],
+        run: _SchedulerRun,
     ) -> None:
         # Marked before the call so a raising finalizer still counts as this
         # invocation's single attempt.
-        finalize_attempted.add(job.job_id())
+        run.finalize_attempted.add(job.job_id())
         try:
             unlocked = self.finalize(job, result) or ()
         except Exception:  # noqa: BLE001 - finalizer failure must not be silent
@@ -756,6 +805,5 @@ class ResourceEpochScheduler:
             # finalizer is replayed on the next run instead of being retried
             # inside this invocation.
             return
-        for unlocked_job in unlocked:
-            pending.setdefault(unlocked_job.job_id(), unlocked_job)
-        resolved.add(job.job_id())
+        self._add_jobs(run, unlocked, seed=False)
+        run.resolved.add(job.job_id())
