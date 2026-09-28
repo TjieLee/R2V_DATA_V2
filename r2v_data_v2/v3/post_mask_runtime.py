@@ -868,11 +868,18 @@ def _validate_publication(storage: RunStorage, paths: ShardPaths) -> DatasetReco
     return dataset
 
 
-def _cleanup_export_staging(storage: RunStorage, paths: ShardPaths) -> None:
+def _cleanup_export_staging(
+    storage: RunStorage,
+    paths: ShardPaths,
+    *,
+    identity: Mapping[str, Any] | None = None,
+) -> None:
     intent = paths.state_root / "export_identity.json"
     if not intent.is_file():
         return
-    if json.loads(intent.read_text()) != _export_identity(storage, paths):
+    if json.loads(intent.read_text()) != (
+        identity if identity is not None else _export_identity(storage, paths)
+    ):
         raise ValueError("export staging owner identity mismatch")
     pattern = re.compile(re.escape(f".{paths.export_root.name}.tmp-") + r"[0-9a-f]{32}")
     for path in paths.export_root.parent.glob(f".{paths.export_root.name}.tmp-*"):

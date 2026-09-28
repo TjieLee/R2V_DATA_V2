@@ -1846,7 +1846,6 @@ def export_shard(
         _ShardStorage,
     )
     from r2v_data_v2.v3.storage import DatasetExporter
-    from r2v_data_v2.v3.subject_attributes import reconcile_subject_attribute_outputs
 
     if formal_production:
         from r2v_data_v2.v3.post_mask_epoch_production import (
@@ -1882,16 +1881,22 @@ def export_shard(
                 f"sealed export publication drifted: {paths.export_root}"
             )
         return {"sample_count": expected["sample_count"], "rebuilt": False}
-    reconcile_subject_attribute_outputs(
-        storage=selected,
-        output_root=storage.root / "subject_attributes",
-        owner_limit=None,
-        invocation_wall_time_seconds=0.0,
-    )
-    _cleanup_export_staging(selected, paths)
+    if not formal_production:
+        from r2v_data_v2.v3.subject_attributes import (
+            reconcile_subject_attribute_outputs,
+        )
+
+        reconcile_subject_attribute_outputs(
+            storage=selected,
+            output_root=storage.root / "subject_attributes",
+            owner_limit=None,
+            invocation_wall_time_seconds=0.0,
+        )
+    export_identity = _export_identity(selected, paths)
+    _cleanup_export_staging(selected, paths, identity=export_identity)
     atomic_write_json(
         _shard_state_root(paths) / "export_identity.json",
-        _export_identity(selected, paths),
+        export_identity,
     )
     dataset = DatasetExporter(storage.config, selected).export(
         overwrite=Path(paths.export_root).exists()

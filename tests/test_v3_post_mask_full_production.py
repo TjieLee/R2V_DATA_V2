@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import subprocess
 from contextlib import contextmanager
@@ -233,6 +234,9 @@ def test_formal_export_missing_marker_uses_existing_exporter(tmp_path, monkeypat
         export_root=tmp_path / "exports" / "shard-000000000-000009999",
     )
     calls = []
+    identity = {"semantic": "test"}
+    paths.state_root.mkdir(parents=True)
+    (paths.state_root / "export_identity.json").write_text(json.dumps(identity))
 
     class FakeExporter:
         def __init__(self, config, storage):
@@ -249,15 +253,11 @@ def test_formal_export_missing_marker_uses_existing_exporter(tmp_path, monkeypat
     )
     monkeypatch.setattr(
         "r2v_data_v2.v3.subject_attributes.reconcile_subject_attribute_outputs",
-        lambda **_: calls.append("reconcile"),
-    )
-    monkeypatch.setattr(
-        "r2v_data_v2.v3.post_mask_runtime._cleanup_export_staging",
-        lambda *_: calls.append("cleanup"),
+        lambda **_: pytest.fail("formal Export must not reconcile completed SAT"),
     )
     monkeypatch.setattr(
         "r2v_data_v2.v3.post_mask_runtime._export_identity",
-        lambda *_: {"semantic": "test"},
+        lambda *_: calls.append("identity") or identity,
     )
     monkeypatch.setattr("r2v_data_v2.v3.storage.DatasetExporter", FakeExporter)
     storage = SimpleNamespace(root=tmp_path / "run", config=object())
@@ -265,7 +265,7 @@ def test_formal_export_missing_marker_uses_existing_exporter(tmp_path, monkeypat
         storage, paths, ("a", "b"), formal_production=True
     )
     assert result == {"sample_count": 2, "rebuilt": True}
-    assert calls == ["reconcile", "cleanup", "construct", ("export", False)]
+    assert calls == ["identity", "construct", ("export", False)]
     assert (paths.state_root / "export_identity.json").is_file()
     assert production.production_shard_completed(paths, ("a", "b")) == 2
 
