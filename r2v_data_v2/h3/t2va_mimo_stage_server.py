@@ -35,7 +35,9 @@ def build_mimo_serve_command(
             "--served-model-name", served_model_name,
             "--host", "127.0.0.1", "--port", str(port),
             "--tp", "4", "--moe-runner-backend", "marlin",
-            "--disable-custom-all-reduce", "--trust-remote-code",
+            "--disable-custom-all-reduce",
+            "--mem-fraction-static", f"{mem_fraction_static:g}",
+            "--trust-remote-code",
             "--reasoning-parser", "mimo", "--tool-call-parser", "mimo",
             "--enable-deterministic-inference",
         ]
