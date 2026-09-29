@@ -2,7 +2,6 @@
 
 from pathlib import Path
 
-
 REPO = Path(__file__).resolve().parents[1]
 LAUNCHER = REPO / "scripts/run_h3_t2va_full_production.sh"
 
@@ -28,3 +27,10 @@ def test_full_launcher_keeps_sam_runtime_path_before_pythonpath_clear():
     runtime_default = text.index("export SAM_AUDIO_RUNTIME_PYTHONPATH=")
     pythonpath_clear = text.index("unset PYTHONPATH")
     assert runtime_default < pythonpath_clear
+
+
+def test_full_launcher_v26_preview_keeps_deterministic_tp4_marlin_command():
+    text = LAUNCHER.read_text()
+    v26 = text.split('if [[ "$MIMO_MODEL" == "mimo-v2.6-flash-rl" ]]; then\n  if [[ -z', 1)[1]
+    assert '--tp 4 --moe-runner-backend marlin --disable-custom-all-reduce' in v26
+    assert '--enable-deterministic-inference' in v26.split('serve_second=', 1)[0]

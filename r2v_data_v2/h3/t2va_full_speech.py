@@ -7,7 +7,7 @@ import json
 import os
 import subprocess
 import tempfile
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from functools import cache
@@ -280,6 +280,15 @@ class _BatchedASRWorker:
         self._decoder = ThreadPoolExecutor(max_workers=8, thread_name_prefix="asr-stem")
         self._stems = OrderedDict()
         self.unique_stem_decode_count = 0
+        self._batch_sizes = Counter()
+        self._segment_count = 0
+
+    def metrics(self):
+        return {
+            "asr_batch_size_distribution": dict(sorted(self._batch_sizes.items())),
+            "asr_unique_stem_decode_count": self.unique_stem_decode_count,
+            "asr_segment_count": self._segment_count,
+        }
 
     def close(self):
         self._decoder.shutdown(wait=True, cancel_futures=True)
@@ -337,6 +346,8 @@ class _BatchedASRWorker:
             except Exception as exc:  # noqa: BLE001 - isolate one unusable segment
                 results[index] = exc
         if valid:
+            self._batch_sizes[len(valid)] += 1
+            self._segment_count += len(valid)
             transcribed = _inference(
                 self.backend,
                 lambda: self.backend.transcribe_batch(

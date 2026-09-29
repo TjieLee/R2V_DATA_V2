@@ -19,7 +19,7 @@ import sys
 import tempfile
 import time
 import uuid
-from collections import deque
+from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from pathlib import Path
@@ -227,6 +227,7 @@ def execute_stage(
     media; validated ready jobs are never touched. Atomic receipts are published
     only after successful output hashing and fsync.
     """
+    stage_started = time.monotonic()
     if (
         not isinstance(factory, str)
         or len(factory.split(":")) != 2
@@ -262,6 +263,27 @@ def execute_stage(
             }
         )
     if not items:
+        root = Path(stage_root).resolve()
+        _atomic_json(
+            root / "invocation.json",
+            {
+                "job_count": 0,
+                "scheduled_job_count": 0,
+                "reused_ready_count": 0,
+                "worker_count": 0,
+                "ready_count": 0,
+                "failed_count": 0,
+                "model_load_wall_seconds": 0.0,
+                "processing_wall_seconds": 0.0,
+                "cpu_finalize_seconds_sum": 0.0,
+                "model_runtime_seconds_sum": 0.0,
+                "model_job_count": 0,
+                "model_batch_count": 0,
+                "gpu_slot_job_counts": {},
+                "stage_wall_seconds": time.monotonic() - stage_started,
+                "throughput_jobs_per_second": 0.0,
+            },
+        )
         return {}
     if not gpu_ids or any(
         not isinstance(gpu, str) or not gpu.strip() or "," in gpu for gpu in gpu_ids
@@ -276,16 +298,28 @@ def execute_stage(
             results[item["job"]["job_id"]] = cached
         else:
             pending.append(item)
-    _atomic_json(
-        root / "invocation.json",
-        {
-            "job_count": len(items),
-            "scheduled_job_count": len(pending),
-            "reused_ready_count": len(results),
-            "worker_count": min(len(pending), len(gpu_ids)),
-        },
-    )
+    metrics = {
+        "job_count": len(items),
+        "scheduled_job_count": len(pending),
+        "reused_ready_count": len(results),
+        "worker_count": min(len(pending), len(gpu_ids)),
+        "model_load_wall_seconds": 0.0,
+        "processing_wall_seconds": 0.0,
+        "cpu_finalize_seconds_sum": 0.0,
+        "model_runtime_seconds_sum": 0.0,
+        "model_job_count": 0,
+        "model_batch_count": 0,
+        "gpu_slot_job_counts": {},
+    }
+    _atomic_json(root / "invocation.json", metrics)
     if not pending:
+        metrics.update(
+            ready_count=len(results),
+            failed_count=0,
+            stage_wall_seconds=time.monotonic() - stage_started,
+            throughput_jobs_per_second=0.0,
+        )
+        _atomic_json(root / "invocation.json", metrics)
         return {item["job"]["job_id"]: results[item["job"]["job_id"]] for item in items}
 
     invocation = root / "workers" / uuid.uuid4().hex
@@ -301,6 +335,7 @@ def execute_stage(
     try:
         for sig in previous:
             signal.signal(sig, _interrupted)
+        load_started = time.monotonic()
         for rank, gpu in enumerate(gpu_ids[: min(len(pending), len(gpu_ids))]):
             manifest = invocation / f"worker-{rank}" / "request.json"
             _atomic_json(
@@ -342,6 +377,19 @@ def execute_stage(
                         signal.pthread_sigmask(signal.SIG_SETMASK, mask)
             except OSError as exc:
                 errors.append(f"worker-{rank} could not start: {exc}")
+        while not errors and any(
+            not manifest.with_name("ready.json").exists() for manifest in manifests
+        ):
+            for process in processes:
+                if process.poll() is not None:
+                    errors.append(f"worker pid={process.pid} exited {process.returncode} before ready")
+            if not errors:
+                time.sleep(0.01)
+        if errors:
+            raise WorkerStageError("; ".join(errors))
+        metrics["model_load_wall_seconds"] = time.monotonic() - load_started
+        dispatched_at = time.monotonic()
+        _atomic_json(queue_path.with_name("dispatch.json"), {"ready": True})
         for process in processes:
             code = process.wait()
             if code != 0:
@@ -357,6 +405,50 @@ def execute_stage(
                 results[item["job"]["job_id"]] = value
         if errors:
             raise WorkerStageError("; ".join(errors))
+        worker_rows = [
+            _read_json(manifest.with_name("metrics.json")) for manifest in manifests
+        ]
+        if any(not isinstance(row, dict) for row in worker_rows):
+            raise WorkerStageError("worker timing metrics missing")
+        metrics["model_job_count"] = sum(row["model_job_count"] for row in worker_rows)
+        metrics["model_batch_count"] = sum(row["model_batch_count"] for row in worker_rows)
+        metrics["model_runtime_seconds_sum"] = sum(
+            row["model_runtime_seconds_sum"] for row in worker_rows
+        )
+        metrics["cpu_finalize_seconds_sum"] = sum(
+            row["cpu_finalize_seconds_sum"] for row in worker_rows
+        )
+        metrics["gpu_slot_job_counts"] = {
+            row["gpu_id"]: row["model_job_count"] for row in worker_rows
+        }
+        metrics["backend_metrics_by_gpu"] = {
+            row["gpu_id"]: row["backend_metrics"]
+            for row in worker_rows if row["backend_metrics"]
+        }
+        if metrics["backend_metrics_by_gpu"]:
+            batches = Counter()
+            for extra in metrics["backend_metrics_by_gpu"].values():
+                batches.update(extra.get("asr_batch_size_distribution", {}))
+            if batches:
+                metrics["asr_batch_size_distribution"] = dict(sorted(batches.items()))
+                for name in ("asr_unique_stem_decode_count", "asr_segment_count"):
+                    metrics[name] = sum(
+                        extra.get(name, 0)
+                        for extra in metrics["backend_metrics_by_gpu"].values()
+                    )
+        completed_at = max(
+            (row["last_model_completed_monotonic"] or dispatched_at)
+            for row in worker_rows
+        )
+        metrics["processing_wall_seconds"] = max(0.0, completed_at - dispatched_at)
+        wall = time.monotonic() - stage_started
+        metrics.update(
+            ready_count=sum(row["status"] == "ready" for row in results.values()),
+            failed_count=sum(row["status"] == "failed" for row in results.values()),
+            stage_wall_seconds=wall,
+            throughput_jobs_per_second=len(pending) / wall if wall else 0.0,
+        )
+        _atomic_json(root / "invocation.json", metrics)
         return {item["job"]["job_id"]: results[item["job"]["job_id"]] for item in items}
     finally:
         for sig in previous:
@@ -386,6 +478,7 @@ def _claim_many(cursor: Path, count: int, size: int) -> list[int]:
 
 
 def _publish_result(backend, request, item, output, intermediate, error):
+    started = time.monotonic()
     directory = output.parent
     files = None
     try:
@@ -422,6 +515,7 @@ def _publish_result(backend, request, item, output, intermediate, error):
             **row,
         },
     )
+    return time.monotonic() - started
 
 
 def _worker(manifest: Path) -> None:
@@ -441,9 +535,17 @@ def _worker(manifest: Path) -> None:
         max_workers=2, thread_name_prefix="stage-finalize"
     ) as finalizers:
         outstanding = deque()
+        model_job_count = 0
+        model_batch_count = 0
+        model_runtime_seconds_sum = 0.0
+        cpu_finalize_seconds_sum = 0.0
+        last_model_completed = None
         size = getattr(backend, "batch_size", 1)
         if type(size) is not int or not 1 <= size <= 16:
             raise ValueError("worker batch size must be between 1 and 16")
+        _atomic_json(manifest.with_name("ready.json"), {"ready": True})
+        while not queue_path.with_name("dispatch.json").exists():
+            time.sleep(0.01)
         cursor = queue_path.with_name("cursor")
         current = _claim_many(cursor, len(items), size)
         prefetch = getattr(backend, "prefetch_batch", None)
@@ -467,6 +569,9 @@ def _worker(manifest: Path) -> None:
                 prepared.append((item, output))
             infer_batch = getattr(backend, "infer_batch", None)
             if infer_batch:
+                model_started = time.monotonic()
+                model_job_count += len(prepared)
+                model_batch_count += 1
                 try:
                     intermediate_rows = infer_batch(
                         [item["job"] for item, _ in prepared],
@@ -476,9 +581,15 @@ def _worker(manifest: Path) -> None:
                         raise ValueError("worker batch result count differs")
                 except Exception as exc:  # noqa: BLE001 - isolate batch sample errors
                     intermediate_rows = [exc] * len(prepared)
+                model_finished = time.monotonic()
+                model_runtime_seconds_sum += model_finished - model_started
+                last_model_completed = model_finished
             else:
                 intermediate_rows = []
                 for item, output in prepared:
+                    model_started = time.monotonic()
+                    model_job_count += 1
+                    model_batch_count += 1
                     try:
                         batch = getattr(backend, "batch_jobs", None)
                         with batch([item["job"]]) if batch else nullcontext():
@@ -486,6 +597,9 @@ def _worker(manifest: Path) -> None:
                             intermediate_rows.append((infer or backend.process)(item["job"], output))
                     except Exception as exc:  # noqa: BLE001 - isolate sample errors
                         intermediate_rows.append(exc)
+                    model_finished = time.monotonic()
+                    model_runtime_seconds_sum += model_finished - model_started
+                    last_model_completed = model_finished
             for (item, output), intermediate in zip(prepared, intermediate_rows, strict=True):
                 error = intermediate if isinstance(intermediate, Exception) else None
                 if error is not None:
@@ -496,12 +610,25 @@ def _worker(manifest: Path) -> None:
                     )
                 )
                 if len(outstanding) >= 4:
-                    outstanding.popleft().result()
+                    cpu_finalize_seconds_sum += outstanding.popleft().result()
             current = following or _claim_many(cursor, len(items), size)
             if current and prefetch and current is not following:
                 prefetch([items[index]["job"] for index in current])
         while outstanding:
-            outstanding.popleft().result()
+            cpu_finalize_seconds_sum += outstanding.popleft().result()
+        extra = getattr(backend, "metrics", None)
+        _atomic_json(
+            manifest.with_name("metrics.json"),
+            {
+                "gpu_id": request["gpu_id"],
+                "model_job_count": model_job_count,
+                "model_batch_count": model_batch_count,
+                "model_runtime_seconds_sum": model_runtime_seconds_sum,
+                "cpu_finalize_seconds_sum": cpu_finalize_seconds_sum,
+                "last_model_completed_monotonic": last_model_completed,
+                "backend_metrics": extra() if extra else {},
+            },
+        )
     _atomic_json(manifest.with_name("complete.json"), {"complete": True})
 
 

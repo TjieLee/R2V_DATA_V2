@@ -261,6 +261,13 @@ def test_full_supervisor_stage_order(tmp_path, capsys):
         "asr",
         "mimo",
     )
+    timing = json.loads(
+        (tmp_path / "shards" / production.shard_name(59) / "stage_timing" / "sam.json").read_text()
+    )
+    assert timing["stage_wall_seconds"] >= 0
+    assert timing["ready_count"] == 2
+    assert timing["failed_count"] == 1
+    assert "stage_wall_seconds" not in result[59]["sam"]
 
 
 def test_node_lifetime_does_not_start_persistent_upstream_pools(tmp_path, monkeypatch):
@@ -701,10 +708,16 @@ def test_full_cli_dry_run_does_not_require_models(tmp_path):
             "--mimo-call-mode", "single",
             "--mimo-gpu-groups", "0,1,2,3;4,5,6,7",
             "--mimo-ports", "8094,8095",
+            "--request-workers", "4",
+            "--asr-batch-size", "8",
+            "--max-clip-duration-seconds", "20",
         ]
     )
     assert single["mimo_model"] == "mimo-v2.6-flash-rl"
     assert single["mimo_call_mode"] == "single"
+    assert single["request_workers"] == 4
+    assert single["asr_batch_size"] == 8
+    assert single["max_clip_duration_seconds"] == 20
     assert single["mimo_endpoints"] == [
         {"gpu_group": "0,1,2,3", "port": 8094},
         {"gpu_group": "4,5,6,7", "port": 8095},

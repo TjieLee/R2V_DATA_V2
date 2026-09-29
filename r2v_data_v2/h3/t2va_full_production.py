@@ -135,6 +135,23 @@ def run_assigned_shards(root, shard_ids, pipeline):
                         raise
                     if hasattr(result, "model_dump"):
                         result = result.model_dump(mode="json")
+                    timing = dict(getattr(pipeline, "last_stage_metrics", {}) or {})
+                    timing["stage_wall_seconds"] = time.monotonic() - started
+                    timing.setdefault("ready_count", result.get("ready_count", result.get("ready", 0)))
+                    timing.setdefault("failed_count", result.get("failed_count", result.get("failed", 0)))
+                    count = timing.get("scheduled_job_count", timing.get("job_count", 0))
+                    timing["throughput_jobs_per_second"] = (
+                        count / timing["stage_wall_seconds"]
+                        if timing["stage_wall_seconds"] else 0.0
+                    )
+                    if "model_call_count" in timing:
+                        timing["model_calls_per_second"] = (
+                            timing["model_call_count"] / timing["stage_wall_seconds"]
+                            if timing["stage_wall_seconds"] else 0.0
+                        )
+                    production.atomic_json(
+                        shard / "stage_timing" / f"{name}.json", timing
+                    )
                     production.atomic_json(
                         shard / "stage_state" / f"{name}.json", result
                     )
@@ -197,6 +214,15 @@ class FullPipeline:
         self.prepared = {}
         self.prefetch = None
         self.pools = None
+        self.last_stage_metrics = {}
+
+    @staticmethod
+    def _execution_metrics(path):
+        try:
+            value = json.loads((path / "invocation.json").read_text())
+        except (OSError, ValueError):
+            return {}
+        return value if isinstance(value, dict) else {}
 
     @contextmanager
     def node(self, shard_ids):
@@ -258,6 +284,7 @@ class FullPipeline:
         shard = self.root / "shards" / production.shard_name(shard_id)
         state = shard / "stage_state"
         execution = {}
+        self.last_stage_metrics = {}
         if name == "canonical":
             if self.prefetch is not None and shard_id in self.prepared:
                 # Re-read after taking invocation ownership: another node may
@@ -319,7 +346,7 @@ class FullPipeline:
                 model_configuration=self.sam_configuration,
                 route="music_first",
             )
-            return stems.run_sam(
+            result = stems.run_sam(
                 inventory,
                 shadow / "separation",
                 state / "sam",
@@ -328,6 +355,8 @@ class FullPipeline:
                 ffprobe=self.ffprobe,
                 **execution,
             )
+            self.last_stage_metrics = self._execution_metrics(state / "sam")
+            return result
         if name == "auk":
             _, records, _ = sam.load_stem_shadow(shadow / "separation")
             eligible = {r.clip_uid for r in records if r.separation_state != "failure"}
@@ -337,7 +366,7 @@ class FullPipeline:
                 case_manifest_path=audio_root / "case_manifest.json",
                 configuration=self.auk_configuration,
             )
-            return stems.run_auk(
+            result = stems.run_auk(
                 inventory,
                 state / "auk",
                 self.gpu_ids,
@@ -345,6 +374,8 @@ class FullPipeline:
                 ffmpeg=self.ffmpeg,
                 **execution,
             )
+            self.last_stage_metrics = self._execution_metrics(state / "auk")
+            return result
         if name == "resolve":
             return resolve_audio_stems(
                 audio_production_root=audio_root,
@@ -365,6 +396,7 @@ class FullPipeline:
                 **({"batch_size": self.asr_batch_size} if name == "asr" and self.asr_batch_size > 1 else {}),
                 **execution,
             )
+            self.last_stage_metrics = self._execution_metrics(state / name)
             provenance = result["provenance"]
             return {
                 "job_count": result["job_count"],
@@ -397,6 +429,25 @@ class FullPipeline:
                     request_workers=self.request_workers,
                     run_id=RUN_ID,
                 )
+                processed_at = time.monotonic()
+                metrics = (
+                    self.mimo_lifecycle.stage_metrics()
+                    if self.mimo_lifecycle is not None
+                    and hasattr(self.mimo_lifecycle, "stage_metrics")
+                    else {}
+                )
+                last_model = metrics.pop("last_model_completion_monotonic", None)
+                metrics["cpu_finalize_tail_wall_seconds"] = (
+                    max(0.0, processed_at - last_model) if last_model is not None else 0.0
+                )
+                metrics["job_count"] = len(states)
+                metrics["ready_count"] = sum(
+                    row["t2va_status"] == "ready" for row in states.values()
+                )
+                metrics["failed_count"] = sum(
+                    row["t2va_status"] == "failed" for row in states.values()
+                )
+                self.last_stage_metrics = metrics
             return {
                 f"{stage}_{status}": sum(
                     row[f"{stage}_status"] == status for row in states.values()

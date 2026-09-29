@@ -28,6 +28,7 @@ class Backend:
         with (self.root / (str(self.pid) + ".jsonl")).open("a") as f:
             f.write(json.dumps(dict(kind=kind, pid=self.pid, **extra)) + "\\n")
     def __enter__(self):
+        time.sleep(self.config.get("startup_sleep", 0))
         self.event("enter")
         return self
     def __exit__(self, *args):
@@ -125,6 +126,31 @@ def receipt(setup, job_id):
     return Path(setup["stage_root"]) / "jobs" / key / "receipt.json"
 
 
+def test_stage_timings_separate_loading_model_work_and_cpu_finalization(setup):
+    setup["gpu_ids"] = ["7"]
+    setup["factory"] = "fake_stage_backend:split_factory"
+    setup["configuration"]["startup_sleep"] = 0.02
+    jobs = [{"job_id": "first"}, {"job_id": "second"}]
+    assert all(row["status"] == "ready" for row in api().execute_stage(jobs=jobs, **setup).values())
+    metrics = json.loads((setup["stage_root"] / "invocation.json").read_text())
+    assert metrics["job_count"] == 2
+    assert metrics["ready_count"] == 2
+    assert metrics["failed_count"] == 0
+    assert metrics["model_load_wall_seconds"] >= 0.02
+    assert metrics["processing_wall_seconds"] >= 0
+    assert metrics["cpu_finalize_seconds_sum"] >= 0.15
+    assert metrics["stage_wall_seconds"] >= metrics["model_load_wall_seconds"]
+    assert metrics["gpu_slot_job_counts"] == {"7": 2}
+    assert metrics["throughput_jobs_per_second"] > 0
+    assert metrics["model_job_count"] == metrics["model_batch_count"] == 2
+
+    api().execute_stage(jobs=jobs, **setup)
+    resumed = json.loads((setup["stage_root"] / "invocation.json").read_text())
+    assert resumed["reused_ready_count"] == 2
+    assert resumed["scheduled_job_count"] == 0
+    assert resumed["model_job_count"] == 0
+
+
 def test_dynamic_queue_10000_load_once_gpu_mapping_and_order(setup):
     setup["gpu_ids"] = [str(i) for i in range(8)]
     before = dict(os.environ)
@@ -176,12 +202,16 @@ def test_failure_continues_retries_once_and_ready_skips(setup):
     count = len(events(setup))
     assert api().execute_stage(jobs=jobs, **setup) == third
     assert len(events(setup)) == count
-    assert json.loads((Path(setup["stage_root"]) / "invocation.json").read_text()) == {
+    invocation = json.loads((Path(setup["stage_root"]) / "invocation.json").read_text())
+    assert {key: invocation[key] for key in (
+        "job_count", "scheduled_job_count", "reused_ready_count", "worker_count"
+    )} == {
         "job_count": 2,
         "scheduled_job_count": 0,
         "reused_ready_count": 2,
         "worker_count": 0,
     }
+    assert invocation["model_job_count"] == 0
     assert len(list(Path(setup["stage_root"]).glob("jobs/*"))) == 2
 
 

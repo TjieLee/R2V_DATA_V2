@@ -166,6 +166,11 @@ def test_batched_asr_decodes_one_stem_and_preserves_segment_order(
         worker.close()
     assert decoded == [Path(asr_jobs[0]["segment"]["source_audio_path"])]
     assert calls == [([16000, 16000, 16000], 16000)] * 2
+    assert worker.metrics() == {
+        "asr_batch_size_distribution": {3: 2},
+        "asr_unique_stem_decode_count": 1,
+        "asr_segment_count": 6,
+    }
 
 
 @pytest.mark.parametrize("failure", ["loader", "inference"])

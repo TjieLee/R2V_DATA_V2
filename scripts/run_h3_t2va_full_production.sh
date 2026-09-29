@@ -111,6 +111,7 @@ if [[ "$MIMO_MODEL" == "mimo-v2.6-flash-rl" ]]; then
     "$SGLANG_ENV/bin/sglang" serve --model-path "$MIMO_CHECKPOINT"
     --served-model-name "$MIMO_MODEL" --host 127.0.0.1 --port "$first_port"
     --tp 4 --moe-runner-backend marlin --disable-custom-all-reduce
+    --enable-deterministic-inference
     --trust-remote-code --reasoning-parser mimo --tool-call-parser mimo)
   serve_second=("${serve[@]}")
   serve_second[1]="CUDA_VISIBLE_DEVICES=$second_group"
