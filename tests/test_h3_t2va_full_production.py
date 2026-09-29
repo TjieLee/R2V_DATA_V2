@@ -617,7 +617,17 @@ def test_cached_shard_selection_migrates_long_clip_to_terminal_skip(
         shard_manifest, clips_root=tmp_path, source_videos_root=tmp_path
     )
     assert len(initial.shots) == 2
-    cached = root / "shards" / production.shard_name(0) / "source/selection.json"
+    old_sources = [
+        {
+            "source_index": shot.source_index,
+            "clip_uid": shot.clip_uid,
+            "video": shot.video_path,
+        }
+        for shot in initial.shots
+    ]
+    shard = root / "shards" / production.shard_name(0)
+    production.atomic_json(shard / "sources.json", old_sources)
+    cached = shard / "source/selection.json"
     production.atomic_json(cached, initial.model_dump(mode="json"))
     original_hash = full.sha256_file
 
@@ -655,6 +665,25 @@ def test_cached_shard_selection_migrates_long_clip_to_terminal_skip(
     skipped = projected[1]
     assert skipped["upstream_failure"] == "clip_duration_over_200s"
     assert "preparation_error" not in skipped
+    assert skipped["clip_uid"] == initial.shots[1].clip_uid
+    assert skipped["video"] == initial.shots[1].video_path
+    assert [
+        {k: row[k] for k in ("source_index", "clip_uid", "video")}
+        for row in projected
+    ] == old_sources
+
+    from r2v_data_v2.h3 import t2va_full_downstream as downstream
+
+    class PreflightProcessor:
+        @staticmethod
+        def evidence(_row):
+            return {}
+
+        @staticmethod
+        def identity(row):
+            return row["clip_uid"]
+
+    downstream._preflight(shard, projected, PreflightProcessor())
 
     class Processor:
         def identity(self, _row):
