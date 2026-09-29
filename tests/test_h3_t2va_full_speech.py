@@ -173,6 +173,68 @@ def test_batched_asr_decodes_one_stem_and_preserves_segment_order(
     }
 
 
+def test_batched_asr_three_batch_lookahead_decodes_each_stem_once(
+    speech, asr_jobs, tmp_path, monkeypatch
+):
+    decoded = Counter()
+
+    def decode(_self, path):
+        decoded[path] += 1
+        return np.zeros(16000, dtype=np.float32)
+
+    monkeypatch.setattr(speech._BatchedASRWorker, "_decode_full", decode)
+    backend = SimpleNamespace(
+        _process=SimpleNamespace(poll=lambda: None),
+        transcribe_batch=lambda **kwargs: [
+            ("spoken", "English") for _ in kwargs["waveforms"]
+        ],
+    )
+    batches = []
+    for batch_index in range(3):
+        batch = []
+        for index in range(8):
+            path = tmp_path / f"stem-{batch_index}-{index}.wav"
+            job = {
+                **asr_jobs[0],
+                "segment": {
+                    **asr_jobs[0]["segment"],
+                    "segment_id": f"segment-{batch_index}-{index}",
+                    "source_audio_path": str(path),
+                    "source_start_sample": 0,
+                    "source_end_sample": 32000,
+                    "start_time": 0.0,
+                    "end_time": 1.0,
+                },
+            }
+            batch.append(job)
+        batches.append(batch)
+
+    worker = speech._BatchedASRWorker(backend, "unused", 8)
+    try:
+        worker.prefetch_batch(batches[0])
+        worker.prefetch_batch(batches[1])
+        assert all(
+            row == {"text": "spoken", "language": "English"}
+            for row in worker.infer_batch(batches[0], [tmp_path] * 8)
+        )
+        worker.prefetch_batch(batches[2])
+        for batch in batches[1:]:
+            assert all(
+                row == {"text": "spoken", "language": "English"}
+                for row in worker.infer_batch(batch, [tmp_path] * 8)
+            )
+    finally:
+        worker.close()
+
+    assert len(decoded) == 24
+    assert set(decoded.values()) == {1}
+    assert worker.metrics() == {
+        "asr_batch_size_distribution": {8: 3},
+        "asr_unique_stem_decode_count": 24,
+        "asr_segment_count": 24,
+    }
+
+
 @pytest.mark.parametrize("failure", ["loader", "inference"])
 def test_asr_prefetch_failure_belongs_to_current_job(
     speech, asr_jobs, tmp_path, monkeypatch, failure

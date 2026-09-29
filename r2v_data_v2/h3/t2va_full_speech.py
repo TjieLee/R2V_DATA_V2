@@ -277,6 +277,7 @@ class _BatchedASRWorker:
         self.backend = backend
         self.ffmpeg = ffmpeg
         self.batch_size = batch_size
+        self._stem_cache_limit = 3 * batch_size
         self._decoder = ThreadPoolExecutor(max_workers=8, thread_name_prefix="asr-stem")
         self._stems = OrderedDict()
         self.unique_stem_decode_count = 0
@@ -325,7 +326,7 @@ class _BatchedASRWorker:
             else:
                 self._stems[path] = self._decoder.submit(self._decode_full, Path(path))
                 self.unique_stem_decode_count += 1
-            while len(self._stems) > 16:
+            while len(self._stems) > self._stem_cache_limit:
                 self._stems.popitem(last=False)
 
     def infer_batch(self, jobs, output_dirs):
