@@ -157,6 +157,55 @@ class PersistentQwen3ASRBackend:
             raise TypeError("Qwen3-ASR worker transcription payload is invalid")
         return text, language
 
+    def transcribe_batch(
+        self, *, waveforms: list[np.ndarray], sample_rate_hz: int
+    ) -> list[tuple[str, str | None]]:
+        if sample_rate_hz != 16000:
+            raise ValueError("Qwen3-ASR worker requires 16 kHz model input")
+        if not 1 <= len(waveforms) <= self.configuration.max_inference_batch_size:
+            raise ValueError("Qwen3-ASR batch size exceeds configured limit")
+        audios = []
+        for waveform in waveforms:
+            if waveform.ndim != 1 or waveform.size == 0 or not np.isfinite(waveform).all():
+                raise ValueError("Qwen3-ASR input must be finite, non-empty mono audio")
+            audio = np.ascontiguousarray(waveform, dtype="<f4")
+            audios.append({
+                "sample_count": int(audio.size),
+                "audio_f32le_base64": base64.b64encode(audio.tobytes()).decode("ascii"),
+            })
+        self._start()
+        process = self._process
+        if process is None or process.stdin is None:
+            raise RuntimeError("Qwen3-ASR worker is not running")
+        self._request_index += 1
+        request_id = f"transcribe-batch-{self._request_index:08d}"
+        process.stdin.write(json.dumps({
+            "request_id": request_id,
+            "operation": "transcribe_batch",
+            "sample_rate_hz": sample_rate_hz,
+            "audios": audios,
+        }, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
+        process.stdin.flush()
+        response = self._read_response()
+        if response.get("request_id") != request_id:
+            raise RuntimeError("Qwen3-ASR worker response request ID differs")
+        if response.get("status") != "ok":
+            raise RuntimeError(
+                "Qwen3-ASR worker transcription failed: "
+                + str(response.get("reason") or "unknown failure")
+            )
+        results = response.get("results")
+        if not isinstance(results, list) or len(results) != len(waveforms):
+            raise ValueError("Qwen3-ASR worker batch result count differs")
+        parsed = []
+        for item in results:
+            if not isinstance(item, dict) or not isinstance(item.get("text"), str) or (
+                item.get("language") is not None and not isinstance(item["language"], str)
+            ):
+                raise TypeError("Qwen3-ASR worker batch result is invalid")
+            parsed.append((item["text"], item.get("language")))
+        return parsed
+
     def close(self, *, force: bool = False) -> None:
         process = self._process
         if process is None:

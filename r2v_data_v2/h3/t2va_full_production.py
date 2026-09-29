@@ -168,6 +168,7 @@ class FullPipeline:
         request_workers=1,
         canonical_workers=16,
         max_clip_duration_seconds=production.MAX_CLIP_DURATION_SECONDS,
+        asr_batch_size=1,
         ffmpeg="ffmpeg",
         ffprobe="ffprobe",
         mimo_lifecycle=None,
@@ -189,6 +190,9 @@ class FullPipeline:
         if not math.isfinite(max_clip_duration_seconds) or max_clip_duration_seconds <= 0:
             raise ValueError("max clip duration must be finite and positive")
         self.max_clip_duration_seconds = max_clip_duration_seconds
+        if type(asr_batch_size) is not int or not 1 <= asr_batch_size <= 8:
+            raise ValueError("ASR batch size must be between 1 and 8")
+        self.asr_batch_size = asr_batch_size
         self.prepared = {}
         self.prefetch = None
         self.pools = None
@@ -357,6 +361,7 @@ class FullPipeline:
                 self.gpu_ids,
                 self.allow_unverified,
                 ffmpeg=self.ffmpeg,
+                **({"batch_size": self.asr_batch_size} if name == "asr" and self.asr_batch_size > 1 else {}),
                 **execution,
             )
             provenance = result["provenance"]

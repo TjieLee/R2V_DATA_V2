@@ -192,6 +192,7 @@ def execute_stage(
     python_path: str | Path | None = None,
     environment: dict[str, str] | None = None,
     log_root: str | Path | None = None,
+    receipt_factory: str | None = None,
 ) -> dict[str, dict]:
     """Run pending jobs on one fresh child per GPU with a shared work cursor.
 
@@ -225,7 +226,7 @@ def execute_stage(
         raise TypeError("configuration must be a dict")
     config = json.loads(_json(configuration))
     config["device"] = "cuda:0"
-    execution = _digest({"factory": factory, "configuration": config})
+    execution = _digest({"factory": receipt_factory or factory, "configuration": config})
     items = []
     seen = set()
     for job in jobs:
@@ -356,18 +357,19 @@ def execute_stage(
                 signal.signal(sig, handler)
 
 
-def _claim(cursor: Path, count: int) -> int | None:
+def _claim_many(cursor: Path, count: int, size: int) -> list[int]:
     with cursor.open("r+", encoding="ascii") as handle:
         fcntl.flock(handle, fcntl.LOCK_EX)
         try:
             index = int(handle.read())
             if index >= count:
-                return None
+                return []
             handle.seek(0)
-            handle.write(str(index + 1))
+            end = min(count, index + size)
+            handle.write(str(end))
             handle.truncate()
             handle.flush()
-            return index
+            return list(range(index, end))
         finally:
             fcntl.flock(handle, fcntl.LOCK_UN)
 
@@ -423,32 +425,65 @@ def _worker(manifest: Path) -> None:
         max_workers=2, thread_name_prefix="stage-finalize"
     ) as finalizers:
         outstanding = deque()
-        while (index := _claim(queue_path.with_name("cursor"), len(items))) is not None:
-            item = items[index]
-            directory = root / "jobs" / item["key"]
-            output = directory / "media"
-            # Invalidate an old failed/mismatched receipt before retrying this job.
-            (directory / "receipt.json").unlink(missing_ok=True)
-            if output.is_symlink():
-                output.unlink()
-            elif output.exists():
-                shutil.rmtree(output)
-            output.mkdir(parents=True, exist_ok=True)
-            try:
-                batch = getattr(backend, "batch_jobs", None)
-                with batch([item["job"]]) if batch else nullcontext():
-                    infer = getattr(backend, "infer", None)
-                    intermediate = (infer or backend.process)(item["job"], output)
-                error = None
-            except Exception as exc:  # noqa: BLE001 - isolate arbitrary backend sample failures
-                intermediate, error = None, exc
-            outstanding.append(
-                finalizers.submit(
-                    _publish_result, backend, request, item, output, intermediate, error
+        size = getattr(backend, "batch_size", 1)
+        if type(size) is not int or not 1 <= size <= 16:
+            raise ValueError("worker batch size must be between 1 and 16")
+        cursor = queue_path.with_name("cursor")
+        current = _claim_many(cursor, len(items), size)
+        prefetch = getattr(backend, "prefetch_batch", None)
+        if current and prefetch:
+            prefetch([items[index]["job"] for index in current])
+        while current:
+            following = _claim_many(cursor, len(items), size) if prefetch else []
+            if following:
+                prefetch([items[index]["job"] for index in following])
+            prepared = []
+            for index in current:
+                item = items[index]
+                directory = root / "jobs" / item["key"]
+                output = directory / "media"
+                (directory / "receipt.json").unlink(missing_ok=True)
+                if output.is_symlink():
+                    output.unlink()
+                elif output.exists():
+                    shutil.rmtree(output)
+                output.mkdir(parents=True, exist_ok=True)
+                prepared.append((item, output))
+            infer_batch = getattr(backend, "infer_batch", None)
+            if infer_batch:
+                try:
+                    intermediate_rows = infer_batch(
+                        [item["job"] for item, _ in prepared],
+                        [output for _, output in prepared],
+                    )
+                    if len(intermediate_rows) != len(prepared):
+                        raise ValueError("worker batch result count differs")
+                except Exception as exc:  # noqa: BLE001 - isolate batch sample errors
+                    intermediate_rows = [exc] * len(prepared)
+            else:
+                intermediate_rows = []
+                for item, output in prepared:
+                    try:
+                        batch = getattr(backend, "batch_jobs", None)
+                        with batch([item["job"]]) if batch else nullcontext():
+                            infer = getattr(backend, "infer", None)
+                            intermediate_rows.append((infer or backend.process)(item["job"], output))
+                    except Exception as exc:  # noqa: BLE001 - isolate sample errors
+                        intermediate_rows.append(exc)
+            for (item, output), intermediate in zip(prepared, intermediate_rows, strict=True):
+                error = intermediate if isinstance(intermediate, Exception) else None
+                if error is not None:
+                    intermediate = None
+                outstanding.append(
+                    finalizers.submit(
+                        _publish_result, backend, request, item, output, intermediate, error
+                    )
                 )
-            )
-            if len(outstanding) >= 4:
-                outstanding.popleft().result()
+                if len(outstanding) >= 4:
+                    outstanding.popleft().result()
+            current = following or _claim_many(cursor, len(items), size)
+            if current and prefetch and current is not following:
+                prefetch([items[index]["job"] for index in current])
         while outstanding:
             outstanding.popleft().result()
     _atomic_json(manifest.with_name("complete.json"), {"complete": True})

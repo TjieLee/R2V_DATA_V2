@@ -76,6 +76,15 @@ class SplitBackend(Backend):
 
 def split_factory(configuration):
     return SplitBackend(configuration)
+
+class BatchBackend(Backend):
+    batch_size = 8
+    def infer_batch(self, jobs, outputs):
+        self.event("batch", job_ids=[job["job_id"] for job in jobs])
+        return [{"job_id": job["job_id"]} for job in jobs]
+
+def batch_factory(configuration):
+    return BatchBackend(configuration)
 """
 
 
@@ -304,6 +313,33 @@ def test_cpu_finalizer_overlaps_next_model_job(setup):
     assert all(row["status"] == "ready" for row in result.values())
     order = [(row["kind"], row.get("job_id")) for row in events(setup)]
     assert order.index(("infer", "second")) < order.index(("finalize_end", "first"))
+
+
+def test_batch_backend_claims_ordered_microbatches(setup):
+    setup["gpu_ids"] = ["5"]
+    setup["factory"] = "fake_stage_backend:batch_factory"
+    jobs = [{"job_id": f"segment-{index:02d}"} for index in range(17)]
+    result = api().execute_stage(jobs=jobs, **setup)
+    assert list(result) == [job["job_id"] for job in jobs]
+    assert [row["job_ids"] for row in events(setup) if row["kind"] == "batch"] == [
+        [job["job_id"] for job in jobs[:8]],
+        [job["job_id"] for job in jobs[8:16]],
+        [job["job_id"] for job in jobs[16:]],
+    ]
+
+
+def test_batch_runtime_reuses_existing_ready_receipt(setup):
+    setup["gpu_ids"] = ["5"]
+    jobs = [{"job_id": "existing"}]
+    original_factory = setup["factory"]
+    first = api().execute_stage(jobs=jobs, **setup)
+    before = len(events(setup))
+    setup["factory"] = "fake_stage_backend:batch_factory"
+    second = api().execute_stage(
+        jobs=jobs, receipt_factory=original_factory, **setup
+    )
+    assert second == first
+    assert len(events(setup)) == before
 
 
 def test_empty_validation_and_non_json_sample_failure(setup):

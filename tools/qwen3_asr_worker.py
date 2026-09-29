@@ -101,9 +101,46 @@ def main(argv: list[str] | None = None) -> int:
             if operation == "shutdown":
                 _emit({"request_id": request_id, "status": "shutdown"})
                 return 0
-            if operation != "transcribe":
+            if operation not in {"transcribe", "transcribe_batch"}:
                 raise ValueError("unsupported Qwen3-ASR worker operation")
             sample_rate_hz = int(request.get("sample_rate_hz") or 0)
+            if operation == "transcribe_batch":
+                audios = request.get("audios")
+                if sample_rate_hz != 16000 or not isinstance(audios, list) or not (
+                    1 <= len(audios) <= arguments.max_inference_batch_size
+                ):
+                    raise ValueError("Qwen3-ASR worker batch request is invalid")
+                batch = []
+                for item in audios:
+                    if not isinstance(item, dict):
+                        raise TypeError("Qwen3-ASR worker batch item must be an object")
+                    count = int(item.get("sample_count") or 0)
+                    payload = item.get("audio_f32le_base64")
+                    if count <= 0 or not isinstance(payload, str):
+                        raise ValueError("Qwen3-ASR worker batch audio is invalid")
+                    waveform = np.frombuffer(
+                        base64.b64decode(payload.encode("ascii"), validate=True), dtype="<f4"
+                    ).copy()
+                    if waveform.size != count or not np.isfinite(waveform).all():
+                        raise ValueError("Qwen3-ASR worker batch waveform differs")
+                    batch.append((waveform, sample_rate_hz))
+                with contextlib.redirect_stdout(sys.stderr):
+                    results = model.transcribe(
+                        audio=batch, context="", language=None, return_time_stamps=False
+                    )
+                if len(results) != len(batch):
+                    raise ValueError("Qwen3-ASR model batch result count differs")
+                _emit({
+                    "request_id": request_id,
+                    "status": "ok",
+                    "results": [
+                        {"text": str(result.text), "language": (
+                            None if result.language is None else str(result.language)
+                        )}
+                        for result in results
+                    ],
+                })
+                continue
             sample_count = int(request.get("sample_count") or 0)
             payload = request.get("audio_f32le_base64")
             if sample_rate_hz != 16000 or sample_count <= 0 or not isinstance(payload, str):

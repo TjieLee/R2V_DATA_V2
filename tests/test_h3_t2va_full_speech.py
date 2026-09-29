@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from r2v_data_v2.h3 import sam_audio_stem_shadow as frozen
@@ -132,6 +133,39 @@ def test_asr_worker_does_not_rehash_published_source_audio(
     )
     with worker.batch_jobs(asr_jobs):
         [worker.process(job, tmp_path) for job in asr_jobs]
+
+
+def test_batched_asr_decodes_one_stem_and_preserves_segment_order(
+    speech, asr_jobs, tmp_path, monkeypatch
+):
+    decoded = []
+    calls = []
+
+    def decode(_self, path):
+        decoded.append(path)
+        return np.arange(48000, dtype=np.float32)
+
+    def transcribe_batch(*, waveforms, sample_rate_hz):
+        calls.append(([len(waveform) for waveform in waveforms], sample_rate_hz))
+        return [(f"segment-{i}", "English") for i in range(len(waveforms))]
+
+    monkeypatch.setattr(speech._BatchedASRWorker, "_decode_full", decode)
+    backend = SimpleNamespace(
+        _process=SimpleNamespace(poll=lambda: None),
+        transcribe_batch=transcribe_batch,
+    )
+    worker = speech._BatchedASRWorker(backend, "unused", 8)
+    try:
+        worker.prefetch_batch(asr_jobs)
+        results = worker.infer_batch(asr_jobs, [tmp_path] * 3)
+        assert results == [
+            {"text": f"segment-{i}", "language": "English"} for i in range(3)
+        ]
+        worker.infer_batch(asr_jobs, [tmp_path] * 3)
+    finally:
+        worker.close()
+    assert decoded == [Path(asr_jobs[0]["segment"]["source_audio_path"])]
+    assert calls == [([16000, 16000, 16000], 16000)] * 2
 
 
 @pytest.mark.parametrize("failure", ["loader", "inference"])

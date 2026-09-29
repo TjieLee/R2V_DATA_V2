@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import tempfile
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from functools import cache
@@ -271,6 +272,86 @@ class _ASRWorker:
         return result
 
 
+class _BatchedASRWorker:
+    def __init__(self, backend, ffmpeg, batch_size):
+        self.backend = backend
+        self.ffmpeg = ffmpeg
+        self.batch_size = batch_size
+        self._decoder = ThreadPoolExecutor(max_workers=8, thread_name_prefix="asr-stem")
+        self._stems = OrderedDict()
+        self.unique_stem_decode_count = 0
+
+    def close(self):
+        self._decoder.shutdown(wait=True, cancel_futures=True)
+
+    def _decode_full(self, path):
+        completed = subprocess.run(
+            [
+                self.ffmpeg, "-nostdin", "-v", "error", "-i", str(path), "-vn",
+                "-ac", "1", "-ar", "16000", "-c:a", "pcm_f32le", "-f", "f32le",
+                "pipe:1",
+            ],
+            check=False,
+            capture_output=True,
+        )
+        if completed.returncode != 0 or not completed.stdout or len(completed.stdout) % 4:
+            raise ValueError("Qwen3 ASR runtime audio preprocessing failed")
+        waveform = np.frombuffer(completed.stdout, dtype="<f4").copy()
+        if not np.isfinite(waveform).all():
+            raise ValueError("Qwen3 ASR runtime waveform is non-finite")
+        return waveform
+
+    def prefetch_batch(self, jobs):
+        for job in jobs:
+            try:
+                path = asr._ReadableDiarizationSegment.model_validate(
+                    job["segment"]
+                ).source_audio_path
+            except Exception:  # noqa: BLE001 - classify malformed segment per job
+                path = None
+            if path is None:
+                continue
+            if path in self._stems:
+                self._stems.move_to_end(path)
+            else:
+                self._stems[path] = self._decoder.submit(self._decode_full, Path(path))
+                self.unique_stem_decode_count += 1
+            while len(self._stems) > 16:
+                self._stems.popitem(last=False)
+
+    def infer_batch(self, jobs, output_dirs):
+        del output_dirs
+        self.prefetch_batch(jobs)
+        results: list[dict | Exception] = [ValueError("unprocessed ASR segment")] * len(jobs)
+        valid, indices = [], []
+        for index, job in enumerate(jobs):
+            try:
+                row = asr._ReadableDiarizationSegment.model_validate(job["segment"])
+                waveform = self._stems[row.source_audio_path].result()
+                start = round(row.start_time * 16000)
+                end = min(round(row.end_time * 16000), len(waveform))
+                if start < 0 or end <= start:
+                    raise ValueError("Qwen3 ASR source interval has no decoded samples")
+                valid.append(np.ascontiguousarray(waveform[start:end]))
+                indices.append(index)
+            except Exception as exc:  # noqa: BLE001 - isolate one unusable segment
+                results[index] = exc
+        if valid:
+            transcribed = _inference(
+                self.backend,
+                lambda: self.backend.transcribe_batch(
+                    waveforms=valid, sample_rate_hz=16000
+                ),
+            )
+            if len(transcribed) != len(valid):
+                raise ValueError("Qwen3 ASR batch result count differs")
+            for index, (text, language) in zip(indices, transcribed, strict=True):
+                result = {"text": text, "language": language}
+                _asr_result(result)
+                results[index] = result
+        return results
+
+
 @contextmanager
 def diarizen_worker(configuration):
     from tools.run_h3_diarization_binding import _runtime_backend
@@ -317,6 +398,31 @@ def asr_worker(configuration):
     try:
         yield _ASRWorker(backend, configuration["ffmpeg"])
     finally:
+        backend.close()
+
+
+@contextmanager
+def batched_asr_worker(configuration):
+    from tools.run_h3_stem_qwen3_asr_shadow import _isolated_backend
+
+    backend = None
+    worker = None
+    try:
+        os.environ.update(configuration["environment"])
+        batch_size = int(os.environ["T2VA_ASR_BATCH_SIZE"])
+        os.environ["QWEN3_ASR_MAX_INFERENCE_BATCH_SIZE"] = str(batch_size)
+        os.environ["QWEN3_ASR_DEVICE"] = "cuda:0"
+        backend = _isolated_backend()
+        backend.__enter__()
+        worker = _BatchedASRWorker(backend, configuration["ffmpeg"], batch_size)
+    except Exception as exc:
+        if backend is not None:
+            backend.close(force=True)
+        raise SystemExit(f"Qwen3-ASR initialization failed: {exc}") from exc
+    try:
+        yield worker
+    finally:
+        worker.close()
         backend.close()
 
 
@@ -415,7 +521,10 @@ def run_asr(
     allow_unverified,
     ffmpeg="ffmpeg",
     execute=execute_stage,
+    batch_size=1,
 ):
+    if type(batch_size) is not int or not 1 <= batch_size <= 8:
+        raise ValueError("ASR batch size must be between 1 and 8")
     shadow = frozen.stem_shadow_root(Path(audio_root), run_id)
     root = shadow / "diarization"
     provenance, _, _ = frozen.validate_stem_diarization_lineage(
@@ -449,17 +558,30 @@ def run_asr(
         )
         key = (row.source_audio_path, row.start_time, row.end_time)
         keys.setdefault(key, []).append(job_id)
+    factory = f"{__name__}:asr_worker"
+    batch_options = (
+        {"receipt_factory": factory} if batch_size > 1 else {}
+    )
     results = execute(
         stage_root=Path(stage_state),
         jobs=jobs,
         gpu_ids=list(gpu_ids),
-        factory=f"{__name__}:asr_worker",
+        factory=f"{__name__}:batched_asr_worker" if batch_size > 1 else factory,
         log_root=Path(stage_state).parent.parent / "logs",
         configuration=configuration,
-        environment=configuration["environment"],
+        environment={
+            **configuration["environment"],
+            **({"T2VA_ASR_BATCH_SIZE": str(batch_size)} if batch_size > 1 else {}),
+        },
+        **batch_options,
     )
 
     configuration_data = configuration["configuration"]
+    if batch_size > 1:
+        configuration_data = {
+            **configuration_data,
+            "max_inference_batch_size": batch_size,
+        }
 
     class Replay:
         current = None

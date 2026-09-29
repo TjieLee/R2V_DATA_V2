@@ -39,6 +39,17 @@ for line in sys.stdin:
     if request['operation'] == 'shutdown':
         emit({'request_id': request_id, 'status': 'shutdown'})
         raise SystemExit(0)
+    if request['operation'] == 'transcribe_batch':
+        emit({
+            'request_id': request_id,
+            'status': 'ok',
+            'results': [
+                {'text': f"samples={len(base64.b64decode(item['audio_f32le_base64'])) // 4}",
+                 'language': 'English'}
+                for item in request['audios']
+            ],
+        })
+        continue
     raw = base64.b64decode(request['audio_f32le_base64'])
     emit({
         'request_id': request_id,
@@ -110,3 +121,18 @@ def test_persistent_qwen_backend_rejects_noncanonical_model_input(
             waveform=np.asarray([0.0, 0.1], dtype=np.float32),
             sample_rate_hz=32000,
         )
+
+
+def test_persistent_qwen_backend_batch_preserves_input_order(tmp_path: Path) -> None:
+    backend = PersistentQwen3ASRBackend(
+        _configuration().model_copy(update={"max_inference_batch_size": 8}),
+        python_path=Path(sys.executable),
+        worker_path=_fake_worker(tmp_path),
+        timeout_seconds=5,
+    )
+    with backend:
+        result = backend.transcribe_batch(
+            waveforms=[np.zeros(3, dtype=np.float32), np.zeros(7, dtype=np.float32)],
+            sample_rate_hz=16000,
+        )
+    assert result == [("samples=3", "English"), ("samples=7", "English")]
