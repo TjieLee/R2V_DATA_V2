@@ -688,16 +688,23 @@ def test_cached_shard_selection_migrates_long_clip_to_terminal_skip(
     downstream._preflight(shard, projected, PreflightProcessor())
 
     class Processor:
-        def identity(self, _row):
-            return "test-identity"
+        def identity(self, row):
+            return row["clip_uid"]
 
-        def process(self, *_args):
-            pytest.fail("duration-excluded clip reached a model stage")
+        def process(self, _stage, row, *_args):
+            if row.get("upstream_failure"):
+                pytest.fail("duration-excluded clip reached a model stage")
+            return {"exports": {}, "model_call_count": 0}
 
-    skip_root = tmp_path / "skip-only"
-    state = production.process_shard(
-        skip_root, 0, [skipped], Processor()
-    )[skipped["clip_uid"]]
+    states = production.process_shard(
+        root,
+        0,
+        projected,
+        Processor(),
+        request_workers=1,
+        allow_existing_identity_mismatch=True,
+    )
+    state = states[skipped["clip_uid"]]
     assert (state["t2va_status"], state["ta2va_status"]) == ("skipped", "skipped")
     assert state["failure_stage"] == "upstream"
     assert state["failure_reason"] == "clip_duration_over_20s"
