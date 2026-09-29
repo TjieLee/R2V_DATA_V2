@@ -716,12 +716,12 @@ def test_single_ra2va_record_keeps_clip_failure_isolated(tmp_path, monkeypatch):
     assert [record.model_call_count for record in records] == [1, 1, 1]
     assert summary.model_call_count == 3
     assert len(completions.requests) == 3
-    assert all(record.backend_provenance.prompt_version == "h3_mimo26_ra2va_single_v6_compact2" for record in records)
-    assert all(record.backend_provenance.schema_version == "r2v.h3.mimo25_backend.72" for record in records)
+    assert all(record.backend_provenance.prompt_version == "h3_mimo26_ra2va_single_v7_compact2_cleanup" for record in records)
+    assert all(record.backend_provenance.schema_version == "r2v.h3.mimo25_backend.73" for record in records)
     assert [item.status for item in load_reconcile_sources(root)] == ["ready", "failed", "ready"]
 
 
-def test_single_ra2va_provenance_reads_frozen_v1_to_v5_and_current_v6(tmp_path, monkeypatch):
+def test_single_ra2va_provenance_reads_frozen_v1_to_v6_and_current_v7(tmp_path, monkeypatch):
     from r2v_data_v2.h3.audio_reuse_prepared import FrozenReuseBackendProvenance
 
     backend = SingleCallOpenAIMimo25Backend(
@@ -734,7 +734,7 @@ def test_single_ra2va_provenance_reads_frozen_v1_to_v5_and_current_v6(tmp_path, 
     )
     current = backend.provenance
     assert (current.schema_version, current.prompt_version) == (
-        "r2v.h3.mimo25_backend.72", "h3_mimo26_ra2va_single_v6_compact2",
+        "r2v.h3.mimo25_backend.73", "h3_mimo26_ra2va_single_v7_compact2_cleanup",
     )
     assert current.annotation_schema_version == "r2v.h3.mimo25_av_annotation.20"
     assert MimoBackendProvenance.model_validate_json(current.model_dump_json()) == current
@@ -748,6 +748,7 @@ def test_single_ra2va_provenance_reads_frozen_v1_to_v5_and_current_v6(tmp_path, 
         (".69", "h3_mimo26_ra2va_single_v3"),
         (".70", "h3_mimo26_ra2va_single_v4"),
         (".71", "h3_mimo26_ra2va_single_v5_compact"),
+        (".72", "h3_mimo26_ra2va_single_v6_compact2"),
     ):
         with monkeypatch.context() as patch:
             patch.setattr(single, "SINGLE_BACKEND_VERSION", f"r2v.h3.mimo25_backend{version}")

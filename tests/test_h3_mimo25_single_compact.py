@@ -150,6 +150,131 @@ def test_compact_visible_subject_is_frozen_entity_only():
         single.MimoSingleCompactAnnotationDraftV2.model_validate(payload)
 
 
+@pytest.mark.parametrize("description", [
+    "a man shown in <Picture 1>",
+    "a man depicted in <Picture 1>",
+    "a man with its visual detail sourced from <Picture 1>",
+    "a man <Picture 1>",
+])
+def test_compact_picture_provenance_is_removed_before_parse(description):
+    payload = _compact_payload()
+    payload["h3_semantics"]["subject_definitions"][0]["description"] = description
+    raw = json.dumps(payload)
+    assert single.parse_structured_json_issues(
+        raw, single.MimoSingleCompactAnnotationDraftV2,
+    )[0] is None
+    canonical, corrections = single._canonicalize_single_compact_raw(raw)
+    draft, issues = single.parse_structured_json_issues(
+        canonical, single.MimoSingleCompactAnnotationDraftV2,
+    )
+    assert issues == []
+    assert draft.h3_semantics.subject_definitions[0].description == "a man"
+    assert corrections == {"compact_subject_picture_provenance_removed": 1}
+    assert json.loads(raw) == payload
+
+
+def test_compact_picture_cleanup_is_local_and_empty_definition_still_fails():
+    payload = _compact_payload()
+    payload["visual_blocks"][0]["text"] += " <Picture 1>"
+    payload["h3_semantics"]["shot1_caption"] += " <Picture 1>"
+    payload["h3_semantics"]["subject_definitions"][0]["description"] = (
+        "a man shown in <Picture 1> depicted in <Picture 2>"
+    )
+    canonical, corrections = single._canonicalize_single_compact_raw(json.dumps(payload))
+    cleaned = json.loads(canonical)
+    assert cleaned["visual_blocks"] == payload["visual_blocks"]
+    assert cleaned["h3_semantics"]["shot1_caption"] == payload["h3_semantics"]["shot1_caption"]
+    assert cleaned["h3_semantics"]["subject_definitions"][0]["description"] == "a man"
+    assert corrections == {"compact_subject_picture_provenance_removed": 1}
+    payload["h3_semantics"]["subject_definitions"][0]["description"] = "shown in <Picture 1>."
+    canonical, _ = single._canonicalize_single_compact_raw(json.dumps(payload))
+    assert single.parse_structured_json_issues(
+        canonical, single.MimoSingleCompactAnnotationDraftV2,
+    )[0] is None
+
+
+def test_compact_attribute_speaker_promotes_to_frozen_entity_owner():
+    payload = _compact_payload()
+    payload["segments"][0]["speaker_subject_label"] = "<Subject 2>"
+    payload["h3_semantics"]["subject_definitions"].append({
+        "subject_label": "<Subject 2>", "description": "a dark coat",
+    })
+    payload["h3_semantics"]["visual_retention_analysis"].append({
+        "subject_label": "<Subject 2>", "marker": "fully_preserved",
+        "description": "The dark coat remains visible.",
+    })
+    job = _job(subjects=[
+        SimpleNamespace(subject_label="<Subject 1>", kind="entity", entity_id="e1"),
+        SimpleNamespace(subject_label="<Subject 2>", kind="attribute", entity_id=None,
+                        owner_entity_id="e1"),
+    ])
+    draft = single.MimoSingleCompactAnnotationDraftV2.model_validate(payload)
+    normalized, corrections = single._normalize_single_compact_speaker_subjects(draft, job)
+    assert normalized.segments[0].speaker_subject_label == "<Subject 1>"
+    assert corrections == {"compact_speaker_attribute_promoted_to_owner": 1}
+    assert draft.segments[0].speaker_subject_label == "<Subject 2>"
+    assert single._validate_single_compact_annotation(
+        normalized, job, allowed_entity_ids={"e1"},
+        allowed_reference_labels={"<Picture 1>", "<Subject 1>", "<Subject 2>"},
+    )[0] == []
+    projected = single._project_compact_to_legacy_annotation(normalized, job)
+    assert projected.av_grounding.segment_groundings[0].entity_id == "e1"
+
+
+def test_compact_background_speaker_downgrades_without_guessing_entity():
+    payload = _compact_payload()
+    job = _job(subjects=[SimpleNamespace(
+        subject_label="<Subject 1>", kind="background", entity_id=None,
+        owner_entity_id=None,
+    )])
+    draft = single.MimoSingleCompactAnnotationDraftV2.model_validate(payload)
+    normalized, corrections = single._normalize_single_compact_speaker_subjects(draft, job)
+    decision = normalized.segments[0]
+    assert (decision.binding_status, decision.speaker_subject_label) == (
+        "no_reliable_subject", None,
+    )
+    assert decision.primary_speaker_group == "g1"
+    assert corrections == {"compact_invalid_speaker_subject_downgraded": 1}
+    assert single._validate_single_compact_annotation(
+        normalized, job, allowed_entity_ids=set(),
+        allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+    )[0] == []
+
+
+def test_compact_valid_entity_speaker_is_unchanged():
+    draft = single.MimoSingleCompactAnnotationDraftV2.model_validate(_compact_payload())
+    normalized, corrections = single._normalize_single_compact_speaker_subjects(draft, _job())
+    assert normalized == draft
+    assert corrections == {}
+
+
+def test_compact_attribute_without_unique_frozen_owner_downgrades():
+    payload = _compact_payload()
+    payload["segments"][0]["speaker_subject_label"] = "<Subject 3>"
+    draft = single.MimoSingleCompactAnnotationDraftV2.model_validate(payload)
+    job = _job(subjects=[
+        SimpleNamespace(subject_label="<Subject 1>", kind="entity", entity_id="e1"),
+        SimpleNamespace(subject_label="<Subject 2>", kind="entity", entity_id="e1"),
+        SimpleNamespace(subject_label="<Subject 3>", kind="attribute", entity_id=None,
+                        owner_entity_id="e1"),
+    ])
+    normalized, corrections = single._normalize_single_compact_speaker_subjects(draft, job)
+    assert normalized.segments[0].binding_status == "no_reliable_subject"
+    assert normalized.segments[0].speaker_subject_label is None
+    assert corrections == {"compact_invalid_speaker_subject_downgraded": 1}
+
+
+def test_compact_attribute_without_owner_downgrades():
+    draft = single.MimoSingleCompactAnnotationDraftV2.model_validate(_compact_payload())
+    job = _job(subjects=[SimpleNamespace(
+        subject_label="<Subject 1>", kind="attribute", entity_id=None,
+    )])
+    normalized, corrections = single._normalize_single_compact_speaker_subjects(draft, job)
+    assert normalized.segments[0].binding_status == "no_reliable_subject"
+    assert normalized.segments[0].speaker_subject_label is None
+    assert corrections == {"compact_invalid_speaker_subject_downgraded": 1}
+
+
 def test_compact_group_subject_conflicts_are_warnings_without_repair():
     payload = _compact_payload()
     payload["h3_semantics"]["subject_definitions"].append({
@@ -282,7 +407,9 @@ def test_single_compact_backend_keeps_raw_response_and_legacy_annotation(tmp_pat
         stem_diarization_root=shadow / "diarization",
         stem_asr_root=shadow / "asr", route="music_first",
     )[:1]
-    raw = json.dumps(_compact_payload())
+    payload = _compact_payload()
+    payload["h3_semantics"]["subject_definitions"][0]["description"] += " shown in <Picture 1>"
+    raw = json.dumps(payload)
     completions = _Completions([(raw, 8), (raw, 8)])
     backend = single.SingleCallOpenAIMimo25Backend(
         MimoBackendConfig(
@@ -312,6 +439,11 @@ def test_single_compact_backend_keeps_raw_response_and_legacy_annotation(tmp_pat
     }
     assert result.speech_av_raw_response == raw
     assert result.raw_responses == (raw,)
+    assert "compact_subject_picture_provenance_removed" in result.diagnostics[0].warnings
+    assert result.deterministic_correction_counts == {
+        "compact_subject_picture_provenance_removed": 1,
+    }
+    assert "<Picture 1>" not in result.annotation.h3_semantics.subject_definitions[0].description
     assert result.annotation.schema_version == "r2v.h3.mimo25_av_annotation.20"
     assert "(S1) <d>" in result.annotation.h3_semantics.shot1_caption
     root = shadow / "single-v5"
@@ -321,6 +453,7 @@ def test_single_compact_backend_keeps_raw_response_and_legacy_annotation(tmp_pat
     )
     record = MimoStemReconcileRecord.model_validate_json((root / "records.jsonl").read_text().splitlines()[0])
     assert record.speech_av_raw_response == raw
+    assert "compact_subject_picture_provenance_removed" in record.diagnostics[0].warnings
     assert record.annotation is not None and record.annotation.schema_version == "r2v.h3.mimo25_av_annotation.20"
 
 
@@ -330,6 +463,7 @@ def test_single_compact_backend_keeps_raw_response_and_legacy_annotation(tmp_pat
     (".69", "h3_mimo26_ra2va_single_v3"),
     (".70", "h3_mimo26_ra2va_single_v4"),
     (".71", "h3_mimo26_ra2va_single_v5_compact"),
+    (".72", "h3_mimo26_ra2va_single_v6_compact2"),
 ])
 def test_historical_single_record_envelopes_remain_readable(tmp_path, monkeypatch, version, prompt):
     _, shadow = _fixture(tmp_path, monkeypatch)

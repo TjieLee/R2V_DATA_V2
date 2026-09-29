@@ -1721,6 +1721,7 @@ class MimoStemReconcileRecord(SchemaModel):
             "h3_mimo26_ra2va_single_v3", "h3_mimo26_ra2va_single_v4",
             "h3_mimo26_ra2va_single_v5_compact",
             "h3_mimo26_ra2va_single_v6_compact2",
+            "h3_mimo26_ra2va_single_v7_compact2_cleanup",
         }
         if single_call:
             invalid_calls = (

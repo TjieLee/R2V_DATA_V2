@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from typing import Any, Literal
@@ -36,11 +37,23 @@ from r2v_data_v2.h3.mimo25_backend import (
 )
 from r2v_data_v2.h3.mimo25_stem_shadow import StemAwareOpenAIMimo25Backend
 from r2v_data_v2.h3.schemas import SchemaModel
-from r2v_data_v2.structured_output import ValidationIssue, parse_structured_json_issues
+from r2v_data_v2.structured_output import (
+    ValidationIssue,
+    normalize_structured_json_envelope,
+    parse_structured_json_issues,
+)
 
-SINGLE_PROMPT_VERSION = "h3_mimo26_ra2va_single_v6_compact2"
-SINGLE_BACKEND_VERSION = "r2v.h3.mimo25_backend.72"
+SINGLE_PROMPT_VERSION = "h3_mimo26_ra2va_single_v7_compact2_cleanup"
+SINGLE_BACKEND_VERSION = "r2v.h3.mimo25_backend.73"
 SINGLE_COMPACT_SCHEMA_VERSION = "r2v.h3.mimo26_single_compact.2"
+
+_COMPACT_PICTURE_LABEL = r"<Picture [1-9]\d*>"
+_COMPACT_PICTURE_PROVENANCE = re.compile(
+    rf"\s*(?:shown in|depicted in|with its visual detail sourced from)\s*"
+    rf"{_COMPACT_PICTURE_LABEL}(?:\s*(?:,|and)\s*{_COMPACT_PICTURE_LABEL})*",
+    re.IGNORECASE,
+)
+_COMPACT_ORPHAN_PICTURE = re.compile(rf"\s*{_COMPACT_PICTURE_LABEL}")
 
 SINGLE_SYSTEM_PROMPT = """Return one MimoSingleCompactAnnotationDraftV2 JSON object after observing the complete original target AV, frozen Pictures, and resolved stems. Original AV is the final audiovisual authority; stems aid acoustic recall. Official H3 demonstrations may contain final speaker markers or Picture provenance; those are final-H3 examples, not fields you own in this compact response.
 
@@ -85,6 +98,73 @@ class MimoSingleCompactAnnotationDraftV2(SchemaModel):
     segments: list[MimoSingleCompactSegmentDecision]
     speaker_voice_profiles: list[MimoSpeakerVoiceProfile]
     h3_semantics: MimoSingleCompactH3Semantics
+
+
+def _canonicalize_single_compact_raw(raw: str) -> tuple[str, dict[str, int]]:
+    try:
+        payload = json.loads(normalize_structured_json_envelope(raw))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return raw, {}
+    if not isinstance(payload, dict):
+        return raw, {}
+    semantics = payload.get("h3_semantics")
+    definitions = semantics.get("subject_definitions") if isinstance(semantics, dict) else None
+    if not isinstance(definitions, list):
+        return raw, {}
+    corrected = 0
+    for definition in definitions:
+        if not isinstance(definition, dict) or not isinstance(definition.get("description"), str):
+            continue
+        description = definition["description"]
+        cleaned = _COMPACT_PICTURE_PROVENANCE.sub("", description)
+        cleaned = _COMPACT_ORPHAN_PICTURE.sub("", cleaned)
+        if cleaned != description:
+            cleaned = re.sub(r"\s+([,.;:])", r"\1", cleaned)
+            cleaned = cleaned.strip(" ,;:\t\r\n")
+            definition["description"] = cleaned if any(char.isalnum() for char in cleaned) else ""
+            corrected += 1
+    if not corrected:
+        return raw, {}
+    return json.dumps(payload, ensure_ascii=False), {
+        "compact_subject_picture_provenance_removed": corrected,
+    }
+
+
+def _normalize_single_compact_speaker_subjects(
+    draft: MimoSingleCompactAnnotationDraftV2, job: Any,
+) -> tuple[MimoSingleCompactAnnotationDraftV2, dict[str, int]]:
+    subjects = {subject.subject_label: subject for subject in job.reference_subjects}
+    segments = []
+    corrections: dict[str, int] = {}
+    for decision in draft.segments:
+        if decision.binding_status != "visible_subject":
+            segments.append(decision)
+            continue
+        subject = subjects.get(decision.speaker_subject_label)
+        if subject is not None and subject.kind == "entity" and subject.entity_id is not None:
+            segments.append(decision)
+            continue
+        owner = None
+        owner_entity_id = getattr(subject, "owner_entity_id", None)
+        if subject is not None and subject.kind == "attribute" and owner_entity_id is not None:
+            candidates = [
+                item for item in job.reference_subjects
+                if item.kind == "entity" and item.entity_id == owner_entity_id
+            ]
+            if len(candidates) == 1:
+                owner = candidates[0]
+        if owner is not None:
+            segments.append(decision.model_copy(update={"speaker_subject_label": owner.subject_label}))
+            code = "compact_speaker_attribute_promoted_to_owner"
+        else:
+            segments.append(decision.model_copy(update={
+                "binding_status": "no_reliable_subject", "speaker_subject_label": None,
+            }))
+            code = "compact_invalid_speaker_subject_downgraded"
+        corrections[code] = corrections.get(code, 0) + 1
+    if not corrections:
+        return draft, {}
+    return draft.model_copy(update={"segments": segments}), corrections
 
 
 def _single_semantic_icl_messages() -> list[dict[str, str]]:
@@ -492,9 +572,13 @@ class SingleCallOpenAIMimo25Backend(StemAwareOpenAIMimo25Backend):
             job, allowed_reference_labels=allowed_reference_labels,
             auxiliary_audio_paths=auxiliary_audio_paths,
         )
-        draft, issues = parse_structured_json_issues(raw, MimoSingleCompactAnnotationDraftV2)
+        canonical_raw, corrections = _canonicalize_single_compact_raw(raw)
+        draft, issues = parse_structured_json_issues(canonical_raw, MimoSingleCompactAnnotationDraftV2)
         annotation = None
         if draft is not None:
+            draft, speaker_corrections = _normalize_single_compact_speaker_subjects(draft, job)
+            for code, count in speaker_corrections.items():
+                corrections[code] = corrections.get(code, 0) + count
             compact_issues, warnings = _validate_single_compact_annotation(
                 draft, job, allowed_entity_ids=allowed_entity_ids,
                 allowed_reference_labels=allowed_reference_labels,
@@ -519,6 +603,8 @@ class SingleCallOpenAIMimo25Backend(StemAwareOpenAIMimo25Backend):
                 annotation.h3_semantics.shot1_caption, speech,
             ))
             diagnostics[0].warnings.extend(direct_warnings)
+        for code, count in sorted(corrections.items()):
+            diagnostics[0].warnings.extend([code] * count)
         if issues:
             raise MimoBackendFailure(
                 code="mimo_structured_output_failed",
@@ -532,6 +618,7 @@ class SingleCallOpenAIMimo25Backend(StemAwareOpenAIMimo25Backend):
             annotation=annotation, raw_responses=(raw,), diagnostics=tuple(diagnostics),
             model_call_count=1, http_attempt_count=1, http_retry_count=0,
             recheck_count=0, input_modality=self._input_modality,
+            deterministic_correction_counts=dict(sorted(corrections.items())),
             speech_av_raw_response=raw,
         )
 
