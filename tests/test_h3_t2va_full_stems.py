@@ -1,5 +1,8 @@
 from pathlib import Path
 
+import numpy as np
+import soundfile as sf
+
 from tests import test_h3_auk_speech_shadow as fixtures
 
 ffmpeg = fixtures.ffmpeg
@@ -77,3 +80,100 @@ def test_auk_replay_publishes_full_inventory(setup, tmp_path, ffmpeg):
         "b": "failed",
         "c": "ready",
     }
+
+
+def test_auk_cpu_finalizer_canonicalizes_one_time(tmp_path, monkeypatch):
+    from r2v_data_v2.h3 import auk_speech_shadow as auk
+    from r2v_data_v2.h3 import t2va_full_stems as stems
+
+    raw = tmp_path / "speech.wav"
+    sf.write(raw, np.zeros((3200, 2), dtype=np.int16), 32000, subtype="PCM_16")
+    calls = []
+
+    def canonicalize(source, output, frames, *, ffmpeg):
+        calls.append((source, frames, ffmpeg))
+        sf.write(output, np.zeros((frames, 2), dtype=np.int16), 32000, subtype="PCM_16")
+        return 0
+
+    monkeypatch.setattr(auk, "canonicalize_speech", canonicalize)
+    worker = object.__new__(stems.AukWorker)
+    worker.configuration = {"ffmpeg": "unused"}
+    job = {
+        "source": {
+            "clip_uid": "a",
+            "clip_display_path": "a",
+            "target_video_path": str(tmp_path / "a.mp4"),
+            "target_video_sha256": "0" * 64,
+            "source_audio_path": str(tmp_path / "audio.flac"),
+            "source_audio_sha256": "0" * 64,
+            "source_frame_count": 3200,
+            "source_duration_seconds": 0.1,
+        }
+    }
+    result = worker.finalize(job, tmp_path, {"raw_path": str(raw), "response": {}})
+    assert result["canonical_adjustment_samples"] == 0
+    assert result["raw_duration_delta_seconds"] == 0
+    assert calls == [(raw, 3200, "unused")]
+
+
+def test_prepared_resolve_publishes_without_second_resolve(tmp_path, monkeypatch):
+    from r2v_data_v2.h3 import auk_speech_shadow as auk
+    from r2v_data_v2.h3 import resolved_audio_stems as resolved
+    from r2v_data_v2.h3.t2va_production import atomic_json
+
+    root = tmp_path / "audio"
+    destination = resolved.downstream_stem_root(root, "pilot")
+    destination.parent.mkdir(parents=True)
+    job = auk.AukJob(
+        clip_uid="a",
+        clip_display_path="a",
+        target_video_path=str(tmp_path / "a.mp4"),
+        target_video_sha256="0" * 64,
+        source_audio_path=str(tmp_path / "a.flac"),
+        source_audio_sha256="1" * 64,
+        source_frame_count=3200,
+        source_duration_seconds=0.1,
+    )
+    inventory = auk._signed(
+        resolved.ResolvedStemInventory,
+        {
+            "source_sam_root": str(destination.parent / "separation"),
+            "source_auk_root": str(destination.parent / "auk_speech_v1"),
+            "source_sam_inventory_fingerprint": "0" * 64,
+            "source_auk_inventory_fingerprint": "1" * 64,
+            "source_sam_records_sha256": "2" * 64,
+            "source_auk_records_sha256": "3" * 64,
+            "source_canonical_audio_manifest_path": str(tmp_path / "clips.jsonl"),
+            "source_canonical_audio_manifest_sha256": "4" * 64,
+            "clip_uids": ["a"],
+            "jobs": [job.model_dump(mode="json")],
+        },
+        "inventory_fingerprint",
+    )
+    record = auk._signed(
+        resolved.ResolvedStemRecord,
+        {
+            "clip_uid": "a",
+            "inventory_fingerprint": inventory.inventory_fingerprint,
+            "source_sam_record_fingerprint": "5" * 64,
+            "source_auk_record_fingerprint": "6" * 64,
+            "status": "failed",
+            "failure_reason": "upstream failure",
+        },
+        "record_fingerprint",
+    )
+    summary = resolved.ResolvedStemSummary(
+        inventory_fingerprint=inventory.inventory_fingerprint,
+        clip_uids=["a"], ready_count=0, failed_count=1,
+    )
+    prepared = tmp_path / "prepared.json"
+    atomic_json(prepared, {
+        "inventory": inventory.model_dump(mode="json"),
+        "records": [record.model_dump(mode="json")],
+        "summary": summary.model_dump(mode="json"),
+    })
+    monkeypatch.setattr(resolved, "_resolve", lambda *_: (_ for _ in ()).throw(AssertionError("replayed")))
+    assert resolved.resolve_audio_stems(
+        audio_production_root=root, shadow_run_id="pilot", prepared_path=prepared
+    ) == summary
+    assert resolved.load_resolved_stems(destination) == (inventory, [record], summary)

@@ -345,6 +345,7 @@ class FullPipeline:
                 audio_production_root=audio_root,
                 shadow_run_id=RUN_ID,
                 overwrite=(shadow / "resolved_stems_v1").exists(),
+                prepared_path=state / "auk/resolved_prepared.json",
             )
         if name in {"diarizen", "asr"}:
             from r2v_data_v2.h3.t2va_full_speech import run_asr, run_diarizen
