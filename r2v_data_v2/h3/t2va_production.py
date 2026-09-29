@@ -1106,7 +1106,22 @@ def prepare_shard(
                             f"{source_index}"
                         )
                     if reason.startswith("clip_duration_over_") and reason.endswith("s"):
-                        row["upstream_failure"] = reason
+                        raw = json.loads(line)
+                        if not isinstance(raw, dict):
+                            raise TypeError(
+                                "duration-excluded source row must be a JSON object"
+                            )
+                        candidate, _ = _path_below_root(
+                            raw.get("video_path"),
+                            root=clips_root,
+                            field_name="video_path",
+                            require_file=False,
+                        )
+                        row.update(
+                            clip_uid=parse_clip_identity(candidate).clip_uid,
+                            video=str(candidate),
+                            upstream_failure=reason,
+                        )
                     else:
                         row["preparation_error"] = (
                             "ValueError: canonical selection excluded source row: "
