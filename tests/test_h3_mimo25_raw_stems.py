@@ -18,14 +18,19 @@ from r2v_data_v2.h3.mimo25_backend import (
     MimoAVAnnotationDraft,
     MimoBackendConfig,
     MimoBackendFailure,
+    MimoBackendProvenance,
     MimoH3Semantics,
     MimoMediaResolver,
     OpenAIMimo25Backend,
     _downgrade_absent_visible_entities,
     _normalize_speaker_annotation,
+    _official_detailed_description_icl_messages,
     protect_direct_dialogue,
 )
-from r2v_data_v2.h3.mimo25_single_backend import SingleCallOpenAIMimo25Backend
+from r2v_data_v2.h3.mimo25_single_backend import (
+    SINGLE_SYSTEM_PROMPT,
+    SingleCallOpenAIMimo25Backend,
+)
 from r2v_data_v2.h3.mimo25_stem_shadow import (
     MIMO25_STEM_RECONCILE_STAGE,
     MimoStemReconcileRecord,
@@ -351,7 +356,10 @@ def _records(shadow):
     return [json.loads(line) for line in path.read_text().splitlines()]
 
 
-def test_single_ra2va_one_request_uses_full_annotation_and_no_binding_proposals(tmp_path, monkeypatch):
+@pytest.mark.parametrize("icl", ["none", "official_ref2va_v1"])
+def test_single_ra2va_one_request_uses_full_annotation_and_no_binding_proposals(
+    tmp_path, monkeypatch, icl
+):
     _, shadow = _fixture(tmp_path, monkeypatch)
     stems = load_stem_shadow(shadow / "separation")[1]
     base = qa.build_mimo25_inventory()
@@ -363,6 +371,7 @@ def test_single_ra2va_one_request_uses_full_annotation_and_no_binding_proposals(
     backend = SingleCallOpenAIMimo25Backend(
         MimoBackendConfig(
             api_key="fake", transport="sglang", model="mimo-v2.6-flash-rl",
+            icl=icl,
             media_resolver=MimoMediaResolver(
                 mode="http", media_root=tmp_path, media_base_url="http://media.invalid",
             ),
@@ -386,6 +395,10 @@ def test_single_ra2va_one_request_uses_full_annotation_and_no_binding_proposals(
     assert len(completions.requests) == 1
     request = completions.requests[0]
     assert request["response_format"]["json_schema"]["name"] == "MimoAVAnnotationDraft"
+    assert request["messages"][1:-1] == (
+        _official_detailed_description_icl_messages()
+        if icl == "official_ref2va_v1" else []
+    )
     content = request["messages"][-1]["content"]
     assert any(item["type"] == "video_url" for item in content)
     assert any(item["type"] == "image_url" for item in content)
@@ -393,6 +406,69 @@ def test_single_ra2va_one_request_uses_full_annotation_and_no_binding_proposals(
     task = next(item["text"] for item in content if item["type"] == "text" and "allowed_segment_ids" in item["text"])
     assert "current_entity_id" not in task
     assert "direct_anchor_present" not in task
+    contract = json.loads(task.split("AUTHORITATIVE INPUT:\n", 1)[1])
+    assert [segment["required_dialogue_block"] for segment in contract["segments"]] == [
+        f"<d>[{segment.asr_language or 'Unknown'}] {segment.asr_text}</d>"
+        for segment in jobs[0].segments if segment.asr_status == "transcribed"
+    ]
+
+
+def test_single_ra2va_nontranscribed_segment_has_no_dialogue_block(tmp_path, monkeypatch):
+    _, shadow = _fixture(tmp_path, monkeypatch)
+    stems = load_stem_shadow(shadow / "separation")[1]
+    jobs = build_stem_reconcile_jobs(
+        base_inventory=qa.build_mimo25_inventory(),
+        stem_diarization_root=shadow / "diarization",
+        stem_asr_root=shadow / "asr", route="music_first",
+    )
+    segment = jobs[0].segments[0].model_copy(update={
+        "segment_id": "segment_0002", "asr_status": "empty",
+        "asr_text": None, "asr_language": None,
+    })
+    job = jobs[0].model_copy(update={"segments": [*jobs[0].segments, segment]})
+    completions = _Completions([(_raw(), 8)])
+    backend = SingleCallOpenAIMimo25Backend(
+        MimoBackendConfig(
+            api_key="fake", transport="sglang", model="mimo-v2.6-flash-rl",
+            icl="none",
+            media_resolver=MimoMediaResolver(
+                mode="http", media_root=tmp_path, media_base_url="http://media.invalid",
+            ),
+        ),
+        stem_records_by_clip={record.clip_uid: record for record in stems},
+        client=SimpleNamespace(chat=SimpleNamespace(completions=completions)),
+    )
+    backend._request(
+        job,
+        allowed_reference_labels={r.picture_label for r in job.reference_images}
+        | {s.subject_label for s in job.reference_subjects},
+        auxiliary_audio_paths=_validated_auxiliary_stems(stems[0]),
+    )
+    content = completions.requests[0]["messages"][-1]["content"]
+    task = next(item["text"] for item in content if item["type"] == "text" and "allowed_segment_ids" in item["text"])
+    segments = json.loads(task.split("AUTHORITATIVE INPUT:\n", 1)[1])["segments"]
+    assert segments[0]["required_dialogue_block"] == (
+        f"<d>[{jobs[0].segments[0].asr_language or 'Unknown'}] "
+        f"{jobs[0].segments[0].asr_text}</d>"
+    )
+    assert "required_dialogue_block" not in segments[1]
+    assert len(completions.requests) == 1
+
+
+def test_single_ra2va_prompt_preserves_visual_acoustic_speaker_and_audio_ownership():
+    for step in range(1, 7):
+        assert f"STEP {step}" in SINGLE_SYSTEM_PROMPT
+    for rule in (
+        "Subject N", "gN", "Sx", "first actual vocal source -> S1",
+        "<Picture N>", "<Audio N>", "required_dialogue_block",
+        "subject_definitions", "visual_retention_analysis", "style_opening",
+        "overall_soundscape", "non_diegetic_music",
+    ):
+        assert rule in SINGLE_SYSTEM_PROMPT
+    assert "Do not put <Picture N> in model-authored definition descriptions" in SINGLE_SYSTEM_PROMPT
+    assert "materializer alone creates <Audio N> definitions" in SINGLE_SYSTEM_PROMPT
+    assert "A silent visible Subject consumes no Sx" in SINGLE_SYSTEM_PROMPT
+    assert "offscreen or unbound actual speakers still receive Sx" in SINGLE_SYSTEM_PROMPT
 
 
 def test_single_ra2va_invalid_output_never_falls_back_or_polishes(tmp_path, monkeypatch):
@@ -458,8 +534,37 @@ def test_single_ra2va_record_keeps_clip_failure_isolated(tmp_path, monkeypatch):
     assert [record.model_call_count for record in records] == [1, 1, 1]
     assert summary.model_call_count == 3
     assert len(completions.requests) == 3
-    assert all(record.backend_provenance.prompt_version == "h3_mimo26_ra2va_single_v1" for record in records)
+    assert all(record.backend_provenance.prompt_version == "h3_mimo26_ra2va_single_v2" for record in records)
+    assert all(record.backend_provenance.schema_version == "r2v.h3.mimo25_backend.68" for record in records)
     assert [item.status for item in load_reconcile_sources(root)] == ["ready", "failed", "ready"]
+
+
+def test_single_ra2va_provenance_reads_frozen_v1_and_current_v2(tmp_path, monkeypatch):
+    from r2v_data_v2.h3 import mimo25_single_backend as single
+    from r2v_data_v2.h3.audio_reuse_prepared import FrozenReuseBackendProvenance
+
+    backend = SingleCallOpenAIMimo25Backend(
+        MimoBackendConfig(
+            api_key="fake", transport="sglang", model="mimo-v2.6-flash-rl",
+            media_resolver=MimoMediaResolver(mode="base64", media_root=tmp_path),
+        ),
+        stem_records_by_clip={},
+        client=SimpleNamespace(chat=SimpleNamespace(completions=None)),
+    )
+    current = backend.provenance
+    assert (current.schema_version, current.prompt_version) == (
+        "r2v.h3.mimo25_backend.68", "h3_mimo26_ra2va_single_v2",
+    )
+    assert MimoBackendProvenance.model_validate_json(current.model_dump_json()) == current
+
+    with monkeypatch.context() as patch:
+        patch.setattr(single, "SINGLE_BACKEND_VERSION", "r2v.h3.mimo25_backend.67")
+        patch.setattr(single, "SINGLE_PROMPT_VERSION", "h3_mimo26_ra2va_single_v1")
+        frozen = backend.provenance
+    assert MimoBackendProvenance.model_validate_json(frozen.model_dump_json()) == frozen
+    assert FrozenReuseBackendProvenance.model_validate_json(
+        frozen.model_dump_json()
+    ).model_dump(mode="json") == frozen.model_dump(mode="json")
 
 
 def test_single_cli_requires_explicit_no_lr_mode_and_v26(tmp_path, monkeypatch):
