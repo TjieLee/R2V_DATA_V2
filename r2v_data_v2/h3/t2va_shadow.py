@@ -729,11 +729,7 @@ def build_t2va_inventory(
     preselected: T2VAShotSelection | None = None,
     verify_audio_files: bool = True,
 ) -> T2VAInventory:
-    from r2v_data_v2.h3.t2va_source import (
-        VIDEO_HASH_NOT_COMPUTED,
-        select_t2va_shots,
-        validate_cached_target,
-    )
+    from r2v_data_v2.h3.t2va_source import select_t2va_shots, validate_cached_target
 
     if preselected is not None:
         if any(
@@ -868,10 +864,6 @@ def build_t2va_inventory(
         clip = by_clip[uid]
         if (
             source_job.target_video_path != shots[uid].video_path
-            or (
-                shots[uid].video_sha256 != VIDEO_HASH_NOT_COMPUTED
-                and source_job.target_video_sha256 != shots[uid].video_sha256
-            )
             or source_job.source_audio_path != clip.target_full_audio_path
             or source_job.source_audio_sha256 != clip.target_full_audio_sha256
             or source_job.source_frame_count != clip.frame_count
