@@ -17,6 +17,10 @@ from pathlib import Path
 SHARD_SIZE = 2_000
 MAX_CLIP_DURATION_SECONDS = 200.0
 CLIP_DURATION_EXCLUSION_REASON = "clip_duration_over_200s"
+
+
+def duration_exclusion_reason(max_seconds: float) -> str:
+    return f"clip_duration_over_{max_seconds:g}s"
 DEFAULT_ROOT = Path(
     "/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/T2VA"
 )
@@ -1089,7 +1093,7 @@ def prepare_shard(
                             "cached T2VA selection does not cover source row "
                             f"{source_index}"
                         )
-                    if reason == CLIP_DURATION_EXCLUSION_REASON:
+                    if reason.startswith("clip_duration_over_") and reason.endswith("s"):
                         row["upstream_failure"] = reason
                     else:
                         row["preparation_error"] = (

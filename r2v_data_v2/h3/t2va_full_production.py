@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 import traceback
@@ -166,6 +167,7 @@ class FullPipeline:
         allow_unverified=False,
         request_workers=1,
         canonical_workers=16,
+        max_clip_duration_seconds=production.MAX_CLIP_DURATION_SECONDS,
         ffmpeg="ffmpeg",
         ffprobe="ffprobe",
         mimo_lifecycle=None,
@@ -184,6 +186,9 @@ class FullPipeline:
         if canonical_workers < 1:
             raise ValueError("canonical workers must be positive")
         self.canonical_workers = canonical_workers
+        if not math.isfinite(max_clip_duration_seconds) or max_clip_duration_seconds <= 0:
+            raise ValueError("max clip duration must be finite and positive")
+        self.max_clip_duration_seconds = max_clip_duration_seconds
         self.prepared = {}
         self.prefetch = None
         self.pools = None
@@ -198,6 +203,7 @@ class FullPipeline:
             clips_root=self.clips_root,
             source_videos_root=self.source_videos_root,
             canonical_workers=self.canonical_workers,
+            max_clip_duration_seconds=self.max_clip_duration_seconds,
             ffmpeg=self.ffmpeg,
             ffprobe=self.ffprobe,
         ) as prefetch:
@@ -275,6 +281,7 @@ class FullPipeline:
                     shard_id,
                     self.clips_root,
                     self.source_videos_root,
+                    max_clip_duration_seconds=self.max_clip_duration_seconds,
                 )
                 audio_root = bootstrap_audio(
                     shard,
@@ -409,10 +416,16 @@ def write_rows(path, rows):
         temporary.unlink(missing_ok=True)
 
 
-def shard_selection(root, index, shard_id, clips_root, source_videos_root):
+def shard_selection(
+    root, index, shard_id, clips_root, source_videos_root,
+    *, max_clip_duration_seconds=production.MAX_CLIP_DURATION_SECONDS,
+):
     from r2v_data_v2.h3.t2va_shadow import fingerprint
     from r2v_data_v2.v3.production_source import JeaVideoMotionAdapter
 
+    if not math.isfinite(max_clip_duration_seconds) or max_clip_duration_seconds <= 0:
+        raise ValueError("max clip duration must be finite and positive")
+    duration_reason = production.duration_exclusion_reason(max_clip_duration_seconds)
     manifest = production.materialize_shard(index, shard_id, root)
     source = root / "shards" / production.shard_name(shard_id) / "source"
     cached = source / "selection.json"
@@ -434,13 +447,13 @@ def shard_selection(root, index, shard_id, clips_root, source_videos_root):
         overlong = [
             shot
             for shot in selection.shots
-            if shot.duration_seconds > production.MAX_CLIP_DURATION_SECONDS
+            if shot.duration_seconds > max_clip_duration_seconds
         ]
         if overlong:
             shots = [
                 shot
                 for shot in selection.shots
-                if shot.duration_seconds <= production.MAX_CLIP_DURATION_SECONDS
+                if shot.duration_seconds <= max_clip_duration_seconds
             ]
             excluded = sorted(
                 [
@@ -448,7 +461,7 @@ def shard_selection(root, index, shard_id, clips_root, source_videos_root):
                     *(
                         {
                             "source_index": shot.source_index,
-                            "reason": production.CLIP_DURATION_EXCLUSION_REASON,
+                            "reason": duration_reason,
                         }
                         for shot in overlong
                     ),
@@ -477,11 +490,11 @@ def shard_selection(root, index, shard_id, clips_root, source_videos_root):
                 if not isinstance(raw, dict):
                     raise TypeError("shot row must be an object")
                 duration = float(raw["duration"])
-                if duration > production.MAX_CLIP_DURATION_SECONDS:
+                if duration > max_clip_duration_seconds:
                     excluded.append(
                         {
                             "source_index": source_index,
-                            "reason": production.CLIP_DURATION_EXCLUSION_REASON,
+                            "reason": duration_reason,
                         }
                     )
                     continue

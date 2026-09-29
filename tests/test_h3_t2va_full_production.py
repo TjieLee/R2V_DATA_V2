@@ -569,6 +569,27 @@ def test_shard_selection_skips_over_200_seconds_before_video_hash(
     ]
 
 
+def test_shard_selection_explicit_20_second_cutoff_and_cached_migration(tmp_path):
+    manifest = shot_manifest(tmp_path)
+    rows = [json.loads(line) for line in manifest.read_text().splitlines()]
+    for row, duration in zip(rows, (19.9, 20.0, 20.1), strict=True):
+        row["duration"] = duration
+    manifest.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    root = tmp_path / "out"
+    index = production.build_source_index(manifest, root)
+    initial = full.shard_selection(root, index, 0, tmp_path, tmp_path)
+    assert len(initial.shots) == 3
+    selected = full.shard_selection(
+        root, index, 0, tmp_path, tmp_path, max_clip_duration_seconds=20.0
+    )
+    assert [shot.duration_seconds for shot in selected.shots] == [19.9, 20.0]
+    assert selected.excluded_rows == [
+        {"source_index": 2, "reason": "clip_duration_over_20s"}
+    ]
+    cached = root / "shards" / production.shard_name(0) / "source/selection.json"
+    assert json.loads(cached.read_text())["excluded_rows"] == selected.excluded_rows
+
+
 def test_cached_shard_selection_migrates_long_clip_to_terminal_skip(
     tmp_path, monkeypatch
 ):

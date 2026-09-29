@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import signal
 import sys
@@ -55,6 +56,7 @@ def main(argv=None):
     parser.add_argument("--gpu-ids", default="0,1,2,3,4,5,6,7")
     parser.add_argument("--request-workers", type=int)
     parser.add_argument("--canonical-workers", type=int, default=16)
+    parser.add_argument("--max-clip-duration-seconds", type=float, default=200.0)
     parser.add_argument("--shards")
     parser.add_argument("--shard-start", type=int, default=0)
     parser.add_argument("--shard-end", type=int)
@@ -104,6 +106,8 @@ def main(argv=None):
         raise ValueError("request workers must be positive")
     if args.canonical_workers < 1:
         raise ValueError("canonical workers must be positive")
+    if not math.isfinite(args.max_clip_duration_seconds) or args.max_clip_duration_seconds <= 0:
+        raise ValueError("max clip duration must be finite and positive")
     if args.mimo_startup_polls < 1:
         raise ValueError("MiMo startup polls must be positive")
     if args.mimo_poll_interval < 0 or args.mimo_cleanup_grace_seconds <= 0:
@@ -163,6 +167,7 @@ def main(argv=None):
             "gpu_ids": gpu_ids,
             "request_workers": args.request_workers,
             "canonical_workers": args.canonical_workers,
+            "max_clip_duration_seconds": args.max_clip_duration_seconds,
             "resume_schedule": resume_schedule,
             "mimo_model": args.mimo_model,
             "mimo_call_mode": args.mimo_call_mode,
@@ -289,6 +294,7 @@ def main(argv=None):
         allow_unverified=args.allow_unverified,
         request_workers=args.request_workers,
         canonical_workers=args.canonical_workers,
+        max_clip_duration_seconds=args.max_clip_duration_seconds,
         ffmpeg=args.ffmpeg,
         ffprobe=args.ffprobe,
         mimo_lifecycle=mimo_client,
