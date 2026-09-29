@@ -607,8 +607,8 @@ def test_cached_shard_selection_migrates_long_clip_to_terminal_skip(
 
     manifest = shot_manifest(tmp_path)
     rows = [json.loads(line) for line in manifest.read_text().splitlines()[:2]]
-    rows[0]["duration"] = 100.0
-    rows[1]["duration"] = 314.0
+    rows[0]["duration"] = 10.0
+    rows[1]["duration"] = 30.0
     manifest.write_text("".join(json.dumps(row) + "\n" for row in rows))
     root = tmp_path / "out"
     index = production.build_source_index(manifest, root)
@@ -637,10 +637,12 @@ def test_cached_shard_selection_migrates_long_clip_to_terminal_skip(
         return original_hash(path)
 
     monkeypatch.setattr(full, "sha256_file", no_video_rehash)
-    selection = full.shard_selection(root, index, 0, tmp_path, tmp_path)
+    selection = full.shard_selection(
+        root, index, 0, tmp_path, tmp_path, max_clip_duration_seconds=20.0
+    )
     assert [shot.source_index for shot in selection.shots] == [0]
     assert selection.excluded_rows == [
-        {"source_index": 1, "reason": "clip_duration_over_200s"}
+        {"source_index": 1, "reason": "clip_duration_over_20s"}
     ]
     assert json.loads(cached.read_text())["shots"] == [
         selection.shots[0].model_dump(mode="json")
@@ -663,7 +665,7 @@ def test_cached_shard_selection_migrates_long_clip_to_terminal_skip(
         backend=None,
     )
     skipped = projected[1]
-    assert skipped["upstream_failure"] == "clip_duration_over_200s"
+    assert skipped["upstream_failure"] == "clip_duration_over_20s"
     assert "preparation_error" not in skipped
     assert skipped["clip_uid"] == initial.shots[1].clip_uid
     assert skipped["video"] == initial.shots[1].video_path
@@ -698,7 +700,7 @@ def test_cached_shard_selection_migrates_long_clip_to_terminal_skip(
     )[skipped["clip_uid"]]
     assert (state["t2va_status"], state["ta2va_status"]) == ("skipped", "skipped")
     assert state["failure_stage"] == "upstream"
-    assert state["failure_reason"] == "clip_duration_over_200s"
+    assert state["failure_reason"] == "clip_duration_over_20s"
 
 
 def test_full_cli_dry_run_does_not_require_models(tmp_path):
