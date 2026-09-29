@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import numpy as np
+import pytest
 import soundfile as sf
 
 from tests import test_h3_auk_speech_shadow as fixtures
@@ -124,6 +125,99 @@ def test_auk_replay_publishes_full_inventory(setup, tmp_path, ffmpeg):
         "b": "failed",
         "c": "ready",
     }
+
+
+def test_auk_optimized_preflight_rejects_occupied_destination_before_execute(
+    setup, tmp_path
+):
+    from r2v_data_v2.h3 import auk_speech_shadow as auk
+    from r2v_data_v2.h3 import t2va_full_stems as stems
+
+    destination = auk.auk_stage_root(
+        Path(setup.audio_production_root), setup.shadow_run_id
+    )
+    destination.mkdir(parents=True)
+    (destination / "sentinel").write_text("not an AuK stage")
+
+    def execute(*args, **kwargs):
+        pytest.fail("AuK inference started before destination preflight")
+
+    with pytest.raises((ValueError, FileNotFoundError)):
+        stems.run_auk(
+            setup, tmp_path / "work", ["0"], eligible={"a"}, execute=execute
+        )
+
+
+def test_auk_preflight_keeps_default_job_checks_and_global_lineage(setup, monkeypatch):
+    from r2v_data_v2.h3 import auk_speech_shadow as auk
+
+    checked = []
+    monkeypatch.setattr(auk, "check_source", lambda job: checked.append(job.clip_uid))
+    auk.preflight(setup, overwrite=False, verify_jobs=False)
+    assert checked == []
+    auk.preflight(setup, overwrite=False)
+    assert checked == setup.clip_uids
+
+    Path(setup.source_case_manifest_path).write_text("changed case manifest")
+    with pytest.raises(ValueError, match="source manifest hash differs"):
+        auk.preflight(setup, overwrite=False, verify_jobs=False)
+
+
+def test_auk_optimized_checks_each_scheduled_source_once_and_reuses_ready(
+    setup, tmp_path, monkeypatch
+):
+    from r2v_data_v2.h3 import auk_speech_shadow as auk
+    from r2v_data_v2.h3 import t2va_full_stems as stems
+    from tests.test_h3_auk_speech_shadow import FakeBackend
+
+    checked = []
+    original_check = auk.check_source
+
+    def check_source(job):
+        checked.append(job.clip_uid)
+        original_check(job)
+
+    def canonicalize(_raw, path, frames, *, ffmpeg):
+        sf.write(path, np.zeros((frames, 2), dtype=np.int16), 32000, subtype="PCM_16")
+        return 0
+
+    monkeypatch.setattr(auk, "check_source", check_source)
+    monkeypatch.setattr(auk, "canonicalize_speech", canonicalize)
+    backend = FakeBackend(setup.model_configuration)
+    worker = object.__new__(stems.AukWorker)
+    worker.backend = backend
+    ready = {}
+    execute_calls = []
+
+    def execute(stage_root, jobs, **kwargs):
+        execute_calls.append((jobs, kwargs["factory"], kwargs["configuration"]))
+        if ready:
+            return ready
+        for item in jobs:
+            output = stage_root / item["job_id"]
+            output.mkdir(parents=True, exist_ok=True)
+            ready[item["job_id"]] = {
+                "status": "ready",
+                "result": worker.infer(item, output),
+            }
+        return ready
+
+    arguments = (setup, tmp_path / "work", ["0"])
+    first = stems.run_auk(*arguments, eligible={"a", "c"}, execute=execute)
+    destination = auk.auk_stage_root(
+        Path(setup.audio_production_root), setup.shadow_run_id
+    )
+    first_records = auk.load_auk_shadow(destination)[1]
+    second = stems.run_auk(*arguments, eligible={"a", "c"}, execute=execute)
+    second_records = auk.load_auk_shadow(destination)[1]
+
+    assert (first.ready_count, second.ready_count) == (2, 2)
+    assert checked == ["c", "a"]
+    assert backend.calls == ["c", "a"]
+    assert execute_calls[0] == execute_calls[1]
+    assert [r.record_fingerprint for r in first_records if r.status == "ready"] == [
+        r.record_fingerprint for r in second_records if r.status == "ready"
+    ]
 
 
 def test_auk_cpu_finalizer_canonicalizes_one_time(tmp_path, monkeypatch):

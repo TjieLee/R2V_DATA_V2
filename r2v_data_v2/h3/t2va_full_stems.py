@@ -95,6 +95,11 @@ class AukWorker:
 def run_auk(inventory, state_root, gpu_ids, *, eligible, ffmpeg="ffmpeg", execute=None):
     from r2v_data_v2.h3 import auk_speech_shadow as auk
 
+    destination = auk.auk_stage_root(
+        Path(inventory.audio_production_root), inventory.shadow_run_id
+    )
+    overwrite = destination.exists()
+    auk.preflight(inventory, overwrite=overwrite, verify_jobs=False)
     if execute is None:
         from r2v_data_v2.h3.t2va_full_workers import execute_stage
 
@@ -115,11 +120,6 @@ def run_auk(inventory, state_root, gpu_ids, *, eligible, ffmpeg="ffmpeg", execut
         },
     )
 
-    destination = auk.auk_stage_root(
-        Path(inventory.audio_production_root), inventory.shadow_run_id
-    )
-    overwrite = destination.exists()
-    auk.preflight(inventory, overwrite=overwrite)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = Path(tempfile.mkdtemp(prefix=f".{auk.AUK_STAGE}-", dir=destination.parent))
     records = []
