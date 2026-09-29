@@ -459,16 +459,27 @@ def test_single_ra2va_prompt_preserves_visual_acoustic_speaker_and_audio_ownersh
     for step in range(1, 7):
         assert f"STEP {step}" in SINGLE_SYSTEM_PROMPT
     for rule in (
-        "Subject N", "gN", "Sx", "first actual vocal source -> S1",
+        "Subject N", "gN", "Sx", "first actual vocal appearance",
+        "gN and Sx are different namespaces",
+        "first distinct speaker appearing in transcribed dialogue -> S1",
+        "next distinct transcribed speaker -> S2",
         "<Picture N>", "<Audio N>", "required_dialogue_block",
         "subject_definitions", "visual_retention_analysis", "style_opening",
         "overall_soundscape", "non_diegetic_music",
     ):
         assert rule in SINGLE_SYSTEM_PROMPT
+    assert "first actual vocal source -> S1" not in SINGLE_SYSTEM_PROMPT
+    assert "only in non-transcribed vocal activity consumes no Sx" in SINGLE_SYSTEM_PROMPT
     assert "Do not put <Picture N> in model-authored definition descriptions" in SINGLE_SYSTEM_PROMPT
     assert "materializer alone creates <Audio N> definitions" in SINGLE_SYSTEM_PROMPT
     assert "A silent visible Subject consumes no Sx" in SINGLE_SYSTEM_PROMPT
-    assert "offscreen or unbound actual speakers still receive Sx" in SINGLE_SYSTEM_PROMPT
+    assert "offscreen or unbound speakers receive Sx only when they have transcribed dialogue" in SINGLE_SYSTEM_PROMPT
+    assert "distinct non-null primary_speaker_group" in SINGLE_SYSTEM_PROMPT
+    assert "first transcribed appearance" in SINGLE_SYSTEM_PROMPT
+    assert "corresponding segment-window speech-stem evidence" in SINGLE_SYSTEM_PROMPT
+    assert "only in non-transcribed activity gets no profile" in SINGLE_SYSTEM_PROMPT
+    assert "Do not add non-dialogue audio to shot1_caption" in SINGLE_SYSTEM_PROMPT
+    assert "Localized diegetic sound may appear" not in SINGLE_SYSTEM_PROMPT
 
 
 def test_single_ra2va_invalid_output_never_falls_back_or_polishes(tmp_path, monkeypatch):
