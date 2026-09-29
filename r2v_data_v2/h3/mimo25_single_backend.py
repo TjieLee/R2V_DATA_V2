@@ -23,8 +23,8 @@ from r2v_data_v2.h3.mimo25_backend import (
 )
 from r2v_data_v2.h3.mimo25_stem_shadow import StemAwareOpenAIMimo25Backend
 
-SINGLE_PROMPT_VERSION = "h3_mimo26_ra2va_single_v2"
-SINGLE_BACKEND_VERSION = "r2v.h3.mimo25_backend.68"
+SINGLE_PROMPT_VERSION = "h3_mimo26_ra2va_single_v3"
+SINGLE_BACKEND_VERSION = "r2v.h3.mimo25_backend.69"
 
 SINGLE_SYSTEM_PROMPT = """Return exactly one MimoAVAnnotationDraft JSON object. Complete these responsibilities within one observation of the original target AV and the supplied frozen Pictures and resolved stems. The original AV is the final audiovisual authority; stems aid acoustic recall. Official ICL shows H3 writing and field boundaries, not the response schema or this clip's facts.
 
@@ -46,8 +46,122 @@ For transcribed segments only, output speaker_voice_profiles for each distinct n
 STEP 6 — NON-DIALOGUE AUDIO
 Listen to original target AV with the music and SFX stems. Put continuous ambience and physical/environmental sound in overall_soundscape, and audience-only score in non_diegetic_music; keep dialogue out of both. Do not add non-dialogue audio to shot1_caption; it contains visual prose, speaker presentation, and exact dialogue. The materializer alone creates <Audio N> definitions, relationships, retention, Picture provenance, and final H3 formatting.
 
+CROSS-STEP CONSISTENCY
+Later steps consume earlier-step state; do not independently reinterpret it. For each segment, av_grounding must agree with the exact same visual_observation.segment_views entry. If an entity has speech_correlated_articulation="observed", do not emit no_visible_lip_motion for that entity in that segment. If the original AV also supports temporal correspondence with that visible entity, do not classify the same vocal source as offscreen. binding_status="visible_entity" requires speech_presentation="onscreen_spoken", entity_id from that segment's visible_entity_ids, and compatible positive AV evidence. binding_status="offscreen" requires speech_presentation="offscreen_spoken", entity_id=null, and genuine offscreen_audio evidence. no_reliable_entity or uncertain requires entity_id=null and must not claim a visible Subject as speaker. shot1_caption must follow the FINAL av_grounding: render a visible bound speaker with its mapped <Subject N> and (Sx), an offscreen speaker as a natural offscreen source with (Sx), and an unresolved speaker without Subject identity. Do not make contradictory speaker claims across visual_observation, av_grounding, and shot1_caption.
+
+OUTPUT INVENTORY
+Treat required_output_inventory as exact and ordered. subject_definitions and visual_retention_analysis each contain exactly one row per supplied Subject in supplied order, without invented Subjects. visual_observation.segment_views, audio_observation.segment_decisions, and av_grounding.segment_groundings each contain exactly one row per supplied segment in chronological order, without missing, duplicated, or invented segments. Use only labels and IDs from the authoritative input.
+
 FINAL
 Return only the supplied annotation schema, not intermediate steps or reasoning."""
+
+
+def _single_semantic_icl_messages() -> list[dict[str, str]]:
+    example = {
+        "schema_version": "r2v.h3.mimo25_av_annotation.20",
+        "visual_observation": {
+            "visual_blocks": [{
+                "block_id": "v1",
+                "text": "<Subject 1> watches quietly beside the doorway while <Subject 2> turns toward the camera side. Their positions remain separate in the steady composition.",
+            }],
+            "segment_views": [
+                {
+                    "segment_id": "segment_0001",
+                    "visible_entity_ids": ["e1", "e2"],
+                    "entity_observations": [
+                        {
+                            "entity_id": "e1", "visibility": "visible", "orientation": "three_quarter",
+                            "face_visibility": "clear", "mouth_visibility": "clear",
+                            "speech_correlated_articulation": "not_observed",
+                        },
+                        {
+                            "entity_id": "e2", "visibility": "visible", "orientation": "three_quarter",
+                            "face_visibility": "clear", "mouth_visibility": "clear",
+                            "speech_correlated_articulation": "observed",
+                        },
+                    ],
+                },
+                {
+                    "segment_id": "segment_0002",
+                    "visible_entity_ids": ["e1", "e2"],
+                    "entity_observations": [
+                        {
+                            "entity_id": "e1", "visibility": "visible", "orientation": "three_quarter",
+                            "face_visibility": "clear", "mouth_visibility": "clear",
+                            "speech_correlated_articulation": "not_observed",
+                        },
+                        {
+                            "entity_id": "e2", "visibility": "visible", "orientation": "three_quarter",
+                            "face_visibility": "clear", "mouth_visibility": "clear",
+                            "speech_correlated_articulation": "not_observed",
+                        },
+                    ],
+                },
+            ],
+        },
+        "audio_observation": {
+            "segment_decisions": [
+                {
+                    "segment_id": "segment_0001", "vocal_composition": "single_speaker",
+                    "resolution": "resolved", "primary_speaker_group": "g1",
+                    "delivery_style": "calm conversational delivery",
+                    "secondary_vocal_activity": {"present": False, "speaker_relation": "none", "kind": None},
+                    "confidence": "high", "audio_evidence_codes": ["source_cluster_support"],
+                },
+                {
+                    "segment_id": "segment_0002", "vocal_composition": "single_speaker",
+                    "resolution": "resolved", "primary_speaker_group": "g2",
+                    "delivery_style": "brief questioning delivery",
+                    "secondary_vocal_activity": {"present": False, "speaker_relation": "none", "kind": None},
+                    "confidence": "medium", "audio_evidence_codes": ["speaker_turn_change"],
+                },
+            ],
+            "speaker_voice_profiles": [
+                {"speaker_group": "g1", "voice_characteristics": "a mid-register voice with a clear timbre and measured cadence"},
+                {"speaker_group": "g2", "voice_characteristics": "a lower voice with restrained questioning delivery"},
+            ],
+        },
+        "av_grounding": {
+            "segment_groundings": [
+                {
+                    "segment_id": "segment_0001", "primary_speaker_group": "g1",
+                    "binding_status": "visible_entity", "speech_presentation": "onscreen_spoken",
+                    "entity_id": "e2", "confidence": "high",
+                    "evidence_codes": ["visible_lip_motion", "av_temporal_alignment"],
+                },
+                {
+                    "segment_id": "segment_0002", "primary_speaker_group": "g2",
+                    "binding_status": "offscreen", "speech_presentation": "offscreen_spoken",
+                    "entity_id": None, "confidence": "medium", "evidence_codes": ["offscreen_audio"],
+                },
+            ],
+        },
+        "h3_semantics": {
+            "subject_definitions": [
+                {"subject_label": "<Subject 1>", "description": "an adult woman with dark shoulder-length hair and a dark green coat"},
+                {"subject_label": "<Subject 2>", "description": "an adult man with short dark hair and a gray jacket"},
+            ],
+            "summary": "Two people pause near an entrance; the visible man answers first, followed by an offscreen speaker.",
+            "style_opening": "Naturalistic live-action cinematography with a steady camera and soft practical lighting.",
+            "shot1_caption": "<Subject 1> watches quietly beside the doorway while <Subject 2> turns toward the camera side. <Subject 2> (S1) replies, <d>[Chinese] 好，我知道了。</d> He pauses as an offscreen voice (S2) asks, <d>[Chinese] 你去哪？</d>",
+            "overall_soundscape": "A quiet interior ambience with faint footsteps and subtle doorway movement.",
+            "non_diegetic_music": "N/A",
+            "visual_retention_analysis": [
+                {"subject_label": "<Subject 1>", "marker": "fully_preserved", "description": "Her hairstyle, coat, and visible proportions remain consistent."},
+                {"subject_label": "<Subject 2>", "marker": "fully_preserved", "description": "His short hair, jacket, and visible proportions remain consistent."},
+            ],
+        },
+        "warnings": [],
+    }
+    return [
+        {"role": "user", "content": (
+            "This is a compact synthetic demonstration of cross-field semantic consistency "
+            "for the single-call annotation schema. It demonstrates Subject/gN/Sx "
+            "relationships and field dependencies only. Do not copy its people, dialogue, "
+            "entities, visual style, or factual content into the real task."
+        )},
+        {"role": "assistant", "content": _compact_json(example)},
+    ]
 
 
 class SingleCallOpenAIMimo25Backend(StemAwareOpenAIMimo25Backend):
@@ -100,6 +214,15 @@ class SingleCallOpenAIMimo25Backend(StemAwareOpenAIMimo25Backend):
                     )
                 segments.append(segment)
             contract["segments"] = segments
+            contract["required_output_inventory"] = {
+                "subject_labels_in_order": [subject.subject_label for subject in job.reference_subjects],
+                "segment_ids_in_order": [segment.segment_id for segment in job.segments],
+                "transcribed_dialogue_blocks_in_order": [
+                    {"segment_id": segment["segment_id"],
+                     "required_dialogue_block": segment["required_dialogue_block"]}
+                    for segment in segments if segment["asr_status"] == "transcribed"
+                ],
+            }
             contract["allowed_h3_reference_labels"] = sorted(allowed_reference_labels)
             content = self._media_content(job)
             for kind in ("speech", "music", "sfx"):
@@ -115,6 +238,7 @@ class SingleCallOpenAIMimo25Backend(StemAwareOpenAIMimo25Backend):
                 "messages": [
                     {"role": "system", "content": SINGLE_SYSTEM_PROMPT},
                     *(_official_detailed_description_icl_messages() if self.config.icl == "official_ref2va_v1" else []),
+                    *(_single_semantic_icl_messages() if self.config.icl == "official_ref2va_v1" else []),
                     {"role": "user", "content": content},
                 ],
                 "temperature": self.config.temperature,

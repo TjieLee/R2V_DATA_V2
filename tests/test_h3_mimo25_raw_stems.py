@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from r2v_data_v2.h3 import audio_shadow_qa as qa
+from r2v_data_v2.h3 import mimo25_single_backend as single
 from r2v_data_v2.h3.mimo25_av_reconcile import _inventory, _job
 from r2v_data_v2.h3.mimo25_backend import (
     AUDIO_FINALIZE_SYSTEM_PROMPT,
@@ -357,7 +358,7 @@ def _records(shadow):
 
 
 @pytest.mark.parametrize("icl", ["none", "official_ref2va_v1"])
-def test_single_ra2va_one_request_uses_full_annotation_and_no_binding_proposals(
+def test_single_ra2va_one_request_respects_icl_none_as_no_examples(
     tmp_path, monkeypatch, icl
 ):
     _, shadow = _fixture(tmp_path, monkeypatch)
@@ -396,7 +397,7 @@ def test_single_ra2va_one_request_uses_full_annotation_and_no_binding_proposals(
     request = completions.requests[0]
     assert request["response_format"]["json_schema"]["name"] == "MimoAVAnnotationDraft"
     assert request["messages"][1:-1] == (
-        _official_detailed_description_icl_messages()
+        [*_official_detailed_description_icl_messages(), *single._single_semantic_icl_messages()]
         if icl == "official_ref2va_v1" else []
     )
     content = request["messages"][-1]["content"]
@@ -411,6 +412,17 @@ def test_single_ra2va_one_request_uses_full_annotation_and_no_binding_proposals(
         f"<d>[{segment.asr_language or 'Unknown'}] {segment.asr_text}</d>"
         for segment in jobs[0].segments if segment.asr_status == "transcribed"
     ]
+    assert contract["required_output_inventory"] == {
+        "subject_labels_in_order": [subject.subject_label for subject in jobs[0].reference_subjects],
+        "segment_ids_in_order": [segment.segment_id for segment in jobs[0].segments],
+        "transcribed_dialogue_blocks_in_order": [
+            {
+                "segment_id": segment.segment_id,
+                "required_dialogue_block": f"<d>[{segment.asr_language or 'Unknown'}] {segment.asr_text}</d>",
+            }
+            for segment in jobs[0].segments if segment.asr_status == "transcribed"
+        ],
+    }
 
 
 def test_single_ra2va_nontranscribed_segment_has_no_dialogue_block(tmp_path, monkeypatch):
@@ -446,12 +458,20 @@ def test_single_ra2va_nontranscribed_segment_has_no_dialogue_block(tmp_path, mon
     )
     content = completions.requests[0]["messages"][-1]["content"]
     task = next(item["text"] for item in content if item["type"] == "text" and "allowed_segment_ids" in item["text"])
-    segments = json.loads(task.split("AUTHORITATIVE INPUT:\n", 1)[1])["segments"]
+    contract = json.loads(task.split("AUTHORITATIVE INPUT:\n", 1)[1])
+    segments = contract["segments"]
     assert segments[0]["required_dialogue_block"] == (
         f"<d>[{jobs[0].segments[0].asr_language or 'Unknown'}] "
         f"{jobs[0].segments[0].asr_text}</d>"
     )
     assert "required_dialogue_block" not in segments[1]
+    assert contract["required_output_inventory"]["segment_ids_in_order"] == [
+        segment.segment_id for segment in job.segments
+    ]
+    assert contract["required_output_inventory"]["transcribed_dialogue_blocks_in_order"] == [
+        {"segment_id": segments[0]["segment_id"],
+         "required_dialogue_block": segments[0]["required_dialogue_block"]}
+    ]
     assert len(completions.requests) == 1
 
 
@@ -480,6 +500,43 @@ def test_single_ra2va_prompt_preserves_visual_acoustic_speaker_and_audio_ownersh
     assert "only in non-transcribed activity gets no profile" in SINGLE_SYSTEM_PROMPT
     assert "Do not add non-dialogue audio to shot1_caption" in SINGLE_SYSTEM_PROMPT
     assert "Localized diegetic sound may appear" not in SINGLE_SYSTEM_PROMPT
+
+
+def test_single_ra2va_prompt_requires_cross_step_consistency_and_exact_output_inventory():
+    for rule in (
+        "CROSS-STEP CONSISTENCY",
+        "visual_observation.segment_views",
+        'speech_correlated_articulation="observed"',
+        "no_visible_lip_motion",
+        'binding_status="visible_entity"',
+        'speech_presentation="onscreen_spoken"',
+        'binding_status="offscreen"',
+        'speech_presentation="offscreen_spoken"',
+        "offscreen_audio",
+        "entity_id=null",
+        "FINAL av_grounding",
+        "OUTPUT INVENTORY",
+        "required_output_inventory",
+        "subject_definitions and visual_retention_analysis",
+        "visual_observation.segment_views, audio_observation.segment_decisions, and av_grounding.segment_groundings",
+    ):
+        assert rule in SINGLE_SYSTEM_PROMPT
+
+
+def test_single_ra2va_semantic_icl_is_valid_and_decouples_subject_from_speaker():
+    user, assistant = single._single_semantic_icl_messages()
+    assert [user["role"], assistant["role"]] == ["user", "assistant"]
+    assert "synthetic demonstration" in user["content"]
+    example = MimoAVAnnotationDraft.model_validate_json(assistant["content"])
+    assert "<Subject 2> (S1)" in example.h3_semantics.shot1_caption
+    assert "offscreen voice (S2)" in example.h3_semantics.shot1_caption
+    assert "<Subject 1> (S1)" not in example.h3_semantics.shot1_caption
+    assert all("<Picture " not in message["content"] for message in (user, assistant))
+    assert all("<Audio " not in message["content"] for message in (user, assistant))
+    assert example.visual_observation.segment_views[0].entity_observations[1].speech_correlated_articulation == "observed"
+    assert example.av_grounding.segment_groundings[0].entity_id == "e2"
+    assert example.av_grounding.segment_groundings[1].binding_status == "offscreen"
+    assert example.av_grounding.segment_groundings[1].evidence_codes == ["offscreen_audio"]
 
 
 def test_single_ra2va_invalid_output_never_falls_back_or_polishes(tmp_path, monkeypatch):
@@ -545,13 +602,12 @@ def test_single_ra2va_record_keeps_clip_failure_isolated(tmp_path, monkeypatch):
     assert [record.model_call_count for record in records] == [1, 1, 1]
     assert summary.model_call_count == 3
     assert len(completions.requests) == 3
-    assert all(record.backend_provenance.prompt_version == "h3_mimo26_ra2va_single_v2" for record in records)
-    assert all(record.backend_provenance.schema_version == "r2v.h3.mimo25_backend.68" for record in records)
+    assert all(record.backend_provenance.prompt_version == "h3_mimo26_ra2va_single_v3" for record in records)
+    assert all(record.backend_provenance.schema_version == "r2v.h3.mimo25_backend.69" for record in records)
     assert [item.status for item in load_reconcile_sources(root)] == ["ready", "failed", "ready"]
 
 
-def test_single_ra2va_provenance_reads_frozen_v1_and_current_v2(tmp_path, monkeypatch):
-    from r2v_data_v2.h3 import mimo25_single_backend as single
+def test_single_ra2va_provenance_reads_frozen_v1_v2_and_current_v3(tmp_path, monkeypatch):
     from r2v_data_v2.h3.audio_reuse_prepared import FrozenReuseBackendProvenance
 
     backend = SingleCallOpenAIMimo25Backend(
@@ -564,18 +620,25 @@ def test_single_ra2va_provenance_reads_frozen_v1_and_current_v2(tmp_path, monkey
     )
     current = backend.provenance
     assert (current.schema_version, current.prompt_version) == (
-        "r2v.h3.mimo25_backend.68", "h3_mimo26_ra2va_single_v2",
+        "r2v.h3.mimo25_backend.69", "h3_mimo26_ra2va_single_v3",
     )
     assert MimoBackendProvenance.model_validate_json(current.model_dump_json()) == current
-
-    with monkeypatch.context() as patch:
-        patch.setattr(single, "SINGLE_BACKEND_VERSION", "r2v.h3.mimo25_backend.67")
-        patch.setattr(single, "SINGLE_PROMPT_VERSION", "h3_mimo26_ra2va_single_v1")
-        frozen = backend.provenance
-    assert MimoBackendProvenance.model_validate_json(frozen.model_dump_json()) == frozen
     assert FrozenReuseBackendProvenance.model_validate_json(
-        frozen.model_dump_json()
-    ).model_dump(mode="json") == frozen.model_dump(mode="json")
+        current.model_dump_json()
+    ).model_dump(mode="json") == current.model_dump(mode="json")
+
+    for version, prompt in (
+        (".67", "h3_mimo26_ra2va_single_v1"),
+        (".68", "h3_mimo26_ra2va_single_v2"),
+    ):
+        with monkeypatch.context() as patch:
+            patch.setattr(single, "SINGLE_BACKEND_VERSION", f"r2v.h3.mimo25_backend{version}")
+            patch.setattr(single, "SINGLE_PROMPT_VERSION", prompt)
+            frozen = backend.provenance
+        assert MimoBackendProvenance.model_validate_json(frozen.model_dump_json()) == frozen
+        assert FrozenReuseBackendProvenance.model_validate_json(
+            frozen.model_dump_json()
+        ).model_dump(mode="json") == frozen.model_dump(mode="json")
 
 
 def test_single_cli_requires_explicit_no_lr_mode_and_v26(tmp_path, monkeypatch):

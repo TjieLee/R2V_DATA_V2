@@ -1718,6 +1718,7 @@ class MimoStemReconcileRecord(SchemaModel):
         ), strict=True))
         single_call = self.backend_provenance.prompt_version in {
             "h3_mimo26_ra2va_single_v1", "h3_mimo26_ra2va_single_v2",
+            "h3_mimo26_ra2va_single_v3",
         }
         if single_call:
             invalid_calls = (
