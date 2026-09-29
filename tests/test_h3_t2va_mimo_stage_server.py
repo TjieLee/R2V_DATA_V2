@@ -55,6 +55,7 @@ def test_mimo_v26_uses_validated_tp4_marlin_without_eagle():
     assert command[command.index("--tp") + 1] == "4"
     assert command[command.index("--moe-runner-backend") + 1] == "marlin"
     assert "--disable-custom-all-reduce" in command
+    assert "--enable-deterministic-inference" in command
     assert not {"--dp", "--ep", "--speculative-algorithm", "--enable-multi-layer-eagle"} & set(command)
 
 

@@ -37,6 +37,7 @@ def build_mimo_serve_command(
             "--tp", "4", "--moe-runner-backend", "marlin",
             "--disable-custom-all-reduce", "--trust-remote-code",
             "--reasoning-parser", "mimo", "--tool-call-parser", "mimo",
+            "--enable-deterministic-inference",
         ]
     command = [
         str(sglang),
