@@ -480,6 +480,18 @@ def process_shard(
                 else:
                     raise ValueError("production source/config identity changed")
             state["preparation_failed"] = bool(row.get("preparation_error"))
+            if (
+                str(row.get("upstream_failure") or "").startswith("clip_duration_over_")
+                and state["t2va_status"] == "ready"
+                and state["ta2va_status"] == "pending"
+            ):
+                state.update(
+                    ta2va_status="skipped",
+                    failure_reason=row["upstream_failure"],
+                    failure_stage="upstream",
+                )
+                save(state)
+                return
             if row.get("upstream_failure") and state["t2va_status"] == "pending":
                 state.update(
                     t2va_status="skipped",

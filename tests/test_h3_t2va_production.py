@@ -295,6 +295,28 @@ def test_fresh_mixed_ready_failed_skipped_shard_completes(tmp_path):
     ]
 
 
+def test_duration_cutoff_resume_preserves_ready_t2va_without_running_ta2va(tmp_path):
+    processor = FakeProcessor()
+    processor.interrupt = ("clip0", "ta2va")
+    rows = sample_rows(1)
+    with pytest.raises(KeyboardInterrupt):
+        production.process_shard(tmp_path, 0, rows, processor, request_workers=1)
+    assert processor.calls == {("clip0", "t2va"): 1, ("clip0", "ta2va"): 1}
+
+    processor.interrupt = None
+    rows[0]["upstream_failure"] = "clip_duration_over_20s"
+    states = production.process_shard(tmp_path, 0, rows, processor, request_workers=1)
+    assert states["clip0"]["t2va_status"] == "ready"
+    assert states["clip0"]["ta2va_status"] == "skipped"
+    assert states["clip0"]["failure_reason"] == "clip_duration_over_20s"
+    assert processor.calls == {("clip0", "t2va"): 1, ("clip0", "ta2va"): 1}
+    shard = tmp_path / "shards" / production.shard_name(0)
+    assert (shard / "artifacts/clip0/t2va/stage.json").is_file()
+    assert list(production.complete_rows(shard / "exports/t2va.jsonl")) == [
+        production.training_row(rows[0]["video"], "('clip0', 't2va')")
+    ]
+
+
 def test_interrupt_and_artifact_recovery(tmp_path):
     processor = FakeProcessor()
     processor.interrupt = ("clip3", "t2va")
