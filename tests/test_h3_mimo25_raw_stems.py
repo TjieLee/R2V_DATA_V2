@@ -201,6 +201,30 @@ def _raw():
     return _annotation().model_dump_json().replace("segment_1", "segment_0001").replace("Exact, text!", "exact transcript")
 
 
+def _single_raw():
+    payload = json.loads(_raw())
+    view = payload["visual_observation"]["segment_views"][0]
+    audio = payload["audio_observation"]["segment_decisions"][0]
+    grounding = payload["av_grounding"]["segment_groundings"][0]
+    payload["schema_version"] = single.SINGLE_COMPACT_SCHEMA_VERSION
+    payload["visual_observation"]["segment_views"] = [{
+        "segment_id": view["segment_id"], "visible_entity_ids": view["visible_entity_ids"],
+    }]
+    payload["audio_observation"]["segment_decisions"] = [{
+        "segment_id": audio["segment_id"],
+        "primary_speaker_group": audio["primary_speaker_group"],
+        "delivery_style": audio["delivery_style"],
+    }]
+    payload["av_grounding"]["segment_groundings"] = [{
+        "segment_id": grounding["segment_id"],
+        "binding_status": grounding["binding_status"],
+        "entity_id": grounding["entity_id"],
+    }]
+    payload["h3_semantics"]["shot1_caption"] = payload["h3_semantics"]["shot1_caption"].replace("(S1)", "")
+    payload.pop("warnings")
+    return json.dumps(payload)
+
+
 def test_turn2_exact_segment_visibility_contract():
     for phrase in (
         'binding_status="visible_entity", entity_id=eX is legal ONLY',
@@ -368,7 +392,7 @@ def test_single_ra2va_one_request_respects_icl_none_as_no_examples(
         base_inventory=base, stem_diarization_root=shadow / "diarization",
         stem_asr_root=shadow / "asr", route="music_first",
     )
-    completions = _Completions([(_raw(), 8)])
+    completions = _Completions([(_single_raw(), 8)])
     backend = SingleCallOpenAIMimo25Backend(
         MimoBackendConfig(
             api_key="fake", transport="sglang", model="mimo-v2.6-flash-rl",
@@ -392,10 +416,12 @@ def test_single_ra2va_one_request_respects_icl_none_as_no_examples(
     assert result.visual_model_call_count == 0
     assert result.audio_model_call_count == 0
     assert result.text_model_call_count == 0
-    assert result.annotation == MimoAVAnnotationDraft.model_validate_json(_raw())
+    assert result.annotation.schema_version == "r2v.h3.mimo25_av_annotation.20"
+    assert "(S1) <d>" in result.annotation.h3_semantics.shot1_caption
+    assert result.speech_av_raw_response == _single_raw()
     assert len(completions.requests) == 1
     request = completions.requests[0]
-    assert request["response_format"]["json_schema"]["name"] == "MimoAVAnnotationDraft"
+    assert request["response_format"]["json_schema"]["name"] == "MimoSingleCompactAnnotationDraft"
     assert request["messages"][1:-1] == (
         [*_official_detailed_description_icl_messages(), *single._single_semantic_icl_messages()]
         if icl == "official_ref2va_v1" else []
@@ -508,7 +534,7 @@ def test_single_ra2va_zero_transcript_request_has_no_dialogue_inventory(tmp_path
     )
     assert len(completions.requests) == 1
     request = completions.requests[0]
-    assert "shot1_caption contains no <d> dialogue blocks and no (Sx) markers" in request["messages"][0]["content"]
+    assert "if it is empty, output no <d> blocks" in request["messages"][0]["content"]
     task = next(item["text"] for item in request["messages"][-1]["content"] if item["type"] == "text" and "allowed_segment_ids" in item["text"])
     contract = json.loads(task.split("AUTHORITATIVE INPUT:\n", 1)[1])
     assert contract["required_output_inventory"]["transcribed_dialogue_blocks_in_order"] == []
@@ -516,87 +542,50 @@ def test_single_ra2va_zero_transcript_request_has_no_dialogue_inventory(tmp_path
 
 
 def test_single_ra2va_prompt_preserves_visual_acoustic_speaker_and_audio_ownership():
-    for step in range(1, 7):
+    for step in range(1, 5):
         assert f"STEP {step}" in SINGLE_SYSTEM_PROMPT
     for rule in (
-        "Subject N", "gN", "Sx", "first actual vocal appearance",
-        "gN and Sx are different namespaces",
-        "first distinct speaker appearing in transcribed dialogue -> S1",
-        "next distinct transcribed speaker -> S2",
+        "<Subject N>", "g1, g2", "(Sx)", "first actual vocal-source appearance",
         "<Picture N>", "<Audio N>", "required_dialogue_block",
         "subject_definitions", "visual_retention_analysis", "style_opening",
         "overall_soundscape", "non_diegetic_music",
     ):
         assert rule in SINGLE_SYSTEM_PROMPT
-    assert "first actual vocal source -> S1" not in SINGLE_SYSTEM_PROMPT
-    assert "only in non-transcribed vocal activity consumes no Sx" in SINGLE_SYSTEM_PROMPT
-    assert "Do not put <Picture N> in model-authored definition descriptions" in SINGLE_SYSTEM_PROMPT
-    assert "materializer alone creates <Audio N> definitions" in SINGLE_SYSTEM_PROMPT
-    assert "A silent visible Subject consumes no Sx" in SINGLE_SYSTEM_PROMPT
-    assert "offscreen or unbound speakers receive Sx only when they have transcribed dialogue" in SINGLE_SYSTEM_PROMPT
-    assert "distinct non-null primary_speaker_group" in SINGLE_SYSTEM_PROMPT
+    assert "Do NOT emit any (S1), (S2)" in SINGLE_SYSTEM_PROMPT
+    assert "pipeline-owned and projected deterministically" in SINGLE_SYSTEM_PROMPT
+    assert "one row per supplied segment" in SINGLE_SYSTEM_PROMPT
     assert "first transcribed appearance" in SINGLE_SYSTEM_PROMPT
-    assert "corresponding segment-window speech-stem evidence" in SINGLE_SYSTEM_PROMPT
-    assert "only in non-transcribed activity gets no profile" in SINGLE_SYSTEM_PROMPT
-    assert "Do not add non-dialogue audio to shot1_caption" in SINGLE_SYSTEM_PROMPT
-    assert "Localized diegetic sound may appear" not in SINGLE_SYSTEM_PROMPT
+    assert "not in shot1_caption" in SINGLE_SYSTEM_PROMPT
 
 
-def test_single_ra2va_prompt_requires_cross_step_consistency_and_exact_output_inventory():
+def test_single_ra2va_prompt_requires_compact_visibility_and_exact_output_inventory():
     for rule in (
-        "CROSS-STEP CONSISTENCY",
         "visual_observation.segment_views",
-        'speech_correlated_articulation="observed"',
-        "no_visible_lip_motion",
-        'binding_status="visible_entity"',
-        'speech_presentation="onscreen_spoken"',
-        'binding_status="offscreen"',
-        'speech_presentation="offscreen_spoken"',
-        "offscreen_audio",
+        "visible_entity requires entity_id from that same segment's visible_entity_ids",
         "entity_id=null",
-        "FINAL av_grounding",
         "OUTPUT INVENTORY",
         "required_output_inventory",
-        "subject_definitions and visual_retention_analysis",
-        "visual_observation.segment_views, audio_observation.segment_decisions, and av_grounding.segment_groundings",
+        "transcribed_dialogue_blocks_in_order",
     ):
         assert rule in SINGLE_SYSTEM_PROMPT
 
 
-def test_single_ra2va_v4_prompt_selects_exact_window_speaker_and_stable_group_identity():
-    for rule in (
-        "EXACT-WINDOW VISIBLE SPEAKER SELECTION",
-        'speech_correlated_articulation="observed"',
-        "MUST be one of those observed-articulation entities",
-        "Never bind a non-articulating visible entity when another visible entity has observed articulation",
-        "visible_lip_motion may only be claimed for an entity whose same-segment",
-        "When no entity has observed articulation, av_temporal_alignment may still support",
-        "STABLE GROUP BINDING",
-        "one acoustic speaker_group must not map to multiple visible entity_ids",
-        "one visible entity must not be published as multiple distinct resolved speaker_groups",
-        "leave that segment unresolved rather than silently moving the same group",
-        "Do not change Step-2 primary_speaker_group in Step 3",
+def test_single_ra2va_v5_prompt_omits_legacy_evidence_logic():
+    for old_rule in (
+        "EXACT-WINDOW VISIBLE SPEAKER SELECTION", "STABLE GROUP BINDING",
+        "visible_lip_motion", "no_visible_lip_motion", "av_temporal_alignment",
+        "speech_correlated_articulation", "offscreen_audio",
     ):
-        assert rule in SINGLE_SYSTEM_PROMPT
+        assert old_rule not in SINGLE_SYSTEM_PROMPT
 
 
-def test_single_ra2va_v4_prompt_projects_sx_without_visual_renumbering_or_hallucinated_dialogue():
+def test_single_ra2va_v5_prompt_leaves_sx_to_pipeline_and_locks_dialogue():
     for rule in (
-        "SPEAKER MARKER PROJECTION",
-        "using ONLY transcribed segments in chronological order",
-        "First distinct non-null/fallback vocal source appearing in transcribed dialogue -> S1",
-        "shot1_caption MUST use this mapping exactly",
-        "visible Subject, articulation, gaze, or AV binding does NOT create a new Sx",
-        "when primary_speaker_group remains the same",
-        "a new primary_speaker_group in transcribed speech must use its own Sx",
-        "EVERY transcribed dialogue block",
-        "Do not rely on implicit marker inheritance",
-        "required_output_inventory.transcribed_dialogue_blocks_in_order is empty",
-        "shot1_caption contains no <d> dialogue blocks and no (Sx) markers",
-        "speaker_voice_profiles is empty",
-        "subject_definitions[*].description is visual appearance content ONLY",
-        "must never contain any <Picture N> label or Picture provenance",
-        "materializer owns all Subject-to-Picture provenance",
+        "each immutable required_dialogue_block exactly once",
+        "Do NOT emit any (S1), (S2)",
+        "speaker IDs are pipeline-owned",
+        "if it is empty, output no <d> blocks",
+        "do not put <Picture N> or Picture provenance",
     ):
         assert rule in SINGLE_SYSTEM_PROMPT
 
@@ -605,16 +594,14 @@ def test_single_ra2va_semantic_icl_is_valid_and_decouples_subject_from_speaker()
     user, assistant = single._single_semantic_icl_messages()
     assert [user["role"], assistant["role"]] == ["user", "assistant"]
     assert "synthetic demonstration" in user["content"]
-    example = MimoAVAnnotationDraft.model_validate_json(assistant["content"])
-    assert "<Subject 2> (S1)" in example.h3_semantics.shot1_caption
-    assert "offscreen voice (S2)" in example.h3_semantics.shot1_caption
-    assert "<Subject 1> (S1)" not in example.h3_semantics.shot1_caption
+    example = single.MimoSingleCompactAnnotationDraft.model_validate_json(assistant["content"])
+    assert "<Subject 2> replies" in example.h3_semantics.shot1_caption
+    assert "offscreen voice asks" in example.h3_semantics.shot1_caption
+    assert "(S1)" not in assistant["content"] and "(S2)" not in assistant["content"]
     assert all("<Picture " not in message["content"] for message in (user, assistant))
     assert all("<Audio " not in message["content"] for message in (user, assistant))
-    assert example.visual_observation.segment_views[0].entity_observations[1].speech_correlated_articulation == "observed"
     assert example.av_grounding.segment_groundings[0].entity_id == "e2"
     assert example.av_grounding.segment_groundings[1].binding_status == "offscreen"
-    assert example.av_grounding.segment_groundings[1].evidence_codes == ["offscreen_audio"]
 
 
 def test_single_ra2va_invalid_output_never_falls_back_or_polishes(tmp_path, monkeypatch):
@@ -659,7 +646,7 @@ def test_single_ra2va_record_keeps_clip_failure_isolated(tmp_path, monkeypatch):
         base_inventory=base, stem_diarization_root=shadow / "diarization",
         stem_asr_root=shadow / "asr", route="music_first",
     )
-    completions = _Completions([(_raw(), 8), ("{}", 8), (_raw(), 8)])
+    completions = _Completions([(_single_raw(), 8), ("{}", 8), (_single_raw(), 8)])
     backend = SingleCallOpenAIMimo25Backend(
         MimoBackendConfig(
             api_key="fake", transport="sglang", model="mimo-v2.6-flash-rl",
@@ -680,12 +667,12 @@ def test_single_ra2va_record_keeps_clip_failure_isolated(tmp_path, monkeypatch):
     assert [record.model_call_count for record in records] == [1, 1, 1]
     assert summary.model_call_count == 3
     assert len(completions.requests) == 3
-    assert all(record.backend_provenance.prompt_version == "h3_mimo26_ra2va_single_v4" for record in records)
-    assert all(record.backend_provenance.schema_version == "r2v.h3.mimo25_backend.70" for record in records)
+    assert all(record.backend_provenance.prompt_version == "h3_mimo26_ra2va_single_v5_compact" for record in records)
+    assert all(record.backend_provenance.schema_version == "r2v.h3.mimo25_backend.71" for record in records)
     assert [item.status for item in load_reconcile_sources(root)] == ["ready", "failed", "ready"]
 
 
-def test_single_ra2va_provenance_reads_frozen_v1_v2_v3_and_current_v4(tmp_path, monkeypatch):
+def test_single_ra2va_provenance_reads_frozen_v1_to_v4_and_current_v5(tmp_path, monkeypatch):
     from r2v_data_v2.h3.audio_reuse_prepared import FrozenReuseBackendProvenance
 
     backend = SingleCallOpenAIMimo25Backend(
@@ -698,8 +685,9 @@ def test_single_ra2va_provenance_reads_frozen_v1_v2_v3_and_current_v4(tmp_path, 
     )
     current = backend.provenance
     assert (current.schema_version, current.prompt_version) == (
-        "r2v.h3.mimo25_backend.70", "h3_mimo26_ra2va_single_v4",
+        "r2v.h3.mimo25_backend.71", "h3_mimo26_ra2va_single_v5_compact",
     )
+    assert current.annotation_schema_version == "r2v.h3.mimo25_av_annotation.20"
     assert MimoBackendProvenance.model_validate_json(current.model_dump_json()) == current
     assert FrozenReuseBackendProvenance.model_validate_json(
         current.model_dump_json()
@@ -709,6 +697,7 @@ def test_single_ra2va_provenance_reads_frozen_v1_v2_v3_and_current_v4(tmp_path, 
         (".67", "h3_mimo26_ra2va_single_v1"),
         (".68", "h3_mimo26_ra2va_single_v2"),
         (".69", "h3_mimo26_ra2va_single_v3"),
+        (".70", "h3_mimo26_ra2va_single_v4"),
     ):
         with monkeypatch.context() as patch:
             patch.setattr(single, "SINGLE_BACKEND_VERSION", f"r2v.h3.mimo25_backend{version}")

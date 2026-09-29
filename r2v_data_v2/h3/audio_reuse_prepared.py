@@ -48,11 +48,13 @@ class FrozenReuseBackendProvenance(MimoBackendProvenance):
                             "r2v.h3.mimo25_backend.63", "r2v.h3.mimo25_backend.64",
                             "r2v.h3.mimo25_backend.65", "r2v.h3.mimo25_backend.66",
                             "r2v.h3.mimo25_backend.67", "r2v.h3.mimo25_backend.68",
-                            "r2v.h3.mimo25_backend.69", "r2v.h3.mimo25_backend.70"]
+                            "r2v.h3.mimo25_backend.69", "r2v.h3.mimo25_backend.70",
+                            "r2v.h3.mimo25_backend.71"]
     prompt_version: Literal["h3_mimo25_speech_assembly_v46", "h3_mimo25_speech_assembly_v47",
                             "h3_mimo25_speech_assembly_v48", "h3_mimo25_speech_assembly_v49",
                             "h3_mimo26_ra2va_single_v1", "h3_mimo26_ra2va_single_v2",
-                            "h3_mimo26_ra2va_single_v3", "h3_mimo26_ra2va_single_v4"]
+                            "h3_mimo26_ra2va_single_v3", "h3_mimo26_ra2va_single_v4",
+                            "h3_mimo26_ra2va_single_v5_compact"]
     policy_version: Literal["h3_mimo25_av_authority_contract_v17", "h3_mimo25_av_authority_contract_v18"]
     visual_prompt_version: Literal["h3_mimo25_visual_only_v4", "h3_mimo25_visual_only_v5"]
 
