@@ -810,9 +810,12 @@ def test_partial_stage_exports_survive_terminal_failure(tmp_path):
     assert processor.calls["clip0", "ta2va"] == 1
 
 
-def test_full_preselected_inventory_matches_legacy_inventory(tmp_path, finalized):
+def test_full_preselected_inventory_matches_legacy_semantics_without_video_hashing(
+    tmp_path, finalized
+):
     from r2v_data_v2.h3 import t2va_full_production as full
     from r2v_data_v2.h3 import t2va_shadow as frozen
+    from r2v_data_v2.h3.t2va_source import VIDEO_HASH_NOT_COMPUTED
 
     root = tmp_path / "production"
     manifest = tmp_path / "shots_f03_motion.jsonl"
@@ -835,8 +838,48 @@ def test_full_preselected_inventory_matches_legacy_inventory(tmp_path, finalized
         preselected=selection,
         verify_audio_files=False,
     )
-    assert fast == legacy
-    assert fast.inventory_fingerprint == legacy.inventory_fingerprint
+
+    assert fast.clip_uids == legacy.clip_uids
+    assert fast.audio_production_root == legacy.audio_production_root
+    assert fast.audio_shadow_run_id == legacy.audio_shadow_run_id
+    assert fast.t2va_run_id == legacy.t2va_run_id
+    assert fast.backend == legacy.backend
+
+    for fast_shot, legacy_shot in zip(
+        fast.shot_selection.shots, legacy.shot_selection.shots, strict=True
+    ):
+        assert fast_shot.video_sha256 == VIDEO_HASH_NOT_COMPUTED
+        assert (
+            fast_shot.clip_uid,
+            fast_shot.source_index,
+            fast_shot.video_path,
+            fast_shot.duration_seconds,
+        ) == (
+            legacy_shot.clip_uid,
+            legacy_shot.source_index,
+            legacy_shot.video_path,
+            legacy_shot.duration_seconds,
+        )
+
+    for fast_job, legacy_job in zip(fast.jobs, legacy.jobs, strict=True):
+        assert fast_job.target_video_sha256 == VIDEO_HASH_NOT_COMPUTED
+        assert (
+            fast_job.clip_uid,
+            fast_job.clip_display_path,
+            fast_job.target_video_path,
+            fast_job.target_duration_seconds,
+            fast_job.speech_facts,
+            fast_job.audio_evidence,
+            fast_job.upstream_failure,
+        ) == (
+            legacy_job.clip_uid,
+            legacy_job.clip_display_path,
+            legacy_job.target_video_path,
+            legacy_job.target_duration_seconds,
+            legacy_job.speech_facts,
+            legacy_job.audio_evidence,
+            legacy_job.upstream_failure,
+        )
 
 
 def test_prepare_shard_reuses_cached_selection_without_path_metadata_scans(
