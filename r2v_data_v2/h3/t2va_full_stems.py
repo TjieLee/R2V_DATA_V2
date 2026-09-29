@@ -253,8 +253,67 @@ class SAMWorker:
     def __exit__(self, *args):
         self.backend = None
 
-    def process(self, job, output_dir):
+    def infer(self, job, output_dir):
+        source = sam.SAMAudioStemJob.model_validate(job["source"])
+        path = Path(source.source_audio_path).expanduser().resolve(strict=True)
+        if sam.sha256_file(path) != source.source_audio_sha256:
+            raise ValueError("canonical source Audio hash changed before SAM separation")
+        probe = FFmpegAudioMediaBackend(
+            ffmpeg=self.ffmpeg, ffprobe=self.ffprobe
+        ).probe_audio_file(path)
+        if (
+            probe.sample_rate_hz,
+            probe.channels,
+            probe.frame_count,
+        ) != (sam.STEM_SAMPLE_RATE_HZ, sam.STEM_CHANNELS, source.source_frame_count):
+            raise ValueError("canonical source Audio format or sample extent changed")
+        raw = output_dir / "stems" / source.clip_uid / "music_first"
+        raw.mkdir(parents=True, exist_ok=True)
+        first_target = raw / "music.raw.wav"
+        residual = raw / "residual_1.raw.wav"
+        second_target = raw / "speech.raw.wav"
+        sfx = raw / "sfx.raw.wav"
+        outcomes = []
+        for prompt, input_path, target, remainder in (
+            (self.inventory.model_configuration.music_prompt, path, first_target, residual),
+            (self.inventory.model_configuration.speech_prompt, residual, second_target, sfx),
+        ):
+            try:
+                result = self.backend.separate(
+                    clip_uid=source.clip_uid,
+                    source_audio_path=input_path,
+                    prompt=prompt,
+                    target_path=target,
+                    residual_path=remainder,
+                )
+                sam._require_separation_result_paths(
+                    result, target_path=target, residual_path=remainder
+                )
+                outcomes.append({"result": result.model_dump(mode="json")})
+                if result.verification_state == "failure":
+                    break
+            except Exception as exc:
+                if "out of memory" in str(exc).lower():
+                    raise SystemExit(str(exc)) from exc
+                outcomes.append({"error": f"{type(exc).__name__}: {exc}"})
+                break
+        return outcomes
+
+    def finalize(self, job, output_dir, outcomes):
         from r2v_data_v2.h3.t2va_full_workers import SampleJobFailure
+
+        class Replay:
+            def __init__(self):
+                self.index = 0
+
+            def separate(self, **_kwargs):
+                if self.index >= len(outcomes):
+                    raise ValueError("SAM Audio separation reported failure")
+                row = outcomes[self.index]
+                self.index += 1
+                if "error" in row:
+                    raise RuntimeError(row["error"])
+                return sam.SAMAudioSeparationResult.model_validate(row["result"])
 
         try:
             record = sam._separate_one_route(
@@ -262,13 +321,14 @@ class SAMWorker:
                 job=sam.SAMAudioStemJob.model_validate(job["source"]),
                 route="music_first",
                 output_root=output_dir,
-                backend=self.backend,
+                backend=Replay(),
                 canonicalizer=sam.FFmpegStemCanonicalizer(
                     ffmpeg=self.ffmpeg, ffprobe=self.ffprobe
                 ),
                 raw_probe_backend=FFmpegAudioMediaBackend(
                     ffmpeg=self.ffmpeg, ffprobe=self.ffprobe
                 ),
+                source_validated=True,
             )
         except sam._SAMAudioRouteFailure as exc:
             if "out of memory" in str(exc).lower():
@@ -284,6 +344,26 @@ class SAMWorker:
             "record": record.model_dump(mode="json"),
             "output_root": str(output_dir),
         }
+
+    def process(self, job, output_dir):
+        return self.finalize(job, output_dir, self.infer(job, output_dir))
+
+    @staticmethod
+    def output_digests(result):
+        record = sam.SAMAudioStemRecord.model_validate(result["record"])
+        root = Path(result["output_root"])
+        digests = {}
+        for call in record.calls:
+            for path, digest in (
+                (call.target_path, call.target_sha256),
+                (call.residual_path, call.residual_sha256),
+            ):
+                digests[Path(path).relative_to(root).as_posix()] = digest
+        for stem in record.stems:
+            digests[Path(stem.canonical_stem_path).relative_to(root).as_posix()] = (
+                stem.canonical_stem_sha256
+            )
+        return digests
 
 
 def run_sam(

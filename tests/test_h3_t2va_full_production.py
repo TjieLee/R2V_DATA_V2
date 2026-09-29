@@ -857,6 +857,17 @@ def test_bootstrap_from_index_and_resume(tmp_path, monkeypatch):
     selection = full.shard_selection(root, index, 0, tmp_path, tmp_path)
     assert [s.source_index for s in selection.shots] == [0, 1, 2]
     calls = []
+    hashed = []
+    full_hash = full.sha256_file
+
+    def count_required_hashes(path):
+        path = __import__("pathlib").Path(path)
+        if path.suffix == ".mp4":
+            pytest.fail("canonical preparation hashed an original video")
+        hashed.append(path)
+        return full_hash(path)
+
+    monkeypatch.setattr(full, "sha256_file", count_required_hashes)
     original_hash = t2va_source.sha256_file
 
     def no_original_video_hash(path):
@@ -875,6 +886,8 @@ def test_bootstrap_from_index_and_resume(tmp_path, monkeypatch):
         root / "shards" / production.shard_name(0), selection, Media()
     )
     assert len(calls) == 3
+    assert hashed.count(audio / "audio/canonical_clips.jsonl") == 1
+    assert __import__("pathlib").Path(selection.shot_manifest_path) not in hashed
     rows = list(production.complete_rows(audio / "audio/canonical_clips.jsonl"))
     assert [r["clip_uid"] for r in rows] == [s.clip_uid for s in selection.shots]
     assert all(r["subject_reference_count"] == 0 for r in rows)

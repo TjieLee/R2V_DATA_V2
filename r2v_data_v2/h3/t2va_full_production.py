@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import math
 import os
+import shutil
+import tempfile
 import time
 import traceback
 import uuid
@@ -25,7 +27,6 @@ from r2v_data_v2.h3.t2va_source import (
     VIDEO_HASH_NOT_COMPUTED,
     T2VAShot,
     T2VAShotSelection,
-    prepare_t2va_audio,
     validate_cached_target,
 )
 
@@ -558,17 +559,54 @@ def bootstrap_audio(
     audio = shard / "audio_production"
     items = audio / "canonical_items"
 
+    def materialize(shot, destination):
+        import soundfile as sf
+
+        items.mkdir(parents=True, exist_ok=True)
+        temporary = Path(tempfile.mkdtemp(prefix=f".{shot.clip_uid}-", dir=items))
+        try:
+            relative = Path("audio/full_audio") / f"{shot.clip_uid}.flac"
+            actual = temporary / relative
+            backend.materialize_full_audio(
+                clip_uid=shot.clip_uid,
+                source_video_path=Path(shot.video_path),
+                destination=actual,
+                sample_rate_hz=32000,
+                channels=2,
+                output_format="flac",
+            )
+            info = sf.info(actual)
+            if (info.format, info.samplerate, info.channels) != ("FLAC", 32000, 2) or info.frames <= 0:
+                raise ValueError("T2VA canonical Audio media contract differs")
+            clip = CanonicalAudioClip(
+                clip_uid=shot.clip_uid,
+                clip_display_path=shot.clip_display_path,
+                media_collection_relpath="jea",
+                media_collection_name="jea",
+                episode_name=shot.source_video_id,
+                clip_name=Path(shot.video_path).stem,
+                shard_id="t2va",
+                target_video_path=shot.video_path,
+                target_video_sha256=shot.video_sha256,
+                target_full_audio_path=str(destination / relative),
+                target_full_audio_sha256=sha256_file(actual),
+                frame_count=info.frames,
+                target_duration_seconds=info.frames / 32000,
+                subject_reference_count=0,
+            )
+            validate_cached_target(shot, clip)
+            canonical = temporary / "audio/canonical_clips.jsonl"
+            canonical.write_text(clip.model_dump_json() + "\n", encoding="utf-8")
+            os.replace(temporary, destination)
+        finally:
+            if temporary.exists():
+                shutil.rmtree(temporary)
+
     def prepare(shot):
         destination = items / shot.clip_uid
         try:
             if not destination.exists():
-                single = selection.model_copy(update={"shots": [shot]})
-                prepare_t2va_audio(
-                    single,
-                    output_root=destination,
-                    audio_backend=backend,
-                    verify_source_videos=False,
-                )
+                materialize(shot, destination)
             rows = list(
                 production.complete_rows(destination / "audio/canonical_clips.jsonl")
             )
@@ -607,6 +645,7 @@ def bootstrap_audio(
         )
         for c in clips
     ]
+    canonical_sha256 = sha256_file(canonical)
     values = {
         "source_pairs_sha256": None,
         "source_asr_inventory_fingerprint": None,
@@ -614,7 +653,7 @@ def bootstrap_audio(
         "targets": targets,
         "source_inventory_kind": "jea_shot_manifest",
         "source_shot_manifest_sha256": selection.shot_manifest_sha256,
-        "source_canonical_audio_manifest_sha256": sha256_file(canonical),
+        "source_canonical_audio_manifest_sha256": canonical_sha256,
     }
     inventory = DiarizationInventory(
         schema_version="r2v.h3.diarization_inventory.5",
@@ -623,7 +662,7 @@ def bootstrap_audio(
         source_shot_manifest_path=selection.shot_manifest_path,
         source_shot_manifest_sha256=selection.shot_manifest_sha256,
         source_canonical_audio_manifest_path=str(canonical),
-        source_canonical_audio_manifest_sha256=sha256_file(canonical),
+        source_canonical_audio_manifest_sha256=canonical_sha256,
         inventory_fingerprint=_inventory_fingerprint(**values),
         source_target_count=len(targets),
         selected_target_count=len(targets),

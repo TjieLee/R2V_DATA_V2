@@ -41,6 +41,50 @@ def test_sam_model_loaded_once_and_inventory_bound_per_request(tmp_path, monkeyp
         assert loads == [config]
 
 
+def test_sam_model_passes_finish_before_cpu_canonicalization(tmp_path, monkeypatch):
+    from r2v_data_v2.h3 import sam_audio_stem_shadow as sam
+    from r2v_data_v2.h3 import t2va_full_stems as stems
+    from r2v_data_v2.h3.t2va_full_workers import _output_files
+    from tests.test_h3_sam_audio_stem_shadow import (
+        _SAM,
+        _canonical_fixture,
+        _Canonicalizer,
+        _configuration,
+        _Media,
+    )
+
+    manifest, _, _ = _canonical_fixture(tmp_path)
+    config = _configuration(tmp_path)
+    inventory = sam.build_sam_audio_stem_inventory(
+        canonical_audio_manifest_path=manifest, model_configuration=config,
+        route="music_first",
+    )
+    inventory_path = tmp_path / "inventory.json"
+    inventory_path.write_text(inventory.model_dump_json())
+    worker = stems.SAMWorker({
+        "model": config.model_dump(mode="json"),
+        "inventory_path": str(inventory_path),
+    })
+    backend = _SAM(config)
+    worker.backend = backend
+    canonicalizer = _Canonicalizer()
+    monkeypatch.setattr(sam, "FFmpegStemCanonicalizer", lambda **_kwargs: canonicalizer)
+    monkeypatch.setattr(stems, "FFmpegAudioMediaBackend", lambda **_kwargs: _Media())
+    job = {"source": inventory.jobs[0].model_dump(mode="json")}
+    output = tmp_path / "worker-output"
+    outcomes = worker.infer(job, output)
+    assert len(backend.calls) == 2
+    assert canonicalizer.sources == []
+    result = worker.finalize(job, output, outcomes)
+    record = sam.SAMAudioStemRecord.model_validate(result["record"])
+    assert record.model_call_count == 2
+    assert len(canonicalizer.sources) == 3
+    assert [item.stem_type for item in record.stems] == ["music", "speech", "sfx"]
+    assert _output_files(output, known_hashes=worker.output_digests(result)) == (
+        _output_files(output)
+    )
+
+
 def test_auk_replay_publishes_full_inventory(setup, tmp_path, ffmpeg):
     from r2v_data_v2.h3 import auk_speech_shadow as auk
     from r2v_data_v2.h3 import t2va_full_stems as stems

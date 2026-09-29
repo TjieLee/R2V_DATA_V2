@@ -696,6 +696,42 @@ def test_voice_first_mapping_and_route_provenance(tmp_path: Path) -> None:
     assert records[0].stem("music").raw_stem_path.endswith("music.raw.wav")
 
 
+def test_route_reuses_required_digests_within_one_clip(tmp_path, monkeypatch):
+    from collections import Counter
+
+    from r2v_data_v2.h3 import sam_audio_stem_shadow as sam
+
+    manifest, _, _ = _canonical_fixture(tmp_path)
+    configuration = _configuration(tmp_path)
+    inventory = build_sam_audio_stem_inventory(
+        canonical_audio_manifest_path=manifest,
+        model_configuration=configuration,
+        route="music_first",
+    )
+    original = sam.sha256_file
+    calls = Counter()
+
+    def counted(path):
+        calls[Path(path)] += 1
+        return original(path)
+
+    monkeypatch.setattr(sam, "sha256_file", counted)
+    job = inventory.jobs[0]
+    record = sam._separate_one_route(
+        inventory=inventory,
+        job=job,
+        route="music_first",
+        output_root=tmp_path / "separation",
+        backend=_SAM(configuration),
+        canonicalizer=_Canonicalizer(),
+        raw_probe_backend=_Media(),
+    )
+    assert record.model_call_count == 2
+    assert calls[Path(job.source_audio_path)] == 1
+    assert calls[Path(record.calls[0].residual_path)] == 1
+    assert all(calls[Path(item.raw_stem_path)] == 1 for item in record.stems)
+
+
 @pytest.mark.parametrize("route,expected", [
     ("voice_first", ["man speaking", "music soundtrack"]),
     ("music_first", ["music soundtrack", "man speaking"]),

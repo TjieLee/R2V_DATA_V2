@@ -74,7 +74,9 @@ def _read_json(path: Path):
         return None
 
 
-def _output_files(directory: Path, *, durable: bool = False) -> dict:
+def _output_files(
+    directory: Path, *, durable: bool = False, known_hashes: dict[str, str] | None = None
+) -> dict:
     if directory.is_symlink() or not directory.is_dir():
         raise ValueError("media must be an owned directory")
     inventory = {}
@@ -87,16 +89,25 @@ def _output_files(directory: Path, *, durable: bool = False) -> dict:
             continue
         if not path.is_file():
             raise ValueError(f"media is not a regular file: {path}")
-        digest = hashlib.sha256()
-        size = 0
-        with path.open("rb") as handle:
-            while chunk := handle.read(1024 * 1024):
-                digest.update(chunk)
-                size += len(chunk)
+        relative = path.relative_to(directory).as_posix()
+        if known_hashes is not None and relative in known_hashes:
+            size = path.stat().st_size
+            value = known_hashes[relative]
             if durable:
-                os.fsync(handle.fileno())
-        inventory[path.relative_to(directory).as_posix()] = {
-            "sha256": digest.hexdigest(),
+                with path.open("rb") as handle:
+                    os.fsync(handle.fileno())
+        else:
+            digest = hashlib.sha256()
+            size = 0
+            with path.open("rb") as handle:
+                while chunk := handle.read(1024 * 1024):
+                    digest.update(chunk)
+                    size += len(chunk)
+                if durable:
+                    os.fsync(handle.fileno())
+            value = digest.hexdigest()
+        inventory[relative] = {
+            "sha256": value,
             "size": size,
         }
     if durable:
@@ -383,7 +394,12 @@ def _publish_result(backend, request, item, output, intermediate, error):
         finish = getattr(backend, "finalize", None)
         result = finish(item["job"], output, intermediate) if finish else intermediate
         _json(result)
-        files = _output_files(output, durable=True)
+        known = getattr(backend, "output_digests", None)
+        files = _output_files(
+            output,
+            durable=True,
+            known_hashes=known(result) if known else None,
+        )
         row = {"status": "ready", "result": result, "failure_reason": None}
     except Exception as exc:  # noqa: BLE001 - isolate individual sample failures
         diagnostics = exc.result if isinstance(exc, SampleJobFailure) else None
