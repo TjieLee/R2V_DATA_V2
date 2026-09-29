@@ -692,7 +692,10 @@ def test_cached_shard_selection_migrates_long_clip_to_terminal_skip(
         def process(self, *_args):
             pytest.fail("duration-excluded clip reached a model stage")
 
-    state = production.process_shard(root, 0, [skipped], Processor())[skipped["clip_uid"]]
+    skip_root = tmp_path / "skip-only"
+    state = production.process_shard(
+        skip_root, 0, [skipped], Processor()
+    )[skipped["clip_uid"]]
     assert (state["t2va_status"], state["ta2va_status"]) == ("skipped", "skipped")
     assert state["failure_stage"] == "upstream"
     assert state["failure_reason"] == "clip_duration_over_200s"
