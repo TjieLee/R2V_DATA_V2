@@ -203,23 +203,19 @@ def _raw():
 
 def _single_raw():
     payload = json.loads(_raw())
-    view = payload["visual_observation"]["segment_views"][0]
     audio = payload["audio_observation"]["segment_decisions"][0]
     grounding = payload["av_grounding"]["segment_groundings"][0]
     payload["schema_version"] = single.SINGLE_COMPACT_SCHEMA_VERSION
-    payload["visual_observation"]["segment_views"] = [{
-        "segment_id": view["segment_id"], "visible_entity_ids": view["visible_entity_ids"],
-    }]
-    payload["audio_observation"]["segment_decisions"] = [{
+    payload["visual_blocks"] = payload.pop("visual_observation")["visual_blocks"]
+    payload["segments"] = [{
         "segment_id": audio["segment_id"],
         "primary_speaker_group": audio["primary_speaker_group"],
         "delivery_style": audio["delivery_style"],
+        "binding_status": "visible_subject" if grounding["binding_status"] == "visible_entity" else grounding["binding_status"],
+        "speaker_subject_label": "<Subject 1>" if grounding["entity_id"] == "e1" else None,
     }]
-    payload["av_grounding"]["segment_groundings"] = [{
-        "segment_id": grounding["segment_id"],
-        "binding_status": grounding["binding_status"],
-        "entity_id": grounding["entity_id"],
-    }]
+    payload["speaker_voice_profiles"] = payload.pop("audio_observation")["speaker_voice_profiles"]
+    payload.pop("av_grounding")
     payload["h3_semantics"]["shot1_caption"] = payload["h3_semantics"]["shot1_caption"].replace("(S1)", "")
     payload.pop("warnings")
     return json.dumps(payload)
@@ -421,7 +417,7 @@ def test_single_ra2va_one_request_respects_icl_none_as_no_examples(
     assert result.speech_av_raw_response == _single_raw()
     assert len(completions.requests) == 1
     request = completions.requests[0]
-    assert request["response_format"]["json_schema"]["name"] == "MimoSingleCompactAnnotationDraft"
+    assert request["response_format"]["json_schema"]["name"] == "MimoSingleCompactAnnotationDraftV2"
     assert request["messages"][1:-1] == (
         [*_official_detailed_description_icl_messages(), *single._single_semantic_icl_messages()]
         if icl == "official_ref2va_v1" else []
@@ -440,6 +436,10 @@ def test_single_ra2va_one_request_respects_icl_none_as_no_examples(
     ]
     assert contract["required_output_inventory"] == {
         "subject_labels_in_order": [subject.subject_label for subject in jobs[0].reference_subjects],
+        "allowed_speaker_subject_labels": [
+            subject.subject_label for subject in jobs[0].reference_subjects
+            if subject.kind == "entity" and subject.entity_id is not None
+        ],
         "segment_ids_in_order": [segment.segment_id for segment in jobs[0].segments],
         "transcribed_dialogue_blocks_in_order": [
             {
@@ -449,6 +449,53 @@ def test_single_ra2va_one_request_respects_icl_none_as_no_examples(
             for segment in jobs[0].segments if segment.asr_status == "transcribed"
         ],
     }
+
+
+def test_single_ra2va_speaker_subject_inventory_excludes_attribute_and_background(tmp_path, monkeypatch):
+    from r2v_data_v2.h3.qwen38_h3_recaption import RecaptionSubjectContract
+
+    _, shadow = _fixture(tmp_path, monkeypatch)
+    stems = load_stem_shadow(shadow / "separation")[1]
+    job = build_stem_reconcile_jobs(
+        base_inventory=qa.build_mimo25_inventory(),
+        stem_diarization_root=shadow / "diarization",
+        stem_asr_root=shadow / "asr", route="music_first",
+    )[0]
+    attribute = RecaptionSubjectContract(
+        subject_index=2, subject_label="<Subject 2>", kind="attribute",
+        attribute_id="hair-1", owner_entity_id="e1", attribute_type="hair",
+        source_picture_labels=["<Picture 1>"],
+    )
+    background = RecaptionSubjectContract(
+        subject_index=3, subject_label="<Subject 3>", kind="background",
+        source_picture_labels=["<Picture 1>"],
+    )
+    job = job.model_copy(update={
+        "reference_subjects": [*job.reference_subjects, attribute, background],
+    })
+    completions = _Completions([(_single_raw(), 8)])
+    backend = SingleCallOpenAIMimo25Backend(
+        MimoBackendConfig(
+            api_key="fake", transport="sglang", model="mimo-v2.6-flash-rl",
+            icl="none",
+            media_resolver=MimoMediaResolver(
+                mode="http", media_root=tmp_path, media_base_url="http://media.invalid",
+            ),
+        ),
+        stem_records_by_clip={record.clip_uid: record for record in stems},
+        client=SimpleNamespace(chat=SimpleNamespace(completions=completions)),
+    )
+    backend._request(
+        job, allowed_reference_labels={"<Subject 1>", "<Subject 2>", "<Subject 3>", "<Picture 1>"},
+        auxiliary_audio_paths=_validated_auxiliary_stems(stems[0]),
+    )
+    task = next(item["text"] for item in completions.requests[0]["messages"][-1]["content"]
+                if item["type"] == "text" and "AUTHORITATIVE INPUT:" in item["text"])
+    contract = json.loads(task.split("AUTHORITATIVE INPUT:\n", 1)[1])
+    assert contract["required_output_inventory"]["subject_labels_in_order"] == [
+        "<Subject 1>", "<Subject 2>", "<Subject 3>",
+    ]
+    assert contract["required_output_inventory"]["allowed_speaker_subject_labels"] == ["<Subject 1>"]
 
 
 def test_single_ra2va_nontranscribed_segment_has_no_dialogue_block(tmp_path, monkeypatch):
@@ -534,7 +581,7 @@ def test_single_ra2va_zero_transcript_request_has_no_dialogue_inventory(tmp_path
     )
     assert len(completions.requests) == 1
     request = completions.requests[0]
-    assert "if it is empty, output no <d> blocks" in request["messages"][0]["content"]
+    assert "If it is empty, output no <d> blocks" in request["messages"][0]["content"]
     task = next(item["text"] for item in request["messages"][-1]["content"] if item["type"] == "text" and "allowed_segment_ids" in item["text"])
     contract = json.loads(task.split("AUTHORITATIVE INPUT:\n", 1)[1])
     assert contract["required_output_inventory"]["transcribed_dialogue_blocks_in_order"] == []
@@ -545,32 +592,32 @@ def test_single_ra2va_prompt_preserves_visual_acoustic_speaker_and_audio_ownersh
     for step in range(1, 5):
         assert f"STEP {step}" in SINGLE_SYSTEM_PROMPT
     for rule in (
-        "<Subject N>", "g1, g2", "(Sx)", "first actual vocal-source appearance",
+        "<Subject N>", "g1, g2", "(Sx)", "first vocal-source appearance",
         "<Picture N>", "<Audio N>", "required_dialogue_block",
         "subject_definitions", "visual_retention_analysis", "style_opening",
         "overall_soundscape", "non_diegetic_music",
     ):
         assert rule in SINGLE_SYSTEM_PROMPT
     assert "Do NOT emit any (S1), (S2)" in SINGLE_SYSTEM_PROMPT
-    assert "pipeline-owned and projected deterministically" in SINGLE_SYSTEM_PROMPT
-    assert "one row per supplied segment" in SINGLE_SYSTEM_PROMPT
+    assert "pipeline owns speaker IDs and projects them deterministically" in SINGLE_SYSTEM_PROMPT
+    assert "exactly one ordered segments row for EVERY supplied DiariZen segment" in SINGLE_SYSTEM_PROMPT
     assert "first transcribed appearance" in SINGLE_SYSTEM_PROMPT
     assert "not in shot1_caption" in SINGLE_SYSTEM_PROMPT
 
 
-def test_single_ra2va_prompt_requires_compact_visibility_and_exact_output_inventory():
+def test_single_ra2va_prompt_requires_subject_binding_and_one_segment_inventory():
     for rule in (
-        "visual_observation.segment_views",
-        "visible_entity requires entity_id from that same segment's visible_entity_ids",
-        "entity_id=null",
-        "OUTPUT INVENTORY",
+        "Do not output a per-segment visible-entity inventory",
+        "visible_subject and speaker_subject_label",
+        "required_output_inventory.allowed_speaker_subject_labels",
+        "Do not output confidence, evidence codes",
         "required_output_inventory",
         "transcribed_dialogue_blocks_in_order",
     ):
         assert rule in SINGLE_SYSTEM_PROMPT
 
 
-def test_single_ra2va_v5_prompt_omits_legacy_evidence_logic():
+def test_single_ra2va_v6_prompt_omits_legacy_evidence_logic():
     for old_rule in (
         "EXACT-WINDOW VISIBLE SPEAKER SELECTION", "STABLE GROUP BINDING",
         "visible_lip_motion", "no_visible_lip_motion", "av_temporal_alignment",
@@ -579,13 +626,13 @@ def test_single_ra2va_v5_prompt_omits_legacy_evidence_logic():
         assert old_rule not in SINGLE_SYSTEM_PROMPT
 
 
-def test_single_ra2va_v5_prompt_leaves_sx_to_pipeline_and_locks_dialogue():
+def test_single_ra2va_v6_prompt_leaves_sx_to_pipeline_and_locks_dialogue():
     for rule in (
-        "each immutable required_dialogue_block exactly once",
+        "every immutable required_dialogue_block exactly once",
         "Do NOT emit any (S1), (S2)",
-        "speaker IDs are pipeline-owned",
-        "if it is empty, output no <d> blocks",
-        "do not put <Picture N> or Picture provenance",
+        "pipeline owns speaker IDs",
+        "If it is empty, output no <d> blocks",
+        "Do not put <Picture N> or Picture provenance",
     ):
         assert rule in SINGLE_SYSTEM_PROMPT
 
@@ -594,14 +641,16 @@ def test_single_ra2va_semantic_icl_is_valid_and_decouples_subject_from_speaker()
     user, assistant = single._single_semantic_icl_messages()
     assert [user["role"], assistant["role"]] == ["user", "assistant"]
     assert "synthetic demonstration" in user["content"]
-    example = single.MimoSingleCompactAnnotationDraft.model_validate_json(assistant["content"])
+    example = single.MimoSingleCompactAnnotationDraftV2.model_validate_json(assistant["content"])
     assert "<Subject 2> replies" in example.h3_semantics.shot1_caption
     assert "offscreen voice asks" in example.h3_semantics.shot1_caption
     assert "(S1)" not in assistant["content"] and "(S2)" not in assistant["content"]
     assert all("<Picture " not in message["content"] for message in (user, assistant))
     assert all("<Audio " not in message["content"] for message in (user, assistant))
-    assert example.av_grounding.segment_groundings[0].entity_id == "e2"
-    assert example.av_grounding.segment_groundings[1].binding_status == "offscreen"
+    assert example.segments[0].speaker_subject_label == "<Subject 2>"
+    assert example.segments[1].binding_status == "offscreen"
+    assert "entity_id" not in assistant["content"]
+    assert "visible_entity_ids" not in assistant["content"]
 
 
 def test_single_ra2va_invalid_output_never_falls_back_or_polishes(tmp_path, monkeypatch):
@@ -667,12 +716,12 @@ def test_single_ra2va_record_keeps_clip_failure_isolated(tmp_path, monkeypatch):
     assert [record.model_call_count for record in records] == [1, 1, 1]
     assert summary.model_call_count == 3
     assert len(completions.requests) == 3
-    assert all(record.backend_provenance.prompt_version == "h3_mimo26_ra2va_single_v5_compact" for record in records)
-    assert all(record.backend_provenance.schema_version == "r2v.h3.mimo25_backend.71" for record in records)
+    assert all(record.backend_provenance.prompt_version == "h3_mimo26_ra2va_single_v6_compact2" for record in records)
+    assert all(record.backend_provenance.schema_version == "r2v.h3.mimo25_backend.72" for record in records)
     assert [item.status for item in load_reconcile_sources(root)] == ["ready", "failed", "ready"]
 
 
-def test_single_ra2va_provenance_reads_frozen_v1_to_v4_and_current_v5(tmp_path, monkeypatch):
+def test_single_ra2va_provenance_reads_frozen_v1_to_v5_and_current_v6(tmp_path, monkeypatch):
     from r2v_data_v2.h3.audio_reuse_prepared import FrozenReuseBackendProvenance
 
     backend = SingleCallOpenAIMimo25Backend(
@@ -685,7 +734,7 @@ def test_single_ra2va_provenance_reads_frozen_v1_to_v4_and_current_v5(tmp_path, 
     )
     current = backend.provenance
     assert (current.schema_version, current.prompt_version) == (
-        "r2v.h3.mimo25_backend.71", "h3_mimo26_ra2va_single_v5_compact",
+        "r2v.h3.mimo25_backend.72", "h3_mimo26_ra2va_single_v6_compact2",
     )
     assert current.annotation_schema_version == "r2v.h3.mimo25_av_annotation.20"
     assert MimoBackendProvenance.model_validate_json(current.model_dump_json()) == current
@@ -698,6 +747,7 @@ def test_single_ra2va_provenance_reads_frozen_v1_to_v4_and_current_v5(tmp_path, 
         (".68", "h3_mimo26_ra2va_single_v2"),
         (".69", "h3_mimo26_ra2va_single_v3"),
         (".70", "h3_mimo26_ra2va_single_v4"),
+        (".71", "h3_mimo26_ra2va_single_v5_compact"),
     ):
         with monkeypatch.context() as patch:
             patch.setattr(single, "SINGLE_BACKEND_VERSION", f"r2v.h3.mimo25_backend{version}")

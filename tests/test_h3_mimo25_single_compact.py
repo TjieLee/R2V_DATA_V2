@@ -30,6 +30,26 @@ def _compact_payload() -> dict:
     return json.loads(_single_raw())
 
 
+def test_v6_raw_schema_has_one_segment_inventory_and_no_entity_evidence_fields():
+    schema = json.dumps(single.MimoSingleCompactAnnotationDraftV2.model_json_schema())
+    assert single.SINGLE_COMPACT_SCHEMA_VERSION == "r2v.h3.mimo26_single_compact.2"
+    for forbidden in (
+        "segment_views", "visible_entity_ids", "entity_id", "orientation",
+        "face_visibility", "mouth_visibility", "speech_correlated_articulation",
+        "confidence", "audio_evidence_codes", "evidence_codes", "speech_presentation",
+    ):
+        assert forbidden not in schema
+    payload = _compact_payload()
+    assert [row["segment_id"] for row in payload["segments"]] == ["segment_0001"]
+    assert "visual_observation" not in payload
+    assert "audio_observation" not in payload
+    assert "av_grounding" not in payload
+    assert single.MimoSingleCompactAnnotationDraftV2.model_validate(payload)
+    payload["segments"][0]["entity_id"] = "e1"
+    with pytest.raises(ValueError):
+        single.MimoSingleCompactAnnotationDraftV2.model_validate(payload)
+
+
 def _job(*, segments=None, subjects=None):
     segment = SimpleNamespace(
         segment_id="segment_0001", asr_status="transcribed",
@@ -38,47 +58,32 @@ def _job(*, segments=None, subjects=None):
     )
     return SimpleNamespace(
         segments=segments if segments is not None else [segment],
-        reference_subjects=subjects if subjects is not None else [SimpleNamespace(subject_label="<Subject 1>")],
+        reference_subjects=subjects if subjects is not None else [
+            SimpleNamespace(subject_label="<Subject 1>", kind="entity", entity_id="e1")
+        ],
     )
 
 
 def _validated(payload: dict, job=None, *, entity_ids=None):
-    draft = single.MimoSingleCompactAnnotationDraft.model_validate(payload)
+    job = job or _job()
+    draft = single.MimoSingleCompactAnnotationDraftV2.model_validate(payload)
     issues, warnings = single._validate_single_compact_annotation(
-        draft, job or _job(), allowed_entity_ids=entity_ids or {"e1"},
-        allowed_reference_labels={"<Subject 1>", "<Picture 1>"},
+        draft, job, allowed_entity_ids=entity_ids or {"e1"},
+        allowed_reference_labels={"<Picture 1>"}
+        | {subject.subject_label for subject in job.reference_subjects},
     )
     return draft, issues, warnings
 
 
-def test_compact_schema_removes_self_reported_evidence_and_uses_new_version():
-    schema = json.dumps(single.MimoSingleCompactAnnotationDraft.model_json_schema())
-    for forbidden in (
-        "orientation", "face_visibility", "mouth_visibility", "speech_correlated_articulation",
-        "confidence", "audio_evidence_codes", "evidence_codes", "speech_presentation",
-    ):
-        assert forbidden not in schema
-    assert single.SINGLE_COMPACT_SCHEMA_VERSION == "r2v.h3.mimo26_single_compact.1"
-    assert single.MimoSingleCompactAnnotationDraft.model_validate(_compact_payload())
-    assert "schema_version" in single.MimoSingleCompactAnnotationDraft.model_json_schema()["required"]
-
-
-def test_compact_inventory_visibility_and_dialogue_are_hard_contracts():
+def test_compact_inventory_subjects_and_dialogue_are_hard_contracts():
     payload = _compact_payload()
     assert _validated(payload)[1] == []
-    for section, field in (
-        ("visual_observation", "segment_views"),
-        ("audio_observation", "segment_decisions"),
-        ("av_grounding", "segment_groundings"),
-    ):
-        broken = json.loads(json.dumps(payload))
-        broken[section][field].append(broken[section][field][0])
-        assert _validated(broken)[1]
     broken = json.loads(json.dumps(payload))
-    broken["av_grounding"]["segment_groundings"][0]["entity_id"] = "e2"
-    assert "visible_entity_absent_from_visual_segment" in {
-        issue.code for issue in _validated(broken, entity_ids={"e1", "e2"})[1]
-    }
+    broken["segments"].append(broken["segments"][0])
+    assert "segment_inventory_mismatch" in {issue.code for issue in _validated(broken)[1]}
+    broken = json.loads(json.dumps(payload))
+    broken["segments"] = []
+    assert "segment_inventory_mismatch" in {issue.code for issue in _validated(broken)[1]}
     broken = json.loads(json.dumps(payload))
     broken["h3_semantics"]["shot1_caption"] = "<Subject 1> says nothing."
     assert "direct_transcribed_dialogue_inventory_mismatch" in {
@@ -87,14 +92,21 @@ def test_compact_inventory_visibility_and_dialogue_are_hard_contracts():
     broken = json.loads(json.dumps(payload))
     broken["h3_semantics"]["subject_definitions"] = []
     with pytest.raises(ValueError):
-        single.MimoSingleCompactAnnotationDraft.model_validate(broken)
+        single.MimoSingleCompactAnnotationDraftV2.model_validate(broken)
+    broken = json.loads(json.dumps(payload))
+    broken["h3_semantics"]["visual_retention_analysis"][0]["subject_label"] = "<Subject 2>"
+    assert "subject_inventory_mismatch" in {issue.code for issue in _validated(broken)[1]}
+    broken = json.loads(json.dumps(payload))
+    broken["h3_semantics"]["subject_definitions"][0]["description"] += " from <Picture 1>"
+    with pytest.raises(ValueError, match="Picture provenance"):
+        single.MimoSingleCompactAnnotationDraftV2.model_validate(broken)
     broken = json.loads(json.dumps(payload))
     broken["h3_semantics"]["shot1_caption"] += " <d>[English] invented words</d>"
     assert "direct_transcribed_dialogue_inventory_mismatch" in {
         issue.code for issue in _validated(broken)[1]
     }
     broken = json.loads(json.dumps(payload))
-    broken["audio_observation"]["segment_decisions"][0]["primary_speaker_group"] = "g2"
+    broken["segments"][0]["primary_speaker_group"] = "g2"
     assert "non_contiguous_speaker_groups" in {issue.code for issue in _validated(broken)[1]}
     broken = json.loads(json.dumps(payload))
     broken["h3_semantics"]["summary"] += " (S9)"
@@ -103,35 +115,86 @@ def test_compact_inventory_visibility_and_dialogue_are_hard_contracts():
     }
 
 
-def test_compact_group_entity_conflicts_are_warnings_without_repair():
+def test_compact_segment_order_must_follow_authoritative_order():
     payload = _compact_payload()
+    second = SimpleNamespace(**{
+        **vars(_job().segments[0]), "segment_id": "segment_0002",
+        "start_time": 1.0, "asr_status": "empty", "asr_text": None,
+    })
+    payload["segments"].append({
+        "segment_id": "segment_0002", "primary_speaker_group": "g1",
+        "delivery_style": None, "binding_status": "uncertain",
+        "speaker_subject_label": None,
+    })
+    job = _job(segments=[*_job().segments, second])
+    assert _validated(payload, job)[1] == []
+    payload["segments"].reverse()
+    assert "segment_inventory_mismatch" in {
+        issue.code for issue in _validated(payload, job)[1]
+    }
+
+
+def test_compact_visible_subject_is_frozen_entity_only():
+    payload = _compact_payload()
+    assert _validated(payload)[1] == []
+    payload["segments"][0]["speaker_subject_label"] = "<Subject 99>"
+    assert "unknown_speaker_subject" in {issue.code for issue in _validated(payload)[1]}
+    payload["segments"][0]["speaker_subject_label"] = "<Subject 1>"
+    for kind in ("attribute", "background"):
+        subject = SimpleNamespace(subject_label="<Subject 1>", kind=kind, entity_id=None)
+        assert "unknown_speaker_subject" in {
+            issue.code for issue in _validated(payload, _job(subjects=[subject]))[1]
+        }
+    payload["segments"][0]["binding_status"] = "offscreen"
+    with pytest.raises(ValueError, match="other bindings require null"):
+        single.MimoSingleCompactAnnotationDraftV2.model_validate(payload)
+
+
+def test_compact_group_subject_conflicts_are_warnings_without_repair():
+    payload = _compact_payload()
+    payload["h3_semantics"]["subject_definitions"].append({
+        "subject_label": "<Subject 2>", "description": "a second person in a dark coat",
+    })
+    payload["h3_semantics"]["visual_retention_analysis"].append({
+        "subject_label": "<Subject 2>", "marker": "fully_preserved",
+        "description": "The second person's coat remains visible.",
+    })
+    subjects = [
+        SimpleNamespace(subject_label="<Subject 1>", kind="entity", entity_id="e1"),
+        SimpleNamespace(subject_label="<Subject 2>", kind="entity", entity_id="e2"),
+    ]
     second = SimpleNamespace(
         segment_id="segment_0002", asr_status="empty", asr_language=None,
         asr_text=None, source_speaker_cluster_id="cluster_b", start_time=1.0, end_time=2.0,
     )
-    payload["visual_observation"]["segment_views"].append({
-        "segment_id": "segment_0002", "visible_entity_ids": ["e1", "e2"],
-    })
-    payload["audio_observation"]["segment_decisions"].append({
+    payload["segments"].append({
         "segment_id": "segment_0002", "primary_speaker_group": "g1", "delivery_style": None,
-    })
-    payload["av_grounding"]["segment_groundings"].append({
-        "segment_id": "segment_0002", "binding_status": "visible_entity", "entity_id": "e2",
+        "binding_status": "visible_subject", "speaker_subject_label": "<Subject 2>",
     })
     draft, issues, warnings = _validated(
-        payload, _job(segments=[*_job().segments, second]), entity_ids={"e1", "e2"},
+        payload, _job(segments=[*_job().segments, second], subjects=subjects),
+        entity_ids={"e1", "e2"},
     )
     assert issues == []
-    assert "compact_group_maps_multiple_entities" in warnings
-    assert draft.av_grounding.segment_groundings[1].entity_id == "e2"
-    payload["audio_observation"]["segment_decisions"][1]["primary_speaker_group"] = "g2"
-    payload["av_grounding"]["segment_groundings"][1]["entity_id"] = "e1"
+    assert "compact_group_maps_multiple_subjects" in warnings
+    assert draft.segments[1].speaker_subject_label == "<Subject 2>"
+    projected = single._project_compact_to_legacy_annotation(
+        draft, _job(segments=[*_job().segments, second], subjects=subjects),
+    )
+    assert [item.entity_id for item in projected.av_grounding.segment_groundings] == ["e1", "e2"]
+    payload["segments"][1]["primary_speaker_group"] = "g2"
+    payload["segments"][1]["speaker_subject_label"] = "<Subject 1>"
     draft, issues, warnings = _validated(
-        payload, _job(segments=[*_job().segments, second]), entity_ids={"e1", "e2"},
+        payload, _job(segments=[*_job().segments, second], subjects=subjects),
+        entity_ids={"e1", "e2"},
     )
     assert issues == []
-    assert "compact_entity_maps_multiple_groups" in warnings
-    assert draft.av_grounding.segment_groundings[1].entity_id == "e1"
+    assert "compact_subject_maps_multiple_groups" in warnings
+    assert draft.segments[1].speaker_subject_label == "<Subject 1>"
+    projected = single._project_compact_to_legacy_annotation(
+        draft, _job(segments=[*_job().segments, second], subjects=subjects),
+    )
+    assert [item.entity_id for item in projected.av_grounding.segment_groundings] == ["e1", "e1"]
 
 
 def test_compact_sx_projection_uses_transcribed_groups_and_strips_model_markers():
@@ -153,6 +216,7 @@ def test_compact_sx_projection_uses_transcribed_groups_and_strips_model_markers(
     assert decision.audio_evidence_codes == ["insufficient_evidence"]
     assert decision.vocal_composition == "uncertain"
     assert projected.av_grounding.segment_groundings[0].evidence_codes == ["insufficient_evidence"]
+    assert projected.visual_observation.segment_views[0].visible_entity_ids == ["e1"]
 
 
 def test_compact_sx_projection_repeats_same_speaker_and_uses_cluster_fallback():
@@ -166,14 +230,9 @@ def test_compact_sx_projection_repeats_same_speaker_and_uses_cluster_fallback():
     ]
     for index, group in ((2, "g1"), (3, None)):
         segment_id = f"segment_{index:04d}"
-        payload["visual_observation"]["segment_views"].append({
-            "segment_id": segment_id, "visible_entity_ids": ["e1"],
-        })
-        payload["audio_observation"]["segment_decisions"].append({
+        payload["segments"].append({
             "segment_id": segment_id, "primary_speaker_group": group, "delivery_style": "calm",
-        })
-        payload["av_grounding"]["segment_groundings"].append({
-            "segment_id": segment_id, "binding_status": "no_reliable_entity", "entity_id": None,
+            "binding_status": "no_reliable_subject", "speaker_subject_label": None,
         })
     block = "<d>[English] exact transcript</d>"
     payload["h3_semantics"]["shot1_caption"] += " Then another voice says " + block + " and later asks " + block
@@ -192,8 +251,8 @@ def test_compact_zero_transcript_strips_accidental_sx_without_dialogue():
         "asr_language": None,
     })
     payload["h3_semantics"]["shot1_caption"] = "<Subject 1> (S9) waits by the door."
-    payload["audio_observation"]["segment_decisions"][0]["delivery_style"] = None
-    payload["audio_observation"]["speaker_voice_profiles"] = []
+    payload["segments"][0]["delivery_style"] = None
+    payload["speaker_voice_profiles"] = []
     draft, issues, _ = _validated(payload, _job(segments=[segment]))
     assert issues == []
     projected = single._project_compact_to_legacy_annotation(draft, _job(segments=[segment]))
@@ -202,14 +261,17 @@ def test_compact_zero_transcript_strips_accidental_sx_without_dialogue():
     assert direct_speech_facts(projected, [segment]) == []
 
 
-def test_compact_visible_choice_is_not_remapped_or_evidence_validated():
+def test_compact_visible_subject_maps_to_frozen_entity_without_remap():
     payload = _compact_payload()
-    payload["visual_observation"]["segment_views"][0]["visible_entity_ids"] = ["e1", "e2"]
-    payload["av_grounding"]["segment_groundings"][0]["entity_id"] = "e2"
-    draft, issues, _ = _validated(payload, entity_ids={"e1", "e2"})
+    subject = SimpleNamespace(subject_label="<Subject 1>", kind="entity", entity_id="e2")
+    job = _job(subjects=[subject])
+    draft, issues, _ = _validated(payload, job, entity_ids={"e2"})
     assert issues == []
-    projected = single._project_compact_to_legacy_annotation(draft, _job())
+    projected = single._project_compact_to_legacy_annotation(draft, job)
     assert projected.av_grounding.segment_groundings[0].entity_id == "e2"
+    assert projected.visual_observation.segment_views[0].visible_entity_ids == ["e2"]
+    assert projected.visual_observation.segment_views[0].entity_observations == []
+    assert "e2" not in json.dumps(payload)
 
 
 def test_single_compact_backend_keeps_raw_response_and_legacy_annotation(tmp_path, monkeypatch):
@@ -242,7 +304,7 @@ def test_single_compact_backend_keeps_raw_response_and_legacy_annotation(tmp_pat
     )
     assert len(completions.requests) == result.model_call_count == 1
     request = completions.requests[0]
-    assert request["response_format"]["json_schema"]["name"] == "MimoSingleCompactAnnotationDraft"
+    assert request["response_format"]["json_schema"]["name"] == "MimoSingleCompactAnnotationDraftV2"
     assert request["response_format"]["json_schema"]["strict"] is True
     assert request["reasoning_effort"] == "none"
     assert request["extra_body"]["chat_template_kwargs"] == {
@@ -260,6 +322,49 @@ def test_single_compact_backend_keeps_raw_response_and_legacy_annotation(tmp_pat
     record = MimoStemReconcileRecord.model_validate_json((root / "records.jsonl").read_text().splitlines()[0])
     assert record.speech_av_raw_response == raw
     assert record.annotation is not None and record.annotation.schema_version == "r2v.h3.mimo25_av_annotation.20"
+
+
+@pytest.mark.parametrize(("version", "prompt"), [
+    (".67", "h3_mimo26_ra2va_single_v1"),
+    (".68", "h3_mimo26_ra2va_single_v2"),
+    (".69", "h3_mimo26_ra2va_single_v3"),
+    (".70", "h3_mimo26_ra2va_single_v4"),
+    (".71", "h3_mimo26_ra2va_single_v5_compact"),
+])
+def test_historical_single_record_envelopes_remain_readable(tmp_path, monkeypatch, version, prompt):
+    _, shadow = _fixture(tmp_path, monkeypatch)
+    stems = load_stem_shadow(shadow / "separation")[1]
+    jobs = build_stem_reconcile_jobs(
+        base_inventory=qa.build_mimo25_inventory(),
+        stem_diarization_root=shadow / "diarization",
+        stem_asr_root=shadow / "asr", route="music_first",
+    )[:1]
+    backend = single.SingleCallOpenAIMimo25Backend(
+        MimoBackendConfig(
+            api_key="fake", transport="sglang", model="mimo-v2.6-flash-rl",
+            media_resolver=MimoMediaResolver(
+                mode="http", media_root=tmp_path, media_base_url="http://media.invalid",
+            ),
+        ),
+        stem_records_by_clip={record.clip_uid: record for record in stems},
+        client=SimpleNamespace(chat=SimpleNamespace(
+            completions=_Completions([(_single_raw(), 8)]),
+        )),
+    )
+    with monkeypatch.context() as patch:
+        patch.setattr(single, "SINGLE_BACKEND_VERSION", f"r2v.h3.mimo25_backend{version}")
+        patch.setattr(single, "SINGLE_PROMPT_VERSION", prompt)
+        root = shadow / "historical-record"
+        run_mimo25_stem_reconcile_shadow(
+            jobs=jobs, stem_records=stems, backend=backend, output_root=root,
+            route="music_first", allow_unverified=True,
+        )
+    record = MimoStemReconcileRecord.model_validate_json(
+        (root / "records.jsonl").read_text().splitlines()[0]
+    )
+    assert record.status == "ready"
+    assert record.backend_provenance.prompt_version == prompt
+    assert record.annotation is not None
 
 
 def test_single_compact_annotation_uses_existing_h3_materializer(tmp_path, monkeypatch):
@@ -305,7 +410,7 @@ def test_single_compact_invalid_output_has_no_retry_or_polish(tmp_path, monkeypa
         stem_diarization_root=shadow / "diarization",
         stem_asr_root=shadow / "asr", route="music_first",
     )
-    raw = json.dumps({**_compact_payload(), "visual_observation": {"visual_blocks": [], "segment_views": []}})
+    raw = json.dumps({**_compact_payload(), "visual_blocks": []})
     completions = _Completions([(raw, 8)])
     backend = single.SingleCallOpenAIMimo25Backend(
         MimoBackendConfig(
