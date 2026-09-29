@@ -61,6 +61,21 @@ class Backend:
 
 def factory(configuration):
     return Backend(configuration)
+
+class SplitBackend(Backend):
+    def infer(self, job, output_dir):
+        self.event("infer", job_id=job["job_id"])
+        return {"job_id": job["job_id"]}
+    def finalize(self, job, output_dir, intermediate):
+        self.event("finalize_start", job_id=job["job_id"])
+        if job["job_id"] == "first":
+            time.sleep(0.15)
+        self.event("finalize_end", job_id=job["job_id"])
+        (output_dir / "artifact.txt").write_text(job["job_id"])
+        return intermediate
+
+def split_factory(configuration):
+    return SplitBackend(configuration)
 """
 
 
@@ -101,7 +116,7 @@ def receipt(setup, job_id):
     return Path(setup["stage_root"]) / "jobs" / key / "receipt.json"
 
 
-def test_partition_10000_load_once_gpu_mapping_and_order(setup):
+def test_dynamic_queue_10000_load_once_gpu_mapping_and_order(setup):
     setup["gpu_ids"] = [str(i) for i in range(8)]
     before = dict(os.environ)
     jobs = [{"job_id": f"job-{i}"} for i in range(10000)]
@@ -110,19 +125,16 @@ def test_partition_10000_load_once_gpu_mapping_and_order(setup):
     assert os.environ == before
     assert "device" not in setup["configuration"]
     records = events(setup)
-    for rank, gpu in enumerate(setup["gpu_ids"]):
-        partition = jobs[rank::8]
-        pid = result[partition[0]["job_id"]]["result"]["pid"]
-        assert [
-            e["job_id"] for e in records if e["kind"] == "process" and e["pid"] == pid
-        ] == [j["job_id"] for j in partition]
-        for job in partition:
-            row = result[job["job_id"]]
-            assert row["status"] == "ready" and row["failure_reason"] is None
-            assert row["result"]["gpu"] == gpu
-            assert row["result"]["device"] == "cuda:0"
-            assert row["result"]["marker"] == "child"
-            assert Path(row["result"]["path"]).is_file()
+    assert {result[j["job_id"]]["result"]["gpu"] for j in jobs} == set(setup["gpu_ids"])
+    assert sorted(e["job_id"] for e in records if e["kind"] == "process") == sorted(
+        j["job_id"] for j in jobs
+    )
+    for job in jobs:
+        row = result[job["job_id"]]
+        assert row["status"] == "ready" and row["failure_reason"] is None
+        assert row["result"]["device"] == "cuda:0"
+        assert row["result"]["marker"] == "child"
+        assert Path(row["result"]["path"]).is_file()
     for kind in ("load", "enter", "close"):
         assert sum(e["kind"] == kind for e in records) == 8
     requests = list(Path(setup["stage_root"]).glob("workers/*/worker-*/request.json"))
@@ -264,13 +276,34 @@ def test_crash_waits_other_workers_leaves_unfinished_pending_then_resumes(
         api().execute_stage(jobs=jobs, **setup)
     slow = json.loads(receipt(setup, "slow").read_text())
     assert slow["status"] == "ready"
-    for job_id in ("crash", "pending"):
-        path = receipt(setup, job_id)
-        assert not path.exists() or json.loads(path.read_text())["status"] == "pending"
+    assert not receipt(setup, "crash").exists()
     Path(setup["configuration"]["events"], "allow").touch()
     result = api().execute_stage(jobs=jobs, **setup)
     assert all(row["status"] == "ready" for row in result.values())
     assert result["slow"]["result"]["pid"] == slow["result"]["pid"]
+
+
+def test_free_slot_takes_next_job_and_cpu_receipt_does_not_block(setup):
+    setup["gpu_ids"] = ["5", "8"]
+    jobs = [
+        {"job_id": "slow", "sleep": 0.3},
+        {"job_id": "fast", "sleep": 0.01},
+        {"job_id": "next", "sleep": 0.01},
+    ]
+    result = api().execute_stage(jobs=jobs, **setup)
+    assert result["fast"]["result"]["pid"] == result["next"]["result"]["pid"]
+    assert result["slow"]["result"]["pid"] != result["next"]["result"]["pid"]
+
+
+def test_cpu_finalizer_overlaps_next_model_job(setup):
+    setup["gpu_ids"] = ["5"]
+    setup["factory"] = "fake_stage_backend:split_factory"
+    result = api().execute_stage(
+        jobs=[{"job_id": "first"}, {"job_id": "second"}], **setup
+    )
+    assert all(row["status"] == "ready" for row in result.values())
+    order = [(row["kind"], row.get("job_id")) for row in events(setup)]
+    assert order.index(("infer", "second")) < order.index(("finalize_end", "first"))
 
 
 def test_empty_validation_and_non_json_sample_failure(setup):

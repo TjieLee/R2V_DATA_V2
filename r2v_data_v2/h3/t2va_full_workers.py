@@ -7,6 +7,7 @@ No model/runtime dependency is imported by the supervisor.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import importlib
 import json
@@ -18,6 +19,9 @@ import sys
 import tempfile
 import time
 import uuid
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from pathlib import Path
 
 
@@ -189,7 +193,7 @@ def execute_stage(
     environment: dict[str, str] | None = None,
     log_root: str | Path | None = None,
 ) -> dict[str, dict]:
-    """Run pending[rank::len(gpu_ids)] in one fresh child per nonempty slice.
+    """Run pending jobs on one fresh child per GPU with a shared work cursor.
 
     python_path selects the worker interpreter (defaults to sys.executable).
     environment overlays a COPY of the parent's environment; GPU visibility
@@ -273,6 +277,9 @@ def execute_stage(
         return {item["job"]["job_id"]: results[item["job"]["job_id"]] for item in items}
 
     invocation = root / "workers" / uuid.uuid4().hex
+    queue_path = invocation / "queue.json"
+    _atomic_json(queue_path, pending)
+    (invocation / "cursor").write_text("0", encoding="ascii")
     child_env = os.environ.copy()
     child_env.update(environment or {})
     processes = []
@@ -282,16 +289,13 @@ def execute_stage(
     try:
         for sig in previous:
             signal.signal(sig, _interrupted)
-        for rank, gpu in enumerate(gpu_ids):
-            partition = pending[rank :: len(gpu_ids)]
-            if not partition:
-                continue
+        for rank, gpu in enumerate(gpu_ids[: min(len(pending), len(gpu_ids))]):
             manifest = invocation / f"worker-{rank}" / "request.json"
             _atomic_json(
                 manifest,
                 {
                     "stage_root": str(root),
-                    "items": partition,
+                    "queue_path": str(queue_path),
                     "factory": factory,
                     "configuration": config,
                     "execution_fingerprint": execution,
@@ -352,17 +356,75 @@ def execute_stage(
                 signal.signal(sig, handler)
 
 
+def _claim(cursor: Path, count: int) -> int | None:
+    with cursor.open("r+", encoding="ascii") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            index = int(handle.read())
+            if index >= count:
+                return None
+            handle.seek(0)
+            handle.write(str(index + 1))
+            handle.truncate()
+            handle.flush()
+            return index
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def _publish_result(backend, request, item, output, intermediate, error):
+    directory = output.parent
+    files = None
+    try:
+        if error is not None:
+            raise error
+        finish = getattr(backend, "finalize", None)
+        result = finish(item["job"], output, intermediate) if finish else intermediate
+        _json(result)
+        files = _output_files(output, durable=True)
+        row = {"status": "ready", "result": result, "failure_reason": None}
+    except Exception as exc:  # noqa: BLE001 - isolate individual sample failures
+        diagnostics = exc.result if isinstance(exc, SampleJobFailure) else None
+        try:
+            _json(diagnostics)
+        except (TypeError, ValueError):
+            diagnostics = None
+        row = {
+            "status": "failed",
+            "result": diagnostics,
+            "failure_reason": f"{type(exc).__name__}: {exc}",
+        }
+    _atomic_json(
+        directory / "receipt.json",
+        {
+            "job_id": item["job"]["job_id"],
+            "input_fingerprint": item["input_fingerprint"],
+            "execution_fingerprint": request["execution_fingerprint"],
+            "output_files": files,
+            **row,
+        },
+    )
+
+
 def _worker(manifest: Path) -> None:
     # The supervisor temporarily masks signals around Popen; do not inherit it.
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, _interrupted)
     signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM, signal.SIGINT})
     request = json.loads(manifest.read_text(encoding="utf-8"))
+    queue_path = Path(request["queue_path"])
+    items = _read_json(queue_path)
+    if not isinstance(items, list):
+        raise TypeError("invalid stage work queue")
     module_name, attribute = request["factory"].split(":")
     make_backend = getattr(importlib.import_module(module_name), attribute)
     root = Path(request["stage_root"])
-    with make_backend(request["configuration"]) as backend:
-        for item in request["items"]:
+    with make_backend(request["configuration"]) as backend, ThreadPoolExecutor(
+        max_workers=2, thread_name_prefix="stage-finalize"
+    ) as finalizers:
+        outstanding = deque()
+        while (index := _claim(queue_path.with_name("cursor"), len(items))) is not None:
+            item = items[index]
             directory = root / "jobs" / item["key"]
             output = directory / "media"
             # Invalidate an old failed/mismatched receipt before retrying this job.
@@ -372,33 +434,23 @@ def _worker(manifest: Path) -> None:
             elif output.exists():
                 shutil.rmtree(output)
             output.mkdir(parents=True, exist_ok=True)
-            files = None
             try:
-                result = backend.process(item["job"], output)
-                _json(result)
-                files = _output_files(output, durable=True)
-                row = {"status": "ready", "result": result, "failure_reason": None}
+                batch = getattr(backend, "batch_jobs", None)
+                with batch([item["job"]]) if batch else nullcontext():
+                    infer = getattr(backend, "infer", None)
+                    intermediate = (infer or backend.process)(item["job"], output)
+                error = None
             except Exception as exc:  # noqa: BLE001 - isolate arbitrary backend sample failures
-                diagnostics = exc.result if isinstance(exc, SampleJobFailure) else None
-                try:
-                    _json(diagnostics)
-                except (TypeError, ValueError):
-                    diagnostics = None
-                row = {
-                    "status": "failed",
-                    "result": diagnostics,
-                    "failure_reason": f"{type(exc).__name__}: {exc}",
-                }
-            _atomic_json(
-                directory / "receipt.json",
-                {
-                    "job_id": item["job"]["job_id"],
-                    "input_fingerprint": item["input_fingerprint"],
-                    "execution_fingerprint": request["execution_fingerprint"],
-                    "output_files": files,
-                    **row,
-                },
+                intermediate, error = None, exc
+            outstanding.append(
+                finalizers.submit(
+                    _publish_result, backend, request, item, output, intermediate, error
+                )
             )
+            if len(outstanding) >= 4:
+                outstanding.popleft().result()
+        while outstanding:
+            outstanding.popleft().result()
     _atomic_json(manifest.with_name("complete.json"), {"complete": True})
 
 
