@@ -475,6 +475,46 @@ def test_single_ra2va_nontranscribed_segment_has_no_dialogue_block(tmp_path, mon
     assert len(completions.requests) == 1
 
 
+def test_single_ra2va_zero_transcript_request_has_no_dialogue_inventory(tmp_path, monkeypatch):
+    _, shadow = _fixture(tmp_path, monkeypatch)
+    stems = load_stem_shadow(shadow / "separation")[1]
+    jobs = build_stem_reconcile_jobs(
+        base_inventory=qa.build_mimo25_inventory(),
+        stem_diarization_root=shadow / "diarization",
+        stem_asr_root=shadow / "asr", route="music_first",
+    )
+    job = jobs[0].model_copy(update={
+        "segments": [segment.model_copy(update={
+            "asr_status": "empty", "asr_text": None, "asr_language": None,
+        }) for segment in jobs[0].segments],
+    })
+    completions = _Completions([(_raw(), 8)])
+    backend = SingleCallOpenAIMimo25Backend(
+        MimoBackendConfig(
+            api_key="fake", transport="sglang", model="mimo-v2.6-flash-rl",
+            icl="none",
+            media_resolver=MimoMediaResolver(
+                mode="http", media_root=tmp_path, media_base_url="http://media.invalid",
+            ),
+        ),
+        stem_records_by_clip={record.clip_uid: record for record in stems},
+        client=SimpleNamespace(chat=SimpleNamespace(completions=completions)),
+    )
+    backend._request(
+        job,
+        allowed_reference_labels={r.picture_label for r in job.reference_images}
+        | {s.subject_label for s in job.reference_subjects},
+        auxiliary_audio_paths=_validated_auxiliary_stems(stems[0]),
+    )
+    assert len(completions.requests) == 1
+    request = completions.requests[0]
+    assert "shot1_caption contains no <d> dialogue blocks and no (Sx) markers" in request["messages"][0]["content"]
+    task = next(item["text"] for item in request["messages"][-1]["content"] if item["type"] == "text" and "allowed_segment_ids" in item["text"])
+    contract = json.loads(task.split("AUTHORITATIVE INPUT:\n", 1)[1])
+    assert contract["required_output_inventory"]["transcribed_dialogue_blocks_in_order"] == []
+    assert all("required_dialogue_block" not in segment for segment in contract["segments"])
+
+
 def test_single_ra2va_prompt_preserves_visual_acoustic_speaker_and_audio_ownership():
     for step in range(1, 7):
         assert f"STEP {step}" in SINGLE_SYSTEM_PROMPT
@@ -519,6 +559,44 @@ def test_single_ra2va_prompt_requires_cross_step_consistency_and_exact_output_in
         "required_output_inventory",
         "subject_definitions and visual_retention_analysis",
         "visual_observation.segment_views, audio_observation.segment_decisions, and av_grounding.segment_groundings",
+    ):
+        assert rule in SINGLE_SYSTEM_PROMPT
+
+
+def test_single_ra2va_v4_prompt_selects_exact_window_speaker_and_stable_group_identity():
+    for rule in (
+        "EXACT-WINDOW VISIBLE SPEAKER SELECTION",
+        'speech_correlated_articulation="observed"',
+        "MUST be one of those observed-articulation entities",
+        "Never bind a non-articulating visible entity when another visible entity has observed articulation",
+        "visible_lip_motion may only be claimed for an entity whose same-segment",
+        "When no entity has observed articulation, av_temporal_alignment may still support",
+        "STABLE GROUP BINDING",
+        "one acoustic speaker_group must not map to multiple visible entity_ids",
+        "one visible entity must not be published as multiple distinct resolved speaker_groups",
+        "leave that segment unresolved rather than silently moving the same group",
+        "Do not change Step-2 primary_speaker_group in Step 3",
+    ):
+        assert rule in SINGLE_SYSTEM_PROMPT
+
+
+def test_single_ra2va_v4_prompt_projects_sx_without_visual_renumbering_or_hallucinated_dialogue():
+    for rule in (
+        "SPEAKER MARKER PROJECTION",
+        "using ONLY transcribed segments in chronological order",
+        "First distinct non-null/fallback vocal source appearing in transcribed dialogue -> S1",
+        "shot1_caption MUST use this mapping exactly",
+        "visible Subject, articulation, gaze, or AV binding does NOT create a new Sx",
+        "when primary_speaker_group remains the same",
+        "a new primary_speaker_group in transcribed speech must use its own Sx",
+        "EVERY transcribed dialogue block",
+        "Do not rely on implicit marker inheritance",
+        "required_output_inventory.transcribed_dialogue_blocks_in_order is empty",
+        "shot1_caption contains no <d> dialogue blocks and no (Sx) markers",
+        "speaker_voice_profiles is empty",
+        "subject_definitions[*].description is visual appearance content ONLY",
+        "must never contain any <Picture N> label or Picture provenance",
+        "materializer owns all Subject-to-Picture provenance",
     ):
         assert rule in SINGLE_SYSTEM_PROMPT
 
@@ -602,12 +680,12 @@ def test_single_ra2va_record_keeps_clip_failure_isolated(tmp_path, monkeypatch):
     assert [record.model_call_count for record in records] == [1, 1, 1]
     assert summary.model_call_count == 3
     assert len(completions.requests) == 3
-    assert all(record.backend_provenance.prompt_version == "h3_mimo26_ra2va_single_v3" for record in records)
-    assert all(record.backend_provenance.schema_version == "r2v.h3.mimo25_backend.69" for record in records)
+    assert all(record.backend_provenance.prompt_version == "h3_mimo26_ra2va_single_v4" for record in records)
+    assert all(record.backend_provenance.schema_version == "r2v.h3.mimo25_backend.70" for record in records)
     assert [item.status for item in load_reconcile_sources(root)] == ["ready", "failed", "ready"]
 
 
-def test_single_ra2va_provenance_reads_frozen_v1_v2_and_current_v3(tmp_path, monkeypatch):
+def test_single_ra2va_provenance_reads_frozen_v1_v2_v3_and_current_v4(tmp_path, monkeypatch):
     from r2v_data_v2.h3.audio_reuse_prepared import FrozenReuseBackendProvenance
 
     backend = SingleCallOpenAIMimo25Backend(
@@ -620,7 +698,7 @@ def test_single_ra2va_provenance_reads_frozen_v1_v2_and_current_v3(tmp_path, mon
     )
     current = backend.provenance
     assert (current.schema_version, current.prompt_version) == (
-        "r2v.h3.mimo25_backend.69", "h3_mimo26_ra2va_single_v3",
+        "r2v.h3.mimo25_backend.70", "h3_mimo26_ra2va_single_v4",
     )
     assert MimoBackendProvenance.model_validate_json(current.model_dump_json()) == current
     assert FrozenReuseBackendProvenance.model_validate_json(
@@ -630,6 +708,7 @@ def test_single_ra2va_provenance_reads_frozen_v1_v2_and_current_v3(tmp_path, mon
     for version, prompt in (
         (".67", "h3_mimo26_ra2va_single_v1"),
         (".68", "h3_mimo26_ra2va_single_v2"),
+        (".69", "h3_mimo26_ra2va_single_v3"),
     ):
         with monkeypatch.context() as patch:
             patch.setattr(single, "SINGLE_BACKEND_VERSION", f"r2v.h3.mimo25_backend{version}")
