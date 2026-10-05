@@ -399,6 +399,33 @@ def test_compact_visible_subject_maps_to_frozen_entity_without_remap():
     assert "e2" not in json.dumps(payload)
 
 
+def test_compact_object_picture_keeps_frozen_entity_speaker_subject():
+    payload = _compact_payload()
+    job = _job(subjects=[SimpleNamespace(
+        subject_label="<Subject 1>", kind="entity", entity_id="e2",
+        source_picture_labels=["<Picture 1>"],
+    )])
+    job.reference_images = [SimpleNamespace(
+        picture_label="<Picture 1>", kind="object", entity_id="e2",
+    )]
+    allowed_entity_ids = {
+        reference.entity_id for reference in job.reference_images
+        if reference.kind == "subject" and reference.entity_id is not None
+    }
+    assert allowed_entity_ids == set()
+    draft = single.MimoSingleCompactAnnotationDraftV2.model_validate(payload)
+    normalized, corrections = single._normalize_single_compact_speaker_subjects(draft, job)
+    assert normalized == draft
+    assert corrections == {}
+    issues, _ = single._validate_single_compact_annotation(
+        normalized, job, allowed_entity_ids=allowed_entity_ids,
+        allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+    )
+    assert issues == []
+    projected = single._project_compact_to_legacy_annotation(normalized, job)
+    assert projected.av_grounding.segment_groundings[0].entity_id == "e2"
+
+
 def test_single_compact_backend_keeps_raw_response_and_legacy_annotation(tmp_path, monkeypatch):
     _, shadow = _fixture(tmp_path, monkeypatch)
     stems = load_stem_shadow(shadow / "separation")[1]

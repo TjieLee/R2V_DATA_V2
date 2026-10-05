@@ -253,7 +253,7 @@ def _validate_single_compact_annotation(
         if decision.binding_status != "visible_subject":
             continue
         label = decision.speaker_subject_label
-        if label not in entity_by_subject or entity_by_subject[label] not in allowed_entity_ids:
+        if label not in entity_by_subject:
             issues.append(ValidationIssue(
                 "unknown_speaker_subject", decision.segment_id, str(label),
             ))
