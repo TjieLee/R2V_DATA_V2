@@ -28,6 +28,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import logging
 import math
 import threading
 import time
@@ -67,6 +68,11 @@ from r2v_data_v2.v3.post_mask_epoch_jobs import (
 from r2v_data_v2.v3.post_mask_epoch_resources import (
     EpochResourceError,
     resolve_cpu_workers,
+)
+from r2v_data_v2.v3.post_mask_epoch_sa_binary_gc import (
+    BinaryJobIds,
+    cleanup_clip_binary,
+    load_binary_job_index,
 )
 from r2v_data_v2.v3.post_mask_epoch_state import atomic_write_bytes, atomic_write_json
 from r2v_data_v2.v3.storage import RunStorage, evaluate_export_state
@@ -128,6 +134,8 @@ SUBJECT_ATTRIBUTE_CLIP_OUTCOME_SCHEMA = (
     "post_mask_epoch_subject_attributes_clip_outcome/1"
 )
 SUBJECT_ATTRIBUTE_POLICY_VERSION = "subject_attributes_epoch_policy/3"
+
+_LOGGER = logging.getLogger(__name__)
 SUBJECT_ATTRIBUTE_DISCOVERY_POLICY_VERSION = "subject_attribute_discovery/1"
 
 SUBJECT_ATTRIBUTE_ATTRIBUTE_PLAN_SCHEMA = (
@@ -1390,6 +1398,14 @@ class SubjectAttributeEpochRunner:
         # A restart constructs a fresh runner and therefore revalidates from
         # disk, preserving fail-closed durable semantics.
         self._clip_plan_cache: dict[tuple[str, str], dict[str, Any]] = {}
+        # Formal Resource-Epoch execution enables this only after its durable
+        # SAT_STARTED handoff. Standalone runners retain strict binary replay.
+        self.online_binary_gc_enabled = False
+        # Load prior phase job records lazily, at most once per group/invocation
+        # when the first NEW clip becomes terminal. Later committed jobs extend
+        # this RAM-only index without scanning historical phases again.
+        self._binary_job_index: dict[tuple[str, str], BinaryJobIds] | None = None
+        self._binary_job_index_lock = threading.Lock()
         # A terminal clip outcome is the SAT restart checkpoint. Keep only its
         # small frozen plan and counts in memory; do not re-open historical
         # clip/frames/masks merely to discover that it is already complete.
@@ -2946,6 +2962,20 @@ class SubjectAttributeEpochRunner:
         payload = dict(result.payload)
         with self._committed_payload_cache_lock:
             self._committed_payload_cache[job_id] = payload
+        if job.job_type in {
+            SUBJECT_ATTRIBUTE_SAM_PROBE_JOB,
+            SUBJECT_ATTRIBUTE_COMPLETION_SAM_JOB,
+            SUBJECT_ATTRIBUTE_COMPLETION_GENERATE_JOB,
+        }:
+            with self._binary_job_index_lock:
+                if self._binary_job_index is not None:
+                    jobs = self._binary_job_index.setdefault(
+                        (job.canonical_shard, job.clip_uid), BinaryJobIds()
+                    )
+                    if job.job_type == SUBJECT_ATTRIBUTE_COMPLETION_GENERATE_JOB:
+                        jobs.completion.add(job_id)
+                    else:
+                        jobs.sam.add(job_id)
         if job.job_type not in {
             SUBJECT_ATTRIBUTE_SAM_PROBE_JOB,
             SUBJECT_ATTRIBUTE_COMPLETION_SAM_JOB,
@@ -3492,6 +3522,40 @@ class SubjectAttributeEpochRunner:
         key = (shard, clip_uid)
         self._completed_clip_cache[key] = (dict(plan), expected)
         self._fresh_completed_clips.add(key)
+        if self.online_binary_gc_enabled:
+            self._gc_new_terminal_clip_binary(shard, clip_uid)
+
+    def _gc_new_terminal_clip_binary(self, shard: str, clip_uid: str) -> None:
+        """Best-effort cleanup after this clip's terminal outcome is durable."""
+        try:
+            with self._binary_job_index_lock:
+                if self._binary_job_index is None:
+                    # Set a sentinel before the one historical phase scan: a
+                    # failed scan must not recur for every terminal clip.
+                    self._binary_job_index = {}
+                    self._binary_job_index.update(
+                        load_binary_job_index(Path(self.ledger.root))
+                    )
+                indexed = self._binary_job_index.get((shard, clip_uid))
+                jobs = BinaryJobIds(
+                    sam=set() if indexed is None else set(indexed.sam),
+                    completion=set() if indexed is None else set(indexed.completion),
+                )
+            result = cleanup_clip_binary(Path(self.ledger.root), jobs, apply=True)
+            with self._sam_mask_cache_lock:
+                for job_id in jobs.sam:
+                    self._pending_fresh_sam_masks.pop(job_id, None)
+                    self._committed_sam_masks.pop(job_id, None)
+            if result["failures"]:
+                _LOGGER.warning(
+                    "Subject Attributes binary GC had %s failures for %s/%s",
+                    result["failures"], shard, clip_uid,
+                )
+        except Exception:  # Disposable cleanup cannot undo terminal publication.
+            _LOGGER.warning(
+                "Subject Attributes binary GC failed for %s/%s",
+                shard, clip_uid, exc_info=True,
+            )
 
     # -- attribute plans -------------------------------------------------------
 

@@ -4098,6 +4098,50 @@ def test_attribute_ready_fixture_yields_an_accepted_record(
         assert (storage.root / "subject_attributes" / name).is_file(), name
 
 
+def test_terminal_attribute_gc_keeps_final_export_and_compaction_inputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The full Resource-Epoch handoff can export after disposable SAM cleanup."""
+    from r2v_data_v2.v3.post_mask_epoch_removal import (
+        export_shard,
+        removal_shard_paths,
+    )
+    from r2v_data_v2.v3.post_mask_epoch_sa_binary_gc import load_binary_job_index
+    from tests.test_v3_post_mask_epoch_removal import _parts_root
+
+    outcome, _events, _handle, storage, ledger = (
+        _production_reference_integrity_outcome(
+            tmp_path, monkeypatch, attribute_ready=True
+        )
+    )
+    assert outcome["subject_attributes_completed"] is True
+    assert outcome["export_completed"] is True
+    assert outcome["completed"] is True
+    assert _sat_markers(ledger) == (True, True)
+
+    binary = Path(ledger.root) / "semantic/subject_attributes/binary/sam"
+    assert load_binary_job_index(Path(ledger.root))[(SHARD, "clip-1")].sam
+    assert not list(binary.glob("*/mask-*.npy"))
+    record = _accepted_owner_record(storage)
+    final_image = storage.root / "subject_attributes" / record.image_path
+    assert final_image.is_file()
+    assert (storage.root / "subject_attributes/enriched_samples.jsonl").is_file()
+    assert (storage.root / "subject_attributes/owners/clip-1/e1.json").is_file()
+
+    paths = removal_shard_paths(
+        post_mask_root=tmp_path / "workspace/data/campaign",
+        entity_mask_root=_parts_root(tmp_path, (SHARD,)),
+        shard=SHARD,
+    )
+    (paths.state_root / "completed.json").unlink()
+    published = export_shard(
+        storage, paths, ("clip-1",), formal_production=True
+    )
+    assert published["rebuilt"] is True
+    assert final_image.is_file()
+    assert (storage.root / "subject_attributes/enriched_samples.jsonl").is_file()
+
+
 def test_attribute_candidate_selection_is_deterministic_across_replay(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

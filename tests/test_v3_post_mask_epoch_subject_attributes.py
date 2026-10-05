@@ -36,6 +36,8 @@ from r2v_data_v2.v3.post_mask_epoch_jobs import (
     RESOURCE_BOOGU,
     RESOURCE_QWEN,
     RESOURCE_SAM,
+    JobResult,
+    ModelJob,
 )
 from r2v_data_v2.v3.post_mask_epoch_quarantine import ClipQuarantine
 from r2v_data_v2.v3.post_mask_epoch_resources import EpochResourceError
@@ -5497,6 +5499,195 @@ def test_fresh_reconcile_uses_durably_published_clip_outcome_without_replay(
     assert stats.no_work_clips == 0
     assert stats.to_dict()["skipped_existing_owners"] == 1
     assert runner.replay_counters["fresh_reconcile_cache_hits"] == 1
+
+
+def test_online_binary_gc_keeps_pending_sibling_and_cold_resume_skips_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a newly published terminal clip may lose its disposable SA binary."""
+    config, storage, uids = _multi_clip_fixture(
+        tmp_path, monkeypatch, run_name="run-online-binary-gc", count=2
+    )
+    runner = _multi_runner(
+        tmp_path, config, storage, uids, cpu_workers=1,
+        ledger_name="ledger-online-binary-gc",
+    )
+    runner.online_binary_gc_enabled = True
+    binary = Path(runner.ledger.root) / "semantic/subject_attributes/binary"
+    files: dict[str, list[Path]] = {}
+    planned: list[ModelJob] = []
+    for clip_uid in uids:
+        sam = ModelJob.create(
+            job_type=SUBJECT_ATTRIBUTE_SAM_PROBE_JOB,
+            resource=RESOURCE_SAM,
+            canonical_shard=SHARD,
+            clip_uid=clip_uid,
+            semantic_inputs={"test": clip_uid, "kind": "sam"},
+            model_identity="test-sam",
+        )
+        completion_sam = ModelJob.create(
+            job_type=SUBJECT_ATTRIBUTE_COMPLETION_SAM_JOB,
+            resource=RESOURCE_SAM,
+            canonical_shard=SHARD,
+            clip_uid=clip_uid,
+            semantic_inputs={"test": clip_uid, "kind": "completion-sam"},
+            model_identity="test-sam",
+        )
+        completion = ModelJob.create(
+            job_type=SUBJECT_ATTRIBUTE_COMPLETION_GENERATE_JOB,
+            resource=RESOURCE_BOOGU,
+            canonical_shard=SHARD,
+            clip_uid=clip_uid,
+            semantic_inputs={"test": clip_uid, "kind": "completion"},
+            model_identity="test-boogu",
+        )
+        planned.extend((sam, completion_sam, completion))
+        files[clip_uid] = [
+            binary / "sam" / sam.job_id() / "mask-000.npy",
+            binary / "sam" / completion_sam.job_id() / "mask-000.npy",
+            binary / "completion" / completion.job_id() / "generated.png",
+        ]
+        for path in files[clip_uid]:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"disposable")
+    runner.ledger.phase("phase-fixture").write_plan(planned)
+
+    seed = runner.seed_jobs()
+    first = [job for job in seed if job.clip_uid == uids[0]]
+    assert len(first) == 1
+    first_client = _QwenClient(discoveries=[_nonhuman_discovery()])
+    _scheduler(runner, _SerialQwenExecutor(runner, first_client)).run(first)
+
+    assert runner._clip_outcome_path(SHARD, uids[0]).is_file()
+    assert all(not path.exists() for path in files[uids[0]])
+    assert all(path.read_bytes() == b"disposable" for path in files[uids[1]])
+
+    cold = _multi_runner(
+        tmp_path, config, storage, uids, cpu_workers=1,
+        ledger_name="ledger-online-binary-gc",
+    )
+    cold.checkpoint_first_resume = True
+    cold.online_binary_gc_enabled = True
+    monkeypatch.setattr(
+        cold, "_derive_clip_plan",
+        lambda storage_arg, clip_uid: (
+            (_ for _ in ()).throw(AssertionError("terminal clip was rederived"))
+            if clip_uid == uids[0]
+            else runner._derive_clip_plan(storage_arg, clip_uid)
+        ),
+    )
+    remaining = cold.seed_jobs()
+    assert {job.clip_uid for job in remaining} == {uids[1]}
+    second_client = _QwenClient(discoveries=[_nonhuman_discovery()])
+    _scheduler(cold, _SerialQwenExecutor(cold, second_client)).run(remaining)
+    assert all(not path.exists() for path in files[uids[1]])
+    assert cold.reconcile_stats(SHARD).terminal_clips == 2
+    assert first_client.discovery_calls == second_client.discovery_calls == 1
+
+
+def test_online_binary_gc_failure_does_not_undo_terminal_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: Any
+) -> None:
+    config, storage = _storage_variant(
+        tmp_path, monkeypatch, "run-online-binary-gc-failure"
+    )
+    runner = _runner(config, storage, tmp_path)
+    runner.online_binary_gc_enabled = True
+    monkeypatch.setattr(
+        "r2v_data_v2.v3.post_mask_epoch_subject_attributes."
+        "load_binary_job_index",
+        lambda _root: (_ for _ in ()).throw(OSError("unlink unavailable")),
+    )
+    qwen = _QwenClient(discoveries=[_nonhuman_discovery()])
+    _drain(runner, qwen)
+
+    assert runner._clip_outcome_path(SHARD, CLIP_UID).is_file()
+    assert runner.reconcile_stats(SHARD).terminal_clips == 1
+    assert qwen.discovery_calls == 1
+    assert "binary GC failed" in caplog.text
+
+
+def test_online_binary_gc_indexes_once_and_cold_completed_scan_does_not_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import r2v_data_v2.v3.post_mask_epoch_subject_attributes as epoch_module
+
+    config, storage, uids = _multi_clip_fixture(
+        tmp_path, monkeypatch, run_name="run-online-index-once", count=2
+    )
+    runner = _multi_runner(
+        tmp_path, config, storage, uids, cpu_workers=1,
+        ledger_name="ledger-online-index-once",
+    )
+    runner.online_binary_gc_enabled = True
+    original = epoch_module.load_binary_job_index
+    calls = 0
+
+    def counted(root: Path) -> Any:
+        nonlocal calls
+        calls += 1
+        return original(root)
+
+    monkeypatch.setattr(epoch_module, "load_binary_job_index", counted)
+    _drain(
+        runner,
+        _QwenClient(discoveries=[_nonhuman_discovery(), _nonhuman_discovery()]),
+    )
+    assert calls == 1
+
+    cold = _multi_runner(
+        tmp_path, config, storage, uids, cpu_workers=1,
+        ledger_name="ledger-online-index-once",
+    )
+    cold.online_binary_gc_enabled = True
+    cold.checkpoint_first_resume = True
+    assert cold.seed_jobs() == []
+    assert cold.reconcile_stats(SHARD).terminal_clips == 2
+    assert calls == 1
+
+
+def test_online_binary_gc_extends_index_after_first_terminal_clip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, storage, uids = _multi_clip_fixture(
+        tmp_path, monkeypatch, run_name="run-online-late-job", count=2
+    )
+    runner = _multi_runner(
+        tmp_path, config, storage, uids, cpu_workers=1,
+        ledger_name="ledger-online-late-job",
+    )
+    runner.online_binary_gc_enabled = True
+    seeded = runner.seed_jobs()
+    first = [job for job in seeded if job.clip_uid == uids[0]]
+    second = [job for job in seeded if job.clip_uid == uids[1]]
+    _scheduler(
+        runner, _SerialQwenExecutor(runner, _QwenClient(discoveries=[_nonhuman_discovery()])),
+    ).run(first)
+    assert runner._binary_job_index is not None
+
+    late_job = ModelJob.create(
+        job_type=SUBJECT_ATTRIBUTE_COMPLETION_SAM_JOB,
+        resource=RESOURCE_SAM,
+        canonical_shard=SHARD,
+        clip_uid=uids[1],
+        semantic_inputs={"test": "planned-after-first-terminal"},
+        model_identity="test-sam",
+    )
+    path = (
+        Path(runner.ledger.root)
+        / "semantic/subject_attributes/binary/sam"
+        / late_job.job_id()
+        / "mask-000.npy"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"disposable")
+    runner._cache_committed_result(late_job, JobResult(outcome="completed"))
+
+    _scheduler(
+        runner, _SerialQwenExecutor(runner, _QwenClient(discoveries=[_nonhuman_discovery()])),
+    ).run(second)
+    assert not path.exists()
+    assert runner.reconcile_stats(SHARD).terminal_clips == 2
 
 
 def test_fresh_processed_owner_replays_once_before_clip_publication(

@@ -799,6 +799,8 @@ def run_subject_attributes_stage(
     _bind_clip_quarantine(subject_attributes, clip_quarantine)
     if resuming and hasattr(subject_attributes, "checkpoint_first_resume"):
         subject_attributes.checkpoint_first_resume = True
+    if hasattr(subject_attributes, "online_binary_gc_enabled"):
+        subject_attributes.online_binary_gc_enabled = True
     eligible_keys = {
         (shard, clip_uid)
         for shard, clip_uids in eligible.items()
