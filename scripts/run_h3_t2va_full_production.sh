@@ -78,6 +78,7 @@ else
   REQUEST_WORKERS="${REQUEST_WORKERS:-1}"
 fi
 CANONICAL_WORKERS="${CANONICAL_WORKERS:-16}"
+MIMO_MEM_FRACTION_STATIC="${MIMO_MEM_FRACTION_STATIC:-0.65}"
 MIMO_STARTUP_POLLS="${MIMO_STARTUP_POLLS:-360}"
 MIMO_POLL_INTERVAL="${MIMO_POLL_INTERVAL:-5}"
 CLEANUP_GRACE_SECONDS="${CLEANUP_GRACE_SECONDS:-30}"
@@ -111,6 +112,8 @@ if [[ "$MIMO_MODEL" == "mimo-v2.6-flash-rl" ]]; then
     "$SGLANG_ENV/bin/sglang" serve --model-path "$MIMO_CHECKPOINT"
     --served-model-name "$MIMO_MODEL" --host 127.0.0.1 --port "$first_port"
     --tp 4 --moe-runner-backend marlin --disable-custom-all-reduce
+    --mem-fraction-static "$MIMO_MEM_FRACTION_STATIC"
+    --enable-deterministic-inference
     --trust-remote-code --reasoning-parser mimo --tool-call-parser mimo)
   serve_second=("${serve[@]}")
   serve_second[1]="CUDA_VISIBLE_DEVICES=$second_group"
@@ -131,12 +134,14 @@ run=("$R2V_PYTHON" "$REPO_ROOT/tools/run_h3_t2va_full_production.py"
   --base-url "$base_url" --media-root "${MEDIA_ROOT:-/mnt/workspace}"
   --request-workers "$REQUEST_WORKERS" --gpu-ids "$GPU_IDS"
   --canonical-workers "$CANONICAL_WORKERS"
+  --max-clip-duration-seconds "${MAX_CLIP_DURATION_SECONDS:-200}"
+  --asr-batch-size "${ASR_BATCH_SIZE:-1}"
   --ffmpeg "${FFMPEG:-ffmpeg}"
   --mimo-sglang "$SGLANG_ENV/bin/sglang"
   --mimo-checkpoint "$MIMO_CHECKPOINT"
   --mimo-model "$MIMO_MODEL"
   --mimo-call-mode "$MIMO_CALL_MODE"
-  --mimo-mem-fraction-static 0.65
+  --mimo-mem-fraction-static "$MIMO_MEM_FRACTION_STATIC"
   --mimo-startup-polls "$MIMO_STARTUP_POLLS"
   --mimo-poll-interval "$MIMO_POLL_INTERVAL"
   --mimo-cleanup-grace-seconds "$CLEANUP_GRACE_SECONDS")

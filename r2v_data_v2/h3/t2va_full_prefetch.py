@@ -30,12 +30,18 @@ def prepare_canonical(request: dict) -> dict:
     """Child-only import boundary; the enclosing worker owns canonical.lock."""
     full = importlib.import_module("r2v_data_v2.h3.t2va_full_production")
     media = importlib.import_module("r2v_data_v2.h3.audio_backends")
+    duration_option = (
+        {"max_clip_duration_seconds": request["max_clip_duration_seconds"]}
+        if request.get("max_clip_duration_seconds", 200.0) != 200.0
+        else {}
+    )
     selection = full.shard_selection(
         Path(request["root"]),
         request["index"],
         request["shard_id"],
         Path(request["clips_root"]),
         Path(request["source_videos_root"]) if request["source_videos_root"] else None,
+        **duration_option,
     )
     audio_root = full.bootstrap_audio(
         Path(request["shard_root"]),
@@ -95,6 +101,7 @@ class CanonicalPrefetch:
         canonical_workers,
         ffmpeg="ffmpeg",
         ffprobe="ffprobe",
+        max_clip_duration_seconds=200.0,
         *,
         worker_factory=_DEFAULT_WORKER,
     ):
@@ -113,6 +120,7 @@ class CanonicalPrefetch:
             "canonical_workers": canonical_workers,
             "ffmpeg": str(ffmpeg),
             "ffprobe": str(ffprobe),
+            "max_clip_duration_seconds": max_clip_duration_seconds,
             "worker_factory": worker_factory,
         }
         self._pending = None

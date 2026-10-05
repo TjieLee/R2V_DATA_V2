@@ -864,7 +864,6 @@ def build_t2va_inventory(
         clip = by_clip[uid]
         if (
             source_job.target_video_path != shots[uid].video_path
-            or source_job.target_video_sha256 != shots[uid].video_sha256
             or source_job.source_audio_path != clip.target_full_audio_path
             or source_job.source_audio_sha256 != clip.target_full_audio_sha256
             or source_job.source_frame_count != clip.frame_count

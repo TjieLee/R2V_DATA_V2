@@ -28,6 +28,7 @@ class Backend:
         with (self.root / (str(self.pid) + ".jsonl")).open("a") as f:
             f.write(json.dumps(dict(kind=kind, pid=self.pid, **extra)) + "\\n")
     def __enter__(self):
+        time.sleep(self.config.get("startup_sleep", 0))
         self.event("enter")
         return self
     def __exit__(self, *args):
@@ -61,6 +62,30 @@ class Backend:
 
 def factory(configuration):
     return Backend(configuration)
+
+class SplitBackend(Backend):
+    def infer(self, job, output_dir):
+        self.event("infer", job_id=job["job_id"])
+        return {"job_id": job["job_id"]}
+    def finalize(self, job, output_dir, intermediate):
+        self.event("finalize_start", job_id=job["job_id"])
+        if job["job_id"] == "first":
+            time.sleep(0.15)
+        self.event("finalize_end", job_id=job["job_id"])
+        (output_dir / "artifact.txt").write_text(job["job_id"])
+        return intermediate
+
+def split_factory(configuration):
+    return SplitBackend(configuration)
+
+class BatchBackend(Backend):
+    batch_size = 8
+    def infer_batch(self, jobs, outputs):
+        self.event("batch", job_ids=[job["job_id"] for job in jobs])
+        return [{"job_id": job["job_id"]} for job in jobs]
+
+def batch_factory(configuration):
+    return BatchBackend(configuration)
 """
 
 
@@ -101,7 +126,32 @@ def receipt(setup, job_id):
     return Path(setup["stage_root"]) / "jobs" / key / "receipt.json"
 
 
-def test_partition_10000_load_once_gpu_mapping_and_order(setup):
+def test_stage_timings_separate_loading_model_work_and_cpu_finalization(setup):
+    setup["gpu_ids"] = ["7"]
+    setup["factory"] = "fake_stage_backend:split_factory"
+    setup["configuration"]["startup_sleep"] = 0.02
+    jobs = [{"job_id": "first"}, {"job_id": "second"}]
+    assert all(row["status"] == "ready" for row in api().execute_stage(jobs=jobs, **setup).values())
+    metrics = json.loads((setup["stage_root"] / "invocation.json").read_text())
+    assert metrics["job_count"] == 2
+    assert metrics["ready_count"] == 2
+    assert metrics["failed_count"] == 0
+    assert metrics["model_load_wall_seconds"] >= 0.02
+    assert metrics["processing_wall_seconds"] >= 0
+    assert metrics["cpu_finalize_seconds_sum"] >= 0.15
+    assert metrics["stage_wall_seconds"] >= metrics["model_load_wall_seconds"]
+    assert metrics["gpu_slot_job_counts"] == {"7": 2}
+    assert metrics["throughput_jobs_per_second"] > 0
+    assert metrics["model_job_count"] == metrics["model_batch_count"] == 2
+
+    api().execute_stage(jobs=jobs, **setup)
+    resumed = json.loads((setup["stage_root"] / "invocation.json").read_text())
+    assert resumed["reused_ready_count"] == 2
+    assert resumed["scheduled_job_count"] == 0
+    assert resumed["model_job_count"] == 0
+
+
+def test_dynamic_queue_10000_load_once_gpu_mapping_and_order(setup):
     setup["gpu_ids"] = [str(i) for i in range(8)]
     before = dict(os.environ)
     jobs = [{"job_id": f"job-{i}"} for i in range(10000)]
@@ -110,19 +160,16 @@ def test_partition_10000_load_once_gpu_mapping_and_order(setup):
     assert os.environ == before
     assert "device" not in setup["configuration"]
     records = events(setup)
-    for rank, gpu in enumerate(setup["gpu_ids"]):
-        partition = jobs[rank::8]
-        pid = result[partition[0]["job_id"]]["result"]["pid"]
-        assert [
-            e["job_id"] for e in records if e["kind"] == "process" and e["pid"] == pid
-        ] == [j["job_id"] for j in partition]
-        for job in partition:
-            row = result[job["job_id"]]
-            assert row["status"] == "ready" and row["failure_reason"] is None
-            assert row["result"]["gpu"] == gpu
-            assert row["result"]["device"] == "cuda:0"
-            assert row["result"]["marker"] == "child"
-            assert Path(row["result"]["path"]).is_file()
+    assert {result[j["job_id"]]["result"]["gpu"] for j in jobs} == set(setup["gpu_ids"])
+    assert sorted(e["job_id"] for e in records if e["kind"] == "process") == sorted(
+        j["job_id"] for j in jobs
+    )
+    for job in jobs:
+        row = result[job["job_id"]]
+        assert row["status"] == "ready" and row["failure_reason"] is None
+        assert row["result"]["device"] == "cuda:0"
+        assert row["result"]["marker"] == "child"
+        assert Path(row["result"]["path"]).is_file()
     for kind in ("load", "enter", "close"):
         assert sum(e["kind"] == kind for e in records) == 8
     requests = list(Path(setup["stage_root"]).glob("workers/*/worker-*/request.json"))
@@ -155,12 +202,16 @@ def test_failure_continues_retries_once_and_ready_skips(setup):
     count = len(events(setup))
     assert api().execute_stage(jobs=jobs, **setup) == third
     assert len(events(setup)) == count
-    assert json.loads((Path(setup["stage_root"]) / "invocation.json").read_text()) == {
+    invocation = json.loads((Path(setup["stage_root"]) / "invocation.json").read_text())
+    assert {key: invocation[key] for key in (
+        "job_count", "scheduled_job_count", "reused_ready_count", "worker_count"
+    )} == {
         "job_count": 2,
         "scheduled_job_count": 0,
         "reused_ready_count": 2,
         "worker_count": 0,
     }
+    assert invocation["model_job_count"] == 0
     assert len(list(Path(setup["stage_root"]).glob("jobs/*"))) == 2
 
 
@@ -264,13 +315,61 @@ def test_crash_waits_other_workers_leaves_unfinished_pending_then_resumes(
         api().execute_stage(jobs=jobs, **setup)
     slow = json.loads(receipt(setup, "slow").read_text())
     assert slow["status"] == "ready"
-    for job_id in ("crash", "pending"):
-        path = receipt(setup, job_id)
-        assert not path.exists() or json.loads(path.read_text())["status"] == "pending"
+    assert not receipt(setup, "crash").exists()
     Path(setup["configuration"]["events"], "allow").touch()
     result = api().execute_stage(jobs=jobs, **setup)
     assert all(row["status"] == "ready" for row in result.values())
     assert result["slow"]["result"]["pid"] == slow["result"]["pid"]
+
+
+def test_free_slot_takes_next_job_and_cpu_receipt_does_not_block(setup):
+    setup["gpu_ids"] = ["5", "8"]
+    jobs = [
+        {"job_id": "slow", "sleep": 0.3},
+        {"job_id": "fast", "sleep": 0.01},
+        {"job_id": "next", "sleep": 0.01},
+    ]
+    result = api().execute_stage(jobs=jobs, **setup)
+    assert result["fast"]["result"]["pid"] == result["next"]["result"]["pid"]
+    assert result["slow"]["result"]["pid"] != result["next"]["result"]["pid"]
+
+
+def test_cpu_finalizer_overlaps_next_model_job(setup):
+    setup["gpu_ids"] = ["5"]
+    setup["factory"] = "fake_stage_backend:split_factory"
+    result = api().execute_stage(
+        jobs=[{"job_id": "first"}, {"job_id": "second"}], **setup
+    )
+    assert all(row["status"] == "ready" for row in result.values())
+    order = [(row["kind"], row.get("job_id")) for row in events(setup)]
+    assert order.index(("infer", "second")) < order.index(("finalize_end", "first"))
+
+
+def test_batch_backend_claims_ordered_microbatches(setup):
+    setup["gpu_ids"] = ["5"]
+    setup["factory"] = "fake_stage_backend:batch_factory"
+    jobs = [{"job_id": f"segment-{index:02d}"} for index in range(17)]
+    result = api().execute_stage(jobs=jobs, **setup)
+    assert list(result) == [job["job_id"] for job in jobs]
+    assert [row["job_ids"] for row in events(setup) if row["kind"] == "batch"] == [
+        [job["job_id"] for job in jobs[:8]],
+        [job["job_id"] for job in jobs[8:16]],
+        [job["job_id"] for job in jobs[16:]],
+    ]
+
+
+def test_batch_runtime_reuses_existing_ready_receipt(setup):
+    setup["gpu_ids"] = ["5"]
+    jobs = [{"job_id": "existing"}]
+    original_factory = setup["factory"]
+    first = api().execute_stage(jobs=jobs, **setup)
+    before = len(events(setup))
+    setup["factory"] = "fake_stage_backend:batch_factory"
+    second = api().execute_stage(
+        jobs=jobs, receipt_factory=original_factory, **setup
+    )
+    assert second == first
+    assert len(events(setup)) == before
 
 
 def test_empty_validation_and_non_json_sample_failure(setup):

@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import math
 import os
+import shutil
+import tempfile
 import time
 import traceback
 import uuid
@@ -24,7 +27,6 @@ from r2v_data_v2.h3.t2va_source import (
     VIDEO_HASH_NOT_COMPUTED,
     T2VAShot,
     T2VAShotSelection,
-    prepare_t2va_audio,
     validate_cached_target,
 )
 
@@ -133,6 +135,23 @@ def run_assigned_shards(root, shard_ids, pipeline):
                         raise
                     if hasattr(result, "model_dump"):
                         result = result.model_dump(mode="json")
+                    timing = dict(getattr(pipeline, "last_stage_metrics", {}) or {})
+                    timing["stage_wall_seconds"] = time.monotonic() - started
+                    timing.setdefault("ready_count", result.get("ready_count", result.get("ready", 0)))
+                    timing.setdefault("failed_count", result.get("failed_count", result.get("failed", 0)))
+                    count = timing.get("scheduled_job_count", timing.get("job_count", 0))
+                    timing["throughput_jobs_per_second"] = (
+                        count / timing["stage_wall_seconds"]
+                        if timing["stage_wall_seconds"] else 0.0
+                    )
+                    if "model_call_count" in timing:
+                        timing["model_calls_per_second"] = (
+                            timing["model_call_count"] / timing["stage_wall_seconds"]
+                            if timing["stage_wall_seconds"] else 0.0
+                        )
+                    production.atomic_json(
+                        shard / "stage_timing" / f"{name}.json", timing
+                    )
                     production.atomic_json(
                         shard / "stage_state" / f"{name}.json", result
                     )
@@ -166,6 +185,8 @@ class FullPipeline:
         allow_unverified=False,
         request_workers=1,
         canonical_workers=16,
+        max_clip_duration_seconds=production.MAX_CLIP_DURATION_SECONDS,
+        asr_batch_size=1,
         ffmpeg="ffmpeg",
         ffprobe="ffprobe",
         mimo_lifecycle=None,
@@ -184,9 +205,24 @@ class FullPipeline:
         if canonical_workers < 1:
             raise ValueError("canonical workers must be positive")
         self.canonical_workers = canonical_workers
+        if not math.isfinite(max_clip_duration_seconds) or max_clip_duration_seconds <= 0:
+            raise ValueError("max clip duration must be finite and positive")
+        self.max_clip_duration_seconds = max_clip_duration_seconds
+        if type(asr_batch_size) is not int or not 1 <= asr_batch_size <= 8:
+            raise ValueError("ASR batch size must be between 1 and 8")
+        self.asr_batch_size = asr_batch_size
         self.prepared = {}
         self.prefetch = None
         self.pools = None
+        self.last_stage_metrics = {}
+
+    @staticmethod
+    def _execution_metrics(path):
+        try:
+            value = json.loads((path / "invocation.json").read_text())
+        except (OSError, ValueError):
+            return {}
+        return value if isinstance(value, dict) else {}
 
     @contextmanager
     def node(self, shard_ids):
@@ -198,6 +234,7 @@ class FullPipeline:
             clips_root=self.clips_root,
             source_videos_root=self.source_videos_root,
             canonical_workers=self.canonical_workers,
+            max_clip_duration_seconds=self.max_clip_duration_seconds,
             ffmpeg=self.ffmpeg,
             ffprobe=self.ffprobe,
         ) as prefetch:
@@ -247,6 +284,7 @@ class FullPipeline:
         shard = self.root / "shards" / production.shard_name(shard_id)
         state = shard / "stage_state"
         execution = {}
+        self.last_stage_metrics = {}
         if name == "canonical":
             if self.prefetch is not None and shard_id in self.prepared:
                 # Re-read after taking invocation ownership: another node may
@@ -275,6 +313,7 @@ class FullPipeline:
                     shard_id,
                     self.clips_root,
                     self.source_videos_root,
+                    max_clip_duration_seconds=self.max_clip_duration_seconds,
                 )
                 audio_root = bootstrap_audio(
                     shard,
@@ -307,7 +346,7 @@ class FullPipeline:
                 model_configuration=self.sam_configuration,
                 route="music_first",
             )
-            return stems.run_sam(
+            result = stems.run_sam(
                 inventory,
                 shadow / "separation",
                 state / "sam",
@@ -316,6 +355,8 @@ class FullPipeline:
                 ffprobe=self.ffprobe,
                 **execution,
             )
+            self.last_stage_metrics = self._execution_metrics(state / "sam")
+            return result
         if name == "auk":
             _, records, _ = sam.load_stem_shadow(shadow / "separation")
             eligible = {r.clip_uid for r in records if r.separation_state != "failure"}
@@ -325,7 +366,7 @@ class FullPipeline:
                 case_manifest_path=audio_root / "case_manifest.json",
                 configuration=self.auk_configuration,
             )
-            return stems.run_auk(
+            result = stems.run_auk(
                 inventory,
                 state / "auk",
                 self.gpu_ids,
@@ -333,11 +374,14 @@ class FullPipeline:
                 ffmpeg=self.ffmpeg,
                 **execution,
             )
+            self.last_stage_metrics = self._execution_metrics(state / "auk")
+            return result
         if name == "resolve":
             return resolve_audio_stems(
                 audio_production_root=audio_root,
                 shadow_run_id=RUN_ID,
                 overwrite=(shadow / "resolved_stems_v1").exists(),
+                prepared_path=state / "auk/resolved_prepared.json",
             )
         if name in {"diarizen", "asr"}:
             from r2v_data_v2.h3.t2va_full_speech import run_asr, run_diarizen
@@ -349,8 +393,10 @@ class FullPipeline:
                 self.gpu_ids,
                 self.allow_unverified,
                 ffmpeg=self.ffmpeg,
+                **({"batch_size": self.asr_batch_size} if name == "asr" and self.asr_batch_size > 1 else {}),
                 **execution,
             )
+            self.last_stage_metrics = self._execution_metrics(state / name)
             provenance = result["provenance"]
             return {
                 "job_count": result["job_count"],
@@ -383,6 +429,25 @@ class FullPipeline:
                     request_workers=self.request_workers,
                     run_id=RUN_ID,
                 )
+                processed_at = time.monotonic()
+                metrics = (
+                    self.mimo_lifecycle.stage_metrics()
+                    if self.mimo_lifecycle is not None
+                    and hasattr(self.mimo_lifecycle, "stage_metrics")
+                    else {}
+                )
+                last_model = metrics.pop("last_model_completion_monotonic", None)
+                metrics["cpu_finalize_tail_wall_seconds"] = (
+                    max(0.0, processed_at - last_model) if last_model is not None else 0.0
+                )
+                metrics["job_count"] = len(states)
+                metrics["ready_count"] = sum(
+                    row["t2va_status"] == "ready" for row in states.values()
+                )
+                metrics["failed_count"] = sum(
+                    row["t2va_status"] == "failed" for row in states.values()
+                )
+                self.last_stage_metrics = metrics
             return {
                 f"{stage}_{status}": sum(
                     row[f"{stage}_status"] == status for row in states.values()
@@ -409,10 +474,16 @@ def write_rows(path, rows):
         temporary.unlink(missing_ok=True)
 
 
-def shard_selection(root, index, shard_id, clips_root, source_videos_root):
+def shard_selection(
+    root, index, shard_id, clips_root, source_videos_root,
+    *, max_clip_duration_seconds=production.MAX_CLIP_DURATION_SECONDS,
+):
     from r2v_data_v2.h3.t2va_shadow import fingerprint
     from r2v_data_v2.v3.production_source import JeaVideoMotionAdapter
 
+    if not math.isfinite(max_clip_duration_seconds) or max_clip_duration_seconds <= 0:
+        raise ValueError("max clip duration must be finite and positive")
+    duration_reason = production.duration_exclusion_reason(max_clip_duration_seconds)
     manifest = production.materialize_shard(index, shard_id, root)
     source = root / "shards" / production.shard_name(shard_id) / "source"
     cached = source / "selection.json"
@@ -434,13 +505,13 @@ def shard_selection(root, index, shard_id, clips_root, source_videos_root):
         overlong = [
             shot
             for shot in selection.shots
-            if shot.duration_seconds > production.MAX_CLIP_DURATION_SECONDS
+            if shot.duration_seconds > max_clip_duration_seconds
         ]
         if overlong:
             shots = [
                 shot
                 for shot in selection.shots
-                if shot.duration_seconds <= production.MAX_CLIP_DURATION_SECONDS
+                if shot.duration_seconds <= max_clip_duration_seconds
             ]
             excluded = sorted(
                 [
@@ -448,7 +519,7 @@ def shard_selection(root, index, shard_id, clips_root, source_videos_root):
                     *(
                         {
                             "source_index": shot.source_index,
-                            "reason": production.CLIP_DURATION_EXCLUSION_REASON,
+                            "reason": duration_reason,
                         }
                         for shot in overlong
                     ),
@@ -477,11 +548,11 @@ def shard_selection(root, index, shard_id, clips_root, source_videos_root):
                 if not isinstance(raw, dict):
                     raise TypeError("shot row must be an object")
                 duration = float(raw["duration"])
-                if duration > production.MAX_CLIP_DURATION_SECONDS:
+                if duration > max_clip_duration_seconds:
                     excluded.append(
                         {
                             "source_index": source_index,
-                            "reason": production.CLIP_DURATION_EXCLUSION_REASON,
+                            "reason": duration_reason,
                         }
                     )
                     continue
@@ -539,17 +610,54 @@ def bootstrap_audio(
     audio = shard / "audio_production"
     items = audio / "canonical_items"
 
+    def materialize(shot, destination):
+        import soundfile as sf
+
+        items.mkdir(parents=True, exist_ok=True)
+        temporary = Path(tempfile.mkdtemp(prefix=f".{shot.clip_uid}-", dir=items))
+        try:
+            relative = Path("audio/full_audio") / f"{shot.clip_uid}.flac"
+            actual = temporary / relative
+            backend.materialize_full_audio(
+                clip_uid=shot.clip_uid,
+                source_video_path=Path(shot.video_path),
+                destination=actual,
+                sample_rate_hz=32000,
+                channels=2,
+                output_format="flac",
+            )
+            info = sf.info(actual)
+            if (info.format, info.samplerate, info.channels) != ("FLAC", 32000, 2) or info.frames <= 0:
+                raise ValueError("T2VA canonical Audio media contract differs")
+            clip = CanonicalAudioClip(
+                clip_uid=shot.clip_uid,
+                clip_display_path=shot.clip_display_path,
+                media_collection_relpath="jea",
+                media_collection_name="jea",
+                episode_name=shot.source_video_id,
+                clip_name=Path(shot.video_path).stem,
+                shard_id="t2va",
+                target_video_path=shot.video_path,
+                target_video_sha256=shot.video_sha256,
+                target_full_audio_path=str(destination / relative),
+                target_full_audio_sha256=sha256_file(actual),
+                frame_count=info.frames,
+                target_duration_seconds=info.frames / 32000,
+                subject_reference_count=0,
+            )
+            validate_cached_target(shot, clip)
+            canonical = temporary / "audio/canonical_clips.jsonl"
+            canonical.write_text(clip.model_dump_json() + "\n", encoding="utf-8")
+            os.replace(temporary, destination)
+        finally:
+            if temporary.exists():
+                shutil.rmtree(temporary)
+
     def prepare(shot):
         destination = items / shot.clip_uid
         try:
             if not destination.exists():
-                single = selection.model_copy(update={"shots": [shot]})
-                prepare_t2va_audio(
-                    single,
-                    output_root=destination,
-                    audio_backend=backend,
-                    verify_source_videos=False,
-                )
+                materialize(shot, destination)
             rows = list(
                 production.complete_rows(destination / "audio/canonical_clips.jsonl")
             )
@@ -588,6 +696,7 @@ def bootstrap_audio(
         )
         for c in clips
     ]
+    canonical_sha256 = sha256_file(canonical)
     values = {
         "source_pairs_sha256": None,
         "source_asr_inventory_fingerprint": None,
@@ -595,7 +704,7 @@ def bootstrap_audio(
         "targets": targets,
         "source_inventory_kind": "jea_shot_manifest",
         "source_shot_manifest_sha256": selection.shot_manifest_sha256,
-        "source_canonical_audio_manifest_sha256": sha256_file(canonical),
+        "source_canonical_audio_manifest_sha256": canonical_sha256,
     }
     inventory = DiarizationInventory(
         schema_version="r2v.h3.diarization_inventory.5",
@@ -604,7 +713,7 @@ def bootstrap_audio(
         source_shot_manifest_path=selection.shot_manifest_path,
         source_shot_manifest_sha256=selection.shot_manifest_sha256,
         source_canonical_audio_manifest_path=str(canonical),
-        source_canonical_audio_manifest_sha256=sha256_file(canonical),
+        source_canonical_audio_manifest_sha256=canonical_sha256,
         inventory_fingerprint=_inventory_fingerprint(**values),
         source_target_count=len(targets),
         selected_target_count=len(targets),

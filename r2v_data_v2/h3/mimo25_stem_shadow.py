@@ -1716,7 +1716,13 @@ class MimoStemReconcileRecord(SchemaModel):
             self.visual_raw_response, self.speech_av_raw_response,
             self.speaker_profile_raw_response, self.audio_finalize_raw_response,
         ), strict=True))
-        single_call = self.backend_provenance.prompt_version == "h3_mimo26_ra2va_single_v1"
+        single_call = self.backend_provenance.prompt_version in {
+            "h3_mimo26_ra2va_single_v1", "h3_mimo26_ra2va_single_v2",
+            "h3_mimo26_ra2va_single_v3", "h3_mimo26_ra2va_single_v4",
+            "h3_mimo26_ra2va_single_v5_compact",
+            "h3_mimo26_ra2va_single_v6_compact2",
+            "h3_mimo26_ra2va_single_v7_compact2_cleanup",
+        }
         if single_call:
             invalid_calls = (
                 self.model_call_count not in {0, 1}

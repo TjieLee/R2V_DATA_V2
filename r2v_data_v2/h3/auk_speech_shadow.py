@@ -22,9 +22,9 @@ from r2v_data_v2.h3.mimo25_av_reconcile import MimoCaseManifest
 from r2v_data_v2.h3.sam_audio_stem_shadow import (
     _publish_directory,
     _read_jsonl,
-    dependency_fingerprint,
     _write_json,
     _write_jsonl,
+    dependency_fingerprint,
     sha256_file,
     stem_shadow_root,
 )
@@ -539,7 +539,7 @@ def canonicalize_speech(
     return adjustment
 
 
-def preflight(inventory: AukInventory, *, overwrite: bool) -> Path:
+def preflight(inventory: AukInventory, *, overwrite: bool, verify_jobs: bool = True) -> Path:
     destination = auk_stage_root(
         Path(inventory.audio_production_root), inventory.shadow_run_id
     )
@@ -570,8 +570,9 @@ def preflight(inventory: AukInventory, *, overwrite: bool) -> Path:
     ]
     if any(p.resolve().is_relative_to(destination) for p in source_paths):
         raise ValueError("AuK output contains a source dependency")
-    for job in inventory.jobs:
-        check_source(job)
+    if verify_jobs:
+        for job in inventory.jobs:
+            check_source(job)
     return destination
 
 

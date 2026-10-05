@@ -942,6 +942,7 @@ def _call_provenance(
     prompt: str,
     input_path: Path,
     result: SAMAudioSeparationResult,
+    digest=sha256_file,
 ) -> SAMAudioCallProvenance:
     target = Path(result.target_path).expanduser().resolve(strict=True)
     residual = Path(result.residual_path).expanduser().resolve(strict=True)
@@ -949,11 +950,11 @@ def _call_provenance(
         pass_index=pass_index,
         prompt=prompt,
         input_path=str(input_path.expanduser().resolve(strict=True)),
-        input_sha256=sha256_file(input_path),
+        input_sha256=digest(input_path),
         target_path=str(target),
-        target_sha256=sha256_file(target),
+        target_sha256=digest(target),
         residual_path=str(residual),
-        residual_sha256=sha256_file(residual),
+        residual_sha256=digest(residual),
         verification_state=result.verification_state,
         candidate_count=result.candidate_count,
         selected_candidate_index=result.selected_candidate_index,
@@ -987,6 +988,7 @@ def _stem_artifact(
     canonical_path: Path,
     canonicalizer: StemCanonicalizer,
     raw_probe_backend: AudioMediaBackend,
+    digest=sha256_file,
 ) -> StemArtifact:
     raw_probe = raw_probe_backend.probe_audio_file(raw_path)
     canonical_probe, settings = canonicalizer.canonicalize(
@@ -1000,13 +1002,13 @@ def _stem_artifact(
         source_end_sample=job.source_frame_count,
         source_duration_seconds=job.source_duration_seconds,
         raw_stem_path=str(raw_path.resolve(strict=True)),
-        raw_stem_sha256=sha256_file(raw_path),
+        raw_stem_sha256=digest(raw_path),
         raw_sample_rate_hz=raw_probe.sample_rate_hz,
         raw_channels=raw_probe.channels,
         raw_frame_count=raw_probe.frame_count,
         raw_duration_seconds=raw_probe.duration_seconds,
         canonical_stem_path=str(canonical_path.resolve(strict=True)),
-        canonical_stem_sha256=sha256_file(canonical_path),
+        canonical_stem_sha256=digest(canonical_path),
         canonical_frame_count=canonical_probe.frame_count,
         canonical_duration_seconds=canonical_probe.duration_seconds,
         raw_duration_delta_seconds=(
@@ -1054,17 +1056,29 @@ def _separate_one_route(
     backend: SAMAudioBackend,
     canonicalizer: StemCanonicalizer,
     raw_probe_backend: AudioMediaBackend,
+    source_validated: bool = False,
 ) -> SAMAudioStemRecord:
     source = Path(job.source_audio_path).expanduser().resolve(strict=True)
-    if sha256_file(source) != job.source_audio_sha256:
-        raise ValueError("canonical source Audio hash changed before SAM separation")
-    source_probe = raw_probe_backend.probe_audio_file(source)
-    if (
-        source_probe.sample_rate_hz != STEM_SAMPLE_RATE_HZ
-        or source_probe.channels != STEM_CHANNELS
-        or source_probe.frame_count != job.source_frame_count
-    ):
-        raise ValueError("canonical source Audio format or sample extent changed")
+    digests = {}
+
+    def digest(path):
+        path = Path(path)
+        if path not in digests:
+            digests[path] = sha256_file(path)
+        return digests[path]
+
+    if not source_validated:
+        if digest(source) != job.source_audio_sha256:
+            raise ValueError("canonical source Audio hash changed before SAM separation")
+        source_probe = raw_probe_backend.probe_audio_file(source)
+        if (
+            source_probe.sample_rate_hz != STEM_SAMPLE_RATE_HZ
+            or source_probe.channels != STEM_CHANNELS
+            or source_probe.frame_count != job.source_frame_count
+        ):
+            raise ValueError("canonical source Audio format or sample extent changed")
+    else:
+        digests[source] = job.source_audio_sha256
     raw_root = output_root / "stems" / job.clip_uid / route
     canonical_root = output_root / "canonical_stems" / job.clip_uid / route
     raw_root.mkdir(parents=True, exist_ok=True)
@@ -1099,6 +1113,7 @@ def _separate_one_route(
                 prompt=first_prompt,
                 input_path=source,
                 result=first_result,
+                digest=digest,
             )
         )
         if first_result.verification_state == "failure":
@@ -1128,6 +1143,7 @@ def _separate_one_route(
                 prompt=second_prompt,
                 input_path=intermediate,
                 result=second_result,
+                digest=digest,
             )
         )
         if second_result.verification_state == "failure":
@@ -1145,6 +1161,7 @@ def _separate_one_route(
                 canonical_path=canonical_root / f"{stem_type}.wav",
                 canonicalizer=canonicalizer,
                 raw_probe_backend=raw_probe_backend,
+                digest=digest,
             )
             for stem_type in ("music", "speech", "sfx")
         ]

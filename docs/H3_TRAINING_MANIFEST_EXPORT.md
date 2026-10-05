@@ -131,3 +131,29 @@ head -n 1 "$EXPORT_ROOT/ta2va_full_audio.jsonl"
 ```
 
 The exporter does not change any frozen caption, reference selection, speaker binding, Audio selection, media asset, or inference artifact.
+
+## R(A)2VA final training review
+
+The optional read-only review page projects the same frozen 12 R2VA/RA2VA task rows as this exporter. It reviews each `(clip_uid, task)` independently; a ready automated product is not automatically a human PASS. The page shows the original target video, all ordered conditioning Pictures and Audio files, the full final H3 caption, and the exact four-field training-row preview. Cross-voice products are not included.
+
+Use separate, writable review and export roots outside the frozen shadow run:
+
+```bash
+python tools/serve_h3_training_task_review.py serve \
+  --ra2va-shadow-root "$RA2VA_SHADOW_ROOT" \
+  --review-root "$REVIEW_ROOT" \
+  --host 127.0.0.1 --port 8769
+```
+
+Open `http://127.0.0.1:8769/` (or forward port 8769 over SSH). The review server accepts loopback binds only; its decision endpoint has no remote authentication. Review and export roots must be outside the frozen shadow root. Decisions and notes are saved under the review root as `annotations.jsonl`, `summary.json`, and `annotations.csv`. An annotation becomes stale if its exact task row changes; stale decisions do not count as reviewed or exportable. The review-side fingerprint is computed from the short four-field row, not from a media scan.
+
+After review, export only current PASS tasks to a fresh output directory:
+
+```bash
+python tools/serve_h3_training_task_review.py export \
+  --ra2va-shadow-root "$RA2VA_SHADOW_ROOT" \
+  --review-root "$REVIEW_ROOT" \
+  --output-root "$REVIEWED_EXPORT_ROOT"
+```
+
+This writes the 12 R(A)2VA task JSONL files plus `videos.jsonl`. ISSUE, SKIP, unreviewed, and stale tasks are absent. Every task row remains exactly `video`, `images`, `audios`, `caption`; `videos.jsonl` contains only `video` and its exported `tasks`. No review metadata, SHA/hash, seed, or verification fields enter training JSONL. The original unreviewed exporter remains unchanged and can still export T(A)2VA independently.

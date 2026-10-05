@@ -17,6 +17,10 @@ from pathlib import Path
 SHARD_SIZE = 2_000
 MAX_CLIP_DURATION_SECONDS = 200.0
 CLIP_DURATION_EXCLUSION_REASON = "clip_duration_over_200s"
+
+
+def duration_exclusion_reason(max_seconds: float) -> str:
+    return f"clip_duration_over_{max_seconds:g}s"
 DEFAULT_ROOT = Path(
     "/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/T2VA"
 )
@@ -476,6 +480,18 @@ def process_shard(
                 else:
                     raise ValueError("production source/config identity changed")
             state["preparation_failed"] = bool(row.get("preparation_error"))
+            if (
+                str(row.get("upstream_failure") or "").startswith("clip_duration_over_")
+                and state["t2va_status"] == "ready"
+                and state["ta2va_status"] == "pending"
+            ):
+                state.update(
+                    ta2va_status="skipped",
+                    failure_reason=row["upstream_failure"],
+                    failure_stage="upstream",
+                )
+                save(state)
+                return
             if row.get("upstream_failure") and state["t2va_status"] == "pending":
                 state.update(
                     t2va_status="skipped",
@@ -1050,6 +1066,16 @@ def prepare_shard(
     prepared = root / "shards" / shard_name(shard_id) / "prepared"
     prepared.mkdir(parents=True, exist_ok=True)
 
+    historical_sources = {}
+    historical_source_path = (
+        root / "shards" / shard_name(shard_id) / "sources.json"
+    )
+    if historical_source_path.is_file():
+        historical_sources = {
+            row["source_index"]: row
+            for row in json.loads(historical_source_path.read_text())
+        }
+
     preselected = None
     selection_path = root / "shards" / shard_name(shard_id) / "source/selection.json"
     if selection_path.is_file():
@@ -1089,8 +1115,31 @@ def prepare_shard(
                             "cached T2VA selection does not cover source row "
                             f"{source_index}"
                         )
-                    if reason == CLIP_DURATION_EXCLUSION_REASON:
-                        row["upstream_failure"] = reason
+                    if reason.startswith("clip_duration_over_") and reason.endswith("s"):
+                        historical = historical_sources.get(source_index)
+                        if historical is not None:
+                            row.update(
+                                clip_uid=historical["clip_uid"],
+                                video=historical["video"],
+                                upstream_failure=reason,
+                            )
+                        else:
+                            raw = json.loads(line)
+                            if not isinstance(raw, dict):
+                                raise TypeError(
+                                    "duration-excluded source row must be a JSON object"
+                                )
+                            candidate, _ = _path_below_root(
+                                raw.get("video_path"),
+                                root=clips_root,
+                                field_name="video_path",
+                                require_file=False,
+                            )
+                            row.update(
+                                clip_uid=parse_clip_identity(candidate).clip_uid,
+                                video=str(candidate),
+                                upstream_failure=reason,
+                            )
                     else:
                         row["preparation_error"] = (
                             "ValueError: canonical selection excluded source row: "

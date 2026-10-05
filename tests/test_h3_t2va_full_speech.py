@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from r2v_data_v2.h3 import sam_audio_stem_shadow as frozen
@@ -132,6 +133,106 @@ def test_asr_worker_does_not_rehash_published_source_audio(
     )
     with worker.batch_jobs(asr_jobs):
         [worker.process(job, tmp_path) for job in asr_jobs]
+
+
+def test_batched_asr_decodes_one_stem_and_preserves_segment_order(
+    speech, asr_jobs, tmp_path, monkeypatch
+):
+    decoded = []
+    calls = []
+
+    def decode(_self, path):
+        decoded.append(path)
+        return np.arange(48000, dtype=np.float32)
+
+    def transcribe_batch(*, waveforms, sample_rate_hz):
+        calls.append(([len(waveform) for waveform in waveforms], sample_rate_hz))
+        return [(f"segment-{i}", "English") for i in range(len(waveforms))]
+
+    monkeypatch.setattr(speech._BatchedASRWorker, "_decode_full", decode)
+    backend = SimpleNamespace(
+        _process=SimpleNamespace(poll=lambda: None),
+        transcribe_batch=transcribe_batch,
+    )
+    worker = speech._BatchedASRWorker(backend, "unused", 8)
+    try:
+        worker.prefetch_batch(asr_jobs)
+        results = worker.infer_batch(asr_jobs, [tmp_path] * 3)
+        assert results == [
+            {"text": f"segment-{i}", "language": "English"} for i in range(3)
+        ]
+        worker.infer_batch(asr_jobs, [tmp_path] * 3)
+    finally:
+        worker.close()
+    assert decoded == [Path(asr_jobs[0]["segment"]["source_audio_path"])]
+    assert calls == [([16000, 16000, 16000], 16000)] * 2
+    assert worker.metrics() == {
+        "asr_batch_size_distribution": {3: 2},
+        "asr_unique_stem_decode_count": 1,
+        "asr_segment_count": 6,
+    }
+
+
+def test_batched_asr_three_batch_lookahead_decodes_each_stem_once(
+    speech, asr_jobs, tmp_path, monkeypatch
+):
+    decoded = Counter()
+
+    def decode(_self, path):
+        decoded[path] += 1
+        return np.zeros(16000, dtype=np.float32)
+
+    monkeypatch.setattr(speech._BatchedASRWorker, "_decode_full", decode)
+    backend = SimpleNamespace(
+        _process=SimpleNamespace(poll=lambda: None),
+        transcribe_batch=lambda **kwargs: [
+            ("spoken", "English") for _ in kwargs["waveforms"]
+        ],
+    )
+    batches = []
+    for batch_index in range(3):
+        batch = []
+        for index in range(8):
+            path = tmp_path / f"stem-{batch_index}-{index}.wav"
+            job = {
+                **asr_jobs[0],
+                "segment": {
+                    **asr_jobs[0]["segment"],
+                    "segment_id": f"segment-{batch_index}-{index}",
+                    "source_audio_path": str(path),
+                    "source_start_sample": 0,
+                    "source_end_sample": 32000,
+                    "start_time": 0.0,
+                    "end_time": 1.0,
+                },
+            }
+            batch.append(job)
+        batches.append(batch)
+
+    worker = speech._BatchedASRWorker(backend, "unused", 8)
+    try:
+        worker.prefetch_batch(batches[0])
+        worker.prefetch_batch(batches[1])
+        assert all(
+            row == {"text": "spoken", "language": "English"}
+            for row in worker.infer_batch(batches[0], [tmp_path] * 8)
+        )
+        worker.prefetch_batch(batches[2])
+        for batch in batches[1:]:
+            assert all(
+                row == {"text": "spoken", "language": "English"}
+                for row in worker.infer_batch(batch, [tmp_path] * 8)
+            )
+    finally:
+        worker.close()
+
+    assert len(decoded) == 24
+    assert set(decoded.values()) == {1}
+    assert worker.metrics() == {
+        "asr_batch_size_distribution": {8: 3},
+        "asr_unique_stem_decode_count": 24,
+        "asr_segment_count": 24,
+    }
 
 
 @pytest.mark.parametrize("failure", ["loader", "inference"])

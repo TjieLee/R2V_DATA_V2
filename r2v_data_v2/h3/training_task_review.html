@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>R(A)2VA Training Review</title>
+  <style>
+    :root { color-scheme: light; font: 14px/1.45 system-ui, sans-serif; color: #19272b; background: #f4f6f5; }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    button, select, textarea, input { font: inherit; }
+    button { cursor: pointer; border: 1px solid #b6c4c2; border-radius: 4px; background: #fff; color: inherit; }
+    button:focus-visible, select:focus-visible, textarea:focus-visible { outline: 2px solid #007d75; outline-offset: 2px; }
+    header { position: sticky; top: 0; z-index: 5; display: flex; align-items: center; gap: 18px; padding: 11px 20px; color: #fff; background: #173330; border-bottom: 3px solid #c7b174; }
+    header strong { font-size: 15px; }
+    header span { color: #d3e2df; }
+    .layout { display: grid; grid-template-columns: minmax(250px, 300px) minmax(0, 1fr); min-height: calc(100vh - 50px); }
+    aside { border-right: 1px solid #ced8d5; background: #fbfcfb; min-width: 0; }
+    .filters { position: sticky; top: 50px; padding: 15px; background: #fbfcfb; border-bottom: 1px solid #ced8d5; }
+    .filters label { display: block; margin: 7px 0; font-size: 12px; color: #46605c; }
+    .filters input, .filters select { display: block; width: 100%; margin-top: 3px; padding: 7px; border: 1px solid #b6c4c2; border-radius: 4px; background: white; color: #19272b; }
+    #clip-list { max-height: calc(100vh - 210px); overflow-y: auto; }
+    .clip { display: block; width: 100%; padding: 10px 15px; border: 0; border-bottom: 1px solid #e1e7e4; border-radius: 0; text-align: left; background: transparent; }
+    .clip.selected { background: #e3f1ec; border-left: 4px solid #0c7b66; padding-left: 11px; }
+    .clip small { display: block; color: #647572; margin-top: 2px; }
+    main { min-width: 0; max-width: 1660px; padding: 16px 24px 55px; }
+    h1 { font-size: 18px; margin: 0 0 10px; overflow-wrap: anywhere; }
+    h2 { font-size: 15px; margin: 0 0 10px; }
+    h3 { font-size: 13px; margin: 12px 0 6px; }
+    section { padding: 17px 0; border-bottom: 1px solid #cdd9d5; }
+    .media-head { display: flex; gap: 22px; align-items: flex-start; flex-wrap: wrap; }
+    .video-wrap { width: min(100%, 780px); }
+    video { display: block; width: 100%; max-height: 55vh; background: #101716; }
+    .muted { color: #637571; }
+    .task-group { margin: 10px 0; }
+    .task-buttons { display: flex; flex-wrap: wrap; gap: 6px; }
+    .task-buttons button { padding: 7px 10px; }
+    .task-buttons button.selected { background: #0c7167; color: #fff; border-color: #0c7167; }
+    .task-buttons button.pass { border-bottom: 3px solid #28834c; }
+    .task-buttons button.issue { border-bottom: 3px solid #ad6b22; }
+    .task-buttons button.skip { border-bottom: 3px solid #7a8180; }
+    .task-buttons button.stale { border-bottom: 3px dashed #a54d41; }
+    .conditioning { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr)); gap: 22px; }
+    .images { display: flex; flex-wrap: wrap; gap: 14px; }
+    figure { width: min(100%, 240px); margin: 0; }
+    figure img { display: block; max-width: 100%; max-height: 220px; object-fit: contain; border: 1px solid #d0dad6; background: #fff; }
+    figcaption, .audio-item { font-size: 12px; margin-top: 6px; }
+    .audio-item { margin-bottom: 14px; }
+    audio { display: block; width: min(100%, 400px); margin: 6px 0; }
+    code { display: block; overflow-wrap: anywhere; white-space: normal; color: #576662; font-size: 11px; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; padding: 14px; border: 1px solid #d0dad6; background: #fff; font: 13px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    #caption { max-height: 68vh; overflow: auto; }
+    #preview { max-height: 210px; overflow: auto; font-size: 11px; }
+    .review-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 12px 0; }
+    .review-actions button { padding: 9px 18px; font-weight: 700; }
+    .review-actions .pass { border-color: #298258; }
+    .review-actions .issue { border-color: #af791f; }
+    .review-actions .skip { border-color: #87908e; }
+    #decision { font-weight: 700; }
+    .tag-list { display: flex; flex-wrap: wrap; gap: 8px 15px; margin: 8px 0 14px; }
+    .tag-list label { white-space: nowrap; }
+    textarea { width: min(100%, 800px); min-height: 88px; padding: 9px; border: 1px solid #b6c4c2; border-radius: 4px; resize: vertical; }
+    details { margin-top: 15px; }
+    summary { cursor: pointer; }
+    @media (max-width: 800px) { .layout { grid-template-columns: 1fr; } aside { border-right: 0; border-bottom: 1px solid #ced8d5; } #clip-list { max-height: 180px; } .filters { position: static; } main { padding: 14px; } header { position: static; } }
+  </style>
+</head>
+<body>
+  <header><strong>R(A)2VA Training Review</strong><span id="progress"></span></header>
+  <div class="layout">
+    <aside>
+      <div class="filters">
+        <label>Clip <input id="search" type="search" placeholder="clip_uid"></label>
+        <label>Decision <select id="status-filter"><option value="all">All</option><option value="unreviewed">Unreviewed</option><option value="PASS">PASS</option><option value="ISSUE">ISSUE</option><option value="SKIP">SKIP</option></select></label>
+        <label>Task <select id="task-filter"><option value="all">All tasks</option></select></label>
+      </div>
+      <nav id="clip-list" aria-label="Clips"></nav>
+    </aside>
+    <main>
+      <h1 id="clip-title"></h1>
+      <section class="media-head">
+        <div class="video-wrap"><h2>Original target video</h2><video id="target-video" controls preload="metadata"></video><code id="video-path"></code></div>
+      </section>
+      <section><h2>Task selector</h2><div id="tasks"></div></section>
+      <section class="conditioning">
+        <div><h2>Conditioning images</h2><div id="images" class="images"></div></div>
+        <div><h2>Conditioning audio</h2><div id="audios"></div></div>
+      </section>
+      <section><h2>Final caption</h2><pre id="caption"></pre></section>
+      <section><h2>Training row preview</h2><pre id="preview"></pre></section>
+      <section>
+        <h2>Review decision</h2><span id="decision" class="muted"></span>
+        <div class="review-actions"><button class="pass" data-decision="PASS">PASS</button><button class="issue" data-decision="ISSUE">ISSUE</button><button class="skip" data-decision="SKIP">SKIP</button><span id="save-message" role="status"></span></div>
+        <h3>Issue tags</h3><div id="tags" class="tag-list"></div>
+        <h3>Notes</h3><textarea id="notes" aria-label="Review notes"></textarea>
+        <details><summary>Advanced</summary><code id="review-key"></code></details>
+      </section>
+    </main>
+  </div>
+  <template id="audio-template"><audio controls preload="none"></audio></template>
+  <script>
+    const data = __DATA__;
+    const casesByClip = new Map();
+    for (const item of data.cases) {
+      if (!casesByClip.has(item.clip_uid)) casesByClip.set(item.clip_uid, []);
+      casesByClip.get(item.clip_uid).push(item);
+    }
+    const clipIds = [...casesByClip.keys()];
+    const stale = new Set(data.stale);
+    let clipUid = clipIds[0] || null;
+    let task = clipUid ? casesByClip.get(clipUid)[0].task : null;
+    const $ = id => document.getElementById(id);
+    const key = item => `${item.clip_uid}|${item.task}`;
+    const status = item => data.annotations[key(item)]?.decision || 'unreviewed';
+
+    function taskLabel(name) {
+      return name.replace(/^ra?2va_/, '').replaceAll('_', ' ');
+    }
+    function matching(item) {
+      const chosen = $('status-filter').value;
+      return (chosen === 'all' || status(item) === chosen)
+        && ($('task-filter').value === 'all' || item.task === $('task-filter').value);
+    }
+    function drawList() {
+      const search = $('search').value.trim().toLowerCase();
+      const list = $('clip-list');
+      list.replaceChildren();
+      for (const id of clipIds) {
+        const entries = casesByClip.get(id);
+        if (!id.toLowerCase().includes(search) || !entries.some(matching)) continue;
+        const button = document.createElement('button');
+        button.className = `clip${id === clipUid ? ' selected' : ''}`;
+        const count = entries.filter(item => status(item) !== 'unreviewed').length;
+        button.textContent = id;
+        const small = document.createElement('small');
+        small.textContent = `${count} / ${entries.length} tasks reviewed`;
+        button.append(small);
+        button.onclick = () => {
+          clipUid = id;
+          task = (entries.find(matching) || entries[0]).task;
+          draw();
+        };
+        list.append(button);
+      }
+    }
+    function drawTasks(entries) {
+      const root = $('tasks');
+      root.replaceChildren();
+      for (const family of ['r2va_', 'ra2va_']) {
+        const group = document.createElement('div');
+        group.className = 'task-group';
+        const heading = document.createElement('h3');
+        heading.textContent = family === 'r2va_' ? 'R2VA' : 'RA2VA';
+        group.append(heading);
+        const buttons = document.createElement('div');
+        buttons.className = 'task-buttons';
+        for (const item of entries.filter(entry => entry.task.startsWith(family))) {
+          const button = document.createElement('button');
+          button.textContent = taskLabel(item.task);
+          button.className = `${item.task === task ? 'selected ' : ''}${status(item).toLowerCase()}${stale.has(key(item)) ? ' stale' : ''}`;
+          button.onclick = () => { task = item.task; draw(); };
+          buttons.append(button);
+        }
+        group.append(buttons);
+        root.append(group);
+      }
+    }
+    function showMedia(item) {
+      if ($('target-video').dataset.path !== item.row.video) {
+        $('target-video').src = item.video_url;
+        $('target-video').dataset.path = item.row.video;
+      }
+      $('video-path').textContent = item.row.video;
+      $('images').replaceChildren();
+      item.row.images.forEach((path, index) => {
+        const figure = document.createElement('figure');
+        const img = document.createElement('img');
+        img.src = item.image_urls[index];
+        img.alt = item.image_labels[index] || `Image ${index + 1}`;
+        img.loading = 'lazy';
+        const caption = document.createElement('figcaption');
+        caption.textContent = `${index + 1}. ${item.image_labels[index] || 'Conditioning image'}`;
+        const code = document.createElement('code');
+        code.textContent = path;
+        figure.append(img, caption, code);
+        $('images').append(figure);
+      });
+      if (!item.row.images.length) $('images').textContent = 'None';
+      $('audios').replaceChildren();
+      item.row.audios.forEach((path, index) => {
+        const block = document.createElement('div');
+        block.className = 'audio-item';
+        const label = document.createElement('strong');
+        label.textContent = `Audio ${index + 1} / ${item.audio_kinds[index] || 'Audio'}`;
+        const player = $('audio-template').content.firstElementChild.cloneNode(true);
+        player.src = item.audio_urls[index];
+        const code = document.createElement('code');
+        code.textContent = path;
+        block.append(label, player, code);
+        $('audios').append(block);
+      });
+      if (!item.row.audios.length) $('audios').textContent = 'None';
+    }
+    function draw() {
+      const reviewed = data.cases.filter(item => status(item) !== 'unreviewed').length;
+      $('progress').textContent = `${reviewed} / ${data.cases.length} tasks reviewed / ${clipIds.length} clips`;
+      drawList();
+      if (!clipUid) { $('clip-title').textContent = 'No available tasks'; return; }
+      const entries = casesByClip.get(clipUid);
+      const item = entries.find(entry => entry.task === task) || entries[0];
+      task = item.task;
+      $('clip-title').textContent = clipUid;
+      drawTasks(entries);
+      showMedia(item);
+      $('caption').textContent = item.row.caption;
+      $('preview').textContent = JSON.stringify(item.row, null, 2);
+      const annotation = data.annotations[key(item)];
+      $('decision').textContent = stale.has(key(item)) ? 'Stale review / review again' : (annotation?.decision || 'Unreviewed');
+      $('review-key').textContent = `${item.clip_uid} / ${item.task} / ${item.sample_fingerprint}`;
+      $('tags').replaceChildren();
+      for (const tag of data.issue_tags) {
+        const label = document.createElement('label');
+        const input = document.createElement('input');
+        input.type = 'checkbox';
+        input.value = tag;
+        input.checked = !!annotation?.issue_tags.includes(tag);
+        label.append(input, document.createTextNode(` ${tag}`));
+        $('tags').append(label);
+      }
+      $('notes').value = annotation?.notes || '';
+      $('save-message').textContent = '';
+    }
+    async function save(decision) {
+      if (!clipUid) return;
+      const item = casesByClip.get(clipUid).find(entry => entry.task === task);
+      const selected = [...$('tags').querySelectorAll('input:checked')].map(input => input.value);
+      if (decision === 'ISSUE' && !selected.length) {
+        $('save-message').textContent = 'Select at least one issue tag.';
+        return;
+      }
+      const annotation = {
+        schema_version: 'r2v.h3.training_task_review.1',
+        clip_uid: item.clip_uid,
+        task: item.task,
+        sample_fingerprint: item.sample_fingerprint,
+        decision,
+        issue_tags: decision === 'ISSUE' ? selected : [],
+        notes: $('notes').value,
+        reviewed_at: new Date().toISOString()
+      };
+      try {
+        const response = await fetch('/api/annotation', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(annotation)});
+        if (!response.ok) throw new Error(await response.text());
+        data.annotations[key(item)] = annotation;
+        stale.delete(key(item));
+        draw();
+        $('save-message').textContent = 'Saved';
+      } catch (error) {
+        $('save-message').textContent = `Save failed: ${error.message}`;
+      }
+    }
+    for (const button of document.querySelectorAll('[data-decision]')) {
+      button.onclick = () => save(button.dataset.decision);
+    }
+    for (const id of ['search', 'status-filter', 'task-filter']) {
+      $(id).addEventListener(id === 'search' ? 'input' : 'change', drawList);
+    }
+    for (const name of data.cases.map(item => item.task).filter((value, index, all) => all.indexOf(value) === index)) {
+      const option = document.createElement('option');
+      option.value = name;
+      option.textContent = name;
+      $('task-filter').append(option);
+    }
+    draw();
+  </script>
+</body>
+</html>

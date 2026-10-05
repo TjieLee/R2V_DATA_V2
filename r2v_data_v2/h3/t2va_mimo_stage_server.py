@@ -35,8 +35,11 @@ def build_mimo_serve_command(
             "--served-model-name", served_model_name,
             "--host", "127.0.0.1", "--port", str(port),
             "--tp", "4", "--moe-runner-backend", "marlin",
-            "--disable-custom-all-reduce", "--trust-remote-code",
+            "--disable-custom-all-reduce",
+            "--mem-fraction-static", f"{mem_fraction_static:g}",
+            "--trust-remote-code",
             "--reasoning-parser", "mimo", "--tool-call-parser", "mimo",
+            "--enable-deterministic-inference",
         ]
     command = [
         str(sglang),
@@ -177,6 +180,11 @@ class StageMimoClient:
         self._log_handle = None
         self._log_path: Path | None = None
         self._started_once = False
+        self.last_startup_seconds = 0.0
+        self._first_request_at = None
+        self._last_request_completed_at = None
+        self._model_runtime_seconds_sum = 0.0
+        self._model_call_count = 0
 
     @contextmanager
     def stage(self, shard_id: int):
@@ -185,6 +193,11 @@ class StageMimoClient:
                 raise RuntimeError("MiMo stage lifecycle is already active")
             self._stage_shard = shard_id
             self._started_once = False
+            self.last_startup_seconds = 0.0
+            self._first_request_at = None
+            self._last_request_completed_at = None
+            self._model_runtime_seconds_sum = 0.0
+            self._model_call_count = 0
         try:
             yield self
         finally:
@@ -281,9 +294,10 @@ class StageMimoClient:
                 )
             if self._probe("/v1/models") and self._probe("/model_info"):
                 self._client = self._new_client()
+                self.last_startup_seconds = time.monotonic() - started
                 print(
                     f"shard={self._stage_shard} mimo_server_ready "
-                    f"startup_seconds={time.monotonic() - started:.3f}",
+                    f"startup_seconds={self.last_startup_seconds:.3f}",
                     flush=True,
                 )
                 return
@@ -345,7 +359,31 @@ class StageMimoClient:
         with self._lock:
             self._ensure_started_locked()
             client = self._client
-        return client.chat.completions.create(**kwargs)
+        started = time.monotonic()
+        with self._lock:
+            if self._first_request_at is None:
+                self._first_request_at = started
+        try:
+            return client.chat.completions.create(**kwargs)
+        finally:
+            completed = time.monotonic()
+            with self._lock:
+                self._last_request_completed_at = completed
+                self._model_call_count += 1
+                self._model_runtime_seconds_sum += completed - started
+
+    def stage_metrics(self):
+        with self._lock:
+            first = self._first_request_at
+            last = self._last_request_completed_at
+            return {
+                "model_load_wall_seconds": self.last_startup_seconds,
+                "endpoint_startup_seconds": [self.last_startup_seconds],
+                "model_call_count": self._model_call_count,
+                "model_runtime_seconds_sum": self._model_runtime_seconds_sum,
+                "processing_wall_seconds": last - first if first is not None and last is not None else 0.0,
+                "last_model_completion_monotonic": last,
+            }
 
 
 class StageMimoPoolClient:
@@ -358,16 +396,36 @@ class StageMimoPoolClient:
         self.chat = _Chat(self)
         self._available: Queue[StageMimoClient] = Queue()
         self._active = False
+        self._metrics_lock = threading.Lock()
+        self._model_call_count = 0
+        self._model_runtime_seconds_sum = 0.0
+        self._first_request_at = None
+        self._last_request_completed_at = None
+        self._endpoint_call_counts = [0] * len(self.endpoints)
+        self._startup_seconds = []
+        self._model_load_wall_seconds = 0.0
 
     @contextmanager
     def stage(self, shard_id: int):
         if self._active:
             raise RuntimeError("MiMo pool stage is already active")
+        started = time.monotonic()
+        with self._metrics_lock:
+            self._model_call_count = 0
+            self._model_runtime_seconds_sum = 0.0
+            self._first_request_at = None
+            self._last_request_completed_at = None
+            self._endpoint_call_counts = [0] * len(self.endpoints)
         with ExitStack() as stack:
             self._available = Queue()
             for endpoint in self.endpoints:
                 stack.enter_context(endpoint.stage(shard_id))
                 endpoint.start()
+            self._model_load_wall_seconds = time.monotonic() - started
+            self._startup_seconds = [
+                getattr(endpoint, "last_startup_seconds", 0.0)
+                for endpoint in self.endpoints
+            ]
             for endpoint in self.endpoints:
                 self._available.put(endpoint)
             self._active = True
@@ -382,7 +440,31 @@ class StageMimoPoolClient:
         if not self._active:
             raise RuntimeError("MiMo request made outside a shard MiMo stage")
         endpoint = self._available.get()
+        started = time.monotonic()
+        with self._metrics_lock:
+            if self._first_request_at is None:
+                self._first_request_at = started
         try:
             return endpoint.chat.completions.create(**kwargs)
         finally:
+            completed = time.monotonic()
+            with self._metrics_lock:
+                self._model_call_count += 1
+                self._model_runtime_seconds_sum += completed - started
+                self._last_request_completed_at = completed
+                self._endpoint_call_counts[self.endpoints.index(endpoint)] += 1
             self._available.put(endpoint)
+
+    def stage_metrics(self):
+        with self._metrics_lock:
+            first = self._first_request_at
+            last = self._last_request_completed_at
+            return {
+                "model_load_wall_seconds": self._model_load_wall_seconds,
+                "endpoint_startup_seconds": list(self._startup_seconds),
+                "endpoint_model_call_counts": list(self._endpoint_call_counts),
+                "model_call_count": self._model_call_count,
+                "model_runtime_seconds_sum": self._model_runtime_seconds_sum,
+                "processing_wall_seconds": last - first if first is not None and last is not None else 0.0,
+                "last_model_completion_monotonic": last,
+            }

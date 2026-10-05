@@ -261,6 +261,13 @@ def test_full_supervisor_stage_order(tmp_path, capsys):
         "asr",
         "mimo",
     )
+    timing = json.loads(
+        (tmp_path / "shards" / production.shard_name(59) / "stage_timing" / "sam.json").read_text()
+    )
+    assert timing["stage_wall_seconds"] >= 0
+    assert timing["ready_count"] == 2
+    assert timing["failed_count"] == 1
+    assert "stage_wall_seconds" not in result[59]["sam"]
 
 
 def test_node_lifetime_does_not_start_persistent_upstream_pools(tmp_path, monkeypatch):
@@ -569,6 +576,27 @@ def test_shard_selection_skips_over_200_seconds_before_video_hash(
     ]
 
 
+def test_shard_selection_explicit_20_second_cutoff_and_cached_migration(tmp_path):
+    manifest = shot_manifest(tmp_path)
+    rows = [json.loads(line) for line in manifest.read_text().splitlines()]
+    for row, duration in zip(rows, (19.9, 20.0, 20.1), strict=True):
+        row["duration"] = duration
+    manifest.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    root = tmp_path / "out"
+    index = production.build_source_index(manifest, root)
+    initial = full.shard_selection(root, index, 0, tmp_path, tmp_path)
+    assert len(initial.shots) == 3
+    selected = full.shard_selection(
+        root, index, 0, tmp_path, tmp_path, max_clip_duration_seconds=20.0
+    )
+    assert [shot.duration_seconds for shot in selected.shots] == [19.9, 20.0]
+    assert selected.excluded_rows == [
+        {"source_index": 2, "reason": "clip_duration_over_20s"}
+    ]
+    cached = root / "shards" / production.shard_name(0) / "source/selection.json"
+    assert json.loads(cached.read_text())["excluded_rows"] == selected.excluded_rows
+
+
 def test_cached_shard_selection_migrates_long_clip_to_terminal_skip(
     tmp_path, monkeypatch
 ):
@@ -579,8 +607,8 @@ def test_cached_shard_selection_migrates_long_clip_to_terminal_skip(
 
     manifest = shot_manifest(tmp_path)
     rows = [json.loads(line) for line in manifest.read_text().splitlines()[:2]]
-    rows[0]["duration"] = 100.0
-    rows[1]["duration"] = 314.0
+    rows[0]["duration"] = 10.0
+    rows[1]["duration"] = 30.0
     manifest.write_text("".join(json.dumps(row) + "\n" for row in rows))
     root = tmp_path / "out"
     index = production.build_source_index(manifest, root)
@@ -589,7 +617,17 @@ def test_cached_shard_selection_migrates_long_clip_to_terminal_skip(
         shard_manifest, clips_root=tmp_path, source_videos_root=tmp_path
     )
     assert len(initial.shots) == 2
-    cached = root / "shards" / production.shard_name(0) / "source/selection.json"
+    old_sources = [
+        {
+            "source_index": shot.source_index,
+            "clip_uid": shot.clip_uid,
+            "video": shot.video_path,
+        }
+        for shot in initial.shots
+    ]
+    shard = root / "shards" / production.shard_name(0)
+    production.atomic_json(shard / "sources.json", old_sources)
+    cached = shard / "source/selection.json"
     production.atomic_json(cached, initial.model_dump(mode="json"))
     original_hash = full.sha256_file
 
@@ -599,10 +637,12 @@ def test_cached_shard_selection_migrates_long_clip_to_terminal_skip(
         return original_hash(path)
 
     monkeypatch.setattr(full, "sha256_file", no_video_rehash)
-    selection = full.shard_selection(root, index, 0, tmp_path, tmp_path)
+    selection = full.shard_selection(
+        root, index, 0, tmp_path, tmp_path, max_clip_duration_seconds=20.0
+    )
     assert [shot.source_index for shot in selection.shots] == [0]
     assert selection.excluded_rows == [
-        {"source_index": 1, "reason": "clip_duration_over_200s"}
+        {"source_index": 1, "reason": "clip_duration_over_20s"}
     ]
     assert json.loads(cached.read_text())["shots"] == [
         selection.shots[0].model_dump(mode="json")
@@ -625,20 +665,49 @@ def test_cached_shard_selection_migrates_long_clip_to_terminal_skip(
         backend=None,
     )
     skipped = projected[1]
-    assert skipped["upstream_failure"] == "clip_duration_over_200s"
+    assert skipped["upstream_failure"] == "clip_duration_over_20s"
     assert "preparation_error" not in skipped
+    assert skipped["clip_uid"] == initial.shots[1].clip_uid
+    assert skipped["video"] == initial.shots[1].video_path
+    assert [
+        {k: row[k] for k in ("source_index", "clip_uid", "video")}
+        for row in projected
+    ] == old_sources
+
+    from r2v_data_v2.h3 import t2va_full_downstream as downstream
+
+    class PreflightProcessor:
+        @staticmethod
+        def evidence(_row):
+            return {}
+
+        @staticmethod
+        def identity(row):
+            return row["clip_uid"]
+
+    downstream._preflight(shard, projected, PreflightProcessor())
 
     class Processor:
-        def identity(self, _row):
-            return "test-identity"
+        def identity(self, row):
+            return row["clip_uid"]
 
-        def process(self, *_args):
-            pytest.fail("duration-excluded clip reached a model stage")
+        def process(self, _stage, row, *_args):
+            if row.get("upstream_failure"):
+                pytest.fail("duration-excluded clip reached a model stage")
+            return {"exports": {}, "model_call_count": 0}
 
-    state = production.process_shard(root, 0, [skipped], Processor())[skipped["clip_uid"]]
+    states = production.process_shard(
+        root,
+        0,
+        projected,
+        Processor(),
+        request_workers=1,
+        allow_existing_identity_mismatch=True,
+    )
+    state = states[skipped["clip_uid"]]
     assert (state["t2va_status"], state["ta2va_status"]) == ("skipped", "skipped")
     assert state["failure_stage"] == "upstream"
-    assert state["failure_reason"] == "clip_duration_over_200s"
+    assert state["failure_reason"] == "clip_duration_over_20s"
 
 
 def test_full_cli_dry_run_does_not_require_models(tmp_path):
@@ -680,10 +749,16 @@ def test_full_cli_dry_run_does_not_require_models(tmp_path):
             "--mimo-call-mode", "single",
             "--mimo-gpu-groups", "0,1,2,3;4,5,6,7",
             "--mimo-ports", "8094,8095",
+            "--request-workers", "4",
+            "--asr-batch-size", "8",
+            "--max-clip-duration-seconds", "20",
         ]
     )
     assert single["mimo_model"] == "mimo-v2.6-flash-rl"
     assert single["mimo_call_mode"] == "single"
+    assert single["request_workers"] == 4
+    assert single["asr_batch_size"] == 8
+    assert single["max_clip_duration_seconds"] == 20
     assert single["mimo_endpoints"] == [
         {"gpu_group": "0,1,2,3", "port": 8094},
         {"gpu_group": "4,5,6,7", "port": 8095},
@@ -836,6 +911,17 @@ def test_bootstrap_from_index_and_resume(tmp_path, monkeypatch):
     selection = full.shard_selection(root, index, 0, tmp_path, tmp_path)
     assert [s.source_index for s in selection.shots] == [0, 1, 2]
     calls = []
+    hashed = []
+    full_hash = full.sha256_file
+
+    def count_required_hashes(path):
+        path = __import__("pathlib").Path(path)
+        if path.suffix == ".mp4":
+            pytest.fail("canonical preparation hashed an original video")
+        hashed.append(path)
+        return full_hash(path)
+
+    monkeypatch.setattr(full, "sha256_file", count_required_hashes)
     original_hash = t2va_source.sha256_file
 
     def no_original_video_hash(path):
@@ -854,6 +940,8 @@ def test_bootstrap_from_index_and_resume(tmp_path, monkeypatch):
         root / "shards" / production.shard_name(0), selection, Media()
     )
     assert len(calls) == 3
+    assert hashed.count(audio / "audio/canonical_clips.jsonl") == 1
+    assert __import__("pathlib").Path(selection.shot_manifest_path) not in hashed
     rows = list(production.complete_rows(audio / "audio/canonical_clips.jsonl"))
     assert [r["clip_uid"] for r in rows] == [s.clip_uid for s in selection.shots]
     assert all(r["subject_reference_count"] == 0 for r in rows)

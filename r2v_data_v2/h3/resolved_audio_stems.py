@@ -218,6 +218,13 @@ def _resolve(
     sam_root, auk_root = root.parent / "separation", root.parent / "auk_speech_v1"
     sam, sam_records, _ = load_stem_shadow(sam_root)
     auk, auk_records, _ = load_auk_shadow(auk_root)
+    return _resolve_records(root, sam, sam_records, auk, auk_records, verify_media=True)
+
+
+def _resolve_records(
+    root: Path, sam, sam_records, auk, auk_records, *, verify_media: bool
+) -> tuple[ResolvedStemInventory, list[ResolvedStemRecord], ResolvedStemSummary]:
+    sam_root, auk_root = root.parent / "separation", root.parent / "auk_speech_v1"
     if sam.route != "music_first" or sam.run_both_routes:
         raise ValueError("resolved policy requires SAM music_first only")
     if (
@@ -260,7 +267,8 @@ def _resolve(
             "status": "ready",
         }
         try:
-            check_source(job)
+            if verify_media:
+                check_source(job)
             if (
                 sam_job.model_dump() != job.model_dump()
                 or s.clip_uid != job.clip_uid
@@ -296,21 +304,22 @@ def _resolve(
                         artifact.canonical_stem_sha256,
                         artifact.canonical_frame_count,
                     )
-                info = sf.info(path)
-                if sha256_file(Path(path)) != digest or (
-                    info.format,
-                    info.subtype,
-                    info.samplerate,
-                    info.channels,
-                    info.frames,
-                ) != (
-                    "WAV",
-                    "PCM_16",
-                    32000,
-                    2,
-                    frames,
-                ):
-                    raise ValueError("resolved canonical stem media differs")
+                if verify_media:
+                    info = sf.info(path)
+                    if sha256_file(Path(path)) != digest or (
+                        info.format,
+                        info.subtype,
+                        info.samplerate,
+                        info.channels,
+                        info.frames,
+                    ) != (
+                        "WAV",
+                        "PCM_16",
+                        32000,
+                        2,
+                        frames,
+                    ):
+                        raise ValueError("resolved canonical stem media differs")
                 values[kind] = ResolvedStem(
                     kind=kind,
                     source_backend="auk" if kind == "speech" else "sam_audio",
@@ -340,7 +349,8 @@ def _resolve(
 
 
 def resolve_audio_stems(
-    *, audio_production_root: Path, shadow_run_id: str, overwrite: bool = False
+    *, audio_production_root: Path, shadow_run_id: str, overwrite: bool = False,
+    prepared_path: Path | None = None,
 ):
     destination = downstream_stem_root(audio_production_root, shadow_run_id)
     if destination.exists():
@@ -355,7 +365,15 @@ def resolve_audio_stems(
             or Path(old.source_auk_root) != destination.parent / "auk_speech_v1"
         ):
             raise ValueError("resolved destination ownership differs")
-    inventory, records, summary = _resolve(destination)
+    if prepared_path is None:
+        inventory, records, summary = _resolve(destination)
+    else:
+        import json
+
+        prepared = json.loads(prepared_path.read_text())
+        inventory = ResolvedStemInventory.model_validate(prepared["inventory"])
+        records = [ResolvedStemRecord.model_validate(row) for row in prepared["records"]]
+        summary = ResolvedStemSummary.model_validate(prepared["summary"])
     temporary = Path(
         tempfile.mkdtemp(prefix=".resolved-stems-", dir=destination.parent)
     )
@@ -363,7 +381,7 @@ def resolve_audio_stems(
         _write_json(temporary / "inventory.json", inventory)
         _write_jsonl(temporary / "records.jsonl", records)
         _write_json(temporary / "summary.json", summary)
-        if (inventory, records, summary) != _resolve(destination):
+        if prepared_path is None and (inventory, records, summary) != _resolve(destination):
             raise ValueError("resolved stem sources changed during publication")
         _publish_directory(temporary, destination, overwrite=overwrite)
     finally:
