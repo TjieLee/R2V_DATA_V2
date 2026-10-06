@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Single-v7 captions</title>
+  <style>
+    :root { color-scheme: light; font-family: system-ui, sans-serif; color: #20272a; background: #f7f8f7; }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    button, input { font: inherit; }
+    header { height: 56px; display: flex; align-items: center; gap: 18px; padding: 0 20px; border-bottom: 1px solid #d9dfdc; background: #fff; }
+    header h1 { font-size: 17px; font-weight: 650; margin: 0; white-space: nowrap; }
+    #position { color: #596660; font-size: 13px; }
+    header nav { margin-left: auto; display: flex; gap: 8px; }
+    button { padding: 6px 11px; border: 1px solid #c4cec9; border-radius: 4px; background: white; color: #183f39; cursor: pointer; }
+    button:hover, button:focus-visible { border-color: #227465; background: #f1f8f5; }
+    button:disabled { opacity: .45; cursor: default; }
+    .layout { display: grid; grid-template-columns: 246px minmax(0, 1fr); min-height: calc(100vh - 56px); }
+    aside { border-right: 1px solid #d9dfdc; background: #fff; padding: 16px 12px; }
+    #search { width: 100%; border: 1px solid #c4cec9; border-radius: 4px; padding: 8px 10px; outline-color: #227465; }
+    #clip-list { display: grid; gap: 2px; margin-top: 12px; }
+    #clip-list button { width: 100%; border: 0; text-align: left; font-size: 12px; font-family: ui-monospace, monospace; color: #33403b; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    #clip-list button.active { background: #e3f1ea; color: #145746; font-weight: 700; }
+    main { min-width: 0; padding: 22px clamp(16px, 3vw, 44px) 48px; max-width: 1320px; width: 100%; }
+    .identity { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; margin-bottom: 18px; }
+    .identity h2 { font: 650 19px ui-monospace, monospace; margin: 0; overflow-wrap: anywhere; }
+    .status { color: #52625a; font-size: 13px; }
+    .status.failed { color: #a13535; }
+    section { border-top: 1px solid #d9dfdc; padding: 18px 0 22px; }
+    section h3 { font-size: 14px; margin: 0 0 12px; font-weight: 700; }
+    .media { display: grid; grid-template-columns: minmax(0, 1fr) 300px; align-items: start; gap: 20px; }
+    video { display: block; width: 100%; aspect-ratio: 16/9; background: #1b2425; }
+    audio { width: 100%; }
+    .refs { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 16px; }
+    .ref img { display: block; width: 100%; aspect-ratio: 4/3; object-fit: contain; background: #e9edeb; border: 1px solid #d9dfdc; }
+    .ref div, .small { font-size: 12px; line-height: 1.55; color: #53615b; }
+    .ref strong { display: block; margin-top: 6px; color: #20272a; font-size: 13px; }
+    .rows { display: grid; gap: 8px; }
+    .row { display: grid; grid-template-columns: minmax(120px, 190px) minmax(0, 1fr); gap: 12px; font-size: 13px; line-height: 1.6; }
+    .row > :first-child { font-weight: 600; color: #44574e; }
+    .row > :last-child { white-space: pre-wrap; overflow-wrap: anywhere; }
+    .caption { display: grid; gap: 20px; }
+    .caption h4 { margin: 0 0 7px; font-size: 12px; text-transform: uppercase; color: #53615b; }
+    .caption p { margin: 0; line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .caption .shot p { font-size: 16px; line-height: 1.75; }
+    .caption .shot { border-left: 3px solid #27836f; padding-left: 16px; }
+    .segments { width: 100%; border-collapse: collapse; font-size: 12px; }
+    .table-scroll { max-width: 100%; overflow-x: auto; }
+    .segments th, .segments td { text-align: left; vertical-align: top; border-bottom: 1px solid #e0e5e2; padding: 8px 10px 8px 0; }
+    .segments th { color: #53615b; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; line-height: 1.55; max-height: 600px; overflow: auto; }
+    details summary { cursor: pointer; font-weight: 600; font-size: 13px; }
+    @media (max-width: 850px) { .layout { grid-template-columns: minmax(0, 1fr); } aside { min-width: 0; border-right: 0; border-bottom: 1px solid #d9dfdc; padding: 10px 16px; } #clip-list { display: flex; overflow-x: auto; } #clip-list button { min-width: 120px; } .media { grid-template-columns: 1fr; } main { padding-top: 18px; } }
+    @media (max-width: 480px) { header { padding: 0 12px; gap: 7px; } header h1 { font-size: 14px; } header nav { gap: 3px; } button { padding: 6px 7px; } .row { grid-template-columns: 1fr; gap: 0; } }
+  </style>
+</head>
+<body>
+  <header><h1>Single-v7 captions</h1><span id="position"></span><nav><button id="previous" type="button">Previous</button><button id="next" type="button">Next</button></nav></header>
+  <div class="layout"><aside><input id="search" type="search" placeholder="Search clip UID" aria-label="Search clip UID"><div id="clip-list"></div></aside><main id="content"></main></div>
+  <script id="cases-data" type="application/json">__DATA__</script>
+  <script>
+    const cases = JSON.parse(document.getElementById('cases-data').textContent);
+    const list = document.getElementById('clip-list');
+    const content = document.getElementById('content');
+    const search = document.getElementById('search');
+    let current = 0;
+    const el = (tag, text, className) => {
+      const node = document.createElement(tag);
+      if (text !== undefined && text !== null) node.textContent = String(text);
+      if (className) node.className = className;
+      return node;
+    };
+    const section = (title) => {
+      const node = el('section');
+      node.append(el('h3', title));
+      content.append(node);
+      return node;
+    };
+    const words = (value) => Array.isArray(value) ? value.join(', ') : (value ?? '');
+    function renderList() {
+      const query = search.value.trim().toLowerCase();
+      list.replaceChildren();
+      cases.forEach((item, index) => {
+        if (!item.clip_uid.toLowerCase().includes(query)) return;
+        const button = el('button', item.clip_uid, index === current ? 'active' : '');
+        button.type = 'button';
+        button.title = item.clip_uid;
+        button.onclick = () => select(index);
+        list.append(button);
+      });
+    }
+    function captionPart(parent, title, value, large = false) {
+      const block = el('div', null, large ? 'shot' : '');
+      block.append(el('h4', title));
+      const text = Array.isArray(value)
+        ? value.map(item => [item.subject_label, item.marker, item.description].filter(Boolean).join(' ')).join('\n')
+        : value;
+      block.append(el('p', text || 'N/A'));
+      parent.append(block);
+    }
+    function render() {
+      const item = cases[current];
+      content.replaceChildren();
+      document.getElementById('position').textContent = `${current + 1} / ${cases.length}`;
+      document.getElementById('previous').disabled = current === 0;
+      document.getElementById('next').disabled = current === cases.length - 1;
+      const heading = el('div', null, 'identity');
+      heading.append(el('h2', item.clip_uid));
+      heading.append(el('span', item.status + (item.failure_reason ? ': ' + item.failure_reason : ''), 'status ' + item.status));
+      content.append(heading);
+
+      const media = section('Original video and target audio');
+      const mediaGrid = el('div', null, 'media');
+      const video = el('video');
+      video.src = item.video_url;
+      video.controls = true;
+      video.preload = 'metadata';
+      const audioBox = el('div');
+      if (item.audio_url) {
+        const audio = el('audio');
+        audio.src = item.audio_url;
+        audio.controls = true;
+        audio.preload = 'none';
+        audioBox.append(audio);
+      }
+      mediaGrid.append(video, audioBox);
+      media.append(mediaGrid);
+
+      const refs = section('References');
+      const refGrid = el('div', null, 'refs');
+      item.references.forEach(ref => {
+        const figure = el('div', null, 'ref');
+        const image = el('img');
+        image.src = ref.url;
+        image.alt = ref.picture_label;
+        image.loading = 'lazy';
+        figure.append(image, el('strong', ref.picture_label), el('div', words(ref.subject_labels)), el('div', ref.kind));
+        refGrid.append(figure);
+      });
+      refs.append(refGrid);
+
+      const subjects = section('Subjects');
+      const subjectRows = el('div', null, 'rows');
+      item.subjects.forEach(subject => {
+        const row = el('div', null, 'row');
+        row.append(el('span', subject.subject_label), el('span', `${subject.kind} / ${words(subject.source_picture_labels)}`));
+        subjectRows.append(row);
+      });
+      subjects.append(subjectRows);
+
+      const caption = section('Latest caption');
+      const fields = el('div', null, 'caption');
+      captionPart(fields, 'Subject definitions', (item.caption.subject_definitions || []).map(def => `${def.subject_label} ${def.description}` ).join('\n'));
+      captionPart(fields, 'Summary', item.caption.summary);
+      captionPart(fields, 'Style opening', item.caption.style_opening);
+      captionPart(fields, 'Shot 1 caption', item.caption.shot1_caption, true);
+      captionPart(fields, 'Overall soundscape', item.caption.overall_soundscape);
+      captionPart(fields, 'Non-diegetic music', item.caption.non_diegetic_music);
+      captionPart(fields, 'Visual retention analysis', item.caption.visual_retention_analysis);
+      caption.append(fields);
+
+      const speech = section('Speech segments');
+      const table = el('table', null, 'segments');
+      const head = el('tr');
+      ['Segment', 'Time', 'Cluster', 'ASR', 'Group / presentation'].forEach(name => head.append(el('th', name)));
+      table.append(head);
+      item.segments.forEach(segment => {
+        const grounding = item.groundings.find(row => row.segment_id === segment.segment_id) || {};
+        const row = el('tr');
+        [segment.segment_id, `${segment.start_time}-${segment.end_time}s`, segment.source_speaker_cluster_id,
+          `${segment.asr_status}${segment.asr_text ? ': ' + segment.asr_text : ''}`,
+          [grounding.primary_speaker_group, grounding.speech_presentation].filter(Boolean).join(' / ')].forEach(value => row.append(el('td', value)));
+        table.append(row);
+      });
+      const tableScroll = el('div', null, 'table-scroll');
+      tableScroll.append(table);
+      speech.append(tableScroll);
+
+      const raw = section('Model output');
+      const details = el('details');
+      details.append(el('summary', 'Raw compact JSON'));
+      let rawText = item.raw_compact || 'N/A';
+      try { rawText = JSON.stringify(JSON.parse(rawText), null, 2); } catch (_) { /* preserve raw response */ }
+      details.append(el('pre', rawText));
+      raw.append(details);
+      renderList();
+    }
+    function select(index) { current = index; render(); window.scrollTo(0, 0); }
+    document.getElementById('previous').onclick = () => select(Math.max(0, current - 1));
+    document.getElementById('next').onclick = () => select(Math.min(cases.length - 1, current + 1));
+    search.oninput = renderList;
+    if (cases.length) render();
+  </script>
+</body>
+</html>
