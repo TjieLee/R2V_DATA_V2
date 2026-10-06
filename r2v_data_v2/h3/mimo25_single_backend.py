@@ -43,8 +43,8 @@ from r2v_data_v2.structured_output import (
     parse_structured_json_issues,
 )
 
-SINGLE_PROMPT_VERSION = "h3_mimo26_ra2va_single_v7_compact2_cleanup"
-SINGLE_BACKEND_VERSION = "r2v.h3.mimo25_backend.73"
+SINGLE_PROMPT_VERSION = "h3_mimo26_ra2va_single_v8_caption_quality"
+SINGLE_BACKEND_VERSION = "r2v.h3.mimo25_backend.74"
 SINGLE_COMPACT_SCHEMA_VERSION = "r2v.h3.mimo26_single_compact.2"
 
 _COMPACT_PICTURE_LABEL = r"<Picture [1-9]\d*>"
@@ -59,6 +59,10 @@ SINGLE_SYSTEM_PROMPT = """Return one MimoSingleCompactAnnotationDraftV2 JSON obj
 
 STEP 1 - VISUAL AND H3 CONTENT
 Watch the entire video and describe composition, foreground/background, Subject appearance, lighting, camera, actions, expression, and chronological progression through the end. Write visual_blocks, concise ordered Subject definitions and retention rows, one style_opening sentence, and a detailed shot1_caption. Cite visibly preserved entity/background <Subject N> naturally at first appearance. Do not put <Picture N> or Picture provenance in subject_definitions[*].description. Do not output a per-segment visible-entity inventory or internal entity IDs. A sampled mouth-open or mouth-closed frame alone does not establish speaker identity.
+Write a concise but content-complete summary with the setting, principal visible Subjects, main visible action or state change, and the role of speech/audio when relevant. Do not reduce it to only the spoken line or a generic event label.
+Write a dense chronological shot1_caption covering the clip from the opening composition through the ending visual state. When visibly relevant, include framing and camera movement, Subject posture, gaze, expression and movement, object interactions, foreground/background spatial relationships, visible progression before, during, and after speech, exact dialogue at its chronological position, and the ending visual state. Prefer complete observable coverage over brevity, but never invent details merely to make the caption longer.
+Use a background <Subject N> only when it helps describe composition, spatial layout, scene continuity, or disambiguation. Do not mention background Subjects mechanically.
+Retention descriptions must be self-contained and unambiguous. Do not begin a retention description with He, She, They, It, His, Her, Their, or Its to refer to the retained Subject. Describe preserved visual traits directly.
 
 STEP 2 - SEGMENT SPEAKER DECISIONS
 Output exactly one ordered segments row for EVERY supplied DiariZen segment, including non-transcribed ones. Assign stable g1, g2, ... acoustic groups by first vocal-source appearance; pauses, language changes, and segment boundaries alone do not create groups. Use primary_speaker_group=null when grouping is unreliable. Give transcribed speech a concise audible delivery_style and use null for non-transcribed segments. For a supported visible speaker choose visible_subject and speaker_subject_label from required_output_inventory.allowed_speaker_subject_labels. For genuine offscreen speech choose offscreen and null; if several people remain plausible, choose no_reliable_subject or uncertain and null rather than guessing. Do not output confidence, evidence codes, mouth/lip fields, or entity_id. Profile only distinct non-null groups in transcribed segments in first transcribed appearance order, using their speech-stem windows; do not re-decide grouping or binding.

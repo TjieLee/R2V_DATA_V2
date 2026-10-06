@@ -242,6 +242,7 @@ class MimoH3ShadowRecord(SchemaModel):
         "h3_mimo25_materializer_v27",
         "h3_mimo25_materializer_v28",
         "h3_mimo25_materializer_v29",
+        "h3_mimo25_materializer_v30",
     ] = (
         MIMO25_MATERIALIZER_VERSION
     )
@@ -792,6 +793,17 @@ def project_audio_relationships(
     return caption, music
 
 
+def _canonicalize_retention_description(subject_label: str, description: str) -> str:
+    text = description.strip()
+    possessive = re.match(r"^(?:His|Her|Their|Its)\b(?:\s+|$)", text, re.IGNORECASE)
+    if possessive:
+        text = text[possessive.end():]
+        if not text:
+            raise ValueError("MiMo retention description must not be empty")
+        return text[0].upper() + text[1:]
+    return re.sub(r"^(?:He|She|They|It)\b", subject_label, text, count=1, flags=re.IGNORECASE)
+
+
 def _visual_retention_lines(
     subjects: Sequence[RecaptionSubjectContract],
     retention: Sequence[MimoVisualRetentionDraft],
@@ -805,9 +817,10 @@ def _visual_retention_lines(
         and markers.get(subject.subject_label) in {"fully_preserved", "partially_preserved"}
         and subject.subject_label not in caption
     ]
-    # Single-shot locator is pipeline-owned; model descriptions remain untouched.
+    # Single-shot locator is pipeline-owned; only leading pronouns are normalized.
     return [
-        f"{item.subject_label} (appears in [Shot 1]): {item.marker} - {item.description.strip()}"
+        f"{item.subject_label} (appears in [Shot 1]): {item.marker} - "
+        f"{_canonicalize_retention_description(item.subject_label, item.description)}"
         for item in retention
     ], warnings
 

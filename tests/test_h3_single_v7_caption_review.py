@@ -162,3 +162,30 @@ def test_http_media_range_and_read_only_page(tmp_path: Path) -> None:
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+def test_viewer_displays_subject_kind_and_owner_without_audio_materialization(tmp_path: Path) -> None:
+    base, override, _ = _fixture(tmp_path)
+    contract_path = base / "source_contract.json"
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    contract["jobs"][0]["reference_subjects"].extend([
+        {
+            "subject_label": "<Subject 2>", "kind": "attribute", "owner_entity_id": "e2",
+            "source_picture_labels": ["<Picture 2>"],
+        },
+        {
+            "subject_label": "<Subject 3>", "kind": "background",
+            "source_picture_labels": ["<Picture 3>"],
+        },
+    ])
+    _write_json(contract_path, contract)
+    subjects = build_caption_cases(base, override)[0]["subjects"]
+    assert [subject["display_label"] for subject in subjects] == [
+        "<Subject 1> [entity]",
+        "<Subject 2> [attribute, owner=<Subject 1>]",
+        "<Subject 3> [background]",
+    ]
+    html = (Path(__file__).parents[1] / "r2v_data_v2/h3/single_v7_caption_review.html").read_text(
+        encoding="utf-8"
+    )
+    assert "Final <Audio N> definitions/relationships are pipeline-owned" in html

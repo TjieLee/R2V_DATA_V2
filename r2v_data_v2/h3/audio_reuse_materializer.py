@@ -44,7 +44,7 @@ from r2v_data_v2.h3.sam_audio_stem_shadow import SAMAudioStemRecord, sha256_file
 from r2v_data_v2.h3.schemas import SchemaModel
 from r2v_data_v2.h3.speaker_ownership import speaker_ownership_reasons
 
-AUDIO_REUSE_MATERIALIZER_VERSION = "h3_mimo25_audio_reuse_materializer_v6"
+AUDIO_REUSE_MATERIALIZER_VERSION = "h3_mimo25_audio_reuse_materializer_v7"
 
 
 def _hash(value: SchemaModel | dict) -> str:
@@ -291,7 +291,8 @@ def select_reuse_audio(
 class AudioReuseProduct(SchemaModel):
     schema_version: Literal["r2v.h3.audio_reuse_product.1"] = "r2v.h3.audio_reuse_product.1"
     materializer_version: Literal["h3_mimo25_audio_reuse_materializer_v3", "h3_mimo25_audio_reuse_materializer_v4",
-                                "h3_mimo25_audio_reuse_materializer_v5", "h3_mimo25_audio_reuse_materializer_v6"] = AUDIO_REUSE_MATERIALIZER_VERSION
+                                "h3_mimo25_audio_reuse_materializer_v5", "h3_mimo25_audio_reuse_materializer_v6",
+                                "h3_mimo25_audio_reuse_materializer_v7"] = AUDIO_REUSE_MATERIALIZER_VERSION
     sample_id: str
     source_h3_sample_id: str
     source_h3_sample_sha256: str
@@ -340,7 +341,7 @@ class AudioReuseProductSummary(SchemaModel):
     schema_version: Literal["r2v.h3.audio_reuse_product_summary.1"] = "r2v.h3.audio_reuse_product_summary.1"
     materializer_version: Literal["h3_mimo25_audio_reuse_materializer_v1", "h3_mimo25_audio_reuse_materializer_v3",
                                 "h3_mimo25_audio_reuse_materializer_v4", "h3_mimo25_audio_reuse_materializer_v5",
-                                "h3_mimo25_audio_reuse_materializer_v6"] = AUDIO_REUSE_MATERIALIZER_VERSION
+                                "h3_mimo25_audio_reuse_materializer_v6", "h3_mimo25_audio_reuse_materializer_v7"] = AUDIO_REUSE_MATERIALIZER_VERSION
     source_hashes: dict[str, str]
     clip_uids: list[str]
     sample_count: int

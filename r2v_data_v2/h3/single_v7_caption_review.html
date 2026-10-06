@@ -144,12 +144,13 @@
       const subjectRows = el('div', null, 'rows');
       item.subjects.forEach(subject => {
         const row = el('div', null, 'row');
-        row.append(el('span', subject.subject_label), el('span', `${subject.kind} / ${words(subject.source_picture_labels)}`));
+        row.append(el('span', subject.display_label), el('span', words(subject.source_picture_labels)));
         subjectRows.append(row);
       });
       subjects.append(subjectRows);
 
       const caption = section('Latest caption');
+      caption.append(el('p', 'This page shows the latest single-call semantic annotation. Final <Audio N> definitions/relationships are pipeline-owned and appear after materialization.', 'small'));
       const fields = el('div', null, 'caption');
       captionPart(fields, 'Subject definitions', (item.caption.subject_definitions || []).map(def => `${def.subject_label} ${def.description}` ).join('\n'));
       captionPart(fields, 'Summary', item.caption.summary);

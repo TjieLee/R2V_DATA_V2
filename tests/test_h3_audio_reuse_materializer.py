@@ -139,6 +139,49 @@ def test_ref2va_visual_retention_locator_and_narrow_coverage(kind, marker, prese
     assert row.render() == f"<Subject 1>: {marker} - Visible form retained."
 
 
+@pytest.mark.parametrize(("description", "expected"), [
+    ("His short dark hair remains consistent.", "Short dark hair remains consistent."),
+    ("Her facial features remain consistent.", "Facial features remain consistent."),
+    ("Its dark leather surface remains unchanged.", "Dark leather surface remains unchanged."),
+    ("Their jackets remain visible.", "Jackets remain visible."),
+    ("He remains seated.", "<Subject 1> remains seated."),
+    ("She remains seated.", "<Subject 1> remains seated."),
+    ("They remain seated.", "<Subject 1> remain seated."),
+    ("It remains in view.", "<Subject 1> remains in view."),
+    ("The dark leather sofa remains unchanged.", "The dark leather sofa remains unchanged."),
+    ("The man adjusts his jacket.", "The man adjusts his jacket."),
+])
+def test_retention_cleanup_only_changes_leading_pronoun(description, expected):
+    subject = RecaptionSubjectContract(
+        subject_index=1, subject_label="<Subject 1>", kind="entity",
+        entity_id="e1", source_picture_labels=["<Picture 1>"],
+    )
+    row = MimoVisualRetentionDraft(
+        subject_label="<Subject 1>", marker="fully_preserved",
+        description=description,
+    )
+    lines, warnings = _visual_retention_lines([subject], [row], "<Subject 1> remains in view.")
+    assert lines == [f"<Subject 1> (appears in [Shot 1]): fully_preserved - {expected}"]
+    assert warnings == []
+    assert row.description == description
+
+
+def test_background_subject_definition_keeps_frozen_picture_relation():
+    from r2v_data_v2.h3.mimo25_backend import MimoSubjectDefinitionDraft
+    from r2v_data_v2.h3.mimo25_h3_materializer import _render_subject_definition
+
+    background = RecaptionSubjectContract(
+        subject_index=2, subject_label="<Subject 2>", kind="background",
+        source_picture_labels=["<Picture 3>"],
+    )
+    rendered = _render_subject_definition(
+        MimoSubjectDefinitionDraft(subject_label="<Subject 2>", description="a gallery wall"),
+        background, subjects=[background],
+    )
+    assert background.entity_id is None
+    assert rendered == "<Subject 2> is a gallery wall, depicted in <Picture 3>."
+
+
 def test_ref2va_materializer_checks_caption_not_definition_or_summary(tmp_path):
     _, sample, source = _case(tmp_path, (), caption="A woman stands in a room.",
                               summary="<Subject 1> stands in a room.")

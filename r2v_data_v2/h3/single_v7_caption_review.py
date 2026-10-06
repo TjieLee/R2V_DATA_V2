@@ -42,7 +42,21 @@ def build_caption_cases(base_root: Path, override_root: Path | None = None) -> l
             except (json.JSONDecodeError, TypeError, AttributeError):
                 pass
 
-        subjects = job["reference_subjects"]
+        frozen_subjects = job["reference_subjects"]
+        entity_labels = {
+            subject["entity_id"]: subject["subject_label"]
+            for subject in frozen_subjects
+            if subject["kind"] == "entity"
+        }
+        subjects = []
+        for subject in frozen_subjects:
+            role = subject["kind"]
+            if role == "attribute":
+                role += f', owner={entity_labels[subject["owner_entity_id"]]}'
+            subjects.append({
+                **subject,
+                "display_label": f'{subject["subject_label"]} [{role}]',
+            })
         references = [
             {
                 "picture_label": image["picture_label"],

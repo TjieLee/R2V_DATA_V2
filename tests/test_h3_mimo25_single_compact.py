@@ -20,6 +20,7 @@ from r2v_data_v2.h3.mimo25_stem_shadow import (
     build_stem_reconcile_jobs,
     run_mimo25_stem_reconcile_shadow,
 )
+from r2v_data_v2.h3.qwen38_h3_recaption import RecaptionAudioContract
 from r2v_data_v2.h3.sam_audio_stem_shadow import load_stem_shadow
 from tests.test_h3_audio_shadow_qa import _fixture
 from tests.test_h3_mimo25_av_shadow import _Completions
@@ -48,6 +49,21 @@ def test_v6_raw_schema_has_one_segment_inventory_and_no_entity_evidence_fields()
     payload["segments"][0]["entity_id"] = "e1"
     with pytest.raises(ValueError):
         single.MimoSingleCompactAnnotationDraftV2.model_validate(payload)
+
+
+def test_single_v8_caption_and_retention_prompt_remain_pipeline_owned():
+    prompt = single.SINGLE_SYSTEM_PROMPT
+    assert single.SINGLE_PROMPT_VERSION == "h3_mimo26_ra2va_single_v8_caption_quality"
+    assert single.SINGLE_BACKEND_VERSION == "r2v.h3.mimo25_backend.74"
+    for phrase in (
+        "content-complete summary", "principal visible Subjects",
+        "opening composition through the ending visual state",
+        "before, during, and after speech", "never invent details",
+        "Do not mention background Subjects mechanically",
+        "Do not begin a retention description with He, She, They, It, His, Her, Their, or Its",
+        "materializer owns <Audio N>", "pipeline owns speaker IDs",
+    ):
+        assert phrase in prompt
 
 
 def _job(*, segments=None, subjects=None):
@@ -491,6 +507,7 @@ def test_single_compact_backend_keeps_raw_response_and_legacy_annotation(tmp_pat
     (".70", "h3_mimo26_ra2va_single_v4"),
     (".71", "h3_mimo26_ra2va_single_v5_compact"),
     (".72", "h3_mimo26_ra2va_single_v6_compact2"),
+    (".73", "h3_mimo26_ra2va_single_v7_compact2_cleanup"),
 ])
 def test_historical_single_record_envelopes_remain_readable(tmp_path, monkeypatch, version, prompt):
     _, shadow = _fixture(tmp_path, monkeypatch)
@@ -561,6 +578,24 @@ def test_single_compact_annotation_uses_existing_h3_materializer(tmp_path, monke
     assert corrected[0].text == source.asr_text
     assert "detailed_description:" in rendered
     assert "(S1) <d>[English] exact transcript</d>" in rendered
+
+    audio = RecaptionAudioContract(
+        audio_index=1, audio_label="<Audio 1>", kind="speaker_speech_reuse",
+        path=job.target_full_audio_path, sha256=job.target_full_audio_sha256,
+        subject_label="<Subject 1>", entity_id="e1", speaker_id="S1",
+        retention_marker="partially_copy",
+    )
+    _, with_audio, _ = _materialize_sample(
+        sample, job, qa._MaterializerInput(annotation, job.request_fingerprint),
+        conditioning_variant="target_speech_reuse", reuse_audio_contracts=[audio],
+    )
+    assert annotation.av_grounding.segment_groundings[0].entity_id == "e1"
+    assert "<Audio 1> is the synchronized speech track for <Subject 1> (S1)" in with_audio
+    detailed = with_audio.split("detailed_description:\n", 1)[1].split("\n\noverall_soundscape:", 1)[0]
+    assert detailed.index("<Subject 1>") < detailed.index("(S1)")
+    assert "with the synchronized speech signal copied directly from <Audio 1>" in detailed
+    assert detailed.index("(S1)") < detailed.index("<d>[English] exact transcript</d>")
+    assert "<Audio 1>: partially_copy - the supplied speech signal is copied directly" in with_audio
 
 
 def test_single_compact_invalid_output_has_no_retry_or_polish(tmp_path, monkeypatch):

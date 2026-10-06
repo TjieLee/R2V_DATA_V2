@@ -41,7 +41,7 @@ MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.20"
 MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.66"
 MIMO25_SPEAKER_MARKER_POLISH_PROMPT_VERSION = "h3_mimo25_speaker_marker_polish_v4"
 MIMO25_ICL_VERSION = "h3_official_ref2va_detailed_shot1_v4"
-MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v29"
+MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v30"
 MIMO25_CANONICAL_ABSENT_SOUNDSCAPE = (
     "No distinct environmental, mechanical, physical, or non-verbal human "
     "sounds are clearly discernible."
@@ -1002,7 +1002,7 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.66", "r2v.h3.mimo25_backend.67", "r2v.h3.mimo25_backend.68", "r2v.h3.mimo25_backend.69", "r2v.h3.mimo25_backend.70", "r2v.h3.mimo25_backend.71", "r2v.h3.mimo25_backend.72", "r2v.h3.mimo25_backend.73"] = MIMO25_BACKEND_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.66", "r2v.h3.mimo25_backend.67", "r2v.h3.mimo25_backend.68", "r2v.h3.mimo25_backend.69", "r2v.h3.mimo25_backend.70", "r2v.h3.mimo25_backend.71", "r2v.h3.mimo25_backend.72", "r2v.h3.mimo25_backend.73", "r2v.h3.mimo25_backend.74"] = MIMO25_BACKEND_VERSION
     audio_finalize_prompt_version: Literal["h3_mimo25_audio_finalize_v6"] = (
         MIMO25_AUDIO_FINALIZE_PROMPT_VERSION
     )
@@ -1030,7 +1030,7 @@ class MimoBackendProvenance(SchemaModel):
     media_mode: Literal["base64", "http"]
     media_root: str
     media_base_url: str | None = None
-    prompt_version: Literal["h3_mimo25_speech_assembly_v49", "h3_mimo26_ra2va_single_v1", "h3_mimo26_ra2va_single_v2", "h3_mimo26_ra2va_single_v3", "h3_mimo26_ra2va_single_v4", "h3_mimo26_ra2va_single_v5_compact", "h3_mimo26_ra2va_single_v6_compact2", "h3_mimo26_ra2va_single_v7_compact2_cleanup"] = (
+    prompt_version: Literal["h3_mimo25_speech_assembly_v49", "h3_mimo26_ra2va_single_v1", "h3_mimo26_ra2va_single_v2", "h3_mimo26_ra2va_single_v3", "h3_mimo26_ra2va_single_v4", "h3_mimo26_ra2va_single_v5_compact", "h3_mimo26_ra2va_single_v6_compact2", "h3_mimo26_ra2va_single_v7_compact2_cleanup", "h3_mimo26_ra2va_single_v8_caption_quality"] = (
         MIMO25_PROMPT_VERSION
     )
     policy_version: Literal["h3_mimo25_av_authority_contract_v18"] = (
@@ -1059,6 +1059,7 @@ class MimoBackendProvenance(SchemaModel):
         "h3_mimo25_materializer_v27",
         "h3_mimo25_materializer_v28",
         "h3_mimo25_materializer_v29",
+        "h3_mimo25_materializer_v30",
     ] = (
         MIMO25_MATERIALIZER_VERSION
     )
@@ -1076,6 +1077,7 @@ class MimoBackendProvenance(SchemaModel):
             or (self.schema_version.endswith(".71")) != (self.prompt_version == "h3_mimo26_ra2va_single_v5_compact")
             or (self.schema_version.endswith(".72")) != (self.prompt_version == "h3_mimo26_ra2va_single_v6_compact2")
             or (self.schema_version.endswith(".73")) != (self.prompt_version == "h3_mimo26_ra2va_single_v7_compact2_cleanup")
+            or (self.schema_version.endswith(".74")) != (self.prompt_version == "h3_mimo26_ra2va_single_v8_caption_quality")
         ):
             raise ValueError("MiMo single-call provenance differs from backend version")
         if not self.base_url.strip() or not self.media_root.strip():
