@@ -51,16 +51,22 @@ def test_v6_raw_schema_has_one_segment_inventory_and_no_entity_evidence_fields()
         single.MimoSingleCompactAnnotationDraftV2.model_validate(payload)
 
 
-def test_single_v8_caption_and_retention_prompt_remain_pipeline_owned():
+def test_single_v9_closed_subject_prompt_preserves_v8_caption_and_dialogue_rules():
     prompt = single.SINGLE_SYSTEM_PROMPT
-    assert single.SINGLE_PROMPT_VERSION == "h3_mimo26_ra2va_single_v8_caption_quality"
-    assert single.SINGLE_BACKEND_VERSION == "r2v.h3.mimo25_backend.74"
+    assert single.SINGLE_PROMPT_VERSION == "h3_mimo26_ra2va_single_v9_closed_subjects"
+    assert single.SINGLE_BACKEND_VERSION == "r2v.h3.mimo25_backend.75"
     for phrase in (
         "content-complete summary", "principal visible Subjects",
         "opening composition through the ending visual state",
         "before, during, and after speech", "never invent details",
         "Do not mention background Subjects mechanically",
         "Do not begin a retention description with He, She, They, It, His, Her, Their, or Its",
+        "supplied Subject inventory is closed",
+        "required_output_inventory.subject_labels_in_order",
+        "ordinary prose instead of assigning it a Subject label",
+        "Never repurpose a Subject label",
+        "frozen source Picture(s) and frozen Subject contract",
+        "Dialogue preservation takes priority over caption elaboration",
         "materializer owns <Audio N>", "pipeline owns speaker IDs",
     ):
         assert phrase in prompt
@@ -131,6 +137,50 @@ def test_compact_inventory_subjects_and_dialogue_are_hard_contracts():
     }
 
 
+def test_extra_visible_people_use_ordinary_prose_but_unknown_subjects_still_fail():
+    payload = _compact_payload()
+    payload["h3_semantics"]["subject_definitions"].append({
+        "subject_label": "<Subject 2>", "description": "a wooden chair",
+    })
+    payload["h3_semantics"]["visual_retention_analysis"].append({
+        "subject_label": "<Subject 2>", "marker": "fully_preserved",
+        "description": "The wooden chair remains visible.",
+    })
+    job = _job(subjects=[
+        SimpleNamespace(subject_label="<Subject 1>", kind="entity", entity_id="e1"),
+        SimpleNamespace(subject_label="<Subject 2>", kind="object", entity_id="e2"),
+    ])
+    payload["h3_semantics"]["shot1_caption"] += (
+        " A woman is seated across the table, and another person enters the foreground."
+    )
+    assert _validated(payload, job)[1] == []
+
+    payload["h3_semantics"]["subject_definitions"].append({
+        "subject_label": "<Subject 3>", "description": "another woman",
+    })
+    payload["h3_semantics"]["shot1_caption"] += " <Subject 3> watches."
+    assert {issue.code for issue in _validated(payload, job)[1]} >= {
+        "subject_inventory_mismatch", "direct_unknown_reference",
+    }
+
+
+def test_missing_second_required_dialogue_remains_a_hard_failure():
+    payload = _compact_payload()
+    second = SimpleNamespace(**{
+        **vars(_job().segments[0]), "segment_id": "segment_0002",
+        "start_time": 1.0, "asr_text": "second exact line",
+    })
+    payload["segments"].append({
+        "segment_id": "segment_0002", "primary_speaker_group": "g1",
+        "delivery_style": "calm delivery", "binding_status": "visible_subject",
+        "speaker_subject_label": "<Subject 1>",
+    })
+    job = _job(segments=[*_job().segments, second])
+    assert "direct_transcribed_dialogue_inventory_mismatch" in {
+        issue.code for issue in _validated(payload, job)[1]
+    }
+
+
 def test_compact_segment_order_must_follow_authoritative_order():
     payload = _compact_payload()
     second = SimpleNamespace(**{
@@ -166,13 +216,15 @@ def test_compact_visible_subject_is_frozen_entity_only():
         single.MimoSingleCompactAnnotationDraftV2.model_validate(payload)
 
 
-@pytest.mark.parametrize("description", [
-    "a man shown in <Picture 1>",
-    "a man depicted in <Picture 1>",
-    "a man with its visual detail sourced from <Picture 1>",
-    "a man <Picture 1>",
+@pytest.mark.parametrize(("description", "expected"), [
+    ("a man shown in <Picture 1>", "a man"),
+    ("a man as shown in <Picture 1>", "a man"),
+    ("a man, as shown in <Picture 1>", "a man"),
+    ("a room depicted in <Picture 2>", "a room"),
+    ("a man with its visual detail sourced from <Picture 1>", "a man"),
+    ("a man <Picture 1>", "a man"),
 ])
-def test_compact_picture_provenance_is_removed_before_parse(description):
+def test_compact_picture_provenance_is_removed_before_parse(description, expected):
     payload = _compact_payload()
     payload["h3_semantics"]["subject_definitions"][0]["description"] = description
     raw = json.dumps(payload)
@@ -184,7 +236,7 @@ def test_compact_picture_provenance_is_removed_before_parse(description):
         canonical, single.MimoSingleCompactAnnotationDraftV2,
     )
     assert issues == []
-    assert draft.h3_semantics.subject_definitions[0].description == "a man"
+    assert draft.h3_semantics.subject_definitions[0].description == expected
     assert corrections == {"compact_subject_picture_provenance_removed": 1}
     assert json.loads(raw) == payload
 
@@ -508,6 +560,7 @@ def test_single_compact_backend_keeps_raw_response_and_legacy_annotation(tmp_pat
     (".71", "h3_mimo26_ra2va_single_v5_compact"),
     (".72", "h3_mimo26_ra2va_single_v6_compact2"),
     (".73", "h3_mimo26_ra2va_single_v7_compact2_cleanup"),
+    (".74", "h3_mimo26_ra2va_single_v8_caption_quality"),
 ])
 def test_historical_single_record_envelopes_remain_readable(tmp_path, monkeypatch, version, prompt):
     _, shadow = _fixture(tmp_path, monkeypatch)

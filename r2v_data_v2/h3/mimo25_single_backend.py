@@ -43,13 +43,13 @@ from r2v_data_v2.structured_output import (
     parse_structured_json_issues,
 )
 
-SINGLE_PROMPT_VERSION = "h3_mimo26_ra2va_single_v8_caption_quality"
-SINGLE_BACKEND_VERSION = "r2v.h3.mimo25_backend.74"
+SINGLE_PROMPT_VERSION = "h3_mimo26_ra2va_single_v9_closed_subjects"
+SINGLE_BACKEND_VERSION = "r2v.h3.mimo25_backend.75"
 SINGLE_COMPACT_SCHEMA_VERSION = "r2v.h3.mimo26_single_compact.2"
 
 _COMPACT_PICTURE_LABEL = r"<Picture [1-9]\d*>"
 _COMPACT_PICTURE_PROVENANCE = re.compile(
-    rf"\s*(?:shown in|depicted in|with its visual detail sourced from)\s*"
+    rf"\s*(?:as shown in|shown in|depicted in|with its visual detail sourced from)\s*"
     rf"{_COMPACT_PICTURE_LABEL}(?:\s*(?:,|and)\s*{_COMPACT_PICTURE_LABEL})*",
     re.IGNORECASE,
 )
@@ -63,12 +63,15 @@ Write a concise but content-complete summary with the setting, principal visible
 Write a dense chronological shot1_caption covering the clip from the opening composition through the ending visual state. When visibly relevant, include framing and camera movement, Subject posture, gaze, expression and movement, object interactions, foreground/background spatial relationships, visible progression before, during, and after speech, exact dialogue at its chronological position, and the ending visual state. Prefer complete observable coverage over brevity, but never invent details merely to make the caption longer.
 Use a background <Subject N> only when it helps describe composition, spatial layout, scene continuity, or disambiguation. Do not mention background Subjects mechanically.
 Retention descriptions must be self-contained and unambiguous. Do not begin a retention description with He, She, They, It, His, Her, Their, or Its to refer to the retained Subject. Describe preserved visual traits directly.
+The supplied Subject inventory is closed. Use only Subject labels listed in required_output_inventory.subject_labels_in_order. Never create a new <Subject N> for another visible person, object, attribute, or background; describe unreferenced visible content with ordinary prose instead of assigning it a Subject label.
+Each supplied <Subject N> refers only to the visual referent represented by its frozen source Picture(s) and frozen Subject contract. Never repurpose a Subject label for a different visible referent. In subject_definitions, describe that Subject's source Picture referent, not another salient person or object in the target video.
 
 STEP 2 - SEGMENT SPEAKER DECISIONS
 Output exactly one ordered segments row for EVERY supplied DiariZen segment, including non-transcribed ones. Assign stable g1, g2, ... acoustic groups by first vocal-source appearance; pauses, language changes, and segment boundaries alone do not create groups. Use primary_speaker_group=null when grouping is unreliable. Give transcribed speech a concise audible delivery_style and use null for non-transcribed segments. For a supported visible speaker choose visible_subject and speaker_subject_label from required_output_inventory.allowed_speaker_subject_labels. For genuine offscreen speech choose offscreen and null; if several people remain plausible, choose no_reliable_subject or uncertain and null rather than guessing. Do not output confidence, evidence codes, mouth/lip fields, or entity_id. Profile only distinct non-null groups in transcribed segments in first transcribed appearance order, using their speech-stem windows; do not re-decide grouping or binding.
 
 STEP 3 - EXACT DIALOGUE
 Place every immutable required_dialogue_block exactly once in shot1_caption, in chronological playback order, with a natural visible or offscreen speaker lead-in. Do not translate, paraphrase, normalize, merge, or omit dialogue. Non-transcribed segments have no dialogue block. Do NOT emit any (S1), (S2), or other (Sx) speaker markers: the pipeline owns speaker IDs and projects them deterministically.
+Before returning, verify that every required_dialogue_block appears exactly once and in chronological order in shot1_caption. Dialogue preservation takes priority over caption elaboration: visual detail must never omit, change, translate, merge, or duplicate a required dialogue block.
 
 STEP 4 - AUDIO AND H3 FIELD BOUNDARIES
 Keep grounding rationale out of the caption. Write a concise summary without task prefix. Put continuous ambience and physical/environmental sound in overall_soundscape and audience-only score in non_diegetic_music, not in shot1_caption; the caption owns visual prose, speaker presentation, and exact dialogue. The materializer owns <Audio N>, Picture provenance, relationships, retention, and final six-section H3 formatting. Treat required_output_inventory as exact and ordered: subject_definitions and visual_retention_analysis each cover every supplied Subject in order; segments covers every supplied segment in order; only transcribed_dialogue_blocks_in_order supplies dialogue. If it is empty, output no <d> blocks and no speaker_voice_profiles.
