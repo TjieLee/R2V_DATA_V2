@@ -992,6 +992,24 @@ def test_single_synthetic_icl_cli_is_single_only_and_defaults_to_baseline():
         cli._parse_arguments([*required, "--single-synthetic-icl-variant", "action_v2"])
 
 
+def test_single_compact3_cli_is_opt_in_and_preserves_action_icl():
+    required = [
+        "--visual-production-root", "/tmp/visual", "--visual-runs-root", "/tmp/runs",
+        "--audio-production-root", "/tmp/audio", "--case-manifest", "/tmp/cases.json",
+    ]
+    default = cli._parse_arguments(required)
+    assert (default.call_mode, default.single_contract, default.single_synthetic_icl_variant) == (
+        "multi", "compact2", "baseline",
+    )
+    v3 = cli._parse_arguments([*required, "--call-mode", "single", "--single-contract", "compact3"])
+    assert (v3.single_contract, v3.single_synthetic_icl_variant) == ("compact3", "action_v2")
+    with pytest.raises(ValueError, match="single-call"):
+        cli._parse_arguments([*required, "--single-contract", "compact3"])
+    with pytest.raises(ValueError, match="action_v2"):
+        cli._parse_arguments([*required, "--call-mode", "single", "--single-contract", "compact3",
+                              "--single-synthetic-icl-variant", "baseline"])
+
+
 def test_cd694_shaped_final_backend_downgrades_anchor_conflict_without_extra_calls(tmp_path, monkeypatch):
     from r2v_data_v2.h3.mimo25_stem_shadow import _validated_auxiliary_stems
 

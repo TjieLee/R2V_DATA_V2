@@ -86,6 +86,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--model", default=MIMO_MODEL)
     parser.add_argument("--call-mode", choices=("multi", "single"), default="multi")
+    parser.add_argument("--single-contract", choices=("compact2", "compact3"))
     parser.add_argument("--base-url", default="http://127.0.0.1:8092/v1")
     parser.add_argument("--media-mode", choices=("base64", "http"))
     parser.add_argument("--media-root", type=Path, default=Path("/mnt/workspace"))
@@ -104,10 +105,15 @@ def _parser() -> argparse.ArgumentParser:
 
 def _parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     arguments = _parser().parse_args(argv)
+    if arguments.single_contract is not None and arguments.call_mode != "single":
+        raise ValueError("compact contract is single-call only")
+    arguments.single_contract = arguments.single_contract or "compact2"
     if arguments.single_synthetic_icl_variant is not None and arguments.call_mode != "single":
         raise ValueError("synthetic ICL variant is single-call only")
     if arguments.single_synthetic_icl_variant is None:
-        arguments.single_synthetic_icl_variant = "baseline"
+        arguments.single_synthetic_icl_variant = "action_v2" if arguments.single_contract == "compact3" else "baseline"
+    if arguments.single_contract == "compact3" and arguments.single_synthetic_icl_variant != "action_v2":
+        raise ValueError("compact3 preserves the action_v2 synthetic ICL")
     # Explicit base64 suppresses only an inherited URL, never an explicit one.
     if arguments.media_base_url is None and arguments.media_mode != "base64":
         arguments.media_base_url = os.environ.get("MIMO_MEDIA_BASE_URL")
@@ -209,6 +215,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         "original_target_av_is_highest_authority": True,
     }
     if arguments.call_mode == "single":
+        result["single_contract"] = arguments.single_contract
         result["single_synthetic_icl_variant"] = arguments.single_synthetic_icl_variant
     if not arguments.dry_run:
         backend_class = (
@@ -232,7 +239,8 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
                 max_completion_tokens=arguments.max_completion_tokens,
             ),
             stem_records_by_clip={record.clip_uid: record for record in selected},
-            **({"single_synthetic_icl_variant": arguments.single_synthetic_icl_variant}
+            **({"single_contract": arguments.single_contract,
+                "single_synthetic_icl_variant": arguments.single_synthetic_icl_variant}
                if arguments.call_mode == "single" else {}),
         )
         summary = run_mimo25_stem_reconcile_shadow(

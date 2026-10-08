@@ -31,6 +31,96 @@ def _compact_payload() -> dict:
     return json.loads(_single_raw())
 
 
+def _v3_payload() -> dict:
+    payload = _compact_payload()
+    payload["schema_version"] = "r2v.h3.mimo26_single_compact.3"
+    payload["segments"][0].update(
+        resolution="resolved", vocal_composition="single_speaker",
+        secondary_vocal_activity={"present": False, "speaker_relation": "none", "kind": None},
+        confidence="medium", audio_evidence_codes=["voice_continuity"],
+        visible_subject_labels=["<Subject 1>"], speech_presentation="onscreen_spoken",
+        evidence_codes=["av_temporal_alignment"],
+    )
+    return payload
+
+
+def test_v3_projects_actual_audio_and_av_facts_without_changing_v2():
+    assert hasattr(single, "MimoSingleCompactAnnotationDraftV3")
+    draft = single.MimoSingleCompactAnnotationDraftV3.model_validate(_v3_payload())
+    projected = single._project_compact_v3_annotation(draft, _job())
+    audio = projected.audio_observation.segment_decisions[0]
+    grounding = projected.av_grounding.segment_groundings[0]
+    assert audio.vocal_composition == "single_speaker"
+    assert audio.resolution == "resolved"
+    assert audio.audio_evidence_codes == ["voice_continuity"]
+    assert audio.confidence == "medium"
+    assert grounding.evidence_codes == ["av_temporal_alignment"]
+    assert grounding.confidence == "medium"
+    assert grounding.entity_id == "e1"
+    assert projected.visual_observation.segment_views[0].visible_entity_ids == ["e1"]
+    assert projected.visual_observation.segment_views[0].entity_observations == []
+    assert "(S1) <d>[English] exact transcript</d>" in projected.h3_semantics.shot1_caption
+    old = single._project_compact_to_legacy_annotation(
+        single.MimoSingleCompactAnnotationDraftV2.model_validate(_compact_payload()), _job(),
+    )
+    assert old.audio_observation.segment_decisions[0].vocal_composition == "uncertain"
+    assert old.av_grounding.segment_groundings[0].evidence_codes == ["insufficient_evidence"]
+
+
+def test_v3_schema_reuses_resolution_and_secondary_activity_contracts():
+    assert hasattr(single, "MimoSingleCompactAnnotationDraftV3")
+    schema = single.MimoSingleCompactAnnotationDraftV3.model_json_schema()
+    assert schema["properties"]["segments"]["items"]["discriminator"]["propertyName"] == "resolution"
+    for branch in schema["properties"]["segments"]["items"]["oneOf"]:
+        definition = schema["$defs"][branch["$ref"].rsplit("/", 1)[1]]
+        assert set(definition["properties"]) == set(definition["required"])
+    payload = _v3_payload()
+    payload["segments"][0]["primary_speaker_group"] = None
+    with pytest.raises(ValueError):
+        single.MimoSingleCompactAnnotationDraftV3.model_validate(payload)
+    payload["segments"][0].update(resolution="uncertain", vocal_composition="uncertain")
+    assert single.MimoSingleCompactAnnotationDraftV3.model_validate(payload)
+    payload["segments"][0].update(vocal_composition="overlapping_secondary_speech")
+    with pytest.raises(ValueError, match="multi-speaker speech requires acoustic refinement"):
+        single.MimoSingleCompactAnnotationDraftV3.model_validate(payload)
+    payload["segments"][0].update(
+        resolution="needs_acoustic_refinement",
+        secondary_vocal_activity={"present": True, "speaker_relation": "different_speaker", "kind": "speech"},
+    )
+    assert single.MimoSingleCompactAnnotationDraftV3.model_validate(payload)
+
+
+@pytest.mark.parametrize("resolution", ["resolved", "uncertain", "needs_acoustic_refinement"])
+@pytest.mark.parametrize("binding", ["offscreen", "no_reliable_subject", "uncertain"])
+def test_v3_nonvisible_binding_requires_null_speaker_subject(resolution, binding):
+    payload = _v3_payload()
+    payload["segments"][0].update(resolution=resolution, binding_status=binding,
+                                   speaker_subject_label="<Subject 99>", speech_presentation="uncertain",
+                                   evidence_codes=["insufficient_evidence"])
+    with pytest.raises(ValueError, match="other bindings require null"):
+        single.MimoSingleCompactAnnotationDraftV3.model_validate(payload)
+
+
+def test_v3_icl_preserves_action_content_and_reports_only_actual_contract_fields():
+    assert hasattr(single, "SINGLE_V3_SYSTEM_PROMPT")
+    prompt = single.SINGLE_V3_SYSTEM_PROMPT
+    for phrase in (
+        "actual segment audio", "gN does not establish single-speaker ownership",
+        "exact segment", "Do not invent AV alignment", "no_reliable_subject",
+        "first transcribed appearance", "immutable required_dialogue_block",
+    ):
+        assert phrase in prompt
+    assert "Do not output a per-segment visible-entity inventory" not in prompt
+    assert "Do not output confidence, evidence codes" not in prompt
+    original = json.loads(single._single_semantic_icl_messages("action_v2")[1]["content"])
+    updated = json.loads(single._single_v3_semantic_icl_messages()[1]["content"])
+    assert updated["h3_semantics"] == original["h3_semantics"]
+    assert updated["visual_blocks"] == original["visual_blocks"]
+    assert updated["speaker_voice_profiles"] == original["speaker_voice_profiles"]
+    assert updated["segments"][0]["evidence_codes"] == ["av_temporal_alignment"]
+    assert updated["segments"][1]["evidence_codes"] == ["offscreen_audio"]
+
+
 def test_v6_raw_schema_has_one_segment_inventory_and_no_entity_evidence_fields():
     schema = json.dumps(single.MimoSingleCompactAnnotationDraftV2.model_json_schema())
     assert single.SINGLE_COMPACT_SCHEMA_VERSION == "r2v.h3.mimo26_single_compact.2"
@@ -760,3 +850,123 @@ def test_single_compact_invalid_output_has_no_retry_or_polish(tmp_path, monkeypa
         )
     assert len(completions.requests) == failure.value.model_call_count == 1
     assert failure.value.speech_av_raw_response == raw
+
+
+def _v3_backend(tmp_path, monkeypatch, payload):
+    _, shadow = _fixture(tmp_path, monkeypatch)
+    stems = load_stem_shadow(shadow / "separation")[1]
+    job = build_stem_reconcile_jobs(
+        base_inventory=qa.build_mimo25_inventory(),
+        stem_diarization_root=shadow / "diarization", stem_asr_root=shadow / "asr",
+        route="music_first",
+    )[0]
+    completions = _Completions([(json.dumps(payload), 8)])
+    backend = single.SingleCallOpenAIMimo25Backend(
+        MimoBackendConfig(
+            api_key="fake", transport="sglang", model="mimo-v2.6-flash-rl",
+            media_resolver=MimoMediaResolver(mode="http", media_root=tmp_path, media_base_url="http://media.invalid"),
+        ), single_contract="compact3", stem_records_by_clip={s.clip_uid: s for s in stems},
+        client=SimpleNamespace(chat=SimpleNamespace(completions=completions)),
+    )
+    options = {
+        "segment_ids": [s.segment_id for s in job.segments],
+        "transcribed_segment_ids": [s.segment_id for s in job.segments if s.asr_status == "transcribed"],
+        "allowed_entity_ids": set(),
+        "allowed_reference_labels": {r.picture_label for r in job.reference_images}
+        | {s.subject_label for s in job.reference_subjects},
+        "auxiliary_audio_paths": _validated_auxiliary_stems(stems[0]),
+    }
+    return backend, job, completions, options
+
+
+def test_v3_backend_uses_common_validator_frozen_subject_authority_and_one_call(tmp_path, monkeypatch):
+    from r2v_data_v2.h3 import mimo25_backend as multi
+
+    backend, job, completions, options = _v3_backend(tmp_path, monkeypatch, _v3_payload())
+    calls = []
+    original = multi.validate_annotation
+
+    def validate(annotation, **kwargs):
+        calls.append(annotation)
+        return original(annotation, **kwargs)
+
+    monkeypatch.setattr(single, "validate_annotation", validate)
+    result = backend.reconcile(job, **options)
+    assert calls == [result.annotation]
+    assert len(completions.requests) == result.model_call_count == 1
+    assert result.recheck_count == result.http_retry_count == 0
+    assert backend.provenance.schema_version == "r2v.h3.mimo25_backend.79"
+    assert backend.provenance.prompt_version == "h3_mimo26_ra2va_single_v11_compact3_audio_av"
+    assert result.annotation.schema_version == "r2v.h3.mimo25_av_annotation.20"
+    assert result.annotation.av_grounding.segment_groundings[0].entity_id == "e1"
+    request = completions.requests[0]
+    assert request["response_format"]["json_schema"]["name"] == "MimoSingleCompactAnnotationDraftV3"
+    assert request["response_format"]["json_schema"]["strict"] is True
+    assert request["messages"][0]["content"] == single.SINGLE_V3_SYSTEM_PROMPT
+    assert request["messages"][1:-3] == multi._official_detailed_description_icl_messages()
+    assert request["messages"][-2]["content"] == single._single_v3_semantic_icl_messages()[1]["content"]
+
+
+@pytest.mark.parametrize(("changes", "code"), [
+    ({"visible_subject_labels": []}, "visible_entity_absent_from_visual_segment"),
+    ({"evidence_codes": ["insufficient_evidence"]}, "visible_entity_binding_not_permitted"),
+    ({"binding_status": "offscreen", "speaker_subject_label": None,
+      "speech_presentation": "offscreen_spoken", "evidence_codes": ["insufficient_evidence"]},
+     "offscreen_presentation_evidence_mismatch"),
+    ({"visible_subject_labels": ["<Subject 99>"]}, "unknown_visible_subject"),
+    ({"speaker_subject_label": "<Subject 99>"}, "unknown_speaker_subject"),
+])
+def test_v3_hard_invariants_do_not_get_fake_evidence_or_retry(tmp_path, monkeypatch, changes, code):
+    payload = _v3_payload()
+    payload["segments"][0].update(changes)
+    backend, job, completions, options = _v3_backend(tmp_path, monkeypatch, payload)
+    with pytest.raises(MimoBackendFailure) as failure:
+        backend.reconcile(job, **options)
+    assert code in {issue.code for issue in failure.value.issues}
+    assert len(completions.requests) == failure.value.model_call_count == 1
+    assert json.loads(failure.value.speech_av_raw_response) == payload
+
+
+def test_v3_uncertain_group_stays_uncertain_and_profiles_stay_acoustic(tmp_path, monkeypatch):
+    payload = _v3_payload()
+    payload["segments"][0].update(
+        resolution="uncertain", vocal_composition="uncertain",
+        binding_status="no_reliable_subject", speaker_subject_label=None,
+        speech_presentation="uncertain", evidence_codes=["insufficient_evidence"],
+    )
+    backend, job, completions, options = _v3_backend(tmp_path, monkeypatch, payload)
+    result = backend.reconcile(job, **options)
+    audio = result.annotation.audio_observation.segment_decisions[0]
+    assert audio.primary_speaker_group == "g1"
+    assert audio.resolution == audio.vocal_composition == "uncertain"
+    assert result.annotation.speaker_voice_profiles[0].speaker_group == "g1"
+    assert result.annotation.av_grounding.segment_groundings[0].entity_id is None
+    assert "(S1) <d>[English] exact transcript</d>" in result.annotation.h3_semantics.shot1_caption
+    assert len(completions.requests) == 1
+
+
+def test_v3_common_review_only_profile_issue_remains_a_warning(tmp_path, monkeypatch):
+    payload = _v3_payload()
+    payload["speaker_voice_profiles"] = []
+    backend, job, completions, options = _v3_backend(tmp_path, monkeypatch, payload)
+    result = backend.reconcile(job, **options)
+    assert result.annotation.speaker_voice_profiles == []
+    assert "speaker_voice_profile_inventory_mismatch" in result.diagnostics[0].warnings
+    assert len(completions.requests) == 1
+
+
+def test_v3_common_speaker_identity_contradiction_remains_hard(tmp_path, monkeypatch):
+    payload = _v3_payload()
+    payload["segments"].append({**payload["segments"][0], "segment_id": "segment_0002", "primary_speaker_group": "g2"})
+    payload["speaker_voice_profiles"].append({"speaker_group": "g2", "voice_characteristics": None})
+    payload["h3_semantics"]["shot1_caption"] += " <Subject 1> replies, <d>[English] a reply</d>"
+    backend, job, completions, options = _v3_backend(tmp_path, monkeypatch, payload)
+    second = job.segments[0].model_copy(update={
+        "segment_id": "segment_0002", "start_time": 1.0, "end_time": 1.5, "asr_text": "a reply",
+    })
+    job = job.model_copy(update={"segments": [*job.segments, second]})
+    options.update(segment_ids=["segment_0001", "segment_0002"], transcribed_segment_ids=["segment_0001", "segment_0002"])
+    with pytest.raises(MimoBackendFailure) as failure:
+        backend.reconcile(job, **options)
+    assert "visible_entity_speaker_group_contradiction" in {issue.code for issue in failure.value.issues}
+    assert len(completions.requests) == 1

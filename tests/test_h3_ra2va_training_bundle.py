@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -16,6 +17,7 @@ from r2v_data_v2.h3.jea_final_renderer import FinalH3SampleV2
 from r2v_data_v2.h3.mimo25_av_reconcile import MimoClipJob
 from r2v_data_v2.h3.mimo25_backend import MimoBackendConfig, MimoMediaResolver
 from r2v_data_v2.h3.mimo25_single_backend import SingleCallOpenAIMimo25Backend
+from r2v_data_v2.h3.mimo25_stem_shadow import run_mimo25_stem_reconcile_shadow
 from r2v_data_v2.h3.resolved_audio_stems import (
     ResolvedStem,
     ResolvedStemInventory,
@@ -30,6 +32,7 @@ from r2v_data_v2.h3.training_task_review import (
 from tests.h3_audio_reuse_prepared_helpers import stem_record_values
 from tests.test_h3_audio_reuse import _seal
 from tests.test_h3_audio_reuse_materializer import _case
+from tests.test_h3_mimo25_av_shadow import _Completions
 from tests.test_h3_training_task_review import _annotation
 
 
@@ -155,6 +158,78 @@ def _fixture(tmp_path, monkeypatch, *, offscreen=False, music="Quiet piano.", no
     return reconcile, job, sample, stem
 
 
+def _single_v3_raw(job, *, binding="visible_subject", composition="single_speaker", music="Quiet piano."):
+    rows = []
+    blocks = []
+    transcribed_groups = []
+    for index, segment in enumerate(job.segments):
+        group = f"g{index + 1}"
+        transcribed = segment.asr_status == "transcribed"
+        multi = composition in {"overlapping_secondary_speech", "sequential_multi_speaker_speech"}
+        same = composition == "same_speaker_nonlexical"
+        rows.append({
+            "segment_id": segment.segment_id, "primary_speaker_group": group,
+            "delivery_style": "calm conversational delivery" if transcribed else None,
+            "binding_status": binding, "speaker_subject_label": "<Subject 1>" if binding == "visible_subject" else None,
+            "resolution": "needs_acoustic_refinement" if multi else "resolved",
+            "vocal_composition": composition,
+            "secondary_vocal_activity": (
+                {"present": True, "speaker_relation": "different_speaker", "kind": "speech"} if multi
+                else {"present": True, "speaker_relation": "same_speaker", "kind": "sigh"} if same
+                else {"present": False, "speaker_relation": "none", "kind": None}
+            ),
+            "confidence": "medium", "audio_evidence_codes": ["voice_continuity"],
+            "visible_subject_labels": ["<Subject 1>"],
+            "speech_presentation": "onscreen_spoken" if binding == "visible_subject" else (
+                "offscreen_spoken" if binding == "offscreen" else "uncertain"),
+            "evidence_codes": ["av_temporal_alignment" if binding == "visible_subject" else (
+                "offscreen_audio" if binding == "offscreen" else "insufficient_evidence")],
+        })
+        if transcribed:
+            transcribed_groups.append(group)
+            lead = "<Subject 1>" if binding == "visible_subject" else "An offscreen voice" if binding == "offscreen" else "A visible woman"
+            blocks.append(f"{lead} says, <d>[{segment.asr_language}] {segment.asr_text}</d>")
+    return {
+        "schema_version": "r2v.h3.mimo26_single_compact.3",
+        "visual_blocks": [{"block_id": "v1", "text": "<Subject 1> stands in a room."}],
+        "segments": rows,
+        "speaker_voice_profiles": [
+            {"speaker_group": group, "voice_characteristics": "a mid-register voice with an even cadence"}
+            for group in transcribed_groups
+        ],
+        "h3_semantics": {
+            "subject_definitions": [{"subject_label": "<Subject 1>", "description": "an adult woman in a blue coat"}],
+            "summary": "A woman stands in a room.",
+            "style_opening": "Naturalistic live-action cinematography with a fixed camera.",
+            "shot1_caption": "<Subject 1> stands in a room. " + " ".join(blocks),
+            "overall_soundscape": "Low interior ambience.", "non_diegetic_music": music,
+            "visual_retention_analysis": [{"subject_label": "<Subject 1>", "marker": "fully_preserved",
+                                           "description": "The blue coat remains recognizable."}],
+        },
+    }
+
+
+def _write_single_v3(reconcile, job, stem, payload):
+    completions = _Completions([(json.dumps(payload), 8)])
+    backend = SingleCallOpenAIMimo25Backend(
+        MimoBackendConfig(api_key="fixture", transport="sglang", model="mimo-v2.6-flash-rl",
+                          media_resolver=MimoMediaResolver(mode="http", media_root=reconcile.parents[5],
+                                                           media_base_url="http://media.invalid/")),
+        single_contract="compact3", stem_records_by_clip={job.clip_uid: stem},
+        client=SimpleNamespace(chat=SimpleNamespace(completions=completions)),
+    )
+    summary = run_mimo25_stem_reconcile_shadow(
+        jobs=[job], stem_records=[stem], backend=backend, output_root=reconcile,
+        route="resolved", allow_unverified=True, overwrite=True, binding_evidence_mode="none",
+    )
+    assert len(completions.requests) == summary.model_call_count == 1
+    assert summary.ready_count == 1, _rows(reconcile / "records.jsonl")
+    record = _rows(reconcile / "records.jsonl")[0]
+    assert json.loads(record["raw_responses"][0]) == payload
+    assert record["backend_provenance"]["schema_version"] == "r2v.h3.mimo25_backend.79"
+    return record
+
+
 @pytest.mark.parametrize("offscreen,music,no_speech,task_count", [
     (False, "Quiet piano.", False, 12), (True, "N/A", False, 12), (False, "Quiet piano.", True, 8),
 ])
@@ -276,7 +351,8 @@ def test_frozen_uncertain_composition_remains_ineligible_for_speaker_reuse(tmp_p
 
 
 @pytest.mark.parametrize("promote_face", [False, True])
-def test_frozen_bundle_projects_selected_references_only_at_materialization(tmp_path, monkeypatch, promote_face):
+@pytest.mark.parametrize("single_v3", [False, True])
+def test_frozen_bundle_projects_selected_references_only_at_materialization(tmp_path, monkeypatch, promote_face, single_v3):
     from r2v_data_v2.h3 import mimo25_av_reconcile as reconcile_module
     from r2v_data_v2.h3.mimo25_h3_materializer import _prepare_materialization_context
     from r2v_data_v2.h3.qwen38_h3_recaption import build_reference_contract
@@ -285,7 +361,7 @@ def test_frozen_bundle_projects_selected_references_only_at_materialization(tmp_
         _visual_reference_inventory,
     )
 
-    reconcile, job, canonical, _ = _fixture(tmp_path, monkeypatch)
+    reconcile, job, canonical, stem = _fixture(tmp_path, monkeypatch)
     refs = _visual_reference_inventory(tmp_path, ["subject", "face", "hair"], same_entity=True)
     canonical = canonical.model_copy(update={"visual_references": refs})
     _augmentation_draws(monkeypatch, [.8 if promote_face else .0, .9])
@@ -309,6 +385,8 @@ def test_frozen_bundle_projects_selected_references_only_at_materialization(tmp_
     raw["source_job_fingerprint"] = job.request_fingerprint
     raw["record_fingerprint"] = prepared._hash({k: v for k, v in raw.items() if k != "record_fingerprint"})
     (reconcile / "records.jsonl").write_text(json.dumps(raw) + "\n")
+    if single_v3:
+        raw = _write_single_v3(reconcile, job, stem, _single_v3_raw(job))
     (reconcile.parents[3] / "h3/samples.jsonl").write_text(canonical.model_dump_json() + "\n")
 
     def forbidden(*a, **kw):
@@ -351,3 +429,110 @@ def test_frozen_bundle_projects_selected_references_only_at_materialization(tmp_
         "r2va_reference", "ra2va_reference_full_audio", "ra2va_reference_speech_bgm",
     }]
     assert references and all(paths == [selected.image_artifact_path] for paths in references)
+
+
+@pytest.mark.parametrize(("binding", "composition", "no_speech", "task_count"), [
+    ("visible_subject", "single_speaker", False, 12),
+    ("visible_subject", "same_speaker_nonlexical", False, 12),
+    ("offscreen", "single_speaker", False, 12),
+    ("no_reliable_subject", "single_speaker", False, 12),
+    ("no_reliable_subject", "uncertain", False, 8),
+    ("no_reliable_subject", "uncertain", True, 8),
+])
+def test_single_v3_raw_to_assets_h3_frames_and_training_keeps_common_contract(
+    tmp_path, monkeypatch, binding, composition, no_speech, task_count,
+):
+    from tools.materialize_h3_ra2va_training_bundle import main
+
+    reconcile, job, _, stem = _fixture(tmp_path, monkeypatch, no_speech=no_speech)
+    payload = _single_v3_raw(job, binding=binding, composition=composition)
+    if binding == "no_reliable_subject":
+        payload["h3_semantics"]["subject_definitions"][0]["description"] = "a white pedestal table"
+    raw = _write_single_v3(reconcile, job, stem, payload)
+    output = tmp_path / "v3-bundle"
+    result = main(["--reconcile-root", str(reconcile), "--output-root", str(output), "--allow-unverified"])
+    assert result["model_call_count"] == 0
+    assert result["product_failed_count"] == 0
+    assert sum(result["task_counts"].values()) == task_count
+    manifest = AudioReuseManifest.model_validate_json((output / "audio_reuse_assets_v1" / job.clip_uid / "manifest.json").read_text())
+    eligible = not no_speech and composition in {"single_speaker", "same_speaker_nonlexical"}
+    assert len(manifest.speakers) == int(eligible)
+    if eligible:
+        assert manifest.speakers[0].entity_id == ("e1" if binding == "visible_subject" else None)
+        expected, _ = sf.read(stem.speech.canonical_stem_path, dtype="int16", always_2d=True)
+        actual, _ = sf.read(manifest.speakers[0].output_path, dtype="int16", always_2d=True)
+        segment = job.segments[0]
+        assert np.array_equal(actual[segment.source_start_sample:segment.source_end_sample],
+                              expected[segment.source_start_sample:segment.source_end_sample])
+    products = _rows(output / "h3_audio_reuse_products_v1/records.jsonl", AudioReuseProduct)
+    assert all(p.status == "ready" and p.schema_version == "r2v.h3.audio_reuse_product.1" for p in products)
+    for product in products:
+        if no_speech:
+            assert "<d>" not in product.rendered_h3_prompt
+        else:
+            assert "(S1)" in product.rendered_h3_prompt
+            assert f"<d>[{job.segments[0].asr_language}] {job.segments[0].asr_text}</d>" in product.rendered_h3_prompt
+    speech_products = [p for p in products if p.conditioning_variant == "target_speech_reuse"]
+    assert len(speech_products) == int(eligible)
+    if eligible:
+        speech_audio = speech_products[0].audio_references[0].contract
+        projected_record = _rows(output / "audio_reuse_prepared_v1/records.jsonl", prepared.AudioReusePreparedSource)[0]
+        assert projected_record.annotation.speaker_voice_profiles[0].voice_characteristics == (
+            raw["annotation"]["audio_observation"]["speaker_voice_profiles"][0]["voice_characteristics"]
+        )
+        # Target reuse currently omits profiles for both backends; do not change its contract here.
+        assert speech_audio.voice_characteristics is None
+    assert len(_rows(output / frame.FRAME_STAGE / "records.jsonl")) == 3 * len(products)
+    for case in build_review_cases(output):
+        assert set(case.row) == {"video", "images", "audios", "caption"}
+        assert all(Path(path).is_file() for path in case.row["images"] + case.row["audios"])
+    if binding == "no_reliable_subject":
+        assert raw["annotation"]["av_grounding"]["segment_groundings"][0]["entity_id"] is None
+        assert "white pedestal table" in products[0].rendered_h3_prompt
+
+
+@pytest.mark.parametrize("composition", ["overlapping_secondary_speech", "sequential_multi_speaker_speech"])
+def test_single_v3_multi_speaker_excludes_reuse_preserves_asr_and_real_h3_failure(tmp_path, monkeypatch, composition):
+    from tools.materialize_h3_ra2va_training_bundle import main
+
+    reconcile, job, _, stem = _fixture(tmp_path, monkeypatch)
+    record = _write_single_v3(reconcile, job, stem, _single_v3_raw(job, binding="no_reliable_subject", composition=composition))
+    assert job.segments[0].asr_text in record["annotation"]["h3_semantics"]["shot1_caption"]
+    output = tmp_path / "multi-bundle"
+    result = main(["--reconcile-root", str(reconcile), "--output-root", str(output), "--allow-unverified"])
+    manifest = AudioReuseManifest.model_validate_json((output / "audio_reuse_assets_v1" / job.clip_uid / "manifest.json").read_text())
+    assert manifest.speakers == []
+    assert {e.reason for e in manifest.exclusions} >= {"non_single_speaker", "secondary_vocal_activity"}
+    products = _rows(output / "h3_audio_reuse_products_v1/records.jsonl", AudioReuseProduct)
+    assert products and all(p.status == "failed" for p in products)
+    assert all("multi_speaker_segment_requires_turn_refinement" in p.failure_reason for p in products)
+    assert result["product_failed_count"] == len(products)
+
+
+def test_single_v3_overlapping_distinct_groups_never_copy_mixed_waveform(tmp_path, monkeypatch):
+    from tools.materialize_h3_ra2va_training_bundle import main
+
+    reconcile, job, _, stem = _fixture(tmp_path, monkeypatch)
+    values = job.model_dump(mode="json", exclude={"request_fingerprint"})
+    first = values["segments"][0]
+    second = {**first, "segment_id": "segment_0002", "source_speaker_cluster_id": "cluster_b",
+              "start_time": first["start_time"] + .05, "end_time": first["end_time"] + .05,
+              "source_start_sample": first["source_start_sample"] + 1600,
+              "source_end_sample": first["source_end_sample"] + 1600, "asr_text": "A second voice answers."}
+    values["segments"].append(second)
+    job = _seal(MimoClipJob, values, "request_fingerprint")
+    record = _write_single_v3(reconcile, job, stem, _single_v3_raw(job, binding="offscreen"))
+    assert [d["primary_speaker_group"] for d in record["annotation"]["audio_observation"]["segment_decisions"]] == ["g1", "g2"]
+    output = tmp_path / "overlap-bundle"
+    result = main(["--reconcile-root", str(reconcile), "--output-root", str(output), "--allow-unverified"])
+    manifest = AudioReuseManifest.model_validate_json((output / f"audio_reuse_assets_v1/{job.clip_uid}/manifest.json").read_text())
+    assert manifest.speakers == []
+    assert [(e.segment_id, e.reason) for e in manifest.exclusions] == [
+        (s.segment_id, "cross_speaker_overlap") for s in job.segments
+    ]
+    assert result["product_failed_count"] == 0
+    products = _rows(output / "h3_audio_reuse_products_v1/records.jsonl", AudioReuseProduct)
+    assert {p.conditioning_variant for p in products} == {"visual_only", "full_audio_reuse"}
+    for product in products:
+        for segment in job.segments:
+            assert f"<d>[{segment.asr_language}] {segment.asr_text}</d>" in product.rendered_h3_prompt

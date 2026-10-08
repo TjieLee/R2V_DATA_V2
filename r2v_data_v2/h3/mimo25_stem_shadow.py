@@ -1727,6 +1727,7 @@ class MimoStemReconcileRecord(SchemaModel):
             "h3_mimo26_ra2va_single_v10_speaker_subject_consistency",
             "h3_mimo26_ra2va_single_v10_dense_icl_ab_v1",
             "h3_mimo26_ra2va_single_v10_action_icl_ab_v2",
+            "h3_mimo26_ra2va_single_v11_compact3_audio_av",
         }
         if single_call:
             invalid_calls = (

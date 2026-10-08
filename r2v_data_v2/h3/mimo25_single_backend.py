@@ -5,14 +5,16 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import Field, StrictStr, model_validator
 
 from r2v_data_v2.h3.mimo25_backend import (
     _DIALOGUE,
     _REFERENCE_LABEL,
+    _REVIEW_ONLY_ISSUES,
     MIMO25_SCHEMA_VERSION,
+    MimoAcousticRefinementAudioSegmentDecision,
     MimoAVAnnotationDraft,
     MimoBackendConfig,
     MimoBackendFailure,
@@ -20,10 +22,13 @@ from r2v_data_v2.h3.mimo25_backend import (
     MimoBackendResult,
     MimoCompletionDiagnostic,
     MimoH3Semantics,
+    MimoResolvedAudioSegmentDecision,
     MimoSpeakerMarkerPolishAudit,
     MimoSpeakerVoiceProfile,
+    MimoUncertainAudioSegmentDecision,
     MimoUsage,
     MimoVisualBlock,
+    SpeechPresentation,
     _compact_json,
     _completion_diagnostic,
     _official_detailed_description_icl_messages,
@@ -34,6 +39,7 @@ from r2v_data_v2.h3.mimo25_backend import (
     _value,
     direct_speech_facts,
     protect_direct_dialogue,
+    validate_annotation,
 )
 from r2v_data_v2.h3.mimo25_stem_shadow import StemAwareOpenAIMimo25Backend
 from r2v_data_v2.h3.schemas import SchemaModel
@@ -50,6 +56,10 @@ DENSE_SINGLE_BACKEND_VERSION = "r2v.h3.mimo25_backend.77"
 ACTION_SINGLE_PROMPT_VERSION = "h3_mimo26_ra2va_single_v10_action_icl_ab_v2"
 ACTION_SINGLE_BACKEND_VERSION = "r2v.h3.mimo25_backend.78"
 SINGLE_COMPACT_SCHEMA_VERSION = "r2v.h3.mimo26_single_compact.2"
+SINGLE_V3_COMPACT_SCHEMA_VERSION = "r2v.h3.mimo26_single_compact.3"
+SINGLE_V3_PROMPT_VERSION = "h3_mimo26_ra2va_single_v11_compact3_audio_av"
+SINGLE_V3_BACKEND_VERSION = "r2v.h3.mimo25_backend.79"
+SingleContract = Literal["compact2", "compact3"]
 SingleSyntheticICLVariant = Literal["baseline", "dense_v1", "action_v2"]
 
 _COMPACT_PICTURE_LABEL = r"<Picture [1-9]\d*>"
@@ -102,6 +112,39 @@ Keep grounding rationale out of the caption. Write a concise summary without tas
 
 Return only compact JSON, not intermediate reasoning."""
 
+# Keep the historical prompt intact; V3 changes only the missing audio/AV contract.
+SINGLE_V3_SYSTEM_PROMPT = SINGLE_SYSTEM_PROMPT.replace(
+    "MimoSingleCompactAnnotationDraftV2", "MimoSingleCompactAnnotationDraftV3",
+).replace(
+    "Do not output a per-segment visible-entity inventory or internal entity IDs.",
+    "Report visible_subject_labels for each exact segment using only frozen entity Subject labels; "
+    "this is actual visual presence, not an inventory inferred from speaker binding. "
+    "Do not output internal entity IDs or invent detailed mouth/articulation metadata.",
+).replace(
+    "Do not output confidence, evidence codes, mouth/lip fields, or entity_id.",
+    "Use original target AV and speech-stem evidence from the actual segment audio to report "
+    "vocal_composition, resolution, secondary_vocal_activity, confidence, and audio_evidence_codes. "
+    "gN does not establish single-speaker ownership; neither a DiariZen segment nor an ASR transcript proves it. "
+    "single_speaker requires actual audio supporting one speaker and no secondary vocal activity. "
+    "same_speaker_nonlexical requires non-speech vocal activity from that same speaker. "
+    "secondary_non_speech_vocalization is another or uncertain voice's non-speech vocal activity. "
+    "overlapping_secondary_speech and sequential_multi_speaker_speech describe multiple speakers "
+    "inside this segment, not merely different gN in adjacent segments; they require "
+    "needs_acoustic_refinement and secondary speech from a different speaker. "
+    "resolved requires a non-null primary_speaker_group; uncertain/refinement may retain a group or use null. "
+    "Do not infer single_speaker from a non-null group. Retain uncertain when composition is not established. "
+    "Report speech_presentation and evidence_codes from actual original AV. visible_subject requires "
+    "onscreen_spoken, the selected Subject's presence in this exact segment's visible_subject_labels, "
+    "and directly observed av_temporal_alignment. Do not invent AV alignment to satisfy validation. "
+    "offscreen_spoken requires offscreen, null speaker_subject_label, and actual offscreen_audio evidence; "
+    "voice_over/device_playback/message_voice_over require their corresponding actual source-context evidence. "
+    "If visual identity or AV alignment is uncertain, use no_reliable_subject or uncertain, null "
+    "speaker_subject_label, uncertain presentation, and insufficient_evidence. "
+    "Acoustic grouping, waveform ownership, and visual identity are separate judgments. "
+    "Unbound/offscreen speech keeps its group, profile, and exact dialogue; profiles describe supported "
+    "audible traits, never traits inferred from appearance. Do not output mouth/lip fields or entity_id.",
+)
+
 
 class MimoSingleCompactSegmentDecision(SchemaModel):
     segment_id: str = Field(min_length=1)
@@ -111,7 +154,7 @@ class MimoSingleCompactSegmentDecision(SchemaModel):
     speaker_subject_label: str | None = Field(pattern=r"^<Subject [1-9]\d*>$")
 
     @model_validator(mode="after")
-    def validate_decision(self) -> MimoSingleCompactSegmentDecision:
+    def validate_subject_binding(self) -> MimoSingleCompactSegmentDecision:
         if self.delivery_style is not None and not self.delivery_style.strip():
             raise ValueError("compact delivery style must be non-empty or null")
         if (self.binding_status == "visible_subject") != (self.speaker_subject_label is not None):
@@ -129,6 +172,50 @@ class MimoSingleCompactAnnotationDraftV2(SchemaModel):
     segments: list[MimoSingleCompactSegmentDecision]
     speaker_voice_profiles: list[MimoSpeakerVoiceProfile]
     h3_semantics: MimoSingleCompactH3Semantics
+
+
+class _MimoSingleCompactAVFields(MimoSingleCompactSegmentDecision):
+    visible_subject_labels: list[Annotated[str, Field(pattern=r"^<Subject [1-9]\d*>$")]]
+    speech_presentation: SpeechPresentation
+    evidence_codes: list[Literal[
+        "av_temporal_alignment", "offscreen_audio", "voice_over_context",
+        "device_playback_context", "message_text_alignment", "insufficient_evidence",
+    ]] = Field(min_length=1, max_length=8)
+
+    @model_validator(mode="after")
+    def validate_visual_inventory(self) -> _MimoSingleCompactAVFields:
+        if len(set(self.visible_subject_labels)) != len(self.visible_subject_labels):
+            raise ValueError("compact visible Subject labels must be unique")
+        return self
+
+
+class MimoSingleCompactResolvedSegmentV3(MimoResolvedAudioSegmentDecision, _MimoSingleCompactAVFields):
+    pass
+
+
+class MimoSingleCompactRefinementSegmentV3(MimoAcousticRefinementAudioSegmentDecision, _MimoSingleCompactAVFields):
+    pass
+
+
+class MimoSingleCompactUncertainSegmentV3(MimoUncertainAudioSegmentDecision, _MimoSingleCompactAVFields):
+    pass
+
+
+MimoSingleCompactSegmentV3 = Annotated[
+    MimoSingleCompactResolvedSegmentV3 | MimoSingleCompactRefinementSegmentV3 | MimoSingleCompactUncertainSegmentV3,
+    Field(discriminator="resolution"),
+]
+
+
+class MimoSingleCompactAnnotationDraftV3(SchemaModel):
+    schema_version: Literal["r2v.h3.mimo26_single_compact.3"]
+    visual_blocks: list[MimoVisualBlock] = Field(min_length=1)
+    segments: list[MimoSingleCompactSegmentV3]
+    speaker_voice_profiles: list[MimoSpeakerVoiceProfile]
+    h3_semantics: MimoSingleCompactH3Semantics
+
+
+CompactDraft = MimoSingleCompactAnnotationDraftV2 | MimoSingleCompactAnnotationDraftV3
 
 
 def _canonicalize_single_compact_raw(raw: str) -> tuple[str, dict[str, int]]:
@@ -337,8 +424,26 @@ def _single_semantic_icl_messages(
     ]
 
 
+def _single_v3_semantic_icl_messages() -> list[dict[str, str]]:
+    messages = _single_semantic_icl_messages("action_v2")
+    example = json.loads(messages[1]["content"])
+    example["schema_version"] = SINGLE_V3_COMPACT_SCHEMA_VERSION
+    for row in example["segments"]:
+        visible = row["binding_status"] == "visible_subject"
+        row.update(
+            resolution="resolved", vocal_composition="single_speaker",
+            secondary_vocal_activity={"present": False, "speaker_relation": "none", "kind": None},
+            confidence="medium", audio_evidence_codes=["voice_continuity"],
+            visible_subject_labels=["<Subject 1>", "<Subject 2>"],
+            speech_presentation="onscreen_spoken" if visible else "offscreen_spoken",
+            evidence_codes=["av_temporal_alignment" if visible else "offscreen_audio"],
+        )
+    messages[1]["content"] = _compact_json(example)
+    return messages
+
+
 def _validate_single_compact_annotation(
-    draft: MimoSingleCompactAnnotationDraftV2,
+    draft: CompactDraft,
     job: Any,
     *,
     allowed_entity_ids: set[str],
@@ -371,6 +476,10 @@ def _validate_single_compact_annotation(
     groups_by_subject: dict[str, set[str]] = {}
     decisions = {row.segment_id: row for row in draft.segments}
     for decision in draft.segments:
+        if isinstance(draft, MimoSingleCompactAnnotationDraftV3):
+            unknown = set(decision.visible_subject_labels) - set(entity_by_subject)
+            if unknown:
+                issues.append(ValidationIssue("unknown_visible_subject", decision.segment_id, str(sorted(unknown))))
         if decision.binding_status != "visible_subject":
             continue
         label = decision.speaker_subject_label
@@ -550,25 +659,81 @@ def _project_compact_to_legacy_annotation(
     return MimoAVAnnotationDraft.model_validate(values)
 
 
+def _project_compact_v3_annotation(draft: MimoSingleCompactAnnotationDraftV3, job: Any) -> MimoAVAnnotationDraft:
+    entity_by_subject = {
+        subject.subject_label: subject.entity_id for subject in job.reference_subjects
+        if subject.kind == "entity" and subject.entity_id is not None
+    }
+    audio_fields = MimoResolvedAudioSegmentDecision.model_fields
+    values = {
+        "schema_version": MIMO25_SCHEMA_VERSION,
+        "visual_observation": {
+            "visual_blocks": [block.model_dump(mode="json") for block in draft.visual_blocks],
+            "segment_views": [{
+                "segment_id": row.segment_id,
+                "visible_entity_ids": [entity_by_subject[label] for label in row.visible_subject_labels],
+                "entity_observations": [],
+            } for row in draft.segments],
+        },
+        "audio_observation": {
+            "segment_decisions": [
+                {key: value for key, value in row.model_dump(mode="json").items() if key in audio_fields}
+                for row in draft.segments
+            ],
+            "speaker_voice_profiles": [profile.model_dump(mode="json") for profile in draft.speaker_voice_profiles],
+        },
+        "av_grounding": {"segment_groundings": [{
+            "segment_id": row.segment_id, "primary_speaker_group": row.primary_speaker_group,
+            "binding_status": {
+                "visible_subject": "visible_entity", "offscreen": "offscreen",
+                "no_reliable_subject": "no_reliable_entity", "uncertain": "uncertain",
+            }[row.binding_status],
+            "entity_id": entity_by_subject[row.speaker_subject_label] if row.binding_status == "visible_subject" else None,
+            "speech_presentation": row.speech_presentation,
+            "confidence": row.confidence, "evidence_codes": row.evidence_codes,
+        } for row in draft.segments]},
+        "h3_semantics": draft.h3_semantics.model_dump(mode="json"), "warnings": [],
+    }
+    annotation = MimoAVAnnotationDraft.model_validate(values)
+    values["h3_semantics"]["shot1_caption"] = _project_compact_speaker_markers(
+        draft.h3_semantics.shot1_caption, direct_speech_facts(annotation, list(job.segments)),
+    )
+    return MimoAVAnnotationDraft.model_validate(values)
+
+
 class SingleCallOpenAIMimo25Backend(StemAwareOpenAIMimo25Backend):
     def __init__(
         self, config: MimoBackendConfig, *,
-        single_synthetic_icl_variant: SingleSyntheticICLVariant = "baseline",
+        single_contract: SingleContract = "compact2",
+        single_synthetic_icl_variant: SingleSyntheticICLVariant | None = None,
         **kwargs: Any,
     ) -> None:
         if config.transport != "sglang":
             raise ValueError("single RA2VA requires SGLang structured output")
+        if single_contract not in {"compact2", "compact3"}:
+            raise ValueError("unknown single compact contract")
+        if single_synthetic_icl_variant is None:
+            single_synthetic_icl_variant = "action_v2" if single_contract == "compact3" else "baseline"
+        if single_contract == "compact3" and single_synthetic_icl_variant != "action_v2":
+            raise ValueError("compact3 preserves the action_v2 synthetic ICL")
         if single_synthetic_icl_variant not in {"baseline", "dense_v1", "action_v2"}:
             raise ValueError("unknown single synthetic ICL variant")
         super().__init__(config, **kwargs)
+        self.single_contract = single_contract
         self.single_synthetic_icl_variant = single_synthetic_icl_variant
+
+    @property
+    def _draft_model(self) -> type[CompactDraft]:
+        return MimoSingleCompactAnnotationDraftV3 if self.single_contract == "compact3" else MimoSingleCompactAnnotationDraftV2
 
     @property
     def provenance(self) -> MimoBackendProvenance:
         values = self.config.provenance().model_dump(
             mode="json", exclude={"configuration_fingerprint"},
         )
-        if self.single_synthetic_icl_variant == "dense_v1":
+        if self.single_contract == "compact3":
+            values.update(schema_version=SINGLE_V3_BACKEND_VERSION, prompt_version=SINGLE_V3_PROMPT_VERSION)
+        elif self.single_synthetic_icl_variant == "dense_v1":
             values.update(
                 schema_version=DENSE_SINGLE_BACKEND_VERSION,
                 prompt_version=DENSE_SINGLE_PROMPT_VERSION,
@@ -645,17 +810,19 @@ class SingleCallOpenAIMimo25Backend(StemAwareOpenAIMimo25Backend):
             payload: dict[str, object] = {
                 "model": self.config.model,
                 "messages": [
-                    {"role": "system", "content": SINGLE_SYSTEM_PROMPT},
+                    {"role": "system", "content": SINGLE_V3_SYSTEM_PROMPT if self.single_contract == "compact3" else SINGLE_SYSTEM_PROMPT},
                     *(_official_detailed_description_icl_messages() if self.config.icl == "official_ref2va_v1" else []),
-                    *(_single_semantic_icl_messages(self.single_synthetic_icl_variant) if self.config.icl == "official_ref2va_v1" else []),
+                    *((_single_v3_semantic_icl_messages() if self.single_contract == "compact3" else
+                       _single_semantic_icl_messages(self.single_synthetic_icl_variant))
+                      if self.config.icl == "official_ref2va_v1" else []),
                     {"role": "user", "content": content},
                 ],
                 "temperature": self.config.temperature,
                 "max_completion_tokens": self.config.max_completion_tokens,
                 "stream": False,
                 "response_format": {"type": "json_schema", "json_schema": {
-                    "name": "MimoSingleCompactAnnotationDraftV2",
-                    "schema": MimoSingleCompactAnnotationDraftV2.model_json_schema(), "strict": True,
+                    "name": self._draft_model.__name__,
+                    "schema": self._draft_model.model_json_schema(), "strict": True,
                 }},
                 "extra_body": {
                     "use_audio_in_video": True,
@@ -712,12 +879,13 @@ class SingleCallOpenAIMimo25Backend(StemAwareOpenAIMimo25Backend):
             auxiliary_audio_paths=auxiliary_audio_paths,
         )
         canonical_raw, corrections = _canonicalize_single_compact_raw(raw)
-        draft, issues = parse_structured_json_issues(canonical_raw, MimoSingleCompactAnnotationDraftV2)
+        draft, issues = parse_structured_json_issues(canonical_raw, self._draft_model)
         annotation = None
         if draft is not None:
-            draft, speaker_corrections = _normalize_single_compact_speaker_subjects(draft, job)
-            for code, count in speaker_corrections.items():
-                corrections[code] = corrections.get(code, 0) + count
+            if isinstance(draft, MimoSingleCompactAnnotationDraftV2):
+                draft, speaker_corrections = _normalize_single_compact_speaker_subjects(draft, job)
+                for code, count in speaker_corrections.items():
+                    corrections[code] = corrections.get(code, 0) + count
             compact_issues, warnings = _validate_single_compact_annotation(
                 draft, job, allowed_entity_ids=allowed_entity_ids,
                 allowed_reference_labels=allowed_reference_labels,
@@ -726,12 +894,28 @@ class SingleCallOpenAIMimo25Backend(StemAwareOpenAIMimo25Backend):
             diagnostics[0].warnings.extend(warnings)
             if not issues:
                 try:
-                    annotation = _project_compact_to_legacy_annotation(draft, job)
+                    annotation = (_project_compact_v3_annotation(draft, job)
+                                  if isinstance(draft, MimoSingleCompactAnnotationDraftV3)
+                                  else _project_compact_to_legacy_annotation(draft, job))
                 except ValueError as exc:
                     issues.append(ValidationIssue(
                         "compact_projection_failed", "annotation", str(exc),
                     ))
         if annotation is not None:
+            if self.single_contract == "compact3":
+                validation_issues = validate_annotation(
+                    annotation, segment_ids=segment_ids,
+                    segment_intervals={s.segment_id: (s.start_time, s.end_time) for s in job.segments},
+                    transcribed_segment_ids=transcribed_segment_ids,
+                    authoritative_transcripts=[s.asr_text for s in job.segments if s.asr_status == "transcribed"],
+                    allowed_entity_ids={s.entity_id for s in job.reference_subjects if s.kind == "entity" and s.entity_id is not None},
+                    allowed_reference_labels=allowed_reference_labels,
+                    reference_subjects=list(job.reference_subjects),
+                    target_duration_seconds=job.target_duration_seconds,
+                    binding_evidence_mode=job.binding_evidence_mode,
+                )
+                issues.extend(issue for issue in validation_issues if issue.code not in _REVIEW_ONLY_ISSUES)
+                diagnostics[0].warnings.extend(issue.code for issue in validation_issues if issue.code in _REVIEW_ONLY_ISSUES)
             speech = direct_speech_facts(annotation, list(job.segments))
             _, direct_issues, direct_warnings = protect_direct_dialogue(
                 annotation.h3_semantics.shot1_caption,

@@ -170,10 +170,15 @@ def test_ra2va_production_dry_run_uses_frozen_inputs_without_video_hashing(tmp_p
     assert result["request_workers"] == 2
     assert result["model_called"] is False
     assert not (tmp_path / "output").exists()
+    assert result["single_contract"] == "compact2"
+    assert cli.main([*args, "--single-contract", "compact3"])["single_contract"] == "compact3"
     default = cli.main(args[:args.index("--mimo-model")] + ["--dry-run"])
     assert (default["model"], default["call_mode"], default["request_workers"], default["endpoints"]) == (
         "mimo-v2.5", "multi", 1, [],
     )
+    assert "single_contract" not in default
+    with pytest.raises(ValueError, match="single-call"):
+        cli.main(args[:args.index("--mimo-model")] + ["--dry-run", "--single-contract", "compact3"])
 
 
 def test_ra2va_endpoint_failure_stops_new_work_and_resumes(tmp_path):

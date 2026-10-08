@@ -64,6 +64,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--gpu-ids", default="0,1,2,3,4,5,6,7")
     parser.add_argument("--mimo-model", default="mimo-v2.5")
     parser.add_argument("--mimo-call-mode", choices=("multi", "single"), default="multi")
+    parser.add_argument("--single-contract", choices=("compact2", "compact3"))
     parser.add_argument("--mimo-gpu-groups", default=os.environ.get("MIMO_GPU_GROUPS"))
     parser.add_argument("--mimo-ports", default=os.environ.get("MIMO_PORTS"))
     parser.add_argument("--mimo-sglang", type=Path)
@@ -112,6 +113,9 @@ def _runtime_paths(arguments) -> tuple[Path, Path]:
 
 def main(argv: list[str] | None = None) -> dict[str, object]:
     arguments = _parser().parse_args(argv)
+    if arguments.single_contract is not None and arguments.mimo_call_mode != "single":
+        raise ValueError("compact contract is single-call only")
+    arguments.single_contract = arguments.single_contract or "compact2"
     if arguments.mimo_call_mode == "single" and arguments.mimo_model != "mimo-v2.6-flash-rl":
         raise ValueError("single RA2VA production requires explicit MiMo V2.6")
     gpu_ids = arguments.gpu_ids.split(",")
@@ -176,6 +180,8 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         "endpoints": endpoints, "request_workers": workers,
         "model_called": False, "production_root": str(output),
     }
+    if arguments.mimo_call_mode == "single":
+        result["single_contract"] = arguments.single_contract
     if arguments.dry_run:
         print(json.dumps(result, sort_keys=True))
         return result
@@ -212,7 +218,10 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         ]) if endpoints else client(config.base_url, 8092)
     )
     backend_class = SingleCallOpenAIMimo25Backend if arguments.mimo_call_mode == "single" else StemAwareOpenAIMimo25Backend
-    backend = backend_class(config, stem_records_by_clip=by_stem, client=mimo_client)
+    backend = backend_class(
+        config, stem_records_by_clip=by_stem, client=mimo_client,
+        **({"single_contract": arguments.single_contract} if arguments.mimo_call_mode == "single" else {}),
+    )
 
     def run_clip(uid: str, destination: Path) -> dict:
         result["model_called"] = True
