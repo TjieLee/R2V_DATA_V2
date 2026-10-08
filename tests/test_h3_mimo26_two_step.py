@@ -218,6 +218,47 @@ def test_joint_schema_and_prompt_reuse_without_stage_conflicts():
     assert "Non-transcribed-only groups consume no Sx" in JOINT_SYSTEM_PROMPT
 
 
+@pytest.mark.parametrize("requirements", [
+    (
+        "VISUAL PERFORMANCE FIDELITY",
+        "authoritative visual action sequence",
+        "intermediate actions", "gestures", "gaze shifts", "expressions",
+        "object interactions", "body and head movements", "camera behavior", "temporal ordering",
+        "minimal local grammatical changes", "Do not replace a sequence of actions with a generic scene summary",
+        "Do not invent unsupported events", "No minimum word count",
+    ),
+    (
+        "VOICE-SOURCE NARRATION CONSISTENCY",
+        "different final speaker groups", "distinct vocal source",
+        'Never use "he continues", "she continues", "the same speaker"',
+        "AV grounding explicitly supports that visible entity",
+        "offscreen or unresolved vocal source separately", "neutral voice description",
+        "do not guess gender or identity", "Do not change, merge or renumber gN/Sx",
+        "exact ASR text, language markers, punctuation and dialogue order",
+    ),
+    (
+        "SOURCE RESPONSIBILITIES",
+        "Frozen Pictures", "stable appearance", "Reference images do not determine actions or speaker identity",
+        "Turn 1 Visual", "DiariZen + Qwen3-ASR", "Original AV", "Speech stem", "Music/SFX stems",
+        "Picture order, Subject numbering or prominence, or grammatical proximity",
+        "Do not reclassify Pictures or reassign Subjects",
+        "shot1_caption owns visual action, speaker presentation and exact dialogue",
+        "summary stays a short target-video overview",
+        "without transcribed ASR", "use the Turn 1 Visual caption", "do not invent (Sx) or <d>",
+    ),
+], ids=["visual_performance", "speaker_narration", "source_ownership"])
+def test_joint_request_supplies_caption_fidelity_guidance(tmp_path, monkeypatch, requirements):
+    _, _, backend, completions, stems, jobs, _, _ = _setup(tmp_path, monkeypatch)
+    result = _reconcile(backend, jobs[0], stems)
+    prompt = completions.requests[1]["messages"][0]["content"]
+    for requirement in requirements:
+        assert requirement in prompt
+    for foreign_contract in ("<Video 1>", "attribute_transfer", "[reference generation]"):
+        assert foreign_contract not in prompt
+    assert result.annotation.h3_semantics.shot1_caption == _drafts()[1]["speech_av"]["shot1_caption"]
+    assert result.model_call_count == len(completions.requests) == 2
+
+
 def _materialize(kwargs, job, annotation):
     sample = qa.FinalH3SampleV2.model_validate_json(
         (kwargs["audio_production_root"] / "h3/samples.jsonl").read_text().splitlines()[0],
@@ -337,8 +378,8 @@ def test_two_step_has_independent_provenance_without_changing_multi(tmp_path, mo
     from r2v_data_v2.h3.audio_reuse_prepared import FrozenReuseBackendProvenance
 
     _, _, backend, _, _, _, multi, _ = _setup(tmp_path, monkeypatch)
-    assert backend.provenance.schema_version == "r2v.h3.mimo25_backend.80"
-    assert backend.provenance.prompt_version == "h3_mimo26_ra2va_two_step_joint_v1"
+    assert backend.provenance.schema_version == "r2v.h3.mimo25_backend.81"
+    assert backend.provenance.prompt_version == "h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity"
     assert multi.provenance.schema_version == "r2v.h3.mimo25_backend.66"
     assert multi.provenance.prompt_version == "h3_mimo25_speech_assembly_v49"
     FrozenReuseBackendProvenance.model_validate_json(backend.provenance.model_dump_json())

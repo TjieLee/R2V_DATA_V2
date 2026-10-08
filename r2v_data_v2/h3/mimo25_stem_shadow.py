@@ -1729,7 +1729,9 @@ class MimoStemReconcileRecord(SchemaModel):
             "h3_mimo26_ra2va_single_v10_action_icl_ab_v2",
             "h3_mimo26_ra2va_single_v11_compact3_audio_av",
         }
-        if self.backend_provenance.prompt_version == "h3_mimo26_ra2va_two_step_joint_v1":
+        if self.backend_provenance.prompt_version in {
+            "h3_mimo26_ra2va_two_step_joint_v1", "h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity",
+        }:
             joint_turns = [d.input_modality for d in self.diagnostics]
             expected_joint_turns = ["target_video_visual_only", "target_video_joint_av_audio"]
             invalid_calls = (

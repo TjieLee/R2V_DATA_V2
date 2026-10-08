@@ -42,8 +42,13 @@ Speaker marker warnings remain visible. Same-entity/group contradictions fail
 with the existing validator issues and original annotation, before shared group
 merging; no Sx guessing or group merge is used to raise readiness.
 
-Only experimental provenance changes: backend `.80`, joint prompt
-`h3_mimo26_ra2va_two_step_joint_v1`. Visual v5, component profile v2/finalizer v6,
+Only experimental provenance changes: backend `.81`, joint prompt
+`h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity`. Version v2 adds visual
+performance fidelity, source responsibilities and distinct-speaker narration
+guidance only. It preserves meaningful Turn 1 actions and ordering rather than
+targeting caption length. There is no new caption validator or automatic prose
+rewrite. The original `.80` / joint v1 records remain readable.
+Visual v5, component profile v2/finalizer v6,
 official ICL v4, authority v18, annotation `.20` and materializer v30 stay frozen.
 The diagnostic `target_video_joint_av_audio` identifies the joint request.
 Its raw is stored in `speech_av_raw_response`; independent profile/finalizer raw
@@ -93,7 +98,7 @@ FROZEN="${FROZEN:-$SHADOW/mimo_reconcile_no_lrasd_http_final_v4}"
 # Start with Two-step only: five clips, at most ten model requests.
 # Use a fresh output name; there is deliberately no --overwrite.
 MODE="${MODE:-two_step}"
-OUT="${OUT:-$SHADOW/mimo_v26_ra2va_two_step_joint_v1_pilot5}"
+OUT="${OUT:-$SHADOW/mimo_v26_ra2va_two_step_joint_v2_caption_fidelity_pilot5}"
 .venv/bin/python - "$FROZEN" "$OUT" "$MODE" <<'PY'
 import json, os, sys, time
 from pathlib import Path
@@ -186,6 +191,38 @@ jq '{clip_uid,status,model_call_count,failure_reason,failure_issues,
      caption:.annotation.h3_semantics.shot1_caption,
      speakers:.annotation.av_grounding.segment_groundings}' "$OUT/records.jsonl"
 ```
+
+### Caption-fidelity v2 pilot
+
+Keep the same first pilot's frozen five jobs and matching resolved stems. Set
+these variables, then run the complete Python block above with the current code:
+
+```bash
+FROZEN="$SHADOW/mimo_v26_ra2va_two_step_joint_v1_pilot5"
+MODE=two_step
+OUT="$SHADOW/mimo_v26_ra2va_two_step_joint_v2_caption_fidelity_pilot5"
+```
+
+Use the same V2.6 endpoint on port 8094 and verified HTTP media server on 8766.
+The new output does not overwrite either v1 experiment. Keep the existing
+per-clip timings, two raw responses, call counts, failures and QA warnings.
+With the same caption viewer, compare the format-fixed v1 run (port 8770) with
+v2 (port 8771):
+
+```bash
+.venv/bin/python tools/serve_h3_single_v7_caption_review.py \
+  --base-root "$SHADOW/mimo_v26_ra2va_two_step_joint_v1_inventory_fix_pilot5" --port 8770
+.venv/bin/python tools/serve_h3_single_v7_caption_review.py \
+  --base-root "$SHADOW/mimo_v26_ra2va_two_step_joint_v2_caption_fidelity_pilot5" --port 8771
+```
+
+Inspect `shot1_visual_description` in the parsed `visual_raw_response` alongside the final
+caption for retained intermediate actions, gaze/gesture changes and ordering.
+Check speaker transitions, exact ASR, Subject/reference relationships and audio
+field separation. The 195457 male/female speaker split remains correct; its
+`She continues (S2)` issue is a model-narration quality check, not a deterministic
+correction. CPU fake-model tests verify the request and unchanged output
+handling, not that MiMo has learned the new narration.
 
 ## Compare quality, not just readiness
 

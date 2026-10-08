@@ -50,8 +50,8 @@ from r2v_data_v2.structured_output import (
     parse_structured_json_issues,
 )
 
-TWO_STEP_BACKEND_VERSION = "r2v.h3.mimo25_backend.80"
-TWO_STEP_PROMPT_VERSION = "h3_mimo26_ra2va_two_step_joint_v1"
+TWO_STEP_BACKEND_VERSION = "r2v.h3.mimo25_backend.81"
+TWO_STEP_PROMPT_VERSION = "h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity"
 JOINT_INPUT_MODALITY = "target_video_joint_av_audio"
 
 
@@ -96,7 +96,26 @@ _JOINT_AUDIO_PROMPT = AUDIO_FINALIZE_SYSTEM_PROMPT.replace(
     "Do not put visual prose, dialogue, Subject labels, Sx, summary or shot1_caption in audio_finalize.",
 )
 JOINT_SYSTEM_PROMPT = (
-    _JOINT_SPEECH_PROMPT + "\n\nACOUSTIC VOICE PROFILES\n" + _JOINT_PROFILE_PROMPT
+    _JOINT_SPEECH_PROMPT
+    + """
+
+SOURCE RESPONSIBILITIES
+Frozen Pictures (<Picture N>) establish the stable appearance of their assigned Subjects, Objects and Background. <Subject N> names a frozen visual entity or attribute, gN names an acoustic speaker group, and (Sx) names a final dialogue speaker; these are different namespaces.
+Turn 1 Visual supplies the observed scene, composition, actions, expressions, interactions and temporal ordering. DiariZen + Qwen3-ASR supply frozen segments, time windows and exact dialogue. Original AV determines actual vocal sources, speaker binding and spatial presentation. Speech stem supports acoustic traits; Music/SFX stems support soundscape/music judgment, not automatic truth from separator residuals.
+Reference images do not determine actions or speaker identity. Do not reclassify Pictures or reassign Subjects, or turn incidental reference-image background into an independent reference requirement.
+
+VISUAL PERFORMANCE FIDELITY
+Treat the Turn 1 shot1_visual_description as the authoritative visual action sequence. Preserve all meaningful observable actions, gestures, gaze shifts, expressions, object interactions, body and head movements, interactions between people, camera behavior, composition changes and scene transitions, and their temporal ordering.
+Integrate speech, pauses and observable reactions into that sequence with only minimal local grammatical changes. Do not replace a sequence of actions with a generic scene summary or omit intermediate actions merely to shorten the caption. Do not invent unsupported events, psychology, relationships or environment details to increase detail. No minimum word count; do not mechanically repeat stable appearance traits.
+
+VOICE-SOURCE NARRATION CONSISTENCY
+Speaker identity and changes come from speech_av grounding, never Picture order, Subject numbering or prominence, or grammatical proximity.
+When two dialogue events belong to different final speaker groups, introduce the second event as a distinct vocal source. Never use "he continues", "she continues", "the same speaker", or equivalent continuation language across a speaker change.
+Attach (Sx) to a visible Subject only when the corresponding AV grounding explicitly supports that visible entity. Describe the offscreen or unresolved vocal source separately from visible Subjects. When identity is uncertain, use a neutral voice description; do not guess gender or identity.
+Do not change, merge or renumber gN/Sx to improve the caption. Preserve the established Sx correspondence and exact ASR text, language markers, punctuation and dialogue order.
+shot1_caption owns visual action, speaker presentation and exact dialogue; summary stays a short target-video overview. Environment and physical sounds belong in overall_soundscape, audience-only music in non_diegetic_music, never in shot1_caption. For clips without transcribed ASR, use the Turn 1 Visual caption; do not invent (Sx) or <d>. Continue returning the joint JSON, not rendered six-section H3 text.
+"""
+    + "\nACOUSTIC VOICE PROFILES\n" + _JOINT_PROFILE_PROMPT
     + "\nWhen supported traits cannot be reliably described, use voice_characteristics=null; never invent a profile. "
     "Profiling must not change speech_av grouping, binding or speaker markers. "
     "If there are no transcribed ASR segments, speaker_voice_profiles=[]; do not create Sx or dialogue. "
