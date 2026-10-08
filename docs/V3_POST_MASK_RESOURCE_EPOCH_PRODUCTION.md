@@ -46,3 +46,86 @@ stage is launched here.
 Server-local checkpoint availability, shared-filesystem `flock`, write access
 to the public output root, and real model quality still require an on-server
 small smoke before full production. This code change runs no real models.
+
+
+## One completed group to final-schema JSONL (2026-10-08)
+
+Formal Global Compaction publishes the official `in_pair_reference/samples.jsonl`
+and `catalog.json` only after **all 48 groups** have completed. This barrier
+is **not** required for consuming an already completed group. A shard's SA
+terminal count reaching 100% does not imply Export is complete: require
+`state/resource_epochs/<group>/completed.json` with `export_completed=true`
+and the corresponding eight `state/shards/<shard>/completed.json` markers.
+
+**Standalone opt-in converter:** `tools/export_completed_postmask_group.py`.
+It reads just the specified completed group's shard `samples.jsonl` files,
+along with the private `subject_attributes/enriched_samples.jsonl` for each
+shard, and emits one JSONL of `r2v.v3.production_sample.1` records.
+No model calls, scheduler change, production-state changes, or global compaction.
+No SHA/hash/checksum, media decoding, whole-tree scans, or source image copies.
+
+From a checkout that already contains the helper:
+
+```bash
+WT=/mnt/workspace/litengjie/data/R2V_DATA_V2_postmask_prod
+"$WT/.venv/bin/python" tools/export_completed_postmask_group.py \
+  --repo "$WT" --group group-000000
+```
+
+**Never switch/update the shared production worktree while jobs run.** If the
+helper exists only on its GitHub topic branch, fetch that branch in the
+ordinary source checkout and extract the tool into a private file without
+changing the production checkout:
+
+```bash
+SRC=/mnt/workspace/litengjie/data/R2V_DATA_V2
+WT=/mnt/workspace/litengjie/data/R2V_DATA_V2_postmask_prod
+HELPER=/mnt/workspace/litengjie/data/export_completed_postmask_group.py
+
+git -C "$SRC" fetch origin feature/postmask-completed-group-export-20261008
+git -C "$SRC" show FETCH_HEAD:tools/export_completed_postmask_group.py > "$HELPER"
+"$WT/.venv/bin/python" "$HELPER" --repo "$WT" --group group-000000
+```
+
+The default output is a **private** directory:
+
+```text
+/mnt/workspace/litengjie/data/r2v_v3_group_exports/post_mask/group-000000/
+  samples.jsonl
+  references/
+    visual/<shard>/...          # links to official shard reference directories
+    attributes/<shard>/...      # links to private final SA images
+```
+
+The output uses the final **schema and semantics**: `sample_id`,
+`clip_uid`, `target_video`, `t2v_caption`, `r2v_instruction`,
+`source.shard_id`, `image_id`, `image_index`, `kind`, and final
+Subject Attributes references. A visually-only record preserves the original
+instruction. For enriched records the instruction becomes
+`enriched_instruction` and accepted attribute images are appended in the
+documented order. The original `target_video` and `t2v_caption` are retained.
+
+**Paths are not byte-identical to global Compaction.** In the standalone
+group JSONL, each `references[*].image_path` is relative to the
+`group-000000/` output root; the eventual global Compaction rewrites the
+references into its own canonical placement. The group converter uses
+**directory symlinks**, so consumers must resolve each image path against the
+group output root and keep official shard reference images plus private
+**final** SA PNGs accessible. Do not GC those inputs while consumers depend
+on these symlinks. This one-shot command does not publish a global
+`catalog.json`, a portable image bundle, or a flattened global
+`enriched_samples.jsonl`.
+
+The command publishes the group output directory by **atomic rename** only
+after the JSONL and symlinks have been prepared. It refuses to overwrite an
+existing result, checks formal completion markers and per-shard/group sample
+counts, and fails on duplicate/orphan/mismatched enriched records rather than
+silently dropping attributes. It only reads the named group's manifest and
+enriched files, not the rest of the campaign; it is manual, not a streaming
+publisher.
+
+At the 2026-10-08 handoff, group `group-000000` had 8 formally completed
+shards, **48,128 SA terminal eligible clips**, and **39,585 accepted exported
+samples**. These are user-reported historical markers, not a live progress
+reading or a claim that the standalone converter has been run on the server.
+The unchanged formal global Compaction will still run after all groups complete.
