@@ -61,6 +61,7 @@ from r2v_data_v2.v3.post_mask_epoch_jobs import (
     OUTCOME_RETRYABLE_FAILED,
     RESOURCE_BOOGU,
     RESOURCE_QWEN,
+    RESOURCE_SAM,
     JobResult,
     ModelJob,
     semantic_input_digest,
@@ -1152,6 +1153,39 @@ def test_boogu_factory_builds_the_worker_slot_epoch(
     assert isinstance(resource, WorkerEpochResource)
     assert isinstance(executor, WorkerSlotExecutor)
     assert executor.slot_count == 8
+
+
+def test_sam_factory_limits_pipeline_admission_to_subject_attributes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _fixture_config(tmp_path, monkeypatch)
+    storage = _pending_storage(config)
+    runner = _runner(config, storage, GroupLedger(tmp_path / "group"))
+    active: list[Any] = [None]
+    factories = build_removal_epoch_factories(
+        config,
+        runner,
+        qwen_epoch_config=build_qwen_epoch_config(config),
+        pool=WorkerPoolConfig(),
+        process_manager=_fake_process_manager(),
+        temporary_root=tmp_path / "tmp",
+        allowed_server_root=tmp_path / "workspace" / "data",
+        with_sam_epoch=True,
+        sam_pipeline_runner=lambda: active[0],
+    )
+    resource, executor = factories[RESOURCE_SAM]()
+    try:
+        # Reference Edit keeps its existing physical-slot admission.
+        assert executor.capacity() == 8
+        class ActiveSA:
+            pass
+
+        active[0] = ActiveSA()
+        # SA admits bounded prepare/infer/persist work, using the SAME pool.
+        assert executor.capacity() == 24
+        assert resource.slot_count == 8
+    finally:
+        executor.close()
 
 
 def test_image_edit_factory_passes_reference_edit_runtime_config(

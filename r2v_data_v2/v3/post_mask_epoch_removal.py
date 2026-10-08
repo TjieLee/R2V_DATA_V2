@@ -1487,6 +1487,7 @@ def build_removal_epoch_factories(
     log_root: Path | None = None,
     job_runner: Callable[[Any, Any], Any] | None = None,
     with_sam_epoch: bool = False,
+    sam_pipeline_runner: Callable[[], Any | None] | None = None,
 ) -> dict[str, Callable[[], tuple[Any, Any]]]:
     """Resource-epoch factories for the image-edit and Qwen epochs.
 
@@ -1548,6 +1549,17 @@ def build_removal_epoch_factories(
                 process_manager=process_manager,
                 log_root=log_root,
             )
+            if sam_pipeline_runner is not None:
+                from r2v_data_v2.v3.post_mask_epoch_sa_execution import (
+                    StageAwareSASamExecutor,
+                )
+
+                return epoch, StageAwareSASamExecutor(
+                    run_job,
+                    pipeline_runner=sam_pipeline_runner,
+                    slot_count=slot_count,
+                    resource=epoch,
+                )
             return epoch, WorkerSlotExecutor(
                 run_job, slot_count=slot_count, resource=epoch
             )
@@ -2234,6 +2246,11 @@ def build_removal_epoch_runner(
                         job_runner=dispatch.run,
                         with_sam_epoch=(
                             reference_edit_enabled or subject_attributes_enabled
+                        ),
+                        sam_pipeline_runner=lambda: (
+                            dispatch.runner
+                            if isinstance(dispatch.runner, _SubjectAttributeEpochRunner)
+                            else None
                         ),
                     )
                 )

@@ -252,6 +252,10 @@ def _emit_subject_attributes_cpu_diagnostics(
     receipt, the durable stage counts, a schema or the config fingerprint.
     """
     counters = dict(getattr(subject_attributes, "seed_counters", None) or {})
+    sam_diagnostics = getattr(subject_attributes, "sam_execution_diagnostics", None)
+    if callable(sam_diagnostics):
+        _emit(emit, "post_mask_epoch_subject_attributes_sam_execution_diagnostics",
+              **sam_diagnostics())
     if not counters:
         return
     _emit(emit, "post_mask_epoch_subject_attributes_cpu_diagnostics", **counters)

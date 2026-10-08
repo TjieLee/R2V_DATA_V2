@@ -4027,28 +4027,49 @@ class SubjectAttributeEpochRunner:
         return masks
 
     def _run_sam_probe(self, job: ModelJob, handle: Any) -> JobResult:
-        """One real legacy ``segment_frame`` call. Nothing else is caught."""
+        """Synchronous compatibility path over the same three SA stages."""
         if job.job_type != SUBJECT_ATTRIBUTE_SAM_PROBE_JOB:
             raise SubjectAttributeEpochError(f"unsupported job type {job.job_type!r}")
-        context = self._sam_probe_context(job)
-        probe_index = context["probe_index"]
-        candidate = context["ordered"][probe_index]
-        if handle is None:
-            raise SubjectAttributeEpochError("subject attribute SAM probe needs a handle")
-        frame_path = (context["storage"].root / candidate.image_path).resolve(
-            strict=False
+        return self.persist_sam_job(
+            job, self.infer_sam_job(job, self.prepare_sam_job(job), handle)
         )
+
+    def prepare_sam_job(self, job: ModelJob) -> dict[str, Any]:
+        """Freeze CPU call arguments after existing durable dependency checks."""
+        if job.job_type == SUBJECT_ATTRIBUTE_SAM_PROBE_JOB:
+            context = self._sam_probe_context(job)
+            candidate = context["ordered"][context["probe_index"]]
+            return {
+                "frame_path": (context["storage"].root / candidate.image_path).resolve(
+                    strict=False
+                ),
+                "frame_slot": int(candidate.frame_slot),
+                "grounding_prompt": str(
+                    context["attribute_plan"]["discovered"]["grounding_prompt"]
+                ),
+            }
+        if job.job_type == SUBJECT_ATTRIBUTE_COMPLETION_SAM_JOB:
+            return self._prepare_completion_sam(job)
+        raise SubjectAttributeEpochError(f"unsupported job type {job.job_type!r}")
+
+    def infer_sam_job(
+        self, job: ModelJob, prepared: Mapping[str, Any], handle: Any
+    ) -> dict[str, Any] | JobResult:
+        """Only the legacy backend call is isolated; snapshot errors stay fatal."""
+        completion = job.job_type == SUBJECT_ATTRIBUTE_COMPLETION_SAM_JOB
+        if handle is None:
+            raise SubjectAttributeEpochError(
+                "subject attribute completion SAM needs a handle" if completion else
+                "subject attribute SAM probe needs a handle"
+            )
         segmenter = _resolve_attribute_segmentation_backend(handle)
         started = time.perf_counter()
         try:
-            returned = segmenter.segment_frame(
-                frame_path=frame_path,
-                frame_slot=int(candidate.frame_slot),
-                grounding_prompt=str(
-                    context["attribute_plan"]["discovered"]["grounding_prompt"]
-                ),
-            )
-        except Exception as exc:  # noqa: BLE001 - legacy per-probe isolation
+            if completion:
+                returned = segmenter.segment_generated_frame(**prepared)
+            else:
+                returned = segmenter.segment_frame(**prepared)
+        except Exception as exc:  # noqa: BLE001 - unchanged legacy per-call isolation
             return JobResult(
                 OUTCOME_COMPLETED,
                 payload={
@@ -4058,14 +4079,31 @@ class SubjectAttributeEpochRunner:
                     "model_call_time_seconds": time.perf_counter() - started,
                 },
             )
-        records = self._publish_masks(job.job_id(), returned)
+        # The backend may reuse buffers on its next call. Transfer ownership
+        # before releasing the physical slot; writer never touches GPU storage.
+        masks = []
+        for mask in returned:
+            if hasattr(mask, "detach"):
+                mask = mask.detach().cpu().numpy()
+            array = np.array(mask, copy=True)
+            array.setflags(write=False)
+            masks.append(array)
+        return {"masks": tuple(masks), "started": started}
+
+    def persist_sam_job(
+        self, job: ModelJob, inferred: Mapping[str, Any] | JobResult
+    ) -> JobResult:
+        """Publish existing mask artifacts/cache before returning any success."""
+        if isinstance(inferred, JobResult):
+            return inferred
+        records = self._publish_masks(job.job_id(), inferred["masks"])
         return JobResult(
             OUTCOME_COMPLETED,
             payload={
                 "status": "sam",
                 "mask_count": len(records),
                 "masks": records,
-                "model_call_time_seconds": time.perf_counter() - started,
+                "model_call_time_seconds": time.perf_counter() - inferred["started"],
             },
         )
 
@@ -6874,12 +6912,13 @@ class SubjectAttributeEpochRunner:
         )
 
     def _run_completion_sam(self, job: ModelJob, handle: Any) -> JobResult:
-        """One generated-frame segmentation call. Nothing else is caught."""
+        """Synchronous compatibility path over the same three SA stages."""
+        return self.persist_sam_job(
+            job, self.infer_sam_job(job, self.prepare_sam_job(job), handle)
+        )
+
+    def _prepare_completion_sam(self, job: ModelJob) -> dict[str, Any]:
         context = self._completion_job_context(job)
-        if handle is None:
-            raise SubjectAttributeEpochError(
-                "subject attribute completion SAM needs a handle"
-            )
         storage = context["storage"]
         candidate = context["candidate"]
         rank = int(context["rank"])
@@ -6927,35 +6966,12 @@ class SubjectAttributeEpochRunner:
                 str(payload.get("generated_png_path", "")),
             ),
         )
-        segmenter = _resolve_attribute_segmentation_backend(handle)
-        started = time.perf_counter()
-        try:
-            returned = segmenter.segment_generated_frame(
-                frame_path=output_path,
-                grounding_prompt=str(
-                    context["attribute_plan"]["discovered"]["grounding_prompt"]
-                ),
-            )
-        except Exception as exc:  # noqa: BLE001 - legacy completion failure scope
-            return JobResult(
-                OUTCOME_COMPLETED,
-                payload={
-                    "status": "sam_failed",
-                    "exception_type": type(exc).__name__,
-                    "error": str(exc),
-                    "model_call_time_seconds": time.perf_counter() - started,
-                },
-            )
-        records = self._publish_masks(job.job_id(), returned)
-        return JobResult(
-            OUTCOME_COMPLETED,
-            payload={
-                "status": "sam",
-                "mask_count": len(records),
-                "masks": records,
-                "model_call_time_seconds": time.perf_counter() - started,
-            },
-        )
+        return {
+            "frame_path": output_path,
+            "grounding_prompt": str(
+                context["attribute_plan"]["discovered"]["grounding_prompt"]
+            ),
+        }
 
     def _run_completion_review(self, job: ModelJob, handle: Any) -> JobResult:
         """One comparative alpha-versus-completion review. Nothing else caught."""
