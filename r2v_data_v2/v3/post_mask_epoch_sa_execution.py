@@ -11,6 +11,7 @@ import time
 from queue import Empty, Queue
 from typing import Any
 
+from .post_mask_epoch_jobs import job_order_key
 from .post_mask_epoch_resources import WorkerSlotExecutor
 from .post_mask_epoch_scheduler import JobExecution
 
@@ -50,6 +51,7 @@ class SASamPipelineExecutor:
                                 f"{stage}_active_peak": 0, f"{stage}_queue_peak": 0})
         self._stats["infer_persist_overlap_count"] = 0
         self._stats["infer_persist_overlap_seconds"] = 0.0
+        self._stats["persist_wait_seconds"] = 0.0
         self._activity_updated = time.monotonic()
         for slot in range(slot_count):
             self._stats[f"infer_slot_{slot}_seconds"] = 0.0
@@ -78,7 +80,7 @@ class SASamPipelineExecutor:
             self._stats["admitted_peak"] = max(self._admitted, self._stats["admitted_peak"])
             # No stage can hold capacity items here: this newly admitted job is
             # part of the same global bound, making this put nonblocking.
-            self._queues["prepare"].put_nowait((job, None))
+            self._queues["prepare"].put_nowait((job, None, time.monotonic()))
             self._record_queue("prepare")
 
     def _record_queue(self, stage: str) -> None:
@@ -91,9 +93,11 @@ class SASamPipelineExecutor:
             item = queue.get()
             if item is None:
                 return
-            job, value = item
+            job, value, enqueued = item
             started = time.monotonic()
             with self._lock:
+                if stage == "persist":
+                    self._stats["persist_wait_seconds"] += started - enqueued
                 self._record_overlap()
                 self._active[stage] += 1
                 key = f"{stage}_active_peak"
@@ -113,13 +117,13 @@ class SASamPipelineExecutor:
                 else:
                     output = self.runner.persist_sam_job(job, value)
                     next_stage = None
-            except BaseException as exc:  # noqa: BLE001 - re-raised by collect, including interrupts
+            except BaseException as exc:  # noqa: BLE001 - transported to collect, including interrupts
                 self._events.put((job, None, exc))
             else:
                 if next_stage is None:
                     self._events.put((job, output, None))
                 else:
-                    self._queues[next_stage].put((job, output))
+                    self._queues[next_stage].put((job, output, time.monotonic()))
                     with self._lock:
                         self._record_queue(next_stage)
             finally:
@@ -151,9 +155,12 @@ class SASamPipelineExecutor:
         with self._lock:
             self._admitted -= len(events)
         for _job, _result, exception in events:
-            if exception is not None:
+            if exception is not None and not isinstance(exception, Exception):
                 raise exception
-        return [JobExecution(job, result, None) for job, result, _ in events]
+        executions = [JobExecution(job, result, exception)
+                      for job, result, exception in events]
+        executions.sort(key=lambda execution: job_order_key(execution.job))
+        return executions
 
     def diagnostics(self) -> dict[str, int | float]:
         """Execution-only cumulative timings and bounded occupancy peaks."""
@@ -225,7 +232,13 @@ class StageAwareSASamExecutor:
             return []
         # Do not reselect here: the caller must be able to drain old work even
         # if its dispatch provider has already changed.
-        results = self._executor.collect()
+        try:
+            results = self._executor.collect()
+        except BaseException:
+            # Fatal control flow may consume a wave without returning it. Drain
+            # threads before resource teardown; uncommitted work resumes cold.
+            self.close()
+            raise
         self._outstanding -= len(results)
         return results
 
@@ -238,5 +251,8 @@ class StageAwareSASamExecutor:
         if self._closed:
             return
         self._closed = True
-        if self._executor is not None:
-            self._executor.close()
+        try:
+            if self._executor is not None:
+                self._executor.close()
+        finally:
+            self._outstanding = 0

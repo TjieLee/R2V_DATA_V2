@@ -4088,7 +4088,8 @@ class SubjectAttributeEpochRunner:
             array = np.array(mask, copy=True)
             array.setflags(write=False)
             masks.append(array)
-        return {"masks": tuple(masks), "started": started}
+        return {"masks": tuple(masks),
+                "inference_wall_seconds": time.perf_counter() - started}
 
     def persist_sam_job(
         self, job: ModelJob, inferred: Mapping[str, Any] | JobResult
@@ -4096,6 +4097,7 @@ class SubjectAttributeEpochRunner:
         """Publish existing mask artifacts/cache before returning any success."""
         if isinstance(inferred, JobResult):
             return inferred
+        started = time.perf_counter()
         records = self._publish_masks(job.job_id(), inferred["masks"])
         return JobResult(
             OUTCOME_COMPLETED,
@@ -4103,7 +4105,9 @@ class SubjectAttributeEpochRunner:
                 "status": "sam",
                 "mask_count": len(records),
                 "masks": records,
-                "model_call_time_seconds": time.perf_counter() - inferred["started"],
+                "model_call_time_seconds": (
+                    inferred["inference_wall_seconds"] + (time.perf_counter() - started)
+                ),
             },
         )
 

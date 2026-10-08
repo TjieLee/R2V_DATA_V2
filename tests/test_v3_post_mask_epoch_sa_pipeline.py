@@ -2,8 +2,8 @@ from threading import Event
 from types import SimpleNamespace
 
 import numpy as np
-import pytest
 
+from r2v_data_v2.v3 import post_mask_epoch_subject_attributes as subject_attributes
 from r2v_data_v2.v3.post_mask_epoch_sa_execution import SASamPipelineExecutor
 from r2v_data_v2.v3.post_mask_epoch_subject_attributes import (
     SUBJECT_ATTRIBUTE_DISCOVERY_JOB,
@@ -103,11 +103,97 @@ def test_writer_failure_no_receipt_and_cold_resume_retries_same_job(tmp_path, mo
         resource=SimpleNamespace(handle_for_slot=lambda slot: fixture._SamBackend(
             fixture._usable_sam(storage, slot=0))))
     try:
-        with pytest.raises(OSError, match="persist EIO"):
-            fixture._scheduler(runner, fixture._SerialQwenExecutor(runner, fixture._QwenClient()),
-                               sam=executor).run(jobs)
+        diagnostics = fixture._scheduler(
+            runner, fixture._SerialQwenExecutor(runner, fixture._QwenClient()),
+            sam=executor).run(jobs)
     finally:
         executor.close()
     assert runner._committed_payload_or_none(jobs[0]) is None
+    assert diagnostics["diagnostics"]["resources"]["sam"]["jobs_retryable_failed"] == 1
     fresh = fixture._runner(config, storage, tmp_path)
     assert jobs[0].job_id() in {job.job_id() for job in fresh.seed_jobs()}
+
+
+def test_same_wave_persist_failure_keeps_sibling_receipt_and_cold_resume(tmp_path, monkeypatch):
+    config, storage, runner, jobs = prepared_runner(
+        tmp_path, monkeypatch, (fixture.ACCESSORY, fixture.SCARF))
+    failed, successful = jobs
+    publish = runner._publish_masks
+    failure = OSError("persist failed for A")
+
+    def fail_one(job_id, masks):
+        if job_id == failed.job_id():
+            raise failure
+        return publish(job_id, masks)
+
+    monkeypatch.setattr(runner, "_publish_masks", fail_one)
+
+    class CompletedWaveExecutor(SASamPipelineExecutor):
+        def collect(self):
+            # Test barrier only: both persistence outcomes must be in one wave.
+            self.close()
+            results = super().collect()
+            assert len(results) == 2
+            assert any(item.exception is failure for item in results)
+            return results
+
+    backend = fixture._SamBackend(fixture._usable_sam(storage, slot=0))
+    executor = CompletedWaveExecutor(runner, slot_count=1,
+        resource=SimpleNamespace(handle_for_slot=lambda slot: backend))
+    finalized = []
+
+    def finalize_sam(job, result):
+        assert runner._committed_payload_or_none(job)["status"] == "sam"
+        finalized.append(job.job_id())
+        return ()  # keep this regression scoped to the SAM receipt wave
+
+    try:
+        diagnostics = fixture._scheduler(
+            runner, fixture._SerialQwenExecutor(runner, fixture._QwenClient()),
+            finalize_sam, executor).run(jobs)
+    finally:
+        executor.close()
+    assert diagnostics["diagnostics"]["resources"]["sam"]["jobs_retryable_failed"] == 1
+    assert runner._committed_payload_or_none(failed) is None
+    assert runner._committed_payload_or_none(successful)["status"] == "sam"
+    assert finalized == [successful.job_id()]
+    assert executor.diagnostics()["admitted"] == 0
+    assert not any(thread.is_alive() for thread in executor._threads)
+
+    fresh = fixture._runner(config, storage, tmp_path)
+    resumed = fresh.seed_jobs()
+    assert failed.job_id() in {job.job_id() for job in resumed}
+    assert successful.job_id() not in {job.job_id() for job in resumed}
+    retry_backend = fixture._SamBackend(fixture._usable_sam(storage, slot=0))
+    fixture._scheduler(
+        fresh, fixture._SerialQwenExecutor(fresh, fixture._QwenClient()),
+        fixture._swallow(SUBJECT_ATTRIBUTE_SAM_PROBE_JOB, fresh),
+        fixture._SerialQwenExecutor(fresh, retry_backend)).run(resumed)
+    assert retry_backend.calls == 1
+    assert fresh._committed_payload_or_none(failed)["status"] == "sam"
+
+
+def test_model_call_timing_excludes_async_writer_queue_wait(tmp_path, monkeypatch):
+    _, storage, runner, jobs = prepared_runner(tmp_path, monkeypatch, (fixture.ACCESSORY,))
+    clock = [100.0]
+    monkeypatch.setattr(subject_attributes.time, "perf_counter", lambda: clock[0])
+
+    class Backend(fixture._SamBackend):
+        def segment_frame(self, **kwargs):
+            clock[0] += 2.0
+            return fixture._usable_sam(storage, slot=0)
+
+    prepared = runner.prepare_sam_job(jobs[0])
+    inferred = runner.infer_sam_job(jobs[0], prepared, Backend())
+    clock[0] += 900.0  # asynchronous queue wait, not model/persistence work
+    publish = runner._publish_masks
+
+    def timed_publish(job_id, masks):
+        records = publish(job_id, masks)
+        clock[0] += 3.0
+        return records
+
+    monkeypatch.setattr(runner, "_publish_masks", timed_publish)
+    result = runner.persist_sam_job(jobs[0], inferred)
+    assert result.payload["model_call_time_seconds"] == 5.0
+    assert set(result.payload) == {"status", "mask_count", "masks", "model_call_time_seconds"}
