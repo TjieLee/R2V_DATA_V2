@@ -5,7 +5,9 @@ The JSON records use r2v.v3.production_sample.1 and the same R2V/SA
 conversion semantics as the frozen Post-Mask compactor. Reference image paths
 are relative to the published group directory. Its ``references`` subtree
 contains only a small number of directory symlinks to the already published
-shard Visual images and preserved private Subject Attributes images.
+shard Export images (both Visual and Subject Attributes). The corresponding
+exported ``enriched_samples.jsonl`` is the source for SA enrichment; no private
+SA aggregate is required.
 
 Usage (run from any directory on the shared production server):
   /mnt/workspace/litengjie/data/R2V_DATA_V2_postmask_prod/.venv/bin/python \
@@ -58,13 +60,9 @@ def _visual_path(shard: str, image_path: str) -> str:
     return f'references/visual/{shard}/{relative[len(prefix):]}'
 
 
-def _attribute_path(shard: str, image_path: str) -> str:
-    return f'references/attributes/{shard}/{_relative_path(image_path)}'
-
-
-def _load_enriched(run_root: Path, models: object) -> dict[str, object]:
-    """Load one shard's private SA source, as the full compactor does."""
-    path = run_root / 'subject_attributes' / 'enriched_samples.jsonl'
+def _load_enriched(shard_root: Path, run_root: Path, models: object) -> dict[str, object]:
+    """Load the already exported SA sidecar (including exported image paths)."""
+    path = shard_root / 'enriched_samples.jsonl'
     if not path.is_file():
         return {}
     enriched = {}
@@ -131,7 +129,7 @@ def _convert_enriched(sample: object, enriched: object, shard: str, models: obje
                 attribute_id=record.attribute_id,
                 owner_entity_id=record.owner_entity_id,
                 attribute_type=record.attribute_type,
-                image_path=_attribute_path(shard, ref.image_path),
+                image_path=_visual_path(shard, ref.image_path),
                 source_frame_index=ref.source_frame_index,
                 synthetic=(
                     record.default_variant == 'generated_background'
@@ -205,18 +203,11 @@ def _models():
     )
 
 
-def _link_shard_references(staging: Path, root: Path, runs: Path, shard: str) -> None:
+def _link_shard_references(staging: Path, root: Path, shard: str) -> None:
     visual = root / 'shards' / shard / 'references'
-    attrs = runs / shard / 'subject_attributes'
     if not visual.is_dir():
-        raise FileNotFoundError(f'missing published shard visual references: {visual}')
+        raise FileNotFoundError(f'missing published shard references: {visual}')
     (staging / 'references' / 'visual' / shard).symlink_to(visual, target_is_directory=True)
-    # A visual-only shard need not have a private SA directory. Attribute
-    # references are emitted only when the actual enriched source includes them.
-    if attrs.is_dir():
-        (staging / 'references' / 'attributes' / shard).symlink_to(
-            attrs, target_is_directory=True
-        )
 
 
 def convert_group(group: str, root: Path, runs: Path, output_dir: Path, models: object) -> int:
@@ -258,16 +249,13 @@ def convert_group(group: str, root: Path, runs: Path, output_dir: Path, models: 
     seen_sample_ids: set[str] = set()
     try:
         (temp_dir / 'references' / 'visual').mkdir(parents=True)
-        (temp_dir / 'references' / 'attributes').mkdir(parents=True)
         with (temp_dir / 'samples.jsonl').open('w', encoding='utf-8') as dest:
             for shard in shards:
-                _link_shard_references(temp_dir, root, runs, shard)
+                _link_shard_references(temp_dir, root, shard)
                 shard_root = root / 'shards' / shard
                 run_root = runs / shard
                 source = shard_root / 'samples.jsonl'
-                enriched = _load_enriched(run_root, models)
-                if (shard_root / 'enriched_samples.jsonl').is_file() and not (run_root / 'subject_attributes' / 'enriched_samples.jsonl').is_file():
-                    raise FileNotFoundError(f'expected private enriched input missing for {shard}')
+                enriched = _load_enriched(shard_root, run_root, models)
                 shard_count = 0
                 with source.open('r', encoding='utf-8') as handle:
                     for line in handle:
@@ -301,7 +289,7 @@ def convert_group(group: str, root: Path, runs: Path, output_dir: Path, models: 
     print(f'DONE: {group} samples={total}, enriched={enriched_count}')
     print(f'JSONL: {output_dir / "samples.jsonl"}')
     print(f'IMAGE_ROOT: {output_dir}')
-    print('Note: images are symlinked, not copied; keep source shards and final SA PNGs available.')
+    print('Note: images are symlinked, not copied; keep source shard Export images available.')
     return total
 
 
