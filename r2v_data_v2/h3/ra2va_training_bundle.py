@@ -51,6 +51,7 @@ def materialize_ra2va_training_bundle(
             job=job, annotation=record.annotation, stem_record=by_clip[job.clip_uid],
             audio_production_root=audio_root, output_root=output / ASSETS_STAGE / job.clip_uid,
             allow_unverified=allow_unverified,
+            backend_provenance=record.source_backend_provenance,
         )
     products = materialize_audio_reuse_products(
         mimo_root=prepared, source_h3_root=prepared / "h3", separation_root=stem_root,

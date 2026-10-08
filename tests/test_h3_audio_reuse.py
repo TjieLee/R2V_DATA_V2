@@ -125,6 +125,51 @@ def _pcm(path, *, container="FLAC"):
     return pcm
 
 
+def test_review_only_identity_group_cannot_publish_speaker_reuse(tmp_path):
+    from types import SimpleNamespace
+
+    from r2v_data_v2.h3.mimo25_recovered_voice import recover_mimo_target_voices
+
+    args = _fixture(tmp_path)
+    payload = args["annotation"].model_dump(mode="json")
+    for grounding in payload["av_grounding"]["segment_groundings"]:
+        grounding["evidence_codes"] = ["voice_continuity"]
+    for view in payload["visual_observation"]["segment_views"]:
+        view["entity_observations"][0]["speech_correlated_articulation"] = "not_assessable"
+    args["annotation"] = MimoAVAnnotationDraft.model_validate(payload)
+    provenance = SimpleNamespace(prompt_version="h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity")
+    manifest = reuse.build_audio_reuse_assets(**args, backend_provenance=provenance)
+    assert manifest.speakers == []
+    assert {(e.segment_id, e.reason) for e in manifest.exclusions} == {
+        (s.segment_id, "unconfirmed_visible_identity") for s in args["job"].segments
+    }
+    assert manifest.music is not None
+    assert not list(args["output_root"].glob("S*.flac"))
+    recovered = recover_mimo_target_voices(
+        job=args["job"], record=SimpleNamespace(annotation=args["annotation"], backend_provenance=provenance),
+        subject_index_by_entity={"e1": 1}, existing_entity_ids=set(), reference_capacity=3,
+        temporary_root=tmp_path / "voice-temp", final_root=tmp_path / "voices",
+        audio_backend=SimpleNamespace(), analyzer=SimpleNamespace(load=lambda _: pytest.fail("restricted voice must not be analyzed")),
+    )
+    assert recovered == ([], [], [])
+
+
+@pytest.mark.parametrize("prompt", [
+    "h3_mimo25_speech_assembly_v49", "h3_mimo26_ra2va_single_v10_speaker_subject_consistency",
+])
+def test_two_step_identity_restriction_does_not_change_other_modes(tmp_path, prompt):
+    from types import SimpleNamespace
+
+    args = _fixture(tmp_path)
+    payload = args["annotation"].model_dump(mode="json")
+    for grounding in payload["av_grounding"]["segment_groundings"]:
+        grounding["evidence_codes"] = ["voice_continuity"]
+    args["annotation"] = MimoAVAnnotationDraft.model_validate(payload)
+    manifest = reuse.build_audio_reuse_assets(**args, backend_provenance=SimpleNamespace(prompt_version=prompt))
+    assert len(manifest.speakers) == 1
+    assert not manifest.exclusions
+
+
 def test_multiple_short_intervals_preserve_exact_samples_and_silence(tmp_path, monkeypatch):
     from r2v_data_v2.h3 import mimo25_recovered_voice
 

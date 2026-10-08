@@ -21,6 +21,7 @@ from r2v_data_v2.h3.mimo25_backend import (
     MimoBackendFailure,
     MimoBackendJob,
     MimoBackendProvenance,
+    MimoBackendResult,
     MimoCompletionDiagnostic,
     MimoSpeakerMarkerPolishAudit,
     MimoSpeakerVoiceProfile,
@@ -45,13 +46,17 @@ from r2v_data_v2.h3.mimo25_backend import (
 )
 from r2v_data_v2.h3.mimo25_stem_shadow import StemAwareOpenAIMimo25Backend
 from r2v_data_v2.h3.schemas import SchemaModel
+from r2v_data_v2.h3.speaker_ownership import (
+    speaker_ownership_reasons,
+    unconfirmed_visible_binding_segments,
+)
 from r2v_data_v2.structured_output import (
     ValidationIssue,
     normalize_structured_json_envelope,
     parse_structured_json_issues,
 )
 
-TWO_STEP_BACKEND_VERSION = "r2v.h3.mimo25_backend.83"
+TWO_STEP_BACKEND_VERSION = "r2v.h3.mimo25_backend.84"
 TWO_STEP_PROMPT_VERSION = "h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity"
 JOINT_INPUT_MODALITY = "target_video_joint_av_audio"
 
@@ -299,6 +304,43 @@ def _normalize_joint_draft(
     assembly.shot1_caption = caption
 
 
+def _normalize_unambiguous_speaker_markers(annotation: MimoAVAnnotationDraft, job: MimoBackendJob) -> int:
+    speech = direct_speech_facts(annotation, list(job.segments))
+    groups = {d.primary_speaker_group for d in annotation.audio_observation.segment_decisions
+              if d.primary_speaker_group is not None}
+    transcribed_ids = {fact["segment_id"] for fact in speech}
+    transcribed_groups = {d.primary_speaker_group for d in annotation.audio_observation.segment_decisions
+                          if d.segment_id in transcribed_ids}
+    if groups != transcribed_groups or any(
+        speaker_ownership_reasons(d) for d in annotation.audio_observation.segment_decisions if d.segment_id in transcribed_ids
+    ):
+        return 0
+    caption = annotation.h3_semantics.shot1_caption
+    blocks = list(_DIALOGUE.finditer(caption))
+    if len(blocks) != len(speech):
+        return 0
+    known = {fact["speaker_id"] for fact in speech}
+    markers = re.compile(r"\(S[1-9]\d*\)")
+    edits = []
+    previous_end = 0
+    for block, fact in zip(blocks, speech, strict=True):
+        lead_in = caption[previous_end:block.start()]
+        for marker in markers.finditer(lead_in):
+            if marker.group()[1:-1] in known:
+                continue
+            # Only an explicit dialogue lead-in; unrelated narrative markers stay hard errors.
+            if not re.fullmatch(r"\s*(?:(?:says|asks|replies|adds|continues)[,:]?\s*)?", lead_in[marker.end():]):
+                return 0
+            edits.append((previous_end + marker.start(), previous_end + marker.end(), f"({fact['speaker_id']})"))
+        previous_end = block.end()
+    if any(marker.group()[1:-1] not in known for marker in markers.finditer(caption[previous_end:])):
+        return 0
+    for start, end, marker in reversed(edits):
+        caption = caption[:start] + marker + caption[end:]
+    annotation.h3_semantics.shot1_caption = caption
+    return len(edits)
+
+
 class TwoStepOpenAIMimo26Backend(StemAwareOpenAIMimo25Backend):
     def __init__(self, config: MimoBackendConfig, **kwargs: Any) -> None:
         if config.transport != "sglang":
@@ -317,6 +359,34 @@ class TwoStepOpenAIMimo26Backend(StemAwareOpenAIMimo25Backend):
         MimoAVAnnotationDraft, MimoSpeakerMarkerPolishAudit, None,
     ]:
         return annotation, MimoSpeakerMarkerPolishAudit(), None
+
+    def reconcile(self, job: MimoBackendJob, **kwargs: Any) -> MimoBackendResult:
+        try:
+            return super().reconcile(job, **kwargs)
+        except MimoBackendFailure as exc:
+            if exc.annotation is None or not exc.issues:
+                raise
+            segments = unconfirmed_visible_binding_segments(exc.annotation)
+            if any(issue.code != "visible_entity_binding_not_permitted" or issue.field not in segments for issue in exc.issues):
+                raise
+            exc.diagnostics[-1].warnings.extend(
+                f"visible_entity_binding_missing_positive_cue:{segment}:identity_publication_restricted"
+                for segment in sorted(segments)
+            )
+            corrections = {}
+            for diagnostic in exc.diagnostics:
+                for warning in diagnostic.warnings:
+                    if warning.startswith("deterministic_correction_count:"):
+                        key, count = warning.removeprefix("deterministic_correction_count:").rsplit("=", 1)
+                        corrections[key] = int(count)
+            return MimoBackendResult(
+                annotation=exc.annotation, raw_responses=exc.raw_responses, diagnostics=exc.diagnostics,
+                model_call_count=exc.model_call_count, http_attempt_count=exc.http_attempt_count,
+                http_retry_count=0, recheck_count=0, input_modality=self._input_modality,
+                visual_model_call_count=exc.visual_model_call_count, visual_raw_response=exc.visual_raw_response,
+                speech_av_raw_response=exc.speech_av_raw_response,
+                deterministic_correction_counts=corrections,
+            )
 
     def _prompt(self, job: MimoBackendJob, *, allowed_reference_labels: set[str]) -> str:
         prefix, encoded = super()._prompt(job, allowed_reference_labels=allowed_reference_labels).split("AUTHORITATIVE INPUT:\n", 1)
@@ -478,7 +548,8 @@ class TwoStepOpenAIMimo26Backend(StemAwareOpenAIMimo25Backend):
                     issues=tuple(issues),
                 )
             # Expose identity contradictions before the shared normalizer can merge gN.
-            identity_issues = [issue for issue in validate_annotation(
+            review_segments = unconfirmed_visible_binding_segments(annotation)
+            strict_issues = [issue for issue in validate_annotation(
                 annotation, segment_ids=[s.segment_id for s in job.segments],
                 segment_intervals={s.segment_id: (s.start_time, s.end_time) for s in job.segments},
                 transcribed_segment_ids=[s.segment_id for s in job.segments if s.asr_status == "transcribed"],
@@ -487,17 +558,27 @@ class TwoStepOpenAIMimo26Backend(StemAwareOpenAIMimo25Backend):
                 allowed_reference_labels=allowed_reference_labels, reference_subjects=job.reference_subjects,
                 target_duration_seconds=job.target_duration_seconds,
                 binding_evidence_mode=getattr(job, "binding_evidence_mode", "legacy_lr_asd"),
-            ) if issue.code in {"visible_entity_speaker_group_contradiction", "speaker_group_entity_contradiction"}]
-            if identity_issues:
+            ) if issue.code in {
+                "visible_entity_speaker_group_contradiction", "speaker_group_entity_contradiction",
+                "visible_entity_absent_from_visual_segment", "unknown_entity", "av_audio_speaker_group_mismatch",
+                "visible_speaker_evidence_presentation_contradiction", "visible_entity_requires_resolved_audio",
+            } or (issue.code == "visible_entity_binding_not_permitted"
+                  and issue.field not in review_segments)]
+            if strict_issues:
                 _, marker_issues, marker_warnings = protect_direct_dialogue(
                     annotation.h3_semantics.shot1_caption, direct_speech_facts(annotation, list(job.segments)),
                     allowed_labels=allowed_reference_labels,
                 )
                 diagnostics[-1].warnings.extend(marker_warnings)
                 raise MimoBackendFailure(
-                    code="mimo_structured_output_failed", reason="MiMo joint speaker identity contradiction",
-                    issues=(*identity_issues, *marker_issues), annotation=annotation,
+                    code="mimo_structured_output_failed", reason="MiMo joint speaker binding contradiction",
+                    issues=(*strict_issues, *marker_issues), annotation=annotation,
                 )
+            marker_count = _normalize_unambiguous_speaker_markers(annotation, job)
+            if marker_count:
+                corrections["joint_unambiguous_speaker_marker_corrected"] += marker_count
+                final = annotation.model_dump(mode="json")
+                diagnostics[-1].warnings.append("joint_speaker_marker_only_correction:review_voice_source_narration")
             audit_corrections()
             return _compact_json(final), tuple(raws), diagnostics, dict(corrections)
         except Exception as exc:

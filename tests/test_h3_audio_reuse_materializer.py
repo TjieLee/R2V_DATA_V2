@@ -328,6 +328,42 @@ def test_repeated_speaker_relation_only_at_first_speech_and_offscreen_no_entity(
     assert prompt.count("<d>[English] Exact, text!</d>") == 2
 
 
+@pytest.mark.parametrize("external_speaker", [None, "S1"])
+def test_two_step_qa_binding_cannot_publish_identity_audio_but_full_audio_stays_available(tmp_path, external_speaker):
+    from types import SimpleNamespace
+
+    from r2v_data_v2.h3.mimo25_h3_materializer import MimoH3MaterializationContractError
+
+    _, sample, source = _case(tmp_path)
+    payload = source.record.annotation.model_dump(mode="json")
+    payload["av_grounding"]["segment_groundings"][0]["evidence_codes"] = ["voice_continuity"]
+    payload["visual_observation"]["segment_views"][0]["entity_observations"][0]["speech_correlated_articulation"] = "not_assessable"
+    annotation = MimoAVAnnotationDraft.model_validate(payload)
+    # Cached reuse assets also cannot bypass the opt-in publication restriction.
+    record = source.record.model_copy(update={
+        "annotation": annotation,
+        "source_backend_provenance": SimpleNamespace(prompt_version="h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity"),
+    })
+    source = product.ValidatedReuseSource(source.job, record, source.manifest, source.manifest_path, source.manifest_sha256)
+    refs, warnings = product.select_reuse_audio(sample, source, {source.job.clip_uid: source})
+    assert refs == []
+    assert "g1:identity_publication_restricted" in warnings
+    with pytest.raises(MimoH3MaterializationContractError, match="unconfirmed_visible_identity_publication"):
+        _materialize_sample(sample, source.job, record, conditioning_variant="target_voice_reference")
+    cached_voice = source.manifest.speakers[0]
+    voice = RecaptionAudioContract(audio_index=1, audio_label="<Audio 1>", kind="target_voice",
+        path=cached_voice.output_path, sha256=cached_voice.output_sha256, retention_marker="reference",
+        subject_label="<Subject 1>", entity_id="e1", speaker_id=external_speaker)
+    with pytest.raises(MimoH3MaterializationContractError, match="unconfirmed_visible_identity_publication"):
+        _materialize_sample(sample, source.job, record, extra_audio_contract=voice)
+    full = RecaptionAudioContract(audio_index=1, audio_label="<Audio 1>", kind="full_audio_reuse",
+        path=source.job.target_full_audio_path, sha256=source.job.target_full_audio_sha256, retention_marker="fully_copy")
+    _, prompt, warnings = _materialize_sample(sample, source.job, record, conditioning_variant="full_audio_reuse", extra_audio_contract=full)
+    assert "<d>[English] Exact, text!</d>" in prompt
+    assert "g1:identity_publication_restricted" in warnings
+    assert annotation.av_grounding.model_dump(mode="json") == payload["av_grounding"]
+
+
 @pytest.mark.parametrize("composition,allowed", [("same_speaker_nonlexical", True), ("secondary_non_speech_vocalization", False)])
 def test_same_speaker_nonlexical_reuse_but_legacy_voice_unchanged(tmp_path, composition, allowed):
     _, sample, source = _case(tmp_path, composition=composition)
@@ -366,6 +402,38 @@ def test_cross_donor_profile_signal_and_mixed_music_ownership(tmp_path, donor_pr
     refs, warnings = product.select_reuse_audio(sample, source, {source.job.clip_uid: source})
     assert [r.contract.kind for r in refs] == ["music_reuse"]
     assert "S1:donor_reuse_unavailable" in warnings
+
+
+@pytest.mark.parametrize("restricted", [False, True])
+def test_legacy_cross_pair_respects_two_step_donor_publication_scope(tmp_path, restricted):
+    from types import SimpleNamespace
+
+    from r2v_data_v2.h3.mimo25_h3_materializer import MimoH3MaterializationContractError
+
+    _, sample, target = _case(tmp_path / "target")
+    _, _, donor = _case(tmp_path / "donor", clip="donor")
+    if restricted:
+        payload = donor.record.annotation.model_dump(mode="json")
+        payload["av_grounding"]["segment_groundings"][0]["evidence_codes"] = ["voice_continuity"]
+        donor_record = donor.record.model_copy(update={
+            "annotation": MimoAVAnnotationDraft.model_validate(payload),
+            "source_backend_provenance": SimpleNamespace(prompt_version="h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity"),
+        })
+        donor = product.ValidatedReuseSource(donor.job, donor_record, donor.manifest, donor.manifest_path, donor.manifest_sha256)
+    values = sample.model_dump(mode="json")
+    values["pair_type"] = "cross_pair"
+    values["subject_voices"][0].update(voice_source="cross_donor", donor_clip_uid="donor",
+        donor_occurrence_id="donor/e1", donor_clip_display_path="01/show/donor")
+    sample = FinalH3SampleV2.model_validate(values)
+    refs, _ = product.select_reuse_audio(sample, target, {"donor": donor})
+    assert len(refs) == (0 if restricted else 1)
+    kwargs = {"donor_records_by_clip": {"donor": donor.record}}
+    if restricted:
+        with pytest.raises(MimoH3MaterializationContractError, match="unconfirmed_visible_identity_publication"):
+            _materialize_sample(sample, target.job, target.record, **kwargs)
+    else:
+        _, prompt, _ = _materialize_sample(sample, target.job, target.record, **kwargs)
+        assert "<Audio 1>" in prompt
 
 
 @pytest.mark.parametrize("kind,retention", [("full_audio_reuse", "fully_copy"), ("music_reference", "reference")])

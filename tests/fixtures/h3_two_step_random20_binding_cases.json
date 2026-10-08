@@ -1,0 +1,120 @@
+[
+  {
+    "clip_uid": "25755cbc2545bad6928c736c",
+    "target_duration_seconds": 6.17628125,
+    "subjects": [["entity", "e1", "<Picture 1>"]],
+    "segments": [
+      {"start_time": 0.0125, "end_time": 0.1925, "source_speaker_cluster_id": "speaker_0", "asr_status": "transcribed", "asr_text": "做。", "asr_language": "Chinese"},
+      {"start_time": 0.0125, "end_time": 0.6125, "source_speaker_cluster_id": "speaker_1", "asr_status": "empty", "asr_text": null, "asr_language": null},
+      {"start_time": 2.4125, "end_time": 4.5925, "source_speaker_cluster_id": "speaker_0", "asr_status": "transcribed", "asr_text": "哪里不就是看那些猪？", "asr_language": "Chinese"},
+      {"start_time": 3.2325, "end_time": 3.7125, "source_speaker_cluster_id": "speaker_1", "asr_status": "empty", "asr_text": null, "asr_language": null}
+    ],
+    "visual": {
+      "segment_views": [
+        {"segment_id": "segment_0001", "visible_entity_ids": ["e1"], "entity_observations": [{"entity_id": "e1", "visibility": "partially_visible", "orientation": "three_quarter", "face_visibility": "clear", "mouth_visibility": "clear", "speech_correlated_articulation": "not_assessable"}]},
+        {"segment_id": "segment_0002", "visible_entity_ids": ["e1"], "entity_observations": [{"entity_id": "e1", "visibility": "partially_visible", "orientation": "three_quarter", "face_visibility": "clear", "mouth_visibility": "clear", "speech_correlated_articulation": "not_assessable"}]},
+        {"segment_id": "segment_0003", "visible_entity_ids": ["e1"], "entity_observations": [{"entity_id": "e1", "visibility": "partially_visible", "orientation": "three_quarter", "face_visibility": "clear", "mouth_visibility": "clear", "speech_correlated_articulation": "not_assessable"}]},
+        {"segment_id": "segment_0004", "visible_entity_ids": ["e1"], "entity_observations": [{"entity_id": "e1", "visibility": "partially_visible", "orientation": "three_quarter", "face_visibility": "clear", "mouth_visibility": "clear", "speech_correlated_articulation": "not_assessable"}]}
+      ],
+      "subject_definitions": [{"subject_label": "<Subject 1>", "description": "A young East Asian man with short dark-brown hair swept to the side, dark eyes, and a black studded collar jacket."}],
+      "visual_retention_analysis": [{"subject_label": "<Subject 1>", "marker": "fully_preserved", "description": "The man's facial features, hairstyle, and studded jacket collar remain consistent with <Picture 1> throughout the shot."}],
+      "style_opening": "Live-action, cinematic, warm indoor lighting with a shallow depth of field.",
+      "shot1_visual_description": "A medium close-up frames <Subject 1> seated at a table in a softly lit interior, with the back of another person's head and shoulder blurred in the right foreground. He looks down toward the table, his expression quiet and focused, then lifts a pair of chopsticks carrying a small piece of food toward his mouth. He takes the bite, chews slowly, and glances briefly toward the person across from him before returning his gaze downward. The camera remains static with a shallow depth of field, keeping him in sharp focus while the foreground figure and pale wall behind him stay softly blurred."
+    },
+    "joint": {
+      "speech_av": {
+        "summary": "The clip shows <Subject 1> eating at a table while two short Chinese dialogue lines are spoken, with the vocal source not reliably attributable to a visible entity.",
+        "audio_observation": {"segment_decisions": [
+          {"segment_id": "segment_0001", "vocal_composition": "single_speaker", "resolution": "uncertain", "primary_speaker_group": "g1", "delivery_style": "short, abrupt utterance", "secondary_vocal_activity": {"present": false, "speaker_relation": "none", "kind": null}, "confidence": "low", "audio_evidence_codes": ["voice_continuity"]},
+          {"segment_id": "segment_0002", "vocal_composition": "single_speaker", "resolution": "uncertain", "primary_speaker_group": "g2", "delivery_style": null, "secondary_vocal_activity": {"present": false, "speaker_relation": "none", "kind": null}, "confidence": "low", "audio_evidence_codes": ["voice_continuity"]},
+          {"segment_id": "segment_0003", "vocal_composition": "single_speaker", "resolution": "uncertain", "primary_speaker_group": "g1", "delivery_style": "conversational, questioning tone", "secondary_vocal_activity": {"present": false, "speaker_relation": "none", "kind": null}, "confidence": "low", "audio_evidence_codes": ["voice_continuity"]},
+          {"segment_id": "segment_0004", "vocal_composition": "single_speaker", "resolution": "uncertain", "primary_speaker_group": "g2", "delivery_style": null, "secondary_vocal_activity": {"present": false, "speaker_relation": "none", "kind": null}, "confidence": "low", "audio_evidence_codes": ["voice_continuity"]}
+        ]},
+        "av_grounding": {"segment_groundings": [
+          {"segment_id": "segment_0001", "primary_speaker_group": "g1", "binding_status": "no_reliable_entity", "speech_presentation": "uncertain", "entity_id": null, "confidence": "low", "evidence_codes": ["no_visible_lip_motion", "av_temporal_alignment"]},
+          {"segment_id": "segment_0002", "primary_speaker_group": "g2", "binding_status": "no_reliable_entity", "speech_presentation": "uncertain", "entity_id": null, "confidence": "low", "evidence_codes": ["no_visible_lip_motion"]},
+          {"segment_id": "segment_0003", "primary_speaker_group": "g1", "binding_status": "no_reliable_entity", "speech_presentation": "uncertain", "entity_id": null, "confidence": "low", "evidence_codes": ["no_visible_lip_motion", "av_temporal_alignment"]},
+          {"segment_id": "segment_0004", "primary_speaker_group": "g2", "binding_status": "no_reliable_entity", "speech_presentation": "uncertain", "entity_id": null, "confidence": "low", "evidence_codes": ["no_visible_lip_motion"]}
+        ]},
+        "shot1_caption": "A medium close-up frames <Subject 1> seated at a table in a softly lit interior, with the back of another person's head and shoulder blurred in the right foreground. He looks down toward the table, his expression quiet and focused, then lifts a pair of chopsticks carrying a small piece of food toward his mouth. A voice (S1) says, <d>[Chinese] 做。</d> He takes the bite, chews slowly, and glances briefly toward the person across from him before returning his gaze downward. Another voice (S2) asks, <d>[Chinese] 哪里不就是看那些猪？</d> The camera remains static with a shallow depth of field, keeping him in sharp focus while the foreground figure and pale wall behind him stay softly blurred.",
+        "warnings": [{"code": "possible_asr_conflict", "segment_id": "segment_0003"}, {"code": "possible_asr_conflict", "segment_id": "segment_0001"}]
+      },
+      "speaker_voice_profiles": [
+        {"speaker_group": "g1", "voice_characteristics": "A mid-to-low register voice with a slightly breathy, relaxed timbre, speaking at a moderate pace with a casual, conversational cadence."},
+        {"speaker_group": "g2", "voice_characteristics": "A mid-register voice with a soft, slightly muffled timbre, delivered at a moderate pace with a subdued, even energy."}
+      ],
+      "audio_finalize": {
+        "overall_soundscape": "Quiet indoor room tone with faint ambient presence and subtle physical sounds of eating, including light utensil movement.",
+        "non_diegetic_music": "A gentle, slow-tempo piano melody plays softly in the background, creating a calm and reflective atmosphere."
+      }
+    }
+  },
+  {
+    "clip_uid": "4e0506dfb9454536cc3c37b1",
+    "target_duration_seconds": 4.76021875,
+    "subjects": [["entity", "e1", "<Picture 1>"], ["background", null, "<Picture 2>"]],
+    "segments": [{"start_time": 1.2725, "end_time": 4.76021875, "source_speaker_cluster_id": "speaker_0", "asr_status": "transcribed", "asr_text": "哎，宁愿陪一帮老男人在里边喝酒，也不愿意陪我多待。", "asr_language": "Chinese"}],
+    "visual": {
+      "segment_views": [{"segment_id": "segment_0001", "visible_entity_ids": ["e1"], "entity_observations": [{"entity_id": "e1", "visibility": "visible", "orientation": "three_quarter", "face_visibility": "clear", "mouth_visibility": "clear", "speech_correlated_articulation": "not_assessable"}]}],
+      "subject_definitions": [
+        {"subject_label": "<Subject 1>", "description": "A young East Asian man with short wavy black hair, wearing a green-and-white striped t-shirt and a thin silver necklace."},
+        {"subject_label": "<Subject 2>", "description": "A dimly lit indoor bar or restaurant interior with a wooden counter, warm bokeh lights, and a chandelier in the background."}
+      ],
+      "visual_retention_analysis": [
+        {"subject_label": "<Subject 1>", "marker": "fully_preserved", "description": "The man's facial features, hairstyle, striped shirt, and necklace are consistently maintained across the shot."},
+        {"subject_label": "<Subject 2>", "marker": "fully_preserved", "description": "The background bar setting with its wooden counter, warm lighting, and bokeh lights remains consistent throughout."}
+      ],
+      "style_opening": "The video uses a realistic cinematic style with warm, low-key indoor lighting and a shallow depth of field.",
+      "shot1_visual_description": "The shot opens on a medium close-up of <Subject 1>, the young man in the green-and-white striped t-shirt, seated in a dimly lit bar setting defined by <Subject 2>. He is positioned on the right side of the frame, angled slightly toward the left, while a woman with shoulder-length brown hair, wearing a black tank top, sits across from him with her back mostly to the camera on the left. The background features a wooden counter, a chandelier, and warm bokeh lights. <Subject 1> looks toward the woman with a slightly open mouth and an attentive expression, then glances away to his right. He then closes his eyes briefly, tilting his head slightly, before opening them again and looking back toward the woman with a more neutral, listening expression. The camera remains static throughout the shot, maintaining a consistent medium close-up framing of the two figures."
+    },
+    "joint": {
+      "speech_av": {
+        "summary": "A single transcribed Chinese utterance is delivered by one vocal source in the bar scene, with the visible man's attentive reaction sequence preserved.",
+        "audio_observation": {"segment_decisions": [{"segment_id": "segment_0001", "vocal_composition": "single_speaker", "resolution": "resolved", "primary_speaker_group": "g1", "delivery_style": "conversational, mildly reproachful", "secondary_vocal_activity": {"present": false, "speaker_relation": "none", "kind": null}, "confidence": "high", "audio_evidence_codes": ["speaker_turn_change"]}]},
+        "av_grounding": {"segment_groundings": [{"segment_id": "segment_0001", "primary_speaker_group": "g1", "binding_status": "visible_entity", "speech_presentation": "onscreen_spoken", "entity_id": "e1", "confidence": "medium", "evidence_codes": ["av_temporal_alignment", "no_visible_lip_motion"]}]},
+        "shot1_caption": "The shot opens on a medium close-up of <Subject 1>, the young man in the green-and-white striped t-shirt, seated in a dimly lit bar setting defined by <Subject 2>. He is positioned on the right side of the frame, angled slightly toward the left, while a woman with shoulder-length brown hair, wearing a black tank top, sits across from him with her back mostly to the camera on the left. The background features a wooden counter, a chandelier, and warm bokeh lights. <Subject 1> (S1) looks toward the woman with a slightly open mouth and an attentive expression, then glances away to his right. He then closes his eyes briefly, tilting his head slightly, before opening them again and looking back toward the woman with a more neutral, listening expression. He says, <d>[Chinese] 哎，宁愿陪一帮老男人在里边喝酒，也不愿意陪我多待。</d> The camera remains static throughout the shot, maintaining a consistent medium close-up framing of the two figures.",
+        "warnings": []
+      },
+      "speaker_voice_profiles": [{"speaker_group": "g1", "voice_characteristics": "Mid-range male register with a clear, slightly nasal timbre; moderate speaking rate with a brief initial sigh-like onset, delivered in a conversational, mildly reproachful tone."}],
+      "audio_finalize": {
+        "overall_soundscape": "Indoor bar ambience with faint background chatter and subtle room reverberation.",
+        "non_diegetic_music": "A soft, slow piano melody plays quietly beneath the scene, functioning as audience-only background music."
+      }
+    }
+  },
+  {
+    "clip_uid": "009a0523c7a1332b52fcc82a",
+    "target_duration_seconds": 3.4954375,
+    "subjects": [["entity", "e1", "<Picture 1>"], ["attribute", "e1", "<Picture 2>", "hair"], ["attribute", "e1", "<Picture 3>", "upper_clothing"]],
+    "segments": [{"start_time": 1.2925, "end_time": 2.9925, "source_speaker_cluster_id": "speaker_0", "asr_status": "transcribed", "asr_text": "难道你也认为跟我结婚？", "asr_language": "Chinese"}],
+    "visual": {
+      "segment_views": [{"segment_id": "segment_0001", "visible_entity_ids": ["e1"], "entity_observations": [{"entity_id": "e1", "visibility": "visible", "orientation": "three_quarter", "face_visibility": "clear", "mouth_visibility": "clear", "speech_correlated_articulation": "not_assessable"}]}],
+      "subject_definitions": [
+        {"subject_label": "<Subject 1>", "description": "A middle-aged East Asian man with a round face, dark eyes, and a slightly open mouth, shown in a three-quarter view."},
+        {"subject_label": "<Subject 2>", "description": "Thick, tousled black hair with a slightly wavy texture and uneven fringe."},
+        {"subject_label": "<Subject 3>", "description": "A light beige short-sleeved button-down shirt with a collar, chest pocket, and visible buttons."}
+      ],
+      "visual_retention_analysis": [
+        {"subject_label": "<Subject 1>", "marker": "fully_preserved", "description": "The man's facial features, three-quarter pose, and expression are retained throughout the shot."},
+        {"subject_label": "<Subject 2>", "marker": "fully_preserved", "description": "The hair's black color, tousled texture, and fringe shape remain consistent."},
+        {"subject_label": "<Subject 3>", "marker": "fully_preserved", "description": "The shirt's beige color, collar, buttons, and chest pocket are consistently visible."}
+      ],
+      "style_opening": "Live-action, cinematic, with soft natural lighting from a window and a shallow depth of field.",
+      "shot1_visual_description": "A medium close-up shows <Subject 1>, the middle-aged man, seated on a green tufted leather booth beside a large window with black frames. He wears <Subject 3>, the light beige button-down shirt, and his <Subject 2>, thick black tousled hair, is visible. The background reveals a brick wall and a red flower outside the textured glass. The camera remains static with a shallow depth of field. The man's gaze is directed slightly off-camera to the right, his mouth slightly open as if speaking or reacting. His expression is attentive and mildly concerned. The lighting is soft and natural, coming from the window on the right, casting gentle shadows on the left side of his face. The scene maintains a consistent composition from start to finish, with no significant movement or state change."
+    },
+    "joint": {
+      "speech_av": {
+        "summary": "A single transcribed Chinese line is spoken by one vocal source; the only visible entity, <Subject 1>, is bound as the speaker with attentive, mildly concerned delivery.",
+        "audio_observation": {"segment_decisions": [{"segment_id": "segment_0001", "vocal_composition": "single_speaker", "resolution": "resolved", "primary_speaker_group": "g1", "delivery_style": "concerned, questioning tone with a slightly open mouth and attentive expression", "secondary_vocal_activity": {"present": false, "speaker_relation": "none", "kind": null}, "confidence": "high", "audio_evidence_codes": ["voice_continuity", "speaker_turn_change"]}]},
+        "av_grounding": {"segment_groundings": [{"segment_id": "segment_0001", "primary_speaker_group": "g1", "binding_status": "visible_entity", "speech_presentation": "onscreen_spoken", "entity_id": "e1", "confidence": "high", "evidence_codes": ["av_temporal_alignment", "voice_continuity", "no_visible_lip_motion"]}]},
+        "shot1_caption": "A medium close-up shows <Subject 1>, the middle-aged man, seated on a green tufted leather booth beside a large window with black frames. He wears <Subject 3>, the light beige button-down shirt, and his <Subject 2>, thick black tousled hair, is visible. The background reveals a brick wall and a red flower outside the textured glass. The camera remains static with a shallow depth of field. The man's gaze is directed slightly off-camera to the right, his mouth slightly open as if speaking or reacting. His expression is attentive and mildly concerned. <Subject 1> (S1) says, <d>[Chinese] 难道你也认为跟我结婚？</d> The lighting is soft and natural, coming from the window on the right, casting gentle shadows on the left side of his face. The scene maintains a consistent composition from start to finish, with no significant movement or state change.",
+        "warnings": []
+      },
+      "speaker_voice_profiles": [{"speaker_group": "g1", "voice_characteristics": "A mid-to-low register male voice with a slightly textured, natural timbre; the line is delivered at a moderate, conversational pace with a questioning, mildly concerned inflection and steady energy."}],
+      "audio_finalize": {
+        "overall_soundscape": "Quiet indoor room tone with a faint, low-level ambient hum; no distinct physical or environmental sound effects are present.",
+        "non_diegetic_music": "N/A"
+      }
+    }
+  }
+]

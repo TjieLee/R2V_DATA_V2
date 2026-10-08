@@ -43,7 +43,10 @@ from r2v_data_v2.h3.qwen38_h3_recaption import (
 from r2v_data_v2.h3.resolved_audio_stems import StemRecord, validate_stem_record
 from r2v_data_v2.h3.sam_audio_stem_shadow import SAMAudioStemRecord, sha256_file
 from r2v_data_v2.h3.schemas import SchemaModel
-from r2v_data_v2.h3.speaker_ownership import speaker_ownership_reasons
+from r2v_data_v2.h3.speaker_ownership import (
+    speaker_ownership_reasons,
+    two_step_identity_restricted_groups,
+)
 
 AUDIO_REUSE_MATERIALIZER_VERSION = "h3_mimo25_audio_reuse_materializer_v7"
 
@@ -206,7 +209,9 @@ def select_reuse_audio(
     """Use frozen donor mappings; speaker capacity is chronological, never quality-ranked."""
     refs: list[ReuseAudioReference] = []
     warnings = [f"{e.segment_id}:reuse_asset_excluded:{e.reason}" for e in source.manifest.exclusions]
-    targets = [(s.speaker_id, s.entity_id, s.subject_index, s) for s in source.manifest.speakers]
+    restricted = two_step_identity_restricted_groups(source.record.annotation, source.record.source_backend_provenance)
+    warnings.extend(f"{group}:identity_publication_restricted" for group in sorted(restricted))
+    targets = [(s.speaker_id, s.entity_id, s.subject_index, s) for s in source.manifest.speakers if s.speaker_group not in restricted]
     if sample.pair_type == "cross_pair":
         # Donor conditioning does not depend on the target having a usable reuse track.
         annotation = source.record.annotation
@@ -216,6 +221,7 @@ def select_reuse_audio(
         for g in annotation.segment_decisions:
             if (g.segment_id in facts and g.binding_status == "visible_entity"
                     and g.speech_presentation == "onscreen_spoken" and g.entity_id
+                    and g.primary_speaker_group not in restricted
                     and not speaker_ownership_reasons(decisions[g.segment_id])):
                 groups.setdefault(facts[g.segment_id], set()).add(g.entity_id)
         subjects = {s.entity_id: s.subject_index for s in source.job.reference_subjects if s.kind == "entity"}
@@ -246,6 +252,8 @@ def select_reuse_audio(
                 continue
             donor_entity = occurrence[len(prefix):]
             candidates = [s for s in owner.manifest.speakers if s.entity_id == donor_entity]
+            donor_restricted = two_step_identity_restricted_groups(owner.record.annotation, owner.record.source_backend_provenance)
+            candidates = [s for s in candidates if s.speaker_group not in donor_restricted]
             if len(candidates) != 1:
                 warnings.append(f"{speaker_id}:donor_speaker_reuse_not_unique")
                 continue

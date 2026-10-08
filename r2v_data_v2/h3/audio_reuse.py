@@ -28,7 +28,10 @@ from r2v_data_v2.h3.sam_audio_stem_shadow import (
     sha256_file,
 )
 from r2v_data_v2.h3.schemas import SchemaModel
-from r2v_data_v2.h3.speaker_ownership import speaker_ownership_reasons
+from r2v_data_v2.h3.speaker_ownership import (
+    speaker_ownership_reasons,
+    two_step_identity_restricted_groups,
+)
 
 SAMPLE_RATE = 32000
 SAMPLE_MAPPING_POLICY = "source_sample_rational_to_32k_round_half_even_v1"
@@ -145,6 +148,7 @@ class ReuseExclusion(SchemaModel):
         "cross_speaker_overlap", "speech_range_outside_stem",
         "speech_range_outside_target", "speaker_id_group_inconsistent",
         "conflicting_entity_provenance", "nonpositive_mapped_range",
+        "unconfirmed_visible_identity",
     ]
 
 
@@ -230,6 +234,7 @@ def build_audio_reuse_assets(
     *, job: MimoClipJob, annotation: MimoAVAnnotationDraft,
     stem_record: StemRecord, audio_production_root: Path,
     output_root: Path, allow_unverified: bool = False,
+    backend_provenance: object | None = None,
 ) -> AudioReuseManifest:
     """Build one clip into a NEW caller-owned shadow directory, never overwrite.
 
@@ -279,6 +284,7 @@ def build_audio_reuse_assets(
     ids = [s.segment_id for s in job.segments]
     decisions = annotation.audio_observation.segment_decisions
     groundings = annotation.av_grounding.segment_groundings
+    identity_restricted = two_step_identity_restricted_groups(annotation, backend_provenance)
     if [d.segment_id for d in decisions] != ids or [g.segment_id for g in groundings] != ids:
         raise AudioReuseIntegrityError("audio_reuse_segment_inventory_mismatch")
     if any(d.primary_speaker_group != g.primary_speaker_group
@@ -303,6 +309,8 @@ def build_audio_reuse_assets(
 
     for segment, decision, grounding in zip(job.segments, decisions, groundings, strict=True):
         group = decision.primary_speaker_group
+        if group in identity_restricted:
+            exclude(segment.segment_id, "unconfirmed_visible_identity", block_group=True)
         ownership_reasons = speaker_ownership_reasons(decision)
         if not ownership_reasons and grounding.binding_status == "visible_entity" and grounding.entity_id is not None:
             group_entities.setdefault(group, set()).add(grounding.entity_id)

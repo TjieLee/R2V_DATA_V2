@@ -62,6 +62,7 @@ from r2v_data_v2.h3.qwen38_h3_recaption import (
     render_h3_prompt,
 )
 from r2v_data_v2.h3.schemas import SchemaModel
+from r2v_data_v2.h3.speaker_ownership import two_step_identity_restricted_groups
 from r2v_data_v2.h3.speech_presentation import SpeechPresentation
 from r2v_data_v2.structured_output import ValidationIssue
 
@@ -842,8 +843,11 @@ def _prepare_materialization_context(
     conditioning_variant: ConditioningVariant | None = None,
     extra_audio_contract: RecaptionAudioContract | None = None,
     reuse_audio_contracts: Sequence[RecaptionAudioContract] | None = None,
+    donor_records_by_clip: Mapping[str, FrozenAnnotationSource] | None = None,
 ) -> _MaterializationContext:
     assert record.annotation is not None
+    provenance = getattr(record, "source_backend_provenance", getattr(record, "backend_provenance", None))
+    restricted = two_step_identity_restricted_groups(record.annotation, provenance)
     transcribed_ids = [item.segment_id for item in job.segments if item.asr_status == "transcribed"]
     blocked = [item.segment_id for item in record.annotation.audio_observation.segment_decisions
                if item.segment_id in transcribed_ids and item.vocal_composition in {
@@ -860,6 +864,7 @@ def _prepare_materialization_context(
         reference_selection=job.reference_selection,
     )
     corrected, warnings = _corrected_segments(projected_sample, job, record)
+    warnings.extend(f"{group}:identity_publication_restricted" for group in sorted(restricted))
     corrected_payload = projected_sample.model_dump(mode="python")
     corrected_payload["speech_segments"] = [
         item.model_dump(mode="python") for item in corrected
@@ -888,6 +893,28 @@ def _prepare_materialization_context(
             **contract.model_dump(mode="json"),
             "audios": [audio.model_dump(mode="json") for audio in reuse_audio_contracts],
         })
+    speaker_ids = _speaker_ids(corrected)
+    blocked_speakers = {speaker_ids[group] for group in restricted if group in speaker_ids}
+    blocked_entities = {g.entity_id for g in record.annotation.av_grounding.segment_groundings
+                        if g.primary_speaker_group in restricted and g.entity_id is not None}
+    if any(audio.speaker_id in blocked_speakers or audio.entity_id in blocked_entities for audio in contract.audios):
+        raise MimoH3MaterializationContractError([ValidationIssue(
+            "unconfirmed_visible_identity_publication", "audios", "QA-only Two-step binding cannot condition identity-specific Audio",
+        )])
+    for voice in sample.subject_voices:
+        if voice.voice_source != "cross_donor" or not any(audio.entity_id == voice.entity_id for audio in contract.audios):
+            continue
+        donor = (donor_records_by_clip or {}).get(voice.donor_clip_uid)
+        if donor is None or donor.annotation is None:
+            continue
+        provenance = getattr(donor, "source_backend_provenance", getattr(donor, "backend_provenance", None))
+        donor_restricted = two_step_identity_restricted_groups(donor.annotation, provenance)
+        if any(g.primary_speaker_group in donor_restricted
+               and voice.donor_occurrence_id == f"{voice.donor_clip_uid}/{g.entity_id}"
+               for g in donor.annotation.av_grounding.segment_groundings):
+            raise MimoH3MaterializationContractError([ValidationIssue(
+                "unconfirmed_visible_identity_publication", "audios", "QA-only Two-step donor cannot condition identity-specific Audio",
+            )])
     return _MaterializationContext(corrected_sample, corrected, warnings, variant, contract)
 
 
@@ -899,10 +926,12 @@ def _materialize_sample(
     conditioning_variant: ConditioningVariant | None = None,
     extra_audio_contract: RecaptionAudioContract | None = None,
     reuse_audio_contracts: Sequence[RecaptionAudioContract] | None = None,
+    donor_records_by_clip: Mapping[str, FrozenAnnotationSource] | None = None,
 ) -> tuple[list[FinalQwen3SpeechSegment], str, list[str]]:
     context = _prepare_materialization_context(
         sample, job, record, conditioning_variant=conditioning_variant,
         extra_audio_contract=extra_audio_contract, reuse_audio_contracts=reuse_audio_contracts,
+        donor_records_by_clip=donor_records_by_clip,
     )
     corrected_sample, corrected = context.sample, context.corrected
     warnings, variant, contract = context.warnings, context.variant, context.contract
@@ -1497,7 +1526,7 @@ def materialize_mimo25_h3_shadow(
                             and item.status == "selected"
                         ]
                     corrected, rendered, warnings = _materialize_sample(
-                        render_sample, job, mimo_record
+                        render_sample, job, mimo_record, donor_records_by_clip=record_by_clip,
                     )
                     warning_counts.update(warnings)
                     values = {

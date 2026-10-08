@@ -193,6 +193,7 @@ def finalize_audio_reuse_shadow(
                 job=job, annotation=record.annotation, stem_record=stems_by_clip[job.clip_uid],
                 audio_production_root=paths.root, output_root=roots["assets"] / job.clip_uid,
                 allow_unverified=allow_unverified,
+                backend_provenance=record.source_backend_provenance,
             ))
     prepared = prepare_audio_reuse_sources(
         audio_production_root=paths.root, visual_production_root=visual_production_root,

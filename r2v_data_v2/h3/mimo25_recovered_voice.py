@@ -30,7 +30,10 @@ from r2v_data_v2.h3.mimo25_backend import (
     MimoAVSegmentGrounding,
 )
 from r2v_data_v2.h3.schemas import SchemaModel
-from r2v_data_v2.h3.speaker_ownership import speaker_ownership_reasons
+from r2v_data_v2.h3.speaker_ownership import (
+    speaker_ownership_reasons,
+    two_step_identity_restricted_groups,
+)
 from r2v_data_v2.h3.voice_quality import _audio_metrics
 
 RECOVERED_VOICE_POLICY_VERSION = "h3_mimo25_recovered_voice_quality_v1"
@@ -417,10 +420,12 @@ def recover_mimo_target_voices(
     groundings = {
         item.segment_id: item for item in record.annotation.av_grounding.segment_groundings
     }
+    restricted = two_step_identity_restricted_groups(record.annotation, getattr(record, "backend_provenance", None))
     candidate_segments = [
         segment
         for segment in job.segments
         if groundings[segment.segment_id].entity_id is not None
+        and audio_decisions[segment.segment_id].primary_speaker_group not in restricted
         and groundings[segment.segment_id].entity_id not in existing_entity_ids
     ]
     if not candidate_segments:

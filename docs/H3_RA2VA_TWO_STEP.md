@@ -439,13 +439,14 @@ from types import SimpleNamespace
 from r2v_data_v2.h3.mimo25_av_reconcile import MimoClipJob
 from r2v_data_v2.h3.mimo25_backend import MimoBackendConfig, MimoBackendFailure, MimoVisualDraft
 from r2v_data_v2.h3.mimo26_two_step_backend import TwoStepOpenAIMimo26Backend, _canonicalize_two_step_visual_payload
+from r2v_data_v2.h3.speaker_ownership import two_step_identity_restricted_groups
 from r2v_data_v2.structured_output import parse_structured_json_issues
 
 root = Path(sys.argv[1])
 jobs = [MimoClipJob.model_validate(j) for j in json.loads((root / "source_contract.json").read_text())["jobs"]]
 records = {r["clip_uid"]: r for r in map(json.loads, (root / "records.jsonl").read_text().splitlines())}
-selected = {"02750d804022e9e8ba5f2964", "aed328a5a4eb2ff45d0d4d66",
-            "86ca3660f631858590d00852", "aa28e97595dd82cbdc96457e"}
+selected = {uid for uid, row in records.items() if row["status"] == "failed"}
+reports = []
 
 class ReplayMedia:
     mode, media_root, media_base_url = "http", Path.cwd(), "http://cached.invalid/"
@@ -485,8 +486,22 @@ for job in jobs:
         except MimoBackendFailure as exc:
             result = exc
             report.update(status="failed", failure_reason=exc.reason, issues=[i.to_dict() for i in exc.issues])
+            report["correction_counts"] = {w.split(":", 1)[1].rsplit("=", 1)[0]: int(w.rsplit("=", 1)[1])
+                for d in result.diagnostics for w in d.warnings if w.startswith("deterministic_correction_count:")}
         report["qa_warnings"] = [w for d in result.diagnostics for w in d.warnings]
+        report["identity_publication_restricted_groups"] = sorted(
+            two_step_identity_restricted_groups(result.annotation, backend.provenance)
+        ) if result.annotation is not None else []
+        report["qa_only_binding"] = report["status"] == "cached_backend_validation_ready" and bool(
+            report["identity_publication_restricted_groups"]
+        )
+    reports.append(report)
     print(json.dumps(report, ensure_ascii=False))
+print(json.dumps({"original_failed_count": len(reports), "actual_model_calls": 0,
+    "safe_cached_recoveries": sum(r["status"] == "cached_backend_validation_ready" for r in reports),
+    "qa_only_binding_recoveries": sum(r.get("qa_only_binding", False) for r in reports),
+    "partial_visual_replays": sum(r["status"] == "visual_schema_passed_joint_missing" for r in reports),
+    "remaining_failures": sum(r["status"] in {"failed", "visual_failed"} for r in reports)}))
 PY
 ```
 
@@ -504,7 +519,7 @@ unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
 export NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost
 export MIMO_API_KEY="${MIMO_API_KEY:-local-no-key}"
 OLD="$SHADOW/mimo_v26_ra2va_two_step_joint_v2_random20"
-OUT="$SHADOW/mimo_v26_ra2va_two_step_joint_v2_format2_recheck"
+OUT="$SHADOW/mimo_v26_ra2va_two_step_joint_v2_format2_recheck_v84"
 .venv/bin/python - "$OLD" "$OUT" <<'PY'
 import json, os, sys, time
 from pathlib import Path
@@ -544,3 +559,53 @@ jq '{clip_uid,status,model_call_count,failure_reason,failure_issues,diagnostics}
 The viewer overlays the two new records for review only; the original Random20
 directory remains unchanged. Correction counts and QA warnings are in
 `diagnostics`; both real raw responses and annotation remain in `records.jsonl`.
+
+## Two-step review-only binding policy (.84)
+
+Joint v2, Visual v5 and both request messages remain unchanged. The common
+validator remains strict for Multi and Single. Two-step can now retain a visible
+binding as QA-only when the entity is present in the exact visual segment, the
+model says `onscreen_spoken`, and only a positive AV cue is missing. Explicit
+negative/source evidence, competing articulation, absent entities, group/entity
+conflicts, non-isolated speakers and frozen ASR mismatches are not waived.
+Profiles may remain nullable. No evidence, entity, group or speaker is invented.
+Diagnostics include `visible_entity_binding_missing_positive_cue:<segment>:`
+`identity_publication_restricted`.
+
+QA-only bindings do not authorize identity-specific Audio products. The existing
+reuse asset builder excludes the entire affected group with
+`unconfirmed_visible_identity`; target and cross-donor selection also exclude
+cached assets from that group. The legacy recovered-voice path skips it. The H3
+Audio publication boundary rejects a voice contract conditioning that speaker
+or entity with `unconfirmed_visible_identity_publication`, including legacy
+cross-donor voices using the already-loaded donor records. Full target audio and music
+remain available. No annotation/schema, caption renderer or waveform ownership
+rule changes; this opt-in policy does not apply to Multi/Single provenance.
+
+Unknown caption markers are corrected only in an immediate dialogue lead-in
+whose exact frozen transcript uniquely determines Sx, with isolated ownership
+and no additional non-transcribed acoustic group. Corrections affect only the
+parenthesized marker, not dialogue, prose, binding or gN, and are counted as
+`joint_unambiguous_speaker_marker_corrected`. Voice-source narration remains QA.
+Unrelated/ambiguous markers stay hard errors.
+
+Three additional user-supplied response payloads and frozen facts are retained
+in `h3_two_step_random20_binding_cases.json`, without media paths/fingerprints.
+They do **not** satisfy the relaxed policy:
+
+| Clip | CPU result |
+| --- | --- |
+| `4e0506dfb9454536cc3c37b1` | Still `visible_entity_binding_not_permitted`: raw explicitly includes `no_visible_lip_motion`, even though alignment is present. |
+| `009a0523c7a1332b52fcc82a` | Same explicit negative evidence; high model confidence does not override it. |
+| `25755cbc2545bad6928c736c` | Still `direct_unknown_speaker: S2`: raw contains actual non-transcribed g2 activity and says "Another voice". No unique marker-only repair; g1/g2 and all Audio/AV decisions stay unchanged. Existing g2 Profile exclusion is audited and raw retains its acoustic traits. |
+
+Across the seven supplied payloads, five have both responses: one complete
+cached validation passes (`aed328`), four remain failed. Two have only Visual
+raw and pass Visual schema, not full-clip validation. None of the supplied full
+cases is restored by downgrading a binding error to QA. The reported `cd694c`
+ASR mismatch and `ecfb50` acoustic contradiction remain hard errors; their raw
+was not supplied locally. Do not claim a revised full Random20 ready count.
+Use the all-failed CPU replay above against the server's original records for
+the complete nine-case report before any new model test. Historical `.80` to
+`.83` provenance remains readable. No model calls, media scans or training
+exports are performed by replay.
