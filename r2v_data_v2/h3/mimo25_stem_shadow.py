@@ -1729,7 +1729,27 @@ class MimoStemReconcileRecord(SchemaModel):
             "h3_mimo26_ra2va_single_v10_action_icl_ab_v2",
             "h3_mimo26_ra2va_single_v11_compact3_audio_av",
         }
-        if single_call:
+        if self.backend_provenance.prompt_version == "h3_mimo26_ra2va_two_step_joint_v1":
+            joint_turns = [d.input_modality for d in self.diagnostics]
+            expected_joint_turns = ["target_video_visual_only", "target_video_joint_av_audio"]
+            invalid_calls = (
+                joint_turns != expected_joint_turns[:len(joint_turns)]
+                or len(joint_turns) != self.model_call_count
+                or self.visual_model_call_count != joint_turns.count("target_video_visual_only")
+                or self.av_model_call_count != joint_turns.count("target_video_joint_av_audio")
+                or self.audio_model_call_count != 0 or self.text_model_call_count != 0
+                or self.speaker_profile_raw_response is not None
+                or self.audio_finalize_raw_response is not None
+                or (self.visual_raw_response is not None and not joint_turns)
+                or (self.speech_av_raw_response is not None and len(joint_turns) != 2)
+                or (len(joint_turns) == 2 and self.visual_raw_response is None)
+                or self.raw_responses != [raw for raw in (self.visual_raw_response, self.speech_av_raw_response) if raw is not None]
+                or (self.status == "ready" and (
+                    joint_turns != expected_joint_turns
+                    or self.visual_raw_response is None or self.speech_av_raw_response is None
+                ))
+            )
+        elif single_call:
             invalid_calls = (
                 self.model_call_count not in {0, 1}
                 or self.av_model_call_count != self.model_call_count

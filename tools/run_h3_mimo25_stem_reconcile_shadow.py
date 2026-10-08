@@ -30,6 +30,7 @@ from r2v_data_v2.h3.mimo25_stem_shadow import (
     run_mimo25_stem_reconcile_shadow,
     usable_stem_reconcile_inventory,
 )
+from r2v_data_v2.h3.mimo26_two_step_backend import TwoStepOpenAIMimo26Backend
 from r2v_data_v2.h3.resolved_audio_stems import (
     StemInventory,
     downstream_stem_root,
@@ -85,7 +86,7 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
     )
     parser.add_argument("--model", default=MIMO_MODEL)
-    parser.add_argument("--call-mode", choices=("multi", "single"), default="multi")
+    parser.add_argument("--call-mode", choices=("multi", "single", "two_step"), default="multi")
     parser.add_argument("--single-contract", choices=("compact2", "compact3"))
     parser.add_argument("--base-url", default="http://127.0.0.1:8092/v1")
     parser.add_argument("--media-mode", choices=("base64", "http"))
@@ -129,6 +130,8 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
             raise ValueError("single RA2VA requires no-LR-ASD binding evidence mode")
         if arguments.model != "mimo-v2.6-flash-rl":
             raise ValueError("single RA2VA requires explicit MiMo V2.6 model")
+    if arguments.call_mode == "two_step" and arguments.model != "mimo-v2.6-flash-rl":
+        raise ValueError("two-step RA2VA requires explicit MiMo V2.6 model")
     paths = jea_production_paths(arguments.audio_production_root)
     route = downstream_stem_route(arguments.shadow_run_id, arguments.sam_route)
     shadow = stem_shadow_root(paths.root, arguments.shadow_run_id)
@@ -144,7 +147,9 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         output_path=arguments.output_root
         or shadow
         / (
-            "mimo_reconcile_no_lrasd_v1"
+            "mimo_v26_ra2va_two_step_v1"
+            if arguments.call_mode == "two_step"
+            else "mimo_reconcile_no_lrasd_v1"
             if arguments.binding_evidence_mode == "none"
             else MIMO25_STEM_RECONCILE_STAGE
         ),
@@ -218,10 +223,11 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         result["single_contract"] = arguments.single_contract
         result["single_synthetic_icl_variant"] = arguments.single_synthetic_icl_variant
     if not arguments.dry_run:
-        backend_class = (
-            SingleCallOpenAIMimo25Backend
-            if arguments.call_mode == "single" else StemAwareOpenAIMimo25Backend
-        )
+        backend_class = {
+            "multi": StemAwareOpenAIMimo25Backend,
+            "single": SingleCallOpenAIMimo25Backend,
+            "two_step": TwoStepOpenAIMimo26Backend,
+        }[arguments.call_mode]
         backend = backend_class(
             MimoBackendConfig(
                 media_resolver=MimoMediaResolver(
