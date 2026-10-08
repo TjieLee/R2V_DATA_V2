@@ -59,7 +59,8 @@ class FrozenReuseBackendProvenance(MimoBackendProvenance):
                             "r2v.h3.mimo25_backend.75", "r2v.h3.mimo25_backend.76",
                             "r2v.h3.mimo25_backend.77", "r2v.h3.mimo25_backend.78",
                             "r2v.h3.mimo25_backend.79", "r2v.h3.mimo25_backend.80",
-                            "r2v.h3.mimo25_backend.81", "r2v.h3.mimo25_backend.82"]
+                            "r2v.h3.mimo25_backend.81", "r2v.h3.mimo25_backend.82",
+                            "r2v.h3.mimo25_backend.83"]
     prompt_version: Literal["h3_mimo25_speech_assembly_v46", "h3_mimo25_speech_assembly_v47",
                             "h3_mimo25_speech_assembly_v48", "h3_mimo25_speech_assembly_v49",
                             "h3_mimo26_ra2va_single_v1", "h3_mimo26_ra2va_single_v2",

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -50,7 +51,7 @@ from r2v_data_v2.structured_output import (
     parse_structured_json_issues,
 )
 
-TWO_STEP_BACKEND_VERSION = "r2v.h3.mimo25_backend.82"
+TWO_STEP_BACKEND_VERSION = "r2v.h3.mimo25_backend.83"
 TWO_STEP_PROMPT_VERSION = "h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity"
 JOINT_INPUT_MODALITY = "target_video_joint_av_audio"
 
@@ -126,7 +127,52 @@ shot1_caption owns visual action, speaker presentation and exact dialogue; summa
 )
 
 
-def _canonicalize_joint_payload(raw: str) -> tuple[str, dict[str, int]]:
+_PICTURE_LABEL = re.compile(r"<Picture [1-9]\d*>")
+_PICTURE_SOURCE_PHRASE = re.compile(
+    r"(?:,?\s+|^)(?:as shown in|shown in|depicted in|with its visual detail sourced from)\s+<Picture [1-9]\d*>"
+)
+_CLOTHING_SOURCE_PREFIX = re.compile(
+    r"^The upper-clothing attribute (?:shown|depicted) in <Picture [1-9]\d*>,\s+(.+)$"
+)
+_FACE_SOURCE_PHRASE = re.compile(r"^(The face of [^<>]+?) in <Picture [1-9]\d*>(, showing .+)$")
+
+
+def _canonicalize_two_step_visual_payload(raw: str, job: MimoBackendJob) -> tuple[str, dict[str, int]]:
+    canonical, prior_corrections = _canonicalize_visual_draft_payload(raw)
+    try:
+        payload = json.loads(normalize_structured_json_envelope(canonical))
+    except (TypeError, ValueError):
+        return canonical, prior_corrections
+    definitions = payload.get("subject_definitions") if isinstance(payload, dict) else None
+    if not isinstance(definitions, list):
+        return canonical, prior_corrections
+    subjects = {subject.subject_label: subject for subject in job.reference_subjects}
+    corrections = Counter(prior_corrections)
+    for row in definitions:
+        if not isinstance(row, dict) or not isinstance(row.get("description"), str):
+            continue
+        subject = subjects.get(row.get("subject_label"))
+        description = row["description"]
+        pictures = set(_PICTURE_LABEL.findall(description))
+        if subject is None or not pictures or not pictures.issubset(subject.source_picture_labels):
+            continue
+        cleaned = description
+        if subject.kind == "attribute":
+            prefix = _CLOTHING_SOURCE_PREFIX.fullmatch(cleaned)
+            if prefix:
+                cleaned = prefix[1][0].upper() + prefix[1][1:]
+            cleaned = _FACE_SOURCE_PHRASE.sub(r"\1\2", cleaned)
+        cleaned = _PICTURE_SOURCE_PHRASE.sub("", cleaned)
+        if cleaned != description:
+            cleaned = cleaned.strip(" ,;:\t\r\n")
+            row["description"] = cleaned if any(char.isalnum() for char in cleaned) else ""
+            corrections["visual_subject_picture_provenance_removed"] += 1
+    return _compact_json(payload), dict(corrections)
+
+
+def _canonicalize_joint_payload(
+    raw: str, job: MimoBackendJob, *, warnings: list[str],
+) -> tuple[str, dict[str, int]]:
     try:
         payload = json.loads(normalize_structured_json_envelope(raw))
     except (TypeError, ValueError):
@@ -149,6 +195,14 @@ def _canonicalize_joint_payload(raw: str) -> tuple[str, dict[str, int]]:
             seen[segment_id] = row
     canonical, corrections = _canonicalize_raw_annotation_payload(_compact_json(payload["speech_av"]))
     payload["speech_av"] = json.loads(canonical)
+    rows = payload["speech_av"].get("warnings")
+    if not job.segments and isinstance(rows, list):
+        retained = [row for row in rows if row != {"code": "possible_asr_conflict", "segment_id": None}]
+        removed = len(rows) - len(retained)
+        if removed:
+            payload["speech_av"]["warnings"] = retained
+            corrections["unscoped_possible_asr_conflict_no_segments"] = removed
+            warnings.append("unscoped_possible_asr_conflict_no_segments")
     return _compact_json(payload), corrections
 
 
@@ -357,7 +411,7 @@ class TwoStepOpenAIMimo26Backend(StemAwareOpenAIMimo25Backend):
                 *(_official_detailed_description_icl_messages() if self.config.icl == "official_ref2va_v1" else []),
                 {"role": "user", "content": content},
             ], MimoVisualDraft, turn_index=0)
-            canonical_visual, visual_corrections = _canonicalize_visual_draft_payload(visual_raw)
+            canonical_visual, visual_corrections = _canonicalize_two_step_visual_payload(visual_raw, job)
             corrections.update(visual_corrections)
             visual, issues = parse_structured_json_issues(canonical_visual, MimoVisualDraft)
             if visual is None or issues:
@@ -386,7 +440,7 @@ class TwoStepOpenAIMimo26Backend(StemAwareOpenAIMimo25Backend):
             joint_raw = request_turn([
                 {"role": "system", "content": prompt}, {"role": "user", "content": joint_content},
             ], MimoJointAVAudioDraft, turn_index=1)
-            canonical_joint, joint_corrections = _canonicalize_joint_payload(joint_raw)
+            canonical_joint, joint_corrections = _canonicalize_joint_payload(joint_raw, job, warnings=diagnostics[-1].warnings)
             corrections.update(joint_corrections)
             joint, issues = parse_structured_json_issues(canonical_joint, MimoJointAVAudioDraft)
             if joint is None or issues:

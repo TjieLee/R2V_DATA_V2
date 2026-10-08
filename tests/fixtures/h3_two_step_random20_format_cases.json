@@ -1,0 +1,143 @@
+[
+  {
+    "clip_uid": "02750d804022e9e8ba5f2964",
+    "target_duration_seconds": 3.29440625,
+    "subjects": [
+      ["entity", "e1", "<Picture 1>"],
+      ["entity", "e3", "<Picture 3>"],
+      ["entity", "e4", "<Picture 4>"],
+      ["entity", "e5", "<Picture 6>"],
+      ["entity", "e6", "<Picture 7>"],
+      ["entity", "e7", "<Picture 8>"],
+      ["attribute", "e1", "<Picture 2>", "face"],
+      ["attribute", "e4", "<Picture 5>", "upper_clothing"]
+    ],
+    "visual": {
+      "segment_views": [{
+        "segment_id": "00000-00001",
+        "visible_entity_ids": ["e1", "e3", "e4", "e5", "e6", "e7"],
+        "entity_observations": [
+          {"entity_id":"e1","visibility":"visible","orientation":"three_quarter","face_visibility":"clear","mouth_visibility":"clear","speech_correlated_articulation":"not_assessable"},
+          {"entity_id":"e3","visibility":"visible","orientation":"front","face_visibility":"clear","mouth_visibility":"clear","speech_correlated_articulation":"not_assessable"},
+          {"entity_id":"e4","visibility":"visible","orientation":"front","face_visibility":"clear","mouth_visibility":"clear","speech_correlated_articulation":"not_assessable"},
+          {"entity_id":"e5","visibility":"visible","orientation":"front","face_visibility":"clear","mouth_visibility":"clear","speech_correlated_articulation":"not_assessable"},
+          {"entity_id":"e6","visibility":"visible","orientation":"front","face_visibility":"occluded","mouth_visibility":"occluded","speech_correlated_articulation":"not_assessable"},
+          {"entity_id":"e7","visibility":"visible","orientation":"front","face_visibility":"clear","mouth_visibility":"clear","speech_correlated_articulation":"not_assessable"}
+        ]
+      }],
+      "subject_definitions": [
+        {"subject_label":"<Subject 1>","description":"A middle-aged man with short dark hair, wearing a dark navy suit over a light blue collared shirt."},
+        {"subject_label":"<Subject 2>","description":"An elderly man with thinning grey hair, wearing a light grey button-down shirt and dark trousers."},
+        {"subject_label":"<Subject 3>","description":"A young man with short dark hair, wearing a white zip-up hoodie over a white t-shirt, a silver pendant necklace, and red trousers."},
+        {"subject_label":"<Subject 4>","description":"A middle-aged woman with dark hair pulled back, wearing a dark denim jacket over a red, white and blue striped shirt and dark trousers."},
+        {"subject_label":"<Subject 5>","description":"A person wearing a light blue medical coat, standing in deep shadow with facial features obscured."},
+        {"subject_label":"<Subject 6>","description":"A young woman with dark hair under a white nurse's cap, wearing a light blue nurse's uniform."},
+        {"subject_label":"<Subject 7>","description":"The face of <Subject 1>, showing short dark hair, dark eyes, and a serious expression."},
+        {"subject_label":"<Subject 8>","description":"A light blue zip-up hoodie with a hood, a front zipper, two lower pockets, and dark trim along the hood and zipper line."}
+      ],
+      "visual_retention_analysis": [
+        {"subject_label":"<Subject 1>","marker":"fully_preserved","description":"The man's short dark hair, facial features, navy suit, light blue shirt, and crouching posture are retained throughout the shot."},
+        {"subject_label":"<Subject 2>","marker":"fully_preserved","description":"The elderly man's grey hair, light grey shirt, and dark trousers remain consistent across the shot."},
+        {"subject_label":"<Subject 3>","marker":"fully_preserved","description":"The young man's white hoodie, white t-shirt, pendant necklace, and red trousers are consistently visible."},
+        {"subject_label":"<Subject 4>","marker":"fully_preserved","description":"The woman's dark denim jacket, striped shirt, dark trousers, and pulled-back hair remain unchanged."},
+        {"subject_label":"<Subject 5>","marker":"fully_preserved","description":"The shadowed figure in the light blue medical coat stays in the same background position with obscured features."},
+        {"subject_label":"<Subject 6>","marker":"fully_preserved","description":"The nurse's white cap, light blue uniform, and facial features remain consistent."},
+        {"subject_label":"<Subject 7>","marker":"fully_preserved","description":"The facial features of <Subject 1> match the reference throughout the shot."},
+        {"subject_label":"<Subject 8>","marker":"fully_preserved","description":"The light blue hoodie with dark trim, front zipper, and pockets is consistently worn by <Subject 3>."}
+      ],
+      "style_opening": "The video uses a realistic live-action style with cool, overcast natural lighting on an outdoor rooftop terrace.",
+      "shot1_visual_description": "The scene opens on an outdoor rooftop terrace with a concrete parapet, grey tiled flooring, and a building with large glass windows and brick accents in the background, with green trees visible beyond the railing. <Subject 1> (S1), the middle-aged man in the dark navy suit, is crouched low near the parapet in the foreground, reaching one hand out toward a person in a light-colored dress whose back is to the camera at the left edge of the frame. Behind him stand <Subject 2> (S2), the elderly man in the light grey shirt; <Subject 3> (S3), the young man in the white hoodie and red trousers; <Subject 4> (S4), the woman in the dark denim jacket; <Subject 6> (S6), the nurse in the light blue uniform; and <Subject 5> (S5), the shadowed figure in the light blue medical coat near the glass windows. <Subject 1> (S1) shifts his weight and adjusts his crouched stance, moving his outstretched hand slightly while keeping his gaze fixed on the person at the left. <Subject 2> (S2) leans forward with a concerned expression, his mouth slightly open, while <Subject 3> (S3) and <Subject 4> (S4) watch the interaction with tense, attentive expressions. The camera remains static at a slightly elevated angle, holding the group in a medium-wide composition throughout the shot."
+    },
+    "joint": {
+      "speech_av": {
+        "summary": "No transcribed speech segments are present in this clip; the speech stem contains only non-speech vocal sounds, so no dialogue inventory or speaker markers are produced.",
+        "audio_observation": {"segment_decisions": []},
+        "av_grounding": {"segment_groundings": []},
+        "shot1_caption": "The scene opens on an outdoor rooftop terrace with a concrete parapet, grey tiled flooring, and a building with large glass windows and brick accents in the background, with green trees visible beyond the railing. <Subject 1>, the middle-aged man in the dark navy suit, is crouched low near the parapet in the foreground, reaching one hand out toward a person in a light-colored dress whose back is to the camera at the left edge of the frame. Behind him stand <Subject 2>, the elderly man in the light grey shirt; <Subject 3>, the young man in the white hoodie and red trousers; <Subject 4>, the woman in the dark denim jacket; <Subject 6>, the nurse in the light blue uniform; and <Subject 5>, the shadowed figure in the light blue medical coat near the glass windows. <Subject 1> shifts his weight and adjusts his crouched stance, moving his outstretched hand slightly while keeping his gaze fixed on the person at the left. <Subject 2> leans forward with a concerned expression, his mouth slightly open, while <Subject 3> and <Subject 4> watch the interaction with tense, attentive expressions. The camera remains static at a slightly elevated angle, holding the group in a medium-wide composition throughout the shot.",
+        "warnings": [{"code":"possible_asr_conflict","segment_id":null}]
+      },
+      "speaker_voice_profiles": [],
+      "audio_finalize": {
+        "overall_soundscape": "The outdoor rooftop setting carries a quiet open-air ambience with faint distant environmental noise, accompanied by brief non-speech vocal sounds such as a sharp intake of breath and a strained grunt.",
+        "non_diegetic_music": "A slow, somber piano melody plays softly beneath the scene, underscoring the tension with sustained, melancholic chords."
+      }
+    }
+  },
+  {
+    "clip_uid": "aed328a5a4eb2ff45d0d4d66",
+    "target_duration_seconds": 3.1835,
+    "subjects": [["entity", "e1", "<Picture 1>"], ["entity", "e2", "<Picture 2>"]],
+    "visual": {
+      "segment_views": [],
+      "subject_definitions": [
+        {"subject_label":"<Subject 1>","description":"A motorcycle rider wearing a black and red leather racing suit with white lettering and a multicolored full-face helmet."},
+        {"subject_label":"<Subject 2>","description":"A black sport motorcycle with blue and green graphics, gold front forks, and a silver exhaust canister."}
+      ],
+      "visual_retention_analysis": [
+        {"subject_label":"<Subject 1>","marker":"fully_preserved","description":"The rider's suit colors, helmet design, and riding posture are maintained throughout the clip."},
+        {"subject_label":"<Subject 2>","marker":"fully_preserved","description":"The motorcycle's color scheme, decals, and structural details remain consistent across the sequence."}
+      ],
+      "style_opening": "Live-action sports footage with natural daylight, motion blur, and dynamic panning camera work following the action on a racetrack.",
+      "shot1_visual_description": "The sequence opens with <Subject 1>, the rider in the black and red suit and multicolored helmet, leaning forward over <Subject 2>, the black sport motorcycle with blue and green graphics, as they speed along a racetrack. The camera pans right, tracking the pair as they navigate a curve past a red barrier and grassy verge. The rider shifts their weight, tucking low against the fuel tank while the motorcycle banks into the turn. As the shot progresses, the camera continues to follow them through the bend, revealing a grey retaining wall and a white banner with text in the background. Another rider in a white and black suit briefly enters the frame from the left, trailing behind. The camera maintains its rightward pan, keeping <Subject 1> and <Subject 2> centered as they accelerate out of the curve and continue down the track, with the background blurring due to the speed of the motion."
+    },
+    "joint": {
+      "speech_av": {
+        "summary": "No transcribed speech segments are present in this clip; the audio inventory contains no dialogue, speaker groups, or speaker bindings.",
+        "audio_observation": {"segment_decisions": []},
+        "av_grounding": {"segment_groundings": []},
+        "shot1_caption": "The sequence opens with <Subject 1>, the rider in the black and red suit and multicolored helmet, leaning forward over <Subject 2>, the black sport motorcycle with blue and green graphics, as they speed along a racetrack. The camera pans right, tracking the pair as they navigate a curve past a red barrier and grassy verge. The rider shifts their weight, tucking low against the fuel tank while the motorcycle banks into the turn. As the shot progresses, the camera continues to follow them through the bend, revealing a grey retaining wall and a white banner with text in the background. Another rider in a white and black suit briefly enters the frame from the left, trailing behind. The camera maintains its rightward pan, keeping <Subject 1> and <Subject 2> centered as they accelerate out of the curve and continue down the track, with the background blurring due to the speed of the motion.",
+        "warnings": [{"code":"possible_asr_conflict","segment_id":null}]
+      },
+      "speaker_voice_profiles": [],
+      "audio_finalize": {
+        "overall_soundscape": "The dominant sound is the high-revving roar of motorcycle engines accelerating and passing by, accompanied by tire noise on the asphalt and the rush of wind from the high-speed motion.",
+        "non_diegetic_music": "N/A"
+      }
+    }
+  },
+  {
+    "clip_uid": "86ca3660f631858590d00852",
+    "subjects": [["entity", "e1", "<Picture 1>"], ["entity", "e2", "<Picture 3>"], ["attribute", "e1", "<Picture 2>", "upper_clothing"]],
+    "visual": {
+      "segment_views": [{"segment_id":"segment_0001","visible_entity_ids":["e1","e2"],"entity_observations":[
+        {"entity_id":"e1","visibility":"visible","orientation":"three_quarter","face_visibility":"clear","mouth_visibility":"clear","speech_correlated_articulation":"not_assessable"},
+        {"entity_id":"e2","visibility":"visible","orientation":"three_quarter","face_visibility":"clear","mouth_visibility":"clear","speech_correlated_articulation":"not_assessable"}
+      ]}],
+      "subject_definitions": [
+        {"subject_label":"<Subject 1>","description":"A young woman with shoulder-length dark hair and straight bangs, shown in <Picture 1>."},
+        {"subject_label":"<Subject 2>","description":"A young man with short dark hair, shown in <Picture 3>."},
+        {"subject_label":"<Subject 3>","description":"The upper-clothing attribute shown in <Picture 2>, a deep red long-sleeved button-up shirt with a collar, chest pockets, gathered cuffs, and a rope belt."}
+      ],
+      "visual_retention_analysis": [
+        {"subject_label":"<Subject 1>","marker":"fully_preserved","description":"The woman's face, hair, and red shirt remain consistent with <Picture 1> throughout the shot."},
+        {"subject_label":"<Subject 2>","marker":"fully_preserved","description":"The man's face, hair, and light-blue shirt remain consistent with <Picture 3> throughout the shot."},
+        {"subject_label":"<Subject 3>","marker":"fully_preserved","description":"The deep red shirt's collar, chest pockets, gathered cuffs, and rope belt remain visible and consistent with <Picture 2>."}
+      ],
+      "style_opening": "Live-action, warm indoor lighting, static medium shot with a bookshelf background.",
+      "shot1_visual_description": "In a warm indoor room, <Subject 1> sits on the left of a striped armchair while <Subject 2> sits on the right, with a table of hot-pot ingredients and a portable stove in front of them and a bookshelf filled with stacked books behind them. <Subject 1> wears <Subject 3>, the deep red long-sleeved button-up shirt, and holds a patterned mug in her right hand, while <Subject 2> holds a small glass of amber liquid in his left hand. They turn toward each other and bring their drinks together for a toast, then <Subject 1> lowers her mug slightly and looks down at it while <Subject 2> keeps his glass raised and gazes at her. <Subject 1> then raises the mug again toward <Subject 2>, who continues to look at her with a slight smile as the shot ends."
+    },
+    "joint": null
+  },
+  {
+    "clip_uid": "aa28e97595dd82cbdc96457e",
+    "subjects": [["entity", "e1", "<Picture 1>"], ["attribute", "e1", "<Picture 2>", "face"], ["background", null, "<Picture 3>"]],
+    "visual": {
+      "segment_views": [{"segment_id":"segment_0001","visible_entity_ids":["e1"],"entity_observations":[
+        {"entity_id":"e1","visibility":"visible","orientation":"three_quarter","face_visibility":"clear","mouth_visibility":"clear","speech_correlated_articulation":"not_assessable"}
+      ]}],
+      "subject_definitions": [
+        {"subject_label":"<Subject 1>","description":"A middle-aged East Asian man with short salt-and-pepper hair, wearing a dark jacket over a dark patterned shirt."},
+        {"subject_label":"<Subject 2>","description":"The face of the man in <Picture 2>, showing his eyes, nose, mouth, and skin texture."},
+        {"subject_label":"<Subject 3>","description":"A dark leather sofa backrest beside a bright window with sheer curtains and a blurred green plant."}
+      ],
+      "visual_retention_analysis": [
+        {"subject_label":"<Subject 1>","marker":"fully_preserved","description":"The man's identity, clothing, and seated posture are retained throughout the shot."},
+        {"subject_label":"<Subject 2>","marker":"fully_preserved","description":"The facial features and expression remain consistent with the reference."},
+        {"subject_label":"<Subject 3>","marker":"fully_preserved","description":"The sofa, window, and plant background are preserved in the scene."}
+      ],
+      "style_opening": "The video uses a realistic live-action style with soft natural window lighting and a static medium close-up camera.",
+      "shot1_visual_description": "A static medium close-up shows <Subject 1> seated on the dark leather sofa of <Subject 3>, with the bright window and sheer curtains behind him. He is turned slightly to his right, looking off-camera with a calm, attentive expression. His mouth moves as he speaks, then he pauses, presses his lips together, and gives a small nod while maintaining his gaze. The lighting remains soft and even across his face, and the background stays unchanged throughout the shot."
+    },
+    "joint": null
+  }
+]

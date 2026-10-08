@@ -44,7 +44,7 @@ Speaker marker warnings remain visible. Same-entity/group contradictions fail
 with the existing validator issues and original annotation, before shared group
 merging; no Sx guessing or group merge is used to raise readiness.
 
-Only experimental provenance changes: backend `.82`, joint prompt
+Only experimental provenance changes: backend `.83`, joint prompt
 `h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity`. Version v2 adds visual
 performance fidelity, source responsibilities and distinct-speaker narration
 guidance only. It preserves meaningful Turn 1 actions and ordering rather than
@@ -52,6 +52,8 @@ targeting caption length. There is no new caption validator or automatic prose
 rewrite. Backend `.82` changes only non-transcribed-only profile publication;
 the v2 prompt stays byte-for-byte unchanged. The original `.80/.81` records
 remain readable with their historical provenance.
+Backend `.83` adds only the scoped pre-parse format normalization documented
+below; `.82` records also remain readable. It changes no model request.
 Visual v5, component profile v2/finalizer v6,
 official ICL v4, authority v18, annotation `.20` and materializer v30 stay frozen.
 The diagnostic `target_video_joint_av_audio` identifies the joint request.
@@ -388,3 +390,157 @@ jq 'select(.clip_uid == "25755cbc2545bad6928c736c") |
 Open `http://127.0.0.1:8771/`. Compare Turn 1 actions with Caption, source
 transitions (including the correct 195457 male/female split), exact ASR and
 soundscape/music boundaries. No training export or materialization is required.
+
+## Random20 format normalization and cached CPU replay
+
+User-supplied `.82` server result: 11/20 ready, 9 failed, 38 requests. Backend
+`.83` preserves Joint v2 and Visual v5, all raw strings, schemas and shared
+validators. Its two scoped pre-parse changes are:
+
+- Remove exactly `{"code":"possible_asr_conflict","segment_id":null}` only
+  when the frozen segment inventory is empty. Keep other warnings unchanged.
+  Record `unscoped_possible_asr_conflict_no_segments` in diagnostics and its
+  deterministic correction count. This does not assert absence of vocals.
+- Remove supported Picture source phrases only inside Subject definitions,
+  and only when every cited Picture belongs to that frozen Subject's sources.
+  Preserve appearance detail, labels, caption and retention. Unknown/mismatched
+  sources, unsupported wording and empty cleaned definitions still fail.
+  Record `visual_subject_picture_provenance_removed`.
+
+The four response payloads supplied by the user are extracted into a focused
+test fixture without media paths or fingerprints. Cached-response CPU results:
+
+| Clip | CPU result |
+| --- | --- |
+| `aed328a5a4eb2ff45d0d4d66` | Complete backend validation passes; unscoped warning excluded and audited. |
+| `02750d804022e9e8ba5f2964` | Warning fixed, but full validation still fails: the unchanged Visual prose contains `(S1)` through `(S6)`, rejected by `MimoVisualBlock`. No Sx/prose cleanup is added. |
+| `86ca3660f631858590d00852` | Visual schema passes after three definition corrections; no Joint raw exists, so not a ready clip. |
+| `aa28e97595dd82cbdc96457e` | Visual schema passes after one face-definition correction; no Joint raw exists, so not a ready clip. |
+
+The other five reported Speaker/binding/ASR/composition failures remain outside
+this fix. Do not infer a new Random20 ready count from partial replays.
+
+### Read original server records without models or media reads
+
+This command uses the original frozen jobs and raw strings, runs the actual
+Two-step backend with cached completions, and never calls an endpoint. The
+replay-only resolver supplies placeholder URLs without opening media. Token
+usage/finish reasons are copied from saved diagnostics, not invented. Nothing
+is written to the old output directory. No stems, source media or hashes are
+scanned; no request is counted as a real model call.
+
+```bash
+cd /mnt/workspace/litengjie/data/R2V_DATA_V2
+OLD="$SHADOW/mimo_v26_ra2va_two_step_joint_v2_random20"
+.venv/bin/python - "$OLD" <<'PY'
+import json, sys
+from pathlib import Path
+from types import SimpleNamespace
+from r2v_data_v2.h3.mimo25_av_reconcile import MimoClipJob
+from r2v_data_v2.h3.mimo25_backend import MimoBackendConfig, MimoBackendFailure, MimoVisualDraft
+from r2v_data_v2.h3.mimo26_two_step_backend import TwoStepOpenAIMimo26Backend, _canonicalize_two_step_visual_payload
+from r2v_data_v2.structured_output import parse_structured_json_issues
+
+root = Path(sys.argv[1])
+jobs = [MimoClipJob.model_validate(j) for j in json.loads((root / "source_contract.json").read_text())["jobs"]]
+records = {r["clip_uid"]: r for r in map(json.loads, (root / "records.jsonl").read_text().splitlines())}
+selected = {"02750d804022e9e8ba5f2964", "aed328a5a4eb2ff45d0d4d66",
+            "86ca3660f631858590d00852", "aa28e97595dd82cbdc96457e"}
+
+class ReplayMedia:
+    mode, media_root, media_base_url = "http", Path.cwd(), "http://cached.invalid/"
+    def resolve(self, path):
+        return self.media_base_url + path.name
+
+for job in jobs:
+    if job.clip_uid not in selected:
+        continue
+    row = records[job.clip_uid]
+    report = {"clip_uid": job.clip_uid, "actual_model_calls": 0}
+    if row["speech_av_raw_response"] is None:
+        canonical, counts = _canonicalize_two_step_visual_payload(row["visual_raw_response"], job)
+        visual, issues = parse_structured_json_issues(canonical, MimoVisualDraft)
+        report.update(status="visual_schema_passed_joint_missing" if visual is not None and not issues else "visual_failed",
+                      correction_counts=counts, issues=[i.to_dict() for i in issues])
+    else:
+        cached = iter(zip((row["visual_raw_response"], row["speech_av_raw_response"]), row["diagnostics"], strict=True))
+        def create(**request):
+            raw, diagnostic = next(cached)
+            usage = diagnostic["usage"]
+            return {"choices": [{"message": {"content": raw}, "finish_reason": diagnostic["finish_reason"]}],
+                    "usage": {**usage, "prompt_tokens_details": {k: usage[k] for k in
+                              ("image_tokens", "video_tokens", "audio_tokens", "cached_tokens")}}}
+        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+        config = MimoBackendConfig(api_key="cpu-replay", transport="sglang", model="mimo-v2.6-flash-rl",
+                                   base_url="http://cached.invalid/v1", media_resolver=ReplayMedia())
+        backend = TwoStepOpenAIMimo26Backend(config, stem_records_by_clip={}, client=client)
+        labels = {r.picture_label for r in job.reference_images} | {s.subject_label for s in job.reference_subjects}
+        try:
+            result = backend.reconcile(job, segment_ids=[s.segment_id for s in job.segments],
+                transcribed_segment_ids=[s.segment_id for s in job.segments if s.asr_status == "transcribed"],
+                allowed_entity_ids=set(backend.build_compact_task_contract(job)["allowed_speaker_bindable_entity_ids"]),
+                allowed_reference_labels=labels,
+                auxiliary_audio_paths={kind: Path(kind + ".wav") for kind in ("speech", "music", "sfx")})
+            report.update(status="cached_backend_validation_ready", correction_counts=result.deterministic_correction_counts)
+        except MimoBackendFailure as exc:
+            result = exc
+            report.update(status="failed", failure_reason=exc.reason, issues=[i.to_dict() for i in exc.issues])
+        report["qa_warnings"] = [w for d in result.diagnostics for w in d.warnings]
+    print(json.dumps(report, ensure_ascii=False))
+PY
+```
+
+### Only two Visual failures need new joint responses
+
+After confirming the CPU report, reuse the existing TP4 endpoint on 8094 and
+HTTP media server on 8766. The following runs just `86ca` and `aa28`, four
+requests if both complete normally. It performs the normal unchanged Visual
+request followed by Joint; it does not generate a missing Joint result during
+CPU replay or overwrite Random20. If another hard failure appears, keep it.
+
+```bash
+cd /mnt/workspace/litengjie/data/R2V_DATA_V2
+unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
+export NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost
+export MIMO_API_KEY="${MIMO_API_KEY:-local-no-key}"
+OLD="$SHADOW/mimo_v26_ra2va_two_step_joint_v2_random20"
+OUT="$SHADOW/mimo_v26_ra2va_two_step_joint_v2_format2_recheck"
+.venv/bin/python - "$OLD" "$OUT" <<'PY'
+import json, os, sys, time
+from pathlib import Path
+from r2v_data_v2.h3.mimo25_av_reconcile import MimoClipJob
+from r2v_data_v2.h3.mimo25_backend import MimoBackendConfig, MimoMediaResolver
+from r2v_data_v2.h3.mimo25_stem_shadow import run_mimo25_stem_reconcile_shadow
+from r2v_data_v2.h3.mimo26_two_step_backend import TwoStepOpenAIMimo26Backend
+from r2v_data_v2.h3.resolved_audio_stems import load_stem_source
+source, output = map(Path, sys.argv[1:])
+contract = json.loads((source / "source_contract.json").read_text())
+selected = {"86ca3660f631858590d00852", "aa28e97595dd82cbdc96457e"}
+jobs = [MimoClipJob.model_validate(j) for j in contract["jobs"] if j["clip_uid"] in selected]
+_, stems, _ = load_stem_source(source.parent / "resolved_stems_v1")
+config = MimoBackendConfig(api_key=os.environ["MIMO_API_KEY"], transport="sglang", model="mimo-v2.6-flash-rl",
+    base_url="http://127.0.0.1:8094/v1", temperature=0.0, thinking="disabled", max_completion_tokens=32768,
+    media_resolver=MimoMediaResolver(mode="http", media_root=Path("/mnt/workspace"), media_base_url="http://127.0.0.1:8766/"))
+backend = TwoStepOpenAIMimo26Backend(config, stem_records_by_clip={s.clip_uid: s for s in stems})
+class TimedBackend:
+    provenance = backend.provenance
+    def reconcile(self, job, **kwargs):
+        started = time.perf_counter()
+        try:
+            return backend.reconcile(job, **kwargs)
+        finally:
+            print(job.clip_uid, "elapsed_seconds=", round(time.perf_counter() - started, 3), flush=True)
+summary = run_mimo25_stem_reconcile_shadow(jobs=jobs, stem_records=stems, backend=TimedBackend(), output_root=output,
+    source_clip_uids=[j.clip_uid for j in jobs], route="resolved", allow_unverified=True,
+    binding_evidence_mode=contract["binding_evidence_mode"])
+print(summary.model_dump_json(indent=2))
+PY
+jq '{clip_count,ready_count,failed_count,model_call_count}' "$OUT/summary.json"
+jq '{clip_uid,status,model_call_count,failure_reason,failure_issues,diagnostics}' "$OUT/records.jsonl"
+.venv/bin/python tools/serve_h3_single_v7_caption_review.py \
+  --base-root "$OLD" --override-root "$OUT" --host 127.0.0.1 --port 8771
+```
+
+The viewer overlays the two new records for review only; the original Random20
+directory remains unchanged. Correction counts and QA warnings are in
+`diagnostics`; both real raw responses and annotation remain in `records.jsonl`.

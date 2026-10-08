@@ -172,6 +172,219 @@ def test_no_transcript_does_not_create_profiles_sx_or_dialogue(tmp_path, monkeyp
     assert len(completions.requests) == 2
 
 
+@pytest.mark.parametrize("clip_uid", ["02750d804022e9e8ba5f2964", "aed328a5a4eb2ff45d0d4d66"])
+def test_no_segments_unscoped_asr_warning_keeps_raw_and_qa_audit(tmp_path, monkeypatch, clip_uid):
+    visual, joint = _drafts()
+    visual["segment_views"] = []
+    joint["speech_av"]["audio_observation"]["segment_decisions"] = []
+    joint["speech_av"]["av_grounding"]["segment_groundings"] = []
+    joint["speaker_voice_profiles"] = []
+    joint["speech_av"]["shot1_caption"] = visual["shot1_visual_description"]
+    joint["speech_av"]["warnings"] = [{"code": "possible_asr_conflict", "segment_id": None}]
+    _, _, backend, completions, stems, jobs, _, _ = _setup(tmp_path, monkeypatch, visual=visual, joint=joint)
+    job = _job({**jobs[0].model_dump(mode="json", exclude={"request_fingerprint"}), "clip_uid": clip_uid, "segments": []})
+    result = _reconcile(backend, job, stems)
+    assert result.annotation.warnings == []
+    assert result.annotation.audio_observation.segment_decisions == []
+    assert result.annotation.av_grounding.segment_groundings == []
+    assert result.annotation.h3_semantics.shot1_caption == visual["shot1_visual_description"]
+    assert result.annotation.h3_semantics.non_diegetic_music == joint["audio_finalize"]["non_diegetic_music"]
+    assert result.speech_av_raw_response == json.dumps(joint)
+    assert result.visual_raw_response == json.dumps(visual)
+    assert result.deterministic_correction_counts == {"unscoped_possible_asr_conflict_no_segments": 1}
+    assert "unscoped_possible_asr_conflict_no_segments" in result.diagnostics[-1].warnings
+    assert "deterministic_correction_count:unscoped_possible_asr_conflict_no_segments=1" in result.diagnostics[-1].warnings
+    assert len(completions.requests) == result.model_call_count == 2
+
+
+def test_null_asr_warning_with_frozen_segments_still_fails(tmp_path, monkeypatch):
+    _, joint = _drafts()
+    joint["speech_av"]["warnings"] = [{"code": "possible_asr_conflict", "segment_id": None}]
+    _, _, backend, completions, stems, jobs, _, _ = _setup(tmp_path, monkeypatch, joint=joint)
+    with pytest.raises(MimoBackendFailure) as caught:
+        _reconcile(backend, jobs[0], stems)
+    assert caught.value.reason == "MiMo joint AV/audio draft failed structured validation"
+    assert caught.value.speech_av_raw_response == json.dumps(joint)
+    assert "unscoped_possible_asr_conflict_no_segments" not in caught.value.diagnostics[-1].warnings
+    assert len(completions.requests) == 2
+
+
+def _visual_source_job(rows):
+    return SimpleNamespace(reference_subjects=[
+        SimpleNamespace(subject_label=f"<Subject {index}>", kind=kind, source_picture_labels=[picture])
+        for index, (kind, picture) in enumerate(rows, 1)
+    ])
+
+
+@pytest.mark.parametrize("descriptions,sources,expected", [
+    (
+        ["A young woman with shoulder-length dark hair and straight bangs, shown in <Picture 1>.",
+         "A young man with short dark hair, shown in <Picture 3>.",
+         "The upper-clothing attribute shown in <Picture 2>, a deep red long-sleeved button-up shirt with a collar, chest pockets, gathered cuffs, and a rope belt."],
+        [("entity", "<Picture 1>"), ("entity", "<Picture 3>"), ("attribute", "<Picture 2>")],
+        ["A young woman with shoulder-length dark hair and straight bangs.",
+         "A young man with short dark hair.",
+         "A deep red long-sleeved button-up shirt with a collar, chest pockets, gathered cuffs, and a rope belt."],
+    ),
+    (
+        ["The face of the man in <Picture 2>, showing his eyes, nose, mouth, and skin texture."],
+        [("attribute", "<Picture 2>")],
+        ["The face of the man, showing his eyes, nose, mouth, and skin texture."],
+    ),
+], ids=["86ca3660f631858590d00852", "aa28e97595dd82cbdc96457e"])
+def test_visual_source_provenance_is_removed_without_changing_visual_facts(descriptions, sources, expected):
+    from pydantic import ValidationError
+
+    from r2v_data_v2.h3.mimo25_backend import MimoVisualDraft
+    from r2v_data_v2.h3.mimo26_two_step_backend import (
+        _canonicalize_two_step_visual_payload,
+    )
+
+    visual, _ = _drafts()
+    visual["subject_definitions"] = [
+        {"subject_label": f"<Subject {index}>", "description": text}
+        for index, text in enumerate(descriptions, 1)
+    ]
+    visual["shot1_visual_description"] += " <Picture 1> preserves the appearance of <Subject 1>."
+    raw = json.dumps(visual)
+    with pytest.raises(ValidationError, match="cannot own Picture provenance"):
+        MimoVisualDraft.model_validate_json(raw)  # The shared/Multi schema stays strict.
+    canonical, corrections = _canonicalize_two_step_visual_payload(raw, _visual_source_job(sources))
+    parsed = MimoVisualDraft.model_validate_json(canonical)
+    assert [d.description for d in parsed.subject_definitions] == expected
+    values = json.loads(canonical)
+    values["subject_definitions"] = visual["subject_definitions"]
+    assert values == visual  # No caption, retention, label or inventory edit.
+    assert json.loads(raw) == visual
+    assert corrections == {"visual_subject_picture_provenance_removed": len(descriptions)}
+
+
+@pytest.mark.parametrize("description,picture", [
+    ("A man shown in <Picture 99>.", "<Picture 1>"),
+    ("A man shown in <Picture 2>.", "<Picture 1>"),
+    ("shown in <Picture 1>.", "<Picture 1>"),
+    ("A man standing beside <Picture 1>.", "<Picture 1>"),
+])
+def test_visual_source_cleanup_does_not_hide_unknown_mismatched_or_empty_facts(description, picture):
+    from pydantic import ValidationError
+
+    from r2v_data_v2.h3.mimo25_backend import MimoVisualDraft
+    from r2v_data_v2.h3.mimo26_two_step_backend import (
+        _canonicalize_two_step_visual_payload,
+    )
+
+    visual, _ = _drafts()
+    visual["subject_definitions"][0]["description"] = description
+    canonical, _ = _canonicalize_two_step_visual_payload(json.dumps(visual), _visual_source_job([("entity", picture)]))
+    with pytest.raises(ValidationError):
+        MimoVisualDraft.model_validate_json(canonical)
+
+
+def test_visual_source_cleanup_preserves_raw_and_records_correction_through_two_requests(tmp_path, monkeypatch):
+    visual, joint = _drafts()
+    visual["subject_definitions"][0]["description"] = "A young woman with dark hair, shown in <Picture 1>."
+    _, _, backend, completions, stems, jobs, _, _ = _setup(tmp_path, monkeypatch, visual=visual, joint=joint)
+    result = _reconcile(backend, jobs[0], stems)
+    assert result.annotation.h3_semantics.subject_definitions[0].description == "A young woman with dark hair."
+    assert result.annotation.h3_semantics.shot1_caption == joint["speech_av"]["shot1_caption"]
+    assert result.visual_raw_response == json.dumps(visual)
+    assert result.speech_av_raw_response == json.dumps(joint)
+    assert result.deterministic_correction_counts == {"visual_subject_picture_provenance_removed": 1}
+    assert "deterministic_correction_count:visual_subject_picture_provenance_removed=1" in result.diagnostics[-1].warnings
+    assert len(completions.requests) == 2
+
+
+_RANDOM20_FORMAT_CASES = json.loads((Path(__file__).parent / "fixtures/h3_two_step_random20_format_cases.json").read_text())
+
+
+@pytest.mark.parametrize("case", _RANDOM20_FORMAT_CASES, ids=lambda case: case["clip_uid"])
+def test_supplied_random20_response_payload_cpu_replay(tmp_path, monkeypatch, case):
+    from r2v_data_v2.h3.mimo25_backend import MimoVisualDraft
+    from r2v_data_v2.h3.mimo26_two_step_backend import (
+        _canonicalize_two_step_visual_payload,
+    )
+
+    visual_raw = json.dumps(case["visual"])
+    source_job = _visual_source_job([(s[0], s[2]) for s in case["subjects"]])
+    canonical, corrections = _canonicalize_two_step_visual_payload(visual_raw, source_job)
+    visual = MimoVisualDraft.model_validate_json(canonical)
+    assert visual.shot1_visual_description == case["visual"]["shot1_visual_description"]
+    assert [r.model_dump(mode="json") for r in visual.visual_retention_analysis] == case["visual"]["visual_retention_analysis"]
+    if case["joint"] is None:
+        expected = 3 if case["clip_uid"].startswith("86ca") else 1
+        assert corrections == {"visual_subject_picture_provenance_removed": expected}
+        return  # Visual-only replay: no cached Joint response exists.
+
+    _, _, backend, completions, stems, jobs, _, _ = _setup(
+        tmp_path, monkeypatch, visual=case["visual"], joint=case["joint"],
+    )
+    values = jobs[0].model_dump(mode="json", exclude={"request_fingerprint"})
+    values.update(clip_uid=case["clip_uid"], segments=[], binding_evidence_mode="none",
+                  target_duration_seconds=case["target_duration_seconds"])
+    subjects, images = [], []
+    for index, source in enumerate(case["subjects"], 1):
+        kind, entity, picture, *attribute = source
+        number = int(picture.removeprefix("<Picture ").removesuffix(">"))
+        subject = {**values["reference_subjects"][0], "subject_index": index, "subject_label": f"<Subject {index}>", "kind": kind,
+                   "entity_id": entity if kind == "entity" else None, "source_picture_labels": [picture]}
+        image = {**values["reference_images"][0], "image_index": number, "picture_label": picture,
+                 "source_image_index": number, "source_image_id": f"image_{number}", "source_image_label": f"<Image {number}>",
+                 "kind": "subject" if kind == "entity" else kind, "entity_id": subject["entity_id"]}
+        if attribute:
+            details = {"owner_entity_id": entity, "attribute_id": f"a{index}", "attribute_type": attribute[0]}
+            subject.update(details)
+            image.update(details)
+        subjects.append(subject)
+        images.append(image)
+    values.update(reference_subjects=subjects, reference_images=sorted(images, key=lambda image: image["image_index"]))
+    count = len(images)
+    values["reference_selection"].update(original_picture_count=count, selected_picture_count=count,
+                                         selected_source_image_indexes=list(range(1, count + 1)),
+                                         selected_source_image_ids=[f"image_{i}" for i in range(1, count + 1)])
+    job = _job(values)
+    labels = {s.subject_label for s in job.reference_subjects} | {r.picture_label for r in job.reference_images}
+    kwargs = {"segment_ids": [], "transcribed_segment_ids": [], "allowed_reference_labels": labels,
+              "allowed_entity_ids": {s.entity_id for s in job.reference_subjects if s.kind == "entity"},
+              "auxiliary_audio_paths": {s.stem_type: Path(s.canonical_stem_path) for s in stems[0].stems}}
+    if case["clip_uid"].startswith("02750"):
+        with pytest.raises(MimoBackendFailure, match="non-visual or pipeline syntax") as caught:
+            backend.reconcile(job, **kwargs)
+        result = caught.value
+        assert "(S1)" in json.loads(result.visual_raw_response)["shot1_visual_description"]
+    else:
+        result = backend.reconcile(job, **kwargs)
+        assert result.annotation.h3_semantics.shot1_caption == case["visual"]["shot1_visual_description"]
+        assert result.annotation.h3_semantics.overall_soundscape == case["joint"]["audio_finalize"]["overall_soundscape"]
+        assert result.deterministic_correction_counts == {"unscoped_possible_asr_conflict_no_segments": 1}
+    assert "unscoped_possible_asr_conflict_no_segments" in result.diagnostics[-1].warnings
+    assert result.visual_raw_response == visual_raw
+    assert result.speech_av_raw_response == json.dumps(case["joint"])
+    assert len(completions.requests) == result.model_call_count == 2
+
+
+@pytest.mark.parametrize("warning", [
+    {"code": "possible_asr_conflict"},
+    {"code": "possible_asr_conflict", "segment_id": None, "detail": "unscoped"},
+    {"code": "another_warning", "segment_id": None},
+])
+def test_empty_inventory_cleanup_leaves_other_malformed_warnings_for_schema(warning):
+    from pydantic import ValidationError
+
+    from r2v_data_v2.h3.mimo26_two_step_backend import (
+        MimoJointAVAudioDraft,
+        _canonicalize_joint_payload,
+    )
+
+    _, joint = _drafts()
+    joint["speech_av"]["warnings"] = [warning]
+    audit = []
+    canonical, corrections = _canonicalize_joint_payload(json.dumps(joint), SimpleNamespace(segments=[]), warnings=audit)
+    assert json.loads(canonical)["speech_av"]["warnings"] == [warning]
+    assert corrections == {} and audit == []
+    with pytest.raises(ValidationError):
+        MimoJointAVAudioDraft.model_validate_json(canonical)
+
+
 @pytest.mark.parametrize("composition", ["overlapping_secondary_speech", "sequential_multi_speaker_speech"])
 def test_multiple_speaker_safety_is_not_relaxed(tmp_path, monkeypatch, composition):
     visual, joint = _drafts()
@@ -400,14 +613,14 @@ def test_integer_temperature_provenance_matches_float_and_two_step(tmp_path):
         float_config, stem_records_by_clip={}, client=SimpleNamespace(),
     )
     assert integer_backend.provenance == float_backend.provenance
-    assert integer_backend.provenance.schema_version == "r2v.h3.mimo25_backend.82"
+    assert integer_backend.provenance.schema_version == "r2v.h3.mimo25_backend.83"
 
 
 def test_two_step_has_independent_provenance_without_changing_multi(tmp_path, monkeypatch):
     from r2v_data_v2.h3.audio_reuse_prepared import FrozenReuseBackendProvenance
 
     _, _, backend, _, _, _, multi, _ = _setup(tmp_path, monkeypatch)
-    assert backend.provenance.schema_version == "r2v.h3.mimo25_backend.82"
+    assert backend.provenance.schema_version == "r2v.h3.mimo25_backend.83"
     assert backend.provenance.prompt_version == "h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity"
     assert multi.provenance.schema_version == "r2v.h3.mimo25_backend.66"
     assert multi.provenance.prompt_version == "h3_mimo25_speech_assembly_v49"
@@ -421,6 +634,7 @@ def test_two_step_has_independent_provenance_without_changing_multi(tmp_path, mo
 @pytest.mark.parametrize("version,prompt", [
     ("r2v.h3.mimo25_backend.80", "h3_mimo26_ra2va_two_step_joint_v1"),
     ("r2v.h3.mimo25_backend.81", "h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity"),
+    ("r2v.h3.mimo25_backend.82", "h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity"),
 ])
 def test_historical_two_step_provenance_remains_readable(tmp_path, monkeypatch, version, prompt):
     from r2v_data_v2.h3.audio_reuse_prepared import FrozenReuseBackendProvenance
