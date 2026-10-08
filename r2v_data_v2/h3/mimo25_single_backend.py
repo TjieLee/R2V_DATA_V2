@@ -43,8 +43,8 @@ from r2v_data_v2.structured_output import (
     parse_structured_json_issues,
 )
 
-SINGLE_PROMPT_VERSION = "h3_mimo26_ra2va_single_v9_closed_subjects"
-SINGLE_BACKEND_VERSION = "r2v.h3.mimo25_backend.75"
+SINGLE_PROMPT_VERSION = "h3_mimo26_ra2va_single_v10_speaker_subject_consistency"
+SINGLE_BACKEND_VERSION = "r2v.h3.mimo25_backend.76"
 SINGLE_COMPACT_SCHEMA_VERSION = "r2v.h3.mimo26_single_compact.2"
 
 _COMPACT_PICTURE_LABEL = r"<Picture [1-9]\d*>"
@@ -68,6 +68,25 @@ Each supplied <Subject N> refers only to the visual referent represented by its 
 
 STEP 2 - SEGMENT SPEAKER DECISIONS
 Output exactly one ordered segments row for EVERY supplied DiariZen segment, including non-transcribed ones. Assign stable g1, g2, ... acoustic groups by first vocal-source appearance; pauses, language changes, and segment boundaries alone do not create groups. Use primary_speaker_group=null when grouping is unreliable. Give transcribed speech a concise audible delivery_style and use null for non-transcribed segments. For a supported visible speaker choose visible_subject and speaker_subject_label from required_output_inventory.allowed_speaker_subject_labels. For genuine offscreen speech choose offscreen and null; if several people remain plausible, choose no_reliable_subject or uncertain and null rather than guessing. Do not output confidence, evidence codes, mouth/lip fields, or entity_id. Profile only distinct non-null groups in transcribed segments in first transcribed appearance order, using their speech-stem windows; do not re-decide grouping or binding.
+
+For visible_subject binding, the selected speaker_subject_label must refer
+to the actual visible speaking person represented by that frozen Subject's
+source Picture(s).
+
+The speaker binding and subject_definitions must describe the same visual
+referent. Never bind a visible speaker to a Subject whose frozen Picture
+represents a table, chair, clothing-only attribute, background, or another
+non-speaking object.
+
+If the visible speaking person does not correspond to any eligible frozen
+entity Subject, use no_reliable_subject with speaker_subject_label=null.
+Do not force a binding to an unrelated Subject.
+
+Use offscreen only when the speech source is genuinely offscreen, not merely
+because the visible speaker lacks a matching frozen Subject.
+
+Preserve the acoustic speaker group, voice profile, and every required
+dialogue block even when entity binding is unresolved.
 
 STEP 3 - EXACT DIALOGUE
 Place every immutable required_dialogue_block exactly once in shot1_caption, in chronological playback order, with a natural visible or offscreen speaker lead-in. Do not translate, paraphrase, normalize, merge, or omit dialogue. Non-transcribed segments have no dialogue block. Do NOT emit any (S1), (S2), or other (Sx) speaker markers: the pipeline owns speaker IDs and projects them deterministically.

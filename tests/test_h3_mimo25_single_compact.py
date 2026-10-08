@@ -51,10 +51,10 @@ def test_v6_raw_schema_has_one_segment_inventory_and_no_entity_evidence_fields()
         single.MimoSingleCompactAnnotationDraftV2.model_validate(payload)
 
 
-def test_single_v9_closed_subject_prompt_preserves_v8_caption_and_dialogue_rules():
+def test_single_v10_prompt_preserves_v9_inventory_and_v8_caption_and_dialogue_rules():
     prompt = single.SINGLE_SYSTEM_PROMPT
-    assert single.SINGLE_PROMPT_VERSION == "h3_mimo26_ra2va_single_v9_closed_subjects"
-    assert single.SINGLE_BACKEND_VERSION == "r2v.h3.mimo25_backend.75"
+    assert single.SINGLE_PROMPT_VERSION == "h3_mimo26_ra2va_single_v10_speaker_subject_consistency"
+    assert single.SINGLE_BACKEND_VERSION == "r2v.h3.mimo25_backend.76"
     for phrase in (
         "content-complete summary", "principal visible Subjects",
         "opening composition through the ending visual state",
@@ -70,6 +70,25 @@ def test_single_v9_closed_subject_prompt_preserves_v8_caption_and_dialogue_rules
         "materializer owns <Audio N>", "pipeline owns speaker IDs",
     ):
         assert phrase in prompt
+
+
+def test_single_v10_speaker_binding_uses_frozen_picture_visual_referent():
+    step2 = single.SINGLE_SYSTEM_PROMPT.split("STEP 2 - SEGMENT SPEAKER DECISIONS")[1]
+    step2 = step2.split("STEP 3 - EXACT DIALOGUE")[0]
+    for phrase in (
+        "actual visible speaking person represented by that frozen Subject's",
+        "source Picture(s)",
+        "speaker binding and subject_definitions must describe the same visual",
+        "table, chair, clothing-only attribute, background",
+        "no_reliable_subject with speaker_subject_label=null",
+        "Do not force a binding to an unrelated Subject",
+        "Use offscreen only when the speech source is genuinely offscreen",
+        "not merely",
+        "because the visible speaker lacks a matching frozen Subject",
+        "Preserve the acoustic speaker group, voice profile, and every required",
+        "dialogue block even when entity binding is unresolved",
+    ):
+        assert phrase in step2
 
 
 def _job(*, segments=None, subjects=None):
@@ -467,6 +486,68 @@ def test_compact_visible_subject_maps_to_frozen_entity_without_remap():
     assert "e2" not in json.dumps(payload)
 
 
+def test_compact_person_picture_allows_visible_speaker_binding():
+    payload = _compact_payload()
+    description = "A woman wearing a blue coat."
+    payload["h3_semantics"]["subject_definitions"][0]["description"] = description
+    job = _job(subjects=[SimpleNamespace(
+        subject_label="<Subject 1>", kind="entity", entity_id="e1",
+        source_picture_labels=["<Picture 1>"],
+    )])
+    draft, issues, _ = _validated(payload, job)
+    assert issues == []
+    projected = single._project_compact_to_legacy_annotation(draft, job)
+    grounding = projected.av_grounding.segment_groundings[0]
+    assert grounding.binding_status == "visible_entity"
+    assert grounding.entity_id == "e1"
+    assert projected.h3_semantics.subject_definitions[0].description == description
+
+
+@pytest.mark.parametrize(("binding", "projected_binding"), [
+    ("no_reliable_subject", "no_reliable_entity"),
+    ("offscreen", "offscreen"),
+])
+def test_compact_unbound_speech_preserves_table_subject_and_acoustic_content(
+    binding, projected_binding,
+):
+    payload = _compact_payload()
+    description = "A white pedestal table."
+    payload["h3_semantics"]["subject_definitions"][0]["description"] = description
+    payload["h3_semantics"]["visual_retention_analysis"][0]["description"] = (
+        "The white pedestal and tabletop remain visible."
+    )
+    payload["visual_blocks"][0]["text"] = "<Subject 1> stands beside a doorway."
+    payload["segments"][0].update(binding_status=binding, speaker_subject_label=None)
+    lead_in = "A visible woman" if binding == "no_reliable_subject" else "An offscreen voice"
+    payload["h3_semantics"]["shot1_caption"] = (
+        "<Subject 1> stands beside a doorway. " + lead_in
+        + " says <d>[English] exact transcript</d>"
+    )
+    job = _job(subjects=[SimpleNamespace(
+        subject_label="<Subject 1>", kind="entity", entity_id="e1",
+        source_picture_labels=["<Picture 1>"],
+    )])
+    draft, issues, _ = _validated(payload, job)
+    assert issues == []
+    normalized, corrections = single._normalize_single_compact_speaker_subjects(draft, job)
+    assert normalized == draft
+    assert corrections == {}
+    projected = single._project_compact_to_legacy_annotation(normalized, job)
+    grounding = projected.av_grounding.segment_groundings[0]
+    assert grounding.binding_status == projected_binding
+    assert grounding.entity_id is None
+    assert grounding.primary_speaker_group == "g1"
+    assert projected.audio_observation.segment_decisions[0].primary_speaker_group == "g1"
+    assert projected.speaker_voice_profiles == draft.speaker_voice_profiles
+    assert [profile.speaker_group for profile in projected.speaker_voice_profiles] == ["g1"]
+    assert projected.h3_semantics.subject_definitions[0].description == description
+    assert projected.h3_semantics.visual_retention_analysis == draft.h3_semantics.visual_retention_analysis
+    assert projected.visual_observation.visual_blocks == draft.visual_blocks
+    assert "(S1) <d>[English] exact transcript</d>" in projected.h3_semantics.shot1_caption
+    assert lead_in in projected.h3_semantics.shot1_caption
+    assert job.segments[0].asr_text == "exact transcript"
+
+
 def test_compact_object_picture_keeps_frozen_entity_speaker_subject():
     payload = _compact_payload()
     job = _job(subjects=[SimpleNamespace(
@@ -561,6 +642,7 @@ def test_single_compact_backend_keeps_raw_response_and_legacy_annotation(tmp_pat
     (".72", "h3_mimo26_ra2va_single_v6_compact2"),
     (".73", "h3_mimo26_ra2va_single_v7_compact2_cleanup"),
     (".74", "h3_mimo26_ra2va_single_v8_caption_quality"),
+    (".75", "h3_mimo26_ra2va_single_v9_closed_subjects"),
 ])
 def test_historical_single_record_envelopes_remain_readable(tmp_path, monkeypatch, version, prompt):
     _, shadow = _fixture(tmp_path, monkeypatch)
