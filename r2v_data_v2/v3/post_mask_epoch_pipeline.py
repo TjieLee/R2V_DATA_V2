@@ -796,159 +796,164 @@ def run_subject_attributes_stage(
         emit=emit,
         cpu_workers=cpu_workers,
     )
-    _bind_clip_quarantine(subject_attributes, clip_quarantine)
-    if resuming and hasattr(subject_attributes, "checkpoint_first_resume"):
-        subject_attributes.checkpoint_first_resume = True
-    if hasattr(subject_attributes, "online_binary_gc_enabled"):
-        subject_attributes.online_binary_gc_enabled = True
-    eligible_keys = {
-        (shard, clip_uid)
-        for shard, clip_uids in eligible.items()
-        for clip_uid in clip_uids
-    }
-    seeded_job_count = 0
-    execution_batches = 0
-    peak_seed_jobs = 0
-    seed_wall_seconds = 0.0
-
-    def batches() -> Iterator[list[Any]]:
-        nonlocal seeded_job_count, execution_batches, peak_seed_jobs
-        nonlocal seed_wall_seconds
-        seed_batches = iter(subject_attributes.seed_job_batches(batch_size))
-        while True:
-            started = time.perf_counter()
-            try:
-                batch = next(seed_batches)
-            except StopIteration:
-                return
-            finally:
-                seed_wall_seconds += time.perf_counter() - started
-            for job in batch:
-                if (job.canonical_shard, job.clip_uid) not in eligible_keys:
-                    raise StageHandoffError(
-                        "Subject Attributes seeded jobs are outside the eligible clip scope"
-                    )
-            seeded_job_count += len(batch)
-            execution_batches += 1
-            peak_seed_jobs = max(peak_seed_jobs, len(batch))
-            yield batch
-            clear = getattr(subject_attributes, "clear_execution_hot_caches", None)
-            if clear is not None:
-                clear()
-
-    scheduler = subject_attributes_scheduler_factory(subject_attributes)
     try:
-        with _stage_timing(emit, "subject_attributes", "scheduler"):
-            outcome = scheduler.run_batches(batches())
-    finally:
-        _emit(
-            emit,
-            "post_mask_epoch_stage_timing",
-            stage="subject_attributes",
-            phase="seed",
-            wall_seconds=seed_wall_seconds,
-        )
-        _emit(
-            emit,
-            "post_mask_epoch_subject_attributes_seeded",
-            seeded_jobs=seeded_job_count,
-        )
-        _emit_subject_attributes_cpu_diagnostics(emit, subject_attributes)
-    _emit_scheduler_diagnostics(emit, "subject_attributes", outcome)
-    unresolved = tuple(outcome.get("unresolved_job_ids", ()))
-    completed = False
-    stats: dict[str, Any] = {}
-    error: str | None = None
-    if not unresolved:
-        completed, stats, error = _timed(
-            emit,
-            "subject_attributes",
-            "reconcile",
-            _reconcile_and_publish_subject_attribute_stats,
-            subject_attributes=subject_attributes,
-            storages=storages,
-            eligible=eligible,
-            clip_quarantine=clip_quarantine,
-        )
-    _emit(
-        emit,
-        "post_mask_epoch_subject_attributes_execution_diagnostics",
-        execution_batches=execution_batches,
-        execution_batch_size=batch_size,
-        execution_batch_peak_seed_jobs=peak_seed_jobs,
-        **{
-            key: value
-            for key, value in dict(
-                getattr(subject_attributes, "seed_counters", None) or {}
-            ).items()
-            if key in {
-                "seed_execution_batches",
-                "seed_execution_clips",
-                "seed_execution_peak_clips",
-            }
-        },
-        **{
-            key: value
-            for key, value in dict(
-                getattr(subject_attributes, "replay_counters", None) or {}
-            ).items()
-            if key in {
-                "committed_payload_cache_hits",
-                "committed_payload_cache_misses",
-                "sam_mask_ram_hits",
-                "sam_mask_disk_loads",
-                "fresh_reconcile_cache_hits",
-                "rank0_working_cache_hits",
-                "rank0_working_cache_misses",
-                "rank0_attribute_replays",
-                "rank0_full_owner_replays",
-                "rank0_unchanged_attribute_reuses",
-                "rank0_terminal_context_hits",
-                "fresh_owner_outcome_hits",
-                "fresh_owner_verify_skips",
-                "fresh_owner_artifact_hits",
-                "owner_replay_calls",
-                "completion_chain_cache_hits",
-                "completion_chain_rebuilds",
-                "completion_chain_unchanged_reuses",
-            }
-        },
-        **{
-            key: value
-            for key, value in dict(
-                getattr(subject_attributes, "replay_timing_seconds", None) or {}
-            ).items()
-            if key == "owner_replay_wall_seconds"
-        },
-    )
-    result.update(
-        {
-            "subject_attributes_job_count": seeded_job_count,
-            "subject_attributes_unresolved": unresolved,
-            "subject_attributes_completed": completed,
-            "subject_attributes_stats": stats,
-            "subject_attributes_reconcile_error": error,
-            "reason": (
-                EXPORT_PENDING_REASON
-                if completed
-                else SUBJECT_ATTRIBUTES_INCOMPLETE_REASON
-            ),
+        _bind_clip_quarantine(subject_attributes, clip_quarantine)
+        if resuming and hasattr(subject_attributes, "checkpoint_first_resume"):
+            subject_attributes.checkpoint_first_resume = True
+        if hasattr(subject_attributes, "online_binary_gc_enabled"):
+            subject_attributes.online_binary_gc_enabled = True
+        eligible_keys = {
+            (shard, clip_uid)
+            for shard, clip_uids in eligible.items()
+            for clip_uid in clip_uids
         }
-    )
-    _emit(
-        emit,
-        "post_mask_epoch_subject_attributes_finished",
-        completed=completed,
-        unresolved=len(unresolved),
-    )
-    if completed:
-        write_composition_handoff(
-            ledger,
-            SUBJECT_ATTRIBUTES_COMPLETED,
-            eligible_clip_uids_by_shard=eligible,
-            clip_quarantine=clip_quarantine,
+        seeded_job_count = 0
+        execution_batches = 0
+        peak_seed_jobs = 0
+        seed_wall_seconds = 0.0
+
+        def batches() -> Iterator[list[Any]]:
+            nonlocal seeded_job_count, execution_batches, peak_seed_jobs
+            nonlocal seed_wall_seconds
+            seed_batches = iter(subject_attributes.seed_job_batches(batch_size))
+            while True:
+                started = time.perf_counter()
+                try:
+                    batch = next(seed_batches)
+                except StopIteration:
+                    return
+                finally:
+                    seed_wall_seconds += time.perf_counter() - started
+                for job in batch:
+                    if (job.canonical_shard, job.clip_uid) not in eligible_keys:
+                        raise StageHandoffError(
+                            "Subject Attributes seeded jobs are outside the eligible clip scope"
+                        )
+                seeded_job_count += len(batch)
+                execution_batches += 1
+                peak_seed_jobs = max(peak_seed_jobs, len(batch))
+                yield batch
+                clear = getattr(subject_attributes, "clear_execution_hot_caches", None)
+                if clear is not None:
+                    clear()
+
+        scheduler = subject_attributes_scheduler_factory(subject_attributes)
+        try:
+            with _stage_timing(emit, "subject_attributes", "scheduler"):
+                outcome = scheduler.run_batches(batches())
+        finally:
+            _emit(
+                emit,
+                "post_mask_epoch_stage_timing",
+                stage="subject_attributes",
+                phase="seed",
+                wall_seconds=seed_wall_seconds,
+            )
+            _emit(
+                emit,
+                "post_mask_epoch_subject_attributes_seeded",
+                seeded_jobs=seeded_job_count,
+            )
+            _emit_subject_attributes_cpu_diagnostics(emit, subject_attributes)
+        _emit_scheduler_diagnostics(emit, "subject_attributes", outcome)
+        unresolved = tuple(outcome.get("unresolved_job_ids", ()))
+        completed = False
+        stats: dict[str, Any] = {}
+        error: str | None = None
+        if not unresolved:
+            completed, stats, error = _timed(
+                emit,
+                "subject_attributes",
+                "reconcile",
+                _reconcile_and_publish_subject_attribute_stats,
+                subject_attributes=subject_attributes,
+                storages=storages,
+                eligible=eligible,
+                clip_quarantine=clip_quarantine,
+            )
+        _emit(
+            emit,
+            "post_mask_epoch_subject_attributes_execution_diagnostics",
+            execution_batches=execution_batches,
+            execution_batch_size=batch_size,
+            execution_batch_peak_seed_jobs=peak_seed_jobs,
+            **{
+                key: value
+                for key, value in dict(
+                    getattr(subject_attributes, "seed_counters", None) or {}
+                ).items()
+                if key in {
+                    "seed_execution_batches",
+                    "seed_execution_clips",
+                    "seed_execution_peak_clips",
+                }
+            },
+            **{
+                key: value
+                for key, value in dict(
+                    getattr(subject_attributes, "replay_counters", None) or {}
+                ).items()
+                if key in {
+                    "committed_payload_cache_hits",
+                    "committed_payload_cache_misses",
+                    "sam_mask_ram_hits",
+                    "sam_mask_disk_loads",
+                    "fresh_reconcile_cache_hits",
+                    "rank0_working_cache_hits",
+                    "rank0_working_cache_misses",
+                    "rank0_attribute_replays",
+                    "rank0_full_owner_replays",
+                    "rank0_unchanged_attribute_reuses",
+                    "rank0_terminal_context_hits",
+                    "fresh_owner_outcome_hits",
+                    "fresh_owner_verify_skips",
+                    "fresh_owner_artifact_hits",
+                    "owner_replay_calls",
+                    "completion_chain_cache_hits",
+                    "completion_chain_rebuilds",
+                    "completion_chain_unchanged_reuses",
+                }
+            },
+            **{
+                key: value
+                for key, value in dict(
+                    getattr(subject_attributes, "replay_timing_seconds", None) or {}
+                ).items()
+                if key == "owner_replay_wall_seconds"
+            },
         )
-    return result
+        result.update(
+            {
+                "subject_attributes_job_count": seeded_job_count,
+                "subject_attributes_unresolved": unresolved,
+                "subject_attributes_completed": completed,
+                "subject_attributes_stats": stats,
+                "subject_attributes_reconcile_error": error,
+                "reason": (
+                    EXPORT_PENDING_REASON
+                    if completed
+                    else SUBJECT_ATTRIBUTES_INCOMPLETE_REASON
+                ),
+            }
+        )
+        _emit(
+            emit,
+            "post_mask_epoch_subject_attributes_finished",
+            completed=completed,
+            unresolved=len(unresolved),
+        )
+        if completed:
+            write_composition_handoff(
+                ledger,
+                SUBJECT_ATTRIBUTES_COMPLETED,
+                eligible_clip_uids_by_shard=eligible,
+                clip_quarantine=clip_quarantine,
+            )
+        return result
+    finally:
+        close_gc = getattr(subject_attributes, "close_online_binary_gc", None)
+        if close_gc is not None:
+            close_gc()
 
 
 def _after_reference_edit(

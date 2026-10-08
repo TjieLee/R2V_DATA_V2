@@ -30,6 +30,7 @@ import io
 import json
 import logging
 import math
+import queue
 import threading
 import time
 from collections import Counter
@@ -1357,6 +1358,67 @@ def _candidate_descriptor(storage: RunStorage, candidate: Any) -> dict[str, Any]
     }
 
 
+class _TerminalBinaryGC:
+    """One bounded worker; historic filesystem reads never share commit locks."""
+
+    def __init__(self, root: Path, cleanup: Any, *, capacity: int = 128) -> None:
+        self.root = root
+        self.cleanup = cleanup
+        self.requests: queue.Queue[Any] = queue.Queue(maxsize=capacity)
+        self.thread = threading.Thread(
+            target=self._run, name="sa-terminal-binary-gc", daemon=False
+        )
+        self.thread.start()
+
+    def submit(
+        self, shard: str, clip_uid: str, sam: frozenset[str],
+        completion: frozenset[str],
+    ) -> bool:
+        try:
+            self.requests.put_nowait((shard, clip_uid, sam, completion))
+        except queue.Full:
+            _LOGGER.warning(
+                "Subject Attributes binary GC queue full for %s/%s; "
+                "leaving intermediates for explicit backfill", shard, clip_uid,
+            )
+            return False
+        return True
+
+    def close(self) -> None:
+        # Only stage shutdown may block, while group ownership is still held.
+        self.requests.put(None)
+        self.thread.join()
+
+    def _run(self) -> None:
+        historic = None
+        while True:
+            request = self.requests.get()
+            if request is None:
+                return
+            shard, clip_uid, sam, completion = request
+            if historic is None:
+                historic = {}
+                try:
+                    historic = load_binary_job_index(self.root)
+                except Exception:
+                    _LOGGER.warning(
+                        "Subject Attributes historic binary GC index failed", exc_info=True,
+                    )
+            prior = historic.get((shard, clip_uid), BinaryJobIds())
+            jobs = BinaryJobIds(
+                sam=set(sam) | prior.sam,
+                completion=set(completion) | prior.completion,
+            )
+            try:
+                self.cleanup(shard, clip_uid, jobs)
+            except Exception:
+                # A disposable cleanup failure must not strand queue shutdown.
+                _LOGGER.warning(
+                    "Subject Attributes binary GC failed for %s/%s",
+                    shard, clip_uid, exc_info=True,
+                )
+
+
 class SubjectAttributeEpochRunner:
     """Durable owner/discovery foundation for the Subject Attributes stage."""
 
@@ -1401,11 +1463,11 @@ class SubjectAttributeEpochRunner:
         # Formal Resource-Epoch execution enables this only after its durable
         # SAT_STARTED handoff. Standalone runners retain strict binary replay.
         self.online_binary_gc_enabled = False
-        # Load prior phase job records lazily, at most once per group/invocation
-        # when the first NEW clip becomes terminal. Later committed jobs extend
-        # this RAM-only index without scanning historical phases again.
-        self._binary_job_index: dict[tuple[str, str], BinaryJobIds] | None = None
+        # Current commits are always indexed under a short RAM-only lock.
+        # Historical plans belong exclusively to the lazy cleanup worker.
+        self._binary_job_index: dict[tuple[str, str], BinaryJobIds] = {}
         self._binary_job_index_lock = threading.Lock()
+        self._terminal_binary_gc: _TerminalBinaryGC | None = None
         # A terminal clip outcome is the SAT restart checkpoint. Keep only its
         # small frozen plan and counts in memory; do not re-open historical
         # clip/frames/masks merely to discover that it is already complete.
@@ -2968,14 +3030,13 @@ class SubjectAttributeEpochRunner:
             SUBJECT_ATTRIBUTE_COMPLETION_GENERATE_JOB,
         }:
             with self._binary_job_index_lock:
-                if self._binary_job_index is not None:
-                    jobs = self._binary_job_index.setdefault(
-                        (job.canonical_shard, job.clip_uid), BinaryJobIds()
-                    )
-                    if job.job_type == SUBJECT_ATTRIBUTE_COMPLETION_GENERATE_JOB:
-                        jobs.completion.add(job_id)
-                    else:
-                        jobs.sam.add(job_id)
+                jobs = self._binary_job_index.setdefault(
+                    (job.canonical_shard, job.clip_uid), BinaryJobIds()
+                )
+                if job.job_type == SUBJECT_ATTRIBUTE_COMPLETION_GENERATE_JOB:
+                    jobs.completion.add(job_id)
+                else:
+                    jobs.sam.add(job_id)
         if job.job_type not in {
             SUBJECT_ATTRIBUTE_SAM_PROBE_JOB,
             SUBJECT_ATTRIBUTE_COMPLETION_SAM_JOB,
@@ -3526,21 +3587,26 @@ class SubjectAttributeEpochRunner:
             self._gc_new_terminal_clip_binary(shard, clip_uid)
 
     def _gc_new_terminal_clip_binary(self, shard: str, clip_uid: str) -> None:
-        """Best-effort cleanup after this clip's terminal outcome is durable."""
-        try:
-            with self._binary_job_index_lock:
-                if self._binary_job_index is None:
-                    # Set a sentinel before the one historical phase scan: a
-                    # failed scan must not recur for every terminal clip.
-                    self._binary_job_index = {}
-                    self._binary_job_index.update(
-                        load_binary_job_index(Path(self.ledger.root))
-                    )
-                indexed = self._binary_job_index.get((shard, clip_uid))
-                jobs = BinaryJobIds(
-                    sam=set() if indexed is None else set(indexed.sam),
-                    completion=set() if indexed is None else set(indexed.completion),
+        """Admit an immutable snapshot only after terminal publication."""
+        with self._binary_job_index_lock:
+            indexed = self._binary_job_index.pop((shard, clip_uid), BinaryJobIds())
+            sam, completion = frozenset(indexed.sam), frozenset(indexed.completion)
+            if self._terminal_binary_gc is None:
+                self._terminal_binary_gc = _TerminalBinaryGC(
+                    Path(self.ledger.root), self._cleanup_terminal_clip_binary
                 )
+            worker = self._terminal_binary_gc
+        worker.submit(shard, clip_uid, sam, completion)
+
+    def close_online_binary_gc(self) -> None:
+        if self._terminal_binary_gc is not None:
+            self._terminal_binary_gc.close()
+            self._terminal_binary_gc = None
+
+    def _cleanup_terminal_clip_binary(
+        self, shard: str, clip_uid: str, jobs: BinaryJobIds
+    ) -> None:
+        try:
             result = cleanup_clip_binary(Path(self.ledger.root), jobs, apply=True)
             with self._sam_mask_cache_lock:
                 for job_id in jobs.sam:

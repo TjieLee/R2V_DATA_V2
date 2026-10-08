@@ -3,9 +3,134 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+
+
+def test_online_worker_is_lazy_bounded_and_scan_does_not_block_admission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from r2v_data_v2.v3 import post_mask_epoch_subject_attributes as sa
+
+    entered, release = threading.Event(), threading.Event()
+    cleaned = []
+    scans = []
+
+    def scan(root):
+        scans.append(root)
+        entered.set()
+        assert release.wait(5)
+        return {(SHARD, "clip-a"): sa.BinaryJobIds(sam={SAM_A})}
+
+    monkeypatch.setattr(sa, "load_binary_job_index", scan)
+    worker = sa._TerminalBinaryGC(Path("unused"), lambda *args: cleaned.append(args), capacity=1)
+    assert not scans
+    assert worker.submit(SHARD, "clip-a", frozenset(), frozenset())
+    assert entered.wait(5)
+    assert worker.submit(SHARD, "clip-b", frozenset({SAM_B}), frozenset())
+    assert not worker.submit(SHARD, "clip-c", frozenset(), frozenset())
+    release.set()
+    worker.close()
+    assert len(scans) == 1
+    assert cleaned[0][2].sam == {SAM_A}
+    assert cleaned[1][2].sam == {SAM_B}
+    assert not worker.thread.is_alive()
+
+
+def test_online_worker_cleanup_does_not_block_next_snapshot(monkeypatch) -> None:
+    from r2v_data_v2.v3 import post_mask_epoch_subject_attributes as sa
+
+    entered, release = threading.Event(), threading.Event()
+    seen = []
+    monkeypatch.setattr(sa, "load_binary_job_index", lambda root: {})
+
+    def cleanup(shard, clip, jobs):
+        seen.append(jobs.sam)
+        entered.set()
+        assert release.wait(5)
+
+    worker = sa._TerminalBinaryGC(Path("unused"), cleanup, capacity=1)
+    worker.submit(SHARD, "clip-a", frozenset({SAM_A}), frozenset())
+    assert entered.wait(5)
+    assert worker.submit(SHARD, "clip-b", frozenset({SAM_B}), frozenset())
+    release.set()
+    worker.close()
+    assert seen == [{SAM_A}, {SAM_B}]
+
+
+def test_current_commit_during_historic_scan_is_in_terminal_snapshot(monkeypatch):
+    from r2v_data_v2.v3 import post_mask_epoch_subject_attributes as sa
+
+    entered, release = threading.Event(), threading.Event()
+    seen = []
+
+    def scan(root):
+        entered.set()
+        assert release.wait(5)
+        return {}
+
+    monkeypatch.setattr(sa, "load_binary_job_index", scan)
+    runner = sa.SubjectAttributeEpochRunner.__new__(sa.SubjectAttributeEpochRunner)
+    runner.ledger = SimpleNamespace(root="unused")
+    runner._binary_job_index = {}
+    runner._binary_job_index_lock = threading.Lock()
+    runner._terminal_binary_gc = None
+    runner._committed_payload_cache = {}
+    runner._committed_payload_cache_lock = threading.Lock()
+    runner._cleanup_terminal_clip_binary = lambda *args: seen.append(args)
+    runner._gc_new_terminal_clip_binary(SHARD, "clip-a")
+    assert entered.wait(5)
+    job = SimpleNamespace(
+        job_type=sa.SUBJECT_ATTRIBUTE_COMPLETION_GENERATE_JOB,
+        canonical_shard=SHARD, clip_uid="clip-b", job_id=lambda: COMPLETION_B,
+    )
+    runner._cache_committed_result(job, SimpleNamespace(payload={}))
+    runner._gc_new_terminal_clip_binary(SHARD, "clip-b")
+    release.set()
+    runner.close_online_binary_gc()
+    assert seen[1][2].completion == {COMPLETION_B}
+
+
+@pytest.mark.parametrize("failure", ["seed", "reconcile"])
+def test_sa_stage_exception_joins_gc_worker(tmp_path, monkeypatch, failure) -> None:
+    from r2v_data_v2.v3 import post_mask_epoch_pipeline as pipeline
+    from r2v_data_v2.v3 import post_mask_epoch_subject_attributes as sa
+    from r2v_data_v2.v3.post_mask_epoch_state import GroupLedger
+
+    cleaned = []
+    monkeypatch.setattr(sa, "load_binary_job_index", lambda root: {})
+    worker = sa._TerminalBinaryGC(tmp_path, lambda *args: cleaned.append(args))
+
+    class Runner:
+        def seed_job_batches(self, size):
+            worker.submit(SHARD, "clip-a", frozenset({SAM_A}), frozenset())
+            if failure == "seed":
+                raise RuntimeError("seed failed")
+            return iter(())
+
+        def close_online_binary_gc(self):
+            worker.close()
+
+    class Scheduler:
+        def run_batches(self, batches):
+            list(batches)
+            return {"unresolved_job_ids": ()}
+
+    def reconcile(**kwargs):
+        raise RuntimeError("reconcile failed")
+
+    monkeypatch.setattr(pipeline, "_reconcile_and_publish_subject_attribute_stats", reconcile)
+    with pytest.raises(RuntimeError, match=f"{failure} failed"):
+        pipeline.run_subject_attributes_stage(
+            config=object(), storages={}, eligible={}, ledger=GroupLedger(tmp_path / "ledger"),
+            result={}, subject_attributes_runner_factory=lambda **kwargs: Runner(),
+            subject_attributes_scheduler_factory=lambda runner: Scheduler(),
+        )
+    assert cleaned
+    assert not worker.thread.is_alive()
 
 SHARD = "shard-000000000-000009999"
 SAM_A = "a" * 64

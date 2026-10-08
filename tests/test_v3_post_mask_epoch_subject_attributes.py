@@ -5557,6 +5557,7 @@ def test_online_binary_gc_keeps_pending_sibling_and_cold_resume_skips_terminal(
     assert len(first) == 1
     first_client = _QwenClient(discoveries=[_nonhuman_discovery()])
     _scheduler(runner, _SerialQwenExecutor(runner, first_client)).run(first)
+    runner.close_online_binary_gc()
 
     assert runner._clip_outcome_path(SHARD, uids[0]).is_file()
     assert all(not path.exists() for path in files[uids[0]])
@@ -5580,6 +5581,7 @@ def test_online_binary_gc_keeps_pending_sibling_and_cold_resume_skips_terminal(
     assert {job.clip_uid for job in remaining} == {uids[1]}
     second_client = _QwenClient(discoveries=[_nonhuman_discovery()])
     _scheduler(cold, _SerialQwenExecutor(cold, second_client)).run(remaining)
+    cold.close_online_binary_gc()
     assert all(not path.exists() for path in files[uids[1]])
     assert cold.reconcile_stats(SHARD).terminal_clips == 2
     assert first_client.discovery_calls == second_client.discovery_calls == 1
@@ -5604,7 +5606,8 @@ def test_online_binary_gc_failure_does_not_undo_terminal_outcome(
     assert runner._clip_outcome_path(SHARD, CLIP_UID).is_file()
     assert runner.reconcile_stats(SHARD).terminal_clips == 1
     assert qwen.discovery_calls == 1
-    assert "binary GC failed" in caplog.text
+    runner.close_online_binary_gc()
+    assert "binary GC index failed" in caplog.text
 
 
 def test_online_binary_gc_indexes_once_and_cold_completed_scan_does_not_index(
@@ -5633,6 +5636,7 @@ def test_online_binary_gc_indexes_once_and_cold_completed_scan_does_not_index(
         runner,
         _QwenClient(discoveries=[_nonhuman_discovery(), _nonhuman_discovery()]),
     )
+    runner.close_online_binary_gc()
     assert calls == 1
 
     cold = _multi_runner(
@@ -5686,6 +5690,7 @@ def test_online_binary_gc_extends_index_after_first_terminal_clip(
     _scheduler(
         runner, _SerialQwenExecutor(runner, _QwenClient(discoveries=[_nonhuman_discovery()])),
     ).run(second)
+    runner.close_online_binary_gc()
     assert not path.exists()
     assert runner.reconcile_stats(SHARD).terminal_clips == 2
 
