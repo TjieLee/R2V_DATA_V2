@@ -400,14 +400,14 @@ def test_integer_temperature_provenance_matches_float_and_two_step(tmp_path):
         float_config, stem_records_by_clip={}, client=SimpleNamespace(),
     )
     assert integer_backend.provenance == float_backend.provenance
-    assert integer_backend.provenance.schema_version == "r2v.h3.mimo25_backend.81"
+    assert integer_backend.provenance.schema_version == "r2v.h3.mimo25_backend.82"
 
 
 def test_two_step_has_independent_provenance_without_changing_multi(tmp_path, monkeypatch):
     from r2v_data_v2.h3.audio_reuse_prepared import FrozenReuseBackendProvenance
 
     _, _, backend, _, _, _, multi, _ = _setup(tmp_path, monkeypatch)
-    assert backend.provenance.schema_version == "r2v.h3.mimo25_backend.81"
+    assert backend.provenance.schema_version == "r2v.h3.mimo25_backend.82"
     assert backend.provenance.prompt_version == "h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity"
     assert multi.provenance.schema_version == "r2v.h3.mimo25_backend.66"
     assert multi.provenance.prompt_version == "h3_mimo25_speech_assembly_v49"
@@ -416,6 +416,22 @@ def test_two_step_has_independent_provenance_without_changing_multi(tmp_path, mo
     values["prompt_version"] = multi.provenance.prompt_version
     with pytest.raises(ValueError, match="provenance differs"):
         MimoBackendProvenance.model_validate(values)
+
+
+@pytest.mark.parametrize("version,prompt", [
+    ("r2v.h3.mimo25_backend.80", "h3_mimo26_ra2va_two_step_joint_v1"),
+    ("r2v.h3.mimo25_backend.81", "h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity"),
+])
+def test_historical_two_step_provenance_remains_readable(tmp_path, monkeypatch, version, prompt):
+    from r2v_data_v2.h3.audio_reuse_prepared import FrozenReuseBackendProvenance
+    from r2v_data_v2.h3.mimo25_backend import _compact_json, _sha256_text
+
+    _, _, backend, _, _, _, _, _ = _setup(tmp_path, monkeypatch)
+    values = backend.provenance.model_dump(mode="json", exclude={"configuration_fingerprint"})
+    values.update(schema_version=version, prompt_version=prompt)
+    values["configuration_fingerprint"] = _sha256_text(_compact_json(values))
+    assert MimoBackendProvenance.model_validate(values).model_dump(mode="json") == values
+    assert FrozenReuseBackendProvenance.model_validate(values).model_dump(mode="json") == values
 
 
 def test_two_step_flows_through_existing_audio_reuse_and_h3_cpu_path(tmp_path):
@@ -499,29 +515,43 @@ def _segment_job(job, texts):
     return _job(values)
 
 
-def test_25755_null_non_transcribed_profile_is_removed_without_speaker_repair(tmp_path, monkeypatch):
-    texts = ["你好，老师。", "请坐下来。", None]
+@pytest.mark.parametrize("extra_traits", [None, "Soft low-register vocal texture."], ids=["null", "non_null"])
+def test_25755_non_transcribed_profile_is_excluded_without_losing_audio_facts(tmp_path, monkeypatch, extra_traits):
+    texts = ["你好，老师。", None, "请坐下来。", None]
     caption = "A woman says, <d>[Chinese] 你好，老师。</d> then continues, <d>[Chinese] 请坐下来。</d>."
-    visual, joint = _segment_drafts(["g1", "g1", "g2"], texts, caption)
+    visual, joint = _segment_drafts(["g1", "g2", "g1", "g2"], texts, caption)
     joint["speaker_voice_profiles"] = [
         {"speaker_group": "g1", "voice_characteristics": "Clear middle register."},
-        {"speaker_group": "g2", "voice_characteristics": None},
+        {"speaker_group": "g2", "voice_characteristics": extra_traits},
     ]
     _, shadow, backend, completions, stems, jobs, _, _ = _setup(tmp_path, monkeypatch, visual=visual, joint=joint)
     job = _segment_job(jobs[0], texts)
     summary = _run(shadow, backend, stems, [job])
     record = MimoStemReconcileRecord.model_validate(_records(shadow)[0])
-    assert summary.ready_count == 1 and len(completions.requests) == record.model_call_count == 2
-    assert [p.speaker_group for p in record.annotation.speaker_voice_profiles] == ["g1"]
+    assert summary.ready_count == 1 and len(completions.requests) == record.model_call_count == 2, record.failure_reason
+    assert [p.model_dump(mode="json") for p in record.annotation.speaker_voice_profiles] == [joint["speaker_voice_profiles"][0]]
     assert record.annotation.h3_semantics.shot1_caption == caption
-    assert [d.primary_speaker_group for d in record.annotation.audio_observation.segment_decisions] == ["g1", "g1", "g2"]
+    assert [d.model_dump(mode="json") for d in record.annotation.audio_observation.segment_decisions] == (
+        joint["speech_av"]["audio_observation"]["segment_decisions"]
+    )
+    assert [d.model_dump(mode="json") for d in record.annotation.av_grounding.segment_groundings] == (
+        joint["speech_av"]["av_grounding"]["segment_groundings"]
+    )
+    assert [fact["speaker_id"] for fact in direct_speech_facts(record.annotation, job.segments)] == ["S1", "S1"]
+    assert [fact["text"] for fact in direct_speech_facts(record.annotation, job.segments)] == [texts[0], texts[2]]
     assert "direct_single_speaker_marker_missing" in record.diagnostics[-1].warnings
-    assert "deterministic_correction_count:joint_non_transcribed_null_profile_removed=1" in record.diagnostics[-1].warnings
+    correction = "joint_non_transcribed_null_profile_removed" if extra_traits is None else "joint_non_transcribed_non_null_profile_excluded"
+    assert f"deterministic_correction_count:{correction}=1" in record.diagnostics[-1].warnings
+    profile_warnings = [w for w in record.diagnostics[-1].warnings if w.startswith("non_transcribed_only_voice_profile_excluded:")]
+    assert profile_warnings == ([] if extra_traits is None else [
+        ("non_transcribed_only_voice_profile_excluded:g2:acoustic traits preserved in speech_av_raw_response; "
+         "not published as an identity-related voice profile"),
+    ])
     assert record.speech_av_raw_response == json.dumps(joint)
-    assert json.loads(record.speech_av_raw_response)["speaker_voice_profiles"][-1]["speaker_group"] == "g2"
+    assert json.loads(record.speech_av_raw_response)["speaker_voice_profiles"][-1] == joint["speaker_voice_profiles"][-1]
     text = completions.requests[1]["messages"][-1]["content"][-1]["text"]
     contract = json.loads(text.split("AUTHORITATIVE INPUT:\n", 1)[1].split("\nTURN 1 VISUAL DRAFT:", 1)[0])
-    assert contract["required_segment_ids_in_order"] == ["segment_0001", "segment_0002", "segment_0003"]
+    assert contract["required_segment_ids_in_order"] == ["segment_0001", "segment_0002", "segment_0003", "segment_0004"]
     assert contract["required_dialogue_blocks_in_order"] == [
         "<d>[Chinese] 你好，老师。</d>", "<d>[Chinese] 请坐下来。</d>",
     ]
@@ -581,8 +611,10 @@ def test_exact_chinese_dialogue_gets_only_missing_language_and_identical_audio_d
 
 
 @pytest.mark.parametrize("profiles", [
-    [{"speaker_group": "g1", "voice_characteristics": None}, {"speaker_group": "g2", "voice_characteristics": "Low register."}],
+    [{"speaker_group": "g1", "voice_characteristics": None}, {"speaker_group": "g2", "voice_characteristics": "Low register."},
+     {"speaker_group": "g2", "voice_characteristics": "Low register."}],
     [{"speaker_group": "g1", "voice_characteristics": None}, {"speaker_group": "g3", "voice_characteristics": None}],
+    [{"speaker_group": "g1", "voice_characteristics": None}, {"speaker_group": "g3", "voice_characteristics": "Low register."}],
     [{"speaker_group": "g2", "voice_characteristics": None}],
     [{"speaker_group": "g1", "voice_characteristics": None}] * 2,
 ])

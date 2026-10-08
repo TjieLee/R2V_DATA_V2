@@ -50,7 +50,7 @@ from r2v_data_v2.structured_output import (
     parse_structured_json_issues,
 )
 
-TWO_STEP_BACKEND_VERSION = "r2v.h3.mimo25_backend.81"
+TWO_STEP_BACKEND_VERSION = "r2v.h3.mimo25_backend.82"
 TWO_STEP_PROMPT_VERSION = "h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity"
 JOINT_INPUT_MODALITY = "target_video_joint_av_audio"
 
@@ -160,7 +160,7 @@ def _required_dialogue_blocks(job: MimoBackendJob) -> list[str]:
 
 
 def _normalize_joint_draft(
-    joint: MimoJointAVAudioDraft, job: MimoBackendJob, corrections: Counter[str],
+    joint: MimoJointAVAudioDraft, job: MimoBackendJob, corrections: Counter[str], *, warnings: list[str],
 ) -> None:
     assembly = joint.speech_av
     audio = assembly.audio_observation
@@ -196,15 +196,22 @@ def _normalize_joint_draft(
     if (
         len(actual_groups) != len(set(actual_groups))
         or not set(required_groups).issubset(actual_groups)
-        or any(profile.speaker_group not in non_transcribed_only or profile.voice_characteristics is not None for profile in extras)
+        or any(profile.speaker_group not in non_transcribed_only for profile in extras)
     ):
         raise MimoBackendFailure(
             code="mimo_structured_output_failed", reason="MiMo joint voice profile inventory differs",
             issues=(ValidationIssue("speaker_voice_profile_inventory_mismatch", "speaker_voice_profiles",
-                                    "required groups must be unique; only null non-transcribed-only extras may be removed"),),
+                                    "required groups must be unique; only known non-transcribed-only extras may be excluded"),),
         )
-    if extras:
-        corrections["joint_non_transcribed_null_profile_removed"] += len(extras)
+    for profile in extras:
+        if profile.voice_characteristics is None:
+            corrections["joint_non_transcribed_null_profile_removed"] += 1
+        else:
+            corrections["joint_non_transcribed_non_null_profile_excluded"] += 1
+            warnings.append(
+                f"non_transcribed_only_voice_profile_excluded:{profile.speaker_group}:"
+                "acoustic traits preserved in speech_av_raw_response; not published as an identity-related voice profile"
+            )
     retained = [profile for profile in profiles if profile.speaker_group in required_groups]
     moved = sum(profile.speaker_group != group for profile, group in zip(retained, required_groups, strict=True))
     if moved:
@@ -386,7 +393,7 @@ class TwoStepOpenAIMimo26Backend(StemAwareOpenAIMimo25Backend):
                 raise MimoBackendFailure(code="mimo_structured_output_failed",
                                          reason="MiMo joint AV/audio draft failed structured validation", issues=tuple(issues))
             assembly = joint.speech_av
-            _normalize_joint_draft(joint, job, corrections)
+            _normalize_joint_draft(joint, job, corrections, warnings=diagnostics[-1].warnings)
             shot1_caption = assembly.shot1_caption
             if not any(s.asr_status == "transcribed" for s in job.segments):
                 shot1_caption = visual.shot1_visual_description
