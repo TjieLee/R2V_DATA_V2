@@ -334,13 +334,14 @@ def prepare_frozen_audio_reuse_sources(
     for job in jobs:
         if job.binding_evidence_mode != "none" or len(job.source_h3_sample_ids) != 1:
             raise ValueError("frozen reference-only job requires one canonical source sample")
-        sample = project_mimo_h3_sample_references(
-            canonical[job.source_h3_sample_ids[0]], reference_images=job.reference_images,
+        sample = canonical[job.source_h3_sample_ids[0]].model_copy(update={"r2v_instruction": job.r2v_instruction})
+        projected = project_mimo_h3_sample_references(
+            sample, reference_images=job.reference_images,
             reference_selection=job.reference_selection,
         )
-        sample = sample.model_copy(update={"r2v_instruction": job.r2v_instruction})
-        if build_reference_contract(sample, "visual_only").subjects != job.reference_subjects:
+        if build_reference_contract(projected, "visual_only").subjects != job.reference_subjects:
             raise ValueError("frozen H3 Subject graph differs from reconcile job")
+        # The materializer needs the complete canonical inventory for its own projection.
         samples.append(sample)
     samples = project_prepared_samples(jobs, samples)
     samples_text = "".join(s.model_dump_json() + "\n" for s in samples)

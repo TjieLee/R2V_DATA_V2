@@ -254,8 +254,31 @@ def test_clip_subset_and_nonready_selection(tmp_path, monkeypatch):
         prepared.prepare_frozen_audio_reuse_sources(reconcile_root=reconcile, prepared_root=tmp_path / "failed")
 
 
-def test_frozen_projection_preserves_recorded_face_promotion_without_sampling(tmp_path, monkeypatch):
+def test_frozen_uncertain_composition_remains_ineligible_for_speaker_reuse(tmp_path, monkeypatch):
+    from tools.materialize_h3_ra2va_training_bundle import main
+
+    reconcile, job, _, _ = _fixture(tmp_path, monkeypatch)
+    raw = _rows(reconcile / "records.jsonl")[0]
+    decision = raw["annotation"]["audio_observation"]["segment_decisions"][0]
+    decision["vocal_composition"] = "uncertain"
+    raw["record_fingerprint"] = prepared._hash({k: v for k, v in raw.items() if k != "record_fingerprint"})
+    (reconcile / "records.jsonl").write_text(json.dumps(raw) + "\n")
+    output = tmp_path / "bundle"
+    result = main(["--reconcile-root", str(reconcile), "--output-root", str(output), "--allow-unverified"])
+    manifest = AudioReuseManifest.model_validate_json((output / f"audio_reuse_assets_v1/{job.clip_uid}/manifest.json").read_text())
+    assert manifest.speakers == []
+    assert [(e.segment_id, e.reason) for e in manifest.exclusions] == [(job.segments[0].segment_id, "non_single_speaker")]
+    products = _rows(output / "h3_audio_reuse_products_v1/records.jsonl", AudioReuseProduct)
+    assert {p.conditioning_variant for p in products} == {"visual_only", "full_audio_reuse"}
+    assert all(p.status == "ready" for p in products)
+    assert result["unavailable_target_speech_reuse_clip_uids"] == [job.clip_uid]
+    assert _rows(output / "audio_reuse_prepared_v1/records.jsonl")[0]["annotation"] == raw["annotation"]
+
+
+@pytest.mark.parametrize("promote_face", [False, True])
+def test_frozen_bundle_projects_selected_references_only_at_materialization(tmp_path, monkeypatch, promote_face):
     from r2v_data_v2.h3 import mimo25_av_reconcile as reconcile_module
+    from r2v_data_v2.h3.mimo25_h3_materializer import _prepare_materialization_context
     from r2v_data_v2.h3.qwen38_h3_recaption import build_reference_contract
     from tests.test_h3_mimo25_av_shadow import (
         _augmentation_draws,
@@ -265,8 +288,11 @@ def test_frozen_projection_preserves_recorded_face_promotion_without_sampling(tm
     reconcile, job, canonical, _ = _fixture(tmp_path, monkeypatch)
     refs = _visual_reference_inventory(tmp_path, ["subject", "face", "hair"], same_entity=True)
     canonical = canonical.model_copy(update={"visual_references": refs})
-    _augmentation_draws(monkeypatch, [.8, .9])
+    _augmentation_draws(monkeypatch, [.8 if promote_face else .0, .9])
     selection, images = reconcile_module.select_mimo_reference_projection(job.clip_uid, refs)
+    assert selection.original_picture_count == 3 and selection.selected_picture_count == 1
+    assert bool(selection.face_promotions) is promote_face
+    assert selection.selected_source_image_indexes == [2 if promote_face else 1]
     projected = reconcile_module.project_mimo_h3_sample_references(
         canonical, reference_images=images, reference_selection=selection,
     )
@@ -289,11 +315,39 @@ def test_frozen_projection_preserves_recorded_face_promotion_without_sampling(tm
         raise AssertionError("frozen references must not be sampled again")
 
     monkeypatch.setattr(reconcile_module, "select_mimo_reference_projection", forbidden)
-    output = tmp_path / "projected"
-    prepared.prepare_frozen_audio_reuse_sources(reconcile_root=reconcile, prepared_root=output)
-    actual = _rows(output / "h3/samples.jsonl", FinalH3SampleV2)[0]
-    assert actual.visual_references == projected.visual_references
-    assert len(actual.visual_references) == 1 and actual.visual_references[0].kind == "subject"
-    assert actual.visual_references[0].image_artifact_path == refs[1].image_artifact_path
+    from tools.materialize_h3_ra2va_training_bundle import main
+
+    output = tmp_path / "bundle"
+    result = main(["--reconcile-root", str(reconcile), "--output-root", str(output), "--allow-unverified"])
+    products = _rows(output / "h3_audio_reuse_products_v1/records.jsonl", AudioReuseProduct)
+    assert all(p.status == "ready" for p in products), [p.failure_reason for p in products]
+    assert result["product_failed_count"] == 0 and result["model_call_count"] == 0
+    stage = output / "audio_reuse_prepared_v1"
+    actual = _rows(stage / "h3/samples.jsonl", FinalH3SampleV2)[0]
+    assert actual.visual_references == refs
+    assert [r.image_index for r in actual.visual_references] == [1, 2, 3]
+    assert [r.owner_entity_id for r in actual.visual_references] == [None, "e1", "e1"]
     assert actual.r2v_instruction == job.r2v_instruction
-    assert _rows(output / "records.jsonl")[0]["annotation"] == raw["annotation"]
+    record = _rows(stage / "records.jsonl", prepared.AudioReusePreparedSource)[0]
+    assert record.annotation.model_dump(mode="json") == raw["annotation"]
+    context = _prepare_materialization_context(actual, job, record, conditioning_variant="visual_only")
+    assert context.sample.visual_references == projected.visual_references
+    assert context.contract.subjects == job.reference_subjects
+    picture = context.contract.pictures[0]
+    selected = refs[1 if promote_face else 0]
+    assert picture.picture_label == "<Picture 1>" and picture.image_index == 1
+    assert picture.image_id == projected.visual_references[0].image_id == "image_1"
+    assert job.reference_images[0].source_image_id == selected.image_id
+    assert picture.image_path == selected.image_artifact_path
+    assert Path(picture.image_path).read_bytes() == Path(selected.image_artifact_path).read_bytes()
+    assert picture.kind == "subject" and picture.entity_id == "e1"
+    assert picture.owner_entity_id is None and picture.attribute_id is None
+    assert context.contract.subjects[0].entity_id == "e1"
+    assert context.contract.subjects[0].source_picture_labels == ["<Picture 1>"]
+    for product in products:
+        assert "<Picture 1>" in product.rendered_h3_prompt
+        assert "<Picture 2>" not in product.rendered_h3_prompt and "<Picture 3>" not in product.rendered_h3_prompt
+    references = [c.row["images"] for c in build_review_cases(output) if c.task in {
+        "r2va_reference", "ra2va_reference_full_audio", "ra2va_reference_speech_bgm",
+    }]
+    assert references and all(paths == [selected.image_artifact_path] for paths in references)
