@@ -374,6 +374,35 @@ def test_empty_segment_input_rejects_invented_av_inventory(tmp_path, monkeypatch
     assert len(completions.requests) == 2
 
 
+def test_integer_temperature_provenance_matches_float_and_two_step(tmp_path):
+    from r2v_data_v2.h3.mimo25_backend import MimoBackendConfig, MimoMediaResolver
+    from r2v_data_v2.h3.mimo26_two_step_backend import TwoStepOpenAIMimo26Backend
+
+    config_values = {
+        "api_key": "local-no-key",
+        "transport": "sglang",
+        "model": "mimo-v2.6-flash-rl",
+        "base_url": "http://127.0.0.1:8094/v1",
+        "media_resolver": MimoMediaResolver(
+            mode="http", media_root=tmp_path,
+            media_base_url="http://127.0.0.1:8766/",
+        ),
+    }
+    integer_config = MimoBackendConfig(**config_values, temperature=0)
+    float_config = MimoBackendConfig(**config_values, temperature=0.0)
+
+    assert integer_config.provenance() == float_config.provenance()
+    assert integer_config.provenance().temperature == 0.0
+    integer_backend = TwoStepOpenAIMimo26Backend(
+        integer_config, stem_records_by_clip={}, client=SimpleNamespace(),
+    )
+    float_backend = TwoStepOpenAIMimo26Backend(
+        float_config, stem_records_by_clip={}, client=SimpleNamespace(),
+    )
+    assert integer_backend.provenance == float_backend.provenance
+    assert integer_backend.provenance.schema_version == "r2v.h3.mimo25_backend.81"
+
+
 def test_two_step_has_independent_provenance_without_changing_multi(tmp_path, monkeypatch):
     from r2v_data_v2.h3.audio_reuse_prepared import FrozenReuseBackendProvenance
 

@@ -1347,7 +1347,8 @@ class MimoBackendConfig:
             "media_resolution": self.media_resolution,
             "thinking": {"type": self.thinking},
             "icl_version": MIMO25_ICL_VERSION if self.icl == "official_ref2va_v1" else None,
-            "temperature": self.temperature,
+            # Keep fingerprint bytes aligned with Pydantic float normalization.
+            "temperature": float(self.temperature),
             "max_completion_tokens": self.max_completion_tokens,
             "response_format": (
                 "json_schema" if self.transport == "sglang" else "json_object"

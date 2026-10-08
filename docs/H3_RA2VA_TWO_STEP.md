@@ -114,7 +114,7 @@ jobs = [MimoClipJob.model_validate(j) for j in contract["jobs"][:5]]
 _, stems, _ = load_stem_source(source.parent / "resolved_stems_v1")
 config = MimoBackendConfig(
     api_key=os.environ["MIMO_API_KEY"], transport="sglang", model="mimo-v2.6-flash-rl",
-    base_url="http://127.0.0.1:8094/v1", temperature=0, thinking="disabled",
+    base_url="http://127.0.0.1:8094/v1", temperature=0.0, thinking="disabled",
     max_completion_tokens=32768, icl="official_ref2va_v1",
     media_resolver=MimoMediaResolver(mode="http", media_root=Path("/mnt/workspace"),
                                     media_base_url=os.environ["MIMO_MEDIA_BASE_URL"]),
