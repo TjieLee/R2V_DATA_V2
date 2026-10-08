@@ -130,11 +130,35 @@ silently dropping attributes. It only reads the named group's manifest and
 enriched files, not the rest of the campaign; it is manual, not a streaming
 publisher.
 
-At the 2026-10-08 handoff, group `group-000000` had 8 formally completed
-shards, **48,128 SA terminal eligible clips**, and **39,585 accepted exported
-samples**. These are user-reported historical markers, not a live progress
-reading or a claim that the standalone converter has been run on the server.
-The unchanged formal global Compaction will still run after all groups complete.
+**2026-10-08 server execution result (operator-reported):** The corrected
+standalone converter completed on the production server with the pinned
+production repo imported via `--repo "$WT"`, without switching the active
+production worktree. It printed:
+
+```text
+shard-000000000-000009999: 4846 final-schema samples
+shard-000010000-000019999: 5732 final-schema samples
+shard-000020000-000029999: 5931 final-schema samples
+shard-000030000-000039999: 5788 final-schema samples
+shard-000040000-000049999: 3599 final-schema samples
+shard-000050000-000059999: 4417 final-schema samples
+shard-000060000-000069999: 4419 final-schema samples
+shard-000070000-000079999: 4853 final-schema samples
+DONE: group-000000 samples=39585, enriched=27837
+```
+
+Output: `/mnt/workspace/litengjie/data/r2v_v3_group_exports/post_mask/group-000000/samples.jsonl`.
+All eight per-shard counts add up to the completed group's `sample_count=39585`.
+Of those, `27837` had a published enriched sidecar record; `11748` used
+the original visual-only instruction. The 48,128 historical SA terminal/eligible
+count is a different denominator (not the accepted Export sample count).
+
+This confirms that the patched helper completed and atomically published a
+full real-world Group 0 conversion. It does **not** independently establish
+that every symlink target can be opened, verify every JSON record, or prove
+parity with the not-yet-run global compactor. Preserve shard Export images
+and downstream-relative image path resolution. The unchanged formal global
+Compaction will still run after all groups complete.
 
 **Important: independent Global Compaction gap discovered 2026-10-08.**
 The current full compactor's `_load_shard_enriched_samples` reads only the
