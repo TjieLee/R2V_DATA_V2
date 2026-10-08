@@ -17,8 +17,10 @@ unchanged; Single Compact2/3 and T2VA/TA2VA are untouched.
    ownership. Caption stays Visual prose plus speech presentation and exact
    dialogue; non-dialogue audio stays in the two final audio fields.
 4. Profile targets are derived from the returned Speech/AV assembly with the
-   existing `_speaker_profile_targets()`. Missing, extra, duplicate or reordered
-   profile groups fail before common normalization. Null is allowed when acoustic
+   existing `_speaker_profile_targets()`. The same unique required groups may be
+   reordered by group key without changing traits. Only null profiles for known
+   non-transcribed-only groups may be removed. Missing/duplicate/unknown groups
+   and non-null extras fail. Null is allowed when acoustic
    traits cannot be reliably described. No-transcript clips have no profiles,
    Sx or dialogue; no-segment clips keep empty Audio/AV inventories.
 5. The final annotation remains `.20`, using the same Multi assembly, common
@@ -28,6 +30,17 @@ unchanged; Single Compact2/3 and T2VA/TA2VA are untouched.
 Successful clips have exactly two requests. There is no snippet extraction,
 separate profile/finalizer call, marker polish, retry or Multi fallback. Failed
 clips retain only the actual attempted stages and raw responses.
+
+The joint authoritative input includes ordered frozen segment IDs and complete
+`<d>[Language] exact text</d>` blocks. Only identical Audio segment rows are
+deduplicated; conflicts fail before evidence canonicalization. Parsed Audio/AV
+inventories must exactly match the frozen order, including no-transcript clips.
+Missing dialogue language markers are restored only when the entire dialogue
+count/order/text is exact. Original joint raw is never changed. Correction counts
+are saved in diagnostic warnings as `deterministic_correction_count:<code>=<n>`.
+Speaker marker warnings remain visible. Same-entity/group contradictions fail
+with the existing validator issues and original annotation, before shared group
+merging; no Sx guessing or group merge is used to raise readiness.
 
 Only experimental provenance changes: backend `.80`, joint prompt
 `h3_mimo26_ra2va_two_step_joint_v1`. Visual v5, component profile v2/finalizer v6,
@@ -71,7 +84,7 @@ export MIMO_API_KEY="${MIMO_API_KEY:-local-no-key}"
 export MIMO_MEDIA_BASE_URL=http://127.0.0.1:8766/
 AUDIO_ROOT=/mnt/workspace/litengjie/data/r2v_audio_runs/random200/random200-src10000-19999-seed20260831-20260831-124415
 SHADOW="$AUDIO_ROOT/sam_audio_stem_shadow_v1/runs/ra2va-no-lrasd-random20-v1"
-FROZEN="$SHADOW/mimo_reconcile_no_lrasd_http_final_v4"
+FROZEN="${FROZEN:-$SHADOW/mimo_reconcile_no_lrasd_http_final_v4}"
 
 # Reuse the verified HTTP server rooted at /mnt/workspace. If not running,
 # start this in a separate terminal in the same namespace as MiMo:
@@ -79,8 +92,8 @@ FROZEN="$SHADOW/mimo_reconcile_no_lrasd_http_final_v4"
 
 # Start with Two-step only: five clips, at most ten model requests.
 # Use a fresh output name; there is deliberately no --overwrite.
-MODE=two_step
-OUT="$SHADOW/mimo_v26_ra2va_two_step_joint_v1_pilot5"
+MODE="${MODE:-two_step}"
+OUT="${OUT:-$SHADOW/mimo_v26_ra2va_two_step_joint_v1_pilot5}"
 .venv/bin/python - "$FROZEN" "$OUT" "$MODE" <<'PY'
 import json, os, sys, time
 from pathlib import Path
@@ -148,6 +161,31 @@ single `[:5]` slice to `[:3]` consistently in both runs.
 Raw responses, stage diagnostics and structural failures are in `records.jsonl`.
 The joint JSON is `speech_av_raw_response`, not a fabricated Turn 3/4 result.
 `pilot_metrics.jsonl` adds elapsed time to the existing calls/failures/warnings.
+
+### Retest the identical frozen five
+
+After the inventory-format fix, use the first pilot's own frozen source contract,
+not a rebuilt random20 inventory. Set the following variables, then run the
+complete pilot block above; its defaults preserve these explicit values:
+
+```bash
+FROZEN="$SHADOW/mimo_v26_ra2va_two_step_joint_v1_pilot5"
+MODE=two_step
+OUT="$SHADOW/mimo_v26_ra2va_two_step_joint_v1_inventory_fix_pilot5"
+```
+
+This retains those exact five jobs, their order/Pictures/ASR and matching resolved
+stems. The new output is separate and there is no overwrite. If the original
+pilot used another directory name, set `FROZEN` to that actual pilot directory.
+Use the existing endpoint and HTTP media server; do not rerun upstream models.
+Inspect missing Sx and conflicting gN even when a format correction succeeds:
+
+```bash
+jq '{clip_uid,status,model_call_count,failure_reason,failure_issues,
+     warnings:[.diagnostics[].warnings[]],
+     caption:.annotation.h3_semantics.shot1_caption,
+     speakers:.annotation.av_grounding.segment_groundings}' "$OUT/records.jsonl"
+```
 
 ## Compare quality, not just readiness
 

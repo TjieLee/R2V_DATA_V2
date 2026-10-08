@@ -386,3 +386,269 @@ def test_two_step_flows_through_existing_audio_reuse_and_h3_cpu_path(tmp_path):
                                            reuse_audio_contracts=[r.contract for r in refs])
     assert "<Audio 1>" in rendered and "<Audio 2>" in rendered
     assert "<d>[English] Exact, text!</d>" in rendered
+
+
+def _segment_drafts(groups, texts, caption):
+    visual, joint = _drafts()
+    speech = joint["speech_av"]
+    original_view = visual["segment_views"][0]
+    original_audio = speech["audio_observation"]["segment_decisions"][0]
+    original_grounding = speech["av_grounding"]["segment_groundings"][0]
+    visual["segment_views"] = []
+    speech["audio_observation"]["segment_decisions"] = []
+    speech["av_grounding"]["segment_groundings"] = []
+    for index, (group, text) in enumerate(zip(groups, texts, strict=True), start=1):
+        segment_id = f"segment_{index:04d}"
+        visual["segment_views"].append({**copy.deepcopy(original_view), "segment_id": segment_id})
+        speech["audio_observation"]["segment_decisions"].append({
+            **copy.deepcopy(original_audio), "segment_id": segment_id,
+            "primary_speaker_group": group, "delivery_style": "calm" if text is not None else None,
+        })
+        speech["av_grounding"]["segment_groundings"].append({
+            **copy.deepcopy(original_grounding), "segment_id": segment_id, "primary_speaker_group": group,
+            "binding_status": "no_reliable_entity", "entity_id": None,
+            "speech_presentation": "uncertain", "evidence_codes": ["insufficient_evidence"],
+        })
+    speech["shot1_caption"] = caption
+    return visual, joint
+
+
+def _segment_job(job, texts):
+    values = job.model_dump(mode="json", exclude={"request_fingerprint"})
+    original = values["segments"][0]
+    values["segments"] = []
+    for index, text in enumerate(texts, start=1):
+        start = (index - 1) * 0.3
+        values["segments"].append({
+            **copy.deepcopy(original), "segment_id": f"segment_{index:04d}",
+            "start_time": start, "end_time": start + 0.2,
+            "source_start_sample": round(start * 32000), "source_end_sample": round((start + 0.2) * 32000),
+            "asr_status": "transcribed" if text is not None else "empty",
+            "asr_text": text, "asr_language": "Chinese" if text is not None else None,
+        })
+    return _job(values)
+
+
+def test_25755_null_non_transcribed_profile_is_removed_without_speaker_repair(tmp_path, monkeypatch):
+    texts = ["你好，老师。", "请坐下来。", None]
+    caption = "A woman says, <d>[Chinese] 你好，老师。</d> then continues, <d>[Chinese] 请坐下来。</d>."
+    visual, joint = _segment_drafts(["g1", "g1", "g2"], texts, caption)
+    joint["speaker_voice_profiles"] = [
+        {"speaker_group": "g1", "voice_characteristics": "Clear middle register."},
+        {"speaker_group": "g2", "voice_characteristics": None},
+    ]
+    _, shadow, backend, completions, stems, jobs, _, _ = _setup(tmp_path, monkeypatch, visual=visual, joint=joint)
+    job = _segment_job(jobs[0], texts)
+    summary = _run(shadow, backend, stems, [job])
+    record = MimoStemReconcileRecord.model_validate(_records(shadow)[0])
+    assert summary.ready_count == 1 and len(completions.requests) == record.model_call_count == 2
+    assert [p.speaker_group for p in record.annotation.speaker_voice_profiles] == ["g1"]
+    assert record.annotation.h3_semantics.shot1_caption == caption
+    assert [d.primary_speaker_group for d in record.annotation.audio_observation.segment_decisions] == ["g1", "g1", "g2"]
+    assert "direct_single_speaker_marker_missing" in record.diagnostics[-1].warnings
+    assert "deterministic_correction_count:joint_non_transcribed_null_profile_removed=1" in record.diagnostics[-1].warnings
+    assert record.speech_av_raw_response == json.dumps(joint)
+    assert json.loads(record.speech_av_raw_response)["speaker_voice_profiles"][-1]["speaker_group"] == "g2"
+    text = completions.requests[1]["messages"][-1]["content"][-1]["text"]
+    contract = json.loads(text.split("AUTHORITATIVE INPUT:\n", 1)[1].split("\nTURN 1 VISUAL DRAFT:", 1)[0])
+    assert contract["required_segment_ids_in_order"] == ["segment_0001", "segment_0002", "segment_0003"]
+    assert contract["required_dialogue_blocks_in_order"] == [
+        "<d>[Chinese] 你好，老师。</d>", "<d>[Chinese] 请坐下来。</d>",
+    ]
+
+
+def test_195457_profiles_reorder_by_transcribed_appearance_without_reassigning_traits(tmp_path, monkeypatch):
+    texts = [None, "你好，老师。", "请坐下来。"]
+    caption = "A voice (S1) says, <d>[Chinese] 你好，老师。</d>. Another voice (S2) replies, <d>[Chinese] 请坐下来。</d>."
+    visual, joint = _segment_drafts(["g1", "g2", "g1"], texts, caption)
+    joint["speaker_voice_profiles"] = [
+        {"speaker_group": "g1", "voice_characteristics": "Low register."},
+        {"speaker_group": "g2", "voice_characteristics": "Bright middle register."},
+    ]
+    _, _, backend, completions, stems, jobs, _, _ = _setup(tmp_path, monkeypatch, visual=visual, joint=joint)
+    result = _reconcile(backend, _segment_job(jobs[0], texts), stems)
+    assert [(p.speaker_group, p.voice_characteristics) for p in result.annotation.speaker_voice_profiles] == [
+        ("g2", "Bright middle register."), ("g1", "Low register."),
+    ]
+    assert result.annotation.h3_semantics.shot1_caption == caption
+    assert result.deterministic_correction_counts["joint_voice_profile_order_normalization"] == 2
+    assert result.speech_av_raw_response == json.dumps(joint)
+    assert len(completions.requests) == 2
+
+
+@pytest.mark.parametrize("duplicate_audio", [False, True], ids=["4e0506", "2b9292"])
+def test_exact_chinese_dialogue_gets_only_missing_language_and_identical_audio_dedup(tmp_path, monkeypatch, duplicate_audio):
+    texts = ["你好，老师。", "请坐下来。"]
+    caption = "A woman (S1) says, <d>你好，老师。</d> and then continues, <d>请坐下来。</d>."
+    visual, joint = _segment_drafts(["g1", "g1"], texts, caption)
+    if duplicate_audio:
+        rows = joint["speech_av"]["audio_observation"]["segment_decisions"]
+        rows.insert(1, copy.deepcopy(rows[0]))
+    _, _, backend, completions, stems, jobs, _, _ = _setup(tmp_path, monkeypatch, visual=visual, joint=joint)
+    result = _reconcile(backend, _segment_job(jobs[0], texts), stems)
+    assert result.annotation.h3_semantics.shot1_caption == (
+        "A woman (S1) says, <d>[Chinese] 你好，老师。</d> and then continues, <d>[Chinese] 请坐下来。</d>."
+    )
+    assert [d.segment_id for d in result.annotation.audio_observation.segment_decisions] == ["segment_0001", "segment_0002"]
+    assert result.deterministic_correction_counts["joint_dialogue_language_marker_restored"] == 2
+    assert result.deterministic_correction_counts.get("joint_audio_segment_duplicate_removed", 0) == int(duplicate_audio)
+    assert result.speech_av_raw_response == json.dumps(joint)
+    assert len(completions.requests) == 2
+    text = completions.requests[1]["messages"][-1]["content"][-1]["text"]
+    contract = json.loads(text.split("AUTHORITATIVE INPUT:\n", 1)[1].split("\nTURN 1 VISUAL DRAFT:", 1)[0])
+    assert contract["required_segment_ids_in_order"] == ["segment_0001", "segment_0002"]
+    assert contract["required_dialogue_blocks_in_order"] == [
+        "<d>[Chinese] 你好，老师。</d>", "<d>[Chinese] 请坐下来。</d>",
+    ]
+
+
+@pytest.mark.parametrize("profiles", [
+    [{"speaker_group": "g1", "voice_characteristics": None}, {"speaker_group": "g2", "voice_characteristics": "Low register."}],
+    [{"speaker_group": "g1", "voice_characteristics": None}, {"speaker_group": "g3", "voice_characteristics": None}],
+    [{"speaker_group": "g2", "voice_characteristics": None}],
+    [{"speaker_group": "g1", "voice_characteristics": None}] * 2,
+])
+def test_profile_normalization_does_not_hide_unsafe_inventory(tmp_path, monkeypatch, profiles):
+    texts = ["你好，老师。", None]
+    visual, joint = _segment_drafts(["g1", "g2"], texts, "A voice (S1) says, <d>[Chinese] 你好，老师。</d>.")
+    joint["speaker_voice_profiles"] = profiles
+    _, _, backend, completions, stems, jobs, _, _ = _setup(tmp_path, monkeypatch, visual=visual, joint=joint)
+    with pytest.raises(MimoBackendFailure) as caught:
+        _reconcile(backend, _segment_job(jobs[0], texts), stems)
+    assert "speaker_voice_profile_inventory_mismatch" in {i.code for i in caught.value.issues}
+    assert caught.value.speech_av_raw_response == json.dumps(joint)
+    assert len(completions.requests) == 2
+
+
+@pytest.mark.parametrize("blocks", [
+    ["你好，老师。", "请你坐下。"], ["你好，老师。"],
+    ["你好，老师。", "你好，老师。", "请坐下来。"], ["请坐下来。", "你好，老师。"],
+    ["[English] 你好，老师。", "请坐下来。"], ["你好，老师。 ", "请坐下来。"],
+    ["[Chinese] 你好，老师。", "[Chinese] 你好，老师。", "[Chinese] 请坐下来。"],
+    ["[Chinese] 请坐下来。", "[Chinese] 你好，老师。"],
+])
+def test_language_normalization_never_repairs_changed_or_inconsistent_dialogue(tmp_path, monkeypatch, blocks):
+    texts = ["你好，老师。", "请坐下来。"]
+    caption = "A voice (S1) says, " + " and continues, ".join(f"<d>{text}</d>" for text in blocks)
+    visual, joint = _segment_drafts(["g1", "g1"], texts, caption)
+    _, _, backend, completions, stems, jobs, _, _ = _setup(tmp_path, monkeypatch, visual=visual, joint=joint)
+    with pytest.raises(MimoBackendFailure) as caught:
+        _reconcile(backend, _segment_job(jobs[0], texts), stems)
+    assert caught.value.speech_av_raw_response == json.dumps(joint)
+    assert not any("joint_dialogue_language_marker_restored" in warning for d in caught.value.diagnostics for warning in d.warnings)
+    assert len(completions.requests) == 2
+
+
+def test_language_normalization_keeps_correct_blocks_and_surrounding_prose_verbatim(tmp_path, monkeypatch):
+    texts = ["你好，老师。", "请坐下来。"]
+    caption = "A woman (S1) says, <d>[Chinese] 你好，老师。</d>; she raises a hand.\nThen: <d>请坐下来。</d>."
+    visual, joint = _segment_drafts(["g1", "g1"], texts, caption)
+    _, _, backend, completions, stems, jobs, _, _ = _setup(tmp_path, monkeypatch, visual=visual, joint=joint)
+    result = _reconcile(backend, _segment_job(jobs[0], texts), stems)
+    assert result.annotation.h3_semantics.shot1_caption == (
+        "A woman (S1) says, <d>[Chinese] 你好，老师。</d>; she raises a hand.\nThen: <d>[Chinese] 请坐下来。</d>."
+    )
+    assert result.deterministic_correction_counts["joint_dialogue_language_marker_restored"] == 1
+    assert len(completions.requests) == 2
+
+
+@pytest.mark.parametrize("difference", ["speaker_group", "evidence_duplicate"])
+def test_conflicting_audio_duplicate_is_not_collapsed(tmp_path, monkeypatch, difference):
+    visual, joint = _drafts()
+    rows = joint["speech_av"]["audio_observation"]["segment_decisions"]
+    duplicate = copy.deepcopy(rows[0])
+    if difference == "speaker_group":
+        duplicate["primary_speaker_group"] = "g2"
+    else:
+        duplicate["audio_evidence_codes"] *= 2
+    rows.append(duplicate)
+    _, _, backend, completions, stems, jobs, _, _ = _setup(tmp_path, monkeypatch, visual=visual, joint=joint)
+    with pytest.raises(MimoBackendFailure) as caught:
+        _reconcile(backend, jobs[0], stems)
+    assert "segment_inventory_mismatch" in {i.code for i in caught.value.issues}
+    assert "conflicting" in str(caught.value)
+    assert caught.value.speech_av_raw_response == json.dumps(joint)
+    assert len(completions.requests) == 2
+
+
+@pytest.mark.parametrize("inventory", ["audio", "grounding"])
+def test_joint_inventories_remain_exact_even_without_transcripts(tmp_path, monkeypatch, inventory):
+    visual, joint = _segment_drafts(["g1", "g1"], [None, None], "A woman turns toward the doorway.")
+    joint["speaker_voice_profiles"] = []
+    speech = joint["speech_av"]
+    rows = speech["audio_observation"]["segment_decisions"] if inventory == "audio" else speech["av_grounding"]["segment_groundings"]
+    rows.reverse()
+    _, _, backend, completions, stems, jobs, _, _ = _setup(tmp_path, monkeypatch, visual=visual, joint=joint)
+    with pytest.raises(MimoBackendFailure) as caught:
+        _reconcile(backend, _segment_job(jobs[0], [None, None]), stems)
+    assert "segment_inventory_mismatch" in {i.code for i in caught.value.issues}
+    assert len(completions.requests) == 2
+
+
+def test_same_visible_entity_two_groups_is_reported_not_merged(tmp_path, monkeypatch):
+    texts = ["你好，老师。", "请坐下来。"]
+    caption = "<Subject 1> (S1) says, <d>[Chinese] 你好，老师。</d>. She (S2) adds, <d>[Chinese] 请坐下来。</d>."
+    visual, joint = _segment_drafts(["g1", "g2"], texts, caption)
+    template = _drafts()[1]["speech_av"]["av_grounding"]["segment_groundings"][0]
+    for row in joint["speech_av"]["av_grounding"]["segment_groundings"]:
+        row.update({key: template[key] for key in ("binding_status", "entity_id", "speech_presentation", "evidence_codes")})
+    joint["speaker_voice_profiles"] = [
+        {"speaker_group": "g1", "voice_characteristics": "Middle register."},
+        {"speaker_group": "g2", "voice_characteristics": "Low register."},
+    ]
+    _, shadow, backend, completions, stems, jobs, _, _ = _setup(tmp_path, monkeypatch, visual=visual, joint=joint)
+    summary = _run(shadow, backend, stems, [_segment_job(jobs[0], texts)])
+    record = MimoStemReconcileRecord.model_validate(_records(shadow)[0])
+    assert summary.failed_count == 1
+    assert "visible_entity_speaker_group_contradiction" in {i.code for i in record.failure_issues}
+    assert [d.primary_speaker_group for d in record.annotation.audio_observation.segment_decisions] == ["g1", "g2"]
+    assert record.annotation.h3_semantics.shot1_caption == caption
+    assert record.speech_av_raw_response == json.dumps(joint)
+    assert len(completions.requests) == record.model_call_count == 2
+
+
+def test_final_annotation_schema_error_keeps_structured_failure_issues(tmp_path, monkeypatch):
+    _, joint = _drafts()
+    joint["speech_av"]["summary"] = ""
+    _, _, backend, completions, stems, jobs, _, _ = _setup(tmp_path, monkeypatch, joint=joint)
+    with pytest.raises(MimoBackendFailure) as caught:
+        _reconcile(backend, jobs[0], stems)
+    assert caught.value.code == "mimo_structured_output_failed"
+    assert "schema_validation" in {i.code for i in caught.value.issues}
+    assert caught.value.speech_av_raw_response == json.dumps(joint)
+    assert len(completions.requests) == 2
+
+
+def test_identity_failure_also_keeps_missing_speaker_marker_diagnostics(tmp_path, monkeypatch):
+    texts = ["你好，老师。", "请坐下来。"]
+    caption = "<Subject 1> says, <d>[Chinese] 你好，老师。</d>. She adds, <d>[Chinese] 请坐下来。</d>."
+    visual, joint = _segment_drafts(["g1", "g2"], texts, caption)
+    template = _drafts()[1]["speech_av"]["av_grounding"]["segment_groundings"][0]
+    for row in joint["speech_av"]["av_grounding"]["segment_groundings"]:
+        row.update({key: template[key] for key in ("binding_status", "entity_id", "speech_presentation", "evidence_codes")})
+    joint["speaker_voice_profiles"] = [
+        {"speaker_group": "g1", "voice_characteristics": None},
+        {"speaker_group": "g2", "voice_characteristics": None},
+    ]
+    _, _, backend, completions, stems, jobs, _, _ = _setup(tmp_path, monkeypatch, visual=visual, joint=joint)
+    with pytest.raises(MimoBackendFailure) as caught:
+        _reconcile(backend, _segment_job(jobs[0], texts), stems)
+    assert {"visible_entity_speaker_group_contradiction", "direct_dialogue_speaker_marker_missing"}.issubset(
+        {i.code for i in caught.value.issues},
+    )
+    assert caught.value.annotation.h3_semantics.shot1_caption == caption
+    assert len(completions.requests) == 2
+
+
+def test_visual_correction_audit_survives_conflicting_joint_audio_rows(tmp_path, monkeypatch):
+    visual, joint = _drafts()
+    visual["segment_views"].append(copy.deepcopy(visual["segment_views"][0]))
+    rows = joint["speech_av"]["audio_observation"]["segment_decisions"]
+    rows.append({**copy.deepcopy(rows[0]), "primary_speaker_group": "g2"})
+    _, _, backend, completions, stems, jobs, _, _ = _setup(tmp_path, monkeypatch, visual=visual, joint=joint)
+    with pytest.raises(MimoBackendFailure) as caught:
+        _reconcile(backend, jobs[0], stems)
+    assert "deterministic_correction_count:visual_segment_row_merge=1" in caught.value.diagnostics[-1].warnings
+    assert caught.value.visual_raw_response == json.dumps(visual)
+    assert caught.value.speech_av_raw_response == json.dumps(joint)
+    assert len(completions.requests) == 2

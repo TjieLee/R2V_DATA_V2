@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
 from r2v_data_v2.h3.mimo25_backend import (
+    _DIALOGUE,
     AUDIO_FINALIZE_SYSTEM_PROMPT,
     MIMO25_SCHEMA_VERSION,
     SPEAKER_PROFILE_SYSTEM_PROMPT,
@@ -36,6 +38,9 @@ from r2v_data_v2.h3.mimo25_backend import (
     _validate_av_observation_usage,
     _validate_finish_reason,
     _value,
+    direct_speech_facts,
+    protect_direct_dialogue,
+    validate_annotation,
 )
 from r2v_data_v2.h3.mimo25_stem_shadow import StemAwareOpenAIMimo25Backend
 from r2v_data_v2.h3.schemas import SchemaModel
@@ -109,9 +114,109 @@ def _canonicalize_joint_payload(raw: str) -> tuple[str, dict[str, int]]:
         return raw, {}
     if not isinstance(payload, dict) or not isinstance(payload.get("speech_av"), dict):
         return raw, {}
+    audio = payload["speech_av"].get("audio_observation")
+    if isinstance(audio, dict) and isinstance(audio.get("segment_decisions"), list):
+        seen = {}
+        for row in audio["segment_decisions"]:
+            if not isinstance(row, dict) or not isinstance(row.get("segment_id"), str):
+                continue  # Malformed rows still go through the existing schema parser.
+            segment_id = row["segment_id"]
+            if segment_id in seen and row != seen[segment_id]:
+                raise MimoBackendFailure(
+                    code="mimo_structured_output_failed", reason="MiMo joint has conflicting Audio segment decisions",
+                    issues=(ValidationIssue("segment_inventory_mismatch", segment_id,
+                                            "conflicting duplicate Audio segment decisions"),),
+                )
+            seen[segment_id] = row
     canonical, corrections = _canonicalize_raw_annotation_payload(_compact_json(payload["speech_av"]))
     payload["speech_av"] = json.loads(canonical)
     return _compact_json(payload), corrections
+
+
+def _required_dialogue_blocks(job: MimoBackendJob) -> list[str]:
+    return [
+        f"<d>[{segment.asr_language or 'Unknown'}] {segment.asr_text}</d>"
+        for segment in job.segments if segment.asr_status == "transcribed"
+    ]
+
+
+def _normalize_joint_draft(
+    joint: MimoJointAVAudioDraft, job: MimoBackendJob, corrections: Counter[str],
+) -> None:
+    assembly = joint.speech_av
+    audio = assembly.audio_observation
+    unique = {}
+    for decision in audio.segment_decisions:
+        if decision.segment_id in unique:
+            # Original JSON conflicts were rejected before common evidence canonicalization.
+            corrections["joint_audio_segment_duplicate_removed"] += 1
+        else:
+            unique[decision.segment_id] = decision
+    audio.segment_decisions = list(unique.values())
+    required_ids = [segment.segment_id for segment in job.segments]
+    for field, rows in (
+        ("audio_observation.segment_decisions", audio.segment_decisions),
+        ("av_grounding.segment_groundings", assembly.av_grounding.segment_groundings),
+    ):
+        if [row.segment_id for row in rows] != required_ids:
+            raise MimoBackendFailure(
+                code="mimo_structured_output_failed", reason="MiMo joint segment inventory differs",
+                issues=(ValidationIssue("segment_inventory_mismatch", field,
+                                        "joint decisions must exactly follow frozen chronological segment IDs"),),
+            )
+
+    required_groups = [target["speaker_group"] for target in _speaker_profile_targets(assembly, job)]
+    profiles = joint.speaker_voice_profiles
+    actual_groups = [profile.speaker_group for profile in profiles]
+    non_transcribed_ids = {s.segment_id for s in job.segments if s.asr_status != "transcribed"}
+    non_transcribed_only = {
+        decision.primary_speaker_group for decision in audio.segment_decisions
+        if decision.segment_id in non_transcribed_ids and decision.primary_speaker_group is not None
+    } - set(required_groups)
+    extras = [profile for profile in profiles if profile.speaker_group not in required_groups]
+    if (
+        len(actual_groups) != len(set(actual_groups))
+        or not set(required_groups).issubset(actual_groups)
+        or any(profile.speaker_group not in non_transcribed_only or profile.voice_characteristics is not None for profile in extras)
+    ):
+        raise MimoBackendFailure(
+            code="mimo_structured_output_failed", reason="MiMo joint voice profile inventory differs",
+            issues=(ValidationIssue("speaker_voice_profile_inventory_mismatch", "speaker_voice_profiles",
+                                    "required groups must be unique; only null non-transcribed-only extras may be removed"),),
+        )
+    if extras:
+        corrections["joint_non_transcribed_null_profile_removed"] += len(extras)
+    retained = [profile for profile in profiles if profile.speaker_group in required_groups]
+    moved = sum(profile.speaker_group != group for profile, group in zip(retained, required_groups, strict=True))
+    if moved:
+        corrections["joint_voice_profile_order_normalization"] += moved
+    by_group = {profile.speaker_group: profile for profile in retained}
+    joint.speaker_voice_profiles = [by_group[group] for group in required_groups]
+
+    caption = assembly.shot1_caption
+    blocks = list(_DIALOGUE.finditer(caption))
+    required_dialogue = _required_dialogue_blocks(job)
+    transcripts = [s for s in job.segments if s.asr_status == "transcribed"]
+    if (
+        len(blocks) != len(required_dialogue)
+        or caption.count("<d>") != len(blocks) or caption.count("</d>") != len(blocks)
+        or any("<d>" in block.group(1) for block in blocks)
+        or any(
+            block.group(0) != locked and block.group(1) != segment.asr_text
+            for block, locked, segment in zip(blocks, required_dialogue, transcripts, strict=True)
+        )
+    ):
+        raise MimoBackendFailure(
+            code="mimo_structured_output_failed", reason="MiMo joint exact dialogue inventory differs",
+            issues=(ValidationIssue("direct_transcribed_dialogue_missing", "shot1_caption",
+                                    "dialogue count, order and exact text must match frozen ASR; only missing language markers are repairable"),),
+        )
+    # All blocks match before any edit. Preserve every transcript byte and all surrounding prose.
+    for block, locked in reversed(list(zip(blocks, required_dialogue, strict=True))):
+        if block.group(0) != locked:
+            caption = caption[:block.start()] + locked + caption[block.end():]
+            corrections["joint_dialogue_language_marker_restored"] += 1
+    assembly.shot1_caption = caption
 
 
 class TwoStepOpenAIMimo26Backend(StemAwareOpenAIMimo25Backend):
@@ -133,12 +238,27 @@ class TwoStepOpenAIMimo26Backend(StemAwareOpenAIMimo25Backend):
     ]:
         return annotation, MimoSpeakerMarkerPolishAudit(), None
 
+    def _prompt(self, job: MimoBackendJob, *, allowed_reference_labels: set[str]) -> str:
+        prefix, encoded = super()._prompt(job, allowed_reference_labels=allowed_reference_labels).split("AUTHORITATIVE INPUT:\n", 1)
+        contract = json.loads(encoded)
+        contract["required_segment_ids_in_order"] = [s.segment_id for s in job.segments]
+        contract["required_dialogue_blocks_in_order"] = _required_dialogue_blocks(job)
+        return prefix + "AUTHORITATIVE INPUT:\n" + _compact_json(contract)
+
     def _request(
         self, job: MimoBackendJob, *, allowed_reference_labels: set[str],
         auxiliary_audio_paths: dict[str, Path] | None = None,
     ) -> tuple[str, tuple[str | None, ...], list[MimoCompletionDiagnostic], dict[str, int]]:
         diagnostics: list[MimoCompletionDiagnostic] = []
         raws: list[str | None] = [None, None, None, None]
+        corrections: Counter[str] = Counter()
+
+        def audit_corrections() -> None:
+            if diagnostics:
+                diagnostics[-1].warnings.extend(
+                    f"deterministic_correction_count:{key}={count}"
+                    for key, count in sorted(corrections.items()) if count
+                )
 
         def request_turn(messages: list[dict[str, Any]], schema: type[SchemaModel], *, turn_index: int) -> str:
             visual_only = turn_index == 0
@@ -212,6 +332,7 @@ class TwoStepOpenAIMimo26Backend(StemAwareOpenAIMimo25Backend):
                 {"role": "user", "content": content},
             ], MimoVisualDraft, turn_index=0)
             canonical_visual, visual_corrections = _canonicalize_visual_draft_payload(visual_raw)
+            corrections.update(visual_corrections)
             visual, issues = parse_structured_json_issues(canonical_visual, MimoVisualDraft)
             if visual is None or issues:
                 raise MimoBackendFailure(code="mimo_visual_structured_output_failed",
@@ -239,25 +360,14 @@ class TwoStepOpenAIMimo26Backend(StemAwareOpenAIMimo25Backend):
             joint_raw = request_turn([
                 {"role": "system", "content": prompt}, {"role": "user", "content": joint_content},
             ], MimoJointAVAudioDraft, turn_index=1)
-            canonical_joint, corrections = _canonicalize_joint_payload(joint_raw)
-            corrections.update(visual_corrections)
+            canonical_joint, joint_corrections = _canonicalize_joint_payload(joint_raw)
+            corrections.update(joint_corrections)
             joint, issues = parse_structured_json_issues(canonical_joint, MimoJointAVAudioDraft)
             if joint is None or issues:
                 raise MimoBackendFailure(code="mimo_structured_output_failed",
                                          reason="MiMo joint AV/audio draft failed structured validation", issues=tuple(issues))
             assembly = joint.speech_av
-            required_groups = [target["speaker_group"] for target in _speaker_profile_targets(assembly, job)]
-            if [p.speaker_group for p in joint.speaker_voice_profiles] != required_groups:
-                raise MimoBackendFailure(
-                    code="mimo_structured_output_failed", reason="MiMo joint voice profile inventory differs",
-                    issues=(ValidationIssue("speaker_voice_profile_inventory_mismatch", "speaker_voice_profiles",
-                                            "voice profiles must exactly follow transcribed primary speaker groups"),),
-                )
-            if not job.segments and (assembly.audio_observation.segment_decisions or assembly.av_grounding.segment_groundings):
-                raise MimoBackendFailure(
-                    code="mimo_structured_output_failed", reason="MiMo joint draft invented an audio/AV segment",
-                    issues=(ValidationIssue("segment_inventory_mismatch", "speech_av", "empty segment input requires empty inventories"),),
-                )
+            _normalize_joint_draft(joint, job, corrections)
             shot1_caption = assembly.shot1_caption
             if not any(s.asr_status == "transcribed" for s in job.segments):
                 shot1_caption = visual.shot1_visual_description
@@ -281,12 +391,42 @@ class TwoStepOpenAIMimo26Backend(StemAwareOpenAIMimo25Backend):
                     **visual.model_dump(mode="json", exclude={"segment_views", "shot1_visual_description"}),
                 },
             }
-            return _compact_json(final), tuple(raws), diagnostics, corrections
+            annotation, issues = parse_structured_json_issues(_compact_json(final), MimoAVAnnotationDraft)
+            if annotation is None or issues:
+                raise MimoBackendFailure(
+                    code="mimo_structured_output_failed", reason="MiMo joint assembled annotation failed structured validation",
+                    issues=tuple(issues),
+                )
+            # Expose identity contradictions before the shared normalizer can merge gN.
+            identity_issues = [issue for issue in validate_annotation(
+                annotation, segment_ids=[s.segment_id for s in job.segments],
+                segment_intervals={s.segment_id: (s.start_time, s.end_time) for s in job.segments},
+                transcribed_segment_ids=[s.segment_id for s in job.segments if s.asr_status == "transcribed"],
+                authoritative_transcripts=[s.asr_text for s in job.segments if s.asr_status == "transcribed"],
+                allowed_entity_ids=set(full_contract["allowed_speaker_bindable_entity_ids"]),
+                allowed_reference_labels=allowed_reference_labels, reference_subjects=job.reference_subjects,
+                target_duration_seconds=job.target_duration_seconds,
+                binding_evidence_mode=getattr(job, "binding_evidence_mode", "legacy_lr_asd"),
+            ) if issue.code in {"visible_entity_speaker_group_contradiction", "speaker_group_entity_contradiction"}]
+            if identity_issues:
+                _, marker_issues, marker_warnings = protect_direct_dialogue(
+                    annotation.h3_semantics.shot1_caption, direct_speech_facts(annotation, list(job.segments)),
+                    allowed_labels=allowed_reference_labels,
+                )
+                diagnostics[-1].warnings.extend(marker_warnings)
+                raise MimoBackendFailure(
+                    code="mimo_structured_output_failed", reason="MiMo joint speaker identity contradiction",
+                    issues=(*identity_issues, *marker_issues), annotation=annotation,
+                )
+            audit_corrections()
+            return _compact_json(final), tuple(raws), diagnostics, dict(corrections)
         except Exception as exc:
+            audit_corrections()
             raise MimoBackendFailure(
                 code=exc.code if isinstance(exc, MimoBackendFailure) else "mimo_request_failed",
                 reason=exc.reason if isinstance(exc, MimoBackendFailure) else f"{type(exc).__name__}: {exc}",
                 issues=exc.issues if isinstance(exc, MimoBackendFailure) else (),
+                annotation=exc.annotation if isinstance(exc, MimoBackendFailure) else None,
                 raw_responses=tuple(raw for raw in raws if raw is not None), diagnostics=tuple(diagnostics),
                 model_call_count=len(diagnostics), http_attempt_count=len(diagnostics),
                 visual_model_call_count=sum(d.input_modality == "target_video_visual_only" for d in diagnostics),
