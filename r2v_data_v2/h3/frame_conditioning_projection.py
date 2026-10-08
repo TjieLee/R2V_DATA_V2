@@ -22,10 +22,12 @@ from r2v_data_v2.h3.audio_reuse_materializer import (
 from r2v_data_v2.h3.audio_reuse_prepared import (
     AudioReusePreparedSource,
     AudioReusePreparedSummary,
+    FrozenAudioReuseInventory,
+    load_prepared_inventory,
     validate_prepared_inputs,
 )
 from r2v_data_v2.h3.jea_final_renderer import FinalH3SampleV2, FinalQwen3SpeechSegment
-from r2v_data_v2.h3.mimo25_av_reconcile import MimoClipJob, MimoInventory
+from r2v_data_v2.h3.mimo25_av_reconcile import MimoClipJob
 from r2v_data_v2.h3.mimo25_h3_materializer import (
     _materialize_sample,
     _prepare_materialization_context,
@@ -35,7 +37,7 @@ from r2v_data_v2.h3.qwen38_h3_recaption import (
     ConditioningVariant,
     RecaptionSubjectContract,
 )
-from r2v_data_v2.h3.resolved_audio_stems import StemRecord
+from r2v_data_v2.h3.resolved_audio_stems import StemRecord, load_stem_source
 from r2v_data_v2.h3.sam_audio_stem_shadow import (
     sha256_file,
     stem_shadow_root,
@@ -240,12 +242,19 @@ def _owned_file(path: Path, root: Path) -> Path:
 def load_projection_sources(shadow: Path) -> tuple[list[ProjectionSource], dict[str, str]]:
     """Reconstruct frozen products with existing materialization, never trust prose alone."""
     prepared, products = shadow / PREPARED_STAGE, shadow / PRODUCTS_STAGE
-    provenance, _, source_stems = validate_stem_diarization_lineage(
-        shadow / "diarization", expected_shadow_root=shadow,
-    )
-    stem_root = Path(provenance.source_stem_root)
+    inventory = load_prepared_inventory(_owned_file(prepared / "inventory.json", shadow))
+    if isinstance(inventory, FrozenAudioReuseInventory):
+        stem_root = Path(inventory.source_stem_root)
+        _, source_stems, _ = load_stem_source(stem_root)
+    else:
+        provenance, _, source_stems = validate_stem_diarization_lineage(
+            shadow / "diarization", expected_shadow_root=shadow,
+        )
+        stem_root = Path(provenance.source_stem_root)
+        if stem_root.is_symlink() or stem_root.resolve().parent != shadow.resolve():
+            raise ValueError("frame source stage escapes current run")
     stems: list[StemRecord] = source_stems
-    for root in (prepared, products, stem_root):
+    for root in (prepared, products):
         if root.is_symlink() or root.resolve().parent != shadow.resolve():
             raise ValueError("frame source stage escapes current run")
     hashes = {}
@@ -259,10 +268,10 @@ def load_projection_sources(shadow: Path) -> tuple[list[ProjectionSource], dict[
     summary = read(products / "summary.json", AudioReuseProductSummary)
     records = read(products / "records.jsonl", AudioReuseProduct, rows=True)
     prep_summary = read(prepared / "summary.json", AudioReusePreparedSummary)
-    inventory = read(prepared / "inventory.json", MimoInventory)
+    hashes[str(prepared / "inventory.json")] = sha256_file(prepared / "inventory.json")
     annotations = read(prepared / "records.jsonl", AudioReusePreparedSource, rows=True)
     samples = read(prepared / "h3/samples.jsonl", FinalH3SampleV2, rows=True)
-    stem_records_path = _owned_file(stem_root / "records.jsonl", shadow)
+    stem_records_path = _owned_file(stem_root / "records.jsonl", stem_root)
     hashes[str(stem_records_path)] = sha256_file(stem_records_path)
     for path in (prepared / "inventory.json", prepared / "records.jsonl", prepared / "h3/samples.jsonl", stem_records_path):
         if summary.source_hashes.get(str(path)) != hashes[str(path.resolve())]:
@@ -374,9 +383,12 @@ def project_product(source: ProjectionSource, metadata: FrameMetadata, mode: Vis
     return FrameConditionedProduct(**values, record_fingerprint=_hash(values))
 
 
-def materialize_frame_conditioned_products(*, audio_production_root: Path, shadow_run_id: str,
-                                         ffmpeg: str = "ffmpeg", output_root: Path | None = None) -> FrameConditionedSummary:
-    shadow = stem_shadow_root(audio_production_root, shadow_run_id).resolve(strict=True)
+def materialize_frame_conditioned_products(*, audio_production_root: Path | None = None, shadow_run_id: str | None = None,
+                                         ffmpeg: str = "ffmpeg", output_root: Path | None = None,
+                                         source_root: Path | None = None) -> FrameConditionedSummary:
+    if source_root is None and audio_production_root is None:
+        raise ValueError("frame projection requires an Audio root or bundle source root")
+    shadow = (source_root if source_root is not None else stem_shadow_root(audio_production_root, shadow_run_id)).resolve(strict=True)
     output = (output_root or shadow / FRAME_STAGE).expanduser()
     if output.exists() or output.is_symlink():
         raise FileExistsError(output)

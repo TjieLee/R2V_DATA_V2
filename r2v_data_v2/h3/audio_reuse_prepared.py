@@ -21,6 +21,7 @@ from r2v_data_v2.h3.mimo25_av_reconcile import (
     build_mimo25_inventory,
     build_mimo25_reference_inventory,
     load_mimo25_reference_sources,
+    project_mimo_h3_sample_references,
 )
 from r2v_data_v2.h3.mimo25_backend import MimoAVAnnotationDraft, MimoBackendProvenance
 from r2v_data_v2.h3.mimo25_stem_shadow import (
@@ -29,7 +30,11 @@ from r2v_data_v2.h3.mimo25_stem_shadow import (
     build_stem_reconcile_jobs,
     usable_stem_reconcile_inventory,
 )
-from r2v_data_v2.h3.resolved_audio_stems import StemRecord
+from r2v_data_v2.h3.resolved_audio_stems import (
+    RESOLVED_STAGE,
+    StemRecord,
+    load_stem_source,
+)
 from r2v_data_v2.h3.sam_audio_stem_shadow import (
     sha256_file,
     validate_stem_diarization_lineage,
@@ -122,6 +127,53 @@ class AudioReusePreparedSummary(SchemaModel):
         return self
 
 
+class FrozenAudioReuseInventory(SchemaModel):
+    """Prepared jobs from reconcile, without claiming a rebuilt Visual inventory."""
+
+    schema_version: Literal["r2v.h3.audio_reuse_frozen_inventory.1"] = "r2v.h3.audio_reuse_frozen_inventory.1"
+    source_reconcile_root: str
+    source_stem_root: str
+    source_h3_root: str
+    source_h3_samples_sha256: str
+    clip_count: int
+    jobs: list[MimoClipJob]
+    inventory_fingerprint: str
+
+    @model_validator(mode="after")
+    def validate_inventory(self) -> FrozenAudioReuseInventory:
+        if self.clip_count != len(self.jobs) or len({j.clip_uid for j in self.jobs}) != self.clip_count:
+            raise ValueError("frozen prepared job inventory differs")
+        if self.inventory_fingerprint != _hash(self.model_dump(mode="json", exclude={"inventory_fingerprint"})):
+            raise ValueError("frozen prepared inventory fingerprint mismatch")
+        return self
+
+
+def load_prepared_inventory(path: Path) -> MimoInventory | FrozenAudioReuseInventory:
+    values = json.loads(path.read_text())
+    model = (FrozenAudioReuseInventory if values.get("schema_version") == "r2v.h3.audio_reuse_frozen_inventory.1"
+             else MimoInventory)
+    return model.model_validate(values)
+
+
+def _publish_prepared(
+    output: Path, inventory: MimoInventory | FrozenAudioReuseInventory,
+    summary: AudioReusePreparedSummary, samples_text: str, records_text: str,
+) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".reuse-prepare-", dir=output.parent) as temporary:
+        stage = Path(temporary) / "prepared"
+        (stage / "h3").mkdir(parents=True)
+        (stage / "h3/samples.jsonl").write_text(samples_text)
+        (stage / "inventory.json").write_text(inventory.model_dump_json(indent=2) + "\n")
+        (stage / "records.jsonl").write_text(records_text)
+        (stage / "summary.json").write_text(summary.model_dump_json(indent=2) + "\n")
+        if any(sha256_file(Path(path)) != digest for path, digest in summary.source_hashes.items()):
+            raise ValueError("frozen preparation input changed")
+        if output.exists():
+            raise FileExistsError(output)
+        stage.rename(output)
+
+
 def load_reconcile_sources(root: Path) -> list[AudioReusePreparedSource]:
     """Validate real stem records, including their original raw/config hashes."""
     result = []
@@ -178,7 +230,7 @@ def overlay_reconcile_sources(
 
 
 def validate_prepared_inputs(
-    inventory: MimoInventory, records: list[AudioReusePreparedSource],
+    inventory: MimoInventory | FrozenAudioReuseInventory, records: list[AudioReusePreparedSource],
     samples: list[FinalH3SampleV2], stems: list[StemRecord],
 ) -> None:
     if [r.clip_uid for r in records] != [j.clip_uid for j in inventory.jobs]:
@@ -221,6 +273,98 @@ def project_prepared_samples(jobs: list[MimoClipJob], samples: list[FinalH3Sampl
         values["speech_segments"] = [s.model_dump(mode="json") for s in speech]
         projected.append(FinalH3SampleV2.model_validate(values))
     return projected
+
+
+def prepare_frozen_audio_reuse_sources(
+    *, reconcile_root: Path, prepared_root: Path, clip_uids: list[str] | None = None,
+    source_h3_root: Path | None = None,
+) -> AudioReusePreparedSummary:
+    """Consume frozen jobs/annotations; never rebuild Visual or diarization inputs."""
+    reconcile = reconcile_root.expanduser().resolve(strict=True)
+    output = prepared_root.expanduser().resolve()
+    if output.exists():
+        raise FileExistsError(output)
+    contract_path = reconcile / "source_contract.json"
+    contract = json.loads(contract_path.read_text())
+    if contract.get("binding_evidence_mode") != "none":
+        raise ValueError("frozen preparation requires reference-only source jobs")
+    jobs = [MimoClipJob.model_validate(row) for row in contract["jobs"]]
+    records = load_reconcile_sources(reconcile)
+    by_clip = _unique(records)
+    requested = set(clip_uids) if clip_uids is not None else set(by_clip)
+    if requested - set(by_clip):
+        raise ValueError("unknown frozen reconcile clip UID")
+    jobs = [j for j in jobs if j.clip_uid in requested and by_clip[j.clip_uid].status == "ready"]
+    if not jobs:
+        raise ValueError("no ready frozen reconcile clips selected")
+    records = [by_clip[j.clip_uid] for j in jobs]
+    stem_root = reconcile.parent / RESOLVED_STAGE
+    stem_inventory, stems, _ = load_stem_source(stem_root)
+    audio_root = Path(stem_inventory.source_canonical_audio_manifest_path).parent.parent
+    h3 = (source_h3_root or audio_root / "h3").expanduser().resolve()
+    if any(output.is_relative_to(root) or root.is_relative_to(output) for root in (reconcile, stem_root, h3)):
+        raise ValueError("frozen prepared output overlaps source stages")
+    samples_path = h3 / "samples.jsonl"
+    if not samples_path.is_file():
+        raise FileNotFoundError(
+            f"Missing frozen canonical H3 sample metadata: {samples_path}; "
+            "supply --source-h3-root with the matching canonical samples.jsonl "
+            "(sample identity and original visual references are required)"
+        )
+    ids = {sample_id for job in jobs for sample_id in job.source_h3_sample_ids}
+    canonical = {}
+    with samples_path.open() as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if row.get("sample_id") not in ids or row.get("pair_type") != "canonical":
+                continue
+            # Frozen canonical metadata supplies identity, not legacy voice binding.
+            row["subject_voices"] = []
+            sample = FinalH3SampleV2.model_validate(row)
+            if sample.sample_id in canonical:
+                raise ValueError("duplicate frozen canonical H3 sample")
+            canonical[sample.sample_id] = sample
+    if ids != set(canonical):
+        raise ValueError(f"missing frozen canonical H3 samples in {samples_path}: {sorted(ids - set(canonical))}")
+    from r2v_data_v2.h3.qwen38_h3_recaption import build_reference_contract
+
+    samples = []
+    for job in jobs:
+        if job.binding_evidence_mode != "none" or len(job.source_h3_sample_ids) != 1:
+            raise ValueError("frozen reference-only job requires one canonical source sample")
+        sample = project_mimo_h3_sample_references(
+            canonical[job.source_h3_sample_ids[0]], reference_images=job.reference_images,
+            reference_selection=job.reference_selection,
+        )
+        sample = sample.model_copy(update={"r2v_instruction": job.r2v_instruction})
+        if build_reference_contract(sample, "visual_only").subjects != job.reference_subjects:
+            raise ValueError("frozen H3 Subject graph differs from reconcile job")
+        samples.append(sample)
+    samples = project_prepared_samples(jobs, samples)
+    samples_text = "".join(s.model_dump_json() + "\n" for s in samples)
+    values = {
+        "schema_version": "r2v.h3.audio_reuse_frozen_inventory.1",
+        "source_reconcile_root": str(reconcile), "source_stem_root": str(stem_root), "source_h3_root": str(h3),
+        "source_h3_samples_sha256": hashlib.sha256(samples_text.encode()).hexdigest(),
+        "clip_count": len(jobs), "jobs": [j.model_dump(mode="json") for j in jobs],
+    }
+    inventory = FrozenAudioReuseInventory(**values, inventory_fingerprint=_hash(values))
+    validate_prepared_inputs(inventory, records, samples, stems)
+    records_text = "".join(r.model_dump_json() + "\n" for r in records)
+    inputs = [contract_path, reconcile / "records.jsonl", reconcile / "summary.json",
+              samples_path, stem_root / "records.jsonl"]
+    summary = AudioReusePreparedSummary(
+        clip_uids=[j.clip_uid for j in jobs], ready_count=len(jobs), failed_count=0, sample_count=len(samples),
+        source_hashes={str(p): sha256_file(p) for p in inputs},
+        chosen_reconcile_roots={j.clip_uid: str(reconcile) for j in jobs},
+        inventory_fingerprint=inventory.inventory_fingerprint,
+        prepared_records_sha256=hashlib.sha256(records_text.encode()).hexdigest(),
+        prepared_samples_sha256=inventory.source_h3_samples_sha256,
+    )
+    _publish_prepared(output, inventory, summary, samples_text, records_text)
+    return summary
 
 
 def prepare_audio_reuse_sources(
@@ -348,17 +492,5 @@ def prepare_audio_reuse_sources(
         prepared_records_sha256=hashlib.sha256(records_text.encode()).hexdigest(),
         prepared_samples_sha256=values["source_h3_samples_sha256"],
     )
-    output.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix=".reuse-prepare-", dir=output.parent) as temporary:
-        stage = Path(temporary) / "prepared"
-        (stage / "h3").mkdir(parents=True)
-        (stage / "h3/samples.jsonl").write_text(samples_text)
-        (stage / "inventory.json").write_text(inventory.model_dump_json(indent=2) + "\n")
-        (stage / "records.jsonl").write_text(records_text)
-        (stage / "summary.json").write_text(summary.model_dump_json(indent=2) + "\n")
-        if any(sha256_file(Path(path)) != digest for path, digest in hashes.items()):
-            raise ValueError("frozen preparation input changed")
-        if output.exists():
-            raise FileExistsError(output)
-        stage.rename(output)
+    _publish_prepared(output, inventory, summary, samples_text, records_text)
     return summary

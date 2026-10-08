@@ -22,11 +22,12 @@ from r2v_data_v2.h3.audio_reuse import (
 )
 from r2v_data_v2.h3.audio_reuse_prepared import (
     AudioReusePreparedSource,
+    load_prepared_inventory,
     validate_prepared_inputs,
 )
 from r2v_data_v2.h3.jea_audio_production import jea_production_paths
 from r2v_data_v2.h3.jea_final_renderer import FinalH3SampleV2, FinalQwen3SpeechSegment
-from r2v_data_v2.h3.mimo25_av_reconcile import MimoClipJob, MimoInventory
+from r2v_data_v2.h3.mimo25_av_reconcile import MimoClipJob
 from r2v_data_v2.h3.mimo25_backend import direct_speech_facts
 from r2v_data_v2.h3.mimo25_h3_materializer import (
     MimoH3MaterializationContractError,
@@ -379,7 +380,7 @@ def materialize_audio_reuse_products(
     input_files = [mimo_root / "inventory.json", mimo_root / "records.jsonl",
                    source_h3_root / "samples.jsonl", separation_root / "records.jsonl"]
     hashes = {str(p): sha256_file(p) for p in input_files}
-    inventory = MimoInventory.model_validate_json(input_files[0].read_text())
+    inventory = load_prepared_inventory(input_files[0])
     records = _rows(input_files[1], AudioReusePreparedSource)
     samples = _rows(input_files[2], FinalH3SampleV2)
     from r2v_data_v2.h3.resolved_audio_stems import RESOLVED_STAGE, load_stem_source
