@@ -47,8 +47,10 @@ SINGLE_PROMPT_VERSION = "h3_mimo26_ra2va_single_v10_speaker_subject_consistency"
 SINGLE_BACKEND_VERSION = "r2v.h3.mimo25_backend.76"
 DENSE_SINGLE_PROMPT_VERSION = "h3_mimo26_ra2va_single_v10_dense_icl_ab_v1"
 DENSE_SINGLE_BACKEND_VERSION = "r2v.h3.mimo25_backend.77"
+ACTION_SINGLE_PROMPT_VERSION = "h3_mimo26_ra2va_single_v10_action_icl_ab_v2"
+ACTION_SINGLE_BACKEND_VERSION = "r2v.h3.mimo25_backend.78"
 SINGLE_COMPACT_SCHEMA_VERSION = "r2v.h3.mimo26_single_compact.2"
-SingleSyntheticICLVariant = Literal["baseline", "dense_v1"]
+SingleSyntheticICLVariant = Literal["baseline", "dense_v1", "action_v2"]
 
 _COMPACT_PICTURE_LABEL = r"<Picture [1-9]\d*>"
 _COMPACT_PICTURE_PROVENANCE = re.compile(
@@ -251,6 +253,80 @@ def _single_semantic_icl_messages(
             "remains beside the doorway. The camera does not move or cut, leaving the two figures "
             "and the doorway in the same spatial arrangement at the end."
         )
+    elif variant == "action_v2":
+        example = {
+            "schema_version": SINGLE_COMPACT_SCHEMA_VERSION,
+            "visual_blocks": [{
+                "block_id": "v1",
+                "text": (
+                    "At a kitchen counter, <Subject 1> spoons dried beans from a white bowl "
+                    "into open <Subject 2>, fastens its lid, and moves the closed jar to the right."
+                ),
+            }],
+            "segments": [
+                {
+                    "segment_id": "segment_0001", "primary_speaker_group": "g1",
+                    "delivery_style": "calm conversational delivery",
+                    "binding_status": "visible_subject", "speaker_subject_label": "<Subject 1>",
+                },
+                {
+                    "segment_id": "segment_0002", "primary_speaker_group": "g2",
+                    "delivery_style": "brief questioning delivery",
+                    "binding_status": "offscreen", "speaker_subject_label": None,
+                },
+            ],
+            "speaker_voice_profiles": [
+                {"speaker_group": "g1", "voice_characteristics": "a mid-register voice with an even cadence"},
+                {"speaker_group": "g2", "voice_characteristics": "a lower voice with a rising question intonation"},
+            ],
+            "h3_semantics": {
+                "subject_definitions": [
+                    {
+                        "subject_label": "<Subject 1>",
+                        "description": "an adult woman with dark hair tied back and a blue shirt with rolled sleeves",
+                    },
+                    {
+                        "subject_label": "<Subject 2>",
+                        "description": "a clear cylindrical glass jar with a wide mouth and a silver screw-top lid",
+                    },
+                ],
+                "summary": (
+                    "At a kitchen counter, a woman spoons dried beans from a bowl into a glass jar, "
+                    "closes it, and sets it aside while an offscreen voice asks about the lid."
+                ),
+                "style_opening": (
+                    "Naturalistic live-action cinematography with a fixed medium view and soft kitchen light."
+                ),
+                "shot1_caption": (
+                    "A fixed medium view looks across a kitchen counter. A white bowl of dried beans "
+                    "sits on the left, the open <Subject 2> stands at center with its silver lid beside "
+                    "it, and <Subject 1> stands behind the counter in a blue rolled-sleeve shirt. She "
+                    "steadies the jar with her left hand and dips a metal spoon into the bowl with her "
+                    "right. As she tips the first spoonful through the jar mouth, she says, "
+                    "<d>[Chinese] 我把豆子装进罐子里。</d> She returns to the bowl, scoops again, and lets "
+                    "more beans fall into the jar; the bean level inside the clear glass rises. An "
+                    "unseen person asks from offscreen, <d>[Chinese] 盖子拧紧了吗？</d> <Subject 1> "
+                    "lowers the spoon beside the bowl, picks up the lid, seats it over the opening, "
+                    "and twists it until it stops. She lifts the closed jar to the right side of the "
+                    "counter and releases it. The camera stays still as she looks down at the filled "
+                    "jar, now separated from the bowl."
+                ),
+                "overall_soundscape": (
+                    "Soft kitchen room ambience under light clinks of the spoon against the bowl and jar."
+                ),
+                "non_diegetic_music": "N/A",
+                "visual_retention_analysis": [
+                    {
+                        "subject_label": "<Subject 1>", "marker": "fully_preserved",
+                        "description": "The woman's tied-back dark hair and rolled blue sleeves remain recognizable.",
+                    },
+                    {
+                        "subject_label": "<Subject 2>", "marker": "fully_preserved",
+                        "description": "The clear jar's cylindrical shape, wide mouth, and silver lid remain recognizable.",
+                    },
+                ],
+            },
+        }
     return [
         {"role": "user", "content": (
             "This is a compact synthetic demonstration of Subject, acoustic group, "
@@ -482,7 +558,7 @@ class SingleCallOpenAIMimo25Backend(StemAwareOpenAIMimo25Backend):
     ) -> None:
         if config.transport != "sglang":
             raise ValueError("single RA2VA requires SGLang structured output")
-        if single_synthetic_icl_variant not in {"baseline", "dense_v1"}:
+        if single_synthetic_icl_variant not in {"baseline", "dense_v1", "action_v2"}:
             raise ValueError("unknown single synthetic ICL variant")
         super().__init__(config, **kwargs)
         self.single_synthetic_icl_variant = single_synthetic_icl_variant
@@ -496,6 +572,11 @@ class SingleCallOpenAIMimo25Backend(StemAwareOpenAIMimo25Backend):
             values.update(
                 schema_version=DENSE_SINGLE_BACKEND_VERSION,
                 prompt_version=DENSE_SINGLE_PROMPT_VERSION,
+            )
+        elif self.single_synthetic_icl_variant == "action_v2":
+            values.update(
+                schema_version=ACTION_SINGLE_BACKEND_VERSION,
+                prompt_version=ACTION_SINGLE_PROMPT_VERSION,
             )
         else:
             values.update(schema_version=SINGLE_BACKEND_VERSION, prompt_version=SINGLE_PROMPT_VERSION)

@@ -52,7 +52,7 @@ class FrozenReuseBackendProvenance(MimoBackendProvenance):
                             "r2v.h3.mimo25_backend.71", "r2v.h3.mimo25_backend.72",
                             "r2v.h3.mimo25_backend.73", "r2v.h3.mimo25_backend.74",
                             "r2v.h3.mimo25_backend.75", "r2v.h3.mimo25_backend.76",
-                            "r2v.h3.mimo25_backend.77"]
+                            "r2v.h3.mimo25_backend.77", "r2v.h3.mimo25_backend.78"]
     prompt_version: Literal["h3_mimo25_speech_assembly_v46", "h3_mimo25_speech_assembly_v47",
                             "h3_mimo25_speech_assembly_v48", "h3_mimo25_speech_assembly_v49",
                             "h3_mimo26_ra2va_single_v1", "h3_mimo26_ra2va_single_v2",
@@ -63,7 +63,8 @@ class FrozenReuseBackendProvenance(MimoBackendProvenance):
                             "h3_mimo26_ra2va_single_v8_caption_quality",
                             "h3_mimo26_ra2va_single_v9_closed_subjects",
                             "h3_mimo26_ra2va_single_v10_speaker_subject_consistency",
-                            "h3_mimo26_ra2va_single_v10_dense_icl_ab_v1"]
+                            "h3_mimo26_ra2va_single_v10_dense_icl_ab_v1",
+                            "h3_mimo26_ra2va_single_v10_action_icl_ab_v2"]
     policy_version: Literal["h3_mimo25_av_authority_contract_v17", "h3_mimo25_av_authority_contract_v18"]
     visual_prompt_version: Literal["h3_mimo25_visual_only_v4", "h3_mimo25_visual_only_v5"]
 
