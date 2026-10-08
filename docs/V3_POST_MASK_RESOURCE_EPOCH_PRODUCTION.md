@@ -58,9 +58,14 @@ terminal count reaching 100% does not imply Export is complete: require
 and the corresponding eight `state/shards/<shard>/completed.json` markers.
 
 **Standalone opt-in converter:** `tools/export_completed_postmask_group.py`.
-It reads just the specified completed group's shard `samples.jsonl` files,
-along with the private `subject_attributes/enriched_samples.jsonl` for each
-shard, and emits one JSONL of `r2v.v3.production_sample.1` records.
+It reads just the specified completed group's shard `samples.jsonl` files
+and **the same shard's already exported `enriched_samples.jsonl`**, when
+present, then emits one JSONL of `r2v.v3.production_sample.1` records.
+The completed shard export already rewrites Visual and Attribute image paths
+and publishes the accepted final Attribute PNGs under its own `references/`.
+No private SA `enriched_samples.jsonl` is required; this matters because
+DatasetExporter can also source its enrichment from private
+`subject_attributes/samples/*.json` when the aggregate is missing.
 No model calls, scheduler change, production-state changes, or global compaction.
 No SHA/hash/checksum, media decoding, whole-tree scans, or source image copies.
 
@@ -93,8 +98,8 @@ The default output is a **private** directory:
 /mnt/workspace/litengjie/data/r2v_v3_group_exports/post_mask/group-000000/
   samples.jsonl
   references/
-    visual/<shard>/...          # links to official shard reference directories
-    attributes/<shard>/...      # links to private final SA images
+    visual/<shard>/...          # links to official shard reference directories,
+                                 # including accepted SA attribute PNGs
 ```
 
 The output uses the final **schema and semantics**: `sample_id`,
@@ -110,9 +115,10 @@ group JSONL, each `references[*].image_path` is relative to the
 `group-000000/` output root; the eventual global Compaction rewrites the
 references into its own canonical placement. The group converter uses
 **directory symlinks**, so consumers must resolve each image path against the
-group output root and keep official shard reference images plus private
-**final** SA PNGs accessible. Do not GC those inputs while consumers depend
-on these symlinks. This one-shot command does not publish a global
+group output root and keep official shard **exported** reference images
+(including final SA PNGs) accessible. Do not GC those inputs while consumers depend
+on these symlinks. The helper does not reference private SA PNGs.
+This one-shot command does not publish a global
 `catalog.json`, a portable image bundle, or a flattened global
 `enriched_samples.jsonl`.
 
@@ -129,3 +135,16 @@ shards, **48,128 SA terminal eligible clips**, and **39,585 accepted exported
 samples**. These are user-reported historical markers, not a live progress
 reading or a claim that the standalone converter has been run on the server.
 The unchanged formal global Compaction will still run after all groups complete.
+
+**Important: independent Global Compaction gap discovered 2026-10-08.**
+The current full compactor's `_load_shard_enriched_samples` reads only the
+private `<runs>/<shard>/subject_attributes/enriched_samples.jsonl`.
+If that private aggregate is absent but the shard's already published
+`enriched_samples.jsonl` exists, the current full compactor can silently
+produce a visual-only record for that shard. This does not change or invalidate
+the finished shard Export; it is a separate final-Compaction input-selection
+bug, **not fixed by the standalone group helper**. Before the 48-group global
+compaction, investigate and fix/test that loader without changing the active
+production worktree. Do not treat a visual-only global result as acceptable
+merely because the private aggregate is missing. The group helper always
+prefers the shard's finished exported sidecar and avoids this dependency.
