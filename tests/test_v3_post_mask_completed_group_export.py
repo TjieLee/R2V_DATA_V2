@@ -119,21 +119,22 @@ def sample_group(tmp_path: Path):
                 image_path=f"references/{uid}/subject_1.png", source_frame_index=1,
             )],
         )) + "\n")
-    attr = runs / shard_b / "subject_attributes"
-    (attr / "final").mkdir(parents=True)
-    (attr / "final/attr.png").write_bytes(b"attribute")
-    (root / "shards" / shard_b / "enriched_samples.jsonl").write_text("{}\n")
+    # Published shard SA sidecar uses exported image paths. No private
+    # aggregate is required, matching the reported production failure.
+    attribute_path = "references/clip-b/attribute_e1_a1_clothing.png"
+    (root / "shards" / shard_b / attribute_path).write_bytes(b"attribute")
     enrich = dict(
         sample_id="clip-b", clip_uid="clip-b", source_run_root=str(runs / shard_b),
         original_visual=dict(target_video="/videos/clip-b.mp4", source=dict(parent_video_id="parent", clip_suffix="0")),
+        original_instruction="original <Image 1>",
         enriched_instruction="updated <Image 1> <Image 2>",
         references=[
-            dict(image_index=1, kind="subject", image_id="image_1", entity_id="e1", source_frame_index=1),
-            dict(image_index=2, kind="attribute", image_id="image_2", attribute_id="a1", owner_entity_id="e1", image_path="final/attr.png", source_frame_index=2),
+            dict(image_index=1, kind="subject", image_id="image_1", entity_id="e1", image_path="references/clip-b/subject_1.png", source_frame_index=1),
+            dict(image_index=2, kind="attribute", image_id="image_2", attribute_id="a1", owner_entity_id="e1", image_path=attribute_path, source_frame_index=2),
         ],
-        accepted_attributes=[dict(attribute_id="a1", owner_entity_id="e1", attribute_type="clothing", image_path="final/attr.png", source_frame_index=2, default_variant=None, final_selection="raw")],
+        accepted_attributes=[dict(attribute_id="a1", owner_entity_id="e1", attribute_type="clothing", image_path=attribute_path, source_frame_index=2, default_variant=None, final_selection="raw")],
     )
-    (attr / "enriched_samples.jsonl").write_text(json.dumps(enrich) + "\n")
+    (root / "shards" / shard_b / "enriched_samples.jsonl").write_text(json.dumps(enrich) + "\n")
     return root, runs, out, marker, shard_b
 
 
@@ -147,7 +148,8 @@ def test_complete_group_maps_to_final_schema_and_images(sample_group):
     assert rows[1]["source"]["shard_id"] == shard_b
     assert [r["kind"] for r in rows[1]["references"]] == ["subject", "attribute"]
     assert all((out / ref["image_path"]).is_file() for row in rows for ref in row["references"])
-    assert (out / "references/attributes" / shard_b).is_symlink()
+    assert (out / "references/visual" / shard_b).is_symlink()
+    assert not (out / "references/attributes").exists()
     with pytest.raises(FileExistsError):
         exporter.convert_group("group-000000", root, runs, out, Models())
 
@@ -162,15 +164,16 @@ def test_unfinished_marker_fails_closed(sample_group):
     assert not out.exists()
 
 
-def test_attribute_source_missing_fails_closed(sample_group):
+def test_private_aggregate_missing_does_not_drop_shard_attributes(sample_group):
     root, runs, out, _, shard_b = sample_group
-    (runs / shard_b / "subject_attributes/enriched_samples.jsonl").unlink()
-    with pytest.raises(FileNotFoundError, match="enriched input missing"):
-        exporter.convert_group("group-000000", root, runs, out, Models())
-    assert not out.exists()
-    assert not list(out.parent.glob(".group-000000.tmp-*"))
+    assert not (runs / shard_b / "subject_attributes/enriched_samples.jsonl").exists()
+    exporter.convert_group("group-000000", root, runs, out, Models())
+    rows = [json.loads(line) for line in (out / "samples.jsonl").read_text().splitlines()]
+    assert rows[1]["r2v_instruction"] == "updated <Image 1> <Image 2>"
+    assert rows[1]["references"][1]["kind"] == "attribute"
+    assert (out / rows[1]["references"][1]["image_path"]).is_file()
 
 
 def test_escape_references_rejected():
     with pytest.raises(ValueError, match="escapes"):
-        exporter._attribute_path("shard-000000000-000009999", "../escape.png")
+        exporter._visual_path("shard-000000000-000009999", "references/../escape.png")
