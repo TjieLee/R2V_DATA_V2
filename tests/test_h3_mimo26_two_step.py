@@ -459,19 +459,23 @@ def test_25755_null_non_transcribed_profile_is_removed_without_speaker_repair(tm
 
 def test_195457_profiles_reorder_by_transcribed_appearance_without_reassigning_traits(tmp_path, monkeypatch):
     texts = [None, "你好，老师。", "请坐下来。"]
-    caption = "A voice (S1) says, <d>[Chinese] 你好，老师。</d>. Another voice (S2) replies, <d>[Chinese] 请坐下来。</d>."
+    caption = "A voice (S1) says, <d>[Chinese] 你好，老师。</d>. She continues (S2), <d>[Chinese] 请坐下来。</d>."
     visual, joint = _segment_drafts(["g1", "g2", "g1"], texts, caption)
     joint["speaker_voice_profiles"] = [
         {"speaker_group": "g1", "voice_characteristics": "Low register."},
         {"speaker_group": "g2", "voice_characteristics": "Bright middle register."},
     ]
     _, _, backend, completions, stems, jobs, _, _ = _setup(tmp_path, monkeypatch, visual=visual, joint=joint)
-    result = _reconcile(backend, _segment_job(jobs[0], texts), stems)
+    job = _segment_job(jobs[0], texts)
+    result = _reconcile(backend, job, stems)
     assert [(p.speaker_group, p.voice_characteristics) for p in result.annotation.speaker_voice_profiles] == [
         ("g2", "Bright middle register."), ("g1", "Low register."),
     ]
+    assert [d.primary_speaker_group for d in result.annotation.audio_observation.segment_decisions] == ["g1", "g2", "g1"]
+    assert [d.primary_speaker_group for d in result.annotation.av_grounding.segment_groundings] == ["g1", "g2", "g1"]
+    assert [fact["speaker_id"] for fact in direct_speech_facts(result.annotation, job.segments)] == ["S1", "S2"]
     assert result.annotation.h3_semantics.shot1_caption == caption
-    assert result.deterministic_correction_counts["joint_voice_profile_order_normalization"] == 2
+    assert result.deterministic_correction_counts == {"joint_voice_profile_order_normalization": 2}
     assert result.speech_av_raw_response == json.dumps(joint)
     assert len(completions.requests) == 2
 
@@ -484,6 +488,7 @@ def test_exact_chinese_dialogue_gets_only_missing_language_and_identical_audio_d
     if duplicate_audio:
         rows = joint["speech_av"]["audio_observation"]["segment_decisions"]
         rows.insert(1, copy.deepcopy(rows[0]))
+        assert rows[0] == rows[1]
     _, _, backend, completions, stems, jobs, _, _ = _setup(tmp_path, monkeypatch, visual=visual, joint=joint)
     result = _reconcile(backend, _segment_job(jobs[0], texts), stems)
     assert result.annotation.h3_semantics.shot1_caption == (
@@ -493,6 +498,9 @@ def test_exact_chinese_dialogue_gets_only_missing_language_and_identical_audio_d
     assert result.deterministic_correction_counts["joint_dialogue_language_marker_restored"] == 2
     assert result.deterministic_correction_counts.get("joint_audio_segment_duplicate_removed", 0) == int(duplicate_audio)
     assert result.speech_av_raw_response == json.dumps(joint)
+    if duplicate_audio:
+        raw_rows = json.loads(result.speech_av_raw_response)["speech_av"]["audio_observation"]["segment_decisions"]
+        assert len(raw_rows) == 3 and raw_rows[0] == raw_rows[1]
     assert len(completions.requests) == 2
     text = completions.requests[1]["messages"][-1]["content"][-1]["text"]
     contract = json.loads(text.split("AUTHORITATIVE INPUT:\n", 1)[1].split("\nTURN 1 VISUAL DRAFT:", 1)[0])

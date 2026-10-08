@@ -189,6 +189,20 @@ jq '{clip_uid,status,model_call_count,failure_reason,failure_issues,
 
 ## Compare quality, not just readiness
 
+Manual QA corrections from the five-clip pilot:
+
+- `1954570387e32d57a8726383`: one male and one female spoken line are two
+  distinct speakers. Preserve both original gN groups and S1/S2; only reorder
+  profiles from g1,g2 to the transcribed appearance order g2,g1, keeping each
+  group's acoustic description. **QA ISSUE:** `She continues (S2)` incorrectly
+  implies speaker continuity. Keep this caption/raw unchanged for review; do
+  not merge speakers or automatically replace the prose or binding.
+- `2b92925573f18e0508c3189f`: the two original `segment_0001` Audio rows are
+  field-for-field identical. Deduplicate the parsed inventory, preserve both
+  rows in the original joint raw, and record
+  `joint_audio_segment_duplicate_removed=1`. Any differing duplicate remains
+  a failure.
+
 The existing read-only caption viewer can display projected annotations:
 
 ```bash
