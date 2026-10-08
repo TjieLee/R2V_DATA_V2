@@ -1,4 +1,4 @@
-# Frozen reconcile to R(A)2VA review bundle
+# Frozen reconcile to R(A)2VA training bundle
 
 This CPU-only entry point consumes `source_contract.json`, `records.jsonl`, and
 `summary.json` from a completed reference-only reconcile. It performs no model
@@ -69,7 +69,12 @@ uses the existing annotation policy, not mere stem existence. Unavailable
 speech variants are omitted, not filled with music-only conditioning.
 
 The bundle summary reports per-task counts, product failures, unavailable speech
-variants, zero model calls, and `production_artifacts_modified=false`.
+variants, zero model calls, `production_artifacts_modified=false`, and
+`human_review_required=false`. There is no manual QA stage, pending-review state,
+or human approval prerequisite for production export. Warnings are non-blocking
+diagnostics; unavailable identity-specific Audio variants are omitted automatically
+while the other valid products continue. Actual annotation/ownership contradictions
+retain their existing failures rather than entering a human review queue.
 
 ### Repeat the failed v1 smoke without overwriting it
 
@@ -113,20 +118,16 @@ the code alone does not prove multiple speakers were heard. Cross-group or unsaf
 overlaps remain blocked, as do confirmed multiple-speaker compositions. Resolving missing
 ownership evidence is a separate task, not part of the reference-projection fix.
 
-## Human review and PASS-only export
+## Automatic production export
 
 ```bash
-.venv/bin/python tools/serve_h3_training_task_review.py serve \
-  --ra2va-shadow-root "$OUT" --review-root "${OUT}-review" \
-  --host 127.0.0.1 --port 8769
-
-# Only after recording human PASS / ISSUE / SKIP decisions:
-.venv/bin/python tools/serve_h3_training_task_review.py export \
-  --ra2va-shadow-root "$OUT" --review-root "${OUT}-review" \
-  --output-root "${OUT}-pass-only"
+.venv/bin/python tools/export_h3_training_manifests.py \
+  --ra2va-shadow-root "$OUT" --output-root "${OUT}-training"
 ```
 
-Review uses the existing 12 R(A)2VA task categories. Ready is not PASS. Known
-semantic issues such as the `469d` table/speaker binding are left for human
-ISSUE review, not repaired here. Export rows have exactly `video`, `images`,
+The existing exporter consumes ready products directly across the 12 R(A)2VA
+task categories. It does not require PASS/ISSUE/SKIP records or read a review
+store, including for historical bundles whose summary said
+`human_review_required=true`. Optional pilot viewers are separate tools, never
+part of the production path. Export rows have exactly `video`, `images`,
 `audios`, `caption`; `videos.jsonl` has only `video` and `tasks`.

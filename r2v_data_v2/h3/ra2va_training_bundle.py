@@ -1,4 +1,4 @@
-"""Deterministic frozen-reconcile to reviewable R(A)2VA task bundle."""
+"""Deterministic frozen-reconcile to production R(A)2VA task bundle."""
 from __future__ import annotations
 
 import json
@@ -31,7 +31,7 @@ def materialize_ra2va_training_bundle(
     *, reconcile_root: Path, output_root: Path, clip_uids: list[str] | None = None,
     source_h3_root: Path | None = None, allow_unverified: bool = False, ffmpeg: str = "ffmpeg",
 ) -> dict:
-    """Publish new owned stages only; human review remains a separate operation."""
+    """Publish available products automatically, without a human review stage."""
     output = output_root.expanduser().resolve()
     if output.exists():
         raise FileExistsError(output)
@@ -76,7 +76,7 @@ def materialize_ra2va_training_bundle(
         "frame_product_count": frames.derived_product_count,
         "task_counts": {task: len(rows) for task, rows in tasks.items()},
         "model_call_count": 0, "production_artifacts_modified": False,
-        "human_review_required": True,
+        "human_review_required": False,
     }
     temporary = output / "summary.json.tmp"
     temporary.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n")

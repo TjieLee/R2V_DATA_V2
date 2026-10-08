@@ -241,6 +241,7 @@ def test_frozen_bundle_real_pcm_materialization_frames_and_pass_only(tmp_path, m
     output = tmp_path / "bundle"
     result = main(["--reconcile-root", str(reconcile), "--output-root", str(output), "--allow-unverified"])
     assert result["model_call_count"] == 0 and result["production_artifacts_modified"] is False
+    assert result["human_review_required"] is False
     assert sum(result["task_counts"].values()) == task_count
     assert before == {p: p.read_bytes() for p in before}
     assert not (reconcile.parent / "audio_reuse_assets_v1").exists()
@@ -299,6 +300,57 @@ def test_frozen_bundle_real_pcm_materialization_frames_and_pass_only(tmp_path, m
     assert set(_rows(export / "videos.jsonl")[0]) == {"video", "tasks"}
     with pytest.raises(FileExistsError):
         main(["--reconcile-root", str(reconcile), "--output-root", str(output), "--allow-unverified"])
+
+
+def test_two_step_unconfirmed_identity_exports_available_products_without_review(tmp_path, monkeypatch):
+    from r2v_data_v2.h3.mimo26_two_step_backend import TwoStepOpenAIMimo26Backend
+    from tools.export_h3_training_manifests import main as export
+    from tools.materialize_h3_ra2va_training_bundle import main
+
+    reconcile, job, _, _ = _fixture(tmp_path, monkeypatch)
+    raw = _rows(reconcile / "records.jsonl")[0]
+    raw["annotation"]["av_grounding"]["segment_groundings"][0]["evidence_codes"] = ["voice_continuity"]
+    raw["annotation"]["visual_observation"]["segment_views"][0]["entity_observations"][0]["speech_correlated_articulation"] = "not_assessable"
+    raw.update(
+        backend_provenance=TwoStepOpenAIMimo26Backend(MimoBackendConfig(
+            api_key="fixture", transport="sglang",
+            media_resolver=MimoMediaResolver(mode="base64", media_root=tmp_path),
+        ), stem_records_by_clip={}).provenance.model_dump(mode="json"),
+        raw_responses=["visual", "joint"], visual_raw_response="visual", speech_av_raw_response="joint",
+        visual_model_call_count=1, model_call_count=2,
+        diagnostics=[
+            {**raw["diagnostics"][0], "input_modality": "target_video_visual_only"},
+            {**raw["diagnostics"][0], "input_modality": "target_video_joint_av_audio"},
+        ],
+    )
+    raw["record_fingerprint"] = prepared._hash({k: v for k, v in raw.items() if k != "record_fingerprint"})
+    (reconcile / "records.jsonl").write_text(json.dumps(raw) + "\n")
+    summary = json.loads((reconcile / "summary.json").read_text())
+    summary.update(visual_model_call_count=1, model_call_count=2)
+    (reconcile / "summary.json").write_text(json.dumps(summary))
+
+    output = tmp_path / "bundle"
+    result = main(["--reconcile-root", str(reconcile), "--output-root", str(output), "--allow-unverified"])
+    assert result["human_review_required"] is False
+    assert result["model_call_count"] == result["product_failed_count"] == 0
+    manifest = AudioReuseManifest.model_validate_json((output / f"audio_reuse_assets_v1/{job.clip_uid}/manifest.json").read_text())
+    assert manifest.speakers == []
+    assert {e.reason for e in manifest.exclusions} == {"unconfirmed_visible_identity"}
+    products = _rows(output / "h3_audio_reuse_products_v1/records.jsonl", AudioReuseProduct)
+    assert {p.conditioning_variant for p in products} == {"visual_only", "full_audio_reuse"}
+    assert all(p.status == "ready" for p in products)
+    assert all("g1:identity_publication_restricted" in p.warnings for p in products)
+    assert _rows(output / "audio_reuse_prepared_v1/records.jsonl")[0]["annotation"] == raw["annotation"]
+    assert _rows(reconcile / "records.jsonl")[0] == raw
+    # Historical bundles remain directly exportable without changing their metadata.
+    historical_summary = {**result, "human_review_required": True}
+    (output / "summary.json").write_text(json.dumps(historical_summary))
+    exported = export(["--ra2va-shadow-root", str(output), "--output-root", str(tmp_path / "training")])
+    rows = [row for task in result["task_counts"] for row in _rows(exported / f"{task}.jsonl")]
+    assert len(rows) == 8
+    assert all(set(row) == {"video", "images", "audios", "caption"} for row in rows)
+    assert json.loads((output / "summary.json").read_text()) == historical_summary
+    assert not (output / "review").exists()
 
 
 def test_frozen_preparation_missing_canonical_metadata_reports_source(tmp_path, monkeypatch):

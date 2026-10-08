@@ -492,14 +492,14 @@ for job in jobs:
         report["identity_publication_restricted_groups"] = sorted(
             two_step_identity_restricted_groups(result.annotation, backend.provenance)
         ) if result.annotation is not None else []
-        report["qa_only_binding"] = report["status"] == "cached_backend_validation_ready" and bool(
+        report["identity_restricted_binding"] = report["status"] == "cached_backend_validation_ready" and bool(
             report["identity_publication_restricted_groups"]
         )
     reports.append(report)
     print(json.dumps(report, ensure_ascii=False))
 print(json.dumps({"original_failed_count": len(reports), "actual_model_calls": 0,
     "safe_cached_recoveries": sum(r["status"] == "cached_backend_validation_ready" for r in reports),
-    "qa_only_binding_recoveries": sum(r.get("qa_only_binding", False) for r in reports),
+    "identity_restricted_binding_recoveries": sum(r.get("identity_restricted_binding", False) for r in reports),
     "partial_visual_replays": sum(r["status"] == "visual_schema_passed_joint_missing" for r in reports),
     "remaining_failures": sum(r["status"] in {"failed", "visual_failed"} for r in reports)}))
 PY
@@ -560,19 +560,20 @@ The viewer overlays the two new records for review only; the original Random20
 directory remains unchanged. Correction counts and QA warnings are in
 `diagnostics`; both real raw responses and annotation remain in `records.jsonl`.
 
-## Two-step review-only binding policy (.84)
+## Two-step automatic binding publication policy (.84)
 
 Joint v2, Visual v5 and both request messages remain unchanged. The common
 validator remains strict for Multi and Single. Two-step can now retain a visible
-binding as QA-only when the entity is present in the exact visual segment, the
-model says `onscreen_spoken`, and only a positive AV cue is missing. Explicit
+binding as ready with automatic identity-publication restrictions when the entity
+is present in the exact visual segment, the model says `onscreen_spoken`, and
+only a positive AV cue is missing. Explicit
 negative/source evidence, competing articulation, absent entities, group/entity
 conflicts, non-isolated speakers and frozen ASR mismatches are not waived.
 Profiles may remain nullable. No evidence, entity, group or speaker is invented.
 Diagnostics include `visible_entity_binding_missing_positive_cue:<segment>:`
 `identity_publication_restricted`.
 
-QA-only bindings do not authorize identity-specific Audio products. The existing
+These bindings do not authorize identity-specific Audio products. The existing
 reuse asset builder excludes the entire affected group with
 `unconfirmed_visible_identity`; target and cross-donor selection also exclude
 cached assets from that group. The legacy recovered-voice path skips it. The H3
@@ -582,11 +583,18 @@ cross-donor voices using the already-loaded donor records. Full target audio and
 remain available. No annotation/schema, caption renderer or waveform ownership
 rule changes; this opt-in policy does not apply to Multi/Single provenance.
 
+Production has no manual QA stage or approval gate. Diagnostics never place a
+clip in a pending-review state or block valid products. The identity exclusions
+above are automatic product selection, not requests for a human decision.
+Available ready products go directly to `tools/export_h3_training_manifests.py`;
+pilot viewers are optional and never a production dependency.
+
 Unknown caption markers are corrected only in an immediate dialogue lead-in
 whose exact frozen transcript uniquely determines Sx, with isolated ownership
 and no additional non-transcribed acoustic group. Corrections affect only the
 parenthesized marker, not dialogue, prose, binding or gN, and are counted as
-`joint_unambiguous_speaker_marker_corrected`. Voice-source narration remains QA.
+`joint_unambiguous_speaker_marker_corrected`. Voice-source narration diagnostics
+are non-blocking.
 Unrelated/ambiguous markers stay hard errors.
 
 Three additional user-supplied response payloads and frozen facts are retained
@@ -602,8 +610,8 @@ They do **not** satisfy the relaxed policy:
 Across the seven supplied payloads, five have both responses: one complete
 cached validation passes (`aed328`), four remain failed. Two have only Visual
 raw and pass Visual schema, not full-clip validation. None of the supplied full
-cases is restored by downgrading a binding error to QA. The reported `cd694c`
-ASR mismatch and `ecfb50` acoustic contradiction remain hard errors; their raw
+cases is restored by downgrading a binding error to a non-blocking diagnostic.
+The reported `cd694c` ASR mismatch and `ecfb50` acoustic contradiction remain hard errors; their raw
 was not supplied locally. Do not claim a revised full Random20 ready count.
 Use the all-failed CPU replay above against the server's original records for
 the complete nine-case report before any new model test. Historical `.80` to
