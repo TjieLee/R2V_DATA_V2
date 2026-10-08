@@ -94,6 +94,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--thinking", choices=("disabled", "enabled"), default="disabled")
     parser.add_argument("--icl", choices=("none", "official_ref2va_v1"), default="official_ref2va_v1")
+    parser.add_argument("--single-synthetic-icl-variant", choices=("baseline", "dense_v1"))
     parser.add_argument("--max-completion-tokens", type=int, default=32768)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--allow-unverified", action="store_true")
@@ -103,6 +104,10 @@ def _parser() -> argparse.ArgumentParser:
 
 def _parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     arguments = _parser().parse_args(argv)
+    if arguments.single_synthetic_icl_variant is not None and arguments.call_mode != "single":
+        raise ValueError("synthetic ICL variant is single-call only")
+    if arguments.single_synthetic_icl_variant is None:
+        arguments.single_synthetic_icl_variant = "baseline"
     # Explicit base64 suppresses only an inherited URL, never an explicit one.
     if arguments.media_base_url is None and arguments.media_mode != "base64":
         arguments.media_base_url = os.environ.get("MIMO_MEDIA_BASE_URL")
@@ -203,6 +208,8 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         "icl": arguments.icl,
         "original_target_av_is_highest_authority": True,
     }
+    if arguments.call_mode == "single":
+        result["single_synthetic_icl_variant"] = arguments.single_synthetic_icl_variant
     if not arguments.dry_run:
         backend_class = (
             SingleCallOpenAIMimo25Backend
@@ -225,6 +232,8 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
                 max_completion_tokens=arguments.max_completion_tokens,
             ),
             stem_records_by_clip={record.clip_uid: record for record in selected},
+            **({"single_synthetic_icl_variant": arguments.single_synthetic_icl_variant}
+               if arguments.call_mode == "single" else {}),
         )
         summary = run_mimo25_stem_reconcile_shadow(
             jobs=jobs,

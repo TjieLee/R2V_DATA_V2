@@ -377,9 +377,13 @@ def _records(shadow):
     return [json.loads(line) for line in path.read_text().splitlines()]
 
 
-@pytest.mark.parametrize("icl", ["none", "official_ref2va_v1"])
+@pytest.mark.parametrize(("icl", "variant"), [
+    ("none", "baseline"),
+    ("official_ref2va_v1", "baseline"),
+    ("official_ref2va_v1", "dense_v1"),
+])
 def test_single_ra2va_one_request_respects_icl_none_as_no_examples(
-    tmp_path, monkeypatch, icl
+    tmp_path, monkeypatch, icl, variant
 ):
     _, shadow = _fixture(tmp_path, monkeypatch)
     stems = load_stem_shadow(shadow / "separation")[1]
@@ -397,6 +401,7 @@ def test_single_ra2va_one_request_respects_icl_none_as_no_examples(
                 mode="http", media_root=tmp_path, media_base_url="http://media.invalid",
             ),
         ),
+        single_synthetic_icl_variant=variant,
         stem_records_by_clip={record.clip_uid: record for record in stems},
         client=SimpleNamespace(chat=SimpleNamespace(completions=completions)),
     )
@@ -419,7 +424,7 @@ def test_single_ra2va_one_request_respects_icl_none_as_no_examples(
     request = completions.requests[0]
     assert request["response_format"]["json_schema"]["name"] == "MimoSingleCompactAnnotationDraftV2"
     assert request["messages"][1:-1] == (
-        [*_official_detailed_description_icl_messages(), *single._single_semantic_icl_messages()]
+        [*_official_detailed_description_icl_messages(), *single._single_semantic_icl_messages(variant)]
         if icl == "official_ref2va_v1" else []
     )
     content = request["messages"][-1]["content"]
@@ -653,6 +658,97 @@ def test_single_ra2va_semantic_icl_is_valid_and_decouples_subject_from_speaker()
     assert "visible_entity_ids" not in assistant["content"]
 
 
+def test_single_dense_icl_changes_only_synthetic_caption_and_preserves_v10_baseline():
+    baseline = single._single_semantic_icl_messages("baseline")
+    assert baseline == single._single_semantic_icl_messages()
+    assert baseline[0] == {
+        "role": "user",
+        "content": (
+            "This is a compact synthetic demonstration of Subject, acoustic group, "
+            "and exact-dialogue field boundaries. Do not copy its people, dialogue, "
+            "entities, visual style, or factual content into the real task."
+        ),
+    }
+    assert baseline[1]["content"] == (
+        '{"h3_semantics":{"non_diegetic_music":"N/A","overall_soundscape":"A quiet interior ambience with faint footsteps and subtle doorway movement.",'
+        '"shot1_caption":"<Subject 1> watches quietly beside the doorway while <Subject 2> turns toward the camera side. <Subject 2> replies, <d>[Chinese] 好，我知道了。</d> He pauses as an offscreen voice asks, <d>[Chinese] 你去哪？</d>",'
+        '"style_opening":"Naturalistic live-action cinematography with a steady camera and soft practical lighting.",'
+        '"subject_definitions":[{"description":"an adult woman with dark shoulder-length hair and a dark green coat","subject_label":"<Subject 1>"},'
+        '{"description":"an adult man with short dark hair and a gray jacket","subject_label":"<Subject 2>"}],'
+        '"summary":"Two people pause near an entrance; the visible man answers first, followed by an offscreen speaker.",'
+        '"visual_retention_analysis":[{"description":"Her hairstyle, coat, and visible proportions remain consistent.","marker":"fully_preserved","subject_label":"<Subject 1>"},'
+        '{"description":"His short hair, jacket, and visible proportions remain consistent.","marker":"fully_preserved","subject_label":"<Subject 2>"}]},'
+        '"schema_version":"r2v.h3.mimo26_single_compact.2",'
+        '"segments":[{"binding_status":"visible_subject","delivery_style":"calm conversational delivery","primary_speaker_group":"g1","segment_id":"segment_0001","speaker_subject_label":"<Subject 2>"},'
+        '{"binding_status":"offscreen","delivery_style":"brief questioning delivery","primary_speaker_group":"g2","segment_id":"segment_0002","speaker_subject_label":null}],'
+        '"speaker_voice_profiles":[{"speaker_group":"g1","voice_characteristics":"a mid-register voice with a measured cadence"},'
+        '{"speaker_group":"g2","voice_characteristics":"a lower voice with questioning delivery"}],'
+        '"visual_blocks":[{"block_id":"v1","text":"<Subject 1> waits beside the doorway while <Subject 2> turns and answers."}]}'
+    )
+    dense = single._single_semantic_icl_messages("dense_v1")
+    assert dense[0] == baseline[0]
+    baseline_json = json.loads(baseline[1]["content"])
+    dense_json = json.loads(dense[1]["content"])
+    caption = dense_json["h3_semantics"].pop("shot1_caption")
+    baseline_caption = baseline_json["h3_semantics"].pop("shot1_caption")
+    assert dense_json == baseline_json
+    assert caption != baseline_caption
+    assert len(caption.split()) > len(baseline_caption.split())
+    for dialogue in ("<d>[Chinese] 好，我知道了。</d>", "<d>[Chinese] 你去哪？</d>"):
+        assert caption.count(dialogue) == 1
+    assert caption.index("好，我知道了。") < caption.index("你去哪？")
+    assert "<Subject 1>" in caption and "<Subject 2>" in caption
+    for forbidden in ("<Subject 3>", "<Picture ", "<Audio ", "(S1)", "(S2)", "[Shot 1]"):
+        assert forbidden not in caption
+    assert single.MimoSingleCompactAnnotationDraftV2.model_validate_json(dense[1]["content"])
+
+
+def test_single_ab_requests_differ_only_in_synthetic_caption(tmp_path, monkeypatch):
+    _, shadow = _fixture(tmp_path, monkeypatch)
+    stems = load_stem_shadow(shadow / "separation")[1]
+    jobs = build_stem_reconcile_jobs(
+        base_inventory=qa.build_mimo25_inventory(),
+        stem_diarization_root=shadow / "diarization", stem_asr_root=shadow / "asr",
+        route="music_first",
+    )
+    requests = []
+    for variant in ("baseline", "dense_v1"):
+        completions = _Completions([(_single_raw(), 8)])
+        backend = SingleCallOpenAIMimo25Backend(
+            MimoBackendConfig(
+                api_key="fake", transport="sglang", model="mimo-v2.6-flash-rl",
+                icl="official_ref2va_v1",
+                media_resolver=MimoMediaResolver(
+                    mode="http", media_root=tmp_path, media_base_url="http://media.invalid",
+                ),
+            ),
+            single_synthetic_icl_variant=variant,
+            stem_records_by_clip={record.clip_uid: record for record in stems},
+            client=SimpleNamespace(chat=SimpleNamespace(completions=completions)),
+        )
+        result = backend.reconcile(
+            jobs[0], segment_ids=[s.segment_id for s in jobs[0].segments],
+            transcribed_segment_ids=[s.segment_id for s in jobs[0].segments if s.asr_status == "transcribed"],
+            allowed_entity_ids={"e1"},
+            allowed_reference_labels={r.picture_label for r in jobs[0].reference_images}
+            | {s.subject_label for s in jobs[0].reference_subjects},
+            auxiliary_audio_paths=_validated_auxiliary_stems(stems[0]),
+        )
+        assert result.model_call_count == len(completions.requests) == 1
+        requests.append(completions.requests[0])
+
+    baseline, dense = requests
+    assert baseline["messages"][0] == dense["messages"][0] == {
+        "role": "system", "content": single.SINGLE_SYSTEM_PROMPT,
+    }
+    official = _official_detailed_description_icl_messages()
+    assert baseline["messages"][1:1 + len(official)] == official
+    assert dense["messages"][1:1 + len(official)] == official
+    assert baseline["messages"][-1] == dense["messages"][-1]
+    baseline["messages"][-2] = dense["messages"][-2]
+    assert baseline == dense
+
+
 def test_single_ra2va_invalid_output_never_falls_back_or_polishes(tmp_path, monkeypatch):
     _, shadow = _fixture(tmp_path, monkeypatch)
     stems = load_stem_shadow(shadow / "separation")[1]
@@ -685,7 +781,13 @@ def test_single_ra2va_invalid_output_never_falls_back_or_polishes(tmp_path, monk
     assert len(completions.requests) == 1
 
 
-def test_single_ra2va_record_keeps_clip_failure_isolated(tmp_path, monkeypatch):
+@pytest.mark.parametrize(("variant", "backend_version", "prompt_version"), [
+    ("baseline", "r2v.h3.mimo25_backend.76", "h3_mimo26_ra2va_single_v10_speaker_subject_consistency"),
+    ("dense_v1", "r2v.h3.mimo25_backend.77", "h3_mimo26_ra2va_single_v10_dense_icl_ab_v1"),
+])
+def test_single_ra2va_record_keeps_clip_failure_isolated(
+    tmp_path, monkeypatch, variant, backend_version, prompt_version,
+):
     from r2v_data_v2.h3.audio_reuse_prepared import load_reconcile_sources
 
     _, shadow = _fixture(tmp_path, monkeypatch)
@@ -703,6 +805,7 @@ def test_single_ra2va_record_keeps_clip_failure_isolated(tmp_path, monkeypatch):
                 mode="http", media_root=tmp_path, media_base_url="http://media.invalid",
             ),
         ),
+        single_synthetic_icl_variant=variant,
         stem_records_by_clip={record.clip_uid: record for record in stems},
         client=SimpleNamespace(chat=SimpleNamespace(completions=completions)),
     )
@@ -716,8 +819,8 @@ def test_single_ra2va_record_keeps_clip_failure_isolated(tmp_path, monkeypatch):
     assert [record.model_call_count for record in records] == [1, 1, 1]
     assert summary.model_call_count == 3
     assert len(completions.requests) == 3
-    assert all(record.backend_provenance.prompt_version == "h3_mimo26_ra2va_single_v10_speaker_subject_consistency" for record in records)
-    assert all(record.backend_provenance.schema_version == "r2v.h3.mimo25_backend.76" for record in records)
+    assert all(record.backend_provenance.prompt_version == prompt_version for record in records)
+    assert all(record.backend_provenance.schema_version == backend_version for record in records)
     assert [item.status for item in load_reconcile_sources(root)] == ["ready", "failed", "ready"]
 
 
@@ -741,6 +844,20 @@ def test_single_ra2va_provenance_reads_frozen_v1_to_v9_and_current_v10(tmp_path,
     assert FrozenReuseBackendProvenance.model_validate_json(
         current.model_dump_json()
     ).model_dump(mode="json") == current.model_dump(mode="json")
+    dense = SingleCallOpenAIMimo25Backend(
+        backend.config, single_synthetic_icl_variant="dense_v1",
+        stem_records_by_clip={},
+        client=SimpleNamespace(chat=SimpleNamespace(completions=None)),
+    ).provenance
+    assert (dense.schema_version, dense.prompt_version) == (
+        "r2v.h3.mimo25_backend.77", "h3_mimo26_ra2va_single_v10_dense_icl_ab_v1",
+    )
+    assert dense.configuration_fingerprint != current.configuration_fingerprint
+    assert dense.icl_version == current.icl_version
+    assert MimoBackendProvenance.model_validate_json(dense.model_dump_json()) == dense
+    assert FrozenReuseBackendProvenance.model_validate_json(
+        dense.model_dump_json()
+    ).model_dump(mode="json") == dense.model_dump(mode="json")
 
     for version, prompt in (
         (".67", "h3_mimo26_ra2va_single_v1"),
@@ -752,6 +869,7 @@ def test_single_ra2va_provenance_reads_frozen_v1_to_v9_and_current_v10(tmp_path,
         (".73", "h3_mimo26_ra2va_single_v7_compact2_cleanup"),
         (".74", "h3_mimo26_ra2va_single_v8_caption_quality"),
         (".75", "h3_mimo26_ra2va_single_v9_closed_subjects"),
+        (".76", "h3_mimo26_ra2va_single_v10_speaker_subject_consistency"),
     ):
         with monkeypatch.context() as patch:
             patch.setattr(single, "SINGLE_BACKEND_VERSION", f"r2v.h3.mimo25_backend{version}")
@@ -774,6 +892,23 @@ def test_single_cli_requires_explicit_no_lr_mode_and_v26(tmp_path, monkeypatch):
         cli.main([*argv, "--dry-run", "--call-mode", "single", "--model", "mimo-v2.6-flash-rl"])
     with pytest.raises(ValueError, match="V2.6"):
         cli.main([*argv, "--dry-run", "--call-mode", "single", "--binding-evidence-mode", "none"])
+
+
+def test_single_synthetic_icl_cli_is_single_only_and_defaults_to_baseline():
+    required = [
+        "--visual-production-root", "/tmp/visual",
+        "--visual-runs-root", "/tmp/runs",
+        "--audio-production-root", "/tmp/audio",
+        "--case-manifest", "/tmp/cases.json",
+    ]
+    assert cli._parse_arguments(required).single_synthetic_icl_variant == "baseline"
+    assert cli._parse_arguments([
+        *required, "--call-mode", "single", "--single-synthetic-icl-variant", "dense_v1",
+    ]).single_synthetic_icl_variant == "dense_v1"
+    with pytest.raises(ValueError, match="single-call"):
+        cli._parse_arguments([*required, "--single-synthetic-icl-variant", "dense_v1"])
+    with pytest.raises(ValueError, match="single-call"):
+        cli._parse_arguments([*required, "--single-synthetic-icl-variant", "baseline"])
 
 
 def test_cd694_shaped_final_backend_downgrades_anchor_conflict_without_extra_calls(tmp_path, monkeypatch):

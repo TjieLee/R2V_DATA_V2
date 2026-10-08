@@ -45,7 +45,10 @@ from r2v_data_v2.structured_output import (
 
 SINGLE_PROMPT_VERSION = "h3_mimo26_ra2va_single_v10_speaker_subject_consistency"
 SINGLE_BACKEND_VERSION = "r2v.h3.mimo25_backend.76"
+DENSE_SINGLE_PROMPT_VERSION = "h3_mimo26_ra2va_single_v10_dense_icl_ab_v1"
+DENSE_SINGLE_BACKEND_VERSION = "r2v.h3.mimo25_backend.77"
 SINGLE_COMPACT_SCHEMA_VERSION = "r2v.h3.mimo26_single_compact.2"
+SingleSyntheticICLVariant = Literal["baseline", "dense_v1"]
 
 _COMPACT_PICTURE_LABEL = r"<Picture [1-9]\d*>"
 _COMPACT_PICTURE_PROVENANCE = re.compile(
@@ -193,7 +196,9 @@ def _normalize_single_compact_speaker_subjects(
     return draft.model_copy(update={"segments": segments}), corrections
 
 
-def _single_semantic_icl_messages() -> list[dict[str, str]]:
+def _single_semantic_icl_messages(
+    variant: SingleSyntheticICLVariant = "baseline",
+) -> list[dict[str, str]]:
     example = {
         "schema_version": SINGLE_COMPACT_SCHEMA_VERSION,
         "visual_blocks": [{
@@ -232,6 +237,20 @@ def _single_semantic_icl_messages() -> list[dict[str, str]]:
             ],
         },
     }
+    if variant == "dense_v1":
+        example["h3_semantics"]["shot1_caption"] = (
+            "The camera holds a steady medium-wide view of an interior doorway. "
+            "<Subject 1> waits beside it in her dark green coat, nearer the left edge of the frame, "
+            "while <Subject 2> stands a little farther into the room in a gray jacket, initially "
+            "turned partly away from her. The doorway remains visible behind them as <Subject 1> "
+            "keeps her gaze on him. <Subject 2> shifts his shoulders, turns toward her, and comes "
+            "into a clearer three-quarter view before he replies, <d>[Chinese] 好，我知道了。</d> "
+            "After his answer, he holds his position and glances back toward the doorway while "
+            "<Subject 1> continues to watch. A voice from outside the visible frame then asks, "
+            "<d>[Chinese] 你去哪？</d> <Subject 2> looks toward the unseen source, and <Subject 1> "
+            "remains beside the doorway. The camera does not move or cut, leaving the two figures "
+            "and the doorway in the same spatial arrangement at the end."
+        )
     return [
         {"role": "user", "content": (
             "This is a compact synthetic demonstration of Subject, acoustic group, "
@@ -456,17 +475,30 @@ def _project_compact_to_legacy_annotation(
 
 
 class SingleCallOpenAIMimo25Backend(StemAwareOpenAIMimo25Backend):
-    def __init__(self, config: MimoBackendConfig, **kwargs: Any) -> None:
+    def __init__(
+        self, config: MimoBackendConfig, *,
+        single_synthetic_icl_variant: SingleSyntheticICLVariant = "baseline",
+        **kwargs: Any,
+    ) -> None:
         if config.transport != "sglang":
             raise ValueError("single RA2VA requires SGLang structured output")
+        if single_synthetic_icl_variant not in {"baseline", "dense_v1"}:
+            raise ValueError("unknown single synthetic ICL variant")
         super().__init__(config, **kwargs)
+        self.single_synthetic_icl_variant = single_synthetic_icl_variant
 
     @property
     def provenance(self) -> MimoBackendProvenance:
         values = self.config.provenance().model_dump(
             mode="json", exclude={"configuration_fingerprint"},
         )
-        values.update(schema_version=SINGLE_BACKEND_VERSION, prompt_version=SINGLE_PROMPT_VERSION)
+        if self.single_synthetic_icl_variant == "dense_v1":
+            values.update(
+                schema_version=DENSE_SINGLE_BACKEND_VERSION,
+                prompt_version=DENSE_SINGLE_PROMPT_VERSION,
+            )
+        else:
+            values.update(schema_version=SINGLE_BACKEND_VERSION, prompt_version=SINGLE_PROMPT_VERSION)
         return MimoBackendProvenance(
             **values, configuration_fingerprint=_sha256_text(_compact_json(values)),
         )
@@ -534,7 +566,7 @@ class SingleCallOpenAIMimo25Backend(StemAwareOpenAIMimo25Backend):
                 "messages": [
                     {"role": "system", "content": SINGLE_SYSTEM_PROMPT},
                     *(_official_detailed_description_icl_messages() if self.config.icl == "official_ref2va_v1" else []),
-                    *(_single_semantic_icl_messages() if self.config.icl == "official_ref2va_v1" else []),
+                    *(_single_semantic_icl_messages(self.single_synthetic_icl_variant) if self.config.icl == "official_ref2va_v1" else []),
                     {"role": "user", "content": content},
                 ],
                 "temperature": self.config.temperature,
