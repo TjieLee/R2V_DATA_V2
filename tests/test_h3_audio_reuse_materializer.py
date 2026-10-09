@@ -537,8 +537,8 @@ def test_asset_hash_and_range_mismatch_fail_closed(tmp_path):
         product.load_reuse_source(manifest_path=source.manifest_path, job=source.job, record=source.record, stem_record=args["stem_record"])
 
 
-def _prepared(tmp_path, *, music="N/A"):
-    args, sample, source = _case(tmp_path / "case", music=music)
+def _prepared(tmp_path, *, music="N/A", case_kwargs=None):
+    args, sample, source = _case(tmp_path / "case", music=music, **(case_kwargs or {}))
     canonical = sample.model_copy(update={"sample_id": "clip-1/canonical", "pair_type": "canonical", "pair_id": "canonical/clip-1", "subject_voices": []})
     root = tmp_path / "prepared"
     h3, mimo, stems, reuse = [root / name for name in ("h3", "mimo", "separation", "reuse")]

@@ -36,6 +36,7 @@ from r2v_data_v2.h3.mimo25_backend import (
     MimoAVAnnotationDraft,
     MimoSubjectDefinitionDraft,
     MimoVisualRetentionDraft,
+    _visible_binding_is_permitted,
     protect_direct_dialogue,
 )
 from r2v_data_v2.h3.mimo25_recovered_voice import (
@@ -64,6 +65,7 @@ from r2v_data_v2.h3.qwen38_h3_recaption import (
 from r2v_data_v2.h3.schemas import SchemaModel
 from r2v_data_v2.h3.speaker_ownership import (
     neutralize_two_step_caption_identity,
+    speaker_ownership_reasons,
     two_step_identity_restricted_groups,
 )
 from r2v_data_v2.h3.speech_presentation import SpeechPresentation
@@ -696,6 +698,70 @@ def validate_authoritative_dialogue(caption: str, expected_blocks: Sequence[str]
         )])
 
 
+def _two_step_first_speaker_marker(
+    caption: str, job: MimoClipJob, record: FrozenAnnotationSource, speech: Sequence[RecaptionSpeechFact],
+) -> str:
+    """Anchor only an exact, single-source reuse caption's first speech lead-in."""
+    provenance = getattr(record, "source_backend_provenance", getattr(record, "backend_provenance", None))
+    if (not getattr(provenance, "prompt_version", "").startswith("h3_mimo26_ra2va_two_step_joint_")
+            or not speech or re.search(r"\(S[1-9]\d*\)", caption)):
+        return caption
+    transcribed = [s for s in job.segments if s.asr_status == "transcribed"]
+    blocks = list(re.finditer(r"<d>[\s\S]*?</d>", caption))
+    expected = [f"<d>[{s.asr_language or 'Unknown'}] {s.asr_text}</d>" for s in transcribed]
+    if ([b.group() for b in blocks] != expected or caption.count("<d>") != len(blocks)
+            or caption.count("</d>") != len(blocks)
+            or [s.segment_id for s in speech] != [s.segment_id for s in transcribed]
+            or {s.speaker_id for s in speech} != {"S1"}):
+        return caption
+    annotation = record.annotation
+    decisions = annotation.audio_observation.segment_decisions
+    groundings = annotation.av_grounding.segment_groundings
+    groups = {d.primary_speaker_group for d in decisions}
+    if (len(groups) != 1 or None in groups or any(speaker_ownership_reasons(d) for d in decisions)
+            or {g.primary_speaker_group for g in groundings} != groups
+            or {s.speaker_cluster_id for s in speech} != groups):
+        return caption
+    entities = {s.entity_id for s in speech}
+    subjects = [s for s in job.reference_subjects if s.kind == "entity" and s.entity_id in entities]
+    if (len(entities) != 1 or None in entities or len(subjects) != 1
+            or {g.entity_id for g in groundings} != entities
+            or {s.entity_subject_label for s in speech} != {subjects[0].subject_label}):
+        return caption
+    views = {v.segment_id: v for v in annotation.visual_observation.segment_views}
+    if ([d.segment_id for d in decisions] != [s.segment_id for s in job.segments]
+            or [g.segment_id for g in groundings] != [s.segment_id for s in job.segments]
+            or any(not _visible_binding_is_permitted(g, views.get(g.segment_id)) for g in groundings)):
+        return caption
+    lead = caption[:blocks[0].start()]
+    entity_labels = {s.subject_label for s in job.reference_subjects if s.kind == "entity"}
+    mentioned = [label for label in re.findall(r"<Subject [1-9]\d*>", lead) if label in entity_labels]
+    subject = subjects[0].subject_label
+    if not mentioned:
+        return caption
+    actor = re.escape(subject)
+    asks = re.search(actor + r"\s+(asks),\s*$", lead) if mentioned[-1] == subject else None
+    saying = (re.search(r"(?:^|(?<=[.!?])\s+)" + actor + r"\s+[^.!?]*(, saying,\s*)$", lead)
+              if mentioned[-1] == subject else None)
+    if asks:
+        position = asks.start(1)
+        return caption[:position] + "(S1) " + caption[position:]
+    if saying:
+        return lead[:saying.start(1)] + f"; {subject} (S1) says, " + caption[blocks[0].start():]
+    # The two observed pronoun forms get an explicit frozen speaker lead-in.
+    # Object Subjects in the visual introduction never determine the speaker.
+    if (re.match(r"A (?:close-up|medium) shot frames " + actor + r"(?:,| seated\b)", lead)
+            and not re.search(r"\b(?:another|other) (?:person|man|woman|speaker|voice)\b", lead, re.IGNORECASE)):
+        for pattern, verb in (
+            (r"(?:^|(?<=[.!?])\s+)Initially, he looks downward [^.!?]*(, and asks,\s*)$", "asks"),
+            (r"(?:^|(?<=[.!?])\s+)In the middle of the shot, he lowers [^.!?]*(, saying,\s*)$", "says"),
+        ):
+            clause = re.search(pattern, lead)
+            if clause:
+                return lead[:clause.start(1)] + f"; {subject} (S1) {verb}, " + caption[blocks[0].start():]
+    return caption
+
+
 def project_authoritative_dialogue(
     caption: str, speech: Sequence[RecaptionSpeechFact],
     presentations: Mapping[str, SpeechPresentation], contract: RecaptionReferenceContract,
@@ -982,6 +1048,10 @@ def _materialize_sample(
     summary = context.summary
     if reuse_audio_contracts is not None:
         summary = prune_summary_dialogue(summary)
+        anchored = _two_step_first_speaker_marker(detailed, job, record, facts.speech)
+        if anchored != detailed:
+            warnings.append("deterministic_correction_count:two_step_first_speaker_marker_inserted=1")
+        detailed = anchored
         detailed = project_authoritative_dialogue(
             detailed, facts.speech,
             {g.segment_id: g.speech_presentation for g in record.annotation.av_grounding.segment_groundings},

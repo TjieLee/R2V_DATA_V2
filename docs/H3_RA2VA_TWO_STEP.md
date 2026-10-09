@@ -795,3 +795,43 @@ Each donor includes `segment_count` and `total_speech_duration_seconds`.
 `entity_id` is clip-local, and `donor_occurrence_id = clip_uid/entity_id` does
 not assert a shared identity across videos. Existing completed sidecars are never
 overwritten; outputs are atomically published. No cross-pair is synthesized.
+
+### Missing first speaker marker: fresh Bundle export
+
+Two-step Audio reuse materialization can anchor the first speech lead-in only
+when all frozen dialogue blocks already match exactly and one reliably bound
+speaker maps uniquely to S1 and a frozen entity Subject. The observed `asks` and
+`saying` forms receive one local explicit Subject/S1 lead-in; later dialogue
+inherits S1. No visual introduction marker is added. Raw, annotation, upstream
+binding and Multi/Single behavior stay unchanged. The product audit includes
+`deterministic_correction_count:two_step_first_speaker_marker_inserted=1`.
+
+The attached real `df6d4b84` and `7864d55e` captions pass CPU H3 rendering for
+visual-only, target speech reuse and full audio reuse, with 3/3 and 2/2 ASR
+blocks respectively. Local tests use media stand-ins, not the server assets.
+They do not establish full Random20 Bundle counts.
+
+Reuse the existing effective reconcile; do not rebuild it or overwrite the
+previous Bundle/JSONL roots:
+
+```bash
+set -e
+cd /mnt/workspace/litengjie/data/R2V_DATA_V2
+: "${SHADOW:?Set SHADOW to the existing Random20 named-run directory}"
+EFFECTIVE="$SHADOW/mimo_v26_ra2va_two_step_joint_v2_effective20_v85"
+BUNDLE="$SHADOW/ra2va_two_step_effective20_v85_training_bundle_marker_v1"
+TRAIN="$SHADOW/ra2va_two_step_effective20_v85_training_jsonl_marker_v1"
+
+.venv/bin/python tools/materialize_h3_ra2va_training_bundle.py \
+  --reconcile-root "$EFFECTIVE" --output-root "$BUNDLE" --allow-unverified
+.venv/bin/python tools/export_h3_training_manifests.py \
+  --ra2va-shadow-root "$BUNDLE" --output-root "$TRAIN"
+.venv/bin/python tools/export_h3_voice_donor_reserve.py --bundle-root "$BUNDLE"
+```
+
+Run the existing automatic product/identity/four-field checks above against
+these new roots. Expected, not locally verified: 45 ready products / 0 failed;
+each of four Visual tasks has 17 rows, each of four Full Audio tasks has 17,
+and each of four Speech+BGM tasks has 11. Donors should remain 8 speakers /
+14 segments. If counts differ, retain and report actual product failures;
+do not change statuses or identity exclusions to reach the expected counts.

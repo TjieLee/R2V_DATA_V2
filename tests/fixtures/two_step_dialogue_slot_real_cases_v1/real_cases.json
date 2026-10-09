@@ -1,0 +1,927 @@
+{
+  "source": "two_step_effective20_v85",
+  "cases": [
+    {
+      "clip_uid": "df6d4b84f3c523af10c3da61",
+      "frozen_job": {
+        "binding_evidence_mode": "none",
+        "clip_uid": "df6d4b84f3c523af10c3da61",
+        "r2v_instruction": "a young man with black hair and round glasses <Image 1>, wearing the glasses shown in <Image 2> sits in a cafe, looking slightly to the side with a thoughtful expression. He wears a light blue striped shirt and round black-framed glasses, his short black hair neatly styled. In the background, a softly lit cafe interior with wooden furniture and hanging lanterns is visible, with soft lighting and blurred figures of other people seated at tables. The camera remains steady, focusing on his face as he subtly shifts his gaze and opens his mouth as if speaking or reacting to someone off-screen. The scene maintains a calm, intimate atmosphere with warm tones and shallow depth of field.",
+        "reference_images": [
+          {
+            "attribute_id": null,
+            "attribute_type": null,
+            "entity_id": "e1",
+            "image_artifact_path": "/mnt/workspace/litengjie/data/r2v_v3_runs/random200/random200-src10000-19999-seed20260831-20260831-124415/clips/df6d4b84f3c523af10c3da61/selected/e1.png",
+            "image_index": 1,
+            "image_sha256": "733499df5e31c0947435aeaac7957a9ca11140ff3ef7b577dd460251fb0821da",
+            "kind": "subject",
+            "owner_entity_id": null,
+            "picture_label": "<Picture 1>",
+            "source_image_id": "image_1",
+            "source_image_index": 1,
+            "source_image_label": "<Image 1>"
+          },
+          {
+            "attribute_id": "a2",
+            "attribute_type": "glasses",
+            "entity_id": null,
+            "image_artifact_path": "/mnt/workspace/litengjie/data/r2v_v3_runs/random200/random200-src10000-19999-seed20260831-20260831-124415/subject_attributes/references/df6d4b84f3c523af10c3da61/a2.png",
+            "image_index": 2,
+            "image_sha256": "71f00abcdd9a99f48de33df3b8721fb74f4c1ee977369c04937973fd3a3ec111",
+            "kind": "attribute",
+            "owner_entity_id": "e1",
+            "picture_label": "<Picture 2>",
+            "source_image_id": "image_2",
+            "source_image_index": 2,
+            "source_image_label": "<Image 2>"
+          }
+        ],
+        "reference_selection": {
+          "dropped_references": [],
+          "face_promotions": [],
+          "original_picture_count": 2,
+          "policy_version": "h3_mimo25_reference_selection_v2",
+          "selected_picture_count": 2,
+          "selected_source_image_ids": [
+            "image_1",
+            "image_2"
+          ],
+          "selected_source_image_indexes": [
+            1,
+            2
+          ]
+        },
+        "reference_subjects": [
+          {
+            "attribute_id": null,
+            "attribute_type": null,
+            "entity_id": "e1",
+            "kind": "entity",
+            "owner_entity_id": null,
+            "source_picture_labels": [
+              "<Picture 1>"
+            ],
+            "subject_index": 1,
+            "subject_label": "<Subject 1>"
+          },
+          {
+            "attribute_id": "a2",
+            "attribute_type": "glasses",
+            "entity_id": null,
+            "kind": "attribute",
+            "owner_entity_id": "e1",
+            "source_picture_labels": [
+              "<Picture 2>"
+            ],
+            "subject_index": 2,
+            "subject_label": "<Subject 2>"
+          }
+        ],
+        "request_fingerprint": "749136172d907c84ebc53de82c5a3d119b2646df27526e12ed1ed892fcc9979c",
+        "segments": [
+          {
+            "asr_language": "Chinese",
+            "asr_status": "transcribed",
+            "asr_text": "多少？",
+            "cluster_binding_status": "unbound",
+            "competing_visible_speaker_evidence": [],
+            "current_entity_id": null,
+            "direct_anchor_seconds": 0.0,
+            "direct_support_seconds_by_entity": {},
+            "end_time": 0.4325,
+            "entity_occurrence_id": null,
+            "identity_scope": "unresolved",
+            "overlapping_visible_entities": [],
+            "segment_id": "segment_0001",
+            "source_end_sample": 13840,
+            "source_sample_rate_hz": 32000,
+            "source_speaker_cluster_id": "speaker_0",
+            "source_start_sample": 400,
+            "start_time": 0.0125
+          },
+          {
+            "asr_language": "Chinese",
+            "asr_status": "transcribed",
+            "asr_text": "情人节表。",
+            "cluster_binding_status": "unbound",
+            "competing_visible_speaker_evidence": [],
+            "current_entity_id": null,
+            "direct_anchor_seconds": 0.0,
+            "direct_support_seconds_by_entity": {},
+            "end_time": 1.8925,
+            "entity_occurrence_id": null,
+            "identity_scope": "unresolved",
+            "overlapping_visible_entities": [],
+            "segment_id": "segment_0002",
+            "source_end_sample": 60560,
+            "source_sample_rate_hz": 32000,
+            "source_speaker_cluster_id": "speaker_0",
+            "source_start_sample": 26640,
+            "start_time": 0.8325
+          },
+          {
+            "asr_language": "Chinese",
+            "asr_status": "transcribed",
+            "asr_text": "今天不就是情人节？",
+            "cluster_binding_status": "unbound",
+            "competing_visible_speaker_evidence": [],
+            "current_entity_id": null,
+            "direct_anchor_seconds": 0.0,
+            "direct_support_seconds_by_entity": {},
+            "end_time": 4.1286875,
+            "entity_occurrence_id": null,
+            "identity_scope": "unresolved",
+            "overlapping_visible_entities": [],
+            "segment_id": "segment_0003",
+            "source_end_sample": 132118,
+            "source_sample_rate_hz": 32000,
+            "source_speaker_cluster_id": "speaker_0",
+            "source_start_sample": 106640,
+            "start_time": 3.3325
+          }
+        ],
+        "source_h3_sample_ids": [
+          "df6d4b84f3c523af10c3da61/canonical"
+        ],
+        "target_duration_seconds": 4.1286875,
+        "target_full_audio_path": "/mnt/workspace/litengjie/data/r2v_audio_runs/random200/random200-src10000-19999-seed20260831-20260831-124415/audio/full_audio/01/不会恋爱的我们/09/v_eecf86d65683c8feb88d_00535.flac",
+        "target_full_audio_sha256": "57d922c12eeb1e5c96c1b69eb14f5214cccf6f8a1dac9b3c3078f595f5bd734f",
+        "target_video_path": "/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/clips_clean_cropped/01/不会恋爱的我们/09/v_eecf86d65683c8feb88d_00535.mp4",
+        "target_video_sha256": "224f0a0cbe27ec4fe91026ebd1765841806f8fc4a371edf7d2dc8f31b092ebc4"
+      },
+      "reconcile_record": {
+        "annotation": {
+          "audio_observation": {
+            "segment_decisions": [
+              {
+                "audio_evidence_codes": [
+                  "voice_continuity"
+                ],
+                "confidence": "medium",
+                "delivery_style": "questioning, slightly raised pitch",
+                "primary_speaker_group": "g1",
+                "resolution": "uncertain",
+                "secondary_vocal_activity": {
+                  "kind": null,
+                  "present": false,
+                  "speaker_relation": "none"
+                },
+                "segment_id": "segment_0001",
+                "vocal_composition": "single_speaker"
+              },
+              {
+                "audio_evidence_codes": [
+                  "voice_continuity"
+                ],
+                "confidence": "medium",
+                "delivery_style": "declarative, steady pace",
+                "primary_speaker_group": "g1",
+                "resolution": "uncertain",
+                "secondary_vocal_activity": {
+                  "kind": null,
+                  "present": false,
+                  "speaker_relation": "none"
+                },
+                "segment_id": "segment_0002",
+                "vocal_composition": "single_speaker"
+              },
+              {
+                "audio_evidence_codes": [
+                  "voice_continuity"
+                ],
+                "confidence": "medium",
+                "delivery_style": "rhetorical question, mildly surprised tone",
+                "primary_speaker_group": "g1",
+                "resolution": "uncertain",
+                "secondary_vocal_activity": {
+                  "kind": null,
+                  "present": false,
+                  "speaker_relation": "none"
+                },
+                "segment_id": "segment_0003",
+                "vocal_composition": "single_speaker"
+              }
+            ],
+            "speaker_voice_profiles": [
+              {
+                "speaker_group": "g1",
+                "voice_characteristics": "A moderately pitched male voice with a clear, smooth timbre. The delivery is conversational and evenly paced, with a slight upward inflection on the questions and a mildly surprised, inquiring tone toward the end."
+              }
+            ]
+          },
+          "av_grounding": {
+            "segment_groundings": [
+              {
+                "binding_status": "visible_entity",
+                "confidence": "medium",
+                "entity_id": "e1",
+                "evidence_codes": [
+                  "av_temporal_alignment",
+                  "visible_lip_motion"
+                ],
+                "primary_speaker_group": "g1",
+                "segment_id": "segment_0001",
+                "speech_presentation": "onscreen_spoken"
+              },
+              {
+                "binding_status": "visible_entity",
+                "confidence": "medium",
+                "entity_id": "e1",
+                "evidence_codes": [
+                  "av_temporal_alignment",
+                  "visible_lip_motion"
+                ],
+                "primary_speaker_group": "g1",
+                "segment_id": "segment_0002",
+                "speech_presentation": "onscreen_spoken"
+              },
+              {
+                "binding_status": "visible_entity",
+                "confidence": "medium",
+                "entity_id": "e1",
+                "evidence_codes": [
+                  "av_temporal_alignment",
+                  "visible_lip_motion"
+                ],
+                "primary_speaker_group": "g1",
+                "segment_id": "segment_0003",
+                "speech_presentation": "onscreen_spoken"
+              }
+            ]
+          },
+          "h3_semantics": {
+            "non_diegetic_music": "A soft, gentle piano melody plays quietly in the background, creating a warm and reflective atmosphere.",
+            "overall_soundscape": "Quiet indoor cafe ambience with faint, indistinct background chatter and subtle room tone.",
+            "shot1_caption": "A close-up shot frames <Subject 1>, the young man, in a warm, softly lit indoor setting resembling a cafe or restaurant, with blurred figures and shelves visible in the background. He wears <Subject 2>, the round wire-frame glasses, and a light blue striped shirt. Initially, he looks downward with a neutral expression, his mouth slightly open as if speaking, and asks, <d>[Chinese] 多少？</d> He then says, <d>[Chinese] 情人节表。</d> As the shot progresses, he lifts his gaze, turning his head slightly to the left while continuing to speak, his expression shifting to one of mild surprise or inquiry as he adds, <d>[Chinese] 今天不就是情人节？</d> The camera remains relatively static with subtle handheld movement, maintaining a tight focus on his face while the background remains out of focus. The lighting is warm and consistent, highlighting his features and the reflective surface of his glasses.",
+            "style_opening": "The video uses a realistic live-action style with warm indoor lighting and a shallow depth of field.",
+            "subject_definitions": [
+              {
+                "description": "A young East Asian man with short black hair and a light blue striped collared shirt.",
+                "subject_label": "<Subject 1>"
+              },
+              {
+                "description": "Thin round wire-frame glasses with dark rims and clear lenses.",
+                "subject_label": "<Subject 2>"
+              }
+            ],
+            "summary": "A close-up of a young man in a cafe who speaks with mild surprise and inquiry.",
+            "visual_retention_analysis": [
+              {
+                "description": "The subject's facial features, hairstyle, and clothing remain consistent throughout the shot.",
+                "marker": "fully_preserved",
+                "subject_label": "<Subject 1>"
+              },
+              {
+                "description": "The glasses maintain their round wire-frame shape and position on the face across all frames.",
+                "marker": "fully_preserved",
+                "subject_label": "<Subject 2>"
+              }
+            ]
+          },
+          "schema_version": "r2v.h3.mimo25_av_annotation.20",
+          "visual_observation": {
+            "segment_views": [
+              {
+                "entity_observations": [
+                  {
+                    "entity_id": "e1",
+                    "face_visibility": "clear",
+                    "mouth_visibility": "clear",
+                    "orientation": "three_quarter",
+                    "speech_correlated_articulation": "not_assessable",
+                    "visibility": "visible"
+                  }
+                ],
+                "segment_id": "segment_0001",
+                "visible_entity_ids": [
+                  "e1"
+                ]
+              },
+              {
+                "entity_observations": [
+                  {
+                    "entity_id": "e1",
+                    "face_visibility": "clear",
+                    "mouth_visibility": "clear",
+                    "orientation": "three_quarter",
+                    "speech_correlated_articulation": "not_assessable",
+                    "visibility": "visible"
+                  }
+                ],
+                "segment_id": "segment_0002",
+                "visible_entity_ids": [
+                  "e1"
+                ]
+              },
+              {
+                "entity_observations": [
+                  {
+                    "entity_id": "e1",
+                    "face_visibility": "clear",
+                    "mouth_visibility": "clear",
+                    "orientation": "three_quarter",
+                    "speech_correlated_articulation": "not_assessable",
+                    "visibility": "visible"
+                  }
+                ],
+                "segment_id": "segment_0003",
+                "visible_entity_ids": [
+                  "e1"
+                ]
+              }
+            ],
+            "visual_blocks": [
+              {
+                "block_id": "v1",
+                "text": "A close-up shot frames <Subject 1>, the young man, in a warm, softly lit indoor setting resembling a cafe or restaurant, with blurred figures and shelves visible in the background. He wears <Subject 2>, the round wire-frame glasses, and a light blue striped shirt. Initially, he looks downward with a neutral expression, his mouth slightly open as if speaking. As the shot progresses, he lifts his gaze, turning his head slightly to the left while continuing to speak, his expression shifting to one of mild surprise or inquiry. The camera remains relatively static with subtle handheld movement, maintaining a tight focus on his face while the background remains out of focus. The lighting is warm and consistent, highlighting his features and the reflective surface of his glasses."
+              }
+            ]
+          },
+          "warnings": []
+        },
+        "audio_finalize_raw_response": null,
+        "audio_model_call_count": 0,
+        "av_model_call_count": 1,
+        "backend_provenance": {
+          "annotation_schema_version": "r2v.h3.mimo25_av_annotation.20",
+          "audio_finalize_prompt_version": "h3_mimo25_audio_finalize_v6",
+          "backend": "sglang_openai_compatible",
+          "base_url": "http://127.0.0.1:8094/v1",
+          "configuration_fingerprint": "89925830fb3598186868f359cc14b66bff3619777aaf9b9c09daeb5515ba46f7",
+          "full_av_recheck_limit": 0,
+          "http_max_attempts": 1,
+          "icl_version": "h3_official_ref2va_detailed_shot1_v4",
+          "materializer_version": "h3_mimo25_materializer_v30",
+          "max_completion_tokens": 32768,
+          "media_base_url": "http://127.0.0.1:8766/",
+          "media_mode": "http",
+          "media_resolution": "default",
+          "media_root": "/mnt/workspace",
+          "model": "mimo-v2.6-flash-rl",
+          "policy_version": "h3_mimo25_av_authority_contract_v18",
+          "prompt_version": "h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity",
+          "response_format": "json_schema",
+          "schema_version": "r2v.h3.mimo25_backend.82",
+          "speaker_marker_polish_prompt_version": "h3_mimo25_speaker_marker_polish_v4",
+          "speaker_profile_prompt_version": "h3_mimo25_speaker_profile_v2",
+          "stream": false,
+          "temperature": 0.0,
+          "thinking": {
+            "type": "disabled"
+          },
+          "transport": "sglang",
+          "video_fps": 4.0,
+          "visual_prompt_version": "h3_mimo25_visual_only_v5"
+        },
+        "clip_uid": "df6d4b84f3c523af10c3da61",
+        "diagnostics": [
+          {
+            "finish_reason": "stop",
+            "http_attempt_count": 1,
+            "input_modality": "target_video_visual_only",
+            "request_error": null,
+            "usage": {
+              "audio_tokens": 26,
+              "cached_tokens": 0,
+              "completion_tokens": 517,
+              "image_tokens": 4139,
+              "prompt_tokens": 33758,
+              "reasoning_tokens": null,
+              "total_tokens": 34275,
+              "video_tokens": 27360
+            },
+            "warnings": [
+              "completion_tokens_details_unavailable"
+            ]
+          },
+          {
+            "finish_reason": "stop",
+            "http_attempt_count": 1,
+            "input_modality": "target_video_joint_av_audio",
+            "request_error": null,
+            "usage": {
+              "audio_tokens": 106,
+              "cached_tokens": 0,
+              "completion_tokens": 769,
+              "image_tokens": null,
+              "prompt_tokens": 32065,
+              "reasoning_tokens": null,
+              "total_tokens": 32834,
+              "video_tokens": 27360
+            },
+            "warnings": [
+              "completion_tokens_details_unavailable",
+              "visible_entity_requires_resolved_audio",
+              "stage_a_av_articulation_contradiction",
+              "visible_entity_requires_resolved_audio",
+              "stage_a_av_articulation_contradiction",
+              "visible_entity_requires_resolved_audio",
+              "stage_a_av_articulation_contradiction",
+              "direct_single_speaker_marker_missing"
+            ]
+          }
+        ],
+        "failure_code": null,
+        "failure_issues": [],
+        "failure_reason": null,
+        "model_call_count": 2,
+        "music_stem_description": null,
+        "music_stem_error": null,
+        "music_stem_raw_response": null,
+        "policy_version": "h3_mimo25_stem_reconcile_v6",
+        "raw_responses": [
+          "{\"segment_views\":[{\"segment_id\":\"segment_0001\",\"visible_entity_ids\":[\"e1\"],\"entity_observations\":[{\"entity_id\":\"e1\",\"visibility\":\"visible\",\"orientation\":\"three_quarter\",\"face_visibility\":\"clear\",\"mouth_visibility\":\"clear\",\"speech_correlated_articulation\": \"not_assessable\"}]},{\"segment_id\":\"segment_0002\",\"visible_entity_ids\":[\"e1\"],\"entity_observations\":[{\"entity_id\":\"e1\",\"visibility\":\"visible\",\"orientation\":\"three_quarter\",\"face_visibility\":\"clear\",\"mouth_visibility\":\"clear\",\"speech_correlated_articulation\": \"not_assessable\"}]},{\"segment_id\":\"segment_0003\",\"visible_entity_ids\":[\"e1\"],\"entity_observations\":[{\"entity_id\":\"e1\",\"visibility\":\"visible\",\"orientation\":\"three_quarter\",\"face_visibility\":\"clear\",\"mouth_visibility\":\"clear\",\"speech_correlated_articulation\": \"not_assessable\"}]}],\"subject_definitions\":[{\"subject_label\":\"<Subject 1>\",\"description\":\"A young East Asian man with short black hair and a light blue striped collared shirt.\"},{\"subject_label\":\"<Subject 2>\",\"description\":\"Thin round wire-frame glasses with dark rims and clear lenses.\"}],\"visual_retention_analysis\":[{\"subject_label\":\"<Subject 1>\",\"marker\":\"fully_preserved\",\"description\":\"The subject's facial features, hairstyle, and clothing remain consistent throughout the shot.\"},{\"subject_label\":\"<Subject 2>\",\"marker\":\"fully_preserved\",\"description\":\"The glasses maintain their round wire-frame shape and position on the face across all frames.\"}],\"style_opening\":\"The video uses a realistic live-action style with warm indoor lighting and a shallow depth of field.\",\"shot1_visual_description\":\"A close-up shot frames <Subject 1>, the young man, in a warm, softly lit indoor setting resembling a cafe or restaurant, with blurred figures and shelves visible in the background. He wears <Subject 2>, the round wire-frame glasses, and a light blue striped shirt. Initially, he looks downward with a neutral expression, his mouth slightly open as if speaking. As the shot progresses, he lifts his gaze, turning his head slightly to the left while continuing to speak, his expression shifting to one of mild surprise or inquiry. The camera remains relatively static with subtle handheld movement, maintaining a tight focus on his face while the background remains out of focus. The lighting is warm and consistent, highlighting his features and the reflective surface of his glasses.\"}",
+          "{\"speech_av\":{\"summary\":\"A close-up of a young man in a cafe who speaks with mild surprise and inquiry.\",\"audio_observation\":{\"segment_decisions\":[{\"segment_id\":\"segment_0001\",\"vocal_composition\":\"single_speaker\",\"resolution\":\"uncertain\",\"primary_speaker_group\":\"g1\",\"delivery_style\":\"questioning, slightly raised pitch\",\"secondary_vocal_activity\":{ \"present\":false,\"speaker_relation\": \"none\",\"kind\":null},\"confidence\":  \"medium\",\"audio_evidence_codes\":[\"voice_continuity\"]},{\"segment_id\":\"segment_0002\",\"vocal_composition\":\"single_speaker\",\"resolution\":\"uncertain\",\"primary_speaker_group\":\"g1\",\"delivery_style\":\"declarative, steady pace\",\"secondary_vocal_activity\":{\"present\":false,\"speaker_relation\":\"none\",\"kind\":null},\"confidence\":\"medium\",\"audio_evidence_codes\":[\"voice_continuity\"]},{\"segment_id\":\"segment_0003\",\"vocal_composition\":\"single_speaker\",\"resolution\":\"uncertain\",\"primary_speaker_group\":\"g1\",\"delivery_style\":\"rhetorical question, mildly surprised tone\",\"secondary_vocal_activity\":{\"present\":false,\"speaker_relation\":\"none\",\"kind\":null},\"confidence\":\"medium\",\"audio_evidence_codes\":[\"voice_continuity\"]}]},\"av_grounding\":{\"segment_groundings\":[{\"segment_id\":\"segment_0001\",\"primary_speaker_group\":\"g1\",\"binding_status\":\"visible_entity\",\"speech_presentation\":\"onscreen_spoken\",\"entity_id\":\"e1\",\"confidence\":\"medium\",\"evidence_codes\":[\"av_temporal_alignment\",\"visible_lip_motion\"]},{\"segment_id\":\"segment_0002\",\"primary_speaker_group\":\"g1\",\"binding_status\":\"visible_entity\",\"speech_presentation\":\"onscreen_spoken\",\"entity_id\":\"e1\",\"confidence\":\"medium\",\"evidence_codes\":[\"av_temporal_alignment\",\"visible_lip_motion\"]},{\"segment_id\":\"segment_0003\",\"primary_speaker_group\":\"g1\",\"binding_status\":\"visible_entity\",\"speech_presentation\":\"onscreen_spoken\",\"entity_id\":\"e1\",\"confidence\":\"medium\",\"evidence_codes\":[\"av_temporal_alignment\",\"visible_lip_motion\"]}]},\"shot1_caption\":\"A close-up shot frames <Subject 1>, the young man, in a warm, softly lit indoor setting resembling a cafe or restaurant, with blurred figures and shelves visible in the background. He wears <Subject 2>, the round wire-frame glasses, and a light blue striped shirt. Initially, he looks downward with a neutral expression, his mouth slightly open as if speaking, and asks, <d>[Chinese] 多少？</d> He then says, <d>[Chinese] 情人节表。</d> As the shot progresses, he lifts his gaze, turning his head slightly to the left while continuing to speak, his expression shifting to one of mild surprise or inquiry as he adds, <d>[Chinese] 今天不就是情人节？</d> The camera remains relatively static with subtle handheld movement, maintaining a tight focus on his face while the background remains out of focus. The lighting is warm and consistent, highlighting his features and the reflective surface of his glasses.\",\"warnings\":[]},\"speaker_voice_profiles\":[{\"speaker_group\":\"g1\",\"voice_characteristics\":\"A moderately pitched male voice with a clear, smooth timbre. The delivery is conversational and evenly paced, with a slight upward inflection on the questions and a mildly surprised, inquiring tone toward the end.\"}],\"audio_finalize\":{\"overall_soundscape\":\"Quiet indoor cafe ambience with faint, indistinct background chatter and subtle room tone.\",\"non_diegetic_music\":\"A soft, gentle piano melody plays quietly in the background, creating a warm and reflective atmosphere.\"}}"
+        ],
+        "record_fingerprint": "8c373436c611fd5dbe531c12aa57d3d14f68304f8ccd983404dbdf2d288a4d6b",
+        "schema_version": "r2v.h3.mimo25_stem_reconcile.14",
+        "sfx_stem_description": null,
+        "sfx_stem_error": null,
+        "sfx_stem_raw_response": null,
+        "source_job_fingerprint": "749136172d907c84ebc53de82c5a3d119b2646df27526e12ed1ed892fcc9979c",
+        "source_stem_record_fingerprint": "878af716f4f344d244d03a2f7eff6d7cb8af34395e47050bdbab9c46af3c3ddd",
+        "speaker_marker_polish_applied": false,
+        "speaker_marker_polish_attempted": false,
+        "speaker_marker_polish_error": null,
+        "speaker_marker_polish_needs_review": null,
+        "speaker_marker_polish_raw_response": null,
+        "speaker_profile_raw_response": null,
+        "speech_av_raw_response": "{\"speech_av\":{\"summary\":\"A close-up of a young man in a cafe who speaks with mild surprise and inquiry.\",\"audio_observation\":{\"segment_decisions\":[{\"segment_id\":\"segment_0001\",\"vocal_composition\":\"single_speaker\",\"resolution\":\"uncertain\",\"primary_speaker_group\":\"g1\",\"delivery_style\":\"questioning, slightly raised pitch\",\"secondary_vocal_activity\":{ \"present\":false,\"speaker_relation\": \"none\",\"kind\":null},\"confidence\":  \"medium\",\"audio_evidence_codes\":[\"voice_continuity\"]},{\"segment_id\":\"segment_0002\",\"vocal_composition\":\"single_speaker\",\"resolution\":\"uncertain\",\"primary_speaker_group\":\"g1\",\"delivery_style\":\"declarative, steady pace\",\"secondary_vocal_activity\":{\"present\":false,\"speaker_relation\":\"none\",\"kind\":null},\"confidence\":\"medium\",\"audio_evidence_codes\":[\"voice_continuity\"]},{\"segment_id\":\"segment_0003\",\"vocal_composition\":\"single_speaker\",\"resolution\":\"uncertain\",\"primary_speaker_group\":\"g1\",\"delivery_style\":\"rhetorical question, mildly surprised tone\",\"secondary_vocal_activity\":{\"present\":false,\"speaker_relation\":\"none\",\"kind\":null},\"confidence\":\"medium\",\"audio_evidence_codes\":[\"voice_continuity\"]}]},\"av_grounding\":{\"segment_groundings\":[{\"segment_id\":\"segment_0001\",\"primary_speaker_group\":\"g1\",\"binding_status\":\"visible_entity\",\"speech_presentation\":\"onscreen_spoken\",\"entity_id\":\"e1\",\"confidence\":\"medium\",\"evidence_codes\":[\"av_temporal_alignment\",\"visible_lip_motion\"]},{\"segment_id\":\"segment_0002\",\"primary_speaker_group\":\"g1\",\"binding_status\":\"visible_entity\",\"speech_presentation\":\"onscreen_spoken\",\"entity_id\":\"e1\",\"confidence\":\"medium\",\"evidence_codes\":[\"av_temporal_alignment\",\"visible_lip_motion\"]},{\"segment_id\":\"segment_0003\",\"primary_speaker_group\":\"g1\",\"binding_status\":\"visible_entity\",\"speech_presentation\":\"onscreen_spoken\",\"entity_id\":\"e1\",\"confidence\":\"medium\",\"evidence_codes\":[\"av_temporal_alignment\",\"visible_lip_motion\"]}]},\"shot1_caption\":\"A close-up shot frames <Subject 1>, the young man, in a warm, softly lit indoor setting resembling a cafe or restaurant, with blurred figures and shelves visible in the background. He wears <Subject 2>, the round wire-frame glasses, and a light blue striped shirt. Initially, he looks downward with a neutral expression, his mouth slightly open as if speaking, and asks, <d>[Chinese] 多少？</d> He then says, <d>[Chinese] 情人节表。</d> As the shot progresses, he lifts his gaze, turning his head slightly to the left while continuing to speak, his expression shifting to one of mild surprise or inquiry as he adds, <d>[Chinese] 今天不就是情人节？</d> The camera remains relatively static with subtle handheld movement, maintaining a tight focus on his face while the background remains out of focus. The lighting is warm and consistent, highlighting his features and the reflective surface of his glasses.\",\"warnings\":[]},\"speaker_voice_profiles\":[{\"speaker_group\":\"g1\",\"voice_characteristics\":\"A moderately pitched male voice with a clear, smooth timbre. The delivery is conversational and evenly paced, with a slight upward inflection on the questions and a mildly surprised, inquiring tone toward the end.\"}],\"audio_finalize\":{\"overall_soundscape\":\"Quiet indoor cafe ambience with faint, indistinct background chatter and subtle room tone.\",\"non_diegetic_music\":\"A soft, gentle piano melody plays quietly in the background, creating a warm and reflective atmosphere.\"}}",
+        "status": "ready",
+        "text_model_call_count": 0,
+        "visual_model_call_count": 1,
+        "visual_raw_response": "{\"segment_views\":[{\"segment_id\":\"segment_0001\",\"visible_entity_ids\":[\"e1\"],\"entity_observations\":[{\"entity_id\":\"e1\",\"visibility\":\"visible\",\"orientation\":\"three_quarter\",\"face_visibility\":\"clear\",\"mouth_visibility\":\"clear\",\"speech_correlated_articulation\": \"not_assessable\"}]},{\"segment_id\":\"segment_0002\",\"visible_entity_ids\":[\"e1\"],\"entity_observations\":[{\"entity_id\":\"e1\",\"visibility\":\"visible\",\"orientation\":\"three_quarter\",\"face_visibility\":\"clear\",\"mouth_visibility\":\"clear\",\"speech_correlated_articulation\": \"not_assessable\"}]},{\"segment_id\":\"segment_0003\",\"visible_entity_ids\":[\"e1\"],\"entity_observations\":[{\"entity_id\":\"e1\",\"visibility\":\"visible\",\"orientation\":\"three_quarter\",\"face_visibility\":\"clear\",\"mouth_visibility\":\"clear\",\"speech_correlated_articulation\": \"not_assessable\"}]}],\"subject_definitions\":[{\"subject_label\":\"<Subject 1>\",\"description\":\"A young East Asian man with short black hair and a light blue striped collared shirt.\"},{\"subject_label\":\"<Subject 2>\",\"description\":\"Thin round wire-frame glasses with dark rims and clear lenses.\"}],\"visual_retention_analysis\":[{\"subject_label\":\"<Subject 1>\",\"marker\":\"fully_preserved\",\"description\":\"The subject's facial features, hairstyle, and clothing remain consistent throughout the shot.\"},{\"subject_label\":\"<Subject 2>\",\"marker\":\"fully_preserved\",\"description\":\"The glasses maintain their round wire-frame shape and position on the face across all frames.\"}],\"style_opening\":\"The video uses a realistic live-action style with warm indoor lighting and a shallow depth of field.\",\"shot1_visual_description\":\"A close-up shot frames <Subject 1>, the young man, in a warm, softly lit indoor setting resembling a cafe or restaurant, with blurred figures and shelves visible in the background. He wears <Subject 2>, the round wire-frame glasses, and a light blue striped shirt. Initially, he looks downward with a neutral expression, his mouth slightly open as if speaking. As the shot progresses, he lifts his gaze, turning his head slightly to the left while continuing to speak, his expression shifting to one of mild surprise or inquiry. The camera remains relatively static with subtle handheld movement, maintaining a tight focus on his face while the background remains out of focus. The lighting is warm and consistent, highlighting his features and the reflective surface of his glasses.\"}"
+      }
+    },
+    {
+      "clip_uid": "7864d55e61e58e88b221c1cd",
+      "frozen_job": {
+        "binding_evidence_mode": "none",
+        "clip_uid": "7864d55e61e58e88b221c1cd",
+        "r2v_instruction": "a man in a white t-shirt <Image 1>, with the facial appearance shown in <Image 2> and with the hairstyle shown in <Image 3> and wearing the clothing shown in <Image 4> sits at a table in a dimly lit dining room with wooden paneling and a large framed artwork, eating from a white bowl with floral patterns <Image 5> using black chopsticks. He leans forward slightly, bringing the bowl closer to his mouth as he takes bites. His expression is focused and calm, with his eyes mostly closed as he savors the food. The lighting is soft and warm, casting gentle shadows across the room. A glass of water sits to the left of the bowl on the table. The camera remains steady, capturing the quiet moment from a medium shot angle.",
+        "reference_images": [
+          {
+            "attribute_id": null,
+            "attribute_type": null,
+            "entity_id": "e1",
+            "image_artifact_path": "/mnt/workspace/litengjie/data/r2v_v3_runs/random200/random200-src10000-19999-seed20260831-20260831-124415/clips/7864d55e61e58e88b221c1cd/selected/e1.png",
+            "image_index": 1,
+            "image_sha256": "f3889d7b284fa7a248bdff67f92af564bc5aa28b0b1659ef0466af9bfd268c52",
+            "kind": "subject",
+            "owner_entity_id": null,
+            "picture_label": "<Picture 1>",
+            "source_image_id": "image_1",
+            "source_image_index": 1,
+            "source_image_label": "<Image 1>"
+          },
+          {
+            "attribute_id": "a1",
+            "attribute_type": "face",
+            "entity_id": null,
+            "image_artifact_path": "/mnt/workspace/litengjie/data/r2v_v3_runs/random200/random200-src10000-19999-seed20260831-20260831-124415/subject_attributes/variants/7864d55e61e58e88b221c1cd/a1/bbox.png",
+            "image_index": 2,
+            "image_sha256": "9d550fff40f1e391b273e590a2fa0d7164a6a2260c7c726fb421a03914cefbca",
+            "kind": "attribute",
+            "owner_entity_id": "e1",
+            "picture_label": "<Picture 2>",
+            "source_image_id": "image_2",
+            "source_image_index": 2,
+            "source_image_label": "<Image 2>"
+          },
+          {
+            "attribute_id": "a3",
+            "attribute_type": "upper_clothing",
+            "entity_id": null,
+            "image_artifact_path": "/mnt/workspace/litengjie/data/r2v_v3_runs/random200/random200-src10000-19999-seed20260831-20260831-124415/subject_attributes/references/7864d55e61e58e88b221c1cd/a3.png",
+            "image_index": 3,
+            "image_sha256": "6e9c9d733d575c81f2505683fcc1a8104b9830cc5170af1424242cbc6ccd1864",
+            "kind": "attribute",
+            "owner_entity_id": "e1",
+            "picture_label": "<Picture 3>",
+            "source_image_id": "image_4",
+            "source_image_index": 4,
+            "source_image_label": "<Image 4>"
+          },
+          {
+            "attribute_id": null,
+            "attribute_type": null,
+            "entity_id": "e2",
+            "image_artifact_path": "/mnt/workspace/litengjie/data/r2v_v3_runs/random200/random200-src10000-19999-seed20260831-20260831-124415/clips/7864d55e61e58e88b221c1cd/selected/e2.png",
+            "image_index": 4,
+            "image_sha256": "26a74d8e1f2d959f0b5b83e00a0eb847f5d4c6957427881993d5bb06cfe4e4ed",
+            "kind": "object",
+            "owner_entity_id": null,
+            "picture_label": "<Picture 4>",
+            "source_image_id": "image_5",
+            "source_image_index": 5,
+            "source_image_label": "<Image 5>"
+          }
+        ],
+        "reference_selection": {
+          "dropped_references": [
+            {
+              "attribute_id": "a2",
+              "attribute_type": "hair",
+              "drop_reason": "hair_sampling_drop",
+              "entity_id": null,
+              "kind": "attribute",
+              "owner_entity_id": "e1",
+              "source_image_id": "image_3",
+              "source_image_index": 3,
+              "source_image_label": "<Image 3>"
+            }
+          ],
+          "face_promotions": [],
+          "original_picture_count": 5,
+          "policy_version": "h3_mimo25_reference_selection_v2",
+          "selected_picture_count": 4,
+          "selected_source_image_ids": [
+            "image_1",
+            "image_2",
+            "image_4",
+            "image_5"
+          ],
+          "selected_source_image_indexes": [
+            1,
+            2,
+            4,
+            5
+          ]
+        },
+        "reference_subjects": [
+          {
+            "attribute_id": null,
+            "attribute_type": null,
+            "entity_id": "e1",
+            "kind": "entity",
+            "owner_entity_id": null,
+            "source_picture_labels": [
+              "<Picture 1>"
+            ],
+            "subject_index": 1,
+            "subject_label": "<Subject 1>"
+          },
+          {
+            "attribute_id": null,
+            "attribute_type": null,
+            "entity_id": "e2",
+            "kind": "entity",
+            "owner_entity_id": null,
+            "source_picture_labels": [
+              "<Picture 4>"
+            ],
+            "subject_index": 2,
+            "subject_label": "<Subject 2>"
+          },
+          {
+            "attribute_id": "a1",
+            "attribute_type": "face",
+            "entity_id": null,
+            "kind": "attribute",
+            "owner_entity_id": "e1",
+            "source_picture_labels": [
+              "<Picture 2>"
+            ],
+            "subject_index": 3,
+            "subject_label": "<Subject 3>"
+          },
+          {
+            "attribute_id": "a3",
+            "attribute_type": "upper_clothing",
+            "entity_id": null,
+            "kind": "attribute",
+            "owner_entity_id": "e1",
+            "source_picture_labels": [
+              "<Picture 3>"
+            ],
+            "subject_index": 4,
+            "subject_label": "<Subject 4>"
+          }
+        ],
+        "request_fingerprint": "7bd83d1d0dea38ff69ea3b376ea13ba57e7bcd5dcc6d83659993048f2f93c0fd",
+        "segments": [
+          {
+            "asr_language": "Chinese",
+            "asr_status": "transcribed",
+            "asr_text": "帮我照看孩子。",
+            "cluster_binding_status": "unbound",
+            "competing_visible_speaker_evidence": [],
+            "current_entity_id": null,
+            "direct_anchor_seconds": 0.0,
+            "direct_support_seconds_by_entity": {},
+            "end_time": 1.4125,
+            "entity_occurrence_id": null,
+            "identity_scope": "unresolved",
+            "overlapping_visible_entities": [],
+            "segment_id": "segment_0001",
+            "source_end_sample": 45200,
+            "source_sample_rate_hz": 32000,
+            "source_speaker_cluster_id": "speaker_0",
+            "source_start_sample": 2320,
+            "start_time": 0.0725
+          },
+          {
+            "asr_language": "Chinese",
+            "asr_status": "transcribed",
+            "asr_text": "住在我这儿不是理所当然。",
+            "cluster_binding_status": "unbound",
+            "competing_visible_speaker_evidence": [],
+            "current_entity_id": null,
+            "direct_anchor_seconds": 0.0,
+            "direct_support_seconds_by_entity": {},
+            "end_time": 3.4725,
+            "entity_occurrence_id": null,
+            "identity_scope": "unresolved",
+            "overlapping_visible_entities": [],
+            "segment_id": "segment_0002",
+            "source_end_sample": 111120,
+            "source_sample_rate_hz": 32000,
+            "source_speaker_cluster_id": "speaker_0",
+            "source_start_sample": 59280,
+            "start_time": 1.8525
+          }
+        ],
+        "source_h3_sample_ids": [
+          "7864d55e61e58e88b221c1cd/canonical"
+        ],
+        "target_duration_seconds": 3.4809375,
+        "target_full_audio_path": "/mnt/workspace/litengjie/data/r2v_audio_runs/random200/random200-src10000-19999-seed20260831-20260831-124415/audio/full_audio/01/不惑之旅/不惑之旅.2021.S01E11.2160P.H265.AAC.Summer/v_cd95605cbc635b330f67_00388.flac",
+        "target_full_audio_sha256": "3236c3a22a2daa827c51cafc50f21f44bba3ef6f95c0139708e928f4308e50b7",
+        "target_video_path": "/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/clips_clean_cropped/01/不惑之旅/不惑之旅.2021.S01E11.2160P.H265.AAC.Summer/v_cd95605cbc635b330f67_00388.mp4",
+        "target_video_sha256": "a58f3321f72f9584b8b3209a1078400ededb638a4b9210736182b7c7eb599695"
+      },
+      "reconcile_record": {
+        "annotation": {
+          "audio_observation": {
+            "segment_decisions": [
+              {
+                "audio_evidence_codes": [
+                  "voice_continuity"
+                ],
+                "confidence": "high",
+                "delivery_style": "conversational, moderately paced with a slightly lowered, requesting tone",
+                "primary_speaker_group": "g1",
+                "resolution": "resolved",
+                "secondary_vocal_activity": {
+                  "kind": null,
+                  "present": false,
+                  "speaker_relation": "none"
+                },
+                "segment_id": "segment_0001",
+                "vocal_composition": "single_speaker"
+              },
+              {
+                "audio_evidence_codes": [
+                  "voice_continuity"
+                ],
+                "confidence": "high",
+                "delivery_style": "conversational, steady pace with a firmer, mildly reproachful tone",
+                "primary_speaker_group": "g1",
+                "resolution": "resolved",
+                "secondary_vocal_activity": {
+                  "kind": null,
+                  "present": false,
+                  "speaker_relation": "none"
+                },
+                "segment_id": "segment_0002",
+                "vocal_composition": "single_speaker"
+              }
+            ],
+            "speaker_voice_profiles": [
+              {
+                "speaker_group": "g1",
+                "voice_characteristics": "A mid-to-low pitched male voice with a slightly husky, grounded timbre. The cadence is moderate and unhurried, with clear articulation and a steady, conversational energy that carries a mildly firm, requesting tone across both lines."
+              }
+            ]
+          },
+          "av_grounding": {
+            "segment_groundings": [
+              {
+                "binding_status": "visible_entity",
+                "confidence": "medium",
+                "entity_id": "e1",
+                "evidence_codes": [
+                  "av_temporal_alignment",
+                  "voice_continuity"
+                ],
+                "primary_speaker_group": "g1",
+                "segment_id": "segment_0001",
+                "speech_presentation": "onscreen_spoken"
+              },
+              {
+                "binding_status": "visible_entity",
+                "confidence": "medium",
+                "entity_id": "e1",
+                "evidence_codes": [
+                  "av_temporal_alignment",
+                  "voice_continuity"
+                ],
+                "primary_speaker_group": "g1",
+                "segment_id": "segment_0002",
+                "speech_presentation": "onscreen_spoken"
+              }
+            ]
+          },
+          "h3_semantics": {
+            "non_diegetic_music": "N/A",
+            "overall_soundscape": "Quiet indoor room tone with a low noise floor; faint, subtle sounds of chopsticks contacting the ceramic bowl and light eating noises are present beneath the dialogue.",
+            "shot1_caption": "A medium shot frames <Subject 1> seated at a light-colored table in a dimly lit interior, with a dark wooden door and a pale green paneled wall forming the background. He wears <Subject 4>, the white T-shirt, and leans forward over <Subject 2>, the white ceramic bowl, holding dark chopsticks in his right hand while his left forearm rests on the table. His gaze is directed downward into the bowl as he lifts noodles toward his mouth, his expression concentrated with a slightly furrowed brow. The camera remains static with a shallow focus that softens the background. In the middle of the shot, he lowers the chopsticks back into the bowl, stirs briefly, and lifts another portion while his mouth moves as if speaking, saying, <d>[Chinese] 帮我照看孩子。</d> He continues to look down at the bowl, chewing and pausing between motions, then adds, <d>[Chinese] 住在我这儿不是理所当然。</d>, with the glass of water at the left edge of the frame remaining still.",
+            "style_opening": "Live-action cinematic realism with soft, directional indoor lighting and a shallow depth of field.",
+            "subject_definitions": [
+              {
+                "description": "A middle-aged East Asian man with short black hair, a broad face, and a stocky build.",
+                "subject_label": "<Subject 1>"
+              },
+              {
+                "description": "A white ceramic bowl with a flared rim, decorated with a pale grey floral band around its exterior.",
+                "subject_label": "<Subject 2>"
+              },
+              {
+                "description": "The face of <Subject 1>, showing a broad nose, heavy brow, and downturned eyes with visible forehead lines.",
+                "subject_label": "<Subject 3>"
+              },
+              {
+                "description": "A white short-sleeved crew-neck T-shirt with a horizontal tonal stripe across the chest.",
+                "subject_label": "<Subject 4>"
+              }
+            ],
+            "summary": "A single male voice speaks two short Chinese lines in sequence, both attributed to the one visible seated man, with no competing or overlapping vocal sources detected.",
+            "visual_retention_analysis": [
+              {
+                "description": "The man's identity, build, and seated posture are maintained throughout the shot.",
+                "marker": "fully_preserved",
+                "subject_label": "<Subject 1>"
+              },
+              {
+                "description": "The bowl's shape, rim, and floral decoration remain consistent across the shot.",
+                "marker": "fully_preserved",
+                "subject_label": "<Subject 2>"
+              },
+              {
+                "description": "The facial features remain consistent as the head tilts downward.",
+                "marker": "fully_preserved",
+                "subject_label": "<Subject 3>"
+              },
+              {
+                "description": "The T-shirt's crew neck, sleeve length, and chest stripe remain visible and unchanged.",
+                "marker": "fully_preserved",
+                "subject_label": "<Subject 4>"
+              }
+            ]
+          },
+          "schema_version": "r2v.h3.mimo25_av_annotation.20",
+          "visual_observation": {
+            "segment_views": [
+              {
+                "entity_observations": [
+                  {
+                    "entity_id": "e1",
+                    "face_visibility": "clear",
+                    "mouth_visibility": "clear",
+                    "orientation": "three_quarter",
+                    "speech_correlated_articulation": "not_assessable",
+                    "visibility": "visible"
+                  }
+                ],
+                "segment_id": "segment_0001",
+                "visible_entity_ids": [
+                  "e1"
+                ]
+              },
+              {
+                "entity_observations": [
+                  {
+                    "entity_id": "e1",
+                    "face_visibility": "clear",
+                    "mouth_visibility": "clear",
+                    "orientation": "three_quarter",
+                    "speech_correlated_articulation": "not_assessable",
+                    "visibility": "visible"
+                  }
+                ],
+                "segment_id": "segment_0002",
+                "visible_entity_ids": [
+                  "e1"
+                ]
+              }
+            ],
+            "visual_blocks": [
+              {
+                "block_id": "v1",
+                "text": "A medium shot frames <Subject 1> seated at a light-colored table in a dimly lit interior, with a dark wooden door and a pale green paneled wall forming the background. He wears <Subject 4>, the white T-shirt, and leans forward over <Subject 2>, the white ceramic bowl, holding dark chopsticks in his right hand while his left forearm rests on the table. His gaze is directed downward into the bowl as he lifts noodles toward his mouth, his expression concentrated with a slightly furrowed brow. The camera remains static with a shallow focus that softens the background. In the middle of the shot, he lowers the chopsticks back into the bowl, stirs briefly, and lifts another portion while his mouth moves as if speaking. He continues to look down at the bowl, chewing and pausing between motions, with the glass of water at the left edge of the frame remaining still."
+              }
+            ]
+          },
+          "warnings": []
+        },
+        "audio_finalize_raw_response": null,
+        "audio_model_call_count": 0,
+        "av_model_call_count": 1,
+        "backend_provenance": {
+          "annotation_schema_version": "r2v.h3.mimo25_av_annotation.20",
+          "audio_finalize_prompt_version": "h3_mimo25_audio_finalize_v6",
+          "backend": "sglang_openai_compatible",
+          "base_url": "http://127.0.0.1:8094/v1",
+          "configuration_fingerprint": "89925830fb3598186868f359cc14b66bff3619777aaf9b9c09daeb5515ba46f7",
+          "full_av_recheck_limit": 0,
+          "http_max_attempts": 1,
+          "icl_version": "h3_official_ref2va_detailed_shot1_v4",
+          "materializer_version": "h3_mimo25_materializer_v30",
+          "max_completion_tokens": 32768,
+          "media_base_url": "http://127.0.0.1:8766/",
+          "media_mode": "http",
+          "media_resolution": "default",
+          "media_root": "/mnt/workspace",
+          "model": "mimo-v2.6-flash-rl",
+          "policy_version": "h3_mimo25_av_authority_contract_v18",
+          "prompt_version": "h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity",
+          "response_format": "json_schema",
+          "schema_version": "r2v.h3.mimo25_backend.82",
+          "speaker_marker_polish_prompt_version": "h3_mimo25_speaker_marker_polish_v4",
+          "speaker_profile_prompt_version": "h3_mimo25_speaker_profile_v2",
+          "stream": false,
+          "temperature": 0.0,
+          "thinking": {
+            "type": "disabled"
+          },
+          "transport": "sglang",
+          "video_fps": 4.0,
+          "visual_prompt_version": "h3_mimo25_visual_only_v5"
+        },
+        "clip_uid": "7864d55e61e58e88b221c1cd",
+        "diagnostics": [
+          {
+            "finish_reason": "stop",
+            "http_attempt_count": 1,
+            "input_modality": "target_video_visual_only",
+            "request_error": null,
+            "usage": {
+              "audio_tokens": 22,
+              "cached_tokens": 0,
+              "completion_tokens": 636,
+              "image_tokens": 4756,
+              "prompt_tokens": 36124,
+              "reasoning_tokens": null,
+              "total_tokens": 36760,
+              "video_tokens": 28800
+            },
+            "warnings": [
+              "completion_tokens_details_unavailable"
+            ]
+          },
+          {
+            "finish_reason": "stop",
+            "http_attempt_count": 1,
+            "input_modality": "target_video_joint_av_audio",
+            "request_error": null,
+            "usage": {
+              "audio_tokens": 90,
+              "cached_tokens": 0,
+              "completion_tokens": 869,
+              "image_tokens": null,
+              "prompt_tokens": 33464,
+              "reasoning_tokens": null,
+              "total_tokens": 34333,
+              "video_tokens": 28800
+            },
+            "warnings": [
+              "completion_tokens_details_unavailable",
+              "direct_single_speaker_marker_missing"
+            ]
+          }
+        ],
+        "failure_code": null,
+        "failure_issues": [],
+        "failure_reason": null,
+        "model_call_count": 2,
+        "music_stem_description": null,
+        "music_stem_error": null,
+        "music_stem_raw_response": null,
+        "policy_version": "h3_mimo25_stem_reconcile_v6",
+        "raw_responses": [
+          "{\"segment_views\":[{\"segment_id\":\"segment_0001\",\"visible_entity_ids\":[\"e1\"],\"entity_observations\":[{\"entity_id\":\"e1\",\"visibility\":\"visible\",\"orientation\":\"three_quarter\",\"face_visibility\":\"clear\",\"mouth_visibility\":\"clear\",\"speech_correlated_articulation\": \"not_assessable\"}]},{\"segment_id\":\"segment_0002\",\"visible_entity_ids\":[\"e1\"],\"entity_observations\":[{\"entity_id\":\"e1\",\"visibility\":\"visible\",\"orientation\":\"three_quarter\",\"face_visibility\":\"clear\",\"mouth_visibility\":\"clear\",\"speech_correlated_articulation\": \"not_assessable\"}]}],\"subject_definitions\":[{\"subject_label\":\"<Subject 1>\",\"description\":\"A middle-aged East Asian man with short black hair, a broad face, and a stocky build.\"},{\"subject_label\":\"<Subject 2>\",\"description\":\"A white ceramic bowl with a flared rim, decorated with a pale grey floral band around its exterior.\"},{\"subject_label\":\"<Subject 3>\",\"description\":\"The face of <Subject 1>, showing a broad nose, heavy brow, and downturned eyes with visible forehead lines.\"},{\"subject_label\":\"<Subject 4>\",\"description\":\"A white short-sleeved crew-neck T-shirt with a horizontal tonal stripe across the chest.\"}],\"visual_retention_analysis\":[{\"subject_label\":\"<Subject 1>\",\"marker\":\"fully_preserved\",\"description\":\"The man's identity, build, and seated posture are maintained throughout the shot.\"},{\"subject_label\":\"<Subject 2>\",\"marker\":\"fully_preserved\",\"description\":\"The bowl's shape, rim, and floral decoration remain consistent across the shot.\"},{\"subject_label\":\"<Subject 3>\",\"marker\":\"fully_preserved\",\"description\":\"The facial features remain consistent as the head tilts downward.\"},{\"subject_label\":\"<Subject 4>\",\"marker\":\"fully_preserved\",\"description\":\"The T-shirt's crew neck, sleeve length, and chest stripe remain visible and unchanged.\"}],\"style_opening\":\"Live-action cinematic realism with soft, directional indoor lighting and a shallow depth of field.\",\"shot1_visual_description\":\"A medium shot frames <Subject 1> seated at a light-colored table in a dimly lit interior, with a dark wooden door and a pale green paneled wall forming the background. He wears <Subject 4>, the white T-shirt, and leans forward over <Subject 2>, the white ceramic bowl, holding dark chopsticks in his right hand while his left forearm rests on the table. His gaze is directed downward into the bowl as he lifts noodles toward his mouth, his expression concentrated with a slightly furrowed brow. The camera remains static with a shallow focus that softens the background. In the middle of the shot, he lowers the chopsticks back into the bowl, stirs briefly, and lifts another portion while his mouth moves as if speaking. He continues to look down at the bowl, chewing and pausing between motions, with the glass of water at the left edge of the frame remaining still.\"}",
+          "{\n  \"speech_av\": {\n    \"summary\": \"A single male voice speaks two short Chinese lines in sequence, both attributed to the one visible seated man, with no competing or overlapping vocal sources detected.\",\n    \"audio_observation\": {\n      \"segment_decisions\": [\n        {\n          \"segment_id\": \"segment_0001\",\n          \"vocal_composition\": \"single_speaker\",\n          \"resolution\": \"resolved\",\n          \"primary_speaker_group\": \"g1\",\n          \"delivery_style\": \"conversational, moderately paced with a slightly lowered, requesting tone\",\n          \"secondary_vocal_activity\": {\n            \"present\": false\n          ,\n            \"speaker_relation\": \"none\"\n          ,\n            \"kind\": null\n          },\n          \"confidence\": \"high\"\n        ,\n          \"audio_evidence_codes\": [\"voice_continuity\"]\n        },\n        {\n          \"segment_id\": \"segment_0002\",\n          \"vocal_composition\": \"single_speaker\",\n          \"resolution\": \"resolved\",\n          \"primary_speaker_group\": \"g1\",\n          \"delivery_style\": \"conversational, steady pace with a firmer, mildly reproachful tone\",\n          \"secondary_vocal_activity\": {\n            \"present\": false\n          ,\n            \"speaker_relation\": \"none\"\n          ,\n            \"kind\": null\n          },\n          \"confidence\": \"high\"\n        ,\n          \"audio_evidence_codes\": [\"voice_continuity\"]\n        }\n      ]\n    },\n    \"av_grounding\": {\n      \"segment_groundings\": [\n        {\n          \"segment_id\": \"segment_0001\",\n          \"primary_speaker_group\": \"g1\",\n          \"binding_status\": \"visible_entity\",\n          \"speech_presentation\": \"onscreen_spoken\",\n          \"entity_id\": \"e1\",\n          \"confidence\": \"medium\",\n          \"evidence_codes\": [\"av_temporal_alignment\", \"voice_continuity\"]\n        },\n        {\n          \"segment_id\": \"segment_0002\",\n          \"primary_speaker_group\": \"g1\",\n          \"binding_status\": \"visible_entity\",\n          \"speech_presentation\": \"onscreen_spoken\",\n          \"entity_id\": \"e1\",\n          \"confidence\": \"medium\",\n          \"evidence_codes\": [\"av_temporal_alignment\", \"voice_continuity\"]\n        }\n      ]\n    },\n    \"shot1_caption\": \"A medium shot frames <Subject 1> seated at a light-colored table in a dimly lit interior, with a dark wooden door and a pale green paneled wall forming the background. He wears <Subject 4>, the white T-shirt, and leans forward over <Subject 2>, the white ceramic bowl, holding dark chopsticks in his right hand while his left forearm rests on the table. His gaze is directed downward into the bowl as he lifts noodles toward his mouth, his expression concentrated with a slightly furrowed brow. The camera remains static with a shallow focus that softens the background. In the middle of the shot, he lowers the chopsticks back into the bowl, stirs briefly, and lifts another portion while his mouth moves as if speaking, saying, <d>[Chinese] 帮我照看孩子。</d> He continues to look down at the bowl, chewing and pausing between motions, then adds, <d>[Chinese] 住在我这儿不是理所当然。</d>, with the glass of water at the left edge of the frame remaining still.\",\n    \"warnings\": []\n  },\n  \"speaker_voice_profiles\": [\n    {\n      \"speaker_group\": \"g1\",\n      \"voice_characteristics\": \"A mid-to-low pitched male voice with a slightly husky, grounded timbre. The cadence is moderate and unhurried, with clear articulation and a steady, conversational energy that carries a mildly firm, requesting tone across both lines.\"\n    }\n  ],\n  \"audio_finalize\": {\n    \"overall_soundscape\": \"Quiet indoor room tone with a low noise floor; faint, subtle sounds of chopsticks contacting the ceramic bowl and light eating noises are present beneath the dialogue.\",\n    \"non_diegetic_music\": \"N/A\"\n  }\n}"
+        ],
+        "record_fingerprint": "674b422580dc890405928b95fc3ac33e7dc67f0aa86f762f54d83c960780c0de",
+        "schema_version": "r2v.h3.mimo25_stem_reconcile.14",
+        "sfx_stem_description": null,
+        "sfx_stem_error": null,
+        "sfx_stem_raw_response": null,
+        "source_job_fingerprint": "7bd83d1d0dea38ff69ea3b376ea13ba57e7bcd5dcc6d83659993048f2f93c0fd",
+        "source_stem_record_fingerprint": "ce8a69fa8a908b745477dfd7ddbb55d762f1587ca4f12ece84bde5bb85ba270d",
+        "speaker_marker_polish_applied": false,
+        "speaker_marker_polish_attempted": false,
+        "speaker_marker_polish_error": null,
+        "speaker_marker_polish_needs_review": null,
+        "speaker_marker_polish_raw_response": null,
+        "speaker_profile_raw_response": null,
+        "speech_av_raw_response": "{\n  \"speech_av\": {\n    \"summary\": \"A single male voice speaks two short Chinese lines in sequence, both attributed to the one visible seated man, with no competing or overlapping vocal sources detected.\",\n    \"audio_observation\": {\n      \"segment_decisions\": [\n        {\n          \"segment_id\": \"segment_0001\",\n          \"vocal_composition\": \"single_speaker\",\n          \"resolution\": \"resolved\",\n          \"primary_speaker_group\": \"g1\",\n          \"delivery_style\": \"conversational, moderately paced with a slightly lowered, requesting tone\",\n          \"secondary_vocal_activity\": {\n            \"present\": false\n          ,\n            \"speaker_relation\": \"none\"\n          ,\n            \"kind\": null\n          },\n          \"confidence\": \"high\"\n        ,\n          \"audio_evidence_codes\": [\"voice_continuity\"]\n        },\n        {\n          \"segment_id\": \"segment_0002\",\n          \"vocal_composition\": \"single_speaker\",\n          \"resolution\": \"resolved\",\n          \"primary_speaker_group\": \"g1\",\n          \"delivery_style\": \"conversational, steady pace with a firmer, mildly reproachful tone\",\n          \"secondary_vocal_activity\": {\n            \"present\": false\n          ,\n            \"speaker_relation\": \"none\"\n          ,\n            \"kind\": null\n          },\n          \"confidence\": \"high\"\n        ,\n          \"audio_evidence_codes\": [\"voice_continuity\"]\n        }\n      ]\n    },\n    \"av_grounding\": {\n      \"segment_groundings\": [\n        {\n          \"segment_id\": \"segment_0001\",\n          \"primary_speaker_group\": \"g1\",\n          \"binding_status\": \"visible_entity\",\n          \"speech_presentation\": \"onscreen_spoken\",\n          \"entity_id\": \"e1\",\n          \"confidence\": \"medium\",\n          \"evidence_codes\": [\"av_temporal_alignment\", \"voice_continuity\"]\n        },\n        {\n          \"segment_id\": \"segment_0002\",\n          \"primary_speaker_group\": \"g1\",\n          \"binding_status\": \"visible_entity\",\n          \"speech_presentation\": \"onscreen_spoken\",\n          \"entity_id\": \"e1\",\n          \"confidence\": \"medium\",\n          \"evidence_codes\": [\"av_temporal_alignment\", \"voice_continuity\"]\n        }\n      ]\n    },\n    \"shot1_caption\": \"A medium shot frames <Subject 1> seated at a light-colored table in a dimly lit interior, with a dark wooden door and a pale green paneled wall forming the background. He wears <Subject 4>, the white T-shirt, and leans forward over <Subject 2>, the white ceramic bowl, holding dark chopsticks in his right hand while his left forearm rests on the table. His gaze is directed downward into the bowl as he lifts noodles toward his mouth, his expression concentrated with a slightly furrowed brow. The camera remains static with a shallow focus that softens the background. In the middle of the shot, he lowers the chopsticks back into the bowl, stirs briefly, and lifts another portion while his mouth moves as if speaking, saying, <d>[Chinese] 帮我照看孩子。</d> He continues to look down at the bowl, chewing and pausing between motions, then adds, <d>[Chinese] 住在我这儿不是理所当然。</d>, with the glass of water at the left edge of the frame remaining still.\",\n    \"warnings\": []\n  },\n  \"speaker_voice_profiles\": [\n    {\n      \"speaker_group\": \"g1\",\n      \"voice_characteristics\": \"A mid-to-low pitched male voice with a slightly husky, grounded timbre. The cadence is moderate and unhurried, with clear articulation and a steady, conversational energy that carries a mildly firm, requesting tone across both lines.\"\n    }\n  ],\n  \"audio_finalize\": {\n    \"overall_soundscape\": \"Quiet indoor room tone with a low noise floor; faint, subtle sounds of chopsticks contacting the ceramic bowl and light eating noises are present beneath the dialogue.\",\n    \"non_diegetic_music\": \"N/A\"\n  }\n}",
+        "status": "ready",
+        "text_model_call_count": 0,
+        "visual_model_call_count": 1,
+        "visual_raw_response": "{\"segment_views\":[{\"segment_id\":\"segment_0001\",\"visible_entity_ids\":[\"e1\"],\"entity_observations\":[{\"entity_id\":\"e1\",\"visibility\":\"visible\",\"orientation\":\"three_quarter\",\"face_visibility\":\"clear\",\"mouth_visibility\":\"clear\",\"speech_correlated_articulation\": \"not_assessable\"}]},{\"segment_id\":\"segment_0002\",\"visible_entity_ids\":[\"e1\"],\"entity_observations\":[{\"entity_id\":\"e1\",\"visibility\":\"visible\",\"orientation\":\"three_quarter\",\"face_visibility\":\"clear\",\"mouth_visibility\":\"clear\",\"speech_correlated_articulation\": \"not_assessable\"}]}],\"subject_definitions\":[{\"subject_label\":\"<Subject 1>\",\"description\":\"A middle-aged East Asian man with short black hair, a broad face, and a stocky build.\"},{\"subject_label\":\"<Subject 2>\",\"description\":\"A white ceramic bowl with a flared rim, decorated with a pale grey floral band around its exterior.\"},{\"subject_label\":\"<Subject 3>\",\"description\":\"The face of <Subject 1>, showing a broad nose, heavy brow, and downturned eyes with visible forehead lines.\"},{\"subject_label\":\"<Subject 4>\",\"description\":\"A white short-sleeved crew-neck T-shirt with a horizontal tonal stripe across the chest.\"}],\"visual_retention_analysis\":[{\"subject_label\":\"<Subject 1>\",\"marker\":\"fully_preserved\",\"description\":\"The man's identity, build, and seated posture are maintained throughout the shot.\"},{\"subject_label\":\"<Subject 2>\",\"marker\":\"fully_preserved\",\"description\":\"The bowl's shape, rim, and floral decoration remain consistent across the shot.\"},{\"subject_label\":\"<Subject 3>\",\"marker\":\"fully_preserved\",\"description\":\"The facial features remain consistent as the head tilts downward.\"},{\"subject_label\":\"<Subject 4>\",\"marker\":\"fully_preserved\",\"description\":\"The T-shirt's crew neck, sleeve length, and chest stripe remain visible and unchanged.\"}],\"style_opening\":\"Live-action cinematic realism with soft, directional indoor lighting and a shallow depth of field.\",\"shot1_visual_description\":\"A medium shot frames <Subject 1> seated at a light-colored table in a dimly lit interior, with a dark wooden door and a pale green paneled wall forming the background. He wears <Subject 4>, the white T-shirt, and leans forward over <Subject 2>, the white ceramic bowl, holding dark chopsticks in his right hand while his left forearm rests on the table. His gaze is directed downward into the bowl as he lifts noodles toward his mouth, his expression concentrated with a slightly furrowed brow. The camera remains static with a shallow focus that softens the background. In the middle of the shot, he lowers the chopsticks back into the bowl, stirs briefly, and lifts another portion while his mouth moves as if speaking. He continues to look down at the bowl, chewing and pausing between motions, with the glass of water at the left edge of the frame remaining still.\"}"
+      }
+    }
+  ]
+}
