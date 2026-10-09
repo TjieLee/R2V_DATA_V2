@@ -737,50 +737,20 @@ class GroupLedger:
         return result
 
     def replay_unique_committed(self, job: Any) -> JobResult | None:
-        """Audit fresh evidence for one conflicting SA completion marker only.
+        """Refresh current receipt authority for a conflicting SA marker only.
 
-        Normal classification keeps its indexed fast path. This exceptional
-        lookup reads raw history so last-record-wins cannot hide a conflicting
-        committed outcome, and updates only the requested job's existing index.
+        Reuse normal last-record-wins replay, not historical artifact auditing.
+        The normal, non-conflicting completion path never calls this helper.
         """
-        job_id = job.job_id()
-        latest: tuple[str, dict[str, Any]] | None = None
-        committed: list[tuple[str, dict[str, Any]]] = []
-        for phase_id in self.phase_ids():
-            records, repaired = self.phase(phase_id).load_receipts()
-            self.jsonl_load_calls += 1
-            if repaired:
-                self._torn_receipts_repaired += 1
-            for receipt in records:
-                if receipt.get("job_id") != job_id:
-                    continue
-                latest = phase_id, receipt
-                if receipt.get("outcome") in COMMITTED_OUTCOMES:
-                    committed.append(latest)
-        result: JobResult | None = None
-        if committed:
-            expected = committed[0][1]
-            if any(receipt != expected for _, receipt in committed[1:]):
-                raise LedgerError(f"contradictory committed receipts for {job_id}")
-            for phase_id, receipt in committed:
-                phase = self.phase(phase_id)
-                try:
-                    state = phase.verify_committed(job, receipt)
-                    if not state.skippable:
-                        raise LedgerError(f"{job_id}: {state.detail}")
-                    result = phase.load_result(job)
-                except (KeyError, TypeError, ValueError, OSError) as exc:
-                    raise LedgerError(f"invalid committed evidence for {job_id}") from exc
-                if result is None:
-                    raise LedgerError(f"committed job {job_id} has no replayable result")
-                latest = phase_id, receipt
-        if latest is None:
-            self._receipt_index.pop(job_id, None)
-            self._job_phase_index.pop(job_id, None)
-        else:
-            phase_id, receipt = latest
-            self._receipt_index[job_id] = receipt
-            self._job_phase_index[job_id] = phase_id
+        self.refresh(force=True)
+        state = self.classify(job)
+        if state.state == STATE_MISMATCH:
+            raise LedgerError(f"{job.job_id()}: {state.detail}")
+        if not state.skippable:
+            return None
+        result = self.load_committed_result(job)
+        if result is None:
+            raise LedgerError(f"committed job {job.job_id()} has no replayable result")
         return result
 
     @property

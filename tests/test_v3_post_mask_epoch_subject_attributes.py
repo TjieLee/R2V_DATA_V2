@@ -45,7 +45,7 @@ from r2v_data_v2.v3.post_mask_epoch_scheduler import (
     JobExecution,
     ResourceEpochScheduler,
 )
-from r2v_data_v2.v3.post_mask_epoch_state import GroupLedger, LedgerError, Receipt
+from r2v_data_v2.v3.post_mask_epoch_state import GroupLedger, Receipt
 from r2v_data_v2.v3.post_mask_epoch_subject_attributes import (
     SUBJECT_ATTRIBUTE_COMPLETION_GENERATE_JOB,
     SUBJECT_ATTRIBUTE_COMPLETION_REVIEW_JOB,
@@ -6338,10 +6338,10 @@ def test_unchanged_interrupted_completion_resume_does_not_audit_receipts(
     assert sam.calls + sam.generated_calls + boogu.calls == 0
 
 
-def test_interrupted_completion_conflicting_committed_history_cannot_repair(
+def test_interrupted_completion_duplicate_receipts_replay_current_result(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Last-record-wins must not hide contradictory evidence during repair."""
+    """A historical result digest difference must not strand completion recovery."""
     config, storage, runner, path, expected = _interrupted_completion_owner(tmp_path, monkeypatch)
     generation_id = expected["generation_job_id"]
     phase = next(
@@ -6350,8 +6350,8 @@ def test_interrupted_completion_conflicting_committed_history_cannot_repair(
         if generation_id in runner.ledger.phase(phase_id).receipts()
     )
     original = phase.receipts()[generation_id]
-    # Append contradictory history only in this temporary test ledger. Normal
-    # indexed classification still sees a completed job of the same identity.
+    # Both receipts completed the same job; replay uses the existing current
+    # result rather than auditing the historical result digests.
     phase.append_receipt(Receipt.from_record({**original, "result_digest": "0" * 64}))
     raw, _ = phase.load_receipts()
     assert sum(record["job_id"] == generation_id for record in raw) == 2
@@ -6360,15 +6360,15 @@ def test_interrupted_completion_conflicting_committed_history_cannot_repair(
     committed = _completion_receipt_files(runner)
     cold = _runner(config, storage, tmp_path, ledger_name=Path(runner.ledger.root).name)
 
-    with pytest.raises(LedgerError, match="contradictory committed receipts"):
-        cold.seed_jobs()
+    assert cold.seed_jobs() == []
 
-    assert path.read_bytes() == marker_bytes
+    assert json.loads(path.read_text(encoding="utf-8")) == expected
     assert _completion_receipt_files(cold) == committed
-    assert not path.with_name("rank-0-outcome-conflict.json").exists()
-    assert not _owner_artifact_file(storage).exists()
-    assert not _owner_outcome_path(cold).exists()
-    assert not cold._clip_outcome_path(SHARD, CLIP_UID).exists()
+    assert path.with_name("rank-0-outcome-conflict.json").read_bytes() == marker_bytes
+    assert _owner_artifact_file(storage).is_file()
+    assert _owner_outcome_path(cold).is_file()
+    assert cold._clip_outcome_path(SHARD, CLIP_UID).is_file()
+    assert cold.reconcile_stats(SHARD).terminal_clips == 1
 
 
 @pytest.mark.parametrize("stale_downstream_identity", [False, True])

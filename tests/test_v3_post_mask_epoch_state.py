@@ -63,7 +63,7 @@ def _commit(phase: PhaseLedger, job: ModelJob, outcome: str = "completed") -> Re
     return phase.commit(job, outcome=outcome, artifact_digests={}, result_digest=digest)
 
 
-def test_unique_replay_refreshes_only_requested_job(tmp_path: Path):
+def test_committed_replay_force_refreshes_existing_shared_index(tmp_path: Path):
     ledger = GroupLedger(tmp_path / "group")
     requested, unrelated = _job("requested"), _job("unrelated")
     ledger.refresh()
@@ -78,8 +78,8 @@ def test_unique_replay_refreshes_only_requested_job(tmp_path: Path):
     assert result.payload == {"status": "review", "verdict": "accept"}
     assert ledger.classify(requested).state == "completed"
     assert ledger.phase_for(requested) == "r000-qwen"
-    assert ledger.classify(unrelated).state == "pending"
-    assert ledger.refresh_calls == refreshes
+    assert ledger.classify(unrelated).state == "completed"
+    assert ledger.refresh_calls == refreshes + 1
 
 
 @pytest.mark.parametrize("second_phase", ["r000-qwen", "r001-qwen"])
@@ -97,26 +97,33 @@ def test_unique_replay_accepts_identical_committed_duplicates(
     assert result.payload["verdict"] == "accept"
 
 
-@pytest.mark.parametrize("second_phase", ["r000-qwen", "r001-qwen"])
-@pytest.mark.parametrize("field,value", [
-    ("job_identity", "different-identity"),
-    ("outcome", "terminal_reject"),
-    ("result_digest", "different-result"),
-    ("artifact_digests", {"mask.npy": "different-mask"}),
-    ("external_artifacts", [{"path": "/different.png", "sha256": "different"}]),
-    ("model_identity", "different-model"),
-])
-def test_unique_replay_rejects_contradictory_committed_history(
-    tmp_path: Path, second_phase: str, field: str, value: Any
-):
+def test_committed_replay_uses_last_receipt_with_different_result_digest(tmp_path: Path):
     ledger = GroupLedger(tmp_path / "group")
     job = _job("clip-1")
-    first = _commit(ledger.phase("r000-qwen"), job)
-    ledger.phase(second_phase).append_receipt(
-        Receipt.from_record({**first.record(), field: value})
+    phase = ledger.phase("r000-qwen")
+    first = _commit(phase, job)
+    latest = Receipt.from_record({**first.record(), "result_digest": "latest-result"})
+    phase.append_receipt(latest)
+    original = phase.receipts_path.read_bytes()
+
+    result = ledger.replay_unique_committed(job)
+
+    assert result is not None
+    assert result.payload["verdict"] == "accept"
+    assert ledger.classify(job).receipt == latest.record()
+    assert phase.receipts_path.read_bytes() == original
+
+
+def test_committed_replay_rejects_latest_identity_mismatch(tmp_path: Path):
+    ledger = GroupLedger(tmp_path / "group")
+    job = _job("clip-1")
+    phase = ledger.phase("r000-qwen")
+    first = _commit(phase, job)
+    phase.append_receipt(
+        Receipt.from_record({**first.record(), "job_identity": "different-identity"})
     )
 
-    with pytest.raises(LedgerError, match="contradictory committed receipts"):
+    with pytest.raises(LedgerError, match="identity"):
         ledger.replay_unique_committed(job)
 
 
@@ -147,8 +154,8 @@ def test_unique_replay_never_commits_pending_or_orphan_result(
     assert ledger.classify(job).state == "pending"
 
 
-@pytest.mark.parametrize("damage", ["missing", "invalid", "changed_payload", "mask"])
-def test_unique_replay_audits_existing_committed_evidence(
+@pytest.mark.parametrize("damage", ["missing", "invalid", "outcome", "external_artifacts"])
+def test_committed_replay_requires_readable_consistent_current_result(
     tmp_path: Path, damage: str
 ):
     ledger = GroupLedger(tmp_path / "group")
@@ -160,16 +167,41 @@ def test_unique_replay_audits_existing_committed_evidence(
         result_path.unlink()
     elif damage == "invalid":
         result_path.write_text("not json")
-    elif damage == "changed_payload":
-        phase.publish_result(job, JobResult("completed", payload={"verdict": "reject"}))
+    elif damage == "outcome":
+        phase.publish_result(job, JobResult("terminal_reject"))
     else:
-        phase.publish_artifact(job.job_id(), "unexpected-mask.npy", b"mask")
         receipt = phase.receipts()[job.job_id()]
-        receipt["artifact_digests"] = {"expected-mask.npy": "not-on-disk"}
+        receipt["external_artifacts"] = [{"path": "/different.png", "sha256": "different"}]
         phase.receipts_path.write_text(json.dumps(receipt) + "\n")
 
     with pytest.raises(LedgerError):
         ledger.replay_unique_committed(job)
+
+
+def test_committed_replay_does_not_audit_historical_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    ledger = GroupLedger(tmp_path / "group")
+    job = _job("clip-1")
+    phase = ledger.phase("r000-qwen")
+    first = _commit(phase, job)
+    phase.publish_result(job, JobResult("completed", payload={"verdict": "reject"}))
+    phase.append_receipt(Receipt.from_record({
+        **first.record(),
+        "result_digest": "historical-digest",
+        "artifact_digests": {"retired-mask.npy": "historical-mask"},
+    }))
+
+    def forbidden(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("completion replay must not audit historical artifacts")
+
+    monkeypatch.setattr(PhaseLedger, "verify_committed", forbidden)
+    monkeypatch.setattr(PhaseLedger, "artifact_digests", forbidden)
+
+    result = ledger.replay_unique_committed(job)
+
+    assert result is not None
+    assert result.payload == {"verdict": "reject"}
 
 
 def test_unique_replay_clears_a_stale_requested_commit_when_now_pending(tmp_path: Path):
