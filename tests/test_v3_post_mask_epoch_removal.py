@@ -25,6 +25,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -1186,6 +1187,51 @@ def test_sam_factory_limits_pipeline_admission_to_subject_attributes(
         assert resource.slot_count == 8
     finally:
         executor.close()
+
+
+@pytest.mark.parametrize("workers", [2, 4])
+def test_sam_factory_opt_in_capacity_is_sa_only_without_loading_models(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, workers: int
+) -> None:
+    from r2v_data_v2.v3.post_mask_epoch_sa_execution import SASamModeResource
+
+    monkeypatch.setenv("POST_MASK_SA_SAM_WORKERS_PER_GPU", str(workers))
+    config = _fixture_config(tmp_path, monkeypatch)
+    active: list[Any] = [None]
+    factories = build_removal_epoch_factories(
+        config, None, job_runner=lambda *_: None,
+        qwen_epoch_config=build_qwen_epoch_config(config),
+        pool=WorkerPoolConfig(), process_manager=_fake_process_manager(),
+        temporary_root=tmp_path / "tmp", allowed_server_root=tmp_path / "workspace/data",
+        with_sam_epoch=True, sam_pipeline_runner=lambda: active[0],
+    )
+    resource, executor = factories[RESOURCE_SAM]()
+    try:
+        assert isinstance(resource, SASamModeResource)
+        assert executor.capacity() == 8
+        active[0] = SimpleNamespace()
+        assert executor.capacity() == 24 * workers
+        assert resource.slot_count == 8 * workers
+        assert not resource.open
+        assert resource._active is None
+        active[0] = None
+        assert executor.capacity() == 8
+    finally:
+        executor.close()
+
+    # Standalone Reference Edit wiring ignores this SA execution-only opt-in.
+    factories = build_removal_epoch_factories(
+        config, None, job_runner=lambda *_: None,
+        qwen_epoch_config=build_qwen_epoch_config(config),
+        pool=WorkerPoolConfig(), process_manager=_fake_process_manager(),
+        temporary_root=tmp_path / "tmp", allowed_server_root=tmp_path / "workspace/data",
+        with_sam_epoch=True,
+    )
+    resource, executor = factories[RESOURCE_SAM]()
+    assert isinstance(resource, WorkerEpochResource)
+    assert isinstance(executor, WorkerSlotExecutor)
+    assert executor.capacity() == 8
+    executor.close()
 
 
 def test_image_edit_factory_passes_reference_edit_runtime_config(

@@ -6,18 +6,95 @@ Only persistence produces a completion eligible for a durable receipt.
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from queue import Empty, Queue
 from typing import Any
 
 from .post_mask_epoch_jobs import job_order_key
-from .post_mask_epoch_resources import WorkerSlotExecutor
+from .post_mask_epoch_resources import (
+    EpochResource,
+    EpochResourceError,
+    WorkerSlotExecutor,
+)
 from .post_mask_epoch_scheduler import JobExecution
 
 
+def resolve_sa_sam_workers_per_gpu() -> int:
+    """Execution-only opt-in; one keeps the original shared SAM handles."""
+    raw = os.environ.get("POST_MASK_SA_SAM_WORKERS_PER_GPU", "").strip() or "1"
+    if raw not in {"1", "2", "4"}:
+        raise ValueError("POST_MASK_SA_SAM_WORKERS_PER_GPU must be 1, 2, or 4")
+    return int(raw)
+
+
+class SASamModeResource(EpochResource):
+    """Swap only SAM residency at a drained RE/SA boundary in opt-in mode.
+
+    The old parent models are closed before the SA children load, avoiding an
+    extra SAM copy per GPU. Qwen/Boogu residency is unaffected.
+    """
+
+    def __init__(self, shared_resource: Any, sa_factory: Any, *,
+                 pipeline_runner: Any, workers_per_gpu: int) -> None:
+        super().__init__(shared_resource.name, shared_resource.process_manager,
+                         log_root=shared_resource.log_root)
+        self.physical_slot_count = shared_resource.slot_count
+        self.workers_per_gpu = workers_per_gpu
+        self._shared = shared_resource
+        self._sa_factory = sa_factory
+        self._provider = pipeline_runner
+        self._active: Any = None
+        self._sa_mode = False
+
+    @property
+    def slot_count(self) -> int:
+        return self.physical_slot_count * (self.workers_per_gpu if self._sa_mode else 1)
+
+    def _activate(self, sa_mode: bool) -> None:
+        if self._active is not None:
+            if self._sa_mode == sa_mode:
+                return
+            self._active.stop()
+            self._active = None
+        self._sa_mode = sa_mode
+        resource = self._sa_factory() if sa_mode else self._shared
+        try:
+            resource.start()
+        except BaseException:
+            resource.stop()
+            raise
+        self._active = resource
+
+    def _start(self) -> None:
+        self._activate(self._provider() is not None)
+
+    def select_mode(self, sa_mode: bool) -> None:
+        if self.open:
+            self._activate(sa_mode)
+        else:
+            # Inspecting capacity must not load models before resource.start.
+            self._sa_mode = sa_mode
+
+    def handle_for_slot(self, slot: int) -> Any:
+        if not self.open or self._active is None:
+            raise EpochResourceError("SAM resource is not started")
+        return self._active.handle_for_slot(slot)
+
+    def _stop(self) -> None:
+        if self._active is not None:
+            self._active.stop()
+            self._active = None
+
+    def counters(self) -> dict[str, Any]:
+        active = {} if self._active is None else self._active.counters()
+        return {**super().counters(), "sam_workers_per_gpu": self.workers_per_gpu,
+                "sam_processes": self.slot_count, "sam_worker_pool": active}
+
+
 class SASamPipelineExecutor:
-    """One inference thread per physical slot; bounded logical admission.
+    """One inference thread per SAM handle; bounded logical admission.
 
     Admission remains occupied until collect, including completed results. Thus
     the entire pipeline (not merely any one queue) has a fixed memory bound.
@@ -167,7 +244,11 @@ class SASamPipelineExecutor:
         with self._lock:
             self._record_overlap()
             return {**self._stats, "admitted": self._admitted,
-                    "physical_slots": self.slot_count, "capacity": self._capacity}
+                    "physical_slots": getattr(self.resource, "physical_slot_count",
+                                              self.slot_count),
+                    "sam_processes": self.slot_count,
+                    "workers_per_gpu": getattr(self.resource, "workers_per_gpu", 1),
+                    "capacity": self._capacity}
 
     def close(self) -> None:
         with self._close_lock:
@@ -186,7 +267,7 @@ class StageAwareSASamExecutor:
     """Select SA overlap only at a drained stage boundary.
 
     The provider is queried after dispatch binds a stage. Reference Edit keeps
-    the original executor and callback. No resource residency changes occur.
+    the original executor and callback. Opt-in mode swaps only the SAM handles.
     """
 
     def __init__(self, run_job: Any, *, pipeline_runner: Any = None,
@@ -210,13 +291,17 @@ class StageAwareSASamExecutor:
             raise RuntimeError("cannot switch SA runner with in-flight jobs")
         if self._executor is not None:
             self._executor.close()
+        select_mode = getattr(self._resource, "select_mode", None)
+        if select_mode is not None:
+            select_mode(runner is not None)
         self._runner = runner
         if runner is None:
             self._executor = WorkerSlotExecutor(self._run_job,
                 slot_count=self._slot_count, resource=self._resource)
         else:
             self._executor = SASamPipelineExecutor(runner,
-                slot_count=self._slot_count, resource=self._resource)
+                slot_count=getattr(self._resource, "slot_count", self._slot_count),
+                resource=self._resource)
             runner.sam_execution_diagnostics = self._executor.diagnostics
         return self._executor
 

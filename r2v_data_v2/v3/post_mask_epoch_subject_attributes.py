@@ -4069,6 +4069,8 @@ class SubjectAttributeEpochRunner:
                 returned = segmenter.segment_generated_frame(**prepared)
             else:
                 returned = segmenter.segment_frame(**prepared)
+        except EpochResourceError:
+            raise
         except Exception as exc:  # noqa: BLE001 - unchanged legacy per-call isolation
             return JobResult(
                 OUTCOME_COMPLETED,

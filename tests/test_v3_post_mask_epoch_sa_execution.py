@@ -3,6 +3,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from r2v_data_v2.v3 import post_mask_epoch_sa_execution as sa_execution
+from r2v_data_v2.v3.post_mask_epoch_resources import EpochResource
 from r2v_data_v2.v3.post_mask_epoch_sa_execution import (
     SASamPipelineExecutor,
     StageAwareSASamExecutor,
@@ -374,3 +376,94 @@ def test_stage_aware_ordinary_failure_drains_capacity_and_allows_stage_switch():
         assert not any(thread.is_alive() for thread in old_threads)
     finally:
         executor.close()
+
+
+class ModeResource(EpochResource):
+    def __init__(self, name, slots, events):
+        super().__init__(name, process_manager=None)
+        self.slot_count = slots
+        self.events = events
+
+    def _start(self):
+        self.events.append((self.name, "start"))
+
+    def _stop(self):
+        if self.open:
+            self.events.append((self.name, "stop"))
+
+    def handle_for_slot(self, slot):
+        assert self.open
+        return (self.name, slot)
+
+
+@pytest.mark.parametrize("workers_per_gpu", [2, 4])
+def test_sa_mode_uses_only_child_pool_and_restores_reference_edit(workers_per_gpu):
+    events, provider = [], [None]
+    shared = ModeResource("reference", 2, events)
+    child_pool = ModeResource("attribute", 2 * workers_per_gpu, events)
+    resource = sa_execution.SASamModeResource(
+        shared, lambda: child_pool, pipeline_runner=lambda: provider[0],
+        workers_per_gpu=workers_per_gpu)
+    resource.start()
+    executor = StageAwareSASamExecutor(lambda job, handle: (job, handle),
+        pipeline_runner=lambda: provider[0], slot_count=2, resource=resource)
+    try:
+        assert executor.capacity() == 2
+        job = make_job("reference")
+        executor.submit(job)
+        assert executor.collect()[0].result == (job, ("reference", 0))
+        provider[0] = Runner()
+        assert executor.capacity() == 6 * workers_per_gpu
+        assert events == [("reference", "start"), ("reference", "stop"),
+                          ("attribute", "start")]
+        assert not shared.open
+        job = make_job("attribute")
+        executor.submit(job)
+        execution, = executor.collect()
+        assert execution.result[1][0] == "attribute"
+        diagnostics = executor.diagnostics()
+        assert diagnostics["physical_slots"] == 2
+        assert diagnostics["sam_processes"] == 2 * workers_per_gpu
+        assert diagnostics["workers_per_gpu"] == workers_per_gpu
+        provider[0] = None
+        assert executor.capacity() == 2
+        assert events[-2:] == [("attribute", "stop"), ("reference", "start")]
+        assert not child_pool.open
+    finally:
+        executor.close()
+        resource.stop()
+    assert events[-1] == ("reference", "stop")
+
+
+def test_cold_sa_mode_never_starts_parent_sam_handles():
+    events, runner = [], Runner()
+    shared = ModeResource("reference", 8, events)
+    child_pool = ModeResource("attribute", 32, events)
+    resource = sa_execution.SASamModeResource(shared, lambda: child_pool,
+        pipeline_runner=lambda: runner, workers_per_gpu=4)
+    resource.start()
+    executor = StageAwareSASamExecutor(lambda *_: None,
+        pipeline_runner=lambda: runner, slot_count=8, resource=resource)
+    try:
+        assert executor.capacity() == 96
+        assert events == [("attribute", "start")]
+        assert shared.start_count == 0
+        executor.submit(make_job("attribute"))
+        assert executor.collect()[0].exception is None
+    finally:
+        executor.close()
+        resource.stop()
+    assert events == [("attribute", "start"), ("attribute", "stop")]
+
+
+@pytest.mark.parametrize("raw, expected", [("", 1), ("1", 1), ("2", 2), ("4", 4)])
+def test_sa_workers_per_gpu_execution_only_option(monkeypatch, raw, expected):
+    monkeypatch.setenv("POST_MASK_SA_SAM_WORKERS_PER_GPU", raw)
+    assert sa_execution.resolve_sa_sam_workers_per_gpu() == expected
+
+
+@pytest.mark.parametrize("raw", ["0", "3", "8", "bad"])
+def test_sa_workers_per_gpu_rejects_unsupported_counts(monkeypatch, raw):
+    monkeypatch.setenv("POST_MASK_SA_SAM_WORKERS_PER_GPU", raw)
+    with pytest.raises(ValueError, match="1, 2, or 4"):
+        sa_execution.resolve_sa_sam_workers_per_gpu()

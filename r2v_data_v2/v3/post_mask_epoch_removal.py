@@ -1551,9 +1551,25 @@ def build_removal_epoch_factories(
             )
             if sam_pipeline_runner is not None:
                 from r2v_data_v2.v3.post_mask_epoch_sa_execution import (
+                    SASamModeResource,
                     StageAwareSASamExecutor,
+                    resolve_sa_sam_workers_per_gpu,
                 )
 
+                workers_per_gpu = resolve_sa_sam_workers_per_gpu()
+                if workers_per_gpu > 1:
+                    from r2v_data_v2.v3.post_mask_epoch_sa_process_pool import (
+                        SASamProcessPool,
+                    )
+
+                    epoch = SASamModeResource(
+                        epoch,
+                        lambda: SASamProcessPool(
+                            config.sam3, pool=pool, workers_per_gpu=workers_per_gpu
+                        ),
+                        pipeline_runner=sam_pipeline_runner,
+                        workers_per_gpu=workers_per_gpu,
+                    )
                 return epoch, StageAwareSASamExecutor(
                     run_job,
                     pipeline_runner=sam_pipeline_runner,

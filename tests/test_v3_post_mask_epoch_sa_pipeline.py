@@ -1,10 +1,17 @@
+import time
 from threading import Event
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from r2v_data_v2.v3 import post_mask_epoch_subject_attributes as subject_attributes
+from r2v_data_v2.v3.post_mask_epoch_resources import (
+    EpochResourceError,
+    WorkerPoolConfig,
+)
 from r2v_data_v2.v3.post_mask_epoch_sa_execution import SASamPipelineExecutor
+from r2v_data_v2.v3.post_mask_epoch_sa_process_pool import SASamProcessPool
 from r2v_data_v2.v3.post_mask_epoch_subject_attributes import (
     SUBJECT_ATTRIBUTE_DISCOVERY_JOB,
     SUBJECT_ATTRIBUTE_SAM_PROBE_JOB,
@@ -197,3 +204,67 @@ def test_model_call_timing_excludes_async_writer_queue_wait(tmp_path, monkeypatc
     result = runner.persist_sam_job(jobs[0], inferred)
     assert result.payload["model_call_time_seconds"] == 5.0
     assert set(result.payload) == {"status", "mask_count", "masks", "model_call_time_seconds"}
+
+
+def test_sam_resource_failure_is_not_published_as_completed_sam_failed(tmp_path, monkeypatch):
+    _, _, runner, jobs = prepared_runner(tmp_path, monkeypatch, (fixture.ACCESSORY,))
+
+    class BrokenWorker:
+        def segment_frame(self, **kwargs):
+            raise EpochResourceError("SAM child exited: CUDA out of memory")
+
+        segment_generated_frame = segment_frame
+
+    with pytest.raises(EpochResourceError, match="CUDA out of memory"):
+        runner.infer_sam_job(jobs[0], runner.prepare_sam_job(jobs[0]), BrokenWorker())
+    assert runner._committed_payload_or_none(jobs[0]) is None
+
+
+class _SpawnReceiptBackend:
+    """CPU-only child exercising the actual IPC -> NPY -> receipt boundary."""
+
+    def __init__(self, config):
+        self.mask = config.mask
+
+    def segment_frame(self, *, frame_path, frame_slot, grounding_prompt):
+        if "belt" in grounding_prompt:
+            time.sleep(0.2)  # let the successful sibling finish its inference
+            raise RuntimeError("CUDA out of memory")
+        return (self.mask,)
+
+    def close(self):
+        pass
+
+
+def test_spawn_failure_has_no_receipt_successful_sibling_is_durable_on_resume(
+    tmp_path, monkeypatch
+):
+    config, storage, runner, jobs = prepared_runner(
+        tmp_path, monkeypatch, (fixture.ACCESSORY, fixture.SCARF))
+    pool = SASamProcessPool(
+        SimpleNamespace(device="cuda", mask=fixture._usable_sam(storage, slot=0)[0]),
+        pool=WorkerPoolConfig(gpu_ids=(3,), timeout_seconds=5, shutdown_grace_seconds=1),
+        workers_per_gpu=2, backend_factory=_SpawnReceiptBackend,
+    )
+    pool.start()
+    children = pool._children[:]
+    executor = SASamPipelineExecutor(runner, slot_count=2, resource=pool)
+    try:
+        report = fixture._scheduler(
+            runner, fixture._SerialQwenExecutor(runner, fixture._QwenClient()),
+            fixture._swallow(SUBJECT_ATTRIBUTE_SAM_PROBE_JOB, runner), executor,
+        ).run(jobs)
+    finally:
+        executor.close()
+        pool.stop()
+    assert report["diagnostics"]["resources"]["sam"]["jobs_retryable_failed"] == 1
+    failed = next(job for job in jobs if runner._committed_payload_or_none(job) is None)
+    successful = next(job for job in jobs if runner._committed_payload_or_none(job) is not None)
+    payload = runner._committed_payload_or_none(successful)
+    assert payload["status"] == "sam"
+    assert np.array_equal(runner._load_sam_masks(payload)[0], fixture._usable_sam(storage, slot=0)[0])
+    assert not any(child.is_alive() for child in children)
+    fresh = fixture._runner(config, storage, tmp_path)
+    resumed_ids = {job.job_id() for job in fresh.seed_jobs()}
+    assert failed.job_id() in resumed_ids
+    assert successful.job_id() not in resumed_ids
