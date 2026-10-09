@@ -69,6 +69,16 @@ scan the whole artifact tree. All ranks may read the same file through the
 formal launcher's `--priority-hints` option. The generic smoke launcher below
 does not accept that option.
 
+Verified forwarding is the existing `scripts/run_v3_post_mask_full_production.sh`
+(`"$@"`) → `tools/run_v3_post_mask_full_production.py` →
+`run_elastic_groups(priority_hints=...)`. The external
+`run_v3_post_mask_cluster_dynamic.sh` was not found in this checkout or the local
+workspace/`/tmp` lookup; its forwarding cannot be verified here. No replacement
+launcher is introduced. Before a cluster restart, confirm that external wrapper
+passes trailing arguments unchanged, or have the existing job launch the formal
+wrapper directly on **every node** as shown below. Merely passing hints to a
+wrapper that discards them does not enable ratio ordering.
+
 `POST_MASK_SA_SAM_WORKERS_PER_GPU` accepts only `1`, `2`, `4`; unset means `1`.
 On eight GPUs these mean respectively 8/16/32 SAM workers and 24/48/96 bounded
 SA admissions. Default `1` retains the existing handles/API. Opt-in `2`/`4`
@@ -77,6 +87,13 @@ remain two workers each. Parent SAM handles close before the child pool loads
 (no extra fifth SAM model per GPU), and returning to Reference Edit restores
 the original worker API. Qwen/Boogu residency and model settings are unchanged.
 Validate three-model co-resident VRAM, not SAM-only VRAM.
+
+In spawn mode, only explicit missing-frame/empty-prompt checks before inference
+retain clip-local `sam_failed` handling. Backend exceptions (including Triton
+`TypeError`), OOM, IPC failures and child loss remain infrastructure failures:
+the existing scheduler leaves those jobs retryable/uncommitted, while durable
+successful siblings are retained. Children return CPU-owned masks; only the
+existing two parent persist workers write NPY/fsync before successful receipts.
 
 Server-local checkpoint availability, shared-filesystem `flock`, write access
 to the public output root, and real model quality still require an on-server
@@ -234,7 +251,8 @@ wall plus actual persistence wall, **excluding asynchronous writer-queue wait**;
 it is not pure GPU compute. Baseline diagnostics may lack the new fields.
 
 The 30–100-clip fixture establishes correctness only. Performance comparison
-requires the same real 256-SAM-job set for 8×1/8×2/8×4 and a longer accepted
+requires an independent single-node 8×H200 run using the same real 256-SAM-job
+set for 8×1/8×2/8×4 and a longer accepted
 isolated workload spanning multiple 128-clip SA working-set batches. Reuse the
 function with that existing fixture and fresh tags/roots, keeping accepted
 models/config and `POST_MASK_CPU_WORKERS=32` fixed. First record co-resident
@@ -262,10 +280,17 @@ must inject each node's real `RANK`/`WORLD_SIZE`; do not substitute `0/1`:
 
 ```bash
 # Post-approval instruction only; run through the existing node/job environment.
+: "${RANK:?PyTorchJob must supply the real node rank}"
+: "${WORLD_SIZE:?PyTorchJob must supply the real node count}"
 POST_MASK_SA_SAM_WORKERS_PER_GPU=4 \
   bash /mnt/workspace/litengjie/data/R2V_DATA_V2_postmask_prod/scripts/run_v3_post_mask_full_production.sh \
   --priority-hints /mnt/workspace/litengjie/data/sa-group-priority-hints.json
 ```
+
+Run that same argument list on all nodes with their own injected rank and the
+same hint file. For the isolated 1/2/4 smoke above, keep two CPU prepare workers,
+two persist workers and the accepted models/config unchanged; real co-resident
+VRAM and full-SA throughput remain unverified until the operator runs it.
 
 If 4 workers/GPU OOM under Qwen/Boogu/SAM co-residency, stop all processes,
 report actual VRAM/failure evidence, and evaluate `2` in isolation; do not swallow

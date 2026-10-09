@@ -7,7 +7,6 @@ there is no feeder thread, hidden result queue, or unbounded affinity table.
 
 from __future__ import annotations
 
-import errno
 import multiprocessing
 import os
 import threading
@@ -35,14 +34,12 @@ def _build_backend(config: Any) -> Any:
     return Sam3AttributeFrameSegmenter(config, backend=backend)
 
 
-def _error_response(exc: BaseException, *, startup: bool = False) -> tuple:
+def _error_response(exc: BaseException) -> tuple:
     if isinstance(exc, (KeyboardInterrupt, SystemExit)):
         return ("fatal", type(exc).__name__, exc.args)
-    local = isinstance(exc, (ValueError, TypeError, OSError)) and not isinstance(
-        exc, PermissionError
-    ) and getattr(exc, "errno", None) != errno.EIO
-    return ("local" if local and not startup else "infrastructure",
-            type(exc).__name__, str(exc))
+    # Once inside model code, even TypeError/ValueError may be CUDA/Triton
+    # failures. Only the explicit input checks in _request are clip-local.
+    return ("infrastructure", type(exc).__name__, str(exc))
 
 
 def _worker_main(connection: Any, config: Any, gpu_id: int, factory: Any) -> None:
@@ -58,7 +55,7 @@ def _worker_main(connection: Any, config: Any, gpu_id: int, factory: Any) -> Non
         try:
             backend = (factory or _build_backend)(config)
         except BaseException as exc:  # noqa: BLE001 - transport child startup failures
-            connection.send(_error_response(exc, startup=True))
+            connection.send(_error_response(exc))
             return
         connection.send(("ready",))
         while True:
@@ -69,11 +66,8 @@ def _worker_main(connection: Any, config: Any, gpu_id: int, factory: Any) -> Non
             try:
                 returned = getattr(backend, operation)(**arguments)
             except BaseException as exc:  # noqa: BLE001 - transport fatal control flow too
-                response = _error_response(exc)
-                connection.send(response)
-                if response[0] != "local":
-                    return
-                continue
+                connection.send(_error_response(exc))
+                return
             try:
                 import numpy as np
 
@@ -84,7 +78,7 @@ def _worker_main(connection: Any, config: Any, gpu_id: int, factory: Any) -> Non
                     masks.append(np.array(mask, copy=True))
                 connection.send(("ok", tuple(masks)))
             except BaseException as exc:  # noqa: BLE001 - snapshot/IPC errors are infrastructure
-                connection.send(_error_response(exc, startup=True))
+                connection.send(_error_response(exc))
                 return
     except (EOFError, OSError):
         return
@@ -210,10 +204,6 @@ class SASamProcessPool:
         if kind == "fatal":
             fatal = KeyboardInterrupt if name == "KeyboardInterrupt" else SystemExit
             raise fatal(*detail)
-        if kind == "local":
-            errors = {"ValueError": ValueError, "TypeError": TypeError,
-                      "FileNotFoundError": FileNotFoundError, "OSError": OSError}
-            raise errors.get(name, OSError)(detail)
         raise EpochResourceError(f"SA SAM {name}: {detail}")
 
     def handle_for_slot(self, index: int) -> _SAMHandle:
@@ -222,7 +212,20 @@ class SASamProcessPool:
         return _SAMHandle(self, index)
 
     def _request(self, preferred: int, operation: str, arguments: dict) -> tuple:
-        key = str(Path(arguments["frame_path"]).parent)
+        # A narrow pre-model input boundary, not exception-type inference.
+        # Keep missing frames/empty prompts local; model and IPC failures below
+        # must reach the scheduler uncommitted as EpochResourceError.
+        if not arguments["grounding_prompt"].strip():
+            raise ValueError("attribute grounding prompt must not be empty")
+        try:
+            frame = Path(arguments["frame_path"]).expanduser().resolve()
+            exists = frame.is_file()
+        except OSError as exc:
+            raise EpochResourceError(f"SA SAM input access failed: {exc}") from exc
+        if not exists:
+            raise FileNotFoundError(f"attribute candidate frame is missing: {frame}")
+        arguments = {**arguments, "frame_path": frame}
+        key = str(frame.parent)
         with self._condition:
             while not self._available:
                 if not self._started or self._closing or self._failure:

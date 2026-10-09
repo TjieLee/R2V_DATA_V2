@@ -1,9 +1,15 @@
 """Execution-only priority probes against isolated synthetic state."""
 
 import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 from r2v_data_v2.v3 import post_mask_epoch_production as production
 from r2v_data_v2.v3.post_mask_epoch_groups import (
@@ -174,3 +180,68 @@ def test_formal_launcher_exposes_optional_hints_cli():
     assert _parser().parse_args(
         ["--priority-hints", "/tmp/hints.json"]
     ).priority_hints == Path("/tmp/hints.json")
+
+
+@pytest.mark.parametrize("rank", [0, 1, 2])
+def test_formal_shell_forwards_hints_to_elastic_consumer(tmp_path, rank):
+    """Dropping shell "$@" or CLI priority_hints forwarding breaks this test."""
+    repo = Path(__file__).resolve().parents[1]
+    sandbox = tmp_path / "checkout"
+    for directory in ("scripts", "tools", "configs", ".venv/bin"):
+        (sandbox / directory).mkdir(parents=True)
+    script = sandbox / "scripts/run_v3_post_mask_full_production.sh"
+    # Execute the real shell unchanged, with only its runtime/environment faked.
+    shutil.copyfile(repo / "scripts" / script.name, script)
+    python = sandbox / ".venv/bin/python"
+    # Execute the original venv path, rather than relocating its binary symlink.
+    python.write_text(f'#!/usr/bin/env bash\nexec {shlex.quote(sys.executable)} "$@"\n')
+    python.chmod(0o755)
+    (sandbox / ".venv/bin/activate").write_text(":\n")
+    official = tmp_path / "official"
+    (sandbox / "server_env.sh").write_text(f"production='{official}'\n")
+    config = yaml.safe_load(
+        (repo / "configs/v3_post_mask_resource_epoch_production.yaml").read_text()
+    )
+    config.update(run_root=str(tmp_path / "run"), export_root=str(official / "shards"))
+    (sandbox / "configs/v3_post_mask_resource_epoch_production.yaml").write_text(
+        yaml.safe_dump(config)
+    )
+    fixture = tmp_path / "fixture"
+    (fixture / "parts").mkdir(parents=True)
+    (fixture / "parts/shard-000000000-000000029.jsonl").write_text("")
+    hints = tmp_path / "private hints.json"
+    hints.write_text("{}")
+    observed = tmp_path / "consumer.json"
+    (sandbox / "tools/run_v3_post_mask_full_production.py").write_text(
+        f"""import json
+import sys
+from pathlib import Path
+sys.path.insert(0, {str(repo)!r})
+from tools import run_v3_post_mask_full_production as cli
+# Keep the real CLI/config/group builder; isolate physical destinations only.
+cli.config_module.ALLOWED_WRITABLE_ROOT = Path({str(tmp_path)!r})
+cli.config_module.OFFICIAL_POST_MASK_EXPORT_ROOT = Path({str(official)!r})
+def consume(root, groups, runner, *, rank, world_size, emit, priority_hints):
+    Path({str(observed)!r}).write_text(json.dumps({{
+        "priority_hints": str(priority_hints), "rank": rank,
+        "world_size": world_size, "state_root": str(root),
+        "group_count": len(groups),
+    }}))
+    # Stop before any real runner, model, compaction or durable state operation.
+    raise SystemExit(0)
+cli.run_elastic_groups = consume
+raise SystemExit(cli.main())
+"""
+    )
+    result = subprocess.run(
+        ["bash", str(script), "--entity-mask-root", str(fixture),
+         "--priority-hints", str(hints)],
+        env={**os.environ, "RANK": str(rank), "WORLD_SIZE": "3"},
+        capture_output=True, text=True, timeout=30, check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(observed.read_text()) == {
+        "priority_hints": str(hints), "rank": rank, "world_size": 3,
+        "state_root": str(official / "state"), "group_count": 1,
+    }
+    assert not (official / "state").exists()

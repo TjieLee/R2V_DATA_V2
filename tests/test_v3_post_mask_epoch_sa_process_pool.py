@@ -16,6 +16,13 @@ from r2v_data_v2.v3.post_mask_epoch_resources import (
     WorkerPoolConfig,
 )
 
+_FRAME_ROOT = Path()
+
+
+@pytest.fixture(autouse=True)
+def _frame_root(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys.modules[__name__], "_FRAME_ROOT", tmp_path)
+
 
 class FakeSegmenter:
     def __init__(self, config):
@@ -38,6 +45,8 @@ class FakeSegmenter:
             raise ValueError("bad clip")
         if grounding_prompt == "type":
             raise TypeError("bad clip")
+        if grounding_prompt == "triton":
+            raise TypeError("'NoneType' object is not a mapping")
         if grounding_prompt == "missing":
             raise FileNotFoundError("missing clip")
         if grounding_prompt == "permission":
@@ -81,7 +90,10 @@ def make_pool(workers=1, gpus=(3,), *, timeout=5, grace=1, startup_failure=False
 
 
 def call(handle, prompt="ok", path="/private/clip/frame.jpg", slot=4):
-    return handle.segment_frame(frame_path=Path(path), frame_slot=slot,
+    frame = _FRAME_ROOT / str(path).lstrip("/")
+    frame.parent.mkdir(parents=True, exist_ok=True)
+    frame.touch(exist_ok=True)
+    return handle.segment_frame(frame_path=frame, frame_slot=slot,
                                 grounding_prompt=prompt)[0]
 
 
@@ -106,7 +118,9 @@ def test_spawn_isolation_gpu_mapping_and_serial_model_reuse(monkeypatch, workers
         assert first.flags.owndata
         second[0] = 0
         assert first[0] > 0
-        generated = handle.segment_generated_frame(frame_path=Path("/private/generated.png"),
+        generated_path = _FRAME_ROOT / "generated.png"
+        generated_path.touch()
+        generated = handle.segment_generated_frame(frame_path=generated_path,
                                                     grounding_prompt="ok")[0]
         assert generated[3] == 0
     finally:
@@ -117,20 +131,42 @@ def test_spawn_isolation_gpu_mapping_and_serial_model_reuse(monkeypatch, workers
     assert os.environ["RANK"] == "outer-job"
 
 
-@pytest.mark.parametrize("prompt,error", [("value", ValueError), ("type", TypeError),
-                                         ("missing", FileNotFoundError)])
-def test_clip_local_error_keeps_worker_usable(prompt, error):
+@pytest.mark.parametrize("generated", [False, True])
+@pytest.mark.parametrize("missing", [False, True])
+def test_explicit_input_error_keeps_worker_usable(tmp_path, generated, missing):
     pool = make_pool()
     pool.start()
     try:
-        with pytest.raises(error):
-            call(pool.handle_for_slot(0), prompt)
+        frame = tmp_path / "input.jpg"
+        if not missing:
+            frame.touch()
+        handle = pool.handle_for_slot(0)
+        method = handle.segment_generated_frame if generated else handle.segment_frame
+        kwargs = {} if generated else {"frame_slot": 0}
+        with pytest.raises(FileNotFoundError if missing else ValueError):
+            method(frame_path=frame, grounding_prompt="ok" if missing else "  ", **kwargs)
         assert call(pool.handle_for_slot(0))[0] > 0
     finally:
         pool.stop()
 
 
-@pytest.mark.parametrize("prompt", ["crash", "oom", "permission", "io"])
+@pytest.mark.parametrize("error", [PermissionError("denied"), OSError(errno.EIO, "I/O failed")])
+def test_input_access_infrastructure_error_is_not_clip_local(monkeypatch, error):
+    pool = make_pool()
+    pool.start()
+    try:
+        def fail_access(_path):
+            raise error
+
+        monkeypatch.setattr(Path, "is_file", fail_access)
+        with pytest.raises(EpochResourceError, match="input access failed"):
+            call(pool.handle_for_slot(0))
+    finally:
+        pool.stop()
+
+
+@pytest.mark.parametrize("prompt", ["crash", "oom", "permission", "io", "triton",
+                                    "type", "value", "missing"])
 def test_infrastructure_failure_is_not_a_clip_local_failure(prompt):
     pool = make_pool()
     pool.start()

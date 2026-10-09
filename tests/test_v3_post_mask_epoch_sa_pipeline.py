@@ -1,3 +1,4 @@
+import os
 import time
 from threading import Event
 from types import SimpleNamespace
@@ -53,7 +54,10 @@ def test_real_runner_masks_are_readonly_independent_before_slot_reuse(tmp_path, 
     assert resumed_backend.calls == 1
 
 
-def test_real_runner_writer_overlap_and_success_receipt_cold_resume(tmp_path, monkeypatch):
+@pytest.mark.parametrize("workers_per_gpu", [1, 4])
+def test_real_runner_writer_overlap_and_success_receipt_cold_resume(
+    tmp_path, monkeypatch, workers_per_gpu
+):
     config, storage, runner, jobs = prepared_runner(
         tmp_path, monkeypatch, (fixture.ACCESSORY, fixture.SCARF))
     writing, release, second = Event(), Event(), Event()
@@ -72,8 +76,29 @@ def test_real_runner_writer_overlap_and_success_receipt_cold_resume(tmp_path, mo
                 second.set()
             return fixture._usable_sam(storage, slot=0)
     backend = Backend()
-    executor = SASamPipelineExecutor(runner, slot_count=1,
-        resource=SimpleNamespace(handle_for_slot=lambda slot: backend))
+    pool = None
+    resource = SimpleNamespace(handle_for_slot=lambda slot: backend)
+    if workers_per_gpu == 4:
+        pool = SASamProcessPool(
+            SimpleNamespace(device="cuda", mask=fixture._usable_sam(storage, slot=0)[0],
+                            failure="none"),
+            pool=WorkerPoolConfig(gpu_ids=(3,), timeout_seconds=5, shutdown_grace_seconds=1),
+            workers_per_gpu=4, backend_factory=_SpawnReceiptBackend,
+        )
+        pool.start()
+        resource = pool
+        infer = runner.infer_sam_job
+
+        def record_completed_inference(job, prepared, handle):
+            result = infer(job, prepared, handle)
+            if job.job_id() == jobs[1].job_id():
+                second.set()
+            return result
+
+        monkeypatch.setattr(runner, "infer_sam_job", record_completed_inference)
+    executor = SASamPipelineExecutor(runner, slot_count=workers_per_gpu, resource=resource)
+    assert len(executor._stage_threads["persist"]) == 2
+    assert all(queue.maxsize == 3 * workers_per_gpu for queue in executor._queues.values())
     try:
         executor.submit(jobs[0])
         assert writing.wait(5)
@@ -87,6 +112,8 @@ def test_real_runner_writer_overlap_and_success_receipt_cold_resume(tmp_path, mo
     finally:
         release.set()
         executor.close()
+        if pool is not None:
+            pool.stop()
     # Feed persisted outcomes through the real ledger/scheduler receipt path.
     class ReadyExecutor:
         def execute_batch(self, batch):
@@ -225,10 +252,20 @@ class _SpawnReceiptBackend:
 
     def __init__(self, config):
         self.mask = config.mask
+        self.failure = getattr(config, "failure", "oom")
+
+        def forbidden_write(*args, **kwargs):
+            raise AssertionError("SAM child must not write NPY")
+
+        np.save = forbidden_write
 
     def segment_frame(self, *, frame_path, frame_slot, grounding_prompt):
-        if "belt" in grounding_prompt:
+        if "belt" in grounding_prompt and self.failure != "none":
             time.sleep(0.2)  # let the successful sibling finish its inference
+            if self.failure == "triton":
+                raise TypeError("'NoneType' object is not a mapping")
+            if self.failure == "crash":
+                os._exit(23)
             raise RuntimeError("CUDA out of memory")
         return (self.mask,)
 
@@ -236,13 +273,15 @@ class _SpawnReceiptBackend:
         pass
 
 
+@pytest.mark.parametrize("failure", ["oom", "triton", "crash"])
 def test_spawn_failure_has_no_receipt_successful_sibling_is_durable_on_resume(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, failure
 ):
     config, storage, runner, jobs = prepared_runner(
         tmp_path, monkeypatch, (fixture.ACCESSORY, fixture.SCARF))
     pool = SASamProcessPool(
-        SimpleNamespace(device="cuda", mask=fixture._usable_sam(storage, slot=0)[0]),
+        SimpleNamespace(device="cuda", mask=fixture._usable_sam(storage, slot=0)[0],
+                        failure=failure),
         pool=WorkerPoolConfig(gpu_ids=(3,), timeout_seconds=5, shutdown_grace_seconds=1),
         workers_per_gpu=2, backend_factory=_SpawnReceiptBackend,
     )
@@ -259,6 +298,7 @@ def test_spawn_failure_has_no_receipt_successful_sibling_is_durable_on_resume(
         pool.stop()
     assert report["diagnostics"]["resources"]["sam"]["jobs_retryable_failed"] == 1
     failed = next(job for job in jobs if runner._committed_payload_or_none(job) is None)
+    assert not runner._sam_mask_path(failed.job_id(), 0).exists()
     successful = next(job for job in jobs if runner._committed_payload_or_none(job) is not None)
     payload = runner._committed_payload_or_none(successful)
     assert payload["status"] == "sam"
@@ -268,3 +308,63 @@ def test_spawn_failure_has_no_receipt_successful_sibling_is_durable_on_resume(
     resumed_ids = {job.job_id() for job in fresh.seed_jobs()}
     assert failed.job_id() in resumed_ids
     assert successful.job_id() not in resumed_ids
+
+
+def test_broken_ipc_does_not_publish_masks_or_success_receipt(tmp_path, monkeypatch):
+    _, storage, runner, jobs = prepared_runner(tmp_path, monkeypatch, (fixture.ACCESSORY,))
+    pool = SASamProcessPool(
+        SimpleNamespace(device="cuda", mask=fixture._usable_sam(storage, slot=0)[0]),
+        pool=WorkerPoolConfig(gpu_ids=(3,), timeout_seconds=5, shutdown_grace_seconds=1),
+        workers_per_gpu=2, backend_factory=_SpawnReceiptBackend,
+    )
+    pool.start()
+    children = pool._children[:]
+    for connection in pool._connections:
+        connection.close()
+    executor = SASamPipelineExecutor(runner, slot_count=2, resource=pool)
+    try:
+        report = fixture._scheduler(
+            runner, fixture._SerialQwenExecutor(runner, fixture._QwenClient()),
+            fixture._swallow(SUBJECT_ATTRIBUTE_SAM_PROBE_JOB, runner), executor,
+        ).run(jobs)
+    finally:
+        executor.close()
+        pool.stop()
+    assert report["diagnostics"]["resources"]["sam"]["jobs_retryable_failed"] == 1
+    assert runner._committed_payload_or_none(jobs[0]) is None
+    assert not runner._sam_mask_path(jobs[0].job_id(), 0).exists()
+    assert not any(child.is_alive() for child in children)
+
+
+@pytest.mark.parametrize("input_error", ["missing", "empty_prompt"])
+def test_known_input_failure_keeps_existing_sam_failed_receipt(tmp_path, monkeypatch, input_error):
+    _, storage, runner, jobs = prepared_runner(tmp_path, monkeypatch, (fixture.ACCESSORY,))
+    prepare = runner.prepare_sam_job
+
+    def invalid_input(job):
+        prepared = prepare(job)
+        if input_error == "missing":
+            prepared["frame_path"] = tmp_path / "absent-frame.jpg"
+        else:
+            prepared["grounding_prompt"] = "  "
+        return prepared
+
+    monkeypatch.setattr(runner, "prepare_sam_job", invalid_input)
+    pool = SASamProcessPool(
+        SimpleNamespace(device="cuda", mask=fixture._usable_sam(storage, slot=0)[0]),
+        pool=WorkerPoolConfig(gpu_ids=(3,), timeout_seconds=5, shutdown_grace_seconds=1),
+        workers_per_gpu=2, backend_factory=_SpawnReceiptBackend,
+    )
+    pool.start()
+    executor = SASamPipelineExecutor(runner, slot_count=2, resource=pool)
+    try:
+        fixture._scheduler(
+            runner, fixture._SerialQwenExecutor(runner, fixture._QwenClient()),
+            fixture._swallow(SUBJECT_ATTRIBUTE_SAM_PROBE_JOB, runner), executor,
+        ).run(jobs)
+        assert pool.counters()["sa_sam_requests"] == 0
+    finally:
+        executor.close()
+        pool.stop()
+    assert runner._committed_payload_or_none(jobs[0])["status"] == "sam_failed"
+    assert not runner._sam_mask_path(jobs[0].job_id(), 0).exists()
