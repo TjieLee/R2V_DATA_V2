@@ -1559,6 +1559,10 @@ def build_removal_epoch_factories(
                     pipeline_runner=sam_pipeline_runner,
                     slot_count=slot_count,
                     resource=epoch,
+                    sam_config=config.sam3,
+                    gpu_ids=pool.gpu_ids,
+                    sam_timeout_seconds=pool.timeout_seconds,
+                    sam_shutdown_seconds=pool.shutdown_grace_seconds,
                 )
             return epoch, WorkerSlotExecutor(
                 run_job, slot_count=slot_count, resource=epoch
