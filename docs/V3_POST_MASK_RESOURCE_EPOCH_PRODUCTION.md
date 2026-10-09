@@ -195,3 +195,133 @@ it is not pure GPU compute. Baseline diagnostics may lack the new fields.
 
 Stop after reviewing the smoke and resume results. This procedure does not
 authorize deployment, merge, production restart or changes to formal outputs.
+
+## Fast SA restart priority + 4 SAM processes per GPU (experimental)
+
+This section applies **only** to
+`feature/post-mask-sa-4proc-priority-io-v1`. The code has NOT passed an
+end-to-end 8-GPU SA production-resume smoke, and must not be installed into
+the live shared `R2V_DATA_V2_postmask_prod` worktree while any node runs.
+
+**Why:** the isolated 256-real-prompt H200 benchmark measured
+1.587 / 2.621 / 3.819 SAM segment calls/s at 1 / 2 / 4 *independent CUDA
+processes* on ONE GPU (2.407x four-versus-one). This benchmark deliberately
+excluded SA NPY disk persistence, Qwen/Boogu model co-residency, receipt
+settlement and CPU finalizers. Of 32 sampled tasks, 4-process mode returned
+40/40 identical masks; 2-process mode had one pixel-mismatching mask, which is
+recorded as a performance-experiment observation rather than turned into a
+new costly validation gate. Neither result proves full semantic equivalence.
+
+### Operator action BEFORE an elastic restart
+
+Generate one shared snapshot on one node. This reads only existing tiny
+`composition/subject_attributes_*.json` metadata plus a **single**
+`os.scandir` count of terminal outcome filenames in each started-SA group.
+It does not recurse through masks, images, model runs or receipts, and does not
+create or modify a production checkpoint. Run this step ONCE, not on every
+node. All paths below are on the shared filesystem.
+
+```bash
+DEV=/mnt/workspace/litengjie/data/R2V_DATA_V2_sa_4proc_dev
+PY=/mnt/workspace/litengjie/data/R2V_DATA_V2/.venv/bin/python
+PRIORITY=/mnt/workspace/litengjie/data/r2v_v3_sa_group_priority_20261009.json
+STATE=/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/in_pair_reference/state/resource_epochs
+
+"$PY" "$DEV/tools/prepare_v3_post_mask_sa_priority.py" \
+  --state-root "$STATE" --output "$PRIORITY"
+```
+
+The printed order is: SA completed/export pending first, then SA started
+descending terminal/eligible clip fraction, then other groups in original
+order. Groups already complete are always skipped. On next **independently
+approved, pinned, all-nodes-restarted** formal launch, set the same environment
+on **every node** (after any server-env overrides, before the launcher):
+
+```bash
+export POST_MASK_SA_GROUP_PRIORITY_FILE="$PRIORITY"
+export POST_MASK_SA_SAM_PROCESSES_PER_GPU=4
+export POST_MASK_SA_SAM_PREPARE_WORKERS=8
+export POST_MASK_SA_SAM_PERSIST_WORKERS=8
+```
+
+When the priority flag is unset, legacy rank rotation is unchanged. When set,
+all ranks try the same shared priority order and use the unchanged nonblocking
+group flock: nodes skip groups another node already owns. A stale snapshot
+cannot skip a group or override its completed marker; remaining known groups
+are appended after prioritized groups. No group identity, shard assignment,
+receipt, or frozen source is altered. The priority file contains only
+execution hints; it is not durable pipeline state.
+
+### SAM resource lifetime
+
+Reference Edit retains its existing one-SAM-handle-per-GPU executor. When the
+drained resource dispatch first enters SA and
+`POST_MASK_SA_SAM_PROCESSES_PER_GPU=4`, its eight original SAM predictors
+are closed; the SA-only pool then spawns **four model processes per physical
+GPU** (32 total) and its CPU/GPU/CPU executor admits at most 96 logical jobs.
+A clip is pinned to one SAM child during the stage so the existing physical
+session reuse remains effective. Qwen and Boogu remain available for SA
+completion and review. With the flag absent (default `1`) the existing
+pipeline remains unchanged. `2` is also supported for resource-budget
+experiments. This is concurrent independent requests, NOT a semantic
+`batch_size=4` inside one SAM predictor.
+
+Prepare and NPY Persist run in parallel thread pools (8 and 8 by default in
+4-process mode), using the existing `atomic_write_bytes`, original NPY
+layout and original receipt publication. The SAM GPU/process slot is released
+once masks are CPU-owned. **No receipt is committed before NPY persistence
+succeeds.** Existing terminal-clip binary GC stays asynchronous. There is no
+production-wide Triton NMS mutex; the temporary mutex in the earlier 8-GPU
+benchmark was only a workaround for concurrent autotuning in one process.
+
+Do not copy a working set of live production RunStorage into a smoke root.
+First run focused CPU tests:
+
+```bash
+cd "$DEV"
+PYTHONPATH="$DEV" "$PY" -m pytest -q \
+  tests/test_v3_post_mask_sa_four_process.py \
+  tests/test_v3_post_mask_epoch_sa_execution.py \
+  tests/test_v3_post_mask_epoch_sa_pipeline.py \
+  tests/test_v3_post_mask_full_production.py
+```
+
+Then an isolated SA-stage / full-stack smoke with real Qwen + Boogu + 32 SAM
+processes **co-resident** on the same eight GPUs, with real SAM masks and
+correct independent checkpoint roots, before formal rollout. The
+one-GPU SAM-only benchmark does NOT establish co-resident VRAM capacity.
+An OOM in an SA child is treated as an epoch-fatal infrastructure error, not
+as an accepted `sam_failed` receipt. Measure model startup, SAM jobs/s,
+SA terminal clips/s, peak VRAM, masks, persisted receipts, and interruption
+resume. Do not assume a 2.4x production SA speedup from the microbenchmark.
+
+### Real eight-GPU standalone process-pool smoke (before full-stack QA)
+
+With the separate development checkout, already-prepared read-only
+`jobs.jsonl` (256 real frame/prompt pairs), and the accepted frozen YAML, run:
+
+```bash
+D=/mnt/workspace/litengjie/data
+DEV="$D/R2V_DATA_V2_sa_4proc_dev"
+PY="$D/R2V_DATA_V2/.venv/bin/python"
+CONFIG="$D/R2V_DATA_V2_postmask_prod/configs/v3_post_mask_resource_epoch_production.yaml"
+JOBS="$D/r2v_v3_sa_gpu_ab_bench/ab_20261009/jobs.jsonl"
+OUT="$D/r2v_v3_sa_gpu_ab_bench/pool32-with-npy-r1"
+
+cd "$D"
+env -u CUDA_VISIBLE_DEVICES \
+  PYTHONPATH="$DEV:$D/vendor/sam3" \
+  "$PY" "$DEV/tools/bench_v3_post_mask_sa_process_pool.py" \
+    --config "$CONFIG" --manifest "$JOBS" --output "$OUT" \
+    --gpu-ids 0,1,2,3,4,5,6,7 --workers-per-gpu 4 \
+    --count 256 --persist-workers 8
+```
+
+This first validates the exact new 32-process IPC, CPU-owned masks and
+concurrent NPY atomic writes, but does NOT exercise the production checkpoint
+scheduler or model co-residency. Inspect `$OUT/metrics.json`, confirm all
+256 jobs and 411 expected masks (for that exact manifest), and compare wall
+time against the old single-process/8-GPU benchmark **only with the caveat**
+that the latter used a global Triton NMS mutex. For any retry use a NEW private
+output directory; never delete live artifacts. Proceed to the isolated
+full-stack test only after this stage succeeds.

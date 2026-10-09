@@ -568,6 +568,7 @@ class WorkerEpochResource(EpochResource):
         self.pool = pool
         self.worker_factory = worker_factory
         self.workers: list[Any] = []
+        self._released_for_sa = False
         self.slot_job_counts: dict[int, int] = {
             slot: 0 for slot in range(len(pool.gpu_ids))
         }
@@ -643,6 +644,19 @@ class WorkerEpochResource(EpochResource):
                 f"{self.name} shutdown incomplete: {'; '.join(errors)}"
             )
 
+    def release_workers_for_sa(self) -> None:
+        """SA-only stage handoff, after Reference Edit has drained.
+
+        The epoch remains owned by ResourceEpochManager and its later stop is
+        still safe. No other resource type can use this handoff.
+        """
+        if self.name != RESOURCE_SAM or not self._open:
+            raise EpochResourceError("SAM stage handoff requires an open SAM epoch")
+        if self._released_for_sa:
+            raise EpochResourceError("SAM stage handoff has already occurred")
+        self._stop()
+        self._released_for_sa = True
+
     def handle_for_slot(self, slot_id: int) -> Any:
         """Return the live worker backend for a slot, never the slot id.
 
@@ -651,6 +665,8 @@ class WorkerEpochResource(EpochResource):
         """
         if not self._open:
             raise EpochResourceError(f"{self.name} epoch is not started")
+        if self._released_for_sa:
+            raise EpochResourceError("original SAM handles released for SA subprocesses")
         if not 0 <= slot_id < self.slot_count:
             raise EpochResourceError(f"invalid {self.name} slot: {slot_id}")
         self.slot_job_counts[slot_id] = self.slot_job_counts.get(slot_id, 0) + 1

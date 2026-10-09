@@ -162,9 +162,11 @@ def main(argv: list[str] | None = None) -> int:
             / f"{socket.gethostname()}-rank-{args.rank}"
         ),
     )
+    priority_file = os.environ.get("POST_MASK_SA_GROUP_PRIORITY_FILE")
     run_elastic_groups(
         root / "state", groups, run_removal_epoch,
         rank=args.rank, world_size=args.world_size, emit=_emit,
+        priority_file=Path(priority_file) if priority_file else None,
     )
     compact_if_complete(root, groups, config, args.base_config)
     _emit("post_mask_production_complete", group_count=len(groups))

@@ -6,6 +6,7 @@ Only persistence produces a completion eligible for a durable receipt.
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from queue import Empty, Queue
@@ -43,6 +44,14 @@ class SASamPipelineExecutor:
         self._admitted = 0
         self._queues = {stage: Queue(maxsize=capacity)
                         for stage in ("prepare", "infer", "persist")}
+        # The 4-process mode keeps a clip on one model to preserve SAM3
+        # physical-session reuse. Default single-model mode is untouched.
+        self._infer_slot_queues = (
+            [Queue(maxsize=capacity) for _ in range(slot_count)]
+            if getattr(resource, "affinity_by_clip", False) else None
+        )
+        self._clip_slots: dict[tuple[str, str], int] = {}
+        self._next_clip_slot = 0
         self._events: Queue = Queue(maxsize=capacity)
         self._stats: dict[str, int | float] = {"admitted_peak": 0}
         self._active = {stage: 0 for stage in self._queues}
@@ -85,10 +94,19 @@ class SASamPipelineExecutor:
 
     def _record_queue(self, stage: str) -> None:
         key = f"{stage}_queue_peak"
-        self._stats[key] = max(self._stats[key], self._queues[stage].qsize())
+        queued = (
+            sum(queue.qsize() for queue in self._infer_slot_queues)
+            if stage == "infer" and self._infer_slot_queues is not None
+            else self._queues[stage].qsize()
+        )
+        self._stats[key] = max(self._stats[key], queued)
 
     def _run(self, stage: str, slot: int) -> None:
-        queue = self._queues[stage]
+        queue = (
+            self._infer_slot_queues[slot]
+            if stage == "infer" and self._infer_slot_queues is not None
+            else self._queues[stage]
+        )
         while True:
             item = queue.get()
             if item is None:
@@ -123,7 +141,18 @@ class SASamPipelineExecutor:
                 if next_stage is None:
                     self._events.put((job, output, None))
                 else:
-                    self._queues[next_stage].put((job, output, time.monotonic()))
+                    if next_stage == "infer" and self._infer_slot_queues is not None:
+                        key = (str(job.canonical_shard), str(job.clip_uid))
+                        with self._lock:
+                            assigned = self._clip_slots.get(key)
+                            if assigned is None:
+                                assigned = self._next_clip_slot % self.slot_count
+                                self._clip_slots[key] = assigned
+                                self._next_clip_slot += 1
+                        target = self._infer_slot_queues[assigned]
+                    else:
+                        target = self._queues[next_stage]
+                    target.put((job, output, time.monotonic()))
                     with self._lock:
                         self._record_queue(next_stage)
             finally:
@@ -167,7 +196,12 @@ class SASamPipelineExecutor:
         with self._lock:
             self._record_overlap()
             return {**self._stats, "admitted": self._admitted,
-                    "physical_slots": self.slot_count, "capacity": self._capacity}
+                    "physical_slots": (
+                        len(self.resource.gpu_ids)
+                        if self._infer_slot_queues is not None else self.slot_count
+                    ),
+                    "model_processes": self.slot_count,
+                    "capacity": self._capacity}
 
     def close(self) -> None:
         with self._close_lock:
@@ -176,8 +210,12 @@ class SASamPipelineExecutor:
                     return
                 self._closed = True
             for stage in ("prepare", "infer", "persist"):
-                for _ in self._stage_threads[stage]:
-                    self._queues[stage].put(None)
+                if stage == "infer" and self._infer_slot_queues is not None:
+                    for queue in self._infer_slot_queues:
+                        queue.put(None)
+                else:
+                    for _ in self._stage_threads[stage]:
+                        self._queues[stage].put(None)
                 for thread in self._stage_threads[stage]:
                     thread.join()
 
@@ -186,15 +224,24 @@ class StageAwareSASamExecutor:
     """Select SA overlap only at a drained stage boundary.
 
     The provider is queried after dispatch binds a stage. Reference Edit keeps
-    the original executor and callback. No resource residency changes occur.
+    the original executor and callback. SA may release the old 8 handles and
+    replace them with independent CUDA processes after the drained boundary.
     """
 
     def __init__(self, run_job: Any, *, pipeline_runner: Any = None,
-                 slot_count: int = 8, resource: Any = None) -> None:
+                 slot_count: int = 8, resource: Any = None,
+                 sam_config: Any = None, gpu_ids: tuple[int, ...] = (),
+                 sam_timeout_seconds: float = 900.0,
+                 sam_shutdown_seconds: float = 30.0) -> None:
         self._run_job = run_job
         self._provider = pipeline_runner or (lambda: None)
         self._slot_count = slot_count
         self._resource = resource
+        self._sam_config = sam_config
+        self._gpu_ids = tuple(gpu_ids)
+        self._sam_timeout_seconds = sam_timeout_seconds
+        self._sam_shutdown_seconds = sam_shutdown_seconds
+        self._sa_pool: Any = None
         self._executor: Any = None
         self._runner: Any = None
         self._outstanding = 0
@@ -215,8 +262,37 @@ class StageAwareSASamExecutor:
             self._executor = WorkerSlotExecutor(self._run_job,
                 slot_count=self._slot_count, resource=self._resource)
         else:
-            self._executor = SASamPipelineExecutor(runner,
-                slot_count=self._slot_count, resource=self._resource)
+            per_gpu = int(os.environ.get("POST_MASK_SA_SAM_PROCESSES_PER_GPU", "1"))
+            if per_gpu not in (1, 2, 4):
+                raise ValueError("POST_MASK_SA_SAM_PROCESSES_PER_GPU must be 1, 2 or 4")
+            resource, slot_count = self._resource, self._slot_count
+            if per_gpu > 1:
+                if self._sam_config is None or not self._gpu_ids:
+                    raise RuntimeError("SA multiprocessing needs SAM config and GPU IDs")
+                from .post_mask_epoch_sa_process import SAProcessPool
+
+                # Reference Edit has already drained. Drop its eight in-process
+                # predictors *before* loading 2/4 predictors per GPU. The
+                # Qwen/Boogu resources stay resident for the SA completion path.
+                self._resource.release_workers_for_sa()
+                self._sa_pool = SAProcessPool(
+                    self._sam_config, self._gpu_ids,
+                    workers_per_gpu=per_gpu,
+                    timeout_seconds=self._sam_timeout_seconds,
+                    shutdown_seconds=self._sam_shutdown_seconds,
+                )
+                self._sa_pool.start()
+                resource, slot_count = self._sa_pool, self._sa_pool.slot_count
+            prepare = int(os.environ.get(
+                "POST_MASK_SA_SAM_PREPARE_WORKERS", str(max(2, 2 * per_gpu))
+            ))
+            persist = int(os.environ.get(
+                "POST_MASK_SA_SAM_PERSIST_WORKERS", str(max(2, 2 * per_gpu))
+            ))
+            self._executor = SASamPipelineExecutor(
+                runner, slot_count=slot_count, resource=resource,
+                prepare_workers=prepare, persist_workers=persist,
+            )
             runner.sam_execution_diagnostics = self._executor.diagnostics
         return self._executor
 
@@ -255,4 +331,9 @@ class StageAwareSASamExecutor:
             if self._executor is not None:
                 self._executor.close()
         finally:
-            self._outstanding = 0
+            try:
+                if self._sa_pool is not None:
+                    self._sa_pool.close()
+                    self._sa_pool = None
+            finally:
+                self._outstanding = 0
