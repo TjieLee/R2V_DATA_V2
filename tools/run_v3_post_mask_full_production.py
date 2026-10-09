@@ -1,4 +1,4 @@
-"""Elastic, fixed-root Post-Mask Resource Epoch production entrypoint."""
+"""Static rank-owned, fixed-root Post-Mask Resource Epoch production entrypoint."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import json
 import os
 import socket
 import sys
+import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -110,6 +111,21 @@ def compact_if_complete(
         _emit("post_mask_production_compacted", samples=catalog["total_samples"])
 
 
+def wait_for_global_groups(state: Path, groups: tuple) -> None:
+    """Wait for every existing small formal marker without inspecting artifacts."""
+    while True:
+        remaining = sum(
+            not production_group_completed(state, group) for group in groups
+        )
+        if not remaining:
+            return
+        _emit(
+            "post_mask_production_waiting_for_global_completion",
+            remaining_group_count=remaining,
+        )
+        time.sleep(10.0)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--base-config", type=Path, default=BASE_CONFIG)
@@ -168,6 +184,9 @@ def main(argv: list[str] | None = None) -> int:
         rank=args.rank, world_size=args.world_size, emit=_emit,
         priority_hints=args.priority_hints,
     )
+    if args.rank != 0:
+        return 0
+    wait_for_global_groups(root / "state", groups)
     compact_if_complete(root, groups, config, args.base_config)
     _emit("post_mask_production_complete", group_count=len(groups))
     return 0
