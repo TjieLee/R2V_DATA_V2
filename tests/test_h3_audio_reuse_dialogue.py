@@ -204,6 +204,220 @@ def test_missing_first_marker_is_not_repaired_for_multi_single_or_legacy_materia
     assert _detail(prompt) == caption
 
 
+def _multi_marker_caption(groups, *, partial=False):
+    blocks = [f"<d>[English] Line {i}.</d>" for i in range(len(groups))]
+    before, after = "<Subject 1> sits at the table. ", "<Subject 1> sits at the table. "
+    previous = None
+    speakers = list(dict.fromkeys(groups))
+    for index, (group, block) in enumerate(zip(groups, blocks, strict=True)):
+        actor = "The voice" if group == previous else ("<Subject 1>" if group == "g1" else "A voice")
+        verb = "continues" if group == previous else "asks"
+        marker = f" (S{speakers.index(group) + 1})" if group != previous else ""
+        original_marker = marker if partial == "complete" or (partial and index == 0) else ""
+        before += f"{actor}{original_marker} {verb}, {block} "
+        after += f"{actor}{marker} {verb}, {block} "
+        previous = group
+    return before + "The camera stays still.", after + "The camera stays still.", blocks
+
+
+@pytest.mark.parametrize("groups", [
+    ("g1", "g1", "g2", "g1", "g1"),
+    ("g1", "g1", "g2", "g3", "g1", "g1"),
+])
+@pytest.mark.parametrize("partial", [False, True, "complete"])
+def test_two_step_multi_markers_all_three_products_ready(tmp_path, groups, partial):
+    from r2v_data_v2.h3 import audio_reuse_materializer as product
+    from r2v_data_v2.h3.audio_reuse_prepared import AudioReusePreparedSource
+    from r2v_data_v2.h3.mimo25_backend import MimoBackendConfig, MimoMediaResolver
+    from r2v_data_v2.h3.mimo26_two_step_backend import TwoStepOpenAIMimo26Backend
+    from tests.test_h3_audio_reuse import _seal
+
+    caption, expected, blocks = _multi_marker_caption(groups, partial=partial)
+    args = _prepared(tmp_path, case_kwargs={
+        "groups": groups, "caption": caption,
+        "speech_payloads": [("English", f"Line {i}.") for i in range(len(groups))],
+    })
+    path = args["mimo_root"] / "records.jsonl"
+    record = AudioReusePreparedSource.model_validate_json(path.read_text())
+    values = record.model_dump(mode="json")
+    values["source_backend_provenance"] = TwoStepOpenAIMimo26Backend(MimoBackendConfig(
+        api_key="fixture", transport="sglang", media_resolver=MimoMediaResolver(mode="base64", media_root=tmp_path),
+    ), stem_records_by_clip={}).provenance.model_dump(mode="json")
+    path.write_text(_seal(AudioReusePreparedSource, values, "prepared_fingerprint").model_dump_json() + "\n")
+    before = {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
+    summary = product.materialize_audio_reuse_products(**args, enable_full_audio_reuse=True)
+    rows = product._rows(args["output_root"] / "records.jsonl", AudioReuseProduct)
+    assert (summary.ready_count, summary.failed_count, summary.model_call_count) == (3, 0, 0), [
+        r.failure_reason for r in rows
+    ]
+    for row in rows:
+        detail = _detail(row.rendered_h3_prompt)
+        assert _blocks(detail) == blocks
+        assert re.findall(r"\(S\d+\)", detail) == re.findall(r"\(S\d+\)", expected)
+        assert [s.speaker_cluster_id for s in row.corrected_speech_segments] == list(groups)
+        assert [s.entity_id for s in row.corrected_speech_segments] == [
+            "e1" if group == "g1" else None for group in groups
+        ]
+        count = len(re.findall(r"\(S\d+\)", expected)) - len(re.findall(r"\(S\d+\)", caption))
+        if count:
+            assert f"deterministic_correction_count:two_step_speaker_markers_inserted={count}" in row.warnings
+        else:
+            assert not any("two_step_speaker_markers_inserted" in warning for warning in row.warnings)
+        if row.conditioning_variant == "target_speech_reuse":
+            expected_detail = expected
+            assert len(row.audio_references) == len(set(groups))
+            for reference in row.audio_references:
+                audio = reference.contract
+                relation = f", with the synchronized speech signal copied directly from {audio.audio_label},"
+                marker = f"({audio.speaker_id})"
+                expected_detail = expected_detail.replace(marker, marker + relation, 1)
+                assert detail.count(f"copied directly from {audio.audio_label}") == 1
+            assert detail == expected_detail
+        else:
+            assert detail == expected
+        validate_product_dialogue_sections(row.rendered_h3_prompt, blocks)
+    assert before == {p: p.read_bytes() for p in before}
+
+
+@pytest.mark.parametrize("case", [
+    "missing_dialogue", "wrong_order", "wrong_text", "wrong_language", "conflicting_marker", "mixed_markers",
+    "unknown_lead", "pronoun_switch", "wrong_subject", "unbound_subject", "missing_group", "uncertain_group",
+    "group_conflict", "entity_conflict", "missing_inventory", "multiple_speakers", "negative_evidence",
+])
+def test_two_step_multi_marker_repair_rejects_unsafe_inputs(tmp_path, case):
+    from r2v_data_v2.h3.mimo25_backend import MimoAVAnnotationDraft
+    from r2v_data_v2.h3.mimo25_h3_materializer import (
+        _audio_facts,
+        _prepare_materialization_context,
+        _two_step_speaker_markers,
+    )
+
+    groups = ("g1", "g2", "g1")
+    caption, _, _ = _multi_marker_caption(groups)
+    _, sample, source = _case(tmp_path, groups, caption=caption,
+                              speech_payloads=[("English", f"Line {i}.") for i in range(len(groups))])
+    context = _prepare_materialization_context(sample, source.job, source.record, reuse_audio_contracts=[])
+    speech = _audio_facts(sample=context.sample, corrected=context.corrected,
+                          record=source.record, contract=context.contract).speech
+    payload = source.record.annotation.model_dump(mode="json")
+    decisions = payload["audio_observation"]["segment_decisions"]
+    groundings = payload["av_grounding"]["segment_groundings"]
+    if case == "missing_dialogue":
+        caption = caption.replace("<d>[English] Line 1.</d>", "")
+    elif case == "wrong_order":
+        caption = caption.replace("Line 0.", "Temp.").replace("Line 1.", "Line 0.").replace("Temp.", "Line 1.")
+    elif case == "wrong_text":
+        caption = caption.replace("Line 1.", "Changed.")
+    elif case == "wrong_language":
+        caption = caption.replace("[English]", "[French]", 1)
+    elif case == "conflicting_marker":
+        caption = caption.replace("A voice asks", "A voice (S1) asks")
+    elif case == "mixed_markers":
+        caption = caption.replace("A voice asks", "A voice (S1) (S2) asks")
+    elif case == "unknown_lead":
+        caption = caption.replace("A voice asks", "A voice raises a question")
+    elif case == "pronoun_switch":
+        caption = caption.replace("A voice asks", "He asks")
+    elif case == "wrong_subject":
+        caption = caption.replace("A voice asks", "<Subject 1> asks")
+    elif case == "unbound_subject":
+        groundings[0].update(binding_status="no_reliable_entity", entity_id=None, speech_presentation="uncertain")
+    elif case == "missing_group":
+        decisions[1]["primary_speaker_group"] = None
+        decisions[1]["resolution"] = "uncertain"
+        groundings[1]["primary_speaker_group"] = None
+    elif case == "uncertain_group":
+        decisions[1]["resolution"] = "uncertain"
+    elif case == "group_conflict":
+        groundings[1]["primary_speaker_group"] = "g1"
+    elif case == "entity_conflict":
+        groundings[1].update(binding_status="visible_entity", entity_id="e1", speech_presentation="onscreen_spoken",
+                             evidence_codes=["visible_lip_motion"])
+    elif case == "missing_inventory":
+        groundings.pop()
+    elif case == "multiple_speakers":
+        decisions[1].update(vocal_composition="sequential_multi_speaker_speech", resolution="needs_acoustic_refinement",
+                            secondary_vocal_activity={"present": True, "speaker_relation": "different_speaker", "kind": "speech"})
+    elif case == "negative_evidence":
+        groundings[0]["evidence_codes"] = ["offscreen_audio"]
+    payload["h3_semantics"]["shot1_caption"] = caption
+    record = source.record.model_copy(update={
+        "annotation": MimoAVAnnotationDraft.model_validate(payload),
+        "source_backend_provenance": SimpleNamespace(prompt_version="h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity"),
+    })
+    before = (source.job.model_dump(), record.model_dump(), sample.model_dump())
+    with pytest.raises(ValueError, match="two_step_speaker_marker_ambiguous|audio_reuse_authoritative_dialogue_mismatch"):
+        _two_step_speaker_markers(caption, source.job, record, speech)
+    assert (source.job.model_dump(), record.model_dump(), sample.model_dump()) == before
+
+
+def test_two_step_multi_markers_follow_transcribed_groups_not_subject_or_group_numbers(tmp_path):
+    from r2v_data_v2.h3.mimo25_h3_materializer import (
+        _audio_facts,
+        _prepare_materialization_context,
+        _two_step_speaker_markers,
+    )
+
+    groups = ("g1", "g2", "g1")
+    original, _, _ = _multi_marker_caption(groups)
+    _, sample, source = _case(tmp_path, groups, caption=original,
+                              speech_payloads=[("English", "Yes.")] * 3)
+    context = _prepare_materialization_context(sample, source.job, source.record, reuse_audio_contracts=[])
+    speech = _audio_facts(sample=context.sample, corrected=context.corrected,
+                          record=source.record, contract=context.contract).speech
+    job = source.job.model_copy(update={"segments": [
+        source.job.segments[0].model_copy(update={"asr_status": "empty", "asr_text": None, "asr_language": None}),
+        *source.job.segments[1:],
+    ]})
+    speech = [speech[1].model_copy(update={"speaker_id": "S1"}), speech[2].model_copy(update={"speaker_id": "S2"})]
+    record = source.record.model_copy(update={"source_backend_provenance": SimpleNamespace(
+        prompt_version="h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity",
+    )})
+    caption = "A voice asks, <d>[English] Yes.</d> <Subject 1> replies, <d>[English] Yes.</d>"
+    repaired, count = _two_step_speaker_markers(caption, job, record, speech)
+    assert repaired == "A voice (S1) asks, <d>[English] Yes.</d> <Subject 1> (S2) replies, <d>[English] Yes.</d>"
+    assert count == 2 and _blocks(repaired) == _blocks(caption)
+
+
+def test_two_step_multi_marker_helper_leaves_fully_marked_caption_to_existing_projection(tmp_path):
+    from r2v_data_v2.h3.mimo25_h3_materializer import (
+        _audio_facts,
+        _prepare_materialization_context,
+        _two_step_speaker_markers,
+    )
+
+    groups = ("g1", "g2", "g1")
+    caption, _, _ = _multi_marker_caption(groups, partial="complete")
+    _, sample, source = _case(tmp_path, groups, caption=caption,
+                              speech_payloads=[("English", f"Line {i}.") for i in range(len(groups))])
+    context = _prepare_materialization_context(sample, source.job, source.record, reuse_audio_contracts=[])
+    speech = _audio_facts(sample=context.sample, corrected=context.corrected,
+                          record=source.record, contract=context.contract).speech
+    record = source.record.model_copy(update={"source_backend_provenance": SimpleNamespace(
+        prompt_version="h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity",
+    )})
+    caption = caption.replace("Line 0.", "Model text.")
+    assert _two_step_speaker_markers(caption, source.job, record, speech) == (caption, 0)
+
+
+def test_multi_marker_repair_does_not_change_other_modes_or_legacy_materialization(tmp_path):
+    groups = ("g1", "g2", "g1")
+    caption, _, _ = _multi_marker_caption(groups)
+    _, sample, source = _case(tmp_path, groups, caption=caption,
+                              speech_payloads=[("English", f"Line {i}.") for i in range(len(groups))])
+    for prompt_version in ("h3_mimo25_speech_assembly_v49", "h3_mimo26_ra2va_single_v10_speaker_subject_consistency"):
+        record = source.record.model_copy(update={
+            "source_backend_provenance": SimpleNamespace(prompt_version=prompt_version),
+        })
+        with pytest.raises(ValueError, match="direct_dialogue_speaker_marker_missing"):
+            _materialize_sample(sample, source.job, record, reuse_audio_contracts=[])
+    record = source.record.model_copy(update={"source_backend_provenance": SimpleNamespace(
+        prompt_version="h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity",
+    )})
+    with pytest.raises(ValueError, match="direct_dialogue_speaker_marker_missing"):
+        _materialize_sample(sample, source.job, record)
+
+
 @pytest.mark.parametrize("case", [
     "multiple_groups", "missing_asr", "wrong_order", "wrong_text", "conflicting_marker",
     "unbound", "missing_entity", "negative_evidence", "competing_speaker", "subject_mapping", "unknown_lead", "other_actor",

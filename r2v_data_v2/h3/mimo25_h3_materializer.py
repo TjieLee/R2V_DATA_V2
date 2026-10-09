@@ -37,6 +37,7 @@ from r2v_data_v2.h3.mimo25_backend import (
     MimoSubjectDefinitionDraft,
     MimoVisualRetentionDraft,
     _visible_binding_is_permitted,
+    direct_speech_facts,
     protect_direct_dialogue,
 )
 from r2v_data_v2.h3.mimo25_recovered_voice import (
@@ -762,6 +763,103 @@ def _two_step_first_speaker_marker(
     return caption
 
 
+def _two_step_speaker_markers(
+    caption: str, job: MimoClipJob, record: FrozenAnnotationSource, speech: Sequence[RecaptionSpeechFact],
+) -> tuple[str, int]:
+    """Anchor complete multi-source dialogue only at unambiguous speech clauses."""
+    provenance = getattr(record, "source_backend_provenance", getattr(record, "backend_provenance", None))
+    if (not getattr(provenance, "prompt_version", "").startswith("h3_mimo26_ra2va_two_step_joint_")
+            or len({s.speaker_id for s in speech}) < 2):
+        return caption, 0
+    transcribed = [s for s in job.segments if s.asr_status == "transcribed"]
+    expected = [f"<d>[{s.asr_language or 'Unknown'}] {s.asr_text}</d>" for s in transcribed]
+
+    def ambiguous():
+        raise MimoH3MaterializationContractError([ValidationIssue(
+            "two_step_speaker_marker_ambiguous", "shot1_caption",
+            "marker repair requires exact speaker ownership and an unambiguous speech lead-in",
+        )])
+
+    blocks = list(re.finditer(r"<d>[\s\S]*?</d>", caption))
+    if len(blocks) != len(speech):
+        validate_authoritative_dialogue(caption, expected)
+        ambiguous()
+    leads, previous_end = [], 0
+    needs_repair = False
+    for index, (block, fact) in enumerate(zip(blocks, speech, strict=True)):
+        lead = caption[previous_end:block.start()]
+        markers = re.findall(r"\((S[1-9]\d*)\)", lead)
+        if any(marker != fact.speaker_id for marker in markers):
+            ambiguous()
+        boundary = index == 0 or fact.speaker_id != speech[index - 1].speaker_id
+        needs_repair |= boundary and not markers
+        leads.append((lead, boundary))
+        previous_end = block.end()
+    if not needs_repair:
+        return caption, 0
+    validate_authoritative_dialogue(caption, expected)
+
+    annotation = record.annotation
+    decisions = annotation.audio_observation.segment_decisions
+    groundings = annotation.av_grounding.segment_groundings
+    inventory = [s.segment_id for s in job.segments]
+    authoritative = direct_speech_facts(annotation, list(job.segments))
+    if ([d.segment_id for d in decisions] != inventory or [g.segment_id for g in groundings] != inventory
+            or [s.segment_id for s in speech] != [s.segment_id for s in transcribed]
+            or [(s.segment_id, s.speaker_id) for s in speech] != [
+                (s["segment_id"], s["speaker_id"]) for s in authoritative
+            ]):
+        ambiguous()
+    audio = {d.segment_id: d for d in decisions}
+    av = {g.segment_id: g for g in groundings}
+    views = {v.segment_id: v for v in annotation.visual_observation.segment_views}
+    restricted = two_step_identity_restricted_groups(annotation, provenance)
+    entity_groups, group_entities = {}, {}
+    for grounding in groundings:
+        group = grounding.primary_speaker_group
+        if grounding.entity_id is not None and (
+            entity_groups.setdefault(grounding.entity_id, group) != group
+            or group_entities.setdefault(group, grounding.entity_id) != grounding.entity_id
+        ):
+            ambiguous()
+    for fact in speech:
+        decision, grounding = audio[fact.segment_id], av[fact.segment_id]
+        if (speaker_ownership_reasons(decision) or decision.resolution != "resolved"
+                or decision.primary_speaker_group != fact.speaker_cluster_id
+                or grounding.primary_speaker_group != decision.primary_speaker_group
+                or (grounding.binding_status == "visible_entity" and decision.primary_speaker_group not in restricted
+                    and not _visible_binding_is_permitted(grounding, views.get(fact.segment_id)))):
+            ambiguous()
+
+    subjects = {s.subject_label: s.entity_id for s in job.reference_subjects if s.kind == "entity"}
+    pieces, inserted = [], 0
+    for (lead, boundary), block, fact in zip(leads, blocks, speech, strict=True):
+        clause = re.search(
+            r"(?:^\s*|(?<=[.!?])\s+)(?P<actor><Subject [1-9]\d*>|A voice|The voice|An offscreen voice|"
+            r"An off-screen voice|An unidentified voice)\s+(?:\((?P<marker>S[1-9]\d*)\)\s+)?"
+            r"(?P<verb>says|asks|replies|answers|adds|continues),\s*$", lead,
+        )
+        if clause is None or re.search(r"\(S[1-9]\d*\)", lead[:clause.start()]):
+            ambiguous()
+        actor = clause.group("actor")
+        grounding = av[fact.segment_id]
+        if actor.startswith("<Subject"):
+            if (subjects.get(actor) != fact.entity_id or fact.entity_id is None
+                    or grounding.entity_id != fact.entity_id
+                    or fact.speaker_cluster_id in restricted
+                    or not _visible_binding_is_permitted(grounding, views.get(fact.segment_id))):
+                ambiguous()
+        elif actor == "The voice" and boundary and clause.group("marker") is None:
+            ambiguous()
+        if boundary and clause.group("marker") is None:
+            position = clause.start("verb")
+            lead = lead[:position] + f"({fact.speaker_id}) " + lead[position:]
+            inserted += 1
+        pieces.extend((lead, block.group()))
+    pieces.append(caption[blocks[-1].end():])
+    return "".join(pieces), inserted
+
+
 def project_authoritative_dialogue(
     caption: str, speech: Sequence[RecaptionSpeechFact],
     presentations: Mapping[str, SpeechPresentation], contract: RecaptionReferenceContract,
@@ -1035,8 +1133,13 @@ def _materialize_sample(
     allowed_labels = {s.subject_label for s in contract.subjects}
     allowed_labels.update(label for s in contract.subjects for label in s.source_picture_labels)
     allowed_labels.update(a.audio_label for a in contract.audios)
+    caption = context.caption
+    if reuse_audio_contracts is not None:
+        caption, inserted = _two_step_speaker_markers(caption, job, record, facts.speech)
+        if inserted:
+            warnings.append(f"deterministic_correction_count:two_step_speaker_markers_inserted={inserted}")
     detailed, direct_issues, correction_warnings = protect_direct_dialogue(
-        context.caption,
+        caption,
         [{"segment_id": s.segment_id, "speaker_id": s.speaker_id, "language": s.language,
           "text": s.text} for s in facts.speech],
         allowed_labels=allowed_labels,
