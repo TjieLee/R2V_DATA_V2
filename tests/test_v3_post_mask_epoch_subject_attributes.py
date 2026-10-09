@@ -6185,7 +6185,7 @@ def test_terminal_completion_outcome_is_never_repaired(
 
 
 @pytest.mark.parametrize(
-    "key", ["seed", "generation_job_id", "owner_candidate_id", "sam_job_id", "review_job_id"]
+    "key", ["seed", "generation_job_id", "owner_candidate_id"]
 )
 def test_interrupted_completion_identity_drift_fails_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, key: str
@@ -6494,3 +6494,289 @@ def test_existing_completion_marker_refreshes_a_stale_pending_ledger(
     assert not marker.with_name("rank-0-outcome-conflict.json").exists()
     assert _completion_receipt_files(warm) == committed
     assert not _owner_outcome_path(warm).exists()
+
+
+def _completion_graph_for(runner: Any, storage: Any) -> dict[str, Any]:
+    owner_plan = _owner_plan_of(runner)
+    discovery_job = runner._expected_discovery_job(SHARD, CLIP_UID, owner_plan)
+    discovery = SubjectAttributeDiscovery.model_validate(
+        runner._discovery_payload(SHARD, CLIP_UID, owner_plan)["discovery"]
+    )
+    context = runner._rank0_context(
+        SHARD, storage, CLIP_UID, owner_plan, discovery, discovery_job.job_id()
+    )
+    return runner._owner_graph(
+        SHARD, storage, CLIP_UID, owner_plan, context, use_completion_cache=False
+    )
+
+
+def _commit_completion_model_result(
+    runner: Any, job: ModelJob, handle: Any, *, phase_id: str
+) -> None:
+    """Use the real model-result publication protocol, without finalization."""
+    phase = runner.ledger.phase(phase_id)
+    phase.write_plan([job])
+    result = runner.run(job, handle)
+    artifacts = {
+        name: phase.publish_artifact(job.job_id(), name, data)
+        for name, data in result.artifacts.items()
+    }
+    result_digest = phase.publish_result(job, result)
+    receipt = phase.commit(
+        job, outcome=result.outcome, artifact_digests=artifacts,
+        result_digest=result_digest, external_artifacts=result.external_artifacts,
+    )
+    runner.ledger.note_commit(phase_id, receipt)
+
+
+def _changed_completion_generation(
+    tmp_path: Path, config: Any, storage: Any, runner: Any, rank: int,
+) -> tuple[Any, Any, Any]:
+    """A historical concurrent generation committed another image for one job."""
+    old_chain = _completion_graph_for(runner, storage)[f"chains{rank}"]["a1"]
+    job = old_chain.generate_job
+    phase_id = runner.ledger.phase_for(job)
+    assert phase_id is not None
+    backend = _BooguBackend(_generated_png(colour=(80, 170, 110)))
+    _commit_completion_model_result(runner, job, backend, phase_id=phase_id)
+    assert backend.calls == 1
+    assert backend.seeds == [old_chain.seed]
+    records, _ = runner.ledger.phase(phase_id).load_receipts()
+    duplicates = [record for record in records if record["job_id"] == job.job_id()]
+    assert len(duplicates) == 2
+    assert duplicates[0]["job_identity"] == duplicates[1]["job_identity"]
+    assert duplicates[0]["result_digest"] != duplicates[1]["result_digest"]
+    cold = _runner(config, storage, tmp_path, ledger_name=Path(runner.ledger.root).name)
+    new_chain = _completion_graph_for(cold, storage)[f"chains{rank}"]["a1"]
+    assert new_chain.generate_job.job_id() == job.job_id()
+    assert new_chain.sam_job.job_id() != old_chain.sam_job.job_id()
+    assert new_chain.next_job.job_id() == new_chain.sam_job.job_id()
+    return cold, old_chain, new_chain
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("paid_stages", [0, 1, 2])
+def test_changed_completion_generation_resumes_only_current_downstream_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, rank: int, paid_stages: int,
+) -> None:
+    """A changed committed image invalidates derived jobs, not the frozen owner."""
+    config, storage, runner, path, old_marker = _interrupted_completion_owner(
+        tmp_path, monkeypatch, rank=rank
+    )
+    stale_bytes = path.read_bytes()
+    cold, old_chain, chain = _changed_completion_generation(
+        tmp_path, config, storage, runner, rank
+    )
+    if paid_stages:
+        _commit_completion_model_result(
+            cold, chain.sam_job,
+            _SamBackend(generated=[[_attribute_mask(storage, slot=1, band=0)]]),
+            phase_id="recovered-sam",
+        )
+        chain = _completion_graph_for(cold, storage)[f"chains{rank}"]["a1"]
+        assert chain.review_job.job_id() != old_chain.review_job.job_id()
+    if paid_stages == 2:
+        _commit_completion_model_result(
+            cold, chain.review_job,
+            _QwenClient(completion_reviews=[_completion_review("accept")]),
+            phase_id="recovered-review",
+        )
+        chain = _completion_graph_for(cold, storage)[f"chains{rank}"]["a1"]
+        assert chain.accepted
+
+    paid = _completion_receipt_files(cold)
+    jobs = cold.seed_jobs()
+
+    expected = [] if paid_stages == 2 else [chain.next_job.job_id()]
+    assert [job.job_id() for job in jobs] == expected
+    assert _completion_receipt_files(cold) == paid
+    if jobs:
+        assert jobs[0].job_type == (
+            SUBJECT_ATTRIBUTE_COMPLETION_SAM_JOB if paid_stages == 0
+            else SUBJECT_ATTRIBUTE_COMPLETION_REVIEW_JOB
+        )
+        assert path.read_bytes() == stale_bytes
+        assert not _owner_outcome_path(cold).exists()
+        # A second interruption before the pending model call must neither pay
+        # old jobs nor loop on the old terminal marker.
+        cold = _runner(config, storage, tmp_path, ledger_name=Path(runner.ledger.root).name)
+        again = cold.seed_jobs()
+        assert [job.job_id() for job in again] == expected
+        assert _completion_receipt_files(cold) == paid
+        assert path.read_bytes() == stale_bytes
+
+    qwen = _QwenClient(completion_reviews=[_completion_review("accept")])
+    sam = _SamBackend(generated=[[_attribute_mask(storage, slot=1, band=0)]])
+    boogu = _BooguBackend()
+    executor, _ = _drain(cold, qwen, sam=sam, boogu=boogu)
+
+    assert boogu.calls == sam.calls == qwen.discovery_calls == qwen.review_calls == 0
+    assert sam.generated_calls == int(paid_stages == 0)
+    assert qwen.completion_review_calls == int(paid_stages < 2)
+    assert all(job.job_type == SUBJECT_ATTRIBUTE_COMPLETION_REVIEW_JOB for job in executor.executed)
+    repaired = json.loads(path.read_text(encoding="utf-8"))
+    assert repaired["generation_job_id"] == old_marker["generation_job_id"]
+    assert repaired["seed"] == old_marker["seed"]
+    assert repaired["sam_job_id"] != old_marker["sam_job_id"]
+    assert repaired["review_job_id"] != old_marker["review_job_id"]
+    assert repaired["status"] == "accepted"
+    backup = path.with_name(f"rank-{rank}-outcome-conflict.json")
+    assert backup.read_bytes() == stale_bytes
+    assert cold.reconcile_stats(SHARD).terminal_clips == 1
+    record, = _read_artifact(storage).records
+    assert record.final_selection == "completed"
+    with Image.open(_output_root(storage) / record.image_path) as image:
+        assert np.any(np.all(np.asarray(image.convert("RGB")) == (80, 170, 110), axis=2))
+
+    stable = {item: item.read_bytes() for item in (path, backup, _owner_artifact_file(storage))}
+    second = _runner(config, storage, tmp_path, ledger_name=Path(runner.ledger.root).name)
+    assert second.seed_jobs() == []
+    assert {item: item.read_bytes() for item in stable} == stable
+
+
+def test_changed_rank0_accept_drops_historical_rank1_from_current_routing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A new accepted rank 0 must not publish the previously accepted rank 1."""
+    config, storage, runner, rank1_path, _ = _interrupted_completion_owner(
+        tmp_path, monkeypatch, rank=1
+    )
+    rank1_bytes = rank1_path.read_bytes()
+    cold, _old_chain, chain = _changed_completion_generation(
+        tmp_path, config, storage, runner, 0
+    )
+    sam = _SamBackend(generated=[[_attribute_mask(storage, slot=1, band=0)]])
+    qwen = _QwenClient(completion_reviews=[_completion_review("accept")])
+    boogu = _BooguBackend()
+
+    _drain(cold, qwen, sam=sam, boogu=boogu)
+
+    assert boogu.calls == qwen.discovery_calls == qwen.review_calls == sam.calls == 0
+    assert qwen.completion_review_calls == sam.generated_calls == 1
+    assert rank1_path.read_bytes() == rank1_bytes
+    artifact = _read_artifact(storage)
+    record, = artifact.records
+    assert record.completion_seed == chain.seed
+    assert artifact.metrics.attribute_completion_candidate1_accepted == 1
+    assert artifact.metrics.attribute_completion_candidate2_accepted == 0
+    assert artifact.metrics.attribute_second_candidate_attempts == 0
+    assert cold.reconcile_stats(SHARD).terminal_clips == 1
+
+
+def test_changed_rank0_reject_unlocks_original_rank1_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The old rank-0 accept cannot suppress newly necessary candidate 2 work."""
+    config, storage, runner, _path, _ = _interrupted_completion_owner(tmp_path, monkeypatch)
+    cold, _old_chain, chain = _changed_completion_generation(
+        tmp_path, config, storage, runner, 0
+    )
+    _commit_completion_model_result(
+        cold, chain.sam_job,
+        _SamBackend(generated=[[_attribute_mask(storage, slot=1, band=0)]]),
+        phase_id="recovered-sam",
+    )
+    chain = _completion_graph_for(cold, storage)["chains0"]["a1"]
+    _commit_completion_model_result(
+        cold, chain.review_job,
+        _QwenClient(completion_reviews=[_completion_review("reject")]),
+        phase_id="recovered-review",
+    )
+
+    jobs = cold.seed_jobs()
+
+    assert len(jobs) == 1
+    assert jobs[0].job_type == SUBJECT_ATTRIBUTE_RAW_REVIEW_JOB
+    assert dict(jobs[0].target)["candidate_rank"] == "1"
+    qwen = _QwenClient(
+        reviews=[SubjectAttributeReviewBatch(
+            owner_entity_id=OWNER,
+            reviews=[_raw_review("a1", structure_complete=False, completion_recommended=True)],
+        )],
+        completion_reviews=[_completion_review("accept")],
+    )
+    sam = _SamBackend(generated=[[_attribute_mask(storage, slot=0, band=0)]])
+    boogu = _BooguBackend(_generated_png(colour=(40, 90, 200)))
+
+    _drain(cold, qwen, sam=sam, boogu=boogu)
+
+    assert qwen.discovery_calls == sam.calls == 0
+    assert qwen.review_calls == qwen.completion_review_calls == sam.generated_calls == boogu.calls == 1
+    artifact = _read_artifact(storage)
+    assert artifact.metrics.attribute_completion_candidate1_accepted == 0
+    assert artifact.metrics.attribute_completion_candidate2_accepted == 1
+    assert artifact.records[0].completion_seed == boogu.seeds[0]
+    assert cold.reconcile_stats(SHARD).terminal_clips == 1
+
+
+def test_changed_generation_does_not_rewrite_terminal_owner_or_clip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dependent job rederivation is not authority to replace published output."""
+    config, storage, runner, path, _ = _interrupted_completion_owner(tmp_path, monkeypatch)
+    published = _runner(config, storage, tmp_path, ledger_name=Path(runner.ledger.root).name)
+    assert published.seed_jobs() == []
+    paths = (
+        path, _owner_outcome_path(published), _owner_artifact_file(storage),
+        published._clip_outcome_path(SHARD, CLIP_UID), _sample_path(storage),
+    )
+    stable = {item: item.read_bytes() for item in paths}
+    cold, _old_chain, _new_chain = _changed_completion_generation(
+        tmp_path, config, storage, published, 0
+    )
+
+    with pytest.raises(SubjectAttributeDurableError):
+        cold.seed_jobs()
+
+    assert {item: item.read_bytes() for item in stable} == stable
+    assert not path.with_name("rank-0-outcome-conflict.json").exists()
+
+
+def test_later_completion_generation_change_reuses_original_conflict_backup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second paid replacement does not create or rewrite backup versions."""
+    config, storage, runner, path, _ = _interrupted_completion_owner(tmp_path, monkeypatch)
+    original_marker = path.read_bytes()
+    cold, _old_chain, chain = _changed_completion_generation(
+        tmp_path, config, storage, runner, 0
+    )
+    generation = chain.generate_job
+    for colour in (None, (210, 180, 60)):
+        if colour is not None:
+            phase_id = cold.ledger.phase_for(generation)
+            assert phase_id is not None
+            _commit_completion_model_result(
+                cold, generation, _BooguBackend(_generated_png(colour=colour)),
+                phase_id=phase_id,
+            )
+            cold = _runner(config, storage, tmp_path, ledger_name=Path(runner.ledger.root).name)
+            chain = _completion_graph_for(cold, storage)["chains0"]["a1"]
+        _commit_completion_model_result(
+            cold, chain.sam_job,
+            _SamBackend(generated=[[_attribute_mask(storage, slot=1, band=0)]]),
+            phase_id="recovered-sam",
+        )
+        chain = _completion_graph_for(cold, storage)["chains0"]["a1"]
+        _commit_completion_model_result(
+            cold, chain.review_job,
+            _QwenClient(completion_reviews=[_completion_review("accept")]),
+            phase_id="recovered-review",
+        )
+        if colour is None:
+            with monkeypatch.context() as patch:
+                def crash_publication(*args: Any, **kwargs: Any) -> None:
+                    raise RuntimeError("interrupt after repaired marker")
+
+                patch.setattr(cold, "_publish_owner_artifact", crash_publication)
+                with pytest.raises(RuntimeError, match="interrupt after repaired marker"):
+                    cold.seed_jobs()
+            first_replacement = path.read_bytes()
+            assert first_replacement != original_marker
+        else:
+            assert cold.seed_jobs() == []
+            assert path.read_bytes() != first_replacement
+        assert path.with_name("rank-0-outcome-conflict.json").read_bytes() == original_marker
+
+    assert cold.reconcile_stats(SHARD).terminal_clips == 1
+    assert len(list(path.parent.glob("*outcome-conflict*"))) == 1
