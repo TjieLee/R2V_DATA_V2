@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 import subprocess
 import tempfile
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter
 from typing import Literal
 
 from pydantic import Field, model_validator
@@ -55,6 +57,7 @@ DERIVED_MODES = ("first_frame", "last_frame", "first_last_frame")
 FRAME_STAGE = "h3_frame_conditioned_products_v1"
 PROJECTION_VERSION = "h3_frame_conditioning_projection_v1"
 EXTRACTION_VERSION = "exact_decoded_first_last_png_v1"
+FFMPEG_TIMEOUT_SECONDS = 30.0
 SECTIONS = ("subject_definitions", "summary", "retention_analysis", "detailed_description",
             "overall_soundscape", "non_diegetic_music")
 _PICTURE = re.compile(r"<Picture [1-9]\d*>")
@@ -347,17 +350,30 @@ def load_projection_sources(shadow: Path) -> tuple[list[ProjectionSource], dict[
 
 
 def extract_frames(job: MimoClipJob, stage: Path, published: Path, *, ffmpeg: str) -> FrameMetadata:
-    """Decode the opening frame and retain the final decoded frame of a tail seek."""
+    """Extract exact first/last frames with bounded, independently logged FFmpeg calls."""
     video = Path(job.target_video_path)
     stage.mkdir(parents=True)
     for name in ("first", "last"):
-        # Keep the preceding keyframe, then decode to EOF (also handles short/VFR clips).
-        seek = ["-sseof", "-1", "-noaccurate_seek"] if name == "last" else []
-        output = ["-update", "1"] if name == "last" else ["-frames:v", "1"]
-        subprocess.run([ffmpeg, "-nostdin", "-v", "error", "-noautorotate", *seek, "-i", str(video),
-                        "-map", "0:v:0", "-an", "-sn", "-dn", *output,
-                        "-fps_mode", "passthrough", "-threads", "1",
-                        str(stage / f"{name}.png")], check=True, capture_output=True)
+        filters = ["-vf", "reverse"] if name == "last" else []
+        command = [ffmpeg, "-nostdin", "-v", "error", "-noautorotate", "-i", str(video),
+                   "-map", "0:v:0", "-an", "-sn", "-dn", *filters, "-frames:v", "1",
+                   "-fps_mode", "passthrough", "-threads", "1", str(stage / f"{name}.png")]
+        progress = f"Frame Projection: clip_uid={job.clip_uid} frame={name}"
+        print(f"{progress} start video={video}", flush=True)
+        started = perf_counter()
+        try:
+            subprocess.run(command, check=True, capture_output=True, timeout=FFMPEG_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired as exc:
+            # subprocess.run kills and waits for the child before raising TimeoutExpired.
+            message = (f"FFmpeg timeout: {progress} elapsed={perf_counter() - started:.2f}s "
+                       f"limit={FFMPEG_TIMEOUT_SECONDS:g}s video={video} command={shlex.join(command)}")
+            print(message, flush=True)
+            raise TimeoutError(message) from exc
+        except subprocess.CalledProcessError as exc:
+            print(f"{progress} failed elapsed={perf_counter() - started:.2f}s returncode={exc.returncode} "
+                  f"video={video} command={shlex.join(command)}", flush=True)
+            raise
+        print(f"{progress} done elapsed={perf_counter() - started:.2f}s", flush=True)
     metadata = FrameMetadata(
         clip_uid=job.clip_uid, source_video_path=job.target_video_path, source_video_sha256=job.target_video_sha256,
         source_duration_seconds=job.target_duration_seconds,

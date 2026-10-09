@@ -7,6 +7,7 @@ import shutil
 import subprocess
 from collections import Counter
 from pathlib import Path
+from time import perf_counter
 from types import SimpleNamespace
 
 import numpy as np
@@ -37,7 +38,7 @@ def ffmpeg():
 @pytest.mark.parametrize("count,variable,rotate,audio_tail", [(1, False, False, False), (3, False, False, False),
                                                             (48, False, True, False), (24, True, False, False),
                                                             (24, False, False, True)])
-def test_tail_seek_matches_exact_sequential_decode_without_video_hash(tmp_path, monkeypatch, ffmpeg, count, variable, rotate, audio_tail):
+def test_reverse_matches_exact_sequential_decode_without_video_hash(tmp_path, monkeypatch, ffmpeg, count, variable, rotate, audio_tail):
     inputs = tmp_path / "inputs"
     inputs.mkdir()
     for i in range(count):
@@ -81,6 +82,61 @@ def test_tail_seek_matches_exact_sequential_decode_without_video_hash(tmp_path, 
     for path, expected in ((metadata.first_frame_path, pixels[0]), (metadata.last_frame_path, pixels[-1])):
         with Image.open(path) as image:
             np.testing.assert_array_equal(np.asarray(image), expected)
+
+
+def test_extract_frames_uses_bounded_reverse_and_prints_progress(tmp_path, monkeypatch, capsys):
+    job = SimpleNamespace(clip_uid="bounded-clip", target_video_path=str(tmp_path / "source video.mp4"),
+                          target_video_sha256="a" * 64, target_duration_seconds=2.0)
+    calls = []
+
+    def run(command, **kwargs):
+        assert kwargs.get("timeout") == 30.0
+        assert kwargs["check"] and kwargs["capture_output"]
+        assert not {"-sseof", "-noaccurate_seek", "-update"}.intersection(command)
+        assert command[command.index("-frames:v") + 1] == "1"
+        calls.append(command)
+        Image.new("RGB", (8, 8), "red").save(command[-1])
+
+    monkeypatch.setattr(frame.subprocess, "run", run)
+    frame.extract_frames(job, tmp_path / "frames", tmp_path / "published", ffmpeg="ffmpeg")
+    assert len(calls) == 2
+    assert "-vf" not in calls[0]
+    assert calls[1][calls[1].index("-vf") + 1] == "reverse"
+    printed = capsys.readouterr().out
+    for role in ("first", "last"):
+        assert f"clip_uid=bounded-clip frame={role} start" in printed
+        assert f"clip_uid=bounded-clip frame={role} done elapsed=" in printed
+
+
+@pytest.mark.parametrize("role", ["first", "last"])
+def test_extract_frames_timeout_kills_child_and_reports_context(tmp_path, monkeypatch, capsys, role):
+    pid_path = tmp_path / "child.pid"
+    executable = tmp_path / "blocked-ffmpeg"
+    executable.write_text(
+        "#!/bin/sh\n"
+        + ("for output do :; done\n"
+           "if [ \"${output##*/}\" = first.png ]; then\n"
+           "    printf first > \"$output\"\n    exit 0\nfi\n" if role == "last" else "")
+        + f"printf '%s' \"$$\" > {str(pid_path)!r}\n"
+        "exec /bin/sleep 60\n"
+    )
+    executable.chmod(0o755)
+    job = SimpleNamespace(clip_uid="blocked-clip", target_video_path=str(tmp_path / "source video.mp4"),
+                          target_video_sha256="a" * 64, target_duration_seconds=2.0)
+    monkeypatch.setattr(frame, "FFMPEG_TIMEOUT_SECONDS", 3.0)
+    started = perf_counter()
+    with pytest.raises(TimeoutError) as failure:
+        frame.extract_frames(job, tmp_path / "frames", tmp_path / "published", ffmpeg=str(executable))
+    assert perf_counter() - started < 10
+    printed = capsys.readouterr().out
+    for expected in ("FFmpeg timeout", "clip_uid=blocked-clip", f"frame={role}", job.target_video_path,
+                     "command=", str(executable)):
+        assert expected in str(failure.value)
+        assert expected in printed
+    pid = int(pid_path.read_text())
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+    assert not (tmp_path / "frames/metadata.json").exists()
 
 
 def _fixture(tmp_path, monkeypatch, ffmpeg):

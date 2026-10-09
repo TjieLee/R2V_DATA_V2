@@ -139,9 +139,14 @@ Audio references, and Subject metadata. Frame projection does not reload stems
 or annotations, reconstruct H3 products, compare rendered captions, or rehash
 input media. It computes each new PNG digest once for the existing metadata.
 Each clip's first/last frame pair is extracted once and reused across Audio
-conditioning variants. The last-frame decoder seeks near EOF, keeps the preceding
-keyframe, and decodes through EOF without resizing, autorotation, or FPS conversion.
-It no longer reverses the complete video.
+conditioning variants. Last-frame extraction uses the previously server-tested
+`-vf reverse -frames:v 1`, without resizing, autorotation, or FPS conversion.
+The tail-seek/update strategy introduced in `64a467e` was withdrawn after a real
+server run stalled in FFmpeg. Each first/last subprocess has a 30-second timeout;
+Python stops and reaps the child on timeout, then reports the clip UID, frame
+role, video path, elapsed time, and exact command. Flushed start/done logs show
+each frame's progress and elapsed time. A timeout fails the export rather than
+retrying, substituting a frame, or leaving an indefinitely running subprocess.
 
 The frozen Audio asset writer reads source PCM for the actual timeline copy,
 writes lossless FLAC, and records its digest once. It does not hash input media
