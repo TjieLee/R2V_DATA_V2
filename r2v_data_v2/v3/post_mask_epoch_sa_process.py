@@ -9,6 +9,7 @@ no child ever writes a production artifact or touches GroupLedger.
 from __future__ import annotations
 
 import multiprocessing as mp
+import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -215,14 +216,20 @@ class SAProcessPool:
                 connection.send(("close", {}))
             except (OSError, EOFError, BrokenPipeError):
                 pass
+        # One shared shutdown deadline, not 32 sequential 30-second waits.
+        deadline = time.monotonic() + self.shutdown_seconds
         for process in self._processes:
-            process.join(timeout=self.shutdown_seconds)
+            process.join(timeout=max(0.0, deadline - time.monotonic()))
+        for process in self._processes:
             if process.is_alive():
                 process.terminate()
-                process.join(timeout=10)
+        deadline = time.monotonic() + 10
+        for process in self._processes:
+            process.join(timeout=max(0.0, deadline - time.monotonic()))
+        for process in self._processes:
             if process.is_alive():
                 process.kill()
-                process.join(timeout=10)
+                process.join(timeout=2)
         for connection in self._connections:
             connection.close()
         self._connections.clear()
