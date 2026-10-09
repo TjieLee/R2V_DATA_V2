@@ -113,7 +113,7 @@ def _wait_execution(stop_event, heartbeat, seconds):
 def run_http_fake_worker(client, *, node_id, worker_instance, stop_event, fake_delay_seconds=0):
     if not 0 <= fake_delay_seconds <= 2:
         raise ValueError("fake delay must be between 0 and 2 seconds")
-    counters = {"executed": 0, "accepted": 0, "model_call_count": 0}
+    counters = {"executed": 0, "accepted": 0, "model_call_count": 0, "reused_checkpoints": 0}
     previous = None
     while not stop_event.is_set():
         sent = time.monotonic()
@@ -164,12 +164,16 @@ def run_http_fake_worker(client, *, node_id, worker_instance, stop_event, fake_d
                     if not _wait_execution(stop_event, heartbeat, fake_delay_seconds):
                         break
                     upstream = task["upstream_status"]
-                    if upstream is not None and upstream != "ready":
+                    if "checkpoint" in task:
+                        status, payload = "ready", task["checkpoint"]
+                        counters["reused_checkpoints"] += 1
+                    elif upstream is not None and upstream != "ready":
                         status, payload = "skipped", {"fake": True, "reason": "upstream_terminal",
                                                       "upstream_status": upstream}
                     else:
                         status, payload = "ready", backend.process(GroupTask(**task["task"]))
-                    counters["executed"] += 1
+                    if "checkpoint" not in task:
+                        counters["executed"] += 1
                     if not heartbeat.execution_allowed() or stop_event.is_set():
                         break
                     body = {k: task[k] for k in ("session_id", "task_id", "claim_token")} | {
@@ -249,5 +253,5 @@ def run_http_fake_workers(*, coordinator_url, node_id, workers, fake_delay_secon
             signal.signal(sig, handler)
         reports.close()
     return {key: sum(result[key] for result in results)
-            for key in ("executed", "accepted", "model_call_count")} | {
+            for key in ("executed", "accepted", "model_call_count", "reused_checkpoints")} | {
                 "invocation_elapsed_seconds": time.monotonic() - started, "node_id": node_id}

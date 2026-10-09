@@ -108,6 +108,23 @@ class HttpGroupCoordinator:
                 atomic_json(self.core.control_path, control)
         for sid in expired:
             self._retire(sid)
+        # A crash can occur after durable revocation but before this policy result.
+        # Inspect only active interrupted requests, never completed media/results.
+        for ordinal, row in self._dispatch_state()["active"].items():
+            meta = row["http"]
+            events = meta["events"]
+            if meta.get("revoked") and "request_started" in events and "response_saved" not in events:
+                sid = row["worker_id"]
+                held = self.claims.pop(sid, None)
+                if held is None:
+                    held = self.core.restore_claim(self.snapshot, int(ordinal), sid)
+                try:
+                    self.core.publish(held, "failed", {
+                        "fake": True, "failure_reason": "interrupted_request_unresolved",
+                        "model_call_count": 0,
+                    }, 0, receipt_metadata=meta)
+                finally:
+                    held.close()
 
     def _retire(self, sid):
         claim = self.claims.pop(sid, None)
@@ -168,7 +185,8 @@ class HttpGroupCoordinator:
             "group_id": self.snapshot.group_id, "stage": self.snapshot.stage,
             "generation": self.snapshot.generation, "ordinal": claim.task.ordinal,
         }, "claim_token": row["http"]["claim_token"], "task": asdict(claim.task),
-            "upstream_status": upstream, "lease_seconds": LEASE_SECONDS}
+            "upstream_status": upstream, "lease_seconds": LEASE_SECONDS,
+            **({"checkpoint": row["http"]["checkpoint"]} if "checkpoint" in row["http"] else {})}
 
     def _connect(self, body):
         node, instance = body["node_id"], body["worker_instance"]
@@ -178,6 +196,7 @@ class HttpGroupCoordinator:
             if meta["node_id"] == node and meta["worker_instance"] == instance:
                 if (not member["released"] and not meta.get("expired")
                         and meta["lease_deadline"] > self.wall_clock()):
+                    self._heartbeat({"session_id": sid, "generation": control["generation"]})
                     return self._context() | {"session_id": sid, "claim": self._claim_wire(sid)}
                 if not body.get("resources_closed"):
                     raise ClaimConflict("local execution must close before a new session")
@@ -212,6 +231,7 @@ class HttpGroupCoordinator:
         return self._context() | {"session_id": sid}
 
     def _claim(self, body):
+        self._expire()
         sid, _ = self._member(body)
         existing = self._claim_wire(sid)
         if existing is not None:
@@ -219,6 +239,14 @@ class HttpGroupCoordinator:
         if self.core.status()["phase"] != "running":
             return self._context() | {"task": None}
         meta = {"claim_token": uuid.uuid4().hex, "revoked": False, "events": {}}
+        self.core.recover(self.snapshot)
+        for row in self._dispatch_state()["active"].values():
+            if row["http"].get("revoked"):
+                events = row["http"]["events"]
+                if "response_saved" in events:
+                    meta["events"] = events
+                    meta["checkpoint"] = events["response_saved"]["checkpoint"]
+                break
         claim = self.core.claim(self.snapshot, sid, claim_metadata=meta)
         if claim is None:
             return self._context() | {"task": None}
@@ -275,6 +303,10 @@ class HttpGroupCoordinator:
             raise ClaimConflict("unknown execution event")
         with self.core._checked(self.snapshot) as (_, dispatch):
             events = dispatch["active"][str(claim.task.ordinal)]["http"]["events"]
+            if event == "response_saved" and ("request_started" not in events or body.get("checkpoint") is None):
+                raise ClaimConflict("saved response requires prior intent and a checkpoint")
+            if event in events and events[event]["checkpoint"] != body.get("checkpoint"):
+                raise ClaimConflict("execution event checkpoint differs")
             events.setdefault(event, {"at": self.wall_clock(), "checkpoint": body.get("checkpoint")})
             self.core._save_dispatch(self.snapshot, dispatch)
         return {"accepted": True}
