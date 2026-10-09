@@ -1444,9 +1444,8 @@ class SubjectAttributeEpochRunner:
         }
         self.emit = emit
         self.clip_quarantine = None
-        # Only the composition's pre-existing SAT_STARTED barrier authorizes
-        # production checkpoint-first replay. Standalone/fresh runners retain
-        # their historical strict plan/artifact verification behavior.
+        # Composition compatibility flag; completed owner/clip outcomes are
+        # restart authority regardless of how this runner is invoked.
         self.checkpoint_first_resume = False
         # Invocation-local execution cache only. The first access still
         # re-derives and validates the complete frozen clip plan from live
@@ -1472,13 +1471,11 @@ class SubjectAttributeEpochRunner:
         ] = {}
         self._fresh_completed_clips: set[tuple[str, str]] = set()
         self._cold_completed_clips: set[tuple[str, str]] = set()
-        # Only owners published by this runner can enter this execution cache.
-        # A new runner has no entries and retains the strict durable replay.
+        # Published or loaded terminal owners share this batch-local cache.
         self._fresh_owner_terminal_cache: dict[
             tuple[str, str, str], tuple[dict[str, Any], OwnerEnrichmentArtifact]
         ] = {}
         self._fresh_owner_terminal_cache_lock = threading.Lock()
-        self._resume_policy: dict[str, Any] | None = None
         # These invocation caches span one active execution batch (normally
         # 128 clips); a drained batch clears them before the next starts.
         self._owner_candidate_cache: dict[
@@ -1949,8 +1946,6 @@ class SubjectAttributeEpochRunner:
             raise SubjectAttributeDurableError(
                 f"completed Subject Attributes clip has no frozen plan for {clip_uid!r}"
             )
-        if self._resume_policy is None:
-            self._resume_policy = self._policy_identity()
         plan_keys = {
             "schema", "clip_uid", "policy", "clip_digest", "effective_export",
             "frames_sha256", "masks_sha256", "classification", "subject_owners",
@@ -1959,7 +1954,7 @@ class SubjectAttributeEpochRunner:
             set(plan) != plan_keys
             or plan.get("schema") != SUBJECT_ATTRIBUTE_CLIP_PLAN_SCHEMA
             or plan.get("clip_uid") != clip_uid
-            or plan.get("policy") != self._resume_policy
+            or not isinstance(plan.get("policy"), dict)
             or plan.get("classification") not in {CLIP_NO_WORK, CLIP_OWNERS}
             or not isinstance(plan.get("subject_owners"), list)
             or not isinstance(plan.get("effective_export"), dict)
@@ -1978,46 +1973,11 @@ class SubjectAttributeEpochRunner:
             raise SubjectAttributeDurableError(
                 f"frozen Subject Attributes owners drifted for {clip_uid!r}"
             )
-        marker_keys = {
-            "schema", "clip_uid", "terminal", "counts", "owner_outcome_ids",
-            "enriched_sample_path", "enriched_sample_sha256",
-        }
-        counts = marker.get("counts")
-        empty_counts = ClipEnrichmentResult(
-            clip_uid=clip_uid,
-            totals=EnrichmentTotals(),
-            owner_limit_reached=False,
-            enriched_sample=None,
-        ).to_counts()
-        if (
-            set(marker) != marker_keys
-            or marker.get("schema") != SUBJECT_ATTRIBUTE_CLIP_OUTCOME_SCHEMA
-            or marker.get("clip_uid") != clip_uid
-            or marker.get("terminal") != "ready"
-            or not isinstance(counts, dict)
-            or set(counts) != set(empty_counts)
-            or any(
-                not isinstance(name, str)
-                or type(value) is not type(empty_counts[name])
-                or not math.isfinite(value)
-                or value < 0
-                for name, value in counts.items()
-            )
-            or (plan["classification"] == CLIP_NO_WORK and counts != empty_counts)
-            or marker.get("owner_outcome_ids") != [
-                owner["owner_entity_id"] for owner in owners if owner["eligible"]
-            ]
-            or marker.get("enriched_sample_path") is not None
-            and not isinstance(marker["enriched_sample_path"], str)
-            or marker.get("enriched_sample_sha256") is not None
-            and not isinstance(marker["enriched_sample_sha256"], str)
-            or (marker.get("enriched_sample_path") is None)
-            != (marker.get("enriched_sample_sha256") is None)
-        ):
-            raise SubjectAttributeDurableError(
-                f"completed Subject Attributes clip outcome drifted for {clip_uid!r}"
-            )
+        marker = self._verified_clip_outcome(
+            shard, self._storage_for(shard), clip_uid, plan, marker
+        )
         self._completed_clip_cache[key] = (plan, marker)
+        self._cold_completed_clips.add(key)
         return plan, marker
 
     def _eligible_owners(self, plan: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -2554,7 +2514,7 @@ class SubjectAttributeEpochRunner:
         attribute_id_start: int,
         outcome: Mapping[str, Any],
     ) -> OwnerEnrichmentArtifact:
-        """Rebuild one terminal owner artifact from its durable outcome."""
+        """Load a published owner once, without replaying historical receipts."""
         fresh = self._fresh_owner_terminal(shard, clip_uid, owner_entity_id)
         if (
             fresh is not None
@@ -2569,26 +2529,35 @@ class SubjectAttributeEpochRunner:
             sample_id=clip_uid,
             owner_entity_id=owner_entity_id,
         )
-        expected_sha = str(outcome["artifact_sha256"])
-        if not path.is_file():
+        try:
+            artifact = OwnerEnrichmentArtifact.model_validate_json(
+                path.read_text(encoding="utf-8")
+            )
+        except FileNotFoundError as exc:
             raise SubjectAttributeDurableError(
                 f"Subject Attributes owner artifact is missing for "
                 f"{clip_uid}/{owner_entity_id}"
-            )
-        if _file_sha256(path) != expected_sha:
-            raise SubjectAttributeDurableError(
-                f"Subject Attributes owner artifact drifted for "
-                f"{clip_uid}/{owner_entity_id}"
-            )
-        try:
-            return OwnerEnrichmentArtifact.model_validate_json(
-                path.read_text(encoding="utf-8")
-            )
+            ) from exc
         except ValueError as exc:
             raise SubjectAttributeDurableError(
                 f"Subject Attributes owner artifact is invalid for "
                 f"{clip_uid}/{owner_entity_id}"
             ) from exc
+        if (
+            artifact.sample_id != clip_uid
+            or artifact.owner_entity_id != owner_entity_id
+            or artifact.attribute_id_start != attribute_id_start
+            or len(artifact.records) != outcome["record_count"]
+        ):
+            raise SubjectAttributeDurableError(
+                f"Subject Attributes owner outcome/artifact identity drifted for "
+                f"{clip_uid}/{owner_entity_id}"
+            )
+        with self._fresh_owner_terminal_cache_lock:
+            self._fresh_owner_terminal_cache[(shard, clip_uid, owner_entity_id)] = (
+                dict(outcome), artifact
+            )
+        return artifact
 
     def _expected_discovery_terminal_artifact(
         self,
@@ -2705,6 +2674,8 @@ class SubjectAttributeEpochRunner:
     def _advance_clip(
         self, shard: str, storage: RunStorage, clip_uid: str
     ) -> list[ModelJob]:
+        if self._completed_clip_checkpoint(shard, clip_uid) is not None:
+            return []
         plan = self._clip_plan(shard, clip_uid)
         return self._advance_clip_with_plan(shard, storage, clip_uid, plan)
 
@@ -2722,6 +2693,8 @@ class SubjectAttributeEpochRunner:
         ``record_count``, and the walk stops at the first unresolved owner. Only
         the clip-plan derivation above it fans out across clips.
         """
+        if self._completed_clip_checkpoint(shard, clip_uid) is not None:
+            return []
         if plan["classification"] == CLIP_NO_WORK:
             self._publish_clip_outcome(shard, storage, clip_uid, plan)
             return []
@@ -2729,6 +2702,12 @@ class SubjectAttributeEpochRunner:
         for index, owner in enumerate(owners):
             owner_entity_id = str(owner["owner_entity_id"])
             outcome = self._owner_outcome(shard, clip_uid, owner_entity_id)
+            if outcome is not None:
+                self._terminal_artifact_for_owner(
+                    shard, clip_uid, owner_entity_id,
+                    int(outcome["attribute_id_start"]), outcome,
+                )
+                continue
             owner_plan = self._owner_plan(
                 shard,
                 clip_uid,
@@ -2736,11 +2715,6 @@ class SubjectAttributeEpochRunner:
                 index,
                 self._attribute_id_start(shard, clip_uid, owners, index),
             )
-            if outcome is not None:
-                self._verify_owner_outcome(
-                    shard, storage, clip_uid, owner_entity_id, owner_plan, outcome
-                )
-                continue
             if owner_plan["preexisting_owner_artifact"].get("valid"):
                 # Zero-model reuse of an already valid legacy artifact.
                 self._verify_preexisting_artifact(shard, clip_uid, owner_plan)
@@ -2840,12 +2814,7 @@ class SubjectAttributeEpochRunner:
         return list(self._iter_seed_targets())
 
     def _cold_terminal_at_seed(self, shard: str, clip_uid: str) -> bool:
-        if not self.checkpoint_first_resume:
-            return False
-        if self._completed_clip_checkpoint(shard, clip_uid) is None:
-            return False
-        self._cold_completed_clips.add((shard, clip_uid))
-        return True
+        return self._completed_clip_checkpoint(shard, clip_uid) is not None
 
     def _skip_preplan_quarantine(self, shard: str, clip_uid: str) -> bool:
         quarantine = self.clip_quarantine
@@ -3341,113 +3310,14 @@ class SubjectAttributeEpochRunner:
         owner_plan: Mapping[str, Any],
         marker: Mapping[str, Any],
     ) -> None:
-        """Re-derive one owner artifact from frozen state and require the marker.
-
-        A discovery outcome additionally requires the exact committed receipt:
-        the marker is never its own authority.
-        """
+        """Require the saved terminal artifact, not a historical model replay."""
         fresh = self._fresh_owner_terminal(shard, clip_uid, owner_entity_id)
         if fresh is not None and fresh[0] == dict(marker):
             self._bump_replay_counter("fresh_owner_verify_skips")
             return
-        label = f"{clip_uid}/{owner_entity_id}"
-        if marker["source"] == OWNER_SOURCE_PREEXISTING:
-            self._verify_preexisting_artifact(shard, clip_uid, owner_plan)
-            artifact = self._load_preexisting(
-                shard, clip_uid, owner_entity_id, owner_plan
-            )
-            expected = self._expected_owner_outcome(
-                clip_uid=clip_uid,
-                owner_entity_id=owner_entity_id,
-                owner_plan=owner_plan,
-                artifact=artifact,
-                source=OWNER_SOURCE_PREEXISTING,
-                discovery_job_id=None,
-            )
-        elif marker["source"] == OWNER_SOURCE_PROCESSED:
-            # The processed owner is authority-free too: the whole legacy owner
-            # algorithm is re-run over the committed receipts and must land on
-            # exactly the artifact and marker that were published.
-            discovery_job = self._expected_discovery_job(shard, clip_uid, owner_plan)
-            discovery_job_id = discovery_job.job_id()
-            if marker["discovery_job_id"] != discovery_job_id:
-                raise SubjectAttributeDurableError(
-                    f"owner outcome discovery job drifted for {label}"
-                )
-            context = self._rank0_context(
-                shard,
-                storage,
-                clip_uid,
-                owner_plan,
-                SubjectAttributeDiscovery.model_validate(
-                    self._discovery_payload(shard, clip_uid, owner_plan).get(
-                        "discovery"
-                    )
-                ),
-                discovery_job_id,
-            )
-            if context["pending"]:
-                raise SubjectAttributeDurableError(
-                    f"owner outcome exists while owner {label} is still pending"
-                )
-            self._verified_raw_state(shard, storage, clip_uid, owner_plan, context)
-            self._verify_completion_outcomes(
-                shard,
-                storage,
-                clip_uid,
-                owner_plan,
-                self._owner_graph(shard, storage, clip_uid, owner_plan, context),
-            )
-            artifact = self._owner_artifact_from_receipts(
-                shard, storage, clip_uid, owner_plan, context["states"]
-            )
-            if isinstance(artifact, _PendingModelCall):
-                raise SubjectAttributeDurableError(
-                    f"owner outcome exists while owner {label} still owes a model call"
-                )
-            expected = self._expected_owner_outcome(
-                clip_uid=clip_uid,
-                owner_entity_id=owner_entity_id,
-                owner_plan=owner_plan,
-                artifact=artifact,
-                source=OWNER_SOURCE_PROCESSED,
-                discovery_job_id=discovery_job_id,
-            )
-        else:
-            job = self._expected_discovery_job(shard, clip_uid, owner_plan)
-            if marker["discovery_job_id"] != job.job_id():
-                raise SubjectAttributeDurableError(
-                    f"owner outcome discovery job drifted for {label}"
-                )
-            payload = self._discovery_payload(shard, clip_uid, owner_plan)
-            artifact = self._expected_discovery_terminal_artifact(
-                clip_uid=clip_uid, owner_plan=owner_plan, payload=payload
-            )
-            if artifact is None:
-                raise SubjectAttributeDurableError(
-                    f"owner outcome exists for a deferred human owner {label}"
-                )
-            expected = self._expected_owner_outcome(
-                clip_uid=clip_uid,
-                owner_entity_id=owner_entity_id,
-                owner_plan=owner_plan,
-                artifact=artifact,
-                source=OWNER_SOURCE_DISCOVERY,
-                discovery_job_id=job.job_id(),
-            )
-        path = _owner_artifact_path(
-            self._output_root(storage),
-            sample_id=clip_uid,
-            owner_entity_id=owner_entity_id,
+        self._terminal_artifact_for_owner(
+            shard, clip_uid, owner_entity_id, int(marker["attribute_id_start"]), marker
         )
-        if not path.is_file() or _file_sha256(path) != expected["artifact_sha256"]:
-            raise SubjectAttributeDurableError(
-                f"owner artifact drifted for {label}"
-            )
-        if dict(marker) != expected:
-            raise SubjectAttributeDurableError(
-                f"owner outcome drifted for {label}"
-            )
 
     # -- clip outcome ----------------------------------------------------------
 
@@ -3462,7 +3332,7 @@ class SubjectAttributeEpochRunner:
         totals = EnrichmentTotals()
         records: list[Any] = []
         enriched = False
-        for index, owner in enumerate(self._eligible_owners(plan)):
+        for owner in self._eligible_owners(plan):
             owner_entity_id = str(owner["owner_entity_id"])
             outcome = self._owner_outcome(shard, clip_uid, owner_entity_id)
             if outcome is None:
@@ -3470,16 +3340,6 @@ class SubjectAttributeEpochRunner:
                     f"Subject Attributes clip {clip_uid!r} has no terminal owner "
                     f"outcome for {owner_entity_id!r}; the stage is not terminal"
                 )
-            owner_plan = self._owner_plan(
-                shard,
-                clip_uid,
-                owner,
-                index,
-                int(outcome["attribute_id_start"]),
-            )
-            self._verify_owner_outcome(
-                shard, storage, clip_uid, owner_entity_id, owner_plan, outcome
-            )
             artifact = self._terminal_artifact_for_owner(
                 shard,
                 clip_uid,
@@ -5345,6 +5205,15 @@ class SubjectAttributeEpochRunner:
         is the next job, and once every call is paid the legacy artifact is
         published together with the processed owner outcome.
         """
+        if self._completed_clip_checkpoint(shard, clip_uid) is not None:
+            return []
+        outcome = self._owner_outcome(shard, clip_uid, owner_entity_id)
+        if outcome is not None:
+            self._terminal_artifact_for_owner(
+                shard, clip_uid, owner_entity_id,
+                int(outcome["attribute_id_start"]), outcome,
+            )
+            return self._advance_clip(shard, storage, clip_uid)
         try:
             prefix = self._owner_prefix(shard, clip_uid, owner_entity_id)
             owner_plan = prefix["owner_plan"]
@@ -5366,12 +5235,6 @@ class SubjectAttributeEpochRunner:
                 # only meaningful once every rank-0 verdict exists.
                 return [context["job"]]
             self._verified_raw_state(shard, storage, clip_uid, owner_plan, context)
-            outcome = self._owner_outcome(shard, clip_uid, owner_entity_id)
-            if outcome is not None:
-                self._verify_owner_outcome(
-                    shard, storage, clip_uid, owner_entity_id, owner_plan, outcome
-                )
-                return self._advance_clip(shard, storage, clip_uid)
         except Exception:
             self._drop_owner_chain_hot_caches((shard, clip_uid, owner_entity_id))
             raise
@@ -7350,57 +7213,47 @@ class SubjectAttributeEpochRunner:
         plan: Mapping[str, Any],
         marker: Mapping[str, Any],
     ) -> dict[str, Any]:
-        if marker.get("schema") != SUBJECT_ATTRIBUTE_CLIP_OUTCOME_SCHEMA:
-            raise SubjectAttributeDurableError(
-                f"clip outcome schema drifted for {clip_uid!r}"
-            )
-        if marker.get("clip_uid") != clip_uid:
-            raise SubjectAttributeDurableError(
-                f"clip outcome clip_uid drifted for {clip_uid!r}"
-            )
-        if marker.get("terminal") != "ready":
-            raise SubjectAttributeDurableError(
-                f"clip outcome terminal is unknown for {clip_uid!r}"
-            )
+        """Validate terminal counts/shape without reconstructing owner results."""
+        marker_keys = {
+            "schema", "clip_uid", "terminal", "counts", "owner_outcome_ids",
+            "enriched_sample_path", "enriched_sample_sha256",
+        }
         counts = marker.get("counts")
-        if not isinstance(counts, dict) or not counts:
-            raise SubjectAttributeDurableError(
-                f"clip outcome counts are missing for {clip_uid!r}"
+        empty_counts = ClipEnrichmentResult(
+            clip_uid=clip_uid,
+            totals=EnrichmentTotals(),
+            owner_limit_reached=False,
+            enriched_sample=None,
+        ).to_counts()
+        if (
+            set(marker) != marker_keys
+            or marker.get("schema") != SUBJECT_ATTRIBUTE_CLIP_OUTCOME_SCHEMA
+            or marker.get("clip_uid") != clip_uid
+            or marker.get("terminal") != "ready"
+            or not isinstance(counts, dict)
+            or set(counts) != set(empty_counts)
+            or any(
+                not isinstance(name, str)
+                or type(value) is not type(empty_counts[name])
+                or not math.isfinite(value)
+                or value < 0
+                for name, value in counts.items()
             )
-        expected, sample = self._clip_outcome_payload(
-            shard, storage, clip_uid, plan
-        )
-        if marker != expected:
+            or (plan["classification"] == CLIP_NO_WORK and counts != empty_counts)
+            or marker.get("owner_outcome_ids") != [
+                owner["owner_entity_id"] for owner in self._eligible_owners(plan)
+            ]
+            or marker.get("enriched_sample_path") is not None
+            and not isinstance(marker["enriched_sample_path"], str)
+            or marker.get("enriched_sample_sha256") is not None
+            and not isinstance(marker["enriched_sample_sha256"], str)
+            or (marker.get("enriched_sample_path") is None)
+            != (marker.get("enriched_sample_sha256") is None)
+        ):
             raise SubjectAttributeDurableError(
-                f"clip outcome drifted for {clip_uid!r}"
+                f"completed Subject Attributes clip outcome drifted for {clip_uid!r}"
             )
-        sample_path = expected["enriched_sample_path"]
-        if sample_path is None:
-            if expected["enriched_sample_sha256"] is not None:
-                raise SubjectAttributeDurableError(
-                    f"clip outcome carries a sample digest without a sample for "
-                    f"{clip_uid!r}"
-                )
-            return marker
-        if sample is None:
-            raise SubjectAttributeDurableError(
-                f"clip outcome expects an enriched sample for {clip_uid!r}"
-            )
-        target = storage.root / str(sample_path)
-        if not target.is_file():
-            raise SubjectAttributeDurableError(
-                f"enriched sample is missing for {clip_uid!r}"
-            )
-        expected_bytes = _expected_artifact_bytes(sample)
-        if target.read_bytes() != expected_bytes:
-            raise SubjectAttributeDurableError(
-                f"enriched sample drifted for {clip_uid!r}"
-            )
-        if _sha256_bytes(expected_bytes) != expected["enriched_sample_sha256"]:
-            raise SubjectAttributeDurableError(
-                f"enriched sample digest drifted for {clip_uid!r}"
-            )
-        return marker
+        return dict(marker)
 
     def reconcile_stats(self, shard: str) -> SubjectAttributeEpochStats:
         """Legacy clip counts rebuilt from the frozen plan and durable outcomes."""
@@ -7412,9 +7265,7 @@ class SubjectAttributeEpochRunner:
             if self._skip_preplan_quarantine(shard, clip_uid):
                 continue
             key = (shard, clip_uid)
-            completed = self._completed_clip_cache.get(key)
-            if completed is None and key in self._cold_completed_clips:
-                completed = self._completed_clip_checkpoint(shard, clip_uid)
+            completed = self._completed_clip_checkpoint(shard, clip_uid)
             if completed is not None:
                 plan, verified = completed
                 if key in self._fresh_completed_clips:
@@ -7425,23 +7276,14 @@ class SubjectAttributeEpochRunner:
                 no_work_clips += int(plan["classification"] == CLIP_NO_WORK)
                 continue
             plan = self._clip_plan(shard, clip_uid)
-            marker = _read_json(self._clip_outcome_path(shard, clip_uid))
-            if marker is None:
-                if plan["classification"] != CLIP_NO_WORK:
-                    # An eligible owner is still waiting (a human owner defers to
-                    # 8b), so the stage is genuinely incomplete.
-                    self._clip_totals(shard, storage, clip_uid, plan)
-                raise SubjectAttributeEpochError(
-                    f"Subject Attributes clip {clip_uid!r} has no durable outcome; "
-                    "the stage is not terminal"
-                )
-            verified = self._verified_clip_outcome(
-                shard, storage, clip_uid, plan, marker
+            if plan["classification"] != CLIP_NO_WORK:
+                # Finished owners can be reused, but without every owner and a
+                # published clip outcome the clip is not yet terminal.
+                self._clip_totals(shard, storage, clip_uid, plan)
+            raise SubjectAttributeEpochError(
+                f"Subject Attributes clip {clip_uid!r} has no durable outcome; "
+                "the stage is not terminal"
             )
-            for key, value in verified["counts"].items():
-                counts[key] += value
-            terminal_clips += 1
-            no_work_clips += int(plan["classification"] == CLIP_NO_WORK)
         return SubjectAttributeEpochStats(
             counts=dict(counts),
             terminal_clips=terminal_clips,
