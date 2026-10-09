@@ -665,3 +665,133 @@ neutral H3 captions/speech metadata and direct training export without manual
 review. The real server media were not materialized locally. The two Visual-only
 cases remain partial replays; the unsupplied ASR/secondary-vocal contradictions
 are not claimed recovered. Historical `.80` through `.84` stay readable.
+
+## Effective Random20 and automatic CPU training export (.85)
+
+The following is a zero-model workflow. Keep `SHADOW` pointed at the original
+Random20 named run, with its existing `resolved_stems_v1` sibling. It does not
+rerun Visual production, separation, DiariZen, ASR or MiMo. CPU frame extraction
+and existing Audio/H3 materialization are the only media processing steps.
+
+The builder retains the original frozen 20-job order and copies its source
+contract byte-for-byte. It replays only `aed328`, `02750`, `4e0506`, `009a05`
+through the current backend using saved Visual/Joint completions, then overlays
+the two real `86ca`/`aa28` recheck records. Other records remain unchanged.
+`25755`, `cd694c`, `ecfb50` are not repaired. Each record is paired by clip UID
+with a row in `effective_sources.json`: actual source path, original record
+fingerprint/provenance, applied postprocess version (null for untouched records),
+validation version, correction counts and automatic identity restrictions.
+
+Original call counters, token usage, finish reasons, errors and raw are retained;
+cached processing adds diagnostic warnings only. `summary.model_call_count` is
+the sum of the selected historical inference audits, **not new requests**.
+`effective_sources.new_model_call_count` is zero. Existing metadata validators
+check provenance, source jobs/stems, record fingerprints and summary; no source
+video/audio hashes or recursive integrity scan are added.
+
+All output directories below must be new. The builder prints actual counts and
+exits 2 if they differ from 20 clips / 17 ready / 3 failed, stopping this block
+before materialization. It never changes status merely to reach that number.
+
+```bash
+set -e
+cd /mnt/workspace/litengjie/data/R2V_DATA_V2
+: "${SHADOW:?Set SHADOW to the existing Random20 named-run directory}"
+BASE="$SHADOW/mimo_v26_ra2va_two_step_joint_v2_random20"
+RECHECK="$SHADOW/mimo_v26_ra2va_two_step_joint_v2_format2_recheck_v84"
+EFFECTIVE="$SHADOW/mimo_v26_ra2va_two_step_joint_v2_effective20_v85"
+BUNDLE="$SHADOW/ra2va_two_step_effective20_v85_training_bundle"
+TRAIN="$SHADOW/ra2va_two_step_effective20_v85_training_jsonl"
+
+.venv/bin/python tools/build_h3_two_step_effective_reconcile.py \
+  --base-root "$BASE" --override-root "$RECHECK" --output-root "$EFFECTIVE"
+.venv/bin/python tools/materialize_h3_ra2va_training_bundle.py \
+  --reconcile-root "$EFFECTIVE" --output-root "$BUNDLE" --allow-unverified
+.venv/bin/python tools/export_h3_training_manifests.py \
+  --ra2va-shadow-root "$BUNDLE" --output-root "$TRAIN"
+.venv/bin/python tools/export_h3_voice_donor_reserve.py --bundle-root "$BUNDLE"
+```
+
+`--allow-unverified` is the existing explicit frozen-pilot stem opt-in, not a
+new bypass. If canonical H3 metadata is stored elsewhere, supply the existing
+`--source-h3-root` option with the matching `h3/samples.jsonl` root. Existing
+materializer failures keep their actual failure reason. No Review/PASS is needed.
+
+Check actual products, identity exclusions and four-field training rows:
+
+```bash
+.venv/bin/python - "$EFFECTIVE" "$BUNDLE" "$TRAIN" <<'PY'
+import json, sys
+from pathlib import Path
+from r2v_data_v2.h3.audio_reuse import AudioReuseManifest
+from r2v_data_v2.h3.audio_reuse_materializer import AudioReuseProduct
+from r2v_data_v2.h3.training_manifest_export import TASK_ORDER
+effective, bundle, train = map(Path, sys.argv[1:])
+summary = json.loads((bundle / "summary.json").read_text())
+audit = json.loads((effective / "effective_sources.json").read_text())
+restricted = {r["clip_uid"]: set(r["identity_publication_restricted_groups"])
+              for r in audit["records"] if r["status"] == "ready"}
+products = [AudioReuseProduct.model_validate_json(line) for line in
+            (bundle / "h3_audio_reuse_products_v1/records.jsonl").read_text().splitlines() if line.strip()]
+exclusions = []
+for uid in summary["clip_uids"]:
+    manifest = AudioReuseManifest.model_validate_json(
+        (bundle / "audio_reuse_assets_v1" / uid / "manifest.json").read_text())
+    assert not restricted[uid].intersection(s.speaker_group for s in manifest.speakers)
+    exclusions.extend({"clip_uid": uid, **e.model_dump(mode="json")} for e in manifest.exclusions)
+for uid in ("4e0506dfb9454536cc3c37b1", "009a0523c7a1332b52fcc82a"):
+    selected = [p for p in products if p.clip_uid == uid and p.status == "ready"]
+    assert {p.conditioning_variant for p in selected} == {"visual_only", "full_audio_reuse"}
+    assert all(s.entity_id is None and s.entity_occurrence_id is None
+               for p in selected for s in p.corrected_speech_segments)
+    assert all("<Subject 1> (S1)" not in p.rendered_h3_prompt for p in selected)
+    assert all("A voice (S1) says," in p.rendered_h3_prompt for p in selected)
+counts = {}
+for task in TASK_ORDER:
+    rows = [json.loads(line) for line in (train / f"{task}.jsonl").read_text().splitlines() if line.strip()]
+    for row in rows:
+        assert set(row) == {"video", "images", "audios", "caption"}
+        assert isinstance(row["caption"], str) and row["caption"]
+        assert isinstance(row["images"], list) and isinstance(row["audios"], list)
+        assert all(Path(p).is_file() for p in [row["video"], *row["images"], *row["audios"]])
+    counts[task] = len(rows)
+assert all(counts[task] == count for task, count in summary["task_counts"].items())
+reserve = json.loads((bundle / "voice_donor_reserve.json").read_text())
+for donor in reserve["donors"]:
+    assert donor["speaker_group"] not in restricted[donor["clip_uid"]]
+    assert donor["segment_count"] == len(donor["segments"])
+    assert all(Path(s["audio_path"]).is_file() and
+               (bundle / s["relative_path"]).resolve() == Path(s["audio_path"])
+               for s in donor["segments"])
+print(json.dumps({"product_failed_count": summary["product_failed_count"], "task_counts": counts,
+    "identity_sound_exclusions": exclusions,
+    "product_failures": [{"clip_uid": p.clip_uid, "variant": p.conditioning_variant,
+                          "failure_reason": p.failure_reason} for p in products if p.status == "failed"],
+    "donor_count": len(reserve["donors"]),
+    "donor_segment_count": sum(d["segment_count"] for d in reserve["donors"]),
+    "new_model_call_count": audit["new_model_call_count"]}, ensure_ascii=False, indent=2))
+PY
+```
+
+The existing Bundle publication policy automatically excludes restricted groups
+from entity voice binding, identity-specific voice and target/cross-donor speaker
+reuse. Legal visual, exact-ASR and full-original-audio products remain available;
+donor export does not change task classification or counts.
+
+### Donor reserve for an existing Bundle
+
+```bash
+.venv/bin/python tools/export_h3_voice_donor_reserve.py --bundle-root "$EXISTING_BUNDLE"
+```
+
+This adds `voice_donor_reserve.json` and per-segment PCM16/32kHz/stereo FLAC under
+`voice_donor_segments_v1/<clip_uid>/<gN>/<segment_id>.flac`. Only eligible
+non-null-entity speakers already present in `AudioReuseManifest.speakers` are
+used; failed or identity-restricted sources are excluded. Every source segment
+is sliced by its exact target sample range from the existing timeline speaker
+FLAC, with no resampling, separation or recognition. Segments are chronological
+within `(clip_uid, entity_id, speaker_group)`; distinct gN are not merged.
+Each donor includes `segment_count` and `total_speech_duration_seconds`.
+`entity_id` is clip-local, and `donor_occurrence_id = clip_uid/entity_id` does
+not assert a shared identity across videos. Existing completed sidecars are never
+overwritten; outputs are atomically published. No cross-pair is synthesized.
