@@ -294,3 +294,34 @@ An OOM in an SA child is treated as an epoch-fatal infrastructure error, not
 as an accepted `sam_failed` receipt. Measure model startup, SAM jobs/s,
 SA terminal clips/s, peak VRAM, masks, persisted receipts, and interruption
 resume. Do not assume a 2.4x production SA speedup from the microbenchmark.
+
+### Real eight-GPU standalone process-pool smoke (before full-stack QA)
+
+With the separate development checkout, already-prepared read-only
+`jobs.jsonl` (256 real frame/prompt pairs), and the accepted frozen YAML, run:
+
+```bash
+D=/mnt/workspace/litengjie/data
+DEV="$D/R2V_DATA_V2_sa_4proc_dev"
+PY="$D/R2V_DATA_V2/.venv/bin/python"
+CONFIG="$D/R2V_DATA_V2_postmask_prod/configs/v3_post_mask_resource_epoch_production.yaml"
+JOBS="$D/r2v_v3_sa_gpu_ab_bench/ab_20261009/jobs.jsonl"
+OUT="$D/r2v_v3_sa_gpu_ab_bench/pool32-with-npy-r1"
+
+cd "$D"
+env -u CUDA_VISIBLE_DEVICES \
+  PYTHONPATH="$DEV:$D/vendor/sam3" \
+  "$PY" "$DEV/tools/bench_v3_post_mask_sa_process_pool.py" \
+    --config "$CONFIG" --manifest "$JOBS" --output "$OUT" \
+    --gpu-ids 0,1,2,3,4,5,6,7 --workers-per-gpu 4 \
+    --count 256 --persist-workers 8
+```
+
+This first validates the exact new 32-process IPC, CPU-owned masks and
+concurrent NPY atomic writes, but does NOT exercise the production checkpoint
+scheduler or model co-residency. Inspect `$OUT/metrics.json`, confirm all
+256 jobs and 411 expected masks (for that exact manifest), and compare wall
+time against the old single-process/8-GPU benchmark **only with the caveat**
+that the latter used a global Triton NMS mutex. For any retry use a NEW private
+output directory; never delete live artifacts. Proceed to the isolated
+full-stack test only after this stage succeeds.
