@@ -4,6 +4,14 @@ This entry point is fake-only. It tests scheduling, ownership adaptation, and
 restart behavior; it does not run Audio/MiMo, materialize H3, or export training
 JSONL. No upstream media is opened, copied, or hashed.
 
+**Multi-node restriction (2026-10-09):** the real two-node preflight found that
+the current JDUFS mount does not enforce flock exclusion across nodes. The
+shared-file `run --fake` command below is therefore local-node only; do not run
+it on two nodes against one run directory. The replacement single-Coordinator
+HTTP design is in
+`superpowers/specs/2026-10-09-ra2va-group-http-coordinator-design.md`;
+its implementation and real two-node acceptance are still pending.
+
 ## Source Publication and Identity
 
 The supported producer is `tools/export_completed_postmask_group.py`. It writes
@@ -132,8 +140,9 @@ were used for legacy Audio imports; no dependencies were installed.
 ## Boundaries
 
 No server writes, GPU calls, real Audio/H3 products, or full group were run.
-Two local launchers were tested, but actual two-node shared-filesystem flock
-behavior remains the next milestone. A worker that stays alive while holding
-its lock is not forcibly reclaimed. A crash before a result is published may
-repeat unpublished fake work; this phase does not assert external exactly-once
-model requests. Durable real Visual/Joint checkpoints remain deferred.
+Two local launchers were tested. The subsequent real two-node flock preflight
+failed as noted above; the HTTP replacement remains pending. In local mode, a
+worker that stays alive while holding its lock is not forcibly reclaimed. A
+crash before a result is published may repeat unpublished fake work; this phase
+does not assert external exactly-once model requests. Durable real Visual/Joint
+checkpoints remain deferred.
