@@ -86,9 +86,12 @@ class WorkerSession:
 
 
 class GroupCoordinator:
-    def __init__(self, run_root: Path, source_root: Path, limit: int, *, max_groups=1):
+    def __init__(self, run_root: Path, source_root: Path, limit: int, *, max_groups=1,
+                 transport="local", coordinator_host=None):
         if not 1 <= limit <= 200 or max_groups < 1:
             raise ValueError("invalid bounded pilot settings")
+        if transport not in ("local", "http") or (transport == "http" and not coordinator_host):
+            raise ValueError("HTTP transport requires designated coordinator host")
         self.run_root = run_root.absolute()
         self.source_root = source_root.absolute()
         self.limit = limit
@@ -97,12 +100,20 @@ class GroupCoordinator:
         settings = {"source_root": str(self.source_root), "limit": limit, "max_groups": max_groups}
         with file_lock(self.run_root / "control.lock", blocking=True):
             if self.control_path.exists():
-                if read_json(self.control_path)["settings"] != settings:
+                existing = read_json(self.control_path)
+                if existing.get("transport", "local") != transport:
+                    raise ValueError("run transport differs; implicit migration is forbidden")
+                if transport == "http" and existing["coordinator_host"] != coordinator_host:
+                    raise ValueError("designated coordinator host differs")
+                if existing["settings"] != settings:
                     raise ValueError("resume settings differ from persisted run")
             else:
+                ownership = ({"transport": "http", "coordinator_host": coordinator_host}
+                             if transport == "http" else {})
                 atomic_json(self.control_path, {
                     "mode": "cpu_fake_pilot", "settings": settings, "generation": 0,
                     "group_id": None, "stage": None, "phase": "idle", "started_groups": [],
+                    **ownership,
                 })
 
     def group_root(self, group_id):
@@ -184,7 +195,7 @@ class GroupCoordinator:
         if changed:
             self._save_dispatch(snapshot, dispatch)
 
-    def claim(self, snapshot, worker_id):
+    def claim(self, snapshot, worker_id, *, claim_metadata=None):
         with self._checked(snapshot) as (control, dispatch):
             if control["phase"] != "running":
                 return None
@@ -203,6 +214,8 @@ class GroupCoordinator:
                     key = str(ordinal)
                     recovered = key in dispatch["active"]
                     dispatch["active"][key] = {"worker_id": worker_id, "generation": snapshot.generation}
+                    if claim_metadata is not None:
+                        dispatch["active"][key]["http"] = claim_metadata
                     if not recovered:
                         dispatch["cursor"] += 1
                     self._save_dispatch(snapshot, dispatch)
@@ -214,7 +227,7 @@ class GroupCoordinator:
                     raise
             return None
 
-    def publish(self, claim, status, payload, elapsed_seconds):
+    def publish(self, claim, status, payload, elapsed_seconds, *, receipt_metadata=None):
         if status not in TERMINAL or claim.lock_handle.closed:
             raise ValueError("publication requires terminal status and owned clip lock")
         snapshot = claim.snapshot
@@ -230,7 +243,8 @@ class GroupCoordinator:
                                "stage": snapshot.stage, "ordinal": claim.task.ordinal,
                                "clip_uid": claim.task.clip_uid, "status": status,
                                "worker_id": claim.worker_id, "elapsed_seconds": elapsed_seconds,
-                               "payload": payload})
+                               "payload": payload,
+                               **({"http": receipt_metadata} if receipt_metadata is not None else {})})
             self._account_results(snapshot, dispatch)
             self.log("published", snapshot, clip_uid=claim.task.clip_uid, status=status,
                      worker_id=claim.worker_id, elapsed_seconds=elapsed_seconds)
@@ -251,7 +265,7 @@ class GroupCoordinator:
                     "active": len(dispatch["active"]), **{k: dispatch[k] for k in TERMINAL},
                     "elapsed_seconds": elapsed, "tasks_per_second": done / elapsed}
 
-    def join(self, snapshot, worker_id):
+    def join(self, snapshot, worker_id, *, member_metadata=None):
         with self._checked(snapshot) as (control, _):
             if control["phase"] != "running":
                 raise StageDraining("stage is draining; new membership refused")
@@ -260,11 +274,36 @@ class GroupCoordinator:
                 raise RuntimeError("worker session is already live")
             try:
                 control["members"][worker_id] = {"generation": snapshot.generation, "released": False}
+                if member_metadata is not None:
+                    control["members"][worker_id]["http"] = member_metadata
                 atomic_json(self.control_path, control)
                 return WorkerSession(snapshot, worker_id, handle)
             except BaseException:
                 handle.close()
                 raise
+
+    def restore_claim(self, snapshot, ordinal, worker_id):
+        with self._checked(snapshot) as (_, dispatch):
+            if dispatch["active"].get(str(ordinal), {}).get("worker_id") != worker_id:
+                raise ValueError("claim owner differs")
+            handle = try_lock(self.stage_root(snapshot) / "clips" / f"{ordinal:06d}.lock")
+            if handle is None:
+                raise RuntimeError("claim handle already owned")
+            try:
+                task = read_inventory_task(self.group_root(snapshot.group_id) / "inventory", ordinal)
+                return TaskClaim(snapshot, task, worker_id, handle)
+            except BaseException:
+                handle.close()
+                raise
+
+    def restore_session(self, snapshot, worker_id):
+        with self._checked(snapshot) as (control, _):
+            if worker_id not in control["members"]:
+                raise ValueError("session owner differs")
+            handle = try_lock(self.stage_root(snapshot) / "sessions" / f"{worker_id}.lock")
+            if handle is None:
+                raise RuntimeError("session handle already owned")
+            return WorkerSession(snapshot, worker_id, handle)
 
     def acknowledge_release(self, session):
         with self._checked(session.snapshot) as (control, _):
