@@ -5879,6 +5879,126 @@ def test_cold_owner_outcome_replays_after_clip_publication_crash(
     assert cold._clip_outcome_path(SHARD, CLIP_UID).is_file()
 
 
+@pytest.mark.parametrize("processed", [False, True])
+@pytest.mark.parametrize("late_visibility", [False, True])
+def test_owner_outcome_refreshes_stale_discovery_receipt_without_models(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    processed: bool, late_visibility: bool,
+) -> None:
+    """A known owner outcome must not fail on an older ledger snapshot."""
+    config, storage = _storage_variant(tmp_path, monkeypatch, "run-stale-ledger")
+    runner = _runner(config, storage, tmp_path)
+    cold = _runner(config, storage, tmp_path)
+    cold.ledger.refresh()  # Snapshot taken before the other ledger commits.
+    qwen = _QwenClient(discoveries=[
+        _human_discovery() if processed else _nonhuman_discovery()
+    ])
+
+    def crash_clip(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("simulated clip publication crash")
+
+    monkeypatch.setattr(runner, "_publish_clip_outcome", crash_clip)
+    _drain(runner, qwen, sam=_SamBackend(ValueError("sam exploded")))
+    assert _owner_outcome_path(runner).is_file()
+    assert not runner._clip_outcome_path(SHARD, CLIP_UID).exists()
+    owner_bytes = _owner_artifact_file(storage).read_bytes()
+    marker_bytes = _owner_outcome_path(runner).read_bytes()
+    phase_ids = cold.ledger.phase_ids
+    scans = 0
+
+    def delayed_phase_visibility() -> tuple[str, ...]:
+        nonlocal scans
+        scans += 1
+        return () if late_visibility and scans == 1 else phase_ids()
+
+    monkeypatch.setattr(cold.ledger, "phase_ids", delayed_phase_visibility)
+    resume_qwen = _QwenClient()
+    executor, jobs = _drain(cold, resume_qwen)
+
+    assert jobs == []
+    assert executor.batches == resume_qwen.discovery_calls == 0
+    assert scans == (2 if late_visibility else 1)
+    assert _owner_artifact_file(storage).read_bytes() == owner_bytes
+    assert _owner_outcome_path(cold).read_bytes() == marker_bytes
+    assert cold._clip_outcome_path(SHARD, CLIP_UID).is_file()
+
+
+def test_owner_outcome_without_discovery_receipt_does_not_trust_orphan_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A result alone cannot authorize a fabricated receipt or owner rewrite."""
+    config, storage = _storage_variant(tmp_path, monkeypatch, "run-orphan-owner")
+    runner = _runner(config, storage, tmp_path)
+    _, jobs = _drain(runner, _QwenClient(discoveries=[_nonhuman_discovery()]))
+    job = jobs[0]
+    phase = runner.ledger.phase(runner.ledger.phase_for(job))
+    result_path = phase.artifact_path(job.job_id(), "result.json")
+    result_bytes = result_path.read_bytes()
+    marker_bytes = _owner_outcome_path(runner).read_bytes()
+    artifact_bytes = _owner_artifact_file(storage).read_bytes()
+    phase.receipts_path.write_bytes(b"")  # Only the temporary test ledger.
+    cold = _runner(config, storage, tmp_path)
+    cold.ledger.refresh()
+    refreshes = cold.ledger.refresh_calls
+
+    with pytest.raises(SubjectAttributeEpochError, match="discovery"):
+        cold.seed_jobs()
+
+    assert cold.ledger.refresh_calls == refreshes + 2
+    assert phase.receipts_path.read_bytes() == b""
+    assert result_path.read_bytes() == result_bytes
+    assert _owner_outcome_path(cold).read_bytes() == marker_bytes
+    assert _owner_artifact_file(storage).read_bytes() == artifact_bytes
+
+
+def test_normal_owner_resume_does_not_rescan_phase_receipts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The new refresh belongs only to an unexpectedly pending lookup."""
+    config, storage = _storage_variant(tmp_path, monkeypatch, "run-visible-ledger")
+    runner = _runner(config, storage, tmp_path)
+    _drain(runner, _QwenClient(discoveries=[_nonhuman_discovery()]))
+    cold = _runner(config, storage, tmp_path)
+    cold.ledger.refresh()
+    refreshes = cold.ledger.refresh_calls
+    reads = cold.ledger.jsonl_load_calls
+
+    assert cold.seed_jobs() == []
+    assert cold.ledger.refresh_calls == refreshes
+    assert cold.ledger.jsonl_load_calls == reads
+
+
+def test_orphan_discovery_result_retries_only_the_pending_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without an owner outcome, an orphan result stays ordinary pending work."""
+    config, storage = _storage_variant(tmp_path, monkeypatch, "run-orphan-result")
+    runner = _runner(config, storage, tmp_path)
+    job, = runner.seed_jobs()
+    phase = runner.ledger.phase("r000-qwen")
+    phase.write_plan([job])
+    phase.publish_result(job, JobResult(
+        outcome="completed",
+        payload={
+            "status": "discovery",
+            "discovery": _nonhuman_discovery().model_dump(mode="json"),
+            "qwen_model_call_time_seconds": 0.0,
+        },
+    ))
+    assert not phase.receipts_path.exists()
+    assert not _owner_outcome_path(runner).exists()
+
+    cold = _runner(config, storage, tmp_path)
+    qwen = _QwenClient(discoveries=[_nonhuman_discovery()])
+    executor, jobs = _drain(cold, qwen)
+
+    assert [item.job_id() for item in jobs] == [job.job_id()]
+    assert [item.job_type for item in executor.executed] == [SUBJECT_ATTRIBUTE_DISCOVERY_JOB]
+    assert qwen.discovery_calls == 1
+    assert cold.ledger.classify(job).skippable
+    assert cold.reconcile_stats(SHARD).terminal_clips == 1
+
+
 def test_fresh_owner_cache_does_not_accept_a_mismatched_marker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

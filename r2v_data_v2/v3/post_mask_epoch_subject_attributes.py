@@ -3423,7 +3423,7 @@ class SubjectAttributeEpochRunner:
                 raise SubjectAttributeDurableError(
                     f"owner outcome discovery job drifted for {label}"
                 )
-            payload = _committed_payload(self.ledger, job)
+            payload = self._discovery_payload(shard, clip_uid, owner_plan)
             artifact = self._expected_discovery_terminal_artifact(
                 clip_uid=clip_uid, owner_plan=owner_plan, payload=payload
             )
@@ -3692,6 +3692,15 @@ class SubjectAttributeEpochRunner:
     def _discovery_payload(self, shard: str, clip_uid: str, owner_plan: Mapping[str, Any]) -> dict[str, Any]:
         job = self._expected_discovery_job(shard, clip_uid, owner_plan)
         payload = self._committed_payload_or_none(job)
+        # This caller requires an already committed discovery (e.g. a durable
+        # owner outcome). Refresh only an unexpectedly pending lookup, never
+        # the ordinary pending-job enumeration or every successful replay.
+        for _ in range(2):
+            if payload is not None:
+                break
+            time.sleep(0.05)
+            self.ledger.refresh(force=True)
+            payload = self._committed_payload_or_none(job)
         if payload is None:
             raise SubjectAttributeEpochError(
                 f"owner {clip_uid}/{owner_plan['owner_entity_id']} has no committed "
