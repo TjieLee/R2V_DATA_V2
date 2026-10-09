@@ -30,7 +30,7 @@ from pathlib import Path
 REPO_DEFAULT = Path('/mnt/workspace/litengjie/data/R2V_DATA_V2_postmask_prod')
 ROOT_DEFAULT = Path('/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/in_pair_reference')
 RUNS_DEFAULT = Path('/mnt/workspace/litengjie/data/r2v_v3_runs/production/jea_motion_v1/in_pair_reference')
-OUTPUT_BASE_DEFAULT = Path('/mnt/workspace/litengjie/data/r2v_v3_group_exports/post_mask')
+OUTPUT_BASE_DEFAULT = ROOT_DEFAULT / 'post_mask'
 GROUP_NAME = re.compile(r'group-[0-9]{6}')
 SHARD_NAME = re.compile(r'shard-[0-9]{9}-[0-9]{9}')
 
