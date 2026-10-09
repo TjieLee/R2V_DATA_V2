@@ -93,3 +93,48 @@ def test_invalid_structured_raw_is_saved_and_not_requested_again(tmp_path, monke
     assert second["failure_code"] == first["failure_code"]
     assert second["visual_raw_response"] == first["visual_raw_response"]
     assert replay.requests == [] and second["model_call_count"] == 1
+
+
+def test_network_exception_without_saved_response_is_unresolved_immediately(tmp_path, monkeypatch):
+    _, _, backend, _, stems, jobs, _, _ = _setup(tmp_path, monkeypatch)
+
+    class Disconnected:
+        def create(self, **payload):
+            raise ConnectionError("response lost")
+
+    result = run(tmp_path / "lost", backend.config, Disconnected(), jobs[0], stems)
+    assert result["failure_code"] == "interrupted_request_unresolved"
+    assert result["unresolved_turns"] == ["visual"]
+
+
+def test_replay_keeps_historical_provenance_not_current_configuration(tmp_path, monkeypatch):
+    from dataclasses import replace
+    _, _, backend, _, stems, jobs, _, _ = _setup(tmp_path, monkeypatch)
+    visual, joint = _drafts()
+    root = tmp_path / "provenance"
+    original = run(root, backend.config, _Completions([(json.dumps(visual), 0), (json.dumps(joint), 12)]), jobs[0], stems)
+    changed = replace(backend.config, model="different-model")
+    calls = _Completions([])
+    resumed = run(root, changed, calls, jobs[0], stems)
+    assert resumed["backend_provenance"] == original["backend_provenance"]
+    assert calls.requests == []
+
+
+def test_missing_joint_cannot_use_different_settings_from_saved_visual(tmp_path, monkeypatch):
+    from dataclasses import replace
+    _, _, backend, _, stems, jobs, _, _ = _setup(tmp_path, monkeypatch)
+    visual, _ = _drafts()
+
+    def crash(event, turn):
+        if event == "response_saved":
+            raise SystemExit("after Visual")
+
+    root = tmp_path / "changed"
+    with pytest.raises(SystemExit):
+        run(root, backend.config, _Completions([(json.dumps(visual), 0)]), jobs[0], stems, event=crash)
+    calls = _Completions([])
+    result = run(root, replace(backend.config, temperature=0.5), calls, jobs[0], stems)
+    assert result["status"] == "failed"
+    assert "settings differ" in result["failure_reason"]
+    assert result["backend_provenance"]["temperature"] == 0
+    assert calls.requests == [] and result["new_request_count"] == 0

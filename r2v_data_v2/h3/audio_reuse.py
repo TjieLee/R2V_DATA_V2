@@ -258,12 +258,16 @@ def _build_audio_reuse_assets(
     stem_record: StemRecord, audio_production_root: Path,
     output_root: Path, allow_unverified: bool = False,
     backend_provenance: object | None = None, frozen_bundle: bool,
+    asset_models: tuple | None = None,
 ) -> AudioReuseManifest:
     """Build one clip into a NEW caller-owned shadow directory, never overwrite.
 
     Call with the finalized annotation and its authoritative stem-reconcile job.
     PCM support requires soundfile/libsndfile. No model/runtime construction occurs.
     """
+    speaker_model, music_model, manifest_model = asset_models or (
+        SpeakerSpeechReuseAsset, MusicReuseAsset, AudioReuseManifest,
+    )
     if not frozen_bundle:
         job = MimoClipJob.model_validate(job.model_dump())
         annotation = MimoAVAnnotationDraft.model_validate(annotation.model_dump())
@@ -417,7 +421,7 @@ def _build_audio_reuse_assets(
             for sid in included:
                 r = ranges[sid]
                 pcm[r.target_start_sample:r.target_end_sample] = speech_pcm[r.target_start_sample:r.target_end_sample]
-            speakers.append(SpeakerSpeechReuseAsset(
+            speakers.append(speaker_model(
                 **common(speech), speaker_group=group, speaker_id=speaker_id,
                 entity_id=entity, subject_index=subjects[0].subject_index if subjects else None,
                 source_segment_ids=included, source_sample_ranges=[ranges[sid] for sid in included],
@@ -427,7 +431,7 @@ def _build_audio_reuse_assets(
         copied = min(frames, len(music_pcm))
         pcm = np.zeros((frames, 2), dtype=np.int16)
         pcm[:copied] = music_pcm[:copied]
-        music_asset = MusicReuseAsset(
+        music_asset = music_model(
             **common(music), copied_frame_count=copied, silence_tail_frame_count=frames-copied,
             truncated_tail_frame_count=len(music_pcm)-copied,
             output_path=str(output / "music.flac"), output_sha256=write_audio(stage / "music.flac", pcm),
@@ -438,7 +442,7 @@ def _build_audio_reuse_assets(
                 if sha256_file(path) != digest:
                     raise AudioReuseIntegrityError("audio_reuse_source_changed_during_build")
         exclusions = list({(e.segment_id, e.reason): e for e in exclusions}.values())
-        manifest = AudioReuseManifest(
+        manifest = manifest_model(
             clip_uid=job.clip_uid, source_job_fingerprint=job.request_fingerprint,
             source_annotation_sha256=annotation_hash, source_stem_record_fingerprint=stem_record.record_fingerprint,
             speakers=speakers, music=music_asset, exclusions=exclusions,

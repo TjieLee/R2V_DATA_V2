@@ -87,7 +87,8 @@ class WorkerSession:
 
 class GroupCoordinator:
     def __init__(self, run_root: Path, source_root: Path, limit: int, *, max_groups=1,
-                 transport="local", coordinator_host=None, coordinator_identity=None):
+                 transport="local", coordinator_host=None, coordinator_identity=None,
+                 mode="cpu_fake_pilot"):
         if not 1 <= limit <= 200 or max_groups < 1:
             raise ValueError("invalid bounded pilot settings")
         if transport not in ("local", "http") or (transport == "http" and not coordinator_host):
@@ -103,6 +104,8 @@ class GroupCoordinator:
         with file_lock(self.run_root / "control.lock", blocking=True):
             if self.control_path.exists():
                 existing = read_json(self.control_path)
+                if existing["mode"] != mode:
+                    raise ValueError("run mode differs; use the original run-id settings")
                 if existing.get("transport", "local") != transport:
                     raise ValueError("run transport differs; implicit migration is forbidden")
                 if transport == "http" and existing["coordinator_host"] != coordinator_host:
@@ -116,7 +119,7 @@ class GroupCoordinator:
                               "coordinator_identity": coordinator_identity}
                              if transport == "http" else {})
                 atomic_json(self.control_path, {
-                    "mode": "cpu_fake_pilot", "settings": settings, "generation": 0,
+                    "mode": mode, "settings": settings, "generation": 0,
                     "group_id": None, "stage": None, "phase": "idle", "started_groups": [],
                     **ownership,
                 })
@@ -344,7 +347,7 @@ class GroupCoordinator:
             index = STAGES.index(snapshot.stage)
             if index == len(STAGES) - 1:
                 atomic_json(self.group_root(snapshot.group_id) / "PILOT_COMPLETE", {
-                    "mode": "cpu_fake_pilot", "selected_count": total,
+                    "mode": control["mode"], "selected_count": total,
                     "generation": snapshot.generation, "model_call_count": 0,
                 })
                 control["phase"] = "complete"

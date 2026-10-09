@@ -81,8 +81,8 @@ def test_audio_stages_reuse_context_and_preserve_exact_sample_windows(tmp_path):
                 worker.process(task_at(tmp_path, "clip-b"), {})
     assert fake.opened.count("canonical") == fake.closed.count("canonical") == 1
     assert len(fake.calls[0:2]) == 2
-    assert fake.calls[0]["prompt"] == "Music"
-    assert fake.calls[1]["prompt"] == "Speech"
+    assert fake.calls[0]["prompt"] == "music soundtrack"
+    assert fake.calls[1]["prompt"] == "human voices"
     assert fake.calls[1]["source_audio_path"] == fake.calls[0]["residual_path"]
     resolved = payloads["resolve"]
     assert resolved["speech"]["path"] == payloads["auk"]["speech"]["path"]
@@ -119,3 +119,53 @@ def test_no_missing_stage_is_silently_substituted(tmp_path):
     with (GroupStageWorker("resolve", tmp_path, backend_factory=PCMBackends().factory) as worker,
           pytest.raises(KeyError)):
         worker.process(task_at(tmp_path), {})
+
+
+def test_sam_unverified_is_preserved_not_promoted_to_success(tmp_path):
+    from r2v_data_v2.h3.ra2va_group_pipeline import GroupStageWorker
+    fake = PCMBackends()
+    original = fake.separate
+
+    def unverified(**kwargs):
+        original(**kwargs)
+        return SimpleNamespace(verification_state="unverified")
+
+    fake.separate = unverified
+    with GroupStageWorker("canonical", tmp_path, backend_factory=fake.factory) as worker:
+        canonical = worker.process(task_at(tmp_path), {})
+    with GroupStageWorker("sam", tmp_path, backend_factory=fake.factory, ffmpeg=ffmpeg()) as worker:
+        result = worker.process(task_at(tmp_path), {"canonical": canonical})
+    assert result["separation_state"] == "unverified"
+    assert result["model_call_count"] == 2
+
+
+def test_audio_stage_recovery_does_not_overwrite_partial_or_repeat_completed_work(tmp_path):
+    from r2v_data_v2.h3.ra2va_group_pipeline import GroupStageWorker
+    fake = PCMBackends()
+    original = fake.materialize_full_audio
+    paths = []
+
+    def interrupted(**kwargs):
+        assert not kwargs["destination"].exists()
+        original(**kwargs)
+        paths.append(kwargs["destination"])
+        raise SystemExit("crash before stage receipt")
+
+    fake.materialize_full_audio = interrupted
+    task = task_at(tmp_path)
+    with (GroupStageWorker("canonical", tmp_path / "out", backend_factory=fake.factory) as worker,
+          pytest.raises(SystemExit)):
+        worker.process(task, {})
+
+    def recovered(**kwargs):
+        assert not kwargs["destination"].exists()
+        paths.append(kwargs["destination"])
+        original(**kwargs)
+
+    fake.materialize_full_audio = recovered
+    with GroupStageWorker("canonical", tmp_path / "out", backend_factory=fake.factory) as worker:
+        result = worker.process(task, {})
+    assert len(paths) == 2 and paths[0] != paths[1]
+    fake.materialize_full_audio = lambda **kwargs: pytest.fail("saved stage must not execute again")
+    with GroupStageWorker("canonical", tmp_path / "out", backend_factory=fake.factory) as worker:
+        assert worker.process(task, {}) == result

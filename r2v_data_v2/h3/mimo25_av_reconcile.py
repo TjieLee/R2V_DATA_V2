@@ -504,7 +504,7 @@ def project_mimo_h3_sample_references(
         if voice["entity_id"] not in subject_indexes:
             raise ValueError("MiMo subject voice has no surviving entity Subject")
         voice["subject_index"] = subject_indexes[voice["entity_id"]]
-    return FinalH3SampleV2.model_validate(sample_values, context={"h3_reference_graph": True})
+    return type(sample).model_validate(sample_values, context={"h3_reference_graph": True})
 
 
 class MimoSegmentEvidence(SchemaModel):

@@ -601,7 +601,7 @@ def _contract_with_voice_profiles(
         speaker_id = audio.get("speaker_id")
         if speaker_id in profile_by_speaker:
             audio["voice_characteristics"] = profile_by_speaker[speaker_id]
-    return RecaptionReferenceContract.model_validate(values)
+    return type(contract).model_validate(values)
 
 
 def _join_picture_labels(labels: Sequence[str]) -> str:
@@ -1015,6 +1015,7 @@ def _prepare_materialization_context(
     extra_audio_contract: RecaptionAudioContract | None = None,
     reuse_audio_contracts: Sequence[RecaptionAudioContract] | None = None,
     donor_records_by_clip: Mapping[str, FrozenAnnotationSource] | None = None,
+    reference_contract: RecaptionReferenceContract | None = None,
 ) -> _MaterializationContext:
     assert record.annotation is not None
     provenance = getattr(record, "source_backend_provenance", getattr(record, "backend_provenance", None))
@@ -1049,10 +1050,10 @@ def _prepare_materialization_context(
     corrected_payload["speech_segments"] = [
         item.model_dump(mode="python") for item in corrected
     ]
-    corrected_sample = FinalH3SampleV2.model_validate(corrected_payload, context={"h3_reference_graph": True})
+    corrected_sample = type(projected_sample).model_validate(corrected_payload, context={"h3_reference_graph": True})
     variant = conditioning_variant or _variant(corrected_sample)
     contract = _contract_with_voice_profiles(
-        build_reference_contract(
+        reference_contract if reference_contract is not None else build_reference_contract(
             corrected_sample,
             "visual_only" if extra_audio_contract is not None or reuse_audio_contracts is not None else variant,
         ),
@@ -1060,7 +1061,7 @@ def _prepare_materialization_context(
         record=record,
     )
     if extra_audio_contract is not None:
-        contract = RecaptionReferenceContract.model_validate(
+        contract = type(contract).model_validate(
             {
                 **contract.model_dump(mode="json"),
                 "audios": [extra_audio_contract.model_dump(mode="json")],
@@ -1069,7 +1070,7 @@ def _prepare_materialization_context(
     if reuse_audio_contracts is not None:
         if extra_audio_contract is not None:
             raise ValueError("reuse Audio contract cannot also supply legacy extra Audio")
-        contract = RecaptionReferenceContract.model_validate({
+        contract = type(contract).model_validate({
             **contract.model_dump(mode="json"),
             "audios": [audio.model_dump(mode="json") for audio in reuse_audio_contracts],
         })
@@ -1107,11 +1108,13 @@ def _materialize_sample(
     extra_audio_contract: RecaptionAudioContract | None = None,
     reuse_audio_contracts: Sequence[RecaptionAudioContract] | None = None,
     donor_records_by_clip: Mapping[str, FrozenAnnotationSource] | None = None,
+    reference_contract: RecaptionReferenceContract | None = None,
 ) -> tuple[list[FinalQwen3SpeechSegment], str, list[str]]:
     context = _prepare_materialization_context(
         sample, job, record, conditioning_variant=conditioning_variant,
         extra_audio_contract=extra_audio_contract, reuse_audio_contracts=reuse_audio_contracts,
         donor_records_by_clip=donor_records_by_clip,
+        reference_contract=reference_contract,
     )
     corrected_sample, corrected = context.sample, context.corrected
     warnings, variant, contract = context.warnings, context.variant, context.contract

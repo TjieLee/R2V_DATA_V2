@@ -112,10 +112,14 @@ def test_cli_fake_only_and_output_boundary(tmp_path):
 
 
 def test_no_model_imports():
-    from r2v_data_v2.h3.ra2va_group_fake import FakeWorker
-    with FakeWorker("mimo"):
-        assert "torch" not in sys.modules
-        assert "r2v_data_v2.h3.mimo26_two_step_backend" not in sys.modules
+    script = """
+import sys
+from r2v_data_v2.h3.ra2va_group_fake import FakeWorker
+with FakeWorker('mimo'):
+    assert 'torch' not in sys.modules
+    assert 'r2v_data_v2.h3.mimo26_two_step_backend' not in sys.modules
+"""
+    subprocess.run([sys.executable, "-c", script], check=True, timeout=10)
 
 
 def test_join_race_with_draining_is_not_infrastructure_failure(tmp_path, monkeypatch):

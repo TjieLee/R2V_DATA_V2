@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import tempfile
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +16,7 @@ from r2v_data_v2.h3.mimo25_av_reconcile import (
 from r2v_data_v2.h3.qwen38_h3_recaption import RecaptionSubjectContract
 from r2v_data_v2.h3.ra2va_group_source import GroupTask
 from r2v_data_v2.h3.schemas import SchemaModel
+from r2v_data_v2.h3.t2va_production import atomic_json
 
 
 class GroupPicture(SchemaModel):
@@ -83,7 +86,7 @@ class GroupStageWorker:
         self.ffmpeg, self.ffprobe = ffmpeg, ffprobe
 
     def __enter__(self):
-        self.context = (nullcontext(None) if self.stage == "resolve"
+        self.context = (nullcontext(None) if self.stage in ("resolve", "export")
                         else self.backend_factory(self.stage))
         self.backend = self.context.__enter__()
         return self
@@ -99,8 +102,22 @@ class GroupStageWorker:
         return audio_metadata(destination)
 
     def process(self, task: GroupTask, upstream: dict[str, dict]) -> dict:
-        output = self.root / self.stage / task.clip_uid
-        output.mkdir(parents=True, exist_ok=True)
+        root = self.root / self.stage / task.clip_uid
+        root.mkdir(parents=True, exist_ok=True)
+        receipt = root / "stage_result.json"
+        if self.stage not in ("mimo", "export") and receipt.exists():
+            return json.loads(receipt.read_text())
+        # An interrupted, unpublished audio file is never overwritten or trusted.
+        output = (Path(tempfile.mkdtemp(prefix="attempt-", dir=root))
+                  if self.stage in ("canonical", "sam", "auk") else root)
+        result = self._process(task, upstream, output)
+        if self.stage not in ("mimo", "export"):
+            atomic_json(receipt, result)
+        return result
+
+    def _process(self, task: GroupTask, upstream: dict[str, dict], output: Path) -> dict:
+        if hasattr(self.backend, "bind_clip"):
+            self.backend.bind_clip(task.clip_uid)
         if self.stage == "canonical":
             path = output / "full.flac"
             self.backend.materialize_full_audio(
@@ -111,18 +128,22 @@ class GroupStageWorker:
         if self.stage == "sam":
             source = Path(upstream["canonical"]["path"])
             outcomes = []
-            for prompt, target, residual in (("Music", "music", "residual"), ("Speech", "speech", "sfx")):
+            configuration = getattr(self.backend, "configuration", None)
+            music_prompt = getattr(configuration, "music_prompt", "music soundtrack")
+            speech_prompt = getattr(configuration, "speech_prompt", "human voices")
+            for prompt, target, residual in ((music_prompt, "music", "residual"), (speech_prompt, "speech", "sfx")):
                 raw, remainder = output / f"{target}.raw.wav", output / f"{residual}.raw.wav"
                 result = self.backend.separate(
                     clip_uid=task.clip_uid, source_audio_path=source, prompt=prompt,
                     target_path=raw, residual_path=remainder,
                 )
-                if result.verification_state != "success":
+                if result.verification_state == "failure":
                     raise ValueError(f"SAM {prompt} separation: {result.verification_state}")
                 outcomes.append(result.verification_state)
                 source = remainder
             return {**{kind: self._stem(output / f"{kind}.raw.wav", output / f"{kind}.wav")
-                       for kind in ("speech", "music", "sfx")}, "separation_state": "success",
+                       for kind in ("speech", "music", "sfx")},
+                    "separation_state": "success" if set(outcomes) == {"success"} else "unverified",
                     "model_call_count": len(outcomes)}
         if self.stage == "auk":
             from r2v_data_v2.h3.auk_speech_shadow import canonicalize_speech
@@ -174,4 +195,18 @@ class GroupStageWorker:
                 segments.append({**segment, "asr_status": "transcribed" if text.strip() else "empty",
                     "asr_text": text if text.strip() else None, "asr_language": language if text.strip() else None})
             return {"job": frozen_job(task, upstream["canonical"], segments).model_dump(mode="json")}
+        if self.stage == "mimo":
+            from r2v_data_v2.h3.ra2va_group_mimo import reconcile_group_job
+
+            client = (self.backend.client_for(task.clip_uid) if hasattr(self.backend, "client_for")
+                      else self.backend.client)
+            return reconcile_group_job(root=output, config=self.backend.config, client=client,
+                job=GroupFrozenJob.model_validate(upstream["asr"]["job"]),
+                stems={kind: upstream["resolve"][kind]["path"] for kind in ("speech", "music", "sfx")})
+        if self.stage == "export":
+            from r2v_data_v2.h3.ra2va_group_export import export_group_clip
+
+            return export_group_clip(root=output, task=task,
+                job=GroupFrozenJob.model_validate(upstream["asr"]["job"]),
+                result=upstream["mimo"], stems=upstream["resolve"], ffmpeg=self.ffmpeg)
         raise ValueError(f"unsupported Group stage: {self.stage}")

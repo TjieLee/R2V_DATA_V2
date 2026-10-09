@@ -38,6 +38,7 @@ class DurableCompletions:
         self.event = event or (lambda *args: None)
         self.new_request_count = self.response_replay_count = 0
         self.unresolved_turns = []
+        self.request_settings_match = True
         self.chat = SimpleNamespace(completions=self)
 
     def create(self, **payload):
@@ -51,12 +52,18 @@ class DurableCompletions:
         if intent_path.exists():
             self.unresolved_turns.append(turn)
             raise InterruptedRequestUnresolved(f"interrupted_request_unresolved:{turn}")
+        if not self.request_settings_match:
+            raise ValueError("resume request settings differ from saved inference provenance")
         started = time.time()
         atomic_json(intent_path, {"clip_uid": self.clip_uid, "turn": turn,
                                  "started_at": started, "model": payload["model"]})
         self.event("request_started", turn)
         self.new_request_count += 1
-        completion = self.client.chat.completions.create(**payload)
+        try:
+            completion = self.client.chat.completions.create(**payload)
+        except Exception:
+            self.unresolved_turns.append(turn)
+            raise
         atomic_json(response_path, {"clip_uid": self.clip_uid, "turn": turn,
             "started_at": started, "completed_at": time.time(),
             "completion": _json_completion(completion)})
@@ -74,7 +81,17 @@ class DurableCompletions:
 def reconcile_group_job(*, root, config, client, job, stems, event=None) -> dict:
     durable = DurableCompletions(root, client, clip_uid=job.clip_uid, event=event)
     backend = TwoStepOpenAIMimo26Backend(config, stem_records_by_clip={}, client=durable)
-    common = {"clip_uid": job.clip_uid, "backend_provenance": backend.provenance.model_dump(mode="json"),
+    current_provenance = backend.provenance.model_dump(mode="json")
+    provenance_path = Path(root) / "inference_provenance.json"
+    if not provenance_path.exists():
+        atomic_json(provenance_path, current_provenance)
+    inference_provenance = json.loads(provenance_path.read_text())
+    # Old responses retain their actual settings. Never issue a missing turn under
+    # different settings and label it as part of the same inference.
+    durable.request_settings_match = (
+        {k: v for k, v in inference_provenance.items() if k != "configuration_fingerprint"}
+        == {k: v for k, v in current_provenance.items() if k != "configuration_fingerprint"})
+    common = {"clip_uid": job.clip_uid, "backend_provenance": inference_provenance,
               "postprocessing_version": "ra2va_group_durable_two_step_v1"}
     try:
         result = backend.reconcile(job, segment_ids=[s.segment_id for s in job.segments],

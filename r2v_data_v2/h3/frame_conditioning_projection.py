@@ -349,7 +349,8 @@ def load_projection_sources(shadow: Path) -> tuple[list[ProjectionSource], dict[
     return result, dict(sorted(hashes.items()))
 
 
-def extract_frames(job: MimoClipJob, stage: Path, published: Path, *, ffmpeg: str) -> FrameMetadata:
+def extract_frames(job: MimoClipJob, stage: Path, published: Path, *, ffmpeg: str,
+                   metadata_type=FrameMetadata) -> FrameMetadata:
     """Extract exact first/last frames with bounded, independently logged FFmpeg calls."""
     video = Path(job.target_video_path)
     stage.mkdir(parents=True)
@@ -374,7 +375,7 @@ def extract_frames(job: MimoClipJob, stage: Path, published: Path, *, ffmpeg: st
                   f"video={video} command={shlex.join(command)}", flush=True)
             raise
         print(f"{progress} done elapsed={perf_counter() - started:.2f}s", flush=True)
-    metadata = FrameMetadata(
+    metadata = metadata_type(
         clip_uid=job.clip_uid, source_video_path=job.target_video_path, source_video_sha256=job.target_video_sha256,
         source_duration_seconds=job.target_duration_seconds,
         first_frame_path=str(published / "first.png"), first_frame_sha256=sha256_file(stage / "first.png"),

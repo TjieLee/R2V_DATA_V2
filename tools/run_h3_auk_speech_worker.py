@@ -64,7 +64,8 @@ def run_worker(input_stream, output_stream) -> None:
             source = Path(request["source_audio_path"])
             if not source.is_absolute() or not source.is_file():
                 raise ValueError("AuK source must be a local audio file")
-            if file_hash(source) != request["source_audio_sha256"]:
+            if (request.get("operation") != "generate_group"
+                    and file_hash(source) != request["source_audio_sha256"]):
                 raise ValueError("AuK source audio hash differs")
             duration = request["source_duration_seconds"]
             if not math.isfinite(duration) or duration <= 0:
