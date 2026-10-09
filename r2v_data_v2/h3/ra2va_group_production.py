@@ -65,6 +65,22 @@ class StaleGeneration(RuntimeError):
     pass
 
 
+@dataclass
+class WorkerSession:
+    snapshot: StageSnapshot
+    worker_id: str
+    lock_handle: object
+
+    def close(self):
+        self.lock_handle.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+
 class GroupCoordinator:
     def __init__(self, run_root: Path, source_root: Path, limit: int, *, max_groups=1):
         if not 1 <= limit <= 200 or max_groups < 1:
@@ -107,13 +123,16 @@ class GroupCoordinator:
     def select_current(self):
         with file_lock(self.run_root / "control.lock", blocking=True):
             control = read_json(self.control_path)
+            if control["group_id"] and (self.group_root(control["group_id"]) / "PILOT_COMPLETE").exists():
+                control["phase"] = "complete"
+                atomic_json(self.control_path, control)
             if control["group_id"] and control["phase"] != "complete":
                 return self._snapshot(control)
             if len(control["started_groups"]) >= self.max_groups:
                 return None
             # An inventory published before a control-write crash is already started.
             roots = self.run_root / "groups"
-            unfinished = sorted(p.parent.name for p in roots.glob("*/inventory/inventory.json")
+            unfinished = sorted(p.parent.parent.name for p in roots.glob("*/inventory/inventory.json")
                                 if not (p.parent.parent / "PILOT_COMPLETE").exists())
             if unfinished:
                 group_id = unfinished[0]
@@ -227,6 +246,73 @@ class GroupCoordinator:
                     "pending": total - done - len(dispatch["active"]),
                     "active": len(dispatch["active"]), **{k: dispatch[k] for k in TERMINAL},
                     "elapsed_seconds": elapsed, "tasks_per_second": done / elapsed}
+
+    def join(self, snapshot, worker_id):
+        with self._checked(snapshot) as (control, _):
+            if control["phase"] != "running":
+                raise RuntimeError("stage is draining; new membership refused")
+            handle = try_lock(self.stage_root(snapshot) / "sessions" / f"{worker_id}.lock")
+            if handle is None:
+                raise RuntimeError("worker session is already live")
+            try:
+                control["members"][worker_id] = {"generation": snapshot.generation, "released": False}
+                atomic_json(self.control_path, control)
+                return WorkerSession(snapshot, worker_id, handle)
+            except BaseException:
+                handle.close()
+                raise
+
+    def acknowledge_release(self, session):
+        with self._checked(session.snapshot) as (control, _):
+            if session.lock_handle.closed:
+                raise ValueError("release acknowledgment requires owned session")
+            control["members"][session.worker_id]["released"] = True
+            atomic_json(self.control_path, control)
+            self.log("released", session.snapshot, worker_id=session.worker_id)
+
+    def advance(self, snapshot):
+        with self._checked(snapshot) as (control, dispatch):
+            if control["phase"] == "complete":
+                return False
+            self._account_results(snapshot, dispatch)
+            total = read_json(self.group_root(snapshot.group_id) / "inventory/inventory.json")["selected_count"]
+            if dispatch["active"] or sum(dispatch[k] for k in TERMINAL) != total:
+                return False
+            if control["phase"] != "draining":
+                control["phase"] = "draining"
+                atomic_json(self.control_path, control)
+            for worker_id, member in control["members"].items():
+                if member["released"]:
+                    continue
+                handle = try_lock(self.stage_root(snapshot) / "sessions" / f"{worker_id}.lock")
+                if handle is None:
+                    return False
+                handle.close()
+            self.log("stage_complete", snapshot, **{k: dispatch[k] for k in TERMINAL},
+                     elapsed_seconds=time.time() - dispatch["started_at"])
+            index = STAGES.index(snapshot.stage)
+            if index == len(STAGES) - 1:
+                atomic_json(self.group_root(snapshot.group_id) / "PILOT_COMPLETE", {
+                    "mode": "cpu_fake_pilot", "selected_count": total,
+                    "generation": snapshot.generation, "model_call_count": 0,
+                })
+                control["phase"] = "complete"
+            else:
+                control.update(stage=STAGES[index + 1], generation=snapshot.generation + 1,
+                               phase="running", members={})
+                self._initialize_stage(self._snapshot(control))
+            atomic_json(self.control_path, control)
+            return True
+
+    def finish_pilot(self, snapshot):
+        if snapshot.stage != "export":
+            raise ValueError("pilot completion requires fake export stage")
+        return self.advance(snapshot)
+
+    def status(self):
+        with file_lock(self.run_root / "control.lock", blocking=True):
+            control = read_json(self.control_path)
+        return control
 
     @staticmethod
     def log(event, snapshot, **fields):
