@@ -52,6 +52,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -317,7 +318,19 @@ class PhaseLedger:
             atomic_write_json(self.plan_path, payload)
             return payload["plan_hash"]
 
-        existing = json.loads(self.plan_path.read_text())
+        # Once observed, this plan must be read, never replaced by the current
+        # subset through the creation branch after a transient missing read.
+        for attempt in range(3):
+            try:
+                plan_text = self.plan_path.read_text()
+                break
+            except FileNotFoundError as exc:
+                if attempt == 2:
+                    raise LedgerError(
+                        f"existing phase plan remains unreadable at {self.plan_path}"
+                    ) from exc
+                time.sleep(0.05)
+        existing = json.loads(plan_text)
         merged = self._validate_existing_plan(existing)
         for job_id, record in current.items():
             known = merged.get(job_id)
