@@ -47,6 +47,7 @@ from r2v_data_v2.h3.mimo25_backend import (
 from r2v_data_v2.h3.mimo25_stem_shadow import StemAwareOpenAIMimo25Backend
 from r2v_data_v2.h3.schemas import SchemaModel
 from r2v_data_v2.h3.speaker_ownership import (
+    neutralize_two_step_caption_identity,
     speaker_ownership_reasons,
     unconfirmed_visible_binding_segments,
 )
@@ -56,7 +57,7 @@ from r2v_data_v2.structured_output import (
     parse_structured_json_issues,
 )
 
-TWO_STEP_BACKEND_VERSION = "r2v.h3.mimo25_backend.84"
+TWO_STEP_BACKEND_VERSION = "r2v.h3.mimo25_backend.85"
 TWO_STEP_PROMPT_VERSION = "h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity"
 JOINT_INPUT_MODALITY = "target_video_joint_av_audio"
 
@@ -369,8 +370,9 @@ class TwoStepOpenAIMimo26Backend(StemAwareOpenAIMimo25Backend):
             segments = unconfirmed_visible_binding_segments(exc.annotation)
             if any(issue.code != "visible_entity_binding_not_permitted" or issue.field not in segments for issue in exc.issues):
                 raise
+            groundings = {g.segment_id: g for g in exc.annotation.av_grounding.segment_groundings}
             exc.diagnostics[-1].warnings.extend(
-                f"visible_entity_binding_missing_positive_cue:{segment}:identity_publication_restricted"
+                f"{'sparse_lip_motion_not_assessable' if 'no_visible_lip_motion' in groundings[segment].evidence_codes else 'visible_entity_binding_missing_positive_cue'}:{segment}:identity_publication_restricted"
                 for segment in sorted(segments)
             )
             corrections = {}
@@ -519,14 +521,18 @@ class TwoStepOpenAIMimo26Backend(StemAwareOpenAIMimo25Backend):
             assembly = joint.speech_av
             _normalize_joint_draft(joint, job, corrections, warnings=diagnostics[-1].warnings)
             shot1_caption = assembly.shot1_caption
+            visual_description = visual.shot1_visual_description
             if not any(s.asr_status == "transcribed" for s in job.segments):
-                shot1_caption = visual.shot1_visual_description
+                visual_description, removed = re.subn(r"\s*\(S[1-9]\d*\)", "", visual_description)
+                if removed:
+                    corrections["no_transcript_visual_speaker_markers_removed"] = removed
+                shot1_caption = visual_description
                 if shot1_caption != assembly.shot1_caption:
                     corrections["no_transcript_visual_caption_projection"] = 1
             final = {
                 "schema_version": MIMO25_SCHEMA_VERSION,
                 "visual_observation": MimoVisualObservation(
-                    visual_blocks=[MimoVisualBlock(block_id="v1", text=visual.shot1_visual_description)],
+                    visual_blocks=[MimoVisualBlock(block_id="v1", text=visual_description)],
                     segment_views=visual.segment_views,
                 ).model_dump(mode="json"),
                 "audio_observation": {
@@ -548,7 +554,7 @@ class TwoStepOpenAIMimo26Backend(StemAwareOpenAIMimo25Backend):
                     issues=tuple(issues),
                 )
             # Expose identity contradictions before the shared normalizer can merge gN.
-            review_segments = unconfirmed_visible_binding_segments(annotation)
+            unconfirmed_segments = unconfirmed_visible_binding_segments(annotation)
             strict_issues = [issue for issue in validate_annotation(
                 annotation, segment_ids=[s.segment_id for s in job.segments],
                 segment_intervals={s.segment_id: (s.start_time, s.end_time) for s in job.segments},
@@ -563,7 +569,7 @@ class TwoStepOpenAIMimo26Backend(StemAwareOpenAIMimo25Backend):
                 "visible_entity_absent_from_visual_segment", "unknown_entity", "av_audio_speaker_group_mismatch",
                 "visible_speaker_evidence_presentation_contradiction", "visible_entity_requires_resolved_audio",
             } or (issue.code == "visible_entity_binding_not_permitted"
-                  and issue.field not in review_segments)]
+                  and issue.field not in unconfirmed_segments)]
             if strict_issues:
                 _, marker_issues, marker_warnings = protect_direct_dialogue(
                     annotation.h3_semantics.shot1_caption, direct_speech_facts(annotation, list(job.segments)),
@@ -574,6 +580,16 @@ class TwoStepOpenAIMimo26Backend(StemAwareOpenAIMimo25Backend):
                     code="mimo_structured_output_failed", reason="MiMo joint speaker binding contradiction",
                     issues=(*strict_issues, *marker_issues), annotation=annotation,
                 )
+            caption, summary, identity_corrections, publishable = neutralize_two_step_caption_identity(
+                annotation, job.segments, self.provenance,
+            )
+            if publishable:
+                annotation.h3_semantics.shot1_caption = caption
+                annotation.h3_semantics.summary = summary
+                corrections.update(identity_corrections)
+                final = annotation.model_dump(mode="json")
+            else:
+                diagnostics[-1].warnings.append("two_step_identity_caption_publication_restricted")
             marker_count = _normalize_unambiguous_speaker_markers(annotation, job)
             if marker_count:
                 corrections["joint_unambiguous_speaker_marker_corrected"] += marker_count

@@ -439,7 +439,7 @@ from types import SimpleNamespace
 from r2v_data_v2.h3.mimo25_av_reconcile import MimoClipJob
 from r2v_data_v2.h3.mimo25_backend import MimoBackendConfig, MimoBackendFailure, MimoVisualDraft
 from r2v_data_v2.h3.mimo26_two_step_backend import TwoStepOpenAIMimo26Backend, _canonicalize_two_step_visual_payload
-from r2v_data_v2.h3.speaker_ownership import two_step_identity_restricted_groups
+from r2v_data_v2.h3.speaker_ownership import neutralize_two_step_caption_identity, two_step_identity_restricted_groups
 from r2v_data_v2.structured_output import parse_structured_json_issues
 
 root = Path(sys.argv[1])
@@ -488,13 +488,20 @@ for job in jobs:
             report.update(status="failed", failure_reason=exc.reason, issues=[i.to_dict() for i in exc.issues])
             report["correction_counts"] = {w.split(":", 1)[1].rsplit("=", 1)[0]: int(w.rsplit("=", 1)[1])
                 for d in result.diagnostics for w in d.warnings if w.startswith("deterministic_correction_count:")}
-        report["qa_warnings"] = [w for d in result.diagnostics for w in d.warnings]
+        report["diagnostic_warnings"] = [w for d in result.diagnostics for w in d.warnings]
         report["identity_publication_restricted_groups"] = sorted(
             two_step_identity_restricted_groups(result.annotation, backend.provenance)
         ) if result.annotation is not None else []
         report["identity_restricted_binding"] = report["status"] == "cached_backend_validation_ready" and bool(
             report["identity_publication_restricted_groups"]
         )
+        if result.annotation is not None:
+            caption, summary, _, publishable = neutralize_two_step_caption_identity(
+                result.annotation, job.segments, backend.provenance)
+            ready = report["status"] == "cached_backend_validation_ready"
+            report.update(caption=caption, summary=summary, caption_publishable=publishable,
+                eligible_h3_products=["visual_only", "full_audio_reuse"] if ready and publishable else [],
+                identity_specific_voice_allowed=ready and not report["identity_publication_restricted_groups"])
     reports.append(report)
     print(json.dumps(report, ensure_ascii=False))
 print(json.dumps({"original_failed_count": len(reports), "actual_model_calls": 0,
@@ -617,3 +624,44 @@ Use the all-failed CPU replay above against the server's original records for
 the complete nine-case report before any new model test. Historical `.80` to
 `.83` provenance remains readable. No model calls, media scans or training
 exports are performed by replay.
+
+## Two-step sparse lip sampling and neutral publication (.85)
+
+Joint v2 and Visual v5 requests are unchanged. For Two-step only,
+`no_visible_lip_motion` is not conclusive when the exact-window target entity's
+Stage1 articulation is `not_assessable` and Stage2 has `av_temporal_alignment`.
+The entity must still be visible; explicit offscreen/voice-over/playback,
+competing articulation, group/entity conflicts, non-isolated speech and ASR
+violations remain hard failures. No evidence or binding is rewritten.
+
+These ready records retain the `.84` automatic whole-group restriction on
+identity-specific voice assets, target reuse and cross-donor reuse. Published
+speech metadata does not bind the restricted gN to an entity/occurrence.
+Simple standalone dialogue lead-ins are projected to `A voice (Sx) says/asks...`;
+paired Subject/Sx markers and the supported explicit summary binding phrase
+are removed without changing dialogue or visual facts. Original Audio/AV
+decisions and both raw responses remain unchanged. Correction counts are in
+diagnostics. If a complex attribution cannot be safely neutralized, automatic
+H3 publication remains restricted; there is no human approval or QA queue.
+
+For jobs with no transcribed segments, final visual prose strips only
+pipeline-owned `(Sx)` markers. It creates no speaker, ASR, dialogue or Profile;
+the original Visual raw and non-speech Soundscape/Music observations are kept.
+
+The CPU replay above now reports neutral Caption, publication eligibility and
+identity restrictions without reading media or calling MiMo. Local saved-raw
+results for this revision:
+
+| Clip | Backend result | Caption/product policy |
+| --- | --- | --- |
+| `4e0506dfb9454536cc3c37b1` | Ready | Subject visual prose retained; dialogue attributed only to `A voice (S1)`. Visual-only/full-original-audio products eligible; g1 identity-specific products excluded. |
+| `009a0523c7a1332b52fcc82a` | Ready | Same neutral dialogue policy; explicit summary entity binding removed. Original predicted e1 binding is not published as a trusted identity label. |
+| `02750d804022e9e8ba5f2964` | Ready | Empty ASR inventory preserved; ten Visual speaker-marker occurrences removed only from final projection. |
+| `25755cbc2545bad6928c736c` | Failed | Unknown S2 remains ambiguous with real non-transcribed g2 activity; no grouping or identity guess. |
+
+These are backend replays of the user-supplied raw, not new inference results.
+CPU temporary-media bundle tests separately verify automatic product exclusions,
+neutral H3 captions/speech metadata and direct training export without manual
+review. The real server media were not materialized locally. The two Visual-only
+cases remain partial replays; the unsupplied ASR/secondary-vocal contradictions
+are not claimed recovered. Historical `.80` through `.84` stay readable.

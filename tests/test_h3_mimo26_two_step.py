@@ -176,6 +176,25 @@ def test_visible_binding_with_explicit_negative_still_fails(tmp_path, monkeypatc
     assert len(completions.requests) == 2
 
 
+@pytest.mark.parametrize("evidence,articulation", [
+    (["no_visible_lip_motion"], "not_assessable"),
+    (["av_temporal_alignment", "no_visible_lip_motion"], "not_observed"),
+    (["av_temporal_alignment", "no_visible_lip_motion", "offscreen_audio"], "not_assessable"),
+    (["av_temporal_alignment", "no_visible_lip_motion", "voice_over_context"], "not_assessable"),
+])
+def test_sparse_lip_uncertainty_does_not_waive_missing_alignment_or_source_contradiction(
+    tmp_path, monkeypatch, evidence, articulation,
+):
+    visual, joint = _drafts()
+    visual["segment_views"][0]["entity_observations"][0]["speech_correlated_articulation"] = articulation
+    joint["speech_av"]["av_grounding"]["segment_groundings"][0]["evidence_codes"] = evidence
+    _, _, backend, completions, stems, jobs, _, _ = _setup(tmp_path, monkeypatch, visual=visual, joint=joint)
+    with pytest.raises(MimoBackendFailure) as caught:
+        _reconcile(backend, jobs[0], stems)
+    assert "visible_entity_binding_not_permitted" in {i.code for i in caught.value.issues}
+    assert len(completions.requests) == 2
+
+
 def test_visual_not_assessable_does_not_override_positive_joint_av_evidence(tmp_path, monkeypatch):
     visual, joint = _drafts()
     visual["segment_views"][0]["entity_observations"][0]["speech_correlated_articulation"] = "not_assessable"
@@ -393,7 +412,7 @@ _RANDOM20_BINDING_CASES = json.loads((Path(__file__).parent / "fixtures/h3_two_s
 
 
 @pytest.mark.parametrize("case", _RANDOM20_BINDING_CASES, ids=lambda case: case["clip_uid"])
-def test_supplied_random20_binding_payloads_remain_hard_failures(tmp_path, monkeypatch, case):
+def test_supplied_random20_binding_payload_cpu_replay(tmp_path, monkeypatch, case):
     _, _, backend, completions, stems, jobs, _, _ = _setup(
         tmp_path, monkeypatch, visual=case["visual"], joint=case["joint"],
     )
@@ -424,26 +443,42 @@ def test_supplied_random20_binding_payloads_remain_hard_failures(tmp_path, monke
                                          selected_source_image_ids=[f"image_{i}" for i in range(1, count + 1)])
     job = _job(values)
     labels = {s.subject_label for s in job.reference_subjects} | {r.picture_label for r in job.reference_images}
-    with pytest.raises(MimoBackendFailure) as caught:
-        backend.reconcile(job, segment_ids=[s.segment_id for s in job.segments],
-            transcribed_segment_ids=[s.segment_id for s in job.segments if s.asr_status == "transcribed"],
-            allowed_reference_labels=labels, allowed_entity_ids={"e1"},
-            auxiliary_audio_paths={s.stem_type: Path(s.canonical_stem_path) for s in stems[0].stems})
-    failure = caught.value
-    expected = "direct_unknown_speaker" if case["clip_uid"].startswith("25755") else "visible_entity_binding_not_permitted"
-    assert expected in {issue.code for issue in failure.issues}
-    annotation = failure.annotation
+    kwargs = {
+        "segment_ids": [s.segment_id for s in job.segments],
+        "transcribed_segment_ids": [s.segment_id for s in job.segments if s.asr_status == "transcribed"],
+        "allowed_reference_labels": labels,
+        "allowed_entity_ids": {"e1"},
+        "auxiliary_audio_paths": {s.stem_type: Path(s.canonical_stem_path) for s in stems[0].stems},
+    }
+    if case["clip_uid"].startswith("25755"):
+        with pytest.raises(MimoBackendFailure) as caught:
+            backend.reconcile(job, **kwargs)
+        result = caught.value
+        assert "direct_unknown_speaker" in {issue.code for issue in result.issues}
+    else:
+        from r2v_data_v2.h3.speaker_ownership import two_step_identity_restricted_groups
+
+        result = backend.reconcile(job, **kwargs)
+        assert two_step_identity_restricted_groups(result.annotation, backend.provenance) == {"g1"}
+        caption = result.annotation.h3_semantics.shot1_caption
+        assert "<Subject 1> (S1)" not in caption
+        assert "A voice (S1) says, <d>[Chinese] " in caption
+        assert "He says, <d>" not in caption
+        assert "is bound as the speaker" not in result.annotation.h3_semantics.summary
+        assert result.deterministic_correction_counts["joint_unconfirmed_caption_identity_neutralized"] > 0
+        print(json.dumps({"clip_uid": job.clip_uid, "status": "ready", "caption": caption,
+                          "identity_restricted_groups": ["g1"], "actual_model_calls": 0}, ensure_ascii=False))
+    annotation = result.annotation
     assert [d.model_dump(mode="json") for d in annotation.audio_observation.segment_decisions] == case["joint"]["speech_av"]["audio_observation"]["segment_decisions"]
     assert annotation.av_grounding.model_dump(mode="json") == case["joint"]["speech_av"]["av_grounding"]
-    assert annotation.h3_semantics.shot1_caption == case["joint"]["speech_av"]["shot1_caption"]
-    assert failure.visual_raw_response == json.dumps(case["visual"])
-    assert failure.speech_av_raw_response == json.dumps(case["joint"])
-    warnings = [w for d in failure.diagnostics for w in d.warnings]
-    assert not any("missing_positive_cue" in w or "speaker_marker_corrected" in w for w in warnings)
+    assert result.visual_raw_response == json.dumps(case["visual"])
+    assert result.speech_av_raw_response == json.dumps(case["joint"])
+    assert len(completions.requests) == result.model_call_count == 2
+    warnings = [w for d in result.diagnostics for w in d.warnings]
     if case["clip_uid"].startswith("25755"):
+        assert annotation.h3_semantics.shot1_caption == case["joint"]["speech_av"]["shot1_caption"]
         assert [p.speaker_group for p in annotation.speaker_voice_profiles] == ["g1"]
         assert "deterministic_correction_count:joint_non_transcribed_non_null_profile_excluded=1" in warnings
-    assert len(completions.requests) == failure.model_call_count == 2
 
 
 @pytest.mark.parametrize("case", _RANDOM20_FORMAT_CASES, ids=lambda case: case["clip_uid"])
@@ -496,10 +531,13 @@ def test_supplied_random20_response_payload_cpu_replay(tmp_path, monkeypatch, ca
               "allowed_entity_ids": {s.entity_id for s in job.reference_subjects if s.kind == "entity"},
               "auxiliary_audio_paths": {s.stem_type: Path(s.canonical_stem_path) for s in stems[0].stems}}
     if case["clip_uid"].startswith("02750"):
-        with pytest.raises(MimoBackendFailure, match="non-visual or pipeline syntax") as caught:
-            backend.reconcile(job, **kwargs)
-        result = caught.value
+        result = backend.reconcile(job, **kwargs)
         assert "(S1)" in json.loads(result.visual_raw_response)["shot1_visual_description"]
+        assert "(S" not in result.annotation.h3_semantics.shot1_caption
+        assert "(S" not in result.annotation.visual_observation.visual_blocks[0].text
+        assert result.annotation.audio_observation.segment_decisions == []
+        assert result.annotation.speaker_voice_profiles == []
+        assert result.deterministic_correction_counts["no_transcript_visual_speaker_markers_removed"] == 10
     else:
         result = backend.reconcile(job, **kwargs)
         assert result.annotation.h3_semantics.shot1_caption == case["visual"]["shot1_visual_description"]
@@ -762,14 +800,14 @@ def test_integer_temperature_provenance_matches_float_and_two_step(tmp_path):
         float_config, stem_records_by_clip={}, client=SimpleNamespace(),
     )
     assert integer_backend.provenance == float_backend.provenance
-    assert integer_backend.provenance.schema_version == "r2v.h3.mimo25_backend.84"
+    assert integer_backend.provenance.schema_version == "r2v.h3.mimo25_backend.85"
 
 
 def test_two_step_has_independent_provenance_without_changing_multi(tmp_path, monkeypatch):
     from r2v_data_v2.h3.audio_reuse_prepared import FrozenReuseBackendProvenance
 
     _, _, backend, _, _, _, multi, _ = _setup(tmp_path, monkeypatch)
-    assert backend.provenance.schema_version == "r2v.h3.mimo25_backend.84"
+    assert backend.provenance.schema_version == "r2v.h3.mimo25_backend.85"
     assert backend.provenance.prompt_version == "h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity"
     assert multi.provenance.schema_version == "r2v.h3.mimo25_backend.66"
     assert multi.provenance.prompt_version == "h3_mimo25_speech_assembly_v49"
@@ -785,6 +823,7 @@ def test_two_step_has_independent_provenance_without_changing_multi(tmp_path, mo
     ("r2v.h3.mimo25_backend.81", "h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity"),
     ("r2v.h3.mimo25_backend.82", "h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity"),
     ("r2v.h3.mimo25_backend.83", "h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity"),
+    ("r2v.h3.mimo25_backend.84", "h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity"),
 ])
 def test_historical_two_step_provenance_remains_readable(tmp_path, monkeypatch, version, prompt):
     from r2v_data_v2.h3.audio_reuse_prepared import FrozenReuseBackendProvenance

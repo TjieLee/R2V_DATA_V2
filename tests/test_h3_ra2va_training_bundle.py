@@ -302,14 +302,17 @@ def test_frozen_bundle_real_pcm_materialization_frames_and_pass_only(tmp_path, m
         main(["--reconcile-root", str(reconcile), "--output-root", str(output), "--allow-unverified"])
 
 
-def test_two_step_unconfirmed_identity_exports_available_products_without_review(tmp_path, monkeypatch):
+@pytest.mark.parametrize("sparse_lip_motion", [False, True])
+def test_two_step_unconfirmed_identity_exports_available_products_without_review(tmp_path, monkeypatch, sparse_lip_motion):
     from r2v_data_v2.h3.mimo26_two_step_backend import TwoStepOpenAIMimo26Backend
     from tools.export_h3_training_manifests import main as export
     from tools.materialize_h3_ra2va_training_bundle import main
 
     reconcile, job, _, _ = _fixture(tmp_path, monkeypatch)
     raw = _rows(reconcile / "records.jsonl")[0]
-    raw["annotation"]["av_grounding"]["segment_groundings"][0]["evidence_codes"] = ["voice_continuity"]
+    raw["annotation"]["av_grounding"]["segment_groundings"][0]["evidence_codes"] = (
+        ["av_temporal_alignment", "no_visible_lip_motion"] if sparse_lip_motion else ["voice_continuity"]
+    )
     raw["annotation"]["visual_observation"]["segment_views"][0]["entity_observations"][0]["speech_correlated_articulation"] = "not_assessable"
     raw.update(
         backend_provenance=TwoStepOpenAIMimo26Backend(MimoBackendConfig(
@@ -340,6 +343,9 @@ def test_two_step_unconfirmed_identity_exports_available_products_without_review
     assert {p.conditioning_variant for p in products} == {"visual_only", "full_audio_reuse"}
     assert all(p.status == "ready" for p in products)
     assert all("g1:identity_publication_restricted" in p.warnings for p in products)
+    assert all(s.entity_id is None and s.entity_occurrence_id is None for p in products for s in p.corrected_speech_segments)
+    assert all("<Subject 1> (S1)" not in p.rendered_h3_prompt for p in products)
+    assert all("A voice (S1) says," in p.rendered_h3_prompt for p in products)
     assert _rows(output / "audio_reuse_prepared_v1/records.jsonl")[0]["annotation"] == raw["annotation"]
     assert _rows(reconcile / "records.jsonl")[0] == raw
     # Historical bundles remain directly exportable without changing their metadata.

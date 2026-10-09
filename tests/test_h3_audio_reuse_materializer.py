@@ -364,6 +364,68 @@ def test_two_step_qa_binding_cannot_publish_identity_audio_but_full_audio_stays_
     assert annotation.av_grounding.model_dump(mode="json") == payload["av_grounding"]
 
 
+def test_two_step_complex_unconfirmed_attribution_is_not_published_as_training_caption(tmp_path):
+    from types import SimpleNamespace
+
+    from r2v_data_v2.h3.mimo25_h3_materializer import MimoH3MaterializationContractError
+
+    _, sample, source = _case(tmp_path, caption="<Subject 1> (S1) turns and asks gently, <d>[English] Exact, text!</d>")
+    payload = source.record.annotation.model_dump(mode="json")
+    payload["av_grounding"]["segment_groundings"][0]["evidence_codes"] = ["av_temporal_alignment", "no_visible_lip_motion"]
+    payload["visual_observation"]["segment_views"][0]["entity_observations"][0]["speech_correlated_articulation"] = "not_assessable"
+    record = source.record.model_copy(update={
+        "annotation": MimoAVAnnotationDraft.model_validate(payload),
+        "source_backend_provenance": SimpleNamespace(prompt_version="h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity"),
+    })
+    with pytest.raises(MimoH3MaterializationContractError, match="two_step_identity_caption_publication_restricted"):
+        _materialize_sample(sample, source.job, record, conditioning_variant="visual_only")
+    full = RecaptionAudioContract(audio_index=1, audio_label="<Audio 1>", kind="full_audio_reuse",
+        path=source.job.target_full_audio_path, sha256=source.job.target_full_audio_sha256, retention_marker="fully_copy")
+    with pytest.raises(MimoH3MaterializationContractError, match="two_step_identity_caption_publication_restricted"):
+        _materialize_sample(sample, source.job, record, conditioning_variant="full_audio_reuse", extra_audio_contract=full)
+    assert record.annotation.model_dump(mode="json") == payload
+
+
+@pytest.mark.parametrize("case", ["summary_marker", "independent_summary", "tail_attribution", "other_speaker_lead"])
+def test_two_step_unconfirmed_identity_publication_covers_all_prose(tmp_path, case):
+    from types import SimpleNamespace
+
+    from r2v_data_v2.h3.mimo25_h3_materializer import MimoH3MaterializationContractError
+    from r2v_data_v2.h3.speaker_ownership import neutralize_two_step_caption_identity
+
+    caption = "<Subject 1> (S1) says, <d>[English] Exact, text!</d>."
+    summary = "A voice speaks."
+    if case == "summary_marker":
+        summary = "<Subject 1> (S1) stands by the door."
+    if case == "independent_summary":
+        summary = "<Subject 1> stands by the door while a voice speaks."
+    if case == "tail_attribution":
+        caption += " The voice belongs to <Subject 1>."
+    if case == "other_speaker_lead":
+        caption += " <Subject 1> (S1) turns. An offscreen voice (S2) says, <d>[English] Exact, text!</d>."
+    _, sample, source = _case(tmp_path, groups=("g1", "g2") if case == "other_speaker_lead" else ("g1",), caption=caption, summary=summary)
+    payload = source.record.annotation.model_dump(mode="json")
+    payload["av_grounding"]["segment_groundings"][0]["evidence_codes"] = ["av_temporal_alignment", "no_visible_lip_motion"]
+    payload["visual_observation"]["segment_views"][0]["entity_observations"][0]["speech_correlated_articulation"] = "not_assessable"
+    record = source.record.model_copy(update={
+        "annotation": MimoAVAnnotationDraft.model_validate(payload),
+        "source_backend_provenance": SimpleNamespace(prompt_version="h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity"),
+    })
+    assert neutralize_two_step_caption_identity(record.annotation, source.job.segments, None) == (caption, summary, {}, True)
+    full = RecaptionAudioContract(audio_index=1, audio_label="<Audio 1>", kind="full_audio_reuse",
+        path=source.job.target_full_audio_path, sha256=source.job.target_full_audio_sha256, retention_marker="fully_copy")
+    for variant, audio in [("visual_only", None), ("full_audio_reuse", full)]:
+        if case == "tail_attribution":
+            with pytest.raises(MimoH3MaterializationContractError, match="two_step_identity_caption_publication_restricted"):
+                _materialize_sample(sample, source.job, record, conditioning_variant=variant, extra_audio_contract=audio)
+        else:
+            _, prompt, _ = _materialize_sample(sample, source.job, record, conditioning_variant=variant, extra_audio_contract=audio)
+            assert "<Subject 1> (S1)" not in prompt
+            if case == "independent_summary":
+                assert summary in prompt
+    assert record.annotation.model_dump(mode="json") == payload
+
+
 @pytest.mark.parametrize("composition,allowed", [("same_speaker_nonlexical", True), ("secondary_non_speech_vocalization", False)])
 def test_same_speaker_nonlexical_reuse_but_legacy_voice_unchanged(tmp_path, composition, allowed):
     _, sample, source = _case(tmp_path, composition=composition)

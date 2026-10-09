@@ -62,7 +62,10 @@ from r2v_data_v2.h3.qwen38_h3_recaption import (
     render_h3_prompt,
 )
 from r2v_data_v2.h3.schemas import SchemaModel
-from r2v_data_v2.h3.speaker_ownership import two_step_identity_restricted_groups
+from r2v_data_v2.h3.speaker_ownership import (
+    neutralize_two_step_caption_identity,
+    two_step_identity_restricted_groups,
+)
 from r2v_data_v2.h3.speech_presentation import SpeechPresentation
 from r2v_data_v2.structured_output import ValidationIssue
 
@@ -427,6 +430,8 @@ def _corrected_segments(
     record: FrozenAnnotationSource,
 ) -> tuple[list[FinalQwen3SpeechSegment], list[str]]:
     assert record.annotation is not None
+    provenance = getattr(record, "source_backend_provenance", getattr(record, "backend_provenance", None))
+    restricted = two_step_identity_restricted_groups(record.annotation, provenance)
     audio_decisions = {
         item.segment_id: item
         for item in record.annotation.audio_observation.segment_decisions
@@ -475,7 +480,7 @@ def _corrected_segments(
             if audio_decision.primary_speaker_group is not None
             else f"fallback__{source.source_speaker_cluster_id}"
         )
-        entity_id = grounding.entity_id if visible_entity_resolved else None
+        entity_id = grounding.entity_id if visible_entity_resolved and group not in restricted else None
         if not resolved:
             warnings.append(f"{segment_id}:acoustic_refinement_unresolved")
         corrected.append(
@@ -833,6 +838,8 @@ class _MaterializationContext:
     warnings: list[str]
     variant: ConditioningVariant
     contract: RecaptionReferenceContract
+    caption: str
+    summary: str
 
 
 def _prepare_materialization_context(
@@ -848,6 +855,14 @@ def _prepare_materialization_context(
     assert record.annotation is not None
     provenance = getattr(record, "source_backend_provenance", getattr(record, "backend_provenance", None))
     restricted = two_step_identity_restricted_groups(record.annotation, provenance)
+    caption, summary, identity_corrections, publishable = neutralize_two_step_caption_identity(
+        record.annotation, job.segments, provenance,
+    )
+    if not publishable:
+        raise MimoH3MaterializationContractError([ValidationIssue(
+            "two_step_identity_caption_publication_restricted", "shot1_caption",
+            "unconfirmed speaker attribution cannot be neutralized without changing visual prose",
+        )])
     transcribed_ids = [item.segment_id for item in job.segments if item.asr_status == "transcribed"]
     blocked = [item.segment_id for item in record.annotation.audio_observation.segment_decisions
                if item.segment_id in transcribed_ids and item.vocal_composition in {
@@ -865,6 +880,7 @@ def _prepare_materialization_context(
     )
     corrected, warnings = _corrected_segments(projected_sample, job, record)
     warnings.extend(f"{group}:identity_publication_restricted" for group in sorted(restricted))
+    warnings.extend(f"deterministic_correction_count:{key}={count}" for key, count in sorted(identity_corrections.items()))
     corrected_payload = projected_sample.model_dump(mode="python")
     corrected_payload["speech_segments"] = [
         item.model_dump(mode="python") for item in corrected
@@ -915,7 +931,7 @@ def _prepare_materialization_context(
             raise MimoH3MaterializationContractError([ValidationIssue(
                 "unconfirmed_visible_identity_publication", "audios", "QA-only Two-step donor cannot condition identity-specific Audio",
             )])
-    return _MaterializationContext(corrected_sample, corrected, warnings, variant, contract)
+    return _MaterializationContext(corrected_sample, corrected, warnings, variant, contract, caption, summary)
 
 
 def _materialize_sample(
@@ -954,7 +970,7 @@ def _materialize_sample(
     allowed_labels.update(label for s in contract.subjects for label in s.source_picture_labels)
     allowed_labels.update(a.audio_label for a in contract.audios)
     detailed, direct_issues, correction_warnings = protect_direct_dialogue(
-        direct.shot1_caption,
+        context.caption,
         [{"segment_id": s.segment_id, "speaker_id": s.speaker_id, "language": s.language,
           "text": s.text} for s in facts.speech],
         allowed_labels=allowed_labels,
@@ -963,7 +979,7 @@ def _materialize_sample(
         raise MimoH3MaterializationContractError(direct_issues)
     warnings.extend(correction_warnings)
     music = direct.non_diegetic_music
-    summary = direct.summary
+    summary = context.summary
     if reuse_audio_contracts is not None:
         summary = prune_summary_dialogue(summary)
         detailed = project_authoritative_dialogue(
