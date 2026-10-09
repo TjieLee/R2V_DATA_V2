@@ -115,6 +115,20 @@ python tools/run_h3_ra2va_group_production.py run --fake \
   --run-id baseline --limit 20 --workers 4 --max-groups 1
 ```
 
+## CPU Validation
+
+The source/coordinator/fake tests plus completed-group export and existing RA2VA
+production regressions pass: 47 tests. The final independent review found an
+early-child-exit reporting gap; two failing exit-code cases were reproduced,
+fixed, and included in that passing run. Ruff, py_compile, and diff-check pass.
+Two-step/Single focused regressions pass: 155 tests.
+
+The extra Multi-call suite has 63 passing tests and four existing failures
+(prompt length, Visual v4 versus v5, and two backend .61 versus .66 assertions).
+All four reproduce on the starting design commit, 5197fb9. No Multi-call code or
+tests were changed to hide them. Existing local cached SoundFile dependencies
+were used for legacy Audio imports; no dependencies were installed.
+
 ## Boundaries
 
 No server writes, GPU calls, real Audio/H3 products, or full group were run.

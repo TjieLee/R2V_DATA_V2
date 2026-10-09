@@ -4,7 +4,9 @@ import json
 import multiprocessing as mp
 import subprocess
 import sys
+import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -148,3 +150,30 @@ def test_completed_stage_elapsed_is_stable(tmp_path, monkeypatch):
     monkeypatch.setattr(module.time, "time", lambda: now + 100)
     after = module.pilot_summary(root)
     assert [s["elapsed_seconds"] for s in before["stages"]] == [s["elapsed_seconds"] for s in after["stages"]]
+
+
+@pytest.mark.parametrize("exitcode", [1, -9])
+def test_early_worker_failure_cannot_return_success(tmp_path, monkeypatch, exitcode):
+    from r2v_data_v2.h3 import ra2va_group_fake as module
+
+    class EarlyFailure:
+        pid = 123
+
+        def __init__(self, **kwargs):
+            self.exitcode = exitcode
+
+        def start(self):
+            pass
+
+        def is_alive(self):
+            return False
+
+        def join(self, timeout=None):
+            pass
+
+    context = SimpleNamespace(Event=threading.Event, Process=EarlyFailure)
+    monkeypatch.setattr(module.mp, "get_context", lambda method: context)
+    source = tmp_path / "post_mask"
+    publish_group(source, count=1)
+    with pytest.raises(RuntimeError, match="resume the same run-id"):
+        run(source, tmp_path / "run", workers=1)

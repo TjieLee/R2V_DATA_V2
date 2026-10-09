@@ -148,6 +148,8 @@ def run_fake_pilot(*, source_root: Path, run_root: Path, workers: int, limit: in
                 child.join(0.05)
             if any(child.exitcode not in (None, 0) for child in children):
                 raise RuntimeError("Fake Worker interrupted; resume the same run-id")
+        if any(child.exitcode not in (None, 0) for child in children):
+            raise RuntimeError("Fake Worker interrupted; resume the same run-id")
     finally:
         stop.set()
         for child in children:
