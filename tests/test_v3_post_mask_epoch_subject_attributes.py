@@ -45,7 +45,7 @@ from r2v_data_v2.v3.post_mask_epoch_scheduler import (
     JobExecution,
     ResourceEpochScheduler,
 )
-from r2v_data_v2.v3.post_mask_epoch_state import GroupLedger
+from r2v_data_v2.v3.post_mask_epoch_state import GroupLedger, LedgerError, Receipt
 from r2v_data_v2.v3.post_mask_epoch_subject_attributes import (
     SUBJECT_ATTRIBUTE_COMPLETION_GENERATE_JOB,
     SUBJECT_ATTRIBUTE_COMPLETION_REVIEW_JOB,
@@ -6023,3 +6023,458 @@ def test_fresh_owner_cache_does_not_accept_a_mismatched_marker(
         runner._terminal_artifact_for_owner(
             SHARD, CLIP_UID, OWNER, 1, wrong_digest
         )
+
+
+def _completion_receipt_files(runner: Any) -> dict[Path, bytes]:
+    """Snapshot only the real temporary ledger's plans, receipts and results."""
+    files: dict[Path, bytes] = {}
+    for phase_id in runner.ledger.phase_ids():
+        phase = runner.ledger.phase(phase_id)
+        paths = [phase.plan_path, phase.receipts_path]
+        paths.extend(
+            phase.artifact_path(record["job_id"], "result.json")
+            for record in phase.read_plan()
+        )
+        files.update({path: path.read_bytes() for path in paths if path.is_file()})
+    return files
+
+
+def _interrupted_completion_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    rank: int = 0,
+    siblings: bool = False,
+) -> tuple[Any, Any, Any, Path, dict[str, Any]]:
+    """Pay real receipts, then crash before any owner artifact is published."""
+    monkeypatch.setattr(time, "perf_counter", lambda: 1.0)
+    if siblings:
+        config, storage, runner, qwen, sam = _two_completion_owner(tmp_path, monkeypatch)
+        boogu = _BooguBackend(_generated_png())
+    else:
+        reviews = [
+            SubjectAttributeReviewBatch(
+                owner_entity_id=OWNER,
+                reviews=[
+                    _raw_review(
+                        "a1", structure_complete=False, completion_recommended=True
+                    )
+                ],
+            )
+            for _ in range(rank + 1)
+        ]
+        config, storage, runner, qwen, sam, boogu, _ = _completion_fixture(
+            tmp_path,
+            monkeypatch,
+            run_name=f"run-interrupted-completion-rank-{rank}",
+            attribute=COMPLETION_ATTRIBUTE,
+            reviews=reviews,
+            completion_reviews=[_completion_review("reject")] * rank
+            + [_completion_review("accept")],
+            boogu=[_generated_png(), _generated_png(colour=(40, 90, 200))],
+        )
+
+    def crash_publication(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("simulated interrupted completion owner publication")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(runner, "_publish_owner_artifact", crash_publication)
+        first = _scheduler(
+            runner,
+            _SerialQwenExecutor(runner, qwen),
+            sam=_SerialQwenExecutor(runner, sam),
+            boogu=_SerialQwenExecutor(runner, boogu),
+        ).run(runner.seed_jobs())
+    assert first["completed"] is False
+    assert not _owner_artifact_file(storage).exists()
+    assert not _owner_outcome_path(runner).exists()
+    assert not runner._clip_outcome_path(SHARD, CLIP_UID).exists()
+    assert qwen.completion_review_calls == (2 if siblings else rank + 1)
+    path = runner._completion_outcome_path(SHARD, CLIP_UID, OWNER, "a1", rank)
+    expected = json.loads(path.read_text(encoding="utf-8"))
+    assert expected["status"] == "accepted"
+    assert expected["completion_review"]["verdict"] == "accept"
+    return config, storage, runner, path, expected
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_interrupted_completion_outcome_repairs_from_receipts_and_stays_stable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, rank: int
+) -> None:
+    """A derived stale marker cannot strand an owner whose receipts all committed."""
+    config, storage, runner, path, expected = _interrupted_completion_owner(
+        tmp_path, monkeypatch, rank=rank
+    )
+    committed = _completion_receipt_files(runner)
+    stale = {
+        **expected,
+        "status": "generation_failed",
+        "reason": "stale completion outcome after interruption",
+        "completed_crop_sha256": "0" * 64,
+        "completion_review": _completion_review("reject").model_dump(mode="json"),
+        "stale_diagnostic": True,
+    }
+    path.write_text(json.dumps(stale), encoding="utf-8")
+    stale_bytes = path.read_bytes()
+    cold = _runner(config, storage, tmp_path, ledger_name=Path(runner.ledger.root).name)
+    qwen, sam, boogu = _QwenClient(), _SamBackend(), _BooguBackend()
+
+    executor, jobs = _drain(cold, qwen, sam=sam, boogu=boogu)
+
+    assert jobs == executor.executed == []
+    assert qwen.discovery_calls + qwen.review_calls + qwen.completion_review_calls == 0
+    assert sam.calls + sam.generated_calls + boogu.calls == 0
+    assert json.loads(path.read_text(encoding="utf-8")) == expected
+    backup = path.with_name(f"rank-{rank}-outcome-conflict.json")
+    assert backup.read_bytes() == stale_bytes
+    assert _completion_receipt_files(cold) == committed
+    assert cold.reconcile_stats(SHARD).terminal_clips == 1
+    published = {
+        item: item.read_bytes()
+        for item in (
+            path, backup, _owner_artifact_file(storage), _owner_outcome_path(cold),
+            _sample_path(storage), cold._clip_outcome_path(SHARD, CLIP_UID),
+        )
+    }
+
+    second = _runner(config, storage, tmp_path, ledger_name=Path(runner.ledger.root).name)
+    again, jobs = _drain(second, qwen, sam=sam, boogu=boogu)
+    assert jobs == again.executed == []
+    assert second.reconcile_stats(SHARD).terminal_clips == 1
+    assert {item: item.read_bytes() for item in published} == published
+    assert _completion_receipt_files(second) == committed
+    assert qwen.discovery_calls + qwen.review_calls + qwen.completion_review_calls == 0
+    assert sam.calls + sam.generated_calls + boogu.calls == 0
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_terminal_completion_outcome_is_never_repaired(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, rank: int
+) -> None:
+    """Repairing an interrupted owner must not weaken published-owner authority."""
+    config, storage, runner, path, expected = _interrupted_completion_owner(
+        tmp_path, monkeypatch, rank=rank
+    )
+    cold = _runner(config, storage, tmp_path, ledger_name=Path(runner.ledger.root).name)
+    assert cold.seed_jobs() == []
+    assert _owner_outcome_path(cold).is_file()
+    path.write_text(json.dumps({**expected, "reason": "terminal corruption"}), encoding="utf-8")
+    protected = {
+        item: item.read_bytes()
+        for item in (path, _owner_outcome_path(cold), _owner_artifact_file(storage))
+    }
+    committed = _completion_receipt_files(cold)
+    second = _runner(config, storage, tmp_path, ledger_name=Path(runner.ledger.root).name)
+
+    with pytest.raises(SubjectAttributeDurableError, match="completion outcome drifted"):
+        second.seed_jobs()
+
+    assert {item: item.read_bytes() for item in protected} == protected
+    assert _completion_receipt_files(second) == committed
+    assert not path.with_name(f"rank-{rank}-outcome-conflict.json").exists()
+
+
+@pytest.mark.parametrize(
+    "key", ["seed", "generation_job_id", "owner_candidate_id", "sam_job_id", "review_job_id"]
+)
+def test_interrupted_completion_identity_drift_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, key: str
+) -> None:
+    """Derived-field repair cannot turn another frozen chain into this chain."""
+    config, storage, runner, path, expected = _interrupted_completion_owner(tmp_path, monkeypatch)
+    wrong = int(expected[key]) + 1 if key == "seed" else "unrelated-frozen-identity"
+    path.write_text(json.dumps({**expected, key: wrong}), encoding="utf-8")
+    stale_bytes = path.read_bytes()
+    committed = _completion_receipt_files(runner)
+    cold = _runner(config, storage, tmp_path, ledger_name=Path(runner.ledger.root).name)
+
+    with pytest.raises(SubjectAttributeDurableError):
+        cold.seed_jobs()
+
+    assert path.read_bytes() == stale_bytes
+    assert _completion_receipt_files(cold) == committed
+    assert not _owner_outcome_path(cold).exists()
+    assert not _owner_artifact_file(storage).exists()
+    assert not path.with_name("rank-0-outcome-conflict.json").exists()
+
+
+def test_interrupted_completion_missing_review_receipt_stays_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stale outcome never substitutes for the model receipt still owed."""
+    monkeypatch.setattr(time, "perf_counter", lambda: 1.0)
+    config, storage, runner, qwen, sam, boogu, _ = _completion_fixture(
+        tmp_path, monkeypatch, run_name="run-completion-review-orphan",
+        attribute=COMPLETION_ATTRIBUTE,
+        reviews=[SubjectAttributeReviewBatch(
+            owner_entity_id=OWNER,
+            reviews=[_raw_review("a1", structure_complete=False, completion_recommended=True)],
+        )],
+        completion_reviews=[_completion_review("accept")],
+        boogu=[_generated_png()],
+    )
+    _drain(
+        runner, qwen, sam=sam, boogu=boogu,
+        finalize=_swallow(SUBJECT_ATTRIBUTE_COMPLETION_SAM_JOB, runner),
+    )
+    runner = _runner(config, storage, tmp_path, ledger_name=Path(runner.ledger.root).name)
+    review_job, = runner.seed_jobs()
+    assert review_job.job_type == SUBJECT_ATTRIBUTE_COMPLETION_REVIEW_JOB
+    # The real review result is published, but the process dies before append.
+    # No existing receipt or terminal marker is removed to create this boundary.
+    phase = runner.ledger.phase("orphan-completion-review")
+    phase.write_plan([review_job])
+    phase.publish_result(review_job, runner.run(review_job, qwen))
+    assert not phase.receipts_path.exists()
+    owner_plan = _owner_plan_of(runner)
+    context = runner._rank0_context(
+        SHARD, storage, CLIP_UID, owner_plan,
+        _human_discovery(attributes=(COMPLETION_ATTRIBUTE,)),
+        runner._expected_discovery_job(SHARD, CLIP_UID, owner_plan).job_id(),
+    )
+    chain = runner._owner_graph(SHARD, storage, CLIP_UID, owner_plan, context)["chains0"]["a1"]
+    assert chain.next_job.job_id() == review_job.job_id()
+    stale = runner._completion_outcome_payload(storage, replace(
+        chain, status="accepted", reason="stale while review pending", next_job=None,
+        review=_completion_review("accept"),
+    ))
+    path = runner._completion_outcome_path(SHARD, CLIP_UID, OWNER, "a1", 0)
+    path.write_text(json.dumps(stale), encoding="utf-8")
+    stale_bytes = path.read_bytes()
+    committed = _completion_receipt_files(runner)
+    cold = _runner(config, storage, tmp_path, ledger_name=Path(runner.ledger.root).name)
+
+    jobs = cold.seed_jobs()
+
+    assert [job.job_id() for job in jobs] == [review_job.job_id()]
+    assert [job.job_type for job in jobs] == [SUBJECT_ATTRIBUTE_COMPLETION_REVIEW_JOB]
+    assert path.read_bytes() == stale_bytes
+    assert _completion_receipt_files(cold) == committed
+    assert not cold.ledger.classify(jobs[0]).skippable
+    assert not _owner_outcome_path(cold).exists()
+    assert not _owner_artifact_file(storage).exists()
+    qwen = _QwenClient(completion_reviews=[_completion_review("accept")])
+    _scheduler(cold, _SerialQwenExecutor(cold, qwen)).run(jobs)
+    assert qwen.completion_review_calls == 1
+    assert qwen.discovery_calls + qwen.review_calls == 0
+    repaired = json.loads(path.read_text(encoding="utf-8"))
+    assert repaired["status"] == "accepted"
+    assert repaired["reason"] == "completion_identity_accepted"
+    assert cold.reconcile_stats(SHARD).terminal_clips == 1
+
+
+def test_interrupted_completion_repair_preserves_sibling_and_binary_gc(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Repair is local; GC waits for terminal publication before removing binary."""
+    config, storage, runner, path, expected = _interrupted_completion_owner(
+        tmp_path, monkeypatch, siblings=True
+    )
+    sibling = runner._completion_outcome_path(SHARD, CLIP_UID, OWNER, "a2", 0)
+    sibling_bytes = sibling.read_bytes()
+    binary_root = Path(runner.ledger.root) / "semantic/subject_attributes/binary"
+    binaries = {item: item.read_bytes() for item in binary_root.rglob("*") if item.is_file()}
+    assert binaries, "real completion receipts must retain replayable binary before publication"
+    committed = _completion_receipt_files(runner)
+    path.write_text(json.dumps({**expected, "reason": "stale first sibling"}), encoding="utf-8")
+    cold = _runner(config, storage, tmp_path, ledger_name=Path(runner.ledger.root).name)
+    cold.online_binary_gc_enabled = True
+    assert {item: item.read_bytes() for item in binaries} == binaries
+
+    assert cold.seed_jobs() == []
+    cold.close_online_binary_gc()
+
+    assert sibling.read_bytes() == sibling_bytes
+    assert _completion_receipt_files(cold) == committed
+    assert json.loads(path.read_text(encoding="utf-8")) == expected
+    assert all(not item.exists() for item in binaries)
+    second = _runner(config, storage, tmp_path, ledger_name=Path(runner.ledger.root).name)
+    second.checkpoint_first_resume = True
+    monkeypatch.setattr(
+        second, "_derive_clip_plan",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("GC-completed clip must not reopen binary replay")
+        ),
+    )
+    assert second.seed_jobs() == []
+    assert second.reconcile_stats(SHARD).terminal_clips == 1
+    assert sibling.read_bytes() == sibling_bytes
+
+
+def test_unchanged_interrupted_completion_resume_does_not_audit_receipts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unchanged intermediate marker retains the normal indexed fast path."""
+    config, storage, runner, path, _ = _interrupted_completion_owner(tmp_path, monkeypatch)
+    marker_bytes = path.read_bytes()
+    committed = _completion_receipt_files(runner)
+    cold = _runner(config, storage, tmp_path, ledger_name=Path(runner.ledger.root).name)
+    monkeypatch.setattr(
+        cold.ledger, "replay_unique_committed",
+        lambda *args: (_ for _ in ()).throw(
+            AssertionError("unchanged completion must not audit receipt history")
+        ),
+    )
+    qwen, sam, boogu = _QwenClient(), _SamBackend(), _BooguBackend()
+
+    executor, jobs = _drain(cold, qwen, sam=sam, boogu=boogu)
+
+    assert jobs == executor.executed == []
+    assert path.read_bytes() == marker_bytes
+    assert _completion_receipt_files(cold) == committed
+    assert not path.with_name("rank-0-outcome-conflict.json").exists()
+    assert cold.reconcile_stats(SHARD).terminal_clips == 1
+    assert qwen.discovery_calls + qwen.review_calls + qwen.completion_review_calls == 0
+    assert sam.calls + sam.generated_calls + boogu.calls == 0
+
+
+def test_interrupted_completion_conflicting_committed_history_cannot_repair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Last-record-wins must not hide contradictory evidence during repair."""
+    config, storage, runner, path, expected = _interrupted_completion_owner(tmp_path, monkeypatch)
+    generation_id = expected["generation_job_id"]
+    phase = next(
+        runner.ledger.phase(phase_id)
+        for phase_id in runner.ledger.phase_ids()
+        if generation_id in runner.ledger.phase(phase_id).receipts()
+    )
+    original = phase.receipts()[generation_id]
+    # Append contradictory history only in this temporary test ledger. Normal
+    # indexed classification still sees a completed job of the same identity.
+    phase.append_receipt(Receipt.from_record({**original, "result_digest": "0" * 64}))
+    raw, _ = phase.load_receipts()
+    assert sum(record["job_id"] == generation_id for record in raw) == 2
+    path.write_text(json.dumps({**expected, "reason": "requires fresh evidence"}), encoding="utf-8")
+    marker_bytes = path.read_bytes()
+    committed = _completion_receipt_files(runner)
+    cold = _runner(config, storage, tmp_path, ledger_name=Path(runner.ledger.root).name)
+
+    with pytest.raises(LedgerError, match="contradictory committed receipts"):
+        cold.seed_jobs()
+
+    assert path.read_bytes() == marker_bytes
+    assert _completion_receipt_files(cold) == committed
+    assert not path.with_name("rank-0-outcome-conflict.json").exists()
+    assert not _owner_artifact_file(storage).exists()
+    assert not _owner_outcome_path(cold).exists()
+    assert not cold._clip_outcome_path(SHARD, CLIP_UID).exists()
+
+
+@pytest.mark.parametrize("stale_downstream_identity", [False, True])
+def test_interrupted_completion_refreshes_warm_chain_before_sibling_finalization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stale_downstream_identity: bool,
+) -> None:
+    """A later sibling must not reuse the chain cache that conflict replay fixed."""
+    monkeypatch.setattr(time, "perf_counter", lambda: 1.0)
+    config, storage, runner, qwen, sam = _two_completion_owner(tmp_path, monkeypatch)
+    _drain(
+        runner, qwen, sam=sam, boogu=_BooguBackend(_generated_png()),
+        finalize=_swallow(SUBJECT_ATTRIBUTE_COMPLETION_SAM_JOB, runner),
+    )
+    runner = _runner(config, storage, tmp_path)
+    reviews = {dict(job.target)["attribute_id"]: job for job in runner.seed_jobs()}
+    assert set(reviews) == {"a1", "a2"}
+    assert all(job.job_type == SUBJECT_ATTRIBUTE_COMPLETION_REVIEW_JOB for job in reviews.values())
+    _scheduler(
+        runner, _SerialQwenExecutor(runner, qwen),
+        finalize=_swallow(SUBJECT_ATTRIBUTE_COMPLETION_REVIEW_JOB, runner),
+    ).run([reviews["a1"]])
+    runner = _runner(config, storage, tmp_path)
+    pending, = runner.seed_jobs()
+    assert pending.job_id() == reviews["a2"].job_id()
+    assert not runner.ledger.classify(pending).skippable
+    assert not _owner_outcome_path(runner).exists()
+    path = runner._completion_outcome_path(SHARD, CLIP_UID, OWNER, "a1", 0)
+    expected = json.loads(path.read_text(encoding="utf-8"))
+    committed = _completion_receipt_files(runner)
+    review_id = expected["review_job_id"]
+    stale_review = _completion_review("reject")
+    runner._committed_payload_cache[review_id] = {
+        "status": "review",
+        "review": stale_review.model_dump(mode="json"),
+        "qwen_model_call_time_seconds": 0.0,
+    }
+    key = (SHARD, CLIP_UID, OWNER, "a1", 0)
+    runner._completion_chain_cache[key] = replace(
+        runner._completion_chain_cache[key], status="review_rejected",
+        reason="completion_qwen_review_reject", review=stale_review,
+        review_job=(
+            replace(reviews["a1"], input_digest="stale-cached-dependency")
+            if stale_downstream_identity else reviews["a1"]
+        ),
+    )
+    path.write_text(json.dumps({
+        **expected, "status": "generation_failed", "reason": "stale warm owner marker",
+    }), encoding="utf-8")
+    stale_bytes = path.read_bytes()
+    events: list[dict[str, Any]] = []
+    runner.emit = events.append
+
+    jobs = runner.seed_jobs()
+
+    assert [job.job_id() for job in jobs] == [pending.job_id()]
+    assert json.loads(path.read_text(encoding="utf-8")) == expected
+    repaired_bytes = path.read_bytes()
+    backup = path.with_name("rank-0-outcome-conflict.json")
+    assert backup.read_bytes() == stale_bytes
+    assert _completion_receipt_files(runner) == committed
+    assert not _owner_outcome_path(runner).exists()
+    assert len(events) == 1
+    assert events[0]["recovery_action"] == "rebuild_derived_marker"
+
+    sibling_qwen = _QwenClient(completion_reviews=[_completion_review("accept")])
+    result = _scheduler(runner, _SerialQwenExecutor(runner, sibling_qwen)).run(jobs)
+
+    assert result["completed"] is True
+    assert sibling_qwen.completion_review_calls == 1
+    assert sibling_qwen.discovery_calls + sibling_qwen.review_calls == 0
+    assert path.read_bytes() == repaired_bytes
+    assert backup.read_bytes() == stale_bytes
+    assert len(events) == 1, "sibling finalization must not conflict with the repaired chain again"
+    assert [record.completion_review.verdict for record in _read_artifact(storage).records] == [
+        "accept", "accept",
+    ]
+    assert runner.reconcile_stats(SHARD).terminal_clips == 1
+
+
+def test_existing_completion_marker_refreshes_a_stale_pending_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A valid marker triggers fresh evidence before a stale snapshot repeats review."""
+    monkeypatch.setattr(time, "perf_counter", lambda: 1.0)
+    config, storage, runner, qwen, sam = _two_completion_owner(tmp_path, monkeypatch)
+    _drain(
+        runner, qwen, sam=sam, boogu=_BooguBackend(_generated_png()),
+        finalize=_swallow(SUBJECT_ATTRIBUTE_COMPLETION_SAM_JOB, runner),
+    )
+    warm = _runner(config, storage, tmp_path)
+    reviews = {dict(job.target)["attribute_id"]: job for job in warm.seed_jobs()}
+    assert set(reviews) == {"a1", "a2"}
+    assert not warm.ledger.classify(reviews["a1"]).skippable
+    committer = _runner(config, storage, tmp_path)
+    _scheduler(
+        committer, _SerialQwenExecutor(committer, qwen),
+        finalize=_swallow(SUBJECT_ATTRIBUTE_COMPLETION_REVIEW_JOB, committer),
+    ).run([reviews["a1"]])
+    publisher = _runner(config, storage, tmp_path)
+    pending, = publisher.seed_jobs()
+    assert pending.job_id() == reviews["a2"].job_id()
+    assert not _owner_outcome_path(publisher).exists()
+    marker = publisher._completion_outcome_path(SHARD, CLIP_UID, OWNER, "a1", 0)
+    marker_bytes = marker.read_bytes()
+    committed = _completion_receipt_files(publisher)
+    # Another runner committed a1, but this ledger/chain snapshot still reports
+    # its review pending. The published marker is the reason to refresh, not to
+    # manufacture a receipt or to execute the already-paid review again.
+    assert warm._committed_payload_or_none(reviews["a1"]) is None
+
+    jobs = warm.seed_jobs()
+
+    assert [job.job_id() for job in jobs] == [reviews["a2"].job_id()]
+    assert warm.ledger.classify(reviews["a1"]).skippable
+    assert not warm.ledger.classify(reviews["a2"]).skippable
+    assert marker.read_bytes() == marker_bytes
+    assert not marker.with_name("rank-0-outcome-conflict.json").exists()
+    assert _completion_receipt_files(warm) == committed
+    assert not _owner_outcome_path(warm).exists()
