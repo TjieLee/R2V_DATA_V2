@@ -13,7 +13,7 @@ bash scripts/run_v3_post_mask_full_production.sh --dry-run
 ```
 
 The launcher accepts externally assigned `RANK` and `WORLD_SIZE` (default
-`0/1`). They rotate scan order only. Every node sees every canonical group and
+`0/1`). They rotate equal-priority ties only. Every node sees every canonical group and
 claims unfinished work via a nonblocking shared `flock`. A node that encounters
 busy groups waits and scans again. A crash releases the lock; a later launch can
 resume with a different node count. Canonical per-shard locks remain in force.
@@ -37,11 +37,46 @@ V3 compactor to publish `samples.jsonl` and `catalog.json` at the official root.
 The compactor's normal publication checks are not used as a completion/resume
 gate. A plain compaction marker makes later launches skip that work as well.
 
-The committed config pins Boogu removal and all Qwen services to
+The committed config selects Boogu removal and pins all Qwen services to
 `Qwen3-VL-8B-Instruct`; the launcher pins the managed physical Qwen model after
-loading `server_env.sh`. Existing Resource Epoch resource sessions own 8 Boogu,
-8 SAM and TP1/DP8 Qwen GPU slots in sequence, not concurrently. No Audio/H3
-stage is launched here.
+loading `server_env.sh`. `ResourceEpochManager` lazily loads and retains Qwen,
+Boogu and SAM together for the shared session: sequential work does not imply
+exclusive model residency. No Audio/H3 stage is launched here.
+
+## Group ordering and SA-only process opt-in
+
+Completed groups still skip using formal markers; existing group/shard locks
+remain authoritative. Unfinished groups prioritize SA-completed awaiting Export,
+then SA-started (descending terminal/eligible ratio when hints exist), Instruct,
+Reference Integrity, Reference Edit, Pair, earlier started groups, then fresh
+groups. Default ordering reads only bounded group/stage markers. Optional hints
+are advisory, never checkpoint/identity: absent/invalid hints fall back to marker
+ordering. Generate them once while all nodes are stopped, using the reviewed
+checkout and a private output outside state:
+
+```bash
+SA_REVIEWED_REPO=${SA_REVIEWED_REPO:?Set the reviewed independent checkout}
+SA_HINT_STATE=${SA_HINT_STATE:?Set the campaign state root to read}
+SA_HINT_FILE=/mnt/workspace/litengjie/data/sa-group-priority-hints.json
+/mnt/workspace/litengjie/data/R2V_DATA_V2/.venv/bin/python \
+  "$SA_REVIEWED_REPO/tools/create_v3_post_mask_priority_hints.py" \
+  --state-root "$SA_HINT_STATE" --output "$SA_HINT_FILE" || exit 1
+```
+
+The helper reads SA-started eligible UID scopes and counts corresponding direct
+outcome-directory entries via `os.scandir`; it does not open each outcome or
+scan the whole artifact tree. All ranks may read the same file through the
+formal launcher's `--priority-hints` option. The generic smoke launcher below
+does not accept that option.
+
+`POST_MASK_SA_SAM_WORKERS_PER_GPU` accepts only `1`, `2`, `4`; unset means `1`.
+On eight GPUs these mean respectively 8/16/32 SAM workers and 24/48/96 bounded
+SA admissions. Default `1` retains the existing handles/API. Opt-in `2`/`4`
+uses independent spawned SAM processes only during SA; CPU prepare/persist
+remain two workers each. Parent SAM handles close before the child pool loads
+(no extra fifth SAM model per GPU), and returning to Reference Edit restores
+the original worker API. Qwen/Boogu residency and model settings are unchanged.
+Validate three-model co-resident VRAM, not SAM-only VRAM.
 
 Server-local checkpoint availability, shared-filesystem `flock`, write access
 to the public output root, and real model quality still require an on-server
@@ -73,7 +108,7 @@ do not install packages or download weights.
 Both arms use the same accepted config: Boogu/SAM checkpoint/runtime paths are
 inherited unchanged, while Qwen is explicitly fixed below to
 `Qwen3-VL-8B-Instruct`. Existing resource defaults are Qwen TP1/DP8 and eight
-Boogu/SAM workers (one per physical GPU 0–7), loaded in separate resource epochs.
+Boogu/SAM workers (one per physical GPU 0–7); all three models can remain resident.
 
 In a fresh Bash shell, supply the three required operator values. Use unused
 checkout paths and output tags below; if they already contain a prior smoke,
@@ -108,7 +143,7 @@ git -C "$SA_NEW_REPO" status --short || exit 1
 
 run_sa_smoke() (
   source "$SA_SERVER_ENV" || return 1
-  repo="$1"; tag="$2"; mode="$3"
+  repo="$1"; tag="$2"; mode="$3"; sam_workers="${4:-1}"
   root="/mnt/workspace/litengjie/data/r2v_v3_post_mask/jea_motion_v1/$tag"
   cd "$repo" || return 1
   export HF_HOME=/mnt/workspace/litengjie/data/cache/huggingface
@@ -127,6 +162,7 @@ run_sa_smoke() (
     no_proxy="127.0.0.1,localhost,${no_proxy:-}" \
     PYTHONPATH="$repo:/mnt/workspace/litengjie/data/vendor/sam3${PYTHONPATH:+:$PYTHONPATH}" \
     POST_MASK_REPO="$repo" POST_MASK_CPU_WORKERS=32 \
+    POST_MASK_SA_SAM_WORKERS_PER_GPU="$sam_workers" \
     POST_MASK_QWEN_MAX_INFLIGHT=8 \
     POST_MASK_QWEN_MODEL_PATH=/mnt/workspace/public/pretrained/Qwen/Qwen3-VL-8B-Instruct \
     POST_MASK_EPOCH_TEMP_ROOT="$root/tmp/resource_epoch" \
@@ -140,7 +176,9 @@ run_sa_smoke() (
 
 # Model-free planning first; this writes only private descriptors/locks/summary.
 run_sa_smoke "$SA_BASELINE_REPO" "$SA_BASELINE_TAG" dry || exit 1
-run_sa_smoke "$SA_NEW_REPO" "$SA_NEW_TAG" dry || exit 1
+run_sa_smoke "$SA_NEW_REPO" "${SA_NEW_TAG}-w1" dry 1 || exit 1
+run_sa_smoke "$SA_NEW_REPO" "${SA_NEW_TAG}-w2" dry 2 || exit 1
+run_sa_smoke "$SA_NEW_REPO" "${SA_NEW_TAG}-w4" dry 4 || exit 1
 ```
 
 Review both logs before proceeding: commits, config, fixture scope, canonical
@@ -167,9 +205,11 @@ compete with a production campaign:
 
 ```bash
 run_sa_smoke "$SA_BASELINE_REPO" "$SA_BASELINE_TAG" run || exit 1
-run_sa_smoke "$SA_NEW_REPO" "$SA_NEW_TAG" run || exit 1
+run_sa_smoke "$SA_NEW_REPO" "${SA_NEW_TAG}-w1" run 1 || exit 1
+run_sa_smoke "$SA_NEW_REPO" "${SA_NEW_TAG}-w2" run 2 || exit 1
+run_sa_smoke "$SA_NEW_REPO" "${SA_NEW_TAG}-w4" run 4 || exit 1
 # Resume: same checkout, config, fixture, tag and roots, without overwrite/delete.
-run_sa_smoke "$SA_NEW_REPO" "$SA_NEW_TAG" run || exit 1
+run_sa_smoke "$SA_NEW_REPO" "${SA_NEW_TAG}-w4" run 4 || exit 1
 ```
 
 For interruption testing, interrupt only the isolated new smoke, then rerun its
@@ -193,5 +233,43 @@ inference time and occupancy/capacity. `model_call_time_seconds` is inference
 wall plus actual persistence wall, **excluding asynchronous writer-queue wait**;
 it is not pure GPU compute. Baseline diagnostics may lack the new fields.
 
+The 30–100-clip fixture establishes correctness only. Performance comparison
+requires the same real 256-SAM-job set for 8×1/8×2/8×4 and a longer accepted
+isolated workload spanning multiple 128-clip SA working-set batches. Reuse the
+function with that existing fixture and fresh tags/roots, keeping accepted
+models/config and `POST_MASK_CPU_WORKERS=32` fixed. First record co-resident
+VRAM, then SAM jobs/s, SA loaded-wave clips/s, GPU utilization, peak host RAM,
+persist queue wait, failure counts and output completeness. Do not replace
+these with whole-pipeline timing. Small pixel differences are accepted; missing
+masks, abnormal attribute counts, model failures or duplicated durable work are
+not. Add no hashes, seed checks or full-image audit.
+
+User-supplied single-H200 SAM-only measurements for 256 jobs were
+1.587/2.621/3.819 jobs/s at 1/2/4 processes. These are not independently verified
+here and do not establish full-SA or three-model co-resident throughput.
+
 Stop after reviewing the smoke and resume results. This procedure does not
 authorize deployment, merge, production restart or changes to formal outputs.
+
+## Deployment / rollback instructions (not executed)
+
+Only after review and successful real 8-GPU SA smoke: stop **all** old campaign
+processes first, switch the shared production worktree to the reviewed immutable
+version once, and confirm its SHA on every node before restart. Never hot-update
+a running shared checkout. Preserve existing `$OUT/state`, private RunStorage
+roots, receipts and exports unchanged; do not migrate/delete state. PyTorchJob
+must inject each node's real `RANK`/`WORLD_SIZE`; do not substitute `0/1`:
+
+```bash
+# Post-approval instruction only; run through the existing node/job environment.
+POST_MASK_SA_SAM_WORKERS_PER_GPU=4 \
+  bash /mnt/workspace/litengjie/data/R2V_DATA_V2_postmask_prod/scripts/run_v3_post_mask_full_production.sh \
+  --priority-hints /mnt/workspace/litengjie/data/sa-group-priority-hints.json
+```
+
+If 4 workers/GPU OOM under Qwen/Boogu/SAM co-residency, stop all processes,
+report actual VRAM/failure evidence, and evaluate `2` in isolation; do not swallow
+OOM or force deployment. Set the environment option to `1` to restore default
+SA execution after stopping processes. A code rollback likewise stops all nodes
+first, restores the prior reviewed version once, and resumes the same roots
+through the existing wrapper and real rank assignment.
