@@ -198,12 +198,11 @@ def test_sa_progress_snapshot_and_global_claim_priority(tmp_path):
     done = state / groups[2].group_id / "composition"
     done.mkdir(parents=True)
     (done / "subject_attributes_completed.json").write_text("{}")
+    (state / groups[3].group_id).mkdir(parents=True)
     payload = build_sa_group_priority(state)
     assert payload["ordered_group_ids"] == [
         groups[2].group_id, groups[1].group_id,
         groups[0].group_id, groups[3].group_id,
-    ] if (state / groups[3].group_id).is_dir() else [
-        groups[2].group_id, groups[1].group_id, groups[0].group_id
     ]
     # Explicit ordering must survive rank rotation when nodes shrink.
     snapshot = tmp_path / "priority.json"
@@ -224,7 +223,7 @@ def test_sa_progress_snapshot_and_global_claim_priority(tmp_path):
         }
 
     production.run_elastic_groups(
-        tmp_path / "state", groups[:3], runner,
+        tmp_path / "state", groups, runner,
         rank=2, world_size=3, sleep=lambda _: None,
         priority_file=snapshot,
     )
