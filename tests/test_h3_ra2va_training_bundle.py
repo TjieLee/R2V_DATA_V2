@@ -230,6 +230,70 @@ def _write_single_v3(reconcile, job, stem, payload):
     return record
 
 
+def test_frozen_bundle_consumes_products_without_media_revalidation(tmp_path, monkeypatch, capsys):
+    from r2v_data_v2.h3 import audio_reuse as reuse
+    from r2v_data_v2.h3 import audio_reuse_materializer as products
+    from r2v_data_v2.h3.ra2va_training_bundle import materialize_ra2va_training_bundle
+    from r2v_data_v2.h3.voice_donor_reserve import export_voice_donor_reserve
+    from tools.export_h3_training_manifests import main as export
+
+    reconcile, job, _, _ = _fixture(tmp_path, monkeypatch)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("frozen bundle must not reconstruct or reverify published inputs")
+
+    for name in ("validate_prepared_inputs", "_verify_hashes", "_prepare_materialization_context",
+                 "_materialize_sample", "load_stem_source"):
+        monkeypatch.setattr(frame, name, forbidden)
+    for name in ("validate_prepared_inputs", "_validate_job_media_integrity", "load_reuse_source"):
+        monkeypatch.setattr(products, name, forbidden)
+    monkeypatch.setattr(reuse, "read_reuse_asset_pcm16", forbidden)
+    original_hash = reuse.sha256_file
+    hashes = []
+
+    def generated_hash(path):
+        assert Path(path).suffix == ".flac"
+        assert ".audio-reuse-" in str(path)
+        hashes.append(str(path))
+        return original_hash(path)
+
+    monkeypatch.setattr(reuse, "sha256_file", generated_hash)
+    frame_hash = frame.sha256_file
+    frame_reads = []
+
+    def frame_metadata_hash(path):
+        frame_reads.append(str(path))
+        return frame_hash(path)
+
+    monkeypatch.setattr(frame, "sha256_file", frame_metadata_hash)
+    product_hash = products.sha256_file
+    product_reads = []
+
+    def product_metadata_hash(path):
+        assert Path(path).name in {"inventory.json", "manifest.json"}
+        product_reads.append(str(path))
+        return product_hash(path)
+
+    monkeypatch.setattr(products, "sha256_file", product_metadata_hash)
+    output = tmp_path / "bundle"
+    result = materialize_ra2va_training_bundle(
+        reconcile_root=reconcile, output_root=output, allow_unverified=True,
+    )
+    assert (result["product_ready_count"], result["product_failed_count"]) == (3, 0)
+    assert sum(result["task_counts"].values()) == 12
+    assert len(hashes) == len(set(hashes)) == 2
+    assert len(frame_reads) == len(set(frame_reads)) == 5
+    assert len(product_reads) == len(set(product_reads)) == 2
+    export(["--output-root", str(tmp_path / "jsonl"), "--ra2va-shadow-root", str(output)])
+    reserve = export_voice_donor_reserve(bundle_root=output)
+    assert len(reserve["donors"]) == 1
+    assert reserve["donors"][0]["clip_uid"] == job.clip_uid
+    printed = capsys.readouterr().out
+    assert all(f"{label}:" in printed for label in (
+        "Prepared", "Audio Assets", "Audio Products", "Frame Projection", "JSONL Export", "Donor Reserve",
+    ))
+
+
 @pytest.mark.parametrize("offscreen,music,no_speech,task_count", [
     (False, "Quiet piano.", False, 12), (True, "N/A", False, 12), (False, "Quiet piano.", True, 8),
 ])

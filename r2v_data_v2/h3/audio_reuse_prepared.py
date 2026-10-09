@@ -173,7 +173,9 @@ def _publish_prepared(
         (stage / "inventory.json").write_text(inventory.model_dump_json(indent=2) + "\n")
         (stage / "records.jsonl").write_text(records_text)
         (stage / "summary.json").write_text(summary.model_dump_json(indent=2) + "\n")
-        if any(sha256_file(Path(path)) != digest for path, digest in summary.source_hashes.items()):
+        if not isinstance(inventory, FrozenAudioReuseInventory) and any(
+            sha256_file(Path(path)) != digest for path, digest in summary.source_hashes.items()
+        ):
             raise ValueError("frozen preparation input changed")
         if output.exists():
             raise FileExistsError(output)

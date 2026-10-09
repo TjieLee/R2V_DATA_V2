@@ -22,6 +22,7 @@ from r2v_data_v2.h3.audio_reuse import (
 )
 from r2v_data_v2.h3.audio_reuse_prepared import (
     AudioReusePreparedSource,
+    FrozenAudioReuseInventory,
     load_prepared_inventory,
     validate_prepared_inputs,
 )
@@ -387,25 +388,34 @@ def materialize_audio_reuse_products(
         raise FileExistsError(output)
     input_files = [mimo_root / "inventory.json", mimo_root / "records.jsonl",
                    source_h3_root / "samples.jsonl", separation_root / "records.jsonl"]
-    hashes = {str(p): sha256_file(p) for p in input_files}
     inventory = load_prepared_inventory(input_files[0])
+    frozen_bundle = isinstance(inventory, FrozenAudioReuseInventory)
+    if frozen_bundle:
+        prepared_summary = json.loads((mimo_root / "summary.json").read_text())
+        hashes = dict(prepared_summary["source_hashes"])
+        hashes.update({str(input_files[0]): sha256_file(input_files[0]),
+                       str(input_files[1]): prepared_summary["prepared_records_sha256"],
+                       str(input_files[2]): prepared_summary["prepared_samples_sha256"]})
+    else:
+        hashes = {str(p): sha256_file(p) for p in input_files}
     records = _rows(input_files[1], AudioReusePreparedSource)
     samples = _rows(input_files[2], FinalH3SampleV2)
     from r2v_data_v2.h3.resolved_audio_stems import RESOLVED_STAGE, load_stem_source
 
-    stems = (
+    stems = [] if frozen_bundle else (
         load_stem_source(separation_root)[1] if separation_root.name == RESOLVED_STAGE
         else _rows(input_files[3], SAMAudioStemRecord)
     )
-    if hashes[str(input_files[2])] != inventory.source_h3_samples_sha256:
+    if not frozen_bundle and hashes[str(input_files[2])] != inventory.source_h3_samples_sha256:
         raise ValueError("frozen H3 samples changed")
     by_clip = {r.clip_uid: r for r in records}
     stem_by_clip = {r.clip_uid: r for r in stems}
     if len(by_clip) != len(records) or set(by_clip) != {j.clip_uid for j in inventory.jobs} or len(stem_by_clip) != len(stems):
         raise ValueError("duplicate or missing frozen clip inventory")
-    validate_prepared_inputs(inventory, records, samples, stems)
-    for job in inventory.jobs:
-        _validate_job_media_integrity(job)
+    if not frozen_bundle:
+        validate_prepared_inputs(inventory, records, samples, stems)
+        for job in inventory.jobs:
+            _validate_job_media_integrity(job)
     sources = {}
     for job in inventory.jobs:
         record = by_clip[job.clip_uid]
@@ -414,9 +424,14 @@ def materialize_audio_reuse_products(
         manifest = reuse_root / job.clip_uid / "manifest.json"
         if not manifest.resolve().is_relative_to(reuse_root):
             raise ValueError("unsafe reuse clip path")
-        if job.clip_uid not in stem_by_clip:
-            raise ValueError("missing frozen SAM record")
-        source = load_reuse_source(manifest_path=manifest, job=job, record=record, stem_record=stem_by_clip[job.clip_uid])
+        if frozen_bundle:
+            source = ValidatedReuseSource(
+                job, record, AudioReuseManifest.model_validate_json(manifest.read_text()), manifest, sha256_file(manifest),
+            )
+        else:
+            if job.clip_uid not in stem_by_clip:
+                raise ValueError("missing frozen SAM record")
+            source = load_reuse_source(manifest_path=manifest, job=job, record=record, stem_record=stem_by_clip[job.clip_uid])
         sources[job.clip_uid] = source
         hashes[str(source.manifest_path)] = source.manifest_sha256
         hashes[job.target_video_path] = job.target_video_sha256
@@ -492,9 +507,10 @@ def materialize_audio_reuse_products(
         stage.mkdir()
         (stage / "records.jsonl").write_text("".join(p.model_dump_json() + "\n" for p in products))
         (stage / "summary.json").write_text(summary.model_dump_json(indent=2) + "\n")
-        for path, digest in hashes.items():
-            if sha256_file(Path(path)) != digest:
-                raise ValueError("frozen reuse input changed during materialization")
+        if not frozen_bundle:
+            for path, digest in hashes.items():
+                if sha256_file(Path(path)) != digest:
+                    raise ValueError("frozen reuse input changed during materialization")
         if output.exists():
             raise FileExistsError(output)
         stage.rename(output)

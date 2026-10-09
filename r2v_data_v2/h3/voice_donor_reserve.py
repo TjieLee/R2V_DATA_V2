@@ -6,6 +6,7 @@ import os
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
+from time import perf_counter
 
 import numpy as np
 
@@ -132,6 +133,7 @@ def export_voice_donor_reserve(*, bundle_root: Path) -> dict:
     A completed JSON sidecar is never replaced. Interrupted exports can reuse
     existing sample-identical crops; conflicting crops fail without modification.
     """
+    started = perf_counter()
     root = bundle_root.expanduser().resolve(strict=True)
     destination = root / RESERVE_FILENAME
     if os.path.lexists(destination):
@@ -173,4 +175,5 @@ def export_voice_donor_reserve(*, bundle_root: Path) -> dict:
     with _temporary_path(destination) as temporary:
         temporary.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         _publish(temporary, destination)
+    print(f"Donor Reserve: {perf_counter() - started:.2f}s", flush=True)
     return result

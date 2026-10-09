@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from time import perf_counter
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -18,12 +19,16 @@ def main(argv=None):
     parser.add_argument("--t2va-root", type=Path)
     parser.add_argument("--ta2va-root", type=Path)
     args = parser.parse_args(argv)
-    return export_training_manifests(
+    started = perf_counter()
+    result = export_training_manifests(
         output_root=args.output_root,
         ra2va_shadow_root=args.ra2va_shadow_root,
         t2va_root=args.t2va_root,
         ta2va_root=args.ta2va_root,
     )
+    if args.ra2va_shadow_root is not None:
+        print(f"JSONL Export: {perf_counter() - started:.2f}s", flush=True)
+    return result
 
 
 if __name__ == "__main__":

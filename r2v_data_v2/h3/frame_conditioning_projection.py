@@ -1,6 +1,7 @@
 """Read-only post-product frame conditioning; no inference or Audio selection."""
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 import tempfile
@@ -217,7 +218,7 @@ class FrameConditionedSummary(SchemaModel):
 
 @dataclass(frozen=True)
 class ProjectionSource:
-    product: AudioReuseProduct
+    product: AudioReuseProduct | dict
     job: MimoClipJob
     subjects: list[RecaptionSubjectContract]
 
@@ -240,8 +241,27 @@ def _owned_file(path: Path, root: Path) -> Path:
 
 
 def load_projection_sources(shadow: Path) -> tuple[list[ProjectionSource], dict[str, str]]:
-    """Reconstruct frozen products with existing materialization, never trust prose alone."""
+    """Consume published Bundle products; retain the legacy standalone loader."""
     prepared, products = shadow / PREPARED_STAGE, shadow / PRODUCTS_STAGE
+    values = json.loads((prepared / "inventory.json").read_text())
+    if values["schema_version"] == "r2v.h3.audio_reuse_frozen_inventory.1":
+        jobs = {j["clip_uid"]: j for j in values["jobs"]}
+        records_path = products / "records.jsonl"
+        hashes = json.loads((products / "summary.json").read_text())["source_hashes"]
+        hashes[str(records_path)] = sha256_file(records_path)
+        result = []
+        for line in records_path.read_text().splitlines():
+            if not line.strip():
+                continue
+            product = json.loads(line)
+            if product["status"] != "ready":
+                continue
+            job = jobs[product["clip_uid"]]
+            result.append(ProjectionSource(
+                product, MimoClipJob.model_construct(**job),
+                [RecaptionSubjectContract.model_construct(**s) for s in job["reference_subjects"]],
+            ))
+        return result, dict(sorted(hashes.items()))
     inventory = load_prepared_inventory(_owned_file(prepared / "inventory.json", shadow))
     if isinstance(inventory, FrozenAudioReuseInventory):
         stem_root = Path(inventory.source_stem_root)
@@ -327,23 +347,17 @@ def load_projection_sources(shadow: Path) -> tuple[list[ProjectionSource], dict[
 
 
 def extract_frames(job: MimoClipJob, stage: Path, published: Path, *, ffmpeg: str) -> FrameMetadata:
-    """Decode first frame and full reversed sequence: no seek, resize, crop, or FPS conversion."""
+    """Decode the opening frame and retain the final decoded frame of a tail seek."""
     video = Path(job.target_video_path)
-    if sha256_file(video) != job.target_video_sha256:
-        raise ValueError("target video changed before frame extraction")
     stage.mkdir(parents=True)
-    for name, filters in (("first", []), ("last", ["-vf", "reverse"])):
-        subprocess.run([ffmpeg, "-nostdin", "-v", "error", "-noautorotate", "-i", str(video),
-                        "-map", "0:v:0", "-an", "-sn", "-dn", *filters,
-                        "-frames:v", "1", "-fps_mode", "passthrough", "-threads", "1",
+    for name in ("first", "last"):
+        # Keep the preceding keyframe, then decode to EOF (also handles short/VFR clips).
+        seek = ["-sseof", "-1", "-noaccurate_seek"] if name == "last" else []
+        output = ["-update", "1"] if name == "last" else ["-frames:v", "1"]
+        subprocess.run([ffmpeg, "-nostdin", "-v", "error", "-noautorotate", *seek, "-i", str(video),
+                        "-map", "0:v:0", "-an", "-sn", "-dn", *output,
+                        "-fps_mode", "passthrough", "-threads", "1",
                         str(stage / f"{name}.png")], check=True, capture_output=True)
-        from PIL import Image
-        with Image.open(stage / f"{name}.png") as image:
-            if image.format != "PNG" or min(image.size) <= 0:
-                raise ValueError("invalid extracted PNG")
-            image.verify()
-    if sha256_file(video) != job.target_video_sha256:
-        raise ValueError("target video changed during frame extraction")
     metadata = FrameMetadata(
         clip_uid=job.clip_uid, source_video_path=job.target_video_path, source_video_sha256=job.target_video_sha256,
         source_duration_seconds=job.target_duration_seconds,
@@ -357,6 +371,8 @@ def extract_frames(job: MimoClipJob, stage: Path, published: Path, *, ffmpeg: st
 def project_product(source: ProjectionSource, metadata: FrameMetadata, mode: VisualReferenceMode,
                     records_hash: str) -> FrameConditionedProduct:
     product, job = source.product, source.job
+    if not isinstance(product, dict):
+        product = product.model_dump(mode="json")
     if (metadata.clip_uid != job.clip_uid or metadata.source_video_path != job.target_video_path
             or metadata.source_video_sha256 != job.target_video_sha256
             or metadata.source_duration_seconds != job.target_duration_seconds):
@@ -369,16 +385,16 @@ def project_product(source: ProjectionSource, metadata: FrameMetadata, mode: Vis
     ).model_dump(mode="json") for i, role in enumerate(roles, 1)]
     values = {
         "schema_version": "r2v.h3.frame_conditioned_product.1", "projection_version": PROJECTION_VERSION,
-        "sample_id": f"{product.sample_id}/{mode}", "source_product_sample_id": product.sample_id,
-        "source_product_record_fingerprint": product.record_fingerprint, "source_product_records_sha256": records_hash,
-        "source_h3_sample_id": product.source_h3_sample_id, "clip_uid": product.clip_uid, "pair_type": product.pair_type,
-        "conditioning_variant": product.conditioning_variant, "visual_reference_mode": mode, "visual_task": VISUAL_TASKS[mode],
+        "sample_id": f"{product['sample_id']}/{mode}", "source_product_sample_id": product["sample_id"],
+        "source_product_record_fingerprint": product["record_fingerprint"], "source_product_records_sha256": records_hash,
+        "source_h3_sample_id": product["source_h3_sample_id"], "clip_uid": product["clip_uid"], "pair_type": product["pair_type"],
+        "conditioning_variant": product["conditioning_variant"], "visual_reference_mode": mode, "visual_task": VISUAL_TASKS[mode],
         "target_video_path": job.target_video_path, "target_video_sha256": job.target_video_sha256,
         "target_duration_seconds": job.target_duration_seconds, "frame_references": pictures,
         "subjects": [{**s.model_dump(mode="json"), "source_picture_labels": ["<Picture 1>"]} for s in source.subjects],
-        "audio_references": [r.model_dump(mode="json") for r in product.audio_references],
-        "corrected_speech_segments": [s.model_dump(mode="json") for s in product.corrected_speech_segments],
-        "warnings": product.warnings, "rendered_h3_prompt": project_prompt(product.rendered_h3_prompt, mode, job.target_duration_seconds),
+        "audio_references": product["audio_references"],
+        "corrected_speech_segments": product["corrected_speech_segments"],
+        "warnings": product["warnings"], "rendered_h3_prompt": project_prompt(product["rendered_h3_prompt"], mode, job.target_duration_seconds),
     }
     return FrameConditionedProduct(**values, record_fingerprint=_hash(values))
 
@@ -396,12 +412,12 @@ def materialize_frame_conditioned_products(*, audio_production_root: Path | None
     if output.parent != shadow or output.name.startswith("."):
         raise ValueError("frame output must be a new direct child of the current shadow run")
     sources, hashes = load_projection_sources(shadow)
+    bundle = source_root is not None
     if any(Path(p).resolve().is_relative_to(output) for p in hashes):
         raise ValueError("frame output overlaps source inputs")
     for source in sources:
         if Path(source.job.clip_uid).name != source.job.clip_uid or source.job.clip_uid in {".", ".."}:
             raise ValueError("unsafe frame clip path")
-        project_prompt(source.product.rendered_h3_prompt, "first_frame", source.job.target_duration_seconds)
     records = []
     frames = {}
     with tempfile.TemporaryDirectory(prefix=".frame-projection-", dir=shadow) as temporary:
@@ -414,10 +430,14 @@ def materialize_frame_conditioned_products(*, audio_production_root: Path | None
             records.extend(project_product(source, frames[uid], mode, hashes[str(shadow / PRODUCTS_STAGE / "records.jsonl")])
                            for mode in DERIVED_MODES)
         (stage / "records.jsonl").write_text("".join(r.model_dump_json() + "\n" for r in records))
+        frame_hashes = {}
         for uid, metadata in frames.items():
-            _verify_hashes({str(stage / "frames" / uid / f"{role}.png"): getattr(metadata, role + "_frame_sha256")
-                            for role in ("first", "last")})
-        frame_hashes = {str(output / p.relative_to(stage)): sha256_file(p) for p in (stage / "frames").rglob("*") if p.is_file()}
+            images = {getattr(metadata, role + "_frame_path"): getattr(metadata, role + "_frame_sha256")
+                      for role in ("first", "last")}
+            if not bundle:
+                _verify_hashes({str(stage / "frames" / uid / Path(path).name): digest for path, digest in images.items()})
+            frame_hashes.update(images)
+            frame_hashes[str(output / "frames" / uid / "metadata.json")] = sha256_file(stage / "frames" / uid / "metadata.json")
         summary = FrameConditionedSummary(
             source_shadow_root=str(shadow), source_ready_product_count=len(sources), derived_product_count=len(records),
             visual_reference_mode_counts={m: len(sources) for m in DERIVED_MODES},
@@ -426,7 +446,8 @@ def materialize_frame_conditioned_products(*, audio_production_root: Path | None
             source_hashes=hashes, frame_hashes=frame_hashes, records_sha256=sha256_file(stage / "records.jsonl"),
         )
         (stage / "summary.json").write_text(summary.model_dump_json(indent=2) + "\n")
-        _verify_hashes(hashes)
+        if not bundle:
+            _verify_hashes(hashes)
         if output.exists() or output.is_symlink():
             raise FileExistsError(output)
         stage.rename(output)

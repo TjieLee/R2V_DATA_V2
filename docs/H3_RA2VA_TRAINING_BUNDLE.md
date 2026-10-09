@@ -131,3 +131,73 @@ store, including for historical bundles whose summary said
 `human_review_required=true`. Optional pilot viewers are separate tools, never
 part of the production path. Export rows have exactly `video`, `images`,
 `audios`, `caption`; `videos.jsonl` has only `video` and `tasks`.
+
+## Lightweight frozen Bundle export
+
+Frozen Bundle consumers use the already-published jobs, products, captions,
+Audio references, and Subject metadata. Frame projection does not reload stems
+or annotations, reconstruct H3 products, compare rendered captions, or rehash
+input media. It computes each new PNG digest once for the existing metadata.
+Each clip's first/last frame pair is extracted once and reused across Audio
+conditioning variants. The last-frame decoder seeks near EOF, keeps the preceding
+keyframe, and decodes through EOF without resizing, autorotation, or FPS conversion.
+It no longer reverses the complete video.
+
+The frozen Audio asset writer reads source PCM for the actual timeline copy,
+writes lossless FLAC, and records its digest once. It does not hash input media
+or decode the generated FLAC again for a PCM comparison. Audio product generation
+does not repeat source/asset integrity scans. Existing speaker ownership,
+overlap, identity-publication restrictions, and task selection stay unchanged.
+The legacy standalone Audio reuse loader keeps its existing behavior. No new
+trust/skip/unsafe CLI switch or human review gate is needed.
+
+Run all three CPU commands in fresh directories; no MiMo endpoint is contacted:
+
+```bash
+set -e
+: "${SHADOW:?Set SHADOW to the existing Random20 named-run directory}"
+EFFECTIVE="$SHADOW/mimo_v26_ra2va_two_step_joint_v2_effective20_v85"
+STAMP=$(date +%Y%m%d-%H%M%S)
+BUNDLE="$SHADOW/ra2va_two_step_effective20_v85_bundle_light_${STAMP}"
+TRAIN="$SHADOW/ra2va_two_step_effective20_v85_jsonl_light_${STAMP}"
+
+.venv/bin/python tools/materialize_h3_ra2va_training_bundle.py \
+  --reconcile-root "$EFFECTIVE" --output-root "$BUNDLE" --allow-unverified
+.venv/bin/python tools/export_h3_training_manifests.py \
+  --ra2va-shadow-root "$BUNDLE" --output-root "$TRAIN"
+.venv/bin/python tools/export_h3_voice_donor_reserve.py --bundle-root "$BUNDLE"
+```
+
+The commands print elapsed seconds for Prepared, Audio Assets, Audio Products,
+Frame Projection, JSONL Export, and Donor Reserve. The first four timings also
+appear in Bundle `summary.json` under `stage_elapsed_seconds`. Compare Frame
+Projection against the measured server baseline of **39.39 seconds**; local
+synthetic CPU tests do not establish the optimized effective20 server time.
+
+Inspect counts without media scans or a production validation gate:
+
+```bash
+.venv/bin/python - "$BUNDLE" "$TRAIN" <<'PY'
+import json, sys
+from pathlib import Path
+bundle, train = map(Path, sys.argv[1:])
+summary = json.loads((bundle / "summary.json").read_text())
+print("Products ready/failed:", summary["product_ready_count"], summary["product_failed_count"])
+print("Stage seconds:", summary["stage_elapsed_seconds"])
+counts = {p.stem: sum(bool(line.strip()) for line in p.read_text().splitlines())
+          for p in sorted(train.glob("*.jsonl")) if p.stem.startswith(("r2va_", "ra2va_"))}
+print("Task counts:", counts, "total:", sum(counts.values()))
+donors = json.loads((bundle / "voice_donor_reserve.json").read_text())["donors"]
+print("Donors/segments:", len(donors), sum(d["segment_count"] for d in donors))
+for line in (bundle / "h3_audio_reuse_products_v1/records.jsonl").read_text().splitlines():
+    product = json.loads(line)
+    if product["status"] == "failed":
+        print("Failure:", product["clip_uid"], product["conditioning_variant"], product["failure_reason"])
+PY
+```
+
+Expected from the existing effective20: 45 ready / 0 failed products, 180 rows
+(four Visual tasks with 17 each, four Full Audio tasks with 17 each, four
+Speech+BGM tasks with 11 each), 8 donors / 14 segments. These are the supplied
+server baseline counts, not a claim that a local synthetic fixture replayed
+the server dataset. Do not replace actual failures or overwrite older bundles.

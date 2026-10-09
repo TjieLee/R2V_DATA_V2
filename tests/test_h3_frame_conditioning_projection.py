@@ -34,6 +34,55 @@ def ffmpeg():
     return binary
 
 
+@pytest.mark.parametrize("count,variable,rotate,audio_tail", [(1, False, False, False), (3, False, False, False),
+                                                            (48, False, True, False), (24, True, False, False),
+                                                            (24, False, False, True)])
+def test_tail_seek_matches_exact_sequential_decode_without_video_hash(tmp_path, monkeypatch, ffmpeg, count, variable, rotate, audio_tail):
+    inputs = tmp_path / "inputs"
+    inputs.mkdir()
+    for i in range(count):
+        Image.new("RGB", (32, 24), ((i * 17) % 256, (i * 31) % 256, (i * 59) % 256)).save(inputs / f"{i}.png")
+    video = tmp_path / "video.mp4"
+    if variable:
+        listing = inputs / "frames.txt"
+        listing.write_text("".join(f"file '{i}.png'\nduration {0.04 + (i % 3) * 0.08}\n" for i in range(count)))
+        input_args = ["-f", "concat", "-safe", "0", "-i", str(listing), "-fps_mode", "vfr"]
+    else:
+        input_args = ["-framerate", "12", "-i", str(inputs / "%d.png")]
+    subprocess.run([ffmpeg, "-v", "error", *input_args, "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                    "-g", "12", "-bf", "2", str(video)], check=True, capture_output=True)
+    if audio_tail:
+        muxed = tmp_path / "audio-tail.mp4"
+        subprocess.run([ffmpeg, "-v", "error", "-i", str(video), "-f", "lavfi", "-i", "anullsrc=r=32000:cl=stereo",
+                        "-t", "8", "-c:v", "copy", "-c:a", "aac", str(muxed)], check=True, capture_output=True)
+        video = muxed
+    if rotate:
+        rotated = tmp_path / "rotated.mp4"
+        subprocess.run([ffmpeg, "-v", "error", "-i", str(video), "-c", "copy", "-metadata:s:v:0", "rotate=90",
+                        str(rotated)], check=True, capture_output=True)
+        video = rotated
+    decoded = subprocess.run([ffmpeg, "-v", "error", "-noautorotate", "-i", str(video), "-map", "0:v:0",
+                              "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+                             check=True, capture_output=True).stdout
+    pixels = np.frombuffer(decoded, dtype=np.uint8).reshape(-1, 24, 32, 3)
+    job = SimpleNamespace(clip_uid="test", target_video_path=str(video), target_video_sha256="a" * 64,
+                          target_duration_seconds=count / 12)
+    original_hash = frame.sha256_file
+    calls = []
+
+    def png_hash(path):
+        assert path.suffix == ".png"
+        calls.append(path)
+        return original_hash(path)
+
+    monkeypatch.setattr(frame, "sha256_file", png_hash)
+    metadata = frame.extract_frames(job, tmp_path / "frames", tmp_path / "frames", ffmpeg=ffmpeg)
+    assert len(calls) == len(set(calls)) == 2
+    for path, expected in ((metadata.first_frame_path, pixels[0]), (metadata.last_frame_path, pixels[-1])):
+        with Image.open(path) as image:
+            np.testing.assert_array_equal(np.asarray(image), expected)
+
+
 def _fixture(tmp_path, monkeypatch, ffmpeg):
     original = sam_fixture._canonical_fixture
     pixels = [np.full((24, 32, 3), color, dtype=np.uint8) for color in ((201, 12, 31), (20, 211, 42), (32, 51, 223))]

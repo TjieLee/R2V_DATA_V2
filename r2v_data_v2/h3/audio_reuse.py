@@ -170,11 +170,11 @@ def _fingerprint(value: SchemaModel) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
-def probe_canonical_target_frames(path: Path, expected_hash: str) -> int:
+def probe_canonical_target_frames(path: Path, expected_hash: str | None) -> int:
     """Probe the frozen target timeline without quantizing its sample subtype."""
     import soundfile as sf
 
-    if not path.is_file() or sha256_file(path) != expected_hash:
+    if expected_hash is not None and (not path.is_file() or sha256_file(path) != expected_hash):
         raise AudioReuseIntegrityError(f"audio_reuse_source_hash_mismatch: {path}")
     info = sf.info(str(path))
     if (info.format, info.samplerate, info.channels) != ("FLAC", SAMPLE_RATE, 2):
@@ -194,10 +194,10 @@ def read_reuse_asset_pcm16(path: Path, expected_hash: str) -> np.ndarray:
     return _read_pcm16(path, expected_hash, container="FLAC")
 
 
-def _read_pcm16(path: Path, expected_hash: str, *, container: str) -> np.ndarray:
+def _read_pcm16(path: Path, expected_hash: str | None, *, container: str) -> np.ndarray:
     import soundfile as sf
 
-    if not path.is_file() or sha256_file(path) != expected_hash:
+    if expected_hash is not None and (not path.is_file() or sha256_file(path) != expected_hash):
         raise AudioReuseIntegrityError(f"audio_reuse_source_hash_mismatch: {path}")
     info = sf.info(str(path))
     if (info.samplerate, info.channels, info.subtype, info.format) != (SAMPLE_RATE, 2, "PCM_16", container):
@@ -208,21 +208,26 @@ def _read_pcm16(path: Path, expected_hash: str, *, container: str) -> np.ndarray
     return pcm
 
 
-def _write_verified(path: Path, pcm: np.ndarray) -> str:
+def _write_lossless(path: Path, pcm: np.ndarray) -> str:
     import soundfile as sf
 
     sf.write(str(path), pcm, SAMPLE_RATE, format="FLAC", subtype="PCM_16")
-    digest = sha256_file(path)
+    return sha256_file(path)
+
+
+def _write_verified(path: Path, pcm: np.ndarray) -> str:
+    digest = _write_lossless(path, pcm)
     if not np.array_equal(read_reuse_asset_pcm16(path, digest), pcm):
         raise AudioReuseIntegrityError("audio_reuse_decoded_samples_differ")
     return digest
 
 
-def _check_stem(stem: StemMedia, target: Path, target_hash: str, frame_count: int) -> np.ndarray:
+def _check_stem(stem: StemMedia, target: Path, target_hash: str, frame_count: int, *, frozen_bundle: bool = False) -> np.ndarray:
     if (Path(stem.source_audio_path).resolve() != target
             or stem.source_audio_sha256 != target_hash or stem.source_end_sample != frame_count):
         raise AudioReuseIntegrityError("audio_reuse_stem_target_lineage_mismatch")
-    pcm = read_canonical_stem_pcm16(Path(stem.canonical_stem_path), stem.canonical_stem_sha256)
+    pcm = (_read_pcm16(Path(stem.canonical_stem_path), None, container="WAV") if frozen_bundle
+           else read_canonical_stem_pcm16(Path(stem.canonical_stem_path), stem.canonical_stem_sha256))
     if len(pcm) != stem.canonical_frame_count:
         raise AudioReuseIntegrityError("audio_reuse_stem_frame_count_mismatch")
     if abs(len(pcm) - frame_count) / SAMPLE_RATE > STEM_ALIGNMENT_TOLERANCE_SECONDS:
@@ -236,14 +241,33 @@ def build_audio_reuse_assets(
     output_root: Path, allow_unverified: bool = False,
     backend_provenance: object | None = None,
 ) -> AudioReuseManifest:
+    return _build_audio_reuse_assets(
+        job=job, annotation=annotation, stem_record=stem_record, audio_production_root=audio_production_root,
+        output_root=output_root, allow_unverified=allow_unverified, backend_provenance=backend_provenance,
+        frozen_bundle=False,
+    )
+
+
+def build_frozen_audio_reuse_assets(**kwargs) -> AudioReuseManifest:
+    """Bundle consumer: copy PCM once, without rereading generated FLAC or hashing inputs."""
+    return _build_audio_reuse_assets(**kwargs, frozen_bundle=True)
+
+
+def _build_audio_reuse_assets(
+    *, job: MimoClipJob, annotation: MimoAVAnnotationDraft,
+    stem_record: StemRecord, audio_production_root: Path,
+    output_root: Path, allow_unverified: bool = False,
+    backend_provenance: object | None = None, frozen_bundle: bool,
+) -> AudioReuseManifest:
     """Build one clip into a NEW caller-owned shadow directory, never overwrite.
 
     Call with the finalized annotation and its authoritative stem-reconcile job.
     PCM support requires soundfile/libsndfile. No model/runtime construction occurs.
     """
-    job = MimoClipJob.model_validate(job.model_dump())
-    annotation = MimoAVAnnotationDraft.model_validate(annotation.model_dump())
-    stem_record = validate_stem_record(stem_record)
+    if not frozen_bundle:
+        job = MimoClipJob.model_validate(job.model_dump())
+        annotation = MimoAVAnnotationDraft.model_validate(annotation.model_dump())
+        stem_record = validate_stem_record(stem_record)
     output = output_root.expanduser().resolve()
     production = audio_production_root.expanduser().resolve(strict=True)
     paths = jea_production_paths(production)
@@ -276,11 +300,12 @@ def build_audio_reuse_assets(
         if path.is_relative_to(output):
             raise ValueError("audio reuse output cannot contain source media")
         sources[path] = stem.canonical_stem_sha256
-    frames = probe_canonical_target_frames(target, job.target_full_audio_sha256)
+    frames = probe_canonical_target_frames(target, None if frozen_bundle else job.target_full_audio_sha256)
     if abs(frames / SAMPLE_RATE - job.target_duration_seconds) > STEM_ALIGNMENT_TOLERANCE_SECONDS:
         raise AudioReuseIntegrityError("audio_reuse_job_target_timeline_mismatch")
-    speech_pcm = _check_stem(speech, target, job.target_full_audio_sha256, frames)
-    music_pcm = _check_stem(music, target, job.target_full_audio_sha256, frames)
+    speech_pcm = _check_stem(speech, target, job.target_full_audio_sha256, frames, frozen_bundle=frozen_bundle)
+    music_pcm = _check_stem(music, target, job.target_full_audio_sha256, frames, frozen_bundle=frozen_bundle)
+    write_audio = _write_lossless if frozen_bundle else _write_verified
     ids = [s.segment_id for s in job.segments]
     decisions = annotation.audio_observation.segment_decisions
     groundings = annotation.av_grounding.segment_groundings
@@ -397,7 +422,7 @@ def build_audio_reuse_assets(
                 entity_id=entity, subject_index=subjects[0].subject_index if subjects else None,
                 source_segment_ids=included, source_sample_ranges=[ranges[sid] for sid in included],
                 source_job_fingerprint=job.request_fingerprint, source_annotation_sha256=annotation_hash,
-                output_path=str(output / name), output_sha256=_write_verified(stage / name, pcm),
+                output_path=str(output / name), output_sha256=write_audio(stage / name, pcm),
             ))
         copied = min(frames, len(music_pcm))
         pcm = np.zeros((frames, 2), dtype=np.int16)
@@ -405,12 +430,13 @@ def build_audio_reuse_assets(
         music_asset = MusicReuseAsset(
             **common(music), copied_frame_count=copied, silence_tail_frame_count=frames-copied,
             truncated_tail_frame_count=len(music_pcm)-copied,
-            output_path=str(output / "music.flac"), output_sha256=_write_verified(stage / "music.flac", pcm),
+            output_path=str(output / "music.flac"), output_sha256=write_audio(stage / "music.flac", pcm),
         )
         # Recheck inputs before atomic publication; never overwrite a source/stage.
-        for path, digest in sources.items():
-            if sha256_file(path) != digest:
-                raise AudioReuseIntegrityError("audio_reuse_source_changed_during_build")
+        if not frozen_bundle:
+            for path, digest in sources.items():
+                if sha256_file(path) != digest:
+                    raise AudioReuseIntegrityError("audio_reuse_source_changed_during_build")
         exclusions = list({(e.segment_id, e.reason): e for e in exclusions}.values())
         manifest = AudioReuseManifest(
             clip_uid=job.clip_uid, source_job_fingerprint=job.request_fingerprint,

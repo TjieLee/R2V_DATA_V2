@@ -125,6 +125,29 @@ def _pcm(path, *, container="FLAC"):
     return pcm
 
 
+@pytest.mark.parametrize("intervals,options", [
+    (((.1, .3, "g1"), (.9, 1.1, "g1")), {}),
+    (((.1, .3, "g1"), (.9, 1.1, "g2")), {"offscreen": True}),
+    (((.1, .3, "g1"), (.2, .4, "g2")), {}),
+    (((.1, .3, "g1"), (.9, 1.1, "g1")), {"mixed": True}),
+])
+def test_frozen_bundle_pcm_and_exclusions_match_legacy(tmp_path, monkeypatch, intervals, options):
+    args = _fixture(tmp_path, intervals=intervals, **options)
+    legacy = reuse.build_audio_reuse_assets(**args)
+    args["output_root"] = tmp_path / "frozen-bundle-assets"
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("no output decode/sample comparison in bundle production")
+
+    monkeypatch.setattr(reuse, "read_reuse_asset_pcm16", forbidden)
+    frozen = reuse.build_frozen_audio_reuse_assets(**args)
+    assert frozen.exclusions == legacy.exclusions
+    assert len(frozen.speakers) == len(legacy.speakers)
+    for new, old in zip([*frozen.speakers, frozen.music], [*legacy.speakers, legacy.music], strict=True):
+        assert new.model_dump(exclude={"output_path"}) == old.model_dump(exclude={"output_path"})
+        np.testing.assert_array_equal(_pcm(new.output_path), _pcm(old.output_path))
+
+
 def test_review_only_identity_group_cannot_publish_speaker_reuse(tmp_path):
     from types import SimpleNamespace
 

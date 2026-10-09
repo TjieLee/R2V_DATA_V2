@@ -4,15 +4,15 @@ from __future__ import annotations
 import json
 from collections import Counter
 from pathlib import Path
+from time import perf_counter
 
-from r2v_data_v2.h3.audio_reuse import build_audio_reuse_assets
+from r2v_data_v2.h3.audio_reuse import build_frozen_audio_reuse_assets
 from r2v_data_v2.h3.audio_reuse_finalizer import (
     ASSETS_STAGE,
     PREPARED_STAGE,
     PRODUCTS_STAGE,
 )
 from r2v_data_v2.h3.audio_reuse_materializer import (
-    AudioReuseProduct,
     materialize_audio_reuse_products,
 )
 from r2v_data_v2.h3.audio_reuse_prepared import (
@@ -35,10 +35,15 @@ def materialize_ra2va_training_bundle(
     output = output_root.expanduser().resolve()
     if output.exists():
         raise FileExistsError(output)
+    elapsed = {}
+    started = perf_counter()
     prepared = output / PREPARED_STAGE
     prepare_frozen_audio_reuse_sources(
         reconcile_root=reconcile_root, prepared_root=prepared, clip_uids=clip_uids, source_h3_root=source_h3_root,
     )
+    elapsed["Prepared"] = perf_counter() - started
+    print(f"Prepared: {elapsed['Prepared']:.2f}s", flush=True)
+    started = perf_counter()
     inventory = load_prepared_inventory(prepared / "inventory.json")
     stem_root = Path(inventory.source_stem_root)
     stem_inventory, stems, _ = load_stem_source(stem_root)
@@ -47,21 +52,28 @@ def materialize_ra2va_training_bundle(
     records = [AudioReusePreparedSource.model_validate_json(line)
                for line in (prepared / "records.jsonl").read_text().splitlines() if line.strip()]
     for job, record in zip(inventory.jobs, records, strict=True):
-        build_audio_reuse_assets(
+        build_frozen_audio_reuse_assets(
             job=job, annotation=record.annotation, stem_record=by_clip[job.clip_uid],
             audio_production_root=audio_root, output_root=output / ASSETS_STAGE / job.clip_uid,
             allow_unverified=allow_unverified,
             backend_provenance=record.source_backend_provenance,
         )
+    elapsed["Audio Assets"] = perf_counter() - started
+    print(f"Audio Assets: {elapsed['Audio Assets']:.2f}s", flush=True)
+    started = perf_counter()
     products = materialize_audio_reuse_products(
         mimo_root=prepared, source_h3_root=prepared / "h3", separation_root=stem_root,
         reuse_root=output / ASSETS_STAGE, audio_production_root=audio_root, output_root=output / PRODUCTS_STAGE,
         enable_full_audio_reuse=True,
     )
+    elapsed["Audio Products"] = perf_counter() - started
+    print(f"Audio Products: {elapsed['Audio Products']:.2f}s", flush=True)
+    started = perf_counter()
     frames = materialize_frame_conditioned_products(source_root=output, ffmpeg=ffmpeg)
-    product_records = [AudioReuseProduct.model_validate_json(line)
-                       for line in (output / PRODUCTS_STAGE / "records.jsonl").read_text().splitlines() if line.strip()]
-    variants = Counter(r.conditioning_variant for r in product_records if r.status == "ready")
+    elapsed["Frame Projection"] = perf_counter() - started
+    print(f"Frame Projection: {elapsed['Frame Projection']:.2f}s", flush=True)
+    product_records = [json.loads(line) for line in (output / PRODUCTS_STAGE / "records.jsonl").read_text().splitlines() if line.strip()]
+    variants = Counter(r["conditioning_variant"] for r in product_records if r["status"] == "ready")
     tasks = build_ra2va_training_task_rows(output)
     summary = {
         "source_reconcile_root": str(reconcile_root.expanduser().resolve()),
@@ -70,13 +82,14 @@ def materialize_ra2va_training_bundle(
         "conditioning_variant_counts": dict(variants),
         "unavailable_target_speech_reuse_clip_uids": [
             j.clip_uid for j in inventory.jobs if not any(
-                r.clip_uid == j.clip_uid and r.conditioning_variant == "target_speech_reuse" for r in product_records
+                r["clip_uid"] == j.clip_uid and r["conditioning_variant"] == "target_speech_reuse" for r in product_records
             )
         ],
         "frame_product_count": frames.derived_product_count,
         "task_counts": {task: len(rows) for task, rows in tasks.items()},
         "model_call_count": 0, "production_artifacts_modified": False,
         "human_review_required": False,
+        "stage_elapsed_seconds": elapsed,
     }
     temporary = output / "summary.json.tmp"
     temporary.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n")
