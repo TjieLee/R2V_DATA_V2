@@ -148,8 +148,13 @@ def run_elastic_groups(
     emit: Callable[..., None] | None = None,
     sleep: Callable[[float], None] = time.sleep,
     backoff_seconds: float = 2.0,
+    priority_file: Path | None = None,
 ) -> dict[str, int]:
-    """Every node scans all groups; rank only rotates scan order."""
+    """Every node claims from one global priority order, or legacy rank rotation.
+
+    An optional operator-produced snapshot is only an execution-order hint. It
+    does not change ownership, group identities, locks or checkpoint eligibility.
+    """
     if world_size < 1 or not 0 <= rank < world_size:
         raise ValueError("invalid rank/world_size")
     if backoff_seconds < 0:
@@ -158,8 +163,27 @@ def run_elastic_groups(
     ordered = tuple(groups)
     if not ordered:
         raise ValueError("production has no groups")
-    start = (rank * max(1, len(ordered) // world_size)) % len(ordered)
-    ordered = ordered[start:] + ordered[:start]
+    if priority_file is not None:
+        payload = json.loads(Path(priority_file).read_text(encoding="utf-8"))
+        names = payload.get("ordered_group_ids") if isinstance(payload, dict) else None
+        if not isinstance(names, list) or any(not isinstance(x, str) for x in names):
+            raise ValueError("SA group priority file needs ordered_group_ids list")
+        priorities = {name: i for i, name in enumerate(names)}
+        if len(priorities) != len(names):
+            raise ValueError("SA group priority file has duplicate group IDs")
+        known = {group.group_id for group in ordered}
+        if set(priorities) - known:
+            raise ValueError("SA group priority file contains unknown group IDs")
+        original = {group.group_id: i for i, group in enumerate(ordered)}
+        ordered = tuple(sorted(ordered, key=lambda group: (
+            priorities.get(group.group_id, len(priorities)),
+            original[group.group_id],
+        )))
+        # Never rank-rotate the prioritised order: all nodes must try the
+        # near-finished groups first and skip those flock-claimed elsewhere.
+    else:
+        start = (rank * max(1, len(ordered) // world_size)) % len(ordered)
+        ordered = ordered[start:] + ordered[:start]
     report = emit or (lambda *_args, **_kwargs: None)
     claimed = 0
     attempted_incomplete: dict[str, str] = {}
