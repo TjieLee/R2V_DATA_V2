@@ -9,8 +9,6 @@ no child ever writes a production artifact or touches GroupLedger.
 from __future__ import annotations
 
 import multiprocessing as mp
-import os
-import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -62,6 +60,12 @@ def _worker_main(connection: Any, config: Any, gpu_id: int) -> None:
                     raise ValueError(f"unknown SAM operation: {operation}")
                 connection.send(("ok", masks))
             except Exception as exc:  # noqa: BLE001 - preserves legacy per-call failure
+                # An OOM is not a harmless single-frame segmentation failure.
+                # Stop the SA epoch without committing an unusable SAM receipt;
+                # its unfinished jobs will resume after operator intervention.
+                if "out of memory" in str(exc).lower() or "device-side assert" in str(exc).lower():
+                    connection.send(("fatal", (type(exc).__name__, str(exc))))
+                    break
                 connection.send(
                     ("error", (type(exc).__name__, str(exc)))
                 )
