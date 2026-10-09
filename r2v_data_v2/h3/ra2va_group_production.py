@@ -65,6 +65,10 @@ class StaleGeneration(RuntimeError):
     pass
 
 
+class StageDraining(RuntimeError):
+    pass
+
+
 @dataclass
 class WorkerSession:
     snapshot: StageSnapshot
@@ -250,7 +254,7 @@ class GroupCoordinator:
     def join(self, snapshot, worker_id):
         with self._checked(snapshot) as (control, _):
             if control["phase"] != "running":
-                raise RuntimeError("stage is draining; new membership refused")
+                raise StageDraining("stage is draining; new membership refused")
             handle = try_lock(self.stage_root(snapshot) / "sessions" / f"{worker_id}.lock")
             if handle is None:
                 raise RuntimeError("worker session is already live")
@@ -288,8 +292,11 @@ class GroupCoordinator:
                 if handle is None:
                     return False
                 handle.close()
+            if "finished_at" not in dispatch:
+                dispatch["finished_at"] = time.time()
+                self._save_dispatch(snapshot, dispatch)
             self.log("stage_complete", snapshot, **{k: dispatch[k] for k in TERMINAL},
-                     elapsed_seconds=time.time() - dispatch["started_at"])
+                     elapsed_seconds=dispatch["finished_at"] - dispatch["started_at"])
             index = STAGES.index(snapshot.stage)
             if index == len(STAGES) - 1:
                 atomic_json(self.group_root(snapshot.group_id) / "PILOT_COMPLETE", {
