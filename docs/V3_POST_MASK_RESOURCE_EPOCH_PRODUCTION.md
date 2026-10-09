@@ -53,16 +53,31 @@ running full-population compaction. The independent converter uses the published
 shard `samples.jsonl` and `enriched_samples.jsonl` (including SA), and
 checks formal group and per-shard completion markers/sample counts. Outputs
 are under
-`/mnt/workspace/litengjie/data/r2v_v3_group_exports/post_mask/<group>/samples.jsonl`.
+`/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/in_pair_reference/post_mask/<group>/samples.jsonl`.
+If an old group export exists under the private
+`/mnt/workspace/litengjie/data/r2v_v3_group_exports/post_mask`, move that
+whole directory once (without overwriting an existing destination) before
+running more conversions:
+
+```bash
+SRC=/mnt/workspace/litengjie/data/r2v_v3_group_exports/post_mask
+DST=/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/in_pair_reference/post_mask
+if [ -d "$SRC" ] && [ ! -e "$DST" ] && [ ! -L "$DST" ]; then
+  mv -T -- "$SRC" "$DST"
+else
+  echo "Source missing or destination already exists; not moving"
+fi
+```
+
 Image reference paths are relative to the group directory. A small set of
 directory symlinks points to already published shard Export `references`;
 **no media is copied**. Keep those source reference directories available.
 This does not modify production worktrees, state, receipts or shard exports.
 
 `tools/export_completed_postmask_group.py` lives in the independent
-completed-group exporter branch, **not** this SA branch. Fetch its previously
-successful pinned version only if missing, into a private tools path
-(no changes to a live production checkout):
+completed-group exporter branch, **not** this SA branch. Fetch the pinned exporter revision with the new public default only if missing,
+into a private tools path (no changes to a live production checkout).
+For an already downloaded copy, update only its original default constant:
 
 ```bash
 D=/mnt/workspace/litengjie/data
@@ -70,14 +85,17 @@ PROD="$D/R2V_DATA_V2_postmask_prod"
 PY="$PROD/.venv/bin/python"
 OUT=/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/in_pair_reference
 RUNS="$D/r2v_v3_runs/production/jea_motion_v1/in_pair_reference"
-DEST="$D/r2v_v3_group_exports/post_mask"
+DEST="$OUT/post_mask"
 SCRIPT="$D/export_completed_postmask_group.py"
 
 if [ ! -f "$SCRIPT" ]; then
   curl -fL \
-    "https://raw.githubusercontent.com/TjieLee/R2V_DATA_V2/7e595596916c8c5b517c2d8ec814c6c40977bf38/tools/export_completed_postmask_group.py" \
+    "https://raw.githubusercontent.com/TjieLee/R2V_DATA_V2/56ea226a5680e4f31c74fc408fee933edb2f21d1/tools/export_completed_postmask_group.py" \
     -o "$SCRIPT"
 fi
+# Keep an existing private helper compatible with the new default.
+sed -i "s@^OUTPUT_BASE_DEFAULT = Path('/mnt/workspace/litengjie/data/r2v_v3_group_exports/post_mask')$@OUTPUT_BASE_DEFAULT = ROOT_DEFAULT / 'post_mask'@" "$SCRIPT"
+grep '^OUTPUT_BASE_DEFAULT' "$SCRIPT"
 ls -lh "$SCRIPT"
 ```
 
