@@ -7,22 +7,22 @@ import pytest
 
 
 def sample(uid="clip-a"):
-    return dict(
-        schema_version="r2v.v3.production_sample.1", sample_id=uid,
-        clip_uid=uid, target_video=f"/videos/{uid}.mp4", t2v_caption="visual",
-        r2v_instruction="Person <Image 1>, shirt <Image 2>, room <Image 3>",
-        references=[
-            dict(image_id="image_1", image_index=1, kind="subject", entity_id="e7",
-                 image_path="references/visual/shard/subject.png", source_frame_index=3,
-                 scope="full", synthetic=False),
-            dict(image_id="image_2", image_index=2, kind="attribute", attribute_id="a2",
-                 owner_entity_id="e7", attribute_type="upper_clothing",
-                 image_path="references/shirt.png", source_frame_index=4, synthetic=False),
-            dict(image_id="image_3", image_index=3, kind="background", scope="scene",
-                 image_path="references/background.png", source_frame_index=5, synthetic=False),
+    return {
+        "schema_version": "r2v.v3.production_sample.1", "sample_id": uid,
+        "clip_uid": uid, "target_video": f"/videos/{uid}.mp4", "t2v_caption": "visual",
+        "r2v_instruction": "Person <Image 1>, shirt <Image 2>, room <Image 3>",
+        "references": [
+            {"image_id": "image_1", "image_index": 1, "kind": "subject", "entity_id": "e7",
+                 "image_path": "references/visual/shard/subject.png", "source_frame_index": 3,
+                 "scope": "full", "synthetic": False},
+            {"image_id": "image_2", "image_index": 2, "kind": "attribute", "attribute_id": "a2",
+                 "owner_entity_id": "e7", "attribute_type": "upper_clothing",
+                 "image_path": "references/shirt.png", "source_frame_index": 4, "synthetic": False},
+            {"image_id": "image_3", "image_index": 3, "kind": "background", "scope": "scene",
+                 "image_path": "references/background.png", "source_frame_index": 5, "synthetic": False},
         ],
-        source=dict(parent_video_id="parent", clip_suffix="01", shard_id="shard"),
-    )
+        "source": {"parent_video_id": "parent", "clip_suffix": "01", "shard_id": "shard"},
+    }
 
 
 def publish_group(source, name="group-000000", count=20, declared=None):
@@ -33,10 +33,10 @@ def publish_group(source, name="group-000000", count=20, declared=None):
     )
     marker = source.parent / "state/resource_epochs" / name / "completed.json"
     marker.parent.mkdir(parents=True, exist_ok=True)
-    marker.write_text(json.dumps(dict(
-        group_id=name, status="completed", export_completed=True,
-        sample_count=count if declared is None else declared,
-    )))
+    marker.write_text(json.dumps({
+        "group_id": name, "status": "completed", "export_completed": True,
+        "sample_count": count if declared is None else declared,
+    }))
     return directory, marker
 
 

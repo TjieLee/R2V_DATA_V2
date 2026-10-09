@@ -114,10 +114,10 @@ def freeze_pilot_inventory(group: PublishedGroup, destination: Path, limit: int)
             os.fsync(output.fileno())
         if len(offsets) != min(limit, group.declared_count):
             raise ValueError("published source has fewer rows than its Export count")
-        metadata = dict(mode="pilot", group_id=group.group_id, source_directory=str(group.directory),
-                        source_samples_path=str(group.samples_path), limit=limit,
-                        selected_count=len(offsets), declared_source_count=group.declared_count,
-                        offsets=offsets)
+        metadata = {"mode": "pilot", "group_id": group.group_id, "source_directory": str(group.directory),
+                        "source_samples_path": str(group.samples_path), "limit": limit,
+                        "selected_count": len(offsets), "declared_source_count": group.declared_count,
+                        "offsets": offsets}
         atomic_json(temporary / "inventory.json", metadata)
         temporary.rename(destination)
         return metadata
