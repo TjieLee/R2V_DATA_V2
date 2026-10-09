@@ -1,4 +1,4 @@
-"""Synthetic checks for elastic formal Post-Mask group ownership."""
+"""Synthetic checks for static formal Post-Mask group ownership."""
 
 from __future__ import annotations
 
@@ -39,8 +39,8 @@ def _completed(group, _ledger, _emit):
     }
 
 
-def test_elastic_restart_with_fewer_nodes_claims_every_remaining_group(tmp_path):
-    groups = _groups(5)
+def test_static_restart_with_fewer_nodes_claims_every_remaining_group(tmp_path):
+    groups = _groups(12)
     visited = []
 
     def interrupted(group, ledger, emit):
@@ -58,6 +58,88 @@ def test_elastic_restart_with_fewer_nodes_claims_every_remaining_group(tmp_path)
     )
     assert all(production.production_group_completed(tmp_path, group) for group in groups)
     assert len(visited) == 2
+
+
+def test_seven_ranks_execute_each_of_48_groups_exactly_once(tmp_path, monkeypatch):
+    groups = _groups(48)
+    expected = [
+        [0, 7, 14, 21, 28, 35, 42],
+        [1, 8, 15, 22, 29, 36, 43],
+        [2, 9, 16, 23, 30, 37, 44],
+        [3, 10, 17, 24, 31, 38, 45],
+        [4, 11, 18, 25, 32, 39, 46],
+        [5, 12, 19, 26, 33, 40, 47],
+        [6, 13, 20, 27, 34, 41],
+    ]
+    completed = production.production_group_completed
+    priority = production.group_priority_key
+    visited = []
+    for rank, indices in enumerate(expected):
+        def check_local(root, group, allowed=indices):
+            assert group.group_index in allowed, "checked another rank's group"
+            return completed(root, group)
+
+        def local_priority(root, group, hints, allowed=indices):
+            assert group.group_index in allowed, "prioritized another rank's group"
+            return priority(root, group, hints)
+
+        def runner(group, ledger, emit):
+            visited.append(group.group_index)
+            return _completed(group, ledger, emit)
+
+        monkeypatch.setattr(production, "production_group_completed", check_local)
+        monkeypatch.setattr(production, "group_priority_key", local_priority)
+        result = production.run_elastic_groups(
+            tmp_path, groups, runner, rank=rank, world_size=7, sleep=lambda _: None
+        )
+        assert result == {"group_count": len(indices), "groups_claimed": len(indices)}
+        assert visited[-len(indices):] == indices
+
+    assert sorted(visited) == list(range(48))
+    assert 16 in expected[2]
+    assert 34 in expected[6]
+
+
+def test_restart_skips_complete_groups_but_not_unfinished_g34(tmp_path):
+    groups = _groups(48)
+    for group in groups:
+        if group.group_index != 34:
+            production.write_production_group_complete(
+                tmp_path, group, _completed(group, None, None)
+            )
+    assert production.run_elastic_groups(
+        tmp_path, groups, lambda *_: pytest.fail("completed group entered runner"),
+        rank=2, world_size=7, sleep=lambda _: None,
+    ) == {"group_count": 7, "groups_claimed": 0}
+
+    visited = []
+
+    def incomplete(group, ledger, emit):
+        visited.append(group.group_index)
+        return {"completed": False, "reason": "durable outcome conflict"}
+
+    with pytest.raises(production.IncompleteGroupError, match="group-000034"):
+        production.run_elastic_groups(
+            tmp_path, groups, incomplete, rank=6, world_size=7, sleep=lambda _: None
+        )
+    assert visited == [34]
+    assert not production.production_group_completed(tmp_path, groups[34])
+    assert production.run_elastic_groups(
+        tmp_path, groups, _completed, rank=6, world_size=7, sleep=lambda _: None,
+    ) == {"group_count": 6, "groups_claimed": 1}
+
+
+def test_rank_with_no_assigned_groups_exits_without_checking_other_groups(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        production, "production_group_completed",
+        lambda *_: pytest.fail("checked another rank's group"),
+    )
+    assert production.run_elastic_groups(
+        tmp_path, _groups(1), lambda *_: pytest.fail("claimed another rank's group"),
+        rank=6, world_size=7, sleep=lambda _: None,
+    ) == {"group_count": 0, "groups_claimed": 0}
 
 
 def test_busy_group_is_rescanned_not_abandoned(tmp_path, monkeypatch):
@@ -349,6 +431,7 @@ def _load_full_tool():
 
 
 def test_full_tool_namespaces_resource_temp_root_per_node(tmp_path, monkeypatch):
+    monkeypatch.setattr(os, "environ", os.environ.copy())
     tool = _load_full_tool()
     official = tmp_path / "public" / "in_pair_reference"
     stage2 = tmp_path / "entity_mask"
@@ -374,6 +457,7 @@ def test_full_tool_namespaces_resource_temp_root_per_node(tmp_path, monkeypatch)
 
 
 def test_full_tool_publishes_one_official_root_and_pins_qwen(tmp_path, monkeypatch):
+    monkeypatch.setattr(os, "environ", os.environ.copy())
     tool = _load_full_tool()
     official = tmp_path / "public" / "in_pair_reference"
     stage2 = tmp_path / "entity_mask"
@@ -397,7 +481,7 @@ def test_full_tool_publishes_one_official_root_and_pins_qwen(tmp_path, monkeypat
         "--entity-mask-root", str(stage2), "--rank", "1", "--world-size", "3",
     ]) == 0
     assert seen["root"] == official / "state"
-    assert seen["compacted"] == official
+    assert "compacted" not in seen
     assert seen["options"]["rank"] == 1
     assert seen["options"]["world_size"] == 3
     assert os.environ["POST_MASK_QWEN_MODEL_PATH"].endswith("Qwen3-VL-8B-Instruct")

@@ -1,4 +1,4 @@
-"""Elastic group claiming for formal Post-Mask Resource Epoch production."""
+"""Static rank-owned groups for formal Post-Mask Resource Epoch production."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from typing import Any
 
 from r2v_data_v2.v3.post_mask_epoch_groups import (
     ResourceEpochGroup,
+    assigned_groups,
     group_ownership,
     group_root,
     record_group_outcome,
@@ -154,17 +155,15 @@ def run_elastic_groups(
     backoff_seconds: float = 2.0,
     priority_hints: Path | None = None,
 ) -> dict[str, int]:
-    """Every node scans all groups; rank rotates only equal-priority ties."""
+    """Run only this rank's groups, retaining priority, locks and resume."""
     if world_size < 1 or not 0 <= rank < world_size:
         raise ValueError("invalid rank/world_size")
     if backoff_seconds < 0:
         raise ValueError("backoff_seconds must be nonnegative")
     root = Path(root)
-    ordered = tuple(groups)
-    if not ordered:
+    if not groups:
         raise ValueError("production has no groups")
-    start = (rank * max(1, len(ordered) // world_size)) % len(ordered)
-    ordered = ordered[start:] + ordered[:start]
+    ordered = assigned_groups(groups, rank=rank, world_size=world_size)
     hints = load_priority_hints(priority_hints)
     ordered = tuple(sorted(ordered, key=lambda group: group_priority_key(root, group, hints)))
     report = emit or (lambda *_args, **_kwargs: None)

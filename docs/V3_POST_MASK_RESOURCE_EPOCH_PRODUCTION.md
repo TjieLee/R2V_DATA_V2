@@ -13,10 +13,11 @@ bash scripts/run_v3_post_mask_full_production.sh --dry-run
 ```
 
 The launcher accepts externally assigned `RANK` and `WORLD_SIZE` (default
-`0/1`). They rotate equal-priority ties only. Every node sees every canonical group and
-claims unfinished work via a nonblocking shared `flock`. A node that encounters
-busy groups waits and scans again. A crash releases the lock; a later launch can
-resume with a different node count. Canonical per-shard locks remain in force.
+`0/1`). Each node checks and runs only groups with `group_index % WORLD_SIZE == RANK`;
+there is no cross-rank work stealing. With seven nodes, G16 belongs to rank 2
+and G34 to rank 6. Priority hints order only the assigned groups. Existing
+nonblocking group `flock`, busy-group retries and canonical per-shard locks
+remain in force. A crash releases the lock; restart reuses the same checkpoints.
 
 The frozen Stage2 input is
 `/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/entity_mask`.
@@ -32,10 +33,17 @@ Subject Attributes terminal barrier and DatasetExporter publication. The group
 marker follows only after every shard export succeeds. Restart skips completed
 shards/groups by reading those markers, without rehashing export trees, receipts,
 or media. Missing markers enter the existing durable ModelJob receipt replay.
-Once all groups finish, one node holds the compaction lock and uses the existing
-V3 compactor to publish `samples.jsonl` and `catalog.json` at the official root.
+After its assigned groups finish, only rank 0 waits for every group's small
+`completed.json`, periodically reporting the remaining group count. Other ranks
+exit after their own groups finish. Once all groups finish, rank 0 holds the
+existing compaction lock and uses the V3 compactor to publish `samples.jsonl`
+and `catalog.json` at the official root.
 The compactor's normal publication checks are not used as a completion/resume
 gate. A plain compaction marker makes later launches skip that work as well.
+
+Static ownership does not repair pre-existing conflicting outcomes, including
+the known G34 Subject Attributes outcome drift. That requires a separate
+targeted recovery; an unfinished or failed G34 never counts as completed.
 
 The committed config selects Boogu removal and pins all Qwen services to
 `Qwen3-VL-8B-Instruct`; the launcher pins the managed physical Qwen model after
