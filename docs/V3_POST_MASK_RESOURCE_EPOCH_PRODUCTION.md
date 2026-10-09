@@ -43,6 +43,99 @@ loading `server_env.sh`. `ResourceEpochManager` lazily loads and retains Qwen,
 Boogu and SAM together for the shared session: sequential work does not imply
 exclusive model residency. No Audio/H3 stage is launched here.
 
+## On-demand export of completed groups (operator-run only)
+
+Once a group has the formal
+`in_pair_reference/state/resource_epochs/group-XXXXXX/completed.json`,
+its published shards can be converted to final
+`r2v.v3.production_sample.1` JSONL without waiting for all 48 groups or
+running full-population compaction. The independent converter uses the published
+shard `samples.jsonl` and `enriched_samples.jsonl` (including SA), and
+checks formal group and per-shard completion markers/sample counts. Outputs
+are under
+`/mnt/workspace/litengjie/data/r2v_v3_group_exports/post_mask/<group>/samples.jsonl`.
+Image reference paths are relative to the group directory. A small set of
+directory symlinks points to already published shard Export `references`;
+**no media is copied**. Keep those source reference directories available.
+This does not modify production worktrees, state, receipts or shard exports.
+
+`tools/export_completed_postmask_group.py` lives in the independent
+completed-group exporter branch, **not** this SA branch. Fetch its previously
+successful pinned version only if missing, into a private tools path
+(no changes to a live production checkout):
+
+```bash
+D=/mnt/workspace/litengjie/data
+PROD="$D/R2V_DATA_V2_postmask_prod"
+PY="$PROD/.venv/bin/python"
+OUT=/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/in_pair_reference
+RUNS="$D/r2v_v3_runs/production/jea_motion_v1/in_pair_reference"
+DEST="$D/r2v_v3_group_exports/post_mask"
+SCRIPT="$D/export_completed_postmask_group.py"
+
+if [ ! -f "$SCRIPT" ]; then
+  curl -fL \
+    "https://raw.githubusercontent.com/TjieLee/R2V_DATA_V2/7e595596916c8c5b517c2d8ec814c6c40977bf38/tools/export_completed_postmask_group.py" \
+    -o "$SCRIPT"
+fi
+ls -lh "$SCRIPT"
+```
+
+**List newly completed groups**, leaving prior exports alone:
+
+```bash
+for marker in "$OUT"/state/resource_epochs/group-*/completed.json; do
+  [ -f "$marker" ] || continue
+  g=$(basename "$(dirname "$marker")")
+  if [ -f "$DEST/$g/samples.jsonl" ]; then
+    echo "$g  ALREADY EXPORTED"
+  else
+    echo "$g  NEW - READY TO EXPORT"
+  fi
+done
+```
+
+**Batch export all new completed groups**, stopping on the first error.
+An existing output directory or symlink is never overwritten:
+
+```bash
+for marker in "$OUT"/state/resource_epochs/group-*/completed.json; do
+  [ -f "$marker" ] || continue
+  g=$(basename "$(dirname "$marker")")
+  target="$DEST/$g"
+  if [ -e "$target" ] || [ -L "$target" ]; then
+    echo "SKIP existing: $g"
+    continue
+  fi
+  echo "========== EXPORT $g =========="
+  "$PY" "$SCRIPT" \
+    --group "$g" \
+    --repo "$PROD" \
+    --root "$OUT" \
+    --runs "$RUNS" \
+    --output-dir "$target" || break
+done
+```
+
+To export **one** specific completed group instead, use the same command with
+`--group group-000001` (replace with an actually completed group) and
+`--output-dir "$DEST/group-000001"`.
+
+**Review final JSONL record counts**:
+
+```bash
+for f in "$DEST"/group-*/samples.jsonl; do
+  [ -f "$f" ] || continue
+  echo "$(basename "$(dirname "$f")"): $(wc -l < "$f") samples"
+done
+```
+
+An SA-completed group without the formal post-Export `completed.json` marker
+is **not** eligible. These shell loops only inspect group markers and
+existing group JSONLs; they do not scan SAM binaries or source images.
+Each JSONL's reference paths remain valid only while its group-relative
+symlinks and the published shard image directories exist.
+
 ## Group ordering and SA-only process opt-in
 
 Completed groups still skip using formal markers; existing group/shard locks
