@@ -6418,7 +6418,9 @@ class SubjectAttributeEpochRunner:
 
     def _emit_completion_conflict(self, event: Mapping[str, Any]) -> None:
         if self.emit is not None:
-            self.emit(dict(event))
+            payload = dict(event)
+            name = payload.pop("event")
+            self.emit(name, **payload)
         else:
             _LOGGER.warning("%s", json.dumps(dict(event), ensure_ascii=False))
 

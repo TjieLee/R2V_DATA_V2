@@ -6165,10 +6165,20 @@ def test_terminal_completion_outcome_is_never_repaired(
     }
     committed = _completion_receipt_files(cold)
     second = _runner(config, storage, tmp_path, ledger_name=Path(runner.ledger.root).name)
+    events: list[dict[str, Any]] = []
+
+    def emit(event_name: str, **details: Any) -> None:
+        events.append({"event": event_name, **details})
+
+    second.emit = emit
 
     with pytest.raises(SubjectAttributeDurableError, match="completion outcome drifted"):
         second.seed_jobs()
 
+    assert len(events) == 1
+    assert events[0]["event"] == "subject_attribute_completion_conflict"
+    assert events[0]["conflicting_fields"] == ["reason"]
+    assert events[0]["recovery_action"] == "fail_closed_terminal_outcome"
     assert {item: item.read_bytes() for item in protected} == protected
     assert _completion_receipt_files(second) == committed
     assert not path.with_name(f"rank-{rank}-outcome-conflict.json").exists()
@@ -6409,7 +6419,11 @@ def test_interrupted_completion_refreshes_warm_chain_before_sibling_finalization
     }), encoding="utf-8")
     stale_bytes = path.read_bytes()
     events: list[dict[str, Any]] = []
-    runner.emit = events.append
+
+    def emit(event_name: str, **details: Any) -> None:
+        events.append({"event": event_name, **details})
+
+    runner.emit = emit
 
     jobs = runner.seed_jobs()
 
@@ -6421,6 +6435,8 @@ def test_interrupted_completion_refreshes_warm_chain_before_sibling_finalization
     assert _completion_receipt_files(runner) == committed
     assert not _owner_outcome_path(runner).exists()
     assert len(events) == 1
+    assert events[0]["event"] == "subject_attribute_completion_conflict"
+    assert "reason" in events[0]["conflicting_fields"]
     assert events[0]["recovery_action"] == "rebuild_derived_marker"
 
     sibling_qwen = _QwenClient(completion_reviews=[_completion_review("accept")])
