@@ -341,6 +341,7 @@ class _OwnerReplay:
         #: 8c chain currently being replayed: legacy calls generation, then the
         #: generated-frame segmentation, then the review.
         self.completion: dict[str, Any] | None = None
+        self._completion_ranks: dict[str, int] = {}
         self.bbox_used: set[str] = set()
         # Model timing is accumulated from the durable receipts the replayed
         # legacy algorithm actually walked, never from wall clock, so a restart
@@ -546,6 +547,7 @@ class _OwnerReplay:
     # -- completion chain ----------------------------------------------------
 
     def begin_completion(self, state, rank, candidate, generate_job) -> None:
+        self._completion_ranks[state.attribute_id] = int(rank)
         self.completion = {
             "state": state,
             "rank": int(rank),
@@ -717,20 +719,14 @@ class _OwnerReplay:
 
     def frozen_seed_for(self, attribute_id: str) -> int | None:
         """The seed of the last completion this attribute actually attempted."""
-        state = self.state_for(attribute_id)
-        found: int | None = None
-        for rank in range(len(state.options)):
-            path = self.epoch._completion_seed_path(
-                self.shard,
-                self.clip_uid,
-                self.owner_entity_id,
-                attribute_id,
-                rank,
-            )
-            payload = _read_json(path)
-            if payload is not None:
-                found = int(payload["seed"])
-        return found
+        rank = self._completion_ranks.get(attribute_id)
+        if rank is None:
+            return None
+        path = self.epoch._completion_seed_path(
+            self.shard, self.clip_uid, self.owner_entity_id, attribute_id, rank
+        )
+        payload = _read_json(path)
+        return int(payload["seed"]) if payload is not None else None
 
     @property
     def qwen_seconds(self) -> float:
@@ -6360,11 +6356,11 @@ class SubjectAttributeEpochRunner:
                     f"completion outcome cannot be repaired: {path}"
                 )
             self._check_completion_marker_identity(
-                existing, expected, path, check_downstream=False
+                existing, expected, path
             )
             original_bytes = path.read_bytes()
-            # Follow dependencies in order; never let the old payload/mask cache
-            # or a last-record-wins receipt choose the conflict's authority.
+            # Follow the latest committed dependencies in order, discarding only
+            # this chain's cached payloads/masks before deriving downstream jobs.
             current = chain
             for stage in ("generate_job", "sam_job", "review_job"):
                 job = getattr(current, stage)
@@ -6385,8 +6381,7 @@ class SubjectAttributeEpochRunner:
                 if result is None:
                     break
             self._check_completion_marker_identity(
-                existing, self._completion_chain_identity(current), path,
-                pending=not current.terminal,
+                existing, self._completion_chain_identity(current), path
             )
             refreshed.add(key)
             with self._completion_chain_cache_lock:
@@ -6403,12 +6398,9 @@ class SubjectAttributeEpochRunner:
                 event["recovery_action"] = "refresh_committed_evidence"
                 return True
             backup = path.with_name(f"rank-{chain.candidate_rank}-outcome-conflict.json")
-            if backup.exists():
-                if backup.read_bytes() != original_bytes:
-                    raise SubjectAttributeDurableError(
-                        f"completion conflict evidence already differs: {backup}"
-                    )
-            else:
+            # Keep the first conflict evidence, including across later upstream
+            # replacements; it is a backup, not authority for the current chain.
+            if not backup.exists():
                 atomic_write_bytes(backup, original_bytes)
             atomic_write_json(path, replacement)
             event["recovery_action"] = "rebuild_derived_marker"
@@ -6427,20 +6419,14 @@ class SubjectAttributeEpochRunner:
     @staticmethod
     def _check_completion_marker_identity(
         existing: Mapping[str, Any], expected: Mapping[str, Any], path: Path,
-        *, pending: bool = False, check_downstream: bool = True,
     ) -> None:
+        # SAM/review jobs and their outputs are derived from the current committed
+        # generation result. Only the frozen upstream identity must stay fixed.
         identity = (
             "schema", "clip_uid", "owner_entity_id", "attribute_id",
             "candidate_rank", "owner_candidate_id", "seed", "generation_job_id",
         )
-        fields = identity + (("sam_job_id", "review_job_id") if check_downstream else ())
-        for name in fields:
-            # A downstream job may not have existed in an earlier failed chain,
-            # but a different non-null job identity is never silently replaced.
-            if name in ("sam_job_id", "review_job_id") and existing.get(name) is None:
-                continue
-            if pending and name in ("sam_job_id", "review_job_id") and expected[name] is None:
-                continue
+        for name in identity:
             if (
                 name not in existing
                 or canonical_json(existing[name]) != canonical_json(expected[name])
