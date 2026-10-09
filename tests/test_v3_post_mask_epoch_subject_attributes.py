@@ -987,8 +987,8 @@ def test_discovery_receipt_before_finalizer_restart_pays_no_qwen(
     assert stats.terminal_clips == 1
     assert stats.to_dict()["screened_nonhuman_subjects"] == 1
 
-    # The marker is never its own authority: a tampered outcome must fail closed
-    # against the committed receipt and the artifact it claims.
+    # Before clip publication, an owner marker must still correspond to its
+    # final artifact's record shape, without auditing historical receipts.
     outcome_path = (
         Path(fresh.ledger.root)
         / "semantic"
@@ -1002,7 +1002,8 @@ def test_discovery_receipt_before_finalizer_restart_pays_no_qwen(
     marker = json.loads(outcome_path.read_text(encoding="utf-8"))
     marker["record_count"] = 7
     outcome_path.write_text(json.dumps(marker), encoding="utf-8")
-    with pytest.raises(SubjectAttributeDurableError, match="owner outcome"):
+    fresh._clip_outcome_path(SHARD, CLIP_UID).unlink()
+    with pytest.raises(SubjectAttributeDurableError, match="owner.*record|owner outcome"):
         _runner(config, storage, tmp_path).reconcile_stats(SHARD)
 
 
@@ -1441,6 +1442,10 @@ def test_durable_plans_reject_any_shape_drift(
     client = _DiscoveryClient(_nonhuman_discovery())
     _drain(runner, client)
     assert client.calls == 1
+    # Exercise frozen pending-plan validation rather than reopening a final
+    # owner/clip whose publication is now the resume authority.
+    runner._clip_outcome_path(SHARD, CLIP_UID).unlink()
+    _owner_outcome_path(runner).unlink()
 
     if mutation == "clip_plan_extra_field":
         path = _clip_plan_path(runner)
@@ -1474,10 +1479,10 @@ def test_durable_plans_reject_any_shape_drift(
     assert fresh_client.calls == 0
 
 
-def test_terminal_clip_rejects_a_tampered_enriched_sample(
+def test_terminal_clip_reuses_sample_without_expected_bytes_replay(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A terminal clip's sample artifact is authority, not a rebuildable cache."""
+    """A terminal sample is not rebuilt or byte-audited from historical owners."""
     monkeypatch.setattr(time, "perf_counter", lambda: 1.0)
     config, storage = _storage_variant(tmp_path, monkeypatch, "run-sample")
     runner = _runner(config, storage, tmp_path)
@@ -1488,9 +1493,13 @@ def test_terminal_clip_rejects_a_tampered_enriched_sample(
     assert sample.is_file(), "a human owner publishes a sample"
     assert runner.reconcile_stats(SHARD).terminal_clips == 1
 
-    sample.write_text("{\"tampered\": true}", encoding="utf-8")
-    with pytest.raises(SubjectAttributeDurableError, match="enriched sample"):
-        _runner(config, storage, tmp_path).reconcile_stats(SHARD)
+    sample.write_text(
+        json.dumps(json.loads(sample.read_text(encoding="utf-8")), indent=4),
+        encoding="utf-8",
+    )
+    final_bytes = sample.read_bytes()
+    assert _runner(config, storage, tmp_path).reconcile_stats(SHARD).terminal_clips == 1
+    assert sample.read_bytes() == final_bytes
 
 
 def test_sam_probes_follow_legacy_frame_order_and_are_conditional(
@@ -1754,6 +1763,8 @@ def test_owner_batched_rank0_review_matches_legacy(
     payload = json.loads(plan_file.read_text(encoding="utf-8"))
     payload["unexpected"] = 1
     plan_file.write_text(json.dumps(payload), encoding="utf-8")
+    runner._clip_outcome_path(SHARD, CLIP_UID).unlink()
+    _owner_outcome_path(runner).unlink()
     with pytest.raises(SubjectAttributeDurableError, match="attribute plan drifted"):
         _runner(config, storage, tmp_path).seed_jobs()
 
@@ -2108,6 +2119,8 @@ def test_raw_state_tamper_fails_closed_without_any_model_call(
     payload = json.loads(path.read_text(encoding="utf-8"))
     payload["attributes"][0]["route_after_rank0"] = "raw_accept_tampered"
     path.write_text(json.dumps(payload), encoding="utf-8")
+    runner._clip_outcome_path(SHARD, CLIP_UID).unlink()
+    _owner_outcome_path(runner).unlink()
 
     fresh = _runner(config, storage, tmp_path)
     fresh_qwen = _QwenClient()
@@ -2530,6 +2543,7 @@ def test_longest_chain_restart_pays_no_model_call_at_all(
     # Crash between the last model receipt and the processed owner outcome: the
     # artifact is on disk but the outcome is not.
     _owner_outcome_path(runner).unlink()
+    runner._clip_outcome_path(SHARD, CLIP_UID).unlink()
 
     fresh = _runner(config, storage, tmp_path, ledger_name="ledger-run-longest")
     fresh_qwen = _QwenClient()
@@ -2916,10 +2930,10 @@ def test_completion_generation_identity_ignores_generator_checkpoint(
     assert runner._completion_generate_policy_identity()["target_area"] == 1024 * 1024
 
 
-def test_rank1_completion_outcome_marker_is_published_and_checked(
+def test_rank1_completion_outcome_marker_is_published_but_not_terminally_replayed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The rank-1 completion outcome is durable authority, never its own."""
+    """Rank-1 intermediate provenance is retained after final owner publication."""
     monkeypatch.setattr(time, "perf_counter", lambda: 1.0)
     config, storage, runner, qwen, sam, boogu, _timeline = _completion_fixture(
         tmp_path,
@@ -2986,14 +3000,11 @@ def test_rank1_completion_outcome_marker_is_published_and_checked(
         tampered = dict(rank1)
         tampered[key] = value
         rank1_path.write_text(json.dumps(tampered), encoding="utf-8")
-        with pytest.raises(
-            SubjectAttributeDurableError, match="completion outcome drifted"
-        ):
-            _runner(
-                config, storage, tmp_path, ledger_name="ledger-run-rank1-marker"
-            ).reconcile_stats(SHARD)
-        # Verification is pure CPU: no handle is ever touched, so a tampered
-        # marker can never cost a model call.
+        assert _runner(
+            config, storage, tmp_path, ledger_name="ledger-run-rank1-marker"
+        ).reconcile_stats(SHARD).terminal_clips == 1
+        # Historical intermediate provenance does not reopen the terminal owner
+        # or cost another model call.
         assert (qwen.discovery_calls, qwen.review_calls, sam.calls, boogu.calls) == (
             1,
             2,
@@ -5796,7 +5807,7 @@ def test_fresh_clip_totals_uses_published_owner_without_disk_replay(
     assert len(records) == 1
     assert enriched is True
     assert runner.replay_counters["fresh_owner_outcome_hits"] > 0
-    assert runner.replay_counters["fresh_owner_verify_skips"] > 0
+    assert runner.replay_counters["fresh_owner_verify_skips"] == 0
     assert runner.replay_counters["fresh_owner_artifact_hits"] > 0
 
     runner.clear_execution_hot_caches()
@@ -5843,10 +5854,10 @@ def test_failed_owner_outcome_publication_does_not_create_fresh_terminal(
     assert cold._clip_outcome_path(SHARD, CLIP_UID).is_file()
 
 
-def test_cold_owner_outcome_replays_after_clip_publication_crash(
+def test_cold_owner_outcome_is_reused_after_clip_publication_crash(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A new runner verifies the durable processed owner before finishing a clip."""
+    """A published owner is authority, not a request to replay model receipts."""
     config, storage = _storage_variant(tmp_path, monkeypatch, "run-owner-cold")
     runner = _runner(config, storage, tmp_path)
     qwen = _QwenClient(discoveries=[_human_discovery()])
@@ -5865,27 +5876,23 @@ def test_cold_owner_outcome_replays_after_clip_publication_crash(
     assert not runner._clip_outcome_path(SHARD, CLIP_UID).exists()
 
     cold = _runner(config, storage, tmp_path)
-    replay = cold._owner_artifact_from_receipts
-    calls = 0
+    def no_historical_replay(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("terminal owner must not replay historical model results")
 
-    def counting_replay(*args: Any, **kwargs: Any) -> Any:
-        nonlocal calls
-        calls += 1
-        return replay(*args, **kwargs)
-
-    monkeypatch.setattr(cold, "_owner_artifact_from_receipts", counting_replay)
+    monkeypatch.setattr(cold, "_owner_artifact_from_receipts", no_historical_replay)
+    monkeypatch.setattr(cold, "_verify_completion_outcomes", no_historical_replay)
+    monkeypatch.setattr(cold, "_completion_chain", no_historical_replay)
     assert cold.seed_jobs() == []
-    assert calls >= 1
     assert cold._clip_outcome_path(SHARD, CLIP_UID).is_file()
 
 
 @pytest.mark.parametrize("processed", [False, True])
 @pytest.mark.parametrize("late_visibility", [False, True])
-def test_owner_outcome_refreshes_stale_discovery_receipt_without_models(
+def test_owner_outcome_reuse_does_not_refresh_stale_discovery_receipt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     processed: bool, late_visibility: bool,
 ) -> None:
-    """A known owner outcome must not fail on an older ledger snapshot."""
+    """Terminal publication remains authoritative over stale ledger snapshots."""
     config, storage = _storage_variant(tmp_path, monkeypatch, "run-stale-ledger")
     runner = _runner(config, storage, tmp_path)
     cold = _runner(config, storage, tmp_path)
@@ -5917,16 +5924,16 @@ def test_owner_outcome_refreshes_stale_discovery_receipt_without_models(
 
     assert jobs == []
     assert executor.batches == resume_qwen.discovery_calls == 0
-    assert scans == (2 if late_visibility else 1)
+    assert scans == 0
     assert _owner_artifact_file(storage).read_bytes() == owner_bytes
     assert _owner_outcome_path(cold).read_bytes() == marker_bytes
     assert cold._clip_outcome_path(SHARD, CLIP_UID).is_file()
 
 
-def test_owner_outcome_without_discovery_receipt_does_not_trust_orphan_result(
+def test_owner_outcome_without_discovery_receipt_reuses_published_artifact(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A result alone cannot authorize a fabricated receipt or owner rewrite."""
+    """The final owner artifact is reused without manufacturing any receipt."""
     config, storage = _storage_variant(tmp_path, monkeypatch, "run-orphan-owner")
     runner = _runner(config, storage, tmp_path)
     _, jobs = _drain(runner, _QwenClient(discoveries=[_nonhuman_discovery()]))
@@ -5941,10 +5948,9 @@ def test_owner_outcome_without_discovery_receipt_does_not_trust_orphan_result(
     cold.ledger.refresh()
     refreshes = cold.ledger.refresh_calls
 
-    with pytest.raises(SubjectAttributeEpochError, match="discovery"):
-        cold.seed_jobs()
+    assert cold.seed_jobs() == []
 
-    assert cold.ledger.refresh_calls == refreshes + 2
+    assert cold.ledger.refresh_calls == refreshes
     assert phase.receipts_path.read_bytes() == b""
     assert result_path.read_bytes() == result_bytes
     assert _owner_outcome_path(cold).read_bytes() == marker_bytes
@@ -5999,10 +6005,10 @@ def test_orphan_discovery_result_retries_only_the_pending_job(
     assert cold.reconcile_stats(SHARD).terminal_clips == 1
 
 
-def test_fresh_owner_cache_does_not_accept_a_mismatched_marker(
+def test_terminal_owner_checks_record_shape_without_historical_digest(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A caller-supplied marker must match the just-published terminal exactly."""
+    """Artifact correspondence is checked, but its historical digest is not replayed."""
     config, storage = _storage_variant(tmp_path, monkeypatch, "run-owner-mismatch")
     _preexisting_nonhuman_artifact(storage)
     runner = _runner(config, storage, tmp_path)
@@ -6013,16 +6019,15 @@ def test_fresh_owner_cache_does_not_accept_a_mismatched_marker(
     assert marker is not None
 
     wrong_count = {**marker, "record_count": 1}
-    with pytest.raises(SubjectAttributeDurableError, match="owner outcome drifted"):
+    with pytest.raises(SubjectAttributeDurableError, match="identity drifted"):
         runner._verify_owner_outcome(
             SHARD, storage, CLIP_UID, OWNER, owner_plan, wrong_count
         )
 
     wrong_digest = {**marker, "artifact_sha256": "0" * 64}
-    with pytest.raises(SubjectAttributeDurableError, match="artifact drifted"):
-        runner._terminal_artifact_for_owner(
-            SHARD, CLIP_UID, OWNER, 1, wrong_digest
-        )
+    assert runner._terminal_artifact_for_owner(
+        SHARD, CLIP_UID, OWNER, 1, wrong_digest
+    ) == _read_artifact(storage)
 
 
 def _completion_receipt_files(runner: Any) -> dict[Path, bytes]:
@@ -6148,10 +6153,10 @@ def test_interrupted_completion_outcome_repairs_from_receipts_and_stays_stable(
 
 
 @pytest.mark.parametrize("rank", [0, 1])
-def test_terminal_completion_outcome_is_never_repaired(
+def test_terminal_completion_outcome_is_not_replayed_or_repaired(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, rank: int
 ) -> None:
-    """Repairing an interrupted owner must not weaken published-owner authority."""
+    """Historical intermediate changes do not invalidate published-owner authority."""
     config, storage, runner, path, expected = _interrupted_completion_owner(
         tmp_path, monkeypatch, rank=rank
     )
@@ -6172,13 +6177,9 @@ def test_terminal_completion_outcome_is_never_repaired(
 
     second.emit = emit
 
-    with pytest.raises(SubjectAttributeDurableError, match="completion outcome drifted"):
-        second.seed_jobs()
+    assert second.seed_jobs() == []
 
-    assert len(events) == 1
-    assert events[0]["event"] == "subject_attribute_completion_conflict"
-    assert events[0]["conflicting_fields"] == ["reason"]
-    assert events[0]["recovery_action"] == "fail_closed_terminal_outcome"
+    assert events == []
     assert {item: item.read_bytes() for item in protected} == protected
     assert _completion_receipt_files(second) == committed
     assert not path.with_name(f"rank-{rank}-outcome-conflict.json").exists()
@@ -6725,8 +6726,7 @@ def test_changed_generation_does_not_rewrite_terminal_owner_or_clip(
         tmp_path, config, storage, published, 0
     )
 
-    with pytest.raises(SubjectAttributeDurableError):
-        cold.seed_jobs()
+    assert cold.seed_jobs() == []
 
     assert {item: item.read_bytes() for item in stable} == stable
     assert not path.with_name("rank-0-outcome-conflict.json").exists()
@@ -6780,3 +6780,227 @@ def test_later_completion_generation_change_reuses_original_conflict_backup(
 
     assert cold.reconcile_stats(SHARD).terminal_clips == 1
     assert len(list(path.parent.glob("*outcome-conflict*"))) == 1
+
+
+def test_terminal_owner_reuses_artifact_after_historical_completion_changed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A paid owner survives ledger drift without rederiving its completion chain."""
+    config, storage, runner, path, _ = _interrupted_completion_owner(tmp_path, monkeypatch)
+    published = _runner(config, storage, tmp_path, ledger_name=Path(runner.ledger.root).name)
+
+    def crash_clip(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("interrupt after owner publication")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(published, "_publish_clip_outcome", crash_clip)
+        with pytest.raises(RuntimeError, match="interrupt after owner publication"):
+            published.seed_jobs()
+    assert _owner_outcome_path(published).is_file()
+    assert not published._clip_outcome_path(SHARD, CLIP_UID).exists()
+    stable = {
+        item: item.read_bytes()
+        for item in (path, _owner_outcome_path(published), _owner_artifact_file(storage))
+    }
+    cold, _old_chain, _new_chain = _changed_completion_generation(
+        tmp_path, config, storage, published, 0
+    )
+    committed = _completion_receipt_files(cold)
+
+    def no_historical_audit(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("published owner must not audit its historical model chain")
+
+    for name in (
+        "_owner_artifact_from_receipts", "_verify_completion_outcomes",
+        "_owner_graph", "_completion_chain", "_discovery_payload",
+    ):
+        monkeypatch.setattr(cold, name, no_historical_audit)
+    monkeypatch.setattr(cold.ledger, "replay_unique_committed", no_historical_audit)
+    from r2v_data_v2.v3 import post_mask_epoch_subject_attributes as module
+
+    original_sha = module._file_sha256
+
+    def no_owner_hash(target: Path) -> str:
+        if target == _owner_artifact_file(storage):
+            raise AssertionError("published owner artifact must not be rehashed")
+        return original_sha(target)
+
+    monkeypatch.setattr(module, "_file_sha256", no_owner_hash)
+    original_read_text = Path.read_text
+    owner_artifact_reads = 0
+
+    def count_owner_reads(target: Path, *args: Any, **kwargs: Any) -> str:
+        nonlocal owner_artifact_reads
+        if target == _owner_artifact_file(storage):
+            owner_artifact_reads += 1
+        return original_read_text(target, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", count_owner_reads)
+    qwen, sam, boogu = _QwenClient(), _SamBackend(), _BooguBackend()
+
+    executor, jobs = _drain(cold, qwen, sam=sam, boogu=boogu)
+
+    assert jobs == executor.executed == []
+    assert qwen.discovery_calls + qwen.review_calls + qwen.completion_review_calls == 0
+    assert sam.calls + sam.generated_calls + boogu.calls == 0
+    assert {item: item.read_bytes() for item in stable} == stable
+    assert _completion_receipt_files(cold) == committed
+    assert cold.reconcile_stats(SHARD).terminal_clips == 1
+    assert owner_artifact_reads == 1, "advance and clip totals must share the parsed artifact"
+    assert cold._clip_outcome_path(SHARD, CLIP_UID).is_file()
+    completed = cold._clip_outcome_path(SHARD, CLIP_UID).read_bytes()
+    second = _runner(config, storage, tmp_path, ledger_name=Path(runner.ledger.root).name)
+    assert second.seed_jobs() == []
+    assert second._clip_outcome_path(SHARD, CLIP_UID).read_bytes() == completed
+    assert {item: item.read_bytes() for item in stable} == stable
+    assert owner_artifact_reads == 1, "ready clip must not reopen the owner artifact"
+
+
+@pytest.mark.parametrize("damage", ["missing", "malformed", "wrong_schema"])
+def test_terminal_owner_requires_readable_final_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, damage: str,
+) -> None:
+    """Terminal receipt independence cannot fabricate a lost published artifact."""
+    config, storage = _storage_variant(tmp_path, monkeypatch, "run-final-owner-damage")
+    runner = _runner(config, storage, tmp_path)
+
+    def crash_clip(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("interrupt before clip publication")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(runner, "_publish_clip_outcome", crash_clip)
+        _drain(runner, _QwenClient(discoveries=[_nonhuman_discovery()]))
+    assert _owner_outcome_path(runner).is_file()
+    assert not runner._clip_outcome_path(SHARD, CLIP_UID).exists()
+    artifact = _owner_artifact_file(storage)
+    if damage == "missing":
+        artifact.unlink()
+    else:
+        artifact.write_text("not JSON" if damage == "malformed" else "{}", encoding="utf-8")
+    marker = _owner_outcome_path(runner).read_bytes()
+    cold = _runner(config, storage, tmp_path)
+
+    with pytest.raises(SubjectAttributeDurableError, match="owner artifact.*(missing|invalid)"):
+        cold.seed_jobs()
+
+    assert _owner_outcome_path(cold).read_bytes() == marker
+    assert not cold._clip_outcome_path(SHARD, CLIP_UID).exists()
+
+
+def test_terminal_clip_reuses_counts_without_owner_reconstruction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ready clip marker and its final sample are the cold accounting authority."""
+    config, storage, runner, _path, _ = _interrupted_completion_owner(tmp_path, monkeypatch)
+    complete = _runner(config, storage, tmp_path, ledger_name=Path(runner.ledger.root).name)
+    assert complete.seed_jobs() == []
+    expected_counts = complete.reconcile_stats(SHARD).to_dict()
+    stable = {
+        item: item.read_bytes()
+        for item in (
+            complete._clip_outcome_path(SHARD, CLIP_UID), _sample_path(storage),
+            _owner_outcome_path(complete), _owner_artifact_file(storage),
+        )
+    }
+    cold = _runner(config, storage, tmp_path, ledger_name=Path(runner.ledger.root).name)
+
+    def no_owner_walk(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("ready clip must not reconstruct terminal owners")
+
+    for name in (
+        "_owner_plan", "_owner_outcome", "_verify_owner_outcome",
+        "_owner_artifact_from_receipts", "_clip_totals", "_completion_chain",
+    ):
+        monkeypatch.setattr(cold, name, no_owner_walk)
+    from r2v_data_v2.v3 import post_mask_epoch_subject_attributes as module
+
+    monkeypatch.setattr(module, "_file_sha256", no_owner_walk)
+    monkeypatch.setattr(module, "_sha256_bytes", no_owner_walk)
+    monkeypatch.setattr(module, "_image_png_sha256", no_owner_walk)
+
+    assert cold.seed_jobs() == []
+    assert cold.reconcile_stats(SHARD).to_dict() == expected_counts
+    assert {item: item.read_bytes() for item in stable} == stable
+
+
+def test_malformed_terminal_clip_outcome_fails_without_rewrite_or_owner_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Final-marker authority still requires readable JSON, never silent repair."""
+    config, storage = _storage_variant(tmp_path, monkeypatch, "run-malformed-final-clip")
+    _preexisting_nonhuman_artifact(storage)
+    runner = _runner(config, storage, tmp_path)
+    assert runner.seed_jobs() == []
+    marker = runner._clip_outcome_path(SHARD, CLIP_UID)
+    marker.write_bytes(b"{malformed ready clip outcome")
+    marker_bytes = marker.read_bytes()
+    owner_bytes = _owner_artifact_file(storage).read_bytes()
+    cold = _runner(config, storage, tmp_path)
+
+    def no_owner_replay(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("malformed clip outcome must not reconstruct owners")
+
+    monkeypatch.setattr(cold, "_owner_artifact_from_receipts", no_owner_replay)
+    monkeypatch.setattr(cold, "_clip_totals", no_owner_replay)
+    qwen, sam, boogu = _QwenClient(), _SamBackend(), _BooguBackend()
+
+    with pytest.raises(SubjectAttributeDurableError, match="invalid durable Subject Attributes JSON"):
+        _drain(cold, qwen, sam=sam, boogu=boogu)
+
+    assert marker.read_bytes() == marker_bytes
+    assert _owner_artifact_file(storage).read_bytes() == owner_bytes
+    assert qwen.discovery_calls + qwen.review_calls + qwen.completion_review_calls == 0
+    assert sam.calls + sam.generated_calls + boogu.calls == 0
+
+
+def test_mixed_terminal_and_pending_owners_reuse_only_finished_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A terminal sibling is reused while the genuinely pending owner is executed."""
+    config, storage = _storage_variant(tmp_path, monkeypatch, "run-mixed-terminal-owners")
+    clip_path = storage.clip_path(CLIP_UID)
+    clip = json.loads(clip_path.read_text(encoding="utf-8"))
+    clip["annotation"]["entities"][1]["reference_type"] = "subject"
+    clip["pairing"]["tokens"]["e2"] = "<ref_subject_2>"
+    clip_path.write_text(json.dumps(clip), encoding="utf-8")
+    masks_path = storage.masks_path(CLIP_UID)
+    masks = json.loads(masks_path.read_text(encoding="utf-8"))
+    masks["entities"]["e2"]["reference_type"] = "subject"
+    masks_path.write_text(json.dumps(masks), encoding="utf-8")
+    runner = _runner(config, storage, tmp_path)
+    _drain(
+        runner, _QwenClient(discoveries=[_nonhuman_discovery()]),
+        finalize=_swallow(SUBJECT_ATTRIBUTE_DISCOVERY_JOB, runner),
+    )
+    cold = _runner(config, storage, tmp_path)
+    pending, = cold.seed_jobs()
+    assert dict(pending.target)["owner_entity_id"] == "e2"
+    assert _owner_outcome_path(cold).exists()
+    assert not cold._owner_outcome_path(SHARD, CLIP_UID, "e2").exists()
+    assert not cold._clip_outcome_path(SHARD, CLIP_UID).exists()
+    stable = {
+        item: item.read_bytes()
+        for item in (_owner_outcome_path(cold), _owner_artifact_file(storage))
+    }
+    resumed = _runner(config, storage, tmp_path)
+    original_discovery = resumed._discovery_payload
+
+    def pending_discovery_only(shard: str, clip_uid: str, owner_plan: Mapping[str, Any]) -> Any:
+        assert owner_plan["owner_entity_id"] == "e2", "finished owner must not replay discovery"
+        return original_discovery(shard, clip_uid, owner_plan)
+
+    monkeypatch.setattr(resumed, "_discovery_payload", pending_discovery_only)
+    qwen = _QwenClient(discoveries=[_nonhuman_discovery("e2")])
+
+    executor, jobs = _drain(resumed, qwen)
+
+    assert [job.job_id() for job in jobs] == [pending.job_id()]
+    assert [job.job_id() for job in executor.executed] == [pending.job_id()]
+    assert qwen.discovery_calls == 1
+    assert {item: item.read_bytes() for item in stable} == stable
+    assert resumed._owner_outcome_path(SHARD, CLIP_UID, "e2").exists()
+    assert resumed._clip_outcome_path(SHARD, CLIP_UID).exists()
+    stats = resumed.reconcile_stats(SHARD)
+    assert stats.terminal_clips == 1
+    assert stats.to_dict()["discovery_calls"] == 2
+    assert stats.to_dict()["screened_nonhuman_subjects"] == 2
