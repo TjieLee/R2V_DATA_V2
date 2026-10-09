@@ -286,6 +286,8 @@ class HttpGroupCoordinator:
         existing = self._receipt(body)
         if existing is not None:
             return existing
+        if body.get("receipt_only"):
+            raise ClaimConflict("terminal receipt has not been accepted")
         sid, claim = self._owned_claim(body)
         if body["status"] not in TERMINAL:
             raise ClaimConflict("invalid terminal status")

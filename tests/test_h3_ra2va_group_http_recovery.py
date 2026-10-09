@@ -72,6 +72,23 @@ def test_duplicate_concurrent_results_count_once(tmp_path):
         assert path.read_bytes() == before
 
 
+def test_receipt_only_cannot_publish_unaccepted_result(tmp_path):
+    service = make_service(tmp_path, count=1)
+    try:
+        task = claim(service, connect(service))
+        body = result_body(task)
+        before = service._dispatch_state()
+        assert service.dispatch("POST", "/v1/tasks/result", body | {"receipt_only": True})[0] == 409
+        assert service._dispatch_state() == before
+        receipt = post(service, "/v1/tasks/result", **body)
+        path = service.core.result_path(service.snapshot, 0)
+        saved = path.read_bytes()
+        assert post(service, "/v1/tasks/result", **(body | {"receipt_only": True})) == receipt
+        assert path.read_bytes() == saved
+    finally:
+        service.close()
+
+
 def test_restart_restores_unexpired_claim_without_reassignment(tmp_path):
     clock = Clock()
     service = make_service(tmp_path, count=2, clock=clock)

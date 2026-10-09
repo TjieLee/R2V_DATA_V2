@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import json
+import multiprocessing as mp
+import os
+import signal
 import threading
 import time
+from http.client import IncompleteRead
 
 import pytest
 
@@ -34,6 +38,66 @@ class ServiceClient:
         if path == "/v1/workers/heartbeat":
             self.renewals += 1
         return response
+
+
+@pytest.mark.parametrize("lost_route", ["connect", "claim", "result"])
+def test_truncated_reply_reconnects_without_duplicate_work(tmp_path, monkeypatch, lost_route):
+    module = timings(monkeypatch)
+    service = make_service(tmp_path, count=1)
+    client = module.GroupHttpClient("http://unused", "test-token")
+    dropped, errors = [], []
+    stop = threading.Event()
+
+    class Reply:
+        def __init__(self, response, truncate):
+            self.response, self.truncate = response, truncate
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def read(self):
+            if self.truncate:
+                raise IncompleteRead(b'{"session_id":', 20)
+            return json.dumps(self.response).encode()
+
+    class Opener:
+        def open(self, req, timeout):
+            path = "/" + req.full_url.split("/", 3)[3]
+            body = json.loads(req.data)
+            code, response = service.dispatch(req.method, path, body)
+            assert code == 200, response
+            truncate = path.endswith("/" + lost_route) and not dropped
+            if truncate:
+                dropped.append(response)
+            return Reply(response, truncate)
+
+    client.opener = Opener()
+
+    def run():
+        try:
+            result.update(module.run_http_fake_worker(client, node_id="a",
+                worker_instance="a", stop_event=stop))
+        except (OSError, RuntimeError, IncompleteRead, AssertionError) as error:
+            errors.append(error)
+
+    result = {}
+    thread = threading.Thread(target=run)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 5
+        while thread.is_alive() and time.monotonic() < deadline:
+            service.tick()
+            time.sleep(0.01)
+        assert not thread.is_alive()
+        assert errors == []
+        assert dropped and result["executed"] == result["accepted"] == 8
+    finally:
+        stop.set()
+        thread.join(3)
+        service.close()
 
 
 def test_long_task_keeps_independent_heartbeats(tmp_path, monkeypatch):
@@ -218,6 +282,71 @@ def test_watchdog_closes_fake_context_before_rejoin(tmp_path, monkeypatch):
         service.close()
 
 
+@pytest.mark.parametrize("accepted_before_outage", [False, True])
+def test_result_outage_closes_context_and_only_reconciles_receipt(
+        tmp_path, monkeypatch, accepted_before_outage):
+    module = timings(monkeypatch)
+    service = make_service(tmp_path, count=1)
+    stop, restore, entered, closed = (threading.Event() for _ in range(4))
+    beats, errors, result, submissions = [], [], {}, []
+    original_beat, original_fake = module.WorkerHeartbeat, module.FakeWorker
+
+    class Beat(original_beat):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            beats.append(self)
+
+    class Tracked(original_fake):
+        def __exit__(self, *args):
+            closed.set()
+            return super().__exit__(*args)
+
+    class Outage(ServiceClient):
+        def call(self, method, path, body=None):
+            if path.endswith("heartbeat") and not restore.is_set():
+                raise OSError("offline")
+            if path.endswith("result"):
+                if not restore.is_set():
+                    if accepted_before_outage and not submissions:
+                        super().call(method, path, body)
+                    submissions.append(body)
+                    entered.set()
+                    raise OSError("result reply unavailable")
+                assert closed.is_set()
+                assert body.get("receipt_only") is True
+                try:
+                    return super().call(method, path, body)
+                finally:
+                    stop.set()
+            return super().call(method, path, body)
+
+    def run():
+        try:
+            result.update(module.run_http_fake_worker(Outage(service), node_id="a",
+                worker_instance="a", stop_event=stop))
+        except (OSError, RuntimeError, IncompleteRead, AssertionError) as error:
+            errors.append(error)
+
+    monkeypatch.setattr(module, "WorkerHeartbeat", Beat)
+    monkeypatch.setattr(module, "FakeWorker", Tracked)
+    thread = threading.Thread(target=run)
+    thread.start()
+    try:
+        assert entered.wait(2)
+        assert beats[0].expired.wait(2)
+        assert closed.wait(1), "result retry held the execution context after watchdog expiry"
+        restore.set()
+        thread.join(3)
+        assert not thread.is_alive() and errors == []
+        assert result["accepted"] == int(accepted_before_outage)
+        assert service.core.progress(service.snapshot)["ready"] == int(accepted_before_outage)
+    finally:
+        stop.set()
+        restore.set()
+        thread.join(3)
+        service.close()
+
+
 def test_release_follows_resource_close(tmp_path, monkeypatch):
     module = timings(monkeypatch)
     service = make_service(tmp_path, count=1)
@@ -257,3 +386,76 @@ def test_http_workers_finish_20_rows_without_shared_state_writes(tmp_path, monke
         assert len(list(service.core.run_root.rglob("PILOT_COMPLETE"))) == 1
         assert not list(service.core.run_root.rglob("COMPLETE"))
         assert result["model_call_count"] == 0
+
+
+def _pool_waiter(url, node, instance, stop, delay, reports):
+    if hasattr(stop, "_cond"):
+        reports.put((os.getpid(), True))
+    else:
+        original = stop.is_set
+        announced = False
+
+        def at_wait():
+            nonlocal announced
+            if not announced:
+                reports.put((os.getpid(), False))
+                announced = True
+            return original()
+
+        stop.is_set = at_wait
+    stop.wait(30)
+
+
+def _launcher_with_killable_waiter(shared_event, reports):
+    module = worker_api()
+    context = mp.get_context("spawn")
+
+    class Context:
+        def Event(self):
+            return shared_event
+
+        def Queue(self):
+            return reports
+
+        def __getattr__(self, name):
+            return getattr(context, name)
+
+    module._child = _pool_waiter
+    module.mp.get_context = lambda method: Context()
+    try:
+        module.run_http_fake_workers(coordinator_url="unused", node_id="a", workers=1)
+    except RuntimeError:
+        pass  # The launcher owns and has already closed the reports queue.
+
+
+def test_launcher_cleanup_after_killing_waiting_child_is_bounded():
+    context = mp.get_context("spawn")
+    shared_event, reports = context.Event(), context.Queue()
+    launcher = context.Process(target=_launcher_with_killable_waiter, args=(shared_event, reports))
+    launcher.start()
+    child_pid = None
+    try:
+        child_pid, uses_event = reports.get(timeout=8)
+        if uses_event:
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                if shared_event._cond._sleeping_count.acquire(False):
+                    shared_event._cond._sleeping_count.release()
+                    break
+                time.sleep(0.005)
+            else:
+                pytest.fail("child did not enter the shared Event wait")
+        os.kill(child_pid, signal.SIGKILL)
+        launcher.join(3)
+        assert not launcher.is_alive(), "launcher blocked while stopping a killed Event waiter"
+        assert launcher.exitcode == 0
+    finally:
+        if launcher.is_alive():
+            launcher.kill()
+        launcher.join(3)
+        if child_pid is not None:
+            try:
+                os.kill(child_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        reports.close()

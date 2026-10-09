@@ -11,6 +11,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from http.client import IncompleteRead
 
 from r2v_data_v2.h3.ra2va_group_fake import FakeWorker
 from r2v_data_v2.h3.ra2va_group_source import GroupTask
@@ -45,6 +46,8 @@ class GroupHttpClient:
             if error.code == 409:
                 raise HttpConflict(message) from error
             raise RuntimeError(f"Coordinator HTTP {error.code}: {message}") from error
+        except IncompleteRead as error:
+            raise OSError("Coordinator response interrupted") from error
 
 
 class WorkerHeartbeat:
@@ -144,6 +147,7 @@ def run_http_fake_worker(client, *, node_id, worker_instance, stop_event, fake_d
         heartbeat = WorkerHeartbeat(client)
         heartbeat.start(session)
         normal_drain = False
+        pending_result = None
         try:
             with FakeWorker(session["stage"]) as backend:
                 task = session.get("claim")
@@ -179,12 +183,14 @@ def run_http_fake_worker(client, *, node_id, worker_instance, stop_event, fake_d
                     body = {k: task[k] for k in ("session_id", "task_id", "claim_token")} | {
                         "status": status, "payload": payload,
                         "elapsed_seconds": time.monotonic() - started}
+                    pending_result = body
                     # An uncertain result is reconciled using the same receipt.
                     # It is never a reason to execute or claim a second task.
-                    while not stop_event.is_set():
+                    while not stop_event.is_set() and heartbeat.execution_allowed():
                         try:
                             client.call("POST", "/v1/tasks/result", body)
                             counters["accepted"] += 1
+                            pending_result = None
                             break
                         except OSError:
                             stop_event.wait(POLL_SECONDS)
@@ -194,6 +200,15 @@ def run_http_fake_worker(client, *, node_id, worker_instance, stop_event, fake_d
         finally:
             heartbeat.stop()
         # Both the context and heartbeat have stopped before release/rejoin.
+        while pending_result is not None and not stop_event.is_set():
+            try:
+                client.call("POST", "/v1/tasks/result", pending_result | {"receipt_only": True})
+                counters["accepted"] += 1
+                break
+            except HttpConflict:
+                break
+            except OSError:
+                stop_event.wait(POLL_SECONDS)
         if normal_drain:
             try:
                 client.call("POST", "/v1/workers/release", identity | {"resources_closed": True})
@@ -210,11 +225,33 @@ def _child(url, node, instance, stop, delay, reports):
                                      stop_event=stop, fake_delay_seconds=delay))
 
 
+class _ProcessStop:
+    """A shared byte has no semaphore that a killed waiter can strand."""
+
+    def __init__(self, flag):
+        self.flag = flag
+
+    def set(self):
+        self.flag.value = 1
+
+    def is_set(self):
+        return bool(self.flag.value)
+
+    def wait(self, seconds):
+        deadline = time.monotonic() + seconds
+        while not self.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(POLL_SECONDS, remaining))
+        return True
+
+
 def run_http_fake_workers(*, coordinator_url, node_id, workers, fake_delay_seconds=0):
     if workers < 1 or not 0 <= fake_delay_seconds <= 2:
         raise ValueError("invalid bounded Fake Worker settings")
     context = mp.get_context("spawn")
-    stop, reports = context.Event(), context.Queue()
+    stop, reports = _ProcessStop(context.RawValue("b", 0)), context.Queue()
     identity = uuid.uuid4().hex
     children = [context.Process(target=_child, args=(coordinator_url, node_id,
         f"{identity}-{i}", stop, fake_delay_seconds, reports)) for i in range(workers)]

@@ -64,7 +64,9 @@ def main():
 
         def factory():
             return HttpGroupCoordinator(GroupCoordinator(root, args.source_root, args.limit,
-                max_groups=args.max_groups, transport="http", coordinator_host=socket.gethostname()))
+                max_groups=args.max_groups, transport="http", coordinator_host=socket.gethostname(),
+                coordinator_identity={"guard_path": str(args.local_lock_path.resolve()),
+                                      "bind_host": args.host, "bind_port": args.port}))
 
         def stop(signum, frame):
             raise KeyboardInterrupt

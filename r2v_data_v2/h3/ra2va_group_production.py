@@ -87,11 +87,13 @@ class WorkerSession:
 
 class GroupCoordinator:
     def __init__(self, run_root: Path, source_root: Path, limit: int, *, max_groups=1,
-                 transport="local", coordinator_host=None):
+                 transport="local", coordinator_host=None, coordinator_identity=None):
         if not 1 <= limit <= 200 or max_groups < 1:
             raise ValueError("invalid bounded pilot settings")
         if transport not in ("local", "http") or (transport == "http" and not coordinator_host):
             raise ValueError("HTTP transport requires designated coordinator host")
+        if transport == "http" and not coordinator_identity:
+            raise ValueError("HTTP transport requires Coordinator identity (local guard and endpoint)")
         self.run_root = run_root.absolute()
         self.source_root = source_root.absolute()
         self.limit = limit
@@ -105,10 +107,13 @@ class GroupCoordinator:
                     raise ValueError("run transport differs; implicit migration is forbidden")
                 if transport == "http" and existing["coordinator_host"] != coordinator_host:
                     raise ValueError("designated coordinator host differs")
+                if transport == "http" and existing.get("coordinator_identity") != coordinator_identity:
+                    raise ValueError("Coordinator identity differs; use the original guard and endpoint")
                 if existing["settings"] != settings:
                     raise ValueError("resume settings differ from persisted run")
             else:
-                ownership = ({"transport": "http", "coordinator_host": coordinator_host}
+                ownership = ({"transport": "http", "coordinator_host": coordinator_host,
+                              "coordinator_identity": coordinator_identity}
                              if transport == "http" else {})
                 atomic_json(self.control_path, {
                     "mode": "cpu_fake_pilot", "settings": settings, "generation": 0,

@@ -24,7 +24,9 @@ def make_service(tmp_path, count=2, *, clock=None, max_groups=1):
     if not source.exists():
         publish_group(source, count=count)
     core = GroupCoordinator(tmp_path / "run", source, 20, max_groups=max_groups,
-                            transport="http", coordinator_host="node-a")
+        transport="http", coordinator_host="node-a",
+        coordinator_identity={"guard_path": str((tmp_path / "guard.lock").resolve()),
+                              "bind_host": "127.0.0.1", "bind_port": 9000})
     return HttpGroupCoordinator(core, wall_clock=clock or Clock())
 
 

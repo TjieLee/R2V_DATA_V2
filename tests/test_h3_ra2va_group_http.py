@@ -42,10 +42,39 @@ def test_owner_host_mismatch_does_not_write(tmp_path):
         before = service.core.control_path.read_bytes()
         with pytest.raises(ValueError, match="host"):
             GroupCoordinator(service.core.run_root, service.core.source_root, 20,
-                             transport="http", coordinator_host="node-b")
+                transport="http", coordinator_host="node-b",
+                coordinator_identity=service.core.status()["coordinator_identity"])
         assert service.core.control_path.read_bytes() == before
     finally:
         service.close()
+
+
+def test_http_run_requires_guard_and_endpoint_identity(tmp_path):
+    with pytest.raises(ValueError, match="Coordinator identity"):
+        GroupCoordinator(tmp_path / "run", tmp_path / "source", 20,
+                         transport="http", coordinator_host="node-a")
+    assert not (tmp_path / "run/control.json").exists()
+
+
+@pytest.mark.parametrize("changed", [
+    {"guard_path": "/tmp/other-coordinator.lock"},
+    {"bind_host": "127.0.0.2"},
+    {"bind_port": 9002},
+    {"guard_path": "/tmp/other-coordinator.lock", "bind_port": 9002},
+])
+def test_guard_and_endpoint_identity_cannot_migrate_run(tmp_path, changed):
+    identity = {"guard_path": str(tmp_path / "coordinator.lock"),
+                "bind_host": "127.0.0.1", "bind_port": 9001}
+    core = GroupCoordinator(tmp_path / "run", tmp_path / "source", 20,
+        transport="http", coordinator_host="node-a", coordinator_identity=identity)
+    before = core.control_path.read_bytes()
+    with pytest.raises(ValueError, match="Coordinator identity"):
+        GroupCoordinator(core.run_root, core.source_root, 20, transport="http",
+            coordinator_host="node-a", coordinator_identity=identity | changed)
+    assert core.control_path.read_bytes() == before
+    resumed = GroupCoordinator(core.run_root, core.source_root, 20, transport="http",
+        coordinator_host="node-a", coordinator_identity=identity)
+    assert resumed.control_path.read_bytes() == before
 
 
 def test_two_clients_claim_different_clips_and_reconnect(tmp_path):
