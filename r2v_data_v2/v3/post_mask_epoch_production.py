@@ -17,6 +17,10 @@ from r2v_data_v2.v3.post_mask_epoch_groups import (
     record_group_outcome,
     write_group_descriptor,
 )
+from r2v_data_v2.v3.post_mask_epoch_priority import (
+    group_priority_key,
+    load_priority_hints,
+)
 from r2v_data_v2.v3.post_mask_epoch_state import GroupLedger, atomic_write_json
 
 
@@ -148,8 +152,9 @@ def run_elastic_groups(
     emit: Callable[..., None] | None = None,
     sleep: Callable[[float], None] = time.sleep,
     backoff_seconds: float = 2.0,
+    priority_hints: Path | None = None,
 ) -> dict[str, int]:
-    """Every node scans all groups; rank only rotates scan order."""
+    """Every node scans all groups; rank rotates only equal-priority ties."""
     if world_size < 1 or not 0 <= rank < world_size:
         raise ValueError("invalid rank/world_size")
     if backoff_seconds < 0:
@@ -160,6 +165,8 @@ def run_elastic_groups(
         raise ValueError("production has no groups")
     start = (rank * max(1, len(ordered) // world_size)) % len(ordered)
     ordered = ordered[start:] + ordered[:start]
+    hints = load_priority_hints(priority_hints)
+    ordered = tuple(sorted(ordered, key=lambda group: group_priority_key(root, group, hints)))
     report = emit or (lambda *_args, **_kwargs: None)
     claimed = 0
     attempted_incomplete: dict[str, str] = {}

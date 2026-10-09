@@ -118,6 +118,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--rank", type=int, default=0)
     parser.add_argument("--world-size", type=int, default=1)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--priority-hints", type=Path, help="Optional read-only advisory group-progress JSON")
     return parser
 
 
@@ -165,6 +166,7 @@ def main(argv: list[str] | None = None) -> int:
     run_elastic_groups(
         root / "state", groups, run_removal_epoch,
         rank=args.rank, world_size=args.world_size, emit=_emit,
+        priority_hints=args.priority_hints,
     )
     compact_if_complete(root, groups, config, args.base_config)
     _emit("post_mask_production_complete", group_count=len(groups))
