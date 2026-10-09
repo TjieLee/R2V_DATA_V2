@@ -194,6 +194,18 @@ class HttpGroupCoordinator:
 
     def _heartbeat(self, body):
         sid, _ = self._member(body)
+        if body.get("execution_stopped"):
+            if not body.get("resources_closed"):
+                raise ClaimConflict("stopped execution must close local resources")
+            with self.core._checked(self.snapshot) as (control, dispatch):
+                control["members"][sid]["http"]["expired"] = True
+                for row in dispatch["active"].values():
+                    if row["worker_id"] == sid:
+                        row["http"]["revoked"] = True
+                self.core._save_dispatch(self.snapshot, dispatch)
+                atomic_json(self.core.control_path, control)
+            self._retire(sid)
+            return self._context() | {"revoked": True}
         with self.core._checked(self.snapshot) as (control, _):
             control["members"][sid]["http"]["lease_deadline"] = self.wall_clock() + LEASE_SECONDS
             atomic_json(self.core.control_path, control)

@@ -40,7 +40,19 @@ def main():
             command.add_argument("--host", required=True)
             command.add_argument("--port", type=int, required=True)
             command.add_argument("--local-lock-path", type=Path, required=True)
+    worker = subparsers.add_parser("worker")
+    worker.add_argument("--fake", action="store_true", required=True)
+    worker.add_argument("--coordinator-url", required=True)
+    worker.add_argument("--node-id", required=True)
+    worker.add_argument("--workers", type=int, default=1)
+    worker.add_argument("--fake-delay-seconds", type=float, default=0)
     args = parser.parse_args()
+    if args.command == "worker":
+        from r2v_data_v2.h3.ra2va_group_http_worker import run_http_fake_workers
+        print(json.dumps(run_http_fake_workers(coordinator_url=args.coordinator_url,
+            node_id=args.node_id, workers=args.workers, fake_delay_seconds=args.fake_delay_seconds),
+            indent=2), flush=True)
+        return
     root = pilot_run_root(args.output_root, args.run_id)
     if args.command == "coordinator":
         from r2v_data_v2.h3.ra2va_group_http import (

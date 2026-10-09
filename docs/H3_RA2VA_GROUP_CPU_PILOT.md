@@ -1,5 +1,8 @@
 # RA2VA Shared-group CPU Pilot
 
+For the separate single-writer HTTP mode, see
+[HTTP CPU Pilot](H3_RA2VA_GROUP_HTTP_CPU_PILOT.md). Existing local mode is unchanged.
+
 This entry point is fake-only. It tests scheduling, ownership adaptation, and
 restart behavior; it does not run Audio/MiMo, materialize H3, or export training
 JSONL. No upstream media is opened, copied, or hashed.
