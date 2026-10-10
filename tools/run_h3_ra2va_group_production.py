@@ -41,6 +41,7 @@ def main():
             command.add_argument("--host", required=True)
             command.add_argument("--port", type=int, required=True)
             command.add_argument("--local-lock-path", type=Path, required=True)
+            command.add_argument("--publish-endpoint", action="store_true")
     worker = subparsers.add_parser("worker")
     modes = worker.add_mutually_exclusive_group(required=True)
     modes.add_argument("--fake", action="store_true")
@@ -74,7 +75,15 @@ def main():
             build_http_server,
             coordinator_process_guard,
         )
+        from r2v_data_v2.h3.ra2va_group_launch import (
+            coordinator_token,
+            local_coordinator_address,
+            publish_endpoint,
+        )
         from r2v_data_v2.h3.ra2va_group_production import GroupCoordinator
+
+        if args.host == "auto":
+            args.host = local_coordinator_address()
 
         def factory():
             return HttpGroupCoordinator(GroupCoordinator(root, args.source_root, args.limit,
@@ -88,10 +97,15 @@ def main():
             raise KeyboardInterrupt
 
         with coordinator_process_guard(args.local_lock_path):
+            token = os.environ.get("R2V_GROUP_COORDINATOR_TOKEN")
+            if args.publish_endpoint and not token:
+                token = coordinator_token(root)
             server = build_http_server(args.host, args.port, service_factory=factory,
-                                       bearer_token=os.environ["R2V_GROUP_COORDINATOR_TOKEN"])
+                                       bearer_token=token)
             previous = signal.signal(signal.SIGTERM, stop)
             try:
+                if args.publish_endpoint:
+                    publish_endpoint(root, args.host, server.server_port, token)
                 server.serve_forever(poll_interval=0.1)
             except KeyboardInterrupt:
                 pass
