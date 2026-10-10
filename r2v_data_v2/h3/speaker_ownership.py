@@ -66,7 +66,7 @@ def unconfirmed_visible_binding_segments(annotation: MimoAVAnnotationDraft) -> s
             continue
         if "no_visible_lip_motion" in grounding.evidence_codes:
             target = next((item for item in view.entity_observations if item.entity_id == grounding.entity_id), None)
-            if (target is None or target.speech_correlated_articulation != "not_assessable"
+            if (target is None or target.speech_correlated_articulation not in {"not_assessable", "uncertain"}
                     or "av_temporal_alignment" not in grounding.evidence_codes):
                 continue
         articulated = _observed_articulation_entity_ids(view, allowed_entity_ids=set(view.visible_entity_ids))
@@ -99,6 +99,8 @@ def neutralize_two_step_caption_identity(
     if [b.group() for b in blocks] != [f"<d>[{s['language'] or 'Unknown'}] {s['text']}</d>" for s in speech]:
         return caption, summary, {}, False
     pieces, counts, previous_end = [], Counter(), 0
+    verbs = r"says|asks|replies|answers|adds|continues|reports|responds|states|explains|whispers|shouts"
+    neutral_actors = {"A voice", "The voice", "An unidentified voice"}
 
     def strip_identity_markers(text, correction):
         for speaker in sorted(speakers):
@@ -108,18 +110,24 @@ def neutralize_two_step_caption_identity(
             counts[correction] += removed
         return text
 
-    for block, fact in zip(blocks, speech, strict=True):
+    for index, (block, fact) in enumerate(zip(blocks, speech, strict=True)):
         lead = strip_identity_markers(caption[previous_end:block.start()], "joint_unconfirmed_caption_identity_neutralized")
         if fact["speaker_id"] in speakers:
             speaker = re.escape(fact["speaker_id"])
-            # Only a standalone, explicit says/asks clause; never infer a pronoun's referent.
+            same_speaker = index > 0 and speech[index - 1]["speaker_id"] == fact["speaker_id"]
+            # A continuation inherits the preceding acoustic source, never a new entity.
+            if same_speaker and (not lead.strip() or re.fullmatch(r"\s*and (?:" + verbs + r")[,:]\s*", lead)):
+                pieces.extend((lead, block.group()))
+                previous_end = block.end()
+                continue
             clause = re.search(
-                r"(?:^|(?<=[.!?])\s+)(?:<Subject [1-9]\d*>|He|She|They|A voice|The voice)"
-                r"\s*(?:\(" + speaker + r"\)\s*)?(says|asks|replies|adds|continues),\s*$", lead,
+                r"(?:^|(?<=[.!?])\s+)(?P<actor><Subject [1-9]\d*>|He|She|They|A voice|The voice|An unidentified voice)"
+                r"\s*(?:\(" + speaker + r"\)\s*)?(?P<speech>(?:[a-z]+ly\s+)*(?:" + verbs + r")[,:])\s*$", lead,
             )
             replacement = None
             if clause is not None:
-                replacement = f"A voice ({fact['speaker_id']}) {clause.group(1)}, "
+                actor = clause.group("actor") if clause.group("actor") in neutral_actors else "A voice"
+                replacement = f"{actor} ({fact['speaker_id']}) {clause.group('speech')} "
             else:
                 # Keep the visible posture/mouth movement, but not its asserted
                 # identity link to the utterance. Other embedded prose stays closed.
@@ -152,6 +160,12 @@ def neutralize_two_step_caption_identity(
     if any(f"({speaker})" in tail for speaker in speakers):
         return caption, summary, {}, False
     pieces.append(tail)
+    for index in range(0, len(pieces), 2):
+        pieces[index], removed = re.subn(
+            r"\b(?:He|She|They) (?:is|are) (?:the |a )?speaker\b", "A voice is heard", pieces[index],
+        )
+        counts["joint_unconfirmed_caption_identity_neutralized"] += removed
+    projected_caption = "".join(pieces)
     projected_summary, removed = re.subn(
         r"the only visible entity, <Subject [1-9]\d*>, is bound as the speaker", "a voice speaks", summary,
     )
@@ -174,8 +188,27 @@ def neutralize_two_step_caption_identity(
     projected_summary = strip_identity_markers(projected_summary, "joint_unconfirmed_summary_identity_neutralized")
     # An unhandled explicit ownership clause is not an independent visual/audio observation.
     ownership = r"\b(?:voice|speaker)\s+(?:belongs to|comes from|is bound to|is)\s+<Subject [1-9]\d*>"
-    summary_binding = r"<Subject [1-9]\d*>\s+(?:speaks|says|asks|replies|is (?:the |a )?speaker|is bound as the speaker)\b"
-    prose = re.sub(r"<d>[\s\S]*?</d>", "", "".join(pieces))
-    if any(re.search(ownership + "|" + summary_binding, text, re.IGNORECASE) for text in (prose, projected_summary)):
+    restricted_labels = [re.escape(s.subject_label) for s in reference_subjects
+                         if s.kind == "entity" and s.entity_id in restricted_entities]
+    subject_actor = "(?:" + "|".join(restricted_labels) + ")" if restricted_labels else r"<Subject [1-9]\d*>"
+    binding = subject_actor + r"\s+(?:speaks|says|asks|replies|is (?:the |a )?speaker|is bound as the speaker)\b"
+    prose = re.sub(r"<d>[\s\S]*?</d>", "", projected_caption)
+    if re.search(ownership + "|" + binding, prose, re.IGNORECASE):
         return caption, summary, {}, False
-    return "".join(pieces), projected_summary, {key: value for key, value in counts.items() if value}, True
+    summary_actor = re.search(
+        r"(?:^|(?<=[.!?,])\s+)(?P<actor><Subject [1-9]\d*>|He|She|They|(?:An?|The) [^,.!?<>]+?)\s+"
+        r"(?:(?:" + verbs + r")|speaks|is (?:the |a )?speaker)\b", projected_summary, re.IGNORECASE,
+    )
+    if (re.search(ownership + "|" + binding, projected_summary, re.IGNORECASE)
+            or (summary_actor and summary_actor.group("actor").casefold() not in {a.casefold() for a in neutral_actors})):
+        # Summary wording must not discard an otherwise usable caption. Project
+        # existing visual context plus acoustic inventory, not a guessed identity.
+        labels = set(re.findall(r"<Subject [1-9]\d*>", projected_summary))
+        if labels - {s.subject_label for s in reference_subjects}:
+            return caption, summary, {}, False
+        opening = re.split(r"(?<=[.!?])\s+", annotation.visual_observation.visual_blocks[0].text, maxsplit=1)[0]
+        opening = re.sub(r"\s*\(S[1-9]\d*\)", "", opening)
+        group_count = len({s["speaker_id"] for s in speech})
+        projected_summary = f"{opening} The clip contains transcribed dialogue from {group_count} acoustic speaker groups."
+        counts["joint_unconfirmed_summary_identity_projected"] += 1
+    return projected_caption, projected_summary, {key: value for key, value in counts.items() if value}, True

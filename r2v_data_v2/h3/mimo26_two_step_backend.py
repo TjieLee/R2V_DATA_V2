@@ -372,7 +372,7 @@ class TwoStepOpenAIMimo26Backend(StemAwareOpenAIMimo25Backend):
                 raise
             groundings = {g.segment_id: g for g in exc.annotation.av_grounding.segment_groundings}
             exc.diagnostics[-1].warnings.extend(
-                f"{'sparse_lip_motion_not_assessable' if 'no_visible_lip_motion' in groundings[segment].evidence_codes else 'visible_entity_binding_missing_positive_cue'}:{segment}:identity_publication_restricted"
+                f"{'sparse_lip_motion_unconfirmed' if 'no_visible_lip_motion' in groundings[segment].evidence_codes else 'visible_entity_binding_missing_positive_cue'}:{segment}:identity_publication_restricted"
                 for segment in sorted(segments)
             )
             corrections = {}

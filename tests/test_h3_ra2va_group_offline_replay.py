@@ -36,7 +36,7 @@ def test_offline_group_replay_uses_saved_responses_and_real_export_without_netwo
     record = json.loads((output / "bundle/records.jsonl").read_text())
     for field in ("annotation", "visual_raw_response", "speech_av_raw_response", "backend_provenance"):
         assert record[field] == old_record[field]
-    assert record["postprocessing_version"] == "ra2va_group_durable_two_step_v2"
+    assert record["postprocessing_version"] == "ra2va_group_durable_two_step_v3"
     assert record["source_record_path"]
     with pytest.raises(FileExistsError):
         replay_group(source_group=group, output_root=output, ffmpeg=ffmpeg())

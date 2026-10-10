@@ -25,6 +25,7 @@ from r2v_data_v2.h3.speaker_ownership import (
 
 CASES = json.loads((Path(__file__).parent / "fixtures/h3_group_pilot10_failures.json").read_text())
 CAPTION_CASES = ["ab27449eaf98b06401161810", "83871dd0401c1f1ce9986ec2"]
+RECOVERABLE_CASES = [*CAPTION_CASES, "d897696ed13b1ea1b2104ea2"]
 
 
 @pytest.mark.parametrize("clip", CAPTION_CASES)
@@ -58,7 +59,7 @@ def test_real_complex_lead_neutralization_preserves_visual_facts_and_exact_asr(c
     assert case == CASES[clip]
 
 
-@pytest.mark.parametrize("clip", CAPTION_CASES)
+@pytest.mark.parametrize("clip", RECOVERABLE_CASES)
 @pytest.mark.parametrize("variant", ["visual_only", "full_audio_reuse"])
 def test_real_restricted_captions_publish_identity_independent_h3_only(tmp_path, clip, variant):
     case = CASES[clip]
@@ -161,7 +162,7 @@ def test_four_real_raw_replays_preserve_audio_and_keep_nonrecoverable_failures(t
         "allowed_reference_labels": {s.subject_label for s in job.reference_subjects}
                                     | {p.picture_label for p in job.reference_images},
         "auxiliary_audio_paths": {s.stem_type: Path(s.canonical_stem_path) for s in stems[0].stems}}
-    if clip in CAPTION_CASES:
+    if clip in RECOVERABLE_CASES:
         result = backend.reconcile(job, **kwargs)
         assert result.model_call_count == 2
         assert result.annotation.audio_observation.model_dump(mode="json") == record["annotation"]["audio_observation"]
