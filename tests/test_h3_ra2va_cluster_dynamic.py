@@ -232,6 +232,31 @@ def test_hangup_uses_the_same_owned_cleanup_as_interrupt(tmp_path, monkeypatch):
     assert signal.SIGHUP in observed
 
 
+def test_completed_worker_is_retired_before_persistent_coordinator_wait(tmp_path, monkeypatch):
+    from r2v_data_v2.h3 import ra2va_group_native_resources
+
+    closed = []
+
+    class Process:
+        def __init__(self, command, **kwargs):
+            self.kind = command[2]
+            self.returncode = 0 if self.kind == "worker" else None
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self):
+            assert closed == ["worker"]
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(subprocess, "Popen", Process)
+    monkeypatch.setattr(ra2va_group_native_resources, "stop_owned_process",
+                        lambda process, *args, **kwargs: closed.append(process.kind))
+    monkeypatch.setattr(api(), "wait_for_endpoint", lambda *args: {"url": "http://node-a:8780", "token": "test"})
+    assert api().launch_node(REPO, environment(tmp_path, role="coordinator"), fake=True) == 130
+    assert closed == ["worker", "coordinator"]
+
+
 def test_native_configuration_uses_env_settings_without_changing_model_semantics():
     values = api().node_configuration(REPO, {"GPU_IDS": "0,1,2,3", "MIMO_GPU_GROUPS": "0,1,2,3",
                                            "MIMO_PORTS": "8098", "ASR_BATCH_SIZE": "8"})

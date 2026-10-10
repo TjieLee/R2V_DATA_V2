@@ -182,10 +182,13 @@ def launch_node(repo_root, environment, *, dry_run=False, fake=False):
             if media is not None and media.poll() is not None:
                 raise RuntimeError("Owned media server exited before local Workers completed")
             time.sleep(.1)
-        if worker.returncode == 0 and coordinator is not None:
+        worker_status = worker.returncode
+        stop_owned_process(worker, set(), grace=float(env.get("R2VA_CLEANUP_SECONDS", "60")))
+        worker = None
+        if worker_status == 0 and coordinator is not None:
             print("Local Workers finished; Coordinator remains available for other nodes. Ctrl+C stops it.", flush=True)
             return coordinator.wait()
-        return worker.returncode
+        return worker_status
     except KeyboardInterrupt:
         return 130
     finally:
