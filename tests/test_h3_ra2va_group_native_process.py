@@ -140,6 +140,16 @@ def test_tp4_command_and_no_overlapping_gpu_replicas(tmp_path):
         NodeMimoServices({"gpu_groups": ["0,1,2,3", "3,4,5,6"], "ports": [8094, 8095]}, log_root=tmp_path)
 
 
+def test_sglang_does_not_inherit_sam_python_dependencies(tmp_path, monkeypatch):
+    from r2v_data_v2.h3.ra2va_group_native_resources import SGLangProcess
+
+    monkeypatch.setenv("PYTHONPATH", "/sam-audio-pydeps")
+    server = SGLangProcess({"sglang": "/sglang", "checkpoint": "/model"}, "0,1,2,3", 8094, tmp_path)
+    assert "PYTHONPATH" not in server.environment
+    assert os.environ["PYTHONPATH"] == "/sam-audio-pydeps"
+    assert server.environment["CUDA_VISIBLE_DEVICES"] == "0,1,2,3"
+
+
 @pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGKILL])
 def test_substitute_sglang_process_is_reaped(tmp_path, sig):
     from r2v_data_v2.h3.ra2va_group_native_resources import SGLangProcess

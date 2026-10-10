@@ -49,6 +49,8 @@ class SGLangProcess:
             served_model_name="mimo-v2.6-flash-rl", port=port,
             mem_fraction_static=configuration.get("mem_fraction_static", .65))
         self.environment = mimo_v26_server_env(gpu_group)
+        # SGLang owns its virtualenv; SAM's binary dependencies are incompatible.
+        self.environment.pop("PYTHONPATH", None)
         self.log_path = Path(log_root) / f"sglang-{port}.log"
         self.process = self.log = None
         self.descendants = set()
