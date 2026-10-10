@@ -84,8 +84,10 @@ def two_step_identity_restricted_groups(annotation: MimoAVAnnotationDraft, prove
             if g.segment_id in segments and g.primary_speaker_group is not None}
 
 
-def neutralize_two_step_caption_identity(annotation, segments, provenance) -> tuple[str, str, dict[str, int], bool]:
-    """Neutralize simple speech lead-ins only; complex attribution stays unpublished."""
+def neutralize_two_step_caption_identity(
+    annotation, segments, provenance, *, reference_subjects=(),
+) -> tuple[str, str, dict[str, int], bool]:
+    """Separate supported visual clauses from unconfirmed speech attribution."""
     caption, summary = annotation.h3_semantics.shot1_caption, annotation.h3_semantics.summary
     restricted = two_step_identity_restricted_groups(annotation, provenance)
     if not restricted:
@@ -94,7 +96,7 @@ def neutralize_two_step_caption_identity(annotation, segments, provenance) -> tu
     decisions = {d.segment_id: d for d in annotation.audio_observation.segment_decisions}
     speakers = {s["speaker_id"] for s in speech if decisions[s["segment_id"]].primary_speaker_group in restricted}
     blocks = list(re.finditer(r"<d>[\s\S]*?</d>", caption))
-    if len(blocks) != len(speech):
+    if [b.group() for b in blocks] != [f"<d>[{s['language'] or 'Unknown'}] {s['text']}</d>" for s in speech]:
         return caption, summary, {}, False
     pieces, counts, previous_end = [], Counter(), 0
 
@@ -115,9 +117,31 @@ def neutralize_two_step_caption_identity(annotation, segments, provenance) -> tu
                 r"(?:^|(?<=[.!?])\s+)(?:<Subject [1-9]\d*>|He|She|They|A voice|The voice)"
                 r"\s*(?:\(" + speaker + r"\)\s*)?(says|asks|replies|adds|continues),\s*$", lead,
             )
-            if clause is None or re.search(r"\(" + speaker + r"\)", lead[:clause.start()]):
+            replacement = None
+            if clause is not None:
+                replacement = f"A voice ({fact['speaker_id']}) {clause.group(1)}, "
+            else:
+                # Keep the visible posture/mouth movement, but not its asserted
+                # identity link to the utterance. Other embedded prose stays closed.
+                clause = re.search(
+                    r"(?:^|(?<=[.!?])\s+)(<Subject [1-9]\d*> faces [^.!?<>]*), saying,\s*$", lead,
+                )
+                if clause is not None and any(
+                    re.search(r"(?:^|(?<=[.!?])\s+)" + re.escape(clause.group(1)) + r"\.", visual.text)
+                    for visual in annotation.visual_observation.visual_blocks
+                ):
+                    replacement = f"{clause.group(1)}. A voice ({fact['speaker_id']}) says, "
+                else:
+                    clause = re.search(
+                        r"(?:^|(?<=[.!?])\s+)(His|Her) mouth moves as (?:he|she) speaks"
+                        r"\s*(?:\(" + speaker + r"\))?,\s*$", lead,
+                    )
+                    if clause is not None:
+                        replacement = f"{clause.group(1)} mouth moves. A voice ({fact['speaker_id']}) says, "
+            if (clause is None or replacement is None
+                    or re.search(r"\(S[1-9]\d*\)", lead[:clause.start()])
+                    or any(marker != fact["speaker_id"] for marker in re.findall(r"\((S[1-9]\d*)\)", clause.group()))):
                 return caption, summary, {}, False
-            replacement = f"A voice ({fact['speaker_id']}) {clause.group(1)}, "
             leading_space = " " if clause.group().startswith(" ") else ""
             new_lead = lead[:clause.start()] + leading_space + replacement
             counts["joint_unconfirmed_caption_identity_neutralized"] += int(new_lead != lead)
@@ -130,6 +154,21 @@ def neutralize_two_step_caption_identity(annotation, segments, provenance) -> tu
     pieces.append(tail)
     projected_summary, removed = re.subn(
         r"the only visible entity, <Subject [1-9]\d*>, is bound as the speaker", "a voice speaks", summary,
+    )
+    counts["joint_unconfirmed_summary_identity_neutralized"] += removed
+    restricted_entities = {g.entity_id for g in annotation.av_grounding.segment_groundings
+                           if g.primary_speaker_group in restricted and g.entity_id is not None}
+    for subject in reference_subjects:
+        if subject.kind != "entity" or subject.entity_id not in restricted_entities:
+            continue
+        projected_summary, removed = re.subn(
+            r"\bwith " + re.escape(subject.subject_label) + r" delivering a warning\b",
+            "with a voice delivering a warning", projected_summary,
+        )
+        counts["joint_unconfirmed_summary_identity_neutralized"] += removed
+    projected_summary, removed = re.subn(
+        r"^(A [^.!?<>]+ stands in [^.!?<>]+) and speaks (a single [^.!?<>]+)\.$",
+        r"\1 while a voice delivers \2.", projected_summary,
     )
     counts["joint_unconfirmed_summary_identity_neutralized"] += removed
     projected_summary = strip_identity_markers(projected_summary, "joint_unconfirmed_summary_identity_neutralized")

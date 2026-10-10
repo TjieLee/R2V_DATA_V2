@@ -110,7 +110,7 @@ def reconcile_group_job(*, root, config, client, job, stems, event=None, replay_
         {k: v for k, v in inference_provenance.items() if k not in ignored}
         == {k: v for k, v in current_provenance.items() if k not in ignored})
     common = {"clip_uid": job.clip_uid, "backend_provenance": inference_provenance,
-              "postprocessing_version": "ra2va_group_durable_two_step_v1"}
+              "postprocessing_version": "ra2va_group_durable_two_step_v2"}
     try:
         result = backend.reconcile(job, segment_ids=[s.segment_id for s in job.segments],
             transcribed_segment_ids=[s.segment_id for s in job.segments if s.asr_status == "transcribed"],

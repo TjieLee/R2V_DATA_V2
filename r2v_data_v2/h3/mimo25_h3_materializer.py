@@ -1021,7 +1021,7 @@ def _prepare_materialization_context(
     provenance = getattr(record, "source_backend_provenance", getattr(record, "backend_provenance", None))
     restricted = two_step_identity_restricted_groups(record.annotation, provenance)
     caption, summary, identity_corrections, publishable = neutralize_two_step_caption_identity(
-        record.annotation, job.segments, provenance,
+        record.annotation, job.segments, provenance, reference_subjects=job.reference_subjects,
     )
     if not publishable:
         raise MimoH3MaterializationContractError([ValidationIssue(

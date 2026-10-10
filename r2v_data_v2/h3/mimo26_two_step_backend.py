@@ -581,7 +581,7 @@ class TwoStepOpenAIMimo26Backend(StemAwareOpenAIMimo25Backend):
                     issues=(*strict_issues, *marker_issues), annotation=annotation,
                 )
             caption, summary, identity_corrections, publishable = neutralize_two_step_caption_identity(
-                annotation, job.segments, self.provenance,
+                annotation, job.segments, self.provenance, reference_subjects=job.reference_subjects,
             )
             if publishable:
                 annotation.h3_semantics.shot1_caption = caption

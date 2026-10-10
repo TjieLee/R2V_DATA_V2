@@ -1,0 +1,2141 @@
+{
+  "ab27449eaf98b06401161810": {
+    "job": {
+      "binding_evidence_mode": "none",
+      "clip_uid": "ab27449eaf98b06401161810",
+      "r2v_instruction": "In a dimly lit traditional Chinese courtyard at night, a bald man in a light gray traditional tunic <Image 1> stands on the left, looking forward with a serious expression. To his right, a man in dark armor with a helmet stands in full dark armor, also facing forward. The camera slowly pushes in as a bald man in a black high-collared robe walks into the foreground, his face coming into focus. He stands still, gazing directly ahead, while the other two remain in the background. The scene is illuminated by warm hanging lanterns, and the dark wooden architecture frames the open archway behind them, revealing a blue-toned night sky. The camera holds steady on a bald man in a black high-collared robe as he maintains a composed posture, with a bald man in a light gray traditional tunic and a man in dark armor with a helmet visible behind him in the softly lit background.",
+      "reference_images": [
+        {
+          "attribute_id": null,
+          "attribute_type": null,
+          "entity_id": "e1",
+          "image_artifact_path": "/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/in_pair_reference/post_mask/group-000000/references/visual/shard-000000000-000009999/ab27449eaf98b06401161810/subject_1.png",
+          "image_index": 1,
+          "kind": "subject",
+          "owner_entity_id": null,
+          "picture_label": "<Picture 1>",
+          "source_image_id": "image_1",
+          "source_image_index": 1,
+          "source_image_label": "<Image 1>"
+        }
+      ],
+      "reference_selection": {
+        "dropped_references": [],
+        "face_promotions": [],
+        "original_picture_count": 1,
+        "policy_version": "h3_mimo25_reference_selection_v2",
+        "selected_picture_count": 1,
+        "selected_source_image_ids": [
+          "image_1"
+        ],
+        "selected_source_image_indexes": [
+          1
+        ]
+      },
+      "reference_subjects": [
+        {
+          "attribute_id": null,
+          "attribute_type": null,
+          "entity_id": "e1",
+          "kind": "entity",
+          "owner_entity_id": null,
+          "source_picture_labels": [
+            "<Picture 1>"
+          ],
+          "subject_index": 1,
+          "subject_label": "<Subject 1>"
+        }
+      ],
+      "segments": [
+        {
+          "asr_language": "Chinese",
+          "asr_status": "transcribed",
+          "asr_text": "大人亲手举荐为官，若此事落实，恐怕大人您也难辞其咎。",
+          "cluster_binding_status": "unbound",
+          "competing_visible_speaker_evidence": [],
+          "current_entity_id": null,
+          "direct_anchor_seconds": 0,
+          "direct_support_seconds_by_entity": {},
+          "end_time": 4.5525,
+          "entity_occurrence_id": null,
+          "identity_scope": "unresolved",
+          "overlapping_visible_entities": [],
+          "segment_id": "segment_0001",
+          "source_end_sample": 145680,
+          "source_sample_rate_hz": 32000,
+          "source_speaker_cluster_id": "speaker_0",
+          "source_start_sample": 400,
+          "start_time": 0.0125
+        }
+      ],
+      "source_h3_sample_ids": [
+        "ab27449eaf98b06401161810"
+      ],
+      "target_duration_seconds": 4.85584375,
+      "target_full_audio_path": "/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/R2VA/ra2va-native-group0-pilot10-20261010T034522/groups/group-000000/stages/000001-canonical/attempts/000003/a4a4c20041d2458980266f85638303de/canonical/ab27449eaf98b06401161810/attempt-sa7qg_da/full.flac",
+      "target_video_path": "/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/clips_clean_cropped/01/丁宝桢/01 4K/v_b597a0641cf76c22e880_00112.mp4"
+    },
+    "record": {
+      "annotation": {
+        "audio_observation": {
+          "segment_decisions": [
+            {
+              "audio_evidence_codes": [
+                "voice_continuity"
+              ],
+              "confidence": "high",
+              "delivery_style": "urgent, warning tone with a firm, measured cadence",
+              "primary_speaker_group": "g1",
+              "resolution": "resolved",
+              "secondary_vocal_activity": {
+                "kind": null,
+                "present": false,
+                "speaker_relation": "none"
+              },
+              "segment_id": "segment_0001",
+              "vocal_composition": "single_speaker"
+            }
+          ],
+          "speaker_voice_profiles": [
+            {
+              "speaker_group": "g1",
+              "voice_characteristics": "A mid-to-low male register with a slightly raspy, textured timbre; the delivery is firm and urgent at a moderate-to-fast pace, with clear emphasis on the warning phrases."
+            }
+          ]
+        },
+        "av_grounding": {
+          "segment_groundings": [
+            {
+              "binding_status": "visible_entity",
+              "confidence": "medium",
+              "entity_id": "e1",
+              "evidence_codes": [
+                "av_temporal_alignment",
+                "no_visible_lip_motion"
+              ],
+              "primary_speaker_group": "g1",
+              "segment_id": "segment_0001",
+              "speech_presentation": "onscreen_spoken"
+            }
+          ]
+        },
+        "h3_semantics": {
+          "non_diegetic_music": "A slow, somber orchestral underscore with sustained low strings and a sparse, melancholic piano melody, building a tense and dramatic atmosphere.",
+          "overall_soundscape": "A quiet interior ambience with a faint low-frequency room presence and subtle environmental noise, with no prominent physical or environmental sound effects.",
+          "shot1_caption": "A medium shot opens on <Subject 1>, the bald man in the light grey traditional tunic, standing in a dimly lit interior with hanging paper lanterns and a cool blue night scene visible through the open structure behind him. He stands beside a man in ornate dark armour and a helmet, with vertical Chinese text overlaid on the left side of the frame. <Subject 1> (S1) faces slightly to the right with his mouth open as if speaking, his brow furrowed, saying, <d>[Chinese] 大人亲手举荐为官，若此事落实，恐怕大人您也难辞其咎。</d> The camera then shifts focus and pans slightly right as a second bald man in a dark high-collared tunic with a moustache moves into the foreground, becoming the dominant figure while <Subject 1> and the armoured man fall out of focus in the background. The foreground man holds a steady, serious gaze forward with his lips pressed together, while the background figures remain visible but blurred behind him.",
+          "style_opening": "The target video uses a cinematic period-drama style with warm lantern light against a cool blue night background.",
+          "subject_definitions": [
+            {
+              "description": "A bald man with a shaved forehead and dark hair at the back of his head, wearing a light grey traditional Chinese tunic with frog-button closures across the chest.",
+              "subject_label": "<Subject 1>"
+            }
+          ],
+          "summary": "A tense period-drama exchange in a lantern-lit interior, with <Subject 1> delivering a warning and a second bald man in a dark tunic moving into the foreground to hold a steady, serious gaze.",
+          "visual_retention_analysis": [
+            {
+              "description": "The bald man's facial features, shaved head, and light grey frog-button tunic remain consistent with the reference image throughout the shot.",
+              "marker": "fully_preserved",
+              "subject_label": "<Subject 1>"
+            }
+          ]
+        },
+        "schema_version": "r2v.h3.mimo25_av_annotation.20",
+        "visual_observation": {
+          "segment_views": [
+            {
+              "entity_observations": [
+                {
+                  "entity_id": "e1",
+                  "face_visibility": "clear",
+                  "mouth_visibility": "clear",
+                  "orientation": "three_quarter",
+                  "speech_correlated_articulation": "not_assessable",
+                  "visibility": "visible"
+                }
+              ],
+              "segment_id": "segment_0001",
+              "visible_entity_ids": [
+                "e1"
+              ]
+            }
+          ],
+          "visual_blocks": [
+            {
+              "block_id": "v1",
+              "text": "A medium shot opens on <Subject 1>, the bald man in the light grey traditional tunic, standing in a dimly lit interior with hanging paper lanterns and a cool blue night scene visible through the open structure behind him. He stands beside a man in ornate dark armour and a helmet, with vertical Chinese text overlaid on the left side of the frame. <Subject 1> faces slightly to the right with his mouth open as if speaking, his brow furrowed. The camera then shifts focus and pans slightly right as a second bald man in a dark high-collared tunic with a moustache moves into the foreground, becoming the dominant figure while <Subject 1> and the armoured man fall out of focus in the background. The foreground man holds a steady, serious gaze forward with his lips pressed together, while the background figures remain visible but blurred behind him."
+            }
+          ]
+        },
+        "warnings": []
+      },
+      "backend_provenance": {
+        "annotation_schema_version": "r2v.h3.mimo25_av_annotation.20",
+        "audio_finalize_prompt_version": "h3_mimo25_audio_finalize_v6",
+        "backend": "sglang_openai_compatible",
+        "base_url": "http://127.0.0.1:8094/v1",
+        "configuration_fingerprint": "52aeea0d49c6379c19373f34f7902a4097c81edc623330ea5e753c0a0c6826ad",
+        "full_av_recheck_limit": 0,
+        "http_max_attempts": 1,
+        "icl_version": "h3_official_ref2va_detailed_shot1_v4",
+        "materializer_version": "h3_mimo25_materializer_v30",
+        "max_completion_tokens": 32768,
+        "media_base_url": "http://127.0.0.1:8766/",
+        "media_mode": "http",
+        "media_resolution": "default",
+        "media_root": "/mnt/workspace",
+        "model": "mimo-v2.6-flash-rl",
+        "policy_version": "h3_mimo25_av_authority_contract_v18",
+        "prompt_version": "h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity",
+        "response_format": "json_schema",
+        "schema_version": "r2v.h3.mimo25_backend.85",
+        "speaker_marker_polish_prompt_version": "h3_mimo25_speaker_marker_polish_v4",
+        "speaker_profile_prompt_version": "h3_mimo25_speaker_profile_v2",
+        "stream": false,
+        "temperature": 0,
+        "thinking": {
+          "type": "disabled"
+        },
+        "transport": "sglang",
+        "video_fps": 4,
+        "visual_prompt_version": "h3_mimo25_visual_only_v5"
+      },
+      "clip_uid": "ab27449eaf98b06401161810",
+      "deterministic_correction_counts": {
+        "audio_evidence_code_deduplication": 1
+      },
+      "diagnostics": [
+        {
+          "finish_reason": "stop",
+          "http_attempt_count": 1,
+          "input_modality": "target_video_visual_only",
+          "request_error": null,
+          "usage": {
+            "audio_tokens": 31,
+            "cached_tokens": 0,
+            "completion_tokens": 381,
+            "image_tokens": 2400,
+            "prompt_tokens": 32779,
+            "reasoning_tokens": null,
+            "total_tokens": 33160,
+            "video_tokens": 28320
+          },
+          "warnings": [
+            "completion_tokens_details_unavailable"
+          ]
+        },
+        {
+          "finish_reason": "stop",
+          "http_attempt_count": 1,
+          "input_modality": "target_video_joint_av_audio",
+          "request_error": null,
+          "usage": {
+            "audio_tokens": 124,
+            "cached_tokens": 0,
+            "completion_tokens": 678,
+            "image_tokens": null,
+            "prompt_tokens": 32569,
+            "reasoning_tokens": null,
+            "total_tokens": 33247,
+            "video_tokens": 28320
+          },
+          "warnings": [
+            "completion_tokens_details_unavailable",
+            "two_step_identity_caption_publication_restricted",
+            "deterministic_correction_count:audio_evidence_code_deduplication=1",
+            "deterministic_correction:audio_evidence_code_deduplication",
+            "visible_entity_requires_confirmed_onscreen_speech",
+            "onscreen_speech_requires_reliable_visible_speaker_evidence",
+            "sparse_lip_motion_not_assessable:segment_0001:identity_publication_restricted"
+          ]
+        }
+      ],
+      "execution": "native",
+      "inference_provenance_by_turn": {
+        "joint": {
+          "annotation_schema_version": "r2v.h3.mimo25_av_annotation.20",
+          "audio_finalize_prompt_version": "h3_mimo25_audio_finalize_v6",
+          "backend": "sglang_openai_compatible",
+          "base_url": "http://127.0.0.1:8094/v1",
+          "configuration_fingerprint": "52aeea0d49c6379c19373f34f7902a4097c81edc623330ea5e753c0a0c6826ad",
+          "full_av_recheck_limit": 0,
+          "http_max_attempts": 1,
+          "icl_version": "h3_official_ref2va_detailed_shot1_v4",
+          "materializer_version": "h3_mimo25_materializer_v30",
+          "max_completion_tokens": 32768,
+          "media_base_url": "http://127.0.0.1:8766/",
+          "media_mode": "http",
+          "media_resolution": "default",
+          "media_root": "/mnt/workspace",
+          "model": "mimo-v2.6-flash-rl",
+          "policy_version": "h3_mimo25_av_authority_contract_v18",
+          "prompt_version": "h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity",
+          "response_format": "json_schema",
+          "schema_version": "r2v.h3.mimo25_backend.85",
+          "speaker_marker_polish_prompt_version": "h3_mimo25_speaker_marker_polish_v4",
+          "speaker_profile_prompt_version": "h3_mimo25_speaker_profile_v2",
+          "stream": false,
+          "temperature": 0,
+          "thinking": {
+            "type": "disabled"
+          },
+          "transport": "sglang",
+          "video_fps": 4,
+          "visual_prompt_version": "h3_mimo25_visual_only_v5"
+        },
+        "visual": {
+          "annotation_schema_version": "r2v.h3.mimo25_av_annotation.20",
+          "audio_finalize_prompt_version": "h3_mimo25_audio_finalize_v6",
+          "backend": "sglang_openai_compatible",
+          "base_url": "http://127.0.0.1:8094/v1",
+          "configuration_fingerprint": "52aeea0d49c6379c19373f34f7902a4097c81edc623330ea5e753c0a0c6826ad",
+          "full_av_recheck_limit": 0,
+          "http_max_attempts": 1,
+          "icl_version": "h3_official_ref2va_detailed_shot1_v4",
+          "materializer_version": "h3_mimo25_materializer_v30",
+          "max_completion_tokens": 32768,
+          "media_base_url": "http://127.0.0.1:8766/",
+          "media_mode": "http",
+          "media_resolution": "default",
+          "media_root": "/mnt/workspace",
+          "model": "mimo-v2.6-flash-rl",
+          "policy_version": "h3_mimo25_av_authority_contract_v18",
+          "prompt_version": "h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity",
+          "response_format": "json_schema",
+          "schema_version": "r2v.h3.mimo25_backend.85",
+          "speaker_marker_polish_prompt_version": "h3_mimo25_speaker_marker_polish_v4",
+          "speaker_profile_prompt_version": "h3_mimo25_speaker_profile_v2",
+          "stream": false,
+          "temperature": 0,
+          "thinking": {
+            "type": "disabled"
+          },
+          "transport": "sglang",
+          "video_fps": 4,
+          "visual_prompt_version": "h3_mimo25_visual_only_v5"
+        }
+      },
+      "model_call_count": 2,
+      "new_request_count": 2,
+      "postprocessing_version": "ra2va_group_durable_two_step_v1",
+      "raw_responses": [
+        "{\"segment_views\":[{\"segment_id\":\"segment_0001\",\"visible_entity_ids\":[\"e1\"],\"entity_observations\":[{\"entity_id\":\"e1\",\"visibility\":\"visible\",\"orientation\":\"three_quarter\",\"face_visibility\":\"clear\",\"mouth_visibility\":\"clear\",\"speech_correlated_articulation\":\"not_assessable\"}]}],\"subject_definitions\":[{\"subject_label\":\"<Subject 1>\",\"description\":\"A bald man with a shaved forehead and dark hair at the back of his head, wearing a light grey traditional Chinese tunic with frog-button closures across the chest.\"}],\"visual_retention_analysis\":[{\"subject_label\":\"<Subject 1>\",\"marker\":\"fully_preserved\",\"description\":\"The bald man's facial features, shaved head, and light grey frog-button tunic remain consistent with the reference image throughout the shot.\"}],\"style_opening\":\"The target video uses a cinematic period-drama style with warm lantern light against a cool blue night background.\",\"shot1_visual_description\":\"A medium shot opens on <Subject 1>, the bald man in the light grey traditional tunic, standing in a dimly lit interior with hanging paper lanterns and a cool blue night scene visible through the open structure behind him. He stands beside a man in ornate dark armour and a helmet, with vertical Chinese text overlaid on the left side of the frame. <Subject 1> faces slightly to the right with his mouth open as if speaking, his brow furrowed. The camera then shifts focus and pans slightly right as a second bald man in a dark high-collared tunic with a moustache moves into the foreground, becoming the dominant figure while <Subject 1> and the armoured man fall out of focus in the background. The foreground man holds a steady, serious gaze forward with his lips pressed together, while the background figures remain visible but blurred behind him.\"}",
+        "{\n  \"speech_av\": {\n    \"summary\": \"A tense period-drama exchange in a lantern-lit interior, with <Subject 1> delivering a warning and a second bald man in a dark tunic moving into the foreground to hold a steady, serious gaze.\",\n    \"audio_observation\": {\n      \"segment_decisions\": [\n        {\n          \"segment_id\": \"segment_0001\",\n          \"vocal_composition\": \"single_speaker\",\n          \"resolution\": \"resolved\",\n          \"primary_speaker_group\": \"g1\",\n          \"delivery_style\": \"urgent, warning tone with a firm, measured cadence\",\n          \"secondary_vocal_activity\": {\n            \"present\": false\n          ,\n            \"speaker_relation\": \"none\",\n            \"kind\": null\n          },\n          \"confidence\": \"high\",\n          \"audio_evidence_codes\": [\"voice_continuity\", \"voice_continuity\"]\n        }\n      ]\n    },\n    \"av_grounding\": {\n      \"segment_groundings\": [\n        {\n          \"segment_id\": \"segment_0001\",\n          \"primary_speaker_group\": \"g1\",\n          \"binding_status\": \"visible_entity\",\n          \"speech_presentation\": \"onscreen_spoken\",\n          \"entity_id\": \"e1\",\n          \"confidence\": \"medium\",\n          \"evidence_codes\": [\"av_temporal_alignment\", \"no_visible_lip_motion\"]\n        }\n      ]\n    },\n    \"shot1_caption\": \"A medium shot opens on <Subject 1>, the bald man in the light grey traditional tunic, standing in a dimly lit interior with hanging paper lanterns and a cool blue night scene visible through the open structure behind him. He stands beside a man in ornate dark armour and a helmet, with vertical Chinese text overlaid on the left side of the frame. <Subject 1> (S1) faces slightly to the right with his mouth open as if speaking, his brow furrowed, saying, <d>[Chinese] 大人亲手举荐为官，若此事落实，恐怕大人您也难辞其咎。</d> The camera then shifts focus and pans slightly right as a second bald man in a dark high-collared tunic with a moustache moves into the foreground, becoming the dominant figure while <Subject 1> and the armoured man fall out of focus in the background. The foreground man holds a steady, serious gaze forward with his lips pressed together, while the background figures remain visible but blurred behind him.\",\n    \"warnings\": []\n  },\n  \"speaker_voice_profiles\": [\n    {\n      \"speaker_group\": \"g1\",\n      \"voice_characteristics\": \"A mid-to-low male register with a slightly raspy, textured timbre; the delivery is firm and urgent at a moderate-to-fast pace, with clear emphasis on the warning phrases.\"\n    }\n  ],\n  \"audio_finalize\": {\n    \"overall_soundscape\": \"A quiet interior ambience with a faint low-frequency room presence and subtle environmental noise, with no prominent physical or environmental sound effects.\",\n    \"non_diegetic_music\": \"A slow, somber orchestral underscore with sustained low strings and a sparse, melancholic piano melody, building a tense and dramatic atmosphere.\"\n  }\n}"
+      ],
+      "response_replay_count": 0,
+      "response_sources": {
+        "joint": "/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/R2VA/ra2va-native-group0-pilot10-20261010T034522/groups/group-000000/stages/000007-mimo/attempts/000003/f88454a27a994c789e89902a8e83784f/mimo/ab27449eaf98b06401161810/joint.response.json",
+        "visual": "/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/R2VA/ra2va-native-group0-pilot10-20261010T034522/groups/group-000000/stages/000007-mimo/attempts/000003/f88454a27a994c789e89902a8e83784f/mimo/ab27449eaf98b06401161810/visual.response.json"
+      },
+      "speech_av_raw_response": "{\n  \"speech_av\": {\n    \"summary\": \"A tense period-drama exchange in a lantern-lit interior, with <Subject 1> delivering a warning and a second bald man in a dark tunic moving into the foreground to hold a steady, serious gaze.\",\n    \"audio_observation\": {\n      \"segment_decisions\": [\n        {\n          \"segment_id\": \"segment_0001\",\n          \"vocal_composition\": \"single_speaker\",\n          \"resolution\": \"resolved\",\n          \"primary_speaker_group\": \"g1\",\n          \"delivery_style\": \"urgent, warning tone with a firm, measured cadence\",\n          \"secondary_vocal_activity\": {\n            \"present\": false\n          ,\n            \"speaker_relation\": \"none\",\n            \"kind\": null\n          },\n          \"confidence\": \"high\",\n          \"audio_evidence_codes\": [\"voice_continuity\", \"voice_continuity\"]\n        }\n      ]\n    },\n    \"av_grounding\": {\n      \"segment_groundings\": [\n        {\n          \"segment_id\": \"segment_0001\",\n          \"primary_speaker_group\": \"g1\",\n          \"binding_status\": \"visible_entity\",\n          \"speech_presentation\": \"onscreen_spoken\",\n          \"entity_id\": \"e1\",\n          \"confidence\": \"medium\",\n          \"evidence_codes\": [\"av_temporal_alignment\", \"no_visible_lip_motion\"]\n        }\n      ]\n    },\n    \"shot1_caption\": \"A medium shot opens on <Subject 1>, the bald man in the light grey traditional tunic, standing in a dimly lit interior with hanging paper lanterns and a cool blue night scene visible through the open structure behind him. He stands beside a man in ornate dark armour and a helmet, with vertical Chinese text overlaid on the left side of the frame. <Subject 1> (S1) faces slightly to the right with his mouth open as if speaking, his brow furrowed, saying, <d>[Chinese] 大人亲手举荐为官，若此事落实，恐怕大人您也难辞其咎。</d> The camera then shifts focus and pans slightly right as a second bald man in a dark high-collared tunic with a moustache moves into the foreground, becoming the dominant figure while <Subject 1> and the armoured man fall out of focus in the background. The foreground man holds a steady, serious gaze forward with his lips pressed together, while the background figures remain visible but blurred behind him.\",\n    \"warnings\": []\n  },\n  \"speaker_voice_profiles\": [\n    {\n      \"speaker_group\": \"g1\",\n      \"voice_characteristics\": \"A mid-to-low male register with a slightly raspy, textured timbre; the delivery is firm and urgent at a moderate-to-fast pace, with clear emphasis on the warning phrases.\"\n    }\n  ],\n  \"audio_finalize\": {\n    \"overall_soundscape\": \"A quiet interior ambience with a faint low-frequency room presence and subtle environmental noise, with no prominent physical or environmental sound effects.\",\n    \"non_diegetic_music\": \"A slow, somber orchestral underscore with sustained low strings and a sparse, melancholic piano melody, building a tense and dramatic atmosphere.\"\n  }\n}",
+      "status": "ready",
+      "unresolved_turns": [],
+      "visual_raw_response": "{\"segment_views\":[{\"segment_id\":\"segment_0001\",\"visible_entity_ids\":[\"e1\"],\"entity_observations\":[{\"entity_id\":\"e1\",\"visibility\":\"visible\",\"orientation\":\"three_quarter\",\"face_visibility\":\"clear\",\"mouth_visibility\":\"clear\",\"speech_correlated_articulation\":\"not_assessable\"}]}],\"subject_definitions\":[{\"subject_label\":\"<Subject 1>\",\"description\":\"A bald man with a shaved forehead and dark hair at the back of his head, wearing a light grey traditional Chinese tunic with frog-button closures across the chest.\"}],\"visual_retention_analysis\":[{\"subject_label\":\"<Subject 1>\",\"marker\":\"fully_preserved\",\"description\":\"The bald man's facial features, shaved head, and light grey frog-button tunic remain consistent with the reference image throughout the shot.\"}],\"style_opening\":\"The target video uses a cinematic period-drama style with warm lantern light against a cool blue night background.\",\"shot1_visual_description\":\"A medium shot opens on <Subject 1>, the bald man in the light grey traditional tunic, standing in a dimly lit interior with hanging paper lanterns and a cool blue night scene visible through the open structure behind him. He stands beside a man in ornate dark armour and a helmet, with vertical Chinese text overlaid on the left side of the frame. <Subject 1> faces slightly to the right with his mouth open as if speaking, his brow furrowed. The camera then shifts focus and pans slightly right as a second bald man in a dark high-collared tunic with a moustache moves into the foreground, becoming the dominant figure while <Subject 1> and the armoured man fall out of focus in the background. The foreground man holds a steady, serious gaze forward with his lips pressed together, while the background figures remain visible but blurred behind him.\"}"
+    },
+    "task": {
+      "ordinal": 3,
+      "clip_uid": "ab27449eaf98b06401161810",
+      "sample_id": "ab27449eaf98b06401161810",
+      "sample": {
+        "schema_version": "r2v.v3.production_sample.1",
+        "sample_id": "ab27449eaf98b06401161810",
+        "clip_uid": "ab27449eaf98b06401161810",
+        "target_video": "/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/clips_clean_cropped/01/丁宝桢/01 4K/v_b597a0641cf76c22e880_00112.mp4",
+        "t2v_caption": "In a dimly lit traditional Chinese courtyard at night, a bald man in a light gray traditional tunic stands on the left, looking forward with a serious expression. To his right, a man in dark armor with a helmet stands in full dark armor, also facing forward. The camera slowly pushes in as a bald man in a black high-collared robe walks into the foreground, his face coming into focus. He stands still, gazing directly ahead, while the other two remain in the background. The scene is illuminated by warm hanging lanterns, and the dark wooden architecture frames the open archway behind them, revealing a blue-toned night sky. The camera holds steady on a bald man in a black high-collared robe as he maintains a composed posture, with a bald man in a light gray traditional tunic and a man in dark armor with a helmet visible behind him in the softly lit background.",
+        "r2v_instruction": "In a dimly lit traditional Chinese courtyard at night, a bald man in a light gray traditional tunic <Image 1> stands on the left, looking forward with a serious expression. To his right, a man in dark armor with a helmet stands in full dark armor, also facing forward. The camera slowly pushes in as a bald man in a black high-collared robe walks into the foreground, his face coming into focus. He stands still, gazing directly ahead, while the other two remain in the background. The scene is illuminated by warm hanging lanterns, and the dark wooden architecture frames the open archway behind them, revealing a blue-toned night sky. The camera holds steady on a bald man in a black high-collared robe as he maintains a composed posture, with a bald man in a light gray traditional tunic and a man in dark armor with a helmet visible behind him in the softly lit background.",
+        "references": [
+          {
+            "image_id": "image_1",
+            "image_index": 1,
+            "kind": "subject",
+            "entity_id": "e1",
+            "attribute_id": null,
+            "owner_entity_id": null,
+            "attribute_type": null,
+            "image_path": "references/visual/shard-000000000-000009999/ab27449eaf98b06401161810/subject_1.png",
+            "source_frame_index": 0,
+            "scope": "local",
+            "visible_region": "head_shoulders",
+            "synthetic": false
+          }
+        ],
+        "source": {
+          "parent_video_id": "v_b597a0641cf76c22e880",
+          "clip_suffix": "112",
+          "shard_id": "shard-000000000-000009999"
+        }
+      },
+      "target_video_path": "/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/clips_clean_cropped/01/丁宝桢/01 4K/v_b597a0641cf76c22e880_00112.mp4",
+      "pictures": [
+        {
+          "image_id": "image_1",
+          "image_index": 1,
+          "kind": "subject",
+          "entity_id": "e1",
+          "attribute_id": null,
+          "owner_entity_id": null,
+          "attribute_type": null,
+          "image_path": "/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/in_pair_reference/post_mask/group-000000/references/visual/shard-000000000-000009999/ab27449eaf98b06401161810/subject_1.png",
+          "source_frame_index": 0,
+          "scope": "local",
+          "visible_region": "head_shoulders",
+          "synthetic": false,
+          "picture_label": "<Picture 1>"
+        }
+      ],
+      "subjects": [
+        {
+          "subject_index": 1,
+          "subject_label": "<Subject 1>",
+          "kind": "entity",
+          "source_picture_labels": [
+            "<Picture 1>"
+          ],
+          "entity_id": "e1"
+        }
+      ]
+    }
+  },
+  "83871dd0401c1f1ce9986ec2": {
+    "job": {
+      "binding_evidence_mode": "none",
+      "clip_uid": "83871dd0401c1f1ce9986ec2",
+      "r2v_instruction": "a man in ornate dark armor with a hooded helmet <Image 1>, with the facial appearance shown in <Image 2> stands in the rain, his face partially visible beneath a hooded helmet with intricate metallic patterns. Rain falls heavily, streaking down the frame and wetting his armor. The scene is dimly lit with a cool blue tone, emphasizing the downpour. a dark, rainy outdoor scene with vertical rain streaks <Image 3> remains consistent throughout, with no visible changes in the environment. The man’s expression is serious, and his mouth moves slightly as if speaking or reacting to something off-screen. The camera holds a steady close-up, focusing on his upper body and face, capturing the texture of the rain and armor details.",
+      "reference_images": [
+        {
+          "attribute_id": null,
+          "attribute_type": null,
+          "entity_id": "e1",
+          "image_artifact_path": "/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/in_pair_reference/post_mask/group-000000/references/visual/shard-000000000-000009999/83871dd0401c1f1ce9986ec2/subject_1.png",
+          "image_index": 1,
+          "kind": "subject",
+          "owner_entity_id": null,
+          "picture_label": "<Picture 1>",
+          "source_image_id": "image_1",
+          "source_image_index": 1,
+          "source_image_label": "<Image 1>"
+        },
+        {
+          "attribute_id": "a1",
+          "attribute_type": "face",
+          "entity_id": null,
+          "image_artifact_path": "/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/in_pair_reference/post_mask/group-000000/references/visual/shard-000000000-000009999/83871dd0401c1f1ce9986ec2/attribute_e1_a1_face.png",
+          "image_index": 2,
+          "kind": "attribute",
+          "owner_entity_id": "e1",
+          "picture_label": "<Picture 2>",
+          "source_image_id": "image_2",
+          "source_image_index": 2,
+          "source_image_label": "<Image 2>"
+        },
+        {
+          "attribute_id": null,
+          "attribute_type": null,
+          "entity_id": null,
+          "image_artifact_path": "/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/in_pair_reference/post_mask/group-000000/references/visual/shard-000000000-000009999/83871dd0401c1f1ce9986ec2/background_1.png",
+          "image_index": 3,
+          "kind": "background",
+          "owner_entity_id": null,
+          "picture_label": "<Picture 3>",
+          "source_image_id": "image_3",
+          "source_image_index": 3,
+          "source_image_label": "<Image 3>"
+        }
+      ],
+      "reference_selection": {
+        "dropped_references": [],
+        "face_promotions": [],
+        "original_picture_count": 3,
+        "policy_version": "h3_mimo25_reference_selection_v2",
+        "selected_picture_count": 3,
+        "selected_source_image_ids": [
+          "image_1",
+          "image_2",
+          "image_3"
+        ],
+        "selected_source_image_indexes": [
+          1,
+          2,
+          3
+        ]
+      },
+      "reference_subjects": [
+        {
+          "attribute_id": null,
+          "attribute_type": null,
+          "entity_id": "e1",
+          "kind": "entity",
+          "owner_entity_id": null,
+          "source_picture_labels": [
+            "<Picture 1>"
+          ],
+          "subject_index": 1,
+          "subject_label": "<Subject 1>"
+        },
+        {
+          "attribute_id": "a1",
+          "attribute_type": "face",
+          "entity_id": null,
+          "kind": "attribute",
+          "owner_entity_id": "e1",
+          "source_picture_labels": [
+            "<Picture 2>"
+          ],
+          "subject_index": 2,
+          "subject_label": "<Subject 2>"
+        },
+        {
+          "attribute_id": null,
+          "attribute_type": null,
+          "entity_id": null,
+          "kind": "background",
+          "owner_entity_id": null,
+          "source_picture_labels": [
+            "<Picture 3>"
+          ],
+          "subject_index": 3,
+          "subject_label": "<Subject 3>"
+        }
+      ],
+      "segments": [
+        {
+          "asr_language": "Chinese",
+          "asr_status": "transcribed",
+          "asr_text": "你们所运的货物，乃是历城县令的贿银。",
+          "cluster_binding_status": "unbound",
+          "competing_visible_speaker_evidence": [],
+          "current_entity_id": null,
+          "direct_anchor_seconds": 0,
+          "direct_support_seconds_by_entity": {},
+          "end_time": 3.0925,
+          "entity_occurrence_id": null,
+          "identity_scope": "unresolved",
+          "overlapping_visible_entities": [],
+          "segment_id": "segment_0001",
+          "source_end_sample": 98960,
+          "source_sample_rate_hz": 32000,
+          "source_speaker_cluster_id": "speaker_0",
+          "source_start_sample": 4880,
+          "start_time": 0.1525
+        }
+      ],
+      "source_h3_sample_ids": [
+        "83871dd0401c1f1ce9986ec2"
+      ],
+      "target_duration_seconds": 3.2495,
+      "target_full_audio_path": "/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/R2VA/ra2va-native-group0-pilot10-20261010T034522/groups/group-000000/stages/000001-canonical/attempts/000006/8ccfb7201f0443ecbba0f8cd41a3663e/canonical/83871dd0401c1f1ce9986ec2/attempt-j27385ea/full.flac",
+      "target_video_path": "/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/clips_clean_cropped/01/丁宝桢/01 4K/v_b597a0641cf76c22e880_00181.mp4"
+    },
+    "record": {
+      "annotation": {
+        "audio_observation": {
+          "segment_decisions": [
+            {
+              "audio_evidence_codes": [
+                "speaker_turn_change",
+                "voice_continuity"
+              ],
+              "confidence": "high",
+              "delivery_style": "firm, accusatory declaration",
+              "primary_speaker_group": "g1",
+              "resolution": "resolved",
+              "secondary_vocal_activity": {
+                "kind": null,
+                "present": false,
+                "speaker_relation": "none"
+              },
+              "segment_id": "segment_0001",
+              "vocal_composition": "single_speaker"
+            }
+          ],
+          "speaker_voice_profiles": [
+            {
+              "speaker_group": "g1",
+              "voice_characteristics": "A mid-to-low register male voice with a slightly rough, resonant timbre, delivered at a measured, deliberate pace with firm, accusatory energy."
+            }
+          ]
+        },
+        "av_grounding": {
+          "segment_groundings": [
+            {
+              "binding_status": "visible_entity",
+              "confidence": "high",
+              "entity_id": "e1",
+              "evidence_codes": [
+                "visible_lip_motion",
+                "av_temporal_alignment",
+                "voice_continuity",
+                "no_visible_lip_motion"
+              ],
+              "primary_speaker_group": "g1",
+              "segment_id": "segment_0001",
+              "speech_presentation": "onscreen_spoken"
+            }
+          ]
+        },
+        "h3_semantics": {
+          "non_diegetic_music": "A tense, rhythmic orchestral underscore with driving low strings and percussion builds suspense beneath the scene.",
+          "overall_soundscape": "Heavy, continuous rainfall dominates the soundscape, with dense water streaks and droplets creating a constant, immersive downpour ambience throughout the clip.",
+          "shot1_caption": "A medium close-up shows <Subject 1>, a man in a dark, wet, hooded robe with a geometric pattern, standing in heavy rain against a dark blue background defined by <Subject 3>. The camera remains static as rain streaks fall continuously across the frame. <Subject 2>, the man's face, is visible through the veil of rain, looking slightly upward and to the side with a serious expression. His mouth moves as he speaks (S1), <d>[Chinese] 你们所运的货物，乃是历城县令的贿银。</d>, and water droplets cling to the fabric of his hood and shoulders. The lighting is dim and cool, emphasizing the wet texture of his clothing and the density of the rainfall.",
+          "style_opening": "The video uses a cinematic, dark, and moody style with heavy rain and cool blue tones.",
+          "subject_definitions": [
+            {
+              "description": "A man wearing a dark, wet, hooded garment with a geometric pattern and a tall pointed hood, shown against a plain white background.",
+              "subject_label": "<Subject 1>"
+            },
+            {
+              "description": "The man's face, showing dark eyes, a mustache, and a goatee, seen through a veil of falling rain.",
+              "subject_label": "<Subject 2>"
+            },
+            {
+              "description": "A dense curtain of vertical rain streaks against a dark blue, blurred background.",
+              "subject_label": "<Subject 3>"
+            }
+          ],
+          "summary": "A hooded man stands in heavy rain and speaks a single accusatory line about the cargo being a county magistrate's bribe money.",
+          "visual_retention_analysis": [
+            {
+              "description": "The hooded figure's garment pattern, hood shape, and overall appearance are retained throughout the shot.",
+              "marker": "fully_preserved",
+              "subject_label": "<Subject 1>"
+            },
+            {
+              "description": "The facial features remain consistent and visible through the rain in all frames.",
+              "marker": "fully_preserved",
+              "subject_label": "<Subject 2>"
+            },
+            {
+              "description": "The heavy rain and dark blue background persist as the constant environment across the entire clip.",
+              "marker": "fully_preserved",
+              "subject_label": "<Subject 3>"
+            }
+          ]
+        },
+        "schema_version": "r2v.h3.mimo25_av_annotation.20",
+        "visual_observation": {
+          "segment_views": [
+            {
+              "entity_observations": [
+                {
+                  "entity_id": "e1",
+                  "face_visibility": "clear",
+                  "mouth_visibility": "clear",
+                  "orientation": "front",
+                  "speech_correlated_articulation": "not_assessable",
+                  "visibility": "visible"
+                }
+              ],
+              "segment_id": "segment_0001",
+              "visible_entity_ids": [
+                "e1"
+              ]
+            }
+          ],
+          "visual_blocks": [
+            {
+              "block_id": "v1",
+              "text": "A medium close-up shows <Subject 1>, a man in a dark, wet, hooded robe with a geometric pattern, standing in heavy rain against a dark blue background defined by <Subject 3>. The camera remains static as rain streaks fall continuously across the frame. <Subject 2>, the man's face, is visible through the veil of rain, looking slightly upward and to the side with a serious expression. His mouth moves as he speaks, and water droplets cling to the fabric of his hood and shoulders. The lighting is dim and cool, emphasizing the wet texture of his clothing and the density of the rainfall."
+            }
+          ]
+        },
+        "warnings": []
+      },
+      "backend_provenance": {
+        "annotation_schema_version": "r2v.h3.mimo25_av_annotation.20",
+        "audio_finalize_prompt_version": "h3_mimo25_audio_finalize_v6",
+        "backend": "sglang_openai_compatible",
+        "base_url": "http://127.0.0.1:8094/v1",
+        "configuration_fingerprint": "52aeea0d49c6379c19373f34f7902a4097c81edc623330ea5e753c0a0c6826ad",
+        "full_av_recheck_limit": 0,
+        "http_max_attempts": 1,
+        "icl_version": "h3_official_ref2va_detailed_shot1_v4",
+        "materializer_version": "h3_mimo25_materializer_v30",
+        "max_completion_tokens": 32768,
+        "media_base_url": "http://127.0.0.1:8766/",
+        "media_mode": "http",
+        "media_resolution": "default",
+        "media_root": "/mnt/workspace",
+        "model": "mimo-v2.6-flash-rl",
+        "policy_version": "h3_mimo25_av_authority_contract_v18",
+        "prompt_version": "h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity",
+        "response_format": "json_schema",
+        "schema_version": "r2v.h3.mimo25_backend.85",
+        "speaker_marker_polish_prompt_version": "h3_mimo25_speaker_marker_polish_v4",
+        "speaker_profile_prompt_version": "h3_mimo25_speaker_profile_v2",
+        "stream": false,
+        "temperature": 0,
+        "thinking": {
+          "type": "disabled"
+        },
+        "transport": "sglang",
+        "video_fps": 4,
+        "visual_prompt_version": "h3_mimo25_visual_only_v5"
+      },
+      "clip_uid": "83871dd0401c1f1ce9986ec2",
+      "deterministic_correction_counts": {
+        "audio_evidence_code_deduplication": 6,
+        "av_grounding_evidence_code_deduplication": 4
+      },
+      "diagnostics": [
+        {
+          "finish_reason": "stop",
+          "http_attempt_count": 1,
+          "input_modality": "target_video_visual_only",
+          "request_error": null,
+          "usage": {
+            "audio_tokens": 21,
+            "cached_tokens": 0,
+            "completion_tokens": 450,
+            "image_tokens": 11897,
+            "prompt_tokens": 42541,
+            "reasoning_tokens": null,
+            "total_tokens": 42991,
+            "video_tokens": 28320
+          },
+          "warnings": [
+            "completion_tokens_details_unavailable"
+          ]
+        },
+        {
+          "finish_reason": "stop",
+          "http_attempt_count": 1,
+          "input_modality": "target_video_joint_av_audio",
+          "request_error": null,
+          "usage": {
+            "audio_tokens": 84,
+            "cached_tokens": 0,
+            "completion_tokens": 536,
+            "image_tokens": null,
+            "prompt_tokens": 32599,
+            "reasoning_tokens": null,
+            "total_tokens": 33135,
+            "video_tokens": 28320
+          },
+          "warnings": [
+            "completion_tokens_details_unavailable",
+            "two_step_identity_caption_publication_restricted",
+            "deterministic_correction_count:audio_evidence_code_deduplication=6",
+            "deterministic_correction_count:av_grounding_evidence_code_deduplication=4",
+            "deterministic_correction:audio_evidence_code_deduplication",
+            "deterministic_correction:av_grounding_evidence_code_deduplication",
+            "stage_a_av_articulation_contradiction",
+            "visible_entity_requires_confirmed_onscreen_speech",
+            "onscreen_speech_requires_reliable_visible_speaker_evidence",
+            "sparse_lip_motion_not_assessable:segment_0001:identity_publication_restricted"
+          ]
+        }
+      ],
+      "execution": "native",
+      "inference_provenance_by_turn": {
+        "joint": {
+          "annotation_schema_version": "r2v.h3.mimo25_av_annotation.20",
+          "audio_finalize_prompt_version": "h3_mimo25_audio_finalize_v6",
+          "backend": "sglang_openai_compatible",
+          "base_url": "http://127.0.0.1:8094/v1",
+          "configuration_fingerprint": "52aeea0d49c6379c19373f34f7902a4097c81edc623330ea5e753c0a0c6826ad",
+          "full_av_recheck_limit": 0,
+          "http_max_attempts": 1,
+          "icl_version": "h3_official_ref2va_detailed_shot1_v4",
+          "materializer_version": "h3_mimo25_materializer_v30",
+          "max_completion_tokens": 32768,
+          "media_base_url": "http://127.0.0.1:8766/",
+          "media_mode": "http",
+          "media_resolution": "default",
+          "media_root": "/mnt/workspace",
+          "model": "mimo-v2.6-flash-rl",
+          "policy_version": "h3_mimo25_av_authority_contract_v18",
+          "prompt_version": "h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity",
+          "response_format": "json_schema",
+          "schema_version": "r2v.h3.mimo25_backend.85",
+          "speaker_marker_polish_prompt_version": "h3_mimo25_speaker_marker_polish_v4",
+          "speaker_profile_prompt_version": "h3_mimo25_speaker_profile_v2",
+          "stream": false,
+          "temperature": 0,
+          "thinking": {
+            "type": "disabled"
+          },
+          "transport": "sglang",
+          "video_fps": 4,
+          "visual_prompt_version": "h3_mimo25_visual_only_v5"
+        },
+        "visual": {
+          "annotation_schema_version": "r2v.h3.mimo25_av_annotation.20",
+          "audio_finalize_prompt_version": "h3_mimo25_audio_finalize_v6",
+          "backend": "sglang_openai_compatible",
+          "base_url": "http://127.0.0.1:8094/v1",
+          "configuration_fingerprint": "52aeea0d49c6379c19373f34f7902a4097c81edc623330ea5e753c0a0c6826ad",
+          "full_av_recheck_limit": 0,
+          "http_max_attempts": 1,
+          "icl_version": "h3_official_ref2va_detailed_shot1_v4",
+          "materializer_version": "h3_mimo25_materializer_v30",
+          "max_completion_tokens": 32768,
+          "media_base_url": "http://127.0.0.1:8766/",
+          "media_mode": "http",
+          "media_resolution": "default",
+          "media_root": "/mnt/workspace",
+          "model": "mimo-v2.6-flash-rl",
+          "policy_version": "h3_mimo25_av_authority_contract_v18",
+          "prompt_version": "h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity",
+          "response_format": "json_schema",
+          "schema_version": "r2v.h3.mimo25_backend.85",
+          "speaker_marker_polish_prompt_version": "h3_mimo25_speaker_marker_polish_v4",
+          "speaker_profile_prompt_version": "h3_mimo25_speaker_profile_v2",
+          "stream": false,
+          "temperature": 0,
+          "thinking": {
+            "type": "disabled"
+          },
+          "transport": "sglang",
+          "video_fps": 4,
+          "visual_prompt_version": "h3_mimo25_visual_only_v5"
+        }
+      },
+      "model_call_count": 2,
+      "new_request_count": 2,
+      "postprocessing_version": "ra2va_group_durable_two_step_v1",
+      "raw_responses": [
+        "{\"segment_views\":[{\"segment_id\":\"segment_0001\",\"visible_entity_ids\":[\"e1\"],\"entity_observations\":[{\"entity_id\":\"e1\",\"visibility\":\"visible\",\"orientation\":\"front\",\"face_visibility\":\"clear\",\"mouth_visibility\":\"clear\",\"speech_correlated_articulation\": \"not_assessable\"}]}],\"subject_definitions\":[{\"subject_label\":\"<Subject 1>\",\"description\":\"A man wearing a dark, wet, hooded garment with a geometric pattern and a tall pointed hood, shown against a plain white background.\"},{\"subject_label\":\"<Subject 2>\",\"description\":\"The man's face, showing dark eyes, a mustache, and a goatee, seen through a veil of falling rain.\"},{\"subject_label\":\"<Subject 3>\",\"description\":\"A dense curtain of vertical rain streaks against a dark blue, blurred background.\"}],\"visual_retention_analysis\":[{\"subject_label\":\"<Subject 1>\",\"marker\":\"fully_preserved\",\"description\":\"The hooded figure's garment pattern, hood shape, and overall appearance are retained throughout the shot.\"},{\"subject_label\":\"<Subject 2>\",\"marker\":\"fully_preserved\",\"description\":\"The facial features remain consistent and visible through the rain in all frames.\"},{\"subject_label\":\"<Subject 3>\",\"marker\":\"fully_preserved\",\"description\":\"The heavy rain and dark blue background persist as the constant environment across the entire clip.\"}],\"style_opening\":\"The video uses a cinematic, dark, and moody style with heavy rain and cool blue tones.\",\"shot1_visual_description\":\"A medium close-up shows <Subject 1>, a man in a dark, wet, hooded robe with a geometric pattern, standing in heavy rain against a dark blue background defined by <Subject 3>. The camera remains static as rain streaks fall continuously across the frame. <Subject 2>, the man's face, is visible through the veil of rain, looking slightly upward and to the side with a serious expression. His mouth moves as he speaks, and water droplets cling to the fabric of his hood and shoulders. The lighting is dim and cool, emphasizing the wet texture of his clothing and the density of the rainfall.\"}",
+        "{\"speech_av\":{\"summary\":\"A hooded man stands in heavy rain and speaks a single accusatory line about the cargo being a county magistrate's bribe money.\",\"audio_observation\":{\"segment_decisions\":[{\"segment_id\":\"segment_0001\",\"vocal_composition\":\"single_speaker\",\"resolution\":\"resolved\",\"primary_speaker_group\":\"g1\",\"delivery_style\":\"firm, accusatory declaration\",\"secondary_vocal_activity\":{ \"present\":false,\"speaker_relation\": \"none\",\"kind\":null},\"confidence\":  \"high\",\"audio_evidence_codes\":[\"speaker_turn_change\",\"voice_continuity\",\"voice_continuity\",\"voice_continuity\",\"voice_continuity\",\"voice_continuity\",\"voice_continuity\",\"voice_continuity\"]}]}, \"av_grounding\":{\"segment_groundings\":[{\"segment_id\":\"segment_0001\",\"primary_speaker_group\":\"g1\",\"binding_status\":\"visible_entity\",\"speech_presentation\":\"onscreen_spoken\",\"entity_id\":\"e1\",\"confidence\":\"high\",\"evidence_codes\":[\"visible_lip_motion\",\"av_temporal_alignment\",\"voice_continuity\",\"no_visible_lip_motion\",\"no_visible_lip_motion\",\"no_visible_lip_motion\",\"no_visible_lip_motion\",\"no_visible_lip_motion\"]}]}, \"shot1_caption\":\"A medium close-up shows <Subject 1>, a man in a dark, wet, hooded robe with a geometric pattern, standing in heavy rain against a dark blue background defined by <Subject 3>. The camera remains static as rain streaks fall continuously across the frame. <Subject 2>, the man's face, is visible through the veil of rain, looking slightly upward and to the side with a serious expression. His mouth moves as he speaks (S1), <d>[Chinese] 你们所运的货物，乃是历城县令的贿银。</d>, and water droplets cling to the fabric of his hood and shoulders. The lighting is dim and cool, emphasizing the wet texture of his clothing and the density of the rainfall.\",\"warnings\":[]},\"speaker_voice_profiles\":[{\"speaker_group\":\"g1\",\"voice_characteristics\":\"A mid-to-low register male voice with a slightly rough, resonant timbre, delivered at a measured, deliberate pace with firm, accusatory energy.\"}],\"audio_finalize\":{\"overall_soundscape\":\"Heavy, continuous rainfall dominates the soundscape, with dense water streaks and droplets creating a constant, immersive downpour ambience throughout the clip.\",\"non_diegetic_music\":\"A tense, rhythmic orchestral underscore with driving low strings and percussion builds suspense beneath the scene.\"}}"
+      ],
+      "response_replay_count": 0,
+      "response_sources": {
+        "joint": "/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/R2VA/ra2va-native-group0-pilot10-20261010T034522/groups/group-000000/stages/000007-mimo/attempts/000006/4d8c33eec1544986b2f67b7ff2d523f3/mimo/83871dd0401c1f1ce9986ec2/joint.response.json",
+        "visual": "/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/R2VA/ra2va-native-group0-pilot10-20261010T034522/groups/group-000000/stages/000007-mimo/attempts/000006/4d8c33eec1544986b2f67b7ff2d523f3/mimo/83871dd0401c1f1ce9986ec2/visual.response.json"
+      },
+      "speech_av_raw_response": "{\"speech_av\":{\"summary\":\"A hooded man stands in heavy rain and speaks a single accusatory line about the cargo being a county magistrate's bribe money.\",\"audio_observation\":{\"segment_decisions\":[{\"segment_id\":\"segment_0001\",\"vocal_composition\":\"single_speaker\",\"resolution\":\"resolved\",\"primary_speaker_group\":\"g1\",\"delivery_style\":\"firm, accusatory declaration\",\"secondary_vocal_activity\":{ \"present\":false,\"speaker_relation\": \"none\",\"kind\":null},\"confidence\":  \"high\",\"audio_evidence_codes\":[\"speaker_turn_change\",\"voice_continuity\",\"voice_continuity\",\"voice_continuity\",\"voice_continuity\",\"voice_continuity\",\"voice_continuity\",\"voice_continuity\"]}]}, \"av_grounding\":{\"segment_groundings\":[{\"segment_id\":\"segment_0001\",\"primary_speaker_group\":\"g1\",\"binding_status\":\"visible_entity\",\"speech_presentation\":\"onscreen_spoken\",\"entity_id\":\"e1\",\"confidence\":\"high\",\"evidence_codes\":[\"visible_lip_motion\",\"av_temporal_alignment\",\"voice_continuity\",\"no_visible_lip_motion\",\"no_visible_lip_motion\",\"no_visible_lip_motion\",\"no_visible_lip_motion\",\"no_visible_lip_motion\"]}]}, \"shot1_caption\":\"A medium close-up shows <Subject 1>, a man in a dark, wet, hooded robe with a geometric pattern, standing in heavy rain against a dark blue background defined by <Subject 3>. The camera remains static as rain streaks fall continuously across the frame. <Subject 2>, the man's face, is visible through the veil of rain, looking slightly upward and to the side with a serious expression. His mouth moves as he speaks (S1), <d>[Chinese] 你们所运的货物，乃是历城县令的贿银。</d>, and water droplets cling to the fabric of his hood and shoulders. The lighting is dim and cool, emphasizing the wet texture of his clothing and the density of the rainfall.\",\"warnings\":[]},\"speaker_voice_profiles\":[{\"speaker_group\":\"g1\",\"voice_characteristics\":\"A mid-to-low register male voice with a slightly rough, resonant timbre, delivered at a measured, deliberate pace with firm, accusatory energy.\"}],\"audio_finalize\":{\"overall_soundscape\":\"Heavy, continuous rainfall dominates the soundscape, with dense water streaks and droplets creating a constant, immersive downpour ambience throughout the clip.\",\"non_diegetic_music\":\"A tense, rhythmic orchestral underscore with driving low strings and percussion builds suspense beneath the scene.\"}}",
+      "status": "ready",
+      "unresolved_turns": [],
+      "visual_raw_response": "{\"segment_views\":[{\"segment_id\":\"segment_0001\",\"visible_entity_ids\":[\"e1\"],\"entity_observations\":[{\"entity_id\":\"e1\",\"visibility\":\"visible\",\"orientation\":\"front\",\"face_visibility\":\"clear\",\"mouth_visibility\":\"clear\",\"speech_correlated_articulation\": \"not_assessable\"}]}],\"subject_definitions\":[{\"subject_label\":\"<Subject 1>\",\"description\":\"A man wearing a dark, wet, hooded garment with a geometric pattern and a tall pointed hood, shown against a plain white background.\"},{\"subject_label\":\"<Subject 2>\",\"description\":\"The man's face, showing dark eyes, a mustache, and a goatee, seen through a veil of falling rain.\"},{\"subject_label\":\"<Subject 3>\",\"description\":\"A dense curtain of vertical rain streaks against a dark blue, blurred background.\"}],\"visual_retention_analysis\":[{\"subject_label\":\"<Subject 1>\",\"marker\":\"fully_preserved\",\"description\":\"The hooded figure's garment pattern, hood shape, and overall appearance are retained throughout the shot.\"},{\"subject_label\":\"<Subject 2>\",\"marker\":\"fully_preserved\",\"description\":\"The facial features remain consistent and visible through the rain in all frames.\"},{\"subject_label\":\"<Subject 3>\",\"marker\":\"fully_preserved\",\"description\":\"The heavy rain and dark blue background persist as the constant environment across the entire clip.\"}],\"style_opening\":\"The video uses a cinematic, dark, and moody style with heavy rain and cool blue tones.\",\"shot1_visual_description\":\"A medium close-up shows <Subject 1>, a man in a dark, wet, hooded robe with a geometric pattern, standing in heavy rain against a dark blue background defined by <Subject 3>. The camera remains static as rain streaks fall continuously across the frame. <Subject 2>, the man's face, is visible through the veil of rain, looking slightly upward and to the side with a serious expression. His mouth moves as he speaks, and water droplets cling to the fabric of his hood and shoulders. The lighting is dim and cool, emphasizing the wet texture of his clothing and the density of the rainfall.\"}"
+    },
+    "task": {
+      "ordinal": 6,
+      "clip_uid": "83871dd0401c1f1ce9986ec2",
+      "sample_id": "83871dd0401c1f1ce9986ec2",
+      "sample": {
+        "schema_version": "r2v.v3.production_sample.1",
+        "sample_id": "83871dd0401c1f1ce9986ec2",
+        "clip_uid": "83871dd0401c1f1ce9986ec2",
+        "target_video": "/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/clips_clean_cropped/01/丁宝桢/01 4K/v_b597a0641cf76c22e880_00181.mp4",
+        "t2v_caption": "a man in ornate dark armor with a hooded helmet stands in the rain, his face partially visible beneath a hooded helmet with intricate metallic patterns. Rain falls heavily, streaking down the frame and wetting his armor. The scene is dimly lit with a cool blue tone, emphasizing the downpour. a dark, rainy outdoor scene with vertical rain streaks remains consistent throughout, with no visible changes in the environment. The man’s expression is serious, and his mouth moves slightly as if speaking or reacting to something off-screen. The camera holds a steady close-up, focusing on his upper body and face, capturing the texture of the rain and armor details.",
+        "r2v_instruction": "a man in ornate dark armor with a hooded helmet <Image 1>, with the facial appearance shown in <Image 2> stands in the rain, his face partially visible beneath a hooded helmet with intricate metallic patterns. Rain falls heavily, streaking down the frame and wetting his armor. The scene is dimly lit with a cool blue tone, emphasizing the downpour. a dark, rainy outdoor scene with vertical rain streaks <Image 3> remains consistent throughout, with no visible changes in the environment. The man’s expression is serious, and his mouth moves slightly as if speaking or reacting to something off-screen. The camera holds a steady close-up, focusing on his upper body and face, capturing the texture of the rain and armor details.",
+        "references": [
+          {
+            "image_id": "image_1",
+            "image_index": 1,
+            "kind": "subject",
+            "entity_id": "e1",
+            "attribute_id": null,
+            "owner_entity_id": null,
+            "attribute_type": null,
+            "image_path": "references/visual/shard-000000000-000009999/83871dd0401c1f1ce9986ec2/subject_1.png",
+            "source_frame_index": 18,
+            "scope": "local",
+            "visible_region": "head_shoulders",
+            "synthetic": false
+          },
+          {
+            "image_id": "image_2",
+            "image_index": 2,
+            "kind": "attribute",
+            "entity_id": null,
+            "attribute_id": "a1",
+            "owner_entity_id": "e1",
+            "attribute_type": "face",
+            "image_path": "references/visual/shard-000000000-000009999/83871dd0401c1f1ce9986ec2/attribute_e1_a1_face.png",
+            "source_frame_index": 0,
+            "scope": null,
+            "visible_region": null,
+            "synthetic": false
+          },
+          {
+            "image_id": "image_3",
+            "image_index": 3,
+            "kind": "background",
+            "entity_id": null,
+            "attribute_id": null,
+            "owner_entity_id": null,
+            "attribute_type": null,
+            "image_path": "references/visual/shard-000000000-000009999/83871dd0401c1f1ce9986ec2/background_1.png",
+            "source_frame_index": 64,
+            "scope": "scene",
+            "visible_region": "whole",
+            "synthetic": true
+          }
+        ],
+        "source": {
+          "parent_video_id": "v_b597a0641cf76c22e880",
+          "clip_suffix": "181",
+          "shard_id": "shard-000000000-000009999"
+        }
+      },
+      "target_video_path": "/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/clips_clean_cropped/01/丁宝桢/01 4K/v_b597a0641cf76c22e880_00181.mp4",
+      "pictures": [
+        {
+          "image_id": "image_1",
+          "image_index": 1,
+          "kind": "subject",
+          "entity_id": "e1",
+          "attribute_id": null,
+          "owner_entity_id": null,
+          "attribute_type": null,
+          "image_path": "/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/in_pair_reference/post_mask/group-000000/references/visual/shard-000000000-000009999/83871dd0401c1f1ce9986ec2/subject_1.png",
+          "source_frame_index": 18,
+          "scope": "local",
+          "visible_region": "head_shoulders",
+          "synthetic": false,
+          "picture_label": "<Picture 1>"
+        },
+        {
+          "image_id": "image_2",
+          "image_index": 2,
+          "kind": "attribute",
+          "entity_id": null,
+          "attribute_id": "a1",
+          "owner_entity_id": "e1",
+          "attribute_type": "face",
+          "image_path": "/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/in_pair_reference/post_mask/group-000000/references/visual/shard-000000000-000009999/83871dd0401c1f1ce9986ec2/attribute_e1_a1_face.png",
+          "source_frame_index": 0,
+          "scope": null,
+          "visible_region": null,
+          "synthetic": false,
+          "picture_label": "<Picture 2>"
+        },
+        {
+          "image_id": "image_3",
+          "image_index": 3,
+          "kind": "background",
+          "entity_id": null,
+          "attribute_id": null,
+          "owner_entity_id": null,
+          "attribute_type": null,
+          "image_path": "/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/in_pair_reference/post_mask/group-000000/references/visual/shard-000000000-000009999/83871dd0401c1f1ce9986ec2/background_1.png",
+          "source_frame_index": 64,
+          "scope": "scene",
+          "visible_region": "whole",
+          "synthetic": true,
+          "picture_label": "<Picture 3>"
+        }
+      ],
+      "subjects": [
+        {
+          "subject_index": 1,
+          "subject_label": "<Subject 1>",
+          "kind": "entity",
+          "source_picture_labels": [
+            "<Picture 1>"
+          ],
+          "entity_id": "e1"
+        },
+        {
+          "subject_index": 2,
+          "subject_label": "<Subject 2>",
+          "kind": "attribute",
+          "source_picture_labels": [
+            "<Picture 2>"
+          ],
+          "attribute_id": "a1",
+          "owner_entity_id": "e1",
+          "attribute_type": "face"
+        },
+        {
+          "subject_index": 3,
+          "subject_label": "<Subject 3>",
+          "kind": "background",
+          "source_picture_labels": [
+            "<Picture 3>"
+          ]
+        }
+      ]
+    }
+  },
+  "6107ee1e8a646cccb1583b3f": {
+    "job": {
+      "binding_evidence_mode": "none",
+      "clip_uid": "6107ee1e8a646cccb1583b3f",
+      "r2v_instruction": "a bald man with a long braid and beard wearing a brown traditional robe <Image 1>, with the facial appearance shown in <Image 2> stands in a dimly lit traditional room with wooden panels and dark curtains holding a document, his expression shifting from focused to surprised as he looks up. The lighting is soft and warm, highlighting the texture of his robe and the details of the room behind him. He remains mostly still, with subtle movements of his head and eyes as he processes what he reads.",
+      "reference_images": [
+        {
+          "attribute_id": null,
+          "attribute_type": null,
+          "entity_id": "e1",
+          "image_artifact_path": "/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/in_pair_reference/post_mask/group-000000/references/visual/shard-000000000-000009999/6107ee1e8a646cccb1583b3f/subject_1.png",
+          "image_index": 1,
+          "kind": "subject",
+          "owner_entity_id": null,
+          "picture_label": "<Picture 1>",
+          "source_image_id": "image_1",
+          "source_image_index": 1,
+          "source_image_label": "<Image 1>"
+        },
+        {
+          "attribute_id": "a1",
+          "attribute_type": "face",
+          "entity_id": null,
+          "image_artifact_path": "/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/in_pair_reference/post_mask/group-000000/references/visual/shard-000000000-000009999/6107ee1e8a646cccb1583b3f/attribute_e1_a1_face.png",
+          "image_index": 2,
+          "kind": "attribute",
+          "owner_entity_id": "e1",
+          "picture_label": "<Picture 2>",
+          "source_image_id": "image_2",
+          "source_image_index": 2,
+          "source_image_label": "<Image 2>"
+        }
+      ],
+      "reference_selection": {
+        "dropped_references": [],
+        "face_promotions": [],
+        "original_picture_count": 2,
+        "policy_version": "h3_mimo25_reference_selection_v2",
+        "selected_picture_count": 2,
+        "selected_source_image_ids": [
+          "image_1",
+          "image_2"
+        ],
+        "selected_source_image_indexes": [
+          1,
+          2
+        ]
+      },
+      "reference_subjects": [
+        {
+          "attribute_id": null,
+          "attribute_type": null,
+          "entity_id": "e1",
+          "kind": "entity",
+          "owner_entity_id": null,
+          "source_picture_labels": [
+            "<Picture 1>"
+          ],
+          "subject_index": 1,
+          "subject_label": "<Subject 1>"
+        },
+        {
+          "attribute_id": "a1",
+          "attribute_type": "face",
+          "entity_id": null,
+          "kind": "attribute",
+          "owner_entity_id": "e1",
+          "source_picture_labels": [
+            "<Picture 2>"
+          ],
+          "subject_index": 2,
+          "subject_label": "<Subject 2>"
+        }
+      ],
+      "segments": [],
+      "source_h3_sample_ids": [
+        "6107ee1e8a646cccb1583b3f"
+      ],
+      "target_duration_seconds": 2.9271875,
+      "target_full_audio_path": "/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/R2VA/ra2va-native-group0-pilot10-20261010T034522/groups/group-000000/stages/000001-canonical/attempts/000008/a31452cf090643d9b1c2479363b5427b/canonical/6107ee1e8a646cccb1583b3f/attempt-1jgf7s8h/full.flac",
+      "target_video_path": "/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/clips_clean_cropped/01/丁宝桢/01 4K/v_b597a0641cf76c22e880_00214.mp4"
+    },
+    "record": {
+      "annotation": null,
+      "backend_provenance": {
+        "annotation_schema_version": "r2v.h3.mimo25_av_annotation.20",
+        "audio_finalize_prompt_version": "h3_mimo25_audio_finalize_v6",
+        "backend": "sglang_openai_compatible",
+        "base_url": "http://127.0.0.1:8094/v1",
+        "configuration_fingerprint": "52aeea0d49c6379c19373f34f7902a4097c81edc623330ea5e753c0a0c6826ad",
+        "full_av_recheck_limit": 0,
+        "http_max_attempts": 1,
+        "icl_version": "h3_official_ref2va_detailed_shot1_v4",
+        "materializer_version": "h3_mimo25_materializer_v30",
+        "max_completion_tokens": 32768,
+        "media_base_url": "http://127.0.0.1:8766/",
+        "media_mode": "http",
+        "media_resolution": "default",
+        "media_root": "/mnt/workspace",
+        "model": "mimo-v2.6-flash-rl",
+        "policy_version": "h3_mimo25_av_authority_contract_v18",
+        "prompt_version": "h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity",
+        "response_format": "json_schema",
+        "schema_version": "r2v.h3.mimo25_backend.85",
+        "speaker_marker_polish_prompt_version": "h3_mimo25_speaker_marker_polish_v4",
+        "speaker_profile_prompt_version": "h3_mimo25_speaker_profile_v2",
+        "stream": false,
+        "temperature": 0,
+        "thinking": {
+          "type": "disabled"
+        },
+        "transport": "sglang",
+        "video_fps": 4,
+        "visual_prompt_version": "h3_mimo25_visual_only_v5"
+      },
+      "clip_uid": "6107ee1e8a646cccb1583b3f",
+      "diagnostics": [
+        {
+          "finish_reason": "stop",
+          "http_attempt_count": 1,
+          "input_modality": "target_video_visual_only",
+          "request_error": null,
+          "usage": {
+            "audio_tokens": 19,
+            "cached_tokens": 0,
+            "completion_tokens": 431,
+            "image_tokens": 7020,
+            "prompt_tokens": 41817,
+            "reasoning_tokens": null,
+            "total_tokens": 42248,
+            "video_tokens": 32640
+          },
+          "warnings": [
+            "completion_tokens_details_unavailable"
+          ]
+        },
+        {
+          "finish_reason": "stop",
+          "http_attempt_count": 1,
+          "input_modality": "target_video_joint_av_audio",
+          "request_error": null,
+          "usage": {
+            "audio_tokens": 76,
+            "cached_tokens": 0,
+            "completion_tokens": 432,
+            "image_tokens": null,
+            "prompt_tokens": 36688,
+            "reasoning_tokens": null,
+            "total_tokens": 37120,
+            "video_tokens": 32640
+          },
+          "warnings": [
+            "completion_tokens_details_unavailable",
+            "deterministic_correction_count:av_grounding_evidence_code_deduplication=7"
+          ]
+        }
+      ],
+      "execution": "native",
+      "failure_code": "mimo_structured_output_failed",
+      "failure_issues": [
+        {
+          "code": "segment_inventory_mismatch",
+          "field": "audio_observation.segment_decisions",
+          "message": "joint decisions must exactly follow frozen chronological segment IDs"
+        }
+      ],
+      "failure_reason": "MiMo joint segment inventory differs",
+      "inference_provenance_by_turn": {
+        "joint": {
+          "annotation_schema_version": "r2v.h3.mimo25_av_annotation.20",
+          "audio_finalize_prompt_version": "h3_mimo25_audio_finalize_v6",
+          "backend": "sglang_openai_compatible",
+          "base_url": "http://127.0.0.1:8094/v1",
+          "configuration_fingerprint": "52aeea0d49c6379c19373f34f7902a4097c81edc623330ea5e753c0a0c6826ad",
+          "full_av_recheck_limit": 0,
+          "http_max_attempts": 1,
+          "icl_version": "h3_official_ref2va_detailed_shot1_v4",
+          "materializer_version": "h3_mimo25_materializer_v30",
+          "max_completion_tokens": 32768,
+          "media_base_url": "http://127.0.0.1:8766/",
+          "media_mode": "http",
+          "media_resolution": "default",
+          "media_root": "/mnt/workspace",
+          "model": "mimo-v2.6-flash-rl",
+          "policy_version": "h3_mimo25_av_authority_contract_v18",
+          "prompt_version": "h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity",
+          "response_format": "json_schema",
+          "schema_version": "r2v.h3.mimo25_backend.85",
+          "speaker_marker_polish_prompt_version": "h3_mimo25_speaker_marker_polish_v4",
+          "speaker_profile_prompt_version": "h3_mimo25_speaker_profile_v2",
+          "stream": false,
+          "temperature": 0,
+          "thinking": {
+            "type": "disabled"
+          },
+          "transport": "sglang",
+          "video_fps": 4,
+          "visual_prompt_version": "h3_mimo25_visual_only_v5"
+        },
+        "visual": {
+          "annotation_schema_version": "r2v.h3.mimo25_av_annotation.20",
+          "audio_finalize_prompt_version": "h3_mimo25_audio_finalize_v6",
+          "backend": "sglang_openai_compatible",
+          "base_url": "http://127.0.0.1:8094/v1",
+          "configuration_fingerprint": "52aeea0d49c6379c19373f34f7902a4097c81edc623330ea5e753c0a0c6826ad",
+          "full_av_recheck_limit": 0,
+          "http_max_attempts": 1,
+          "icl_version": "h3_official_ref2va_detailed_shot1_v4",
+          "materializer_version": "h3_mimo25_materializer_v30",
+          "max_completion_tokens": 32768,
+          "media_base_url": "http://127.0.0.1:8766/",
+          "media_mode": "http",
+          "media_resolution": "default",
+          "media_root": "/mnt/workspace",
+          "model": "mimo-v2.6-flash-rl",
+          "policy_version": "h3_mimo25_av_authority_contract_v18",
+          "prompt_version": "h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity",
+          "response_format": "json_schema",
+          "schema_version": "r2v.h3.mimo25_backend.85",
+          "speaker_marker_polish_prompt_version": "h3_mimo25_speaker_marker_polish_v4",
+          "speaker_profile_prompt_version": "h3_mimo25_speaker_profile_v2",
+          "stream": false,
+          "temperature": 0,
+          "thinking": {
+            "type": "disabled"
+          },
+          "transport": "sglang",
+          "video_fps": 4,
+          "visual_prompt_version": "h3_mimo25_visual_only_v5"
+        }
+      },
+      "model_call_count": 2,
+      "new_request_count": 2,
+      "postprocessing_version": "ra2va_group_durable_two_step_v1",
+      "raw_responses": [
+        "{\"segment_views\":[{\"segment_id\":\"segment_0001\",\"visible_entity_ids\":[\"e1\"],\"entity_observations\":[{\"entity_id\":\"e1\",\"visibility\":\"visible\",\"orientation\":\"three_quarter\",\"face_visibility\":\"clear\",\"mouth_visibility\":\"clear\",\"speech_correlated_articulation\":\"not_assessable\"}]}],\"subject_definitions\":[{\"subject_label\":\"<Subject 1>\",\"description\":\"A middle-aged man with a shaved forehead, dark hair pulled back into a long braid, a thin mustache and goatee, wearing a brown sleeveless tunic with gold fasteners over a patterned olive-green long-sleeved shirt.\"},{\"subject_label\":\"<Subject 2>\",\"description\":\"The facial features of <Subject 1>, including the furrowed brow, downcast eyes, thin mustache, goatee, and the small mole near the right temple.\"}],\"visual_retention_analysis\":[{\"subject_label\":\"<Subject 1>\",\"marker\":\"fully_preserved\",\"description\":\"The man's shaved forehead, braid, mustache, goatee, and layered brown-and-olive clothing remain consistent throughout the shot.\"},{\"subject_label\":\"<Subject 2>\",\"marker\":\"fully_preserved\",\"description\":\"The facial features referenced from <Picture 2>, including the furrowed brow, downcast gaze, and mole near the temple, are maintained as the head turns.\"}],\"style_opening\":\"The target video uses a realistic cinematic style with warm, low-key indoor lighting and a shallow depth of field.\",\"shot1_visual_description\":\"A medium close-up shows <Subject 1> standing in a dimly lit room with dark wooden window frames and a blurred green plant in the background. He holds a piece of paper low in the frame, his head bowed as he reads it with a furrowed brow. He then lifts his head, turning his face slightly toward the camera with a tense, questioning expression, his eyes shifting focus. After a brief pause, he lowers his gaze back down toward the paper, his brow remaining furrowed as the camera holds steady on him.\"}",
+        "{\"speech_av\":{\"summary\":\"A medium close-up shows <Subject 1> reading a paper in a dimly lit room, lifting his head with a tense, questioning expression, then lowering his gaze again.\",\"audio_observation\":{\"segment_decisions\":[{ \"segment_id\":\"segment_0001\",\"vocal_composition\":\"single_speaker\",\"resolution\":\"resolved\",\"primary_speaker_group\": \"g1\",\"delivery_style\": null,\"secondary_vocal_activity\": {\"present\": false,\"speaker_relation\": \"none\",\"kind\": null},\"confidence\":  \"high\",\"audio_evidence_codes\": [\"speaker_turn_change\"]}]},\"av_grounding\":{\"segment_groundings\":[{ \"segment_id\":\"segment_0001\",\"primary_speaker_group\": \"g1\",\"binding_status\": \"no_reliable_entity\",\"speech_presentation\": \"uncertain\",\"entity_id\": null,\"confidence\": \"medium\",\"evidence_codes\": [\"no_visible_lip_motion\",\"no_visible_lip_motion\",\"no_visible_lip_motion\",\"no_visible_lip_motion\",\"no_visible_lip_motion\",\"no_visible_lip_motion\",\"no_visible_lip_motion\",\"no_visible_lip_motion\"]}]},\"shot1_caption\":\"A medium close-up shows <Subject 1> standing in a dimly lit room with dark wooden window frames and a blurred green plant in the background. He holds a piece of paper low in the frame, his head bowed as he reads it with a furrowed brow. He then lifts his head, turning his face slightly toward the camera with a tense, questioning expression, his eyes shifting focus. After a brief pause, he lowers his gaze back down toward the paper, his brow remaining furrowed as the camera holds steady on him.\",\"warnings\":[]},\"speaker_voice_profiles\":[],\"audio_finalize\":{\"overall_soundscape\":\"A low, continuous rumble of distant thunder and steady rain fills the room, with occasional sharper claps of thunder rolling through.\",\"non_diegetic_music\":\"A tense, sustained orchestral string drone with a slow, ominous swell builds quietly beneath the scene, adding suspense.\"}}"
+      ],
+      "response_replay_count": 0,
+      "response_sources": {
+        "joint": "/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/R2VA/ra2va-native-group0-pilot10-20261010T034522/groups/group-000000/stages/000007-mimo/attempts/000008/926260739142455088526e8ba082200d/mimo/6107ee1e8a646cccb1583b3f/joint.response.json",
+        "visual": "/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/R2VA/ra2va-native-group0-pilot10-20261010T034522/groups/group-000000/stages/000007-mimo/attempts/000008/926260739142455088526e8ba082200d/mimo/6107ee1e8a646cccb1583b3f/visual.response.json"
+      },
+      "speech_av_raw_response": "{\"speech_av\":{\"summary\":\"A medium close-up shows <Subject 1> reading a paper in a dimly lit room, lifting his head with a tense, questioning expression, then lowering his gaze again.\",\"audio_observation\":{\"segment_decisions\":[{ \"segment_id\":\"segment_0001\",\"vocal_composition\":\"single_speaker\",\"resolution\":\"resolved\",\"primary_speaker_group\": \"g1\",\"delivery_style\": null,\"secondary_vocal_activity\": {\"present\": false,\"speaker_relation\": \"none\",\"kind\": null},\"confidence\":  \"high\",\"audio_evidence_codes\": [\"speaker_turn_change\"]}]},\"av_grounding\":{\"segment_groundings\":[{ \"segment_id\":\"segment_0001\",\"primary_speaker_group\": \"g1\",\"binding_status\": \"no_reliable_entity\",\"speech_presentation\": \"uncertain\",\"entity_id\": null,\"confidence\": \"medium\",\"evidence_codes\": [\"no_visible_lip_motion\",\"no_visible_lip_motion\",\"no_visible_lip_motion\",\"no_visible_lip_motion\",\"no_visible_lip_motion\",\"no_visible_lip_motion\",\"no_visible_lip_motion\",\"no_visible_lip_motion\"]}]},\"shot1_caption\":\"A medium close-up shows <Subject 1> standing in a dimly lit room with dark wooden window frames and a blurred green plant in the background. He holds a piece of paper low in the frame, his head bowed as he reads it with a furrowed brow. He then lifts his head, turning his face slightly toward the camera with a tense, questioning expression, his eyes shifting focus. After a brief pause, he lowers his gaze back down toward the paper, his brow remaining furrowed as the camera holds steady on him.\",\"warnings\":[]},\"speaker_voice_profiles\":[],\"audio_finalize\":{\"overall_soundscape\":\"A low, continuous rumble of distant thunder and steady rain fills the room, with occasional sharper claps of thunder rolling through.\",\"non_diegetic_music\":\"A tense, sustained orchestral string drone with a slow, ominous swell builds quietly beneath the scene, adding suspense.\"}}",
+      "status": "failed",
+      "unresolved_turns": [],
+      "visual_raw_response": "{\"segment_views\":[{\"segment_id\":\"segment_0001\",\"visible_entity_ids\":[\"e1\"],\"entity_observations\":[{\"entity_id\":\"e1\",\"visibility\":\"visible\",\"orientation\":\"three_quarter\",\"face_visibility\":\"clear\",\"mouth_visibility\":\"clear\",\"speech_correlated_articulation\":\"not_assessable\"}]}],\"subject_definitions\":[{\"subject_label\":\"<Subject 1>\",\"description\":\"A middle-aged man with a shaved forehead, dark hair pulled back into a long braid, a thin mustache and goatee, wearing a brown sleeveless tunic with gold fasteners over a patterned olive-green long-sleeved shirt.\"},{\"subject_label\":\"<Subject 2>\",\"description\":\"The facial features of <Subject 1>, including the furrowed brow, downcast eyes, thin mustache, goatee, and the small mole near the right temple.\"}],\"visual_retention_analysis\":[{\"subject_label\":\"<Subject 1>\",\"marker\":\"fully_preserved\",\"description\":\"The man's shaved forehead, braid, mustache, goatee, and layered brown-and-olive clothing remain consistent throughout the shot.\"},{\"subject_label\":\"<Subject 2>\",\"marker\":\"fully_preserved\",\"description\":\"The facial features referenced from <Picture 2>, including the furrowed brow, downcast gaze, and mole near the temple, are maintained as the head turns.\"}],\"style_opening\":\"The target video uses a realistic cinematic style with warm, low-key indoor lighting and a shallow depth of field.\",\"shot1_visual_description\":\"A medium close-up shows <Subject 1> standing in a dimly lit room with dark wooden window frames and a blurred green plant in the background. He holds a piece of paper low in the frame, his head bowed as he reads it with a furrowed brow. He then lifts his head, turning his face slightly toward the camera with a tense, questioning expression, his eyes shifting focus. After a brief pause, he lowers his gaze back down toward the paper, his brow remaining furrowed as the camera holds steady on him.\"}"
+    },
+    "task": {
+      "ordinal": 8,
+      "clip_uid": "6107ee1e8a646cccb1583b3f",
+      "sample_id": "6107ee1e8a646cccb1583b3f",
+      "sample": {
+        "schema_version": "r2v.v3.production_sample.1",
+        "sample_id": "6107ee1e8a646cccb1583b3f",
+        "clip_uid": "6107ee1e8a646cccb1583b3f",
+        "target_video": "/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/clips_clean_cropped/01/丁宝桢/01 4K/v_b597a0641cf76c22e880_00214.mp4",
+        "t2v_caption": "a bald man with a long braid and beard wearing a brown traditional robe stands in a dimly lit traditional room with wooden panels and dark curtains holding a document, his expression shifting from focused to surprised as he looks up. The lighting is soft and warm, highlighting the texture of his robe and the details of the room behind him. He remains mostly still, with subtle movements of his head and eyes as he processes what he reads.",
+        "r2v_instruction": "a bald man with a long braid and beard wearing a brown traditional robe <Image 1>, with the facial appearance shown in <Image 2> stands in a dimly lit traditional room with wooden panels and dark curtains holding a document, his expression shifting from focused to surprised as he looks up. The lighting is soft and warm, highlighting the texture of his robe and the details of the room behind him. He remains mostly still, with subtle movements of his head and eyes as he processes what he reads.",
+        "references": [
+          {
+            "image_id": "image_1",
+            "image_index": 1,
+            "kind": "subject",
+            "entity_id": "e1",
+            "attribute_id": null,
+            "owner_entity_id": null,
+            "attribute_type": null,
+            "image_path": "references/visual/shard-000000000-000009999/6107ee1e8a646cccb1583b3f/subject_1.png",
+            "source_frame_index": 0,
+            "scope": "local",
+            "visible_region": "head_shoulders",
+            "synthetic": false
+          },
+          {
+            "image_id": "image_2",
+            "image_index": 2,
+            "kind": "attribute",
+            "entity_id": null,
+            "attribute_id": "a1",
+            "owner_entity_id": "e1",
+            "attribute_type": "face",
+            "image_path": "references/visual/shard-000000000-000009999/6107ee1e8a646cccb1583b3f/attribute_e1_a1_face.png",
+            "source_frame_index": 8,
+            "scope": null,
+            "visible_region": null,
+            "synthetic": false
+          }
+        ],
+        "source": {
+          "parent_video_id": "v_b597a0641cf76c22e880",
+          "clip_suffix": "214",
+          "shard_id": "shard-000000000-000009999"
+        }
+      },
+      "target_video_path": "/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/clips_clean_cropped/01/丁宝桢/01 4K/v_b597a0641cf76c22e880_00214.mp4",
+      "pictures": [
+        {
+          "image_id": "image_1",
+          "image_index": 1,
+          "kind": "subject",
+          "entity_id": "e1",
+          "attribute_id": null,
+          "owner_entity_id": null,
+          "attribute_type": null,
+          "image_path": "/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/in_pair_reference/post_mask/group-000000/references/visual/shard-000000000-000009999/6107ee1e8a646cccb1583b3f/subject_1.png",
+          "source_frame_index": 0,
+          "scope": "local",
+          "visible_region": "head_shoulders",
+          "synthetic": false,
+          "picture_label": "<Picture 1>"
+        },
+        {
+          "image_id": "image_2",
+          "image_index": 2,
+          "kind": "attribute",
+          "entity_id": null,
+          "attribute_id": "a1",
+          "owner_entity_id": "e1",
+          "attribute_type": "face",
+          "image_path": "/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/in_pair_reference/post_mask/group-000000/references/visual/shard-000000000-000009999/6107ee1e8a646cccb1583b3f/attribute_e1_a1_face.png",
+          "source_frame_index": 8,
+          "scope": null,
+          "visible_region": null,
+          "synthetic": false,
+          "picture_label": "<Picture 2>"
+        }
+      ],
+      "subjects": [
+        {
+          "subject_index": 1,
+          "subject_label": "<Subject 1>",
+          "kind": "entity",
+          "source_picture_labels": [
+            "<Picture 1>"
+          ],
+          "entity_id": "e1"
+        },
+        {
+          "subject_index": 2,
+          "subject_label": "<Subject 2>",
+          "kind": "attribute",
+          "source_picture_labels": [
+            "<Picture 2>"
+          ],
+          "attribute_id": "a1",
+          "owner_entity_id": "e1",
+          "attribute_type": "face"
+        }
+      ]
+    }
+  },
+  "d897696ed13b1ea1b2104ea2": {
+    "job": {
+      "binding_evidence_mode": "none",
+      "clip_uid": "d897696ed13b1ea1b2104ea2",
+      "r2v_instruction": "a dimly lit traditional Chinese courtyard with lanterns and wooden structures a soldier in ornate dark armor with a tall helmet <Image 1> runs through the courtyard, then stops and turns to face a man in a light gray traditional tunic with a long braid <Image 2>. The camera follows closely as they stand side by side, facing forward. a soldier in ornate dark armor with a tall helmet remains still, while a man in a light gray traditional tunic with a long braid turns his head slightly to look at a soldier in ornate dark armor with a tall helmet. The scene is quiet, with soft light from lanterns and candles casting shadows on the stone walls and wooden beams.",
+      "reference_images": [
+        {
+          "attribute_id": null,
+          "attribute_type": null,
+          "entity_id": "e1",
+          "image_artifact_path": "/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/in_pair_reference/post_mask/group-000000/references/visual/shard-000000000-000009999/d897696ed13b1ea1b2104ea2/subject_1.png",
+          "image_index": 1,
+          "kind": "subject",
+          "owner_entity_id": null,
+          "picture_label": "<Picture 1>",
+          "source_image_id": "image_1",
+          "source_image_index": 1,
+          "source_image_label": "<Image 1>"
+        },
+        {
+          "attribute_id": null,
+          "attribute_type": null,
+          "entity_id": "e2",
+          "image_artifact_path": "/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/in_pair_reference/post_mask/group-000000/references/visual/shard-000000000-000009999/d897696ed13b1ea1b2104ea2/subject_2.png",
+          "image_index": 2,
+          "kind": "subject",
+          "owner_entity_id": null,
+          "picture_label": "<Picture 2>",
+          "source_image_id": "image_2",
+          "source_image_index": 2,
+          "source_image_label": "<Image 2>"
+        }
+      ],
+      "reference_selection": {
+        "dropped_references": [],
+        "face_promotions": [],
+        "original_picture_count": 2,
+        "policy_version": "h3_mimo25_reference_selection_v2",
+        "selected_picture_count": 2,
+        "selected_source_image_ids": [
+          "image_1",
+          "image_2"
+        ],
+        "selected_source_image_indexes": [
+          1,
+          2
+        ]
+      },
+      "reference_subjects": [
+        {
+          "attribute_id": null,
+          "attribute_type": null,
+          "entity_id": "e1",
+          "kind": "entity",
+          "owner_entity_id": null,
+          "source_picture_labels": [
+            "<Picture 1>"
+          ],
+          "subject_index": 1,
+          "subject_label": "<Subject 1>"
+        },
+        {
+          "attribute_id": null,
+          "attribute_type": null,
+          "entity_id": "e2",
+          "kind": "entity",
+          "owner_entity_id": null,
+          "source_picture_labels": [
+            "<Picture 2>"
+          ],
+          "subject_index": 2,
+          "subject_label": "<Subject 2>"
+        }
+      ],
+      "segments": [
+        {
+          "asr_language": "Chinese",
+          "asr_status": "transcribed",
+          "asr_text": "懂了，大人。",
+          "cluster_binding_status": "unbound",
+          "competing_visible_speaker_evidence": [],
+          "current_entity_id": null,
+          "direct_anchor_seconds": 0,
+          "direct_support_seconds_by_entity": {},
+          "end_time": 2.2925,
+          "entity_occurrence_id": null,
+          "identity_scope": "unresolved",
+          "overlapping_visible_entities": [],
+          "segment_id": "segment_0001",
+          "source_end_sample": 73360,
+          "source_sample_rate_hz": 32000,
+          "source_speaker_cluster_id": "speaker_0",
+          "source_start_sample": 48400,
+          "start_time": 1.5125
+        },
+        {
+          "asr_language": "Chinese",
+          "asr_status": "transcribed",
+          "asr_text": "裴荣兄回来了。",
+          "cluster_binding_status": "unbound",
+          "competing_visible_speaker_evidence": [],
+          "current_entity_id": null,
+          "direct_anchor_seconds": 0,
+          "direct_support_seconds_by_entity": {},
+          "end_time": 3.5325,
+          "entity_occurrence_id": null,
+          "identity_scope": "unresolved",
+          "overlapping_visible_entities": [],
+          "segment_id": "segment_0002",
+          "source_end_sample": 113040,
+          "source_sample_rate_hz": 32000,
+          "source_speaker_cluster_id": "speaker_0",
+          "source_start_sample": 85520,
+          "start_time": 2.6725
+        },
+        {
+          "asr_language": "Chinese",
+          "asr_status": "transcribed",
+          "asr_text": "回禀大人。",
+          "cluster_binding_status": "unbound",
+          "competing_visible_speaker_evidence": [],
+          "current_entity_id": null,
+          "direct_anchor_seconds": 0,
+          "direct_support_seconds_by_entity": {},
+          "end_time": 4.9125,
+          "entity_occurrence_id": null,
+          "identity_scope": "unresolved",
+          "overlapping_visible_entities": [],
+          "segment_id": "segment_0003",
+          "source_end_sample": 157200,
+          "source_sample_rate_hz": 32000,
+          "source_speaker_cluster_id": "speaker_1",
+          "source_start_sample": 138640,
+          "start_time": 4.3325
+        },
+        {
+          "asr_language": "Chinese",
+          "asr_status": "transcribed",
+          "asr_text": "乱风岗确实有异动。",
+          "cluster_binding_status": "unbound",
+          "competing_visible_speaker_evidence": [],
+          "current_entity_id": null,
+          "direct_anchor_seconds": 0,
+          "direct_support_seconds_by_entity": {},
+          "end_time": 6.8725,
+          "entity_occurrence_id": null,
+          "identity_scope": "unresolved",
+          "overlapping_visible_entities": [],
+          "segment_id": "segment_0004",
+          "source_end_sample": 219920,
+          "source_sample_rate_hz": 32000,
+          "source_speaker_cluster_id": "speaker_1",
+          "source_start_sample": 175760,
+          "start_time": 5.4925
+        },
+        {
+          "asr_language": "Chinese",
+          "asr_status": "transcribed",
+          "asr_text": "刘玉柏的师爷尤大明带人掘空冢起货。",
+          "cluster_binding_status": "unbound",
+          "competing_visible_speaker_evidence": [],
+          "current_entity_id": null,
+          "direct_anchor_seconds": 0,
+          "direct_support_seconds_by_entity": {},
+          "end_time": 9.8525,
+          "entity_occurrence_id": null,
+          "identity_scope": "unresolved",
+          "overlapping_visible_entities": [],
+          "segment_id": "segment_0005",
+          "source_end_sample": 315280,
+          "source_sample_rate_hz": 32000,
+          "source_speaker_cluster_id": "speaker_1",
+          "source_start_sample": 225040,
+          "start_time": 7.0325
+        },
+        {
+          "asr_language": "Chinese",
+          "asr_status": "transcribed",
+          "asr_text": "卑职已留下人继续跟踪，只待大人一声令下，必可将贼人一网打尽。",
+          "cluster_binding_status": "unbound",
+          "competing_visible_speaker_evidence": [],
+          "current_entity_id": null,
+          "direct_anchor_seconds": 0,
+          "direct_support_seconds_by_entity": {},
+          "end_time": 16.0981875,
+          "entity_occurrence_id": null,
+          "identity_scope": "unresolved",
+          "overlapping_visible_entities": [],
+          "segment_id": "segment_0006",
+          "source_end_sample": 515142,
+          "source_sample_rate_hz": 32000,
+          "source_speaker_cluster_id": "speaker_1",
+          "source_start_sample": 349200,
+          "start_time": 10.9125
+        }
+      ],
+      "source_h3_sample_ids": [
+        "d897696ed13b1ea1b2104ea2"
+      ],
+      "target_duration_seconds": 16.0981875,
+      "target_full_audio_path": "/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/R2VA/ra2va-native-group0-pilot10-20261010T034522/groups/group-000000/stages/000001-canonical/attempts/000002/c36d836f93674ee68113227c7be6843e/canonical/d897696ed13b1ea1b2104ea2/attempt-_tuuaxav/full.flac",
+      "target_video_path": "/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/clips_clean_cropped/01/丁宝桢/01 4K/v_b597a0641cf76c22e880_00108.mp4"
+    },
+    "record": {
+      "annotation": {
+        "audio_observation": {
+          "segment_decisions": [
+            {
+              "audio_evidence_codes": [
+                "voice_continuity"
+              ],
+              "confidence": "high",
+              "delivery_style": "brisk, deferential acknowledgment",
+              "primary_speaker_group": "g1",
+              "resolution": "resolved",
+              "secondary_vocal_activity": {
+                "kind": null,
+                "present": false,
+                "speaker_relation": "none"
+              },
+              "segment_id": "segment_0001",
+              "vocal_composition": "single_speaker"
+            },
+            {
+              "audio_evidence_codes": [
+                "voice_continuity"
+              ],
+              "confidence": "high",
+              "delivery_style": "conversational, announcing an arrival",
+              "primary_speaker_group": "g1",
+              "resolution": "resolved",
+              "secondary_vocal_activity": {
+                "kind": null,
+                "present": false,
+                "speaker_relation": "none"
+              },
+              "segment_id": "segment_0002",
+              "vocal_composition": "single_speaker"
+            },
+            {
+              "audio_evidence_codes": [
+                "voice_continuity"
+              ],
+              "confidence": "high",
+              "delivery_style": "formal, respectful report opening",
+              "primary_speaker_group": "g2",
+              "resolution": "resolved",
+              "secondary_vocal_activity": {
+                "kind": null,
+                "present": false,
+                "speaker_relation": "none"
+              },
+              "segment_id": "segment_0003",
+              "vocal_composition": "single_speaker"
+            },
+            {
+              "audio_evidence_codes": [
+                "voice_continuity"
+              ],
+              "confidence": "high",
+              "delivery_style": "steady, reporting tone",
+              "primary_speaker_group": "g2",
+              "resolution": "resolved",
+              "secondary_vocal_activity": {
+                "kind": null,
+                "present": false,
+                "speaker_relation": "none"
+              },
+              "segment_id": "segment_0004",
+              "vocal_composition": "single_speaker"
+            },
+            {
+              "audio_evidence_codes": [
+                "voice_continuity"
+              ],
+              "confidence": "high",
+              "delivery_style": "measured, informative report",
+              "primary_speaker_group": "g2",
+              "resolution": "resolved",
+              "secondary_vocal_activity": {
+                "kind": null,
+                "present": false,
+                "speaker_relation": "none"
+              },
+              "segment_id": "segment_0005",
+              "vocal_composition": "single_speaker"
+            },
+            {
+              "audio_evidence_codes": [
+                "voice_continuity"
+              ],
+              "confidence": "high",
+              "delivery_style": "urgent, resolute request for orders",
+              "primary_speaker_group": "g2",
+              "resolution": "resolved",
+              "secondary_vocal_activity": {
+                "kind": null,
+                "present": false,
+                "speaker_relation": "none"
+              },
+              "segment_id": "segment_0006",
+              "vocal_composition": "single_speaker"
+            }
+          ],
+          "speaker_voice_profiles": [
+            {
+              "speaker_group": "g1",
+              "voice_characteristics": "Mid-register male voice with a clear, slightly bright timbre; brisk, clipped cadence and moderate energy, delivered with a deferential, conversational tone."
+            },
+            {
+              "speaker_group": "g2",
+              "voice_characteristics": "Mid-to-low register male voice with a slightly textured, grounded timbre; steady, deliberate cadence that grows more urgent and energetic toward the end of the report."
+            }
+          ]
+        },
+        "av_grounding": {
+          "segment_groundings": [
+            {
+              "binding_status": "visible_entity",
+              "confidence": "medium",
+              "entity_id": "e1",
+              "evidence_codes": [
+                "av_temporal_alignment",
+                "no_visible_lip_motion"
+              ],
+              "primary_speaker_group": "g1",
+              "segment_id": "segment_0001",
+              "speech_presentation": "onscreen_spoken"
+            },
+            {
+              "binding_status": "visible_entity",
+              "confidence": "medium",
+              "entity_id": "e1",
+              "evidence_codes": [
+                "av_temporal_alignment",
+                "voice_continuity"
+              ],
+              "primary_speaker_group": "g1",
+              "segment_id": "segment_0002",
+              "speech_presentation": "onscreen_spoken"
+            },
+            {
+              "binding_status": "visible_entity",
+              "confidence": "medium",
+              "entity_id": "e2",
+              "evidence_codes": [
+                "av_temporal_alignment",
+                "voice_continuity"
+              ],
+              "primary_speaker_group": "g2",
+              "segment_id": "segment_0003",
+              "speech_presentation": "onscreen_spoken"
+            },
+            {
+              "binding_status": "visible_entity",
+              "confidence": "medium",
+              "entity_id": "e2",
+              "evidence_codes": [
+                "av_temporal_alignment",
+                "voice_continuity"
+              ],
+              "primary_speaker_group": "g2",
+              "segment_id": "segment_0004",
+              "speech_presentation": "onscreen_spoken"
+            },
+            {
+              "binding_status": "visible_entity",
+              "confidence": "medium",
+              "entity_id": "e2",
+              "evidence_codes": [
+                "av_temporal_alignment",
+                "voice_continuity"
+              ],
+              "primary_speaker_group": "g2",
+              "segment_id": "segment_0005",
+              "speech_presentation": "onscreen_spoken"
+            },
+            {
+              "binding_status": "visible_entity",
+              "confidence": "medium",
+              "entity_id": "e2",
+              "evidence_codes": [
+                "av_temporal_alignment",
+                "voice_continuity"
+              ],
+              "primary_speaker_group": "g2",
+              "segment_id": "segment_0006",
+              "speech_presentation": "onscreen_spoken"
+            }
+          ]
+        },
+        "h3_semantics": {
+          "non_diegetic_music": "A tense, low orchestral underscore with sustained strings and deep percussion hits builds through the opening, then recedes into a quiet, ominous drone beneath the dialogue.",
+          "overall_soundscape": "Steady heavy rain falling throughout, with wet splashing and dripping on hard surfaces; occasional low thunder rumbles in the distance. Faint interior room tone with subtle cloth and armor movement rustles as the figures shift.",
+          "shot1_caption": "In a rain-slicked night street lined with traditional buildings and glowing lanterns, <Subject 1> runs toward the camera, his dark studded armor and tall crested helmet catching the light. The camera tracks with him as he rushes past a wooden railing and enters a dimly lit interior hall decorated with painted screens, hanging lanterns, and candle stands. Inside, he slows to a stop and stands with his back to the camera, facing <Subject 2>, who stands with his back turned, showing his shaved forehead and long black queue braid. <Subject 1> (S1) says, <d>[Chinese] 懂了，大人。</d> and adds, <d>[Chinese] 裴荣兄回来了。</d> The camera circles behind them, revealing the hall's ornate wooden lattice windows and calligraphy banners. <Subject 1> turns his head slightly, and the camera shifts to a side angle showing both men in profile: <Subject 2> in his light grey knotted jacket and <Subject 1> in his helmeted armor, standing close together in conversation against the backdrop of the lantern-lit hall and the blue night beyond the doorway. <Subject 2> (S2) reports, <d>[Chinese] 回禀大人。</d> <d>[Chinese] 乱风岗确实有异动。</d> <d>[Chinese] 刘玉柏的师爷尤大明带人掘空冢起货。</d> <d>[Chinese] 卑职已留下人继续跟踪，只待大人一声令下，必可将贼人一网打尽。</d> The shot ends with both men facing forward in a two-shot, <Subject 2> looking slightly to his left with a serious expression while <Subject 1> looks ahead with a faint smile.",
+          "style_opening": "Live-action cinematic period drama with warm lantern and candle lighting against cool blue night exteriors, using shallow depth of field and handheld camera movement.",
+          "subject_definitions": [
+            {
+              "description": "A man wearing dark studded lamellar armor with a tall crested helmet, a round chest medallion, and red trousers.",
+              "subject_label": "<Subject 1>"
+            },
+            {
+              "description": "A man with a shaved forehead and a long black queue braid, wearing a light grey traditional jacket with knotted frog closures.",
+              "subject_label": "<Subject 2>"
+            }
+          ],
+          "summary": "In a lantern-lit hall at night, an armored runner reports to a queue-braided official about suspicious grave-robbing activity, awaiting orders to act.",
+          "visual_retention_analysis": [
+            {
+              "description": "The armored figure's armor, helmet, and build remain consistent across all appearances.",
+              "marker": "fully_preserved",
+              "subject_label": "<Subject 1>"
+            },
+            {
+              "description": "The queue hairstyle, facial profile, and grey jacket remain consistent throughout the clip.",
+              "marker": "fully_preserved",
+              "subject_label": "<Subject 2>"
+            }
+          ]
+        },
+        "schema_version": "r2v.h3.mimo25_av_annotation.20",
+        "visual_observation": {
+          "segment_views": [
+            {
+              "entity_observations": [
+                {
+                  "entity_id": "e1",
+                  "face_visibility": "clear",
+                  "mouth_visibility": "clear",
+                  "orientation": "front",
+                  "speech_correlated_articulation": "uncertain",
+                  "visibility": "visible"
+                }
+              ],
+              "segment_id": "segment_0001",
+              "visible_entity_ids": [
+                "e1"
+              ]
+            },
+            {
+              "entity_observations": [
+                {
+                  "entity_id": "e1",
+                  "face_visibility": "occluded",
+                  "mouth_visibility": "occluded",
+                  "orientation": "back",
+                  "speech_correlated_articulation": "uncertain",
+                  "visibility": "visible"
+                },
+                {
+                  "entity_id": "e2",
+                  "face_visibility": "occluded",
+                  "mouth_visibility": "occluded",
+                  "orientation": "back",
+                  "speech_correlated_articulation": "uncertain",
+                  "visibility": "visible"
+                }
+              ],
+              "segment_id": "segment_0002",
+              "visible_entity_ids": [
+                "e1",
+                "e2"
+              ]
+            },
+            {
+              "entity_observations": [
+                {
+                  "entity_id": "e1",
+                  "face_visibility": "occluded",
+                  "mouth_visibility": "occluded",
+                  "orientation": "back",
+                  "speech_correlated_articulation": "uncertain",
+                  "visibility": "visible"
+                },
+                {
+                  "entity_id": "e2",
+                  "face_visibility": "occluded",
+                  "mouth_visibility": "occluded",
+                  "orientation": "back",
+                  "speech_correlated_articulation": "uncertain",
+                  "visibility": "visible"
+                }
+              ],
+              "segment_id": "segment_0003",
+              "visible_entity_ids": [
+                "e1",
+                "e2"
+              ]
+            },
+            {
+              "entity_observations": [
+                {
+                  "entity_id": "e1",
+                  "face_visibility": "occluded",
+                  "mouth_visibility": "occluded",
+                  "orientation": "back",
+                  "speech_correlated_articulation": "uncertain",
+                  "visibility": "visible"
+                },
+                {
+                  "entity_id": "e2",
+                  "face_visibility": "occluded",
+                  "mouth_visibility": "occluded",
+                  "orientation": "back",
+                  "speech_correlated_articulation": "uncertain",
+                  "visibility": "visible"
+                }
+              ],
+              "segment_id": "segment_0004",
+              "visible_entity_ids": [
+                "e1",
+                "e2"
+              ]
+            },
+            {
+              "entity_observations": [
+                {
+                  "entity_id": "e1",
+                  "face_visibility": "occluded",
+                  "mouth_visibility": "occluded",
+                  "orientation": "back",
+                  "speech_correlated_articulation": "uncertain",
+                  "visibility": "visible"
+                },
+                {
+                  "entity_id": "e2",
+                  "face_visibility": "occluded",
+                  "mouth_visibility": "occluded",
+                  "orientation": "back",
+                  "speech_correlated_articulation": "uncertain",
+                  "visibility": "visible"
+                }
+              ],
+              "segment_id": "segment_0005",
+              "visible_entity_ids": [
+                "e1",
+                "e2"
+              ]
+            },
+            {
+              "entity_observations": [
+                {
+                  "entity_id": "e1",
+                  "face_visibility": "clear",
+                  "mouth_visibility": "clear",
+                  "orientation": "front",
+                  "speech_correlated_articulation": "uncertain",
+                  "visibility": "visible"
+                },
+                {
+                  "entity_id": "e2",
+                  "face_visibility": "clear",
+                  "mouth_visibility": "clear",
+                  "orientation": "front",
+                  "speech_correlated_articulation": "uncertain",
+                  "visibility": "visible"
+                }
+              ],
+              "segment_id": "segment_0006",
+              "visible_entity_ids": [
+                "e1",
+                "e2"
+              ]
+            }
+          ],
+          "visual_blocks": [
+            {
+              "block_id": "v1",
+              "text": "In a rain-slicked night street lined with traditional buildings and glowing lanterns, <Subject 1> runs toward the camera, his dark studded armor and tall crested helmet catching the light. The camera tracks with him as he rushes past a wooden railing and enters a dimly lit interior hall decorated with painted screens, hanging lanterns, and candle stands. Inside, he slows to a stop and stands with his back to the camera, facing <Subject 2>, who stands with his back turned, showing his shaved forehead and long black queue braid. The camera circles behind them, revealing the hall's ornate wooden lattice windows and calligraphy banners. <Subject 1> turns his head slightly, and the camera shifts to a side angle showing both men in profile: <Subject 2> in his light grey knotted jacket and <Subject 1> in his helmeted armor, standing close together in conversation against the backdrop of the lantern-lit hall and the blue night beyond the doorway. The shot ends with both men facing forward in a two-shot, <Subject 2> looking slightly to his left with a serious expression while <Subject 1> looks ahead with a faint smile."
+            }
+          ]
+        },
+        "warnings": []
+      },
+      "backend_provenance": {
+        "annotation_schema_version": "r2v.h3.mimo25_av_annotation.20",
+        "audio_finalize_prompt_version": "h3_mimo25_audio_finalize_v6",
+        "backend": "sglang_openai_compatible",
+        "base_url": "http://127.0.0.1:8094/v1",
+        "configuration_fingerprint": "52aeea0d49c6379c19373f34f7902a4097c81edc623330ea5e753c0a0c6826ad",
+        "full_av_recheck_limit": 0,
+        "http_max_attempts": 1,
+        "icl_version": "h3_official_ref2va_detailed_shot1_v4",
+        "materializer_version": "h3_mimo25_materializer_v30",
+        "max_completion_tokens": 32768,
+        "media_base_url": "http://127.0.0.1:8766/",
+        "media_mode": "http",
+        "media_resolution": "default",
+        "media_root": "/mnt/workspace",
+        "model": "mimo-v2.6-flash-rl",
+        "policy_version": "h3_mimo25_av_authority_contract_v18",
+        "prompt_version": "h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity",
+        "response_format": "json_schema",
+        "schema_version": "r2v.h3.mimo25_backend.85",
+        "speaker_marker_polish_prompt_version": "h3_mimo25_speaker_marker_polish_v4",
+        "speaker_profile_prompt_version": "h3_mimo25_speaker_profile_v2",
+        "stream": false,
+        "temperature": 0,
+        "thinking": {
+          "type": "disabled"
+        },
+        "transport": "sglang",
+        "video_fps": 4,
+        "visual_prompt_version": "h3_mimo25_visual_only_v5"
+      },
+      "clip_uid": "d897696ed13b1ea1b2104ea2",
+      "diagnostics": [
+        {
+          "finish_reason": "stop",
+          "http_attempt_count": 1,
+          "input_modality": "target_video_visual_only",
+          "request_error": null,
+          "usage": {
+            "audio_tokens": 101,
+            "cached_tokens": 0,
+            "completion_tokens": 1034,
+            "image_tokens": 3996,
+            "prompt_tokens": 59794,
+            "reasoning_tokens": null,
+            "total_tokens": 60828,
+            "video_tokens": 53336
+          },
+          "warnings": [
+            "completion_tokens_details_unavailable"
+          ]
+        },
+        {
+          "finish_reason": "stop",
+          "http_attempt_count": 1,
+          "input_modality": "target_video_joint_av_audio",
+          "request_error": null,
+          "usage": {
+            "audio_tokens": 404,
+            "cached_tokens": 0,
+            "completion_tokens": 1877,
+            "image_tokens": null,
+            "prompt_tokens": 59514,
+            "reasoning_tokens": null,
+            "total_tokens": 61391,
+            "video_tokens": 53336
+          },
+          "warnings": [
+            "completion_tokens_details_unavailable"
+          ]
+        }
+      ],
+      "execution": "native",
+      "failure_code": "mimo_structured_output_failed",
+      "failure_issues": [
+        {
+          "code": "visible_entity_binding_not_permitted",
+          "field": "segment_0001",
+          "message": "visible binding requires exact visibility and a positive direct AV cue without explicit source, negative articulation, or competing-speaker contradiction"
+        }
+      ],
+      "failure_reason": "MiMo joint speaker binding contradiction",
+      "inference_provenance_by_turn": {
+        "joint": {
+          "annotation_schema_version": "r2v.h3.mimo25_av_annotation.20",
+          "audio_finalize_prompt_version": "h3_mimo25_audio_finalize_v6",
+          "backend": "sglang_openai_compatible",
+          "base_url": "http://127.0.0.1:8094/v1",
+          "configuration_fingerprint": "52aeea0d49c6379c19373f34f7902a4097c81edc623330ea5e753c0a0c6826ad",
+          "full_av_recheck_limit": 0,
+          "http_max_attempts": 1,
+          "icl_version": "h3_official_ref2va_detailed_shot1_v4",
+          "materializer_version": "h3_mimo25_materializer_v30",
+          "max_completion_tokens": 32768,
+          "media_base_url": "http://127.0.0.1:8766/",
+          "media_mode": "http",
+          "media_resolution": "default",
+          "media_root": "/mnt/workspace",
+          "model": "mimo-v2.6-flash-rl",
+          "policy_version": "h3_mimo25_av_authority_contract_v18",
+          "prompt_version": "h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity",
+          "response_format": "json_schema",
+          "schema_version": "r2v.h3.mimo25_backend.85",
+          "speaker_marker_polish_prompt_version": "h3_mimo25_speaker_marker_polish_v4",
+          "speaker_profile_prompt_version": "h3_mimo25_speaker_profile_v2",
+          "stream": false,
+          "temperature": 0,
+          "thinking": {
+            "type": "disabled"
+          },
+          "transport": "sglang",
+          "video_fps": 4,
+          "visual_prompt_version": "h3_mimo25_visual_only_v5"
+        },
+        "visual": {
+          "annotation_schema_version": "r2v.h3.mimo25_av_annotation.20",
+          "audio_finalize_prompt_version": "h3_mimo25_audio_finalize_v6",
+          "backend": "sglang_openai_compatible",
+          "base_url": "http://127.0.0.1:8094/v1",
+          "configuration_fingerprint": "52aeea0d49c6379c19373f34f7902a4097c81edc623330ea5e753c0a0c6826ad",
+          "full_av_recheck_limit": 0,
+          "http_max_attempts": 1,
+          "icl_version": "h3_official_ref2va_detailed_shot1_v4",
+          "materializer_version": "h3_mimo25_materializer_v30",
+          "max_completion_tokens": 32768,
+          "media_base_url": "http://127.0.0.1:8766/",
+          "media_mode": "http",
+          "media_resolution": "default",
+          "media_root": "/mnt/workspace",
+          "model": "mimo-v2.6-flash-rl",
+          "policy_version": "h3_mimo25_av_authority_contract_v18",
+          "prompt_version": "h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity",
+          "response_format": "json_schema",
+          "schema_version": "r2v.h3.mimo25_backend.85",
+          "speaker_marker_polish_prompt_version": "h3_mimo25_speaker_marker_polish_v4",
+          "speaker_profile_prompt_version": "h3_mimo25_speaker_profile_v2",
+          "stream": false,
+          "temperature": 0,
+          "thinking": {
+            "type": "disabled"
+          },
+          "transport": "sglang",
+          "video_fps": 4,
+          "visual_prompt_version": "h3_mimo25_visual_only_v5"
+        }
+      },
+      "model_call_count": 2,
+      "new_request_count": 2,
+      "postprocessing_version": "ra2va_group_durable_two_step_v1",
+      "raw_responses": [
+        "{\"segment_views\":[{\"segment_id\":\"segment_0001\",\"visible_entity_ids\":[\"e1\"],\"entity_observations\":[{\"entity_id\":\"e1\",\"visibility\":\"visible\",\"orientation\":\"front\",\"face_visibility\":\"clear\",\"mouth_visibility\":\"clear\",\"speech_correlated_articulation\": \"uncertain\"}]},{\"segment_id\":\"segment_0002\",\"visible_entity_ids\":[\"e1\",\"e2\"],\"entity_observations\":[{\"entity_id\":\"e1\",\"visibility\":\"visible\",\"orientation\":\"back\",\"face_visibility\":\"occluded\",\"mouth_visibility\":\"occluded\",\"speech_correlated_articulation\": \"uncertain\"},{\"entity_id\":\"e2\",\"visibility\":\"visible\",\"orientation\":\"back\",\"face_visibility\":\"occluded\",\"mouth_visibility\":\"occluded\",\"speech_correlated_articulation\": \"uncertain\"}]},{\"segment_id\":\"segment_0003\",\"visible_entity_ids\":[\"e1\",\"e2\"],\"entity_observations\":[{\"entity_id\":\"e1\",\"visibility\":\"visible\",\"orientation\":\"back\",\"face_visibility\":\"occluded\",\"mouth_visibility\":\"occluded\",\"speech_correlated_articulation\": \"uncertain\"},{\"entity_id\":\"e2\",\"visibility\":\"visible\",\"orientation\":\"back\",\"face_visibility\":\"occluded\",\"mouth_visibility\":\"occluded\",\"speech_correlated_articulation\": \"uncertain\"}]},{\"segment_id\":\"segment_0004\",\"visible_entity_ids\":[\"e1\",\"e2\"],\"entity_observations\":[{\"entity_id\":\"e1\",\"visibility\":\"visible\",\"orientation\":\"back\",\"face_visibility\":\"occluded\",\"mouth_visibility\":\"occluded\",\"speech_correlated_articulation\": \"uncertain\"},{\"entity_id\":\"e2\",\"visibility\":\"visible\",\"orientation\":\"back\",\"face_visibility\":\"occluded\",\"mouth_visibility\":\"occluded\",\"speech_correlated_articulation\": \"uncertain\"}]},{\"segment_id\":\"segment_0005\",\"visible_entity_ids\":[\"e1\",\"e2\"],\"entity_observations\":[{\"entity_id\":\"e1\",\"visibility\":\"visible\",\"orientation\":\"back\",\"face_visibility\":\"occluded\",\"mouth_visibility\":\"occluded\",\"speech_correlated_articulation\": \"uncertain\"},{\"entity_id\":\"e2\",\"visibility\":\"visible\",\"orientation\":\"back\",\"face_visibility\":\"occluded\",\"mouth_visibility\":\"occluded\",\"speech_correlated_articulation\": \"uncertain\"}]},{\"segment_id\":\"segment_0006\",\"visible_entity_ids\":[\"e1\",\"e2\"],\"entity_observations\":[{\"entity_id\":\"e1\",\"visibility\":\"visible\",\"orientation\":\"front\",\"face_visibility\":\"clear\",\"mouth_visibility\":\"clear\",\"speech_correlated_articulation\": \"uncertain\"},{\"entity_id\":\"e2\",\"visibility\":\"visible\",\"orientation\":\"front\",\"face_visibility\":\"clear\",\"mouth_visibility\":\"clear\",\"speech_correlated_articulation\": \"uncertain\"}]}],\"subject_definitions\":[{\"subject_label\":\"<Subject 1>\",\"description\":\"A man wearing dark studded lamellar armor with a tall crested helmet, a round chest medallion, and red trousers.\"},{\"subject_label\":\"<Subject 2>\",\"description\":\"A man with a shaved forehead and a long black queue braid, wearing a light grey traditional jacket with knotted frog closures.\"}],\"visual_retention_analysis\":[{\"subject_label\":\"<Subject 1>\",\"marker\":\"fully_preserved\",\"description\":\"The armored figure's armor, helmet, and build remain consistent across all appearances.\"},{\"subject_label\":\"<Subject 2>\",\"marker\":\"fully_preserved\",\"description\":\"The queue hairstyle, facial profile, and grey jacket remain consistent throughout the clip.\"}],\"style_opening\":\"Live-action cinematic period drama with warm lantern and candle lighting against cool blue night exteriors, using shallow depth of field and handheld camera movement.\",\"shot1_visual_description\":\"In a rain-slicked night street lined with traditional buildings and glowing lanterns, <Subject 1> runs toward the camera, his dark studded armor and tall crested helmet catching the light. The camera tracks with him as he rushes past a wooden railing and enters a dimly lit interior hall decorated with painted screens, hanging lanterns, and candle stands. Inside, he slows to a stop and stands with his back to the camera, facing <Subject 2>, who stands with his back turned, showing his shaved forehead and long black queue braid. The camera circles behind them, revealing the hall's ornate wooden lattice windows and calligraphy banners. <Subject 1> turns his head slightly, and the camera shifts to a side angle showing both men in profile: <Subject 2> in his light grey knotted jacket and <Subject 1> in his helmeted armor, standing close together in conversation against the backdrop of the lantern-lit hall and the blue night beyond the doorway. The shot ends with both men facing forward in a two-shot, <Subject 2> looking slightly to his left with a serious expression while <Subject 1> looks ahead with a faint smile.\"}",
+        "{\n  \"speech_av\": {\n    \"summary\": \"In a lantern-lit hall at night, an armored runner reports to a queue-braided official about suspicious grave-robbing activity, awaiting orders to act.\",\n    \"audio_observation\": {\n      \"segment_decisions\": [\n        {\n          \"segment_id\": \"segment_0001\",\n          \"vocal_composition\": \"single_speaker\",\n          \"resolution\": \"resolved\",\n          \"primary_speaker_group\": \"g1\",\n          \"delivery_style\": \"brisk, deferential acknowledgment\",\n          \"secondary_vocal_activity\": {\n            \"present\": false\n          ,\n            \"speaker_relation\": \"none\"\n          ,\n            \"kind\": null\n          },\n          \"confidence\":  \t\"high\"\n        ,\n          \"audio_evidence_codes\": [\"voice_continuity\"]\n        },\n        {\n          \"segment_id\": \"segment_0002\",\n          \"vocal_composition\": \"single_speaker\",\n          \"resolution\": \"resolved\",\n          \"primary_speaker_group\": \"g1\",\n          \"delivery_style\": \"conversational, announcing an arrival\",\n          \"secondary_vocal_activity\": {\n            \"present\": false\n          ,\n            \"speaker_relation\": \"none\"\n          ,\n            \"kind\": null\n          },\n          \"confidence\": \"high\",\n          \"audio_evidence_codes\": [\"voice_continuity\"]\n        },\n        {\n          \"segment_id\": \"segment_0003\",\n          \"vocal_composition\": \"single_speaker\",\n          \"resolution\": \"resolved\",\n          \"primary_speaker_group\": \"g2\",\n          \"delivery_style\": \"formal, respectful report opening\",\n          \"secondary_vocal_activity\": {\n            \"present\": false\n          ,\n            \"speaker_relation\": \"none\"\n          ,\n            \"kind\": null\n          },\n          \"confidence\": \"high\",\n          \"audio_evidence_codes\": [\"voice_continuity\"]\n        },\n        {\n          \"segment_id\": \"segment_0004\",\n          \"vocal_composition\": \"single_speaker\",\n          \"resolution\": \"resolved\",\n          \"primary_speaker_group\": \"g2\",\n          \"delivery_style\": \"steady, reporting tone\",\n          \"secondary_vocal_activity\": {\n            \"present\": false\n          ,\n            \"speaker_relation\": \"none\"\n          ,\n            \"kind\": null\n          },\n          \"confidence\": \"high\",\n          \"audio_evidence_codes\": [\"voice_continuity\"]\n        },\n        {\n          \"segment_id\": \"segment_0005\",\n          \"vocal_composition\": \"single_speaker\",\n          \"resolution\": \"resolved\",\n          \"primary_speaker_group\": \"g2\",\n          \"delivery_style\": \"measured, informative report\",\n          \"secondary_vocal_activity\": {\n            \"present\": false\n          ,\n            \"speaker_relation\": \"none\"\n          ,\n            \"kind\": null\n          },\n          \"confidence\": \"high\",\n          \"audio_evidence_codes\": [\"voice_continuity\"]\n        },\n        {\n          \"segment_id\": \"segment_0006\",\n          \"vocal_composition\": \"single_speaker\",\n          \"resolution\": \"resolved\",\n          \"primary_speaker_group\": \"g2\",\n          \"delivery_style\": \"urgent, resolute request for orders\",\n          \"secondary_vocal_activity\": {\n            \"present\": false\n          ,\n            \"speaker_relation\": \"none\"\n          ,\n            \"kind\": null\n          },\n          \"confidence\": \"high\",\n          \"audio_evidence_codes\": [\"voice_continuity\"]\n        }\n      ]\n    },\n    \"av_grounding\": {\n      \"segment_groundings\": [\n        {\n          \"segment_id\": \"segment_0001\",\n          \"primary_speaker_group\": \"g1\",\n          \"binding_status\": \"visible_entity\",\n          \"speech_presentation\": \"onscreen_spoken\",\n          \"entity_id\": \"e1\",\n          \"confidence\": \"medium\",\n          \"evidence_codes\": [\"av_temporal_alignment\", \"no_visible_lip_motion\"]\n        },\n        {\n          \"segment_id\": \"segment_0002\",\n          \"primary_speaker_group\": \"g1\",\n          \"binding_status\": \"visible_entity\",\n          \"speech_presentation\": \"onscreen_spoken\",\n          \"entity_id\": \"e1\",\n          \"confidence\": \"medium\",\n          \"evidence_codes\": [\"av_temporal_alignment\", \"voice_continuity\"]\n        },\n        {\n          \"segment_id\": \"segment_0003\",\n          \"primary_speaker_group\": \"g2\",\n          \"binding_status\": \"visible_entity\",\n          \"speech_presentation\": \"onscreen_spoken\",\n          \"entity_id\": \"e2\",\n          \"confidence\": \"medium\",\n          \"evidence_codes\": [\"av_temporal_alignment\", \"voice_continuity\"]\n        },\n        {\n          \"segment_id\": \"segment_0004\",\n          \"primary_speaker_group\": \"g2\",\n          \"binding_status\": \"visible_entity\",\n          \"speech_presentation\": \"onscreen_spoken\",\n          \"entity_id\": \"e2\",\n          \"confidence\": \"medium\",\n          \"evidence_codes\": [\"av_temporal_alignment\", \"voice_continuity\"]\n        },\n        {\n          \"segment_id\": \"segment_0005\",\n          \"primary_speaker_group\": \"g2\",\n          \"binding_status\": \"visible_entity\",\n          \"speech_presentation\": \"onscreen_spoken\",\n          \"entity_id\": \"e2\",\n          \"confidence\": \"medium\",\n          \"evidence_codes\": [\"av_temporal_alignment\", \"voice_continuity\"]\n        },\n        {\n          \"segment_id\": \"segment_0006\",\n          \"primary_speaker_group\": \"g2\",\n          \"binding_status\": \"visible_entity\",\n          \"speech_presentation\": \"onscreen_spoken\",\n          \"entity_id\": \"e2\",\n          \"confidence\": \"medium\",\n          \"evidence_codes\": [\"av_temporal_alignment\", \"voice_continuity\"]\n        }\n      ]\n    },\n    \"shot1_caption\": \"In a rain-slicked night street lined with traditional buildings and glowing lanterns, <Subject 1> runs toward the camera, his dark studded armor and tall crested helmet catching the light. The camera tracks with him as he rushes past a wooden railing and enters a dimly lit interior hall decorated with painted screens, hanging lanterns, and candle stands. Inside, he slows to a stop and stands with his back to the camera, facing <Subject 2>, who stands with his back turned, showing his shaved forehead and long black queue braid. <Subject 1> (S1) says, <d>[Chinese] 懂了，大人。</d> and adds, <d>[Chinese] 裴荣兄回来了。</d> The camera circles behind them, revealing the hall's ornate wooden lattice windows and calligraphy banners. <Subject 1> turns his head slightly, and the camera shifts to a side angle showing both men in profile: <Subject 2> in his light grey knotted jacket and <Subject 1> in his helmeted armor, standing close together in conversation against the backdrop of the lantern-lit hall and the blue night beyond the doorway. <Subject 2> (S2) reports, <d>[Chinese] 回禀大人。</d> <d>[Chinese] 乱风岗确实有异动。</d> <d>[Chinese] 刘玉柏的师爷尤大明带人掘空冢起货。</d> <d>[Chinese] 卑职已留下人继续跟踪，只待大人一声令下，必可将贼人一网打尽。</d> The shot ends with both men facing forward in a two-shot, <Subject 2> looking slightly to his left with a serious expression while <Subject 1> looks ahead with a faint smile.\",\n    \"warnings\": []\n  },\n  \"speaker_voice_profiles\": [\n    {\n      \"speaker_group\": \"g1\",\n      \"voice_characteristics\": \"Mid-register male voice with a clear, slightly bright timbre; brisk, clipped cadence and moderate energy, delivered with a deferential, conversational tone.\"\n    },\n    {\n      \"speaker_group\": \"g2\",\n      \"voice_characteristics\": \"Mid-to-low register male voice with a slightly textured, grounded timbre; steady, deliberate cadence that grows more urgent and energetic toward the end of the report.\"\n    }\n  ],\n  \"audio_finalize\": {\n    \"overall_soundscape\": \"Steady heavy rain falling throughout, with wet splashing and dripping on hard surfaces; occasional low thunder rumbles in the distance. Faint interior room tone with subtle cloth and armor movement rustles as the figures shift.\",\n    \"non_diegetic_music\": \"A tense, low orchestral underscore with sustained strings and deep percussion hits builds through the opening, then recedes into a quiet, ominous drone beneath the dialogue.\"\n  }\n}"
+      ],
+      "response_replay_count": 0,
+      "response_sources": {
+        "joint": "/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/R2VA/ra2va-native-group0-pilot10-20261010T034522/groups/group-000000/stages/000007-mimo/attempts/000002/5daf82f3f98a463e818805b05364bb9c/mimo/d897696ed13b1ea1b2104ea2/joint.response.json",
+        "visual": "/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/R2VA/ra2va-native-group0-pilot10-20261010T034522/groups/group-000000/stages/000007-mimo/attempts/000002/5daf82f3f98a463e818805b05364bb9c/mimo/d897696ed13b1ea1b2104ea2/visual.response.json"
+      },
+      "speech_av_raw_response": "{\n  \"speech_av\": {\n    \"summary\": \"In a lantern-lit hall at night, an armored runner reports to a queue-braided official about suspicious grave-robbing activity, awaiting orders to act.\",\n    \"audio_observation\": {\n      \"segment_decisions\": [\n        {\n          \"segment_id\": \"segment_0001\",\n          \"vocal_composition\": \"single_speaker\",\n          \"resolution\": \"resolved\",\n          \"primary_speaker_group\": \"g1\",\n          \"delivery_style\": \"brisk, deferential acknowledgment\",\n          \"secondary_vocal_activity\": {\n            \"present\": false\n          ,\n            \"speaker_relation\": \"none\"\n          ,\n            \"kind\": null\n          },\n          \"confidence\":  \t\"high\"\n        ,\n          \"audio_evidence_codes\": [\"voice_continuity\"]\n        },\n        {\n          \"segment_id\": \"segment_0002\",\n          \"vocal_composition\": \"single_speaker\",\n          \"resolution\": \"resolved\",\n          \"primary_speaker_group\": \"g1\",\n          \"delivery_style\": \"conversational, announcing an arrival\",\n          \"secondary_vocal_activity\": {\n            \"present\": false\n          ,\n            \"speaker_relation\": \"none\"\n          ,\n            \"kind\": null\n          },\n          \"confidence\": \"high\",\n          \"audio_evidence_codes\": [\"voice_continuity\"]\n        },\n        {\n          \"segment_id\": \"segment_0003\",\n          \"vocal_composition\": \"single_speaker\",\n          \"resolution\": \"resolved\",\n          \"primary_speaker_group\": \"g2\",\n          \"delivery_style\": \"formal, respectful report opening\",\n          \"secondary_vocal_activity\": {\n            \"present\": false\n          ,\n            \"speaker_relation\": \"none\"\n          ,\n            \"kind\": null\n          },\n          \"confidence\": \"high\",\n          \"audio_evidence_codes\": [\"voice_continuity\"]\n        },\n        {\n          \"segment_id\": \"segment_0004\",\n          \"vocal_composition\": \"single_speaker\",\n          \"resolution\": \"resolved\",\n          \"primary_speaker_group\": \"g2\",\n          \"delivery_style\": \"steady, reporting tone\",\n          \"secondary_vocal_activity\": {\n            \"present\": false\n          ,\n            \"speaker_relation\": \"none\"\n          ,\n            \"kind\": null\n          },\n          \"confidence\": \"high\",\n          \"audio_evidence_codes\": [\"voice_continuity\"]\n        },\n        {\n          \"segment_id\": \"segment_0005\",\n          \"vocal_composition\": \"single_speaker\",\n          \"resolution\": \"resolved\",\n          \"primary_speaker_group\": \"g2\",\n          \"delivery_style\": \"measured, informative report\",\n          \"secondary_vocal_activity\": {\n            \"present\": false\n          ,\n            \"speaker_relation\": \"none\"\n          ,\n            \"kind\": null\n          },\n          \"confidence\": \"high\",\n          \"audio_evidence_codes\": [\"voice_continuity\"]\n        },\n        {\n          \"segment_id\": \"segment_0006\",\n          \"vocal_composition\": \"single_speaker\",\n          \"resolution\": \"resolved\",\n          \"primary_speaker_group\": \"g2\",\n          \"delivery_style\": \"urgent, resolute request for orders\",\n          \"secondary_vocal_activity\": {\n            \"present\": false\n          ,\n            \"speaker_relation\": \"none\"\n          ,\n            \"kind\": null\n          },\n          \"confidence\": \"high\",\n          \"audio_evidence_codes\": [\"voice_continuity\"]\n        }\n      ]\n    },\n    \"av_grounding\": {\n      \"segment_groundings\": [\n        {\n          \"segment_id\": \"segment_0001\",\n          \"primary_speaker_group\": \"g1\",\n          \"binding_status\": \"visible_entity\",\n          \"speech_presentation\": \"onscreen_spoken\",\n          \"entity_id\": \"e1\",\n          \"confidence\": \"medium\",\n          \"evidence_codes\": [\"av_temporal_alignment\", \"no_visible_lip_motion\"]\n        },\n        {\n          \"segment_id\": \"segment_0002\",\n          \"primary_speaker_group\": \"g1\",\n          \"binding_status\": \"visible_entity\",\n          \"speech_presentation\": \"onscreen_spoken\",\n          \"entity_id\": \"e1\",\n          \"confidence\": \"medium\",\n          \"evidence_codes\": [\"av_temporal_alignment\", \"voice_continuity\"]\n        },\n        {\n          \"segment_id\": \"segment_0003\",\n          \"primary_speaker_group\": \"g2\",\n          \"binding_status\": \"visible_entity\",\n          \"speech_presentation\": \"onscreen_spoken\",\n          \"entity_id\": \"e2\",\n          \"confidence\": \"medium\",\n          \"evidence_codes\": [\"av_temporal_alignment\", \"voice_continuity\"]\n        },\n        {\n          \"segment_id\": \"segment_0004\",\n          \"primary_speaker_group\": \"g2\",\n          \"binding_status\": \"visible_entity\",\n          \"speech_presentation\": \"onscreen_spoken\",\n          \"entity_id\": \"e2\",\n          \"confidence\": \"medium\",\n          \"evidence_codes\": [\"av_temporal_alignment\", \"voice_continuity\"]\n        },\n        {\n          \"segment_id\": \"segment_0005\",\n          \"primary_speaker_group\": \"g2\",\n          \"binding_status\": \"visible_entity\",\n          \"speech_presentation\": \"onscreen_spoken\",\n          \"entity_id\": \"e2\",\n          \"confidence\": \"medium\",\n          \"evidence_codes\": [\"av_temporal_alignment\", \"voice_continuity\"]\n        },\n        {\n          \"segment_id\": \"segment_0006\",\n          \"primary_speaker_group\": \"g2\",\n          \"binding_status\": \"visible_entity\",\n          \"speech_presentation\": \"onscreen_spoken\",\n          \"entity_id\": \"e2\",\n          \"confidence\": \"medium\",\n          \"evidence_codes\": [\"av_temporal_alignment\", \"voice_continuity\"]\n        }\n      ]\n    },\n    \"shot1_caption\": \"In a rain-slicked night street lined with traditional buildings and glowing lanterns, <Subject 1> runs toward the camera, his dark studded armor and tall crested helmet catching the light. The camera tracks with him as he rushes past a wooden railing and enters a dimly lit interior hall decorated with painted screens, hanging lanterns, and candle stands. Inside, he slows to a stop and stands with his back to the camera, facing <Subject 2>, who stands with his back turned, showing his shaved forehead and long black queue braid. <Subject 1> (S1) says, <d>[Chinese] 懂了，大人。</d> and adds, <d>[Chinese] 裴荣兄回来了。</d> The camera circles behind them, revealing the hall's ornate wooden lattice windows and calligraphy banners. <Subject 1> turns his head slightly, and the camera shifts to a side angle showing both men in profile: <Subject 2> in his light grey knotted jacket and <Subject 1> in his helmeted armor, standing close together in conversation against the backdrop of the lantern-lit hall and the blue night beyond the doorway. <Subject 2> (S2) reports, <d>[Chinese] 回禀大人。</d> <d>[Chinese] 乱风岗确实有异动。</d> <d>[Chinese] 刘玉柏的师爷尤大明带人掘空冢起货。</d> <d>[Chinese] 卑职已留下人继续跟踪，只待大人一声令下，必可将贼人一网打尽。</d> The shot ends with both men facing forward in a two-shot, <Subject 2> looking slightly to his left with a serious expression while <Subject 1> looks ahead with a faint smile.\",\n    \"warnings\": []\n  },\n  \"speaker_voice_profiles\": [\n    {\n      \"speaker_group\": \"g1\",\n      \"voice_characteristics\": \"Mid-register male voice with a clear, slightly bright timbre; brisk, clipped cadence and moderate energy, delivered with a deferential, conversational tone.\"\n    },\n    {\n      \"speaker_group\": \"g2\",\n      \"voice_characteristics\": \"Mid-to-low register male voice with a slightly textured, grounded timbre; steady, deliberate cadence that grows more urgent and energetic toward the end of the report.\"\n    }\n  ],\n  \"audio_finalize\": {\n    \"overall_soundscape\": \"Steady heavy rain falling throughout, with wet splashing and dripping on hard surfaces; occasional low thunder rumbles in the distance. Faint interior room tone with subtle cloth and armor movement rustles as the figures shift.\",\n    \"non_diegetic_music\": \"A tense, low orchestral underscore with sustained strings and deep percussion hits builds through the opening, then recedes into a quiet, ominous drone beneath the dialogue.\"\n  }\n}",
+      "status": "failed",
+      "unresolved_turns": [],
+      "visual_raw_response": "{\"segment_views\":[{\"segment_id\":\"segment_0001\",\"visible_entity_ids\":[\"e1\"],\"entity_observations\":[{\"entity_id\":\"e1\",\"visibility\":\"visible\",\"orientation\":\"front\",\"face_visibility\":\"clear\",\"mouth_visibility\":\"clear\",\"speech_correlated_articulation\": \"uncertain\"}]},{\"segment_id\":\"segment_0002\",\"visible_entity_ids\":[\"e1\",\"e2\"],\"entity_observations\":[{\"entity_id\":\"e1\",\"visibility\":\"visible\",\"orientation\":\"back\",\"face_visibility\":\"occluded\",\"mouth_visibility\":\"occluded\",\"speech_correlated_articulation\": \"uncertain\"},{\"entity_id\":\"e2\",\"visibility\":\"visible\",\"orientation\":\"back\",\"face_visibility\":\"occluded\",\"mouth_visibility\":\"occluded\",\"speech_correlated_articulation\": \"uncertain\"}]},{\"segment_id\":\"segment_0003\",\"visible_entity_ids\":[\"e1\",\"e2\"],\"entity_observations\":[{\"entity_id\":\"e1\",\"visibility\":\"visible\",\"orientation\":\"back\",\"face_visibility\":\"occluded\",\"mouth_visibility\":\"occluded\",\"speech_correlated_articulation\": \"uncertain\"},{\"entity_id\":\"e2\",\"visibility\":\"visible\",\"orientation\":\"back\",\"face_visibility\":\"occluded\",\"mouth_visibility\":\"occluded\",\"speech_correlated_articulation\": \"uncertain\"}]},{\"segment_id\":\"segment_0004\",\"visible_entity_ids\":[\"e1\",\"e2\"],\"entity_observations\":[{\"entity_id\":\"e1\",\"visibility\":\"visible\",\"orientation\":\"back\",\"face_visibility\":\"occluded\",\"mouth_visibility\":\"occluded\",\"speech_correlated_articulation\": \"uncertain\"},{\"entity_id\":\"e2\",\"visibility\":\"visible\",\"orientation\":\"back\",\"face_visibility\":\"occluded\",\"mouth_visibility\":\"occluded\",\"speech_correlated_articulation\": \"uncertain\"}]},{\"segment_id\":\"segment_0005\",\"visible_entity_ids\":[\"e1\",\"e2\"],\"entity_observations\":[{\"entity_id\":\"e1\",\"visibility\":\"visible\",\"orientation\":\"back\",\"face_visibility\":\"occluded\",\"mouth_visibility\":\"occluded\",\"speech_correlated_articulation\": \"uncertain\"},{\"entity_id\":\"e2\",\"visibility\":\"visible\",\"orientation\":\"back\",\"face_visibility\":\"occluded\",\"mouth_visibility\":\"occluded\",\"speech_correlated_articulation\": \"uncertain\"}]},{\"segment_id\":\"segment_0006\",\"visible_entity_ids\":[\"e1\",\"e2\"],\"entity_observations\":[{\"entity_id\":\"e1\",\"visibility\":\"visible\",\"orientation\":\"front\",\"face_visibility\":\"clear\",\"mouth_visibility\":\"clear\",\"speech_correlated_articulation\": \"uncertain\"},{\"entity_id\":\"e2\",\"visibility\":\"visible\",\"orientation\":\"front\",\"face_visibility\":\"clear\",\"mouth_visibility\":\"clear\",\"speech_correlated_articulation\": \"uncertain\"}]}],\"subject_definitions\":[{\"subject_label\":\"<Subject 1>\",\"description\":\"A man wearing dark studded lamellar armor with a tall crested helmet, a round chest medallion, and red trousers.\"},{\"subject_label\":\"<Subject 2>\",\"description\":\"A man with a shaved forehead and a long black queue braid, wearing a light grey traditional jacket with knotted frog closures.\"}],\"visual_retention_analysis\":[{\"subject_label\":\"<Subject 1>\",\"marker\":\"fully_preserved\",\"description\":\"The armored figure's armor, helmet, and build remain consistent across all appearances.\"},{\"subject_label\":\"<Subject 2>\",\"marker\":\"fully_preserved\",\"description\":\"The queue hairstyle, facial profile, and grey jacket remain consistent throughout the clip.\"}],\"style_opening\":\"Live-action cinematic period drama with warm lantern and candle lighting against cool blue night exteriors, using shallow depth of field and handheld camera movement.\",\"shot1_visual_description\":\"In a rain-slicked night street lined with traditional buildings and glowing lanterns, <Subject 1> runs toward the camera, his dark studded armor and tall crested helmet catching the light. The camera tracks with him as he rushes past a wooden railing and enters a dimly lit interior hall decorated with painted screens, hanging lanterns, and candle stands. Inside, he slows to a stop and stands with his back to the camera, facing <Subject 2>, who stands with his back turned, showing his shaved forehead and long black queue braid. The camera circles behind them, revealing the hall's ornate wooden lattice windows and calligraphy banners. <Subject 1> turns his head slightly, and the camera shifts to a side angle showing both men in profile: <Subject 2> in his light grey knotted jacket and <Subject 1> in his helmeted armor, standing close together in conversation against the backdrop of the lantern-lit hall and the blue night beyond the doorway. The shot ends with both men facing forward in a two-shot, <Subject 2> looking slightly to his left with a serious expression while <Subject 1> looks ahead with a faint smile.\"}"
+    },
+    "task": {
+      "ordinal": 2,
+      "clip_uid": "d897696ed13b1ea1b2104ea2",
+      "sample_id": "d897696ed13b1ea1b2104ea2",
+      "sample": {
+        "schema_version": "r2v.v3.production_sample.1",
+        "sample_id": "d897696ed13b1ea1b2104ea2",
+        "clip_uid": "d897696ed13b1ea1b2104ea2",
+        "target_video": "/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/clips_clean_cropped/01/丁宝桢/01 4K/v_b597a0641cf76c22e880_00108.mp4",
+        "t2v_caption": "a dimly lit traditional Chinese courtyard with lanterns and wooden structures a soldier in ornate dark armor with a tall helmet runs through the courtyard, then stops and turns to face a man in a light gray traditional tunic with a long braid. The camera follows closely as they stand side by side, facing forward. a soldier in ornate dark armor with a tall helmet remains still, while a man in a light gray traditional tunic with a long braid turns his head slightly to look at a soldier in ornate dark armor with a tall helmet. The scene is quiet, with soft light from lanterns and candles casting shadows on the stone walls and wooden beams.",
+        "r2v_instruction": "a dimly lit traditional Chinese courtyard with lanterns and wooden structures a soldier in ornate dark armor with a tall helmet <Image 1> runs through the courtyard, then stops and turns to face a man in a light gray traditional tunic with a long braid <Image 2>. The camera follows closely as they stand side by side, facing forward. a soldier in ornate dark armor with a tall helmet remains still, while a man in a light gray traditional tunic with a long braid turns his head slightly to look at a soldier in ornate dark armor with a tall helmet. The scene is quiet, with soft light from lanterns and candles casting shadows on the stone walls and wooden beams.",
+        "references": [
+          {
+            "image_id": "image_1",
+            "image_index": 1,
+            "kind": "subject",
+            "entity_id": "e1",
+            "attribute_id": null,
+            "owner_entity_id": null,
+            "attribute_type": null,
+            "image_path": "references/visual/shard-000000000-000009999/d897696ed13b1ea1b2104ea2/subject_1.png",
+            "source_frame_index": 0,
+            "scope": "local",
+            "visible_region": "upper_body",
+            "synthetic": false
+          },
+          {
+            "image_id": "image_2",
+            "image_index": 2,
+            "kind": "subject",
+            "entity_id": "e2",
+            "attribute_id": null,
+            "owner_entity_id": null,
+            "attribute_type": null,
+            "image_path": "references/visual/shard-000000000-000009999/d897696ed13b1ea1b2104ea2/subject_2.png",
+            "source_frame_index": 358,
+            "scope": "local",
+            "visible_region": "head_shoulders",
+            "synthetic": false
+          }
+        ],
+        "source": {
+          "parent_video_id": "v_b597a0641cf76c22e880",
+          "clip_suffix": "108",
+          "shard_id": "shard-000000000-000009999"
+        }
+      },
+      "target_video_path": "/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/clips_clean_cropped/01/丁宝桢/01 4K/v_b597a0641cf76c22e880_00108.mp4",
+      "pictures": [
+        {
+          "image_id": "image_1",
+          "image_index": 1,
+          "kind": "subject",
+          "entity_id": "e1",
+          "attribute_id": null,
+          "owner_entity_id": null,
+          "attribute_type": null,
+          "image_path": "/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/in_pair_reference/post_mask/group-000000/references/visual/shard-000000000-000009999/d897696ed13b1ea1b2104ea2/subject_1.png",
+          "source_frame_index": 0,
+          "scope": "local",
+          "visible_region": "upper_body",
+          "synthetic": false,
+          "picture_label": "<Picture 1>"
+        },
+        {
+          "image_id": "image_2",
+          "image_index": 2,
+          "kind": "subject",
+          "entity_id": "e2",
+          "attribute_id": null,
+          "owner_entity_id": null,
+          "attribute_type": null,
+          "image_path": "/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/in_pair_reference/post_mask/group-000000/references/visual/shard-000000000-000009999/d897696ed13b1ea1b2104ea2/subject_2.png",
+          "source_frame_index": 358,
+          "scope": "local",
+          "visible_region": "head_shoulders",
+          "synthetic": false,
+          "picture_label": "<Picture 2>"
+        }
+      ],
+      "subjects": [
+        {
+          "subject_index": 1,
+          "subject_label": "<Subject 1>",
+          "kind": "entity",
+          "source_picture_labels": [
+            "<Picture 1>"
+          ],
+          "entity_id": "e1"
+        },
+        {
+          "subject_index": 2,
+          "subject_label": "<Subject 2>",
+          "kind": "entity",
+          "source_picture_labels": [
+            "<Picture 2>"
+          ],
+          "entity_id": "e2"
+        }
+      ]
+    }
+  }
+}
