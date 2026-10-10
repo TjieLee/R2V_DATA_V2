@@ -834,6 +834,10 @@ def _two_step_speaker_markers(
     subjects = {s.subject_label: s.entity_id for s in job.reference_subjects if s.kind == "entity"}
     pieces, inserted = [], 0
     for (lead, boundary), block, fact in zip(leads, blocks, speech, strict=True):
+        last_clause = re.split(r"[.!?]\s+", lead)[-1].strip()
+        actors = re.findall(r"(?:^|\b(?:where|while|as|and)\s+)(<Subject [1-9]\d*>)", last_clause)
+        if actors and (fact.entity_id is None or subjects.get(actors[-1]) != fact.entity_id):
+            ambiguous()
         if not boundary or re.search(r"\(S[1-9]\d*\)", lead):
             pieces.extend((lead, block.group()))
             continue
@@ -845,11 +849,11 @@ def _two_step_speaker_markers(
         if clause is None:
             # The ordered ASR slot already identifies gN/Sx. Only rule out an
             # explicit incompatible actor; do not parse an open-ended verb list.
-            last_clause = re.split(r"[.!?]\s+", lead)[-1].strip()
             labels = {label for label in re.findall(r"<Subject [1-9]\d*>", last_clause) if label in subjects}
             neutral = re.match(r"(?:A voice|The voice|An unidentified voice|An off-?screen voice)\b", last_clause)
             if labels:
-                if fact.entity_id is None or {subjects[label] for label in labels} != {fact.entity_id}:
+                if (not actors or fact.entity_id is None
+                        or {subjects[label] for label in labels} != {fact.entity_id}):
                     ambiguous()
             elif not neutral and (len({s.entity_id for s in speech}) != 1 or fact.entity_id is None
                                   or not re.match(r"(?:He|She|They)\b", last_clause)):

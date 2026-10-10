@@ -102,7 +102,8 @@ def test_uncertain_audio_with_stable_group_is_identity_restricted_not_promoted()
         assert not two_step_identity_restricted_groups(annotation, SimpleNamespace(prompt_version=prompt))
 
 
-def test_marker_does_not_infer_actor_from_last_mentioned_subject(tmp_path):
+@pytest.mark.parametrize("conflict", ["different_actor", "object_mention", "continuation_actor"])
+def test_marker_does_not_infer_actor_from_subject_mention(tmp_path, conflict):
     from r2v_data_v2.h3.mimo25_h3_materializer import (
         MimoH3MaterializationContractError,
         _audio_facts,
@@ -111,8 +112,15 @@ def test_marker_does_not_infer_actor_from_last_mentioned_subject(tmp_path):
     )
     from tests.test_h3_audio_reuse_materializer import _case
 
-    caption = "<Subject 3> quietly questions <Subject 1>, <d>[English] Exact, text!</d>"
-    _, sample, source = _case(tmp_path, ("g1",), caption=caption, all_visible=True)
+    groups = ("g1", "g1", "g2") if conflict == "continuation_actor" else ("g1",)
+    caption = {
+        "different_actor": "<Subject 3> quietly questions <Subject 1>, <d>[English] Exact, text!</d>",
+        "object_mention": "A different man standing next to <Subject 1> quietly replies, <d>[English] Exact, text!</d>",
+        "continuation_actor": ("<Subject 1> says, <d>[English] Exact, text!</d>. "
+                               "<Subject 3> asks, <d>[English] Exact, text!</d>. "
+                               "A voice replies, <d>[English] Exact, text!</d>"),
+    }[conflict]
+    _, sample, source = _case(tmp_path, groups, caption=caption)
     record = source.record.model_copy(update={"source_backend_provenance": SimpleNamespace(
         prompt_version="h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity")})
     context = _prepare_materialization_context(sample, source.job, record, reuse_audio_contracts=[])
