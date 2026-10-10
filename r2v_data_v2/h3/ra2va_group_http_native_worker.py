@@ -164,8 +164,7 @@ class NativeStageExecution:
 
     def __exit__(self, *args):
         started = time.monotonic()
-        if not self.allowed():
-            self.stop_event.set()
+        # Session expiry closes this execution; the node-wide stop is only for shutdown.
         if self.process is not None and self.process.pid is not None:
             from r2v_data_v2.h3.t2va_full_workers import _descendants
             self.descendants.update(_descendants({self.process.pid}))

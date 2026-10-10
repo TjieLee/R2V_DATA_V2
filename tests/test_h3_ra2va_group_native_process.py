@@ -97,6 +97,78 @@ def test_watchdog_stops_native_inference_and_detached_child(tmp_path):
     assert not thread.is_alive() and errors and not executor.process.is_alive()
     with pytest.raises(ProcessLookupError):
         os.kill(int((tmp_path / "nested.pid").read_text()), 0)
+    assert not stop.is_set()
+
+
+def test_native_watchdog_rejoins_after_cleanup_without_stopping_node(tmp_path, monkeypatch):
+    from dataclasses import asdict
+
+    from r2v_data_v2.h3 import ra2va_group_http_worker
+    from r2v_data_v2.h3.ra2va_group_http_native_worker import run_http_native_worker
+    from tests.test_h3_ra2va_group_pipeline import task_at
+
+    permission, stop = Permission(), threading.Event()
+    sessions, errors, reports = [], [], []
+    task = {"task": asdict(task_at(tmp_path)), "upstream_results": {},
+            "artifact_root": str(tmp_path / "claim"), "session_id": "expired-session",
+            "task_id": "canonical/clip", "claim_token": "expired-token"}
+
+    class Heartbeat:
+        def __init__(self, client):
+            pass
+
+        def start(self, session):
+            pass
+
+        def stop(self):
+            pass
+
+        def execution_allowed(self):
+            return permission.execution_allowed()
+
+    class Client:
+        def call(self, method, path, body):
+            if path == "/v1/workers/connect":
+                sessions.append(body)
+                if len(sessions) == 1:
+                    return {"finished": False, "session_id": "expired-session", "generation": 1,
+                            "stage": "canonical", "claim": task}
+                assert body["previous_session_id"] == "expired-session"
+                assert body["resources_closed"] is True and not stop.is_set()
+                assert (tmp_path / "closed").exists()
+                with pytest.raises(ProcessLookupError):
+                    os.kill(int((tmp_path / "nested.pid").read_text()), 0)
+                return {"finished": True}
+            assert path == "/v1/workers/heartbeat"
+            assert body["execution_stopped"] is True and body["resources_closed"] is True
+            return {}
+
+    monkeypatch.setattr(ra2va_group_http_worker, "WorkerHeartbeat", Heartbeat)
+
+    def run():
+        try:
+            reports.append(run_http_native_worker(Client(), node_id="node-a", worker_instance="gpu-0",
+                stop_event=stop, backend_factory=ProcessFixtureFactory(tmp_path, wait=True), gpu_id="0"))
+        except (AssertionError, OSError, RuntimeError) as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 10
+        while not (tmp_path / "nested.pid").exists() and time.monotonic() < deadline:
+            time.sleep(.02)
+        assert (tmp_path / "nested.pid").exists()
+        time.sleep(.3)
+        permission.allowed = False
+        thread.join(8)
+        assert not thread.is_alive() and errors == []
+        assert len(sessions) == 2 and not stop.is_set()
+        assert reports == [{"executed": 0, "accepted": 0, "model_call_count": 0, "reused_checkpoints": 0}]
+    finally:
+        permission.allowed = False
+        stop.set()
+        thread.join(8)
 
 
 def test_tp4_services_start_once_per_node_generation_and_cleanup(tmp_path):
