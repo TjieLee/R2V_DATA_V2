@@ -1,4 +1,4 @@
-"""Bounded RA2VA group CPU scheduling pilot. No model or real export runs."""
+"""Bounded RA2VA Group pilots: explicit Fake or Native HTTP execution."""
 
 from __future__ import annotations
 
@@ -37,17 +37,31 @@ def main():
             command.add_argument("--workers", type=int, default=4)
             command.add_argument("--poll-seconds", type=float, default=0.05)
         if name == "coordinator":
+            command.add_argument("--execution-mode", choices=("fake", "native", "cpu_fixture"), default="fake")
             command.add_argument("--host", required=True)
             command.add_argument("--port", type=int, required=True)
             command.add_argument("--local-lock-path", type=Path, required=True)
     worker = subparsers.add_parser("worker")
-    worker.add_argument("--fake", action="store_true", required=True)
+    modes = worker.add_mutually_exclusive_group(required=True)
+    modes.add_argument("--fake", action="store_true")
+    modes.add_argument("--native", action="store_true")
+    worker.add_argument("--configuration", type=Path)
+    worker.add_argument("--cpu-fixtures", type=Path)
+    worker.add_argument("--ffmpeg", default="ffmpeg")
     worker.add_argument("--coordinator-url", required=True)
     worker.add_argument("--node-id", required=True)
     worker.add_argument("--workers", type=int, default=1)
     worker.add_argument("--fake-delay-seconds", type=float, default=0)
     args = parser.parse_args()
     if args.command == "worker":
+        if args.native:
+            from r2v_data_v2.h3.ra2va_group_http_native_worker import (
+                run_http_native_workers,
+            )
+            print(json.dumps(run_http_native_workers(coordinator_url=args.coordinator_url, node_id=args.node_id,
+                workers=args.workers, configuration_path=args.configuration, cpu_fixtures=args.cpu_fixtures,
+                ffmpeg=args.ffmpeg), indent=2), flush=True)
+            return
         from r2v_data_v2.h3.ra2va_group_http_worker import run_http_fake_workers
         print(json.dumps(run_http_fake_workers(coordinator_url=args.coordinator_url,
             node_id=args.node_id, workers=args.workers, fake_delay_seconds=args.fake_delay_seconds),
@@ -65,6 +79,8 @@ def main():
         def factory():
             return HttpGroupCoordinator(GroupCoordinator(root, args.source_root, args.limit,
                 max_groups=args.max_groups, transport="http", coordinator_host=socket.gethostname(),
+                mode={"fake": "cpu_fake_pilot", "native": "http_native_pilot",
+                      "cpu_fixture": "http_native_cpu_pilot"}[args.execution_mode],
                 coordinator_identity={"guard_path": str(args.local_lock_path.resolve()),
                                       "bind_host": args.host, "bind_port": args.port}))
 
