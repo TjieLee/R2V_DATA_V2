@@ -74,15 +74,16 @@ def test_all_ranks_preserve_stage_priority(tmp_path, rank, monkeypatch):
     monkeypatch.setattr(
         "os.scandir", lambda *_: pytest.fail("scheduler scanned outcomes")
     )
+    expected = {0: [6, 3, 0], 1: [4, 1], 2: [5, 2]}
     assert _run(tmp_path, groups, rank=rank, world_size=3) == [
-        g.group_id for g in reversed(groups[:7])
+        groups[i].group_id for i in expected[rank]
     ]
 
 
-def test_equal_priority_keeps_rank_rotation(tmp_path):
+def test_equal_priority_keeps_assigned_group_order(tmp_path):
     groups = _groups(4)
     assert _run(tmp_path, groups, rank=1, world_size=2) == [
-        g.group_id for g in groups[2:] + groups[:2]
+        groups[i].group_id for i in (1, 3)
     ]
 
 
@@ -98,24 +99,25 @@ def test_claimed_group_precedes_new_group_with_missing_hints(tmp_path):
 
 
 def test_hints_sort_sa_progress_only_and_ignore_unknown_invalid_entries(tmp_path):
-    groups = _groups(5)
-    for group in groups[:3]:
+    groups = _groups(10)
+    for group in groups[:7]:
         _marker(tmp_path, group, "subject_attributes_started")
-    _marker(tmp_path, groups[3], "subject_attributes_completed")
+    _marker(tmp_path, groups[7], "subject_attributes_completed")
     hints = tmp_path / "hints.json"
     hints.write_text(
         json.dumps(
             {
                 groups[0].group_id: {"terminal": 10, "eligible": 100},
-                groups[1].group_id: {"terminal": 99, "eligible": 100},
-                groups[2].group_id: {"terminal": -1, "eligible": 100},
-                groups[4].group_id: {"terminal": 100, "eligible": 100},
+                groups[1].group_id: {"terminal": 20, "eligible": 100},
+                groups[3].group_id: {"terminal": 99, "eligible": 100},
+                groups[5].group_id: {"terminal": -1, "eligible": 100},
+                groups[9].group_id: {"terminal": 100, "eligible": 100},
                 "unknown": {"terminal": 100, "eligible": 100},
             }
         )
     )
     assert _run(tmp_path, groups, rank=1, world_size=2, priority_hints=hints) == [
-        groups[i].group_id for i in (3, 1, 0, 2, 4)
+        groups[i].group_id for i in (7, 3, 1, 5, 9)
     ]
 
 
