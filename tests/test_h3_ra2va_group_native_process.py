@@ -172,6 +172,33 @@ def test_group_runtime_configs_do_not_require_legacy_hash_fields(tmp_path, monke
         assert "dependency_files" not in backend.configuration.model_dump()
 
 
+def test_native_asr_adapter_supplies_ffmpeg_to_existing_worker(monkeypatch):
+    from types import SimpleNamespace
+
+    from r2v_data_v2.h3.ra2va_group_runtime import NativeBackendFactory
+    closed = []
+
+    class Backend:
+        _process = SimpleNamespace(poll=lambda: None)
+
+        def __enter__(self):
+            return self
+
+        def close(self, **kwargs):
+            closed.append(True)
+
+        def transcribe(self, *, waveform, sample_rate_hz):
+            assert waveform == "waveform" and sample_rate_hz == 16000
+            return " exact frozen text ", "English"
+    monkeypatch.setenv("QWEN3_ASR_DEVICE", "test-device")
+    monkeypatch.setattr("tools.run_h3_stem_qwen3_asr_shadow._isolated_backend", Backend)
+    factory = NativeBackendFactory({"asr": {"environment": {}}}, mimo_config=None, ffmpeg="pilot-ffmpeg")
+    with factory("asr") as backend:
+        assert backend.transcribe(waveform="waveform", sample_rate_hz=16000) == (
+            " exact frozen text ", "English")
+    assert closed == [True]
+
+
 def test_native_child_sigkill_is_infrastructure_interruption(tmp_path):
     from r2v_data_v2.h3.ra2va_group_http_native_worker import NativeStageExecution
     executor = NativeStageExecution({"stage": "canonical"}, backend_factory=ProcessFixtureFactory(tmp_path),

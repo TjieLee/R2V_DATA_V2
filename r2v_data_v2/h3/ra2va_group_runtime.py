@@ -126,7 +126,7 @@ class NativeBackendFactory:
                 yield backend
         elif stage == "asr":
             from r2v_data_v2.h3.t2va_full_speech import asr_worker
-            with asr_worker(self.configuration[stage]) as worker:
+            with asr_worker({"ffmpeg": self.ffmpeg, **self.configuration[stage]}) as worker:
                 yield _SpeechBackend(worker.backend)
         elif stage == "mimo":
             from openai import OpenAI
