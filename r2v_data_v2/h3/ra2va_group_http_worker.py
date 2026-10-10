@@ -30,10 +30,13 @@ class GroupHttpClient:
         self.base_url = base_url.rstrip("/")
         self.bearer_token = bearer_token
         self.timeout_seconds = timeout_seconds
+        self.run_root = os.environ.get("R2VA_RUN_ROOT")
         # Localhost/private routing must not accidentally use the notebook proxy.
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
     def call(self, method, path, body=None):
+        if path == "/v1/workers/connect" and self.run_root is not None:
+            body = (body or {}) | {"run_root": self.run_root}
         request = urllib.request.Request(self.base_url + path, method=method,
             data=None if body is None else json.dumps(body).encode(),
             headers={"Authorization": f"Bearer {self.bearer_token}",

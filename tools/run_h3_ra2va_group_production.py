@@ -31,6 +31,7 @@ def main():
         if name in ("run", "coordinator"):
             command.add_argument("--source-root", type=Path, default=SOURCE_ROOT)
             command.add_argument("--limit", type=int, required=True)
+            command.add_argument("--start-row", type=int, default=0)
             command.add_argument("--max-groups", type=int, default=1)
         if name == "run":
             command.add_argument("--fake", action="store_true", required=True)
@@ -87,7 +88,8 @@ def main():
 
         def factory():
             return HttpGroupCoordinator(GroupCoordinator(root, args.source_root, args.limit,
-                max_groups=args.max_groups, transport="http", coordinator_host=socket.gethostname(),
+                max_groups=args.max_groups, start_row=args.start_row,
+                transport="http", coordinator_host=socket.gethostname(),
                 mode={"fake": "cpu_fake_pilot", "native": "http_native_pilot",
                       "cpu_fixture": "http_native_cpu_pilot"}[args.execution_mode],
                 coordinator_identity={"guard_path": str(args.local_lock_path.resolve()),
@@ -99,13 +101,13 @@ def main():
         with coordinator_process_guard(args.local_lock_path):
             token = os.environ.get("R2V_GROUP_COORDINATOR_TOKEN")
             if args.publish_endpoint and not token:
-                token = coordinator_token(root)
+                token = coordinator_token(os.environ.get("R2VA_TOKEN_FILE"))
             server = build_http_server(args.host, args.port, service_factory=factory,
                                        bearer_token=token)
             previous = signal.signal(signal.SIGTERM, stop)
             try:
                 if args.publish_endpoint:
-                    publish_endpoint(root, args.host, server.server_port, token)
+                    publish_endpoint(root, args.host, server.server_port)
                 server.serve_forever(poll_interval=0.1)
             except KeyboardInterrupt:
                 pass
@@ -119,7 +121,8 @@ def main():
     else:
         result = run_fake_pilot(source_root=args.source_root, run_root=root,
                                 workers=args.workers, limit=args.limit,
-                                max_groups=args.max_groups, poll_seconds=args.poll_seconds)
+                                max_groups=args.max_groups, start_row=args.start_row,
+                                poll_seconds=args.poll_seconds)
     print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
 
 

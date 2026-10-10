@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import socket
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -109,6 +110,32 @@ def test_auth_failure_does_not_mutate_state(tmp_path):
         before = service.core.control_path.read_bytes()
         assert request(url, "/v1/workers/connect", {}, token="wrong")[0] == 401
         assert service.core.control_path.read_bytes() == before
+
+
+def test_reconnect_to_reused_endpoint_cannot_join_a_different_run(tmp_path, monkeypatch):
+    from r2v_data_v2.h3.ra2va_group_http import build_http_server
+    from r2v_data_v2.h3.ra2va_group_http_worker import GroupHttpClient, HttpConflict
+
+    original = make_service(tmp_path / "original")
+    other = make_service(tmp_path / "other")
+    monkeypatch.setenv("R2VA_RUN_ROOT", str(original.core.run_root))
+    server = build_http_server("127.0.0.1", 0, service_factory=lambda: original, bearer_token="test-token")
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": .02})
+    thread.start()
+    try:
+        client = GroupHttpClient(f"http://127.0.0.1:{server.server_port}", "test-token")
+        body = {"node_id": "node-b", "worker_instance": "surviving-worker", "resources_closed": True}
+        assert client.call("POST", "/v1/workers/connect", body)["session_id"] is not None
+        server.service = other
+        with pytest.raises(HttpConflict, match="different run"):
+            client.call("POST", "/v1/workers/connect", body)
+        assert other.core.status().get("members", {}) == {}
+    finally:
+        server.shutdown()
+        thread.join(3)
+        server.server_close()
+        original.close()
+        other.close()
 
 
 def test_local_guard_and_busy_bind_reject_before_factory(tmp_path):

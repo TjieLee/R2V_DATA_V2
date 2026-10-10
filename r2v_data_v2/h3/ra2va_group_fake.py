@@ -128,10 +128,10 @@ def pilot_summary(run_root: Path) -> dict:
 
 
 def run_fake_pilot(*, source_root: Path, run_root: Path, workers: int, limit: int,
-                   max_groups: int, poll_seconds: float) -> dict:
+                   max_groups: int, poll_seconds: float, start_row=0) -> dict:
     if workers < 1 or poll_seconds <= 0:
         raise ValueError("workers and poll_seconds must be positive")
-    coordinator = GroupCoordinator(run_root, source_root, limit, max_groups=max_groups)
+    coordinator = GroupCoordinator(run_root, source_root, limit, max_groups=max_groups, start_row=start_row)
     context = mp.get_context("spawn")
     stop = context.Event()
     identifier = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"

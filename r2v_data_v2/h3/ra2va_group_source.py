@@ -85,21 +85,27 @@ def adapt_production_sample(sample: ProductionSample, group_directory: Path, ord
                      sample.model_dump(mode="json"), sample.target_video, pictures, subjects)
 
 
-def freeze_pilot_inventory(group: PublishedGroup, destination: Path, limit: int) -> dict:
-    if not 1 <= limit <= 200:
-        raise ValueError("CPU pilot limit must be between 1 and 200")
+def freeze_pilot_inventory(group: PublishedGroup, destination: Path, limit: int, *, start_row=0) -> dict:
+    if not 1 <= limit <= 200 or start_row < 0:
+        raise ValueError("CPU pilot limit must be between 1 and 200 and start_row nonnegative")
     if destination.exists():
         metadata = json.loads((destination / "inventory.json").read_text())
-        if metadata["limit"] != limit or metadata["group_id"] != group.group_id:
+        if (metadata["limit"] != limit or metadata["group_id"] != group.group_id
+                or metadata.get("start_row", 0) != start_row):
             raise ValueError("resume inventory settings differ")
         return metadata
+    if start_row and start_row >= group.declared_count:
+        raise ValueError("selected source range is empty")
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = Path(tempfile.mkdtemp(prefix=".inventory-", dir=destination.parent))
     try:
-        offsets, seen = [], set()
+        offsets, seen, source_row = [], set(), 0
         with group.samples_path.open() as source, (temporary / "tasks.jsonl").open("wb") as output:
             for line in source:
                 if not line.strip():
+                    continue
+                source_row += 1
+                if source_row <= start_row:
                     continue
                 sample = ProductionSample.model_validate_json(line)
                 if sample.clip_uid in seen:
@@ -112,10 +118,10 @@ def freeze_pilot_inventory(group: PublishedGroup, destination: Path, limit: int)
                     break
             output.flush()
             os.fsync(output.fileno())
-        if len(offsets) != min(limit, group.declared_count):
+        if len(offsets) != min(limit, group.declared_count - start_row):
             raise ValueError("published source has fewer rows than its Export count")
         metadata = {"mode": "pilot", "group_id": group.group_id, "source_directory": str(group.directory),
-                        "source_samples_path": str(group.samples_path), "limit": limit,
+                        "source_samples_path": str(group.samples_path), "limit": limit, "start_row": start_row,
                         "selected_count": len(offsets), "declared_source_count": group.declared_count,
                         "offsets": offsets}
         atomic_json(temporary / "inventory.json", metadata)

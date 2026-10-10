@@ -29,6 +29,12 @@ foreground until Ctrl+C, including after local Workers finish, so delayed or
 reconnecting nodes can still obtain the terminal state. SIGINT, SIGTERM and
 SIGHUP use the same owned-process cleanup.
 
+For an independent 8-clip Pilot after the original first 10 rows, use identical
+`R2VA_START_ROW=10 R2VA_LIMIT=8` on both nodes. The zero-based start counts
+nonempty source rows. Only the prefix through the selected range is read;
+start row and limit are frozen in run control and inventory. Resume must use
+the same values, and never silently selects another range.
+
 Output is exclusively:
 
 ```text
@@ -56,15 +62,28 @@ The TCP port defaults to 8780 (`R2VA_COORDINATOR_PORT`).
 
 Only after acquiring `/tmp/<run-id>.coordinator.lock`, binding TCP and restoring
 the existing run does Coordinator atomically publish `coordinator_endpoint.json`.
-That private (0600) file contains URL and the existing HTTP bearer credential;
-the credential is reused on resume, not printed or passed on the command line.
-Nodes need shared read access under the same authorized account. Workers never
-write discovery, cursor, claims, generation or terminal control state.
-This launcher assumes trusted nodes and the same authorized OS account, not
-hostile co-located users. The existing loopback media server serves the entire
-workspace; its HTTP reads do not enforce the discovery file's 0600 permissions.
-Do not expose that service or the discovery metadata to untrusted users. This
-entry does not change an existing media service's access policy.
+That file contains only the URL, never the bearer credential. Before attaching,
+Workers authenticate and confirm that `/v1/status` names the requested run root;
+a stale URL serving a different run is rejected. Every subsequent Worker
+connect/reconnect also carries that run root and is rejected before joining or
+loading resources if the endpoint now serves another run.
+
+Deployment provisions the same credential once on each authorized node at
+`/root/.config/r2va/coordinator.token` (directory 0700, file 0600), using the
+authenticated SSH channel rather than shared storage. The normal Bash command
+needs no credential argument. `R2VA_TOKEN_FILE` can select another node-local
+file; it must be outside the configured HTTP media root. A missing/private-mode
+error stops startup before any Worker or model is launched. The existing
+`R2V_GROUP_COORDINATOR_TOKEN` environment override remains supported.
+
+The credential is reused on resume, never printed or passed on the command
+line. Discovery, run logs and shared output contain no credential. Do not put
+the token in `/mnt/workspace`: even a 0600 file there can be read by a
+same-account media server. New nodes require the same one-time private credential
+provisioning; they do not obtain secrets from the public discovery file.
+Workers never write discovery, cursor, claims, generation or terminal state.
+This launcher assumes trusted nodes and private-network HTTP, not hostile
+co-located users or automatic Coordinator election.
 
 There is no automatic Coordinator failover. A Worker with missing/unreachable
 discovery waits and reports a bounded startup error; it never promotes itself.
@@ -76,6 +95,8 @@ or start the same `python -m http.server --directory /mnt/workspace` service use
 by the successful Pilot. Only a service started by this invocation is stopped
 on exit. Existing media services are not adopted or terminated. Native Workers
 close their owned model resources before the local Coordinator stops.
+The launcher retains the latest observed child processes while its Worker is
+alive, so an abnormal Worker exit can also clean up detached model backends.
 
 ## CPU And Dry Run
 

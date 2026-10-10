@@ -86,10 +86,10 @@ class WorkerSession:
 
 
 class GroupCoordinator:
-    def __init__(self, run_root: Path, source_root: Path, limit: int, *, max_groups=1,
+    def __init__(self, run_root: Path, source_root: Path, limit: int, *, max_groups=1, start_row=0,
                  transport="local", coordinator_host=None, coordinator_identity=None,
                  mode="cpu_fake_pilot"):
-        if not 1 <= limit <= 200 or max_groups < 1:
+        if not 1 <= limit <= 200 or max_groups < 1 or start_row < 0:
             raise ValueError("invalid bounded pilot settings")
         if transport not in ("local", "http") or (transport == "http" and not coordinator_host):
             raise ValueError("HTTP transport requires designated coordinator host")
@@ -99,8 +99,11 @@ class GroupCoordinator:
         self.source_root = source_root.absolute()
         self.limit = limit
         self.max_groups = max_groups
+        self.start_row = start_row
         self.control_path = self.run_root / "control.json"
         settings = {"source_root": str(self.source_root), "limit": limit, "max_groups": max_groups}
+        if start_row:
+            settings["start_row"] = start_row
         with file_lock(self.run_root / "control.lock", blocking=True):
             if self.control_path.exists():
                 existing = read_json(self.control_path)
@@ -166,7 +169,8 @@ class GroupCoordinator:
                     return None
                 group = candidates[0]
                 group_id = group.group_id
-                freeze_pilot_inventory(group, self.group_root(group_id) / "inventory", self.limit)
+                freeze_pilot_inventory(group, self.group_root(group_id) / "inventory", self.limit,
+                                       start_row=self.start_row)
             control.update(group_id=group_id, stage=STAGES[0],
                            generation=control["generation"] + 1, phase="running", members={})
             if group_id not in control["started_groups"]:

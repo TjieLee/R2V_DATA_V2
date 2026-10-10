@@ -248,6 +248,8 @@ class HttpGroupCoordinator:
         return wire
 
     def _connect(self, body):
+        if body.get("run_root", str(self.core.run_root)) != str(self.core.run_root):
+            raise ClaimConflict("Worker belongs to a different run")
         expected = {"http_native_pilot": "native", "http_native_cpu_pilot": "cpu_fixture"}.get(self.mode, "fake")
         if body.get("execution_mode", "fake") != expected:
             raise ClaimConflict("Worker execution mode differs from run mode")
@@ -426,7 +428,7 @@ class HttpGroupCoordinator:
                 return 503, {"error": "Coordinator stopped"}
             try:
                 if method == "GET" and path == "/v1/status":
-                    return 200, self._context() | {"control": self.core.status(),
+                    return 200, self._context() | {"run_root": str(self.core.run_root), "control": self.core.status(),
                         "progress": None if self.snapshot is None else self.core.progress(self.snapshot)}
                 handlers = {
                     "/v1/workers/connect": self._connect,
