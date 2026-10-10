@@ -222,6 +222,10 @@ MiMo/export invocation took 556.58 seconds, including 94.87 seconds of SGLang
 cold startup. The 20 saved real requests span 449.55 seconds (448.81 seconds
 summed request durations). Every clip has exactly two requests and two saved
 responses, zero replayed requests and no model retry/polish/fallback.
+The SGLang HTTP log has 21 completion POSTs: its built-in startup warmup at
+12:00:21 and the 20 audited clip requests ending at 12:07:47. The startup source
+uses a generated warmup image and at most 8 output tokens; it is not a clip
+request, retry or additional pipeline turn.
 SAM receipts retain `separation_state=unverified` with ranking disabled; they
 were not relabeled as verified separation success.
 
