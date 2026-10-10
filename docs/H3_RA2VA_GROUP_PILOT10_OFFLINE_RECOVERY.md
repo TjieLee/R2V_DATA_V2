@@ -20,6 +20,12 @@ The d89769 failure does **not** prove a wrong speaker identity. It is unresolved
 
 For 6107ee, the complete **expected** ID set is empty. Both generated lists contain an extra ID, so sorting or identical-row deduplication cannot make the inventories correct. No inventory normalization change is justified by this case.
 
+Validation sites (unchanged except the narrowly extended neutralizer):
+
+- ab2744 / 83871d: `mimo25_h3_materializer.py:1026` raises `two_step_identity_caption_publication_restricted` for both visual_only and full_audio_reuse when neutralization is unsafe. Their original export records each contain two product failures, not an inference failure.
+- 6107ee: `mimo26_two_step_backend.py:240` compares the ordered Audio and AV IDs to the frozen IDs. Frozen `[]` conflicts with generated `["segment_0001"]`; the generated Audio row asserts `single_speaker/resolved/g1`, and its AV row asserts `no_reliable_entity/uncertain`.
+- d89769: `speaker_ownership.py:69` admits the existing sparse-sampling exception only for target articulation `not_assessable` with `av_temporal_alignment`. Its first target observation is `uncertain`, so `no_visible_lip_motion` remains incompatible with the visible binding under the unchanged common validator. Confidence does not bypass this rule.
+
 ## Code Boundaries
 
 - `speaker_ownership.py::neutralize_two_step_caption_identity`: two narrow embedded lead forms plus their Summary forms; exact ordered frozen dialogue comparison before any neutralization.
@@ -63,12 +69,54 @@ Run from the existing server checkout after pulling the repair. No endpoint or G
 cd /mnt/workspace/litengjie/data/R2V_DATA_V2
 git pull --ff-only origin feature/h3-audio-jea-qwen3-v1
 ROOT=/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/R2VA
-.venv/bin/python tools/replay_h3_ra2va_group_pilot.py \\
-  --source-group "$ROOT/ra2va-native-group0-pilot10-20261010T034522/groups/group-000000" \\
+.venv/bin/python tools/replay_h3_ra2va_group_pilot.py \
+  --source-group "$ROOT/ra2va-native-group0-pilot10-20261010T034522/groups/group-000000" \
   --output-root "$ROOT/ra2va-pilot10-caption-recovery-$(date +%Y%m%dT%H%M%S)/group-000000"
 ```
 
 Outputs: `offline_replay.json`, per-clip reconcile/audit and H3 products, aggregate `bundle/source_contract.json`, `bundle/records.jsonl`, twelve `bundle/training/*.jsonl` task files and `bundle/voice_donor_reserve.json`.
+
+## Real Server CPU Result
+
+Executed on Node A from `/mnt/workspace/litengjie/data/R2V_DATA_V2` at repair commit `4b5b68b8effccc9d3d9e69fa104f2c5ff33dd1a8`. All model completions were read from the original pilot; no GPU stage or model endpoint was started.
+
+New output (historical inputs and outputs untouched):
+```text
+/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/R2VA/ra2va-pilot10-caption-recovery-20261010T051100Z/group-000000
+```
+
+| Metric | Original | Offline recovery |
+| --- | --- | --- |
+| Reconcile Ready / Failed | 8 / 2 | 8 / 2 |
+| Usable training videos | 6 / 10 | 8 / 10 |
+| H3 products Ready / Failed | 15 / 4 | 19 / 0 |
+| Training tasks | 60 | 76 |
+| Donors / segments | 2 / 6 | 2 / 6 |
+| New model requests | - | 0 |
+
+CPU replay/export elapsed: **16.125 seconds**. Replayed responses: 20; historical inference calls: 20. These are not new HTTP calls.
+
+Task counts: `r2va_{reference,first_frame,last_frame,first_last_frame}` each 8; `ra2va_{reference,first_frame,last_frame,first_last_frame}_full_audio` each 8; the four corresponding `_speech_bgm` tasks each 3. Total: 32 + 32 + 12 = 76. `training/videos.jsonl` is an 8-video index, not a thirteenth training task.
+
+The two restored clips each publish only visual_only and full_audio_reuse products (eight training rows per clip). Their `AudioReuseManifest.speakers` lists remain empty; g1 retains `unconfirmed_visible_identity`. Neither clip enters target_speech_reuse or donor reserve. The original full audio is referenced without an entity-specific voice association.
+
+Correction audit:
+
+| Clip | Caption identity neutralizations | Summary identity neutralizations |
+| --- | --- | --- |
+| ab27449eaf98b06401161810 | 2 (marker removal + speech-clause separation) | 1 |
+| 83871dd0401c1f1ce9986ec2 | 1 | 1 |
+
+Existing evidence-code duplicate counts remain separate from these new corrections. No evidence code, gN, binding, ASR, or visual observation was invented or removed.
+
+Read-only acceptance comparison against the original pilot confirmed:
+
+- All ten Visual/Joint raw strings, response source paths, historical backend provenance, and the complete ordered source contract are unchanged.
+- All eight Ready annotations retain identical Audio observations, AV grounding, and Visual observations. Frozen dialogue text/language/order is exact for every Ready clip.
+- The original six successful annotations are entirely unchanged. All original 60 task rows remain semantically identical, allowing only the new generated asset root.
+- All 76 task rows have exactly video/images/audios/caption; their 53 unique referenced files exist.
+- Donor identities and all segment IDs/times/sample ranges are unchanged: 42038d7dc619cfa7bebee437/e1/g1/S1 has 2 segments; 9fc15fd3eb25f6120af4f7ef/e1/g1/S1 has 4. All six segment paths and bundle-relative paths are valid.
+- 6107ee and d89769 retain their genuine failure reasons; no fallback products or fabricated annotations were emitted for them.
 
 ## Next GPU Pilot (Not Started)
 
@@ -76,7 +124,7 @@ After this CPU export result is accepted: select only 6-10 **new** frozen clips 
 
 ## Validation
 
-- Original focused regression: 504 passed, 7 skipped (Group, Two-step, Single Compact, Audio reuse/materializer/donor, T2VA speech/server).
+- Final focused regression: **507 passed, 7 skipped** in 71.53s (Group, Two-step, Single Compact, Audio reuse/materializer/donor, T2VA speech/server).
 - Final caption/replay/materializer/Two-step focused run: 208 passed, including real recorded drafts, unsupported identity prose, unknown Subject, Visual uncertainty, and exact ASR negative cases.
 - Ruff, py_compile and diff-check passed.
 - Additional whole-repository run: 6584 passed, 250 failed, 144 skipped. All 250 failing node IDs reproduced on isolated baseline fa7fb5b (234 + 16 cases); no attempt to repair historical tests or unrelated modules. Representative failures include old backend/prompt provenance assertions in test_h3_mimo25_two_turn.py, historical fixtures in test_h3_mimo25_av_shadow.py, and unrelated V3/Person Replacement contracts.
