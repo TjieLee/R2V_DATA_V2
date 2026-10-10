@@ -45,10 +45,12 @@ Real GPU execution requires approval. Do not launch a full group.
 
 ## Approved Single-Node GPU Pilot Commands
 
-The commands below are **prepared, not executed**. Sync the reviewed code to
-Node A first; this change is locally committed and has not been pushed.
-Paths were checked by read-only SSH, not by loading weights. Select unused GPUs
-and ports before starting; an occupied SGLang port is rejected, not adopted.
+The commands below limit execution to a new Pilot run. After explicit GPU
+approval, the first 10 rows were used for the single-node run recorded below.
+Sync reviewed code to `/mnt/workspace/litengjie/data/R2V_DATA_V2` on Node A
+using `git pull --ff-only`; Git pushes are performed locally, never on servers.
+Select unused GPUs and ports before starting; an occupied SGLang port is
+rejected, not adopted.
 
 Run this setup once in Node A Terminal 1. In Terminals 2 and 3, use the same
 environment values, especially the exact printed RUN and Coordinator token.
@@ -109,6 +111,8 @@ resources, not frozen prompts or sampling rules. Two TP4 replicas can use
 `gpu_groups=["0,1,2,3","4,5,6,7"]`, `ports=[8094,8095]` and eight distinct
 ordinary `gpu_ids`. The main Python must have the same SAM dependencies used by
 the existing T2VA runner; isolated AuK/DiariZen/Qwen-ASR interpreters are reused.
+The Group SGLang process removes inherited `PYTHONPATH` so SAM's compiled
+dependencies cannot shadow packages in the dedicated MiMo virtualenv.
 
 ## Progress, Results And Stop
 
@@ -144,20 +148,14 @@ and worker command with the original RUN, token, port, local guard and limits.
 Completed terminal tasks are not re-executed. An unresolved MiMo request remains
 Failed rather than being retried. No history is deleted or overwritten.
 
-## Remaining Validation
-
-Real SAM/AuK/DiariZen/ASR/SGLang loads, GPU memory release, node-local media
-fetching and real end-to-end quality are untested in this change. First run
-10-20 clips on one node after approval, then the same HTTP plane on two GPU nodes.
-No GPU models, production group, or remote outputs were started by Codex.
-
 ## Local CPU Validation
 
 - Task 1: 39 focused tests passed, including unchanged Fake HTTP execution.
 - Task 2: 27 focused tests passed for isolated stage processes and shared TP4
   lifecycle. Final lifecycle regressions also cover exited group leaders,
   detached children, busy ports and event acknowledgments arriving after expiry.
-- Final Group suite: 125 passed in 57.78 seconds. The 20-clip HTTP Native
+- Final Group suite after server integration fixes: 127 passed in 59.14 seconds.
+  The earlier 20-clip HTTP Native
   fixture case took 10.42 seconds, with 160 unique terminal results, 60 products,
   240 four-field tasks, 20 donors and 40 segments. It made zero real model calls;
   40 MiMo requests were simulated. These counts are not GPU Pilot expectations.
@@ -166,7 +164,95 @@ No GPU models, production group, or remote outputs were started by Codex.
   original `6ee2743` baseline: old Turn 2 prompt length, Visual v4 and backend
   `.61` assertions disagree with already-existing v5/`.66`. No protected code
   or historical test was changed to hide these failures.
+- After the two server integration fixes, the focused Two-step, Single,
+  Audio/H3, donor and T2VA lifecycle regression subset passed: 360 passed,
+  7 skipped in 10.18 seconds.
 - Ruff, Python compilation and `git diff --check` passed. Independent review
   found no remaining blocking issue after the process/event lifecycle fixes.
-- Read-only SSH confirmed runtime paths and read only the first source row of
-  group-000000. No full source JSONL traversal, model load or server write ran.
+- Initial read-only SSH confirmed runtime paths and read only the first source
+  row of group-000000. Subsequent explicitly approved GPU execution is recorded
+  separately below; no full source JSONL traversal or full-group run was used.
+
+## Single-Node Server Pilot, 2026-10-10
+
+Node A: `r2v_data` / `nb-94ayoy238c-0`, four ordinary workers on GPUs 0-3,
+one shared MiMo V2.6 TP4+Marlin replica on port 8094. Existing HTTP media service
+8766 serves `/mnt/workspace` and is not owned or stopped by this run.
+
+```text
+/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/R2VA/
+  ra2va-native-group0-pilot10-20261010T034522/
+```
+
+The frozen inventory is only the first 10 rows of published group-000000,
+`limit=10`, `max_groups=1`. The source's publication marker reports 39,585 rows;
+the Pilot does not traverse them or mark the full source group COMPLETE.
+
+Two runtime integration errors were found before any MiMo request:
+
+- ASR context lacked its existing required `ffmpeg` configuration. Fixed only
+  in the Group adapter, with a regression exercising the existing ASR context.
+- SGLang inherited SAM's `PYTHONPATH`, loading an incompatible SciPy against
+  MiMo's NumPy. Fixed by isolating the Group SGLang environment, with a regression.
+
+The same run-id resumed at the missing stage after each locally pushed fix and
+server fast-forward pull. Earlier terminal results were reused, not recomputed.
+Original `worker.log`, `worker-resume1.log`, `worker-resume2.log` and corresponding
+Coordinator logs retain the actual failures and restart evidence.
+
+Runtime code on the server: `3c68ee7881057c11c6a3a4b4049521c86cca9db5`.
+All eight stages completed, with 80 clip-stage terminal receipts and no pending
+or active claims. Only `PILOT_COMPLETE` exists, not full-group `COMPLETE`, and
+only group-000000 was started. The following are actual server results:
+
+| Stage | Ready | Failed | Skipped | Persisted wall seconds |
+| --- | ---: | ---: | ---: | ---: |
+| canonical | 10 | 0 | 0 | 5.53 |
+| SAM | 10 | 0 | 0 | 100.57 |
+| AuK | 10 | 0 | 0 | 133.09 |
+| resolve | 10 | 0 | 0 | 2.63 |
+| DiariZen | 10 | 0 | 0 | 38.22 |
+| ASR | 10 | 0 | 0 | 235.58 |
+| MiMo Two-step | 8 | 2 | 0 | 785.21 |
+| export | 6 | 2 | 2 | 7.96 |
+
+ASR/MiMo persisted wall times include the startup errors, local fixes, pulls
+and restart delays, so are not steady-state throughput measurements. The final
+MiMo/export invocation took 556.58 seconds, including 94.87 seconds of SGLang
+cold startup. The 20 saved real requests span 449.55 seconds (448.81 seconds
+summed request durations). Every clip has exactly two requests and two saved
+responses, zero replayed requests and no model retry/polish/fallback.
+SAM receipts retain `separation_state=unverified` with ranking disabled; they
+were not relabeled as verified separation success.
+
+Actual terminal business failures, left unchanged:
+
+- `d897696ed13b1ea1b2104ea2`: `visible_entity_binding_not_permitted` on
+  segment_0001. Visual articulation is `uncertain`; joint evidence contains
+  `av_temporal_alignment` and `no_visible_lip_motion`. The frozen existing
+  binding policy rejects it; this integration does not alter that policy.
+- `6107ee1e8a646cccb1583b3f`: `segment_inventory_mismatch` in joint audio
+  decisions. Both real responses are saved; export is skipped.
+- `ab27449eaf98b06401161810` and `83871dd0401c1f1ce9986ec2`: MiMo Ready, but
+  existing H3 publication rejects visual-only/full-audio products with
+  `two_step_identity_caption_publication_restricted`. Their unconfirmed
+  identity attribution cannot be safely neutralized without changing visual
+  prose. No unsafe identity product was published and no caption was rewritten.
+
+Bundle: **15 Ready / 4 Failed products**, **60 training tasks**, **2 donors /
+6 segments**. Four Visual task types each have 6 rows, four Full Audio types
+each have 6, and four Speech+BGM types each have 3. All 60 task rows use exactly
+`video/images/audios/caption`; the separate `videos.jsonl` is the 6-video index,
+not another training task. Donors are 42038d7/e1/g1/S1 (2 segments) and
+9fc15fd/e1/g1/S1 (4 segments); these clip-local e1 identities are not merged.
+All six generated segment paths exist.
+
+The launcher and Coordinator exited, ports 8094/8780 closed, and all eight GPUs
+returned to 0 MiB. The pre-existing 8766 media server remains running. Server
+tracked files are clean; unrelated pre-existing untracked files are untouched.
+
+This validates single-node real stage execution, startup-failure resume and
+bounded resource cleanup, not full production quality or a real mid-request
+GPU interruption. Two-node GPU execution, hard-killed-host cleanup and a larger
+production run remain untested. The four product failures remain visible in
+the existing summaries; no manual QA/PASS gate or additional checks were added.
