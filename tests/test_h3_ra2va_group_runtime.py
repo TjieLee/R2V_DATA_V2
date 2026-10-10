@@ -178,13 +178,13 @@ def test_video_duration_probe_rejects_missing_or_invalid_format_duration(monkeyp
 
 def test_real_ffprobe_short_video_duration_gate(tmp_path, monkeypatch):
     from r2v_data_v2.h3 import ra2va_group_pipeline as pipeline
-    from tests.test_h3_ra2va_group_pipeline import ffmpeg, task_at
+    from tests.test_h3_ra2va_group_pipeline import task_at
 
-    ffprobe = shutil.which("ffprobe")
-    if ffprobe is None:
-        pytest.skip("real ffprobe is not installed")
+    ffmpeg, ffprobe = shutil.which("ffmpeg"), shutil.which("ffprobe")
+    if ffmpeg is None or ffprobe is None:
+        pytest.skip("real ffmpeg/ffprobe is not installed")
     video = tmp_path / "short.mp4"
-    subprocess.run([ffmpeg(), "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=32x32:r=10",
+    subprocess.run([ffmpeg, "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=32x32:r=10",
                     "-t", "0.3", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-y", str(video)], check=True)
     task = task_at(tmp_path)
     task = type(task)(**{**vars(task), "target_video_path": str(video)})
