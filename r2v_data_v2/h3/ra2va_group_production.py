@@ -88,7 +88,7 @@ class WorkerSession:
 class GroupCoordinator:
     def __init__(self, run_root: Path, source_root: Path, limit: int | None, *, max_groups=1, start_row=0,
                  transport="local", coordinator_host=None, coordinator_identity=None,
-                 mode="cpu_fake_pilot"):
+                 mode="cpu_fake_pilot", group_parts=1):
         full_group = limit is None
         if ((full_group != mode.endswith("_production")) or (full_group and start_row != 0)
                 or (not full_group and (not 1 <= limit <= 200 or max_groups == 0))
@@ -98,15 +98,20 @@ class GroupCoordinator:
             raise ValueError("HTTP transport requires designated coordinator host")
         if transport == "http" and not coordinator_identity:
             raise ValueError("HTTP transport requires Coordinator identity (local guard and endpoint)")
+        if group_parts not in (1, 4) or (not full_group and group_parts != 1):
+            raise ValueError("group parts require full production scope and must be 1 or 4")
         self.run_root = run_root.absolute()
         self.source_root = source_root.absolute()
         self.limit = limit
         self.max_groups = max_groups
         self.start_row = start_row
+        self.group_parts = group_parts
         self.completion_marker = "COMPLETE" if full_group else "PILOT_COMPLETE"
         self._inventories = {}
         self.control_path = self.run_root / "control.json"
         settings = {"source_root": str(self.source_root), "limit": limit, "max_groups": max_groups}
+        if group_parts > 1:
+            settings["group_parts"] = group_parts
         if start_row:
             settings["start_row"] = start_row
         with file_lock(self.run_root / "control.lock", blocking=True):
@@ -154,11 +159,18 @@ class GroupCoordinator:
     def _snapshot(control):
         return StageSnapshot(*(control[k] for k in ("group_id", "stage", "generation", "phase")))
 
-    def _initialize_stage(self, snapshot):
+    def _initialize_stage(self, snapshot, part_index=0):
         path = self.stage_root(snapshot) / "dispatch.json"
         if not path.exists():
-            atomic_json(path, {"generation": snapshot.generation, "cursor": 0, "active": {},
-                               "ready": 0, "failed": 0, "skipped": 0, "started_at": time.time()})
+            state = {"generation": snapshot.generation, "cursor": 0, "active": {},
+                     "ready": 0, "failed": 0, "skipped": 0, "started_at": time.time()}
+            if self.group_parts > 1:
+                parts = self.inventory(snapshot.group_id)["parts"]
+                bounds = parts[part_index]
+                state.update(**bounds, part_index=part_index, part_count=len(parts),
+                             cursor=bounds["start_ordinal"],
+                             selected_count=bounds["end_ordinal"] - bounds["start_ordinal"])
+            atomic_json(path, state)
 
     def select_current(self):
         with file_lock(self.run_root / "control.lock", blocking=True):
@@ -184,9 +196,11 @@ class GroupCoordinator:
                 group = candidates[0]
                 group_id = group.group_id
                 freeze_group_inventory(group, self.group_root(group_id) / "inventory", self.limit,
-                                       start_row=self.start_row)
+                                       start_row=self.start_row, group_parts=self.group_parts)
             control.update(group_id=group_id, stage=STAGES[0],
                            generation=control["generation"] + 1, phase="running", members={})
+            if self.group_parts > 1:
+                control["part_index"] = 0
             self._inventories.clear()
             if group_id not in control["started_groups"]:
                 control["started_groups"].append(group_id)
@@ -229,7 +243,7 @@ class GroupCoordinator:
             self._account_results(snapshot, dispatch)
             inventory = self.group_root(snapshot.group_id) / "inventory"
             inventory_metadata = self.inventory(snapshot.group_id)
-            count = inventory_metadata["selected_count"]
+            count = dispatch.get("end_ordinal", inventory_metadata["selected_count"])
             candidates = [int(key) for key in dispatch["active"]]
             if dispatch["cursor"] < count:
                 candidates.append(dispatch["cursor"])
@@ -286,14 +300,18 @@ class GroupCoordinator:
     def progress(self, snapshot):
         with self._checked(snapshot) as (control, dispatch):
             self._account_results(snapshot, dispatch)
-            total = self.inventory(snapshot.group_id)["selected_count"]
+            total = dispatch.get("selected_count", self.inventory(snapshot.group_id)["selected_count"])
             done = sum(dispatch[k] for k in TERMINAL)
             elapsed = max(time.time() - dispatch["started_at"], 0.000001)
-            return {"group": snapshot.group_id, "stage": snapshot.stage,
+            progress = {"group": snapshot.group_id, "stage": snapshot.stage,
                     "generation": snapshot.generation, "phase": control["phase"],
                     "pending": total - done - len(dispatch["active"]),
                     "active": len(dispatch["active"]), **{k: dispatch[k] for k in TERMINAL},
                     "elapsed_seconds": elapsed, "tasks_per_second": done / elapsed}
+            if "part_index" in dispatch:
+                progress.update({k: dispatch[k] for k in (
+                    "part_index", "part_count", "start_ordinal", "end_ordinal")})
+            return progress
 
     def join(self, snapshot, worker_id, *, member_metadata=None):
         with self._checked(snapshot) as (control, _):
@@ -349,7 +367,7 @@ class GroupCoordinator:
             if control["phase"] == "complete":
                 return False
             self._account_results(snapshot, dispatch)
-            total = self.inventory(snapshot.group_id)["selected_count"]
+            total = dispatch.get("selected_count", self.inventory(snapshot.group_id)["selected_count"])
             if dispatch["active"] or sum(dispatch[k] for k in TERMINAL) != total:
                 return False
             if control["phase"] != "draining":
@@ -366,24 +384,41 @@ class GroupCoordinator:
                 dispatch["finished_at"] = time.time()
                 self._save_dispatch(snapshot, dispatch)
             self.log("stage_complete", snapshot, **{k: dispatch[k] for k in TERMINAL},
-                     elapsed_seconds=dispatch["finished_at"] - dispatch["started_at"])
+                     elapsed_seconds=dispatch["finished_at"] - dispatch["started_at"],
+                     **({"part_index": dispatch["part_index"]} if "part_index" in dispatch else {}))
             index = STAGES.index(snapshot.stage)
             if index == len(STAGES) - 1:
+                if self.group_parts > 1:
+                    part_index = dispatch["part_index"]
+                    part_root = self.group_root(snapshot.group_id) / "parts" / f"part-{part_index:03d}"
+                    atomic_json(part_root / "COMPLETE", {
+                        "mode": control["mode"], "selected_count": total,
+                        "generation": snapshot.generation,
+                        **{k: dispatch[k] for k in ("part_index", "part_count", "start_ordinal", "end_ordinal")},
+                    })
+                    self.log("part_complete", snapshot, part_index=part_index, selected_count=total,
+                             bundle_root=str(part_root / "bundle"))
+                    if part_index + 1 < dispatch["part_count"]:
+                        control.update(stage=STAGES[0], generation=snapshot.generation + 1,
+                                       part_index=part_index + 1, phase="running", members={})
+                        self._initialize_stage(self._snapshot(control), part_index + 1)
+                        atomic_json(self.control_path, control)
+                        return True
                 counts = {}
                 if control["mode"].startswith("http_native"):
                     calls = sum(read_json(path)["payload"].get("model_call_count", 0)
                         for path in self.group_root(snapshot.group_id).glob("stages/*-mimo/results/*.json"))
                     counts = {"model_call_count": calls if control["mode"] in ("http_native_pilot", "http_native_production") else 0,
-                              "simulated_mimo_request_count": calls if control["mode"] == "http_native_cpu_pilot" else 0}
+                              "simulated_mimo_request_count": calls if control["mode"] in ("http_native_cpu_pilot", "http_native_cpu_production") else 0}
                 atomic_json(self.group_root(snapshot.group_id) / self.completion_marker, {
-                    "mode": control["mode"], "selected_count": total,
+                    "mode": control["mode"], "selected_count": self.inventory(snapshot.group_id)["selected_count"],
                     "generation": snapshot.generation, "model_call_count": 0, **counts,
                 })
                 control["phase"] = "complete"
             else:
                 control.update(stage=STAGES[index + 1], generation=snapshot.generation + 1,
                                phase="running", members={})
-                self._initialize_stage(self._snapshot(control))
+                self._initialize_stage(self._snapshot(control), control.get("part_index", 0))
             atomic_json(self.control_path, control)
             return True
 

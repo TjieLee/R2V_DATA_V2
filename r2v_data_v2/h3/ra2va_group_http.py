@@ -194,7 +194,7 @@ class HttpGroupCoordinator:
             if (self.mode.startswith("http_native") and self.snapshot.stage == "export"
                     and (progress := self.core.progress(self.snapshot))["active"] == progress["pending"] == 0):
                 from r2v_data_v2.h3.ra2va_group_local import _collect_export
-                _collect_export(self.core.group_root(self.snapshot.group_id))
+                _collect_export(self.core.group_root(self.snapshot.group_id), self.snapshot)
             if self.core.advance(self.snapshot):
                 self._close_handles()
                 self._restore()
@@ -205,6 +205,9 @@ class HttpGroupCoordinator:
             "finished": self.core.budget_finished(control),
             "lease_seconds": LEASE_SECONDS,
             "run_mode": self.mode,
+            "part_index": control.get("part_index", 0),
+            "part_count": (len(self.core.inventory(control["group_id"])["parts"])
+                           if self.core.group_parts > 1 and control["group_id"] else 1),
         }
 
     def _member(self, body):
@@ -250,7 +253,7 @@ class HttpGroupCoordinator:
         if body.get("run_root", str(self.core.run_root)) != str(self.core.run_root):
             raise ClaimConflict("Worker belongs to a different run")
         expected = {"http_native_pilot": "native", "http_native_production": "native",
-                    "http_native_cpu_pilot": "cpu_fixture"}.get(self.mode, "fake")
+                    "http_native_cpu_pilot": "cpu_fixture", "http_native_cpu_production": "cpu_fixture"}.get(self.mode, "fake")
         if body.get("execution_mode", "fake") != expected:
             raise ClaimConflict("Worker execution mode differs from run mode")
         node, instance = body["node_id"], body["worker_instance"]

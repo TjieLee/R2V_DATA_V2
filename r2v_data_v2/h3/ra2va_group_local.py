@@ -84,12 +84,25 @@ def _worker(coordinator, worker_id, stop, fixtures_path, ffmpeg):
             continue
 
 
-def _collect_export(group_root):
-    summary_path = group_root / "bundle/summary.json"
+def _collect_export(group_root, snapshot=None):
+    scope = None
+    if snapshot is not None:
+        scope = read_json(group_root / "stages" / f"{snapshot.generation:06d}-export/dispatch.json")
+    partitioned = scope is not None and "part_index" in scope
+    output_root = (group_root / "parts" / f"part-{scope['part_index']:03d}"
+                   if partitioned else group_root)
+    summary_path = output_root / "bundle/summary.json"
     if summary_path.exists():
         return read_json(summary_path)
     output = summary_path.parent
-    roots = sorted((group_root / "stages").glob("*-export/results/*.json"))
+
+    def results(stage):
+        if partitioned:
+            generation = snapshot.generation - (len(STAGES) - 1) + STAGES.index(stage)
+            return sorted((group_root / "stages" / f"{generation:06d}-{stage}/results").glob("*.json"))
+        return sorted((group_root / "stages").glob(f"*-{stage}/results/*.json"))
+
+    roots = results("export")
     tasks, donors, summaries = {key: [] for key in RA2VA_TASK_ORDER}, [], []
     for path in roots:
         result = read_json(path)
@@ -106,11 +119,11 @@ def _collect_export(group_root):
             donors.append(donor)
     output.mkdir(parents=True, exist_ok=True)
     jobs, records = [], []
-    for path in sorted((group_root / "stages").glob("*-asr/results/*.json")):
+    for path in results("asr"):
         result = read_json(path)
         if "job" in result["payload"]:
             jobs.append(result["payload"]["job"])
-    for path in sorted((group_root / "stages").glob("*-mimo/results/*.json")):
+    for path in results("mimo"):
         records.append(read_json(path)["payload"])
     atomic_json(output / "source_contract.json", {"schema_version": "r2v.h3.group_source_contract.1", "jobs": jobs})
     _write_rows(output / "records.jsonl", records)
@@ -126,6 +139,9 @@ def _collect_export(group_root):
         "product_failed_count": sum(s["product_failed_count"] for s in summaries),
         "task_counts": {key: len(value) for key, value in tasks.items()}, "donor_count": len(donors),
         "donor_segment_count": sum(d["segment_count"] for d in donors)}
+    if partitioned:
+        summary.update({k: scope[k] for k in (
+            "part_index", "part_count", "start_ordinal", "end_ordinal", "selected_count")})
     atomic_json(summary_path, summary)
     return summary
 

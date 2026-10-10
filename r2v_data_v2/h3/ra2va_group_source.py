@@ -8,6 +8,7 @@ import re
 import shutil
 import tempfile
 from dataclasses import asdict, dataclass
+from itertools import pairwise
 from pathlib import Path
 
 from r2v_data_v2.h3.schemas import entity_reference_order
@@ -91,7 +92,10 @@ def freeze_pilot_inventory(group: PublishedGroup, destination: Path, limit: int,
     return freeze_group_inventory(group, destination, limit, start_row=start_row)
 
 
-def freeze_group_inventory(group: PublishedGroup, destination: Path, limit: int | None, *, start_row=0) -> dict:
+def freeze_group_inventory(group: PublishedGroup, destination: Path, limit: int | None, *, start_row=0,
+                           group_parts=1) -> dict:
+    if group_parts not in (1, 4) or (limit is not None and group_parts != 1):
+        raise ValueError("group parts require full production scope and must be 1 or 4")
     if limit is None:
         if start_row:
             raise ValueError("full group cannot start partway through the source")
@@ -102,7 +106,8 @@ def freeze_group_inventory(group: PublishedGroup, destination: Path, limit: int 
     if destination.exists():
         metadata = json.loads((destination / "inventory.json").read_text())
         if (metadata["limit"] != limit or metadata["group_id"] != group.group_id
-                or metadata.get("start_row", 0) != start_row):
+                or metadata.get("start_row", 0) != start_row
+                or metadata.get("group_parts", 1) != group_parts):
             raise ValueError("resume inventory settings differ")
         return metadata
     if start_row and start_row >= group.declared_count:
@@ -136,6 +141,13 @@ def freeze_group_inventory(group: PublishedGroup, destination: Path, limit: int 
                         "source_samples_path": str(group.samples_path), "limit": limit, "start_row": start_row,
                         "selected_count": len(offsets), "declared_source_count": group.declared_count,
                         "offsets": offsets}
+        if group_parts > 1:
+            count = len(offsets)
+            boundaries = [count * part // group_parts for part in range(group_parts + 1)]
+            metadata.update(group_parts=group_parts, parts=[
+                {"start_ordinal": start, "end_ordinal": end}
+                for start, end in pairwise(boundaries) if start < end]
+                or [{"start_ordinal": 0, "end_ordinal": 0}])
         atomic_json(temporary / "inventory.json", metadata)
         temporary.rename(destination)
         return metadata

@@ -111,19 +111,24 @@ def pilot_summary(run_root: Path) -> dict:
             elapsed = max(dispatch.get("finished_at", time.time()) - dispatch["started_at"], 0.000001)
             stages.append({"group": group, "stage": path.parent.name.split("-", 1)[1],
                            "generation": dispatch["generation"],
-                           "pending": metadata["selected_count"] - done - len(dispatch["active"]),
+                           "pending": dispatch.get("selected_count", metadata["selected_count"]) - done - len(dispatch["active"]),
                            "active": len(dispatch["active"]),
                            **{k: dispatch[k] for k in ("ready", "failed", "skipped")},
-                           "elapsed_seconds": elapsed, "tasks_per_second": done / elapsed})
+                           "elapsed_seconds": elapsed, "tasks_per_second": done / elapsed,
+                           **({k: dispatch[k] for k in ("part_index", "part_count", "start_ordinal", "end_ordinal")}
+                              if "part_index" in dispatch else {})})
     result = {"mode": control["mode"], "settings": control["settings"],
             "completed_groups": completed, "started_groups": control["started_groups"],
             "model_call_count": 0, "stages": stages}
+    result["completed_parts"] = len(list(run_root.glob("groups/*/parts/part-*/COMPLETE")))
     if control["mode"].startswith("http_native"):
         calls = sum(read_json(path)["payload"].get("model_call_count", 0)
                     for path in run_root.glob("groups/*/stages/*-mimo/results/*.json"))
         result["model_call_count"] = calls if control["mode"] in ("http_native_pilot", "http_native_production") else 0
-        result["simulated_mimo_request_count"] = calls if control["mode"] == "http_native_cpu_pilot" else 0
-        result["exports"] = [read_json(path) for path in run_root.glob("groups/*/bundle/summary.json")]
+        result["simulated_mimo_request_count"] = calls if control["mode"] in ("http_native_cpu_pilot", "http_native_cpu_production") else 0
+        paths = list(run_root.glob("groups/*/bundle/summary.json")) + list(
+            run_root.glob("groups/*/parts/part-*/bundle/summary.json"))
+        result["exports"] = [read_json(path) for path in sorted(paths)]
     return result
 
 

@@ -150,6 +150,12 @@ def launch_node(repo_root, environment, *, dry_run=False, fake=False):
     run_id = environment.get("R2VA_RUN_ID", "ra2va-group-production-v1" if full_group else "ra2va-group-pilot20-v1")
     output_root = Path(environment.get("R2VA_OUTPUT_ROOT", OUTPUT_ROOT))
     run_root = pilot_run_root(output_root, run_id)
+    group_parts = int(environment.get("R2VA_GROUP_PARTS", "4" if full_group else "1"))
+    control_path = run_root / "control.json"
+    if "R2VA_GROUP_PARTS" not in environment and control_path.exists():
+        group_parts = json.loads(control_path.read_text())["settings"].get("group_parts", 1)
+    if group_parts not in (1, 4) or (not full_group and group_parts != 1):
+        raise ValueError("group parts require full production scope and must be 1 or 4")
     python = environment.get("R2V_PYTHON", str(repo_root / ".venv/bin/python"))
     tool = str(repo_root / "tools/run_h3_ra2va_group_production.py")
     values = node_configuration(repo_root, environment)
@@ -162,12 +168,14 @@ def launch_node(repo_root, environment, *, dry_run=False, fake=False):
         *(["--full-group"] if full_group else ["--limit", environment.get("R2VA_LIMIT", "20")]),
         "--start-row", environment.get("R2VA_START_ROW", "0"),
         "--max-groups", environment.get("R2VA_MAX_GROUPS", "0" if full_group else "1"),
+        "--group-parts", str(group_parts),
         "--host", environment.get("R2VA_COORDINATOR_HOST", "auto"),
         "--port", environment.get("R2VA_COORDINATOR_PORT", "8780"),
         "--local-lock-path", f"/tmp/{run_id}.coordinator.lock", "--publish-endpoint"]
     plan = {"role": role, "run_root": str(run_root), "node_id": node, "workers": workers,
         "start_row": int(environment.get("R2VA_START_ROW", "0")),
         "full_group": full_group, "limit": None if full_group else int(environment.get("R2VA_LIMIT", "20")),
+        "group_parts": group_parts,
         "max_clip_duration_seconds": values.get("max_clip_duration_seconds", 20),
         "asr_batch_size": values["asr"].get("batch_size", 8),
         "gpu_ids": values["gpu_ids"], "mimo_gpu_groups": values["mimo"]["gpu_groups"],

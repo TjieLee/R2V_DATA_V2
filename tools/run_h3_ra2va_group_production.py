@@ -41,6 +41,7 @@ def main():
             command.add_argument("--workers", type=int, default=4)
             command.add_argument("--poll-seconds", type=float, default=0.05)
         if name == "coordinator":
+            command.add_argument("--group-parts", type=int, choices=(1, 4), default=1)
             command.add_argument("--execution-mode", choices=("fake", "native", "cpu_fixture"), default="fake")
             command.add_argument("--host", required=True)
             command.add_argument("--port", type=int, required=True)
@@ -93,7 +94,7 @@ def main():
 
         def factory():
             return HttpGroupCoordinator(GroupCoordinator(root, args.source_root, args.limit,
-                max_groups=args.max_groups, start_row=args.start_row,
+                max_groups=args.max_groups, start_row=args.start_row, group_parts=args.group_parts,
                 transport="http", coordinator_host=socket.gethostname(),
                 mode=({"fake": "cpu_fake_production", "native": "http_native_production"}[args.execution_mode]
                       if args.full_group else {"fake": "cpu_fake_pilot", "native": "http_native_pilot",

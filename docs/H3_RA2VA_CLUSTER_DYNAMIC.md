@@ -42,8 +42,71 @@ in source order, without reading media or computing hashes. `R2VA_MAX_GROUPS=0`
 (the full-scope default) processes newly published groups continuously;
 `R2VA_MAX_GROUPS=1` stops after one complete group. This budget remains cumulative
 across restarts. All nodes still share one current group and stage; there is no
-rank/shard assignment. Only a full group writes `COMPLETE`; bounded runs continue
-to write only `PILOT_COMPLETE`. `--dry-run` remains available on the same command.
+rank/shard assignment. Only all completed production parts write the group-level
+`COMPLETE`; bounded runs continue to write only `PILOT_COMPLETE`. `--dry-run`
+remains available on the same command.
+
+### Early Training Delivery
+
+New full-production runs default to four ordered parts per source group. All
+nodes work on the same current part through canonical, SAM, AuK, resolve,
+DiariZen, ASR, MiMo and export. The next part starts only after training JSONL
+and donor reserve publication and the existing Worker release barrier. Models
+still stay loaded across clips within each stage, not across part boundaries.
+This trades four sets of stage/model startups for earlier training data.
+
+The full inventory is frozen once. Part `i` uses zero-based original ordinals
+`floor(N*i/4)` through `floor(N*(i+1)/4)-1`, without shuffling, renumbering clips,
+or re-reading source media. Empty parts in groups smaller than four clips are
+omitted. Source groups containing 35,000-40,000 clips yield about 8,750-10,000
+clips per part; duration-skipped and failed clips retain their terminal status.
+
+```text
+R2VA/<run-id>/groups/group-000000/
+  inventory/                     # one full frozen source inventory
+  stages/                        # unique generation for every part/stage
+  parts/part-000/
+    bundle/training/             # existing 12 task JSONL files + index
+    bundle/voice_donor_reserve.json
+    bundle/source_contract.json
+    bundle/records.jsonl
+    bundle/summary.json
+    COMPLETE                     # this part, not the whole source group
+  parts/part-001/                 # independent publication; no rewrite of part-000
+  parts/part-002/
+  parts/part-003/
+  COMPLETE                       # only after the last part completes
+```
+
+Train from each published part's `bundle/training/` as soon as that part's
+`COMPLETE` exists. Parts contain disjoint clips; combine their task files later
+without deduplication or re-materialization. The donor index references the
+existing per-clip audio assets and includes every eligible speech segment.
+There is no extra group-wide training merge or model request.
+
+Resume uses the original run-id, part boundaries, generation and terminal
+receipts. `max_groups` still counts source groups, not parts, so a budget of one
+finishes all four parts but never starts the next group. Status includes
+`part_index` (zero-based), `part_count`, ordinal bounds and `completed_parts`.
+Logs emit `part_complete` with the delivered bundle path.
+
+Historical unsplit full runs and bounded Pilots remain unsplit on restart:
+the entry reads the saved part setting instead of silently migrating them.
+`R2VA_GROUP_PARTS=1` is available for legacy deployments; new normal submissions
+need no prefix or additional argument. An explicit changed setting for an
+existing run is rejected. Multi/Single, prompts, ASR, Speaker rules and training
+row formats are unchanged. CPU tests cover part boundaries, lost control writes,
+claim fencing, release barriers and actual per-part audio/H3/JSONL exports;
+this is not a new GPU throughput measurement.
+
+CPU regression on 2026-10-10: 12 focused part tests passed. Two local HTTP Fake
+Workers completed 20 clips across 32 generations with 160 unique terminal
+clip-stage results. The real CPU materialization fixture completed 8 synthetic
+clips in four parts: 24 ready products, 0 failed products, 96 four-field task
+rows (8 per task), 8 donors and 16 segments. The first part was published before
+the second started, and its files stayed byte-for-byte unchanged afterward.
+Real model calls: 0; simulated Visual/Joint responses: 16. These local tests are
+not a new real two-node or GPU Pilot.
 
 `MAX_CLIP_DURATION_SECONDS=20` is the default, matching the supplied T2VA setup.
 Canonical probes video duration once and skips longer clips before audio
