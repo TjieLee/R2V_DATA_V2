@@ -5,9 +5,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import secrets
 import signal
 import socket
 import sys
+from contextlib import ExitStack
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -83,9 +85,13 @@ def main():
             coordinator_process_guard,
         )
         from r2v_data_v2.h3.ra2va_group_launch import (
+            _start_media,
             coordinator_token,
             local_coordinator_address,
+            node_configuration,
             publish_endpoint,
+            publish_shared_token,
+            shared_token_path,
         )
         from r2v_data_v2.h3.ra2va_group_production import GroupCoordinator
 
@@ -93,6 +99,8 @@ def main():
             args.host = local_coordinator_address()
 
         def factory():
+            if shared_credentials:
+                publish_shared_token(root, token)
             return HttpGroupCoordinator(GroupCoordinator(root, args.source_root, args.limit,
                 max_groups=args.max_groups, start_row=args.start_row, group_parts=args.group_parts,
                 transport="http", coordinator_host=socket.gethostname(),
@@ -105,13 +113,30 @@ def main():
         def stop(signum, frame):
             raise KeyboardInterrupt
 
-        with coordinator_process_guard(args.local_lock_path):
+        with coordinator_process_guard(args.local_lock_path), ExitStack() as cleanup:
+            for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+                previous = signal.signal(sig, stop)
+                cleanup.callback(signal.signal, sig, previous)
             token = os.environ.get("R2V_GROUP_COORDINATOR_TOKEN")
+            shared_credentials = args.publish_endpoint and not token and not os.environ.get("R2VA_TOKEN_FILE")
             if args.publish_endpoint and not token:
-                token = coordinator_token(os.environ.get("R2VA_TOKEN_FILE"))
+                if shared_credentials:
+                    path = shared_token_path(root)
+                    token = coordinator_token(path) if path.exists() else secrets.token_urlsafe(32)
+                    repo = Path(__file__).resolve().parents[1]
+                    values = node_configuration(repo, os.environ)
+                    if path.resolve().is_relative_to(Path(values["mimo"]["media_root"]).resolve()):
+                        from r2v_data_v2.h3.ra2va_group_native_resources import (
+                            stop_owned_process,
+                        )
+
+                        media = _start_media(sys.executable, values, os.environ, repo, require_private=True)
+                        if media is not None:
+                            cleanup.callback(stop_owned_process, media, set(), grace=5)
+                else:
+                    token = coordinator_token(os.environ["R2VA_TOKEN_FILE"])
             server = build_http_server(args.host, args.port, service_factory=factory,
                                        bearer_token=token)
-            previous = signal.signal(signal.SIGTERM, stop)
             try:
                 if args.publish_endpoint:
                     publish_endpoint(root, args.host, server.server_port)
@@ -121,7 +146,6 @@ def main():
             finally:
                 server.server_close()
                 server.service.close()
-                signal.signal(signal.SIGTERM, previous)
         return
     if args.command == "status":
         result = pilot_summary(root)

@@ -170,19 +170,28 @@ a stale URL serving a different run is rejected. Every subsequent Worker
 connect/reconnect also carries that run root and is rejected before joining or
 loading resources if the endpoint now serves another run.
 
-Deployment provisions the same credential once on each authorized node at
-`/root/.config/r2va/coordinator.token` (directory 0700, file 0600), using the
-authenticated SSH channel rather than shared storage. The normal Bash command
-needs no credential argument. `R2VA_TOKEN_FILE` can select another node-local
-file; it must be outside the configured HTTP media root. A missing/private-mode
-error stops startup before any Worker or model is launched. The existing
-`R2V_GROUP_COORDINATOR_TOKEN` environment override remains supported.
+Fresh cluster containers no longer need `/root/.config/r2va/coordinator.token`.
+By default, the designated Coordinator creates one random per-run credential at
+`<run-root>/.ra2va-private/coordinator.token`, only after acquiring its local lock
+and binding TCP. The directory is 0700, the atomically published file is 0600,
+and resume reuses it without rotation. Workers wait for that file read-only;
+they never initialize it or promote themselves to Coordinator. The normal
+Bash command needs no credential argument or environment injection.
 
-The credential is reused on resume, never printed or passed on the command
-line. Discovery, run logs and shared output contain no credential. Do not put
-the token in `/mnt/workspace`: even a 0600 file there can be read by a
-same-account media server. New nodes require the same one-time private credential
-provisioning; they do not obtain secrets from the public discovery file.
+The launcher starts a loopback-only media server that rejects `.ra2va-private`
+paths, including URL-encoded paths and resolved symlinks, and disables directory
+listings. It checks this policy before shared-credential initialization. An
+existing unrestricted media server is not reused or stopped: startup explains
+that it must be stopped by its owner or a free media port configured. Do not
+independently serve the shared tree with an unrestricted file server. Unix
+permissions alone do not protect credentials from a same-account HTTP server.
+
+`R2VA_TOKEN_FILE` still supports an explicitly provisioned private node-local
+file outside the HTTP media root. `R2V_GROUP_COORDINATOR_TOKEN` remains supported
+for platforms that can inject the same secret on all nodes. Explicit overrides
+take precedence and do not create a shared token. Credentials are never printed,
+passed on the command line or copied into discovery, logs, bundles or JSONL.
+The private per-run file is the only shared credential location.
 Workers never write discovery, cursor, claims, generation or terminal state.
 This launcher assumes trusted nodes and private-network HTTP, not hostile
 co-located users or automatic Coordinator election.

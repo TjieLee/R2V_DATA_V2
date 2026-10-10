@@ -13,6 +13,9 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+PRIVATE_DIRECTORY = ".ra2va-private"
+MEDIA_POLICY = "private-paths-denied-v1"
+
 
 def local_coordinator_address():
     # UDP connect selects the local default route; it sends no network packet.
@@ -29,6 +32,44 @@ def coordinator_token(token_file=None):
     if not token or any(character.isspace() for character in token):
         raise ValueError(f"Invalid Coordinator credential file: {path}")
     return token
+
+
+def shared_token_path(run_root):
+    return Path(run_root) / PRIVATE_DIRECTORY / "coordinator.token"
+
+
+def publish_shared_token(run_root, token):
+    """Only the Coordinator calls this, after owning its local lock and TCP."""
+    path = shared_token_path(run_root)
+    path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    path.parent.chmod(0o700)
+    if path.exists():
+        if coordinator_token(path) != token:
+            raise ValueError("Coordinator credential changed during startup")
+        return
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, prefix=".token-", delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(token + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def wait_for_shared_token(run_root, timeout, coordinator=None):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if coordinator is not None and coordinator.poll() is not None:
+            raise RuntimeError("Coordinator exited during credential initialization")
+        try:
+            return coordinator_token(shared_token_path(run_root))
+        except FileNotFoundError:
+            time.sleep(.1)
+    raise TimeoutError("Coordinator credential initialization timed out; start rank 0 with the same run-id")
 
 
 def publish_endpoint(run_root, host, port):
@@ -97,17 +138,29 @@ def _runtime_environment(repo_root, run_root, environment):
     return env
 
 
-def _start_media(python, values, environment, repo_root):
+def _start_media(python, values, environment, repo_root, *, require_private=False):
     url = urllib.parse.urlsplit(values["mimo"]["media_base_url"])
     if url.hostname not in {"127.0.0.1", "localhost"}:
+        if require_private:
+            raise ValueError("Shared credentials require the node-local private media server")
         return None
     port = url.port or 80
     try:
         with socket.create_connection((url.hostname, port), timeout=1):
+            if require_private:
+                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                try:
+                    with opener.open(url.geturl().rstrip("/") + "/_r2va_media_policy", timeout=1) as response:
+                        private = response.headers.get("X-R2VA-Media-Policy") == MEDIA_POLICY
+                except OSError:
+                    private = False
+                if not private:
+                    raise RuntimeError(f"Existing media server lacks private-file isolation: {url.geturl()}; "
+                                       "stop that server or select a free media port")
             print(f"media: using existing {url.geturl()}", flush=True)
             return None
     except OSError:
-        command = [python, "-m", "http.server", str(port), "--bind", "127.0.0.1",
+        command = [python, "-m", "r2v_data_v2.h3.ra2va_group_media", "--port", str(port),
                    "--directory", values["mimo"]["media_root"]]
         process = subprocess.Popen(command, cwd=repo_root, env=environment, start_new_session=True)
     try:
@@ -186,11 +239,12 @@ def launch_node(repo_root, environment, *, dry_run=False, fake=False):
     if dry_run:
         return 0
     env = _runtime_environment(repo_root, run_root, environment)
-    if not env.get("R2V_GROUP_COORDINATOR_TOKEN"):
-        token_file = Path(env.get("R2VA_TOKEN_FILE", Path.home() / ".config/r2va/coordinator.token")).resolve()
+    if not env.get("R2V_GROUP_COORDINATOR_TOKEN") and env.get("R2VA_TOKEN_FILE"):
+        token_file = Path(env["R2VA_TOKEN_FILE"]).resolve()
         if token_file.is_relative_to(Path(values["mimo"]["media_root"]).resolve()):
             raise ValueError("Coordinator credential must be outside the media root")
         env["R2V_GROUP_COORDINATOR_TOKEN"] = coordinator_token(token_file)
+    shared_credentials = not env.get("R2V_GROUP_COORDINATOR_TOKEN")
     coordinator = worker = media = None
     worker_descendants = set()
     handlers = {}
@@ -201,8 +255,14 @@ def launch_node(repo_root, environment, *, dry_run=False, fake=False):
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         handlers[sig] = signal.signal(sig, interrupted)
     try:
+        if shared_credentials and (not fake or shared_token_path(run_root).resolve().is_relative_to(
+                Path(values["mimo"]["media_root"]).resolve())):
+            media = _start_media(python, values, env, repo_root, require_private=True)
         if role == "coordinator":
             coordinator = subprocess.Popen(coordinator_command, cwd=repo_root, env=env, start_new_session=True)
+        if shared_credentials:
+            env["R2V_GROUP_COORDINATOR_TOKEN"] = wait_for_shared_token(
+                run_root, float(env.get("R2VA_WAIT_SECONDS", "300")), coordinator)
         endpoint = wait_for_endpoint(run_root, float(env.get("R2VA_WAIT_SECONDS", "300")), coordinator,
                                      token=env["R2V_GROUP_COORDINATOR_TOKEN"])
         print(f"coordinator: {endpoint['url']}; node={node}", flush=True)
@@ -212,7 +272,8 @@ def launch_node(repo_root, environment, *, dry_run=False, fake=False):
             command += ["--fake-delay-seconds", env.get("R2VA_FAKE_DELAY_SECONDS", "0")]
         else:
             atomic_json(configuration, values)
-            media = _start_media(python, values, env, repo_root)
+            if not shared_credentials:
+                media = _start_media(python, values, env, repo_root)
             command += ["--configuration", str(configuration)]
         worker = subprocess.Popen(command, cwd=repo_root, env=env, start_new_session=True)
         while worker.poll() is None:
