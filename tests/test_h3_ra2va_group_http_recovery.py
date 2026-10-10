@@ -107,6 +107,63 @@ def test_restart_restores_unexpired_claim_without_reassignment(tmp_path):
         restarted.close()
 
 
+def test_replacement_master_preserves_results_generation_and_unexpired_claim(tmp_path):
+    import socket
+
+    from r2v_data_v2.h3.ra2va_group_http import HttpGroupCoordinator
+    from r2v_data_v2.h3.ra2va_group_launch import confirm_stopped_coordinator
+    from r2v_data_v2.h3.ra2va_group_production import GroupCoordinator
+
+    source = tmp_path / "post_mask"
+    publish_group(source, count=4)
+    with socket.socket() as unused:
+        unused.bind(("127.0.0.1", 0))
+        old_port = unused.getsockname()[1]
+    identity = {"guard_path": str(tmp_path / "coordinator.lock"),
+                "bind_host": "127.0.0.1", "bind_port": old_port}
+    clock = Clock()
+    core = GroupCoordinator(tmp_path / "run", source, 20, transport="http",
+                            coordinator_host="old-master", coordinator_identity=identity)
+    service = HttpGroupCoordinator(core, wall_clock=clock)
+    for index, status in enumerate(("ready", "failed", "skipped")):
+        task = claim(service, connect(service, f"finished-{index}"))
+        post(service, "/v1/tasks/result", **result_body(task, status))
+    pending_session = connect(service, "pending")
+    pending = claim(service, pending_session)
+    control = core.status()
+    dispatch_path = core.stage_root(service.snapshot) / "dispatch.json"
+    dispatch = dispatch_path.read_bytes()
+    results = {path: path.read_bytes() for path in dispatch_path.parent.glob("results/*.json")}
+    service.close()
+
+    replacement = GroupCoordinator(core.run_root, source, 20, transport="http",
+        coordinator_host="new-master", coordinator_identity=identity | {"bind_host": "127.0.0.2"},
+        coordinator_resume=confirm_stopped_coordinator)
+    updated = replacement.status()
+    assert updated["coordinator_host"] == "new-master"
+    assert updated["coordinator_identity"]["bind_host"] == "127.0.0.2"
+    for field in ("generation", "stage", "phase", "members", "settings", "started_groups"):
+        assert updated[field] == control[field]
+    assert updated["coordinator_restarts"][-1]["previous_host"] == "old-master"
+    assert dispatch_path.read_bytes() == dispatch
+    assert all(path.read_bytes() == contents for path, contents in results.items())
+    restarted = HttpGroupCoordinator(replacement, wall_clock=clock)
+    try:
+        assert connect(restarted, "pending")["claim"] == pending
+        assert claim(restarted, connect(restarted, "other"))["task"] is None
+        clock.now += 61
+        restarted.tick()
+        assert restarted.dispatch("POST", "/v1/tasks/result", result_body(pending))[0] == 409
+        recovered = claim(restarted, connect(restarted, "other"))
+        assert recovered["task_id"] == pending["task_id"]
+        assert recovered["claim_token"] != pending["claim_token"]
+        post(restarted, "/v1/tasks/result", **result_body(recovered))
+        assert restarted.core.progress(restarted.snapshot)["ready"] == 2
+        assert all(path.read_bytes() == contents for path, contents in results.items())
+    finally:
+        restarted.close()
+
+
 def test_expired_token_rejected_and_unpublished_work_reclaimed(tmp_path):
     clock = Clock()
     service = make_service(tmp_path, count=1, clock=clock)

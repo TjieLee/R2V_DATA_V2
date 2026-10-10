@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import signal
@@ -88,6 +89,22 @@ def publish_endpoint(run_root, host, port):
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
+
+
+def confirm_stopped_coordinator(previous, current):
+    """Manual cluster restart only; the new master already owns its local lock and TCP."""
+    if any(previous[key] != current[key] for key in ("guard_path", "bind_port")):
+        raise ValueError("Coordinator resume must keep the original run guard and port")
+    if previous["bind_host"] == current["bind_host"]:
+        return  # Binding this endpoint already proved it was free on this host.
+    try:
+        with socket.create_connection((previous["bind_host"], previous["bind_port"]), timeout=3):
+            pass
+    except OSError as error:
+        if error.errno in (errno.ECONNREFUSED, errno.EHOSTUNREACH, errno.ENETUNREACH):
+            return
+        raise RuntimeError("cannot confirm previous Coordinator is stopped; stop the old cluster before resume") from error
+    raise RuntimeError("Previous Coordinator is still reachable; stop the old cluster before resume")
 
 
 def wait_for_endpoint(run_root, timeout, coordinator=None, *, token):
@@ -224,7 +241,8 @@ def launch_node(repo_root, environment, *, dry_run=False, fake=False):
         "--group-parts", str(group_parts),
         "--host", environment.get("R2VA_COORDINATOR_HOST", "auto"),
         "--port", environment.get("R2VA_COORDINATOR_PORT", "8780"),
-        "--local-lock-path", f"/tmp/{run_id}.coordinator.lock", "--publish-endpoint"]
+        "--local-lock-path", f"/tmp/{run_id}.coordinator.lock", "--publish-endpoint",
+        "--resume-stopped-coordinator"]
     plan = {"role": role, "run_root": str(run_root), "node_id": node, "workers": workers,
         "start_row": int(environment.get("R2VA_START_ROW", "0")),
         "full_group": full_group, "limit": None if full_group else int(environment.get("R2VA_LIMIT", "20")),

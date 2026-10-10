@@ -88,7 +88,7 @@ class WorkerSession:
 class GroupCoordinator:
     def __init__(self, run_root: Path, source_root: Path, limit: int | None, *, max_groups=1, start_row=0,
                  transport="local", coordinator_host=None, coordinator_identity=None,
-                 mode="cpu_fake_pilot", group_parts=1):
+                 mode="cpu_fake_pilot", group_parts=1, coordinator_resume=None):
         full_group = limit is None
         if ((full_group != mode.endswith("_production")) or (full_group and start_row != 0)
                 or (not full_group and (not 1 <= limit <= 200 or max_groups == 0))
@@ -121,12 +121,23 @@ class GroupCoordinator:
                     raise ValueError("run mode differs; use the original run-id settings")
                 if existing.get("transport", "local") != transport:
                     raise ValueError("run transport differs; implicit migration is forbidden")
-                if transport == "http" and existing["coordinator_host"] != coordinator_host:
+                host_changed = transport == "http" and existing["coordinator_host"] != coordinator_host
+                identity_changed = transport == "http" and existing.get("coordinator_identity") != coordinator_identity
+                if host_changed and coordinator_resume is None:
                     raise ValueError("designated coordinator host differs")
-                if transport == "http" and existing.get("coordinator_identity") != coordinator_identity:
+                if identity_changed and coordinator_resume is None:
                     raise ValueError("Coordinator identity differs; use the original guard and endpoint")
                 if existing["settings"] != settings:
                     raise ValueError("resume settings differ from persisted run")
+                if host_changed or identity_changed:
+                    coordinator_resume(existing["coordinator_identity"], coordinator_identity)
+                    existing.setdefault("coordinator_restarts", []).append({
+                        "previous_host": existing["coordinator_host"],
+                        "previous_identity": existing["coordinator_identity"],
+                        "host": coordinator_host, "identity": coordinator_identity, "resumed_at": time.time(),
+                    })
+                    existing.update(coordinator_host=coordinator_host, coordinator_identity=coordinator_identity)
+                    atomic_json(self.control_path, existing)
             else:
                 ownership = ({"transport": "http", "coordinator_host": coordinator_host,
                               "coordinator_identity": coordinator_identity}

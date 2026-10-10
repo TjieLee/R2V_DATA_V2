@@ -199,7 +199,15 @@ co-located users or automatic Coordinator election.
 There is no automatic Coordinator failover. A Worker with missing/unreachable
 discovery waits and reports a bounded startup error; it never promotes itself.
 The existing HTTP heartbeat, watchdog, claim fencing and receipt semantics are
-unchanged. Stop/restart Coordinator on the original designated node only.
+unchanged. Stop the old cluster job before resubmitting the same Bash command.
+The newly designated rank 0 may have a different container hostname/private IP;
+the launcher resumes the same run and republishes its discovered address, keeping
+the original local guard path/port, generation, claims and terminal results.
+This is an operator-initiated cluster restart, not automatic failover: Workers
+never promote themselves. A listening previous endpoint or an ambiguous timeout
+blocks replacement. Refused/unreachable old endpoints are accepted only under
+the requirement that the previous job has already been stopped. Host/address
+changes are recorded in `control.json` under `coordinator_restarts`.
 
 For default local media URL `http://127.0.0.1:8766/`, use an existing HTTP service
 or start the same `python -m http.server --directory /mnt/workspace` service used

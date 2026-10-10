@@ -49,6 +49,8 @@ def main():
             command.add_argument("--port", type=int, required=True)
             command.add_argument("--local-lock-path", type=Path, required=True)
             command.add_argument("--publish-endpoint", action="store_true")
+            command.add_argument("--resume-stopped-coordinator", action="store_true",
+                                 help="resume on the new master after the previous cluster job was stopped")
     worker = subparsers.add_parser("worker")
     modes = worker.add_mutually_exclusive_group(required=True)
     modes.add_argument("--fake", action="store_true")
@@ -86,6 +88,7 @@ def main():
         )
         from r2v_data_v2.h3.ra2va_group_launch import (
             _start_media,
+            confirm_stopped_coordinator,
             coordinator_token,
             local_coordinator_address,
             node_configuration,
@@ -108,7 +111,8 @@ def main():
                       if args.full_group else {"fake": "cpu_fake_pilot", "native": "http_native_pilot",
                                                "cpu_fixture": "http_native_cpu_pilot"}[args.execution_mode]),
                 coordinator_identity={"guard_path": str(args.local_lock_path.resolve()),
-                                      "bind_host": args.host, "bind_port": args.port}))
+                                      "bind_host": args.host, "bind_port": args.port},
+                coordinator_resume=confirm_stopped_coordinator if args.resume_stopped_coordinator else None))
 
         def stop(signum, frame):
             raise KeyboardInterrupt

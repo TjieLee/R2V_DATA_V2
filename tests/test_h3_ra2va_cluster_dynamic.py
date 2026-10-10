@@ -293,6 +293,46 @@ def test_occupied_coordinator_port_cannot_publish_discovery_or_control(tmp_path)
     assert not (tmp_path / "output/discovery20/coordinator_endpoint.json").exists()
 
 
+def test_replacement_master_cannot_take_over_a_listening_coordinator(tmp_path):
+    with socket.socket() as old:
+        old.bind(("127.0.0.1", 0))
+        old.listen()
+        identity = {"guard_path": str(tmp_path / "guard.lock"),
+                    "bind_host": "127.0.0.1", "bind_port": old.getsockname()[1]}
+        with pytest.raises(RuntimeError, match="still reachable"):
+            api().confirm_stopped_coordinator(identity, identity | {"bind_host": "127.0.0.2"})
+
+
+def test_replacement_master_does_not_treat_timeout_as_stopped(tmp_path, monkeypatch):
+    identity = {"guard_path": str(tmp_path / "guard.lock"), "bind_host": "127.0.0.1", "bind_port": 8780}
+
+    def timeout(*args, **kwargs):
+        raise TimeoutError("network partition")
+
+    monkeypatch.setattr(socket, "create_connection", timeout)
+    with pytest.raises(RuntimeError, match="cannot confirm"):
+        api().confirm_stopped_coordinator(identity, identity | {"bind_host": "127.0.0.2"})
+
+
+@pytest.mark.parametrize("error_name", ["ECONNREFUSED", "EHOSTUNREACH"])
+def test_explicit_restart_accepts_refused_or_removed_old_master(tmp_path, monkeypatch, error_name):
+    import errno
+
+    identity = {"guard_path": str(tmp_path / "guard.lock"), "bind_host": "old-master", "bind_port": 8780}
+    def unavailable(*args, **kwargs):
+        raise OSError(getattr(errno, error_name), "previous cluster job stopped")
+
+    monkeypatch.setattr(socket, "create_connection", unavailable)
+    api().confirm_stopped_coordinator(identity, identity | {"bind_host": "new-master"})
+
+
+@pytest.mark.parametrize("changed", [{"guard_path": "/tmp/other.lock"}, {"bind_port": 9876}])
+def test_replacement_master_keeps_run_guard_and_port(tmp_path, changed):
+    identity = {"guard_path": str(tmp_path / "guard.lock"), "bind_host": "127.0.0.1", "bind_port": 8780}
+    with pytest.raises(ValueError, match="guard and port"):
+        api().confirm_stopped_coordinator(identity, identity | changed)
+
+
 def test_two_independent_node_launchers_discover_same_run_and_resume_without_reexecution(tmp_path):
     publish_group(tmp_path / "post_mask", count=21)
     worker_env = environment(tmp_path)
@@ -328,6 +368,8 @@ def test_two_independent_node_launchers_discover_same_run_and_resume_without_ree
         assert not (root / "groups/group-000000/COMPLETE").exists()
         assert not (root / "groups/group-000001").exists()
         resume_log = tmp_path / "resumed.log"
+        replacement_address = api().local_coordinator_address()
+        coordinator_env["R2VA_COORDINATOR_HOST"] = replacement_address
         with resume_log.open("w") as stream:
             resumed = launch(coordinator_env, "--fake", output=stream)
         try:
@@ -336,7 +378,8 @@ def test_two_independent_node_launchers_discover_same_run_and_resume_without_ree
             resumed.terminate()
             resumed.wait(timeout=5)
         assert {str(path): path.read_bytes() for path in rows} == contents
-        assert json.loads((root / "coordinator_endpoint.json").read_text()) == endpoint
+        assert json.loads((root / "coordinator_endpoint.json").read_text()) == {
+            "url": endpoint["url"].replace("127.0.0.1", replacement_address)}
         assert all(json.loads(data)["payload"].get("model_call_count", 0) == 0 for data in contents.values())
     finally:
         for process in (worker, coordinator):
