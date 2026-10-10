@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# Run once on each node; only the designated node uses R2VA_ROLE=coordinator.
+# The cluster's global RANK selects one Coordinator; all nodes run this entry.
 set +x
 set -euo pipefail
 REPO_ROOT="${R2VA_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 if [[ -z "${R2VA_REPO_ROOT:-}" && ! -f "$REPO_ROOT/tools/run_h3_ra2va_cluster_node.py" ]]; then
   REPO_ROOT=/mnt/workspace/litengjie/data/R2V_DATA_V2
 fi
-export R2VA_ROLE="${R2VA_ROLE:-worker}"
-if [[ "${R2VA_FULL_GROUP:-0}" == "1" ]]; then
+export R2VA_ROLE="${R2VA_ROLE:-auto}"
+export R2VA_FULL_GROUP="${R2VA_FULL_GROUP:-1}"
+if [[ "$R2VA_FULL_GROUP" == "1" ]]; then
   export R2VA_RUN_ID="${R2VA_RUN_ID:-ra2va-group-production-v1}"
   export R2VA_MAX_GROUPS="${R2VA_MAX_GROUPS:-0}"
 else

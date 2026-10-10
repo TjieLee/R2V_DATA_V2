@@ -40,6 +40,7 @@ def environment(tmp_path, role="worker", node="node-b"):
            "R2VA_TOKEN_FILE": str(token_file),
            "R2VA_OUTPUT_ROOT": str(tmp_path / "output"), "R2VA_RUN_ID": "discovery20",
            "R2VA_SOURCE_ROOT": str(tmp_path / "post_mask"), "R2VA_LIMIT": "20",
+           "R2VA_FULL_GROUP": "0",
            "R2VA_MAX_GROUPS": "1", "R2VA_ROLE": role, "R2VA_NODE_ID": node,
            "R2VA_COORDINATOR_HOST": "127.0.0.1", "R2VA_COORDINATOR_PORT": str(port()),
            "R2VA_WAIT_SECONDS": "10", "R2VA_FAKE_DELAY_SECONDS": ".08",
@@ -182,6 +183,49 @@ def test_default_bash_plan_needs_no_ips_ssh_or_rank_and_writes_nothing(tmp_path)
     assert list(tmp_path.rglob("*")) == before
 
 
+@pytest.mark.parametrize(("rank", "role"), [("0", "coordinator"), ("1", "worker"), ("7", "worker")])
+def test_bash_defaults_to_full_production_and_selects_role_from_cluster_rank(tmp_path, rank, role):
+    env = environment(tmp_path)
+    for key in ("R2VA_ROLE", "R2VA_FULL_GROUP", "R2VA_RUN_ID", "R2VA_MAX_GROUPS",
+                "R2VA_COORDINATOR_HOST"):
+        env.pop(key, None)
+    env.update(RANK=rank, WORLD_SIZE="8")
+    before = list(tmp_path.rglob("*"))
+    result = subprocess.run(["bash", str(SCRIPT), "--dry-run"], env=env,
+                            capture_output=True, text=True, timeout=5, check=False)
+    assert result.returncode == 0, result.stderr
+    plan = json.loads(result.stdout)
+    assert plan["role"] == role
+    assert plan["full_group"] is True and plan["limit"] is None
+    assert plan["run_root"] == str(tmp_path / "output/ra2va-group-production-v1")
+    if role == "coordinator":
+        command = plan["coordinator"]
+        assert "--full-group" in command and "--limit" not in command
+        assert command[command.index("--max-groups") + 1] == "0"
+        assert command[command.index("--host") + 1] == "auto"
+    else:
+        assert plan["coordinator"] is None
+    assert not any(flag in result.stdout for flag in ("--rank", "--world-size", "--seed", "ssh "))
+    assert list(tmp_path.rglob("*")) == before
+
+
+@pytest.mark.parametrize("cluster", [
+    {}, {"RANK": ""}, {"RANK": "-1"}, {"RANK": "node-a"},
+    {"RANK": "2", "WORLD_SIZE": "2"}, {"RANK": "0", "WORLD_SIZE": "0"},
+    {"RANK": "0", "WORLD_SIZE": "invalid"},
+])
+def test_bash_auto_role_rejects_missing_or_invalid_cluster_rank_without_writes(tmp_path, cluster):
+    env = environment(tmp_path)
+    for key in ("R2VA_ROLE", "RANK", "WORLD_SIZE"):
+        env.pop(key, None)
+    env.update(cluster)
+    result = subprocess.run(["bash", str(SCRIPT), "--dry-run"], env=env,
+                            capture_output=True, text=True, timeout=5, check=False)
+    assert result.returncode != 0
+    assert "cluster RANK" in result.stderr
+    assert not (tmp_path / "output").exists()
+
+
 def test_coordinator_dry_run_keeps_pilot_budget_and_uses_auto_address(tmp_path):
     env = environment(tmp_path, role="coordinator")
     env.pop("R2VA_COORDINATOR_HOST")
@@ -252,8 +296,8 @@ def test_occupied_coordinator_port_cannot_publish_discovery_or_control(tmp_path)
 def test_two_independent_node_launchers_discover_same_run_and_resume_without_reexecution(tmp_path):
     publish_group(tmp_path / "post_mask", count=21)
     worker_env = environment(tmp_path)
-    worker_env["R2VA_START_ROW"] = "1"
-    coordinator_env = {**worker_env, "R2VA_ROLE": "coordinator", "R2VA_NODE_ID": "node-a"}
+    worker_env.update(R2VA_START_ROW="1", R2VA_ROLE="auto", RANK="1", WORLD_SIZE="2")
+    coordinator_env = {**worker_env, "RANK": "0", "R2VA_NODE_ID": "node-a"}
     worker = launch(worker_env, "--fake")
     log = tmp_path / "coordinator.log"
     with log.open("w") as stream:

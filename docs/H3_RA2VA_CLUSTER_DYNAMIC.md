@@ -1,48 +1,40 @@
 # RA2VA Per-Node One-Command Launch
 
-Each node runs the same Bash script. Choose exactly one Coordinator node;
-other nodes discover its URL through the shared run directory and initiate HTTP
-connections. No Worker IP list, SSH fan-out, rank sharding, or automatic election.
+Each node runs the same Bash command. The cluster's global `RANK=0` selects the
+Coordinator node; other ranks discover its URL through the shared run directory
+and initiate HTTP connections. RANK selects roles only, never clips or shards.
+No Worker IP list, SSH fan-out, rank sharding, or automatic election.
 The existing central SSH launcher remains available and unchanged.
 
 ## Launch
 
-On the designated Coordinator node (also runs local Workers):
-
-```bash
-R2VA_ROLE=coordinator bash /mnt/workspace/litengjie/data/parallel_scripts/run_h3_ra2va_cluster_dynamic.sh
-```
-
-On every other node:
+Submit this exact command on every node, with no environment prefix:
 
 ```bash
 bash /mnt/workspace/litengjie/data/parallel_scripts/run_h3_ra2va_cluster_dynamic.sh
 ```
 
-Default run: `ra2va-group-pilot20-v1`, 20 clips, cumulative `max_groups=1`.
-This remains a bounded Pilot, not full-group production. Restart the same commands
-on the same designated Coordinator node to resume. Use an identical
-`R2VA_RUN_ID` on every node for a new experiment. Workers may start first and wait
+The script defaults to full-group production and `R2VA_ROLE=auto`. The platform
+must supply a global, nonnegative `RANK`, with exactly one rank 0. If `WORLD_SIZE`
+is supplied, rank must be smaller than it. Missing/invalid rank stops before run
+state, Workers or models are created; it never defaults every node to rank 0.
+Do not use per-GPU `LOCAL_RANK` in place of the global node rank. Explicit
+`R2VA_ROLE=coordinator|worker` remains available for existing manual deployments.
+
+Default run: `ra2va-group-production-v1`. Restart the same command with the same
+rank-0 host to resume; there is no automatic Coordinator failover. Use an
+identical `R2VA_RUN_ID` on every node for a new run. Workers may start first and wait
 up to 300 seconds (`R2VA_WAIT_SECONDS`) for Coordinator readiness.
 Worker-only commands exit after completion. The Coordinator command stays in the
 foreground until Ctrl+C, including after local Workers finish, so delayed or
 reconnecting nodes can still obtain the terminal state. SIGINT, SIGTERM and
 SIGHUP use the same owned-process cleanup.
 
-## Full-Group Production
+## Production Scope And Resources
 
-Full-group scope is explicit and uses a different default run-id. No partial
-source selection or Pilot completion marker is reused. On the designated node:
-
-```bash
-R2VA_ROLE=coordinator R2VA_FULL_GROUP=1 bash /mnt/workspace/litengjie/data/parallel_scripts/run_h3_ra2va_cluster_dynamic.sh
-```
-
-On every other node:
-
-```bash
-R2VA_FULL_GROUP=1 bash /mnt/workspace/litengjie/data/parallel_scripts/run_h3_ra2va_cluster_dynamic.sh
-```
+Full-group scope is set inside the entry script. No partial source selection or
+Pilot completion marker is reused. No `R2VA_FULL_GROUP=1` or role prefix is needed
+in the submitted command.
 
 Default production run-id: `ra2va-group-production-v1`. Use the same run-id and
 scope on restart. Full scope freezes all rows of each published group once,
@@ -51,7 +43,7 @@ in source order, without reading media or computing hashes. `R2VA_MAX_GROUPS=0`
 `R2VA_MAX_GROUPS=1` stops after one complete group. This budget remains cumulative
 across restarts. All nodes still share one current group and stage; there is no
 rank/shard assignment. Only a full group writes `COMPLETE`; bounded runs continue
-to write only `PILOT_COMPLETE`. `--dry-run` remains available on either command.
+to write only `PILOT_COMPLETE`. `--dry-run` remains available on the same command.
 
 `MAX_CLIP_DURATION_SECONDS=20` is the default, matching the supplied T2VA setup.
 Canonical probes video duration once and skips longer clips before audio
@@ -73,6 +65,9 @@ Full-group scope has CPU source/HTTP/barrier/resume regression coverage. The
 throughput or long-running stability measurement. Do not interpret a dry run as
 starting production.
 
+Manual bounded tests must explicitly set `R2VA_FULL_GROUP=0`; the old 20-row
+default and cumulative `max_groups=1` then remain available under
+`ra2va-group-pilot20-v1`. This override is for tests, not the cluster submission.
 For an independent 8-clip Pilot after the original first 10 rows, use identical
 `R2VA_START_ROW=10 R2VA_LIMIT=8` on both nodes. The zero-based start counts
 nonempty source rows. Only the prefix through the selected range is read;
@@ -145,13 +140,15 @@ alive, so an abnormal Worker exit can also clean up detached model backends.
 ## CPU And Dry Run
 
 ```bash
-R2VA_ROLE=coordinator bash /mnt/workspace/litengjie/data/parallel_scripts/run_h3_ra2va_cluster_dynamic.sh --dry-run
 bash /mnt/workspace/litengjie/data/parallel_scripts/run_h3_ra2va_cluster_dynamic.sh --dry-run
 ```
 
-`--dry-run` does not write run state, contact SSH or load models. `--fake` runs
-the existing eight CPU Fake stages and does not produce training data. Use a
-separate run-id for Fake tests; Native/Fake state is not interchangeable.
+`--dry-run` reads the platform's RANK but does not write run state, contact SSH or
+load models. Outside a cluster job, supply RANK explicitly for a manual dry run
+or use the existing explicit role override. `--fake` runs
+the existing eight CPU Fake stages and does not produce training data. Set
+`R2VA_FULL_GROUP=0` and a separate run-id for bounded Fake tests;
+Native/Fake state is not interchangeable.
 
 Install the entry after updating the correct checkout, never a T2VA checkout:
 
@@ -195,13 +192,13 @@ The frozen Native run is ready for a separately authorized GPU start/resume.
 On Node A:
 
 ```bash
-R2VA_ROLE=coordinator R2VA_RUN_ID=ra2va-dualnode-pilot8-r11-18-20261010T072147Z R2VA_START_ROW=10 R2VA_LIMIT=8 R2VA_MAX_GROUPS=1 bash /mnt/workspace/litengjie/data/parallel_scripts/run_h3_ra2va_cluster_dynamic.sh
+R2VA_FULL_GROUP=0 R2VA_ROLE=coordinator R2VA_RUN_ID=ra2va-dualnode-pilot8-r11-18-20261010T072147Z R2VA_START_ROW=10 R2VA_LIMIT=8 R2VA_MAX_GROUPS=1 bash /mnt/workspace/litengjie/data/parallel_scripts/run_h3_ra2va_cluster_dynamic.sh
 ```
 
 On Node B:
 
 ```bash
-R2VA_RUN_ID=ra2va-dualnode-pilot8-r11-18-20261010T072147Z R2VA_START_ROW=10 R2VA_LIMIT=8 R2VA_MAX_GROUPS=1 bash /mnt/workspace/litengjie/data/parallel_scripts/run_h3_ra2va_cluster_dynamic.sh
+R2VA_FULL_GROUP=0 R2VA_ROLE=worker R2VA_RUN_ID=ra2va-dualnode-pilot8-r11-18-20261010T072147Z R2VA_START_ROW=10 R2VA_LIMIT=8 R2VA_MAX_GROUPS=1 bash /mnt/workspace/litengjie/data/parallel_scripts/run_h3_ra2va_cluster_dynamic.sh
 ```
 
 Local verification: 356 related Group/Two-step/Single/T2VA tests passed;

@@ -133,8 +133,17 @@ def launch_node(repo_root, environment, *, dry_run=False, fake=False):
     from r2v_data_v2.h3.t2va_production import atomic_json
 
     role = environment.get("R2VA_ROLE", "worker")
+    if role == "auto":
+        try:
+            rank = int(environment["RANK"])
+            world_size = int(environment["WORLD_SIZE"]) if "WORLD_SIZE" in environment else None
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("automatic role selection requires a valid global cluster RANK and WORLD_SIZE when supplied") from error
+        if rank < 0 or (world_size is not None and not rank < world_size):
+            raise ValueError("global cluster RANK must be nonnegative and less than WORLD_SIZE when supplied")
+        role = "coordinator" if rank == 0 else "worker"
     if role not in {"coordinator", "worker"}:
-        raise ValueError("R2VA_ROLE must be coordinator or worker")
+        raise ValueError("R2VA_ROLE must be auto, coordinator or worker")
     full_group = environment.get("R2VA_FULL_GROUP", "0") == "1"
     if full_group and int(environment.get("R2VA_START_ROW", "0")):
         raise ValueError("full group cannot use a partial source range")
