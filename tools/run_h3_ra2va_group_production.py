@@ -1,4 +1,4 @@
-"""Bounded RA2VA Group pilots: explicit Fake or Native HTTP execution."""
+"""RA2VA Group execution with separate bounded Pilot and full-group scopes."""
 
 from __future__ import annotations
 
@@ -30,7 +30,10 @@ def main():
         command.add_argument("--run-id", required=True)
         if name in ("run", "coordinator"):
             command.add_argument("--source-root", type=Path, default=SOURCE_ROOT)
-            command.add_argument("--limit", type=int, required=True)
+            scope = command.add_mutually_exclusive_group(required=True)
+            scope.add_argument("--limit", type=int)
+            if name == "coordinator":
+                scope.add_argument("--full-group", action="store_true")
             command.add_argument("--start-row", type=int, default=0)
             command.add_argument("--max-groups", type=int, default=1)
         if name == "run":
@@ -55,6 +58,8 @@ def main():
     worker.add_argument("--workers", type=int, default=1)
     worker.add_argument("--fake-delay-seconds", type=float, default=0)
     args = parser.parse_args()
+    if getattr(args, "full_group", False) and (args.start_row or args.execution_mode == "cpu_fixture"):
+        parser.error("full-group requires start-row=0 and native or fake execution")
     if args.command == "worker":
         if args.native:
             from r2v_data_v2.h3.ra2va_group_http_native_worker import (
@@ -90,8 +95,9 @@ def main():
             return HttpGroupCoordinator(GroupCoordinator(root, args.source_root, args.limit,
                 max_groups=args.max_groups, start_row=args.start_row,
                 transport="http", coordinator_host=socket.gethostname(),
-                mode={"fake": "cpu_fake_pilot", "native": "http_native_pilot",
-                      "cpu_fixture": "http_native_cpu_pilot"}[args.execution_mode],
+                mode=({"fake": "cpu_fake_production", "native": "http_native_production"}[args.execution_mode]
+                      if args.full_group else {"fake": "cpu_fake_pilot", "native": "http_native_pilot",
+                                               "cpu_fixture": "http_native_cpu_pilot"}[args.execution_mode]),
                 coordinator_identity={"guard_path": str(args.local_lock_path.resolve()),
                                       "bind_host": args.host, "bind_port": args.port}))
 

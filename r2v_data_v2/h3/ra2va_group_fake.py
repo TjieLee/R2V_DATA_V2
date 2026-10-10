@@ -50,7 +50,7 @@ class FakeWorker:
 
 def _budget_finished(coordinator):
     control = coordinator.status()
-    return control["phase"] == "complete" and len(control["started_groups"]) >= coordinator.max_groups
+    return coordinator.budget_finished(control)
 
 
 def run_fake_worker(coordinator, worker_id, stop_event, *, poll_seconds=0.05):
@@ -103,7 +103,7 @@ def pilot_summary(run_root: Path) -> dict:
     completed = 0
     for group in control["started_groups"]:
         group_root = run_root / "groups" / group
-        completed += (group_root / "PILOT_COMPLETE").is_file()
+        completed += (group_root / "PILOT_COMPLETE").is_file() or (group_root / "COMPLETE").is_file()
         metadata = read_json(group_root / "inventory/inventory.json")
         for path in sorted((group_root / "stages").glob("*/dispatch.json")):
             dispatch = read_json(path)
@@ -121,7 +121,7 @@ def pilot_summary(run_root: Path) -> dict:
     if control["mode"].startswith("http_native"):
         calls = sum(read_json(path)["payload"].get("model_call_count", 0)
                     for path in run_root.glob("groups/*/stages/*-mimo/results/*.json"))
-        result["model_call_count"] = calls if control["mode"] == "http_native_pilot" else 0
+        result["model_call_count"] = calls if control["mode"] in ("http_native_pilot", "http_native_production") else 0
         result["simulated_mimo_request_count"] = calls if control["mode"] == "http_native_cpu_pilot" else 0
         result["exports"] = [read_json(path) for path in run_root.glob("groups/*/bundle/summary.json")]
     return result

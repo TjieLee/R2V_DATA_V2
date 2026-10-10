@@ -29,6 +29,50 @@ foreground until Ctrl+C, including after local Workers finish, so delayed or
 reconnecting nodes can still obtain the terminal state. SIGINT, SIGTERM and
 SIGHUP use the same owned-process cleanup.
 
+## Full-Group Production
+
+Full-group scope is explicit and uses a different default run-id. No partial
+source selection or Pilot completion marker is reused. On the designated node:
+
+```bash
+R2VA_ROLE=coordinator R2VA_FULL_GROUP=1 bash /mnt/workspace/litengjie/data/parallel_scripts/run_h3_ra2va_cluster_dynamic.sh
+```
+
+On every other node:
+
+```bash
+R2VA_FULL_GROUP=1 bash /mnt/workspace/litengjie/data/parallel_scripts/run_h3_ra2va_cluster_dynamic.sh
+```
+
+Default production run-id: `ra2va-group-production-v1`. Use the same run-id and
+scope on restart. Full scope freezes all rows of each published group once,
+in source order, without reading media or computing hashes. `R2VA_MAX_GROUPS=0`
+(the full-scope default) processes newly published groups continuously;
+`R2VA_MAX_GROUPS=1` stops after one complete group. This budget remains cumulative
+across restarts. All nodes still share one current group and stage; there is no
+rank/shard assignment. Only a full group writes `COMPLETE`; bounded runs continue
+to write only `PILOT_COMPLETE`. `--dry-run` remains available on either command.
+
+`MAX_CLIP_DURATION_SECONDS=20` is the default, matching the supplied T2VA setup.
+Canonical probes video duration once and skips longer clips before audio
+extraction or model inference. It does not truncate videos. Skipped clips retain
+terminal state and are not retried on resume.
+
+SAM, AuK and DiariZen use persistent per-GPU stage workers and per-clip inference,
+as in T2VA. ASR now actually calls the batch API: each clip's ordered segments are
+processed in batches of at most `ASR_BATCH_SIZE=8`, decoding its Speech stem once.
+This does not change sample windows, segment ownership or transcript order.
+Unlike T2VA's shard-wide segment queue, these batches do not cross clip receipt
+boundaries. Models stay loaded across clips within a stage and are released at
+the barrier before the next stage, not reloaded for every clip. MiMo remains two
+TP4 replicas per eight-GPU node, Visual + Joint exactly two requests per completed
+clip, with no additional model repair calls.
+
+Full-group scope has CPU source/HTTP/barrier/resume regression coverage. The
+16-clip real GPU Pilot below validates the existing model path, not a full-group
+throughput or long-running stability measurement. Do not interpret a dry run as
+starting production.
+
 For an independent 8-clip Pilot after the original first 10 rows, use identical
 `R2VA_START_ROW=10 R2VA_LIMIT=8` on both nodes. The zero-based start counts
 nonempty source rows. Only the prefix through the selected range is read;
@@ -165,3 +209,36 @@ the unchanged T2VA Worker-pool suite passed all 15 tests separately, while its
 process-cleanup test was timing-sensitive in combined runs. An older
 Multi-call suite produced the same 143 passes and 18 failures on this revision
 and baseline `a457702`. Ruff, `py_compile`, Bash syntax and diff checks passed.
+
+## 2026-10-10 Real Pilot16
+
+Run `ra2va-dualnode-pilot16-r19-34-20261010T084641Z` selected source rows 19-34,
+without overlap with the earlier 18 clips. Both nodes used revision
+`023942cb6cc8f761752ddeca528604bc5c9bdae2`. There were 128 unique terminal
+clip-stage results: Node A executed 52 and Node B 76. MiMo processed eight clips
+on each node, 32 real requests total. MiMo: 15 Ready / 1 Failed. Effective training
+videos: 13/16. Products: 37 Ready / 5 Failed. Training: 148 rows across 12 tasks
+(four Visual tasks x 13, four Full Audio tasks x 13, four Speech+BGM tasks x 11).
+Donors: 11 speakers / 26 segments. Only `PILOT_COMPLETE` was written. Both nodes
+finished with zero GPU memory use and no owned model processes.
+
+Wall time was 847.36 seconds, including startup and barriers:
+
+| Stage | Total seconds | Slowest worker initialization seconds |
+| --- | ---: | ---: |
+| Canonical | 6.98 | 2.18 |
+| SAM | 148.88 | 147.26 |
+| AuK | 152.66 | 151.16 |
+| Resolve | 4.50 | 2.19 |
+| DiariZen | 37.60 | 35.99 |
+| ASR | 28.76 | 21.89 |
+| MiMo | 457.05 | 190.07 |
+| Export | 10.92 | 2.31 |
+
+Each node started its two TP4 servers sequentially; the two nodes loaded in
+parallel. Summing the slowest initialization per stage gives 553.04 seconds
+(65.27%), but some of that overlaps another worker's useful processing. It is
+not pure startup wall time, and the remaining time includes queueing and cleanup,
+not only inference. A small Pilot therefore does not establish steady-state
+production throughput. Source evidence remains in the original run's node
+launch logs, `native_stage_loaded` events and stage `dispatch.json` timestamps.

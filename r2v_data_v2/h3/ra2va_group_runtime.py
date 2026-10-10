@@ -81,20 +81,53 @@ class GroupDiariZenBackend(GroupAukBackend):
 
 
 class _SpeechBackend:
-    def __init__(self, backend):
+    def __init__(self, backend, *, ffmpeg, batch_size):
         self.backend = backend
+        self.ffmpeg, self.batch_size = ffmpeg, batch_size
 
     def __getattr__(self, name):
         from r2v_data_v2.h3.t2va_full_speech import _inference
         method = getattr(self.backend, name)
         return lambda **kwargs: _inference(self.backend, lambda: method(**kwargs))
 
+    def transcribe_segments(self, *, audio_path, frame_count, segments):
+        import numpy as np
+
+        from r2v_data_v2.h3.qwen3_asr import load_qwen3_asr_model_input
+
+        if not segments:
+            return []
+        waveform, rate = load_qwen3_asr_model_input(
+            Path(audio_path), 0, frame_count / 32000, ffmpeg=self.ffmpeg,
+        )
+        windows = []
+        for segment in segments:
+            if segment["source_sample_rate_hz"] != 32000:
+                raise ValueError("Qwen3 ASR source sample rate must be 32000")
+            # Match T2VA's rounding after mapping the frozen canonical window.
+            start = round(segment["source_start_sample"] / 32000 * 16000)
+            end = min(round(segment["source_end_sample"] / 32000 * 16000), len(waveform))
+            if segment["source_start_sample"] < 0 or end <= start:
+                raise ValueError("Qwen3 ASR source interval has no decoded samples")
+            windows.append(np.ascontiguousarray(waveform[start:end]))
+        results = []
+        for offset in range(0, len(windows), self.batch_size):
+            batch = windows[offset:offset + self.batch_size]
+            transcribed = ([self.transcribe(waveform=batch[0], sample_rate_hz=rate)]
+                           if self.batch_size == 1 else
+                           self.transcribe_batch(waveforms=batch, sample_rate_hz=rate))
+            if len(transcribed) != len(batch):
+                raise ValueError("Qwen3 ASR batch result count differs")
+            results.extend(transcribed)
+        return results
+
 
 class NativeBackendFactory:
     """Use supplied runtime configurations, never rebuild hash-heavy inventories."""
 
     def __init__(self, configuration, *, mimo_config, ffmpeg="ffmpeg", ffprobe="ffprobe"):
-        self.configuration, self.mimo_config = configuration, mimo_config
+        self.configuration = {"max_clip_duration_seconds": 20, **configuration}
+        self.mimo_config = mimo_config
         self.ffmpeg, self.ffprobe = ffmpeg, ffprobe
 
     @contextmanager
@@ -126,8 +159,18 @@ class NativeBackendFactory:
                 yield backend
         elif stage == "asr":
             from r2v_data_v2.h3.t2va_full_speech import asr_worker
-            with asr_worker({"ffmpeg": self.ffmpeg, **self.configuration[stage]}) as worker:
-                yield _SpeechBackend(worker.backend)
+            values = self.configuration[stage]
+            environment = dict(values.get("environment", {}))
+            try:
+                batch_size = (values["batch_size"] if "batch_size" in values else
+                              int(environment.get("QWEN3_ASR_MAX_INFERENCE_BATCH_SIZE", 8)))
+            except (TypeError, ValueError) as error:
+                raise ValueError("Qwen3 ASR batch size must be an integer from 1 to 8") from error
+            if isinstance(batch_size, bool) or not isinstance(batch_size, int) or not 1 <= batch_size <= 8:
+                raise ValueError("Qwen3 ASR batch size must be an integer from 1 to 8")
+            environment["QWEN3_ASR_MAX_INFERENCE_BATCH_SIZE"] = str(batch_size)
+            with asr_worker({**values, "ffmpeg": self.ffmpeg, "environment": environment}) as worker:
+                yield _SpeechBackend(worker.backend, ffmpeg=self.ffmpeg, batch_size=batch_size)
         elif stage == "mimo":
             from openai import OpenAI
             with OpenAI(api_key=self.mimo_config.api_key, base_url=self.mimo_config.base_url,

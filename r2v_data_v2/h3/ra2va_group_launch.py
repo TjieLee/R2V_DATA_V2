@@ -78,6 +78,8 @@ def node_configuration(repo_root, environment):
     values["mimo"]["gpu_groups"] = environment.get("MIMO_GPU_GROUPS", "0,1,2,3;4,5,6,7").split(";")
     values["mimo"]["ports"] = [int(port) for port in environment.get("MIMO_PORTS", "8094,8095").split(",")]
     values["mimo"]["mem_fraction_static"] = float(environment.get("MIMO_MEM_FRACTION_STATIC", ".65"))
+    values["max_clip_duration_seconds"] = float(environment.get("MAX_CLIP_DURATION_SECONDS", "20"))
+    values["asr"]["batch_size"] = int(environment.get("ASR_BATCH_SIZE", "8"))
     values["asr"]["environment"]["QWEN3_ASR_MAX_INFERENCE_BATCH_SIZE"] = environment.get("ASR_BATCH_SIZE", "8")
     return values
 
@@ -133,7 +135,10 @@ def launch_node(repo_root, environment, *, dry_run=False, fake=False):
     role = environment.get("R2VA_ROLE", "worker")
     if role not in {"coordinator", "worker"}:
         raise ValueError("R2VA_ROLE must be coordinator or worker")
-    run_id = environment.get("R2VA_RUN_ID", "ra2va-group-pilot20-v1")
+    full_group = environment.get("R2VA_FULL_GROUP", "0") == "1"
+    if full_group and int(environment.get("R2VA_START_ROW", "0")):
+        raise ValueError("full group cannot use a partial source range")
+    run_id = environment.get("R2VA_RUN_ID", "ra2va-group-production-v1" if full_group else "ra2va-group-pilot20-v1")
     output_root = Path(environment.get("R2VA_OUTPUT_ROOT", OUTPUT_ROOT))
     run_root = pilot_run_root(output_root, run_id)
     python = environment.get("R2V_PYTHON", str(repo_root / ".venv/bin/python"))
@@ -144,15 +149,18 @@ def launch_node(repo_root, environment, *, dry_run=False, fake=False):
     configuration = run_root / "node-logs" / node / "launch_configuration.json"
     coordinator_command = [python, tool, "coordinator", "--execution-mode", "fake" if fake else "native",
         "--source-root", str(environment.get("R2VA_SOURCE_ROOT", SOURCE_ROOT)), "--output-root", str(output_root),
-        "--run-id", run_id, "--limit", environment.get("R2VA_LIMIT", "20"),
+        "--run-id", run_id,
+        *(["--full-group"] if full_group else ["--limit", environment.get("R2VA_LIMIT", "20")]),
         "--start-row", environment.get("R2VA_START_ROW", "0"),
-        "--max-groups", environment.get("R2VA_MAX_GROUPS", "1"),
+        "--max-groups", environment.get("R2VA_MAX_GROUPS", "0" if full_group else "1"),
         "--host", environment.get("R2VA_COORDINATOR_HOST", "auto"),
         "--port", environment.get("R2VA_COORDINATOR_PORT", "8780"),
         "--local-lock-path", f"/tmp/{run_id}.coordinator.lock", "--publish-endpoint"]
     plan = {"role": role, "run_root": str(run_root), "node_id": node, "workers": workers,
         "start_row": int(environment.get("R2VA_START_ROW", "0")),
-        "limit": int(environment.get("R2VA_LIMIT", "20")),
+        "full_group": full_group, "limit": None if full_group else int(environment.get("R2VA_LIMIT", "20")),
+        "max_clip_duration_seconds": values.get("max_clip_duration_seconds", 20),
+        "asr_batch_size": values["asr"].get("batch_size", 8),
         "gpu_ids": values["gpu_ids"], "mimo_gpu_groups": values["mimo"]["gpu_groups"],
         "mimo_ports": values["mimo"]["ports"], "call_mode": "two_step",
         "execution": "fake" if fake else "native",

@@ -86,7 +86,18 @@ def adapt_production_sample(sample: ProductionSample, group_directory: Path, ord
 
 
 def freeze_pilot_inventory(group: PublishedGroup, destination: Path, limit: int, *, start_row=0) -> dict:
-    if not 1 <= limit <= 200 or start_row < 0:
+    if limit is None:
+        raise ValueError("pilot requires a bounded limit")
+    return freeze_group_inventory(group, destination, limit, start_row=start_row)
+
+
+def freeze_group_inventory(group: PublishedGroup, destination: Path, limit: int | None, *, start_row=0) -> dict:
+    if limit is None:
+        if start_row:
+            raise ValueError("full group cannot start partway through the source")
+    elif not 1 <= limit <= 200:
+        raise ValueError("CPU pilot limit must be between 1 and 200")
+    if start_row < 0:
         raise ValueError("CPU pilot limit must be between 1 and 200 and start_row nonnegative")
     if destination.exists():
         metadata = json.loads((destination / "inventory.json").read_text())
@@ -118,9 +129,10 @@ def freeze_pilot_inventory(group: PublishedGroup, destination: Path, limit: int,
                     break
             output.flush()
             os.fsync(output.fileno())
-        if len(offsets) != min(limit, group.declared_count - start_row):
+        expected = group.declared_count if limit is None else min(limit, group.declared_count - start_row)
+        if len(offsets) != expected:
             raise ValueError("published source has fewer rows than its Export count")
-        metadata = {"mode": "pilot", "group_id": group.group_id, "source_directory": str(group.directory),
+        metadata = {"mode": "full_group" if limit is None else "pilot", "group_id": group.group_id, "source_directory": str(group.directory),
                         "source_samples_path": str(group.samples_path), "limit": limit, "start_row": start_row,
                         "selected_count": len(offsets), "declared_source_count": group.declared_count,
                         "offsets": offsets}
@@ -132,8 +144,9 @@ def freeze_pilot_inventory(group: PublishedGroup, destination: Path, limit: int,
             shutil.rmtree(temporary)
 
 
-def read_inventory_task(inventory_root: Path, ordinal: int) -> GroupTask:
-    metadata = json.loads((inventory_root / "inventory.json").read_text())
+def read_inventory_task(inventory_root: Path, ordinal: int, *, metadata=None) -> GroupTask:
+    if metadata is None:
+        metadata = json.loads((inventory_root / "inventory.json").read_text())
     with (inventory_root / "tasks.jsonl").open("rb") as source:
         source.seek(metadata["offsets"][ordinal])
         return GroupTask(**json.loads(source.readline()))

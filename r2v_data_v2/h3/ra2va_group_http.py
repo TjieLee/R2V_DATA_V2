@@ -169,7 +169,7 @@ class HttpGroupCoordinator:
             "visual_raw_response": raw.get("visual"), "speech_av_raw_response": raw.get("joint"),
             "raw_responses": [raw[t] for t in ("visual", "joint") if t in raw],
             "model_call_count": sum(f"{t}.request_started" in meta["events"] for t in ("visual", "joint")),
-            "new_request_count": 0, "execution": "native" if self.mode == "http_native_pilot" else "cpu_fixture",
+            "new_request_count": 0, "execution": "native" if self.mode in ("http_native_pilot", "http_native_production") else "cpu_fixture",
             "response_sources": {t: str(Path(root) / f"{t}.response.json") for t, root in replay.items()}}
 
     def _retire(self, sid):
@@ -202,8 +202,7 @@ class HttpGroupCoordinator:
     def _context(self):
         control = self.core.status()
         return {k: control[k] for k in ("group_id", "stage", "generation", "phase")} | {
-            "finished": control["phase"] == "complete"
-                and len(control["started_groups"]) >= self.core.max_groups,
+            "finished": self.core.budget_finished(control),
             "lease_seconds": LEASE_SECONDS,
             "run_mode": self.mode,
         }
@@ -250,7 +249,8 @@ class HttpGroupCoordinator:
     def _connect(self, body):
         if body.get("run_root", str(self.core.run_root)) != str(self.core.run_root):
             raise ClaimConflict("Worker belongs to a different run")
-        expected = {"http_native_pilot": "native", "http_native_cpu_pilot": "cpu_fixture"}.get(self.mode, "fake")
+        expected = {"http_native_pilot": "native", "http_native_production": "native",
+                    "http_native_cpu_pilot": "cpu_fixture"}.get(self.mode, "fake")
         if body.get("execution_mode", "fake") != expected:
             raise ClaimConflict("Worker execution mode differs from run mode")
         node, instance = body["node_id"], body["worker_instance"]

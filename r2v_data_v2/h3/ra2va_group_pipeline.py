@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import math
+import subprocess
 import tempfile
 from contextlib import nullcontext
 from pathlib import Path
@@ -77,13 +79,38 @@ def audio_metadata(path: Path) -> dict:
             "channels": info.channels, "sample_format": info.subtype}
 
 
+def _positive_duration(value) -> float:
+    try:
+        duration = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError("video duration must be finite and positive") from error
+    if not math.isfinite(duration) or duration <= 0:
+        raise ValueError("video duration must be finite and positive")
+    return duration
+
+
+def probe_video_duration(path: Path, *, ffprobe="ffprobe") -> float:
+    completed = subprocess.run([
+        ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "json", str(path),
+    ], check=False, capture_output=True, text=True)
+    if completed.returncode != 0:
+        raise ValueError("video duration probe failed")
+    try:
+        value = json.loads(completed.stdout)["format"]["duration"]
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("video duration is missing or invalid") from error
+    return _positive_duration(value)
+
+
 class GroupStageWorker:
     """One persistent backend context per stage; shared control is not written here."""
 
-    def __init__(self, stage, artifact_root, *, backend_factory, ffmpeg="ffmpeg", ffprobe="ffprobe"):
+    def __init__(self, stage, artifact_root, *, backend_factory, ffmpeg="ffmpeg", ffprobe="ffprobe",
+                 duration_probe=None):
         self.stage, self.root = stage, Path(artifact_root)
         self.backend_factory = backend_factory
         self.ffmpeg, self.ffprobe = ffmpeg, ffprobe
+        self.duration_probe = duration_probe
         self.mimo_event, self.mimo_replay_roots = None, None
 
     def __enter__(self):
@@ -120,6 +147,13 @@ class GroupStageWorker:
         if hasattr(self.backend, "bind_clip"):
             self.backend.bind_clip(task.clip_uid)
         if self.stage == "canonical":
+            configuration = getattr(self.backend_factory, "configuration", {})
+            if self.duration_probe is not None or "max_clip_duration_seconds" in configuration:
+                cap = _positive_duration(configuration.get("max_clip_duration_seconds", 20))
+                probe = self.duration_probe or probe_video_duration
+                duration = _positive_duration(probe(Path(task.target_video_path), ffprobe=self.ffprobe))
+                if duration > cap:
+                    return {"status": "skipped", "reason": f"clip_duration_over_{cap:g}s"}
             path = output / "full.flac"
             self.backend.materialize_full_audio(
                 clip_uid=task.clip_uid, source_video_path=Path(task.target_video_path), destination=path,
@@ -188,11 +222,22 @@ class GroupStageWorker:
         if self.stage == "asr":
             from r2v_data_v2.h3.qwen3_asr import load_qwen3_asr_model_input
 
+            rows = upstream["diarizen"]["segments"]
+            speech = upstream["resolve"]["speech"]
+            transcribe_segments = getattr(self.backend, "transcribe_segments", None)
+            if callable(transcribe_segments):
+                transcribed = transcribe_segments(audio_path=Path(speech["path"]),
+                    frame_count=speech["frame_count"], segments=rows)
+            else:
+                transcribed = []
+                for segment in rows:
+                    waveform, rate = load_qwen3_asr_model_input(Path(speech["path"]),
+                        segment["start_time"], segment["end_time"], ffmpeg=self.ffmpeg)
+                    transcribed.append(self.backend.transcribe(waveform=waveform, sample_rate_hz=rate))
+            if len(transcribed) != len(rows):
+                raise ValueError("Qwen3 ASR segment result count differs")
             segments = []
-            for segment in upstream["diarizen"]["segments"]:
-                waveform, rate = load_qwen3_asr_model_input(Path(upstream["resolve"]["speech"]["path"]),
-                    segment["start_time"], segment["end_time"], ffmpeg=self.ffmpeg)
-                text, language = self.backend.transcribe(waveform=waveform, sample_rate_hz=rate)
+            for segment, (text, language) in zip(rows, transcribed, strict=True):
                 segments.append({**segment, "asr_status": "transcribed" if text.strip() else "empty",
                     "asr_text": text if text.strip() else None, "asr_language": language if text.strip() else None})
             return {"job": frozen_job(task, upstream["canonical"], segments).model_dump(mode="json")}

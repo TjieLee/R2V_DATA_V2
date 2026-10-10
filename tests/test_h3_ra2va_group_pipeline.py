@@ -169,3 +169,114 @@ def test_audio_stage_recovery_does_not_overwrite_partial_or_repeat_completed_wor
     fake.materialize_full_audio = lambda **kwargs: pytest.fail("saved stage must not execute again")
     with GroupStageWorker("canonical", tmp_path / "out", backend_factory=fake.factory) as worker:
         assert worker.process(task, {}) == result
+
+
+def test_asr_uses_native_segments_interface_without_rebuilding_metadata(tmp_path):
+    from r2v_data_v2.h3.ra2va_group_pipeline import GroupStageWorker
+    fake = PCMBackends()
+    rows = [{"segment_id": "s1", "start_time": 0.1, "end_time": 0.3,
+             "source_start_sample": 3200, "source_end_sample": 9600,
+             "source_sample_rate_hz": 32000, "source_speaker_cluster_id": "speaker_0"},
+            {"segment_id": "s2", "start_time": 0.5, "end_time": 0.7,
+             "source_start_sample": 16000, "source_end_sample": 22400,
+             "source_sample_rate_hz": 32000, "source_speaker_cluster_id": "speaker_1"}]
+    rows = [{**row, "identity_scope": "unresolved", "direct_anchor_seconds": 0,
+             "cluster_binding_status": "unbound", "overlapping_visible_entities": [],
+             "direct_support_seconds_by_entity": {}, "competing_visible_speaker_evidence": []}
+            for row in rows]
+    speech = {"path": str(tmp_path / "not-decoded-by-pipeline.wav"), "frame_count": 32000}
+    calls = []
+
+    def transcribe_segments(**kwargs):
+        calls.append(kwargs)
+        return [("  Exact first.  ", "English"), (" ", "Chinese")]
+
+    fake.transcribe_segments = transcribe_segments
+    fake.transcribe = lambda **kw: pytest.fail("native interface must not use scalar fallback")
+    with GroupStageWorker("asr", tmp_path / "out", backend_factory=fake.factory) as worker:
+        result = worker.process(task_at(tmp_path), {"diarizen": {"segments": rows},
+            "resolve": {"speech": speech}, "canonical": speech})
+    assert calls == [{"audio_path": tmp_path / "not-decoded-by-pipeline.wav",
+                      "frame_count": 32000, "segments": rows}]
+    segments = result["job"]["segments"]
+    assert [s["segment_id"] for s in segments] == ["s1", "s2"]
+    assert [(s["source_start_sample"], s["source_end_sample"]) for s in segments] == [(3200, 9600), (16000, 22400)]
+    assert [s["asr_status"] for s in segments] == ["transcribed", "empty"]
+    assert [s["asr_text"] for s in segments] == ["  Exact first.  ", None]
+    assert [s["asr_language"] for s in segments] == ["English", None]
+
+
+def test_asr_rejects_native_result_count_mismatch(tmp_path):
+    from r2v_data_v2.h3.ra2va_group_pipeline import GroupStageWorker
+    fake = PCMBackends()
+    fake.transcribe_segments = lambda **kw: []
+    speech = {"path": str(tmp_path / "absent.wav"), "frame_count": 32000}
+    with (GroupStageWorker("asr", tmp_path, backend_factory=fake.factory) as worker,
+          pytest.raises(ValueError, match="result count")):
+        worker.process(task_at(tmp_path), {"diarizen": {"segments": [{"segment_id": "s1"}]},
+            "resolve": {"speech": speech}, "canonical": speech})
+
+
+@pytest.mark.parametrize("configured_cap,duration,reason", [
+    (None, 20.000001, "clip_duration_over_20s"),
+    (2.0, 2.000001, "clip_duration_over_2s"),
+])
+def test_canonical_skips_overlong_video_before_audio_and_reuses_receipt(
+    tmp_path, monkeypatch, configured_cap, duration, reason
+):
+    from r2v_data_v2.h3.ra2va_group_pipeline import GroupStageWorker
+    fake = PCMBackends()
+    fake.materialize_full_audio = lambda **kw: pytest.fail("overlong clip must not extract audio")
+
+    class Factory:
+        configuration = {} if configured_cap is None else {"max_clip_duration_seconds": configured_cap}
+
+        def __call__(self, stage):
+            assert stage == "canonical"
+            return fake.factory(stage)
+
+    probes = []
+
+    def probe(path, *, ffprobe):
+        probes.append((path, ffprobe))
+        return duration
+
+    monkeypatch.setattr("r2v_data_v2.h3.ra2va_group_pipeline.probe_video_duration", probe)
+    task = task_at(tmp_path)
+    with GroupStageWorker("canonical", tmp_path / "out", backend_factory=Factory(),
+                          ffprobe="selected-ffprobe", duration_probe=probe if configured_cap is None else None) as worker:
+        result = worker.process(task, {})
+        assert result["status"] == "skipped" and result["reason"] == reason
+        assert worker.process(task, {}) == result
+    assert probes == [(type(tmp_path)(task.target_video_path), "selected-ffprobe")]
+    assert not list((tmp_path / "out").rglob("full.flac"))
+
+
+def test_canonical_duration_equal_to_default_limit_is_admitted(tmp_path):
+    from r2v_data_v2.h3.ra2va_group_pipeline import GroupStageWorker
+    fake = PCMBackends()
+    with GroupStageWorker("canonical", tmp_path, backend_factory=fake.factory,
+                          duration_probe=lambda *args, **kw: 20.0) as worker:
+        result = worker.process(task_at(tmp_path), {})
+    assert result["frame_count"] == 32000
+
+
+def test_legacy_fake_factory_does_not_probe_missing_video(tmp_path, monkeypatch):
+    from r2v_data_v2.h3.ra2va_group_pipeline import GroupStageWorker
+    monkeypatch.setattr("r2v_data_v2.h3.ra2va_group_pipeline.probe_video_duration",
+                        lambda *args, **kwargs: pytest.fail("legacy fake must not probe"), raising=False)
+    fake = PCMBackends()
+    with GroupStageWorker("canonical", tmp_path, backend_factory=fake.factory) as worker:
+        result = worker.process(task_at(tmp_path), {})
+    assert result["frame_count"] == 32000
+
+
+@pytest.mark.parametrize("duration", [0, -1, float("nan"), float("inf"), "N/A", None])
+def test_canonical_invalid_duration_fails_before_audio(tmp_path, duration):
+    from r2v_data_v2.h3.ra2va_group_pipeline import GroupStageWorker
+    fake = PCMBackends()
+    fake.materialize_full_audio = lambda **kw: pytest.fail("invalid duration must not extract audio")
+    with (GroupStageWorker("canonical", tmp_path, backend_factory=fake.factory,
+                           duration_probe=lambda *args, **kw: duration) as worker,
+          pytest.raises(ValueError, match="duration")):
+        worker.process(task_at(tmp_path), {})

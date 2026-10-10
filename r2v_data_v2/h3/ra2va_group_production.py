@@ -1,4 +1,4 @@
-"""CPU pilot coordinator: shared groups, atomic claims, and terminal results."""
+"""Group coordinator: atomic claims, stage barriers, and terminal results."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from pathlib import Path
 from r2v_data_v2.h3.ra2va_group_source import (
     GroupTask,
     discover_published_groups,
-    freeze_pilot_inventory,
+    freeze_group_inventory,
     read_inventory_task,
 )
 from r2v_data_v2.h3.t2va_production import atomic_json, file_lock
@@ -86,11 +86,14 @@ class WorkerSession:
 
 
 class GroupCoordinator:
-    def __init__(self, run_root: Path, source_root: Path, limit: int, *, max_groups=1, start_row=0,
+    def __init__(self, run_root: Path, source_root: Path, limit: int | None, *, max_groups=1, start_row=0,
                  transport="local", coordinator_host=None, coordinator_identity=None,
                  mode="cpu_fake_pilot"):
-        if not 1 <= limit <= 200 or max_groups < 1 or start_row < 0:
-            raise ValueError("invalid bounded pilot settings")
+        full_group = limit is None
+        if ((full_group != mode.endswith("_production")) or (full_group and start_row != 0)
+                or (not full_group and (not 1 <= limit <= 200 or max_groups == 0))
+                or max_groups < 0 or start_row < 0):
+            raise ValueError("invalid group scope or budget settings")
         if transport not in ("local", "http") or (transport == "http" and not coordinator_host):
             raise ValueError("HTTP transport requires designated coordinator host")
         if transport == "http" and not coordinator_identity:
@@ -100,6 +103,8 @@ class GroupCoordinator:
         self.limit = limit
         self.max_groups = max_groups
         self.start_row = start_row
+        self.completion_marker = "COMPLETE" if full_group else "PILOT_COMPLETE"
+        self._inventories = {}
         self.control_path = self.run_root / "control.json"
         settings = {"source_root": str(self.source_root), "limit": limit, "max_groups": max_groups}
         if start_row:
@@ -130,6 +135,15 @@ class GroupCoordinator:
     def group_root(self, group_id):
         return self.run_root / "groups" / group_id
 
+    def inventory(self, group_id):
+        if group_id not in self._inventories:
+            self._inventories[group_id] = read_json(self.group_root(group_id) / "inventory/inventory.json")
+        return self._inventories[group_id]
+
+    def budget_finished(self, control):
+        return bool(self.max_groups and control["phase"] == "complete"
+                    and len(control["started_groups"]) >= self.max_groups)
+
     def stage_root(self, snapshot):
         return self.group_root(snapshot.group_id) / "stages" / f"{snapshot.generation:06d}-{snapshot.stage}"
 
@@ -149,17 +163,17 @@ class GroupCoordinator:
     def select_current(self):
         with file_lock(self.run_root / "control.lock", blocking=True):
             control = read_json(self.control_path)
-            if control["group_id"] and (self.group_root(control["group_id"]) / "PILOT_COMPLETE").exists():
+            if control["group_id"] and (self.group_root(control["group_id"]) / self.completion_marker).exists():
                 control["phase"] = "complete"
                 atomic_json(self.control_path, control)
             if control["group_id"] and control["phase"] != "complete":
                 return self._snapshot(control)
-            if len(control["started_groups"]) >= self.max_groups:
+            if self.budget_finished(control):
                 return None
             # An inventory published before a control-write crash is already started.
             roots = self.run_root / "groups"
             unfinished = sorted(p.parent.parent.name for p in roots.glob("*/inventory/inventory.json")
-                                if not (p.parent.parent / "PILOT_COMPLETE").exists())
+                                if not (p.parent.parent / self.completion_marker).exists())
             if unfinished:
                 group_id = unfinished[0]
             else:
@@ -169,10 +183,11 @@ class GroupCoordinator:
                     return None
                 group = candidates[0]
                 group_id = group.group_id
-                freeze_pilot_inventory(group, self.group_root(group_id) / "inventory", self.limit,
+                freeze_group_inventory(group, self.group_root(group_id) / "inventory", self.limit,
                                        start_row=self.start_row)
             control.update(group_id=group_id, stage=STAGES[0],
                            generation=control["generation"] + 1, phase="running", members={})
+            self._inventories.clear()
             if group_id not in control["started_groups"]:
                 control["started_groups"].append(group_id)
             snapshot = self._snapshot(control)
@@ -213,7 +228,8 @@ class GroupCoordinator:
                 return None
             self._account_results(snapshot, dispatch)
             inventory = self.group_root(snapshot.group_id) / "inventory"
-            count = read_json(inventory / "inventory.json")["selected_count"]
+            inventory_metadata = self.inventory(snapshot.group_id)
+            count = inventory_metadata["selected_count"]
             candidates = [int(key) for key in dispatch["active"]]
             if dispatch["cursor"] < count:
                 candidates.append(dispatch["cursor"])
@@ -222,7 +238,7 @@ class GroupCoordinator:
                 if handle is None:
                     continue
                 try:
-                    task = read_inventory_task(inventory, ordinal)
+                    task = read_inventory_task(inventory, ordinal, metadata=inventory_metadata)
                     key = str(ordinal)
                     recovered = key in dispatch["active"]
                     metadata = (claim_metadata(dispatch["active"].get(key), task)
@@ -270,7 +286,7 @@ class GroupCoordinator:
     def progress(self, snapshot):
         with self._checked(snapshot) as (control, dispatch):
             self._account_results(snapshot, dispatch)
-            total = read_json(self.group_root(snapshot.group_id) / "inventory/inventory.json")["selected_count"]
+            total = self.inventory(snapshot.group_id)["selected_count"]
             done = sum(dispatch[k] for k in TERMINAL)
             elapsed = max(time.time() - dispatch["started_at"], 0.000001)
             return {"group": snapshot.group_id, "stage": snapshot.stage,
@@ -304,7 +320,8 @@ class GroupCoordinator:
             if handle is None:
                 raise RuntimeError("claim handle already owned")
             try:
-                task = read_inventory_task(self.group_root(snapshot.group_id) / "inventory", ordinal)
+                task = read_inventory_task(self.group_root(snapshot.group_id) / "inventory", ordinal,
+                                           metadata=self.inventory(snapshot.group_id))
                 return TaskClaim(snapshot, task, worker_id, handle)
             except BaseException:
                 handle.close()
@@ -332,7 +349,7 @@ class GroupCoordinator:
             if control["phase"] == "complete":
                 return False
             self._account_results(snapshot, dispatch)
-            total = read_json(self.group_root(snapshot.group_id) / "inventory/inventory.json")["selected_count"]
+            total = self.inventory(snapshot.group_id)["selected_count"]
             if dispatch["active"] or sum(dispatch[k] for k in TERMINAL) != total:
                 return False
             if control["phase"] != "draining":
@@ -356,9 +373,9 @@ class GroupCoordinator:
                 if control["mode"].startswith("http_native"):
                     calls = sum(read_json(path)["payload"].get("model_call_count", 0)
                         for path in self.group_root(snapshot.group_id).glob("stages/*-mimo/results/*.json"))
-                    counts = {"model_call_count": calls if control["mode"] == "http_native_pilot" else 0,
+                    counts = {"model_call_count": calls if control["mode"] in ("http_native_pilot", "http_native_production") else 0,
                               "simulated_mimo_request_count": calls if control["mode"] == "http_native_cpu_pilot" else 0}
-                atomic_json(self.group_root(snapshot.group_id) / "PILOT_COMPLETE", {
+                atomic_json(self.group_root(snapshot.group_id) / self.completion_marker, {
                     "mode": control["mode"], "selected_count": total,
                     "generation": snapshot.generation, "model_call_count": 0, **counts,
                 })
