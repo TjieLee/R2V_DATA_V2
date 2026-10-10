@@ -221,9 +221,11 @@ class GroupCoordinator:
                     task = read_inventory_task(inventory, ordinal)
                     key = str(ordinal)
                     recovered = key in dispatch["active"]
+                    metadata = (claim_metadata(dispatch["active"].get(key), task)
+                                if callable(claim_metadata) else claim_metadata)
                     dispatch["active"][key] = {"worker_id": worker_id, "generation": snapshot.generation}
-                    if claim_metadata is not None:
-                        dispatch["active"][key]["http"] = claim_metadata
+                    if metadata is not None:
+                        dispatch["active"][key]["http"] = metadata
                     if not recovered:
                         dispatch["cursor"] += 1
                     self._save_dispatch(snapshot, dispatch)

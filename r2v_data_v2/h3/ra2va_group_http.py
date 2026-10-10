@@ -47,6 +47,7 @@ class HttpGroupCoordinator:
         if core.status().get("transport") != "http":
             raise ValueError("HTTP service requires HTTP transport")
         self.core = core
+        self.mode = core.status()["mode"]
         self.wall_clock = wall_clock
         self.lock = threading.RLock()
         self.sessions = {}
@@ -145,6 +146,11 @@ class HttpGroupCoordinator:
                 return
             self.core.recover(self.snapshot)
             self._expire()
+            if (self.mode.startswith("http_native") and self.snapshot.stage == "export"
+                    and self.core.status()["phase"] == "draining"
+                    and self.core.progress(self.snapshot)["active"] == 0):
+                from r2v_data_v2.h3.ra2va_group_local import _collect_export
+                _collect_export(self.core.group_root(self.snapshot.group_id))
             if self.core.advance(self.snapshot):
                 self._close_handles()
                 self._restore()
@@ -155,6 +161,7 @@ class HttpGroupCoordinator:
             "finished": control["phase"] == "complete"
                 and len(control["started_groups"]) >= self.core.max_groups,
             "lease_seconds": LEASE_SECONDS,
+            "run_mode": self.mode,
         }
 
     def _member(self, body):
@@ -181,14 +188,24 @@ class HttpGroupCoordinator:
             previous = StageSnapshot(self.snapshot.group_id, STAGES[index - 1],
                                      self.snapshot.generation - 1, "complete")
             upstream = read_json(self.core.result_path(previous, claim.task.ordinal))["status"]
-        return {"session_id": sid, "task_id": {
+        wire = {"session_id": sid, "task_id": {
             "group_id": self.snapshot.group_id, "stage": self.snapshot.stage,
             "generation": self.snapshot.generation, "ordinal": claim.task.ordinal,
         }, "claim_token": row["http"]["claim_token"], "task": asdict(claim.task),
             "upstream_status": upstream, "lease_seconds": LEASE_SECONDS,
             **({"checkpoint": row["http"]["checkpoint"]} if "checkpoint" in row["http"] else {})}
+        if self.mode.startswith("http_native"):
+            wire["upstream_results"] = {stage: str(self.core.result_path(StageSnapshot(
+                self.snapshot.group_id, stage, self.snapshot.generation - index + i, "complete"),
+                claim.task.ordinal)) for i, stage in enumerate(STAGES[:index])}
+            wire["artifact_root"] = str(self.core.stage_root(self.snapshot) / "attempts"
+                / f"{claim.task.ordinal:06d}" / row["http"]["claim_token"])
+        return wire
 
     def _connect(self, body):
+        expected = {"http_native_pilot": "native", "http_native_cpu_pilot": "cpu_fixture"}.get(self.mode, "fake")
+        if body.get("execution_mode", "fake") != expected:
+            raise ClaimConflict("Worker execution mode differs from run mode")
         node, instance = body["node_id"], body["worker_instance"]
         control = self.core.status()
         for sid, member in control.get("members", {}).items():
@@ -238,16 +255,18 @@ class HttpGroupCoordinator:
             return existing
         if self.core.status()["phase"] != "running":
             return self._context() | {"task": None}
-        meta = {"claim_token": uuid.uuid4().hex, "revoked": False, "events": {}}
         self.core.recover(self.snapshot)
-        for row in self._dispatch_state()["active"].values():
-            if row["http"].get("revoked"):
-                events = row["http"]["events"]
+
+        def metadata(previous, task):
+            meta = {"claim_token": uuid.uuid4().hex, "revoked": False, "events": {}}
+            if previous is not None and previous["http"].get("revoked"):
+                events = previous["http"]["events"]
                 if "response_saved" in events:
                     meta["events"] = events
                     meta["checkpoint"] = events["response_saved"]["checkpoint"]
-                break
-        claim = self.core.claim(self.snapshot, sid, claim_metadata=meta)
+            return meta
+
+        claim = self.core.claim(self.snapshot, sid, claim_metadata=metadata)
         if claim is None:
             return self._context() | {"task": None}
         self.claims[sid] = claim

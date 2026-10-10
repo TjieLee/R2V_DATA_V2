@@ -113,9 +113,37 @@ def _wait_execution(stop_event, heartbeat, seconds):
     return False
 
 
+class _FakeExecution:
+    def __init__(self, session, heartbeat, stop, delay):
+        self.backend = FakeWorker(session["stage"])
+        self.heartbeat, self.stop, self.delay = heartbeat, stop, delay
+
+    def __enter__(self):
+        self.backend.__enter__()
+        return self
+
+    def __exit__(self, *args):
+        return self.backend.__exit__(*args)
+
+    def execute(self, task):
+        if not _wait_execution(self.stop, self.heartbeat, self.delay):
+            raise HttpConflict("execution permission ended")
+        upstream = task["upstream_status"]
+        if "checkpoint" in task:
+            return "ready", task["checkpoint"]
+        if upstream is not None and upstream != "ready":
+            return "skipped", {"fake": True, "reason": "upstream_terminal", "upstream_status": upstream}
+        return "ready", self.backend.process(GroupTask(**task["task"]))
+
+
 def run_http_fake_worker(client, *, node_id, worker_instance, stop_event, fake_delay_seconds=0):
     if not 0 <= fake_delay_seconds <= 2:
         raise ValueError("fake delay must be between 0 and 2 seconds")
+    return run_http_worker(client, node_id=node_id, worker_instance=worker_instance, stop_event=stop_event,
+        executor_factory=lambda session, heartbeat: _FakeExecution(session, heartbeat, stop_event, fake_delay_seconds))
+
+
+def run_http_worker(client, *, node_id, worker_instance, stop_event, executor_factory, execution_mode="fake"):
     counters = {"executed": 0, "accepted": 0, "model_call_count": 0, "reused_checkpoints": 0}
     previous = None
     while not stop_event.is_set():
@@ -132,7 +160,7 @@ def run_http_fake_worker(client, *, node_id, worker_instance, stop_event, fake_d
             session = client.call("POST", "/v1/workers/connect", {
                 "node_id": node_id, "worker_instance": worker_instance,
                 "previous_session_id": None if previous is None else previous["session_id"],
-                "resources_closed": True})
+                "resources_closed": True, "execution_mode": execution_mode})
         except OSError:
             stop_event.wait(POLL_SECONDS)
             continue
@@ -149,7 +177,7 @@ def run_http_fake_worker(client, *, node_id, worker_instance, stop_event, fake_d
         normal_drain = False
         pending_result = None
         try:
-            with FakeWorker(session["stage"]) as backend:
+            with executor_factory(session, heartbeat) as backend:
                 task = session.get("claim")
                 while not stop_event.is_set() and heartbeat.execution_allowed():
                     try:
@@ -165,19 +193,13 @@ def run_http_fake_worker(client, *, node_id, worker_instance, stop_event, fake_d
                         stop_event.wait(POLL_SECONDS)
                         continue
                     started = time.monotonic()
-                    if not _wait_execution(stop_event, heartbeat, fake_delay_seconds):
-                        break
-                    upstream = task["upstream_status"]
-                    if "checkpoint" in task:
-                        status, payload = "ready", task["checkpoint"]
+                    status, payload = backend.execute(task)
+                    if "checkpoint" in task and execution_mode == "fake":
                         counters["reused_checkpoints"] += 1
-                    elif upstream is not None and upstream != "ready":
-                        status, payload = "skipped", {"fake": True, "reason": "upstream_terminal",
-                                                      "upstream_status": upstream}
                     else:
-                        status, payload = "ready", backend.process(GroupTask(**task["task"]))
-                    if "checkpoint" not in task:
                         counters["executed"] += 1
+                    if execution_mode == "native":
+                        counters["model_call_count"] += payload.get("new_request_count", 0)
                     if not heartbeat.execution_allowed() or stop_event.is_set():
                         break
                     body = {k: task[k] for k in ("session_id", "task_id", "claim_token")} | {
