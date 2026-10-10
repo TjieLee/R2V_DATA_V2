@@ -118,3 +118,50 @@ install -m 755 /mnt/workspace/litengjie/data/R2V_DATA_V2/scripts/run_h3_ra2va_cl
 Local regression proves two independent launch processes can discover one run,
 both execute tasks, publish 160 unique terminal rows, and resume with zero task
 reexecution. This is not evidence of a new real two-node GPU Pilot.
+
+## 2026-10-10 Deployment Preflight
+
+Both `nb-94ayoy238c-0` (Coordinator) and `nb-6numx1uhso-0` updated using
+`git pull --ff-only` to `b821367cb41eaad91c4ef59cce7c90e74e73078d` and
+installed the Bash entry. `/root` and `/tmp` are node-local `overlay` storage.
+The identical SSH-provisioned credentials use directory 0700 and file 0600.
+
+New Native run, with no Workers or models started:
+
+```text
+/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/R2VA/ra2va-dualnode-pilot8-r11-18-20261010T072147Z
+```
+
+Only source rows 11-18 were selected (`start_row=10`, `limit=8`), with no
+clip overlap against `ra2va-native-group0-pilot10-20261010T034522`.
+Node B discovered `http://6.167.51.186:8780` without an IP argument:
+authenticated status 200, absent/wrong credential 401, wrong-run connect 409.
+Discovery contains only `url`; the credential is absent from shared run files.
+
+Coordinator stop/restart on Node A preserved the inventory, settings,
+generation 1, canonical stage, eight pending clips and zero active/terminal
+results. Resume status was available from Node B in 1.062 seconds. The owned
+Coordinator was then stopped with no remaining run processes. Evidence is in
+`cpu-preflight.json`, `cpu-preflight-resume.json`, `cpu-preflight-cleanup.json`
+and the two Coordinator logs under that run. No GPU Pilot, inference or new
+training output was produced: the review found startup issues, so this run
+stopped at the requested preflight boundary after fixing them.
+
+The frozen Native run is ready for a separately authorized GPU start/resume.
+On Node A:
+
+```bash
+R2VA_ROLE=coordinator R2VA_RUN_ID=ra2va-dualnode-pilot8-r11-18-20261010T072147Z R2VA_START_ROW=10 R2VA_LIMIT=8 R2VA_MAX_GROUPS=1 bash /mnt/workspace/litengjie/data/parallel_scripts/run_h3_ra2va_cluster_dynamic.sh
+```
+
+On Node B:
+
+```bash
+R2VA_RUN_ID=ra2va-dualnode-pilot8-r11-18-20261010T072147Z R2VA_START_ROW=10 R2VA_LIMIT=8 R2VA_MAX_GROUPS=1 bash /mnt/workspace/litengjie/data/parallel_scripts/run_h3_ra2va_cluster_dynamic.sh
+```
+
+Local verification: 356 related Group/Two-step/Single/T2VA tests passed;
+the unchanged T2VA Worker-pool suite passed all 15 tests separately, while its
+process-cleanup test was timing-sensitive in combined runs. An older
+Multi-call suite produced the same 143 passes and 18 failures on this revision
+and baseline `a457702`. Ruff, `py_compile`, Bash syntax and diff checks passed.
