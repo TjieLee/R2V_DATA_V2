@@ -1,7 +1,7 @@
 # RA2VA HTTP Group CPU Pilot
 
-Status: Tasks 1-3 implemented and locally tested; real two-node acceptance is
-pending SSH recovery.
+Status: Tasks 1-3 implemented and locally tested; Task 4 real two-node HTTP CPU
+acceptance passed on 2026-10-10 using the committed `cd7875c` snapshot.
 No GPU, model calls, real Audio/H3 products, full group, or automatic failover.
 
 ## Ownership and Recovery
@@ -34,7 +34,7 @@ Resume uses the original run-id on Node A; no automatic failover or run migratio
 Use an existing Python 3.12 environment. Set `R2V_GROUP_COORDINATOR_TOKEN` privately
 in each process environment, never in committed commands or logs. Assign RUN_ID
 once, then reuse it. Local tests may use temporary published V3 fixtures/output.
-For a later authorized remote Pilot, verify A_PRIVATE_IP, PORT and LOCAL_GUARD:
+For a new authorized remote Pilot, verify A_PRIVATE_IP, PORT and LOCAL_GUARD:
 
 ```bash
 SOURCE=/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/in_pair_reference/post_mask
@@ -73,13 +73,106 @@ one PILOT_COMPLETE, no full COMPLETE or second inventory. Interrupted attempts
 are separate from accepted results. Logs include node/session, generation,
 claim/reclaim/publication/release/revocation, elapsed time and throughput.
 
-## Pending Real-node Proof
+## Real Two-node Evidence (2026-10-10)
 
-Local loopback does not prove actual two-node behavior. After access restoration,
-use a fresh run to prove both hostnames complete concurrent distinct clips, Worker
-kill/reclaim, stale rejection, Coordinator restart with unexpired work, draining
-barrier, and completed-run resume. No remote connections or writes were made for
-the local implementation milestone.
+Run: `cpu-http-group20-20261010T023035`, below the authorized R2VA output root.
+The shared `code/` directory is a Git archive of the tested `cd7875c` commit, used
+by both nodes. Neither existing server checkout was changed (both stayed at
+`65f4dad`); no push was performed. Node A was `nb-94ayoy238c-0`, Node B was
+`nb-6numx1uhso-0`. Node B's direct private HTTP request returned 200. Node A's
+`findmnt -T /tmp` returned `/ overlay overlay`; its process guard was not on
+JDUFS. A second Coordinator launch was rejected by that local guard.
+
+The published group-000000 declares 39,585 source rows. Only its first twenty
+ordered V3 rows were frozen; reference/media files were not scanned or decoded.
+Initial Fake execution delay was 2s, then 0.5s after the controlled interruption.
+
+- 160 unique terminal results: 160 ready, 0 failed, 0 skipped, 0 active/pending.
+- Node A published 89 results; Node B published 71. Both held different clips
+  concurrently in group-000000, generation 1 (ordinals 0 and 1).
+- Zero model calls. One group inventory and one `PILOT_COMPLETE`, no full
+  `COMPLETE`. Cumulative `max_groups=1` survived every restart.
+- Total harness elapsed: 139.88s, including deliberate crashes and lease waiting.
+
+| Stage (all Fake) | Accepted | Elapsed (s) | Tasks/s |
+| --- | ---: | ---: | ---: |
+| canonical | 20 | 73.795 | 0.271 |
+| sam | 20 | 10.596 | 1.888 |
+| auk | 20 | 5.324 | 3.757 |
+| resolve | 20 | 5.277 | 3.790 |
+| diarizen | 20 | 5.264 | 3.799 |
+| asr | 20 | 5.280 | 3.788 |
+| mimo | 20 | 5.276 | 3.791 |
+| export | 20 | 5.270 | 3.795 |
+
+These numbers measure bounded Fake scheduling, not Audio/MiMo throughput. The
+canonical stage includes the real 60s lease expiry; sam includes the second
+Coordinator crash/recovery.
+
+### Recovery Proof
+
+1. SIGKILL Node B's owned child after a claim and before publication, then SIGKILL
+   Node A Coordinator. Same-host/run-id restart retained that unexpired claim and
+   token. Node A reclaimed it only after the persisted lease expired, 58.03s after
+   the kill snapshot, with a different token. The old token returned HTTP 409.
+2. A live heartbeat session held generation 1 in draining with all twenty results
+   ready. Releasing it allowed generation 2; the dead revoked Worker did not
+   permanently block the barrier.
+3. A test-only wrapper stopped the Coordinator after atomic result publication
+   and before accounting. SIGKILL/restart recovered the unchanged result and
+   counted it once. The repeated accepted receipt returned 200. No production
+   fault-control endpoint, source modification or new flag was added.
+4. Across generation change, an accepted old receipt returned 200 without
+   rewriting; an unaccepted old claim and old heartbeat returned 409.
+5. Completed-run restart preserved every terminal result byte. Both resumed
+   Worker launchers reported `executed=0`, `accepted=0`, `model_call_count=0`.
+   Terminal failed/skipped immutability was verified in the local controlled
+   regressions, not injected into this all-success remote inventory.
+
+The first setup attempt failed before shared-state initialization because the
+test wrapper had not transferred after an SCP timeout. SSH-streamed transfer
+succeeded; the error log was retained. This was not a clip/business failure.
+Final checks found no owned Coordinator/Worker PIDs and no listening test port.
+No existing output or source data was overwritten or deleted.
+
+### Evidence and Resume
+
+Evidence is retained under:
+
+```text
+/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/R2VA/cpu-http-group20-20261010T023035/evidence/
+```
+
+It includes `acceptance-summary.json`, the completed `timeline.jsonl`, per-node
+Worker and Coordinator logs, `duplicate-coordinator-guard.log`, `focused.log`,
+and the one-off `pilot.py` / `coordinator_gate.py` test harness. The harness is
+historical evidence, not a command to rerun against this completed directory.
+Private endpoint details remain in that evidence, not repository configuration.
+
+To inspect the completed run without launching work:
+
+```bash
+OUTPUT=/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/R2VA
+RUN_ID=cpu-http-group20-20261010T023035
+CODE="$OUTPUT/$RUN_ID/code"
+PY=/mnt/workspace/litengjie/data/R2V_DATA_V2/.venv/bin/python
+"$PY" "$CODE/tools/run_h3_ra2va_group_production.py" status \
+  --output-root "$OUTPUT" --run-id "$RUN_ID"
+```
+
+Authorized resume uses the Coordinator/Worker commands above with this CODE/PY,
+original Node A private bind, port 18970 and
+`LOCAL_GUARD=/tmp/cpu-http-group20-20261010T023035.coordinator.lock`.
+Set the same private token in each participating process environment. Never
+resume this HTTP Fake run as a native/GPU run. The completed service is stopped.
+
+Six focused Group suites passed again: 80 passed in 22.86s (26 multiprocessing
+resource-tracker warnings during intentional process kills). No runtime source
+changed for this remote milestone. Actual network-partition/watchdog expiry and
+GPU process termination were not exercised remotely; their CPU watchdog tests
+remain local. No real Audio/H3 training products were generated by this Fake run.
+Real Audio/MiMo device isolation, model release and quality acceptance remain
+separate work; this result does not authorize full-group production.
 
 ## Local Evidence (2026-10-10)
 

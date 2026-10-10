@@ -1,8 +1,10 @@
 # RA2VA Group Local Integration
 
-Local CPU integration only. This does not accept real two-node locking/network
-behavior, GPU resource cleanup or model quality. No server data was modified.
-HTTP Workers remain fake-only until their separate real-node acceptance.
+This document covers local CPU integration, not GPU resource cleanup or model
+quality. A separate real two-node HTTP Fake Pilot passed on 2026-10-10; see
+`H3_RA2VA_GROUP_HTTP_CPU_PILOT.md`. Server writes for that test were confined to
+its newly authorized R2VA run; source media and existing checkouts stayed intact.
+HTTP Workers remain fake-only; native GPU stage integration is not accepted yet.
 
 ## Modules
 
@@ -108,7 +110,8 @@ its log is `/tmp/ra2va-native-cpu-cli-final-20261010.log`.
 
 ## Remaining Acceptance
 
-Real two-node HTTP claims/recovery and real Audio/MiMo GPU execution are still
+Real two-node HTTP Fake claims/recovery passed (160 unique terminal results,
+89 from Node A and 71 from Node B). Real Audio/MiMo GPU execution is still
 pending. No automatic failover or GPU watchdog-cleanup guarantee is claimed.
 Before real models, validate process/device isolation, release acknowledgments,
 the single TP4 endpoint lifecycle and interrupted-request handling on the server.

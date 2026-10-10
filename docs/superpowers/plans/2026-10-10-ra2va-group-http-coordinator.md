@@ -1,6 +1,6 @@
 # RA2VA Group HTTP Coordinator Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Native Tasks 1-3 were approved and are implemented locally. Task 4 remains deferred.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Native Tasks 1-3 are implemented locally; Task 4 passed real two-node CPU acceptance on 2026-10-10.
 
 **Goal:** Replace cross-node file-lock coordination with one persistent HTTP Coordinator and verify CPU Fake scheduling/recovery locally, then on two real nodes with a 20-row Pilot.
 
@@ -23,7 +23,7 @@
 - Lease expiry revokes submission authority, not proof of remote process death. A stopped/expired Fake Worker must close local execution before rejoining. Future GPU termination remains unproven.
 - Terminal ready/failed/skipped is immutable. Reconcile existing results before reclaiming interrupted work; no business-failure retry or extra model request.
 - No GPU/MiMo, full group, media reads/hash scans, seed shuffle, static shard assignment, QA gate, Redis/database, or protected T2VA/Multi/Single/Two-step/Audio/H3 changes.
-- SSH currently fails with `proxy read: Broken pipe`. Do not retry or change network configuration during Tasks 1-3; Task 4 waits for restored access and verified direct node-to-node HTTP.
+- SSH failed with `proxy read: Broken pipe` during Tasks 1-3, so remote acceptance was deferred. Access and direct node-to-node HTTP were verified for Task 4 on 2026-10-10 after user authorization.
 
 ## Review Focus
 
@@ -116,9 +116,9 @@ Active metadata is nested under `http` in dispatch entries; member metadata unde
 
 **Interfaces:** Use the already-tested Coordinator/Worker CLI from Tasks 1-3. Nodes share only source/output storage; both Workers communicate with Node A HTTP. No new production fault-control endpoints or distributed lock primitives.
 
-- [ ] **Step 1: Wait for restored access.** This Task is deferred while SSH is broken. Once the user reports restored connectivity, perform one bounded read-only preflight: hostnames, Node A local `/tmp` or `/run` mount using `findmnt -T`, and available private address/port. Direct HTTP is checked after service startup in Step 2. Stop/report failure rather than loop, expose a public service, or modify network settings. Browser access alone is insufficient evidence.
-- [ ] **Step 2: Freeze and launch in a new run.** Use `--limit 20 --max-groups 1`, the full source root below, and new `R2VA/cpu-http-group20-<timestamp>`; never reuse old lock-test/Pilot directories. Snapshot tested code under that new run if needed; do not edit server checkouts. Store token only in process environment. Place the process guard on the verified local mount and use the same guard/bind on resume. After starting the Coordinator, call its authenticated `/v1/status` directly from Node B; failure stops owned test processes and leaves this milestone pending. Assign RUN_ID once, record it, and reuse it unchanged on every resume. A_PRIVATE_IP, PORT and LOCAL_GUARD come from the preflight, not guessed values.
-  Planned CLI shape (not executable until Tasks 1-3 are implemented):
+- [x] **Step 1: Wait for restored access.** This Task was deferred while SSH was broken. Once the user reported restored connectivity, perform one bounded read-only preflight: hostnames, Node A local `/tmp` or `/run` mount using `findmnt -T`, and available private address/port. Direct HTTP is checked after service startup in Step 2. Stop/report failure rather than loop, expose a public service, or modify network settings. Browser access alone is insufficient evidence.
+- [x] **Step 2: Freeze and launch in a new run.** Use `--limit 20 --max-groups 1`, the full source root below, and new `R2VA/cpu-http-group20-<timestamp>`; never reuse old lock-test/Pilot directories. Snapshot tested code under that new run if needed; do not edit server checkouts. Store token only in process environment. Place the process guard on the verified local mount and use the same guard/bind on resume. After starting the Coordinator, call its authenticated `/v1/status` directly from Node B; failure stops owned test processes and leaves this milestone pending. Assign RUN_ID once, record it, and reuse it unchanged on every resume. A_PRIVATE_IP, PORT and LOCAL_GUARD come from the preflight, not guessed values.
+  Implemented CLI shape:
   ```bash
   SOURCE=/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/in_pair_reference/post_mask
   OUTPUT=/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/R2VA
@@ -130,11 +130,11 @@ Active metadata is nested under `http` in dispatch entries; member metadata unde
     --coordinator-url "http://$A_PRIVATE_IP:$PORT" --node-id "$NODE_ID" \
     --workers 1 --fake-delay-seconds 1
   ```
-- [ ] **Step 3: Prove concurrent participation.** Start one actual Worker per node with bounded delay. Observe both active on different clips in the same group/generation before either stage drains; capture overlapping execution timestamps and successful terminal receipts from both hostnames. If launch latency prevents overlap, use test-harness Events/gates, not extra production scheduling controls. Two successful launcher exits alone do not pass.
-- [ ] **Step 4: Prove Worker interruption and stale rejection.** Kill only the owned Node B Fake Worker after a confirmed claim and before publication. Node A must preserve that claim until permission expires, then recover unpublished work with a new token. Submit the retained old token through the normal API and record rejection without mutation. Restart Node B only after its old local execution has stopped; retain both interrupted-attempt and accepted-result records.
-- [ ] **Step 5: Prove Coordinator restart and barrier.** Kill the owned Coordinator with an unexpired claim, restart only on Node A with the original run-id/guard/endpoint, and show no immediate reassignment. Exercise one result-before-count failure and one live release hold using test-harness synchronization, not shipping crash flags. Verify a dead revoked member eventually stops blocking, while a live unreleased member still blocks. Never kill unrelated server processes.
-- [ ] **Step 6: Complete and resume without work.** For an all-success Fake inventory, verify 160 unique clip-stage terminal results (20x8), pending=active=0, zero model calls, actual completions from both nodes, one PILOT_COMPLETE and no full COMPLETE. Verify failed/skipped immutability in the controlled local cases from Task 3; never relabel a real terminal result. Restart completed run and confirm no result bytes change, no task executes, no second group inventory is created, and max_groups remains 1. Interrupted attempts are reported separately from accepted terminal counts.
-- [ ] **Step 7: Report actual evidence and commit docs locally.** Preserve timestamps, node/worker/session, generation, task/token, interruption/reclaim, receipt/accounting, release/revoke, per-stage elapsed/throughput and owned-process cleanup outcomes in the new run. Publish a concise measured summary and exact launch/resume/status commands in the runbook. Mark any missing remote proof explicitly; never substitute local simulations or claim GPU readiness. Commit `docs(h3): record two-node HTTP CPU pilot evidence` only after real acceptance; no automatic push or GPU/full-group launch.
+- [x] **Step 3: Prove concurrent participation.** Start one actual Worker per node with bounded delay. Observe both active on different clips in the same group/generation before either stage drains; capture overlapping execution timestamps and successful terminal receipts from both hostnames. If launch latency prevents overlap, use test-harness Events/gates, not extra production scheduling controls. Two successful launcher exits alone do not pass.
+- [x] **Step 4: Prove Worker interruption and stale rejection.** Kill only the owned Node B Fake Worker after a confirmed claim and before publication. Node A must preserve that claim until permission expires, then recover unpublished work with a new token. Submit the retained old token through the normal API and record rejection without mutation. Restart Node B only after its old local execution has stopped; retain both interrupted-attempt and accepted-result records.
+- [x] **Step 5: Prove Coordinator restart and barrier.** Kill the owned Coordinator with an unexpired claim, restart only on Node A with the original run-id/guard/endpoint, and show no immediate reassignment. Exercise one result-before-count failure and one live release hold using test-harness synchronization, not shipping crash flags. Verify a dead revoked member eventually stops blocking, while a live unreleased member still blocks. Never kill unrelated server processes.
+- [x] **Step 6: Complete and resume without work.** For an all-success Fake inventory, verify 160 unique clip-stage terminal results (20x8), pending=active=0, zero model calls, actual completions from both nodes, one PILOT_COMPLETE and no full COMPLETE. Verify failed/skipped immutability in the controlled local cases from Task 3; never relabel a real terminal result. Restart completed run and confirm no result bytes change, no task executes, no second group inventory is created, and max_groups remains 1. Interrupted attempts are reported separately from accepted terminal counts.
+- [x] **Step 7: Report actual evidence and commit docs locally.** Preserve timestamps, node/worker/session, generation, task/token, interruption/reclaim, receipt/accounting, release/revoke, per-stage elapsed/throughput and owned-process cleanup outcomes in the new run. Publish a concise measured summary and exact launch/resume/status commands in the runbook. Mark any missing remote proof explicitly; never substitute local simulations or claim GPU readiness. Commit `docs(h3): record two-node HTTP CPU pilot evidence` only after real acceptance; no automatic push or GPU/full-group launch.
 
 ## Verification Commands and Handoff
 
@@ -167,4 +167,11 @@ git diff a47741d -- r2v_data_v2/h3/ra2va_group_production.py
 git status --short
 ```
 
-Tasks 1-3 are implemented locally with TDD and separate commits. Task 4 remains pending until real access is restored. Local verification and its known baseline failures are recorded in docs/H3_RA2VA_GROUP_HTTP_CPU_PILOT.md. Passing CPU scheduling tests never authorizes automatic GPU integration, production rollout, or push.
+Tasks 1-3 are implemented locally with TDD and separate commits. Task 4 passed on
+2026-10-10 in `cpu-http-group20-20261010T023035`: 160 unique ready results, Node A
+89 / Node B 71, zero model calls, 139.88s including fault injection and actual
+lease expiry. Completed resume executed zero tasks. Only PILOT_COMPLETE was
+created; max_groups stayed 1. Local verification, real-node evidence and known
+baseline failures are recorded in docs/H3_RA2VA_GROUP_HTTP_CPU_PILOT.md. Passing
+CPU scheduling tests never authorizes automatic GPU integration, production
+rollout, or push.
