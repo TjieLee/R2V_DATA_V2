@@ -800,14 +800,14 @@ def test_integer_temperature_provenance_matches_float_and_two_step(tmp_path):
         float_config, stem_records_by_clip={}, client=SimpleNamespace(),
     )
     assert integer_backend.provenance == float_backend.provenance
-    assert integer_backend.provenance.schema_version == "r2v.h3.mimo25_backend.85"
+    assert integer_backend.provenance.schema_version == "r2v.h3.mimo25_backend.86"
 
 
 def test_two_step_has_independent_provenance_without_changing_multi(tmp_path, monkeypatch):
     from r2v_data_v2.h3.audio_reuse_prepared import FrozenReuseBackendProvenance
 
     _, _, backend, _, _, _, multi, _ = _setup(tmp_path, monkeypatch)
-    assert backend.provenance.schema_version == "r2v.h3.mimo25_backend.85"
+    assert backend.provenance.schema_version == "r2v.h3.mimo25_backend.86"
     assert backend.provenance.prompt_version == "h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity"
     assert multi.provenance.schema_version == "r2v.h3.mimo25_backend.66"
     assert multi.provenance.prompt_version == "h3_mimo25_speech_assembly_v49"
@@ -824,6 +824,7 @@ def test_two_step_has_independent_provenance_without_changing_multi(tmp_path, mo
     ("r2v.h3.mimo25_backend.82", "h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity"),
     ("r2v.h3.mimo25_backend.83", "h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity"),
     ("r2v.h3.mimo25_backend.84", "h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity"),
+    ("r2v.h3.mimo25_backend.85", "h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity"),
 ])
 def test_historical_two_step_provenance_remains_readable(tmp_path, monkeypatch, version, prompt):
     from r2v_data_v2.h3.audio_reuse_prepared import FrozenReuseBackendProvenance

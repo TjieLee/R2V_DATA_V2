@@ -57,7 +57,7 @@ from r2v_data_v2.structured_output import (
     parse_structured_json_issues,
 )
 
-TWO_STEP_BACKEND_VERSION = "r2v.h3.mimo25_backend.85"
+TWO_STEP_BACKEND_VERSION = "r2v.h3.mimo25_backend.86"
 TWO_STEP_PROMPT_VERSION = "h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity"
 JOINT_INPUT_MODALITY = "target_video_joint_av_audio"
 
@@ -367,7 +367,7 @@ class TwoStepOpenAIMimo26Backend(StemAwareOpenAIMimo25Backend):
         except MimoBackendFailure as exc:
             if exc.annotation is None or not exc.issues:
                 raise
-            segments = unconfirmed_visible_binding_segments(exc.annotation)
+            segments = unconfirmed_visible_binding_segments(exc.annotation, include_acoustic_uncertainty=True)
             if any(issue.code != "visible_entity_binding_not_permitted" or issue.field not in segments for issue in exc.issues):
                 raise
             groundings = {g.segment_id: g for g in exc.annotation.av_grounding.segment_groundings}
@@ -554,7 +554,7 @@ class TwoStepOpenAIMimo26Backend(StemAwareOpenAIMimo25Backend):
                     issues=tuple(issues),
                 )
             # Expose identity contradictions before the shared normalizer can merge gN.
-            unconfirmed_segments = unconfirmed_visible_binding_segments(annotation)
+            unconfirmed_segments = unconfirmed_visible_binding_segments(annotation, include_acoustic_uncertainty=True)
             strict_issues = [issue for issue in validate_annotation(
                 annotation, segment_ids=[s.segment_id for s in job.segments],
                 segment_intervals={s.segment_id: (s.start_time, s.end_time) for s in job.segments},
@@ -567,8 +567,8 @@ class TwoStepOpenAIMimo26Backend(StemAwareOpenAIMimo25Backend):
             ) if issue.code in {
                 "visible_entity_speaker_group_contradiction", "speaker_group_entity_contradiction",
                 "visible_entity_absent_from_visual_segment", "unknown_entity", "av_audio_speaker_group_mismatch",
-                "visible_speaker_evidence_presentation_contradiction", "visible_entity_requires_resolved_audio",
-            } or (issue.code == "visible_entity_binding_not_permitted"
+                "visible_speaker_evidence_presentation_contradiction",
+            } or (issue.code in {"visible_entity_binding_not_permitted", "visible_entity_requires_resolved_audio"}
                   and issue.field not in unconfirmed_segments)]
             if strict_issues:
                 _, marker_issues, marker_warnings = protect_direct_dialogue(
@@ -590,6 +590,11 @@ class TwoStepOpenAIMimo26Backend(StemAwareOpenAIMimo25Backend):
                 final = annotation.model_dump(mode="json")
             else:
                 diagnostics[-1].warnings.append("two_step_identity_caption_publication_restricted")
+            diagnostics[-1].warnings.extend(
+                f"acoustic_identity_unconfirmed:{d.segment_id}:identity_publication_restricted"
+                for d in annotation.audio_observation.segment_decisions
+                if d.segment_id in unconfirmed_segments and d.resolution == "uncertain"
+            )
             marker_count = _normalize_unambiguous_speaker_markers(annotation, job)
             if marker_count:
                 corrections["joint_unambiguous_speaker_marker_corrected"] += marker_count

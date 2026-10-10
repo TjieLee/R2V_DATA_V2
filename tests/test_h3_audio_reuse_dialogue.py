@@ -281,7 +281,7 @@ def test_two_step_multi_markers_all_three_products_ready(tmp_path, groups, parti
 
 @pytest.mark.parametrize("case", [
     "missing_dialogue", "wrong_order", "wrong_text", "wrong_language", "conflicting_marker", "mixed_markers",
-    "unknown_lead", "pronoun_switch", "wrong_subject", "unbound_subject", "missing_group", "uncertain_group",
+    "pronoun_switch", "wrong_subject", "unbound_subject", "missing_group", "uncertain_group",
     "group_conflict", "entity_conflict", "missing_inventory", "multiple_speakers", "negative_evidence",
 ])
 def test_two_step_multi_marker_repair_rejects_unsafe_inputs(tmp_path, case):
@@ -314,8 +314,6 @@ def test_two_step_multi_marker_repair_rejects_unsafe_inputs(tmp_path, case):
         caption = caption.replace("A voice asks", "A voice (S1) asks")
     elif case == "mixed_markers":
         caption = caption.replace("A voice asks", "A voice (S1) (S2) asks")
-    elif case == "unknown_lead":
-        caption = caption.replace("A voice asks", "A voice raises a question")
     elif case == "pronoun_switch":
         caption = caption.replace("A voice asks", "He asks")
     elif case == "wrong_subject":

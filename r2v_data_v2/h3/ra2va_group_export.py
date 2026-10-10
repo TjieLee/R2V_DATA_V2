@@ -134,7 +134,7 @@ def export_group_clip(*, root, task, job, result, stems, ffmpeg="ffmpeg") -> dic
         return json.loads(summary_path.read_text())
     root.mkdir(parents=True, exist_ok=True)
     annotation = MimoAVAnnotationDraft.model_validate(result["annotation"])
-    provenance = SimpleNamespace(**result["backend_provenance"])
+    provenance = SimpleNamespace(**result.get("postprocessing_backend_provenance", result["backend_provenance"]))
     record = SimpleNamespace(annotation=annotation, source_backend_provenance=provenance)
     legacy_job = SimpleNamespace(**job.__dict__, target_full_audio_sha256=None,
                                  target_video_sha256=None, request_fingerprint=None)

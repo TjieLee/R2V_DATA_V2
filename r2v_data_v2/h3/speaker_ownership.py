@@ -51,18 +51,27 @@ def speaker_ownership_reasons(
     return reasons
 
 
-def unconfirmed_visible_binding_segments(annotation: MimoAVAnnotationDraft) -> set[str]:
+def unconfirmed_visible_binding_segments(
+    annotation: MimoAVAnnotationDraft, *, include_acoustic_uncertainty: bool = False,
+) -> set[str]:
     """Two-step sparse-sampling uncertainty, never a conflicting speech source."""
     views = {view.segment_id: view for view in annotation.visual_observation.segment_views}
+    audio = {decision.segment_id: decision for decision in annotation.audio_observation.segment_decisions}
     result = set()
     for grounding in annotation.av_grounding.segment_groundings:
         view = views.get(grounding.segment_id)
+        decision = audio.get(grounding.segment_id)
+        acoustic_uncertainty = (include_acoustic_uncertainty and decision is not None and decision.resolution == "uncertain"
+                                and not speaker_ownership_reasons(decision))
         if (view is None or grounding.entity_id not in view.visible_entity_ids
                 or grounding.binding_status != "visible_entity" or grounding.speech_presentation != "onscreen_spoken"
                 or set(grounding.evidence_codes) & {
                     "offscreen_audio", "voice_over_context", "device_playback_context",
                     "source_cluster_conflict", "lr_asd_conflict",
-                } or _visible_binding_is_permitted(grounding, view)):
+                } or (_visible_binding_is_permitted(grounding, view) and not acoustic_uncertainty)):
+            continue
+        if (include_acoustic_uncertainty and decision is not None
+                and decision.resolution == "uncertain" and not acoustic_uncertainty):
             continue
         if "no_visible_lip_motion" in grounding.evidence_codes:
             target = next((item for item in view.entity_observations if item.entity_id == grounding.entity_id), None)
@@ -79,7 +88,9 @@ def two_step_identity_restricted_groups(annotation: MimoAVAnnotationDraft, prove
     """An unconfirmed Two-step identity cannot authorize identity-specific Audio."""
     if not getattr(provenance, "prompt_version", "").startswith("h3_mimo26_ra2va_two_step_joint_"):
         return set()
-    segments = unconfirmed_visible_binding_segments(annotation)
+    segments = unconfirmed_visible_binding_segments(
+        annotation, include_acoustic_uncertainty=getattr(provenance, "schema_version", "").endswith(".86"),
+    )
     return {g.primary_speaker_group for g in annotation.av_grounding.segment_groundings
             if g.segment_id in segments and g.primary_speaker_group is not None}
 

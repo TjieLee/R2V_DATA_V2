@@ -113,9 +113,9 @@ def test_effective20_overlay_preserves_order_audit_and_three_failures(tmp_path, 
         expected = override_by_clip if source == override else original_by_clip
         assert item["source_record_fingerprint"] == expected[row.clip_uid]["record_fingerprint"]
         assert item["postprocess_backend_version"] == (
-            "r2v.h3.mimo25_backend.85" if item["operation"] == "cpu_replay" else None
+            "r2v.h3.mimo25_backend.86" if item["operation"] == "cpu_replay" else None
         )
-        assert item["effective_validation_backend_version"] == "r2v.h3.mimo25_backend.85"
+        assert item["effective_validation_backend_version"] == "r2v.h3.mimo25_backend.86"
     assert before == {p: p.read_bytes() for p in before}
     with pytest.raises(FileExistsError):
         effective.build_effective_reconcile(base_root=base, override_root=override, output_root=output,
@@ -277,7 +277,7 @@ def test_saved_random20_payloads_replay_preserves_facts_and_identity_restriction
     original = MimoStemReconcileRecord(**values, record_fingerprint=_hash(values))
     replayed = replay_two_step_record(job, original)
     assert replayed.raw_responses == original.raw_responses
-    assert replayed.backend_provenance.schema_version.endswith(".85")
+    assert replayed.backend_provenance.schema_version.endswith(".86")
     assert replayed.model_call_count == original.model_call_count == 2
     if case["clip_uid"].startswith("25755"):
         assert replayed.status == "failed"

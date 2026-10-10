@@ -766,10 +766,10 @@ def _two_step_first_speaker_marker(
 def _two_step_speaker_markers(
     caption: str, job: MimoClipJob, record: FrozenAnnotationSource, speech: Sequence[RecaptionSpeechFact],
 ) -> tuple[str, int]:
-    """Anchor complete multi-source dialogue only at unambiguous speech clauses."""
+    """Bind complete ordered dialogue slots to structured speakers, not verbs."""
     provenance = getattr(record, "source_backend_provenance", getattr(record, "backend_provenance", None))
     if (not getattr(provenance, "prompt_version", "").startswith("h3_mimo26_ra2va_two_step_joint_")
-            or len({s.speaker_id for s in speech}) < 2):
+            or not speech):
         return caption, 0
     transcribed = [s for s in job.segments if s.asr_status == "transcribed"]
     expected = [f"<d>[{s.asr_language or 'Unknown'}] {s.asr_text}</d>" for s in transcribed]
@@ -834,13 +834,36 @@ def _two_step_speaker_markers(
     subjects = {s.subject_label: s.entity_id for s in job.reference_subjects if s.kind == "entity"}
     pieces, inserted = [], 0
     for (lead, boundary), block, fact in zip(leads, blocks, speech, strict=True):
+        if not boundary or re.search(r"\(S[1-9]\d*\)", lead):
+            pieces.extend((lead, block.group()))
+            continue
         clause = re.search(
             r"(?:^\s*|(?<=[.!?])\s+)(?P<actor><Subject [1-9]\d*>|A voice|The voice|An offscreen voice|"
             r"An off-screen voice|An unidentified voice)\s+(?:\((?P<marker>S[1-9]\d*)\)\s+)?"
             r"(?P<verb>says|asks|replies|answers|adds|continues),\s*$", lead,
         )
-        if clause is None or re.search(r"\(S[1-9]\d*\)", lead[:clause.start()]):
-            ambiguous()
+        if clause is None:
+            # The ordered ASR slot already identifies gN/Sx. Only rule out an
+            # explicit incompatible actor; do not parse an open-ended verb list.
+            last_clause = re.split(r"[.!?]\s+", lead)[-1].strip()
+            labels = {label for label in re.findall(r"<Subject [1-9]\d*>", last_clause) if label in subjects}
+            neutral = re.match(r"(?:A voice|The voice|An unidentified voice|An off-?screen voice)\b", last_clause)
+            if labels:
+                if fact.entity_id is None or {subjects[label] for label in labels} != {fact.entity_id}:
+                    ambiguous()
+            elif not neutral and (len({s.entity_id for s in speech}) != 1 or fact.entity_id is None
+                                  or not re.match(r"(?:He|She|They)\b", last_clause)):
+                ambiguous()
+            if neutral and neutral.group() == "The voice" and boundary:
+                ambiguous()
+            if not lead.rstrip():
+                ambiguous()
+            end = len(lead.rstrip())
+            position = end - 1 if lead[end - 1] in ",:;" else end
+            lead = lead[:position] + f" ({fact.speaker_id})" + lead[position:]
+            pieces.extend((lead, block.group()))
+            inserted += 1
+            continue
         actor = clause.group("actor")
         grounding = av[fact.segment_id]
         if actor.startswith("<Subject"):
@@ -1138,6 +1161,10 @@ def _materialize_sample(
     allowed_labels.update(a.audio_label for a in contract.audios)
     caption = context.caption
     if reuse_audio_contracts is not None:
+        anchored = _two_step_first_speaker_marker(caption, job, record, facts.speech)
+        if anchored != caption:
+            warnings.append("deterministic_correction_count:two_step_first_speaker_marker_inserted=1")
+        caption = anchored
         caption, inserted = _two_step_speaker_markers(caption, job, record, facts.speech)
         if inserted:
             warnings.append(f"deterministic_correction_count:two_step_speaker_markers_inserted={inserted}")
@@ -1154,10 +1181,6 @@ def _materialize_sample(
     summary = context.summary
     if reuse_audio_contracts is not None:
         summary = prune_summary_dialogue(summary)
-        anchored = _two_step_first_speaker_marker(detailed, job, record, facts.speech)
-        if anchored != detailed:
-            warnings.append("deterministic_correction_count:two_step_first_speaker_marker_inserted=1")
-        detailed = anchored
         detailed = project_authoritative_dialogue(
             detailed, facts.speech,
             {g.segment_id: g.speech_presentation for g in record.annotation.av_grounding.segment_groundings},

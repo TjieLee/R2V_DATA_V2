@@ -1002,7 +1002,7 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.66", "r2v.h3.mimo25_backend.67", "r2v.h3.mimo25_backend.68", "r2v.h3.mimo25_backend.69", "r2v.h3.mimo25_backend.70", "r2v.h3.mimo25_backend.71", "r2v.h3.mimo25_backend.72", "r2v.h3.mimo25_backend.73", "r2v.h3.mimo25_backend.74", "r2v.h3.mimo25_backend.75", "r2v.h3.mimo25_backend.76", "r2v.h3.mimo25_backend.77", "r2v.h3.mimo25_backend.78", "r2v.h3.mimo25_backend.79", "r2v.h3.mimo25_backend.80", "r2v.h3.mimo25_backend.81", "r2v.h3.mimo25_backend.82", "r2v.h3.mimo25_backend.83", "r2v.h3.mimo25_backend.84", "r2v.h3.mimo25_backend.85"] = MIMO25_BACKEND_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.66", "r2v.h3.mimo25_backend.67", "r2v.h3.mimo25_backend.68", "r2v.h3.mimo25_backend.69", "r2v.h3.mimo25_backend.70", "r2v.h3.mimo25_backend.71", "r2v.h3.mimo25_backend.72", "r2v.h3.mimo25_backend.73", "r2v.h3.mimo25_backend.74", "r2v.h3.mimo25_backend.75", "r2v.h3.mimo25_backend.76", "r2v.h3.mimo25_backend.77", "r2v.h3.mimo25_backend.78", "r2v.h3.mimo25_backend.79", "r2v.h3.mimo25_backend.80", "r2v.h3.mimo25_backend.81", "r2v.h3.mimo25_backend.82", "r2v.h3.mimo25_backend.83", "r2v.h3.mimo25_backend.84", "r2v.h3.mimo25_backend.85", "r2v.h3.mimo25_backend.86"] = MIMO25_BACKEND_VERSION
     audio_finalize_prompt_version: Literal["h3_mimo25_audio_finalize_v6"] = (
         MIMO25_AUDIO_FINALIZE_PROMPT_VERSION
     )
@@ -1084,7 +1084,7 @@ class MimoBackendProvenance(SchemaModel):
             or (self.schema_version.endswith(".78")) != (self.prompt_version == "h3_mimo26_ra2va_single_v10_action_icl_ab_v2")
             or (self.schema_version.endswith(".79")) != (self.prompt_version == "h3_mimo26_ra2va_single_v11_compact3_audio_av")
             or (self.schema_version.endswith(".80")) != (self.prompt_version == "h3_mimo26_ra2va_two_step_joint_v1")
-            or (self.schema_version.endswith((".81", ".82", ".83", ".84", ".85"))) != (self.prompt_version == "h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity")
+            or (self.schema_version.endswith((".81", ".82", ".83", ".84", ".85", ".86"))) != (self.prompt_version == "h3_mimo26_ra2va_two_step_joint_v2_caption_fidelity")
         ):
             raise ValueError("MiMo single-call provenance differs from backend version")
         if not self.base_url.strip() or not self.media_root.strip():
