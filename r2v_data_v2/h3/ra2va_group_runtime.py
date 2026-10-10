@@ -46,6 +46,12 @@ class GroupAukBackend(PersistentAukBackend):
     def __enter__(self):
         return _start_jsonl(self, worker_path())
 
+    def _read(self):
+        try:
+            return super()._read()
+        except (TimeoutError, BrokenPipeError, EOFError) as error:
+            raise RuntimeError(f"Native model process interrupted: {error}") from error
+
     def generate(self, job, raw_path):
         self._send({"request_id": job.clip_uid, "operation": "generate_group",
             "raw_output_path": str(raw_path), "source_audio_path": job.source_audio_path,
@@ -53,10 +59,12 @@ class GroupAukBackend(PersistentAukBackend):
         response = self._read()
         if response.get("request_id") != job.clip_uid or response.get("status") not in {"ok", "failed"}:
             raise ValueError("AuK worker response identity/status differs")
+        if "out of memory" in response.get("reason", "").lower():
+            raise RuntimeError(f"AuK inference process failed: {response['reason']}")
         return response
 
 
-class GroupDiariZenBackend(PersistentAukBackend):
+class GroupDiariZenBackend(GroupAukBackend):
     def __enter__(self):
         return _start_jsonl(self, Path(__file__).resolve().parents[2] / "tools/run_h3_ra2va_group_diarizen_worker.py")
 
@@ -66,6 +74,8 @@ class GroupDiariZenBackend(PersistentAukBackend):
         if response.get("request_id") != clip_uid:
             raise RuntimeError("DiariZen native response belongs to another task")
         if response["status"] != "ready":
+            if "out of memory" in response["reason"].lower():
+                raise RuntimeError(response["reason"])
             raise ValueError(response["reason"])
         return response["segments"]
 
@@ -130,6 +140,7 @@ class NativeBackendFactory:
 def load_native_configuration(path, endpoint_index=0):
     from r2v_data_v2.h3.mimo25_backend import MimoBackendConfig, MimoMediaResolver
     values = json.loads(Path(path).read_text())
+    values["log_root"] = os.path.expandvars(values["log_root"])
     mimo = values["mimo"]
     config = MimoBackendConfig(api_key=os.environ.get("MIMO_API_KEY", "local"), transport="sglang",
         model="mimo-v2.6-flash-rl", base_url=f"http://127.0.0.1:{mimo['ports'][endpoint_index]}/v1",

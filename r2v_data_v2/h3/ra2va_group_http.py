@@ -113,6 +113,17 @@ class HttpGroupCoordinator:
         # Inspect only active interrupted requests, never completed media/results.
         for ordinal, row in self._dispatch_state()["active"].items():
             meta = row["http"]
+            if self.mode.startswith("http_native") and meta.get("revoked"):
+                replay, unresolved = self._native_recovery(meta)
+                if unresolved:
+                    sid = row["worker_id"]
+                    held = self.core.restore_claim(self.snapshot, int(ordinal), sid)
+                    try:
+                        self.core.publish(held, "failed", self._unresolved_payload(meta, replay, unresolved),
+                                          0, receipt_metadata=meta)
+                    finally:
+                        held.close()
+                continue
             events = meta["events"]
             if meta.get("revoked") and "request_started" in events and "response_saved" not in events:
                 sid = row["worker_id"]
@@ -126,6 +137,40 @@ class HttpGroupCoordinator:
                     }, 0, receipt_metadata=meta)
                 finally:
                     held.close()
+
+    def _native_recovery(self, meta):
+        replay, unresolved = {}, []
+        for turn in ("visual", "joint"):
+            started = meta["events"].get(f"{turn}.request_started")
+            if started is None:
+                continue
+            root = Path(started["checkpoint"]["root"])
+            response = root / f"{turn}.response.json"
+            if response.is_file():
+                value = read_json(response)
+                if value["clip_uid"] != meta["identity"]["clip_uid"] or value["turn"] != turn:
+                    raise ClaimConflict("saved response task/turn differs")
+                replay[turn] = str(root)
+            else:
+                unresolved.append(turn)
+        return replay, unresolved
+
+    def _unresolved_payload(self, meta, replay, unresolved):
+        raw, provenance = {}, None
+        for turn, root in replay.items():
+            completion = read_json(Path(root) / f"{turn}.response.json")["completion"]
+            raw[turn] = completion["choices"][0]["message"]["content"]
+            provenance_path = Path(root) / "inference_provenance.json"
+            if provenance_path.is_file():
+                provenance = read_json(provenance_path)
+        return {"clip_uid": meta["identity"]["clip_uid"], "status": "failed", "annotation": None,
+            "failure_code": "interrupted_request_unresolved", "failure_reason": "interrupted_request_unresolved",
+            "unresolved_turns": unresolved, "backend_provenance": provenance,
+            "visual_raw_response": raw.get("visual"), "speech_av_raw_response": raw.get("joint"),
+            "raw_responses": [raw[t] for t in ("visual", "joint") if t in raw],
+            "model_call_count": sum(f"{t}.request_started" in meta["events"] for t in ("visual", "joint")),
+            "new_request_count": 0, "execution": "native" if self.mode == "http_native_pilot" else "cpu_fixture",
+            "response_sources": {t: str(Path(root) / f"{t}.response.json") for t, root in replay.items()}}
 
     def _retire(self, sid):
         claim = self.claims.pop(sid, None)
@@ -147,8 +192,7 @@ class HttpGroupCoordinator:
             self.core.recover(self.snapshot)
             self._expire()
             if (self.mode.startswith("http_native") and self.snapshot.stage == "export"
-                    and self.core.status()["phase"] == "draining"
-                    and self.core.progress(self.snapshot)["active"] == 0):
+                    and (progress := self.core.progress(self.snapshot))["active"] == progress["pending"] == 0):
                 from r2v_data_v2.h3.ra2va_group_local import _collect_export
                 _collect_export(self.core.group_root(self.snapshot.group_id))
             if self.core.advance(self.snapshot):
@@ -200,6 +244,7 @@ class HttpGroupCoordinator:
                 claim.task.ordinal)) for i, stage in enumerate(STAGES[:index])}
             wire["artifact_root"] = str(self.core.stage_root(self.snapshot) / "attempts"
                 / f"{claim.task.ordinal:06d}" / row["http"]["claim_token"])
+            wire["replay_roots"] = row["http"].get("replay_roots", {})
         return wire
 
     def _connect(self, body):
@@ -259,7 +304,20 @@ class HttpGroupCoordinator:
 
         def metadata(previous, task):
             meta = {"claim_token": uuid.uuid4().hex, "revoked": False, "events": {}}
+            identity = {"group_id": self.snapshot.group_id, "stage": self.snapshot.stage,
+                "generation": self.snapshot.generation, "ordinal": task.ordinal, "clip_uid": task.clip_uid}
+            if self.mode.startswith("http_native"):
+                meta["identity"] = identity
             if previous is not None and previous["http"].get("revoked"):
+                if self.mode.startswith("http_native"):
+                    old = previous["http"]
+                    if old["identity"] != identity:
+                        raise ClaimConflict("checkpoint task identity differs")
+                    replay, unresolved = self._native_recovery(old)
+                    if unresolved:
+                        raise ClaimConflict("unresolved model request cannot be reassigned")
+                    meta["events"], meta["replay_roots"] = old["events"], replay
+                    return meta
                 events = previous["http"]["events"]
                 if "response_saved" in events:
                     meta["events"] = events
@@ -322,6 +380,8 @@ class HttpGroupCoordinator:
         event = body["event"]
         if event not in ("execution_started", "request_started", "response_saved"):
             raise ClaimConflict("unknown execution event")
+        if self.mode.startswith("http_native") and event != "execution_started":
+            return self._native_event(body, claim)
         with self.core._checked(self.snapshot) as (_, dispatch):
             events = dispatch["active"][str(claim.task.ordinal)]["http"]["events"]
             if event == "response_saved" and ("request_started" not in events or body.get("checkpoint") is None):
@@ -329,6 +389,26 @@ class HttpGroupCoordinator:
             if event in events and events[event]["checkpoint"] != body.get("checkpoint"):
                 raise ClaimConflict("execution event checkpoint differs")
             events.setdefault(event, {"at": self.wall_clock(), "checkpoint": body.get("checkpoint")})
+            self.core._save_dispatch(self.snapshot, dispatch)
+        return {"accepted": True}
+
+    def _native_event(self, body, claim):
+        turn, event = body.get("turn"), body["event"]
+        if claim.snapshot.stage != "mimo" or turn not in ("visual", "joint"):
+            raise ClaimConflict("Native model event requires MiMo Visual/Joint turn")
+        root = Path(self._claim_wire(claim.worker_id)["artifact_root"]) / "mimo" / claim.task.clip_uid
+        checkpoint = {"root": str(root), "turn": turn}
+        if body.get("checkpoint") != checkpoint:
+            raise ClaimConflict("checkpoint must belong to this claim, clip and turn")
+        with self.core._checked(self.snapshot) as (_, dispatch):
+            meta = dispatch["active"][str(claim.task.ordinal)]["http"]
+            events, key = meta["events"], f"{turn}.{event}"
+            if event == "response_saved" and f"{turn}.request_started" not in events:
+                raise ClaimConflict("saved response requires prior intent")
+            if key in events and events[key]["checkpoint"] != checkpoint:
+                raise ClaimConflict("turn event already belongs to another attempt")
+            events.setdefault(key, {"at": self.wall_clock(), "checkpoint": checkpoint,
+                "identity": meta["identity"] | {"turn": turn}, "claim_token": body["claim_token"]})
             self.core._save_dispatch(self.snapshot, dispatch)
         return {"accepted": True}
 

@@ -49,6 +49,12 @@ def _stage_child(pipe, stage, factory, ffmpeg, ffprobe, execution, gpu_id):
                 task = pipe.recv()
                 if task is None:
                     return
+                def event(name, turn):
+                    pipe.send(("event", (name, turn)))
+                    if pipe.recv() != "confirmed":
+                        raise RuntimeError("Coordinator did not confirm model event")
+                worker.mimo_event = event
+                worker.mimo_replay_roots = task.get("replay_roots")
                 pipe.send(("result", _execute(worker, task, execution)))
     except EOFError:
         pass
@@ -77,13 +83,14 @@ class _ProcessHandle:
 
 class NativeStageExecution:
     def __init__(self, session, *, backend_factory, ffmpeg, execution, heartbeat, stop_event,
-                 gpu_id=None, ffprobe="ffprobe", cleanup_seconds=5, services=None, endpoint_index=0):
+                 gpu_id=None, ffprobe="ffprobe", cleanup_seconds=5, services=None, endpoint_index=0, client=None):
         self.session, self.factory = session, backend_factory
         self.ffmpeg, self.ffprobe, self.execution = ffmpeg, ffprobe, execution
         self.heartbeat, self.stop_event, self.gpu_id = heartbeat, stop_event, gpu_id
         self.cleanup_seconds, self.services, self.endpoint_index = cleanup_seconds, services, endpoint_index
         self.descendants, self.process, self.pipe = set(), None, None
         self.joined = False
+        self.client = client
 
     def allowed(self):
         return not self.stop_event.is_set() and self.heartbeat.execution_allowed()
@@ -134,15 +141,34 @@ class NativeStageExecution:
             if not self.allowed():
                 raise HttpConflict("Native execution permission ended")
             self.pipe.send(task)
-            kind, value = self._receive()
-            assert kind == "result"
-            return value
+            while True:
+                kind, value = self._receive()
+                if kind == "result":
+                    return value
+                assert kind == "event"
+                name, turn = value
+                body = {k: task[k] for k in ("session_id", "task_id", "claim_token")} | {
+                    "event": name, "turn": turn, "checkpoint": {"turn": turn,
+                        "root": str(Path(task["artifact_root"]) / "mimo" / task["task"]["clip_uid"])}}
+                while self.allowed():
+                    try:
+                        self.client.call("POST", "/v1/tasks/event", body)
+                        if not self.allowed():
+                            raise HttpConflict("Model event reply arrived after watchdog expiry")
+                        self.pipe.send("confirmed")
+                        break
+                    except OSError:
+                        time.sleep(.05)
+                else:
+                    raise HttpConflict("Model event was not confirmed before watchdog expiry")
 
     def __exit__(self, *args):
         started = time.monotonic()
         if not self.allowed():
             self.stop_event.set()
         if self.process is not None and self.process.pid is not None:
+            from r2v_data_v2.h3.t2va_full_workers import _descendants
+            self.descendants.update(_descendants({self.process.pid}))
             if self.process.is_alive() and self.allowed():
                 try:
                     self.pipe.send(None)
@@ -166,7 +192,7 @@ def run_http_native_worker(client, *, node_id, worker_instance, stop_event, back
         execution_mode=execution, executor_factory=lambda session, heartbeat: NativeStageExecution(
             session, backend_factory=backend_factory, ffmpeg=ffmpeg, ffprobe=ffprobe, execution=execution,
             heartbeat=heartbeat, stop_event=stop_event, gpu_id=gpu_id,
-            services=services, endpoint_index=endpoint_index))
+            services=services, endpoint_index=endpoint_index, client=client))
 
 
 def run_http_native_workers(*, coordinator_url, node_id, workers, configuration_path=None,

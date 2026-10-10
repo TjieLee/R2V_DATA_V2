@@ -182,3 +182,73 @@ def test_native_child_sigkill_is_infrastructure_interruption(tmp_path):
         with pytest.raises(RuntimeError, match="exited"):
             executor._receive()
     assert executor.process.exitcode == -signal.SIGKILL
+
+
+def test_sglang_busy_port_is_not_adopted_as_our_model(tmp_path):
+    import socket
+
+    from r2v_data_v2.h3.ra2va_group_native_resources import SGLangProcess
+    with socket.socket() as occupied:
+        occupied.bind(("127.0.0.1", 0))
+        occupied.listen()
+        server = SGLangProcess({"sglang": "unused", "checkpoint": "/model"},
+                                "0,1,2,3", occupied.getsockname()[1], tmp_path)
+        server.command = [sys.executable, "-c", "import time; time.sleep(60)"]
+        try:
+            with pytest.raises(OSError):
+                server.launch()
+        finally:
+            server.close()
+        assert server.process is None
+
+
+def test_cleanup_reaps_owned_group_after_leader_has_exited(tmp_path):
+    import subprocess
+
+    from r2v_data_v2.h3.ra2va_group_native_resources import stop_owned_process
+    child_pid_path = tmp_path / "orphan.pid"
+    child_code = "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"
+    parent_code = ("import subprocess,sys,time; from pathlib import Path; "
+                   f"child=subprocess.Popen([sys.executable,'-c',{child_code!r}]); "
+                   f"Path({str(child_pid_path)!r}).write_text(str(child.pid)); time.sleep(.2)")
+    parent = subprocess.Popen([sys.executable, "-c", parent_code], start_new_session=True)
+    parent.wait(timeout=5)
+    child_pid = int(child_pid_path.read_text())
+    try:
+        stop_owned_process(parent, set(), grace=.1)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(.02)
+        else:
+            pytest.fail("owned child survived after its group leader exited")
+    finally:
+        try:
+            os.kill(child_pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def test_late_event_ack_cannot_authorize_request_after_watchdog_expiry(tmp_path):
+    from types import SimpleNamespace
+
+    from r2v_data_v2.h3.ra2va_group_http_native_worker import NativeStageExecution
+    from r2v_data_v2.h3.ra2va_group_http_worker import HttpConflict
+    permission, sent = Permission(), []
+
+    def call(*args):
+        permission.allowed = False
+        return {"accepted": True}
+    executor = NativeStageExecution({"stage": "mimo"}, backend_factory=None,
+        ffmpeg="ffmpeg", execution="native", heartbeat=permission, stop_event=threading.Event(),
+        client=SimpleNamespace(call=call))
+    executor.pipe = SimpleNamespace(send=sent.append)
+    executor._receive = lambda: ("event", ("request_started", "visual"))
+    task = {"session_id": "session", "task_id": "task", "claim_token": "token",
+            "artifact_root": str(tmp_path), "task": {"clip_uid": "clip"}}
+    with pytest.raises(HttpConflict, match="watchdog"):
+        executor.execute(task)
+    assert sent == [task]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import signal
+import socket
 import subprocess
 import threading
 import time
@@ -19,23 +20,25 @@ from r2v_data_v2.h3.t2va_mimo_stage_server import (
 
 def stop_owned_process(process, descendants, *, grace=2):
     """Also stop observed nested backends which detached from the parent's PGID."""
-    descendants.update(_descendants({process.pid}))
-    for pid in descendants:
-        _signal_pid(pid, signal.SIGTERM)
-    if process.poll() is None:
+    def signal_group(sig):
+        # Children can retain the owned PGID after their leader exits.
         try:
-            _signal_pid(process.pid, signal.SIGTERM, group=True)
+            _signal_pid(process.pid, sig, group=True)
         except PermissionError:
             if process.poll() is None:
                 raise
+
+    descendants.update(_descendants({process.pid}))
+    for pid in descendants:
+        _signal_pid(pid, signal.SIGTERM)
+    signal_group(signal.SIGTERM)
     try:
         process.wait(timeout=grace)
     except subprocess.TimeoutExpired:
         pass
     for pid in descendants:
         _signal_pid(pid, signal.SIGKILL)
-    if process.poll() is None:
-        _signal_pid(process.pid, signal.SIGKILL, group=True)
+    signal_group(signal.SIGKILL)
     process.wait(timeout=5)
 
 
@@ -51,6 +54,9 @@ class SGLangProcess:
         self.descendants = set()
 
     def launch(self):
+        # Never interpret somebody else's already-running endpoint as ours.
+        with socket.socket() as available:
+            available.bind(("127.0.0.1", self.port))
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         self.log = self.log_path.open("a")
         try:
@@ -142,6 +148,9 @@ class NodeMimoServices:
         try:
             if not allowed():
                 raise RuntimeError("MiMo endpoint permission expired")
+            process = getattr(self.servers[index], "process", None)
+            if process is not None and process.poll() is not None:
+                raise RuntimeError("Node-owned SGLang process exited; no implicit restart")
             yield
         finally:
             slot.release()

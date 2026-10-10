@@ -31,7 +31,7 @@ def _json_completion(value):
 
 
 class DurableCompletions:
-    def __init__(self, root, client, *, clip_uid, event=None):
+    def __init__(self, root, client, *, clip_uid, event=None, replay_roots=None):
         self.root, self.clip_uid = Path(root), clip_uid
         self.root.mkdir(parents=True, exist_ok=True)
         self.client = client.with_options(max_retries=0) if isinstance(client, OpenAI) else client
@@ -39,6 +39,8 @@ class DurableCompletions:
         self.new_request_count = self.response_replay_count = 0
         self.unresolved_turns = []
         self.request_settings_match = True
+        self.replay_roots = {turn: Path(path) for turn, path in (replay_roots or {}).items()}
+        self.response_sources = {}
         self.chat = SimpleNamespace(completions=self)
 
     def create(self, **payload):
@@ -46,9 +48,17 @@ class DurableCompletions:
         turn = {"MimoVisualDraft": "visual", "MimoJointAVAudioDraft": "joint"}[name]
         response_path = self.root / f"{turn}.response.json"
         intent_path = self.root / f"{turn}.request.json"
+        if not response_path.exists() and turn in self.replay_roots:
+            response_path = self.replay_roots[turn] / f"{turn}.response.json"
         if response_path.exists():
+            response = json.loads(response_path.read_text())
+            if response["clip_uid"] != self.clip_uid or response["turn"] != turn:
+                raise ValueError("replayed MiMo response belongs to another clip/turn")
             self.response_replay_count += 1
-            return json.loads(response_path.read_text())["completion"]
+            self.response_sources[turn] = str(response_path)
+            return response["completion"]
+        if turn in self.replay_roots:
+            raise ValueError("authorized MiMo replay response is missing")
         if intent_path.exists():
             self.unresolved_turns.append(turn)
             raise InterruptedRequestUnresolved(f"interrupted_request_unresolved:{turn}")
@@ -67,6 +77,7 @@ class DurableCompletions:
         atomic_json(response_path, {"clip_uid": self.clip_uid, "turn": turn,
             "started_at": started, "completed_at": time.time(),
             "completion": _json_completion(completion)})
+        self.response_sources[turn] = str(response_path)
         self.event("response_saved", turn)
         return completion
 
@@ -74,23 +85,30 @@ class DurableCompletions:
         return {"new_request_count": self.new_request_count,
                 "response_replay_count": self.response_replay_count,
                 "unresolved_turns": self.unresolved_turns,
-                "model_call_count": sum((self.root / f"{turn}.request.json").is_file()
+                "response_sources": self.response_sources,
+                "model_call_count": sum(turn in self.replay_roots or (self.root / f"{turn}.request.json").is_file()
                                         for turn in ("visual", "joint"))}
 
 
-def reconcile_group_job(*, root, config, client, job, stems, event=None) -> dict:
-    durable = DurableCompletions(root, client, clip_uid=job.clip_uid, event=event)
+def reconcile_group_job(*, root, config, client, job, stems, event=None, replay_roots=None) -> dict:
+    durable = DurableCompletions(root, client, clip_uid=job.clip_uid, event=event, replay_roots=replay_roots)
     backend = TwoStepOpenAIMimo26Backend(config, stem_records_by_clip={}, client=durable)
     current_provenance = backend.provenance.model_dump(mode="json")
     provenance_path = Path(root) / "inference_provenance.json"
     if not provenance_path.exists():
         atomic_json(provenance_path, current_provenance)
     inference_provenance = json.loads(provenance_path.read_text())
+    replay_provenance = {turn: json.loads((Path(path) / "inference_provenance.json").read_text())
+                         for turn, path in (replay_roots or {}).items()}
+    if "visual" in replay_provenance:
+        inference_provenance = replay_provenance["visual"]
     # Old responses retain their actual settings. Never issue a missing turn under
     # different settings and label it as part of the same inference.
+    addresses = {"base_url", "media_base_url"} if replay_roots else set()
+    ignored = {"configuration_fingerprint"} | addresses
     durable.request_settings_match = (
-        {k: v for k, v in inference_provenance.items() if k != "configuration_fingerprint"}
-        == {k: v for k, v in current_provenance.items() if k != "configuration_fingerprint"})
+        {k: v for k, v in inference_provenance.items() if k not in ignored}
+        == {k: v for k, v in current_provenance.items() if k not in ignored})
     common = {"clip_uid": job.clip_uid, "backend_provenance": inference_provenance,
               "postprocessing_version": "ra2va_group_durable_two_step_v1"}
     try:
@@ -115,5 +133,7 @@ def reconcile_group_job(*, root, config, client, job, stems, event=None) -> dict
             "speech_av_raw_response": exc.speech_av_raw_response,
             "diagnostics": [d.model_dump(mode="json") for d in exc.diagnostics]}
     values.update(durable.audit())
+    values["inference_provenance_by_turn"] = {turn: replay_provenance.get(turn, json.loads(provenance_path.read_text()))
+                                              for turn in durable.response_sources}
     atomic_json(Path(root) / "reconcile.json", values)
     return values

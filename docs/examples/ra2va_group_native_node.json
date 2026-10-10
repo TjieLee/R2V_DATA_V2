@@ -1,0 +1,45 @@
+{
+  "gpu_ids": ["0", "1", "2", "3"],
+  "log_root": "${R2VA_RUN_ROOT}/node-logs/${HOSTNAME}",
+  "ffmpeg": "/usr/bin/ffmpeg",
+  "ffprobe": "/usr/bin/ffprobe",
+  "sam": {
+    "implementation_root": "/mnt/workspace/litengjie/data/audio_deps/sam-audio-src",
+    "model_path": "/mnt/workspace/public/pretrained/Facebook/sam-audio-large-tv",
+    "t5_base_path": "/mnt/workspace/public/pretrained/google/t5-base",
+    "speech_prompt": "human voices",
+    "music_prompt": "music soundtrack"
+  },
+  "auk": {
+    "python_path": "/mnt/workspace/litengjie/data/audio_deps/auk/auk-venv/bin/python",
+    "code_root": "/mnt/workspace/litengjie/data/audio_deps/auk/AuK-src",
+    "checkpoint_path": "/mnt/workspace/litengjie/data/audio_deps/auk/AuK/auk_base.safetensors",
+    "qwen_path": "/mnt/workspace/litengjie/data/audio_deps/auk/Qwen2.5-Omni-3B"
+  },
+  "diarizen": {
+    "python_path": "/mnt/workspace/litengjie/data/audio_deps/diarizen-venv/bin/python",
+    "code_root": "/mnt/workspace/litengjie/data/audio_deps/DiariZen",
+    "model_cache": "/mnt/workspace/litengjie/data/audio_deps/diarizen-model-cache",
+    "model_identifier": "BUT-FIT/diarizen-wavlm-large-s80-md-v2"
+  },
+  "asr": {
+    "environment": {
+      "QWEN3_ASR_ENV": "/mnt/workspace/litengjie/data/audio_deps/qwen3-asr-venv",
+      "QWEN3_ASR_MODEL_PATH": "/mnt/workspace/public/pretrained/Qwen/Qwen3-ASR-1.7B",
+      "QWEN3_ASR_DEVICE": "cuda:0",
+      "QWEN3_ASR_DTYPE": "bfloat16",
+      "QWEN3_ASR_MAX_INFERENCE_BATCH_SIZE": "1"
+    }
+  },
+  "mimo": {
+    "sglang": "/mnt/workspace/litengjie/data/audio_deps/mimo26-sglang-env/bin/sglang",
+    "checkpoint": "/mnt/workspace/public/pretrained/MiMo/MiMo-V2.6-Flash-RL",
+    "gpu_groups": ["0,1,2,3"],
+    "ports": [8094],
+    "mem_fraction_static": 0.65,
+    "startup_timeout_seconds": 1800,
+    "timeout_seconds": 900,
+    "media_root": "/mnt/workspace",
+    "media_base_url": "http://127.0.0.1:8766/"
+  }
+}

@@ -115,9 +115,16 @@ def pilot_summary(run_root: Path) -> dict:
                            "active": len(dispatch["active"]),
                            **{k: dispatch[k] for k in ("ready", "failed", "skipped")},
                            "elapsed_seconds": elapsed, "tasks_per_second": done / elapsed})
-    return {"mode": "cpu_fake_pilot", "settings": control["settings"],
+    result = {"mode": control["mode"], "settings": control["settings"],
             "completed_groups": completed, "started_groups": control["started_groups"],
             "model_call_count": 0, "stages": stages}
+    if control["mode"].startswith("http_native"):
+        calls = sum(read_json(path)["payload"].get("model_call_count", 0)
+                    for path in run_root.glob("groups/*/stages/*-mimo/results/*.json"))
+        result["model_call_count"] = calls if control["mode"] == "http_native_pilot" else 0
+        result["simulated_mimo_request_count"] = calls if control["mode"] == "http_native_cpu_pilot" else 0
+        result["exports"] = [read_json(path) for path in run_root.glob("groups/*/bundle/summary.json")]
+    return result
 
 
 def run_fake_pilot(*, source_root: Path, run_root: Path, workers: int, limit: int,

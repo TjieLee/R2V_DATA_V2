@@ -84,6 +84,7 @@ class GroupStageWorker:
         self.stage, self.root = stage, Path(artifact_root)
         self.backend_factory = backend_factory
         self.ffmpeg, self.ffprobe = ffmpeg, ffprobe
+        self.mimo_event, self.mimo_replay_roots = None, None
 
     def __enter__(self):
         self.context = (nullcontext(None) if self.stage in ("resolve", "export")
@@ -202,6 +203,7 @@ class GroupStageWorker:
                       else self.backend.client)
             return reconcile_group_job(root=output, config=self.backend.config, client=client,
                 job=GroupFrozenJob.model_validate(upstream["asr"]["job"]),
+                event=self.mimo_event, replay_roots=self.mimo_replay_roots,
                 stems={kind: upstream["resolve"][kind]["path"] for kind in ("speech", "music", "sfx")})
         if self.stage == "export":
             from r2v_data_v2.h3.ra2va_group_export import export_group_clip

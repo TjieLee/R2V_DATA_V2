@@ -348,9 +348,15 @@ class GroupCoordinator:
                      elapsed_seconds=dispatch["finished_at"] - dispatch["started_at"])
             index = STAGES.index(snapshot.stage)
             if index == len(STAGES) - 1:
+                counts = {}
+                if control["mode"].startswith("http_native"):
+                    calls = sum(read_json(path)["payload"].get("model_call_count", 0)
+                        for path in self.group_root(snapshot.group_id).glob("stages/*-mimo/results/*.json"))
+                    counts = {"model_call_count": calls if control["mode"] == "http_native_pilot" else 0,
+                              "simulated_mimo_request_count": calls if control["mode"] == "http_native_cpu_pilot" else 0}
                 atomic_json(self.group_root(snapshot.group_id) / "PILOT_COMPLETE", {
                     "mode": control["mode"], "selected_count": total,
-                    "generation": snapshot.generation, "model_call_count": 0,
+                    "generation": snapshot.generation, "model_call_count": 0, **counts,
                 })
                 control["phase"] = "complete"
             else:
